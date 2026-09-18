@@ -1,5 +1,6 @@
 #pragma once
 
+#include <expected>
 #include <string>
 
 namespace kidi::core {
@@ -17,4 +18,15 @@ struct Error {
     std::string message;
 };
 
+template <typename T>
+using Result = std::expected<T, Error>;
+
 } // namespace kidi::core
+
+namespace kidi {
+
+using core::Error;
+using core::ErrorCode;
+using core::Result;
+
+} // namespace kidi

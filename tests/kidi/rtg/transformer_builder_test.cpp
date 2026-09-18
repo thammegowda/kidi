@@ -98,19 +98,14 @@ int main() {
                                             "define feed-forward output");
 
     kidi::rtg::TransformerBuilder builder(graph->get(), *weights, 4, 3, 2, 1.0e-5F);
-    auto normalized_id =
-        status ? builder.layer_norm(input_id, "norm", normalized_output_id)
-               : std::expected<std::uint32_t, kidi::core::Error>{std::unexpected(std::move(status.error()))};
-    auto linear_id =
-        normalized_id
-            ? builder.linear(*normalized_id, "ff.w_1", 4, 3, linear_output_id)
-            : std::expected<std::uint32_t, kidi::core::Error>{std::unexpected(std::move(normalized_id.error()))};
-    auto gelu_id = linear_id
-                       ? builder.gelu(*linear_id, gelu_output_id)
-                       : std::expected<std::uint32_t, kidi::core::Error>{std::unexpected(std::move(linear_id.error()))};
-    auto result_id = gelu_id
-                         ? builder.linear(*gelu_id, "ff.w_2", 3, 4, output_id)
-                         : std::expected<std::uint32_t, kidi::core::Error>{std::unexpected(std::move(gelu_id.error()))};
+    auto normalized_id = status ? builder.layer_norm(input_id, "norm", normalized_output_id)
+                                : kidi::Result<std::uint32_t>{std::unexpected(std::move(status.error()))};
+    auto linear_id = normalized_id ? builder.linear(*normalized_id, "ff.w_1", 4, 3, linear_output_id)
+                                   : kidi::Result<std::uint32_t>{std::unexpected(std::move(normalized_id.error()))};
+    auto gelu_id = linear_id ? builder.gelu(*linear_id, gelu_output_id)
+                             : kidi::Result<std::uint32_t>{std::unexpected(std::move(linear_id.error()))};
+    auto result_id = gelu_id ? builder.linear(*gelu_id, "ff.w_2", 3, 4, output_id)
+                             : kidi::Result<std::uint32_t>{std::unexpected(std::move(gelu_id.error()))};
     if (!result_id) {
         std::cerr << result_id.error().message << '\n';
         return 1;

@@ -7,3 +7,9 @@ namespace kidi::core {
 [[nodiscard]] std::string_view version() noexcept;
 
 } // namespace kidi::core
+
+namespace kidi {
+
+using core::version;
+
+} // namespace kidi

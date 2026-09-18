@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <expected>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -22,12 +21,9 @@ public:
     EmbeddingGraph(const EmbeddingGraph&) = delete;
     EmbeddingGraph& operator=(const EmbeddingGraph&) = delete;
 
-    [[nodiscard]] static std::expected<EmbeddingGraph, core::Error> create(const model::Weights& weights,
-                                                                           std::string_view weight_name,
-                                                                           std::int32_t vocabulary_size,
-                                                                           std::int32_t hidden_size);
-    [[nodiscard]] std::expected<std::vector<float>, core::Error> run(std::span<const std::int32_t> token_ids,
-                                                                     std::size_t batch_size = 1);
+    [[nodiscard]] static Result<EmbeddingGraph> create(const model::Weights& weights, std::string_view weight_name,
+                                                       std::int32_t vocabulary_size, std::int32_t hidden_size);
+    [[nodiscard]] Result<std::vector<float>> run(std::span<const std::int32_t> token_ids, std::size_t batch_size = 1);
 
 private:
     EmbeddingGraph(runtime::YnnExecutable executable, std::int32_t vocabulary_size, std::int32_t hidden_size,

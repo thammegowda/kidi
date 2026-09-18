@@ -1,6 +1,5 @@
 #pragma once
 
-#include <expected>
 #include <filesystem>
 
 #include "kidi/core/error.h"
@@ -18,7 +17,7 @@ public:
     Package(const Package&) = delete;
     Package& operator=(const Package&) = delete;
 
-    [[nodiscard]] static std::expected<Package, core::Error> load(const std::filesystem::path& manifest_path);
+    [[nodiscard]] static Result<Package> load(const std::filesystem::path& manifest_path);
 
     [[nodiscard]] const model::ModelManifest& manifest() const noexcept;
     [[nodiscard]] const model::Weights& weights() const noexcept;

@@ -73,7 +73,7 @@ int main() {
 
     write_file(directory / "invalid.yaml", valid_manifest("../outside.safetensors"));
     auto invalid = kidi::model::ModelManifest::load(directory / "invalid.yaml");
-    if (invalid || invalid.error().code != kidi::core::ErrorCode::INVALID_MANIFEST) {
+    if (invalid || invalid.error().code != kidi::ErrorCode::INVALID_MANIFEST) {
         std::cerr << "escaping model path was accepted\n";
         return 1;
     }

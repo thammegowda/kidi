@@ -28,7 +28,7 @@ DecoderGraph::DecoderGraph(runtime::YnnExecutable executable, std::int32_t hidde
                            std::int32_t maximum_position) noexcept
     : executable_(std::move(executable)), hidden_size_(hidden_size), maximum_position_(maximum_position) {}
 
-std::expected<DecoderGraph, core::Error> DecoderGraph::create(const Package& package) {
+Result<DecoderGraph> DecoderGraph::create(const Package& package) {
     const auto& architecture = package.manifest().architecture;
     auto graph = runtime::YnnGraph::create(4);
     if (!graph) return std::unexpected(std::move(graph.error()));
@@ -118,20 +118,18 @@ std::expected<DecoderGraph, core::Error> DecoderGraph::create(const Package& pac
     return DecoderGraph(std::move(*executable), architecture.hidden_size, architecture.maximum_position);
 }
 
-std::expected<std::vector<float>, core::Error> DecoderGraph::run(std::span<const float> embeddings,
-                                                                 std::size_t batch_size,
-                                                                 std::span<const float> memory) {
+Result<std::vector<float>> DecoderGraph::run(std::span<const float> embeddings, std::size_t batch_size,
+                                             std::span<const float> memory) {
     const auto hidden_size = static_cast<std::size_t>(hidden_size_);
     if (batch_size == 0 || embeddings.empty() || embeddings.size() % (batch_size * hidden_size) != 0 ||
         memory.empty() || memory.size() % hidden_size != 0) {
-        return std::unexpected(core::Error{core::ErrorCode::INVALID_ARGUMENT, "decoder input has incompatible shape"});
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "decoder input has incompatible shape"});
     }
     const auto target_length = embeddings.size() / (batch_size * hidden_size);
     const auto source_length = memory.size() / hidden_size;
     if (target_length > static_cast<std::size_t>(maximum_position_) ||
         source_length > static_cast<std::size_t>(maximum_position_)) {
-        return std::unexpected(
-            core::Error{core::ErrorCode::INVALID_ARGUMENT, "decoder input exceeds the position limit"});
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "decoder input exceeds the position limit"});
     }
 
     const std::array<std::size_t, 3> decoder_shape = {batch_size, target_length, hidden_size};
@@ -160,7 +158,7 @@ GeneratorGraph::GeneratorGraph(runtime::YnnExecutable executable, std::int32_t h
                                std::int32_t vocabulary_size) noexcept
     : executable_(std::move(executable)), hidden_size_(hidden_size), vocabulary_size_(vocabulary_size) {}
 
-std::expected<GeneratorGraph, core::Error> GeneratorGraph::create(const Package& package) {
+Result<GeneratorGraph> GeneratorGraph::create(const Package& package) {
     const auto& architecture = package.manifest().architecture;
     auto graph = runtime::YnnGraph::create(2);
     if (!graph) return std::unexpected(std::move(graph.error()));
@@ -196,11 +194,10 @@ std::expected<GeneratorGraph, core::Error> GeneratorGraph::create(const Package&
     return GeneratorGraph(std::move(*executable), architecture.hidden_size, architecture.target_vocabulary_size);
 }
 
-std::expected<std::vector<float>, core::Error> GeneratorGraph::run(std::span<const float> hidden_states) {
+Result<std::vector<float>> GeneratorGraph::run(std::span<const float> hidden_states) {
     const auto hidden_size = static_cast<std::size_t>(hidden_size_);
     if (hidden_states.empty() || hidden_states.size() % hidden_size != 0) {
-        return std::unexpected(
-            core::Error{core::ErrorCode::INVALID_ARGUMENT, "generator input has incompatible shape"});
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "generator input has incompatible shape"});
     }
     const auto batch_size = hidden_states.size() / hidden_size;
     const std::array<std::size_t, 3> input_shape = {batch_size, 1, hidden_size};
@@ -221,7 +218,7 @@ Decoder::Decoder(EmbeddingGraph embedding, DecoderGraph graph, GeneratorGraph ge
       generator_(std::move(generator)),
       hidden_size_(hidden_size) {}
 
-std::expected<Decoder, core::Error> Decoder::create(const Package& package) {
+Result<Decoder> Decoder::create(const Package& package) {
     const auto& architecture = package.manifest().architecture;
     auto embedding = EmbeddingGraph::create(package.weights(), "tgt_embed.0.lut.weight",
                                             architecture.target_vocabulary_size, architecture.hidden_size);
@@ -233,12 +230,10 @@ std::expected<Decoder, core::Error> Decoder::create(const Package& package) {
     return Decoder(std::move(*embedding), std::move(*graph), std::move(*generator), architecture.hidden_size);
 }
 
-std::expected<std::vector<float>, core::Error> Decoder::next(std::span<const float> memory,
-                                                             std::span<const std::int32_t> token_ids,
-                                                             std::size_t batch_size) {
+Result<std::vector<float>> Decoder::next(std::span<const float> memory, std::span<const std::int32_t> token_ids,
+                                         std::size_t batch_size) {
     if (batch_size == 0 || token_ids.empty() || token_ids.size() % batch_size != 0) {
-        return std::unexpected(
-            core::Error{core::ErrorCode::INVALID_ARGUMENT, "decoder token input has incompatible shape"});
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "decoder token input has incompatible shape"});
     }
     auto embeddings = embedding_.run(token_ids, batch_size);
     if (!embeddings) return std::unexpected(std::move(embeddings.error()));

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <expected>
 #include <filesystem>
 #include <string>
 
@@ -62,7 +61,7 @@ struct ModelManifest {
     std::string input_format;
     std::string output_format;
 
-    [[nodiscard]] static std::expected<ModelManifest, core::Error> load(const std::filesystem::path& path);
+    [[nodiscard]] static Result<ModelManifest> load(const std::filesystem::path& path);
 };
 
 } // namespace kidi::model

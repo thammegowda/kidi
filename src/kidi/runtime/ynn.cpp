@@ -39,7 +39,7 @@ private:
 
 class YnnThreadPool {
 public:
-    static std::expected<std::shared_ptr<YnnThreadPool>, core::Error> create() {
+    static Result<std::shared_ptr<YnnThreadPool>> create() {
         const auto concurrency = std::max(1U, std::thread::hardware_concurrency());
         auto result = std::shared_ptr<YnnThreadPool>(new YnnThreadPool(static_cast<int>(concurrency - 1)));
         auto status =
@@ -64,19 +64,19 @@ private:
 
 namespace {
 
-std::expected<std::shared_ptr<YnnThreadPool>, core::Error> default_thread_pool() {
+Result<std::shared_ptr<YnnThreadPool>> default_thread_pool() {
     static const auto result = YnnThreadPool::create();
     return result;
 }
 
 } // namespace
 
-std::expected<void, core::Error> check_ynn_status(ynn_status status, const char* operation) {
+Result<void> check_ynn_status(ynn_status status, const char* operation) {
     if (status == ynn_status_success) {
         return {};
     }
-    return std::unexpected(core::Error{
-        core::ErrorCode::RUNTIME,
+    return std::unexpected(Error{
+        ErrorCode::RUNTIME,
         std::string(operation) + " failed with YNNPACK status " + std::to_string(status),
     });
 }
@@ -101,7 +101,7 @@ YnnGraph::~YnnGraph() {
     }
 }
 
-std::expected<YnnGraph, core::Error> YnnGraph::create(std::uint32_t external_value_count) {
+Result<YnnGraph> YnnGraph::create(std::uint32_t external_value_count) {
     ynn_subgraph_t graph = nullptr;
     if (auto status = check_ynn_status(ynn_create_subgraph(external_value_count, 0, &graph), "create graph"); !status) {
         return std::unexpected(std::move(status.error()));
@@ -113,7 +113,7 @@ ynn_subgraph_t YnnGraph::get() const noexcept { return graph_; }
 
 ynn_subgraph_t YnnGraph::release() noexcept { return std::exchange(graph_, nullptr); }
 
-std::expected<YnnExecutable, core::Error> YnnGraph::compile() && {
+Result<YnnExecutable> YnnGraph::compile() && {
     auto thread_pool = default_thread_pool();
     if (!thread_pool) return std::unexpected(std::move(thread_pool.error()));
     if (auto status = check_ynn_status(ynn_optimize_subgraph(graph_, (*thread_pool)->get(), 0), "optimize graph");
@@ -153,25 +153,20 @@ YnnExecutable::~YnnExecutable() {
     if (graph_ != nullptr) ynn_delete_subgraph(graph_);
 }
 
-std::expected<void, core::Error> YnnExecutable::set_shape(std::uint32_t external_id,
-                                                          std::span<const std::size_t> dimensions) {
+Result<void> YnnExecutable::set_shape(std::uint32_t external_id, std::span<const std::size_t> dimensions) {
     return check_ynn_status(ynn_set_external_value_shape(runtime_, external_id, dimensions.size(), dimensions.data()),
                             "set external shape");
 }
 
-std::expected<void, core::Error> YnnExecutable::reshape() {
-    return check_ynn_status(ynn_reshape_runtime(runtime_), "reshape runtime");
-}
+Result<void> YnnExecutable::reshape() { return check_ynn_status(ynn_reshape_runtime(runtime_), "reshape runtime"); }
 
-std::expected<void, core::Error> YnnExecutable::bind(std::uint32_t external_id, void* data) {
+Result<void> YnnExecutable::bind(std::uint32_t external_id, void* data) {
     return check_ynn_status(ynn_set_external_value_data(runtime_, external_id, data), "bind external value");
 }
 
-std::expected<void, core::Error> YnnExecutable::invoke() {
-    return check_ynn_status(ynn_invoke_runtime(runtime_), "invoke runtime");
-}
+Result<void> YnnExecutable::invoke() { return check_ynn_status(ynn_invoke_runtime(runtime_), "invoke runtime"); }
 
-std::expected<std::vector<std::size_t>, core::Error> YnnExecutable::shape(std::uint32_t external_id) const {
+Result<std::vector<std::size_t>> YnnExecutable::shape(std::uint32_t external_id) const {
     std::array<std::size_t, YNN_MAX_TENSOR_RANK> dimensions{};
     std::size_t rank = dimensions.size();
     if (auto status = check_ynn_status(ynn_get_external_value_shape(runtime_, external_id, &rank, dimensions.data()),

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <expected>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -23,10 +22,10 @@ public:
     Tokenizer(const Tokenizer&) = delete;
     Tokenizer& operator=(const Tokenizer&) = delete;
 
-    [[nodiscard]] static std::expected<Tokenizer, core::Error> load(const std::filesystem::path& path);
+    [[nodiscard]] static Result<Tokenizer> load(const std::filesystem::path& path);
 
-    [[nodiscard]] std::expected<std::vector<std::int32_t>, core::Error> encode(std::string_view text) const;
-    [[nodiscard]] std::expected<std::string, core::Error> decode(std::span<const std::int32_t> ids) const;
+    [[nodiscard]] Result<std::vector<std::int32_t>> encode(std::string_view text) const;
+    [[nodiscard]] Result<std::string> decode(std::span<const std::int32_t> ids) const;
     [[nodiscard]] std::size_t vocabulary_size() const noexcept;
     [[nodiscard]] std::optional<std::int32_t> token_id(std::string_view token) const;
 

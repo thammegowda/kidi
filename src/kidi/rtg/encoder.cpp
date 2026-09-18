@@ -22,7 +22,7 @@ EncoderGraph::EncoderGraph(runtime::YnnExecutable executable, std::int32_t hidde
                            std::int32_t maximum_source_tokens) noexcept
     : executable_(std::move(executable)), hidden_size_(hidden_size), maximum_source_tokens_(maximum_source_tokens) {}
 
-std::expected<EncoderGraph, core::Error> EncoderGraph::create(const Package& package) {
+Result<EncoderGraph> EncoderGraph::create(const Package& package) {
     const auto& manifest = package.manifest();
     const auto& architecture = manifest.architecture;
     auto graph = runtime::YnnGraph::create(2);
@@ -83,14 +83,13 @@ std::expected<EncoderGraph, core::Error> EncoderGraph::create(const Package& pac
     return EncoderGraph(std::move(*executable), architecture.hidden_size, manifest.limits.source_tokens);
 }
 
-std::expected<std::vector<float>, core::Error> EncoderGraph::run(std::span<const float> embeddings) {
+Result<std::vector<float>> EncoderGraph::run(std::span<const float> embeddings) {
     if (embeddings.empty() || embeddings.size() % static_cast<std::size_t>(hidden_size_) != 0) {
-        return std::unexpected(core::Error{core::ErrorCode::INVALID_ARGUMENT, "encoder input has incompatible shape"});
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "encoder input has incompatible shape"});
     }
     const auto token_count = embeddings.size() / static_cast<std::size_t>(hidden_size_);
     if (token_count > static_cast<std::size_t>(maximum_source_tokens_)) {
-        return std::unexpected(
-            core::Error{core::ErrorCode::INVALID_ARGUMENT, "encoder input exceeds the source token limit"});
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "encoder input exceeds the source token limit"});
     }
 
     const std::array<std::size_t, 3> shape = {
@@ -111,7 +110,7 @@ std::expected<std::vector<float>, core::Error> EncoderGraph::run(std::span<const
 Encoder::Encoder(EmbeddingGraph embedding, EncoderGraph graph) noexcept
     : embedding_(std::move(embedding)), graph_(std::move(graph)) {}
 
-std::expected<Encoder, core::Error> Encoder::create(const Package& package) {
+Result<Encoder> Encoder::create(const Package& package) {
     const auto& architecture = package.manifest().architecture;
     auto embedding = EmbeddingGraph::create(package.weights(), "src_embed.0.lut.weight",
                                             architecture.source_vocabulary_size, architecture.hidden_size);
@@ -121,7 +120,7 @@ std::expected<Encoder, core::Error> Encoder::create(const Package& package) {
     return Encoder(std::move(*embedding), std::move(*graph));
 }
 
-std::expected<std::vector<float>, core::Error> Encoder::run(std::span<const std::int32_t> token_ids) {
+Result<std::vector<float>> Encoder::run(std::span<const std::int32_t> token_ids) {
     auto embeddings = embedding_.run(token_ids);
     if (!embeddings) return std::unexpected(std::move(embeddings.error()));
     return graph_.run(*embeddings);

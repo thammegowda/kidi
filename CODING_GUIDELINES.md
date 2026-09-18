@@ -7,7 +7,10 @@ to kidi-owned C++ code. Code under `third_party/` follows its upstream project.
 
 - Require C++23.
 - Prefer standard-library types and vocabulary: RAII, value semantics,
-  `std::expected`, `std::span`, ranges, smart pointers, and algorithms.
+  `std::span`, ranges, smart pointers, and algorithms.
+- In nested `kidi` namespaces, use the root error vocabulary unqualified:
+  `Result<T>`, `Error`, and `ErrorCode`. External code uses `kidi::Result<T>`.
+- Do not spell the underlying `std::expected<T, core::Error>` directly.
 - Keep ownership explicit. Prefer values and references; use pointers only when
   nullability or indirection is part of the contract.
 - Keep public APIs small and typed. Do not expose dependency-specific types

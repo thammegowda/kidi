@@ -74,12 +74,12 @@ Weights::Weights(Weights&&) noexcept = default;
 Weights& Weights::operator=(Weights&&) noexcept = default;
 Weights::~Weights() = default;
 
-std::expected<Weights, core::Error> Weights::load(const std::filesystem::path& path) {
+Result<Weights> Weights::load(const std::filesystem::path& path) {
     try {
         return Weights(std::make_unique<Impl>(path));
     } catch (const safetensors::SafetensorsException& error) {
-        return std::unexpected(core::Error{
-            core::ErrorCode::INVALID_ARGUMENT,
+        return std::unexpected(Error{
+            ErrorCode::INVALID_ARGUMENT,
             "cannot load Safetensors weights " + path.string() + ": " + error.what(),
         });
     }
@@ -89,23 +89,22 @@ bool Weights::contains(std::string_view name) const { return impl_->checkpoint.c
 
 std::size_t Weights::size() const noexcept { return impl_->checkpoint.tensors().size(); }
 
-std::expected<TensorView, core::Error> Weights::tensor(std::string_view name) const {
+Result<TensorView> Weights::tensor(std::string_view name) const {
     if (!contains(name)) {
-        return std::unexpected(
-            core::Error{core::ErrorCode::INVALID_ARGUMENT, "weight tensor not found: " + std::string(name)});
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "weight tensor not found: " + std::string(name)});
     }
     const auto& tensor = impl_->checkpoint.at(std::string(name));
     const auto data_type = parse_data_type(tensor.dtype);
     if (!data_type) {
-        return std::unexpected(core::Error{
-            core::ErrorCode::UNSUPPORTED,
+        return std::unexpected(Error{
+            ErrorCode::UNSUPPORTED,
             "weight tensor " + std::string(name) + " has unsupported dtype " + tensor.dtype,
         });
     }
     const auto alignment = data_type_size(*data_type);
     if (!tensor.is_aligned(alignment)) {
-        return std::unexpected(core::Error{
-            core::ErrorCode::INVALID_ARGUMENT,
+        return std::unexpected(Error{
+            ErrorCode::INVALID_ARGUMENT,
             "weight tensor " + std::string(name) + " is not aligned for zero-copy access",
         });
     }

@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <expected>
 #include <memory>
 #include <span>
 #include <vector>
@@ -25,9 +24,9 @@ public:
     YnnGraph(const YnnGraph&) = delete;
     YnnGraph& operator=(const YnnGraph&) = delete;
 
-    [[nodiscard]] static std::expected<YnnGraph, core::Error> create(std::uint32_t external_value_count);
+    [[nodiscard]] static Result<YnnGraph> create(std::uint32_t external_value_count);
     [[nodiscard]] ynn_subgraph_t get() const noexcept;
-    [[nodiscard]] std::expected<YnnExecutable, core::Error> compile() &&;
+    [[nodiscard]] Result<YnnExecutable> compile() &&;
 
 private:
     explicit YnnGraph(ynn_subgraph_t graph);
@@ -45,12 +44,11 @@ public:
     YnnExecutable(const YnnExecutable&) = delete;
     YnnExecutable& operator=(const YnnExecutable&) = delete;
 
-    [[nodiscard]] std::expected<void, core::Error> set_shape(std::uint32_t external_id,
-                                                             std::span<const std::size_t> dimensions);
-    [[nodiscard]] std::expected<void, core::Error> reshape();
-    [[nodiscard]] std::expected<void, core::Error> bind(std::uint32_t external_id, void* data);
-    [[nodiscard]] std::expected<void, core::Error> invoke();
-    [[nodiscard]] std::expected<std::vector<std::size_t>, core::Error> shape(std::uint32_t external_id) const;
+    [[nodiscard]] Result<void> set_shape(std::uint32_t external_id, std::span<const std::size_t> dimensions);
+    [[nodiscard]] Result<void> reshape();
+    [[nodiscard]] Result<void> bind(std::uint32_t external_id, void* data);
+    [[nodiscard]] Result<void> invoke();
+    [[nodiscard]] Result<std::vector<std::size_t>> shape(std::uint32_t external_id) const;
 
 private:
     friend class YnnGraph;
@@ -61,6 +59,6 @@ private:
     std::shared_ptr<YnnThreadPool> thread_pool_;
 };
 
-[[nodiscard]] std::expected<void, core::Error> check_ynn_status(ynn_status status, const char* operation);
+[[nodiscard]] Result<void> check_ynn_status(ynn_status status, const char* operation);
 
 } // namespace kidi::runtime

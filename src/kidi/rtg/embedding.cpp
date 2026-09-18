@@ -40,19 +40,17 @@ EmbeddingGraph::EmbeddingGraph(runtime::YnnExecutable executable, std::int32_t v
       positions_id_(POSITIONS_ID),
       output_id_(OUTPUT_ID) {}
 
-std::expected<EmbeddingGraph, core::Error> EmbeddingGraph::create(const model::Weights& weights,
-                                                                  std::string_view weight_name,
-                                                                  std::int32_t vocabulary_size,
-                                                                  std::int32_t hidden_size) {
+Result<EmbeddingGraph> EmbeddingGraph::create(const model::Weights& weights, std::string_view weight_name,
+                                              std::int32_t vocabulary_size, std::int32_t hidden_size) {
     if (vocabulary_size <= 0 || hidden_size <= 0 || hidden_size % 2 != 0) {
-        return std::unexpected(core::Error{core::ErrorCode::INVALID_ARGUMENT, "invalid embedding dimensions"});
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid embedding dimensions"});
     }
     auto weight = weights.tensor(weight_name);
     if (!weight) return std::unexpected(std::move(weight.error()));
     const std::array<std::int64_t, 2> expected_shape = {vocabulary_size, hidden_size};
     if (weight->data_type != model::DataType::F32 || !std::ranges::equal(weight->shape, expected_shape)) {
-        return std::unexpected(core::Error{
-            core::ErrorCode::INVALID_ARGUMENT,
+        return std::unexpected(Error{
+            ErrorCode::INVALID_ARGUMENT,
             "embedding weight has incompatible dtype or shape: " + std::string(weight_name),
         });
     }
@@ -117,15 +115,13 @@ std::expected<EmbeddingGraph, core::Error> EmbeddingGraph::create(const model::W
     return EmbeddingGraph(std::move(*executable), vocabulary_size, hidden_size, std::move(scale));
 }
 
-std::expected<std::vector<float>, core::Error> EmbeddingGraph::run(std::span<const std::int32_t> token_ids,
-                                                                   std::size_t batch_size) {
+Result<std::vector<float>> EmbeddingGraph::run(std::span<const std::int32_t> token_ids, std::size_t batch_size) {
     if (batch_size == 0 || token_ids.empty() || token_ids.size() % batch_size != 0) {
-        return std::unexpected(core::Error{core::ErrorCode::INVALID_ARGUMENT, "cannot embed an empty sequence"});
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "cannot embed an empty sequence"});
     }
     for (const auto token_id : token_ids) {
         if (token_id < 0 || token_id >= vocabulary_size_) {
-            return std::unexpected(
-                core::Error{core::ErrorCode::INVALID_ARGUMENT, "token ID is outside the vocabulary"});
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "token ID is outside the vocabulary"});
         }
     }
 

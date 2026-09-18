@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <expected>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -28,8 +27,8 @@ public:
     Translator(const Translator&) = delete;
     Translator& operator=(const Translator&) = delete;
 
-    [[nodiscard]] static std::expected<Translator, core::Error> load(const std::filesystem::path& manifest_path);
-    [[nodiscard]] std::expected<Translation, core::Error> translate(std::string_view source);
+    [[nodiscard]] static Result<Translator> load(const std::filesystem::path& manifest_path);
+    [[nodiscard]] Result<Translation> translate(std::string_view source);
 
 private:
     Translator(Package package, Encoder encoder, Decoder decoder) noexcept;

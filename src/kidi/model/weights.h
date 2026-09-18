@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <expected>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -49,11 +48,11 @@ public:
     Weights(const Weights&) = delete;
     Weights& operator=(const Weights&) = delete;
 
-    [[nodiscard]] static std::expected<Weights, core::Error> load(const std::filesystem::path& path);
+    [[nodiscard]] static Result<Weights> load(const std::filesystem::path& path);
 
     [[nodiscard]] bool contains(std::string_view name) const;
     [[nodiscard]] std::size_t size() const noexcept;
-    [[nodiscard]] std::expected<TensorView, core::Error> tensor(std::string_view name) const;
+    [[nodiscard]] Result<TensorView> tensor(std::string_view name) const;
 
 private:
     struct Impl;

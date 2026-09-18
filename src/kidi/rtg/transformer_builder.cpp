@@ -21,16 +21,16 @@ TransformerBuilder::TransformerBuilder(ynn_subgraph_t graph, const model::Weight
       attention_heads_(attention_heads),
       layer_norm_epsilon_(layer_norm_epsilon) {}
 
-std::expected<std::uint32_t, core::Error> TransformerBuilder::weight(std::string_view name, std::int32_t first_extent,
-                                                                     std::int32_t second_extent) const {
+Result<std::uint32_t> TransformerBuilder::weight(std::string_view name, std::int32_t first_extent,
+                                                 std::int32_t second_extent) const {
     auto tensor = weights_.tensor(name);
     if (!tensor) return std::unexpected(std::move(tensor.error()));
     const bool shape_matches = second_extent == 0 ? tensor->shape.size() == 1 && tensor->shape[0] == first_extent
                                                   : tensor->shape.size() == 2 && tensor->shape[0] == first_extent &&
                                                         tensor->shape[1] == second_extent;
     if (tensor->data_type != model::DataType::F32 || !shape_matches) {
-        return std::unexpected(core::Error{
-            core::ErrorCode::INVALID_ARGUMENT,
+        return std::unexpected(Error{
+            ErrorCode::INVALID_ARGUMENT,
             "weight has incompatible dtype or shape: " + std::string(name),
         });
     }
@@ -47,7 +47,7 @@ std::expected<std::uint32_t, core::Error> TransformerBuilder::weight(std::string
     return id;
 }
 
-std::expected<std::uint32_t, core::Error> TransformerBuilder::scalar(float value) const {
+Result<std::uint32_t> TransformerBuilder::scalar(float value) const {
     std::uint32_t id = YNN_INVALID_VALUE_ID;
     auto status = runtime::check_ynn_status(
         ynn_define_tensor(graph_, ynn_type_fp32, 0, nullptr, &value, YNN_VALUE_FLAG_COPY_DATA, &id), "define scalar");
@@ -55,18 +55,16 @@ std::expected<std::uint32_t, core::Error> TransformerBuilder::scalar(float value
     return id;
 }
 
-std::expected<std::uint32_t, core::Error> TransformerBuilder::linear(std::uint32_t input_id, std::string_view prefix,
-                                                                     std::int32_t input_size, std::int32_t output_size,
-                                                                     std::uint32_t output_id) const {
+Result<std::uint32_t> TransformerBuilder::linear(std::uint32_t input_id, std::string_view prefix,
+                                                 std::int32_t input_size, std::int32_t output_size,
+                                                 std::uint32_t output_id) const {
     return linear(input_id, std::string(prefix) + ".weight", std::string(prefix) + ".bias", input_size, output_size,
                   output_id);
 }
 
-std::expected<std::uint32_t, core::Error> TransformerBuilder::linear(std::uint32_t input_id,
-                                                                     std::string_view weight_name,
-                                                                     std::string_view bias_name,
-                                                                     std::int32_t input_size, std::int32_t output_size,
-                                                                     std::uint32_t output_id) const {
+Result<std::uint32_t> TransformerBuilder::linear(std::uint32_t input_id, std::string_view weight_name,
+                                                 std::string_view bias_name, std::int32_t input_size,
+                                                 std::int32_t output_size, std::uint32_t output_id) const {
     auto weight_id = weight(weight_name, output_size, input_size);
     if (!weight_id) return std::unexpected(std::move(weight_id.error()));
     auto bias_id = weight(bias_name, output_size);
@@ -86,16 +84,14 @@ std::expected<std::uint32_t, core::Error> TransformerBuilder::linear(std::uint32
     return output_id;
 }
 
-std::expected<std::uint32_t, core::Error> TransformerBuilder::gelu(std::uint32_t input_id,
-                                                                   std::uint32_t output_id) const {
+Result<std::uint32_t> TransformerBuilder::gelu(std::uint32_t input_id, std::uint32_t output_id) const {
     auto status = runtime::check_ynn_status(ynn::define_gelu(graph_, input_id, output_id), "define exact GELU");
     if (!status) return std::unexpected(std::move(status.error()));
     return output_id;
 }
 
-std::expected<std::uint32_t, core::Error> TransformerBuilder::layer_norm(std::uint32_t input_id,
-                                                                         std::string_view prefix,
-                                                                         std::uint32_t output_id) const {
+Result<std::uint32_t> TransformerBuilder::layer_norm(std::uint32_t input_id, std::string_view prefix,
+                                                     std::uint32_t output_id) const {
     auto scale_id = weight(std::string(prefix) + ".weight", hidden_size_);
     if (!scale_id) return std::unexpected(std::move(scale_id.error()));
     auto bias_id = weight(std::string(prefix) + ".bias", hidden_size_);
@@ -164,9 +160,8 @@ std::expected<std::uint32_t, core::Error> TransformerBuilder::layer_norm(std::ui
     return output_id;
 }
 
-std::expected<std::uint32_t, core::Error> TransformerBuilder::feed_forward(std::uint32_t input_id,
-                                                                           std::string_view prefix,
-                                                                           std::uint32_t output_id) const {
+Result<std::uint32_t> TransformerBuilder::feed_forward(std::uint32_t input_id, std::string_view prefix,
+                                                       std::uint32_t output_id) const {
     auto hidden_id = linear(input_id, std::string(prefix) + ".w_1", hidden_size_, feed_forward_size_);
     if (!hidden_id) return std::unexpected(std::move(hidden_id.error()));
     auto activated_id = gelu(*hidden_id);
@@ -174,12 +169,11 @@ std::expected<std::uint32_t, core::Error> TransformerBuilder::feed_forward(std::
     return linear(*activated_id, std::string(prefix) + ".w_2", feed_forward_size_, hidden_size_, output_id);
 }
 
-std::expected<std::uint32_t, core::Error> TransformerBuilder::attention(std::uint32_t query_id, std::uint32_t key_id,
-                                                                        std::uint32_t value_id, std::uint32_t mask_id,
-                                                                        std::string_view prefix,
-                                                                        std::uint32_t output_id) const {
+Result<std::uint32_t> TransformerBuilder::attention(std::uint32_t query_id, std::uint32_t key_id,
+                                                    std::uint32_t value_id, std::uint32_t mask_id,
+                                                    std::string_view prefix, std::uint32_t output_id) const {
     if (attention_heads_ <= 0 || hidden_size_ % attention_heads_ != 0) {
-        return std::unexpected(core::Error{core::ErrorCode::INVALID_ARGUMENT, "invalid attention dimensions"});
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid attention dimensions"});
     }
 
     auto query_projection_id = linear(query_id, std::string(prefix) + ".linears.0", hidden_size_, hidden_size_);
@@ -194,7 +188,7 @@ std::expected<std::uint32_t, core::Error> TransformerBuilder::attention(std::uin
         static_cast<std::size_t>(hidden_size_ / attention_heads_),
     };
     constexpr std::array<std::int32_t, 4> HEAD_MAJOR_AXES = {0, 2, 1, 3};
-    const auto split_heads = [&](std::uint32_t input_id) -> std::expected<std::uint32_t, core::Error> {
+    const auto split_heads = [&](std::uint32_t input_id) -> Result<std::uint32_t> {
         std::uint32_t split_id = YNN_INVALID_VALUE_ID;
         auto status = runtime::check_ynn_status(
             ynn_define_split_dim(graph_, -1, HEAD_SPLIT.size(), HEAD_SPLIT.data(), input_id, &split_id, 0),

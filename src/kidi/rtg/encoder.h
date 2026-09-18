@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <expected>
 #include <span>
 #include <vector>
 
@@ -20,8 +19,8 @@ public:
     EncoderGraph(const EncoderGraph&) = delete;
     EncoderGraph& operator=(const EncoderGraph&) = delete;
 
-    [[nodiscard]] static std::expected<EncoderGraph, core::Error> create(const Package& package);
-    [[nodiscard]] std::expected<std::vector<float>, core::Error> run(std::span<const float> embeddings);
+    [[nodiscard]] static Result<EncoderGraph> create(const Package& package);
+    [[nodiscard]] Result<std::vector<float>> run(std::span<const float> embeddings);
 
 private:
     EncoderGraph(runtime::YnnExecutable executable, std::int32_t hidden_size,
@@ -40,8 +39,8 @@ public:
     Encoder(const Encoder&) = delete;
     Encoder& operator=(const Encoder&) = delete;
 
-    [[nodiscard]] static std::expected<Encoder, core::Error> create(const Package& package);
-    [[nodiscard]] std::expected<std::vector<float>, core::Error> run(std::span<const std::int32_t> token_ids);
+    [[nodiscard]] static Result<Encoder> create(const Package& package);
+    [[nodiscard]] Result<std::vector<float>> run(std::span<const std::int32_t> token_ids);
 
 private:
     Encoder(EmbeddingGraph embedding, EncoderGraph graph) noexcept;

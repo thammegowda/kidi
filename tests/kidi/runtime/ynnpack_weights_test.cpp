@@ -43,8 +43,8 @@ int main() {
     const auto path = std::filesystem::temp_directory_path() / "kidi-ynnpack-weights.safetensors";
     write_weights(path);
     auto weights = kidi::model::Weights::load(path);
-    auto weight = weights ? weights->tensor("weight")
-                          : std::expected<kidi::model::TensorView, kidi::core::Error>{std::unexpected(weights.error())};
+    auto weight =
+        weights ? weights->tensor("weight") : kidi::Result<kidi::model::TensorView>{std::unexpected(weights.error())};
     if (!weight) {
         std::cerr << "failed to load mapped weight\n";
         return 1;

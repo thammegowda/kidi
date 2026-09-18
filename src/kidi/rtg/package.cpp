@@ -9,11 +9,11 @@
 namespace kidi::rtg {
 namespace {
 
-std::optional<core::Error> validate_tokenizer(const text::Tokenizer& tokenizer, std::int32_t expected_size,
-                                              const model::SpecialTokenIds& special_tokens, std::string_view label) {
+std::optional<Error> validate_tokenizer(const text::Tokenizer& tokenizer, std::int32_t expected_size,
+                                        const model::SpecialTokenIds& special_tokens, std::string_view label) {
     if (tokenizer.vocabulary_size() != static_cast<std::size_t>(expected_size)) {
-        return core::Error{
-            core::ErrorCode::INVALID_MANIFEST,
+        return Error{
+            ErrorCode::INVALID_MANIFEST,
             std::string(label) + " tokenizer vocabulary size is " + std::to_string(tokenizer.vocabulary_size()) +
                 "; expected " + std::to_string(expected_size),
         };
@@ -28,8 +28,8 @@ std::optional<core::Error> validate_tokenizer(const text::Tokenizer& tokenizer, 
     for (const auto& [token, expected_id] : expected_tokens) {
         const auto actual_id = tokenizer.token_id(token);
         if (!actual_id || *actual_id != expected_id) {
-            return core::Error{
-                core::ErrorCode::INVALID_MANIFEST,
+            return Error{
+                ErrorCode::INVALID_MANIFEST,
                 std::string(label) + " tokenizer maps " + std::string(token) + " to " +
                     (actual_id ? std::to_string(*actual_id) : "no ID") + "; expected " + std::to_string(expected_id),
             };
@@ -47,7 +47,7 @@ Package::Package(model::ModelManifest manifest, model::Weights weights, text::To
       source_tokenizer_(std::move(source_tokenizer)),
       target_tokenizer_(std::move(target_tokenizer)) {}
 
-std::expected<Package, core::Error> Package::load(const std::filesystem::path& manifest_path) {
+Result<Package> Package::load(const std::filesystem::path& manifest_path) {
     auto manifest = model::ModelManifest::load(manifest_path);
     if (!manifest) {
         return std::unexpected(std::move(manifest.error()));

@@ -50,7 +50,7 @@ float normalized_score(const Beam& beam, float alpha) {
 Translator::Translator(Package package, Encoder encoder, Decoder decoder) noexcept
     : package_(std::move(package)), encoder_(std::move(encoder)), decoder_(std::move(decoder)) {}
 
-std::expected<Translator, core::Error> Translator::load(const std::filesystem::path& manifest_path) {
+Result<Translator> Translator::load(const std::filesystem::path& manifest_path) {
     auto package = Package::load(manifest_path);
     if (!package) return std::unexpected(std::move(package.error()));
     auto encoder = Encoder::create(*package);
@@ -60,7 +60,7 @@ std::expected<Translator, core::Error> Translator::load(const std::filesystem::p
     return Translator(std::move(*package), std::move(*encoder), std::move(*decoder));
 }
 
-std::expected<Translation, core::Error> Translator::translate(std::string_view source) {
+Result<Translation> Translator::translate(std::string_view source) {
     const auto& manifest = package_.manifest();
     auto source_ids = package_.source_tokenizer().encode(source);
     if (!source_ids) return std::unexpected(std::move(source_ids.error()));
@@ -99,8 +99,7 @@ std::expected<Translation, core::Error> Translator::translate(std::string_view s
         auto log_probabilities = decoder_.next(*memory, prefixes, active_beams.size());
         if (!log_probabilities) return std::unexpected(std::move(log_probabilities.error()));
         if (log_probabilities->size() != active_beams.size() * vocabulary_size) {
-            return std::unexpected(
-                core::Error{core::ErrorCode::RUNTIME, "decoder returned an incompatible probability shape"});
+            return std::unexpected(Error{ErrorCode::RUNTIME, "decoder returned an incompatible probability shape"});
         }
         std::vector<std::size_t> probability_batches(beam_size, beam_size);
         for (std::size_t batch = 0; batch < active_beams.size(); ++batch) {
@@ -129,8 +128,7 @@ std::expected<Translation, core::Error> Translator::translate(std::string_view s
             }
         }
         if (candidates.size() != beam_size) {
-            return std::unexpected(
-                core::Error{core::ErrorCode::RUNTIME, "beam search found too few finite candidates"});
+            return std::unexpected(Error{ErrorCode::RUNTIME, "beam search found too few finite candidates"});
         }
 
         std::vector<Candidate> ranked;

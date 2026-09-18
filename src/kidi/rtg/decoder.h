@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <expected>
 #include <span>
 #include <vector>
 
@@ -21,10 +20,9 @@ public:
     DecoderGraph(const DecoderGraph&) = delete;
     DecoderGraph& operator=(const DecoderGraph&) = delete;
 
-    [[nodiscard]] static std::expected<DecoderGraph, core::Error> create(const Package& package);
-    [[nodiscard]] std::expected<std::vector<float>, core::Error> run(std::span<const float> embeddings,
-                                                                     std::size_t batch_size,
-                                                                     std::span<const float> memory);
+    [[nodiscard]] static Result<DecoderGraph> create(const Package& package);
+    [[nodiscard]] Result<std::vector<float>> run(std::span<const float> embeddings, std::size_t batch_size,
+                                                 std::span<const float> memory);
 
 private:
     DecoderGraph(runtime::YnnExecutable executable, std::int32_t hidden_size, std::int32_t maximum_position) noexcept;
@@ -42,8 +40,8 @@ public:
     GeneratorGraph(const GeneratorGraph&) = delete;
     GeneratorGraph& operator=(const GeneratorGraph&) = delete;
 
-    [[nodiscard]] static std::expected<GeneratorGraph, core::Error> create(const Package& package);
-    [[nodiscard]] std::expected<std::vector<float>, core::Error> run(std::span<const float> hidden_states);
+    [[nodiscard]] static Result<GeneratorGraph> create(const Package& package);
+    [[nodiscard]] Result<std::vector<float>> run(std::span<const float> hidden_states);
 
 private:
     GeneratorGraph(runtime::YnnExecutable executable, std::int32_t hidden_size, std::int32_t vocabulary_size) noexcept;
@@ -61,10 +59,9 @@ public:
     Decoder(const Decoder&) = delete;
     Decoder& operator=(const Decoder&) = delete;
 
-    [[nodiscard]] static std::expected<Decoder, core::Error> create(const Package& package);
-    [[nodiscard]] std::expected<std::vector<float>, core::Error> next(std::span<const float> memory,
-                                                                      std::span<const std::int32_t> token_ids,
-                                                                      std::size_t batch_size);
+    [[nodiscard]] static Result<Decoder> create(const Package& package);
+    [[nodiscard]] Result<std::vector<float>> next(std::span<const float> memory,
+                                                  std::span<const std::int32_t> token_ids, std::size_t batch_size);
 
 private:
     Decoder(EmbeddingGraph embedding, DecoderGraph graph, GeneratorGraph generator, std::int32_t hidden_size) noexcept;

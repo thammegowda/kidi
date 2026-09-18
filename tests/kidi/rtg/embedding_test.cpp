@@ -34,9 +34,8 @@ int main() {
     const auto path = std::filesystem::temp_directory_path() / "kidi-embedding-test.safetensors";
     write_weights(path);
     auto weights = kidi::model::Weights::load(path);
-    auto graph = weights
-                     ? kidi::rtg::EmbeddingGraph::create(*weights, "embedding", 3, 4)
-                     : std::expected<kidi::rtg::EmbeddingGraph, kidi::core::Error>{std::unexpected(weights.error())};
+    auto graph = weights ? kidi::rtg::EmbeddingGraph::create(*weights, "embedding", 3, 4)
+                         : kidi::Result<kidi::rtg::EmbeddingGraph>{std::unexpected(weights.error())};
     if (!graph) {
         std::cerr << graph.error().message << '\n';
         return 1;

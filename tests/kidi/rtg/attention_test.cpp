@@ -93,9 +93,8 @@ int main() {
                                             "define attention output");
 
     kidi::rtg::TransformerBuilder builder(graph->get(), *weights, 4, 8, 2, 1.0e-5F);
-    auto result_id = status
-                         ? builder.attention(input_id, input_id, input_id, mask_id, "attn", output_id)
-                         : std::expected<std::uint32_t, kidi::core::Error>{std::unexpected(std::move(status.error()))};
+    auto result_id = status ? builder.attention(input_id, input_id, input_id, mask_id, "attn", output_id)
+                            : kidi::Result<std::uint32_t>{std::unexpected(std::move(status.error()))};
     if (!result_id) {
         std::cerr << result_id.error().message << '\n';
         return 1;

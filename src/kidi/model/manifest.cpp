@@ -123,10 +123,10 @@ std::optional<std::string> validate(const ModelManifest& manifest) {
 
 } // namespace
 
-std::expected<ModelManifest, core::Error> ModelManifest::load(const std::filesystem::path& path) {
+Result<ModelManifest> ModelManifest::load(const std::filesystem::path& path) {
     try {
         if (!std::filesystem::is_regular_file(path)) {
-            return std::unexpected(core::Error{core::ErrorCode::IO, "manifest does not exist: " + path.string()});
+            return std::unexpected(Error{ErrorCode::IO, "manifest does not exist: " + path.string()});
         }
         const auto absolute_path = std::filesystem::absolute(path).lexically_normal();
         const auto package_directory = absolute_path.parent_path();
@@ -138,18 +138,18 @@ std::expected<ModelManifest, core::Error> ModelManifest::load(const std::filesys
         manifest.package_directory = package_directory;
         auto weights_file = resolve_package_file(package_directory, root, "weights_file");
         if (!weights_file) {
-            return std::unexpected(core::Error{core::ErrorCode::INVALID_MANIFEST, std::move(weights_file.error())});
+            return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, std::move(weights_file.error())});
         }
         manifest.weights_file = std::move(*weights_file);
 
         const auto tokenizers = root["tokenizers"];
         auto source_tokenizer = resolve_package_file(package_directory, tokenizers, "source");
         if (!source_tokenizer) {
-            return std::unexpected(core::Error{core::ErrorCode::INVALID_MANIFEST, std::move(source_tokenizer.error())});
+            return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, std::move(source_tokenizer.error())});
         }
         auto target_tokenizer = resolve_package_file(package_directory, tokenizers, "target");
         if (!target_tokenizer) {
-            return std::unexpected(core::Error{core::ErrorCode::INVALID_MANIFEST, std::move(target_tokenizer.error())});
+            return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, std::move(target_tokenizer.error())});
         }
         manifest.tokenizers = {
             .source = std::move(*source_tokenizer),
@@ -200,14 +200,14 @@ std::expected<ModelManifest, core::Error> ModelManifest::load(const std::filesys
         };
 
         if (auto error = validate(manifest)) {
-            return std::unexpected(core::Error{core::ErrorCode::INVALID_MANIFEST, std::move(*error)});
+            return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, std::move(*error)});
         }
         return manifest;
     } catch (const YAML::Exception& error) {
         return std::unexpected(
-            core::Error{core::ErrorCode::INVALID_MANIFEST, "invalid YAML manifest: " + std::string(error.what())});
+            Error{ErrorCode::INVALID_MANIFEST, "invalid YAML manifest: " + std::string(error.what())});
     } catch (const std::exception& error) {
-        return std::unexpected(core::Error{core::ErrorCode::INVALID_MANIFEST, error.what()});
+        return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, error.what()});
     }
 }
 
