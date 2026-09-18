@@ -1,0 +1,16 @@
+include_guard(GLOBAL)
+
+function(kidi_add_test target source)
+    add_executable(${target} "${source}")
+    target_link_libraries(${target} PRIVATE kidi::kidi ${ARGN})
+    add_test(NAME ${target} COMMAND ${target})
+endfunction()
+
+kidi_add_test(kidi_manifest_test tests/kidi/model/manifest_test.cpp)
+kidi_add_test(kidi_tokenizer_test tests/kidi/text/tokenizer_test.cpp ZLIB::ZLIB)
+kidi_add_test(kidi_rtg_package_test tests/kidi/rtg/package_test.cpp)
+kidi_add_test(kidi_weights_test tests/kidi/model/weights_test.cpp)
+kidi_add_test(kidi_ynnpack_weights_test tests/kidi/runtime/ynnpack_weights_test.cpp kidi::ynnpack)
+kidi_add_test(kidi_rtg_embedding_test tests/kidi/rtg/embedding_test.cpp)
+kidi_add_test(kidi_rtg_transformer_builder_test tests/kidi/rtg/transformer_builder_test.cpp)
+kidi_add_test(kidi_rtg_attention_test tests/kidi/rtg/attention_test.cpp)

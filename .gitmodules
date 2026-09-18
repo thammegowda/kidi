@@ -1,0 +1,28 @@
+
+[submodule "third_party/xnnpack"]
+	path = third_party/xnnpack
+	url = https://github.com/google/XNNPACK.git
+[submodule "third_party/slinky"]
+	path = third_party/slinky
+	url = https://github.com/dsharlet/slinky.git
+[submodule "third_party/tokenizerspp"]
+	path = third_party/tokenizerspp
+	url = https://github.com/thammegowda/tokenizerspp
+[submodule "yaml-cpp"]
+	path = third_party/yaml-cpp
+	url = https://github.com/jbeder/yaml-cpp.git
+[submodule "nlohmann-json"]
+	path = third_party/nlohmann-json
+	url = https://github.com/nlohmann/json.git
+[submodule "uni-algo"]
+	path = third_party/uni-algo
+	url = https://github.com/uni-algo/uni-algo.git
+[submodule "abseil-cpp"]
+	path = third_party/abseil-cpp
+	url = https://github.com/abseil/abseil-cpp.git
+[submodule "re2"]
+	path = third_party/re2
+	url = https://github.com/google/re2.git
+[submodule "zlib"]
+	path = third_party/zlib
+	url = https://github.com/madler/zlib.git
