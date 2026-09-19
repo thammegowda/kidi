@@ -9,6 +9,8 @@
 namespace kidi::rtg {
 namespace {
 
+constexpr std::string_view MANIFEST_FILENAME = "model.yaml";
+
 std::optional<Error> validate_tokenizer(const text::Tokenizer& tokenizer, std::int32_t expected_size,
                                         const model::SpecialTokenIds& special_tokens, std::string_view label) {
     if (tokenizer.vocabulary_size() != static_cast<std::size_t>(expected_size)) {
@@ -47,8 +49,11 @@ Package::Package(model::ModelManifest manifest, model::Weights weights, text::To
       source_tokenizer_(std::move(source_tokenizer)),
       target_tokenizer_(std::move(target_tokenizer)) {}
 
-Result<Package> Package::load(const std::filesystem::path& manifest_path) {
-    auto manifest = model::ModelManifest::load(manifest_path);
+Result<Package> Package::load(const std::filesystem::path& model_directory) {
+    if (!std::filesystem::is_directory(model_directory)) {
+        return std::unexpected(Error{ErrorCode::IO, "not a model directory: " + model_directory.string()});
+    }
+    auto manifest = model::ModelManifest::load(model_directory / MANIFEST_FILENAME);
     if (!manifest) {
         return std::unexpected(std::move(manifest.error()));
     }

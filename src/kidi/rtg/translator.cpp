@@ -45,13 +45,35 @@ float normalized_score(const Beam& beam, float alpha) {
     return beam.score / penalty;
 }
 
+Result<model::DecodeDefaults> resolve_options(const model::ModelManifest& manifest, const DecodeOptions& options) {
+    model::DecodeDefaults result = {
+        .beam_size = options.beam_size.value_or(manifest.decode_defaults.beam_size),
+        .maximum_extra_tokens = options.maximum_extra_tokens.value_or(manifest.decode_defaults.maximum_extra_tokens),
+        .length_penalty = options.length_penalty.value_or(manifest.decode_defaults.length_penalty),
+    };
+    if (result.beam_size <= 0 || result.beam_size > manifest.limits.maximum_beam_size) {
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT,
+                  "beam size must be between 1 and " + std::to_string(manifest.limits.maximum_beam_size)});
+    }
+    if (result.maximum_extra_tokens <= 0 || result.maximum_extra_tokens > manifest.limits.maximum_extra_tokens) {
+        return std::unexpected(Error{
+            ErrorCode::INVALID_ARGUMENT,
+            "maximum extra tokens must be between 1 and " + std::to_string(manifest.limits.maximum_extra_tokens)});
+    }
+    if (result.length_penalty < 0.0F) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "length penalty cannot be negative"});
+    }
+    return result;
+}
+
 } // namespace
 
 Translator::Translator(Package package, Encoder encoder, Decoder decoder) noexcept
     : package_(std::move(package)), encoder_(std::move(encoder)), decoder_(std::move(decoder)) {}
 
-Result<Translator> Translator::load(const std::filesystem::path& manifest_path) {
-    auto package = Package::load(manifest_path);
+Result<Translator> Translator::load(const std::filesystem::path& model_directory) {
+    auto package = Package::load(model_directory);
     if (!package) return std::unexpected(std::move(package.error()));
     auto encoder = Encoder::create(*package);
     if (!encoder) return std::unexpected(std::move(encoder.error()));
@@ -60,8 +82,10 @@ Result<Translator> Translator::load(const std::filesystem::path& manifest_path) 
     return Translator(std::move(*package), std::move(*encoder), std::move(*decoder));
 }
 
-Result<Translation> Translator::translate(std::string_view source) {
+Result<Translation> Translator::translate(std::string_view source, DecodeOptions options) {
     const auto& manifest = package_.manifest();
+    auto decode = resolve_options(manifest, options);
+    if (!decode) return std::unexpected(std::move(decode.error()));
     auto source_ids = package_.source_tokenizer().encode(source);
     if (!source_ids) return std::unexpected(std::move(source_ids.error()));
     if (source_ids->empty() || source_ids->back() != manifest.special_tokens.end) {
@@ -70,16 +94,15 @@ Result<Translation> Translator::translate(std::string_view source) {
     auto memory = encoder_.run(*source_ids);
     if (!memory) return std::unexpected(std::move(memory.error()));
 
-    const auto beam_size = static_cast<std::size_t>(manifest.decode_defaults.beam_size);
+    const auto beam_size = static_cast<std::size_t>(decode->beam_size);
     const auto vocabulary_size = static_cast<std::size_t>(manifest.architecture.target_vocabulary_size);
     std::vector<Beam> beams(beam_size, Beam{
                                            .token_ids = {manifest.special_tokens.begin},
                                            .score = 0.0F,
-                                           .length = manifest.decode_defaults.maximum_extra_tokens,
+                                           .length = decode->maximum_extra_tokens,
                                            .active = true,
                                        });
-    const auto maximum_steps =
-        source_ids->size() + static_cast<std::size_t>(manifest.decode_defaults.maximum_extra_tokens);
+    const auto maximum_steps = source_ids->size() + static_cast<std::size_t>(decode->maximum_extra_tokens);
     for (std::size_t step = 1; step <= maximum_steps; ++step) {
         std::vector<std::size_t> active_beams;
         active_beams.reserve(beam_size);
@@ -162,8 +185,7 @@ Result<Translation> Translator::translate(std::string_view source) {
     }
 
     const auto best = std::ranges::max_element(beams, [&](const Beam& left, const Beam& right) {
-        return normalized_score(left, manifest.decode_defaults.length_penalty) <
-               normalized_score(right, manifest.decode_defaults.length_penalty);
+        return normalized_score(left, decode->length_penalty) < normalized_score(right, decode->length_penalty);
     });
     std::vector<std::int32_t> output_ids(best->token_ids.begin() + 1, best->token_ids.end());
     if (const auto end = std::ranges::find(output_ids, manifest.special_tokens.end); end != output_ids.end()) {
@@ -175,7 +197,7 @@ Result<Translation> Translator::translate(std::string_view source) {
     return Translation{
         .text = std::move(*text),
         .token_ids = std::move(output_ids),
-        .score = normalized_score(*best, manifest.decode_defaults.length_penalty),
+        .score = normalized_score(*best, decode->length_penalty),
     };
 }
 

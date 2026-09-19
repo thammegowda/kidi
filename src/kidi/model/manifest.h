@@ -5,6 +5,7 @@
 #include <string>
 
 #include "kidi/core/error.h"
+#include "kidi/model/precision.h"
 
 namespace kidi::model {
 
@@ -58,6 +59,7 @@ struct ModelManifest {
     RtgArchitecture architecture;
     RtgLimits limits;
     DecodeDefaults decode_defaults;
+    WeightSpec weights;
     std::string input_format;
     std::string output_format;
 

@@ -12,6 +12,11 @@ option(KIDI_BUILD_TESTS "Build kidi tests" ON)
 include(cmake/dependencies.cmake)
 include(cmake/ynnpack.cmake)
 
+add_library(kidi_argparse src/kidi/cli/argparse.cpp)
+add_library(kidi::argparse ALIAS kidi_argparse)
+target_include_directories(kidi_argparse PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+target_compile_features(kidi_argparse PUBLIC cxx_std_23)
+
 add_library(kidi
     src/kidi/core/version.cpp
     src/kidi/model/manifest.cpp
@@ -47,7 +52,7 @@ target_link_libraries(kidi
 
 add_executable(kidi_cli src/kidi/cli/main.cpp)
 set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
-target_link_libraries(kidi_cli PRIVATE kidi::kidi)
+target_link_libraries(kidi_cli PRIVATE kidi::argparse kidi::kidi)
 
 include(CTest)
 

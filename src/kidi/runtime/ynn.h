@@ -24,7 +24,7 @@ public:
     YnnGraph(const YnnGraph&) = delete;
     YnnGraph& operator=(const YnnGraph&) = delete;
 
-    [[nodiscard]] static Result<YnnGraph> create(std::uint32_t external_value_count);
+    [[nodiscard]] static Result<YnnGraph> create(std::uint32_t external_value_count, std::uint32_t flags = 0);
     [[nodiscard]] ynn_subgraph_t get() const noexcept;
     [[nodiscard]] Result<YnnExecutable> compile() &&;
 

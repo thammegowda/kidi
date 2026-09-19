@@ -101,9 +101,10 @@ YnnGraph::~YnnGraph() {
     }
 }
 
-Result<YnnGraph> YnnGraph::create(std::uint32_t external_value_count) {
+Result<YnnGraph> YnnGraph::create(std::uint32_t external_value_count, std::uint32_t flags) {
     ynn_subgraph_t graph = nullptr;
-    if (auto status = check_ynn_status(ynn_create_subgraph(external_value_count, 0, &graph), "create graph"); !status) {
+    if (auto status = check_ynn_status(ynn_create_subgraph(external_value_count, flags, &graph), "create graph");
+        !status) {
         return std::unexpected(std::move(status.error()));
     }
     return YnnGraph(graph);

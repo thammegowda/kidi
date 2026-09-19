@@ -12,8 +12,11 @@ namespace kidi::rtg {
 
 class TransformerBuilder {
 public:
-    TransformerBuilder(ynn_subgraph_t graph, const model::Weights& weights, std::int32_t hidden_size,
-                       std::int32_t feed_forward_size, std::int32_t attention_heads, float layer_norm_epsilon) noexcept;
+    TransformerBuilder(
+        ynn_subgraph_t graph, const model::Weights& weights, std::int32_t hidden_size, std::int32_t feed_forward_size,
+        std::int32_t attention_heads, float layer_norm_epsilon,
+        model::WeightEncoding weight_encoding = model::WeightEncoding::F32,
+        model::LinearWeightLayout linear_weight_layout = model::LinearWeightLayout::OUTPUT_INPUT) noexcept;
 
     [[nodiscard]] Result<std::uint32_t> linear(std::uint32_t input_id, std::string_view prefix, std::int32_t input_size,
                                                std::int32_t output_size,
@@ -34,7 +37,8 @@ public:
 
 private:
     [[nodiscard]] Result<std::uint32_t> weight(std::string_view name, std::int32_t first_extent,
-                                               std::int32_t second_extent = 0) const;
+                                               std::int32_t second_extent = 0,
+                                               model::DataType data_type = model::DataType::F32) const;
     [[nodiscard]] Result<std::uint32_t> scalar(float value) const;
 
     ynn_subgraph_t graph_;
@@ -43,6 +47,8 @@ private:
     std::int32_t feed_forward_size_;
     std::int32_t attention_heads_;
     float layer_norm_epsilon_;
+    model::WeightEncoding weight_encoding_;
+    model::LinearWeightLayout linear_weight_layout_;
 };
 
 } // namespace kidi::rtg

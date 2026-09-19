@@ -10,25 +10,44 @@
 #include "ynnpack/composites/composites.h"
 
 namespace kidi::rtg {
+namespace {
+
+Result<ynn_type> to_ynn_type(model::DataType data_type) {
+    switch (data_type) {
+        case model::DataType::F32:
+            return ynn_type_fp32;
+        case model::DataType::BF16:
+            return ynn_type_bf16;
+        case model::DataType::I8:
+            return ynn_type_int8;
+        default:
+            return std::unexpected(Error{ErrorCode::UNSUPPORTED, "unsupported YNNPACK weight data type"});
+    }
+}
+
+} // namespace
 
 TransformerBuilder::TransformerBuilder(ynn_subgraph_t graph, const model::Weights& weights, std::int32_t hidden_size,
                                        std::int32_t feed_forward_size, std::int32_t attention_heads,
-                                       float layer_norm_epsilon) noexcept
+                                       float layer_norm_epsilon, model::WeightEncoding weight_encoding,
+                                       model::LinearWeightLayout linear_weight_layout) noexcept
     : graph_(graph),
       weights_(weights),
       hidden_size_(hidden_size),
       feed_forward_size_(feed_forward_size),
       attention_heads_(attention_heads),
-      layer_norm_epsilon_(layer_norm_epsilon) {}
+      layer_norm_epsilon_(layer_norm_epsilon),
+      weight_encoding_(weight_encoding),
+      linear_weight_layout_(linear_weight_layout) {}
 
 Result<std::uint32_t> TransformerBuilder::weight(std::string_view name, std::int32_t first_extent,
-                                                 std::int32_t second_extent) const {
+                                                 std::int32_t second_extent, model::DataType data_type) const {
     auto tensor = weights_.tensor(name);
     if (!tensor) return std::unexpected(std::move(tensor.error()));
     const bool shape_matches = second_extent == 0 ? tensor->shape.size() == 1 && tensor->shape[0] == first_extent
                                                   : tensor->shape.size() == 2 && tensor->shape[0] == first_extent &&
                                                         tensor->shape[1] == second_extent;
-    if (tensor->data_type != model::DataType::F32 || !shape_matches) {
+    if (tensor->data_type != data_type || !shape_matches) {
         return std::unexpected(Error{
             ErrorCode::INVALID_ARGUMENT,
             "weight has incompatible dtype or shape: " + std::string(name),
@@ -39,9 +58,11 @@ Result<std::uint32_t> TransformerBuilder::weight(std::string_view name, std::int
         static_cast<std::size_t>(first_extent),
         static_cast<std::size_t>(second_extent),
     };
+    auto type = to_ynn_type(data_type);
+    if (!type) return std::unexpected(std::move(type.error()));
     std::uint32_t id = YNN_INVALID_VALUE_ID;
     auto status = runtime::check_ynn_status(
-        ynn_define_tensor(graph_, ynn_type_fp32, second_extent == 0 ? 1 : 2, dimensions.data(), tensor->data(), 0, &id),
+        ynn_define_tensor(graph_, *type, second_extent == 0 ? 1 : 2, dimensions.data(), tensor->data(), 0, &id),
         "define mapped weight");
     if (!status) return std::unexpected(std::move(status.error()));
     return id;
@@ -65,20 +86,70 @@ Result<std::uint32_t> TransformerBuilder::linear(std::uint32_t input_id, std::st
 Result<std::uint32_t> TransformerBuilder::linear(std::uint32_t input_id, std::string_view weight_name,
                                                  std::string_view bias_name, std::int32_t input_size,
                                                  std::int32_t output_size, std::uint32_t output_id) const {
-    auto weight_id = weight(weight_name, output_size, input_size);
+    const auto matrix_type = model::matrix_data_type(weight_encoding_);
+    const auto first_extent =
+        linear_weight_layout_ == model::LinearWeightLayout::OUTPUT_INPUT ? output_size : input_size;
+    const auto second_extent =
+        linear_weight_layout_ == model::LinearWeightLayout::OUTPUT_INPUT ? input_size : output_size;
+    auto weight_id = weight(weight_name, first_extent, second_extent, matrix_type);
     if (!weight_id) return std::unexpected(std::move(weight_id.error()));
     auto bias_id = weight(bias_name, output_size);
     if (!bias_id) return std::unexpected(std::move(bias_id.error()));
 
+    if (weight_encoding_ == model::WeightEncoding::INT8_PER_CHANNEL) {
+        if (linear_weight_layout_ != model::LinearWeightLayout::INPUT_OUTPUT) {
+            return std::unexpected(
+                Error{ErrorCode::INVALID_ARGUMENT, "INT8 linear weights require INPUT_OUTPUT layout"});
+        }
+        auto scale_id = weight(model::quantization_scale_name(weight_name), output_size, 1);
+        if (!scale_id) return std::unexpected(std::move(scale_id.error()));
+
+        constexpr std::array<std::int32_t, 1> REDUCE_AXIS = {-1};
+        std::uint32_t min_max_id = YNN_INVALID_VALUE_ID;
+        std::uint32_t input_zero_point_id = YNN_INVALID_VALUE_ID;
+        std::uint32_t input_scale_id = YNN_INVALID_VALUE_ID;
+        std::uint32_t quantized_input_id = YNN_INVALID_VALUE_ID;
+        auto status = runtime::check_ynn_status(
+            ynn_define_reduce(graph_, ynn_reduce_min_max, REDUCE_AXIS.size(), REDUCE_AXIS.data(), input_id,
+                              YNN_INVALID_VALUE_ID, &min_max_id, YNN_NODE_FLAG_KEEP_DIMS),
+            "define INT8 input range");
+        if (status)
+            status =
+                runtime::check_ynn_status(ynn_define_dynamic_quantization(graph_, min_max_id, ynn_type_int8,
+                                                                          &input_zero_point_id, &input_scale_id, 0),
+                                          "define INT8 input quantization");
+        if (status)
+            status = runtime::check_ynn_status(ynn_define_quantize(graph_, input_id, ynn_type_int8, input_zero_point_id,
+                                                                   input_scale_id, &quantized_input_id, 0),
+                                               "quantize linear input");
+        if (status)
+            status = runtime::check_ynn_status(
+                ynn::define_blockwise_dot(graph_, quantized_input_id, input_zero_point_id, input_scale_id, *weight_id,
+                                          YNN_INVALID_VALUE_ID, *scale_id, static_cast<std::size_t>(input_size),
+                                          *bias_id, ynn_type_fp32, output_id, 0),
+                "define INT8 linear");
+        if (!status) return std::unexpected(std::move(status.error()));
+        return output_id;
+    }
+
     constexpr std::array<std::int32_t, 2> TRANSPOSE_AXES = {1, 0};
-    std::uint32_t transposed_weight_id = YNN_INVALID_VALUE_ID;
-    auto status =
-        runtime::check_ynn_status(ynn_define_static_transpose(graph_, TRANSPOSE_AXES.size(), TRANSPOSE_AXES.data(),
-                                                              *weight_id, &transposed_weight_id, 0),
-                                  "transpose linear weight");
+    std::uint32_t dot_input_id = weight_encoding_ == model::WeightEncoding::BF16 ? YNN_INVALID_VALUE_ID : input_id;
+    std::uint32_t dot_weight_id =
+        linear_weight_layout_ == model::LinearWeightLayout::OUTPUT_INPUT ? YNN_INVALID_VALUE_ID : *weight_id;
+    Result<void> status;
+    if (weight_encoding_ == model::WeightEncoding::BF16) {
+        status = runtime::check_ynn_status(
+            ynn_define_convert(graph_, input_id, ynn_type_bf16, &dot_input_id, YNN_NODE_FLAG_NO_EXCESS_PRECISION),
+            "convert linear input to BF16");
+    }
+    if (status && linear_weight_layout_ == model::LinearWeightLayout::OUTPUT_INPUT)
+        status =
+            runtime::check_ynn_status(ynn_define_static_transpose(graph_, TRANSPOSE_AXES.size(), TRANSPOSE_AXES.data(),
+                                                                  *weight_id, &dot_weight_id, 0),
+                                      "transpose linear weight");
     if (status) {
         status = runtime::check_ynn_status(
-            ynn_define_dot(graph_, 1, input_id, transposed_weight_id, *bias_id, &output_id, 0), "define linear");
+            ynn_define_dot(graph_, 1, dot_input_id, dot_weight_id, *bias_id, &output_id, 0), "define linear");
     }
     if (!status) return std::unexpected(std::move(status.error()));
     return output_id;

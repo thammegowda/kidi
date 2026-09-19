@@ -6,6 +6,10 @@ function(kidi_add_test target source)
     add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
+add_executable(kidi_argparse_test tests/kidi/cli/argparse_test.cpp)
+target_link_libraries(kidi_argparse_test PRIVATE kidi::argparse)
+add_test(NAME kidi_argparse_test COMMAND kidi_argparse_test)
+
 kidi_add_test(kidi_manifest_test tests/kidi/model/manifest_test.cpp)
 kidi_add_test(kidi_tokenizer_test tests/kidi/text/tokenizer_test.cpp ZLIB::ZLIB)
 kidi_add_test(kidi_rtg_package_test tests/kidi/rtg/package_test.cpp)
@@ -14,3 +18,5 @@ kidi_add_test(kidi_ynnpack_weights_test tests/kidi/runtime/ynnpack_weights_test.
 kidi_add_test(kidi_rtg_embedding_test tests/kidi/rtg/embedding_test.cpp)
 kidi_add_test(kidi_rtg_transformer_builder_test tests/kidi/rtg/transformer_builder_test.cpp)
 kidi_add_test(kidi_rtg_attention_test tests/kidi/rtg/attention_test.cpp)
+kidi_add_test(kidi_rtg_precision_test tests/kidi/rtg/precision_test.cpp)
+kidi_add_test(kidi_rtg_int8_precision_test tests/kidi/rtg/int8_precision_test.cpp)

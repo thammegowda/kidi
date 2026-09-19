@@ -45,6 +45,24 @@ std::optional<std::string> require_positive(std::int32_t value, std::string_view
     return std::nullopt;
 }
 
+WeightEncoding parse_weight_encoding(const YAML::Node& weights) {
+    if (!weights) return WeightEncoding::F32;
+    const auto encoding =
+        weights["encoding"] ? weights["encoding"].as<std::string>() : weights["data_type"].as<std::string>("F32");
+    if (encoding == "F32") return WeightEncoding::F32;
+    if (encoding == "BF16") return WeightEncoding::BF16;
+    if (encoding == "INT8_PER_CHANNEL") return WeightEncoding::INT8_PER_CHANNEL;
+    throw std::runtime_error("unsupported weight encoding '" + encoding + "'");
+}
+
+LinearWeightLayout parse_linear_weight_layout(const YAML::Node& weights) {
+    if (!weights) return LinearWeightLayout::OUTPUT_INPUT;
+    const auto layout = weights["linear_layout"].as<std::string>("OUTPUT_INPUT");
+    if (layout == "OUTPUT_INPUT") return LinearWeightLayout::OUTPUT_INPUT;
+    if (layout == "INPUT_OUTPUT") return LinearWeightLayout::INPUT_OUTPUT;
+    throw std::runtime_error("unsupported linear weight layout '" + layout + "'");
+}
+
 std::optional<std::string> validate(const ModelManifest& manifest) {
     if (manifest.format_version != 1) {
         return "unsupported format_version; expected 1";
@@ -54,6 +72,13 @@ std::optional<std::string> validate(const ModelManifest& manifest) {
     }
     if (manifest.input_format != "moses_tokenized" || manifest.output_format != "moses_tokenized") {
         return "the RTG MVP requires moses_tokenized input and output";
+    }
+    if (manifest.weights.format != "safetensors") {
+        return "the RTG MVP requires Safetensors weights";
+    }
+    if (manifest.weights.encoding != WeightEncoding::F32 &&
+        manifest.weights.linear_layout != LinearWeightLayout::INPUT_OUTPUT) {
+        return "reduced-precision weights require INPUT_OUTPUT linear layout";
     }
 
     const std::array positive_fields = {
@@ -197,6 +222,13 @@ Result<ModelManifest> ModelManifest::load(const std::filesystem::path& path) {
             .beam_size = required<std::int32_t>(decode, "beam_size"),
             .maximum_extra_tokens = required<std::int32_t>(decode, "maximum_extra_tokens"),
             .length_penalty = required<float>(decode, "length_penalty"),
+        };
+
+        const auto weights = root["weights"];
+        manifest.weights = {
+            .format = weights ? weights["format"].as<std::string>("safetensors") : "safetensors",
+            .encoding = parse_weight_encoding(weights),
+            .linear_layout = parse_linear_weight_layout(weights),
         };
 
         if (auto error = validate(manifest)) {

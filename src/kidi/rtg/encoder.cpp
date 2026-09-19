@@ -25,7 +25,9 @@ EncoderGraph::EncoderGraph(runtime::YnnExecutable executable, std::int32_t hidde
 Result<EncoderGraph> EncoderGraph::create(const Package& package) {
     const auto& manifest = package.manifest();
     const auto& architecture = manifest.architecture;
-    auto graph = runtime::YnnGraph::create(2);
+    const auto graph_flags =
+        manifest.weights.encoding == model::WeightEncoding::BF16 ? YNN_FLAG_NO_EXCESS_PRECISION : 0;
+    auto graph = runtime::YnnGraph::create(2, graph_flags);
     if (!graph) return std::unexpected(std::move(graph.error()));
 
     const std::array<std::size_t, 3> input_shape = {
@@ -47,7 +49,8 @@ Result<EncoderGraph> EncoderGraph::create(const Package& package) {
 
     TransformerBuilder builder(graph->get(), package.weights(), architecture.hidden_size,
                                architecture.feed_forward_size, architecture.attention_heads,
-                               architecture.layer_norm_epsilon);
+                               architecture.layer_norm_epsilon, manifest.weights.encoding,
+                               manifest.weights.linear_layout);
     std::uint32_t hidden_id = input_id;
     for (std::int32_t layer = 0; layer < architecture.encoder_layers; ++layer) {
         const auto prefix = "encoder.layers." + std::to_string(layer);
@@ -111,9 +114,11 @@ Encoder::Encoder(EmbeddingGraph embedding, EncoderGraph graph) noexcept
     : embedding_(std::move(embedding)), graph_(std::move(graph)) {}
 
 Result<Encoder> Encoder::create(const Package& package) {
-    const auto& architecture = package.manifest().architecture;
-    auto embedding = EmbeddingGraph::create(package.weights(), "src_embed.0.lut.weight",
-                                            architecture.source_vocabulary_size, architecture.hidden_size);
+    const auto& manifest = package.manifest();
+    const auto& architecture = manifest.architecture;
+    auto embedding =
+        EmbeddingGraph::create(package.weights(), "src_embed.0.lut.weight", architecture.source_vocabulary_size,
+                               architecture.hidden_size, manifest.weights.encoding);
     if (!embedding) return std::unexpected(std::move(embedding.error()));
     auto graph = EncoderGraph::create(package);
     if (!graph) return std::unexpected(std::move(graph.error()));

@@ -22,6 +22,13 @@ TensorShape = Tuple[int, ...]
 POSITIONAL_BUFFERS = {"src_embed.1.pe", "tgt_embed.1.pe"}
 TIED_OUTPUT_WEIGHT = "generator.proj.weight"
 TIED_TARGET_WEIGHT = "tgt_embed.0.lut.weight"
+EMBEDDING_WEIGHTS = {"src_embed.0.lut.weight", TIED_TARGET_WEIGHT}
+WEIGHT_ENCODINGS = {
+    "fp32": "F32",
+    "bf16": "BF16",
+    "int8": "INT8_PER_CHANNEL",
+}
+QUANTIZATION_SCALE_SUFFIX = ".scale"
 
 
 class ConversionError(ValueError):
@@ -150,6 +157,48 @@ def validate_state(
     return exported
 
 
+def quantize_per_channel(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    maximum = tensor.abs().max(dim=1, keepdim=True).values
+    scale = maximum / 127.0
+    scale = torch.where(maximum == 0, torch.ones_like(scale), scale)
+    quantized = torch.round(tensor / scale).clamp(-127, 127).to(torch.int8)
+    return quantized, scale.to(torch.float32)
+
+
+def encode_state(state: Mapping[str, torch.Tensor], precision: str) -> Dict[str, torch.Tensor]:
+    if precision == "fp32":
+        return dict(state)
+
+    result: Dict[str, torch.Tensor] = {}
+    target_encoded: torch.Tensor | None = None
+    target_scale: torch.Tensor | None = None
+    for name, tensor in state.items():
+        if tensor.ndim != 2:
+            result[name] = tensor
+            continue
+
+        if precision == "bf16":
+            encoded = tensor.to(torch.bfloat16)
+        elif precision == "int8":
+            encoded, scale = quantize_per_channel(tensor)
+            result[name + QUANTIZATION_SCALE_SUFFIX] = scale.contiguous()
+            if name == TIED_TARGET_WEIGHT:
+                target_scale = scale
+        else:
+            raise ConversionError(f"unsupported precision: {precision}")
+
+        result[name] = encoded.contiguous() if name in EMBEDDING_WEIGHTS else encoded.t().contiguous()
+        if name == TIED_TARGET_WEIGHT:
+            target_encoded = encoded
+
+    if target_encoded is None:
+        raise ConversionError("target embedding weight was not encoded")
+    result[TIED_OUTPUT_WEIGHT] = target_encoded.t().contiguous()
+    if target_scale is not None:
+        result[TIED_OUTPUT_WEIGHT + QUANTIZATION_SCALE_SUFFIX] = target_scale.clone().contiguous()
+    return result
+
+
 def find_checkpoint(model_directory: Path) -> Path:
     checkpoints = sorted((model_directory / "models").glob("*.pkl"))
     if len(checkpoints) != 1:
@@ -198,7 +247,9 @@ def write_manifest(
     source_tokenizer: str,
     target_tokenizer: str,
     checkpoint: Mapping[str, object],
+    precision: str,
 ) -> None:
+    reduced_precision = precision != "fp32"
     document = {
         "format_version": 1,
         "model_type": "rtg_transformer_nmt",
@@ -225,8 +276,9 @@ def write_manifest(
         "decode": {"beam_size": 4, "maximum_extra_tokens": 50, "length_penalty": 0.6},
         "weights": {
             "format": "safetensors",
-            "data_type": "F32",
-            "aliases": {TIED_OUTPUT_WEIGHT: TIED_TARGET_WEIGHT},
+            "encoding": WEIGHT_ENCODINGS[precision],
+            "linear_layout": "INPUT_OUTPUT" if reduced_precision else "OUTPUT_INPUT",
+            "aliases": {} if reduced_precision else {TIED_OUTPUT_WEIGHT: TIED_TARGET_WEIGHT},
             "omitted": sorted(POSITIONAL_BUFFERS),
         },
         "provenance": {
@@ -272,7 +324,7 @@ def convert(args: argparse.Namespace) -> Path:
         if not isinstance(state, Mapping):
             raise ConversionError("checkpoint has no model_state mapping")
 
-        exported = validate_state(state, model_args)
+        exported = encode_state(validate_state(state, model_args), args.precision)
         save_file(exported, staging / "model.safetensors", metadata={"format": "kidi-rtg-v1"})
 
         converter = find_tokenizer_converter(args.tokenizer_converter)
@@ -290,6 +342,7 @@ def convert(args: argparse.Namespace) -> Path:
             source_tokenizer.name,
             target_tokenizer.name,
             checkpoint,
+            args.precision,
         )
         os.replace(staging, destination)
         return destination
@@ -304,6 +357,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("output", type=Path, help="new kidi model package directory")
     parser.add_argument("--tokenizer-converter", type=Path, help="path to nlcodec_to_tokenizer_json.py")
     parser.add_argument("--gzip-tokenizers", action="store_true", help="write deterministic .json.gz tokenizers")
+    parser.add_argument(
+        "--precision",
+        choices=tuple(WEIGHT_ENCODINGS),
+        default="fp32",
+        help="matrix and embedding weight encoding (default: fp32)",
+    )
     return parser.parse_args()
 
 

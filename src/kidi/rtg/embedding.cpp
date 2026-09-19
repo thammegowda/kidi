@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -41,21 +42,38 @@ EmbeddingGraph::EmbeddingGraph(runtime::YnnExecutable executable, std::int32_t v
       output_id_(OUTPUT_ID) {}
 
 Result<EmbeddingGraph> EmbeddingGraph::create(const model::Weights& weights, std::string_view weight_name,
-                                              std::int32_t vocabulary_size, std::int32_t hidden_size) {
+                                              std::int32_t vocabulary_size, std::int32_t hidden_size,
+                                              model::WeightEncoding weight_encoding) {
     if (vocabulary_size <= 0 || hidden_size <= 0 || hidden_size % 2 != 0) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid embedding dimensions"});
     }
     auto weight = weights.tensor(weight_name);
     if (!weight) return std::unexpected(std::move(weight.error()));
+    const auto data_type = model::matrix_data_type(weight_encoding);
     const std::array<std::int64_t, 2> expected_shape = {vocabulary_size, hidden_size};
-    if (weight->data_type != model::DataType::F32 || !std::ranges::equal(weight->shape, expected_shape)) {
+    if (weight->data_type != data_type || !std::ranges::equal(weight->shape, expected_shape)) {
         return std::unexpected(Error{
             ErrorCode::INVALID_ARGUMENT,
             "embedding weight has incompatible dtype or shape: " + std::string(weight_name),
         });
     }
+    std::optional<model::TensorView> quantization_scale;
+    if (weight_encoding == model::WeightEncoding::INT8_PER_CHANNEL) {
+        const auto scale_name = model::quantization_scale_name(weight_name);
+        auto scale = weights.tensor(scale_name);
+        if (!scale) return std::unexpected(std::move(scale.error()));
+        const std::array<std::int64_t, 2> scale_shape = {vocabulary_size, 1};
+        if (scale->data_type != model::DataType::F32 || !std::ranges::equal(scale->shape, scale_shape)) {
+            return std::unexpected(Error{
+                ErrorCode::INVALID_ARGUMENT,
+                "embedding scale has incompatible dtype or shape: " + scale_name,
+            });
+        }
+        quantization_scale = *scale;
+    }
 
-    auto graph = runtime::YnnGraph::create(3);
+    const auto graph_flags = weight_encoding == model::WeightEncoding::BF16 ? YNN_FLAG_NO_EXCESS_PRECISION : 0;
+    auto graph = runtime::YnnGraph::create(3, graph_flags);
     if (!graph) return std::unexpected(std::move(graph.error()));
     const std::array<std::size_t, 3> token_shape = {0, 0, 1};
     const std::array<std::size_t, 3> hidden_shape = {1, 0, static_cast<std::size_t>(hidden_size)};
@@ -70,9 +88,15 @@ Result<EmbeddingGraph> EmbeddingGraph::create(const model::Weights& weights, std
     std::uint32_t output_id = OUTPUT_ID;
     std::uint32_t weight_id = YNN_INVALID_VALUE_ID;
     std::uint32_t gathered_id = YNN_INVALID_VALUE_ID;
+    std::uint32_t quantization_scale_id = YNN_INVALID_VALUE_ID;
+    std::uint32_t gathered_quantization_scale_id = YNN_INVALID_VALUE_ID;
+    std::uint32_t dequantized_id = YNN_INVALID_VALUE_ID;
     std::uint32_t scaled_id = YNN_INVALID_VALUE_ID;
     std::uint32_t scale_id = YNN_INVALID_VALUE_ID;
     auto scale = std::make_unique<float>(std::sqrt(static_cast<float>(hidden_size)));
+    const auto weight_type = weight_encoding == model::WeightEncoding::BF16               ? ynn_type_bf16
+                             : weight_encoding == model::WeightEncoding::INT8_PER_CHANNEL ? ynn_type_int8
+                                                                                          : ynn_type_fp32;
 
     auto status = runtime::check_ynn_status(
         ynn_define_tensor(graph->get(), ynn_type_int32, token_shape.size(), token_shape.data(), nullptr,
@@ -89,9 +113,16 @@ Result<EmbeddingGraph> EmbeddingGraph::create(const model::Weights& weights, std
                               YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &output_id),
             "define embedding output");
     if (status)
-        status = runtime::check_ynn_status(ynn_define_tensor(graph->get(), ynn_type_fp32, weight_shape.size(),
+        status = runtime::check_ynn_status(ynn_define_tensor(graph->get(), weight_type, weight_shape.size(),
                                                              weight_shape.data(), weight->data(), 0, &weight_id),
                                            "define embedding weight");
+    if (status && quantization_scale) {
+        const std::array<std::size_t, 3> quantization_scale_shape = {static_cast<std::size_t>(vocabulary_size), 1, 1};
+        status = runtime::check_ynn_status(
+            ynn_define_tensor(graph->get(), ynn_type_fp32, quantization_scale_shape.size(),
+                              quantization_scale_shape.data(), quantization_scale->data(), 0, &quantization_scale_id),
+            "define embedding quantization scale");
+    }
     if (status)
         status = runtime::check_ynn_status(
             ynn_define_tensor(graph->get(), ynn_type_fp32, 0, nullptr, scale.get(), 0, &scale_id),
@@ -100,9 +131,20 @@ Result<EmbeddingGraph> EmbeddingGraph::create(const model::Weights& weights, std
         status = runtime::check_ynn_status(ynn_define_gather(graph->get(), gather_axes.size(), gather_axes.data(), 3,
                                                              weight_id, token_id, &gathered_id, 0),
                                            "define embedding gather");
+    if (status && quantization_scale)
+        status = runtime::check_ynn_status(
+            ynn_define_gather(graph->get(), gather_axes.size(), gather_axes.data(), 3, quantization_scale_id, token_id,
+                              &gathered_quantization_scale_id, 0),
+            "define embedding scale gather");
+    if (status && quantization_scale)
+        status = runtime::check_ynn_status(
+            ynn_define_dequantize(graph->get(), gathered_id, YNN_INVALID_VALUE_ID, gathered_quantization_scale_id,
+                                  ynn_type_fp32, &dequantized_id, 0),
+            "dequantize embedding");
+    if (!quantization_scale) dequantized_id = gathered_id;
     if (status)
         status = runtime::check_ynn_status(
-            ynn_define_binary(graph->get(), ynn_binary_multiply, gathered_id, scale_id, &scaled_id, 0),
+            ynn_define_binary(graph->get(), ynn_binary_multiply, dequantized_id, scale_id, &scaled_id, 0),
             "scale embeddings");
     if (status)
         status = runtime::check_ynn_status(

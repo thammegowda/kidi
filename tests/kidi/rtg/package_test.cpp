@@ -72,10 +72,14 @@ int main() {
     write(directory / "tokenizer.tgt.json", TOKENIZER_JSON);
     write(directory / "model.yaml", MANIFEST_YAML);
 
-    auto package = kidi::rtg::Package::load(directory / "model.yaml");
+    auto package = kidi::rtg::Package::load(directory);
     if (!package || package->source_tokenizer().token_id("<s>") != 2 ||
         package->target_tokenizer().vocabulary_size() != 5) {
         std::cerr << "valid RTG package was rejected\n";
+        return 1;
+    }
+    if (kidi::rtg::Package::load(directory / "model.yaml")) {
+        std::cerr << "manifest path was accepted as a model directory\n";
         return 1;
     }
 

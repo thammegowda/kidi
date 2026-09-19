@@ -8,26 +8,9 @@
 #include <string_view>
 
 #include "kidi/core/error.h"
+#include "kidi/model/precision.h"
 
 namespace kidi::model {
-
-enum class DataType {
-    BOOL,
-    U8,
-    I8,
-    U16,
-    I16,
-    U32,
-    I32,
-    U64,
-    I64,
-    F16,
-    BF16,
-    F32,
-    F64,
-    E4M3,
-    E5M2,
-};
 
 struct TensorView {
     DataType data_type;

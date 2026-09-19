@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,6 +20,12 @@ struct Translation {
     float score;
 };
 
+struct DecodeOptions {
+    std::optional<std::int32_t> beam_size;
+    std::optional<std::int32_t> maximum_extra_tokens;
+    std::optional<float> length_penalty;
+};
+
 class Translator {
 public:
     Translator(Translator&&) noexcept = default;
@@ -27,8 +34,8 @@ public:
     Translator(const Translator&) = delete;
     Translator& operator=(const Translator&) = delete;
 
-    [[nodiscard]] static Result<Translator> load(const std::filesystem::path& manifest_path);
-    [[nodiscard]] Result<Translation> translate(std::string_view source);
+    [[nodiscard]] static Result<Translator> load(const std::filesystem::path& model_directory);
+    [[nodiscard]] Result<Translation> translate(std::string_view source, DecodeOptions options = {});
 
 private:
     Translator(Package package, Encoder encoder, Decoder decoder) noexcept;

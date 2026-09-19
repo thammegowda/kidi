@@ -29,8 +29,11 @@ DecoderGraph::DecoderGraph(runtime::YnnExecutable executable, std::int32_t hidde
     : executable_(std::move(executable)), hidden_size_(hidden_size), maximum_position_(maximum_position) {}
 
 Result<DecoderGraph> DecoderGraph::create(const Package& package) {
-    const auto& architecture = package.manifest().architecture;
-    auto graph = runtime::YnnGraph::create(4);
+    const auto& manifest = package.manifest();
+    const auto& architecture = manifest.architecture;
+    const auto graph_flags =
+        manifest.weights.encoding == model::WeightEncoding::BF16 ? YNN_FLAG_NO_EXCESS_PRECISION : 0;
+    auto graph = runtime::YnnGraph::create(4, graph_flags);
     if (!graph) return std::unexpected(std::move(graph.error()));
 
     const std::array<std::size_t, 3> decoder_shape = {
@@ -70,7 +73,8 @@ Result<DecoderGraph> DecoderGraph::create(const Package& package) {
 
     TransformerBuilder builder(graph->get(), package.weights(), architecture.hidden_size,
                                architecture.feed_forward_size, architecture.attention_heads,
-                               architecture.layer_norm_epsilon);
+                               architecture.layer_norm_epsilon, manifest.weights.encoding,
+                               manifest.weights.linear_layout);
     std::uint32_t hidden_id = input_id;
     for (std::int32_t layer = 0; layer < architecture.decoder_layers; ++layer) {
         const auto prefix = "decoder.layers." + std::to_string(layer);
@@ -159,8 +163,11 @@ GeneratorGraph::GeneratorGraph(runtime::YnnExecutable executable, std::int32_t h
     : executable_(std::move(executable)), hidden_size_(hidden_size), vocabulary_size_(vocabulary_size) {}
 
 Result<GeneratorGraph> GeneratorGraph::create(const Package& package) {
-    const auto& architecture = package.manifest().architecture;
-    auto graph = runtime::YnnGraph::create(2);
+    const auto& manifest = package.manifest();
+    const auto& architecture = manifest.architecture;
+    const auto graph_flags =
+        manifest.weights.encoding == model::WeightEncoding::BF16 ? YNN_FLAG_NO_EXCESS_PRECISION : 0;
+    auto graph = runtime::YnnGraph::create(2, graph_flags);
     if (!graph) return std::unexpected(std::move(graph.error()));
     const std::array<std::size_t, 3> input_shape = {
         0,
@@ -181,8 +188,11 @@ Result<GeneratorGraph> GeneratorGraph::create(const Package& package) {
 
     TransformerBuilder builder(graph->get(), package.weights(), architecture.hidden_size,
                                architecture.feed_forward_size, architecture.attention_heads,
-                               architecture.layer_norm_epsilon);
-    auto logits_id = builder.linear(input_id, "tgt_embed.0.lut.weight", "generator.proj.bias", architecture.hidden_size,
+                               architecture.layer_norm_epsilon, manifest.weights.encoding,
+                               manifest.weights.linear_layout);
+    const auto generator_weight =
+        manifest.weights.encoding == model::WeightEncoding::F32 ? "tgt_embed.0.lut.weight" : "generator.proj.weight";
+    auto logits_id = builder.linear(input_id, generator_weight, "generator.proj.bias", architecture.hidden_size,
                                     architecture.target_vocabulary_size);
     if (!logits_id) return std::unexpected(std::move(logits_id.error()));
     status = runtime::check_ynn_status(ynn::define_log_softmax(graph->get(), *logits_id, output_id),
@@ -219,9 +229,11 @@ Decoder::Decoder(EmbeddingGraph embedding, DecoderGraph graph, GeneratorGraph ge
       hidden_size_(hidden_size) {}
 
 Result<Decoder> Decoder::create(const Package& package) {
-    const auto& architecture = package.manifest().architecture;
-    auto embedding = EmbeddingGraph::create(package.weights(), "tgt_embed.0.lut.weight",
-                                            architecture.target_vocabulary_size, architecture.hidden_size);
+    const auto& manifest = package.manifest();
+    const auto& architecture = manifest.architecture;
+    auto embedding =
+        EmbeddingGraph::create(package.weights(), "tgt_embed.0.lut.weight", architecture.target_vocabulary_size,
+                               architecture.hidden_size, manifest.weights.encoding);
     if (!embedding) return std::unexpected(std::move(embedding.error()));
     auto graph = DecoderGraph::create(package);
     if (!graph) return std::unexpected(std::move(graph.error()));

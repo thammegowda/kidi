@@ -17,7 +17,7 @@ public:
     Package(const Package&) = delete;
     Package& operator=(const Package&) = delete;
 
-    [[nodiscard]] static Result<Package> load(const std::filesystem::path& manifest_path);
+    [[nodiscard]] static Result<Package> load(const std::filesystem::path& model_directory);
 
     [[nodiscard]] const model::ModelManifest& manifest() const noexcept;
     [[nodiscard]] const model::Weights& weights() const noexcept;

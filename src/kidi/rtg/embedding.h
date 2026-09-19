@@ -21,8 +21,9 @@ public:
     EmbeddingGraph(const EmbeddingGraph&) = delete;
     EmbeddingGraph& operator=(const EmbeddingGraph&) = delete;
 
-    [[nodiscard]] static Result<EmbeddingGraph> create(const model::Weights& weights, std::string_view weight_name,
-                                                       std::int32_t vocabulary_size, std::int32_t hidden_size);
+    [[nodiscard]] static Result<EmbeddingGraph> create(
+        const model::Weights& weights, std::string_view weight_name, std::int32_t vocabulary_size,
+        std::int32_t hidden_size, model::WeightEncoding weight_encoding = model::WeightEncoding::F32);
     [[nodiscard]] Result<std::vector<float>> run(std::span<const std::int32_t> token_ids, std::size_t batch_size = 1);
 
 private:
