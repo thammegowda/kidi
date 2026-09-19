@@ -17,7 +17,7 @@ namespace {
 
 void write_weights(const std::filesystem::path& path) {
     std::string header =
-        R"({"norm.weight":{"dtype":"F32","shape":[4],"data_offsets":[0,16]},"norm.bias":{"dtype":"F32","shape":[4],"data_offsets":[16,32]},"ff.w_1.weight":{"dtype":"F32","shape":[3,4],"data_offsets":[32,80]},"ff.w_1.bias":{"dtype":"F32","shape":[3],"data_offsets":[80,92]},"ff.w_2.weight":{"dtype":"F32","shape":[4,3],"data_offsets":[92,140]},"ff.w_2.bias":{"dtype":"F32","shape":[4],"data_offsets":[140,156]}})";
+        R"({"norm.weight":{"dtype":"F32","shape":[4],"data_offsets":[0,16]},"norm.bias":{"dtype":"F32","shape":[4],"data_offsets":[16,32]},"ff.w_1.weight":{"dtype":"F32","shape":[4,3],"data_offsets":[32,80]},"ff.w_1.bias":{"dtype":"F32","shape":[3],"data_offsets":[80,92]},"ff.w_2.weight":{"dtype":"F32","shape":[3,4],"data_offsets":[92,140]},"ff.w_2.bias":{"dtype":"F32","shape":[4],"data_offsets":[140,156]}})";
     while (header.size() % 8 != 0) header.push_back(' ');
 
     std::ofstream output(path, std::ios::binary);
@@ -29,11 +29,11 @@ void write_weights(const std::filesystem::path& path) {
     constexpr std::array NORMALIZATION_WEIGHT = {1.5F, 0.5F, 2.0F, -1.0F};
     constexpr std::array NORMALIZATION_BIAS = {0.1F, -0.2F, 0.3F, 0.4F};
     constexpr std::array FIRST_WEIGHT = {
-        0.25F, -0.5F, 1.0F, 0.75F, -1.0F, 0.5F, 0.125F, 0.25F, 0.6F, -0.2F, -0.4F, 0.9F,
+        0.25F, -1.0F, 0.6F, -0.5F, 0.5F, -0.2F, 1.0F, 0.125F, -0.4F, 0.75F, 0.25F, 0.9F,
     };
     constexpr std::array FIRST_BIAS = {0.2F, -0.1F, 0.3F};
     constexpr std::array SECOND_WEIGHT = {
-        0.3F, -0.7F, 0.2F, 1.0F, 0.1F, -0.5F, -0.4F, 0.8F, 0.6F, 0.25F, 0.5F, -1.0F,
+        0.3F, 1.0F, -0.4F, 0.25F, -0.7F, 0.1F, 0.8F, 0.5F, 0.2F, -0.5F, 0.6F, -1.0F,
     };
     constexpr std::array SECOND_BIAS = {-0.2F, 0.4F, 0.05F, -0.3F};
     const auto write_values = [&output](const auto& values) {

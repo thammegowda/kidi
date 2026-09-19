@@ -100,9 +100,10 @@ python3 tools/convert_rtg.py --precision int8 /path/to/rtg-model /path/to/kidi-i
 | `bf16` | BF16 | FP32 | BF16 dot with FP32 accumulation |
 | `int8` | symmetric per-channel INT8 plus FP32 scales | FP32 | dynamic INT8 activations, FP32 output |
 
-Reduced-precision linear weights use `[input, output]` storage. Embeddings keep
-`[vocabulary, hidden]`; tied output projection values are stored separately in
-linear layout. INT8 uses one scale per output channel or embedding row.
+All linear weights use `[input, output]` storage. Embeddings keep
+`[vocabulary, hidden]`; reduced-precision tied output projection values are
+stored separately in linear layout. INT8 uses one scale per output channel or
+embedding row.
 
 RTG checkpoints use Python pickle and must only be converted from a trusted
 source. The resulting runtime package contains no pickle or PyTorch files.

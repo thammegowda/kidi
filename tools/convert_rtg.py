@@ -166,9 +166,6 @@ def quantize_per_channel(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
 
 
 def encode_state(state: Mapping[str, torch.Tensor], precision: str) -> Dict[str, torch.Tensor]:
-    if precision == "fp32":
-        return dict(state)
-
     result: Dict[str, torch.Tensor] = {}
     target_encoded: torch.Tensor | None = None
     target_scale: torch.Tensor | None = None
@@ -177,7 +174,9 @@ def encode_state(state: Mapping[str, torch.Tensor], precision: str) -> Dict[str,
             result[name] = tensor
             continue
 
-        if precision == "bf16":
+        if precision == "fp32":
+            encoded = tensor
+        elif precision == "bf16":
             encoded = tensor.to(torch.bfloat16)
         elif precision == "int8":
             encoded, scale = quantize_per_channel(tensor)
@@ -193,9 +192,10 @@ def encode_state(state: Mapping[str, torch.Tensor], precision: str) -> Dict[str,
 
     if target_encoded is None:
         raise ConversionError("target embedding weight was not encoded")
-    result[TIED_OUTPUT_WEIGHT] = target_encoded.t().contiguous()
-    if target_scale is not None:
-        result[TIED_OUTPUT_WEIGHT + QUANTIZATION_SCALE_SUFFIX] = target_scale.clone().contiguous()
+    if precision != "fp32":
+        result[TIED_OUTPUT_WEIGHT] = target_encoded.t().contiguous()
+        if target_scale is not None:
+            result[TIED_OUTPUT_WEIGHT + QUANTIZATION_SCALE_SUFFIX] = target_scale.clone().contiguous()
     return result
 
 
@@ -277,7 +277,6 @@ def write_manifest(
         "weights": {
             "format": "safetensors",
             "encoding": WEIGHT_ENCODINGS[precision],
-            "linear_layout": "INPUT_OUTPUT" if reduced_precision else "OUTPUT_INPUT",
             "aliases": {} if reduced_precision else {TIED_OUTPUT_WEIGHT: TIED_TARGET_WEIGHT},
             "omitted": sorted(POSITIONAL_BUFFERS),
         },

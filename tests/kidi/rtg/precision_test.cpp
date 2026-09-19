@@ -65,8 +65,7 @@ int main() {
                                                                    YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &output_id),
                                                  "define BF16 test output");
 
-    kidi::rtg::TransformerBuilder builder(graph->get(), *weights, 4, 8, 2, 1.0e-5F, kidi::model::WeightEncoding::BF16,
-                                          kidi::model::LinearWeightLayout::INPUT_OUTPUT);
+    kidi::rtg::TransformerBuilder builder(graph->get(), *weights, 4, 8, 2, 1.0e-5F, kidi::model::WeightEncoding::BF16);
     auto result_id = status ? builder.linear(input_id, "linear", 4, 3, output_id)
                             : kidi::Result<std::uint32_t>{std::unexpected(std::move(status.error()))};
     if (!result_id) {

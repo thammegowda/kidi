@@ -49,8 +49,7 @@ Result<EncoderGraph> EncoderGraph::create(const Package& package) {
 
     TransformerBuilder builder(graph->get(), package.weights(), architecture.hidden_size,
                                architecture.feed_forward_size, architecture.attention_heads,
-                               architecture.layer_norm_epsilon, manifest.weights.encoding,
-                               manifest.weights.linear_layout);
+                               architecture.layer_norm_epsilon, manifest.weights.encoding);
     std::uint32_t hidden_id = input_id;
     for (std::int32_t layer = 0; layer < architecture.encoder_layers; ++layer) {
         const auto prefix = "encoder.layers." + std::to_string(layer);

@@ -29,16 +29,14 @@ Result<ynn_type> to_ynn_type(model::DataType data_type) {
 
 TransformerBuilder::TransformerBuilder(ynn_subgraph_t graph, const model::Weights& weights, std::int32_t hidden_size,
                                        std::int32_t feed_forward_size, std::int32_t attention_heads,
-                                       float layer_norm_epsilon, model::WeightEncoding weight_encoding,
-                                       model::LinearWeightLayout linear_weight_layout) noexcept
+                                       float layer_norm_epsilon, model::WeightEncoding weight_encoding) noexcept
     : graph_(graph),
       weights_(weights),
       hidden_size_(hidden_size),
       feed_forward_size_(feed_forward_size),
       attention_heads_(attention_heads),
       layer_norm_epsilon_(layer_norm_epsilon),
-      weight_encoding_(weight_encoding),
-      linear_weight_layout_(linear_weight_layout) {}
+      weight_encoding_(weight_encoding) {}
 
 Result<std::uint32_t> TransformerBuilder::weight(std::string_view name, std::int32_t first_extent,
                                                  std::int32_t second_extent, model::DataType data_type) const {
@@ -87,20 +85,12 @@ Result<std::uint32_t> TransformerBuilder::linear(std::uint32_t input_id, std::st
                                                  std::string_view bias_name, std::int32_t input_size,
                                                  std::int32_t output_size, std::uint32_t output_id) const {
     const auto matrix_type = model::matrix_data_type(weight_encoding_);
-    const auto first_extent =
-        linear_weight_layout_ == model::LinearWeightLayout::OUTPUT_INPUT ? output_size : input_size;
-    const auto second_extent =
-        linear_weight_layout_ == model::LinearWeightLayout::OUTPUT_INPUT ? input_size : output_size;
-    auto weight_id = weight(weight_name, first_extent, second_extent, matrix_type);
+    auto weight_id = weight(weight_name, input_size, output_size, matrix_type);
     if (!weight_id) return std::unexpected(std::move(weight_id.error()));
     auto bias_id = weight(bias_name, output_size);
     if (!bias_id) return std::unexpected(std::move(bias_id.error()));
 
     if (weight_encoding_ == model::WeightEncoding::INT8_PER_CHANNEL) {
-        if (linear_weight_layout_ != model::LinearWeightLayout::INPUT_OUTPUT) {
-            return std::unexpected(
-                Error{ErrorCode::INVALID_ARGUMENT, "INT8 linear weights require INPUT_OUTPUT layout"});
-        }
         auto scale_id = weight(model::quantization_scale_name(weight_name), output_size, 1);
         if (!scale_id) return std::unexpected(std::move(scale_id.error()));
 
@@ -132,25 +122,41 @@ Result<std::uint32_t> TransformerBuilder::linear(std::uint32_t input_id, std::st
         return output_id;
     }
 
-    constexpr std::array<std::int32_t, 2> TRANSPOSE_AXES = {1, 0};
     std::uint32_t dot_input_id = weight_encoding_ == model::WeightEncoding::BF16 ? YNN_INVALID_VALUE_ID : input_id;
-    std::uint32_t dot_weight_id =
-        linear_weight_layout_ == model::LinearWeightLayout::OUTPUT_INPUT ? YNN_INVALID_VALUE_ID : *weight_id;
     Result<void> status;
     if (weight_encoding_ == model::WeightEncoding::BF16) {
         status = runtime::check_ynn_status(
             ynn_define_convert(graph_, input_id, ynn_type_bf16, &dot_input_id, YNN_NODE_FLAG_NO_EXCESS_PRECISION),
             "convert linear input to BF16");
     }
-    if (status && linear_weight_layout_ == model::LinearWeightLayout::OUTPUT_INPUT)
-        status =
-            runtime::check_ynn_status(ynn_define_static_transpose(graph_, TRANSPOSE_AXES.size(), TRANSPOSE_AXES.data(),
-                                                                  *weight_id, &dot_weight_id, 0),
-                                      "transpose linear weight");
     if (status) {
-        status = runtime::check_ynn_status(
-            ynn_define_dot(graph_, 1, dot_input_id, dot_weight_id, *bias_id, &output_id, 0), "define linear");
+        status = runtime::check_ynn_status(ynn_define_dot(graph_, 1, dot_input_id, *weight_id, *bias_id, &output_id, 0),
+                                           "define linear");
     }
+    if (!status) return std::unexpected(std::move(status.error()));
+    return output_id;
+}
+
+Result<std::uint32_t> TransformerBuilder::tied_projection(std::uint32_t input_id, std::string_view embedding_name,
+                                                          std::string_view bias_name, std::int32_t hidden_size,
+                                                          std::int32_t vocabulary_size, std::uint32_t output_id) const {
+    if (weight_encoding_ != model::WeightEncoding::F32) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "tied projection requires FP32 embedding weights"});
+    }
+    auto embedding_id = weight(embedding_name, vocabulary_size, hidden_size);
+    if (!embedding_id) return std::unexpected(std::move(embedding_id.error()));
+    auto bias_id = weight(bias_name, vocabulary_size);
+    if (!bias_id) return std::unexpected(std::move(bias_id.error()));
+
+    constexpr std::array<std::int32_t, 2> TRANSPOSE_AXES = {1, 0};
+    std::uint32_t transposed_id = YNN_INVALID_VALUE_ID;
+    auto status =
+        runtime::check_ynn_status(ynn_define_static_transpose(graph_, TRANSPOSE_AXES.size(), TRANSPOSE_AXES.data(),
+                                                              *embedding_id, &transposed_id, 0),
+                                  "transpose tied embedding");
+    if (status)
+        status = runtime::check_ynn_status(ynn_define_dot(graph_, 1, input_id, transposed_id, *bias_id, &output_id, 0),
+                                           "define tied projection");
     if (!status) return std::unexpected(std::move(status.error()));
     return output_id;
 }

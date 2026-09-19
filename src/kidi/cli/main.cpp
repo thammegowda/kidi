@@ -22,7 +22,6 @@ int inspect(const kidi::cli::Namespace& arguments) {
               << "model: " << manifest.model_type << '\n'
               << "weights: " << manifest.weights_file.string() << '\n'
               << "weight encoding: " << kidi::model::to_string(manifest.weights.encoding) << '\n'
-              << "linear layout: " << kidi::model::to_string(manifest.weights.linear_layout) << '\n'
               << "weight tensors: " << package->weights().size() << '\n'
               << "vocabularies: " << package->source_tokenizer().vocabulary_size() << ", "
               << package->target_tokenizer().vocabulary_size() << '\n'

@@ -55,14 +55,6 @@ WeightEncoding parse_weight_encoding(const YAML::Node& weights) {
     throw std::runtime_error("unsupported weight encoding '" + encoding + "'");
 }
 
-LinearWeightLayout parse_linear_weight_layout(const YAML::Node& weights) {
-    if (!weights) return LinearWeightLayout::OUTPUT_INPUT;
-    const auto layout = weights["linear_layout"].as<std::string>("OUTPUT_INPUT");
-    if (layout == "OUTPUT_INPUT") return LinearWeightLayout::OUTPUT_INPUT;
-    if (layout == "INPUT_OUTPUT") return LinearWeightLayout::INPUT_OUTPUT;
-    throw std::runtime_error("unsupported linear weight layout '" + layout + "'");
-}
-
 std::optional<std::string> validate(const ModelManifest& manifest) {
     if (manifest.format_version != 1) {
         return "unsupported format_version; expected 1";
@@ -75,10 +67,6 @@ std::optional<std::string> validate(const ModelManifest& manifest) {
     }
     if (manifest.weights.format != "safetensors") {
         return "the RTG MVP requires Safetensors weights";
-    }
-    if (manifest.weights.encoding != WeightEncoding::F32 &&
-        manifest.weights.linear_layout != LinearWeightLayout::INPUT_OUTPUT) {
-        return "reduced-precision weights require INPUT_OUTPUT linear layout";
     }
 
     const std::array positive_fields = {
@@ -228,7 +216,6 @@ Result<ModelManifest> ModelManifest::load(const std::filesystem::path& path) {
         manifest.weights = {
             .format = weights ? weights["format"].as<std::string>("safetensors") : "safetensors",
             .encoding = parse_weight_encoding(weights),
-            .linear_layout = parse_linear_weight_layout(weights),
         };
 
         if (auto error = validate(manifest)) {

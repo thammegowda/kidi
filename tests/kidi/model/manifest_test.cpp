@@ -53,8 +53,7 @@ std::string valid_manifest(std::string_view weights_file = "model.safetensors") 
            "  length_penalty: 0.6\n"
            "weights:\n"
            "  format: safetensors\n"
-           "  encoding: BF16\n"
-           "  linear_layout: INPUT_OUTPUT\n";
+           "  encoding: BF16\n";
 }
 
 } // namespace
@@ -71,8 +70,7 @@ int main() {
     auto manifest = kidi::model::ModelManifest::load(directory / "model.yaml");
     if (!manifest || manifest->architecture.hidden_size != 768 ||
         manifest->weights_file != directory / "model.safetensors" ||
-        manifest->weights.encoding != kidi::model::WeightEncoding::BF16 ||
-        manifest->weights.linear_layout != kidi::model::LinearWeightLayout::INPUT_OUTPUT) {
+        manifest->weights.encoding != kidi::model::WeightEncoding::BF16) {
         std::cerr << "valid manifest was rejected\n";
         return 1;
     }

@@ -73,8 +73,7 @@ Result<DecoderGraph> DecoderGraph::create(const Package& package) {
 
     TransformerBuilder builder(graph->get(), package.weights(), architecture.hidden_size,
                                architecture.feed_forward_size, architecture.attention_heads,
-                               architecture.layer_norm_epsilon, manifest.weights.encoding,
-                               manifest.weights.linear_layout);
+                               architecture.layer_norm_epsilon, manifest.weights.encoding);
     std::uint32_t hidden_id = input_id;
     for (std::int32_t layer = 0; layer < architecture.decoder_layers; ++layer) {
         const auto prefix = "decoder.layers." + std::to_string(layer);
@@ -188,12 +187,12 @@ Result<GeneratorGraph> GeneratorGraph::create(const Package& package) {
 
     TransformerBuilder builder(graph->get(), package.weights(), architecture.hidden_size,
                                architecture.feed_forward_size, architecture.attention_heads,
-                               architecture.layer_norm_epsilon, manifest.weights.encoding,
-                               manifest.weights.linear_layout);
-    const auto generator_weight =
-        manifest.weights.encoding == model::WeightEncoding::F32 ? "tgt_embed.0.lut.weight" : "generator.proj.weight";
-    auto logits_id = builder.linear(input_id, generator_weight, "generator.proj.bias", architecture.hidden_size,
-                                    architecture.target_vocabulary_size);
+                               architecture.layer_norm_epsilon, manifest.weights.encoding);
+    auto logits_id = manifest.weights.encoding == model::WeightEncoding::F32
+                         ? builder.tied_projection(input_id, "tgt_embed.0.lut.weight", "generator.proj.bias",
+                                                   architecture.hidden_size, architecture.target_vocabulary_size)
+                         : builder.linear(input_id, "generator.proj.weight", "generator.proj.bias",
+                                          architecture.hidden_size, architecture.target_vocabulary_size);
     if (!logits_id) return std::unexpected(std::move(logits_id.error()));
     status = runtime::check_ynn_status(ynn::define_log_softmax(graph->get(), *logits_id, output_id),
                                        "define generator log softmax");

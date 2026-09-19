@@ -46,13 +46,21 @@ void write_weights(const std::filesystem::path& path) {
         output.write(reinterpret_cast<const char*>(values.data()),
                      static_cast<std::streamsize>(values.size() * sizeof(values[0])));
     };
-    write_values(QUERY_WEIGHT);
+    const auto write_transposed = [&output](const auto& values, std::size_t rows, std::size_t columns) {
+        for (std::size_t column = 0; column < columns; ++column) {
+            for (std::size_t row = 0; row < rows; ++row) {
+                const auto value = values[row * columns + column];
+                output.write(reinterpret_cast<const char*>(&value), sizeof(value));
+            }
+        }
+    };
+    write_transposed(QUERY_WEIGHT, 4, 4);
     write_values(QUERY_BIAS);
-    write_values(KEY_WEIGHT);
+    write_transposed(KEY_WEIGHT, 4, 4);
     write_values(KEY_BIAS);
-    write_values(VALUE_WEIGHT);
+    write_transposed(VALUE_WEIGHT, 4, 4);
     write_values(VALUE_BIAS);
-    write_values(OUTPUT_WEIGHT);
+    write_transposed(OUTPUT_WEIGHT, 4, 4);
     write_values(OUTPUT_BIAS);
 }
 

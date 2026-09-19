@@ -29,15 +29,9 @@ enum class WeightEncoding {
     INT8_PER_CHANNEL,
 };
 
-enum class LinearWeightLayout {
-    OUTPUT_INPUT,
-    INPUT_OUTPUT,
-};
-
 struct WeightSpec {
     std::string format;
     WeightEncoding encoding;
-    LinearWeightLayout linear_layout;
 };
 
 [[nodiscard]] constexpr DataType matrix_data_type(WeightEncoding encoding) noexcept {
@@ -59,15 +53,6 @@ struct WeightSpec {
             return "BF16";
         case WeightEncoding::INT8_PER_CHANNEL:
             return "INT8_PER_CHANNEL";
-    }
-}
-
-[[nodiscard]] constexpr std::string_view to_string(LinearWeightLayout layout) noexcept {
-    switch (layout) {
-        case LinearWeightLayout::OUTPUT_INPUT:
-            return "OUTPUT_INPUT";
-        case LinearWeightLayout::INPUT_OUTPUT:
-            return "INPUT_OUTPUT";
     }
 }
 
