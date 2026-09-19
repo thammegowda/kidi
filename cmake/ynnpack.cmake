@@ -17,9 +17,19 @@ add_subdirectory(
 set(YNNPACK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(YNNPACK_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(YNN_ENABLE_CPUINFO OFF CACHE BOOL "" FORCE)
-if(APPLE)
-    set(YNN_ENABLE_ARM64_SME OFF CACHE BOOL "" FORCE)
-    set(YNN_ENABLE_ARM64_SME2 OFF CACHE BOOL "" FORCE)
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+    add_library(cpuinfo STATIC "${PROJECT_SOURCE_DIR}/src/kidi/runtime/apple_cpuinfo.cpp")
+    target_include_directories(cpuinfo PUBLIC "${PROJECT_SOURCE_DIR}/src/kidi/runtime/apple_cpuinfo")
+    target_compile_features(cpuinfo PUBLIC cxx_std_23)
+    set(YNN_ENABLE_CPUINFO ON CACHE BOOL "" FORCE)
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 17)
+        set(YNN_ENABLE_ARM64_SME ON CACHE BOOL "" FORCE)
+        set(YNN_ENABLE_ARM64_SME2 ON CACHE BOOL "" FORCE)
+    else()
+        set(YNN_ENABLE_ARM64_SME OFF CACHE BOOL "" FORCE)
+        set(YNN_ENABLE_ARM64_SME2 OFF CACHE BOOL "" FORCE)
+    endif()
 endif()
 
 # YNNPACK's code generators currently resolve helper scripts relative to the

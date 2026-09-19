@@ -157,6 +157,40 @@ def validate_state(
     return exported
 
 
+def canonicalize_attention_state(
+    state: Mapping[str, torch.Tensor], model_args: Mapping[str, object]
+) -> Dict[str, torch.Tensor]:
+    result = dict(state)
+
+    def fuse(projections: Tuple[str, ...], destination: str) -> None:
+        result[destination + ".weight"] = torch.cat(
+            [result.pop(projection + ".weight") for projection in projections], dim=0
+        ).contiguous()
+        result[destination + ".bias"] = torch.cat(
+            [result.pop(projection + ".bias") for projection in projections], dim=0
+        ).contiguous()
+
+    def rename(source: str, destination: str) -> None:
+        result[destination + ".weight"] = result.pop(source + ".weight")
+        result[destination + ".bias"] = result.pop(source + ".bias")
+
+    for layer in range(int(model_args["enc_layers"])):
+        prefix = f"encoder.layers.{layer}.self_attn"
+        fuse(tuple(f"{prefix}.linears.{projection}" for projection in range(3)), f"{prefix}.qkv")
+        rename(f"{prefix}.linears.3", f"{prefix}.out")
+
+    for layer in range(int(model_args["dec_layers"])):
+        self_prefix = f"decoder.layers.{layer}.self_attn"
+        fuse(tuple(f"{self_prefix}.linears.{projection}" for projection in range(3)), f"{self_prefix}.qkv")
+        rename(f"{self_prefix}.linears.3", f"{self_prefix}.out")
+
+        source_prefix = f"decoder.layers.{layer}.src_attn"
+        rename(f"{source_prefix}.linears.0", f"{source_prefix}.q")
+        fuse((f"{source_prefix}.linears.1", f"{source_prefix}.linears.2"), f"{source_prefix}.kv")
+        rename(f"{source_prefix}.linears.3", f"{source_prefix}.out")
+    return result
+
+
 def quantize_per_channel(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     maximum = tensor.abs().max(dim=1, keepdim=True).values
     scale = maximum / 127.0
@@ -323,7 +357,8 @@ def convert(args: argparse.Namespace) -> Path:
         if not isinstance(state, Mapping):
             raise ConversionError("checkpoint has no model_state mapping")
 
-        exported = encode_state(validate_state(state, model_args), args.precision)
+        canonical = canonicalize_attention_state(validate_state(state, model_args), model_args)
+        exported = encode_state(canonical, args.precision)
         save_file(exported, staging / "model.safetensors", metadata={"format": "kidi-rtg-v1"})
 
         converter = find_tokenizer_converter(args.tokenizer_converter)

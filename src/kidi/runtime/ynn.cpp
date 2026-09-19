@@ -3,11 +3,14 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include "slinky/base/thread_pool_impl.h"
+#include "ynnpack/base/arch.h"
 
 namespace kidi::runtime {
 namespace {
@@ -39,9 +42,8 @@ private:
 
 class YnnThreadPool {
 public:
-    static Result<std::shared_ptr<YnnThreadPool>> create() {
-        const auto concurrency = std::max(1U, std::thread::hardware_concurrency());
-        auto result = std::shared_ptr<YnnThreadPool>(new YnnThreadPool(static_cast<int>(concurrency - 1)));
+    static Result<std::shared_ptr<YnnThreadPool>> create(std::size_t total_threads) {
+        auto result = std::shared_ptr<YnnThreadPool>(new YnnThreadPool(static_cast<int>(total_threads - 1)));
         auto status =
             check_ynn_status(ynn_create_threadpool(Scheduler::interface(), &result->scheduler_, 0, &result->handle_),
                              "create thread pool");
@@ -64,12 +66,61 @@ private:
 
 namespace {
 
+std::atomic<std::size_t> configured_thread_count = 0;
+
 Result<std::shared_ptr<YnnThreadPool>> default_thread_pool() {
-    static const auto result = YnnThreadPool::create();
-    return result;
+    struct PoolCache {
+        std::mutex mutex;
+        std::unordered_map<std::size_t, std::weak_ptr<YnnThreadPool>> pools;
+    };
+    static PoolCache cache;
+
+    const auto total_threads = ynn_thread_count();
+    std::scoped_lock lock(cache.mutex);
+    if (auto existing = cache.pools[total_threads].lock()) return existing;
+    auto created = YnnThreadPool::create(total_threads);
+    if (!created) return std::unexpected(std::move(created.error()));
+    cache.pools[total_threads] = *created;
+    return *created;
 }
 
 } // namespace
+
+void set_ynn_thread_count(std::size_t total_threads) noexcept {
+    configured_thread_count.store(total_threads, std::memory_order_relaxed);
+}
+
+std::size_t ynn_thread_count() noexcept {
+    const auto configured = configured_thread_count.load(std::memory_order_relaxed);
+    return configured == 0 ? std::max(1U, std::thread::hardware_concurrency()) : configured;
+}
+
+std::uint64_t ynn_supported_arch_flags() noexcept { return ynn::get_supported_arch_flags(); }
+
+std::string ynn_supported_arch_names() {
+    const auto flags = ynn_supported_arch_flags();
+    std::string result;
+    const auto append = [&](std::uint64_t flag, const char* name) {
+        if ((flags & flag) == 0) return;
+        if (!result.empty()) result += ',';
+        result += name;
+    };
+#ifdef YNN_ARCH_ARM
+    append(ynn::arch_flag::neon, "neon");
+    append(ynn::arch_flag::neonfma, "fma");
+    append(ynn::arch_flag::neondot, "dotprod");
+    append(ynn::arch_flag::neonfp16, "fp16");
+    append(ynn::arch_flag::neonfp16arith, "fp16arith");
+    append(ynn::arch_flag::neonbf16, "bf16");
+    append(ynn::arch_flag::neonfp8, "fp8");
+    append(ynn::arch_flag::neonfp8dot4, "fp8dot4");
+    append(ynn::arch_flag::neoni8mm, "i8mm");
+    append(ynn::arch_flag::sme, "sme");
+    append(ynn::arch_flag::sme2, "sme2");
+    append(ynn::arch_flag::sve, "sve");
+#endif
+    return result.empty() ? "generic" : result;
+}
 
 Result<void> check_ynn_status(ynn_status status, const char* operation) {
     if (status == ynn_status_success) {
@@ -136,7 +187,9 @@ YnnExecutable::YnnExecutable(ynn_subgraph_t graph, ynn_runtime_t runtime, std::s
 YnnExecutable::YnnExecutable(YnnExecutable&& other) noexcept
     : graph_(std::exchange(other.graph_, nullptr)),
       runtime_(std::exchange(other.runtime_, nullptr)),
-      thread_pool_(std::move(other.thread_pool_)) {}
+      thread_pool_(std::move(other.thread_pool_)),
+      external_shapes_(std::move(other.external_shapes_)),
+      reshape_needed_(other.reshape_needed_) {}
 
 YnnExecutable& YnnExecutable::operator=(YnnExecutable&& other) noexcept {
     if (this != &other) {
@@ -145,6 +198,8 @@ YnnExecutable& YnnExecutable::operator=(YnnExecutable&& other) noexcept {
         graph_ = std::exchange(other.graph_, nullptr);
         runtime_ = std::exchange(other.runtime_, nullptr);
         thread_pool_ = std::move(other.thread_pool_);
+        external_shapes_ = std::move(other.external_shapes_);
+        reshape_needed_ = other.reshape_needed_;
     }
     return *this;
 }
@@ -155,11 +210,26 @@ YnnExecutable::~YnnExecutable() {
 }
 
 Result<void> YnnExecutable::set_shape(std::uint32_t external_id, std::span<const std::size_t> dimensions) {
-    return check_ynn_status(ynn_set_external_value_shape(runtime_, external_id, dimensions.size(), dimensions.data()),
-                            "set external shape");
+    if (const auto existing = external_shapes_.find(external_id);
+        existing != external_shapes_.end() && std::ranges::equal(existing->second, dimensions)) {
+        return {};
+    }
+    auto status =
+        check_ynn_status(ynn_set_external_value_shape(runtime_, external_id, dimensions.size(), dimensions.data()),
+                         "set external shape");
+    if (status) {
+        external_shapes_.insert_or_assign(external_id, std::vector<std::size_t>(dimensions.begin(), dimensions.end()));
+        reshape_needed_ = true;
+    }
+    return status;
 }
 
-Result<void> YnnExecutable::reshape() { return check_ynn_status(ynn_reshape_runtime(runtime_), "reshape runtime"); }
+Result<void> YnnExecutable::reshape() {
+    if (!reshape_needed_) return {};
+    auto status = check_ynn_status(ynn_reshape_runtime(runtime_), "reshape runtime");
+    if (status) reshape_needed_ = false;
+    return status;
+}
 
 Result<void> YnnExecutable::bind(std::uint32_t external_id, void* data) {
     return check_ynn_status(ynn_set_external_value_data(runtime_, external_id, data), "bind external value");
@@ -176,6 +246,18 @@ Result<std::vector<std::size_t>> YnnExecutable::shape(std::uint32_t external_id)
         return std::unexpected(std::move(status.error()));
     }
     return std::vector<std::size_t>(dimensions.begin(), dimensions.begin() + static_cast<std::ptrdiff_t>(rank));
+}
+
+Result<std::int32_t> YnnExecutable::concurrency() const {
+    std::int32_t result = 0;
+    std::size_t result_size = sizeof(result);
+    if (auto status =
+            check_ynn_status(ynn_query_runtime(runtime_, ynn_runtime_property_concurrency, &result, &result_size),
+                             "query runtime concurrency");
+        !status) {
+        return std::unexpected(std::move(status.error()));
+    }
+    return result;
 }
 
 } // namespace kidi::runtime

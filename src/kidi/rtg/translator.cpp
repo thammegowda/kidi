@@ -1,6 +1,7 @@
 #include "kidi/rtg/translator.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +12,34 @@
 
 namespace kidi::rtg {
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+class ScopedTimer {
+public:
+    explicit ScopedTimer(std::uint64_t* elapsed_ns) : elapsed_ns_(elapsed_ns) {
+        if (elapsed_ns_) started_ = Clock::now();
+    }
+
+    ~ScopedTimer() {
+        if (elapsed_ns_) *elapsed_ns_ += elapsed_since(started_);
+    }
+
+    static std::uint64_t elapsed_since(Clock::time_point started) {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count());
+    }
+
+private:
+    std::uint64_t* elapsed_ns_;
+    Clock::time_point started_;
+};
+
+template <typename Function>
+auto measure(std::uint64_t* elapsed_ns, Function&& function) {
+    ScopedTimer timer(elapsed_ns);
+    return std::forward<Function>(function)();
+}
 
 struct Beam {
     std::vector<std::int32_t> token_ids;
@@ -72,37 +101,44 @@ Result<model::DecodeDefaults> resolve_options(const model::ModelManifest& manife
 Translator::Translator(Package package, Encoder encoder, Decoder decoder) noexcept
     : package_(std::move(package)), encoder_(std::move(encoder)), decoder_(std::move(decoder)) {}
 
-Result<Translator> Translator::load(const std::filesystem::path& model_directory) {
-    auto package = Package::load(model_directory);
+Result<Translator> Translator::load(const std::filesystem::path& model_directory, InferenceStats* stats) {
+    auto package = measure(stats ? &stats->package_load_ns : nullptr, [&] { return Package::load(model_directory); });
     if (!package) return std::unexpected(std::move(package.error()));
-    auto encoder = Encoder::create(*package);
+    auto encoder = measure(stats ? &stats->graph_compile_ns : nullptr, [&] { return Encoder::create(*package); });
     if (!encoder) return std::unexpected(std::move(encoder.error()));
-    auto decoder = Decoder::create(*package);
+    auto decoder = measure(stats ? &stats->graph_compile_ns : nullptr, [&] { return Decoder::create(*package); });
     if (!decoder) return std::unexpected(std::move(decoder.error()));
     return Translator(std::move(*package), std::move(*encoder), std::move(*decoder));
 }
 
-Result<Translation> Translator::translate(std::string_view source, DecodeOptions options) {
+Result<Translation> Translator::translate(std::string_view source, DecodeOptions options, InferenceStats* stats) {
+    ScopedTimer translate_timer(stats ? &stats->translate_ns : nullptr);
     const auto& manifest = package_.manifest();
     auto decode = resolve_options(manifest, options);
     if (!decode) return std::unexpected(std::move(decode.error()));
-    auto source_ids = package_.source_tokenizer().encode(source);
+    auto source_ids = measure(stats ? &stats->source_tokenize_ns : nullptr,
+                              [&] { return package_.source_tokenizer().encode(source); });
     if (!source_ids) return std::unexpected(std::move(source_ids.error()));
     if (source_ids->empty() || source_ids->back() != manifest.special_tokens.end) {
         source_ids->push_back(manifest.special_tokens.end);
     }
-    auto memory = encoder_.run(*source_ids);
+    auto memory = measure(stats ? &stats->encoder_ns : nullptr, [&] { return encoder_.run(*source_ids, stats); });
     if (!memory) return std::unexpected(std::move(memory.error()));
+    auto projected_source = measure(stats ? &stats->source_projection_ns : nullptr,
+                                    [&] { return decoder_.prepare_source(*memory, stats); });
+    if (!projected_source) return std::unexpected(std::move(projected_source.error()));
 
     const auto beam_size = static_cast<std::size_t>(decode->beam_size);
     const auto vocabulary_size = static_cast<std::size_t>(manifest.architecture.target_vocabulary_size);
+    const auto maximum_steps = source_ids->size() + static_cast<std::size_t>(decode->maximum_extra_tokens);
+    std::optional<SelfKVCache> self_cache;
+    if (beam_size == 1) self_cache = decoder_.create_self_cache(maximum_steps);
     std::vector<Beam> beams(beam_size, Beam{
                                            .token_ids = {manifest.special_tokens.begin},
                                            .score = 0.0F,
                                            .length = decode->maximum_extra_tokens,
                                            .active = true,
                                        });
-    const auto maximum_steps = source_ids->size() + static_cast<std::size_t>(decode->maximum_extra_tokens);
     for (std::size_t step = 1; step <= maximum_steps; ++step) {
         std::vector<std::size_t> active_beams;
         active_beams.reserve(beam_size);
@@ -113,16 +149,40 @@ Result<Translation> Translator::translate(std::string_view source, DecodeOptions
         }
         if (active_beams.empty()) break;
 
-        std::vector<std::int32_t> prefixes;
-        prefixes.reserve(active_beams.size() * beams.front().token_ids.size());
-        for (const auto beam_index : active_beams) {
-            const auto& beam = beams[beam_index];
-            prefixes.insert(prefixes.end(), beam.token_ids.begin(), beam.token_ids.end());
-        }
-        auto log_probabilities = decoder_.next(*memory, prefixes, active_beams.size());
+        auto log_probabilities = measure(stats ? &stats->decoder_ns : nullptr, [&] {
+            if (self_cache) {
+                return decoder_.next_greedy(*projected_source, beams.front().token_ids.back(), step - 1, *self_cache,
+                                            stats);
+            }
+            std::vector<std::int32_t> prefixes;
+            prefixes.reserve(active_beams.size() * beams.front().token_ids.size());
+            for (const auto beam_index : active_beams) {
+                const auto& beam = beams[beam_index];
+                prefixes.insert(prefixes.end(), beam.token_ids.begin(), beam.token_ids.end());
+            }
+            return decoder_.next(*projected_source, prefixes, active_beams.size(), stats);
+        });
         if (!log_probabilities) return std::unexpected(std::move(log_probabilities.error()));
+        if (stats) ++stats->decoder_steps;
         if (log_probabilities->size() != active_beams.size() * vocabulary_size) {
             return std::unexpected(Error{ErrorCode::RUNTIME, "decoder returned an incompatible probability shape"});
+        }
+        const auto host_search_started = stats ? Clock::now() : Clock::time_point{};
+        if (self_cache) {
+            const auto best_token = std::ranges::max_element(*log_probabilities);
+            const auto token_id = static_cast<std::int32_t>(std::distance(log_probabilities->begin(), best_token));
+            if (options.compute_score) {
+                float sum = 0.0F;
+                for (const auto logit : *log_probabilities) sum += std::exp(logit - *best_token);
+                beams.front().score -= std::log(sum);
+            }
+            beams.front().token_ids.push_back(token_id);
+            const bool ended = token_id == manifest.special_tokens.end;
+            if (ended) beams.front().length = static_cast<std::int32_t>(step);
+            beams.front().active = !ended;
+            if (stats) stats->host_search_ns += ScopedTimer::elapsed_since(host_search_started);
+            if (ended) break;
+            continue;
         }
         std::vector<std::size_t> probability_batches(beam_size, beam_size);
         for (std::size_t batch = 0; batch < active_beams.size(); ++batch) {
@@ -181,6 +241,7 @@ Result<Translation> Translator::translate(std::string_view source, DecodeOptions
             any_active = any_active || active;
         }
         beams = std::move(next_beams);
+        if (stats) stats->host_search_ns += ScopedTimer::elapsed_since(host_search_started);
         if (!any_active) break;
     }
 
@@ -192,7 +253,8 @@ Result<Translation> Translator::translate(std::string_view source, DecodeOptions
         output_ids.erase(end, output_ids.end());
     }
     std::erase(output_ids, manifest.special_tokens.pad);
-    auto text = package_.target_tokenizer().decode(output_ids);
+    auto text = measure(stats ? &stats->target_decode_ns : nullptr,
+                        [&] { return package_.target_tokenizer().decode(output_ids); });
     if (!text) return std::unexpected(std::move(text.error()));
     return Translation{
         .text = std::move(*text),

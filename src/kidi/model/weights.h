@@ -5,7 +5,9 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "kidi/core/error.h"
 #include "kidi/model/precision.h"
@@ -22,6 +24,12 @@ struct TensorView {
     [[nodiscard]] const void* data() const noexcept;
 };
 
+struct StateMappingSpec {
+    std::vector<std::string> sources;
+    std::string destination;
+    std::int64_t concat_axis = 0;
+};
+
 class Weights {
 public:
     Weights(Weights&&) noexcept;
@@ -31,7 +39,8 @@ public:
     Weights(const Weights&) = delete;
     Weights& operator=(const Weights&) = delete;
 
-    [[nodiscard]] static Result<Weights> load(const std::filesystem::path& path);
+    [[nodiscard]] static Result<Weights> load(const std::filesystem::path& path,
+                                              std::span<const StateMappingSpec> mappings = {});
 
     [[nodiscard]] bool contains(std::string_view name) const;
     [[nodiscard]] std::size_t size() const noexcept;

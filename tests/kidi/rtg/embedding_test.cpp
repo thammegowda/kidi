@@ -66,6 +66,15 @@ int main() {
         }
     }
 
+    constexpr std::array<std::int32_t, 1> OFFSET_ID = {2};
+    auto offset_output = graph->run(OFFSET_ID, 1, 1);
+    if (!offset_output || offset_output->size() != 4 ||
+        !std::equal(offset_output->begin(), offset_output->end(), output->begin() + 4,
+                    [](float left, float right) { return near(left, right); })) {
+        std::cerr << "offset embedding mismatch\n";
+        return 1;
+    }
+
     constexpr std::array<std::int32_t, 4> BATCH_IDS = {1, 2, 2, 1};
     auto batch_output = graph->run(BATCH_IDS, 2);
     if (!batch_output || batch_output->size() != 16) {

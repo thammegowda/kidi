@@ -13,9 +13,10 @@ namespace {
 void write_fixture(const std::filesystem::path& path) {
     std::string header = R"({"bf16":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]},)"
                          R"("weight":{"dtype":"F32","shape":[2],"data_offsets":[4,12]},)"
-                         R"("int8":{"dtype":"I8","shape":[2],"data_offsets":[12,14]},)"
-                         R"("e4m3":{"dtype":"F8_E4M3","shape":[2],"data_offsets":[14,16]},)"
-                         R"("e5m2":{"dtype":"F8_E5M2","shape":[2],"data_offsets":[16,18]}})";
+                         R"("weight2":{"dtype":"F32","shape":[2],"data_offsets":[12,20]},)"
+                         R"("int8":{"dtype":"I8","shape":[2],"data_offsets":[20,22]},)"
+                         R"("e4m3":{"dtype":"F8_E4M3","shape":[2],"data_offsets":[22,24]},)"
+                         R"("e5m2":{"dtype":"F8_E5M2","shape":[2],"data_offsets":[24,26]}})";
     while (header.size() % 8 != 0) {
         header.push_back(' ');
     }
@@ -29,11 +30,13 @@ void write_fixture(const std::filesystem::path& path) {
     output.write(header.data(), static_cast<std::streamsize>(header.size()));
     constexpr std::array<std::uint16_t, 2> BF16 = {0x3FA0, 0xC020};
     constexpr std::array VALUES = {1.25F, -2.5F};
+    constexpr std::array VALUES2 = {3.0F, 4.0F};
     constexpr std::array<std::int8_t, 2> INT8 = {12, -7};
     constexpr std::array<std::uint8_t, 2> E4M3 = {0x3A, 0xC2};
     constexpr std::array<std::uint8_t, 2> E5M2 = {0x3D, 0xC1};
     output.write(reinterpret_cast<const char*>(BF16.data()), sizeof(BF16));
     output.write(reinterpret_cast<const char*>(VALUES.data()), sizeof(VALUES));
+    output.write(reinterpret_cast<const char*>(VALUES2.data()), sizeof(VALUES2));
     output.write(reinterpret_cast<const char*>(INT8.data()), sizeof(INT8));
     output.write(reinterpret_cast<const char*>(E4M3.data()), sizeof(E4M3));
     output.write(reinterpret_cast<const char*>(E5M2.data()), sizeof(E5M2));
@@ -46,7 +49,7 @@ int main() {
     write_fixture(path);
 
     auto weights = kidi::model::Weights::load(path);
-    if (!weights || weights->size() != 5 || !weights->contains("weight")) {
+    if (!weights || weights->size() != 6 || !weights->contains("weight")) {
         std::cerr << "failed to map Safetensors fixture\n";
         return 1;
     }
@@ -66,6 +69,22 @@ int main() {
         int8->data_type != kidi::model::DataType::I8 || !e4m3 || e4m3->data_type != kidi::model::DataType::E4M3 ||
         !e5m2 || e5m2->data_type != kidi::model::DataType::E5M2) {
         std::cerr << "Safetensors dtype mapping is incorrect\n";
+        return 1;
+    }
+
+    const std::array mappings = {kidi::model::StateMappingSpec{
+        .sources = {R"(^weight$)", "weight2"},
+        .destination = "fused",
+        .concat_axis = 0,
+    }};
+    auto mapped = kidi::model::Weights::load(path, mappings);
+    auto fused =
+        mapped ? mapped->tensor("fused") : kidi::Result<kidi::model::TensorView>{std::unexpected(mapped.error())};
+    const auto* fused_values = fused ? static_cast<const float*>(fused->data()) : nullptr;
+    if (!mapped || mapped->size() != 5 || mapped->contains("weight") || mapped->contains("weight2") || !fused ||
+        fused->shape.size() != 1 || fused->shape[0] != 4 || fused_values[0] != 1.25F || fused_values[1] != -2.5F ||
+        fused_values[2] != 3.0F || fused_values[3] != 4.0F) {
+        std::cerr << "state mapping fusion is incorrect\n";
         return 1;
     }
 

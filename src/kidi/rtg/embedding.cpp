@@ -32,19 +32,20 @@ std::vector<float> positional_encoding(std::size_t length, std::int32_t hidden_s
 } // namespace
 
 EmbeddingGraph::EmbeddingGraph(runtime::YnnExecutable executable, std::int32_t vocabulary_size,
-                               std::int32_t hidden_size, std::unique_ptr<float> scale)
+                               std::int32_t hidden_size, std::unique_ptr<float> scale, std::vector<float> positions)
     : executable_(std::move(executable)),
       vocabulary_size_(vocabulary_size),
       hidden_size_(hidden_size),
       scale_(std::move(scale)),
+      positions_(std::move(positions)),
       token_ids_id_(TOKEN_IDS_ID),
       positions_id_(POSITIONS_ID),
       output_id_(OUTPUT_ID) {}
 
 Result<EmbeddingGraph> EmbeddingGraph::create(const model::Weights& weights, std::string_view weight_name,
                                               std::int32_t vocabulary_size, std::int32_t hidden_size,
-                                              model::WeightEncoding weight_encoding) {
-    if (vocabulary_size <= 0 || hidden_size <= 0 || hidden_size % 2 != 0) {
+                                              model::WeightEncoding weight_encoding, std::int32_t maximum_position) {
+    if (vocabulary_size <= 0 || hidden_size <= 0 || hidden_size % 2 != 0 || maximum_position < 0) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid embedding dimensions"});
     }
     auto weight = weights.tensor(weight_name);
@@ -154,10 +155,12 @@ Result<EmbeddingGraph> EmbeddingGraph::create(const model::Weights& weights, std
 
     auto executable = std::move(*graph).compile();
     if (!executable) return std::unexpected(std::move(executable.error()));
-    return EmbeddingGraph(std::move(*executable), vocabulary_size, hidden_size, std::move(scale));
+    auto positions = positional_encoding(static_cast<std::size_t>(maximum_position), hidden_size);
+    return EmbeddingGraph(std::move(*executable), vocabulary_size, hidden_size, std::move(scale), std::move(positions));
 }
 
-Result<std::vector<float>> EmbeddingGraph::run(std::span<const std::int32_t> token_ids, std::size_t batch_size) {
+Result<std::vector<float>> EmbeddingGraph::run(std::span<const std::int32_t> token_ids, std::size_t batch_size,
+                                               std::size_t position_offset) {
     if (batch_size == 0 || token_ids.empty() || token_ids.size() % batch_size != 0) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "cannot embed an empty sequence"});
     }
@@ -168,17 +171,25 @@ Result<std::vector<float>> EmbeddingGraph::run(std::span<const std::int32_t> tok
     }
 
     const auto sequence_length = token_ids.size() / batch_size;
+    if (position_offset > std::numeric_limits<std::size_t>::max() - sequence_length) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "embedding position is outside the supported range"});
+    }
+    const auto required_positions = position_offset + sequence_length;
     const std::array<std::size_t, 3> token_shape = {batch_size, sequence_length, 1};
     const std::array<std::size_t, 3> hidden_shape = {1, sequence_length, static_cast<std::size_t>(hidden_size_)};
-    auto positions = positional_encoding(sequence_length, hidden_size_);
-    std::vector<std::int32_t> owned_token_ids(token_ids.begin(), token_ids.end());
+    if (positions_.size() < required_positions * static_cast<std::size_t>(hidden_size_)) {
+        positions_ = positional_encoding(required_positions, hidden_size_);
+    }
     std::vector<float> output(token_ids.size() * static_cast<std::size_t>(hidden_size_));
 
     auto status = executable_.set_shape(token_ids_id_, token_shape);
     if (status) status = executable_.set_shape(positions_id_, hidden_shape);
     if (status) status = executable_.reshape();
-    if (status) status = executable_.bind(token_ids_id_, owned_token_ids.data());
-    if (status) status = executable_.bind(positions_id_, positions.data());
+    if (status) status = executable_.bind(token_ids_id_, const_cast<std::int32_t*>(token_ids.data()));
+    if (status) {
+        status = executable_.bind(positions_id_,
+                                  positions_.data() + position_offset * static_cast<std::size_t>(hidden_size_));
+    }
     if (status) status = executable_.bind(output_id_, output.data());
     if (status) status = executable_.invoke();
     if (!status) return std::unexpected(std::move(status.error()));

@@ -24,6 +24,7 @@ add_library(kidi
     src/kidi/rtg/decoder.cpp
     src/kidi/rtg/embedding.cpp
     src/kidi/rtg/encoder.cpp
+    src/kidi/rtg/linear.cpp
     src/kidi/rtg/package.cpp
     src/kidi/rtg/transformer_builder.cpp
     src/kidi/rtg/translator.cpp

@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -8,6 +9,7 @@
 #include "kidi/core/version.h"
 #include "kidi/rtg/package.h"
 #include "kidi/rtg/translator.h"
+#include "kidi/runtime/ynn.h"
 
 namespace {
 
@@ -25,7 +27,9 @@ int inspect(const kidi::cli::Namespace& arguments) {
               << "weight tensors: " << package->weights().size() << '\n'
               << "vocabularies: " << package->source_tokenizer().vocabulary_size() << ", "
               << package->target_tokenizer().vocabulary_size() << '\n'
-              << "beam: " << manifest.decode_defaults.beam_size << '\n';
+              << "beam: " << manifest.decode_defaults.beam_size << '\n'
+              << "runtime: ynnpack_cpu\n"
+              << "cpu features: " << kidi::runtime::ynn_supported_arch_names() << '\n';
     return 0;
 }
 
@@ -34,6 +38,14 @@ int predict(const kidi::cli::Namespace& arguments) {
     if (input_type != "text") {
         std::cerr << "kidi: input type '" << input_type << "' is not supported yet\n";
         return 2;
+    }
+    if (arguments.contains("threads")) {
+        const auto threads = arguments.get<std::int32_t>("threads");
+        if (threads <= 0) {
+            std::cerr << "kidi: thread count must be positive\n";
+            return 2;
+        }
+        kidi::runtime::set_ynn_thread_count(static_cast<std::size_t>(threads));
     }
 
     const auto& input_path = arguments.get<std::string>("input");
@@ -60,7 +72,9 @@ int predict(const kidi::cli::Namespace& arguments) {
         output = &output_file;
     }
 
-    auto translator = kidi::rtg::Translator::load(arguments.get<std::filesystem::path>("model"));
+    kidi::rtg::InferenceStats profile;
+    auto* profile_ptr = arguments.get<bool>("profile") ? &profile : nullptr;
+    auto translator = kidi::rtg::Translator::load(arguments.get<std::filesystem::path>("model"), profile_ptr);
     if (!translator) {
         std::cerr << "kidi: " << translator.error().message << '\n';
         return 1;
@@ -72,8 +86,11 @@ int predict(const kidi::cli::Namespace& arguments) {
         options.maximum_extra_tokens = arguments.get<std::int32_t>("maximum_extra_tokens");
     }
     if (arguments.contains("length_penalty")) options.length_penalty = arguments.get<float>("length_penalty");
+    options.compute_score = arguments.get<bool>("score");
 
     std::size_t line_number = 0;
+    std::size_t translated_items = 0;
+    std::size_t target_tokens = 0;
     for (std::string line; std::getline(*input, line);) {
         ++line_number;
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -81,7 +98,7 @@ int predict(const kidi::cli::Namespace& arguments) {
             *output << '\n';
             continue;
         }
-        auto translation = translator->translate(line, options);
+        auto translation = translator->translate(line, options, profile_ptr);
         if (!translation) {
             std::cerr << "kidi: input line " << line_number << ": " << translation.error().message << '\n';
             return 1;
@@ -93,10 +110,49 @@ int predict(const kidi::cli::Namespace& arguments) {
             std::cerr << "kidi: cannot write output: " << output_path << '\n';
             return 1;
         }
+        ++translated_items;
+        target_tokens += translation->token_ids.size();
     }
     if (input->bad()) {
         std::cerr << "kidi: cannot read input: " << input_path << '\n';
         return 1;
+    }
+    if (arguments.get<bool>("stats")) {
+        std::cerr << "kidi_metrics|input_lines=" << line_number << "|translated_items=" << translated_items
+                  << "|target_tokens=" << target_tokens << '\n';
+    }
+    if (profile_ptr) {
+        std::cerr << "kidi_profile|backend=ynnpack_cpu|threads=" << kidi::runtime::ynn_thread_count()
+                  << "|ynn_arch_flags=" << kidi::runtime::ynn_supported_arch_flags()
+                  << "|ynn_arch=" << kidi::runtime::ynn_supported_arch_names()
+                  << "|package_load_ns=" << profile.package_load_ns << "|graph_compile_ns=" << profile.graph_compile_ns
+                  << "|source_tokenize_ns=" << profile.source_tokenize_ns << "|encoder_ns=" << profile.encoder_ns
+                  << "|source_embedding_ns=" << profile.source_embedding_ns
+                  << "|encoder_max_concurrency=" << profile.encoder_graph.max_concurrency
+                  << "|encoder_prepare_ns=" << profile.encoder_graph.prepare_ns
+                  << "|encoder_reshape_ns=" << profile.encoder_graph.reshape_ns
+                  << "|encoder_bind_ns=" << profile.encoder_graph.bind_ns
+                  << "|encoder_invoke_ns=" << profile.encoder_graph.invoke_ns << "|decoder_ns=" << profile.decoder_ns
+                  << "|source_projection_ns=" << profile.source_projection_ns
+                  << "|source_projection_max_concurrency=" << profile.source_projection_graph.max_concurrency
+                  << "|source_projection_prepare_ns=" << profile.source_projection_graph.prepare_ns
+                  << "|source_projection_reshape_ns=" << profile.source_projection_graph.reshape_ns
+                  << "|source_projection_bind_ns=" << profile.source_projection_graph.bind_ns
+                  << "|source_projection_invoke_ns=" << profile.source_projection_graph.invoke_ns
+                  << "|target_embedding_ns=" << profile.target_embedding_ns
+                  << "|decoder_max_concurrency=" << profile.decoder_graph.max_concurrency
+                  << "|decoder_prepare_ns=" << profile.decoder_graph.prepare_ns
+                  << "|decoder_reshape_ns=" << profile.decoder_graph.reshape_ns
+                  << "|decoder_bind_ns=" << profile.decoder_graph.bind_ns
+                  << "|decoder_invoke_ns=" << profile.decoder_graph.invoke_ns
+                  << "|last_hidden_ns=" << profile.last_hidden_ns
+                  << "|generator_max_concurrency=" << profile.generator_graph.max_concurrency
+                  << "|generator_prepare_ns=" << profile.generator_graph.prepare_ns
+                  << "|generator_reshape_ns=" << profile.generator_graph.reshape_ns
+                  << "|generator_bind_ns=" << profile.generator_graph.bind_ns
+                  << "|generator_invoke_ns=" << profile.generator_graph.invoke_ns
+                  << "|host_search_ns=" << profile.host_search_ns << "|target_decode_ns=" << profile.target_decode_ns
+                  << "|translate_ns=" << profile.translate_ns << "|decoder_steps=" << profile.decoder_steps << '\n';
     }
     return 0;
 }
@@ -129,6 +185,16 @@ int main(int argc, char** argv) {
         .metavar("ALPHA")
         .help("Wu length penalty exponent");
     predict_parser.add_argument("--score").action(kidi::cli::Action::STORE_TRUE).help("append hypothesis score");
+    predict_parser.add_argument("--stats")
+        .action(kidi::cli::Action::STORE_TRUE)
+        .help("emit machine-readable generation stats to stderr");
+    predict_parser.add_argument("--profile")
+        .action(kidi::cli::Action::STORE_TRUE)
+        .help("emit machine-readable inference timings to stderr");
+    predict_parser.add_argument("-j", "--threads")
+        .type<std::int32_t>()
+        .metavar("N")
+        .help("total YNNPACK threads including the caller");
     predict_parser.add_argument("-i", "--in")
         .dest("input")
         .default_value(std::string("-"))

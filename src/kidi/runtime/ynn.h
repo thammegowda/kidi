@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <ynnpack.h>
@@ -14,6 +16,11 @@ namespace kidi::runtime {
 
 class YnnExecutable;
 class YnnThreadPool;
+
+void set_ynn_thread_count(std::size_t total_threads) noexcept;
+[[nodiscard]] std::size_t ynn_thread_count() noexcept;
+[[nodiscard]] std::uint64_t ynn_supported_arch_flags() noexcept;
+[[nodiscard]] std::string ynn_supported_arch_names();
 
 class YnnGraph {
 public:
@@ -49,6 +56,7 @@ public:
     [[nodiscard]] Result<void> bind(std::uint32_t external_id, void* data);
     [[nodiscard]] Result<void> invoke();
     [[nodiscard]] Result<std::vector<std::size_t>> shape(std::uint32_t external_id) const;
+    [[nodiscard]] Result<std::int32_t> concurrency() const;
 
 private:
     friend class YnnGraph;
@@ -57,6 +65,8 @@ private:
     ynn_subgraph_t graph_ = nullptr;
     ynn_runtime_t runtime_ = nullptr;
     std::shared_ptr<YnnThreadPool> thread_pool_;
+    std::unordered_map<std::uint32_t, std::vector<std::size_t>> external_shapes_;
+    bool reshape_needed_ = true;
 };
 
 [[nodiscard]] Result<void> check_ynn_status(ynn_status status, const char* operation);

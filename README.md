@@ -37,6 +37,20 @@ ctest --preset debug
 All C and C++ dependencies are submodules under `third_party/`. Configuration
 does not download source code after the recursive clone.
 
+### Apple Silicon
+
+On arm64 macOS, kidi detects CPU features through `sysctl` and enables
+YNNPACK's matching NEON, dot-product, BF16, I8MM, SME, and SME2 kernels at
+runtime. Unsupported instructions remain disabled, so the same binary can run
+on older Apple Silicon. `kidi inspect` prints the selected CPU features and
+`kidi predict --profile` includes both their names and YNNPACK bitmask.
+
+YNNPACK is a CPU runtime and cannot dispatch work to Metal or the Apple Neural
+Engine. ANE execution requires a separate Core ML model graph. The current RTG
+package and decoder are not Core ML assets, so kidi does not claim NPU use;
+an ANE backend must export and load an incremental decoder with explicit K/V
+state before it can be benchmarked fairly against the CPU path.
+
 ## Model Package
 
 ```text
@@ -77,6 +91,12 @@ kidi predict --beam-size 2 --max-extra-tokens 20 --length-penalty 0.6 --score \
 The default input type is `text`. `--inp-type jsonl` is reserved for future
 chat-model input and is not yet supported.
 
+Use `--stats` to emit exact input, translation, and generated target-token
+counts to stderr. Use `--profile` to emit aggregate package-load, graph-build,
+encoder, decoder, generator, and host-search timings in nanoseconds. Both
+options leave translation output unchanged. `--threads N` sets total YNNPACK
+threads including the calling thread.
+
 Use `kidi --help` and `kidi predict --help` for the complete command syntax.
 
 ## Convert RTG
@@ -104,6 +124,11 @@ All linear weights use `[input, output]` storage. Embeddings keep
 `[vocabulary, hidden]`; reduced-precision tied output projection values are
 stored separately in linear layout. INT8 uses one scale per output channel or
 embedding row.
+
+## Benchmark
+
+The reproducible FP32/BF16/INT8 process benchmark is under
+[`benchmarks/rtg`](benchmarks/rtg/README.md).
 
 RTG checkpoints use Python pickle and must only be converted from a trusted
 source. The resulting runtime package contains no pickle or PyTorch files.

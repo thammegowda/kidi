@@ -7,6 +7,7 @@
 #include "kidi/core/error.h"
 #include "kidi/rtg/embedding.h"
 #include "kidi/rtg/package.h"
+#include "kidi/rtg/profile.h"
 #include "kidi/runtime/ynn.h"
 
 namespace kidi::rtg {
@@ -20,7 +21,7 @@ public:
     EncoderGraph& operator=(const EncoderGraph&) = delete;
 
     [[nodiscard]] static Result<EncoderGraph> create(const Package& package);
-    [[nodiscard]] Result<std::vector<float>> run(std::span<const float> embeddings);
+    [[nodiscard]] Result<std::vector<float>> run(std::span<const float> embeddings, GraphRunStats* stats = nullptr);
 
 private:
     EncoderGraph(runtime::YnnExecutable executable, std::int32_t hidden_size,
@@ -40,7 +41,8 @@ public:
     Encoder& operator=(const Encoder&) = delete;
 
     [[nodiscard]] static Result<Encoder> create(const Package& package);
-    [[nodiscard]] Result<std::vector<float>> run(std::span<const std::int32_t> token_ids);
+    [[nodiscard]] Result<std::vector<float>> run(std::span<const std::int32_t> token_ids,
+                                                 InferenceStats* stats = nullptr);
 
 private:
     Encoder(EmbeddingGraph embedding, EncoderGraph graph) noexcept;

@@ -17,7 +17,7 @@ namespace {
 
 void write_weights(const std::filesystem::path& path) {
     std::string header =
-        R"({"attn.linears.0.weight":{"dtype":"F32","shape":[4,4],"data_offsets":[0,64]},"attn.linears.0.bias":{"dtype":"F32","shape":[4],"data_offsets":[64,80]},"attn.linears.1.weight":{"dtype":"F32","shape":[4,4],"data_offsets":[80,144]},"attn.linears.1.bias":{"dtype":"F32","shape":[4],"data_offsets":[144,160]},"attn.linears.2.weight":{"dtype":"F32","shape":[4,4],"data_offsets":[160,224]},"attn.linears.2.bias":{"dtype":"F32","shape":[4],"data_offsets":[224,240]},"attn.linears.3.weight":{"dtype":"F32","shape":[4,4],"data_offsets":[240,304]},"attn.linears.3.bias":{"dtype":"F32","shape":[4],"data_offsets":[304,320]}})";
+        R"({"attn.qkv.weight":{"dtype":"F32","shape":[4,12],"data_offsets":[0,192]},"attn.qkv.bias":{"dtype":"F32","shape":[12],"data_offsets":[192,240]},"attn.out.weight":{"dtype":"F32","shape":[4,4],"data_offsets":[240,304]},"attn.out.bias":{"dtype":"F32","shape":[4],"data_offsets":[304,320]}})";
     while (header.size() % 8 != 0) header.push_back(' ');
 
     std::ofstream output(path, std::ios::binary);
@@ -54,11 +54,16 @@ void write_weights(const std::filesystem::path& path) {
             }
         }
     };
-    write_transposed(QUERY_WEIGHT, 4, 4);
+    for (std::size_t input = 0; input < 4; ++input) {
+        for (const auto* weight : {&QUERY_WEIGHT, &KEY_WEIGHT, &VALUE_WEIGHT}) {
+            for (std::size_t channel = 0; channel < 4; ++channel) {
+                const auto value = (*weight)[channel * 4 + input];
+                output.write(reinterpret_cast<const char*>(&value), sizeof(value));
+            }
+        }
+    }
     write_values(QUERY_BIAS);
-    write_transposed(KEY_WEIGHT, 4, 4);
     write_values(KEY_BIAS);
-    write_transposed(VALUE_WEIGHT, 4, 4);
     write_values(VALUE_BIAS);
     write_transposed(OUTPUT_WEIGHT, 4, 4);
     write_values(OUTPUT_BIAS);
@@ -75,7 +80,7 @@ int main() {
         return 1;
     }
 
-    auto graph = kidi::runtime::YnnGraph::create(3);
+    auto graph = kidi::runtime::YnnGraph::create(7);
     if (!graph) {
         std::cerr << graph.error().message << '\n';
         return 1;
@@ -85,6 +90,10 @@ int main() {
     std::uint32_t input_id = 0;
     std::uint32_t mask_id = 1;
     std::uint32_t output_id = 2;
+    std::uint32_t projected_output_id = 3;
+    std::uint32_t last_query_id = 4;
+    std::uint32_t decode_output_id = 5;
+    std::uint32_t decode_one_output_id = 6;
     auto status = kidi::runtime::check_ynn_status(
         ynn_define_tensor(graph->get(), ynn_type_fp32, INPUT_SHAPE.size(), INPUT_SHAPE.data(), nullptr,
                           YNN_VALUE_FLAG_EXTERNAL_INPUT, &input_id),
@@ -99,12 +108,59 @@ int main() {
             kidi::runtime::check_ynn_status(ynn_define_tensor(graph->get(), ynn_type_fp32, INPUT_SHAPE.size(), nullptr,
                                                               nullptr, YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &output_id),
                                             "define attention output");
+    if (status)
+        status = kidi::runtime::check_ynn_status(
+            ynn_define_tensor(graph->get(), ynn_type_fp32, INPUT_SHAPE.size(), nullptr, nullptr,
+                              YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &projected_output_id),
+            "define projected attention output");
+    constexpr std::array<std::size_t, 3> LAST_QUERY_SHAPE = {1, 1, 4};
+    if (status)
+        status = kidi::runtime::check_ynn_status(
+            ynn_define_tensor(graph->get(), ynn_type_fp32, LAST_QUERY_SHAPE.size(), LAST_QUERY_SHAPE.data(), nullptr,
+                              YNN_VALUE_FLAG_EXTERNAL_INPUT, &last_query_id),
+            "define last attention query");
+    if (status)
+        status = kidi::runtime::check_ynn_status(
+            ynn_define_tensor(graph->get(), ynn_type_fp32, LAST_QUERY_SHAPE.size(), nullptr, nullptr,
+                              YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &decode_output_id),
+            "define decode attention output");
+    if (status)
+        status = kidi::runtime::check_ynn_status(
+            ynn_define_tensor(graph->get(), ynn_type_fp32, LAST_QUERY_SHAPE.size(), nullptr, nullptr,
+                              YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &decode_one_output_id),
+            "define decode-one attention output");
 
     kidi::rtg::TransformerBuilder builder(graph->get(), *weights, 4, 8, 2, 1.0e-5F);
-    auto result_id = status ? builder.attention(input_id, input_id, input_id, mask_id, "attn", output_id)
+    auto result_id = status ? builder.self_attention(input_id, mask_id, "attn", output_id)
                             : kidi::Result<std::uint32_t>{std::unexpected(std::move(status.error()))};
     if (!result_id) {
         std::cerr << result_id.error().message << '\n';
+        return 1;
+    }
+    auto projected_ids = builder.linear_split(input_id, "attn.qkv", 4, 4, 3);
+    auto projected_result_id =
+        projected_ids ? builder.attention_from_projections((*projected_ids)[0], (*projected_ids)[1],
+                                                           (*projected_ids)[2], mask_id, "attn", projected_output_id)
+                      : kidi::Result<std::uint32_t>{std::unexpected(std::move(projected_ids.error()))};
+    if (!projected_result_id) {
+        std::cerr << projected_result_id.error().message << '\n';
+        return 1;
+    }
+    auto last_projection_ids = builder.linear_split(last_query_id, "attn.qkv", 4, 4, 3);
+    auto decode_result_id =
+        last_projection_ids
+            ? builder.attention_from_projections((*last_projection_ids)[0], (*projected_ids)[1], (*projected_ids)[2],
+                                                 YNN_INVALID_VALUE_ID, "attn", decode_output_id)
+            : kidi::Result<std::uint32_t>{std::unexpected(std::move(last_projection_ids.error()))};
+    if (!decode_result_id) {
+        std::cerr << decode_result_id.error().message << '\n';
+        return 1;
+    }
+    auto decode_one_result_id = builder.attention_decode_one_from_projections(
+        (*last_projection_ids)[0], (*projected_ids)[1], (*projected_ids)[2], YNN_INVALID_VALUE_ID, "attn",
+        decode_one_output_id);
+    if (!decode_one_result_id) {
+        std::cerr << decode_one_result_id.error().message << '\n';
         return 1;
     }
 
@@ -122,12 +178,19 @@ int main() {
         0.0F, -1.0e9F, -1.0e9F, 0.0F, 0.0F, -1.0e9F, 0.0F, 0.0F, 0.0F,
     };
     std::array<float, 12> output{};
+    std::array<float, 12> projected_output{};
+    std::array<float, 4> decode_output{};
+    std::array<float, 4> decode_one_output{};
     status = executable->set_shape(input_id, RUN_INPUT_SHAPE);
     if (status) status = executable->set_shape(mask_id, RUN_MASK_SHAPE);
     if (status) status = executable->reshape();
     if (status) status = executable->bind(input_id, input.data());
+    if (status) status = executable->bind(last_query_id, input.data() + 8);
     if (status) status = executable->bind(mask_id, const_cast<float*>(mask.data()));
     if (status) status = executable->bind(output_id, output.data());
+    if (status) status = executable->bind(projected_output_id, projected_output.data());
+    if (status) status = executable->bind(decode_output_id, decode_output.data());
+    if (status) status = executable->bind(decode_one_output_id, decode_one_output.data());
     if (status) status = executable->invoke();
     if (!status) {
         std::cerr << status.error().message << '\n';
@@ -139,9 +202,18 @@ int main() {
         1.196354151F, -0.066927783F, 0.657077312F, 0.518348098F, 0.961920202F, 0.348947883F,
     };
     for (std::size_t index = 0; index < output.size(); ++index) {
-        if (std::abs(output[index] - EXPECTED[index]) > 3.0e-5F) {
+        if (std::abs(output[index] - EXPECTED[index]) > 3.0e-5F ||
+            std::abs(projected_output[index] - output[index]) > 3.0e-5F) {
             std::cerr << "attention mismatch at " << index << ": " << output[index] << " vs " << EXPECTED[index]
                       << '\n';
+            return 1;
+        }
+    }
+    for (std::size_t index = 0; index < decode_output.size(); ++index) {
+        if (std::abs(decode_output[index] - output[index + 8]) > 3.0e-5F ||
+            std::abs(decode_one_output[index] - decode_output[index]) > 3.0e-5F) {
+            std::cerr << "decode attention mismatch at " << index << ": " << decode_output[index] << " vs "
+                      << output[index + 8] << '\n';
             return 1;
         }
     }

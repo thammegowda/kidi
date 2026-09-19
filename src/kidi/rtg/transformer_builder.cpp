@@ -1,5 +1,6 @@
 #include "kidi/rtg/transformer_builder.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -32,11 +33,11 @@ TransformerBuilder::TransformerBuilder(ynn_subgraph_t graph, const model::Weight
                                        float layer_norm_epsilon, model::WeightEncoding weight_encoding) noexcept
     : graph_(graph),
       weights_(weights),
+      linear_(graph, weights, weight_encoding),
       hidden_size_(hidden_size),
       feed_forward_size_(feed_forward_size),
       attention_heads_(attention_heads),
-      layer_norm_epsilon_(layer_norm_epsilon),
-      weight_encoding_(weight_encoding) {}
+      layer_norm_epsilon_(layer_norm_epsilon) {}
 
 Result<std::uint32_t> TransformerBuilder::weight(std::string_view name, std::int32_t first_extent,
                                                  std::int32_t second_extent, model::DataType data_type) const {
@@ -77,88 +78,26 @@ Result<std::uint32_t> TransformerBuilder::scalar(float value) const {
 Result<std::uint32_t> TransformerBuilder::linear(std::uint32_t input_id, std::string_view prefix,
                                                  std::int32_t input_size, std::int32_t output_size,
                                                  std::uint32_t output_id) const {
-    return linear(input_id, std::string(prefix) + ".weight", std::string(prefix) + ".bias", input_size, output_size,
-                  output_id);
+    return linear_.define(input_id, prefix, input_size, output_size, output_id);
 }
 
 Result<std::uint32_t> TransformerBuilder::linear(std::uint32_t input_id, std::string_view weight_name,
                                                  std::string_view bias_name, std::int32_t input_size,
                                                  std::int32_t output_size, std::uint32_t output_id) const {
-    const auto matrix_type = model::matrix_data_type(weight_encoding_);
-    auto weight_id = weight(weight_name, input_size, output_size, matrix_type);
-    if (!weight_id) return std::unexpected(std::move(weight_id.error()));
-    auto bias_id = weight(bias_name, output_size);
-    if (!bias_id) return std::unexpected(std::move(bias_id.error()));
-
-    if (weight_encoding_ == model::WeightEncoding::INT8_PER_CHANNEL) {
-        auto scale_id = weight(model::quantization_scale_name(weight_name), output_size, 1);
-        if (!scale_id) return std::unexpected(std::move(scale_id.error()));
-
-        constexpr std::array<std::int32_t, 1> REDUCE_AXIS = {-1};
-        std::uint32_t min_max_id = YNN_INVALID_VALUE_ID;
-        std::uint32_t input_zero_point_id = YNN_INVALID_VALUE_ID;
-        std::uint32_t input_scale_id = YNN_INVALID_VALUE_ID;
-        std::uint32_t quantized_input_id = YNN_INVALID_VALUE_ID;
-        auto status = runtime::check_ynn_status(
-            ynn_define_reduce(graph_, ynn_reduce_min_max, REDUCE_AXIS.size(), REDUCE_AXIS.data(), input_id,
-                              YNN_INVALID_VALUE_ID, &min_max_id, YNN_NODE_FLAG_KEEP_DIMS),
-            "define INT8 input range");
-        if (status)
-            status =
-                runtime::check_ynn_status(ynn_define_dynamic_quantization(graph_, min_max_id, ynn_type_int8,
-                                                                          &input_zero_point_id, &input_scale_id, 0),
-                                          "define INT8 input quantization");
-        if (status)
-            status = runtime::check_ynn_status(ynn_define_quantize(graph_, input_id, ynn_type_int8, input_zero_point_id,
-                                                                   input_scale_id, &quantized_input_id, 0),
-                                               "quantize linear input");
-        if (status)
-            status = runtime::check_ynn_status(
-                ynn::define_blockwise_dot(graph_, quantized_input_id, input_zero_point_id, input_scale_id, *weight_id,
-                                          YNN_INVALID_VALUE_ID, *scale_id, static_cast<std::size_t>(input_size),
-                                          *bias_id, ynn_type_fp32, output_id, 0),
-                "define INT8 linear");
-        if (!status) return std::unexpected(std::move(status.error()));
-        return output_id;
-    }
-
-    std::uint32_t dot_input_id = weight_encoding_ == model::WeightEncoding::BF16 ? YNN_INVALID_VALUE_ID : input_id;
-    Result<void> status;
-    if (weight_encoding_ == model::WeightEncoding::BF16) {
-        status = runtime::check_ynn_status(
-            ynn_define_convert(graph_, input_id, ynn_type_bf16, &dot_input_id, YNN_NODE_FLAG_NO_EXCESS_PRECISION),
-            "convert linear input to BF16");
-    }
-    if (status) {
-        status = runtime::check_ynn_status(ynn_define_dot(graph_, 1, dot_input_id, *weight_id, *bias_id, &output_id, 0),
-                                           "define linear");
-    }
-    if (!status) return std::unexpected(std::move(status.error()));
-    return output_id;
+    return linear_.define(input_id, weight_name, bias_name, input_size, output_size, output_id);
 }
 
 Result<std::uint32_t> TransformerBuilder::tied_projection(std::uint32_t input_id, std::string_view embedding_name,
                                                           std::string_view bias_name, std::int32_t hidden_size,
                                                           std::int32_t vocabulary_size, std::uint32_t output_id) const {
-    if (weight_encoding_ != model::WeightEncoding::F32) {
-        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "tied projection requires FP32 embedding weights"});
-    }
-    auto embedding_id = weight(embedding_name, vocabulary_size, hidden_size);
-    if (!embedding_id) return std::unexpected(std::move(embedding_id.error()));
-    auto bias_id = weight(bias_name, vocabulary_size);
-    if (!bias_id) return std::unexpected(std::move(bias_id.error()));
+    return linear_.define_tied(input_id, embedding_name, bias_name, hidden_size, vocabulary_size, output_id);
+}
 
-    constexpr std::array<std::int32_t, 2> TRANSPOSE_AXES = {1, 0};
-    std::uint32_t transposed_id = YNN_INVALID_VALUE_ID;
-    auto status =
-        runtime::check_ynn_status(ynn_define_static_transpose(graph_, TRANSPOSE_AXES.size(), TRANSPOSE_AXES.data(),
-                                                              *embedding_id, &transposed_id, 0),
-                                  "transpose tied embedding");
-    if (status)
-        status = runtime::check_ynn_status(ynn_define_dot(graph_, 1, input_id, transposed_id, *bias_id, &output_id, 0),
-                                           "define tied projection");
-    if (!status) return std::unexpected(std::move(status.error()));
-    return output_id;
+Result<std::vector<std::uint32_t>> TransformerBuilder::linear_split(std::uint32_t input_id, std::string_view prefix,
+                                                                    std::int32_t input_size, std::int32_t output_size,
+                                                                    std::size_t output_count,
+                                                                    std::span<const std::uint32_t> output_ids) const {
+    return linear_.define_split(input_id, prefix, input_size, output_size, output_count, output_ids);
 }
 
 Result<std::uint32_t> TransformerBuilder::gelu(std::uint32_t input_id, std::uint32_t output_id) const {
@@ -246,19 +185,31 @@ Result<std::uint32_t> TransformerBuilder::feed_forward(std::uint32_t input_id, s
     return linear(*activated_id, std::string(prefix) + ".w_2", feed_forward_size_, hidden_size_, output_id);
 }
 
-Result<std::uint32_t> TransformerBuilder::attention(std::uint32_t query_id, std::uint32_t key_id,
-                                                    std::uint32_t value_id, std::uint32_t mask_id,
-                                                    std::string_view prefix, std::uint32_t output_id) const {
+Result<std::uint32_t> TransformerBuilder::self_attention(std::uint32_t input_id, std::uint32_t mask_id,
+                                                         std::string_view prefix, std::uint32_t output_id) const {
+    auto projections = linear_split(input_id, std::string(prefix) + ".qkv", hidden_size_, hidden_size_, 3);
+    if (!projections) return std::unexpected(std::move(projections.error()));
+    return attention_from_projections((*projections)[0], (*projections)[1], (*projections)[2], mask_id, prefix,
+                                      output_id);
+}
+
+Result<std::uint32_t> TransformerBuilder::attention_with_projected_key_value(
+    std::uint32_t query_id, std::uint32_t projected_key_id, std::uint32_t projected_value_id, std::uint32_t mask_id,
+    std::string_view prefix, std::uint32_t output_id) const {
+    auto query_projection_id = linear(query_id, std::string(prefix) + ".q", hidden_size_, hidden_size_);
+    if (!query_projection_id) return std::unexpected(std::move(query_projection_id.error()));
+    return attention_from_projections(*query_projection_id, projected_key_id, projected_value_id, mask_id, prefix,
+                                      output_id);
+}
+
+Result<std::uint32_t> TransformerBuilder::attention_from_projections(std::uint32_t projected_query_id,
+                                                                     std::uint32_t projected_key_id,
+                                                                     std::uint32_t projected_value_id,
+                                                                     std::uint32_t mask_id, std::string_view prefix,
+                                                                     std::uint32_t output_id) const {
     if (attention_heads_ <= 0 || hidden_size_ % attention_heads_ != 0) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid attention dimensions"});
     }
-
-    auto query_projection_id = linear(query_id, std::string(prefix) + ".linears.0", hidden_size_, hidden_size_);
-    if (!query_projection_id) return std::unexpected(std::move(query_projection_id.error()));
-    auto key_projection_id = linear(key_id, std::string(prefix) + ".linears.1", hidden_size_, hidden_size_);
-    if (!key_projection_id) return std::unexpected(std::move(key_projection_id.error()));
-    auto value_projection_id = linear(value_id, std::string(prefix) + ".linears.2", hidden_size_, hidden_size_);
-    if (!value_projection_id) return std::unexpected(std::move(value_projection_id.error()));
 
     const std::array<std::size_t, 2> HEAD_SPLIT = {
         static_cast<std::size_t>(attention_heads_),
@@ -280,11 +231,11 @@ Result<std::uint32_t> TransformerBuilder::attention(std::uint32_t query_id, std:
         return transposed_id;
     };
 
-    auto head_query_id = split_heads(*query_projection_id);
+    auto head_query_id = split_heads(projected_query_id);
     if (!head_query_id) return std::unexpected(std::move(head_query_id.error()));
-    auto head_key_id = split_heads(*key_projection_id);
+    auto head_key_id = split_heads(projected_key_id);
     if (!head_key_id) return std::unexpected(std::move(head_key_id.error()));
-    auto head_value_id = split_heads(*value_projection_id);
+    auto head_value_id = split_heads(projected_value_id);
     if (!head_value_id) return std::unexpected(std::move(head_value_id.error()));
 
     constexpr std::array<std::int32_t, 4> TRANSPOSE_LAST_AXES = {0, 1, 3, 2};
@@ -333,7 +284,105 @@ Result<std::uint32_t> TransformerBuilder::attention(std::uint32_t query_id, std:
             ynn_define_fuse_dim(graph_, -2, 2, sequence_major_context_id, &concatenated_context_id, 0),
             "concatenate attention heads");
     if (!status) return std::unexpected(std::move(status.error()));
-    return linear(concatenated_context_id, std::string(prefix) + ".linears.3", hidden_size_, hidden_size_, output_id);
+    return linear(concatenated_context_id, std::string(prefix) + ".out", hidden_size_, hidden_size_, output_id);
+}
+
+Result<std::uint32_t> TransformerBuilder::attention_decode_one_from_projections(
+    std::uint32_t projected_query_id, std::uint32_t projected_key_id, std::uint32_t projected_value_id,
+    std::uint32_t mask_id, std::string_view prefix, std::uint32_t output_id) const {
+    if (attention_heads_ <= 0 || hidden_size_ % attention_heads_ != 0) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid attention dimensions"});
+    }
+
+    const std::array<std::size_t, 2> HEAD_SPLIT = {
+        static_cast<std::size_t>(attention_heads_),
+        static_cast<std::size_t>(hidden_size_ / attention_heads_),
+    };
+    constexpr std::array<std::int32_t, 4> HEAD_MAJOR_AXES = {0, 2, 1, 3};
+    const auto split_heads = [&](std::uint32_t input_id) -> Result<std::uint32_t> {
+        std::uint32_t split_id = YNN_INVALID_VALUE_ID;
+        auto status = runtime::check_ynn_status(
+            ynn_define_split_dim(graph_, -1, HEAD_SPLIT.size(), HEAD_SPLIT.data(), input_id, &split_id, 0),
+            "split decode-one attention heads");
+        std::uint32_t transposed_id = YNN_INVALID_VALUE_ID;
+        if (status) {
+            status = runtime::check_ynn_status(
+                ynn_define_static_transpose(graph_, HEAD_MAJOR_AXES.size(), HEAD_MAJOR_AXES.data(), split_id,
+                                            &transposed_id, 0),
+                "transpose decode-one attention heads");
+        }
+        if (!status) return std::unexpected(std::move(status.error()));
+        return transposed_id;
+    };
+
+    auto head_query_id = split_heads(projected_query_id);
+    if (!head_query_id) return std::unexpected(std::move(head_query_id.error()));
+    auto head_key_id = split_heads(projected_key_id);
+    if (!head_key_id) return std::unexpected(std::move(head_key_id.error()));
+    auto head_value_id = split_heads(projected_value_id);
+    if (!head_value_id) return std::unexpected(std::move(head_value_id.error()));
+
+    constexpr std::array<std::int32_t, 4> TRANSPOSE_LAST_AXES = {0, 1, 3, 2};
+    std::uint32_t transposed_query_id = YNN_INVALID_VALUE_ID;
+    std::uint32_t transposed_scores_id = YNN_INVALID_VALUE_ID;
+    std::uint32_t scores_id = YNN_INVALID_VALUE_ID;
+    std::uint32_t scaled_scores_id = YNN_INVALID_VALUE_ID;
+    std::uint32_t masked_scores_id = YNN_INVALID_VALUE_ID;
+    std::uint32_t probabilities_id = YNN_INVALID_VALUE_ID;
+    std::uint32_t context_id = YNN_INVALID_VALUE_ID;
+    std::uint32_t sequence_major_context_id = YNN_INVALID_VALUE_ID;
+    std::uint32_t concatenated_context_id = YNN_INVALID_VALUE_ID;
+    auto scale_id = scalar(1.0F / std::sqrt(static_cast<float>(hidden_size_ / attention_heads_)));
+    if (!scale_id) return std::unexpected(std::move(scale_id.error()));
+
+    auto status = runtime::check_ynn_status(
+        ynn_define_static_transpose(graph_, TRANSPOSE_LAST_AXES.size(), TRANSPOSE_LAST_AXES.data(), *head_query_id,
+                                    &transposed_query_id, 0),
+        "transpose decode-one query");
+    if (status) {
+        status = runtime::check_ynn_status(ynn_define_dot(graph_, 1, *head_key_id, transposed_query_id,
+                                                          YNN_INVALID_VALUE_ID, &transposed_scores_id, 0),
+                                           "define decode-one attention scores");
+    }
+    if (status) {
+        status = runtime::check_ynn_status(
+            ynn_define_static_transpose(graph_, TRANSPOSE_LAST_AXES.size(), TRANSPOSE_LAST_AXES.data(),
+                                        transposed_scores_id, &scores_id, 0),
+            "transpose decode-one attention scores");
+    }
+    if (status) {
+        status = runtime::check_ynn_status(
+            ynn_define_binary(graph_, ynn_binary_multiply, scores_id, *scale_id, &scaled_scores_id, 0),
+            "scale decode-one attention scores");
+    }
+    if (status && mask_id != YNN_INVALID_VALUE_ID) {
+        status = runtime::check_ynn_status(
+            ynn_define_binary(graph_, ynn_binary_add, scaled_scores_id, mask_id, &masked_scores_id, 0),
+            "mask decode-one attention scores");
+    }
+    if (mask_id == YNN_INVALID_VALUE_ID) masked_scores_id = scaled_scores_id;
+    if (status) {
+        status = runtime::check_ynn_status(ynn::define_softmax(graph_, masked_scores_id, 1.0F, probabilities_id),
+                                           "define decode-one attention softmax");
+    }
+    if (status) {
+        status = runtime::check_ynn_status(
+            ynn_define_dot(graph_, 1, probabilities_id, *head_value_id, YNN_INVALID_VALUE_ID, &context_id, 0),
+            "define decode-one attention context");
+    }
+    if (status) {
+        status = runtime::check_ynn_status(
+            ynn_define_static_transpose(graph_, HEAD_MAJOR_AXES.size(), HEAD_MAJOR_AXES.data(), context_id,
+                                        &sequence_major_context_id, 0),
+            "transpose decode-one attention context");
+    }
+    if (status) {
+        status = runtime::check_ynn_status(
+            ynn_define_fuse_dim(graph_, -2, 2, sequence_major_context_id, &concatenated_context_id, 0),
+            "concatenate decode-one attention heads");
+    }
+    if (!status) return std::unexpected(std::move(status.error()));
+    return linear(concatenated_context_id, std::string(prefix) + ".out", hidden_size_, hidden_size_, output_id);
 }
 
 } // namespace kidi::rtg
