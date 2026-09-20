@@ -7,12 +7,14 @@ import argparse
 import csv
 import importlib
 import importlib.metadata
+import json
 import os
 import platform
 import re
 import shlex
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import time
@@ -179,11 +181,18 @@ def chrf(scorer, reference: Path | None, hypothesis: Path) -> str:
 
 
 def model_encoding(model: Path) -> str:
-    manifest = model / "model.yaml"
-    for line in manifest.read_text(encoding="utf-8").splitlines():
-        if line.strip().startswith("encoding:"):
-            return line.split(":", 1)[1].strip()
-    return "F32"
+    with (model / "model.safetensors").open("rb") as stream:
+        header_size = struct.unpack("<Q", stream.read(8))[0]
+        header = json.loads(stream.read(header_size))
+    dtypes = {
+        tensor["dtype"]
+        for name, tensor in header.items()
+        if name.endswith(".weight") and len(tensor["shape"]) == 2
+    }
+    if len(dtypes) != 1:
+        return "mixed:" + ",".join(sorted(dtypes))
+    dtype = dtypes.pop()
+    return "INT8_PER_CHANNEL" if dtype == "I8" else dtype
 
 
 def machine_description() -> str:

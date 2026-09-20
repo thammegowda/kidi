@@ -23,11 +23,7 @@ POSITIONAL_BUFFERS = {"src_embed.1.pe", "tgt_embed.1.pe"}
 TIED_OUTPUT_WEIGHT = "generator.proj.weight"
 TIED_TARGET_WEIGHT = "tgt_embed.0.lut.weight"
 EMBEDDING_WEIGHTS = {"src_embed.0.lut.weight", TIED_TARGET_WEIGHT}
-WEIGHT_ENCODINGS = {
-    "fp32": "F32",
-    "bf16": "BF16",
-    "int8": "INT8_PER_CHANNEL",
-}
+WEIGHT_PRECISIONS = ("fp32", "bf16", "int8")
 QUANTIZATION_SCALE_SUFFIX = ".scale"
 
 
@@ -281,17 +277,14 @@ def write_manifest(
     source_tokenizer: str,
     target_tokenizer: str,
     checkpoint: Mapping[str, object],
-    precision: str,
 ) -> None:
-    separate_output_weight = precision == "int8"
     document = {
         "format_version": 1,
-        "model_type": "rtg_transformer_nmt",
         "weights_file": "model.safetensors",
         "tokenizers": {"source": source_tokenizer, "target": target_tokenizer},
         "io": {"input_format": "moses_tokenized", "output_format": "moses_tokenized"},
-        "special_tokens": {"pad": 0, "unknown": 1, "begin": 2, "end": 3},
-        "architecture": {
+        "model": {
+            "type": "rtg_transformer_nmt",
             "encoder_layers": int(model_args["enc_layers"]),
             "decoder_layers": int(model_args["dec_layers"]),
             "hidden_size": int(model_args["hid_size"]),
@@ -305,14 +298,12 @@ def write_manifest(
             "layer_norm_epsilon": 1.0e-5,
             "position_encoding": "sinusoidal",
             "maximum_position": 5000,
+            "source_tokens": 160,
         },
-        "limits": {"source_tokens": 160, "maximum_extra_tokens": 50, "maximum_beam_size": 4},
-        "decode": {"beam_size": 4, "maximum_extra_tokens": 50, "length_penalty": 0.6},
-        "weights": {
-            "format": "safetensors",
-            "encoding": WEIGHT_ENCODINGS[precision],
-            "aliases": {} if separate_output_weight else {TIED_OUTPUT_WEIGHT: TIED_TARGET_WEIGHT},
-            "omitted": sorted(POSITIONAL_BUFFERS),
+        "decode": {
+            "beam_size": 4,
+            "maximum_extra_tokens": 50,
+            "length_penalty": 0.6,
         },
         "provenance": {
             "rtg_model_type": str(checkpoint["model_type"]),
@@ -376,7 +367,6 @@ def convert(args: argparse.Namespace) -> Path:
             source_tokenizer.name,
             target_tokenizer.name,
             checkpoint,
-            args.precision,
         )
         os.replace(staging, destination)
         return destination
@@ -393,7 +383,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gzip-tokenizers", action="store_true", help="write deterministic .json.gz tokenizers")
     parser.add_argument(
         "--precision",
-        choices=tuple(WEIGHT_ENCODINGS),
+        choices=WEIGHT_PRECISIONS,
         default="fp32",
         help="matrix and embedding weight encoding (default: fp32)",
     )

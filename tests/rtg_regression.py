@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 MODEL_ID = "thammegowda/rtg-500eng-v1"
-MODEL_REVISION = "e166c18be310898939569a50a23d7de2c9ccf9ed"
+MODEL_REVISION = "8581803b79d7ab3f46697140788272e3417bb238"
 PAYLOAD = ("model.yaml", "model.safetensors", "tokenizer.src.json.gz", "tokenizer.tgt.json.gz")
 DATA = Path(__file__).resolve().parent / "data"
 INPUT = DATA / "sample.input.txt"

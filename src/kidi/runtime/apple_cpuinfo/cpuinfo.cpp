@@ -1,4 +1,4 @@
-#include <cpuinfo.h>
+#include "cpuinfo.h"
 
 #include <cstddef>
 
@@ -18,9 +18,7 @@ extern "C" {
 
 bool cpuinfo_initialize(void) { return true; }
 
-bool cpuinfo_has_arm_neon(void) {
-    return has_feature("hw.optional.arm.AdvSIMD") || has_feature("hw.optional.neon");
-}
+bool cpuinfo_has_arm_neon(void) { return has_feature("hw.optional.arm.AdvSIMD") || has_feature("hw.optional.neon"); }
 
 bool cpuinfo_has_arm_neon_fma(void) { return cpuinfo_has_arm_neon(); }
 

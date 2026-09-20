@@ -1,7 +1,8 @@
 #pragma once
 #include <memory>
 #include "kidi/layers/transformer.h"
-#include "kidi/model/package.h"
+#include "kidi/model/weights.h"
+#include <yaml-cpp/yaml.h>
 #include "kidi/inference/profile.h"
 
 namespace kidi::model {
@@ -19,9 +20,11 @@ struct DecoderState {
 KIDI_MODULE(Transformer);
 class TransformerImpl : public Module {
 public:
-    TransformerImpl(const Package&, tensor::Device);
+    explicit TransformerImpl(const YAML::Node& config);
     ~TransformerImpl();
-    static auto create(const Package&, tensor::Device) -> Result<Transformer>;
+    static auto validate_config(const YAML::Node& config) -> Result<void>;
+    static auto create(const YAML::Node& config) -> Result<Transformer>;
+    static auto state_mapping_specs() -> std::span<const StateMappingSpec>;
     auto encode(std::span<const std::vector<std::int32_t>> sources, inference::InferenceStats* = nullptr)
         -> Result<EncoderState>;
     auto create_state(std::size_t batch, std::size_t capacity) -> Result<DecoderState>;

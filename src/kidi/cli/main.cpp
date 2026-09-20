@@ -6,6 +6,10 @@
 #include <string>
 #include <vector>
 
+#include <spdlog/cfg/env.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
+
 #include "kidi/cli/argparse.h"
 #include "kidi/core/version.h"
 #include "kidi/model/package.h"
@@ -16,26 +20,32 @@
 namespace {
 
 auto inference_backend(const kidi::cli::Namespace& arguments) -> kidi::inference::InferenceBackend {
-    return arguments.get<std::string>("backend") == "mps" ? kidi::inference::InferenceBackend::MPS
-                                                          : kidi::inference::InferenceBackend::YNNPACK;
+    const auto& backend = arguments.get<std::string>("backend");
+    return backend == "mps" || (backend == "auto" && kidi::module_device == kidi::tensor::Device::apple_gpu())
+               ? kidi::inference::InferenceBackend::MPS
+               : kidi::inference::InferenceBackend::YNNPACK;
 }
 
 auto inspect(const kidi::cli::Namespace& arguments) -> int {
     auto package = kidi::model::Package::load(arguments.get<std::filesystem::path>("model"));
     if (!package) {
-        std::cerr << "kidi: " << package.error().message << '\n';
+        spdlog::error("{}", package.error().message);
         return 1;
     }
-    const auto& manifest = package->manifest();
-    std::cout << "format: " << manifest.format_version << '\n'
-              << "model: " << manifest.model_type << '\n'
-              << "weights: " << manifest.weights_file.string() << '\n'
-              << "weight encoding: " << kidi::model::to_string(manifest.weights.encoding) << '\n'
+    const auto& config = package->config();
+    auto validation = kidi::model::TransformerImpl::validate_config(config["model"]);
+    if (!validation) {
+        spdlog::error("{}", validation.error().message);
+        return 1;
+    }
+    std::cout << "format: " << config["format_version"].as<int>() << '\n'
+              << "model: " << config["model"]["type"].as<std::string>() << '\n'
+              << "weights: " << config["weights_file"].as<std::string>() << '\n'
               << "weight tensors: " << package->weights().size() << '\n'
               << "vocabularies: " << package->source_tokenizer().vocabulary_size() << ", "
               << package->target_tokenizer().vocabulary_size() << '\n'
-              << "beam: " << manifest.decode_defaults.beam_size << '\n'
-              << "runtime: ynnpack_cpu\n"
+              << "beam: " << config["decode"]["beam_size"].as<int>() << '\n'
+              << "default device: " << kidi::tensor::to_string(kidi::module_device) << '\n'
               << "cpu features: " << kidi::runtime::ynn::supported_arch_names() << '\n';
     for (const auto& backend : kidi::tensor::BackendRegistry::instance().backends()) {
         std::cout << "tensor backend: " << kidi::tensor::to_string(backend.device_kind) << ' ' << backend.name
@@ -50,13 +60,13 @@ auto inspect(const kidi::cli::Namespace& arguments) -> int {
 auto predict(const kidi::cli::Namespace& arguments) -> int {
     const auto& input_type = arguments.get<std::string>("inp_type");
     if (input_type != "text") {
-        std::cerr << "kidi: input type '" << input_type << "' is not supported yet\n";
+        spdlog::error("input type '{}' is not supported yet", input_type);
         return 2;
     }
     if (arguments.contains("threads")) {
         const auto threads = arguments.get<std::int32_t>("threads");
         if (threads <= 0) {
-            std::cerr << "kidi: thread count must be positive\n";
+            spdlog::error("thread count must be positive");
             return 2;
         }
         kidi::runtime::ynn::set_thread_count(static_cast<std::size_t>(threads));
@@ -68,7 +78,7 @@ auto predict(const kidi::cli::Namespace& arguments) -> int {
     if (input_path != "-") {
         input_file.open(input_path);
         if (!input_file) {
-            std::cerr << "kidi: cannot open input file: " << input_path << '\n';
+            spdlog::error("cannot open input file: {}", input_path);
             return 1;
         }
         input = &input_file;
@@ -80,7 +90,7 @@ auto predict(const kidi::cli::Namespace& arguments) -> int {
     if (output_path != "-") {
         output_file.open(output_path);
         if (!output_file) {
-            std::cerr << "kidi: cannot open output file: " << output_path << '\n';
+            spdlog::error("cannot open output file: {}", output_path);
             return 1;
         }
         output = &output_file;
@@ -91,11 +101,11 @@ auto predict(const kidi::cli::Namespace& arguments) -> int {
     const auto batch_window =
         arguments.contains("batch_window") ? arguments.get<std::int32_t>("batch_window") : batch_size;
     if (batch_size < 1 || batch_size > 256) {
-        std::cerr << "kidi: batch size must be between 1 and 256\n";
+        spdlog::error("batch size must be between 1 and 256");
         return 2;
     }
     if (batch_window < batch_size || batch_window > 4096) {
-        std::cerr << "kidi: batch window must be between batch-size and 4096\n";
+        spdlog::error("batch window must be between batch-size and 4096");
         return 2;
     }
     auto* profile_ptr = arguments.get<bool>("profile") ? &profile : nullptr;
@@ -103,7 +113,7 @@ auto predict(const kidi::cli::Namespace& arguments) -> int {
     auto translator = kidi::inference::Translator::load(arguments.get<std::filesystem::path>("model"), backend,
                                                         profile_ptr, batch_size);
     if (!translator) {
-        std::cerr << "kidi: " << translator.error().message << '\n';
+        spdlog::error("{}", translator.error().message);
         return 1;
     }
 
@@ -125,8 +135,7 @@ auto predict(const kidi::cli::Namespace& arguments) -> int {
             if (!line.empty()) sources.push_back(line);
         auto translations = translator->translate_batch(sources, options, profile_ptr);
         if (!translations) {
-            std::cerr << "kidi: batch ending at input line " << line_number << ": " << translations.error().message
-                      << '\n';
+            spdlog::error("batch ending at input line {}: {}", line_number, translations.error().message);
             return false;
         }
         std::size_t index = 0;
@@ -143,7 +152,7 @@ auto predict(const kidi::cli::Namespace& arguments) -> int {
         output->flush();
         pending.clear();
         if (!*output) {
-            std::cerr << "kidi: cannot write output: " << output_path << '\n';
+            spdlog::error("cannot write output: {}", output_path);
             return false;
         }
         return true;
@@ -156,7 +165,7 @@ auto predict(const kidi::cli::Namespace& arguments) -> int {
     }
     if (!pending.empty() && !flush()) return 1;
     if (input->bad()) {
-        std::cerr << "kidi: cannot read input: " << input_path << '\n';
+        spdlog::error("cannot read input: {}", input_path);
         return 1;
     }
     if (arguments.get<bool>("stats")) {
@@ -182,6 +191,9 @@ auto predict(const kidi::cli::Namespace& arguments) -> int {
 } // namespace
 
 auto main(int argc, char** argv) -> int {
+    spdlog::set_default_logger(spdlog::stderr_color_mt("kidi"));
+    spdlog::set_pattern("[%n] [%l] %v");
+    spdlog::cfg::load_env_levels();
     kidi::cli::ArgumentParser parser("kidi", "Run optimized RTG translation models.");
     parser.version("kidi " + std::string(kidi::version()));
     auto& commands = parser.add_subparsers().required();
@@ -214,9 +226,9 @@ auto main(int argc, char** argv) -> int {
         .action(kidi::cli::Action::STORE_TRUE)
         .help("emit machine-readable inference timings to stderr");
     predict_parser.add_argument("--backend")
-        .choices({"ynnpack", "mps"})
-        .default_value(std::string("ynnpack"))
-        .help("inference backend");
+        .choices({"auto", "ynnpack", "mps"})
+        .default_value(std::string("auto"))
+        .help("inference backend (auto prefers an available GPU)");
     predict_parser.add_argument("--batch-size")
         .type<std::int32_t>()
         .default_value(std::int32_t{1})
@@ -261,10 +273,11 @@ auto main(int argc, char** argv) -> int {
         if (command == "predict") return predict(arguments);
         throw std::logic_error("unhandled command: " + command);
     } catch (const kidi::cli::ParseError& error) {
-        std::cerr << error.usage() << "kidi: error: " << error.what() << '\n';
+        std::cerr << error.usage();
+        spdlog::error("{}", error.what());
         return 2;
     } catch (const std::exception& error) {
-        std::cerr << "kidi: " << error.what() << '\n';
+        spdlog::error("{}", error.what());
         return 1;
     }
 }

@@ -49,7 +49,9 @@ on older Apple Silicon. `kidi inspect` prints the selected CPU features and
 
 YNNPACK is a CPU runtime and cannot dispatch work to Metal or the Apple Neural
 Engine. `--backend mps --beam-size 1` selects the eager Metal backend
-for FP32, BF16, or INT8 packages. YNNPACK remains the default. ANE
+for FP32, BF16, or INT8 packages. The default `--backend auto` selects an
+available GPU execution backend, otherwise YNNPACK CPU. Use `--backend ynnpack`
+to require CPU execution. ANE
 execution requires a separate Core ML model graph, so kidi does not claim NPU
 execution until an incremental decoder with explicit K/V state is available.
 
@@ -89,7 +91,10 @@ immediately; Metal calls enqueue work and `context.synchronize()` makes results
 ready for host inspection. Model inference synchronizes before returning logits.
 
 ```cpp
-layers::Linear linear = std::make_shared<layers::LinearImpl>(weights, "projection", encoding);
+ModuleScope construction(tensor::DType::BF16, false);
+layers::Linear linear(768, 2048);
+ops::require(linear->set_state(weights));
+ops::Context context(linear->device());
 auto projected = linear->forward(context, input);
 auto activated = context.gelu(projected);
 context.synchronize();
@@ -103,15 +108,32 @@ The scoped thread-local `ops::is_inplace` mode is handled internally. Decoder
 cache updates use `scatter_`; explicit synchronization is still required before
 host inspection of queued Metal operations.
 
-Weights are bound once into reusable `Linear`, `LayerNorm`, `Attention`,
-`FeedForward`, `EncoderBlock`, and `DecoderBlock` layers. Both devices run the
+Constructors declare dimensions and structure without checkpoint or prefix arguments.
+Registered children determine state names automatically. `set_state(weights)`
+binds weights after construction, validates shapes/dtypes atomically, and transfers
+only when the source device differs. Checkpoint keys must match the registered
+names; RTG import-name mapping happens once at package loading.
+
+`ModuleScope` temporarily sets thread-local `module_dtype`, `allocate_parameters`,
+and `module_device`, inherited by nested constructors and restored on scope exit.
+Defaults are FP32, allocated parameters, and an available GPU execution device
+(CPU otherwise). `ModuleScope(tensor::Device::cpu())` overrides only the device.
+New threads start with their own defaults. Existing modules retain their device;
+scopes do not alter `forward()` behavior. Allocated weights/biases start at zero,
+LayerNorm scales and INT8 scales at one. Initialize floating weights as needed
+through their writable `state_dict()` handles before using them; automatic random
+initialization, autograd, and training are not implemented.
+
+Both devices run the
 same `model::Transformer`. Generic greedy, batched greedy, and beam search use
 ordinary C++ loops in `inference::Decoder`; K/V caches are explicit tensor state.
 
 Every neural implementation is a `Module` subclass named `<Name>Impl`;
-`KIDI_MODULE(Name)` provides its shared-pointer alias. `forward(...)` performs
-computation. Registered parameters and child modules support `state_dict()` and
-validated `load_state_dict(...)`; typed `ModuleList` and `ModuleMap` containers
+`KIDI_MODULE(Name)` provides a `ModuleHolder<NameImpl>` with shared ownership and
+constructor forwarding. Construct layers directly as `Linear(input_size, output_size)`;
+copying a holder shares the same module. Use `Linear{nullptr}` for an empty holder.
+`forward(...)` performs computation. Registered parameters and child modules support `state_dict()` and
+validated `set_state(...)` and copying `load_state_dict(...)`; typed `ModuleList` and `ModuleMap` containers
 register their children automatically. No shared-pointer copies are needed in
 forward calls.
 
@@ -138,6 +160,44 @@ tokenizer.tgt.json[.gz]
 
 `--model` points to this directory. Kidi loads `model.yaml` by convention, then
 resolves its weights and tokenizer paths relative to the model directory.
+
+Configuration is plain YAML. Model settings belong together under `model`;
+decoding defaults belong under `decode`. For example:
+
+```yaml
+format_version: 1
+weights_file: model.safetensors
+tokenizers: {source: tokenizer.src.json.gz, target: tokenizer.tgt.json.gz}
+io: {input_format: moses_tokenized, output_format: moses_tokenized}
+model:
+  type: rtg_transformer_nmt
+  encoder_layers: 9
+  decoder_layers: 6
+  hidden_size: 768
+  feed_forward_size: 2048
+  attention_heads: 12
+  source_vocabulary_size: 512000
+  target_vocabulary_size: 64000
+  activation: gelu
+  attention_bias: true
+  tied_embeddings: one-way
+  layer_norm_epsilon: 0.00001
+  position_encoding: sinusoidal
+  maximum_position: 5000
+  source_tokens: 160
+decode:
+  beam_size: 4
+  maximum_extra_tokens: 50
+  length_penalty: 0.6
+```
+
+Models receive `config["model"]` directly and validate their own settings.
+The package infers special-token IDs from the source and target tokenizer files;
+do not duplicate those IDs in the YAML configuration.
+Safetensors is the supported checkpoint format; each layer reads the weight dtype
+and any INT8 scales from the checkpoint. No format or encoding field is needed.
+CLI decoding options override YAML defaults without config-imposed upper limits.
+The former flat `model_type`/`architecture` layout is not supported.
 
 Inspect a package manifest with:
 
@@ -180,6 +240,10 @@ threads including the calling thread.
 
 Use `kidi --help` and `kidi predict --help` for the complete command syntax.
 
+Human-readable diagnostics use [spdlog](https://github.com/gabime/spdlog) on
+stderr; set `SPDLOG_LEVEL` to control their level. Translation output and
+machine-readable `--stats`/`--profile` records are separate from logging.
+
 ## Convert RTG
 
 The converter runs in a trusted Python environment with RTG's PyTorch version:
@@ -204,8 +268,8 @@ python3 tools/convert_rtg.py --precision int8 /path/to/rtg-model /path/to/kidi-i
 All linear weights use `[input, output]` storage. Embeddings keep
 `[vocabulary, hidden]`. FP32 and BF16 exports store the tied target embedding
 only once; the output projection uses it with transposed access. Older BF16
-packages with a separate output matrix remain supported. INT8 retains separate
-output storage and uses one scale per output channel or embedding row.
+exports must be regenerated with the nested config. INT8 retains separate output
+storage and uses one scale per output channel or embedding row.
 
 ## Model Regression Test
 

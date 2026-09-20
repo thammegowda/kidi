@@ -220,6 +220,22 @@ auto Weights::load(const std::filesystem::path& path, std::span<const StateMappi
 
 auto Weights::contains(std::string_view name) const -> bool { return contains_tensor(*impl_, name); }
 
+auto Weights::state_dict() const -> Result<StateDict> {
+    StateDict result;
+    const auto append = [&](const auto& tensors) -> Result<void> {
+        for (const auto& [name, unused] : tensors) {
+            if (!contains(name)) continue;
+            auto value = tensor(name);
+            if (!value) return std::unexpected(std::move(value.error()));
+            result.emplace(name, std::move(*value));
+        }
+        return {};
+    };
+    for (auto status : {append(impl_->checkpoint.tensors()), append(impl_->aliases), append(impl_->transformed)})
+        if (!status) return std::unexpected(std::move(status.error()));
+    return result;
+}
+
 auto Weights::size() const noexcept -> std::size_t {
     return impl_->checkpoint.tensors().size() - impl_->hidden.size() + impl_->transformed.size() +
            impl_->aliases.size();

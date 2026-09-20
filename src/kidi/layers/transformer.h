@@ -1,10 +1,8 @@
 #pragma once
 
 #include <array>
-#include <string_view>
 
 #include "kidi/core/module.h"
-#include "kidi/model/weights.h"
 #include "kidi/ops/context.h"
 
 namespace kidi::layers {
@@ -28,14 +26,11 @@ KIDI_MODULE(Linear);
 /// Supports FP32, BF16, and per-channel INT8 weight encodings.
 class LinearImpl : public Module {
 public:
-    LinearImpl(const model::Weights&, std::string_view prefix, model::WeightEncoding);
-    LinearImpl(const model::Weights&, std::string_view weight, std::string_view bias, model::WeightEncoding,
-               bool transpose = false);
+    LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose = false);
     auto forward(ops::Context&, const Tensor&) const -> Tensor;
 
 private:
     Tensor weight_, bias_, scale_;
-    model::WeightEncoding encoding_;
     bool transpose_;
 };
 
@@ -44,7 +39,7 @@ KIDI_MODULE(LayerNorm);
 /// Normalizes the final dimension, then applies learned scale and bias.
 class LayerNormImpl : public Module {
 public:
-    LayerNormImpl(const model::Weights&, std::string_view prefix, float epsilon);
+    LayerNormImpl(std::int32_t hidden_size, float epsilon);
     auto forward(ops::Context&, const Tensor&) const -> Tensor;
 
     /// Returns the residual sum and its normalized value without separate dispatches.
@@ -61,15 +56,16 @@ KIDI_MODULE(Embedding);
 /// Maps row-major token IDs to FP32 tensors shaped [batch, sequence, hidden].
 class EmbeddingImpl : public Module {
 public:
-    EmbeddingImpl(const model::Weights&, std::string_view weight, model::WeightEncoding, std::int32_t maximum_position);
+    EmbeddingImpl(std::int32_t vocabulary_size, std::int32_t hidden_size, std::int32_t maximum_position);
     auto forward(ops::Context&, std::span<const std::int32_t> tokens, std::size_t batch, std::size_t position = 0) const
         -> Tensor;
     auto forward_(ops::Context&, Tensor& output, std::span<const std::int32_t> tokens, std::size_t batch,
                   std::size_t position = 0) const -> Tensor&;
 
 private:
-    Tensor weight_, scale_, positions_;
-    model::WeightEncoding encoding_;
+    Tensor weight_, scale_;
+    mutable Tensor positions_;
+    std::int32_t hidden_size_, maximum_position_;
 };
 
 KIDI_MODULE(Attention);
@@ -78,7 +74,7 @@ KIDI_MODULE(Attention);
 /// Applies an optional additive mask and a learned output projection.
 class AttentionImpl : public Module {
 public:
-    AttentionImpl(const model::Weights&, std::string_view prefix, model::WeightEncoding, Shape);
+    explicit AttentionImpl(Shape);
     auto forward(ops::Context&, const Tensor& query, const KeyValue&, const Tensor& mask) const -> Tensor;
 
 private:
@@ -92,7 +88,7 @@ KIDI_MODULE(FeedForward);
 /// Normalization and residual connections belong to the enclosing block.
 class FeedForwardImpl : public Module {
 public:
-    FeedForwardImpl(const model::Weights&, std::string_view prefix, model::WeightEncoding);
+    FeedForwardImpl(std::int32_t hidden_size, std::int32_t feed_forward_size);
     auto forward(ops::Context&, const Tensor&) const -> Tensor;
 
 private:
@@ -104,7 +100,7 @@ KIDI_MODULE(EncoderBlock);
 /// Pre-normalized self-attention and feed-forward block with residual connections.
 class EncoderBlockImpl : public Module {
 public:
-    EncoderBlockImpl(const model::Weights&, std::string_view prefix, model::WeightEncoding, Shape);
+    explicit EncoderBlockImpl(Shape);
     auto forward(ops::Context&, const Tensor&, const Tensor& mask) const -> Tensor;
 
 private:
@@ -120,7 +116,7 @@ KIDI_MODULE(DecoderBlock);
 /// Supports full prefixes or incremental decoding with explicit key/value caches.
 class DecoderBlockImpl : public Module {
 public:
-    DecoderBlockImpl(const model::Weights&, std::string_view prefix, model::WeightEncoding, Shape);
+    explicit DecoderBlockImpl(Shape);
 
     /// Precomputes encoder keys and values for reuse across decoder steps.
     auto project_source(ops::Context&, const Tensor&) const -> KeyValue;

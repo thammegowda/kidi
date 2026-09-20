@@ -25,7 +25,7 @@ add_library(kidi
     src/kidi/inference/translator.cpp
     src/kidi/layers/position_encoding.cpp
     src/kidi/layers/transformer.cpp
-    src/kidi/model/manifest.cpp
+    src/kidi/model/config.cpp
     src/kidi/model/package.cpp
     src/kidi/model/transformer.cpp
     src/kidi/model/weights.cpp
@@ -53,9 +53,9 @@ target_compile_features(kidi PUBLIC cxx_std_23)
 target_link_libraries(kidi
     PUBLIC
         kidi::ynnpack
+        yaml-cpp::yaml-cpp
     PRIVATE
         tokenizerpp
-        yaml-cpp::yaml-cpp
         ZLIB::ZLIB
         ${CMAKE_DL_LIBS}
 )
@@ -107,7 +107,7 @@ endif()
 
 add_executable(kidi_cli src/kidi/cli/main.cpp)
 set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
-target_link_libraries(kidi_cli PRIVATE kidi::argparse kidi::kidi)
+target_link_libraries(kidi_cli PRIVATE kidi::argparse kidi::kidi spdlog::spdlog)
 
 include(CTest)
 

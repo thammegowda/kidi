@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <numeric>
@@ -44,27 +45,26 @@ auto measure(std::uint64_t* elapsed_ns, Function&& function) {
     return std::forward<Function>(function)();
 }
 
-auto resolve_options(const model::ModelManifest& manifest, const DecodeOptions& options)
-    -> Result<model::DecodeDefaults> {
-    model::DecodeDefaults result = {
-        .beam_size = options.beam_size.value_or(manifest.decode_defaults.beam_size),
-        .maximum_extra_tokens = options.maximum_extra_tokens.value_or(manifest.decode_defaults.maximum_extra_tokens),
-        .length_penalty = options.length_penalty.value_or(manifest.decode_defaults.length_penalty),
-    };
-    if (result.beam_size <= 0 || result.beam_size > manifest.limits.maximum_beam_size) {
+auto resolve_options(const YAML::Node& config, const DecodeOptions& options) -> Result<YAML::Node> {
+    try {
+        auto result = YAML::Clone(config);
+        if (options.beam_size) result["beam_size"] = *options.beam_size;
+        if (options.maximum_extra_tokens) result["maximum_extra_tokens"] = *options.maximum_extra_tokens;
+        if (options.length_penalty) result["length_penalty"] = *options.length_penalty;
+        const auto beam = result["beam_size"].as<std::int32_t>();
+        const auto extra = result["maximum_extra_tokens"].as<std::int32_t>();
+        const auto penalty = result["length_penalty"].as<float>();
+        if (beam <= 0) return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "beam size must be positive"});
+        if (extra <= 0)
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "maximum extra tokens must be positive"});
+        if (!std::isfinite(penalty) || penalty < 0)
+            return std::unexpected(
+                Error{ErrorCode::INVALID_ARGUMENT, "length penalty must be finite and non-negative"});
+        return result;
+    } catch (const YAML::Exception& error) {
         return std::unexpected(
-            Error{ErrorCode::INVALID_ARGUMENT,
-                  "beam size must be between 1 and " + std::to_string(manifest.limits.maximum_beam_size)});
+            Error{ErrorCode::INVALID_MANIFEST, "invalid decode config: " + std::string(error.what())});
     }
-    if (result.maximum_extra_tokens <= 0 || result.maximum_extra_tokens > manifest.limits.maximum_extra_tokens) {
-        return std::unexpected(Error{
-            ErrorCode::INVALID_ARGUMENT,
-            "maximum extra tokens must be between 1 and " + std::to_string(manifest.limits.maximum_extra_tokens)});
-    }
-    if (result.length_penalty < 0.0F) {
-        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "length penalty cannot be negative"});
-    }
-    return result;
 }
 
 } // namespace
@@ -73,7 +73,12 @@ Translator::Translator(model::Package package, model::Transformer model, Inferen
     : package_(std::move(package)), model_(std::move(model)), backend_(backend) {}
 
 auto Translator::load(const std::filesystem::path& model_directory, InferenceStats* stats) -> Result<Translator> {
-    return load(model_directory, InferenceBackend::YNNPACK, stats);
+    if (module_device != tensor::Device::cpu() && module_device != tensor::Device::apple_gpu())
+        return std::unexpected(
+            Error{ErrorCode::UNSUPPORTED, "no translation backend for " + tensor::to_string(module_device)});
+    return load(model_directory,
+                module_device == tensor::Device::apple_gpu() ? InferenceBackend::MPS : InferenceBackend::YNNPACK,
+                stats);
 }
 
 auto Translator::load(const std::filesystem::path& model_directory, InferenceBackend backend, InferenceStats* stats,
@@ -83,9 +88,19 @@ auto Translator::load(const std::filesystem::path& model_directory, InferenceBac
     auto package =
         measure(stats ? &stats->package_load_ns : nullptr, [&] { return model::Package::load(model_directory); });
     if (!package) return std::unexpected(std::move(package.error()));
-    auto model = model::TransformerImpl::create(
-        *package, backend == InferenceBackend::MPS ? tensor::Device::apple_gpu() : tensor::Device::cpu());
+    auto defaults = resolve_options(package->config()["decode"], {});
+    if (!defaults) return std::unexpected(std::move(defaults.error()));
+    auto embedding = package->weights().tensor("target_embedding.weight");
+    if (!embedding) return std::unexpected(std::move(embedding.error()));
+    auto model = [&] {
+        const ModuleScope construction(
+            embedding->dtype(), false,
+            backend == InferenceBackend::MPS ? tensor::Device::apple_gpu() : tensor::Device::cpu());
+        return model::TransformerImpl::create(package->config()["model"]);
+    }();
     if (!model) return std::unexpected(std::move(model.error()));
+    auto loaded = (*model)->set_state(package->weights());
+    if (!loaded) return std::unexpected(std::move(loaded.error()));
     Translator translator(std::move(*package), std::move(*model), backend);
     translator.batch_size_ = batch_size;
     return translator;
@@ -94,21 +109,21 @@ auto Translator::load(const std::filesystem::path& model_directory, InferenceBac
 auto Translator::translate(std::string_view source, DecodeOptions options, InferenceStats* stats)
     -> Result<Translation> {
     ScopedTimer translate_timer(stats ? &stats->translate_ns : nullptr, stats ? &stats->graph_compile_ns : nullptr);
-    const auto& manifest = package_.manifest();
-    auto decode = resolve_options(manifest, options);
+    const auto config = package_.config()["decode"];
+    auto decode = resolve_options(config, options);
     if (!decode) return std::unexpected(std::move(decode.error()));
     auto source_ids = measure(stats ? &stats->source_tokenize_ns : nullptr,
                               [&] { return package_.source_tokenizer().encode(source); });
     if (!source_ids) return std::unexpected(std::move(source_ids.error()));
-    if (source_ids->empty() || source_ids->back() != manifest.special_tokens.end) {
-        source_ids->push_back(manifest.special_tokens.end);
+    if (source_ids->empty() || source_ids->back() != config["source_end_id"].as<std::int32_t>()) {
+        source_ids->push_back(config["source_end_id"].as<std::int32_t>());
     }
-    const auto maximum_steps = source_ids->size() + static_cast<std::size_t>(decode->maximum_extra_tokens);
+    const auto maximum_steps = source_ids->size() + (*decode)["maximum_extra_tokens"].as<std::size_t>();
     auto projected_source = model_->encode(std::array{*source_ids}, stats);
     if (!projected_source) return std::unexpected(std::move(projected_source.error()));
 
-    const auto beam_size = static_cast<std::size_t>(decode->beam_size);
-    const auto vocabulary_size = static_cast<std::size_t>(manifest.architecture.target_vocabulary_size);
+    const auto beam_size = (*decode)["beam_size"].as<std::size_t>();
+    const auto vocabulary_size = config["vocabulary_size"].as<std::size_t>();
     std::optional<model::DecoderState> self_cache;
     if (beam_size == 1) {
         auto cache = model_->create_state(1, maximum_steps);
@@ -117,16 +132,16 @@ auto Translator::translate(std::string_view source, DecodeOptions options, Infer
     }
     const inference::SearchOptions search{
         .vocabulary_size = vocabulary_size,
-        .end_id = manifest.special_tokens.end,
-        .pad_id = manifest.special_tokens.pad,
+        .end_id = config["end_id"].as<std::int32_t>(),
+        .pad_id = config["pad_id"].as<std::int32_t>(),
         .maximum_steps = maximum_steps,
         .beam_size = beam_size,
-        .length_penalty = decode->length_penalty,
+        .length_penalty = (*decode)["length_penalty"].as<float>(),
         .compute_score = options.compute_score,
-        .unfinished_score_length = static_cast<std::size_t>(decode->maximum_extra_tokens)};
+        .unfinished_score_length = (*decode)["maximum_extra_tokens"].as<std::size_t>()};
     tensor::Tensor score_storage;
     auto generated = inference::Decoder::generate(
-        std::array{manifest.special_tokens.begin}, search,
+        std::array{config["begin_id"].as<std::int32_t>()}, search,
         [&](const inference::DecodeRequest& request) -> Result<inference::TokenScores> {
             auto scores = model_->forward(*projected_source, self_cache ? request.prefixes.last(1) : request.prefixes,
                                           request.beam_indices.size(), self_cache ? &*self_cache : nullptr, stats);
@@ -152,7 +167,7 @@ auto Translator::translate(std::string_view source, DecodeOptions options, Infer
 auto Translator::translate_batch(std::span<const std::string> sources, DecodeOptions options, InferenceStats* stats)
     -> Result<std::vector<Translation>> {
     if (sources.empty()) return std::vector<Translation>{};
-    if (options.beam_size.value_or(package_.manifest().decode_defaults.beam_size) != 1) {
+    if (options.beam_size.value_or(package_.config()["decode"]["beam_size"].as<std::int32_t>()) != 1) {
         std::vector<Translation> results;
         for (const auto& source : sources) {
             auto result = translate(source, options, stats);
@@ -162,8 +177,8 @@ auto Translator::translate_batch(std::span<const std::string> sources, DecodeOpt
         return results;
     }
     ScopedTimer timer(stats ? &stats->translate_ns : nullptr, stats ? &stats->graph_compile_ns : nullptr);
-    const auto& manifest = package_.manifest();
-    auto decode = resolve_options(manifest, options);
+    const auto config = package_.config()["decode"];
+    auto decode = resolve_options(config, options);
     if (!decode) return std::unexpected(std::move(decode.error()));
     std::vector<std::vector<std::int32_t>> ids;
     std::vector<std::size_t> limits;
@@ -171,9 +186,9 @@ auto Translator::translate_batch(std::span<const std::string> sources, DecodeOpt
         auto encoded = measure(stats ? &stats->source_tokenize_ns : nullptr,
                                [&] { return package_.source_tokenizer().encode(source); });
         if (!encoded) return std::unexpected(std::move(encoded.error()));
-        if (encoded->empty() || encoded->back() != manifest.special_tokens.end)
-            encoded->push_back(manifest.special_tokens.end);
-        limits.push_back(encoded->size() + static_cast<std::size_t>(decode->maximum_extra_tokens));
+        if (encoded->empty() || encoded->back() != config["source_end_id"].as<std::int32_t>())
+            encoded->push_back(config["source_end_id"].as<std::int32_t>());
+        limits.push_back(encoded->size() + (*decode)["maximum_extra_tokens"].as<std::size_t>());
         ids.push_back(std::move(*encoded));
     }
     std::vector<std::size_t> order(ids.size());
@@ -195,15 +210,14 @@ auto Translator::translate_batch(std::span<const std::string> sources, DecodeOpt
         if (!state) return std::unexpected(std::move(state.error()));
         std::vector<SearchOptions> settings;
         for (auto limit : batch_limits)
-            settings.push_back(
-                {.vocabulary_size = static_cast<std::size_t>(manifest.architecture.target_vocabulary_size),
-                 .end_id = manifest.special_tokens.end,
-                 .pad_id = manifest.special_tokens.pad,
-                 .maximum_steps = limit,
-                 .length_penalty = decode->length_penalty,
-                 .compute_score = options.compute_score,
-                 .unfinished_score_length = static_cast<std::size_t>(decode->maximum_extra_tokens)});
-        const std::vector<std::int32_t> initial(count, manifest.special_tokens.begin);
+            settings.push_back({.vocabulary_size = config["vocabulary_size"].as<std::size_t>(),
+                                .end_id = config["end_id"].as<std::int32_t>(),
+                                .pad_id = config["pad_id"].as<std::int32_t>(),
+                                .maximum_steps = limit,
+                                .length_penalty = (*decode)["length_penalty"].as<float>(),
+                                .compute_score = options.compute_score,
+                                .unfinished_score_length = (*decode)["maximum_extra_tokens"].as<std::size_t>()});
+        const std::vector<std::int32_t> initial(count, config["begin_id"].as<std::int32_t>());
         tensor::Tensor score_storage;
         auto batch = Decoder::generate_batch(
             initial, settings,

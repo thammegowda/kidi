@@ -36,8 +36,9 @@ auto main() -> int {
         const auto path = std::filesystem::temp_directory_path() / "kidi-embedding-test.safetensors";
         write_weights(path);
         auto weights = ops::require(model::Weights::load(path));
-        layers::Embedding embedding =
-            std::make_shared<layers::EmbeddingImpl>(weights, "embedding", model::WeightEncoding::F32, 8);
+        const ModuleScope construction(tensor::DType::F32, false);
+        layers::Embedding embedding(3, 4, 8);
+        ops::require(embedding->set_state(StateDict{{"weight", ops::require(weights.tensor("embedding"))}}));
         std::vector devices{tensor::Device::cpu()};
 #if defined(__APPLE__)
         devices.push_back(tensor::Device::apple_gpu());

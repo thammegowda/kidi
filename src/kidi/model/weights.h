@@ -10,10 +10,12 @@
 #include <vector>
 
 #include "kidi/core/error.h"
-#include "kidi/model/precision.h"
+#include "kidi/core/module.h"
 #include "kidi/tensor/tensor.h"
 
 namespace kidi::model {
+
+using DataType = tensor::DType;
 
 struct StateMappingSpec {
     std::vector<std::string> sources;
@@ -36,6 +38,7 @@ public:
     auto contains(std::string_view name) const -> bool;
     auto size() const noexcept -> std::size_t;
     auto tensor(std::string_view name) const -> Result<tensor::Tensor>;
+    auto state_dict() const -> Result<StateDict>;
 
 private:
     struct Impl;

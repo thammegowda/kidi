@@ -9,7 +9,6 @@
 #include <iostream>
 #include <string>
 
-#include "kidi/model/precision.h"
 #include "kidi/model/weights.h"
 #include "kidi/layers/position_encoding.h"
 #if defined(__APPLE__)
@@ -65,9 +64,16 @@ auto main() -> int {
     try {
         const auto path = std::filesystem::temp_directory_path() / "kidi-int8-precision-test.safetensors";
         write_int8_weights(path);
-        auto weights = require(model::Weights::load(path));
-        layers::Linear linear =
-            std::make_shared<layers::LinearImpl>(weights, "linear", model::WeightEncoding::INT8_PER_CHANNEL);
+        const std::array mappings{model::StateMappingSpec{{R"(linear\.weight\.scale)"}, "linear.scale"}};
+        auto weights = require(model::Weights::load(path, mappings));
+        const ModuleScope construction(tensor::DType::I8, false);
+        layers::Linear linear(4, 3);
+        ModuleMap<> modules;
+        modules->insert("linear", linear);
+        auto missing_scale = require(weights.state_dict());
+        missing_scale.erase("linear.scale");
+        if (modules->set_state(missing_scale)) return 1;
+        require(modules->set_state(weights));
         const std::array input_values{-1.F, 0.F, 1.F, 2.F, -2.F, -1.F, 1.F, 2.F};
         const std::array expected{0.6F, 2.55F, 1.675F, 0.35F, 3.05F, 1.3F};
         std::vector devices{tensor::Device::cpu()};
@@ -158,8 +164,9 @@ auto main() -> int {
         const auto embedding_path = std::filesystem::temp_directory_path() / "kidi-int8-embedding-test.safetensors";
         write_int8_embeddings(embedding_path);
         auto embedding_weights = require(model::Weights::load(embedding_path));
-        layers::Embedding embedding = std::make_shared<layers::EmbeddingImpl>(
-            embedding_weights, "embedding", model::WeightEncoding::INT8_PER_CHANNEL, 2);
+        layers::Embedding embedding(3, 4, 2);
+        require(embedding->set_state(StateDict{{"weight", require(embedding_weights.tensor("embedding"))},
+                                               {"scale", require(embedding_weights.tensor("embedding.scale"))}}));
         const auto frequency = std::exp(-(std::log(10000.F) / 4.F) * 2.F);
         const std::array embedded_expected{2.F,
                                            5.F,

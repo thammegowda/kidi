@@ -6,7 +6,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <string>
+#include <thread>
 
 #include "kidi/model/weights.h"
 #include "kidi/tensor/tensor.h"
@@ -48,23 +50,154 @@ auto write_weights(const std::filesystem::path& path) -> void {
 
 auto near(float left, float right) -> bool { return std::abs(left - right) < 2.0e-5F; }
 
+class DeferredParameter : public kidi::Module {
+public:
+    explicit DeferredParameter(bool allocate) {
+        register_parameter("weight", weight_, {4, 3}, kidi::tensor::DType::F32, allocate);
+        register_parameter("tied", tied_, {4, 3}, kidi::tensor::DType::F32, false);
+        tie_parameter("tied", "weight");
+    }
+
+private:
+    kidi::tensor::Tensor weight_;
+    kidi::tensor::Tensor tied_;
+};
+
 } // namespace
 
 auto main() -> int {
     using namespace kidi;
     try {
+        const auto default_device = module_device;
+        if (default_device != default_module_device()) return 1;
+        for (const auto& backend : tensor::BackendRegistry::instance().backends())
+            if (backend.device_kind == tensor::DeviceKind::A_GPU && backend.execution_available &&
+                default_device != tensor::Device::apple_gpu())
+                return 1;
+        const ModuleScope cpu_parameters(tensor::Device::cpu());
+        layers::Linear scoped{nullptr};
+        {
+            const ModuleScope outer(tensor::DType::BF16, false, default_device);
+            scoped = layers::Linear(4, 3);
+            if (scoped->device() != default_device || scoped->state_dict().at("weight").defined()) return 1;
+            {
+                const ModuleScope inner(tensor::DType::F32, true, tensor::Device::cpu());
+                layers::FeedForward nested(4, 8);
+                for (const auto& [name, value] : nested->state_dict())
+                    if (!value.defined() || value.dtype() != tensor::DType::F32 ||
+                        value.device() != tensor::Device::cpu())
+                        return 1;
+            }
+            if (module_dtype != tensor::DType::BF16 || allocate_parameters || module_device != default_device) return 1;
+            bool isolated = false;
+            std::thread worker([&] {
+                isolated = module_dtype == tensor::DType::F32 && allocate_parameters && module_device == default_device;
+                const ModuleScope local(tensor::DType::I8, true, tensor::Device::cpu());
+                layers::LinearImpl child(4, 3);
+                const auto state = child.state_dict();
+                isolated = isolated && state.at("weight").dtype() == tensor::DType::I8 && state.at("scale").defined() &&
+                           child.device() == tensor::Device::cpu();
+            });
+            worker.join();
+            if (!isolated || module_dtype != tensor::DType::BF16 || allocate_parameters ||
+                module_device != default_device)
+                return 1;
+            bool rejected = false;
+            try {
+                const ModuleScope failure(tensor::DType::I8, true, tensor::Device::cpu());
+                layers::LinearImpl invalid(4, 3, true);
+            } catch (const ops::Failure&) {
+                rejected = true;
+            }
+            if (!rejected || module_dtype != tensor::DType::BF16 || allocate_parameters ||
+                module_device != default_device)
+                return 1;
+        }
+        if (module_dtype != tensor::DType::F32 || !allocate_parameters || module_device != tensor::Device::cpu())
+            return 1;
+        StateDict scoped_state{{"weight", ops::require(tensor::Tensor::zeros({4, 3}, tensor::DType::BF16))},
+                               {"bias", ops::require(tensor::Tensor::zeros({3}, tensor::DType::F32))}};
+        ops::require(scoped->set_state(scoped_state));
+        if (scoped->state_dict().at("weight").device() != default_device) return 1;
+        ops::require(scoped->load_state_dict(scoped_state));
+        if (scoped->state_dict().at("weight").device() != default_device) return 1;
+        {
+            const ModuleScope selected(default_device);
+            layers::EmbeddingImpl allocated(3, 4, 8);
+            if (allocated.state_dict().at("weight").device() != default_device) return 1;
+        }
+        layers::Linear scratch(4, 3);
+        auto shared = scratch;
+        layers::Linear empty(nullptr);
+        if (!scratch || empty || shared.get() != scratch.get() || &*scratch != scratch.ptr().get()) return 1;
+        auto moved = std::move(shared);
+        if (shared || moved.get() != scratch.get()) return 1;
+        auto scratch_state = scratch->state_dict();
+        auto scratch_values = ops::require(scratch_state.at("weight").data<float>());
+        std::mt19937 generator(7);
+        std::uniform_real_distribution<float> distribution(-0.5F, 0.5F);
+        for (auto& value : scratch_values) value = distribution(generator);
+        ops::Context scratch_context;
+        const std::array scratch_input{1.F, 2.F, 3.F, 4.F};
+        auto scratch_tensor = ops::require(tensor::Tensor::from_host({1, 4}, std::span<const float>(scratch_input)));
+        auto scratch_output = scratch->forward(scratch_context, scratch_tensor);
+        scratch_context.synchronize();
+        const auto scratch_result = ops::require(scratch_output.data<float>());
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            float expected = 0;
+            for (std::size_t input = 0; input < 4; ++input)
+                expected += scratch_input[input] * scratch_values[input * 3 + channel];
+            if (!near(scratch_result[channel], expected)) return 1;
+        }
+        const ModuleScope construction(tensor::DType::F32, false);
+        layers::Linear unbound(4, 3);
+        bool unbound_rejected = false;
+        try {
+            unbound->forward(scratch_context, scratch_tensor);
+        } catch (const ops::Failure&) {
+            unbound_rejected = true;
+        }
+        if (!unbound_rejected) return 1;
         const auto path = std::filesystem::temp_directory_path() / "kidi-transformer-builder-test.safetensors";
         write_weights(path);
         auto weights = ops::require(model::Weights::load(path));
-        layers::LayerNorm norm = std::make_shared<layers::LayerNormImpl>(weights, "norm", 1e-5F);
-        layers::Linear first = std::make_shared<layers::LinearImpl>(weights, "ff.w_1", model::WeightEncoding::F32);
-        layers::Linear second = std::make_shared<layers::LinearImpl>(weights, "ff.w_2", model::WeightEncoding::F32);
-        ModuleList<layers::LinearImpl> projections = std::make_shared<ModuleListImpl<layers::LinearImpl>>();
+        ModuleList<DeferredParameter> deferred;
+        deferred->push_back(ModuleHolder<DeferredParameter>(false));
+        deferred->push_back(ModuleHolder<DeferredParameter>(false));
+        if (deferred->state_dict().at("0.weight").defined()) return 1;
+        const StateDict initial{{"0.weight", ops::require(weights.tensor("ff.w_1.weight"))},
+                                {"1.weight", ops::require(weights.tensor("ff.w_1.weight"))}};
+        auto bad_initial = initial;
+        bad_initial["1.weight"] = ops::require(tensor::Tensor::zeros({1}, tensor::DType::F32));
+        if (deferred->set_state(bad_initial) || deferred->state_dict().at("0.weight").defined()) return 1;
+        ops::require(deferred->set_state(initial));
+        const auto bound = deferred->state_dict();
+        if (ops::require(bound.at("0.weight").host_bytes()).data() !=
+            ops::require(initial.at("0.weight").host_bytes()).data())
+            return 1;
+        ops::require(deferred->load_state_dict(initial));
+        const auto copied = deferred->state_dict();
+        if (ops::require(copied.at("0.weight").host_bytes()).data() !=
+                ops::require(copied.at("0.tied").host_bytes()).data() ||
+            ops::require(copied.at("0.weight").host_bytes()).data() ==
+                ops::require(initial.at("0.weight").host_bytes()).data())
+            return 1;
+        DeferredParameter allocated(true);
+        if (!allocated.state_dict().at("weight").defined()) return 1;
+        layers::LayerNorm norm(4, 1e-5F);
+        layers::Linear first(4, 3);
+        layers::Linear second(3, 4);
+        ModuleList<layers::LinearImpl> projections;
         projections->push_back(first);
         projections->push_back(second);
-        ModuleMap<> modules = std::make_shared<ModuleMapImpl<>>();
+        ModuleMap<> modules;
         modules->insert("projections", projections);
         modules->insert("norm", norm);
+        if (projections->at(0).get() != first.get() || modules->at("norm").get() != norm.get()) return 1;
+        const std::array mappings{model::StateMappingSpec{{R"(ff\.w_1\.(weight|bias))"}, "projections.0.$1"},
+                                  model::StateMappingSpec{{R"(ff\.w_2\.(weight|bias))"}, "projections.1.$1"}};
+        auto mapped = ops::require(model::Weights::load(path, mappings));
+        ops::require(modules->set_state(mapped));
         const auto snapshot = modules->state_dict();
         if (snapshot.size() != 6 || !snapshot.contains("projections.0.weight") || !snapshot.contains("norm.bias"))
             return 1;

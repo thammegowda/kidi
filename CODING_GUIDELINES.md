@@ -34,13 +34,21 @@ to kidi-owned C++ code. Code under `third_party/` follows its upstream project.
   flag value. Do not toggle the flag manually in model code.
 - Neural layers and models derive from `Module`, implement typed `forward(...)`,
   and use `<Name>Impl` for the implementation with `KIDI_MODULE(Name)` declaring
-  the `std::shared_ptr<NameImpl>` alias. Prefer shared ownership at composition
+  the `ModuleHolder<NameImpl>` alias. Construct via `Name(args...)`, not
+  `std::make_shared<NameImpl>(args...)`; use `Name{nullptr}` for an empty holder.
+  Prefer shared ownership at composition
   boundaries; borrow `Impl&`/`const Impl&` or use `->forward` without copying the
-  shared pointer inside hot paths.
+  holder inside hot paths. Use `ptr()` when an explicit shared pointer is needed.
 - Register parameter members and child modules during construction. Use typed
   `ModuleList<Impl>` / `ModuleMap<Impl>` for registered containers. Module objects
   are nonmovable so registered tensor-member addresses remain valid. Use
   `load_state_dict`, not in-place weight mutation, to replace prepared parameters.
+- Constructors take dimensions/structure, not checkpoint objects or name prefixes.
+  Registered module paths define state keys. Use scoped `ModuleScope` for thread-local
+  dtype, allocation and device defaults; do not thread those arguments through every
+  layer or read them during forward execution. `set_state` binds validated checkpoint
+  state after construction; same-device buffers are shared, cross-device buffers are
+  transferred. Respect parameter ties and atomic loading on failure.
 
 ## Naming
 

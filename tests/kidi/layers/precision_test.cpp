@@ -8,7 +8,6 @@
 #include <iostream>
 #include <string>
 
-#include "kidi/model/precision.h"
 #include "kidi/model/weights.h"
 
 namespace {
@@ -46,9 +45,13 @@ auto main() -> int {
         const auto path = std::filesystem::temp_directory_path() / "kidi-bf16-precision-test.safetensors";
         write_bf16_weights(path);
         auto weights = ops::require(model::Weights::load(path));
-        layers::Linear linear = std::make_shared<layers::LinearImpl>(weights, "linear", model::WeightEncoding::BF16);
-        layers::Linear tied = std::make_shared<layers::LinearImpl>(weights, "tgt_embed.0.lut.weight", "linear.bias",
-                                                                   model::WeightEncoding::BF16, true);
+        const ModuleScope construction(tensor::DType::BF16, false);
+        layers::Linear linear(4, 3);
+        ops::require(linear->set_state(StateDict{{"weight", ops::require(weights.tensor("linear.weight"))},
+                                                 {"bias", ops::require(weights.tensor("linear.bias"))}}));
+        layers::Linear tied(4, 3, true);
+        ops::require(tied->set_state(StateDict{{"weight", ops::require(weights.tensor("tgt_embed.0.lut.weight"))},
+                                               {"bias", ops::require(weights.tensor("linear.bias"))}}));
         const std::array inputs{1.F, 2.F, 3.F, 4.F, -1.F, 0.5F, 2.F, -0.5F};
         const std::array expected{3.1F, 3.55F, 3.425F, 1.475F, 1.175F, -1.2F};
         std::vector devices{tensor::Device::cpu()};

@@ -26,3 +26,6 @@
 [submodule "zlib"]
 	path = third_party/zlib
 	url = https://github.com/madler/zlib.git
+[submodule "third_party/spdlog"]
+	path = third_party/spdlog
+	url = https://github.com/gabime/spdlog.git

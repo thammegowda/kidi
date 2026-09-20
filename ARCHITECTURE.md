@@ -26,6 +26,47 @@ RTG is an import/package format, not the owner of general modeling code. Do not
 add independent CPU and GPU model implementations. Backend fusion belongs in
 operators, not duplicated Transformer equations.
 
+## Configuration
+
+Configuration stays in `YAML::Node`; there are no model-specific configuration
+structs or mirrored manifest types. `model::load_config` reads `model.yaml`,
+checks package structure and file paths, and resolves file paths relative to
+the package. `Package::config()` exposes that document.
+
+`config["model"]` is self-contained: `type`, architecture fields,
+and `source_tokens` live together. The package derives source padding and decoder
+token IDs from the tokenizers, adding them to the in-memory `model` and `decode`
+nodes. IDs are not duplicated in the configuration file, and source/target
+tokenizers may assign different IDs. Model construction consumes only this node;
+precision, allocation, and device are scoped construction settings. State is
+assigned separately after registration:
+
+```cpp
+const auto embedding = ops::require(package.weights().tensor("target_embedding.weight"));
+ModuleScope construction(embedding.dtype(), false);
+auto model = ops::require(model::TransformerImpl::create(package.config()["model"]));
+ops::require(model->set_state(package.weights()));
+```
+
+The model validates its own supported architecture and caches runtime dimensions
+during construction. It does not read YAML during token execution. Translation
+resolves defaults and CLI overrides from `config["decode"]`, without configuration
+caps on beam size or extra tokens. It checks positive counts and finite,
+non-negative penalties. Actual positional capacity and allocation failures remain
+runtime constraints. Typed tensors and search requests remain runtime values,
+not config types.
+Safetensors is the checkpoint format. The inference loader derives the construction
+dtype from the checkpoint. Layer constructors declare matching shapes/dtypes and
+required INT8 scale parameters without reading weights. `set_state` validates them
+before assignment. There is no separate encoding enum or YAML precision setting.
+The execution policy follows stored weights; any future compute-precision override
+is a separate runtime option, not a duplicate declaration of checkpoint metadata.
+The old flat manifest layout is not supported or automatically migrated.
+
+CLI diagnostics use spdlog on stderr. Translation results and inspection output
+remain on stdout; machine-readable metric/profile records retain their unadorned
+format on stderr. `SPDLOG_LEVEL` controls the human-readable logger.
+
 ## Eager Contract
 
 `ops::Context` belongs to one device and one caller at a time. Inputs and outputs
@@ -176,46 +217,79 @@ query APIs; the eager cache prepares a separate executable for each signature.
 ## Models and Generation
 
 Neural implementations derive from `Module`, use `<Name>Impl` class names, and
-expose a typed `forward(...)` method. `KIDI_MODULE(Name)` declares the ordinary
-`std::shared_ptr<NameImpl>` alias. The base deliberately does not prescribe one
+expose a typed `forward(...)` method. `KIDI_MODULE(Name)` declares a
+`ModuleHolder<NameImpl>` alias. The holder forwards constructor arguments to
+`std::make_shared<NameImpl>` and owns that shared pointer. The base deliberately does not prescribe one
 virtual forward signature: embeddings, attention, blocks, and models have
 different typed inputs. It is an ownership/registration base, not a type-erased
 execution engine.
 
 ```cpp
-layers::Linear projection = std::make_shared<layers::LinearImpl>(weights, "projection", encoding);
+ModuleScope construction(tensor::DType::BF16, false, tensor::Device::cpu());
+layers::Linear projection(768, 2048);
+ops::require(projection->set_state(weights));
 auto output = projection->forward(context, input);
 const auto& implementation = *projection;
 auto another = implementation.forward(context, input);
 ```
 
-Model/layer composition owns pointers; forward paths dereference or borrow them
-without reference-count increments. `ModuleList<Impl>` and `ModuleMap<Impl>` are
-shared-pointer aliases for their typed container implementations. Omit `Impl`
+Model/layer composition owns holders; `->`, `*`, and `get()` borrow the implementation
+without reference-count increments. `ptr()` exposes the underlying shared pointer
+by const reference for explicit ownership interoperation. Copying a holder shares
+the module; moving transfers ownership. `Name{nullptr}` creates an empty holder,
+testable with `bool`. Default construction invokes the implementation's default
+constructor, so layers requiring dimensions must receive them or explicit `nullptr`.
+`ModuleList<Impl>` and `ModuleMap<Impl>` are holders for their typed container
+implementations and default-construct usable empty containers. Omit `Impl`
 to store heterogeneous `Module` pointers. Lists register numeric child names;
 maps register supplied names. Iteration and `at()` return references rather
 than copying pointers. The Transformer owns typed encoder/decoder module lists.
 
-`register_parameter(name, tensor_member)` and `register_module(name, child)` are
-protected construction helpers. Names must be nonempty, unique, and contain no
+`register_parameter(name, tensor_member, shape, dtype)` and
+`register_module(name, child)` are protected construction helpers. Parameter
+shape/dtype declarations remain available when storage is deferred. Names must be nonempty, unique, and contain no
 dot; null children and cycles are rejected. Module objects cannot be copied or
 moved because parameter registration points to stable tensor members. Copy the
-shared-pointer alias to share a module instead.
+holder to share a module instead. `ModuleScope` saves and restores
+the thread-local `module_dtype`, `allocate_parameters`, and `module_device`, including
+on exception unwinding. Nested modules inherit the policy; new threads do not
+inherit a caller's overrides. Defaults are FP32, allocation enabled, and the first
+available GPU execution backend (Metal, then CUDA), otherwise CPU. Storage-only
+backends do not qualify. Explicit unsupported devices are not silently substituted.
+
+Each module captures its device at construction. The model's context and state
+buffers use that device, independent of later scopes. Parameter allocation honors
+it; with allocation disabled only parameter metadata is created, and derived
+embedding positions are allocated lazily. Low-level tensor/ops APIs still accept
+explicit devices. CLI `--backend auto` follows the GPU-first default; explicit
+`ynnpack` and `mps` override it.
+
+Allocated weights and biases are zeroed, LayerNorm weights and quantization scales
+start at one. Callers can initialize writable floating tensors via `state_dict()`
+before first use, including random initialization without any checkpoint. This
+does not add automatic random initializers or an autograd/training implementation.
 
 `state_dict()` returns an in-memory ordered map of qualified names to tensor
 handles, recursively including registered children. It shares existing tensor
 storage; it is not disk serialization. Derived position tables and generation
 caches are not parameters. State keys follow module registration names, not
-necessarily the original imported RTG checkpoint names.
+necessarily the original imported RTG checkpoint names. `TransformerImpl::state_mapping_specs()`
+adapts RTG names once when loading the package; layer constructors never receive
+checkpoint paths or prefixes.
 
-`load_state_dict(state, strict=true)` returns `Result<void>`. It validates all
+`set_state(weights)` and `set_state(StateDict)` bind tensors after construction.
+On the same device they retain incoming storage, including read-only mapped weights;
+cross-device tensors are transferred to the module's captured device. Caller-retained
+state shares same-device storage, so it must not be mutated during inference.
+`load_state_dict(state, strict=true)` instead copies into fresh storage. Both validate all
 keys, shapes, and dtypes before changes; strict mode requires exact keys, while
 non-strict mode loads matching entries and ignores missing/unexpected ones.
-All matched tensors are copied to fresh storage on the parameter's existing
-device before committing any replacements. This supports read-only mmap weights,
-keeps the supplied state independent of loaded parameters, and changes identities
+All required transfers/copies finish before committing replacements. Copying loads
+keep the supplied state independent of loaded parameters and change identities
 used by prepared-operator caches so later forward calls see the new weights.
-Old prepared entries remain bounded by normal eviction. No autograd, optimizer,
+Registered ties preserve shared target-embedding/output storage in both loading
+modes; conflicting values for tied keys are rejected. A canonical key suffices
+when loading a tie. Old prepared entries remain bounded by normal eviction. No autograd, optimizer,
 or buffer serialization framework is added.
 
 Synchronize before exporting/loading tensors that may have pending device work.
@@ -223,7 +297,8 @@ Do not load state concurrently with forward calls. After changing model weights,
 discard previously computed encoder/decoder caches and start a new generation.
 Sharing a model pointer does not make its execution context thread-safe.
 
-Layers bind weights once during construction. For example, the decoder block
+Layers register their parameters and children during construction, then load state
+separately. For example, the decoder block
 computes self-attention, cross-attention, and feed-forward residuals directly
 using `Linear`, `LayerNorm`, `Attention`, and `FeedForward` objects.
 
@@ -260,7 +335,8 @@ does not silently fall back to CPU.
 
 ## Compatibility and Verification
 
-CLI flags and package formats remain compatible. Legacy machine-readable profile
+CLI flags remain stable. Packages require the nested YAML layout described above;
+there is no flat-config compatibility path. Legacy machine-readable profile
 field `graph_compile_ns` now reports backend operator preparation. The old detailed
 graph counters and `last_hidden_ns` have been removed rather than reporting zeros.
 Consumers should tolerate absent legacy keys. `translate_ns`

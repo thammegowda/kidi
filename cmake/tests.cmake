@@ -10,7 +10,7 @@ add_executable(kidi_argparse_test tests/kidi/cli/argparse_test.cpp)
 target_link_libraries(kidi_argparse_test PRIVATE kidi::argparse)
 add_test(NAME kidi_argparse_test COMMAND kidi_argparse_test)
 
-kidi_add_test(kidi_manifest_test tests/kidi/model/manifest_test.cpp)
+kidi_add_test(kidi_manifest_test tests/kidi/model/config_test.cpp)
 kidi_add_test(kidi_tokenizer_test tests/kidi/text/tokenizer_test.cpp ZLIB::ZLIB)
 kidi_add_test(kidi_rtg_package_test tests/kidi/model/package_test.cpp)
 kidi_add_test(kidi_decoder_test tests/kidi/inference/decoder_test.cpp)

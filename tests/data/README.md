@@ -50,7 +50,13 @@ The golden output was generated on 2026-09-20 using the independently saved
 pre-pruning eager Kidi release binary (SHA-256
 `49fde6606a7da05b37432498d3bb4498877e6236bbab7122fb92bbf0586a1c32`), on Apple M5
 with macOS 26.6.2. It uses the BF16 Hub model at revision
-`e166c18be310898939569a50a23d7de2c9ccf9ed`, also pinned in the regression runner.
+`e166c18be310898939569a50a23d7de2c9ccf9ed`.
+The runner now pins `8581803b79d7ab3f46697140788272e3417bb238`, with deduplicated
+BF16 weights and nested model/decode YAML. Token IDs and weight dtypes come from
+the tokenizer/checkpoint files; decoding settings are defaults, not caps.
+The expected translations are unchanged; both CPU and Metal match
+all 50 sentences. The original PyTorch RTG FP32 implementation also matches
+these expected translations exactly.
 This is a behavior regression test; baseline translation errors are intentionally
 preserved, and a high score does not establish multilingual translation quality.
 

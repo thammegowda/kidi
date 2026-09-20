@@ -73,10 +73,16 @@ auto main() -> int {
     try {
         const auto path = std::filesystem::temp_directory_path() / "kidi-attention-test.safetensors";
         write_weights(path);
-        auto weights = ops::require(model::Weights::load(path));
-        layers::Linear qkv = std::make_shared<layers::LinearImpl>(weights, "attn.qkv", model::WeightEncoding::F32);
-        layers::Attention attention = std::make_shared<layers::AttentionImpl>(
-            weights, "attn", model::WeightEncoding::F32, layers::Shape{4, 8, 2, 1e-5F});
+        const std::array mappings{model::StateMappingSpec{{R"(attn\.qkv\.(weight|bias))"}, "qkv.$1"},
+                                  model::StateMappingSpec{{R"(attn\.out\.(weight|bias))"}, "attention.output.$1"}};
+        auto weights = ops::require(model::Weights::load(path, mappings));
+        const ModuleScope construction(tensor::DType::F32, false);
+        layers::Linear qkv(4, 12);
+        layers::Attention attention(layers::Shape{4, 8, 2, 1e-5F});
+        ModuleMap<> modules;
+        modules->insert("qkv", qkv);
+        modules->insert("attention", attention);
+        ops::require(modules->set_state(weights));
         const std::array input_values{1.F, 2.F, 3.F, 4.F, 0.5F, -1.F, 2.F, -0.5F, 3.F, 0.25F, -2.F, 1.F};
         const std::array mask_values{0.F, -1e9F, -1e9F, 0.F, 0.F, -1e9F, 0.F, 0.F, 0.F};
         const std::array expected{0.514999986F, 0.700000048F,  1.379999995F, 0.089999951F, 0.243209749F, 0.126859829F,
