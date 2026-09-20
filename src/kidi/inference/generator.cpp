@@ -15,7 +15,8 @@ auto elapsed(Clock::time_point start) -> std::uint64_t {
 Generator::Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model,
                      std::array<std::int32_t, 3> special)
     : config_(std::move(config)), tokenizer_(std::move(tokenizer)), model_(std::move(model)), special_(special) {}
-auto Generator::load(const std::filesystem::path& directory, tensor::Device device) -> Result<Generator> {
+auto Generator::load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits,
+                     std::int32_t group_size, bool packed_prefill) -> Result<Generator> {
     try {
         auto config = require(model::load_config(directory / "model.yaml"));
         require(model::Gemma4Impl::validate_config(config["model"]));
@@ -33,10 +34,12 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
         if (!tokenizer.token_id("<bos>") || !tokenizer.token_id("<|turn>"))
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Gemma tokenizer lacks chat delimiters"});
         auto weights = require(model::Weights::load(config["weights_file"].as<std::string>()));
-        const auto embedding = require(weights.tensor("model.language_model.embed_tokens.weight"));
-        const ModuleScope construction(embedding.dtype(), false, device);
+        const auto parameter = require(weights.tensor(config["model"]["quantization_config"]
+                                                          ? "model.language_model.norm.weight"
+                                                          : "model.language_model.embed_tokens.weight"));
+        const ModuleScope construction(parameter.dtype(), false, device);
         auto model = require(model::Gemma4Impl::create(config["model"]));
-        require(model->set_checkpoint(weights));
+        require(model->set_checkpoint(weights, weight_bits, group_size, packed_prefill));
         return Generator(std::move(config), std::move(tokenizer), std::move(model), special);
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
@@ -64,6 +67,7 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
             throw ops::Failure(
                 {ErrorCode::INVALID_ARGUMENT, "prompt and generation must fit the context; counts must be positive"});
         auto state = require(model_->create_state(capacity));
+        state.crop_local_attention = !options.full_attention_cache;
         const std::array extra_stops{special_[1]};
         const SearchOptions search{.vocabulary_size = tokenizer_.vocabulary_size(),
                                    .end_id = special_[0],

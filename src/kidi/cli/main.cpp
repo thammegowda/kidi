@@ -47,7 +47,9 @@ auto inspect(const kidi::cli::Namespace& arguments) -> int {
             spdlog::error("{}", weights.error().message);
             return 1;
         }
-        const auto embedding = weights->tensor("model.language_model.embed_tokens.weight");
+        const bool qat = static_cast<bool>((*document)["model"]["quantization_config"]);
+        const auto embedding = weights->tensor(qat ? "model.language_model.embed_tokens.embedding_quantized"
+                                                   : "model.language_model.embed_tokens.weight");
         if (!embedding) {
             spdlog::error("{}", embedding.error().message);
             return 1;
@@ -57,6 +59,7 @@ auto inspect(const kidi::cli::Namespace& arguments) -> int {
                   << "weights: " << (*document)["weights_file"].as<std::string>() << '\n'
                   << "checkpoint tensors (including unused modalities): " << weights->size() << '\n'
                   << "weight dtype: " << kidi::tensor::to_string(embedding->dtype()) << '\n'
+                  << "native mobile QAT: " << (qat ? "yes" : "no") << '\n'
                   << "text layers: " << (*document)["model"]["num_hidden_layers"].as<int>() << '\n'
                   << "vocabulary: " << (*document)["model"]["vocab_size"].as<int>() << '\n'
                   << "default device: " << kidi::tensor::to_string(kidi::module_device) << '\n';
@@ -105,7 +108,11 @@ auto generate(const kidi::cli::Namespace& arguments) -> int {
     const auto device = backend == kidi::inference::InferenceBackend::MPS ? kidi::tensor::Device::apple_gpu()
                                                                           : kidi::tensor::Device::cpu();
     const auto started = std::chrono::steady_clock::now();
-    auto generator = kidi::inference::Generator::load(arguments.get<std::filesystem::path>("model"), device);
+    const auto weight_bits = arguments.get<std::int32_t>("weight_bits");
+    const auto group_size = arguments.get<std::int32_t>("group_size");
+    const auto packed_prefill = arguments.get<bool>("packed_prefill");
+    auto generator = kidi::inference::Generator::load(arguments.get<std::filesystem::path>("model"), device,
+                                                      weight_bits, group_size, packed_prefill);
     if (!generator) {
         spdlog::error("{}", generator.error().message);
         return 1;
@@ -119,7 +126,8 @@ auto generate(const kidi::cli::Namespace& arguments) -> int {
         .context_size = arguments.get<std::size_t>("context_size"),
         .prefill_chunk_size = arguments.get<std::size_t>("prefill_chunk_size"),
         .raw_prompt = arguments.get<bool>("raw_prompt"),
-        .ignore_eos = arguments.get<bool>("ignore_eos")};
+        .ignore_eos = arguments.get<bool>("ignore_eos"),
+        .full_attention_cache = arguments.get<bool>("full_attention_cache")};
     for (std::int32_t run = -warmups; run < runs; ++run) {
         auto result = generator->generate(prompt, options);
         if (!result) {
@@ -131,6 +139,10 @@ auto generate(const kidi::cli::Namespace& arguments) -> int {
         if (arguments.get<bool>("profile")) {
             const auto& stats = result->stats;
             std::cerr << "kidi_generation|backend=" << kidi::inference::to_string(backend)
+                      << "|native_qat=" << generator->native_qat() << "|weight_bits=" << weight_bits
+                      << "|group_size=" << group_size << "|packed_prefill=" << packed_prefill
+                      << "|crop_local_attention="
+                      << (device == kidi::tensor::Device::cpu() && !options.full_attention_cache)
                       << "|batch_size=1|threads=" << threads << "|run=" << run << "|load_ns=" << load_ns
                       << "|prompt_tokens=" << stats.prompt_tokens
                       << "|generated_tokens=" << result->generation.decoder_steps
@@ -295,7 +307,20 @@ auto main(int argc, char** argv) -> int {
     generate_parser.add_argument("--prefill-chunk-size").dest("prefill_chunk_size").default_value<std::size_t>(128);
     generate_parser.add_argument("--raw-prompt").dest("raw_prompt").action(kidi::cli::Action::STORE_TRUE);
     generate_parser.add_argument("--ignore-eos").dest("ignore_eos").action(kidi::cli::Action::STORE_TRUE);
+    generate_parser.add_argument("--full-attention-cache")
+        .dest("full_attention_cache")
+        .action(kidi::cli::Action::STORE_TRUE)
+        .help("disable CPU local-history cropping for the previous numerical path");
     generate_parser.add_argument("--profile").action(kidi::cli::Action::STORE_TRUE);
+    generate_parser.add_argument("--weight-bits")
+        .dest("weight_bits")
+        .default_value<std::int32_t>(0)
+        .help("0: original weights; 4 or 8: load-time groupwise packing");
+    generate_parser.add_argument("--group-size").dest("group_size").default_value<std::int32_t>(128);
+    generate_parser.add_argument("--packed-prefill")
+        .dest("packed_prefill")
+        .action(kidi::cli::Action::STORE_TRUE)
+        .help("use packed GEMM for prefill too; default uses original floating weights");
     generate_parser.add_argument("--runs").default_value<std::int32_t>(1);
     generate_parser.add_argument("--warmups").default_value<std::int32_t>(0);
 

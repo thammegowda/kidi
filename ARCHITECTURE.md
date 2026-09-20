@@ -349,8 +349,62 @@ copying `GemmaState` aliases mutable history. Start a new state for an independe
 request. The generic decoder accepts additional stop IDs; disabling EOS stopping
 is an explicit benchmark option that retains generated special tokens.
 
+Gemma can prepare Q4/Q8 linear weights in memory through `set_checkpoint` runtime
+options. The registered state still holds original tensors. `ops::Context` owns
+derived packed bytes/scales and retains source handles, preventing address reuse;
+packing is shared across prefill/decode shapes. Q4 mode uses grouped MLP weights
+and per-channel Q8 for other projections. By default only single-row calls use
+packed weights; `packed_prefill` enables packed GEMM for multi-row calls too.
+Reloading a Gemma checkpoint resets its prepared context, so disabling quantization
+cannot reuse stale packed weights. There is no offline checkpoint rewrite.
+
+CPU packed operators use YNNPACK's integer dot path with dynamic INT8 activation
+quantization. Metal GEMV directly reads packed Q4/Q8 and FP32 activations; tiled
+GEMM unpacks into bounded FP16 threadgroup tiles and accumulates in FP32. These
+are different compute policies and do not guarantee identical logits. Supported
+FP32 normalization, rotary, and pointwise operations use small Metal kernels;
+unsupported layouts retain their existing private MPSGraph implementation.
+Gemma attention bounds reads by 128-token active-prefix buckets while retaining
+the explicit full-capacity cache. CPU additionally crops old masked local history
+inside prepared attention operators; global attention keeps the full active prefix.
+The lower bound preserves every token visible to the first query of a prefill
+chunk. GPU keeps its previous range because cropping did not improve measurements.
+`GemmaState::crop_local_attention = false` or CLI `--full-attention-cache` disables
+the CPU crop, which can otherwise change floating-point reduction order and
+quantized outputs. Local circular caches are not implemented.
+
+`ops::Context::rms_norm_residual` computes post-normalization, residual addition,
+and optional scalar output scaling in one operator. All operands are same-device
+FP32 tensors; no input is mutated. Gemma uses it for post-attention, post-MLP, and
+post-per-layer-input residuals. CPU and Metal implement the same equation without
+duplicating model topology or introducing model-level graphs.
+
 CUDA/QNN storage providers remain separate from execution; unsupported execution
 does not silently fall back to CPU.
+
+### Native Gemma Mobile QAT
+
+The original `gemma` quantization policy is retained under `model.quantization_config`.
+Model construction resolves its supported per-module bit widths; registered packed
+projections declare byte shapes, trained weight scales, and activation scales.
+Packed embeddings declare their per-row or per-layer scale geometry. The loader
+converts offset-packed Q2/Q4 bytes to signed packed encoding in memory and validates
+scales before binding state. It does not quantize the trained model again, rewrite
+the checkpoint, or load unused modality encoders. QAT precision overrides are rejected.
+
+Calibrated CPU projections quantize activations directly with the trained scale
+before integer dot products; uncalibrated projections retain dynamic activation
+quantization. Metal calibrates input once into prepared scratch and fuses output
+rounding into the packed projection. Static-range rounding uses ties-to-even,
+INT8 clipping, and zero-scale bypass. K/V cache values are rounded using their
+trained scales, while storage remains FP32.
+
+Default calibrated Metal prefill may cache expanded FP16 matrices for native
+matrix multiplication, sharing them across input shapes. Packed GEMV remains the
+decode path. `Context(device, true)` and CLI `--packed-prefill` request packed
+prefill instead. These derived caches retain owners and are released with the
+context; there is no claim of a fixed-byte memory budget. Native QAT is a separately
+identified checkpoint path, not a silent replacement of BF16 or PTQ behavior.
 
 ## Compatibility and Verification
 

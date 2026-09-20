@@ -1,4 +1,5 @@
 #include "kidi/ops/context.h"
+#include "kidi/ops/quantization.h"
 #include "kidi/tensor/arena.h"
 #include <array>
 #include <cmath>
@@ -44,8 +45,85 @@ auto main() -> int {
             }
             if (ops::require(escaped.data<float>())[0] != 6.F) return 1;
             ops::Context context(device);
+            {
+                for (int bits : {2, 4, 8}) {
+                    const std::array weights{0.F, -7.F, 7.F, 1.F, 0.F, 14.F, -14.F, 2.F,
+                                             0.F, 0.F,  0.F, 0.F, 7.F, -7.F, 1.F,   -1.F};
+                    auto original = ops::require(tensor::Tensor::from_host({2, 8}, std::span<const float>(weights)));
+                    auto packed = ops::require(ops::pack_weight(original, bits, 4));
+                    const std::array activation{0.F, 1.F, 2.F, 3.F, 4.F, 5.F, 6.F, 255.F};
+                    auto operand =
+                        ops::require(tensor::Tensor::from_host({1, 8}, std::span<const float>(activation), device));
+                    auto output = context.packed_linear(operand, packed.values, packed.scales, bits, 4);
+                    context.synchronize();
+                    const auto bytes = ops::require(packed.values.data<std::uint8_t>());
+                    const auto scales = ops::require(packed.scales.data<float>());
+                    const auto values = ops::require(output.data<float>());
+                    for (std::size_t row = 0; row < 2; ++row) {
+                        float expected = 0;
+                        for (std::size_t channel = 0; channel < 8; ++channel) {
+                            const auto offset = row * 8 + channel;
+                            const auto raw =
+                                (bytes[offset / (8 / bits)] >> ((offset % (8 / bits)) * bits)) & ((1 << bits) - 1);
+                            const auto integer = (raw ^ (1 << (bits - 1))) - (1 << (bits - 1));
+                            expected += activation[channel] * integer * scales[row * 2 + channel / 4];
+                        }
+                        if (!std::isfinite(values[row]) || std::abs(values[row] - expected) > 1e-3F) return 1;
+                    }
+                    if (ops::pack_weight(original, bits, 3)) return 1;
+                    context.prepare_linear_weights(original, bits, 4);
+                    auto rebound = context.linear(operand, original, {}, true);
+                    context.synchronize();
+                    const auto rebound_values = ops::require(rebound.data<float>());
+                    for (std::size_t row = 0; row < 2; ++row)
+                        if (std::abs(rebound_values[row] - values[row]) > 1e-3F) return 1;
+                    std::vector<float> many_values(33 * 8);
+                    for (std::size_t row = 0; row < 33; ++row)
+                        std::copy(activation.begin(), activation.end(), many_values.begin() + row * 8);
+                    auto many =
+                        ops::require(tensor::Tensor::from_host({33, 8}, std::span<const float>(many_values), device));
+                    auto tiled = context.linear(many, original, {}, true);
+                    context.synchronize();
+                    const auto tiled_values = ops::require(tiled.data<float>());
+                    for (std::size_t row = 0; row < 33; ++row)
+                        for (std::size_t column = 0; column < 2; ++column)
+                            if (!std::isfinite(tiled_values[row * 2 + column]) ||
+                                std::abs(tiled_values[row * 2 + column] - values[column]) > 0.1F)
+                                return 1;
+                }
+            }
             auto input = ops::require(
                 tensor::Tensor::from_host({1, 4}, std::span<const float>(std::array{1.F, 2.F, 3.F, 4.F}), device));
+            {
+                constexpr std::size_t WIDTH = 256, COLUMNS = 35;
+                std::vector<float> weights(COLUMNS * WIDTH);
+                for (std::size_t column = 0; column < COLUMNS; ++column)
+                    for (std::size_t channel = 0; channel < WIDTH; ++channel)
+                        weights[column * WIDTH + channel] =
+                            (static_cast<int>((column * 7 + channel) % 15) - 7) * (channel < 128 ? 0.125F : 0.25F);
+                auto original =
+                    ops::require(tensor::Tensor::from_host({COLUMNS, WIDTH}, std::span<const float>(weights)));
+                auto packed = ops::require(ops::pack_weight(original));
+                for (std::size_t rows : {1, 3, 33}) {
+                    std::vector<float> activations(rows * WIDTH);
+                    for (std::size_t index = 0; index < activations.size(); ++index)
+                        activations[index] = float(index % 256);
+                    auto operand = ops::require(tensor::Tensor::from_host({static_cast<std::int64_t>(rows), WIDTH},
+                                                                          std::span<const float>(activations), device));
+                    const auto output = context.packed_linear(operand, packed.values, packed.scales, 4, 128);
+                    context.synchronize();
+                    const auto values = ops::require(output.data<float>());
+                    for (std::size_t row = 0; row < rows; ++row)
+                        for (std::size_t column = 0; column < COLUMNS; ++column) {
+                            float expected = 0;
+                            for (std::size_t channel = 0; channel < WIDTH; ++channel)
+                                expected += activations[row * WIDTH + channel] * weights[column * WIDTH + channel];
+                            if (!std::isfinite(values[row * COLUMNS + column]) ||
+                                std::abs(values[row * COLUMNS + column] - expected) > 0.05F)
+                                return 1;
+                        }
+                }
+            }
             auto result = context.add(input, input);
             auto normalized = context.softmax(result);
             context.synchronize();
@@ -65,12 +143,21 @@ auto main() -> int {
             auto other_scale = ops::require(
                 tensor::Tensor::from_host({4}, std::span<const float>(std::array{2.F, -4.F, 1.F, 6.F}), device));
             auto other_rms = context.rms_norm(rms_input, other_scale, 1e-6F);
+            auto rms_residual = context.rms_norm_residual(rms_input, rms_scale, rms_input, 1e-6F);
+            auto output_scale =
+                ops::require(tensor::Tensor::from_host({1}, std::span<const float>(std::array{0.5F}), device));
+            auto rms_scaled = context.rms_norm_residual(rms_input, rms_scale, rms_input, 1e-6F, output_scale);
             context.synchronize();
             const auto rms_values = ops::require(rms_output.data<float>());
             for (std::size_t channel = 0; channel < 4; ++channel) {
                 const auto expected = rms_input_values[channel] * rms_scale_values[channel] / std::sqrt(7.5F + 1e-6F);
                 if (std::abs(rms_values[channel] - expected) > 1e-5F || rms_values[4 + channel] != 0.F) return 1;
                 if (std::abs(ops::require(other_rms.data<float>())[channel] - 2.F * expected) > 1e-5F) return 1;
+                if (std::abs(ops::require(rms_residual.data<float>())[channel] -
+                             (rms_input_values[channel] + expected)) > 1e-5F ||
+                    std::abs(ops::require(rms_scaled.data<float>())[channel] -
+                             0.5F * (rms_input_values[channel] + expected)) > 1e-5F)
+                    return 1;
             }
             bool invalid_rms = false;
             try {
@@ -82,11 +169,25 @@ auto main() -> int {
             auto activation_input = ops::require(
                 tensor::Tensor::from_host({2, 2}, std::span<const float>(std::array{-4.F, -1.F, 0.F, 3.F}), device));
             auto activated = context.gelu(activation_input, true);
+            const auto rounding_input = ops::require(tensor::Tensor::from_host(
+                {8}, std::span<const float>(std::array{-100.F, -1.25F, -0.75F, -0.25F, 0.25F, 0.75F, 1.25F, 100.F}),
+                device));
+            const auto rounded = context.static_round(rounding_input, 0.5F);
+            context.synchronize();
+            const std::array rounding_expected{-64.F, -1.F, -1.F, 0.F, 0.F, 1.F, 1.F, 63.5F};
+            if (!std::ranges::equal(ops::require(rounded.data<float>()), rounding_expected)) return 1;
+            auto large = ops::require(tensor::Tensor::from_host(
+                {4}, std::span<const float>(std::array{-1000.F, -20.F, 20.F, 1000.F}), device));
+            auto large_gelu = context.gelu(large, true);
             auto hyperbolic = context.tanh(activation_input);
             auto projection = context.linear(activation_input, activation_input, {}, true);
             context.synchronize();
             const auto activation_values = ops::require(activation_input.data<float>());
             const auto activated_values = ops::require(activated.data<float>());
+            const auto large_values = ops::require(large_gelu.data<float>());
+            if (large_values[0] != 0.F || large_values[1] != 0.F || large_values[2] != 20.F ||
+                large_values[3] != 1000.F)
+                return 1;
             const auto hyperbolic_values = ops::require(hyperbolic.data<float>());
             for (std::size_t index = 0; index < activation_values.size(); ++index) {
                 const auto value = activation_values[index];
@@ -110,18 +211,75 @@ auto main() -> int {
                 tensor::Tensor::from_host({1, 2, 2}, std::span<const float>(std::array{1.F, 0.F, 0.F, 1.F}), device));
             auto mask = ops::require(tensor::Tensor::zeros({1, 1, 1, 2}, tensor::DType::F32, device));
             auto attended = context.grouped_query_attention(query, memory, memory, 2, 1, mask);
+            auto broadcast_mask = ops::require(tensor::Tensor::zeros({1}, tensor::DType::F32, device));
+            auto broadcast_attended = context.grouped_query_attention(query, memory, memory, 2, 1, broadcast_mask);
             context.synchronize();
             const auto rotated_values = ops::require(rotated.data<float>());
             if (rotated_values[0] != -3.F || rotated_values[1] != 2.F || rotated_values[2] != 1.F ||
                 rotated_values[3] != 4.F)
                 return 1;
             const auto attention_values = ops::require(attended.data<float>());
+            const auto broadcast_values = ops::require(broadcast_attended.data<float>());
+            for (std::size_t index = 0; index < attention_values.size(); ++index)
+                if (std::abs(attention_values[index] - broadcast_values[index]) > 1e-5F) return 1;
             const auto probability = 1.F / (1.F + std::exp(1.F));
             for (std::size_t head = 0; head < 2; ++head)
                 if (std::abs(attention_values[head * 2] - probability) > 1e-5F ||
                     std::abs(attention_values[head * 2 + 1] - (1.F - probability)) > 1e-5F)
                     return 1;
             auto saved = result;
+            {
+                constexpr std::int64_t HEADS = 4, KEY_HEADS = 2, WIDTH = 40, LENGTH = 259;
+                std::vector<float> queries(HEADS * WIDTH), keys(LENGTH * KEY_HEADS * WIDTH), values(keys.size());
+                std::vector<float> mask_values(LENGTH, -1e9F);
+                for (std::size_t index = 0; index < queries.size(); ++index)
+                    queries[index] = std::sin(float(index)) * 0.2F;
+                for (std::size_t index = 0; index < keys.size(); ++index) {
+                    keys[index] = std::cos(float(index) * 0.13F);
+                    values[index] = std::sin(float(index) * 0.17F);
+                }
+                for (std::size_t position = 131; position < LENGTH; ++position) mask_values[position] = 0.F;
+                const auto tensor_query = ops::require(
+                    tensor::Tensor::from_host({1, 1, HEADS * WIDTH}, std::span<const float>(queries), device));
+                const auto tensor_key = ops::require(
+                    tensor::Tensor::from_host({1, LENGTH, KEY_HEADS * WIDTH}, std::span<const float>(keys), device));
+                const auto tensor_value = ops::require(
+                    tensor::Tensor::from_host({1, LENGTH, KEY_HEADS * WIDTH}, std::span<const float>(values), device));
+                auto tensor_mask = ops::require(
+                    tensor::Tensor::from_host({1, 1, 1, LENGTH}, std::span<const float>(mask_values), device));
+                const auto first = context.grouped_query_attention(tensor_query, tensor_key, tensor_value, HEADS,
+                                                                   KEY_HEADS, tensor_mask, 0.5F);
+                const auto second = context.grouped_query_attention(tensor_query, tensor_key, tensor_value, HEADS,
+                                                                    KEY_HEADS, tensor_mask, 0.5F);
+                context.synchronize();
+                const auto actual = ops::require(first.data<float>()), repeated = ops::require(second.data<float>());
+                for (std::size_t head = 0; head < HEADS; ++head) {
+                    std::vector<float> scores(LENGTH);
+                    for (std::size_t position = 0; position < LENGTH; ++position) {
+                        float dot = 0;
+                        for (std::size_t channel = 0; channel < WIDTH; ++channel)
+                            dot += queries[head * WIDTH + channel] *
+                                   keys[(position * KEY_HEADS + head / 2) * WIDTH + channel];
+                        scores[position] = dot * 0.5F + mask_values[position];
+                    }
+                    const auto maximum = *std::ranges::max_element(scores);
+                    float denominator = 0;
+                    for (auto& score : scores) {
+                        score = std::exp(score - maximum);
+                        denominator += score;
+                    }
+                    for (std::size_t channel = 0; channel < WIDTH; ++channel) {
+                        float expected_value = 0;
+                        for (std::size_t position = 0; position < LENGTH; ++position)
+                            expected_value += scores[position] *
+                                              values[(position * KEY_HEADS + head / 2) * WIDTH + channel] / denominator;
+                        const auto offset = head * WIDTH + channel;
+                        if (!std::isfinite(actual[offset]) || std::abs(actual[offset] - expected_value) > 2e-5F ||
+                            std::abs(repeated[offset] - expected_value) > 2e-5F)
+                            return 1;
+                    }
+                }
+            }
             for (int iteration = 0; iteration < 12; ++iteration) {
                 auto temporary = context.multiply(result, result);
                 context.synchronize();

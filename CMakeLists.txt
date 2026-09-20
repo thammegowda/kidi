@@ -33,6 +33,7 @@ add_library(kidi
     src/kidi/model/transformer.cpp
     src/kidi/model/weights.cpp
     src/kidi/ops/context.cpp
+    src/kidi/ops/quantization.cpp
     src/kidi/runtime/operator.cpp
     src/kidi/runtime/ynn/operators.cpp
     src/kidi/runtime/ynn/graph.cpp
@@ -43,6 +44,11 @@ add_library(kidi
     src/kidi/text/tokenizer.cpp
 )
 add_library(kidi::kidi ALIAS kidi)
+
+if(KIDI_BUILD_BENCHMARKS)
+    add_executable(kidi_gemma_quality benchmarks/gemma/quality.cpp)
+    target_link_libraries(kidi_gemma_quality PRIVATE kidi::kidi)
+endif()
 
 target_include_directories(kidi
     PUBLIC
@@ -75,12 +81,14 @@ if(APPLE)
             src/kidi/runtime/mps/graph.mm
             src/kidi/runtime/mps/operators.cpp
             src/kidi/runtime/mps/quantized_linear.mm
+            src/kidi/runtime/mps/eager_kernels.mm
             src/kidi/tensor/metal_backend.mm
     )
     set_source_files_properties(
         src/kidi/runtime/mps/graph.mm
         src/kidi/runtime/mps/command_batch.mm
         src/kidi/runtime/mps/quantized_linear.mm
+        src/kidi/runtime/mps/eager_kernels.mm
         src/kidi/tensor/metal_backend.mm
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
     )
@@ -94,6 +102,9 @@ if(APPLE)
     )
 
     if(KIDI_BUILD_BENCHMARKS)
+        add_executable(kidi_metal_packed_bench benchmarks/metal/packed_linear_bench.mm)
+        set_source_files_properties(benchmarks/metal/packed_linear_bench.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_link_libraries(kidi_metal_packed_bench PRIVATE kidi::kidi ${KIDI_METAL_FRAMEWORK} ${KIDI_MPS_FRAMEWORK})
         add_executable(kidi_metal_int8_bench benchmarks/metal/int8_linear_bench.cpp)
         target_link_libraries(kidi_metal_int8_bench PRIVATE kidi::kidi)
         add_executable(kidi_metal_lowering_bench benchmarks/metal/lowering_bench.mm)

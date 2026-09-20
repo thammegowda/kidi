@@ -17,6 +17,10 @@ def configure(directory: Path) -> Path:
         if not (directory / filename).is_file():
             raise ValueError(f"Missing {filename}")
     model["type"] = "gemma4_text"
+    if "quantization_config" in original:
+        if original["quantization_config"].get("quant_method") != "gemma":
+            raise ValueError("Only the native Gemma QAT Safetensors format is supported")
+        model["quantization_config"] = original["quantization_config"]
     document = {
         "format_version": 1,
         "weights_file": "model.safetensors",

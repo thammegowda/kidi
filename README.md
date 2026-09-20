@@ -185,6 +185,28 @@ generation must fit the context. `--runs`, `--warmups`, `--ignore-eos`, and
 prefill, recurrent decoding, and operator preparation; cold and warm numbers
 should not be mixed.
 
+Low-bit execution is opt-in: `--weight-bits 8` uses per-channel Q8 projections;
+`--weight-bits 4 --group-size 32` uses grouped Q4 MLPs and per-channel Q8 for
+other projections. Packing occurs in memory at load time; the checkpoint is
+never rewritten. Embeddings stay at original precision. Multi-row prefill uses
+original floating weights by default, with `--packed-prefill` available for
+packed GEMM. Retaining original weights means this is not a low-bit-only memory
+footprint. Q4 changes predictions; BF16 remains the default, and Q8 is the more
+conservative tested low-bit option. See [the packed execution study](benchmarks/gemma/LOW_BIT.md)
+for measured speed, memory, loading cost, and quality differences.
+
+CPU local attention skips old masked history in stable buckets. This improves
+long-context speed but may change floating-point reductions and generated tokens.
+Use `--full-attention-cache` to retain the previous full-history numerical path.
+
+For faster execution, the native `google/gemma-4-E2B-it-qat-mobile-transformers`
+checkpoint is supported directly. Run the same config-only setup helper in its
+model directory, then use `kidi generate` without `--weight-bits`: trained mixed
+Q2/Q4/Q8 weights and activation/cache scales come from the checkpoint. The loader
+rejects PTQ precision overrides. Default GPU prefill caches expanded FP16 matrices;
+`--packed-prefill` avoids that cache but is slower. See [the native QAT report](benchmarks/gemma/QAT.md)
+for downloads, correctness checks, memory costs, and the remaining LiteRT-LM gap.
+
 See [the Gemma benchmark report](benchmarks/gemma/README.md) for measured CPU/GPU
 comparisons with LiteRT-LM, including MTP, precision differences, and the applied
 executable-reuse optimization. LiteRT-LM remains faster in the measured cases.

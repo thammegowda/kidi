@@ -55,7 +55,10 @@ enum class Operation {
     RESIDUAL_NORM,
     RMS_NORM,
     TANH,
-    ROTARY
+    ROTARY,
+    PACKED_LINEAR,
+    RMS_NORM_RESIDUAL,
+    STATIC_ROUND
 };
 struct OperatorSpec {
     Operation operation;
@@ -63,6 +66,7 @@ struct OperatorSpec {
     tensor::DType dtype = tensor::DType::F32;
     float epsilon = 0;
     bool dynamic_parameters = false;
+    bool packed_prefill = false;
 };
 
 struct AllocationStats {

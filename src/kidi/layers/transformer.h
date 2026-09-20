@@ -26,11 +26,14 @@ KIDI_MODULE(Linear);
 /// Supports FP32, BF16, and per-channel INT8 weight encodings.
 class LinearImpl : public Module {
 public:
-    LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose = false, bool bias = true);
+    LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose = false, bool bias = true,
+               std::int32_t packed_bits = 0);
     auto forward(ops::Context&, const Tensor&) const -> Tensor;
 
 private:
     Tensor weight_, bias_, scale_;
+    Tensor input_scale_, output_scale_;
+    std::int32_t packed_bits_ = 0, input_size_ = 0;
     bool transpose_, has_bias_;
 };
 

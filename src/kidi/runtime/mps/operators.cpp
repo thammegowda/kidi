@@ -1,9 +1,13 @@
 #include "kidi/runtime/operator.h"
 #include "kidi/runtime/mps/graph.h"
 #include "kidi/runtime/mps/quantized_linear.h"
+#include "kidi/runtime/mps/eager_kernels.h"
 #include "kidi/ops/context.h"
 #include "kidi/tensor/metal.h"
 #include <array>
+#include <bit>
+#include <map>
+#include <tuple>
 #include <cmath>
 #include <optional>
 #include <algorithm>
@@ -45,17 +49,43 @@ public:
     Stream& stream;
     std::optional<mps::Executable> executable;
     std::optional<mps::QuantizedLinear> quantized;
+    Tensor packed_weight, packed_scales, packed_input;
+    Tensor prefill_weight, prefill_output;
+    std::optional<mps::Executable> prefill_executable;
+    std::int32_t packed_bits = 0, packed_group = 0;
+    float packed_input_scale = 0, packed_output_scale = 0;
     std::vector<std::int64_t> shape;
     DType dtype;
     std::size_t dynamic_count;
     bool scatter = false;
+    bool eager = false;
+    Operation operation;
+    float epsilon = 0;
     OutputPool pool;
     explicit MetalOperator(Stream& owner) : stream(owner) {}
     auto run(TensorInputs inputs) -> Tensor override {
         auto output = pool.acquire(shape, dtype, tensor::Device::apple_gpu());
-        if (quantized)
+        if (eager)
+            require(mps::encode_eager(stream.commands(), operation, epsilon, inputs, output));
+        else if (quantized)
             require(quantized->encode(stream.commands(), inputs[0], output));
-        else {
+        else if (packed_bits) {
+            if (packed_input.defined())
+                require(mps::encode_eager(stream.commands(), Operation::STATIC_ROUND, packed_input_scale,
+                                          inputs.first(1), packed_input));
+            if (prefill_executable) {
+                const std::array feeds{packed_input.defined() ? packed_input : inputs[0], prefill_weight};
+                std::array outputs{prefill_output.defined() ? prefill_output : output};
+                require(prefill_executable->encode(stream.commands(), feeds, outputs));
+                if (prefill_output.defined())
+                    require(mps::encode_eager(stream.commands(), Operation::STATIC_ROUND, packed_output_scale,
+                                              {&prefill_output}, output));
+            } else {
+                require(mps::encode_packed_linear(stream.commands(), packed_input.defined() ? packed_input : inputs[0],
+                                                  packed_weight, packed_scales, output, packed_bits, packed_group, 0.F,
+                                                  packed_output_scale));
+            }
+        } else {
             std::array outputs{output};
             require(executable->encode(stream.commands(), inputs.first(dynamic_count), outputs));
         }
@@ -93,6 +123,24 @@ public:
         auto result = std::make_unique<MetalOperator>(stream_);
         result->scatter = spec.operation == Operation::SCATTER;
         result->dtype = spec.dtype;
+        bool device_fp32 = true;
+        for (std::size_t index = 0; index < inputs.size(); ++index)
+            device_fp32 &= inputs[index].dtype() == DType::F32 && inputs[index].device() == tensor::Device::apple_gpu();
+        const bool simple_binary =
+            (spec.operation == Operation::ADD || spec.operation == Operation::MULTIPLY) &&
+            (std::ranges::equal(inputs[0].shape(), inputs[1].shape()) || inputs[1].numel() == 1 ||
+             (inputs[0].dimensions() > 0 && inputs[1].dimensions() == 1 && inputs[1].size(0) == inputs[0].size(-1)));
+        if (device_fp32 && (spec.operation == Operation::RMS_NORM || spec.operation == Operation::RMS_NORM_RESIDUAL ||
+                            spec.operation == Operation::ROTARY || spec.operation == Operation::TANH ||
+                            spec.operation == Operation::STATIC_ROUND ||
+                            (spec.operation == Operation::GELU && spec.attributes[0]) || simple_binary)) {
+            result->eager = true;
+            result->operation = spec.operation;
+            result->epsilon = spec.epsilon;
+            result->dynamic_count = inputs.size();
+            result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            return result;
+        }
         if (result->scatter && ops::is_inplace) {
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
             return result;
@@ -103,6 +151,60 @@ public:
             require(result->quantized->prepare(inputs[0]));
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
             result->shape.back() = inputs[1].size(1);
+            return result;
+        }
+        if (spec.operation == Operation::PACKED_LINEAR) {
+            result->dynamic_count = 1;
+            result->packed_bits = spec.attributes[0];
+            result->packed_group = spec.attributes[1];
+            result->packed_input_scale = spec.epsilon;
+            result->packed_output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]));
+            if (spec.epsilon > 0)
+                result->packed_input = require(Tensor::empty({inputs[0].shape().begin(), inputs[0].shape().end()},
+                                                             DType::F32, tensor::Device::apple_gpu()));
+            result->packed_weight = require(inputs[1].to(tensor::Device::apple_gpu()));
+            result->packed_scales = require(inputs[2].to(tensor::Device::apple_gpu()));
+            result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            result->shape.back() = inputs[1].size(0);
+            if (!spec.packed_prefill && inputs[0].numel() / inputs[0].size(-1) >= 4 &&
+                (result->packed_input_scale > 0 || result->packed_output_scale > 0)) {
+                const auto key =
+                    std::tuple{require(inputs[1].host_bytes()).data(), require(inputs[2].host_bytes()).data(),
+                               result->packed_bits, result->packed_group};
+                auto found = prefill_weights_.find(key);
+                if (found == prefill_weights_.end()) {
+                    const auto columns = inputs[1].size(0), width = inputs[0].size(-1);
+                    auto expanded =
+                        require(Tensor::empty({static_cast<std::int64_t>(columns), static_cast<std::int64_t>(width)},
+                                              DType::F16, tensor::Device::apple_gpu()));
+                    auto destination = reinterpret_cast<_Float16*>(require(expanded.host_bytes()).data());
+                    const auto source = require(inputs[1].data<std::uint8_t>());
+                    const auto scales = require(inputs[2].data<float>());
+                    const auto bits = result->packed_bits, per_byte = 8 / bits;
+                    const auto groups = width / result->packed_group;
+                    for (std::size_t column = 0; column < columns; ++column)
+                        for (std::size_t channel = 0; channel < width; ++channel) {
+                            const auto offset = column * width + channel;
+                            const auto raw =
+                                (source[offset / per_byte] >> ((offset % per_byte) * bits)) & ((1 << bits) - 1);
+                            const auto integer = (raw ^ (1 << (bits - 1))) - (1 << (bits - 1));
+                            destination[offset] = static_cast<_Float16>(
+                                integer * scales[column * groups + channel / result->packed_group]);
+                        }
+                    found =
+                        prefill_weights_.emplace(key, PrefillWeight{inputs[1], inputs[2], std::move(expanded)}).first;
+                }
+                result->prefill_weight = found->second.value;
+                auto graph = require(mps::Graph::create());
+                const std::array feeds{graph.placeholder(inputs[0].shape(), DType::F32),
+                                       graph.placeholder(result->prefill_weight.shape(), DType::F16)};
+                const auto hidden = graph.matmul(graph.cast(feeds[0], DType::F16), feeds[1], false, true);
+                const std::array outputs{graph.cast(hidden, DType::F32)};
+                result->prefill_executable = require(graph.compile(feeds, outputs));
+                if (result->packed_output_scale > 0)
+                    result->prefill_output =
+                        require(Tensor::empty(result->shape, DType::F32, tensor::Device::apple_gpu()));
+            }
             return result;
         }
         auto graph = require(mps::Graph::create());
@@ -135,14 +237,20 @@ public:
             case Operation::ATTENTION: {
                 const auto heads = spec.attributes[0];
                 const auto head_width = static_cast<std::int64_t>(inputs[0].size(2)) / heads;
-                if (spec.attributes.size() == 2) {
+                if (spec.attributes.size() >= 2) {
                     const auto key_heads = spec.attributes[1];
                     const std::array<std::int64_t, 5> axes{0, 2, 3, 1, 4};
                     const auto split = [&](std::size_t index) {
+                        auto operand = operands[index];
+                        auto length = static_cast<std::int64_t>(inputs[index].size(1));
+                        if (index != 0 && spec.attributes.size() == 4) {
+                            length = spec.attributes[3];
+                            if (spec.attributes[2] || length != static_cast<std::int64_t>(inputs[index].size(1)))
+                                operand = graph.slice(operand, 1, spec.attributes[2], length);
+                        }
                         return graph.transpose(
-                            graph.reshape(operands[index], {static_cast<std::int64_t>(inputs[index].size(0)),
-                                                            static_cast<std::int64_t>(inputs[index].size(1)), key_heads,
-                                                            index == 0 ? heads / key_heads : 1, head_width}),
+                            graph.reshape(operand, {static_cast<std::int64_t>(inputs[index].size(0)), length, key_heads,
+                                                    index == 0 ? heads / key_heads : 1, head_width}),
                             axes);
                     };
                     auto scores = graph.matmul(split(0), split(1), false, true);
@@ -268,6 +376,11 @@ public:
     }
 
 private:
+    struct PrefillWeight {
+        Tensor source, scale, value;
+    };
+    std::map<std::tuple<const std::byte*, const std::byte*, std::int32_t, std::int32_t>, PrefillWeight>
+        prefill_weights_;
     Stream stream_;
 };
 } // namespace
