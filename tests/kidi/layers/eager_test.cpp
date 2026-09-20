@@ -55,6 +55,72 @@ auto main() -> int {
             float total = 0;
             for (auto value : probabilities) total += value;
             if (std::abs(total - 1) > 1e-5F) return 1;
+            const std::array rms_input_values{1.F, 2.F, 3.F, 4.F, 0.F, 0.F, 0.F, 0.F};
+            const std::array rms_scale_values{1.F, -2.F, 0.5F, 3.F};
+            auto rms_input =
+                ops::require(tensor::Tensor::from_host({2, 4}, std::span<const float>(rms_input_values), device));
+            auto rms_scale =
+                ops::require(tensor::Tensor::from_host({4}, std::span<const float>(rms_scale_values), device));
+            auto rms_output = context.rms_norm(rms_input, rms_scale, 1e-6F);
+            auto other_scale = ops::require(
+                tensor::Tensor::from_host({4}, std::span<const float>(std::array{2.F, -4.F, 1.F, 6.F}), device));
+            auto other_rms = context.rms_norm(rms_input, other_scale, 1e-6F);
+            context.synchronize();
+            const auto rms_values = ops::require(rms_output.data<float>());
+            for (std::size_t channel = 0; channel < 4; ++channel) {
+                const auto expected = rms_input_values[channel] * rms_scale_values[channel] / std::sqrt(7.5F + 1e-6F);
+                if (std::abs(rms_values[channel] - expected) > 1e-5F || rms_values[4 + channel] != 0.F) return 1;
+                if (std::abs(ops::require(other_rms.data<float>())[channel] - 2.F * expected) > 1e-5F) return 1;
+            }
+            bool invalid_rms = false;
+            try {
+                context.rms_norm(rms_input, rms_scale, 0.F);
+            } catch (const ops::Failure& error) {
+                invalid_rms = error.error().code == ErrorCode::INVALID_ARGUMENT;
+            }
+            if (!invalid_rms) return 1;
+            auto activation_input = ops::require(
+                tensor::Tensor::from_host({2, 2}, std::span<const float>(std::array{-4.F, -1.F, 0.F, 3.F}), device));
+            auto activated = context.gelu(activation_input, true);
+            auto hyperbolic = context.tanh(activation_input);
+            auto projection = context.linear(activation_input, activation_input, {}, true);
+            context.synchronize();
+            const auto activation_values = ops::require(activation_input.data<float>());
+            const auto activated_values = ops::require(activated.data<float>());
+            const auto hyperbolic_values = ops::require(hyperbolic.data<float>());
+            for (std::size_t index = 0; index < activation_values.size(); ++index) {
+                const auto value = activation_values[index];
+                const auto expected = 0.5F * value *
+                                      (1.F + std::tanh(std::sqrt(2.F / 3.14159265358979323846F) *
+                                                       (value + 0.044715F * value * value * value)));
+                if (std::abs(activated_values[index] - expected) > 1e-5F ||
+                    std::abs(hyperbolic_values[index] - std::tanh(value)) > 1e-5F)
+                    return 1;
+            }
+            const auto projection_values = ops::require(projection.data<float>());
+            if (projection_values[0] != 17.F || projection_values[1] != -3.F || projection_values[3] != 9.F) return 1;
+            auto rope_input = context.reshape(input, {1, 1, 1, 4});
+            auto cosine = ops::require(
+                tensor::Tensor::from_host({1, 1, 1, 2}, std::span<const float>(std::array{0.F, 1.F}), device));
+            auto sine = ops::require(
+                tensor::Tensor::from_host({1, 1, 1, 2}, std::span<const float>(std::array{1.F, 0.F}), device));
+            auto rotated = context.rotary(rope_input, cosine, sine);
+            auto query = context.reshape(input, {1, 1, 4});
+            auto memory = ops::require(
+                tensor::Tensor::from_host({1, 2, 2}, std::span<const float>(std::array{1.F, 0.F, 0.F, 1.F}), device));
+            auto mask = ops::require(tensor::Tensor::zeros({1, 1, 1, 2}, tensor::DType::F32, device));
+            auto attended = context.grouped_query_attention(query, memory, memory, 2, 1, mask);
+            context.synchronize();
+            const auto rotated_values = ops::require(rotated.data<float>());
+            if (rotated_values[0] != -3.F || rotated_values[1] != 2.F || rotated_values[2] != 1.F ||
+                rotated_values[3] != 4.F)
+                return 1;
+            const auto attention_values = ops::require(attended.data<float>());
+            const auto probability = 1.F / (1.F + std::exp(1.F));
+            for (std::size_t head = 0; head < 2; ++head)
+                if (std::abs(attention_values[head * 2] - probability) > 1e-5F ||
+                    std::abs(attention_values[head * 2 + 1] - (1.F - probability)) > 1e-5F)
+                    return 1;
             auto saved = result;
             for (int iteration = 0; iteration < 12; ++iteration) {
                 auto temporary = context.multiply(result, result);

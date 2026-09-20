@@ -35,6 +35,8 @@ struct SearchOptions {
     float length_penalty = 0.0F;
     bool compute_score = true;
     std::optional<std::size_t> unfinished_score_length;
+    std::span<const std::int32_t> stop_ids;
+    bool stop_on_eos = true;
 };
 
 struct Generation {

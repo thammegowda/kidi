@@ -230,6 +230,7 @@ auto Graph::scalar(double value, tensor::DType dtype) -> Value {
 KIDI_MPS_UNARY(exp, exponentWithTensor, "create MPSGraph exponent")
 KIDI_MPS_UNARY(log, logarithmWithTensor, "create MPSGraph logarithm")
 KIDI_MPS_UNARY(erf, erfWithTensor, "create MPSGraph erf")
+KIDI_MPS_UNARY(tanh, tanhWithTensor, "create MPSGraph tanh")
 
 #undef KIDI_MPS_UNARY
 

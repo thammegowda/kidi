@@ -5,7 +5,7 @@ tensors. There is no Kidi model graph, symbolic value type, generic compiler,
 lowerer, graph partitioner, or recorded control flow.
 
 ```text
-inference::Decoder -> model::Transformer -> layers -> ops::Context -> backend
+inference::Decoder -> model::{Transformer, Gemma4} -> layers -> ops::Context -> backend
 ```
 
 ## Ownership
@@ -132,8 +132,12 @@ Decoder K/V updates now use `scatter_`. A copied `DecoderState` shares the mutab
 caches; create an independent state for another generation or branch. In-place
 operations affect activations and caches, not registered inference parameters.
 
-Linear and normalization parameters are fixed inference weights. Prepared
-operators key parameter identity as well as dtype and shapes and retain owners.
+Linear and normalization parameters are fixed inference weights. Constant-weight
+prepared operators key parameter identity as well as dtype and shapes and retain
+owners. Same-device RMSNorm parameters and Metal linear parameters instead use
+dynamic bindings, allowing one shape-specialized executable to serve many layers
+without recompiling their weights. Queued bindings retain their tensor owners;
+host-constant fallback and CPU packed projections still use identity-keyed entries.
 Do not mutate their storage after first use; replace registered parameters with
 `load_state_dict`, or create a new context/model. Activations, masks, and token indices are dynamic bindings and
 may change between completed calls without recompilation. This is an inference
@@ -328,8 +332,23 @@ the prompt, EOS, and PAD; limits count generated tokens. Optional unfinished-sco
 length preserves historical RTG truncation normalization. Translation preserves
 bounded length-sorted batching and restores original input order.
 
-The shipped package loader remains RTG encoder-decoder-specific. Generic search
-supports decoder-only callbacks, but no decoder-only model loader is implied.
+`model::Gemma4` implements dense Gemma 4 text decoding using RMSNorm, gated
+tanh-GELU MLPs, grouped-query attention, local/global masks, proportional RoPE,
+shared K/V, per-layer embeddings, and logit softcapping. `inference::Generator`
+loads the original Hugging Face checkpoint and single tokenizer through the
+Gemma configuration path. `Package` remains the RTG two-tokenizer package API.
+Gemma key mapping and small BF16-to-FP32 normalization conversions happen at
+load time; there is no offline checkpoint conversion. Embeddings and the tied
+output projection retain CPU-mapped weights, with looked-up rows allocated on
+the execution device. Other projections execute on the selected backend.
+
+Gemma generation currently supports greedy, batch-one, text-only requests.
+Prefill is chunked and skips unused output projections between chunks. Its
+explicit fixed-capacity caches are shared by the configured later layers;
+copying `GemmaState` aliases mutable history. Start a new state for an independent
+request. The generic decoder accepts additional stop IDs; disabling EOS stopping
+is an explicit benchmark option that retains generated special tokens.
+
 CUDA/QNN storage providers remain separate from execution; unsupported execution
 does not silently fall back to CPU.
 

@@ -80,6 +80,7 @@ public:
     auto exp(Value value, std::string_view name = {}) -> Value;
     auto log(Value value, std::string_view name = {}) -> Value;
     auto erf(Value value, std::string_view name = {}) -> Value;
+    auto tanh(Value value, std::string_view name = {}) -> Value;
 
     auto matmul(Value left, Value right, bool transpose_left = false, bool transpose_right = false,
                 std::string_view name = {}) -> Value;

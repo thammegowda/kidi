@@ -9,6 +9,10 @@
 namespace kidi::inference {
 namespace {
 using Clock = std::chrono::steady_clock;
+auto is_end(std::int32_t token, const SearchOptions& options) -> bool {
+    return options.stop_on_eos &&
+           (token == options.end_id || std::ranges::find(options.stop_ids, token) != options.stop_ids.end());
+}
 auto elapsed(Clock::time_point start) -> std::uint64_t {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
 }
@@ -50,7 +54,8 @@ auto Decoder::generate(std::span<const std::int32_t> prompt, const SearchOptions
     if (prompt.empty() || !score || options.vocabulary_size == 0 || options.vocabulary_size > INT32_MAX ||
         options.beam_size == 0 || options.beam_size > options.vocabulary_size || options.maximum_steps == 0 ||
         !valid_token(options.end_id) || !valid_token(options.pad_id) || !std::ranges::all_of(prompt, valid_token) ||
-        !std::isfinite(options.length_penalty) || options.length_penalty < 0)
+        !std::ranges::all_of(options.stop_ids, valid_token) || !std::isfinite(options.length_penalty) ||
+        options.length_penalty < 0)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid generation request"});
 
     std::vector<Beam> beams(options.beam_size, Beam{{prompt.begin(), prompt.end()},
@@ -95,7 +100,7 @@ auto Decoder::generate(std::span<const std::int32_t> prompt, const SearchOptions
                     beams.front().score += *best;
             }
             beams.front().tokens.push_back(token);
-            beams.front().active = token != options.end_id;
+            beams.front().active = !is_end(token, options);
             if (!beams.front().active) beams.front().length = step;
             if (stats) stats->host_search_ns += elapsed(started);
             if (!beams.front().active) break;
@@ -149,7 +154,7 @@ auto Decoder::generate(std::span<const std::int32_t> prompt, const SearchOptions
             const auto& previous = beams[candidate.beam];
             auto tokens = previous.tokens;
             tokens.push_back(candidate.token);
-            const bool ended = previous.active && candidate.token == options.end_id;
+            const bool ended = previous.active && is_end(candidate.token, options);
             const bool is_active = previous.active && !ended;
             next.push_back({std::move(tokens), candidate.score, ended ? step : previous.length, is_active});
             any_active |= is_active;
@@ -163,8 +168,10 @@ auto Decoder::generate(std::span<const std::int32_t> prompt, const SearchOptions
                normalized_score(right.score, right.length, options.length_penalty);
     });
     std::vector<std::int32_t> result(best->tokens.begin() + prompt.size(), best->tokens.end());
-    if (auto end = std::ranges::find(result, options.end_id); end != result.end()) result.erase(end, result.end());
-    std::erase(result, options.pad_id);
+    if (auto end = std::ranges::find_if(result, [&](auto token) { return is_end(token, options); });
+        end != result.end())
+        result.erase(end, result.end());
+    if (options.stop_on_eos) std::erase(result, options.pad_id);
     return Generation{std::move(result), normalized_score(best->score, best->length, options.length_penalty), steps};
 }
 } // namespace kidi::inference
@@ -183,7 +190,10 @@ auto Decoder::generate_batch(std::span<const std::int32_t> initial_tokens, std::
             static_cast<std::size_t>(initial_tokens[row]) >= vocabulary || settings.end_id < 0 ||
             static_cast<std::size_t>(settings.end_id) >= vocabulary || settings.pad_id < 0 ||
             static_cast<std::size_t>(settings.pad_id) >= vocabulary || !std::isfinite(settings.length_penalty) ||
-            settings.length_penalty < 0)
+            settings.length_penalty < 0 ||
+            std::ranges::any_of(
+                settings.stop_ids,
+                [&](auto token) { return token < 0 || static_cast<std::size_t>(token) >= vocabulary; }))
             return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid batch generation settings"});
     }
     std::vector<Generation> results(options.size());
@@ -224,12 +234,13 @@ auto Decoder::generate_batch(std::span<const std::int32_t> initial_tokens, std::
                     result.score += *best;
             }
             ++result.decoder_steps;
-            if (token != settings.end_id && token != settings.pad_id) result.token_ids.push_back(token);
-            finished[row] = token == settings.end_id || step + 1 == settings.maximum_steps;
+            if (!is_end(token, settings) && (!settings.stop_on_eos || token != settings.pad_id))
+                result.token_ids.push_back(token);
+            finished[row] = is_end(token, settings) || step + 1 == settings.maximum_steps;
             tokens[row] = finished[row] ? settings.pad_id : token;
             if (finished[row]) {
                 --remaining;
-                const auto length = token == settings.end_id
+                const auto length = is_end(token, settings)
                                         ? step + 1
                                         : settings.unfinished_score_length.value_or(settings.maximum_steps);
                 result.score = normalized_score(result.score, length, settings.length_penalty);

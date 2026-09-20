@@ -21,6 +21,14 @@ auto main() -> int {
     if (!generated || !prefixes_valid || generated->token_ids != std::vector<std::int32_t>{4} ||
         generated->decoder_steps != 2)
         return 1;
+    const std::array<std::int32_t, 1> additional_stops{4};
+    auto multi_stop = greedy;
+    multi_stop.stop_ids = additional_stops;
+    auto stopped = Decoder::generate(std::array<std::int32_t, 2>{1, 2}, multi_stop, language_model);
+    if (!stopped || !stopped->token_ids.empty() || stopped->decoder_steps != 1) return 1;
+    multi_stop.stop_on_eos = false;
+    auto fixed = Decoder::generate(std::array<std::int32_t, 2>{1, 2}, multi_stop, language_model);
+    if (!fixed || fixed->token_ids != std::vector<std::int32_t>{4, 3, 3, 3} || fixed->decoder_steps != 4) return 1;
     auto beam = greedy;
     beam.beam_size = 2;
     const auto conditioned_model = [&](const DecodeRequest& request) -> kidi::Result<TokenScores> {

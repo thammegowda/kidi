@@ -51,10 +51,15 @@ public:
     auto matmul(const Tensor& left, const Tensor& right, bool transpose_right = false) -> Tensor;
     auto scaled_dot_product_attention(const Tensor& query, const Tensor& key, const Tensor& value, std::int32_t heads,
                                       const Tensor& mask = {}) -> Tensor;
+    auto grouped_query_attention(const Tensor& query, const Tensor& key, const Tensor& value, std::int32_t heads,
+                                 std::int32_t key_value_heads, const Tensor& mask, float scale = 1.F) -> Tensor;
+    auto rotary(const Tensor& input, const Tensor& cosine, const Tensor& sine) -> Tensor;
     auto linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight = false) -> Tensor;
     auto quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias) -> Tensor;
-    auto gelu(const Tensor& input) -> Tensor;
-    auto gelu_(Tensor& input) -> Tensor&;
+    auto gelu(const Tensor& input, bool approximate = false) -> Tensor;
+    auto gelu_(Tensor& input, bool approximate = false) -> Tensor&;
+    auto tanh(const Tensor& input) -> Tensor;
+    auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
     auto layer_norm(const Tensor& input, const Tensor& scale, const Tensor& bias, float epsilon) -> Tensor;
     auto layer_norm_(Tensor& input, const Tensor& scale, const Tensor& bias, float epsilon) -> Tensor&;
     auto residual_layer_norm(const Tensor& input, const Tensor& residual, const Tensor& scale, const Tensor& bias,

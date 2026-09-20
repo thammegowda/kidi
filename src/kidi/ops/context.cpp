@@ -34,9 +34,10 @@ auto nanoseconds(Clock::time_point start) -> std::uint64_t {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
 }
 auto operation_name(Operation operation) -> std::string_view {
-    constexpr std::array names{"add",    "multiply",   "cast",    "matmul",      "linear",       "quantized_linear",
-                               "gelu",   "layer_norm", "softmax", "log_softmax", "transpose",    "slice",
-                               "gather", "concat",     "scatter", "attention",   "residual_norm"};
+    constexpr std::array names{"add",    "multiply",   "cast",    "matmul",      "linear",        "quantized_linear",
+                               "gelu",   "layer_norm", "softmax", "log_softmax", "transpose",     "slice",
+                               "gather", "concat",     "scatter", "attention",   "residual_norm", "rms_norm",
+                               "tanh",   "rotary"};
     return names.at(static_cast<std::size_t>(operation));
 }
 struct OperatorProfile {
@@ -89,8 +90,14 @@ struct Context::Impl {
         key.insert(key.end(), spec.attributes.begin(), spec.attributes.end());
         const bool constant_parameters =
             spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
-            spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RESIDUAL_NORM;
+            spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RESIDUAL_NORM ||
+            spec.operation == Operation::RMS_NORM;
         const std::size_t parameter_start = spec.operation == Operation::RESIDUAL_NORM ? 2 : 1;
+        spec.dynamic_parameters = spec.operation == Operation::RMS_NORM ||
+                                  (spec.operation == Operation::LINEAR && device == tensor::Device::apple_gpu());
+        for (std::size_t index = parameter_start; index < inputs.size(); ++index)
+            spec.dynamic_parameters = spec.dynamic_parameters && inputs[index].device() == device;
+        key.push_back(spec.dynamic_parameters);
         for (std::size_t index = 0; index < inputs.size(); ++index) {
             const auto& input = inputs[index];
             if (!input.defined() || !input.is_contiguous())
@@ -100,20 +107,32 @@ struct Context::Impl {
             key.push_back(static_cast<int>(input.dtype()));
             key.push_back(input.dimensions());
             key.insert(key.end(), input.shape().begin(), input.shape().end());
-            if (constant_parameters && index >= parameter_start)
+            if (constant_parameters && !spec.dynamic_parameters && index >= parameter_start)
                 key.push_back(reinterpret_cast<std::intptr_t>(require(input.host_bytes()).data()));
         }
         const auto invalid = [](bool condition, const char* message) {
             if (condition) throw Failure({ErrorCode::INVALID_ARGUMENT, message});
         };
         const auto& input = inputs.front();
+        if (spec.operation == Operation::ROTARY) {
+            invalid(input.dimensions() != 4 || input.dtype() != tensor::DType::F32 || input.size(3) % 2,
+                    "rotary expects FP32 [batch, sequence, heads, even width]");
+            for (std::size_t index = 1; index < 3; ++index)
+                invalid(inputs[index].dimensions() != 4 || inputs[index].dtype() != tensor::DType::F32 ||
+                            inputs[index].size(0) != 1 || inputs[index].size(1) != input.size(1) ||
+                            inputs[index].size(2) != 1 || inputs[index].size(3) != input.size(3) / 2,
+                        "rotary frequency shape or dtype mismatch");
+        }
         if (spec.operation == Operation::ATTENTION) {
             const auto& key = inputs[1];
             const auto& value = inputs[2];
             const auto heads = spec.attributes[0];
+            const auto key_heads = spec.attributes.size() == 2 ? spec.attributes[1] : heads;
             invalid(heads <= 0 || input.dimensions() != 3 || key.dimensions() != 3 || value.dimensions() != 3,
                     "attention expects rank-three tensors and positive head count");
-            invalid(input.size(2) % heads != 0 || input.size(2) != key.size(2) ||
+            invalid(key_heads <= 0 || heads % key_heads, "invalid key/value head count");
+            invalid(input.size(2) % heads != 0 || key.size(2) % key_heads ||
+                        input.size(2) / heads != key.size(2) / key_heads ||
                         !std::ranges::equal(key.shape(), value.shape()) ||
                         (key.size(0) != 1 && key.size(0) != input.size(0)),
                     "attention shape mismatch");
@@ -138,10 +157,13 @@ struct Context::Impl {
             const bool transpose = spec.operation != Operation::QUANTIZED_LINEAR && spec.attributes[0];
             invalid(input.size(-1) != weight.size(transpose ? -1 : -2), "matrix contraction dimensions differ");
             if (constant_parameters) {
-                const auto& bias = inputs.back();
-                invalid(weight.dimensions() != 2 || bias.dimensions() != 1 ||
-                            bias.size(0) != weight.size(transpose ? 0 : 1) || bias.dtype() != tensor::DType::F32,
-                        "linear parameter shape or dtype mismatch");
+                invalid(weight.dimensions() != 2, "linear weights require rank two");
+                if (inputs.size() > 2) {
+                    const auto& bias = inputs.back();
+                    invalid(bias.dimensions() != 1 || bias.size(0) != weight.size(transpose ? 0 : 1) ||
+                                bias.dtype() != tensor::DType::F32,
+                            "linear parameter shape or dtype mismatch");
+                }
             }
         }
         if (spec.operation == Operation::QUANTIZED_LINEAR)
@@ -149,9 +171,12 @@ struct Context::Impl {
                         inputs[2].dtype() != tensor::DType::F32 || inputs[2].dimensions() != 2 ||
                         inputs[2].size(0) != inputs[1].size(1) || inputs[2].size(1) != 1,
                     "quantized linear parameter mismatch");
-        if (spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RESIDUAL_NORM) {
+        if (spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RESIDUAL_NORM ||
+            spec.operation == Operation::RMS_NORM) {
             invalid(!input.dimensions() || !std::isfinite(spec.epsilon) || spec.epsilon <= 0,
                     "invalid normalization request");
+            if (spec.operation == Operation::RMS_NORM)
+                invalid(input.dtype() != tensor::DType::F32, "RMS normalization expects FP32 input");
             if (spec.operation == Operation::RESIDUAL_NORM)
                 invalid(input.dtype() != tensor::DType::F32 || inputs[1].dtype() != input.dtype() ||
                             !std::ranges::equal(input.shape(), inputs[1].shape()),
@@ -198,7 +223,7 @@ struct Context::Impl {
                 parameters.clear();
             }
             found = operators.emplace(key, std::move(prepared)).first;
-            if (constant_parameters)
+            if (constant_parameters && !spec.dynamic_parameters)
                 for (std::size_t index = parameter_start; index < inputs.size(); ++index)
                     parameters.push_back(inputs[index]);
             preparation +=
@@ -314,16 +339,35 @@ auto Context::scaled_dot_product_attention(const Tensor& query, const Tensor& ke
 }
 auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight) -> Tensor {
     const std::array<std::int64_t, 1> attributes{transpose_weight};
+    if (!bias.defined()) return impl_->run({Operation::LINEAR, attributes}, {&input, &weight});
     return impl_->run({Operation::LINEAR, attributes}, {&input, &weight, &bias});
 }
 auto Context::quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias)
     -> Tensor {
     return impl_->run({Operation::QUANTIZED_LINEAR}, {&input, &weight, &scale, &bias});
 }
-auto Context::gelu(const Tensor& input) -> Tensor { return impl_->run({Operation::GELU}, {&input}); }
-auto Context::gelu_(Tensor& input) -> Tensor& {
-    impl_->run({Operation::GELU}, {&input}, nullptr, &input);
+auto Context::gelu(const Tensor& input, bool approximate) -> Tensor {
+    const std::array<std::int64_t, 1> attributes{approximate};
+    return impl_->run({Operation::GELU, attributes}, {&input});
+}
+auto Context::gelu_(Tensor& input, bool approximate) -> Tensor& {
+    const std::array<std::int64_t, 1> attributes{approximate};
+    impl_->run({Operation::GELU, attributes}, {&input}, nullptr, &input);
     return input;
+}
+auto Context::tanh(const Tensor& input) -> Tensor { return impl_->run({Operation::TANH}, {&input}); }
+auto Context::rotary(const Tensor& input, const Tensor& cosine, const Tensor& sine) -> Tensor {
+    return impl_->run({Operation::ROTARY}, {&input, &cosine, &sine});
+}
+auto Context::grouped_query_attention(const Tensor& query, const Tensor& key, const Tensor& value, std::int32_t heads,
+                                      std::int32_t key_value_heads, const Tensor& mask, float scale) -> Tensor {
+    if (!std::isfinite(scale) || scale <= 0 || !mask.defined())
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "grouped attention requires a mask and positive scale"});
+    const std::array<std::int64_t, 2> attributes{heads, key_value_heads};
+    return impl_->run({Operation::ATTENTION, attributes, tensor::DType::F32, scale}, {&query, &key, &value, &mask});
+}
+auto Context::rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor {
+    return impl_->run({Operation::RMS_NORM, {}, tensor::DType::F32, epsilon}, {&input, &scale});
 }
 auto Context::layer_norm(const Tensor& input, const Tensor& scale, const Tensor& bias, float epsilon) -> Tensor {
     return impl_->run({Operation::LAYER_NORM, {}, tensor::DType::F32, epsilon}, {&input, &scale, &bias});

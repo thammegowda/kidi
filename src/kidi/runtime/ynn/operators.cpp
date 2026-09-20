@@ -130,8 +130,10 @@ public:
         const bool paired = spec.operation == Operation::RESIDUAL_NORM;
         auto graph = require(ynn::Graph::create(inputs.size() + (paired ? 2 : 1), flags));
         auto native = graph.get();
-        const auto constant = spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
-                              spec.operation == Operation::LAYER_NORM || paired;
+        const auto constant =
+            !spec.dynamic_parameters &&
+            (spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
+             spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RMS_NORM || paired);
         const std::size_t dynamic_count = constant ? (paired ? 2 : 1) : inputs.size();
         std::vector<std::uint32_t> operands;
         for (std::size_t index = 0; index < inputs.size(); ++index) {
@@ -179,6 +181,42 @@ public:
             case Operation::ATTENTION: {
                 const auto heads = static_cast<std::size_t>(spec.attributes[0]);
                 const auto head_width = inputs[0].size(2) / heads;
+                if (spec.attributes.size() == 2) {
+                    const auto key_heads = static_cast<std::size_t>(spec.attributes[1]);
+                    const auto reshape = [&](std::uint32_t input, std::span<const std::size_t> shape) {
+                        auto output = YNN_INVALID_VALUE_ID;
+                        check(ynn_define_static_reshape(native, shape.size(), shape.data(), input, &output, 0));
+                        return output;
+                    };
+                    const auto transpose = [&](std::uint32_t input, std::array<std::int32_t, 5> axes) {
+                        auto output = YNN_INVALID_VALUE_ID;
+                        check(ynn_define_static_transpose(native, axes.size(), axes.data(), input, &output, 0));
+                        return output;
+                    };
+                    const auto split = [&](std::size_t index, bool key) {
+                        const std::array shape{inputs[index].size(0), inputs[index].size(1), key_heads,
+                                               index == 0 ? heads / key_heads : std::size_t{1}, head_width};
+                        return transpose(reshape(operands[index], shape),
+                                         key ? std::array<std::int32_t, 5>{0, 2, 3, 4, 1}
+                                             : std::array<std::int32_t, 5>{0, 2, 3, 1, 4});
+                    };
+                    auto scores = YNN_INVALID_VALUE_ID, probability = YNN_INVALID_VALUE_ID,
+                         hidden = YNN_INVALID_VALUE_ID;
+                    check(ynn_define_dot(native, 1, split(0, false), split(1, true), YNN_INVALID_VALUE_ID, &scores, 0));
+                    scores = binary(ynn_binary_multiply, scores, scalar(spec.epsilon));
+                    std::vector<std::size_t> mask_shape(5 - inputs[3].dimensions(), 1);
+                    mask_shape.insert(mask_shape.end(), inputs[3].shape().begin(), inputs[3].shape().end());
+                    if (inputs[3].dimensions() == 4) {
+                        mask_shape[0] = inputs[3].size(0);
+                        mask_shape[1] = 1;
+                    }
+                    scores = binary(ynn_binary_add, scores, reshape(operands[3], mask_shape));
+                    check(::ynn::define_softmax(native, scores, 1.F, probability));
+                    check(ynn_define_dot(native, 1, probability, split(2, false), YNN_INVALID_VALUE_ID, &hidden, 0));
+                    const std::array shape{inputs[0].size(0), inputs[0].size(1), inputs[0].size(2)};
+                    result = reshape(transpose(hidden, {0, 3, 1, 2, 4}), shape);
+                    break;
+                }
                 const auto reshape = [&](std::uint32_t input, std::span<const std::size_t> shape) {
                     auto output = YNN_INVALID_VALUE_ID;
                     check(ynn_define_static_reshape(native, shape.size(), shape.data(), input, &output, 0));
@@ -220,7 +258,8 @@ public:
                     check(ynn_define_static_transpose(native, axes.size(), axes.data(), operands[1], &right, 0));
                 }
                 check(ynn_define_dot(native, 1, operands[0], right, YNN_INVALID_VALUE_ID, &result, 0));
-                if (spec.operation == Operation::LINEAR) result = binary(ynn_binary_add, result, operands[2]);
+                if (spec.operation == Operation::LINEAR && operands.size() == 3)
+                    result = binary(ynn_binary_add, result, operands[2]);
                 break;
             }
             case Operation::QUANTIZED_LINEAR: {
@@ -234,11 +273,49 @@ public:
                 break;
             }
             case Operation::GELU: {
+                if (spec.attributes[0]) {
+                    auto square = binary(ynn_binary_multiply, operands[0], operands[0]);
+                    auto cubic = binary(ynn_binary_multiply, square, operands[0]);
+                    auto inner =
+                        binary(ynn_binary_add, operands[0], binary(ynn_binary_multiply, cubic, scalar(0.044715F)));
+                    auto probability = binary(
+                        ynn_binary_add, scalar(1.F),
+                        unary(ynn_unary_tanh,
+                              binary(ynn_binary_multiply, inner, scalar(std::sqrt(2.F / 3.14159265358979323846F)))));
+                    result = binary(ynn_binary_multiply, binary(ynn_binary_multiply, operands[0], scalar(0.5F)),
+                                    probability);
+                    break;
+                }
                 auto normalized = binary(ynn_binary_multiply, operands[0], scalar(std::sqrt(2.0F) / 2.0F));
                 auto probability =
                     binary(ynn_binary_add, binary(ynn_binary_multiply, unary(ynn_unary_erf, normalized), scalar(0.5F)),
                            scalar(0.5F));
                 result = binary(ynn_binary_multiply, operands[0], probability);
+                break;
+            }
+            case Operation::ROTARY: {
+                const std::int32_t axis = 3;
+                const std::int64_t begin = 0, middle = inputs[0].size(3) / 2, end = inputs[0].size(3), stride = 1;
+                auto first = YNN_INVALID_VALUE_ID, second = YNN_INVALID_VALUE_ID;
+                check(ynn_define_static_slice(native, 1, &axis, &begin, &middle, &stride, operands[0], &first, 0));
+                check(ynn_define_static_slice(native, 1, &axis, &middle, &end, &stride, operands[0], &second, 0));
+                const std::array parts{binary(ynn_binary_subtract, binary(ynn_binary_multiply, first, operands[1]),
+                                              binary(ynn_binary_multiply, second, operands[2])),
+                                       binary(ynn_binary_add, binary(ynn_binary_multiply, second, operands[1]),
+                                              binary(ynn_binary_multiply, first, operands[2]))};
+                check(ynn_define_concatenate(native, axis, parts.size(), parts.data(), &result, 0));
+                break;
+            }
+            case Operation::TANH:
+                result = unary(ynn_unary_tanh, operands[0]);
+                break;
+            case Operation::RMS_NORM: {
+                auto square = binary(ynn_binary_multiply, operands[0], operands[0]);
+                auto mean_square =
+                    binary(ynn_binary_multiply, reduce(ynn_reduce_sum, square), scalar(1.F / inputs[0].size(-1)));
+                auto inverse =
+                    unary(ynn_unary_reciprocal_square_root, binary(ynn_binary_add, mean_square, scalar(spec.epsilon)));
+                result = binary(ynn_binary_multiply, binary(ynn_binary_multiply, operands[0], inverse), operands[1]);
                 break;
             }
             case Operation::RESIDUAL_NORM:

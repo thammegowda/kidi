@@ -1,15 +1,16 @@
 # kidi
 
-Kidi is a small C++23 inference toolkit. The first milestone runs exported RTG
-Transformer NMT models directly with YNNPACK on CPU and memory-mapped
+Kidi is a small C++23 inference toolkit for RTG translation and Gemma 4 text
+generation, using YNNPACK on CPU, Metal on Apple GPUs, and memory-mapped
 Safetensors weights.
 
 Repository: [thammegowda/kidi](https://github.com/thammegowda/kidi).
 
 Kidi-owned code follows [CODING_GUIDELINES.md](CODING_GUIDELINES.md).
 
-The MVP accepts and returns Moses-tokenized UTF-8 text. Raw-text normalization
-and detokenization are deliberately outside the first runtime contract.
+RTG translation accepts and returns Moses-tokenized UTF-8 text; normalization
+and detokenization remain outside that contract. Gemma accepts ordinary UTF-8
+prompts and uses the original model tokenizer.
 
 ## Build
 
@@ -149,7 +150,46 @@ and original output order, including blank lines, are preserved. See
 performance and numerical differences. Earlier graph throughput reports are
 historical and do not describe the current eager implementation.
 
-## Model Package
+## Gemma 4 Text Generation
+
+Gemma 4 E2B-it runs directly from the original Hugging Face Safetensors checkpoint.
+The setup helper only creates `model.yaml`; it does not convert, requantize, or
+rewrite weights or tokenizers. Key adaptation and small normalization-parameter
+promotions happen in memory when loading. Large embedding tables remain mapped
+on CPU, including for Metal execution.
+
+With the Hugging Face CLI and PyYAML installed:
+
+```bash
+hf download google/gemma-4-E2B-it config.json model.safetensors tokenizer.json \
+  --revision 3e22461f65e89153144f8adb70e3b8c2cc9845a7 \
+  --local-dir ../models/gemma-4-E2B-it
+python tools/configure_gemma4.py ../models/gemma-4-E2B-it
+build-release/kidi inspect --model ../models/gemma-4-E2B-it
+build-release/kidi generate --model ../models/gemma-4-E2B-it --backend mps \
+  --prompt 'What is the capital of France?' --max-new-tokens 64 --profile
+```
+
+Use `--backend ynnpack --threads 4` for CPU. The default backend is `auto`.
+Omitting `--prompt` reads a prompt from standard input. Single-user-turn chat
+formatting is applied by default, with thinking disabled; `--raw-prompt` accepts
+an already serialized prompt. Generation is greedy and batch size one. The
+current implementation is text-only: no image/audio encoders or speculative
+decoding are loaded. E2B-it is verified on the 16 GiB Apple M5; E4B has not been
+validated end to end on this machine.
+
+`--context-size` and `--max-new-tokens` override the YAML decoding defaults
+(2048 and 256). `--prefill-chunk-size` defaults to 128. The prompt and requested
+generation must fit the context. `--runs`, `--warmups`, `--ignore-eos`, and
+`--profile` support repeatable performance measurements. Profile records separate
+prefill, recurrent decoding, and operator preparation; cold and warm numbers
+should not be mixed.
+
+See [the Gemma benchmark report](benchmarks/gemma/README.md) for measured CPU/GPU
+comparisons with LiteRT-LM, including MTP, precision differences, and the applied
+executable-reuse optimization. LiteRT-LM remains faster in the measured cases.
+
+## RTG Model Package
 
 ```text
 model.yaml

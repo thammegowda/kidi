@@ -17,21 +17,25 @@ auto split_qkv(ops::Context& context, const Tensor& projected) -> std::array<Ten
             context.slice(projected, 2, 2 * width, width)};
 }
 } // namespace
-LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose) : transpose_(transpose) {
+LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose, bool bias)
+    : transpose_(transpose), has_bias_(bias) {
     check_precision(module_dtype);
     if (module_dtype == tensor::DType::I8 && transpose)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "INT8 linear requires input-output weight layout"});
     register_parameter("weight", weight_,
                        transpose ? std::vector<std::int64_t>{output_size, input_size}
                                  : std::vector<std::int64_t>{input_size, output_size});
-    register_parameter("bias", bias_, {output_size}, tensor::DType::F32);
+    if (bias)
+        register_parameter("bias", bias_, {output_size}, tensor::DType::F32);
+    else if (module_dtype == tensor::DType::I8)
+        bias_ = require(Tensor::zeros({output_size}, tensor::DType::F32, device()));
     if (module_dtype == tensor::DType::I8) {
         register_parameter("scale", scale_, {output_size, 1}, tensor::DType::F32);
         if (allocate_parameters) std::ranges::fill(require(scale_.data<float>()), 1.F);
     }
 }
 auto LinearImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    if (!weight_.defined() || !bias_.defined())
+    if (!weight_.defined() || (has_bias_ && !bias_.defined()))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "linear state has not been initialized"});
     if (weight_.dtype() == tensor::DType::I8) return context.quantized_linear(input, weight_, scale_, bias_);
     return context.linear(weight_.dtype() == tensor::DType::BF16 ? context.cast(input, tensor::DType::BF16) : input,

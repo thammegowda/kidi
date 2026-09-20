@@ -108,7 +108,9 @@ public:
         auto graph = require(mps::Graph::create());
         std::vector<mps::Value> operands, feeds;
         const bool paired = spec.operation == Operation::RESIDUAL_NORM;
-        const auto constant = spec.operation == Operation::LINEAR || spec.operation == Operation::LAYER_NORM || paired;
+        const auto constant = !spec.dynamic_parameters &&
+                              (spec.operation == Operation::LINEAR || spec.operation == Operation::LAYER_NORM ||
+                               spec.operation == Operation::RMS_NORM || paired);
         const std::size_t parameter_start = paired ? 2 : 1;
         for (std::size_t index = 0; index < inputs.size(); ++index) {
             if (constant && index >= parameter_start)
@@ -133,6 +135,30 @@ public:
             case Operation::ATTENTION: {
                 const auto heads = spec.attributes[0];
                 const auto head_width = static_cast<std::int64_t>(inputs[0].size(2)) / heads;
+                if (spec.attributes.size() == 2) {
+                    const auto key_heads = spec.attributes[1];
+                    const std::array<std::int64_t, 5> axes{0, 2, 3, 1, 4};
+                    const auto split = [&](std::size_t index) {
+                        return graph.transpose(
+                            graph.reshape(operands[index], {static_cast<std::int64_t>(inputs[index].size(0)),
+                                                            static_cast<std::int64_t>(inputs[index].size(1)), key_heads,
+                                                            index == 0 ? heads / key_heads : 1, head_width}),
+                            axes);
+                    };
+                    auto scores = graph.matmul(split(0), split(1), false, true);
+                    scores = graph.multiply(scores, graph.scalar(spec.epsilon, DType::F32));
+                    std::vector<std::int64_t> mask_shape(5 - inputs[3].dimensions(), 1);
+                    mask_shape.insert(mask_shape.end(), inputs[3].shape().begin(), inputs[3].shape().end());
+                    if (inputs[3].dimensions() == 4) {
+                        mask_shape[0] = inputs[3].size(0);
+                        mask_shape[1] = 1;
+                    }
+                    scores = graph.add(scores, graph.reshape(operands[3], mask_shape));
+                    auto hidden = graph.matmul(graph.softmax(scores, 4), split(2));
+                    const std::array<std::int64_t, 5> merge{0, 3, 1, 2, 4};
+                    output = graph.reshape(graph.transpose(hidden, merge), inputs[0].shape());
+                    break;
+                }
                 const std::array<std::int64_t, 4> axes{0, 2, 1, 3};
                 const auto split = [&](std::size_t index) {
                     return graph.transpose(
@@ -156,12 +182,45 @@ public:
             case Operation::LINEAR:
                 output = graph.matmul(operands[0], operands[1], false, spec.attributes[0]);
                 output = graph.cast(output, DType::F32);
-                if (spec.operation == Operation::LINEAR) output = graph.add(output, operands[2]);
+                if (spec.operation == Operation::LINEAR && operands.size() == 3)
+                    output = graph.add(output, operands[2]);
                 break;
             case Operation::GELU: {
+                if (spec.attributes[0]) {
+                    auto square = graph.multiply(operands[0], operands[0]);
+                    auto cubic = graph.multiply(square, operands[0]);
+                    auto inner = graph.add(operands[0], graph.multiply(cubic, graph.scalar(0.044715F, DType::F32)));
+                    auto probability =
+                        graph.add(graph.scalar(1.F, DType::F32),
+                                  graph.tanh(graph.multiply(
+                                      inner, graph.scalar(std::sqrt(2.F / 3.14159265358979323846F), DType::F32))));
+                    output = graph.multiply(graph.multiply(operands[0], graph.scalar(0.5F, DType::F32)), probability);
+                    break;
+                }
                 auto normalized = graph.multiply(operands[0], graph.scalar(std::sqrt(2.0F) / 2.0F, DType::F32));
                 auto half = graph.scalar(0.5F, DType::F32);
                 output = graph.multiply(operands[0], graph.add(graph.multiply(graph.erf(normalized), half), half));
+                break;
+            }
+            case Operation::ROTARY: {
+                const auto width = static_cast<std::int64_t>(inputs[0].size(3) / 2);
+                auto first = graph.slice(operands[0], 3, 0, width);
+                auto second = graph.slice(operands[0], 3, width, width);
+                const std::array parts{
+                    graph.subtract(graph.multiply(first, operands[1]), graph.multiply(second, operands[2])),
+                    graph.add(graph.multiply(second, operands[1]), graph.multiply(first, operands[2]))};
+                output = graph.concat(parts, 3);
+                break;
+            }
+            case Operation::TANH:
+                output = graph.tanh(operands[0]);
+                break;
+            case Operation::RMS_NORM: {
+                auto square = graph.multiply(operands[0], operands[0]);
+                auto mean_square =
+                    graph.multiply(graph.reduce_sum(square, axis), graph.scalar(1.F / inputs[0].size(-1), DType::F32));
+                auto zero = graph.scalar(0.F, DType::F32);
+                output = graph.normalize(operands[0], zero, mean_square, operands[1], zero, spec.epsilon);
                 break;
             }
             case Operation::RESIDUAL_NORM:

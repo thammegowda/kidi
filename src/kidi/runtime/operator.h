@@ -52,13 +52,17 @@ enum class Operation {
     CONCAT,
     SCATTER,
     ATTENTION,
-    RESIDUAL_NORM
+    RESIDUAL_NORM,
+    RMS_NORM,
+    TANH,
+    ROTARY
 };
 struct OperatorSpec {
     Operation operation;
     std::span<const std::int64_t> attributes;
     tensor::DType dtype = tensor::DType::F32;
     float epsilon = 0;
+    bool dynamic_parameters = false;
 };
 
 struct AllocationStats {

@@ -22,10 +22,13 @@ add_library(kidi
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
     src/kidi/inference/decoder.cpp
+    src/kidi/inference/generator.cpp
     src/kidi/inference/translator.cpp
     src/kidi/layers/position_encoding.cpp
+    src/kidi/layers/gemma.cpp
     src/kidi/layers/transformer.cpp
     src/kidi/model/config.cpp
+    src/kidi/model/gemma.cpp
     src/kidi/model/package.cpp
     src/kidi/model/transformer.cpp
     src/kidi/model/weights.cpp

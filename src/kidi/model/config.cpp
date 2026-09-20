@@ -30,12 +30,18 @@ auto load_config(const std::filesystem::path& path) -> Result<YAML::Node> {
             return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "unsupported config; expected format_version 1"});
         if (!config["model"].IsMap() || !config["decode"].IsMap())
             return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "model and decode must be YAML mappings"});
-        for (const auto* key : {"input_format", "output_format"})
-            if (config["io"][key].as<std::string>() != "moses_tokenized")
-                return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "input and output must be moses_tokenized"});
         auto weights = resolve_file(directory, config["weights_file"]);
         if (!weights) return std::unexpected(std::move(weights.error()));
         config["weights_file"] = weights->string();
+        if (config["model"]["type"].as<std::string>() == "gemma4_text") {
+            auto tokenizer = resolve_file(directory, config["tokenizer_file"]);
+            if (!tokenizer) return std::unexpected(std::move(tokenizer.error()));
+            config["tokenizer_file"] = tokenizer->string();
+            return config;
+        }
+        for (const auto* key : {"input_format", "output_format"})
+            if (config["io"][key].as<std::string>() != "moses_tokenized")
+                return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "input and output must be moses_tokenized"});
         for (const auto* key : {"source", "target"}) {
             auto tokenizer = resolve_file(directory, config["tokenizers"][key]);
             if (!tokenizer) return std::unexpected(std::move(tokenizer.error()));

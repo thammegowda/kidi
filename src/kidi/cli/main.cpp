@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -13,7 +14,9 @@
 #include "kidi/cli/argparse.h"
 #include "kidi/core/version.h"
 #include "kidi/model/package.h"
+#include "kidi/model/config.h"
 #include "kidi/inference/translator.h"
+#include "kidi/inference/generator.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/tensor/backend.h"
 
@@ -27,6 +30,38 @@ auto inference_backend(const kidi::cli::Namespace& arguments) -> kidi::inference
 }
 
 auto inspect(const kidi::cli::Namespace& arguments) -> int {
+    const auto directory = arguments.get<std::filesystem::path>("model");
+    auto document = kidi::model::load_config(directory / "model.yaml");
+    if (!document) {
+        spdlog::error("{}", document.error().message);
+        return 1;
+    }
+    if ((*document)["model"]["type"].as<std::string>() == "gemma4_text") {
+        auto validation = kidi::model::Gemma4Impl::validate_config((*document)["model"]);
+        if (!validation) {
+            spdlog::error("{}", validation.error().message);
+            return 1;
+        }
+        auto weights = kidi::model::Weights::load((*document)["weights_file"].as<std::string>());
+        if (!weights) {
+            spdlog::error("{}", weights.error().message);
+            return 1;
+        }
+        const auto embedding = weights->tensor("model.language_model.embed_tokens.weight");
+        if (!embedding) {
+            spdlog::error("{}", embedding.error().message);
+            return 1;
+        }
+        std::cout << "format: " << (*document)["format_version"].as<int>() << '\n'
+                  << "model: gemma4_text\n"
+                  << "weights: " << (*document)["weights_file"].as<std::string>() << '\n'
+                  << "checkpoint tensors (including unused modalities): " << weights->size() << '\n'
+                  << "weight dtype: " << kidi::tensor::to_string(embedding->dtype()) << '\n'
+                  << "text layers: " << (*document)["model"]["num_hidden_layers"].as<int>() << '\n'
+                  << "vocabulary: " << (*document)["model"]["vocab_size"].as<int>() << '\n'
+                  << "default device: " << kidi::tensor::to_string(kidi::module_device) << '\n';
+        return 0;
+    }
     auto package = kidi::model::Package::load(arguments.get<std::filesystem::path>("model"));
     if (!package) {
         spdlog::error("{}", package.error().message);
@@ -55,6 +90,59 @@ auto inspect(const kidi::cli::Namespace& arguments) -> int {
         std::cout << '\n';
     }
     return 0;
+}
+
+auto generate(const kidi::cli::Namespace& arguments) -> int {
+    const auto threads = arguments.get<std::int32_t>("threads");
+    const auto runs = arguments.get<std::int32_t>("runs");
+    const auto warmups = arguments.get<std::int32_t>("warmups");
+    if (threads <= 0 || runs <= 0 || warmups < 0) {
+        spdlog::error("threads and runs must be positive; warmups must be non-negative");
+        return 2;
+    }
+    kidi::runtime::ynn::set_thread_count(threads);
+    const auto backend = inference_backend(arguments);
+    const auto device = backend == kidi::inference::InferenceBackend::MPS ? kidi::tensor::Device::apple_gpu()
+                                                                          : kidi::tensor::Device::cpu();
+    const auto started = std::chrono::steady_clock::now();
+    auto generator = kidi::inference::Generator::load(arguments.get<std::filesystem::path>("model"), device);
+    if (!generator) {
+        spdlog::error("{}", generator.error().message);
+        return 1;
+    }
+    const auto load_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
+    auto prompt = arguments.get<std::string>("prompt");
+    if (prompt.empty()) prompt.assign(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
+    const kidi::inference::GenerationOptions options{
+        .maximum_new_tokens = arguments.get<std::size_t>("max_new_tokens"),
+        .context_size = arguments.get<std::size_t>("context_size"),
+        .prefill_chunk_size = arguments.get<std::size_t>("prefill_chunk_size"),
+        .raw_prompt = arguments.get<bool>("raw_prompt"),
+        .ignore_eos = arguments.get<bool>("ignore_eos")};
+    for (std::int32_t run = -warmups; run < runs; ++run) {
+        auto result = generator->generate(prompt, options);
+        if (!result) {
+            spdlog::error("{}", result.error().message);
+            return 1;
+        }
+        if (run < 0) continue;
+        std::cout << result->text << '\n';
+        if (arguments.get<bool>("profile")) {
+            const auto& stats = result->stats;
+            std::cerr << "kidi_generation|backend=" << kidi::inference::to_string(backend)
+                      << "|batch_size=1|threads=" << threads << "|run=" << run << "|load_ns=" << load_ns
+                      << "|prompt_tokens=" << stats.prompt_tokens
+                      << "|generated_tokens=" << result->generation.decoder_steps
+                      << "|decode_tokens=" << stats.decode_tokens << "|tokenize_ns=" << stats.tokenize_ns
+                      << "|prefill_ns=" << stats.prefill_ns << "|decode_ns=" << stats.decode_ns
+                      << "|preparation_ns=" << stats.preparation_ns << "|ttft_ns=" << stats.time_to_first_token_ns
+                      << "|token_ids=";
+            for (auto token : result->generation.token_ids) std::cerr << token << ',';
+            std::cerr << '\n';
+        }
+    }
+    return std::cout ? 0 : 1;
 }
 
 auto predict(const kidi::cli::Namespace& arguments) -> int {
@@ -194,12 +282,25 @@ auto main(int argc, char** argv) -> int {
     spdlog::set_default_logger(spdlog::stderr_color_mt("kidi"));
     spdlog::set_pattern("[%n] [%l] %v");
     spdlog::cfg::load_env_levels();
-    kidi::cli::ArgumentParser parser("kidi", "Run optimized RTG translation models.");
+    kidi::cli::ArgumentParser parser("kidi", "Run translation and text generation models.");
     parser.version("kidi " + std::string(kidi::version()));
     auto& commands = parser.add_subparsers().required();
+    auto& generate_parser = commands.add_parser("generate", "generate text with Gemma 4");
+    generate_parser.add_argument("-m", "--model").type<std::filesystem::path>().required().metavar("DIR");
+    generate_parser.add_argument("--prompt").default_value(std::string{}).help("prompt text; stdin when omitted");
+    generate_parser.add_argument("--backend").default_value(std::string("auto")).choices({"auto", "ynnpack", "mps"});
+    generate_parser.add_argument("-j", "--threads").default_value<std::int32_t>(4);
+    generate_parser.add_argument("--max-new-tokens").dest("max_new_tokens").default_value<std::size_t>(0);
+    generate_parser.add_argument("--context-size").dest("context_size").default_value<std::size_t>(0);
+    generate_parser.add_argument("--prefill-chunk-size").dest("prefill_chunk_size").default_value<std::size_t>(128);
+    generate_parser.add_argument("--raw-prompt").dest("raw_prompt").action(kidi::cli::Action::STORE_TRUE);
+    generate_parser.add_argument("--ignore-eos").dest("ignore_eos").action(kidi::cli::Action::STORE_TRUE);
+    generate_parser.add_argument("--profile").action(kidi::cli::Action::STORE_TRUE);
+    generate_parser.add_argument("--runs").default_value<std::int32_t>(1);
+    generate_parser.add_argument("--warmups").default_value<std::int32_t>(0);
 
     auto& inspect_parser = commands.add_parser("inspect", "inspect a model package");
-    inspect_parser.description("Inspect an RTG model package.");
+    inspect_parser.description("Inspect an RTG or Gemma model package.");
     inspect_parser.add_argument("-m", "--model")
         .type<std::filesystem::path>()
         .required()
@@ -271,6 +372,7 @@ auto main(int argc, char** argv) -> int {
         const auto& command = arguments.get<std::string>("command");
         if (command == "inspect") return inspect(arguments);
         if (command == "predict") return predict(arguments);
+        if (command == "generate") return generate(arguments);
         throw std::logic_error("unhandled command: " + command);
     } catch (const kidi::cli::ParseError& error) {
         std::cerr << error.usage();
