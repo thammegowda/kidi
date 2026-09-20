@@ -32,11 +32,13 @@ struct TransformerImpl::State {
           encoder_norm(std::make_shared<layers::LayerNormImpl>(package.weights(), "encoder.norm",
                                                                manifest.architecture.layer_norm_epsilon)),
           decoder_norm(std::make_shared<layers::LayerNormImpl>(package.weights(), "decoder.norm",
-                                                               manifest.architecture.layer_norm_epsilon)),
-          generator(std::make_shared<layers::LinearImpl>(
-              package.weights(),
-              manifest.weights.encoding == WeightEncoding::F32 ? "tgt_embed.0.lut.weight" : "generator.proj.weight",
-              "generator.proj.bias", manifest.weights.encoding, manifest.weights.encoding == WeightEncoding::F32)) {
+                                                               manifest.architecture.layer_norm_epsilon)) {
+        const bool tied =
+            manifest.weights.encoding == WeightEncoding::F32 ||
+            (manifest.weights.encoding == WeightEncoding::BF16 && !package.weights().contains("generator.proj.weight"));
+        generator = std::make_shared<layers::LinearImpl>(package.weights(),
+                                                         tied ? "tgt_embed.0.lut.weight" : "generator.proj.weight",
+                                                         "generator.proj.bias", manifest.weights.encoding, tied);
         const auto& arch = manifest.architecture;
         const layers::Shape shape{arch.hidden_size, arch.feed_forward_size, arch.attention_heads,
                                   arch.layer_norm_epsilon};

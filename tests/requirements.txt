@@ -1,0 +1,2 @@
+huggingface-hub==1.8.0
+sacrebleu==2.6.0

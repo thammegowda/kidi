@@ -226,7 +226,7 @@ def encode_state(state: Mapping[str, torch.Tensor], precision: str) -> Dict[str,
 
     if target_encoded is None:
         raise ConversionError("target embedding weight was not encoded")
-    if precision != "fp32":
+    if precision == "int8":
         result[TIED_OUTPUT_WEIGHT] = target_encoded.t().contiguous()
         if target_scale is not None:
             result[TIED_OUTPUT_WEIGHT + QUANTIZATION_SCALE_SUFFIX] = target_scale.clone().contiguous()
@@ -283,7 +283,7 @@ def write_manifest(
     checkpoint: Mapping[str, object],
     precision: str,
 ) -> None:
-    reduced_precision = precision != "fp32"
+    separate_output_weight = precision == "int8"
     document = {
         "format_version": 1,
         "model_type": "rtg_transformer_nmt",
@@ -311,7 +311,7 @@ def write_manifest(
         "weights": {
             "format": "safetensors",
             "encoding": WEIGHT_ENCODINGS[precision],
-            "aliases": {} if reduced_precision else {TIED_OUTPUT_WEIGHT: TIED_TARGET_WEIGHT},
+            "aliases": {} if separate_output_weight else {TIED_OUTPUT_WEIGHT: TIED_TARGET_WEIGHT},
             "omitted": sorted(POSITIONAL_BUFFERS),
         },
         "provenance": {
