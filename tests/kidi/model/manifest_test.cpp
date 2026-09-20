@@ -7,12 +7,12 @@
 
 namespace {
 
-void write_file(const std::filesystem::path& path, std::string_view content = {}) {
+auto write_file(const std::filesystem::path& path, std::string_view content = {}) -> void {
     std::ofstream output(path, std::ios::binary);
     output << content;
 }
 
-std::string valid_manifest(std::string_view weights_file = "model.safetensors") {
+auto valid_manifest(std::string_view weights_file = "model.safetensors") -> std::string {
     return "format_version: 1\n"
            "model_type: rtg_transformer_nmt\n"
            "weights_file: " +
@@ -58,7 +58,7 @@ std::string valid_manifest(std::string_view weights_file = "model.safetensors") 
 
 } // namespace
 
-int main() {
+auto main() -> int {
     const auto directory = std::filesystem::temp_directory_path() / "kidi-manifest-test";
     std::filesystem::remove_all(directory);
     std::filesystem::create_directories(directory);

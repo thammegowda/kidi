@@ -12,7 +12,7 @@ namespace kidi::model {
 namespace {
 
 template <typename T>
-T required(const YAML::Node& node, std::string_view key) {
+auto required(const YAML::Node& node, std::string_view key) -> T {
     const auto value = node[std::string(key)];
     if (!value) {
         throw std::runtime_error("missing required field '" + std::string(key) + "'");
@@ -20,8 +20,8 @@ T required(const YAML::Node& node, std::string_view key) {
     return value.as<T>();
 }
 
-std::expected<std::filesystem::path, std::string> resolve_package_file(const std::filesystem::path& package_directory,
-                                                                       const YAML::Node& node, std::string_view key) {
+auto resolve_package_file(const std::filesystem::path& package_directory, const YAML::Node& node, std::string_view key)
+    -> std::expected<std::filesystem::path, std::string> {
     const auto declared = std::filesystem::path(required<std::string>(node, key));
     if (declared.empty() || declared.is_absolute()) {
         return std::unexpected("field '" + std::string(key) + "' must be a relative file path");
@@ -38,14 +38,14 @@ std::expected<std::filesystem::path, std::string> resolve_package_file(const std
     return resolved;
 }
 
-std::optional<std::string> require_positive(std::int32_t value, std::string_view field) {
+auto require_positive(std::int32_t value, std::string_view field) -> std::optional<std::string> {
     if (value <= 0) {
         return "field '" + std::string(field) + "' must be positive";
     }
     return std::nullopt;
 }
 
-WeightEncoding parse_weight_encoding(const YAML::Node& weights) {
+auto parse_weight_encoding(const YAML::Node& weights) -> WeightEncoding {
     if (!weights) return WeightEncoding::F32;
     const auto encoding =
         weights["encoding"] ? weights["encoding"].as<std::string>() : weights["data_type"].as<std::string>("F32");
@@ -55,7 +55,7 @@ WeightEncoding parse_weight_encoding(const YAML::Node& weights) {
     throw std::runtime_error("unsupported weight encoding '" + encoding + "'");
 }
 
-std::optional<std::string> validate(const ModelManifest& manifest) {
+auto validate(const ModelManifest& manifest) -> std::optional<std::string> {
     if (manifest.format_version != 1) {
         return "unsupported format_version; expected 1";
     }
@@ -136,7 +136,7 @@ std::optional<std::string> validate(const ModelManifest& manifest) {
 
 } // namespace
 
-Result<ModelManifest> ModelManifest::load(const std::filesystem::path& path) {
+auto ModelManifest::load(const std::filesystem::path& path) -> Result<ModelManifest> {
     try {
         if (!std::filesystem::is_regular_file(path)) {
             return std::unexpected(Error{ErrorCode::IO, "manifest does not exist: " + path.string()});

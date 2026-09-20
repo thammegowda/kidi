@@ -9,6 +9,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 option(KIDI_BUILD_TESTS "Build kidi tests" ON)
+option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 include(cmake/dependencies.cmake)
 include(cmake/ynnpack.cmake)
 
@@ -18,17 +19,24 @@ target_include_directories(kidi_argparse PUBLIC $<BUILD_INTERFACE:${CMAKE_CURREN
 target_compile_features(kidi_argparse PUBLIC cxx_std_23)
 
 add_library(kidi
+    src/kidi/core/module.cpp
     src/kidi/core/version.cpp
+    src/kidi/inference/decoder.cpp
+    src/kidi/inference/translator.cpp
+    src/kidi/layers/position_encoding.cpp
+    src/kidi/layers/transformer.cpp
     src/kidi/model/manifest.cpp
+    src/kidi/model/package.cpp
+    src/kidi/model/transformer.cpp
     src/kidi/model/weights.cpp
-    src/kidi/rtg/decoder.cpp
-    src/kidi/rtg/embedding.cpp
-    src/kidi/rtg/encoder.cpp
-    src/kidi/rtg/linear.cpp
-    src/kidi/rtg/package.cpp
-    src/kidi/rtg/transformer_builder.cpp
-    src/kidi/rtg/translator.cpp
-    src/kidi/runtime/ynn.cpp
+    src/kidi/ops/context.cpp
+    src/kidi/runtime/operator.cpp
+    src/kidi/runtime/ynn/operators.cpp
+    src/kidi/runtime/ynn/graph.cpp
+    src/kidi/tensor/backend.cpp
+    src/kidi/tensor/cpu_backend.cpp
+    src/kidi/tensor/cuda_backend.cpp
+    src/kidi/tensor/tensor.cpp
     src/kidi/text/tokenizer.cpp
 )
 add_library(kidi::kidi ALIAS kidi)
@@ -49,7 +57,53 @@ target_link_libraries(kidi
         tokenizerpp
         yaml-cpp::yaml-cpp
         ZLIB::ZLIB
+        ${CMAKE_DL_LIBS}
 )
+
+if(APPLE)
+    enable_language(OBJCXX)
+    find_library(KIDI_FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(KIDI_METAL_FRAMEWORK Metal REQUIRED)
+    find_library(KIDI_MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
+    find_library(KIDI_MPSGRAPH_FRAMEWORK MetalPerformanceShadersGraph REQUIRED)
+    target_sources(kidi
+        PRIVATE
+            src/kidi/runtime/mps/command_batch.mm
+            src/kidi/runtime/mps/graph.mm
+            src/kidi/runtime/mps/operators.cpp
+            src/kidi/runtime/mps/quantized_linear.mm
+            src/kidi/tensor/metal_backend.mm
+    )
+    set_source_files_properties(
+        src/kidi/runtime/mps/graph.mm
+        src/kidi/runtime/mps/command_batch.mm
+        src/kidi/runtime/mps/quantized_linear.mm
+        src/kidi/tensor/metal_backend.mm
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
+    )
+    target_compile_definitions(kidi PRIVATE KIDI_HAS_METAL=1)
+    target_link_libraries(kidi
+        PRIVATE
+            ${KIDI_FOUNDATION_FRAMEWORK}
+            ${KIDI_METAL_FRAMEWORK}
+            ${KIDI_MPS_FRAMEWORK}
+            ${KIDI_MPSGRAPH_FRAMEWORK}
+    )
+
+    if(KIDI_BUILD_BENCHMARKS)
+        add_executable(kidi_metal_int8_bench benchmarks/metal/int8_linear_bench.cpp)
+        target_link_libraries(kidi_metal_int8_bench PRIVATE kidi::kidi)
+        add_executable(kidi_metal_lowering_bench benchmarks/metal/lowering_bench.mm)
+        set_source_files_properties(benchmarks/metal/lowering_bench.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_link_libraries(kidi_metal_lowering_bench
+            PRIVATE
+                kidi::kidi
+                ${KIDI_FOUNDATION_FRAMEWORK}
+                ${KIDI_METAL_FRAMEWORK}
+                ${KIDI_MPSGRAPH_FRAMEWORK}
+        )
+    endif()
+endif()
 
 add_executable(kidi_cli src/kidi/cli/main.cpp)
 set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)

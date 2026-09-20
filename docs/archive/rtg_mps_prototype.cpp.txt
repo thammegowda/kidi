@@ -1,0 +1,303 @@
+#include "kidi/rtg/mps_model.h"
+
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <numeric>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "kidi/layers/transformer.h"
+#include "kidi/layers/position_encoding.h"
+#include "kidi/rtg/embedding.h"
+#include "kidi/tensor/graph.h"
+#include "kidi/tensor/tensor.h"
+
+namespace kidi::rtg {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+using layers::TransformerLayers;
+using tensor::Executable;
+using tensor::Graph;
+using tensor::Value;
+using tensor::DType;
+using tensor::Device;
+using tensor::Tensor;
+
+std::uint64_t elapsed_since(Clock::time_point started) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count());
+}
+
+layers::TransformerDimensions dimensions(const model::RtgArchitecture& architecture) {
+    return {
+        .hidden_size = architecture.hidden_size,
+        .feed_forward_size = architecture.feed_forward_size,
+        .attention_heads = architecture.attention_heads,
+        .layer_norm_epsilon = architecture.layer_norm_epsilon,
+    };
+}
+
+Result<Executable> build_source_graph(const Package& package, Device device) {
+    const auto& architecture = package.manifest().architecture;
+    Graph graph;
+    TransformerLayers layers(graph, package.weights(), package.manifest().weights.encoding,
+                                dimensions(architecture));
+    const auto input = graph.placeholder({1, -1, architecture.hidden_size}, DType::F32, "source_embeddings");
+    auto hidden = input;
+    for (std::int32_t layer = 0; layer < architecture.encoder_layers; ++layer) {
+        hidden = layers.encoder_layer(hidden, "encoder.layers." + std::to_string(layer));
+    }
+    const auto memory = layers.layer_norm(hidden, "encoder.norm");
+    std::vector<Value> outputs;
+    outputs.reserve(static_cast<std::size_t>(2 * architecture.decoder_layers));
+    for (std::int32_t layer = 0; layer < architecture.decoder_layers; ++layer) {
+        const auto projected =
+            layers.source_key_value(memory, "decoder.layers." + std::to_string(layer) + ".src_attn");
+        outputs.insert(outputs.end(), projected.begin(), projected.end());
+    }
+    const std::array inputs = {input};
+    return graph.compile(inputs, outputs, device);
+}
+
+Result<Executable> build_decoder_graph(const Package& package, std::size_t capacity, Device device) {
+    const auto& manifest = package.manifest();
+    const auto& architecture = manifest.architecture;
+    Graph graph;
+    TransformerLayers layers(graph, package.weights(), manifest.weights.encoding, dimensions(architecture));
+
+    std::vector<Value> inputs;
+    inputs.reserve(static_cast<std::size_t>(2 * architecture.decoder_layers + 1));
+    for (std::int32_t layer = 0; layer < architecture.decoder_layers; ++layer) {
+        inputs.push_back(graph.placeholder({1, -1, architecture.hidden_size}, DType::F32,
+                                           "source_key_" + std::to_string(layer)));
+        inputs.push_back(graph.placeholder({1, -1, architecture.hidden_size}, DType::F32,
+                                           "source_value_" + std::to_string(layer)));
+    }
+    const auto maximum_steps = graph.placeholder({}, DType::I32, "maximum_steps");
+    inputs.push_back(maximum_steps);
+
+    auto positions = layers::sinusoidal_position_encoding(capacity, architecture.hidden_size);
+    if (!positions) return std::unexpected(std::move(positions.error()));
+    const auto position_table = graph.constant(*positions, "target_positions");
+    std::vector<std::int32_t> position_indices(capacity);
+    std::iota(position_indices.begin(), position_indices.end(), 0);
+    auto position_index_tensor = Tensor::from_host(
+        {static_cast<std::int64_t>(capacity)}, std::span<const std::int32_t>(position_indices));
+    if (!position_index_tensor) return std::unexpected(std::move(position_index_tensor.error()));
+    const auto all_positions = graph.constant(*position_index_tensor, "position_indices");
+
+    const auto token = graph.scalar(manifest.special_tokens.begin, DType::I32);
+    const auto step = graph.scalar(0, DType::I32);
+    const auto finished = graph.scalar(0, DType::BOOL);
+    const auto score = graph.scalar(0, DType::F32);
+    const std::array<std::int64_t, 1> output_shape = {static_cast<std::int64_t>(capacity)};
+    const auto output_ids = graph.filled(manifest.special_tokens.pad, output_shape, DType::I32);
+    const std::array<std::int64_t, 3> cache_shape = {
+        1,
+        static_cast<std::int64_t>(capacity),
+        architecture.hidden_size,
+    };
+    std::vector<Value> initial_state = {token, step, finished, score, output_ids};
+    initial_state.reserve(5 + static_cast<std::size_t>(2 * architecture.decoder_layers));
+    for (std::int32_t layer = 0; layer < architecture.decoder_layers; ++layer) {
+        initial_state.push_back(graph.filled(0, cache_shape, DType::F32));
+        initial_state.push_back(graph.filled(0, cache_shape, DType::F32));
+    }
+
+    const auto loop = graph.while_loop(
+        initial_state,
+        [&](std::span<const Value> state) {
+            const auto within_limit = graph.less(state[1], maximum_steps, "decode.within_limit");
+            return graph.logical_and(within_limit, graph.logical_not(state[2], "decode.not_finished"),
+                                     "decode.continue");
+        },
+        [&](std::span<const Value> state) {
+            const auto cache_index = graph.reshape(state[1], {1}, "decode.cache_index");
+            const auto visible = graph.less_equal(all_positions, state[1], "decode.visible_positions");
+            const auto mask_values = graph.select(visible, graph.scalar(0, DType::F32),
+                                                  graph.scalar(-1.0e9, DType::F32), "decode.self_mask_values");
+            const auto self_mask = graph.reshape(
+                mask_values, {1, 1, 1, static_cast<std::int64_t>(capacity)}, "decode.self_mask");
+            auto hidden = layers.embedding(state[0], state[1], position_table, "tgt_embed.0.lut.weight",
+                                           architecture.target_vocabulary_size);
+            std::vector<Value> next_caches;
+            next_caches.reserve(static_cast<std::size_t>(2 * architecture.decoder_layers));
+            for (std::int32_t layer = 0; layer < architecture.decoder_layers; ++layer) {
+                const auto cache_offset = 5 + static_cast<std::size_t>(2 * layer);
+                const auto decoded = layers.decode_layer(
+                    hidden, state[cache_offset], state[cache_offset + 1], cache_index, self_mask,
+                    inputs[static_cast<std::size_t>(2 * layer)], inputs[static_cast<std::size_t>(2 * layer + 1)],
+                    "decoder.layers." + std::to_string(layer));
+                hidden = decoded.hidden;
+                next_caches.push_back(decoded.key_cache);
+                next_caches.push_back(decoded.value_cache);
+            }
+            hidden = layers.layer_norm(hidden, "decoder.norm");
+            const auto logits = manifest.weights.encoding == model::WeightEncoding::F32
+                                    ? layers.tied_projection(hidden, "tgt_embed.0.lut.weight",
+                                                             "generator.proj.bias",
+                                                             architecture.target_vocabulary_size)
+                                    : layers.linear(hidden, "generator.proj.weight", "generator.proj.bias",
+                                                    architecture.hidden_size,
+                                                    architecture.target_vocabulary_size);
+            const auto selected = graph.reshape(graph.argmax(logits, 2, "decode.argmax"), {}, "decode.token");
+            const auto next_output_ids = graph.scatter(state[4], graph.reshape(selected, {1}), cache_index, 0,
+                                                       "decode.output_ids");
+            const std::array<std::int64_t, 1> vocabulary_axis = {2};
+            const auto maximum = graph.reduce_max(logits, vocabulary_axis, "decode.maximum");
+            const auto shifted = graph.subtract(logits, maximum, "decode.shifted_logits");
+            const auto exponential = graph.exp(shifted, "decode.exp_logits");
+            const auto sum = graph.reduce_sum(exponential, vocabulary_axis, "decode.exp_sum");
+            const auto log_normalizer = graph.reshape(graph.log(sum, "decode.log_sum"), {}, "decode.log_normalizer");
+            const auto next_score = graph.subtract(state[3], log_normalizer, "decode.score");
+            const auto next_step = graph.add(state[1], graph.scalar(1, DType::I32), "decode.next_step");
+            const auto next_finished =
+                graph.equal(selected, graph.scalar(manifest.special_tokens.end, DType::I32), "decode.finished");
+            std::vector<Value> next = {selected, next_step, next_finished, next_score, next_output_ids};
+            next.insert(next.end(), next_caches.begin(), next_caches.end());
+            return next;
+        },
+        "greedy_decode");
+    if (loop.size() != initial_state.size()) {
+        if (auto status = graph.status(); !status) return std::unexpected(std::move(status.error()));
+        return std::unexpected(Error{ErrorCode::RUNTIME, "MPSGraph greedy loop returned invalid state"});
+    }
+    const std::array outputs = {loop[4], loop[1], loop[3]};
+    return graph.compile(inputs, outputs, device);
+}
+
+} // namespace
+
+struct MpsModel::Impl {
+    EmbeddingGraph source_embedding;
+    Executable source;
+    Executable decoder;
+    std::int32_t hidden_size;
+    std::int32_t decoder_layers;
+    std::int32_t source_token_limit;
+    std::size_t target_capacity;
+    Device device;
+};
+
+MpsModel::MpsModel(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+MpsModel::MpsModel(MpsModel&&) noexcept = default;
+MpsModel& MpsModel::operator=(MpsModel&&) noexcept = default;
+MpsModel::~MpsModel() = default;
+
+Result<MpsModel> MpsModel::create(const Package& package, Device device) {
+    const auto& manifest = package.manifest();
+    const auto& architecture = manifest.architecture;
+    if (manifest.weights.encoding == model::WeightEncoding::INT8_PER_CHANNEL) {
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED,
+                                     "native MPS backend supports FP32 and BF16 weights; INT8 requires LiteRT"});
+    }
+    const auto capacity = static_cast<std::size_t>(manifest.limits.source_tokens) +
+                          static_cast<std::size_t>(manifest.limits.maximum_extra_tokens);
+    if (capacity == 0 || capacity > static_cast<std::size_t>(architecture.maximum_position)) {
+        return std::unexpected(Error{ErrorCode::INVALID_MANIFEST,
+                                     "MPS target capacity exceeds positional encoding capacity"});
+    }
+    auto source_embedding =
+        EmbeddingGraph::create(package.weights(), "src_embed.0.lut.weight", architecture.source_vocabulary_size,
+                               architecture.hidden_size, manifest.weights.encoding, architecture.maximum_position);
+    if (!source_embedding) return std::unexpected(std::move(source_embedding.error()));
+    auto source = build_source_graph(package, device);
+    if (!source) return std::unexpected(std::move(source.error()));
+    auto decoder = build_decoder_graph(package, capacity, device);
+    if (!decoder) return std::unexpected(std::move(decoder.error()));
+    return MpsModel(std::make_unique<Impl>(Impl{
+        .source_embedding = std::move(*source_embedding),
+        .source = std::move(*source),
+        .decoder = std::move(*decoder),
+        .hidden_size = architecture.hidden_size,
+        .decoder_layers = architecture.decoder_layers,
+        .source_token_limit = manifest.limits.source_tokens,
+        .target_capacity = capacity,
+        .device = device,
+    }));
+}
+
+Result<MpsGreedyResult> MpsModel::greedy(std::span<const std::int32_t> source_ids, std::size_t maximum_steps,
+                                         bool compute_score, InferenceStats* stats) {
+    if (source_ids.empty() || source_ids.size() > static_cast<std::size_t>(impl_->source_token_limit)) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "MPS source token count is outside model limits"});
+    }
+    if (maximum_steps == 0 || maximum_steps > impl_->target_capacity) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "MPS target token count is outside model limits"});
+    }
+
+    auto started = Clock::now();
+    auto source_embeddings = impl_->source_embedding.run(source_ids);
+    if (!source_embeddings) return std::unexpected(std::move(source_embeddings.error()));
+    if (stats) stats->source_embedding_ns += elapsed_since(started);
+    auto device_embeddings = source_embeddings->to(impl_->device);
+    if (!device_embeddings) return std::unexpected(std::move(device_embeddings.error()));
+
+    const auto source_length = source_ids.size();
+    std::vector<Tensor> source_outputs;
+    source_outputs.reserve(static_cast<std::size_t>(2 * impl_->decoder_layers));
+    for (std::int32_t layer = 0; layer < impl_->decoder_layers; ++layer) {
+        for (std::int32_t kind = 0; kind < 2; ++kind) {
+            auto tensor = Tensor::empty({1, static_cast<std::int64_t>(source_length), impl_->hidden_size},
+                                        DType::F32, impl_->device);
+            if (!tensor) return std::unexpected(std::move(tensor.error()));
+            source_outputs.push_back(std::move(*tensor));
+        }
+    }
+    const std::array source_inputs = {*device_embeddings};
+    started = Clock::now();
+    auto status = impl_->source.run(source_inputs, source_outputs);
+    if (stats) {
+        const auto elapsed = elapsed_since(started);
+        stats->encoder_ns += elapsed;
+        stats->encoder_graph.invoke_ns += elapsed;
+    }
+    if (!status) return std::unexpected(std::move(status.error()));
+
+    const std::array<std::int32_t, 1> maximum_step_value = {static_cast<std::int32_t>(maximum_steps)};
+    auto maximum_step_tensor =
+        Tensor::from_host({}, std::span<const std::int32_t>(maximum_step_value), impl_->device);
+    if (!maximum_step_tensor) return std::unexpected(std::move(maximum_step_tensor.error()));
+    std::vector<Tensor> decoder_inputs = source_outputs;
+    decoder_inputs.push_back(std::move(*maximum_step_tensor));
+    std::vector<Tensor> decoder_outputs;
+    auto token_output = Tensor::empty({static_cast<std::int64_t>(impl_->target_capacity)}, DType::I32,
+                                      impl_->device);
+    auto length_output = Tensor::empty({}, DType::I32, impl_->device);
+    auto score_output = Tensor::empty({}, DType::F32, impl_->device);
+    if (!token_output) return std::unexpected(std::move(token_output.error()));
+    if (!length_output) return std::unexpected(std::move(length_output.error()));
+    if (!score_output) return std::unexpected(std::move(score_output.error()));
+    decoder_outputs.push_back(std::move(*token_output));
+    decoder_outputs.push_back(std::move(*length_output));
+    decoder_outputs.push_back(std::move(*score_output));
+
+    started = Clock::now();
+    status = impl_->decoder.run(decoder_inputs, decoder_outputs);
+    if (stats) stats->decoder_ns += elapsed_since(started);
+    if (!status) return std::unexpected(std::move(status.error()));
+    auto length = decoder_outputs[1].data<std::int32_t>();
+    auto tokens = decoder_outputs[0].data<std::int32_t>();
+    auto score = decoder_outputs[2].data<float>();
+    if (!length) return std::unexpected(std::move(length.error()));
+    if (!tokens) return std::unexpected(std::move(tokens.error()));
+    if (!score) return std::unexpected(std::move(score.error()));
+    if (length->front() < 0 || static_cast<std::size_t>(length->front()) > maximum_steps) {
+        return std::unexpected(Error{ErrorCode::RUNTIME, "MPS decoder returned an invalid target length"});
+    }
+    const auto count = static_cast<std::size_t>(length->front());
+    if (stats) stats->decoder_steps += count;
+    return MpsGreedyResult{
+        .token_ids = std::vector<std::int32_t>(tokens->begin(), tokens->begin() + static_cast<std::ptrdiff_t>(count)),
+        .score = compute_score ? score->front() : 0.0F,
+        .decoder_steps = count,
+    };
+}
+
+std::string_view MpsModel::device_name() const noexcept { return impl_->decoder.device_name(); }
+
+} // namespace kidi::rtg

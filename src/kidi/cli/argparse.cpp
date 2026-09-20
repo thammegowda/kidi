@@ -13,9 +13,9 @@
 namespace kidi::cli {
 namespace {
 
-bool is_option(std::string_view value) { return value.size() > 1 && value.front() == '-'; }
+auto is_option(std::string_view value) -> bool { return value.size() > 1 && value.front() == '-'; }
 
-std::string option_destination(std::span<const std::string> names) {
+auto option_destination(std::span<const std::string> names) -> std::string {
     auto selected = names.front();
     for (const auto& name : names) {
         if (name.starts_with("--")) {
@@ -29,13 +29,13 @@ std::string option_destination(std::span<const std::string> names) {
     return result;
 }
 
-std::string uppercase(std::string value) {
+auto uppercase(std::string value) -> std::string {
     std::ranges::transform(value, value.begin(),
                            [](unsigned char character) { return static_cast<char>(std::toupper(character)); });
     return value;
 }
 
-std::string join(std::span<const std::string> values, std::string_view separator) {
+auto join(std::span<const std::string> values, std::string_view separator) -> std::string {
     std::string result;
     for (std::size_t index = 0; index < values.size(); ++index) {
         if (index != 0) result += separator;
@@ -49,17 +49,19 @@ std::string join(std::span<const std::string> values, std::string_view separator
 ParseError::ParseError(std::string message, std::string usage)
     : std::runtime_error(std::move(message)), usage_(std::move(usage)) {}
 
-std::string_view ParseError::usage() const noexcept { return usage_; }
+auto ParseError::usage() const noexcept -> std::string_view { return usage_; }
 
-bool Namespace::contains(std::string_view destination) const { return values_.contains(std::string(destination)); }
+auto Namespace::contains(std::string_view destination) const -> bool {
+    return values_.contains(std::string(destination));
+}
 
-ParseStatus Namespace::status() const noexcept { return status_; }
+auto Namespace::status() const noexcept -> ParseStatus { return status_; }
 
-bool Namespace::should_exit() const noexcept { return status_ != ParseStatus::READY; }
+auto Namespace::should_exit() const noexcept -> bool { return status_ != ParseStatus::READY; }
 
-std::string_view Namespace::output() const noexcept { return output_; }
+auto Namespace::output() const noexcept -> std::string_view { return output_; }
 
-void Namespace::set(std::string destination, std::any value) {
+auto Namespace::set(std::string destination, std::any value) -> void {
     values_.insert_or_assign(std::move(destination), std::move(value));
 }
 
@@ -68,28 +70,28 @@ Argument::Argument(std::vector<std::string> names)
     destination_ = optional_ ? option_destination(names_) : names_.front();
 }
 
-Argument& Argument::help(std::string value) {
+auto Argument::help(std::string value) -> Argument& {
     help_ = std::move(value);
     return *this;
 }
 
-Argument& Argument::metavar(std::string value) {
+auto Argument::metavar(std::string value) -> Argument& {
     metavar_ = std::move(value);
     return *this;
 }
 
-Argument& Argument::dest(std::string value) {
+auto Argument::dest(std::string value) -> Argument& {
     if (value.empty()) throw std::logic_error("argument destination cannot be empty");
     destination_ = std::move(value);
     return *this;
 }
 
-Argument& Argument::required(bool value) noexcept {
+auto Argument::required(bool value) noexcept -> Argument& {
     required_ = value;
     return *this;
 }
 
-Argument& Argument::action(Action value) {
+auto Argument::action(Action value) -> Argument& {
     action_ = value;
     if (action_ == Action::STORE_TRUE) {
         converter_ = [](std::string_view) { return std::any(true); };
@@ -107,24 +109,24 @@ Argument& Argument::action(Action value) {
     return *this;
 }
 
-Argument& Argument::choices(std::initializer_list<std::string_view> values) {
+auto Argument::choices(std::initializer_list<std::string_view> values) -> Argument& {
     choices_.clear();
     choices_.reserve(values.size());
     for (const auto value : values) choices_.emplace_back(value);
     return *this;
 }
 
-bool Argument::is_flag() const noexcept { return action_ != Action::STORE; }
+auto Argument::is_flag() const noexcept -> bool { return action_ != Action::STORE; }
 
-std::string Argument::display_name() const { return optional_ ? join(names_, ", ") : value_name(); }
+auto Argument::display_name() const -> std::string { return optional_ ? join(names_, ", ") : value_name(); }
 
-std::string Argument::value_name() const {
+auto Argument::value_name() const -> std::string {
     if (!metavar_.empty()) return metavar_;
     if (!choices_.empty()) return "{" + join(choices_, ",") + "}";
     return optional_ ? uppercase(destination_) : destination_;
 }
 
-std::any Argument::parse(std::string_view value) const {
+auto Argument::parse(std::string_view value) const -> std::any {
     if (!choices_.empty() && std::ranges::find(choices_, value) == choices_.end()) {
         throw std::invalid_argument("invalid choice '" + std::string(value) + "' (choose from " + join(choices_, ", ") +
                                     ")");
@@ -137,18 +139,18 @@ Subparsers::Subparsers(ArgumentParser& owner, std::string destination)
 
 Subparsers::~Subparsers() = default;
 
-Subparsers& Subparsers::required(bool value) noexcept {
+auto Subparsers::required(bool value) noexcept -> Subparsers& {
     required_ = value;
     return *this;
 }
 
-Subparsers& Subparsers::dest(std::string value) {
+auto Subparsers::dest(std::string value) -> Subparsers& {
     if (value.empty()) throw std::logic_error("subcommand destination cannot be empty");
     destination_ = std::move(value);
     return *this;
 }
 
-ArgumentParser& Subparsers::add_parser(std::string name, std::string help) {
+auto Subparsers::add_parser(std::string name, std::string help) -> ArgumentParser& {
     if (name.empty() || is_option(name)) throw std::logic_error("invalid command name: " + name);
     if (find(name) != nullptr) throw std::logic_error("duplicate command: " + name);
     auto parser = std::make_unique<ArgumentParser>(owner_.program_ + " " + name);
@@ -157,7 +159,7 @@ ArgumentParser& Subparsers::add_parser(std::string name, std::string help) {
     return result;
 }
 
-const Subparsers::Entry* Subparsers::find(std::string_view name) const {
+auto Subparsers::find(std::string_view name) const -> const Subparsers::Entry* {
     const auto iterator = std::ranges::find(entries_, name, &Entry::name);
     return iterator == entries_.end() ? nullptr : std::addressof(*iterator);
 }
@@ -169,24 +171,24 @@ ArgumentParser::ArgumentParser(std::string program, std::string description)
 
 ArgumentParser::~ArgumentParser() = default;
 
-ArgumentParser& ArgumentParser::description(std::string value) {
+auto ArgumentParser::description(std::string value) -> ArgumentParser& {
     description_ = std::move(value);
     return *this;
 }
 
-ArgumentParser& ArgumentParser::version(std::string value) {
+auto ArgumentParser::version(std::string value) -> ArgumentParser& {
     version_ = std::move(value);
     return *this;
 }
 
-Subparsers& ArgumentParser::add_subparsers(std::string destination) {
+auto ArgumentParser::add_subparsers(std::string destination) -> Subparsers& {
     if (!positionals_.empty()) throw std::logic_error("subparsers cannot follow positional arguments");
     if (subparsers_ != nullptr) throw std::logic_error("only one subparser group is supported");
     subparsers_ = std::unique_ptr<Subparsers>(new Subparsers(*this, std::move(destination)));
     return *subparsers_;
 }
 
-Namespace ArgumentParser::parse_args(int argc, const char* const argv[]) const {
+auto ArgumentParser::parse_args(int argc, const char* const argv[]) const -> Namespace {
     if (argc < 1 || argv == nullptr) throw std::logic_error("invalid argc/argv");
     std::vector<std::string_view> arguments;
     arguments.reserve(static_cast<std::size_t>(argc - 1));
@@ -194,7 +196,7 @@ Namespace ArgumentParser::parse_args(int argc, const char* const argv[]) const {
     return parse_args(arguments);
 }
 
-Namespace ArgumentParser::parse_args(std::span<const std::string_view> arguments) const {
+auto ArgumentParser::parse_args(std::span<const std::string_view> arguments) const -> Namespace {
     Namespace result;
     std::unordered_set<const Argument*> seen;
     for (const auto& argument : arguments_) {
@@ -271,7 +273,7 @@ Namespace ArgumentParser::parse_args(std::span<const std::string_view> arguments
     return result;
 }
 
-std::string ArgumentParser::format_usage() const {
+auto ArgumentParser::format_usage() const -> std::string {
     std::string result = "usage: " + program_ + " [-h]";
     if (version_) result += " [--version]";
     for (const auto& argument : arguments_) {
@@ -295,7 +297,7 @@ std::string ArgumentParser::format_usage() const {
     return result + "\n";
 }
 
-std::string ArgumentParser::format_help() const {
+auto ArgumentParser::format_help() const -> std::string {
     std::string result = format_usage();
     if (!description_.empty()) result += "\n" + description_ + "\n";
 
@@ -326,7 +328,7 @@ std::string ArgumentParser::format_help() const {
     return result;
 }
 
-Argument& ArgumentParser::add_argument(std::vector<std::string> names) {
+auto ArgumentParser::add_argument(std::vector<std::string> names) -> Argument& {
     if (names.empty() || names.front().empty()) throw std::logic_error("argument name cannot be empty");
     const bool optional = is_option(names.front());
     for (const auto& name : names) {
@@ -354,7 +356,7 @@ Argument& ArgumentParser::add_argument(std::vector<std::string> names) {
     return *result;
 }
 
-void ArgumentParser::set_value(Namespace& result, const Argument& argument, std::string_view value) const {
+auto ArgumentParser::set_value(Namespace& result, const Argument& argument, std::string_view value) const -> void {
     try {
         result.set(argument.destination_, argument.parse(value));
     } catch (const std::invalid_argument& error) {
@@ -362,7 +364,7 @@ void ArgumentParser::set_value(Namespace& result, const Argument& argument, std:
     }
 }
 
-void ArgumentParser::validate_arguments(const std::unordered_set<const Argument*>& seen) const {
+auto ArgumentParser::validate_arguments(const std::unordered_set<const Argument*>& seen) const -> void {
     std::vector<std::string> missing;
     for (const auto& argument : arguments_) {
         if (argument->required_ && !seen.contains(argument.get())) missing.push_back(argument->display_name());
@@ -370,9 +372,9 @@ void ArgumentParser::validate_arguments(const std::unordered_set<const Argument*
     if (!missing.empty()) fail("the following arguments are required: " + join(missing, ", "));
 }
 
-void ArgumentParser::fail(std::string message) const { throw ParseError(std::move(message), format_usage()); }
+auto ArgumentParser::fail(std::string message) const -> void { throw ParseError(std::move(message), format_usage()); }
 
-std::string ArgumentParser::argument_help(const Argument& argument) {
+auto ArgumentParser::argument_help(const Argument& argument) -> std::string {
     auto result = argument.help_;
     if (argument.default_value_ && argument.action_ == Action::STORE && !argument.default_display_.empty()) {
         if (!result.empty()) result += " ";
@@ -381,8 +383,8 @@ std::string ArgumentParser::argument_help(const Argument& argument) {
     return result;
 }
 
-void ArgumentParser::append_rows(std::string& output, std::string_view heading,
-                                 const std::vector<std::pair<std::string, std::string>>& rows) {
+auto ArgumentParser::append_rows(std::string& output, std::string_view heading,
+                                 const std::vector<std::pair<std::string, std::string>>& rows) -> void {
     if (rows.empty()) return;
     constexpr std::size_t LABEL_WIDTH = 26;
     output += "\n" + std::string(heading) + ":\n";

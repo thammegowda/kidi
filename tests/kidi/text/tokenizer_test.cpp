@@ -22,7 +22,7 @@ constexpr std::string_view TOKENIZER_JSON = R"({
   }
 })";
 
-bool write_gzip(const std::filesystem::path& path, std::string_view contents) {
+auto write_gzip(const std::filesystem::path& path, std::string_view contents) -> bool {
     gzFile output = gzopen(path.c_str(), "wb");
     if (output == nullptr) {
         return false;
@@ -33,7 +33,7 @@ bool write_gzip(const std::filesystem::path& path, std::string_view contents) {
 
 } // namespace
 
-int main() {
+auto main() -> int {
     const auto directory = std::filesystem::temp_directory_path() / "kidi-tokenizer-test";
     std::filesystem::remove_all(directory);
     std::filesystem::create_directories(directory);

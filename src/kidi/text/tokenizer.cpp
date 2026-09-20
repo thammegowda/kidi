@@ -11,7 +11,7 @@
 namespace kidi::text {
 namespace {
 
-Result<std::string> read_plain(const std::filesystem::path& path) {
+auto read_plain(const std::filesystem::path& path) -> Result<std::string> {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         return std::unexpected(Error{ErrorCode::IO, "cannot open tokenizer: " + path.string()});
@@ -23,7 +23,7 @@ Result<std::string> read_plain(const std::filesystem::path& path) {
     return contents;
 }
 
-Result<std::string> read_gzip(const std::filesystem::path& path) {
+auto read_gzip(const std::filesystem::path& path) -> Result<std::string> {
     gzFile input = gzopen(path.c_str(), "rb");
     if (input == nullptr) {
         return std::unexpected(Error{ErrorCode::IO, "cannot open gzip tokenizer: " + path.string()});
@@ -51,7 +51,7 @@ Result<std::string> read_gzip(const std::filesystem::path& path) {
     return contents;
 }
 
-bool has_gzip_suffix(const std::filesystem::path& path) { return path.extension() == ".gz"; }
+auto has_gzip_suffix(const std::filesystem::path& path) -> bool { return path.extension() == ".gz"; }
 
 } // namespace
 
@@ -63,10 +63,10 @@ struct Tokenizer::Impl {
 
 Tokenizer::Tokenizer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Tokenizer::Tokenizer(Tokenizer&&) noexcept = default;
-Tokenizer& Tokenizer::operator=(Tokenizer&&) noexcept = default;
+auto Tokenizer::operator=(Tokenizer&&) noexcept -> Tokenizer& = default;
 Tokenizer::~Tokenizer() = default;
 
-Result<Tokenizer> Tokenizer::load(const std::filesystem::path& path) {
+auto Tokenizer::load(const std::filesystem::path& path) -> Result<Tokenizer> {
     if (!std::filesystem::is_regular_file(path)) {
         return std::unexpected(Error{ErrorCode::IO, "tokenizer does not exist: " + path.string()});
     }
@@ -91,7 +91,7 @@ Result<Tokenizer> Tokenizer::load(const std::filesystem::path& path) {
     return Tokenizer(std::make_unique<Impl>(std::move(*tokenizer)));
 }
 
-Result<std::vector<std::int32_t>> Tokenizer::encode(std::string_view text) const {
+auto Tokenizer::encode(std::string_view text) const -> Result<std::vector<std::int32_t>> {
     auto encoding = impl_->value.encode(text, false);
     if (!encoding) {
         return std::unexpected(Error{ErrorCode::RUNTIME, "tokenizer encode failed: " + encoding.error().message()});
@@ -99,7 +99,7 @@ Result<std::vector<std::int32_t>> Tokenizer::encode(std::string_view text) const
     return encoding->get_ids();
 }
 
-Result<std::string> Tokenizer::decode(std::span<const std::int32_t> ids) const {
+auto Tokenizer::decode(std::span<const std::int32_t> ids) const -> Result<std::string> {
     const std::vector<std::int32_t> owned_ids(ids.begin(), ids.end());
     auto text = impl_->value.decode(owned_ids, false);
     if (!text) {
@@ -108,9 +108,9 @@ Result<std::string> Tokenizer::decode(std::span<const std::int32_t> ids) const {
     return std::move(*text);
 }
 
-std::size_t Tokenizer::vocabulary_size() const noexcept { return impl_->value.get_vocab_size(); }
+auto Tokenizer::vocabulary_size() const noexcept -> std::size_t { return impl_->value.get_vocab_size(); }
 
-std::optional<std::int32_t> Tokenizer::token_id(std::string_view token) const {
+auto Tokenizer::token_id(std::string_view token) const -> std::optional<std::int32_t> {
     return impl_->value.token_to_id(token);
 }
 

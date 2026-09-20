@@ -3,25 +3,11 @@
 #include <string>
 #include <string_view>
 
+#include "kidi/tensor/dtype.h"
+
 namespace kidi::model {
 
-enum class DataType {
-    BOOL,
-    U8,
-    I8,
-    U16,
-    I16,
-    U32,
-    I32,
-    U64,
-    I64,
-    F16,
-    BF16,
-    F32,
-    F64,
-    E4M3,
-    E5M2,
-};
+using DataType = tensor::DType;
 
 enum class WeightEncoding {
     F32,
@@ -34,7 +20,7 @@ struct WeightSpec {
     WeightEncoding encoding;
 };
 
-[[nodiscard]] constexpr DataType matrix_data_type(WeightEncoding encoding) noexcept {
+constexpr auto matrix_data_type(WeightEncoding encoding) noexcept -> DataType {
     switch (encoding) {
         case WeightEncoding::F32:
             return DataType::F32;
@@ -45,7 +31,7 @@ struct WeightSpec {
     }
 }
 
-[[nodiscard]] constexpr std::string_view to_string(WeightEncoding encoding) noexcept {
+constexpr auto to_string(WeightEncoding encoding) noexcept -> std::string_view {
     switch (encoding) {
         case WeightEncoding::F32:
             return "F32";
@@ -56,7 +42,7 @@ struct WeightSpec {
     }
 }
 
-[[nodiscard]] inline std::string quantization_scale_name(std::string_view weight_name) {
+inline auto quantization_scale_name(std::string_view weight_name) -> std::string {
     return std::string(weight_name) + ".scale";
 }
 

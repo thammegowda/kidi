@@ -63,7 +63,7 @@ struct ModelManifest {
     std::string input_format;
     std::string output_format;
 
-    [[nodiscard]] static Result<ModelManifest> load(const std::filesystem::path& path);
+    static auto load(const std::filesystem::path& path) -> Result<ModelManifest>;
 };
 
 } // namespace kidi::model

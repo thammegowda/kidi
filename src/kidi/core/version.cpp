@@ -2,6 +2,6 @@
 
 namespace kidi::core {
 
-std::string_view version() noexcept { return "0.1.0"; }
+auto version() noexcept -> std::string_view { return "0.1.0"; }
 
 } // namespace kidi::core

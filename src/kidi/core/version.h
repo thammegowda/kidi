@@ -4,7 +4,7 @@
 
 namespace kidi::core {
 
-[[nodiscard]] std::string_view version() noexcept;
+auto version() noexcept -> std::string_view;
 
 } // namespace kidi::core
 

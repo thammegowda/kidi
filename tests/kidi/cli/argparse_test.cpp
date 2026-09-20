@@ -9,7 +9,7 @@
 
 namespace {
 
-void configure(kidi::cli::ArgumentParser& parser) {
+auto configure(kidi::cli::ArgumentParser& parser) -> void {
     parser.version("kidi 1.2.3");
     auto& commands = parser.add_subparsers().required();
 
@@ -30,11 +30,13 @@ void configure(kidi::cli::ArgumentParser& parser) {
     predict.add_argument("-m", "--model").type<std::filesystem::path>().required().metavar("DIR");
 }
 
-bool contains(std::string_view value, std::string_view part) { return value.find(part) != std::string_view::npos; }
+auto contains(std::string_view value, std::string_view part) -> bool {
+    return value.find(part) != std::string_view::npos;
+}
 
 } // namespace
 
-int main() {
+auto main() -> int {
     kidi::cli::ArgumentParser parser("kidi", "small inference toolkit");
     configure(parser);
 

@@ -17,7 +17,7 @@
 namespace kidi::model {
 namespace {
 
-std::optional<DataType> parse_data_type(std::string_view value) {
+auto parse_data_type(std::string_view value) -> std::optional<DataType> {
     if (value == "BOOL") return DataType::BOOL;
     if (value == "U8") return DataType::U8;
     if (value == "I8") return DataType::I8;
@@ -36,34 +36,20 @@ std::optional<DataType> parse_data_type(std::string_view value) {
     return std::nullopt;
 }
 
-std::size_t data_type_size(DataType data_type) {
-    switch (data_type) {
-        case DataType::BOOL:
-        case DataType::U8:
-        case DataType::I8:
-        case DataType::E4M3:
-        case DataType::E5M2:
-            return 1;
-        case DataType::U16:
-        case DataType::I16:
-        case DataType::F16:
-        case DataType::BF16:
-            return 2;
-        case DataType::U32:
-        case DataType::I32:
-        case DataType::F32:
-            return 4;
-        case DataType::U64:
-        case DataType::I64:
-        case DataType::F64:
-            return 8;
-    }
-}
+auto data_type_size(DataType data_type) -> std::size_t { return tensor::element_size(data_type); }
 
 struct OwnedTensor {
     DataType data_type;
     std::vector<std::int64_t> shape;
     std::vector<std::byte> bytes;
+};
+
+struct RawTensorView {
+    DataType data_type;
+    std::span<const std::int64_t> shape;
+    std::span<const std::byte> bytes;
+
+    auto element_size() const noexcept -> std::size_t { return tensor::element_size(data_type); }
 };
 
 } // namespace
@@ -79,7 +65,7 @@ struct Weights::Impl {
 
 namespace {
 
-std::string render_template(std::string_view value, const std::smatch& match) {
+auto render_template(std::string_view value, const std::smatch& match) -> std::string {
     std::string result;
     for (std::size_t index = 0; index < value.size();) {
         if (value[index] == '$' && index + 1 < value.size() &&
@@ -98,16 +84,16 @@ std::string render_template(std::string_view value, const std::smatch& match) {
     return result;
 }
 
-TensorView mapped_tensor_view(const safetensors::MappedTensor& tensor) {
+auto mapped_tensor_view(const safetensors::MappedTensor& tensor) -> RawTensorView {
     const auto data_type = parse_data_type(tensor.dtype);
     if (!data_type) throw std::invalid_argument("unsupported mapped tensor dtype: " + tensor.dtype);
-    return TensorView{.data_type = *data_type, .shape = tensor.shape, .bytes = tensor.bytes()};
+    return RawTensorView{.data_type = *data_type, .shape = tensor.shape, .bytes = tensor.bytes()};
 }
 
 template <typename Storage>
-TensorView tensor_view(const Storage& impl, std::string_view name) {
+auto tensor_view(const Storage& impl, std::string_view name) -> RawTensorView {
     if (const auto transformed = impl.transformed.find(std::string(name)); transformed != impl.transformed.end()) {
-        return TensorView{
+        return RawTensorView{
             .data_type = transformed->second.data_type,
             .shape = transformed->second.shape,
             .bytes = transformed->second.bytes,
@@ -120,12 +106,12 @@ TensorView tensor_view(const Storage& impl, std::string_view name) {
 }
 
 template <typename Storage>
-bool contains_tensor(const Storage& impl, std::string_view name) {
+auto contains_tensor(const Storage& impl, std::string_view name) -> bool {
     return impl.transformed.contains(std::string(name)) || impl.aliases.contains(std::string(name)) ||
            (!impl.hidden.contains(std::string(name)) && impl.checkpoint.contains(std::string(name)));
 }
 
-OwnedTensor concatenate_tensors(const std::vector<TensorView>& inputs, std::int64_t axis) {
+auto concatenate_tensors(const std::vector<RawTensorView>& inputs, std::int64_t axis) -> OwnedTensor {
     if (inputs.empty()) throw std::invalid_argument("weight mapping has no inputs");
     const auto rank = static_cast<std::int64_t>(inputs.front().shape.size());
     if (axis < 0) axis += rank;
@@ -172,7 +158,7 @@ OwnedTensor concatenate_tensors(const std::vector<TensorView>& inputs, std::int6
 }
 
 template <typename Storage>
-void apply_state_mappings(Storage& impl, const std::vector<StateMappingSpec>& specs) {
+auto apply_state_mappings(Storage& impl, const std::vector<StateMappingSpec>& specs) -> void {
     for (const auto& spec : specs) {
         const std::regex anchor(spec.sources.front());
         std::vector<std::string> keys;
@@ -203,7 +189,7 @@ void apply_state_mappings(Storage& impl, const std::vector<StateMappingSpec>& sp
                 continue;
             }
 
-            std::vector<TensorView> tensors;
+            std::vector<RawTensorView> tensors;
             tensors.reserve(sources.size());
             for (const auto& source : sources) tensors.push_back(tensor_view(impl, source));
             impl.transformed.emplace(destination, concatenate_tensors(tensors, spec.concat_axis));
@@ -214,22 +200,14 @@ void apply_state_mappings(Storage& impl, const std::vector<StateMappingSpec>& sp
 
 } // namespace
 
-std::size_t TensorView::element_count() const noexcept {
-    return std::accumulate(shape.begin(), shape.end(), std::size_t{1}, std::multiplies<>{});
-}
-
-std::size_t TensorView::element_size() const noexcept { return data_type_size(data_type); }
-
-const void* TensorView::data() const noexcept { return bytes.data(); }
-
-Weights::Weights(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Weights::Weights(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Weights::Weights(Weights&&) noexcept = default;
-Weights& Weights::operator=(Weights&&) noexcept = default;
+auto Weights::operator=(Weights&&) noexcept -> Weights& = default;
 Weights::~Weights() = default;
 
-Result<Weights> Weights::load(const std::filesystem::path& path, std::span<const StateMappingSpec> mappings) {
+auto Weights::load(const std::filesystem::path& path, std::span<const StateMappingSpec> mappings) -> Result<Weights> {
     try {
-        auto impl = std::make_unique<Impl>(path);
+        auto impl = std::make_shared<Impl>(path);
         apply_state_mappings(*impl, std::vector<StateMappingSpec>(mappings.begin(), mappings.end()));
         return Weights(std::move(impl));
     } catch (const std::exception& error) {
@@ -240,31 +218,25 @@ Result<Weights> Weights::load(const std::filesystem::path& path, std::span<const
     }
 }
 
-bool Weights::contains(std::string_view name) const { return contains_tensor(*impl_, name); }
+auto Weights::contains(std::string_view name) const -> bool { return contains_tensor(*impl_, name); }
 
-std::size_t Weights::size() const noexcept {
+auto Weights::size() const noexcept -> std::size_t {
     return impl_->checkpoint.tensors().size() - impl_->hidden.size() + impl_->transformed.size() +
            impl_->aliases.size();
 }
 
-Result<TensorView> Weights::tensor(std::string_view name) const {
+auto Weights::tensor(std::string_view name) const -> Result<tensor::Tensor> {
     if (!contains(name)) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "weight tensor not found: " + std::string(name)});
     }
-    if (impl_->transformed.contains(std::string(name)) || impl_->aliases.contains(std::string(name))) {
-        return tensor_view(*impl_, name);
-    }
-    const auto& tensor = impl_->checkpoint.at(std::string(name));
-    const auto data_type = parse_data_type(tensor.dtype);
-    if (!data_type) {
-        return std::unexpected(Error{ErrorCode::UNSUPPORTED,
-                                     "weight tensor " + std::string(name) + " has unsupported dtype " + tensor.dtype});
-    }
-    if (!tensor.is_aligned(data_type_size(*data_type))) {
+    const auto raw = tensor_view(*impl_, name);
+    if (reinterpret_cast<std::uintptr_t>(raw.bytes.data()) % data_type_size(raw.data_type) != 0) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT,
                                      "weight tensor " + std::string(name) + " is not aligned for zero-copy access"});
     }
-    return mapped_tensor_view(tensor);
+    std::shared_ptr<const void> owner = impl_;
+    return tensor::Tensor::from_blob(std::vector<std::int64_t>(raw.shape.begin(), raw.shape.end()), raw.data_type,
+                                     raw.bytes, std::move(owner));
 }
 
 } // namespace kidi::model

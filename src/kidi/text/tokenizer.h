@@ -16,18 +16,18 @@ namespace kidi::text {
 class Tokenizer {
 public:
     Tokenizer(Tokenizer&&) noexcept;
-    Tokenizer& operator=(Tokenizer&&) noexcept;
+    auto operator=(Tokenizer&&) noexcept -> Tokenizer&;
     ~Tokenizer();
 
     Tokenizer(const Tokenizer&) = delete;
-    Tokenizer& operator=(const Tokenizer&) = delete;
+    auto operator=(const Tokenizer&) -> Tokenizer& = delete;
 
-    [[nodiscard]] static Result<Tokenizer> load(const std::filesystem::path& path);
+    static auto load(const std::filesystem::path& path) -> Result<Tokenizer>;
 
-    [[nodiscard]] Result<std::vector<std::int32_t>> encode(std::string_view text) const;
-    [[nodiscard]] Result<std::string> decode(std::span<const std::int32_t> ids) const;
-    [[nodiscard]] std::size_t vocabulary_size() const noexcept;
-    [[nodiscard]] std::optional<std::int32_t> token_id(std::string_view token) const;
+    auto encode(std::string_view text) const -> Result<std::vector<std::int32_t>>;
+    auto decode(std::span<const std::int32_t> ids) const -> Result<std::string>;
+    auto vocabulary_size() const noexcept -> std::size_t;
+    auto token_id(std::string_view token) const -> std::optional<std::int32_t>;
 
 private:
     struct Impl;

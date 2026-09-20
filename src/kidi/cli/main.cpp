@@ -4,17 +4,24 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "kidi/cli/argparse.h"
 #include "kidi/core/version.h"
-#include "kidi/rtg/package.h"
-#include "kidi/rtg/translator.h"
-#include "kidi/runtime/ynn.h"
+#include "kidi/model/package.h"
+#include "kidi/inference/translator.h"
+#include "kidi/runtime/ynn/graph.h"
+#include "kidi/tensor/backend.h"
 
 namespace {
 
-int inspect(const kidi::cli::Namespace& arguments) {
-    auto package = kidi::rtg::Package::load(arguments.get<std::filesystem::path>("model"));
+auto inference_backend(const kidi::cli::Namespace& arguments) -> kidi::inference::InferenceBackend {
+    return arguments.get<std::string>("backend") == "mps" ? kidi::inference::InferenceBackend::MPS
+                                                          : kidi::inference::InferenceBackend::YNNPACK;
+}
+
+auto inspect(const kidi::cli::Namespace& arguments) -> int {
+    auto package = kidi::model::Package::load(arguments.get<std::filesystem::path>("model"));
     if (!package) {
         std::cerr << "kidi: " << package.error().message << '\n';
         return 1;
@@ -29,11 +36,18 @@ int inspect(const kidi::cli::Namespace& arguments) {
               << package->target_tokenizer().vocabulary_size() << '\n'
               << "beam: " << manifest.decode_defaults.beam_size << '\n'
               << "runtime: ynnpack_cpu\n"
-              << "cpu features: " << kidi::runtime::ynn_supported_arch_names() << '\n';
+              << "cpu features: " << kidi::runtime::ynn::supported_arch_names() << '\n';
+    for (const auto& backend : kidi::tensor::BackendRegistry::instance().backends()) {
+        std::cout << "tensor backend: " << kidi::tensor::to_string(backend.device_kind) << ' ' << backend.name
+                  << " storage=" << (backend.storage_available ? "yes" : "no")
+                  << " execution=" << (backend.execution_available ? "yes" : "no");
+        if (!backend.storage_available) std::cout << " reason=" << backend.unavailable_reason;
+        std::cout << '\n';
+    }
     return 0;
 }
 
-int predict(const kidi::cli::Namespace& arguments) {
+auto predict(const kidi::cli::Namespace& arguments) -> int {
     const auto& input_type = arguments.get<std::string>("inp_type");
     if (input_type != "text") {
         std::cerr << "kidi: input type '" << input_type << "' is not supported yet\n";
@@ -45,7 +59,7 @@ int predict(const kidi::cli::Namespace& arguments) {
             std::cerr << "kidi: thread count must be positive\n";
             return 2;
         }
-        kidi::runtime::set_ynn_thread_count(static_cast<std::size_t>(threads));
+        kidi::runtime::ynn::set_thread_count(static_cast<std::size_t>(threads));
     }
 
     const auto& input_path = arguments.get<std::string>("input");
@@ -72,15 +86,28 @@ int predict(const kidi::cli::Namespace& arguments) {
         output = &output_file;
     }
 
-    kidi::rtg::InferenceStats profile;
+    kidi::inference::InferenceStats profile;
+    const auto batch_size = arguments.get<std::int32_t>("batch_size");
+    const auto batch_window =
+        arguments.contains("batch_window") ? arguments.get<std::int32_t>("batch_window") : batch_size;
+    if (batch_size < 1 || batch_size > 256) {
+        std::cerr << "kidi: batch size must be between 1 and 256\n";
+        return 2;
+    }
+    if (batch_window < batch_size || batch_window > 4096) {
+        std::cerr << "kidi: batch window must be between batch-size and 4096\n";
+        return 2;
+    }
     auto* profile_ptr = arguments.get<bool>("profile") ? &profile : nullptr;
-    auto translator = kidi::rtg::Translator::load(arguments.get<std::filesystem::path>("model"), profile_ptr);
+    const auto backend = inference_backend(arguments);
+    auto translator = kidi::inference::Translator::load(arguments.get<std::filesystem::path>("model"), backend,
+                                                        profile_ptr, batch_size);
     if (!translator) {
         std::cerr << "kidi: " << translator.error().message << '\n';
         return 1;
     }
 
-    kidi::rtg::DecodeOptions options;
+    kidi::inference::DecodeOptions options;
     if (arguments.contains("beam_size")) options.beam_size = arguments.get<std::int32_t>("beam_size");
     if (arguments.contains("maximum_extra_tokens")) {
         options.maximum_extra_tokens = arguments.get<std::int32_t>("maximum_extra_tokens");
@@ -91,28 +118,43 @@ int predict(const kidi::cli::Namespace& arguments) {
     std::size_t line_number = 0;
     std::size_t translated_items = 0;
     std::size_t target_tokens = 0;
+    std::vector<std::string> pending;
+    const auto flush = [&]() -> bool {
+        std::vector<std::string> sources;
+        for (const auto& line : pending)
+            if (!line.empty()) sources.push_back(line);
+        auto translations = translator->translate_batch(sources, options, profile_ptr);
+        if (!translations) {
+            std::cerr << "kidi: batch ending at input line " << line_number << ": " << translations.error().message
+                      << '\n';
+            return false;
+        }
+        std::size_t index = 0;
+        for (const auto& line : pending) {
+            if (!line.empty()) {
+                const auto& translation = (*translations)[index++];
+                *output << translation.text;
+                if (arguments.get<bool>("score")) *output << '\t' << translation.score;
+                ++translated_items;
+                target_tokens += translation.token_ids.size();
+            }
+            *output << '\n';
+        }
+        output->flush();
+        pending.clear();
+        if (!*output) {
+            std::cerr << "kidi: cannot write output: " << output_path << '\n';
+            return false;
+        }
+        return true;
+    };
     for (std::string line; std::getline(*input, line);) {
         ++line_number;
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) {
-            *output << '\n';
-            continue;
-        }
-        auto translation = translator->translate(line, options, profile_ptr);
-        if (!translation) {
-            std::cerr << "kidi: input line " << line_number << ": " << translation.error().message << '\n';
-            return 1;
-        }
-        *output << translation->text;
-        if (arguments.get<bool>("score")) *output << '\t' << translation->score;
-        *output << '\n';
-        if (!*output) {
-            std::cerr << "kidi: cannot write output: " << output_path << '\n';
-            return 1;
-        }
-        ++translated_items;
-        target_tokens += translation->token_ids.size();
+        pending.push_back(std::move(line));
+        if (pending.size() == static_cast<std::size_t>(batch_window) && !flush()) return 1;
     }
+    if (!pending.empty() && !flush()) return 1;
     if (input->bad()) {
         std::cerr << "kidi: cannot read input: " << input_path << '\n';
         return 1;
@@ -122,35 +164,15 @@ int predict(const kidi::cli::Namespace& arguments) {
                   << "|target_tokens=" << target_tokens << '\n';
     }
     if (profile_ptr) {
-        std::cerr << "kidi_profile|backend=ynnpack_cpu|threads=" << kidi::runtime::ynn_thread_count()
-                  << "|ynn_arch_flags=" << kidi::runtime::ynn_supported_arch_flags()
-                  << "|ynn_arch=" << kidi::runtime::ynn_supported_arch_names()
+        std::cerr << "kidi_profile|backend=" << kidi::inference::to_string(backend)
+                  << "|threads=" << kidi::runtime::ynn::thread_count()
+                  << "|ynn_arch_flags=" << kidi::runtime::ynn::supported_arch_flags()
+                  << "|ynn_arch=" << kidi::runtime::ynn::supported_arch_names()
                   << "|package_load_ns=" << profile.package_load_ns << "|graph_compile_ns=" << profile.graph_compile_ns
                   << "|source_tokenize_ns=" << profile.source_tokenize_ns << "|encoder_ns=" << profile.encoder_ns
-                  << "|source_embedding_ns=" << profile.source_embedding_ns
-                  << "|encoder_max_concurrency=" << profile.encoder_graph.max_concurrency
-                  << "|encoder_prepare_ns=" << profile.encoder_graph.prepare_ns
-                  << "|encoder_reshape_ns=" << profile.encoder_graph.reshape_ns
-                  << "|encoder_bind_ns=" << profile.encoder_graph.bind_ns
-                  << "|encoder_invoke_ns=" << profile.encoder_graph.invoke_ns << "|decoder_ns=" << profile.decoder_ns
+                  << "|source_embedding_ns=" << profile.source_embedding_ns << "|decoder_ns=" << profile.decoder_ns
                   << "|source_projection_ns=" << profile.source_projection_ns
-                  << "|source_projection_max_concurrency=" << profile.source_projection_graph.max_concurrency
-                  << "|source_projection_prepare_ns=" << profile.source_projection_graph.prepare_ns
-                  << "|source_projection_reshape_ns=" << profile.source_projection_graph.reshape_ns
-                  << "|source_projection_bind_ns=" << profile.source_projection_graph.bind_ns
-                  << "|source_projection_invoke_ns=" << profile.source_projection_graph.invoke_ns
                   << "|target_embedding_ns=" << profile.target_embedding_ns
-                  << "|decoder_max_concurrency=" << profile.decoder_graph.max_concurrency
-                  << "|decoder_prepare_ns=" << profile.decoder_graph.prepare_ns
-                  << "|decoder_reshape_ns=" << profile.decoder_graph.reshape_ns
-                  << "|decoder_bind_ns=" << profile.decoder_graph.bind_ns
-                  << "|decoder_invoke_ns=" << profile.decoder_graph.invoke_ns
-                  << "|last_hidden_ns=" << profile.last_hidden_ns
-                  << "|generator_max_concurrency=" << profile.generator_graph.max_concurrency
-                  << "|generator_prepare_ns=" << profile.generator_graph.prepare_ns
-                  << "|generator_reshape_ns=" << profile.generator_graph.reshape_ns
-                  << "|generator_bind_ns=" << profile.generator_graph.bind_ns
-                  << "|generator_invoke_ns=" << profile.generator_graph.invoke_ns
                   << "|host_search_ns=" << profile.host_search_ns << "|target_decode_ns=" << profile.target_decode_ns
                   << "|translate_ns=" << profile.translate_ns << "|decoder_steps=" << profile.decoder_steps << '\n';
     }
@@ -159,8 +181,8 @@ int predict(const kidi::cli::Namespace& arguments) {
 
 } // namespace
 
-int main(int argc, char** argv) {
-    kidi::cli::ArgumentParser parser("kidi", "Run RTG translation models with YNNPACK.");
+auto main(int argc, char** argv) -> int {
+    kidi::cli::ArgumentParser parser("kidi", "Run optimized RTG translation models.");
     parser.version("kidi " + std::string(kidi::version()));
     auto& commands = parser.add_subparsers().required();
 
@@ -191,6 +213,19 @@ int main(int argc, char** argv) {
     predict_parser.add_argument("--profile")
         .action(kidi::cli::Action::STORE_TRUE)
         .help("emit machine-readable inference timings to stderr");
+    predict_parser.add_argument("--backend")
+        .choices({"ynnpack", "mps"})
+        .default_value(std::string("ynnpack"))
+        .help("inference backend");
+    predict_parser.add_argument("--batch-size")
+        .type<std::int32_t>()
+        .default_value(std::int32_t{1})
+        .metavar("N")
+        .help("independent sentences per batch (1 to 256; CPU executes serially)");
+    predict_parser.add_argument("--batch-window")
+        .type<std::int32_t>()
+        .metavar("N")
+        .help("bounded input window for length grouping (default: batch-size; maximum 4096)");
     predict_parser.add_argument("-j", "--threads")
         .type<std::int32_t>()
         .metavar("N")

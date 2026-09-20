@@ -1,0 +1,378 @@
+#include "kidi/ops/context.h"
+#include "kidi/runtime/operator.h"
+#include <array>
+#include <bit>
+#include <chrono>
+#include <map>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
+#include <utility>
+
+namespace kidi::ops {
+thread_local bool is_inplace = false;
+
+using runtime::Operation;
+using runtime::OperatorSpec;
+using runtime::TensorInputs;
+namespace {
+class InplaceScope {
+public:
+    explicit InplaceScope(bool enabled) noexcept : previous_(std::exchange(is_inplace, enabled)) {}
+    ~InplaceScope() { is_inplace = previous_; }
+    InplaceScope(const InplaceScope&) = delete;
+    auto operator=(const InplaceScope&) -> InplaceScope& = delete;
+
+private:
+    bool previous_;
+};
+
+using Clock = std::chrono::steady_clock;
+auto nanoseconds(Clock::time_point start) -> std::uint64_t {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+}
+auto operation_name(Operation operation) -> std::string_view {
+    constexpr std::array names{"add",    "multiply",   "cast",    "matmul",      "linear",       "quantized_linear",
+                               "gelu",   "layer_norm", "softmax", "log_softmax", "transpose",    "slice",
+                               "gather", "concat",     "scatter", "attention",   "residual_norm"};
+    return names.at(static_cast<std::size_t>(operation));
+}
+struct OperatorProfile {
+    std::uint64_t calls = 0, prepare_ns = 0, dispatch_ns = 0, run_ns = 0, wait_ns = 0;
+    std::uint64_t allocations = 0, allocated_bytes = 0, output_bytes = 0;
+};
+} // namespace
+struct Context::Impl {
+    tensor::Device device;
+    std::unique_ptr<runtime::OperatorBackend> backend;
+    std::map<std::vector<std::int64_t>, std::unique_ptr<runtime::Operator>> operators;
+    std::vector<std::int64_t> dispatch_key;
+    std::vector<Tensor> parameters;
+    std::uint64_t preparation = 0;
+    bool profiling = false;
+    bool profile_requested = false;
+    bool synchronize_operators = false;
+    std::size_t skip_requests = 0, requests = 0;
+    std::string phase = "unspecified";
+    std::map<std::string, OperatorProfile> profiles;
+    std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> synchronization;
+    ~Impl() {
+        try {
+            if (backend) backend->synchronize();
+            for (const auto& [key, profile] : profiles)
+                std::cerr << "kidi_op|device=" << tensor::to_string(device)
+                          << "|mode=" << (synchronize_operators ? "sync" : "host") << '|' << key
+                          << "|calls=" << profile.calls << "|prepare_ns=" << profile.prepare_ns
+                          << "|dispatch_ns=" << profile.dispatch_ns << "|run_ns=" << profile.run_ns
+                          << "|wait_ns=" << profile.wait_ns << "|allocations=" << profile.allocations
+                          << "|allocated_bytes=" << profile.allocated_bytes << "|output_bytes=" << profile.output_bytes
+                          << '\n';
+            for (const auto& [label, counters] : synchronization)
+                std::cerr << "kidi_op_sync|device=" << tensor::to_string(device) << "|phase=" << label
+                          << "|calls=" << counters.first << "|wait_ns=" << counters.second << '\n';
+        } catch (...) {
+        }
+    }
+    auto run(OperatorSpec spec, TensorInputs inputs, Tensor* residual = nullptr, Tensor* destination = nullptr)
+        -> Tensor {
+        const InplaceScope mode(destination != nullptr);
+        if (is_inplace) require(destination->host_bytes());
+        const auto entered = profiling ? Clock::now() : Clock::time_point{};
+        const auto preparation_before = preparation;
+        auto& key = dispatch_key;
+        key.clear();
+        key.insert(key.end(), {static_cast<int>(spec.operation), static_cast<int>(spec.dtype),
+                               std::bit_cast<std::int32_t>(spec.epsilon), is_inplace});
+        key.push_back(spec.attributes.size());
+        key.insert(key.end(), spec.attributes.begin(), spec.attributes.end());
+        const bool constant_parameters =
+            spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
+            spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RESIDUAL_NORM;
+        const std::size_t parameter_start = spec.operation == Operation::RESIDUAL_NORM ? 2 : 1;
+        for (std::size_t index = 0; index < inputs.size(); ++index) {
+            const auto& input = inputs[index];
+            if (!input.defined() || !input.is_contiguous())
+                throw Failure({ErrorCode::INVALID_ARGUMENT, "eager operations require defined contiguous tensors"});
+            if ((!constant_parameters || index < parameter_start) && input.device() != device)
+                throw Failure({ErrorCode::INVALID_ARGUMENT, "eager operand device mismatch"});
+            key.push_back(static_cast<int>(input.dtype()));
+            key.push_back(input.dimensions());
+            key.insert(key.end(), input.shape().begin(), input.shape().end());
+            if (constant_parameters && index >= parameter_start)
+                key.push_back(reinterpret_cast<std::intptr_t>(require(input.host_bytes()).data()));
+        }
+        const auto invalid = [](bool condition, const char* message) {
+            if (condition) throw Failure({ErrorCode::INVALID_ARGUMENT, message});
+        };
+        const auto& input = inputs.front();
+        if (spec.operation == Operation::ATTENTION) {
+            const auto& key = inputs[1];
+            const auto& value = inputs[2];
+            const auto heads = spec.attributes[0];
+            invalid(heads <= 0 || input.dimensions() != 3 || key.dimensions() != 3 || value.dimensions() != 3,
+                    "attention expects rank-three tensors and positive head count");
+            invalid(input.size(2) % heads != 0 || input.size(2) != key.size(2) ||
+                        !std::ranges::equal(key.shape(), value.shape()) ||
+                        (key.size(0) != 1 && key.size(0) != input.size(0)),
+                    "attention shape mismatch");
+            for (std::size_t index = 0; index < inputs.size(); ++index)
+                invalid(inputs[index].dtype() != tensor::DType::F32, "attention expects FP32 tensors");
+            if (inputs.size() == 4) {
+                const std::array<std::size_t, 4> scores{input.size(0), static_cast<std::size_t>(heads), input.size(1),
+                                                        key.size(1)};
+                const auto& mask = inputs[3];
+                invalid(mask.dimensions() > scores.size(), "attention mask rank mismatch");
+                for (std::size_t axis = 0; axis < mask.dimensions(); ++axis) {
+                    auto extent = mask.size(axis);
+                    invalid(extent != 1 && extent != scores[scores.size() - mask.dimensions() + axis],
+                            "attention mask shape mismatch");
+                }
+            }
+        }
+        if (spec.operation == Operation::MATMUL || spec.operation == Operation::LINEAR ||
+            spec.operation == Operation::QUANTIZED_LINEAR) {
+            const auto& weight = inputs[1];
+            invalid(input.dimensions() < 2 || weight.dimensions() < 2, "matrix operations require rank two or higher");
+            const bool transpose = spec.operation != Operation::QUANTIZED_LINEAR && spec.attributes[0];
+            invalid(input.size(-1) != weight.size(transpose ? -1 : -2), "matrix contraction dimensions differ");
+            if (constant_parameters) {
+                const auto& bias = inputs.back();
+                invalid(weight.dimensions() != 2 || bias.dimensions() != 1 ||
+                            bias.size(0) != weight.size(transpose ? 0 : 1) || bias.dtype() != tensor::DType::F32,
+                        "linear parameter shape or dtype mismatch");
+            }
+        }
+        if (spec.operation == Operation::QUANTIZED_LINEAR)
+            invalid(input.dtype() != tensor::DType::F32 || inputs[1].dtype() != tensor::DType::I8 ||
+                        inputs[2].dtype() != tensor::DType::F32 || inputs[2].dimensions() != 2 ||
+                        inputs[2].size(0) != inputs[1].size(1) || inputs[2].size(1) != 1,
+                    "quantized linear parameter mismatch");
+        if (spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RESIDUAL_NORM) {
+            invalid(!input.dimensions() || !std::isfinite(spec.epsilon) || spec.epsilon <= 0,
+                    "invalid normalization request");
+            if (spec.operation == Operation::RESIDUAL_NORM)
+                invalid(input.dtype() != tensor::DType::F32 || inputs[1].dtype() != input.dtype() ||
+                            !std::ranges::equal(input.shape(), inputs[1].shape()),
+                        "residual normalization shape or dtype mismatch");
+            for (std::size_t index = parameter_start; index < inputs.size(); ++index)
+                invalid(inputs[index].dimensions() != 1 || inputs[index].size(0) != input.size(-1) ||
+                            inputs[index].dtype() != tensor::DType::F32,
+                        "normalization parameter mismatch");
+        }
+        if (spec.operation == Operation::ADD || spec.operation == Operation::MULTIPLY) {
+            const auto& other = inputs[1];
+            invalid(input.dtype() != other.dtype(), "arithmetic operand dtype mismatch");
+            const auto common = std::min(input.dimensions(), other.dimensions());
+            for (std::size_t index = 1; index <= common; ++index) {
+                const auto left = input.size(-static_cast<std::int64_t>(index)),
+                           right = other.size(-static_cast<std::int64_t>(index));
+                invalid(left != right && left != 1 && right != 1, "incompatible broadcast dimensions");
+            }
+            spec.dtype = input.dtype();
+        }
+        if (spec.operation == Operation::TRANSPOSE) {
+            invalid(spec.attributes.size() != input.dimensions(), "transpose rank mismatch");
+            for (std::size_t index = 0; index < spec.attributes.size(); ++index) {
+                const auto axis = spec.attributes[index];
+                invalid(axis < 0 || static_cast<std::size_t>(axis) >= input.dimensions() ||
+                            std::find(spec.attributes.begin(), spec.attributes.begin() + index, axis) !=
+                                spec.attributes.begin() + index,
+                        "invalid transpose permutation");
+            }
+        }
+        if (spec.operation == Operation::SCATTER)
+            invalid(input.dimensions() != 3 || inputs[1].dimensions() != 3 || input.size(0) != inputs[1].size(0) ||
+                        input.size(2) != inputs[1].size(2) || inputs[1].dtype() != input.dtype() ||
+                        inputs[2].dtype() != tensor::DType::I32 || inputs[2].dimensions() != 1 ||
+                        inputs[2].size(0) != inputs[1].size(1),
+                    "cache scatter shape or dtype mismatch");
+        auto found = operators.find(key);
+        if (found == operators.end()) {
+            auto start = std::chrono::steady_clock::now();
+            auto prepared = backend->prepare(spec, inputs);
+            if (operators.size() >= 1024) {
+                backend->synchronize();
+                operators.clear();
+                parameters.clear();
+            }
+            found = operators.emplace(key, std::move(prepared)).first;
+            if (constant_parameters)
+                for (std::size_t index = parameter_start; index < inputs.size(); ++index)
+                    parameters.push_back(inputs[index]);
+            preparation +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+        }
+        const auto execute = [&]() -> Tensor {
+            if (is_inplace) return found->second->run_(inputs, *destination);
+            if (!residual) return found->second->run(inputs);
+            auto outputs = found->second->run_pair(inputs);
+            *residual = std::move(outputs[0]);
+            return std::move(outputs[1]);
+        };
+        if (!profiling) return execute();
+        const auto dispatch_ns = nanoseconds(entered) - (preparation - preparation_before);
+        const auto allocations_before = found->second->allocations();
+        auto started = Clock::now();
+        auto output = execute();
+        const auto run_ns = nanoseconds(started);
+        std::uint64_t wait_ns = 0;
+        if (synchronize_operators) {
+            started = Clock::now();
+            backend->synchronize();
+            wait_ns = nanoseconds(started);
+        }
+        const auto allocations_after = found->second->allocations();
+        std::ostringstream label;
+        label << "phase=" << phase << "|op=" << operation_name(spec.operation) << (is_inplace ? "_" : "") << "|shapes=";
+        for (std::size_t operand = 0; operand < inputs.size(); ++operand) {
+            if (operand) label << ';';
+            label << '[';
+            for (auto extent : inputs[operand].shape()) label << extent << ',';
+            label << ']';
+        }
+        label << "|attrs=";
+        for (auto attribute : spec.attributes) label << attribute << ',';
+        auto& profile = profiles[label.str()];
+        ++profile.calls;
+        profile.prepare_ns += preparation - preparation_before;
+        profile.dispatch_ns += dispatch_ns;
+        profile.run_ns += run_ns;
+        profile.wait_ns += wait_ns;
+        profile.allocations += allocations_after.count - allocations_before.count;
+        profile.allocated_bytes += allocations_after.bytes - allocations_before.bytes;
+        profile.output_bytes += output.nbytes() + (residual ? residual->nbytes() : 0);
+        return output;
+    }
+};
+Context::Context(tensor::Device device) : impl_(std::make_unique<Impl>()) {
+    impl_->device = device;
+    impl_->dispatch_key.reserve(128);
+    const auto profile = std::getenv("KIDI_PROFILE_OPS");
+    impl_->profiling = profile && (std::string_view(profile) == "host" || std::string_view(profile) == "sync");
+    impl_->profile_requested = impl_->profiling;
+    if (const auto skip = std::getenv("KIDI_PROFILE_OPS_SKIP")) impl_->skip_requests = std::strtoull(skip, nullptr, 10);
+    if (impl_->skip_requests) impl_->profiling = false;
+    impl_->synchronize_operators = profile && std::string_view(profile) == "sync";
+    if (device == tensor::Device::cpu()) impl_->backend = runtime::cpu_operators();
+#if defined(KIDI_HAS_METAL)
+    else if (device == tensor::Device::apple_gpu())
+        impl_->backend = runtime::metal_operators();
+#endif
+    else
+        throw Failure({ErrorCode::UNSUPPORTED, "no eager backend for requested device"});
+}
+Context::~Context() = default;
+Context::Context(Context&&) noexcept = default;
+auto Context::operator=(Context&&) noexcept -> Context& = default;
+auto Context::device() const noexcept -> tensor::Device { return impl_->device; }
+auto Context::synchronize() -> void {
+    if (!impl_->profiling) return impl_->backend->synchronize();
+    const auto started = Clock::now();
+    impl_->backend->synchronize();
+    const auto duration = nanoseconds(started);
+    auto& counters = impl_->synchronization[impl_->phase];
+    ++counters.first;
+    counters.second += duration;
+}
+auto Context::profile_phase(std::string_view phase) -> void {
+    if (!impl_->profile_requested) return;
+    if (phase == "encoder") impl_->profiling = ++impl_->requests > impl_->skip_requests;
+    impl_->phase = phase;
+}
+auto Context::preparation_ns() const noexcept -> std::uint64_t { return impl_->preparation; }
+auto Context::add(const Tensor& left, const Tensor& right) -> Tensor {
+    return impl_->run({Operation::ADD}, {&left, &right});
+}
+auto Context::add_(Tensor& left, const Tensor& right) -> Tensor& {
+    impl_->run({Operation::ADD}, {&left, &right}, nullptr, &left);
+    return left;
+}
+auto Context::multiply(const Tensor& left, const Tensor& right) -> Tensor {
+    return impl_->run({Operation::MULTIPLY}, {&left, &right});
+}
+auto Context::multiply_(Tensor& left, const Tensor& right) -> Tensor& {
+    impl_->run({Operation::MULTIPLY}, {&left, &right}, nullptr, &left);
+    return left;
+}
+auto Context::cast(const Tensor& input, tensor::DType dtype) -> Tensor {
+    if (!input.defined() || input.device() != device())
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid cast operand"});
+    if (input.dtype() == dtype) return input;
+    return impl_->run({Operation::CAST, {}, dtype}, {&input});
+}
+auto Context::matmul(const Tensor& left, const Tensor& right, bool transpose_right) -> Tensor {
+    const std::array<std::int64_t, 1> attributes{transpose_right};
+    return impl_->run({Operation::MATMUL, attributes}, {&left, &right});
+}
+auto Context::scaled_dot_product_attention(const Tensor& query, const Tensor& key, const Tensor& value,
+                                           std::int32_t heads, const Tensor& mask) -> Tensor {
+    const std::array<std::int64_t, 1> attributes{heads};
+    if (mask.defined()) return impl_->run({Operation::ATTENTION, attributes}, {&query, &key, &value, &mask});
+    return impl_->run({Operation::ATTENTION, attributes}, {&query, &key, &value});
+}
+auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight) -> Tensor {
+    const std::array<std::int64_t, 1> attributes{transpose_weight};
+    return impl_->run({Operation::LINEAR, attributes}, {&input, &weight, &bias});
+}
+auto Context::quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias)
+    -> Tensor {
+    return impl_->run({Operation::QUANTIZED_LINEAR}, {&input, &weight, &scale, &bias});
+}
+auto Context::gelu(const Tensor& input) -> Tensor { return impl_->run({Operation::GELU}, {&input}); }
+auto Context::gelu_(Tensor& input) -> Tensor& {
+    impl_->run({Operation::GELU}, {&input}, nullptr, &input);
+    return input;
+}
+auto Context::layer_norm(const Tensor& input, const Tensor& scale, const Tensor& bias, float epsilon) -> Tensor {
+    return impl_->run({Operation::LAYER_NORM, {}, tensor::DType::F32, epsilon}, {&input, &scale, &bias});
+}
+auto Context::layer_norm_(Tensor& input, const Tensor& scale, const Tensor& bias, float epsilon) -> Tensor& {
+    impl_->run({Operation::LAYER_NORM, {}, tensor::DType::F32, epsilon}, {&input, &scale, &bias}, nullptr, &input);
+    return input;
+}
+auto Context::residual_layer_norm(const Tensor& input, const Tensor& residual, const Tensor& scale, const Tensor& bias,
+                                  float epsilon) -> std::array<Tensor, 2> {
+    Tensor sum;
+    auto normalized = impl_->run({Operation::RESIDUAL_NORM, {}, tensor::DType::F32, epsilon},
+                                 {&input, &residual, &scale, &bias}, &sum);
+    return {std::move(sum), std::move(normalized)};
+}
+auto Context::softmax(const Tensor& input, bool logarithmic) -> Tensor {
+    return impl_->run({logarithmic ? Operation::LOG_SOFTMAX : Operation::SOFTMAX}, {&input});
+}
+auto Context::softmax_(Tensor& input, bool logarithmic) -> Tensor& {
+    impl_->run({logarithmic ? Operation::LOG_SOFTMAX : Operation::SOFTMAX}, {&input}, nullptr, &input);
+    return input;
+}
+auto Context::transpose(const Tensor& input, std::span<const std::int64_t> axes) -> Tensor {
+    return impl_->run({Operation::TRANSPOSE, axes, input.dtype()}, {&input});
+}
+auto Context::slice(const Tensor& input, std::int64_t axis, std::int64_t start, std::int64_t length) -> Tensor {
+    if (input.device() != device()) throw Failure({ErrorCode::INVALID_ARGUMENT, "slice operand device mismatch"});
+    auto view = require(input.narrow(axis, start, length));
+    if (view.is_contiguous() && (device() == tensor::Device::cpu() || view.storage_offset() == 0)) return view;
+    const std::array attributes{axis, start, length};
+    return impl_->run({Operation::SLICE, attributes, input.dtype()}, {&input});
+}
+auto Context::gather(const Tensor& input, const Tensor& indices, std::int64_t axis) -> Tensor {
+    const std::array attributes{axis};
+    return impl_->run({Operation::GATHER, attributes, input.dtype()}, {&input, &indices});
+}
+auto Context::concat(std::span<const Tensor> inputs, std::int64_t axis) -> Tensor {
+    if (inputs.empty()) throw Failure({ErrorCode::INVALID_ARGUMENT, "empty concatenation"});
+    const std::array attributes{axis};
+    return impl_->run({Operation::CONCAT, attributes, inputs.front().dtype()}, inputs);
+}
+auto Context::reshape(const Tensor& input, std::vector<std::int64_t> shape) -> Tensor {
+    return require(input.reshape(std::move(shape)));
+}
+auto Context::scatter(const Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor {
+    return impl_->run({Operation::SCATTER, {}, input.dtype()}, {&input, &updates, &indices});
+}
+auto Context::scatter_(Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor& {
+    impl_->run({Operation::SCATTER, {}, input.dtype()}, {&input, &updates, &indices}, nullptr, &input);
+    return input;
+}
+} // namespace kidi::ops

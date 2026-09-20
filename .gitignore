@@ -5,3 +5,10 @@
 __pycache__/
 *.pyc
 /ynnpack
+
+# Generated Metal benchmark output; keep source, reports, and corpus inputs.
+/benchmarks/metal/**/*.log
+/benchmarks/metal/**/*.quality.json
+/benchmarks/metal/**/*.jsonl
+/benchmarks/metal/*-20[0-9]*/**/*.txt
+/benchmarks/metal/execution-study-*.txt

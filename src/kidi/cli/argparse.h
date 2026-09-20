@@ -28,7 +28,7 @@ template <typename>
 inline constexpr bool ALWAYS_FALSE = false;
 
 template <typename T>
-T parse_argument(std::string_view value) {
+auto parse_argument(std::string_view value) -> T {
     if constexpr (std::same_as<T, std::string>) {
         return std::string(value);
     } else if constexpr (std::same_as<T, bool>) {
@@ -57,7 +57,7 @@ T parse_argument(std::string_view value) {
 }
 
 template <typename T>
-std::string display_argument(const T& value) {
+auto display_argument(const T& value) -> std::string {
     if constexpr (std::same_as<T, std::string>) {
         return value;
     } else if constexpr (std::same_as<T, bool>) {
@@ -89,7 +89,7 @@ class ParseError : public std::runtime_error {
 public:
     ParseError(std::string message, std::string usage);
 
-    [[nodiscard]] std::string_view usage() const noexcept;
+    auto usage() const noexcept -> std::string_view;
 
 private:
     std::string usage_;
@@ -98,7 +98,7 @@ private:
 class Namespace {
 public:
     template <typename T>
-    [[nodiscard]] const T& get(std::string_view destination) const {
+    auto get(std::string_view destination) const -> const T& {
         const auto iterator = values_.find(std::string(destination));
         if (iterator == values_.end()) {
             throw std::logic_error("argument has no value: " + std::string(destination));
@@ -110,15 +110,15 @@ public:
         return *value;
     }
 
-    [[nodiscard]] bool contains(std::string_view destination) const;
-    [[nodiscard]] ParseStatus status() const noexcept;
-    [[nodiscard]] bool should_exit() const noexcept;
-    [[nodiscard]] std::string_view output() const noexcept;
+    auto contains(std::string_view destination) const -> bool;
+    auto status() const noexcept -> ParseStatus;
+    auto should_exit() const noexcept -> bool;
+    auto output() const noexcept -> std::string_view;
 
 private:
     friend class ArgumentParser;
 
-    void set(std::string destination, std::any value);
+    auto set(std::string destination, std::any value) -> void;
 
     std::unordered_map<std::string, std::any> values_;
     ParseStatus status_ = ParseStatus::READY;
@@ -127,22 +127,22 @@ private:
 
 class Argument {
 public:
-    Argument& help(std::string value);
-    Argument& metavar(std::string value);
-    Argument& dest(std::string value);
-    Argument& required(bool value = true) noexcept;
-    Argument& action(Action value);
-    Argument& choices(std::initializer_list<std::string_view> values);
+    auto help(std::string value) -> Argument&;
+    auto metavar(std::string value) -> Argument&;
+    auto dest(std::string value) -> Argument&;
+    auto required(bool value = true) noexcept -> Argument&;
+    auto action(Action value) -> Argument&;
+    auto choices(std::initializer_list<std::string_view> values) -> Argument&;
 
     template <typename T>
-    Argument& type() {
+    auto type() -> Argument& {
         if (action_ != Action::STORE) throw std::logic_error("flag actions cannot have a value type");
         converter_ = [](std::string_view value) { return std::any(detail::parse_argument<T>(value)); };
         return *this;
     }
 
     template <typename T>
-    Argument& default_value(T value) {
+    auto default_value(T value) -> Argument& {
         type<T>();
         default_display_ = detail::display_argument(value);
         default_value_ = std::move(value);
@@ -154,10 +154,10 @@ private:
 
     explicit Argument(std::vector<std::string> names);
 
-    [[nodiscard]] bool is_flag() const noexcept;
-    [[nodiscard]] std::string display_name() const;
-    [[nodiscard]] std::string value_name() const;
-    [[nodiscard]] std::any parse(std::string_view value) const;
+    auto is_flag() const noexcept -> bool;
+    auto display_name() const -> std::string;
+    auto value_name() const -> std::string;
+    auto parse(std::string_view value) const -> std::any;
 
     std::vector<std::string> names_;
     std::string destination_;
@@ -181,11 +181,11 @@ public:
     ~Subparsers();
 
     Subparsers(const Subparsers&) = delete;
-    Subparsers& operator=(const Subparsers&) = delete;
+    auto operator=(const Subparsers&) -> Subparsers& = delete;
 
-    Subparsers& required(bool value = true) noexcept;
-    Subparsers& dest(std::string value);
-    ArgumentParser& add_parser(std::string name, std::string help = {});
+    auto required(bool value = true) noexcept -> Subparsers&;
+    auto dest(std::string value) -> Subparsers&;
+    auto add_parser(std::string name, std::string help = {}) -> ArgumentParser&;
 
 private:
     friend class ArgumentParser;
@@ -198,7 +198,7 @@ private:
 
     explicit Subparsers(ArgumentParser& owner, std::string destination);
 
-    [[nodiscard]] const Entry* find(std::string_view name) const;
+    auto find(std::string_view name) const -> const Entry*;
 
     ArgumentParser& owner_;
     std::string destination_;
@@ -212,15 +212,15 @@ public:
     ~ArgumentParser();
 
     ArgumentParser(const ArgumentParser&) = delete;
-    ArgumentParser& operator=(const ArgumentParser&) = delete;
+    auto operator=(const ArgumentParser&) -> ArgumentParser& = delete;
     ArgumentParser(ArgumentParser&&) = delete;
-    ArgumentParser& operator=(ArgumentParser&&) = delete;
+    auto operator=(ArgumentParser&&) -> ArgumentParser& = delete;
 
-    ArgumentParser& description(std::string value);
-    ArgumentParser& version(std::string value);
+    auto description(std::string value) -> ArgumentParser&;
+    auto version(std::string value) -> ArgumentParser&;
 
     template <typename... Names>
-    Argument& add_argument(std::string name, Names&&... aliases) {
+    auto add_argument(std::string name, Names&&... aliases) -> Argument& {
         std::vector<std::string> names;
         names.reserve(1 + sizeof...(Names));
         names.push_back(std::move(name));
@@ -228,24 +228,24 @@ public:
         return add_argument(std::move(names));
     }
 
-    Subparsers& add_subparsers(std::string destination = "command");
+    auto add_subparsers(std::string destination = "command") -> Subparsers&;
 
-    [[nodiscard]] Namespace parse_args(int argc, const char* const argv[]) const;
-    [[nodiscard]] Namespace parse_args(std::span<const std::string_view> arguments) const;
-    [[nodiscard]] std::string format_usage() const;
-    [[nodiscard]] std::string format_help() const;
+    auto parse_args(int argc, const char* const argv[]) const -> Namespace;
+    auto parse_args(std::span<const std::string_view> arguments) const -> Namespace;
+    auto format_usage() const -> std::string;
+    auto format_help() const -> std::string;
 
 private:
     friend class Subparsers;
 
-    Argument& add_argument(std::vector<std::string> names);
-    void set_value(Namespace& result, const Argument& argument, std::string_view value) const;
-    void validate_arguments(const std::unordered_set<const Argument*>& seen) const;
-    [[noreturn]] void fail(std::string message) const;
+    auto add_argument(std::vector<std::string> names) -> Argument&;
+    auto set_value(Namespace& result, const Argument& argument, std::string_view value) const -> void;
+    auto validate_arguments(const std::unordered_set<const Argument*>& seen) const -> void;
+    [[noreturn]] auto fail(std::string message) const -> void;
 
-    static std::string argument_help(const Argument& argument);
-    static void append_rows(std::string& output, std::string_view heading,
-                            const std::vector<std::pair<std::string, std::string>>& rows);
+    static auto argument_help(const Argument& argument) -> std::string;
+    static auto append_rows(std::string& output, std::string_view heading,
+                            const std::vector<std::pair<std::string, std::string>>& rows) -> void;
 
     std::string program_;
     std::string description_;

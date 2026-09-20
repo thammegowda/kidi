@@ -10,7 +10,7 @@
 
 namespace {
 
-void write_fixture(const std::filesystem::path& path) {
+auto write_fixture(const std::filesystem::path& path) -> void {
     std::string header = R"({"bf16":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]},)"
                          R"("weight":{"dtype":"F32","shape":[2],"data_offsets":[4,12]},)"
                          R"("weight2":{"dtype":"F32","shape":[2],"data_offsets":[12,20]},)"
@@ -44,7 +44,7 @@ void write_fixture(const std::filesystem::path& path) {
 
 } // namespace
 
-int main() {
+auto main() -> int {
     const auto path = std::filesystem::temp_directory_path() / "kidi-weights-test.safetensors";
     write_fixture(path);
 
@@ -54,10 +54,12 @@ int main() {
         return 1;
     }
     auto tensor = weights->tensor("weight");
-    const auto* values = tensor ? static_cast<const float*>(tensor->data()) : nullptr;
-    if (!tensor || tensor->data_type != kidi::model::DataType::F32 || tensor->element_size() != sizeof(float) ||
-        tensor->shape.size() != 1 || tensor->shape[0] != 2 || tensor->element_count() != 2 || values[0] != 1.25F ||
-        values[1] != -2.5F) {
+    auto values = tensor ? std::as_const(*tensor).data<float>()
+                         : kidi::Result<std::span<const float>>{std::unexpected(tensor.error())};
+    if (!tensor || !values || tensor->dtype() != kidi::model::DataType::F32 ||
+        kidi::tensor::element_size(tensor->dtype()) != sizeof(float) || tensor->shape().size() != 1 ||
+        tensor->shape()[0] != 2 || tensor->numel() != 2 || (*values)[0] != 1.25F || (*values)[1] != -2.5F ||
+        tensor->data<float>().has_value()) {
         std::cerr << "mapped tensor view is incorrect\n";
         return 1;
     }
@@ -65,9 +67,9 @@ int main() {
     const auto int8 = weights->tensor("int8");
     const auto e4m3 = weights->tensor("e4m3");
     const auto e5m2 = weights->tensor("e5m2");
-    if (!bf16 || bf16->data_type != kidi::model::DataType::BF16 || bf16->element_size() != 2 || !int8 ||
-        int8->data_type != kidi::model::DataType::I8 || !e4m3 || e4m3->data_type != kidi::model::DataType::E4M3 ||
-        !e5m2 || e5m2->data_type != kidi::model::DataType::E5M2) {
+    if (!bf16 || bf16->dtype() != kidi::model::DataType::BF16 || kidi::tensor::element_size(bf16->dtype()) != 2 ||
+        !int8 || int8->dtype() != kidi::model::DataType::I8 || !e4m3 || e4m3->dtype() != kidi::model::DataType::E4M3 ||
+        !e5m2 || e5m2->dtype() != kidi::model::DataType::E5M2) {
         std::cerr << "Safetensors dtype mapping is incorrect\n";
         return 1;
     }
@@ -78,12 +80,12 @@ int main() {
         .concat_axis = 0,
     }};
     auto mapped = kidi::model::Weights::load(path, mappings);
-    auto fused =
-        mapped ? mapped->tensor("fused") : kidi::Result<kidi::model::TensorView>{std::unexpected(mapped.error())};
-    const auto* fused_values = fused ? static_cast<const float*>(fused->data()) : nullptr;
+    auto fused = mapped ? mapped->tensor("fused") : kidi::Result<kidi::tensor::Tensor>{std::unexpected(mapped.error())};
+    auto fused_values = fused ? std::as_const(*fused).data<float>()
+                              : kidi::Result<std::span<const float>>{std::unexpected(fused.error())};
     if (!mapped || mapped->size() != 5 || mapped->contains("weight") || mapped->contains("weight2") || !fused ||
-        fused->shape.size() != 1 || fused->shape[0] != 4 || fused_values[0] != 1.25F || fused_values[1] != -2.5F ||
-        fused_values[2] != 3.0F || fused_values[3] != 4.0F) {
+        !fused_values || fused->shape().size() != 1 || fused->shape()[0] != 4 || (*fused_values)[0] != 1.25F ||
+        (*fused_values)[1] != -2.5F || (*fused_values)[2] != 3.0F || (*fused_values)[3] != 4.0F) {
         std::cerr << "state mapping fusion is incorrect\n";
         return 1;
     }

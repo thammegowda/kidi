@@ -1,0 +1,15 @@
+# Generated benchmark state
+work-*/
+*.log
+results-*.csv
+command-plan-*.txt
+
+# Python scratch state
+__pycache__/
+.cache/
+
+# Keep benchmark source and curated reports trackable
+!run.py
+!README.md
+## Ignore all report markdown files; user may force add some useful ones
+report-*.md

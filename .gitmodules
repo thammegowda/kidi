@@ -1,7 +1,7 @@
 
 [submodule "third_party/xnnpack"]
 	path = third_party/xnnpack
-	url = https://github.com/google/XNNPACK.git
+	url = https://github.com/thammegowda/XNNPACK.git
 [submodule "third_party/slinky"]
 	path = third_party/slinky
 	url = https://github.com/dsharlet/slinky.git
