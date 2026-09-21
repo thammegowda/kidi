@@ -212,7 +212,9 @@ def machine_description() -> str:
 def make_command(args: argparse.Namespace, model: Path, input_path: Path, output_path: Path) -> list[str]:
     command = [
         str(args.binary),
-        "generate",
+        "translate",
+        "--backend",
+        "ynnpack",
         "--model",
         str(model),
         "--in",

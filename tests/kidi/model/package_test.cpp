@@ -123,12 +123,12 @@ auto main() -> int {
     auto invalid_decode = YAML::Load(std::string(MANIFEST_YAML));
     invalid_decode["decode"]["beam_size"] = 0;
     write(directory / "model.yaml", YAML::Dump(invalid_decode));
-    auto translator = kidi::inference::Translator::load(directory);
+    auto translator = kidi::inference::Translator::load(directory, kidi::module_device);
     if (translator || translator.error().code != kidi::ErrorCode::INVALID_ARGUMENT) return 1;
     invalid_decode["decode"]["beam_size"] = 1;
     invalid_decode["decode"]["length_penalty"] = std::numeric_limits<float>::quiet_NaN();
     write(directory / "model.yaml", YAML::Dump(invalid_decode));
-    translator = kidi::inference::Translator::load(directory);
+    translator = kidi::inference::Translator::load(directory, kidi::module_device);
     if (translator || translator.error().code != kidi::ErrorCode::INVALID_ARGUMENT) return 1;
 
     write(directory / "model.yaml", MANIFEST_YAML);

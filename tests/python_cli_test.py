@@ -271,7 +271,9 @@ class PythonCliTest(unittest.TestCase):
     def test_launchers(self):
         console = Path(sys.executable).parent / ("kidi.exe" if os.name == "nt" else "kidi")
         for arguments, expected in [(["--version"], 0), (["generate", "--help"], 0), (["chat", "--help"], 0),
+                        (["translate", "--help"], 0),
                         (["generate", "--interactive"], 2), (["generate", "--system", "Hi"], 2),
+                        (["generate", "--beam-size", "2"], 2), (["translate", "--max-new-tokens", "8"], 2),
                         (["chat", "--in", "missing"], 2), (["chat", "--max-active", "2"], 2),
                         (["unknown-command"], 2)]:
             with self.subTest(arguments=arguments):

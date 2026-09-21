@@ -75,7 +75,6 @@ private:
 
 auto make_ynnpack_backend() -> std::shared_ptr<Backend>;
 auto make_metal_backend() -> std::shared_ptr<Backend>;
-auto make_cuda_backend() -> std::shared_ptr<Backend>;
 auto make_unavailable_backend(DeviceKind kind, std::string name, std::string reason) -> std::shared_ptr<Backend>;
 
 } // namespace kidi::tensor

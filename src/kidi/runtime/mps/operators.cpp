@@ -27,14 +27,12 @@ struct Stream {
     OutputPool outputs;
     AllocationStats output_allocations;
     std::unordered_set<void*> output_buffers;
-    bool reuse_outputs = true;
     std::size_t prefill_cache_limit = std::numeric_limits<std::size_t>::max();
     bool profile_memory = std::getenv("KIDI_PROFILE_MEMORY") != nullptr;
     std::size_t observed_device_bytes = 0, recommended_working_set_bytes = 0;
-    std::size_t peak_pending = 0, scratch_bytes = 0, peak_scratch_bytes = 0, expanded_bytes = 0;
+    std::size_t peak_pending = 0, expanded_bytes = 0;
     Stream() {
         pending.reserve(512);
-        if (const auto value = std::getenv("KIDI_METAL_REUSE_OUTPUTS")) reuse_outputs = std::string_view(value) != "0";
         if (const auto value = std::getenv("KIDI_PREFILL_CACHE_BYTES")) {
             char* end = nullptr;
             const auto bytes = std::strtoull(value, &end, 10);
@@ -42,31 +40,26 @@ struct Stream {
                 throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prefill cache bytes must be 0..16 GiB"});
             prefill_cache_limit = bytes;
         }
-        if (prefill_cache_limit != std::numeric_limits<std::size_t>::max() && !reuse_outputs)
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "bounded prefill weights require shared output reuse"});
     }
     ~Stream() {
         if (profile_memory)
-            std::cerr << "kidi_metal_memory|reuse_outputs=" << reuse_outputs
-                      << "|prefill_cache_limit=" << prefill_cache_limit
+            std::cerr << "kidi_metal_memory|prefill_cache_limit=" << prefill_cache_limit
                       << "|output_allocations=" << output_allocations.count
                       << "|output_allocated_bytes=" << output_allocations.bytes
-                      << "|peak_scratch_bytes=" << peak_scratch_bytes << "|expanded_weight_bytes=" << expanded_bytes
-                      << "|peak_external_owner_slots=" << peak_pending
+                      << "|expanded_weight_bytes=" << expanded_bytes << "|peak_external_owner_slots=" << peak_pending
                       << "|observed_peak_device_bytes=" << observed_device_bytes
                       << "|recommended_working_set_bytes=" << recommended_working_set_bytes << '\n';
     }
-    auto acquire(std::span<const std::int64_t> shape, DType dtype, OutputPool& fallback) -> Tensor {
-        auto& pool = reuse_outputs ? outputs : fallback;
-        const auto before = pool.allocations();
-        auto output = pool.acquire(shape, dtype, tensor::Device::apple_gpu());
-        output_allocations.count += pool.allocations().count - before.count;
-        output_allocations.bytes += pool.allocations().bytes - before.bytes;
-        if (reuse_outputs) output_buffers.insert(require(tensor::metal_buffer(output)).handle);
+    auto acquire(std::span<const std::int64_t> shape, DType dtype) -> Tensor {
+        const auto before = outputs.allocations();
+        auto output = outputs.acquire(shape, dtype, tensor::Device::apple_gpu());
+        output_allocations.count += outputs.allocations().count - before.count;
+        output_allocations.bytes += outputs.allocations().bytes - before.bytes;
+        output_buffers.insert(require(tensor::metal_buffer(output)).handle);
         return output;
     }
     auto retain(const Tensor& tensor) -> void {
-        if (reuse_outputs && output_buffers.contains(require(tensor::metal_buffer(tensor)).handle)) return;
+        if (output_buffers.contains(require(tensor::metal_buffer(tensor)).handle)) return;
         pending.push_back(tensor);
         peak_pending = std::max(peak_pending, pending.size());
     }
@@ -92,8 +85,8 @@ public:
     Stream& stream;
     std::optional<mps::Executable> executable;
     std::optional<mps::QuantizedLinear> quantized;
-    Tensor packed_weight, packed_scales, packed_input;
-    Tensor prefill_weight, prefill_output;
+    Tensor packed_weight, packed_scales;
+    Tensor prefill_weight;
     std::shared_ptr<const mps::Executable> prefill_executable;
     std::int32_t packed_bits = 0, packed_group = 0;
     float packed_input_scale = 0, packed_output_scale = 0;
@@ -106,17 +99,14 @@ public:
     bool eager = false;
     Operation operation;
     float epsilon = 0;
-    OutputPool pool;
-    std::size_t scratch_bytes = 0;
     explicit MetalOperator(Stream& owner) : stream(owner) {}
-    ~MetalOperator() override { stream.scratch_bytes -= scratch_bytes; }
     auto run(TensorInputs inputs) -> Tensor override {
-        auto output = stream.acquire(shape, dtype, pool);
+        auto output = stream.acquire(shape, dtype);
         if (greedy) {
             const std::array temporary_shape{static_cast<std::int64_t>(output.numel()),
                                              static_cast<std::int64_t>((inputs[0].size(-1) + 1023) / 1024),
                                              std::int64_t{2}};
-            auto scratch = stream.acquire(temporary_shape, DType::F32, pool);
+            auto scratch = stream.acquire(temporary_shape, DType::F32);
             require(mps::encode_greedy_token(stream.commands(), inputs[0], scratch, output));
         } else if (eager)
             require(mps::encode_eager(stream.commands(), operation, epsilon, inputs, output));
@@ -125,10 +115,7 @@ public:
         else if (packed_bits) {
             Tensor calibrated_input;
             if (packed_input_scale > 0) {
-                calibrated_input =
-                    stream.reuse_outputs
-                        ? stream.acquire(inputs[0].shape(), prefill_executable ? DType::F16 : DType::F32, pool)
-                        : packed_input;
+                calibrated_input = stream.acquire(inputs[0].shape(), prefill_executable ? DType::F16 : DType::F32);
                 require(mps::encode_eager(stream.commands(), Operation::STATIC_ROUND, packed_input_scale,
                                           inputs.first(1), calibrated_input));
             }
@@ -137,14 +124,12 @@ public:
                 if (!weight.defined()) {
                     const std::array<std::int64_t, 2> matrix_shape{static_cast<std::int64_t>(packed_weight.size(0)),
                                                                    static_cast<std::int64_t>(inputs[0].size(-1))};
-                    weight = stream.acquire(matrix_shape, DType::F16, pool);
+                    weight = stream.acquire(matrix_shape, DType::F16);
                     require(mps::encode_expand_packed_weight(stream.commands(), packed_weight, packed_scales, weight,
                                                              packed_bits, packed_group));
                 }
                 const std::array feeds{calibrated_input.defined() ? calibrated_input : inputs[0], weight};
-                auto projected = packed_output_scale > 0
-                                     ? (stream.reuse_outputs ? stream.acquire(shape, DType::F32, pool) : prefill_output)
-                                     : output;
+                auto projected = packed_output_scale > 0 ? stream.acquire(shape, DType::F32) : output;
                 std::array outputs{projected};
                 require(prefill_executable->encode(stream.commands(), feeds, outputs));
                 if (packed_output_scale > 0)
@@ -176,8 +161,8 @@ public:
         return destination;
     }
     auto run_pair(TensorInputs inputs) -> std::array<Tensor, 2> override {
-        auto normalized = stream.acquire(shape, dtype, pool);
-        auto residual = stream.acquire(shape, dtype, pool);
+        auto normalized = stream.acquire(shape, dtype);
+        auto residual = stream.acquire(shape, dtype);
         std::array outputs{normalized, residual};
         require(executable->encode(stream.commands(), inputs.first(dynamic_count), outputs));
         for (std::size_t index = 0; index < dynamic_count; ++index) stream.retain(inputs[index]);
@@ -297,18 +282,7 @@ public:
                     program = prefill_programs_.emplace(std::move(program_key), std::move(executable)).first;
                 }
                 result->prefill_executable = program->second;
-                if (result->packed_output_scale > 0 && !stream_.reuse_outputs)
-                    result->prefill_output =
-                        require(Tensor::empty(result->shape, DType::F32, tensor::Device::apple_gpu()));
             }
-            if (spec.epsilon > 0 && !stream_.reuse_outputs)
-                result->packed_input = require(Tensor::empty({inputs[0].shape().begin(), inputs[0].shape().end()},
-                                                             result->prefill_executable ? DType::F16 : DType::F32,
-                                                             tensor::Device::apple_gpu()));
-            result->scratch_bytes = (result->packed_input.defined() ? result->packed_input.nbytes() : 0) +
-                                    (result->prefill_output.defined() ? result->prefill_output.nbytes() : 0);
-            stream_.scratch_bytes += result->scratch_bytes;
-            stream_.peak_scratch_bytes = std::max(stream_.peak_scratch_bytes, stream_.scratch_bytes);
             return result;
         }
         auto graph = require(mps::Graph::create());

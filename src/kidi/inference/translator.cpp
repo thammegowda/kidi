@@ -69,20 +69,14 @@ auto resolve_options(const YAML::Node& config, const DecodeOptions& options) -> 
 
 } // namespace
 
-Translator::Translator(model::Package package, model::Transformer model, InferenceBackend backend) noexcept
-    : package_(std::move(package)), model_(std::move(model)), backend_(backend) {}
+Translator::Translator(model::Package package, model::Transformer model) noexcept
+    : package_(std::move(package)), model_(std::move(model)) {}
 
-auto Translator::load(const std::filesystem::path& model_directory, InferenceStats* stats) -> Result<Translator> {
-    if (module_device != tensor::Device::cpu() && module_device != tensor::Device::apple_gpu())
-        return std::unexpected(
-            Error{ErrorCode::UNSUPPORTED, "no translation backend for " + tensor::to_string(module_device)});
-    return load(model_directory,
-                module_device == tensor::Device::apple_gpu() ? InferenceBackend::MPS : InferenceBackend::YNNPACK,
-                stats);
-}
-
-auto Translator::load(const std::filesystem::path& model_directory, InferenceBackend backend, InferenceStats* stats,
+auto Translator::load(const std::filesystem::path& model_directory, tensor::Device device, InferenceStats* stats,
                       std::size_t batch_size) -> Result<Translator> {
+    if (device != tensor::Device::cpu() && device != tensor::Device::apple_gpu())
+        return std::unexpected(
+            Error{ErrorCode::UNSUPPORTED, "no translation backend for " + tensor::to_string(device)});
     if (batch_size == 0 || batch_size > 256)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "batch size must be between 1 and 256"});
     auto package =
@@ -93,15 +87,13 @@ auto Translator::load(const std::filesystem::path& model_directory, InferenceBac
     auto embedding = package->weights().tensor("target_embedding.weight");
     if (!embedding) return std::unexpected(std::move(embedding.error()));
     auto model = [&] {
-        const ModuleScope construction(
-            embedding->dtype(), false,
-            backend == InferenceBackend::MPS ? tensor::Device::apple_gpu() : tensor::Device::cpu());
+        const ModuleScope construction(embedding->dtype(), false, device);
         return model::TransformerImpl::create(package->config()["model"]);
     }();
     if (!model) return std::unexpected(std::move(model.error()));
     auto loaded = (*model)->set_state(package->weights());
     if (!loaded) return std::unexpected(std::move(loaded.error()));
-    Translator translator(std::move(*package), std::move(*model), backend);
+    Translator translator(std::move(*package), std::move(*model));
     translator.batch_size_ = batch_size;
     return translator;
 }

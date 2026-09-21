@@ -104,25 +104,6 @@ auto main() -> int {
         }
     }
 
-    const auto cuda =
-        std::ranges::find_if(backends, [](const auto& info) { return info.device_kind == DeviceKind::CUDA; });
-    if (cuda != backends.end() && cuda->storage_available) {
-        auto gpu = tensor->to(Device::cuda());
-        if (!require(gpu.has_value(), gpu ? "" : gpu.error().message)) return 1;
-        if (!require(
-                gpu->device() == Device::cuda() && gpu->backend_name() == "cuda-cudnn" && !gpu->is_host_accessible(),
-                "unexpected CUDA tensor metadata")) {
-            return 1;
-        }
-        auto round_trip = gpu->to(Device::cpu());
-        if (!require(round_trip.has_value(), round_trip ? "" : round_trip.error().message)) return 1;
-        auto round_trip_values = round_trip->data<float>();
-        if (!require(round_trip_values.has_value() && std::ranges::equal(*round_trip_values, *values),
-                     "CUDA tensor transfer changed values")) {
-            return 1;
-        }
-    }
-
     auto invalid_shape = Tensor::empty({-1}, DType::F32);
     auto high_rank = Tensor::empty(std::vector<std::int64_t>(10, 1), DType::F32);
     if (!require(high_rank.has_value(), "high-rank tensor allocation failed")) return 1;
@@ -135,10 +116,13 @@ auto main() -> int {
                  "metadata inline transition failed"))
         return 1;
     if (!require(!invalid_shape.has_value(), "negative shape unexpectedly succeeded")) return 1;
-    auto unavailable = tensor->to(Device::qualcomm_npu());
-    if (!require(!unavailable.has_value() && unavailable.error().code == kidi::ErrorCode::UNSUPPORTED,
-                 "unavailable Hexagon transfer unexpectedly succeeded")) {
-        return 1;
+    for (const auto device : {Device::qualcomm_npu(), Device::cuda()}) {
+        auto unavailable = tensor->to(device);
+        if (!require(!unavailable.has_value() && unavailable.error().code == kidi::ErrorCode::UNSUPPORTED &&
+                         unavailable.error().message.find("not implemented") != std::string::npos,
+                     "placeholder backend transfer unexpectedly succeeded")) {
+            return 1;
+        }
     }
 
     auto blob_owner = std::make_shared<std::array<float, 2>>(std::array<float, 2>{7, 8});

@@ -110,7 +110,7 @@ def run(args: argparse.Namespace) -> None:
     OUTPUT.unlink(missing_ok=True)
     subprocess.run(
         [
-            str(binary), "generate", "--model", str(directory),
+            str(binary), "translate", "--model", str(directory),
             "--backend", args.backend, "--threads", str(args.threads),
             "--beam-size", "1", "--batch-size", "1", "--batch-window", "1",
             "--max-extra-tokens", "50", "--length-penalty", "0.6",

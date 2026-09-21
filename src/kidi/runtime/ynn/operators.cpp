@@ -367,7 +367,7 @@ public:
                     check(ynn_define_static_transpose(native, 2, axes.data(), operands[1], &weight, 0));
                 }
                 if (packed && spec.epsilon > 0 && spec.attributes[1] == inputs[0].size(-1) &&
-                    inputs[0].numel() > inputs[0].size(-1) && !std::getenv("KIDI_CPU_BLOCKWISE_PREFILL")) {
+                    inputs[0].numel() > inputs[0].size(-1)) {
                     const std::size_t columns = padded_columns;
                     auto channel_scale = YNN_INVALID_VALUE_ID;
                     check(ynn_define_static_reshape(native, 1, &columns, operands[2], &channel_scale, 0));
