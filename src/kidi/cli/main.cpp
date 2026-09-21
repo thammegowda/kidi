@@ -16,6 +16,7 @@
 
 #include "kidi/cli/argparse.h"
 #include "kidi/cli/main.h"
+#include "kidi/cli/interactive.h"
 #include "kidi/core/version.h"
 #include "kidi/model/package.h"
 #include "kidi/model/config.h"
@@ -159,6 +160,8 @@ auto generate_chat(const kidi::cli::Namespace& arguments, std::istream& input, s
             .prefill_chunk_size = arguments.get<std::size_t>("prefill_chunk_size"),
             .ignore_eos = arguments.get<bool>("ignore_eos"),
             .full_attention_cache = arguments.get<bool>("full_attention_cache")};
+        if (arguments.get<std::string>("command") == "chat")
+            return kidi::cli::interactive_chat(generator, options, arguments, load_ns);
         const kidi::inference::ServingOptions limits{.maximum_active = arguments.get<std::size_t>("max_active"),
                                                      .maximum_requests = arguments.get<std::size_t>("queue_size"),
                                                      .cache_token_budget = arguments.get<std::size_t>("cache_tokens"),
@@ -377,10 +380,16 @@ auto generate(const kidi::cli::Namespace& arguments) -> int {
     }
     const auto type = (*config)["model"]["type"].as<std::string>();
     const bool chat = type == "gemma4_text";
+    const bool interactive = arguments.get<std::string>("command") == "chat";
+    if (interactive && !chat) {
+        spdlog::error("chat requires a chat model");
+        return 2;
+    }
     if (!chat && type != "rtg_transformer_nmt") {
         spdlog::error("unsupported model type: {}", type);
         return 2;
     }
+    if (interactive) return generate_chat(arguments, std::cin, std::cout);
     if (chat && (arguments.contains("beam_size") || arguments.contains("maximum_extra_tokens") ||
                  arguments.contains("length_penalty") || arguments.get<bool>("score") || arguments.get<bool>("stats") ||
                  arguments.get<std::int32_t>("batch_size") != 1 || arguments.contains("batch_window"))) {
@@ -441,33 +450,44 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
     auto& generate_parser = commands.add_parser("generate", "generate one result per input line, in input order");
     generate_parser.description(
         "RTG reads Moses-tokenized text lines; chat models read JSONL messages. Output preserves input order.");
-    generate_parser.add_argument("-m", "--model").type<std::filesystem::path>().required().metavar("DIR");
+    auto& chat_parser = commands.add_parser("chat", "interactive multi-turn chat with streaming replies");
+    chat_parser.description("Chat in the terminal with a loaded model. Type /help for shell commands.");
+    chat_parser.add_argument("--system").default_value(std::string{}).help("system instruction");
+    chat_parser.add_argument("--color")
+        .default_value(std::string("auto"))
+        .choices({"auto", "always", "never"})
+        .help("terminal colors; auto respects NO_COLOR");
     generate_parser.add_argument("--max-active").dest("max_active").default_value<std::size_t>(4);
     generate_parser.add_argument("--queue-size").dest("queue_size").default_value<std::size_t>(64);
-    generate_parser.add_argument("--cache-tokens")
-        .dest("cache_tokens")
-        .default_value<std::size_t>(8192)
-        .help("sum of reserved dense context capacities for line generation");
-    generate_parser.add_argument("--backend").default_value(std::string("auto")).choices({"auto", "ynnpack", "mps"});
-    generate_parser.add_argument("-j", "--threads").default_value<std::int32_t>(4);
-    generate_parser.add_argument("--max-new-tokens").dest("max_new_tokens").default_value<std::size_t>(0);
-    generate_parser.add_argument("--context-size").dest("context_size").default_value<std::size_t>(0);
-    generate_parser.add_argument("--prefill-chunk-size").dest("prefill_chunk_size").default_value<std::size_t>(128);
-    generate_parser.add_argument("--ignore-eos").dest("ignore_eos").action(kidi::cli::Action::STORE_TRUE);
-    generate_parser.add_argument("--full-attention-cache")
-        .dest("full_attention_cache")
-        .action(kidi::cli::Action::STORE_TRUE)
-        .help("disable CPU local-history cropping for the previous numerical path");
-    generate_parser.add_argument("--profile").action(kidi::cli::Action::STORE_TRUE);
-    generate_parser.add_argument("--weight-bits")
-        .dest("weight_bits")
-        .default_value<std::int32_t>(0)
-        .help("0: original weights; 4 or 8: load-time groupwise packing");
-    generate_parser.add_argument("--group-size").dest("group_size").default_value<std::int32_t>(128);
-    generate_parser.add_argument("--packed-prefill")
-        .dest("packed_prefill")
-        .action(kidi::cli::Action::STORE_TRUE)
-        .help("use packed GEMM for prefill; default may cache FP16 matrices for native QAT");
+    for (auto* command_parser : {&generate_parser, &chat_parser}) {
+        command_parser->add_argument("-m", "--model").type<std::filesystem::path>().required().metavar("DIR");
+        command_parser->add_argument("--cache-tokens")
+            .dest("cache_tokens")
+            .default_value<std::size_t>(8192)
+            .help("budget for reserved dense context tokens");
+        command_parser->add_argument("--backend")
+            .default_value(std::string("auto"))
+            .choices({"auto", "ynnpack", "mps"});
+        command_parser->add_argument("-j", "--threads").default_value<std::int32_t>(4);
+        command_parser->add_argument("--max-new-tokens").dest("max_new_tokens").default_value<std::size_t>(0);
+        command_parser->add_argument("--context-size").dest("context_size").default_value<std::size_t>(0);
+        command_parser->add_argument("--prefill-chunk-size").dest("prefill_chunk_size").default_value<std::size_t>(128);
+        command_parser->add_argument("--ignore-eos").dest("ignore_eos").action(kidi::cli::Action::STORE_TRUE);
+        command_parser->add_argument("--full-attention-cache")
+            .dest("full_attention_cache")
+            .action(kidi::cli::Action::STORE_TRUE)
+            .help("disable CPU local-history cropping for the previous numerical path");
+        command_parser->add_argument("--profile").action(kidi::cli::Action::STORE_TRUE);
+        command_parser->add_argument("--weight-bits")
+            .dest("weight_bits")
+            .default_value<std::int32_t>(0)
+            .help("0: original weights; 4 or 8: load-time groupwise packing");
+        command_parser->add_argument("--group-size").dest("group_size").default_value<std::int32_t>(128);
+        command_parser->add_argument("--packed-prefill")
+            .dest("packed_prefill")
+            .action(kidi::cli::Action::STORE_TRUE)
+            .help("use packed GEMM for prefill; default may cache FP16 matrices for native QAT");
+    }
 
     auto& inspect_parser = commands.add_parser("inspect", "inspect a model package");
     inspect_parser.description("Inspect an RTG or Gemma 4 model package.");
@@ -519,7 +539,7 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         }
         const auto& command = arguments.get<std::string>("command");
         if (command == "inspect") return inspect(arguments);
-        if (command == "generate") return generate(arguments);
+        if (command == "generate" || command == "chat") return generate(arguments);
         throw std::logic_error("unhandled command: " + command);
     } catch (const kidi::cli::ParseError& error) {
         std::cerr << error.usage();

@@ -227,7 +227,7 @@ printf '%s\n' '{"messages":[{"role":"user","content":"What is the capital of Fra
 ```
 
 Use `--backend ynnpack --threads 4` for CPU. The default backend is `auto`.
-`generate` always reads one request per line and preserves input order. The model
+`generate` reads one request per line and preserves input order. The model
 type determines the format: RTG uses Moses-tokenized text; Gemma 4 uses JSONL.
 Use `-i/--in FILE` and `-o/--out FILE`, or `-` for stdin/stdout (the defaults).
 Each JSON line contains a conversation in the common chat-message format:
@@ -301,6 +301,75 @@ for downloads, correctness checks, memory costs, and the remaining LiteRT-LM gap
 See [the Gemma 4 benchmark report](benchmarks/gemma4/README.md) for measured CPU/GPU
 comparisons with LiteRT-LM, including MTP, precision differences, and the applied
 executable-reuse optimization. LiteRT-LM remains faster in the measured cases.
+
+### Interactive Chat
+
+```bash
+python -m kidi chat \
+  --model ../models/gemma-4-E2B-it-qat-mobile-transformers --backend mps \
+  --system "Be concise." --max-new-tokens 256
+```
+
+Type ordinary text at `You>`. The model is loaded once; replies stream as text
+becomes available, and completed user/assistant turns stay in conversation history.
+The same checkpoint chat template used by JSONL formats every turn. `chat` uses
+stdin/stdout and does not accept `--in`, `--out` or batching options. It replaces
+`generate --interactive`; `generate` is exclusively for line-oriented processing.
+Chat requires a chat model; RTG remains line-oriented translation.
+
+| Command | Action |
+|---|---|
+| `/help` | Show shell commands |
+| `/clear` | Reset history, retaining the system instruction |
+| `/system TEXT` | Replace the system instruction and reset history; omit TEXT to clear it |
+| `/multiline` | Collect text until `/send`; `/cancel` discards it |
+| `/exit` or `/quit` | Exit; EOF/Ctrl-D also exits |
+
+Start with `//` to send a message beginning with a literal slash. Ctrl-C during
+generation cancels at the next model-step boundary, releases request state, and
+discards that incomplete turn. Ctrl-C at the input prompt clears the current line.
+Cancellation does not reload the model or erase completed history. Inference errors
+that invalidate the engine terminate the shell; invalid or overlong prompts leave
+it usable. History is never silently truncated: use `/clear` when it no longer
+fits `--context-size` together with the output budget.
+
+`--color auto|always|never` controls ANSI prompt colors. `auto` enables colors on
+a terminal unless `NO_COLOR` is set or `TERM=dumb`; `always` explicitly overrides
+auto-detection. Model output is not interpreted as terminal control sequences.
+Chat has one active request and one queue slot. `--cache-tokens`, context/output limits, quantization
+and backend options still apply. `--profile` writes per-turn metrics to stderr.
+
+Before the first `You>` prompt, chat prints model load time and a memory snapshot,
+without requiring a message or `--profile`. Memory can grow on the first reply as
+lazy operators and caches are prepared; startup is not a warmed-memory estimate.
+
+Every completed reply shows output token count, decode tok/s, time to first token,
+and total turn time. Decode speed uses recurrent model-step time (excluding prefill
+and terminal output), including a stop-token step when present; the displayed output
+count excludes stop tokens. First-token/total times start at request enqueue, not
+model loading. Replies with no recurrent decode step show `decode n/a`. Cancelled
+turns do not print completion stats. `--profile` is not required for this summary.
+
+On macOS, the footer shows process `footprint` from `TASK_VM_INFO.phys_footprint`,
+the footprint accounting used by system monitors. Unlike RSS, this accounts for
+compressed and other memory charged to the process, so an idle/compressed model
+does not misleadingly appear to use only a few hundred MiB. `RAM headroom` is the
+kernel's `kern.memorystatus_level` percentage, matching the system-wide percentage
+queried by `memory_pressure -Q`; it is not the fraction of completely unused pages.
+Total physical RAM is shown separately. Headroom is not a guaranteed allocatable
+byte budget or a substitute for the OS memory-pressure level.
+
+Linux still reports process RSS and free/total physical RAM (excluding reclaimable
+caches); Windows reports process working set and available physical RAM. Figures
+are startup/end-of-turn snapshots, not peaks or model-only allocations. GPU allocations
+must not be added to process footprint on unified-memory systems. Unsupported or
+failed counters display `n/a` rather than an invented zero.
+
+Weights and prepared operators persist between turns, but conversation history is
+re-prefilled each turn; cross-turn KV-cache reuse is not implemented here. Unicode
+byte fragments are buffered until decodable, so not every token produces visible
+text. This mode uses the existing `enqueue_chat`/`step`/`cancel` API, not a second
+generation loop or coroutine runtime.
 
 ## RTG Model Package
 

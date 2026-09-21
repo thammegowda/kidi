@@ -91,8 +91,10 @@ auto main(int argc, char** argv) -> int {
             std::array<inference::GenerationOptions, 4> options;
             std::vector<inference::TextGeneration> serial;
             for (std::size_t row = 0; row < prompts.size(); ++row) {
-                options[row] = {
-                    .maximum_new_tokens = row == 0 ? 3U : 12U, .context_size = 128, .prefill_chunk_size = 8};
+                options[row] = {.maximum_new_tokens = row == 0 ? 3U : 12U,
+                                .context_size = 128,
+                                .prefill_chunk_size = 8,
+                                .stream_text = true};
                 serial.push_back(ops::require(generator.generate(prompts[row], options[row])));
             }
             ops::require(generator.configure_serving(
@@ -102,6 +104,7 @@ auto main(int argc, char** argv) -> int {
                 ids[row] = ops::require(generator.enqueue(prompts[row], options[row]));
             if (generator.enqueue(prompts[3], options[3])) throw std::runtime_error("serving backpressure failed");
             std::array<std::vector<std::int32_t>, 4> streamed;
+            std::array<std::string, 4> streamed_text;
             std::array<bool, 4> finished{};
             std::size_t completed = 0, steps = 0;
             while (generator.pending_requests()) {
@@ -115,10 +118,12 @@ auto main(int argc, char** argv) -> int {
                     const auto row = static_cast<std::size_t>(found - ids.begin());
                     if (finished[row]) throw std::runtime_error("duplicate completion or post-completion token");
                     if (event.token) streamed[row].push_back(*event.token);
+                    streamed_text[row] += event.text;
                     if (event.completed) {
                         if (event.completed->generation.token_ids != serial[row].generation.token_ids ||
                             event.completed->generation.decoder_steps != serial[row].generation.decoder_steps ||
-                            streamed[row] != serial[row].generation.token_ids)
+                            streamed[row] != serial[row].generation.token_ids ||
+                            streamed_text[row] != serial[row].text || event.completed->text != streamed_text[row])
                             throw std::runtime_error("serving differs from serial at row " + std::to_string(row));
                         finished[row] = true;
                         ++completed;

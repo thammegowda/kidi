@@ -148,6 +148,29 @@ auto Tokenizer::decode(std::span<const std::int32_t> ids) const -> Result<std::s
     return std::move(*text);
 }
 
+auto Tokenizer::decode_delta(std::span<const std::int32_t> ids, std::string& emitted, bool final) const
+    -> Result<std::string> {
+    auto decoded = decode(ids);
+    if (!decoded) return std::unexpected(std::move(decoded.error()));
+    if (!decoded->starts_with(emitted))
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "tokenizer revised already streamed text"});
+    auto end = decoded->size();
+    if (!final) {
+        const auto replacement = decoded->find("\xEF\xBF\xBD", emitted.size());
+        if (replacement != std::string::npos) end = replacement;
+        if (end) {
+            auto lead = end - 1;
+            while (lead && (static_cast<unsigned char>((*decoded)[lead]) & 0xC0) == 0x80) --lead;
+            const auto byte = static_cast<unsigned char>((*decoded)[lead]);
+            const std::size_t width = byte < 0x80 ? 1 : byte < 0xE0 ? 2 : byte < 0xF0 ? 3 : 4;
+            if (end - lead < width) end = lead;
+        }
+    }
+    auto delta = decoded->substr(emitted.size(), end - emitted.size());
+    emitted.append(delta);
+    return delta;
+}
+
 auto Tokenizer::vocabulary_size() const noexcept -> std::size_t { return impl_->value.get_vocab_size(); }
 
 auto Tokenizer::token_id(std::string_view token) const -> std::optional<std::int32_t> {

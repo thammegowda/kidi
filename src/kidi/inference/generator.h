@@ -11,6 +11,7 @@ struct GenerationOptions {
     std::size_t maximum_new_tokens = 0, context_size = 0, prefill_chunk_size = 128;
     std::size_t prefix_cache_bytes = 0;
     bool raw_prompt = false, ignore_eos = false, full_attention_cache = false;
+    bool stream_text = false;
 };
 struct GenerationStats {
     bool device_selection = false;
@@ -37,6 +38,7 @@ struct GenerationEvent {
     std::uint64_t request_id;
     std::optional<std::int32_t> token;
     std::optional<TextGeneration> completed;
+    std::string text;
 };
 struct GenerationStep {
     std::vector<GenerationEvent> events;
@@ -81,6 +83,7 @@ private:
         std::optional<model::Gemma4State> state;
         GenerationStats stats;
         std::chrono::steady_clock::time_point enqueued;
+        std::string streamed_text;
     };
     std::optional<ServingOptions> serving_;
     std::deque<QueuedGeneration> waiting_;

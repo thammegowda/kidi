@@ -99,6 +99,27 @@ auto main(int argc, char** argv) -> int {
     const std::array invalid{kidi::text::ChatMessage{"tool", "ignored"}, kidi::text::ChatMessage{"user", "Hi"}};
     if (chat->format_chat(invalid)) return 1;
 
+    std::ofstream(directory / "bytes.json") << R"({
+      "version":"1.0", "decoder":{"type":"ByteFallback"},
+      "model":{"type":"WordLevel", "unk_token":"<unk>",
+               "vocab":{"<unk>":0,"<0xE2>":1,"<0x82>":2,"<0xAC>":3,"!":4}}
+    })";
+    auto bytes = kidi::text::Tokenizer::load(directory / "bytes.json");
+    if (!bytes) return 1;
+    const std::array<std::int32_t, 4> byte_tokens{1, 2, 3, 4};
+    std::string emitted;
+    for (std::size_t count = 1; count <= byte_tokens.size(); ++count) {
+        auto delta = bytes->decode_delta(std::span(byte_tokens).first(count), emitted);
+        if (!delta || (count < 3 && !delta->empty())) return 1;
+    }
+    auto tail = bytes->decode_delta(byte_tokens, emitted, true);
+    auto complete = bytes->decode(byte_tokens);
+    if (!tail || !tail->empty() || !complete || emitted != *complete || emitted != "\xE2\x82\xAC!") return 1;
+    emitted.clear();
+    auto partial = bytes->decode_delta(std::span(byte_tokens).first(1), emitted);
+    auto final = bytes->decode_delta(std::span(byte_tokens).first(1), emitted, true);
+    if (!partial || !partial->empty() || !final || final->empty()) return 1;
+
     std::filesystem::remove_all(directory);
     return 0;
 }

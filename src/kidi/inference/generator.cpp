@@ -376,6 +376,9 @@ auto Generator::step() -> Result<GenerationStep> {
                 request.stats.time_to_first_token_ns = elapsed(request.enqueued);
             GenerationEvent event{request.id, {}, {}};
             if (request.search.result().token_ids.size() > previous) event.token = token;
+            if (request.options.stream_text)
+                event.text = require(tokenizer_.decode_delta(request.search.result().token_ids, request.streamed_text,
+                                                             request.search.finished()));
             if (request.search.finished()) {
                 TextGeneration completed;
                 completed.generation = std::move(request.search).result();

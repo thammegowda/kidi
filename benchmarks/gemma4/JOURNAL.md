@@ -4,6 +4,89 @@ Short progress notes for the current implementation. Measurements are explorator
 unless explicitly labelled as paired acceptance results. Historical comparisons
 remain in [QAT.md](QAT.md).
 
+## 2026-09-20: Chat Initialization Statistics
+
+Chat now prints and flushes model load time plus the existing memory snapshot
+before the first `You>` prompt. No user input or profiling flag is required.
+Decode speed remains a per-reply metric; startup does not invent a token rate.
+Initial memory can be lower than after generation because caches prepare lazily.
+The existing terminal regression verifies the summary arrives before any input;
+the chat test also checks that it appears once alongside the per-reply summaries.
+
+## 2026-09-20: Correct macOS Memory Accounting
+
+The initial RSS/unused-page footer was technically labeled but misleading for
+practical memory monitoring. The live Kidi process had a 6.241 GiB footprint
+while RSS was only 0.307 GiB after compression; `top` showed about 6391 MiB.
+At the initial observation macOS had only 76 MiB unused, but `memory_pressure -Q`
+reported 44% system-wide free. These are different counters, not a unit error.
+
+The macOS footer now uses `TASK_VM_INFO.phys_footprint` and labels the kernel
+`kern.memorystatus_level` percentage as RAM headroom. It does not convert that
+percentage into a purported free-byte budget. An independent live-process check
+matched 2.81 GiB displayed to 2.807 GiB from `proc_pid_rusage`; both the footer and
+`memory_pressure -Q` reported 31% in that check. The user's running chat was not
+stopped or restarted. Values are snapshots and change with other workloads.
+
+The existing live-terminal regression now compares the displayed footprint with
+`proc_pid_rusage` for the still-running child process, not just a plausible range.
+Native CPU and rebuilt-wheel Metal CLI tests pass; the CLI and wheel are rebuilt.
+Test processes used zero retained expanded-weight cache to reduce pressure while
+the user's chat remained open. This does not change the default cache policy.
+
+## 2026-09-20: Chat Reply Statistics
+
+Completed replies now show output token count, recurrent decode tok/s, first-token
+latency, total turn time, current process RSS, and system free/total physical RAM
+with percentage free. The footer is always shown, dimmed when colors are enabled;
+`--profile` additionally emits raw generated-token and decode counters on stderr.
+No decode step means `decode n/a`; cancelled/rejected turns have no completion stats.
+
+Decode timing excludes prefill and terminal output, and includes a stop-token step
+when present; visible output counts exclude stop tokens. Memory is sampled at turn
+completion, not a peak or model-only measurement. macOS/Linux report free physical
+pages, excluding reclaimable caches; Windows reports available physical memory.
+Missing counters show `n/a`. Non-macOS memory branches have not been runtime-tested.
+Existing CLI checks cover footer counts, valid memory ranges, single-token replies,
+history isolation and cancellation without timing-threshold assertions.
+
+## 2026-09-20: Dedicated Chat Command
+
+Renamed the interactive entry point to `kidi chat` (also `python -m kidi chat`).
+`generate` remains ordered line processing; the `--interactive` flag is removed.
+Model/backend options share one parser setup, but file/batch options stay with
+`generate` and system/color options with `chat`. The loaded model, streaming,
+history and cancellation behavior are unchanged. Earlier entries below describe
+the previous CLI spelling.
+
+Validated native parser/builds, all five installed-wheel CLI tests on CPU and
+Metal, and both strict RTG regressions (chrF2 100). The rebuilt wheel includes
+the command split. Invalid cross-command options and non-chat models are rejected.
+
+## 2026-09-20: Interactive Streaming Chat
+
+- Added `generate --interactive`: load once, preserve multi-turn history, ignore
+  `--in`/`--out`, and stream replies through the existing serving event API.
+  No coroutine shim or duplicate decoder loop was needed.
+- Added opt-in text deltas with Unicode byte-fragment buffering; JSONL remains
+  completion-oriented. Existing serving checks now require concatenated deltas
+  to equal the final decoded response.
+- Shell supports system instructions, history reset, multiline entry, help and
+  exit. TTY-aware colors respect `NO_COLOR`; explicit always/never modes work.
+  Ctrl-C cancels a turn between model steps and returns to a usable prompt.
+- CPU checks cover live PTY streaming/cancellation, multi-turn equivalence to
+  JSONL, ignored file paths, context-error recovery, EOF and color policy.
+  Tokenizer tests cover UTF-8 byte fallback split across token events.
+- Deliberate limits: each turn re-prefills history; no cross-turn KV reuse.
+  Incremental text uses cumulative decoding for correctness, not an optimized
+  tokenizer streaming kernel. No new throughput claim is made.
+- Final gates: all 16 native CTest targets pass; CPU/Metal serving probes have
+  exact streamed-text/final-response parity. All five Python CLI tests pass
+  through the rebuilt wheel on both backends, including PTY cancellation.
+  Both installed-wheel RTG regressions remain chrF2 100 over 50 sentences.
+  Diagnostics and whitespace checks are clean. Windows terminal behavior was
+  not tested. No commits or staging were performed.
+
 ## 2026-09-20: Ordered Chat JSONL
 
 - Unified CLI inference under `generate`, dispatching by model type. RTG keeps

@@ -67,13 +67,22 @@ CLI diagnostics use spdlog on stderr. Translation results and inspection output
 remain on stdout; machine-readable metric/profile records retain their unadorned
 format on stderr. `SPDLOG_LEVEL` controls the human-readable logger.
 
-The `generate` CLI dispatches by `model.type` and always processes lines in input
+The `generate` CLI dispatches by `model.type` and normally processes lines in input
 order. RTG reads text lines; Gemma 4 reads JSONL `messages` arrays with optional
 `id` and `max_tokens`. `Tokenizer::format_chat` uses the original checkpoint's
 Jinja template and special-token configuration; `Generator::enqueue_chat` passes
 the serialized result to the existing raw-prompt enqueue path. Text messages may
 include system/developer instructions and user/assistant history. Tools and
 multimodal content are rejected. No generic model execution abstraction is added.
+
+The dedicated `chat` command uses stdin/stdout and the same
+loaded `Generator` for a terminal chat session. The shell owns system/user/assistant
+history and configures one serving slot. Successful replies append assistant text;
+rejected or cancelled requests remove the pending user turn. Context overflow is
+reported without silently truncating history. Terminal commands, ANSI color policy
+and scoped SIGINT handling live in `cli/interactive.*`, outside inference code.
+Model/backend options are shared with `generate`; system/color options are
+chat-only, while file I/O and batching options are generate-only.
 
 ## Eager Contract
 
@@ -438,6 +447,17 @@ ready requests decode each step before one bounded round-robin prefill chunk.
 Completion and cancellation release reservations. Cancellation has no completion
 event; unknown IDs are rejected. Drain or cancel requests before blocking generation
 or reconfiguration. A failed model step invalidates serving and requires reload.
+
+`GenerationOptions::stream_text` opts into `GenerationEvent::text` deltas alongside
+the existing token and completion events. `Tokenizer::decode_delta` decodes the
+accumulated token prefix, withholds incomplete UTF-8/replacement suffixes until
+stable or final, and rejects decoders that revise already-emitted text. It uses
+quadratic cumulative decode work in output length, a conservative tradeoff for
+short interactive replies; JSONL does not enable it. Deltas concatenate to the
+ordinary final text. Cancellation destroys the request's decoder state too.
+The terminal flushes deltas after each model step. Cancellation is cooperative
+between steps, not GPU preemption. No cross-turn KV retention or new coroutine
+abstraction is introduced; weights and prepared operators remain loaded.
 
 Serving events may finish out of order. The CLI retains completed records until
 their preceding input records are emitted, counting these retained completions

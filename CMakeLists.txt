@@ -120,7 +120,7 @@ if(APPLE)
     endif()
 endif()
 
-add_library(kidi_cli_main STATIC src/kidi/cli/main.cpp)
+add_library(kidi_cli_main STATIC src/kidi/cli/main.cpp src/kidi/cli/interactive.cpp)
 target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi spdlog::spdlog nlohmann_json::nlohmann_json)
 
 add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)
