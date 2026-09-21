@@ -146,14 +146,17 @@ Use the existing optional benchmark environment, or install
 [requirements.txt](requirements.txt) in a Python 3.12 environment.
 
 ```sh
+.cache/gemma-venv/bin/python -m pip install '.[hf]'
 .cache/gemma-venv/bin/hf download google/gemma-4-E2B-it-qat-mobile-transformers \
   config.json model.safetensors tokenizer.json tokenizer_config.json chat_template.jinja \
   --revision dd693ff40353f057ca5f07e945ad867f4afbf2ec \
   --local-dir ../models/gemma-4-E2B-it-qat-mobile-transformers
-.cache/gemma-venv/bin/python tools/configure_gemma4.py \
+.cache/gemma-venv/bin/python -m kidi.converters.gemma4 \
   ../models/gemma-4-E2B-it-qat-mobile-transformers
-build-release/kidi generate --model ../models/gemma-4-E2B-it-qat-mobile-transformers \
-  --backend ynnpack --threads 4 --prompt 'What is the capital of France?' --profile
+printf '%s\n' '{"messages":[{"role":"user","content":"What is the capital of France?"}]}' | \
+  .cache/gemma-venv/bin/python -m kidi generate \
+    --model ../models/gemma-4-E2B-it-qat-mobile-transformers \
+    --backend ynnpack --threads 4 --profile
 ```
 
 Do not pass `--weight-bits` for native QAT; the trained checkpoint defines it.

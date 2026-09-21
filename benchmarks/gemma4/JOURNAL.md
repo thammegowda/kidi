@@ -4,6 +4,35 @@ Short progress notes for the current implementation. Measurements are explorator
 unless explicitly labelled as paired acceptance results. Historical comparisons
 remain in [QAT.md](QAT.md).
 
+## 2026-09-20: Automated Hub Setup
+
+Added `pip install '.[hf]'` and Python-launcher `--model @owner/model` resolution
+for chat, generation and inspection. `-c/--cache` defaults to the Kidi model-hub
+directory. Optional `@revision` pins a checkpoint; normal Hugging Face auth and
+offline cache behavior apply. Native argument parsing precedes any download.
+
+The converter implementations now live in `kidi.converters.gemma4` and
+`kidi.converters.rtg`; the obsolete source-tree launchers and requirements file
+have been removed. Examples invoke the packaged modules and their extras directly.
+Gemma configuration is written
+atomically without rewriting weights or tokenizers. Ready-made Hub packages retain
+their configuration. RTG conversion dependencies remain in the separate `convert`
+extra rather than enlarging the inference install.
+
+Real download/automatic setup and offline reuse succeeded for the pinned Google
+QAT checkpoint. `thammegowda/rtg-500eng-v1` is private: anonymous lookup failed,
+but the existing authorized login downloaded it, and offline inspection passed.
+No credentials were printed or embedded and no model visibility was changed.
+
+Final validation: all 16 native tests and nine installed Python CLI/Hub tests on
+each of CPU and Metal pass. RTG loaded through `@thammegowda/rtg-500eng-v1` retains
+chrF2 100 over the 50-sentence fixture on both backends. Actual Gemma Hub chat and
+RTG translation work from outside the source checkout. Installed converter import,
+FP32/BF16/INT8 smoke checks and bundled tokenizer-helper lookup pass. A base wheel
+without `[hf]` still handles local commands and reports a concise missing-extra
+error for Hub references. The distribution wheel was rebuilt; no commits or staging
+were performed.
+
 ## 2026-09-20: Chat Initialization Statistics
 
 Chat now prints and flushes model load time plus the existing memory snapshot

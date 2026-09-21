@@ -194,11 +194,12 @@ Use a Python 3.12 environment for the optional benchmark dependencies:
 ```sh
 python3.12 -m venv .cache/gemma-venv
 .cache/gemma-venv/bin/pip install -r benchmarks/gemma4/requirements.txt
+.cache/gemma-venv/bin/python -m pip install '.[hf]'
 .cache/gemma-venv/bin/hf download google/gemma-4-E2B-it \
   config.json model.safetensors tokenizer.json tokenizer_config.json chat_template.jinja \
   --revision 3e22461f65e89153144f8adb70e3b8c2cc9845a7 \
   --local-dir ../models/gemma-4-E2B-it
-.cache/gemma-venv/bin/python tools/configure_gemma4.py ../models/gemma-4-E2B-it
+.cache/gemma-venv/bin/python -m kidi.converters.gemma4 ../models/gemma-4-E2B-it
 .cache/gemma-venv/bin/hf download litert-community/gemma-4-E2B-it-litert-lm \
   gemma-4-E2B-it.litertlm \
   --revision b3ca0d2f076785a8f4b2219ddbd2bdb99954eae1 \

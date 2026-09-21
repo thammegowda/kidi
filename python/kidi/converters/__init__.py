@@ -1,0 +1,1 @@
+"""Model setup and conversion utilities; optional dependencies load on demand."""

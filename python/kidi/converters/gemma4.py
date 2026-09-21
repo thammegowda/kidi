@@ -3,6 +3,8 @@
 
 import argparse
 import json
+import os
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -32,8 +34,16 @@ def configure(directory: Path) -> Path:
         "decode": {"maximum_new_tokens": 256, "context_size": 2048},
     }
     destination = directory / "model.yaml"
-    with destination.open("x") as output:
-        yaml.safe_dump(document, output, sort_keys=False)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=".model.yaml.", delete=False) as output:
+            temporary = Path(output.name)
+            yaml.safe_dump(document, output, sort_keys=False)
+        os.link(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return destination
 
 

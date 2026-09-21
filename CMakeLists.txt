@@ -133,6 +133,8 @@ if(KIDI_BUILD_PYTHON)
     nanobind_add_module(_native STABLE_ABI python/bindings.cpp)
     target_link_libraries(_native PRIVATE kidi_cli_main)
     install(TARGETS _native LIBRARY DESTINATION kidi COMPONENT python)
+    install(FILES "${KIDI_THIRD_PARTY_DIR}/tokenizerspp/tools/nlcodec_to_tokenizer_json.py"
+        DESTINATION kidi/converters COMPONENT python)
     execute_process(
         COMMAND "${Python_EXECUTABLE}" -c
             "from importlib.metadata import distribution; package = distribution('nanobind'); print(next(package.locate_file(file) for file in package.files if file.name == 'LICENSE' and '.dist-info' in str(file)))"

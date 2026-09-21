@@ -1,6 +1,7 @@
 """Run against an installed wheel: python -m unittest discover -s tests -p python_cli_test.py."""
 
 import os
+import importlib.util
 import json
 import re
 import subprocess
@@ -9,8 +10,106 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import kidi
+
+
+class HubCliTest(unittest.TestCase):
+    def test_resolution_only_after_valid_arguments(self):
+        with patch("kidi.hub.resolve") as resolve:
+            self.assertEqual(kidi.main(["chat", "--help", "-m", "@google/example"]), 0)
+            self.assertEqual(kidi.main(["chat", "-m", "@google/example", "--not-an-option"]), 2)
+            self.assertEqual(kidi.main(["inspect", "-m", "/nonexistent-kidi-test"]), 1)
+            resolve.assert_not_called()
+        for args, cache in [(["-m", "@google/example"], "~/.cache/kidi/model-hub"),
+                            (["--model=@google/example", "-c", "custom cache"], "custom cache"),
+                            (["-m=@google/example", "--cache=other"], "other")]:
+            with self.subTest(args=args), patch("kidi.hub.resolve", return_value=Path("/nonexistent-kidi-test")) as resolve:
+                self.assertEqual(kidi.main(["inspect", *args]), 1)
+                resolve.assert_called_once_with("google/example", cache)
+
+    def test_missing_extra(self):
+        from kidi.hub import resolve
+
+        with patch.dict(sys.modules, {"huggingface_hub": None}):
+            with self.assertRaisesRegex(RuntimeError, r"kidi\[hf\]"):
+                resolve("google/example")
+
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
+    def test_cached_setup_and_validation(self):
+        import yaml
+        from kidi.hub import resolve
+        from kidi.converters.gemma4 import configure
+
+        with tempfile.TemporaryDirectory() as root:
+            cache = Path(root).resolve()
+            snapshot = cache / "models--google--example" / "snapshots" / ("a" * 40)
+            snapshot.mkdir(parents=True)
+            original = {"model_type": "gemma4", "text_config": {"hidden_size": 4},
+                        "quantization_config": {"quant_method": "gemma"}}
+            (snapshot / "config.json").write_text(json.dumps(original))
+            with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
+                with self.assertRaisesRegex(ValueError, "Missing model.safetensors"):
+                    resolve("google/example", cache)
+                self.assertFalse((snapshot / "model.yaml").exists())
+                (snapshot / "model.safetensors").write_bytes(b"test weights")
+                (snapshot / "tokenizer.json").write_text("{}")
+                (snapshot / "tokenizer_config.json").write_text("{}")
+                with self.assertRaisesRegex(ValueError, "chat_template"):
+                    resolve("google/example", cache)
+                self.assertFalse((snapshot / "model.yaml").exists())
+                (snapshot / "chat_template.jinja").write_text("{{ messages }}")
+                self.assertEqual(resolve("google/example@revision", cache), snapshot)
+                self.assertEqual(download.call_args.kwargs["revision"], snapshot.name)
+                self.assertEqual(download.call_args.kwargs["cache_dir"], cache)
+                config = snapshot / "model.yaml"
+                self.assertEqual(yaml.safe_load(config.read_text())["model"]["quantization_config"],
+                                 original["quantization_config"])
+                saved = config.read_bytes()
+                self.assertEqual(resolve("google/example", cache), snapshot)
+                self.assertEqual(config.read_bytes(), saved)
+                with self.assertRaises(FileExistsError):
+                    configure(snapshot)
+                self.assertEqual(config.read_bytes(), saved)
+                self.assertFalse(list(snapshot.glob(".model.yaml.*")))
+                self.assertEqual((snapshot / "model.safetensors").read_bytes(), b"test weights")
+                (snapshot / "model.safetensors").unlink()
+                with self.assertRaisesRegex(ValueError, "Missing model.safetensors"):
+                    resolve("google/example", cache)
+                config.unlink()
+                original["model_type"] = "unsupported"
+                (snapshot / "config.json").write_text(json.dumps(original))
+                download.reset_mock()
+                with self.assertRaisesRegex(ValueError, "Automatic setup supports"):
+                    resolve("google/example", cache)
+                self.assertEqual(download.call_count, 1)
+
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
+    def test_preconfigured_package_paths(self):
+        import yaml
+        from kidi.hub import resolve
+
+        with tempfile.TemporaryDirectory() as root:
+            snapshot = Path(root).resolve() / ("b" * 40)
+            snapshot.mkdir()
+            document = {"format_version": 1, "model": {"type": "rtg_transformer_nmt"}, "decode": {},
+                        "weights_file": "weights.safetensors",
+                        "tokenizers": {"source": "src.json.gz", "target": "tgt.json.gz"}}
+            config = snapshot / "model.yaml"
+            config.write_text(yaml.safe_dump(document))
+            for name in ("weights.safetensors", "src.json.gz", "tgt.json.gz"):
+                (snapshot / name).write_bytes(b"fixture")
+            saved = config.read_bytes()
+            with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
+                self.assertEqual(resolve("owner/rtg", root), snapshot)
+                self.assertEqual(config.read_bytes(), saved)
+                self.assertIn("src.json.gz", download.call_args.kwargs["allow_patterns"])
+                for unsafe in ("../outside", "/absolute", "*.safetensors", "C:\\weights"):
+                    document["weights_file"] = unsafe
+                    config.write_text(yaml.safe_dump(document))
+                    with self.assertRaisesRegex(ValueError, "Invalid package file path"):
+                        resolve("owner/rtg", root)
 
 
 class PythonCliTest(unittest.TestCase):

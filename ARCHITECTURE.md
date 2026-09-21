@@ -67,6 +67,24 @@ CLI diagnostics use spdlog on stderr. Translation results and inspection output
 remain on stdout; machine-readable metric/profile records retain their unadorned
 format on stderr. `SPDLOG_LEVEL` controls the human-readable logger.
 
+The Python launcher optionally resolves `--model @owner/repo[@revision]` through
+Hugging Face Hub. Native parsing and help run first; only a validated Hub reference
+invokes the injected `ModelResolver`. `-c/--cache` defaults to
+`~/.cache/kidi/model-hub` and is expanded by Python. Local model paths bypass the
+resolver. The standalone executable has no Python/download dependency and reports
+that Hub references require the Python launcher.
+
+The `hf` extra supplies Hub, PyYAML and filelock. The resolver reads model metadata
+first, then downloads required files at the same resolved commit using Hub's normal
+snapshot/blob cache. Ready-made Kidi manifests retain their declared relative file
+paths; unsupported or escaping paths are rejected. Dense Gemma 4 snapshots without
+Kidi YAML use `kidi.converters.gemma4.configure`, under a per-snapshot lock, with an
+atomic no-overwrite config install. Original files remain unchanged. Incomplete
+caches fail rather than being marked ready; `HF_HUB_OFFLINE=1` requires cached
+files. No downloaded Python code or pickled checkpoints execute during resolution.
+Explicit trusted RTG conversion is separate in `kidi.converters.rtg` with the
+`convert` extra; its NLCodec helper is bundled in wheels.
+
 The `generate` CLI dispatches by `model.type` and normally processes lines in input
 order. RTG reads text lines; Gemma 4 reads JSONL `messages` arrays with optional
 `id` and `max_tokens`. `Tokenizer::format_chat` uses the original checkpoint's

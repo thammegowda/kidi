@@ -9,6 +9,10 @@ description = "C++ inference for RTG translation and Gemma 4 text generation"
 readme = "README.md"
 requires-python = ">=3.12"
 
+[project.optional-dependencies]
+hf = ["huggingface-hub>=1.0,<2", "PyYAML>=6", "filelock>=3.12"]
+convert = ["torch>=2", "ruamel.yaml>=0.17", "safetensors>=0.4,<1"]
+
 [project.urls]
 Repository = "https://github.com/thammegowda/kidi"
 

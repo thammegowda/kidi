@@ -6,6 +6,9 @@ Safetensors weights.
 
 Repository: [thammegowda/kidi](https://github.com/thammegowda/kidi).
 
+**New here?** Follow the [Getting Started: Gemma 4 Chat](docs/getting-started.md)
+guide to install Kidi, download the tested Google QAT checkpoint, and start chatting.
+
 Kidi-owned code follows [CODING_GUIDELINES.md](CODING_GUIDELINES.md).
 
 RTG translation accepts and returns Moses-tokenized UTF-8 text; normalization
@@ -23,6 +26,38 @@ python -m kidi --help
 kidi --version
 ```
 
+For automatic model downloads and setup, install the optional `hf` extra:
+
+```bash
+python -m pip install '.[hf]'
+python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers
+```
+
+Backend selection defaults to `auto`. It selects Metal when an Apple GPU
+execution backend is available, otherwise YNNPACK CPU. Use a build or wheel
+compatible with your OS and architecture; automatic selection does not enable
+CUDA inference or make a macOS wheel usable on Linux or Windows.
+
+The pip-installed `kidi` command supports the same syntax. `@owner/model` resolves
+a Hugging Face repository, downloads supported model files and creates Kidi config
+when needed. `-c/--cache` defaults to `~/.cache/kidi/model-hub/`; use it on `chat`,
+`generate` or `inspect` to select another download cache. `@owner/model@REVISION`
+pins a revision; `HF_HUB_OFFLINE=1` reuses an already complete cached model. Native
+Gemma 4 (original floating-point or mobile QAT) and ready-made Kidi packages are
+supported; arbitrary HF architectures, sharded checkpoints and GGUF are not.
+Local model paths do not import or require Hub dependencies. The standalone C++
+binary does not download models; use the Python launcher for `@` references.
+
+Ready-made RTG packages work too:
+
+```bash
+printf '%s\n' 'Comment allez @-@ vous ?' | \
+  python -m kidi generate -m @thammegowda/rtg-500eng-v1 --beam-size 1
+```
+
+That repository is currently private and requires an authorized Hugging Face login.
+It already contains Kidi config/tokenizers, so the resolver does not convert it.
+
 Once these packaging files are present at the requested Git revision, direct
 Git installation also works; pip initializes the pinned submodules recursively:
 
@@ -30,6 +65,8 @@ Git installation also works; pip initializes the pinned submodules recursively:
 python -m pip install "git+https://github.com/thammegowda/kidi.git"
 # Select a branch, tag or commit:
 python -m pip install "git+https://github.com/thammegowda/kidi.git@REVISION"
+# Include automatic Hugging Face model setup:
+python -m pip install "kidi[hf] @ git+https://github.com/thammegowda/kidi.git@REVISION"
 ```
 
 Local-directory and Git installs compile from source: a C++23 toolchain is
@@ -60,6 +97,15 @@ to the same C++ entry point as the native executable. For an in-process call,
 `kidi.main(["--version"])` returns the integer exit code; omit the argument to use
 `sys.argv[1:]`. The entry point uses native stdin/stdout/stderr, retains the GIL,
 and is a CLI bridge, not a tensor/model Python API.
+
+Model setup/converters are included in wheels as importable modules:
+`kidi.converters.gemma4` provides `configure(directory)` and
+`kidi.converters.rtg` provides the legacy RTG conversion functions. Run them with
+`python -m kidi.converters.gemma4 DIR` or `python -m kidi.converters.rtg --help`.
+The Gemma helper uses PyYAML from `[hf]`; RTG conversion needs `[convert]`
+(PyTorch, ruamel.yaml and Safetensors) and a trusted export. The NLCodec tokenizer
+helper is bundled in the wheel. Use the packaged modules directly; no source-tree
+converter scripts are required.
 
 Installed-package smoke tests use only the standard library:
 
@@ -219,10 +265,10 @@ With the Hugging Face CLI and PyYAML installed:
 hf download google/gemma-4-E2B-it config.json model.safetensors tokenizer.json tokenizer_config.json chat_template.jinja \
   --revision 3e22461f65e89153144f8adb70e3b8c2cc9845a7 \
   --local-dir ../models/gemma-4-E2B-it
-python tools/configure_gemma4.py ../models/gemma-4-E2B-it
+python -m kidi.converters.gemma4 ../models/gemma-4-E2B-it
 build-release/kidi inspect --model ../models/gemma-4-E2B-it
 printf '%s\n' '{"messages":[{"role":"user","content":"What is the capital of France?"}]}' | \
-  build-release/kidi generate --model ../models/gemma-4-E2B-it --backend mps \
+  build-release/kidi generate --model ../models/gemma-4-E2B-it \
     --max-new-tokens 64 --profile
 ```
 
@@ -306,7 +352,7 @@ executable-reuse optimization. LiteRT-LM remains faster in the measured cases.
 
 ```bash
 python -m kidi chat \
-  --model ../models/gemma-4-E2B-it-qat-mobile-transformers --backend mps \
+  --model ../models/gemma-4-E2B-it-qat-mobile-transformers \
   --system "Be concise." --max-new-tokens 256
 ```
 
@@ -333,7 +379,7 @@ that invalidate the engine terminate the shell; invalid or overlong prompts leav
 it usable. History is never silently truncated: use `/clear` when it no longer
 fits `--context-size` together with the output budget.
 
-`--color auto|always|never` controls ANSI prompt colors. `auto` enables colors on
+`--color auto|always|never` controls ANSI prompt colors and defaults to `auto`, enabling colors on
 a terminal unless `NO_COLOR` is set or `TERM=dumb`; `always` explicitly overrides
 auto-detection. Model output is not interpreted as terminal control sequences.
 Chat has one active request and one queue slot. `--cache-tokens`, context/output limits, quantization
@@ -468,17 +514,20 @@ machine-readable `--stats`/`--profile` records are separate from logging.
 
 ## Convert RTG
 
-The converter runs in a trusted Python environment with RTG's PyTorch version:
+Install the conversion extra in a trusted Python environment compatible with your
+RTG export. From the repository root:
 
 ```bash
-python3 tools/convert_rtg.py /path/to/exported-rtg-model /path/to/kidi-model
+python -m pip install '.[convert]'
+python -m kidi.converters.rtg /path/to/exported-rtg-model /path/to/kidi-model
 ```
 
-Select the matrix and embedding weight encoding during conversion:
+Once installed, the converter can run from any directory. Select the matrix and
+embedding weight encoding during conversion:
 
 ```bash
-python3 tools/convert_rtg.py --precision bf16 /path/to/rtg-model /path/to/kidi-bf16
-python3 tools/convert_rtg.py --precision int8 /path/to/rtg-model /path/to/kidi-int8
+python -m kidi.converters.rtg --precision bf16 /path/to/rtg-model /path/to/kidi-bf16
+python -m kidi.converters.rtg --precision int8 /path/to/rtg-model /path/to/kidi-int8
 ```
 
 | Precision | Matrix and embedding storage | Other parameters | Execution |
