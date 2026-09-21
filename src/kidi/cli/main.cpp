@@ -401,7 +401,7 @@ auto generate(const kidi::cli::Namespace& arguments, const std::filesystem::path
          arguments.get<bool>("ignore_eos") || arguments.get<bool>("full_attention_cache") ||
          arguments.get<std::int32_t>("weight_bits") || arguments.get<bool>("packed_prefill") ||
          arguments.get<std::size_t>("max_active") != 4 || arguments.get<std::size_t>("queue_size") != 64 ||
-         arguments.get<std::size_t>("cache_tokens") != 8192 ||
+         arguments.get<std::size_t>("cache_tokens") != 16384 ||
          arguments.get<std::size_t>("prefill_chunk_size") != 128 || arguments.get<std::int32_t>("group_size") != 128)) {
         spdlog::error("chat options are unsupported for RTG; use --max-extra-tokens and --batch-size");
         return 2;
@@ -472,7 +472,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             .help("Hugging Face model cache directory");
         command_parser->add_argument("--cache-tokens")
             .dest("cache_tokens")
-            .default_value<std::size_t>(8192)
+            .default_value<std::size_t>(16384)
             .help("budget for reserved dense context tokens");
         command_parser->add_argument("--backend")
             .default_value(std::string("auto"))

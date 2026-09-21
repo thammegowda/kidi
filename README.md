@@ -1,24 +1,115 @@
-# kidi
+# Kidi <a href="docs/kidi-logo.png"><img src="docs/kidi-logo-small.png" alt="Kidi logo" width="48" height="48"></a>
 
-Kidi is a small C++23 inference toolkit for RTG translation and Gemma 4 text
-generation, using YNNPACK on CPU, Metal on Apple GPUs, and memory-mapped
-Safetensors weights.
+**Kidi** (means Spark in Kannada), is a lightweight, extensible C++23 toolkit for
+local neural-network inference. Build models from reusable tensor operations and
+neural layers, and run the same model code on CPU or GPU.
 
-Repository: [thammegowda/kidi](https://github.com/thammegowda/kidi).
+RTG translation and Gemma 4 text generation are the two model families currently
+implemented and tested. They exercise the toolkit; they do not define the scope
+of its core tensor, layer, and inference APIs. New architectures require a model
+implementation and weight-loading support, not just a different checkpoint URL.
 
-**New here?** Follow the [Getting Started: Gemma 4 Chat](docs/getting-started.md)
-guide to install Kidi, download the tested Google QAT checkpoint, and start chatting.
+[Getting Started](docs/getting-started.md) | [Installation](#python-installation) |
+[Chat](#interactive-chat) | [Translation](#rtg-model-package) |
+[Build](#build) | [Architecture](ARCHITECTURE.md) | [Benchmarks](#benchmark)
 
-Kidi-owned code follows [CODING_GUIDELINES.md](CODING_GUIDELINES.md).
+## Small by Design
 
-RTG translation accepts and returns Moses-tokenized UTF-8 text; normalization
-and detokenization remain outside that contract. Gemma 4 accepts ordinary UTF-8
-prompts and uses the original model tokenizer.
+The native runtime and its project dependencies fit in a single executable or
+Python wheel. Current **macOS arm64 release** artifacts, measured on 2026-09-20:
+
+| Distribution | Size | Includes |
+|---|---|---|
+| Standalone `kidi` executable | **8.16 MiB** | Native CLI, CPU and Metal backends, tokenizers; no Python required |
+| Python wheel (`cp312-abi3`) | **2.46 MiB** download | Native extension, CLI launchers, converters, and linked project dependencies |
+
+The wheel's contents total **6.58 MiB uncompressed**. Both distributions are
+self-contained with respect to project-native dependencies: no separate inference
+runtime, PyTorch, or Transformers installation is needed to run local models.
+The wheel requires Python 3.12+; both distributions use OS libraries/frameworks.
+Hub downloads and legacy model conversion have separate optional Python extras.
+
+These are artifact sizes, not inference RAM requirements. Model weights are
+downloaded separately, and weights, activations, and caches dominate runtime memory.
+Sizes vary with platform, compiler, and build options.
+
+## Features
+
+- **One model implementation, multiple backends.** Shared C++ layers and model
+  equations run through YNNPACK on CPU or Metal on Apple GPUs, with automatic
+  backend selection or an explicit override.
+- **Direct eager execution.** Compose concrete tensors, reusable neural layers,
+  and explicit decoder state in ordinary C++; no model graph export or separate
+  graph-conversion pipeline is required.
+- **Memory-mapped weights and mixed precision.** Safetensors loading, FP32/BF16
+  tensors, and quantized operators support compact model packages. Available
+  precision paths depend on the model and backend.
+- **Interactive and batch workflows.** Streaming chat, multi-turn history,
+  cancellation, ordered file processing, batching, and bounded request queues
+  serve the supported models. Greedy and beam decoding share inference utilities.
+- **Simple distribution.** A native executable or a Python wheel exposes the
+  same CLI through `kidi` and `python -m kidi`. No Python tensor framework is
+  required for inference.
+- **Optional model-hub integration.** Download and configure compatible models
+  by Hub ID, pin revisions, reuse a configurable cache, and run offline once
+  model files are cached.
+
+### Tested Models
+
+| Model family | Validated capabilities |
+|---|---|
+| RTG Transformer | Translation, greedy/beam decoding, FP32/BF16/INT8 packages |
+| Gemma 4 E2B-it | Text-only streaming chat and ordered JSONL generation; original floating-point and native mobile QAT weights |
+
+Model support is explicit: a shared runtime does not imply compatibility with
+every Hugging Face architecture. See the model sections below for formats,
+decoding options, and validation limits.
+
+## Quick Start
+
+The tested setup is Apple Silicon with macOS 26+ and Python 3.12+. Source
+installation also requires Git and a C++23 toolchain, such as current Xcode
+Command Line Tools. In an activated Python environment:
+
+```bash
+git clone --recurse-submodules https://github.com/thammegowda/kidi.git
+cd kidi
+python -m pip install '.[hf]'
+python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers
+```
+
+The first launch downloads and configures the model; later launches reuse the
+cache. The model loads once and replies stream as you chat. Type `/exit` to leave,
+`/clear` to reset the conversation, or `/help` for shell commands.
+
+Backend selection is automatic: Metal when available, otherwise YNNPACK CPU.
+Gemma defaults to an 8,192-token output budget and a 16,384-token context. For
+a smaller memory budget, add `--context-size 2048 --max-new-tokens 256`.
+
+See the [getting-started guide](docs/getting-started.md) for environment setup,
+cache locations, authentication, offline use, and troubleshooting. E2B-it has
+been tested on a 16 GiB Apple M5; runtime memory use exceeds the download size.
+E4B and Linux/Windows builds have not been validated end to end here.
+
+## Commands at a Glance
+
+| Command | Purpose | Input |
+|---|---|---|
+| `kidi chat -m MODEL` | Interactive, streaming conversation | Ordinary UTF-8 text |
+| `kidi generate -m MODEL -i INPUT -o OUTPUT` | Ordered generation or translation | Chat JSONL for Gemma 4; text lines for RTG |
+| `kidi inspect -m MODEL` | Inspect a package and available backends | A model path or supported Hub ID |
+
+`MODEL` is a local package directory or `@owner/model` with the pip-installed
+`hf` extra. Run any command with `--help` for its options. RTG accepts and returns
+Moses-tokenized UTF-8 text; normalization and detokenization are separate steps.
+Gemma 4 uses the checkpoint's original tokenizer and chat template.
 
 ## Python Installation
 
+### From a Checkout
+
 The Python package requires Python 3.12+ and exposes the native CLI through
-nanobind. From a recursive clone, install with:
+nanobind. From a recursive clone, a local-model-only installation needs no Hub extra:
 
 ```bash
 python -m pip install .
@@ -58,8 +149,10 @@ printf '%s\n' 'Comment allez @-@ vous ?' | \
 That repository is currently private and requires an authorized Hugging Face login.
 It already contains Kidi config/tokenizers, so the resolver does not convert it.
 
-Once these packaging files are present at the requested Git revision, direct
-Git installation also works; pip initializes the pinned submodules recursively:
+### From Git
+
+Pip can install directly from a Git revision containing the Python package;
+it initializes the pinned submodules recursively:
 
 ```bash
 python -m pip install "git+https://github.com/thammegowda/kidi.git"
@@ -75,7 +168,11 @@ scikit-build-core and nanobind in its isolated build environment. Model weights
 are not included. On macOS the current CLI requires macOS 26+ because it uses
 the system libc++ floating-point `std::from_chars` implementation.
 
-For compiler-free distribution, build wheels on each target OS/architecture:
+### Prebuilt Wheels
+
+A compatible wheel needs no compiler or source checkout on the receiving machine.
+To build one for distribution, run this from a recursive clone on each target
+OS/architecture:
 
 ```bash
 python -m pip wheel --no-deps . --wheel-dir dist
@@ -91,6 +188,8 @@ no separate `kidi` executable or checkout is required. CPython wheels use the
 standard CPython versions. OS system libraries/frameworks are still required;
 the wheel's platform tag records its minimum OS and architecture. Validate Linux
 wheel dependencies with auditwheel before publishing manylinux wheels.
+
+### Python Entry Point and Converters
 
 `python -m kidi` and the installed `kidi` command forward arguments and exit codes
 to the same C++ entry point as the native executable. For an in-process call,
@@ -143,7 +242,7 @@ does not download source code after the recursive clone.
 
 ### Apple Silicon
 
-On arm64 macOS, kidi detects CPU features through `sysctl` and enables
+On arm64 macOS, Kidi detects CPU features through `sysctl` and enables
 YNNPACK's matching NEON, dot-product, BF16, I8MM, SME, and SME2 kernels at
 runtime. Unsupported instructions remain disabled, so the same binary can run
 on older Apple Silicon. `kidi inspect` prints the selected CPU features and
@@ -153,9 +252,7 @@ YNNPACK is a CPU runtime and cannot dispatch work to Metal or the Apple Neural
 Engine. `--backend mps --beam-size 1` selects the eager Metal backend
 for FP32, BF16, or INT8 packages. The default `--backend auto` selects an
 available GPU execution backend, otherwise YNNPACK CPU. Use `--backend ynnpack`
-to require CPU execution. ANE
-execution requires a separate Core ML model graph, so kidi does not claim NPU
-execution until an incremental decoder with explicit K/V state is available.
+to require CPU execution. Apple Neural Engine execution is not implemented.
 
 ## Tensor Backends
 
@@ -310,12 +407,19 @@ decoding are loaded. E2B-it is verified on the 16 GiB Apple M5; E4B has not been
 validated end to end on this machine.
 
 `--context-size` and `--max-new-tokens` override the YAML decoding defaults
-(2048 and 256). `--prefill-chunk-size` defaults to 128. The prompt and requested
+(16384 and 8192 for newly configured Gemma models). The default `--cache-tokens`
+budget is 16384, so one full-sized request fits; increase it for concurrent
+full-sized requests. `--prefill-chunk-size` defaults to 128. The prompt and requested
 generation must fit the context. `--profile` adds per-request timing fields and
 an aggregate serving record on stderr. Per-request decode/preparation time is
 reported only with `--max-active 1`; shared batch work is reported in aggregate.
 `--ignore-eos` is a benchmark option. Repeats and warmups are handled by the
 benchmark driver through repeated JSONL records, not CLI modes.
+
+Hub resolution upgrades only local generated Gemma YAML that exactly matches the
+old 2048-context/256-output defaults. Customized configurations and downloaded Hub
+manifests are preserved. For an existing manually configured directory, override
+with `--context-size 16384 --max-new-tokens 8192` or edit its decoding settings.
 
 The former `predict` subcommand is replaced by `generate`. `--prompt`,
 `--input-lines`, `--raw-prompt`, `--runs`, `--warmups`, and `--prefix-cache-bytes`
@@ -352,8 +456,8 @@ executable-reuse optimization. LiteRT-LM remains faster in the measured cases.
 
 ```bash
 python -m kidi chat \
-  --model ../models/gemma-4-E2B-it-qat-mobile-transformers \
-  --system "Be concise." --max-new-tokens 256
+  --model @google/gemma-4-E2B-it-qat-mobile-transformers \
+  --system "Be concise."
 ```
 
 Type ordinary text at `You>`. The model is loaded once; replies stream as text
@@ -393,20 +497,28 @@ Every completed reply shows output token count, decode tok/s, time to first toke
 and total turn time. Decode speed uses recurrent model-step time (excluding prefill
 and terminal output), including a stop-token step when present; the displayed output
 count excludes stop tokens. First-token/total times start at request enqueue, not
-model loading. Replies with no recurrent decode step show `decode n/a`. Cancelled
+model loading. Replies with no recurrent decode step show `n/a tok/s`. Cancelled
 turns do not print completion stats. `--profile` is not required for this summary.
 
-On macOS, the footer shows process `footprint` from `TASK_VM_INFO.phys_footprint`,
+The compact footer groups output tokens and decode speed, first/last-token timing,
+and memory. `1st` is time to first token; `last` is total turn time, both measured
+from enqueue. Memory uses GiB, not decimal GB:
+
+```text
+[25tok @ 41.1tok/s | 1st 0.88s last 1.49s | RAM 5.1GiB 40% headroom 16GiB total]
+```
+
+On macOS, the first `RAM` value shows process footprint from `TASK_VM_INFO.phys_footprint`,
 the footprint accounting used by system monitors. Unlike RSS, this accounts for
 compressed and other memory charged to the process, so an idle/compressed model
-does not misleadingly appear to use only a few hundred MiB. `RAM headroom` is the
+does not misleadingly appear to use only a few hundred MiB. `headroom` is the
 kernel's `kern.memorystatus_level` percentage, matching the system-wide percentage
 queried by `memory_pressure -Q`; it is not the fraction of completely unused pages.
-Total physical RAM is shown separately. Headroom is not a guaranteed allocatable
+Total physical RAM is shown last. Headroom is not a guaranteed allocatable
 byte budget or a substitute for the OS memory-pressure level.
 
-Linux still reports process RSS and free/total physical RAM (excluding reclaimable
-caches); Windows reports process working set and available physical RAM. Figures
+Linux reports process RSS and the percentage of free physical RAM (excluding
+reclaimable caches); Windows reports process working set and available RAM percentage. Figures
 are startup/end-of-turn snapshots, not peaks or model-only allocations. GPU allocations
 must not be added to process footprint on unified-memory systems. Unsupported or
 failed counters display `n/a` rather than an invented zero.
@@ -514,6 +626,9 @@ machine-readable `--stats`/`--profile` records are separate from logging.
 
 ## Convert RTG
 
+Convert only trusted RTG exports: their PyTorch checkpoints use Python pickle.
+The resulting Kidi runtime package contains no pickle or PyTorch files.
+
 Install the conversion extra in a trusted Python environment compatible with your
 RTG export. From the repository root:
 
@@ -582,11 +697,16 @@ against human translations.
 
 ## Benchmark
 
-The reproducible FP32/BF16/INT8 process benchmark is under
-[`benchmarks/rtg`](benchmarks/rtg/README.md).
+- [Gemma 4](benchmarks/gemma4/README.md): CPU/GPU comparisons with LiteRT-LM,
+  precision checks, and the [implementation journal](benchmarks/gemma4/JOURNAL.md).
+- [RTG](benchmarks/rtg/README.md): reproducible FP32/BF16/INT8 process benchmarks.
+- [Apple Metal](benchmarks/metal/README.md): synchronized and device-resident
+  measurements; see the [eager migration report](benchmarks/metal/EAGER_MIGRATION.md)
+  for the current architecture. Earlier graph results are historical.
 
-The Apple Metal lowering benchmark, including synchronized and device-resident
-results, is under [`benchmarks/metal`](benchmarks/metal/README.md).
+## Development
 
-RTG checkpoints use Python pickle and must only be converted from a trusted
-source. The resulting runtime package contains no pickle or PyTorch files.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for module boundaries and execution contracts,
+and [CODING_GUIDELINES.md](CODING_GUIDELINES.md) for Kidi-owned code conventions.
+Build and run native unit tests with the [CMake presets](#build); use the
+[model regression test](#model-regression-test) for end-to-end RTG checks.

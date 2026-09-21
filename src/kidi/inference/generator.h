@@ -32,7 +32,7 @@ struct GenerationBatch {
     std::uint64_t prefill_ns = 0, decode_ns = 0, generation_ns = 0, preparation_ns = 0;
 };
 struct ServingOptions {
-    std::size_t maximum_active = 4, maximum_requests = 64, cache_token_budget = 8192, prefill_tokens_per_step = 128;
+    std::size_t maximum_active = 4, maximum_requests = 64, cache_token_budget = 16384, prefill_tokens_per_step = 128;
 };
 struct GenerationEvent {
     std::uint64_t request_id;

@@ -66,6 +66,8 @@ class HubCliTest(unittest.TestCase):
                 config = snapshot / "model.yaml"
                 self.assertEqual(yaml.safe_load(config.read_text())["model"]["quantization_config"],
                                  original["quantization_config"])
+                self.assertEqual(yaml.safe_load(config.read_text())["decode"],
+                                 {"maximum_new_tokens": 8192, "context_size": 16384})
                 saved = config.read_bytes()
                 self.assertEqual(resolve("google/example", cache), snapshot)
                 self.assertEqual(config.read_bytes(), saved)
@@ -74,6 +76,17 @@ class HubCliTest(unittest.TestCase):
                 self.assertEqual(config.read_bytes(), saved)
                 self.assertFalse(list(snapshot.glob(".model.yaml.*")))
                 self.assertEqual((snapshot / "model.safetensors").read_bytes(), b"test weights")
+                legacy = yaml.safe_load(saved)
+                legacy["decode"] = {"maximum_new_tokens": 256, "context_size": 2048}
+                config.write_text(yaml.safe_dump(legacy))
+                resolve("google/example", cache)
+                self.assertEqual(config.read_bytes(), saved)
+                customized = yaml.safe_load(saved)
+                customized["decode"]["maximum_new_tokens"] = 512
+                config.write_text(yaml.safe_dump(customized))
+                custom_bytes = config.read_bytes()
+                resolve("google/example", cache)
+                self.assertEqual(config.read_bytes(), custom_bytes)
                 (snapshot / "model.safetensors").unlink()
                 with self.assertRaisesRegex(ValueError, "Missing model.safetensors"):
                     resolve("google/example", cache)
@@ -129,15 +142,14 @@ class PythonCliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("\x1b", result.stdout)
         self.assertEqual(result.stdout.count("Kidi chat"), 1)
-        self.assertEqual(result.stdout.count("[loaded in "), 1)
-        self.assertRegex(result.stdout.split("You> ", 1)[0], r"\[loaded in [0-9.]+ s \| (?:RSS|footprint) ")
+        self.assertEqual(result.stdout.count("[load "), 1)
+        self.assertRegex(result.stdout.split("You> ", 1)[0], r"\[load [0-9.]+s \| RAM ")
         self.assertEqual(result.stdout.count("Assistant> "), 3)
         self.assertIn("Error: ", result.stdout)
         self.assertIn("Conversation cleared.", result.stdout)
-        summary_pattern = (r"\[(\d+) tokens \| decode ([0-9.]+ tok/s|n/a) \| first token ([0-9.]+) s"
-                   r" \| total ([0-9.]+) s \| (?:RSS|footprint) (?:[0-9.]+ GiB|n/a)"
-                   r" \| RAM (?:headroom (?:[0-9]+%|n/a) \((?:[0-9.]+ GiB total|total n/a)\)"
-                   r"|free (?:[0-9.]+/[0-9.]+ GiB \([0-9.]+%\)|n/a))\]")
+        summary_pattern = (r"\[(\d+)tok @ ([0-9.]+|n/a) ?tok/s \| 1st ([0-9.]+)s last ([0-9.]+)s"
+                   r" \| RAM (?:[0-9.]+GiB|n/a) (?:[0-9]+%|n/a) (?:headroom|free)"
+                   r" (?:[0-9.]+GiB|n/a) total\]")
         summaries = re.findall(summary_pattern, result.stdout)
         self.assertEqual(len(summaries), 3)
         for tokens, speed, first_token, total in summaries:
@@ -145,24 +157,13 @@ class PythonCliTest(unittest.TestCase):
             if speed != "n/a":
                 self.assertGreater(float(speed.split()[0]), 0)
             self.assertGreaterEqual(float(total), float(first_token))
-        if sys.platform == "darwin":
-            memory = re.findall(r"footprint ([0-9.]+) GiB \| RAM headroom ([0-9]+)% \(([0-9.]+) GiB total\)",
+        if sys.platform in {"darwin", "linux", "win32"}:
+            memory = re.findall(r"RAM ([0-9.]+)GiB ([0-9]+)% (?:headroom|free) ([0-9.]+)GiB total",
                                 result.stdout)
             self.assertEqual(len(memory), 4)
-            for footprint, percent, total in memory:
-                self.assertGreater(float(footprint), 0)
+            for used, percent, total in memory:
+                self.assertGreater(float(used), 0)
                 self.assertGreater(float(total), 0)
-                self.assertGreaterEqual(int(percent), 0)
-                self.assertLessEqual(int(percent), 100)
-        elif sys.platform in {"linux", "win32"}:
-            memory = re.findall(r"RSS ([0-9.]+) GiB \| RAM free ([0-9.]+)/([0-9.]+) GiB \(([0-9.]+)%\)",
-                                result.stdout)
-            self.assertEqual(len(memory), 4)
-            for resident, free, total, percent in memory:
-                self.assertGreater(float(resident), 0)
-                self.assertGreater(float(total), 0)
-                self.assertGreaterEqual(float(free), 0)
-                self.assertLessEqual(float(free), float(total))
                 self.assertGreaterEqual(float(percent), 0)
                 self.assertLessEqual(float(percent), 100)
         transcript = re.sub(r"\n" + summary_pattern, "", result.stdout)
@@ -178,7 +179,7 @@ class PythonCliTest(unittest.TestCase):
         single = subprocess.run(command + ["chat", *options[:-1], "1", "--color", "never", "--profile"],
                     input="Hi\n/exit\n", text=True, capture_output=True, timeout=120)
         self.assertEqual(single.returncode, 0, single.stderr)
-        self.assertIn("decode n/a", single.stdout)
+        self.assertIn("n/a tok/s", single.stdout)
         self.assertIn("|decode_tokens=0|decode_ns=0", single.stderr)
         for color, expected in [("auto", False), ("always", True)]:
             with self.subTest(color=color):
@@ -217,8 +218,8 @@ class PythonCliTest(unittest.TestCase):
 
         try:
             startup = read_until(b"You> ")
-            self.assertRegex(startup, rb"\[loaded in [0-9.]+ s \| (?:RSS|footprint) ")
-            self.assertIn(b"RAM ", startup)
+            self.assertRegex(startup, rb"\[load [0-9.]+s \| RAM ")
+            self.assertRegex(startup, rb"(?:headroom|free) (?:[0-9.]+GiB|n/a) total")
             self.assertNotIn(b"tok/s", startup)
             os.write(master, b"Count from one to a hundred.\n")
             read_until(b"Assistant> ")
@@ -230,7 +231,7 @@ class PythonCliTest(unittest.TestCase):
             os.kill(process.pid, signal.SIGINT)
             cancelled = read_until(b"You> ")
             self.assertIn(b"Cancelled", cancelled)
-            self.assertNotIn(b"tokens | decode", cancelled)
+            self.assertNotIn(b"tok/s", cancelled)
             os.kill(process.pid, signal.SIGINT)
             read_until(b"You> ")
             os.write(master, b"/clear\n")
@@ -246,7 +247,7 @@ class PythonCliTest(unittest.TestCase):
 
                 os.write(master, b"Say hello.\n")
                 response = read_until(b"You> ")
-                match = re.search(rb"footprint ([0-9.]+) GiB", response)
+                match = re.search(rb"RAM ([0-9.]+)GiB", response)
                 self.assertIsNotNone(match, response)
                 libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
                 libproc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]

@@ -79,7 +79,10 @@ first, then downloads required files at the same resolved commit using Hub's nor
 snapshot/blob cache. Ready-made Kidi manifests retain their declared relative file
 paths; unsupported or escaping paths are rejected. Dense Gemma 4 snapshots without
 Kidi YAML use `kidi.converters.gemma4.configure`, under a per-snapshot lock, with an
-atomic no-overwrite config install. Original files remain unchanged. Incomplete
+atomic no-overwrite config install. A local generated config exactly matching the
+old 256-output/2048-context defaults is atomically upgraded to 8192/16384 under
+that lock; customized configs and downloaded manifests are left alone. Original
+weights and tokenizer files remain unchanged. Incomplete
 caches fail rather than being marked ready; `HF_HUB_OFFLINE=1` requires cached
 files. No downloaded Python code or pickled checkpoints execute during resolution.
 Explicit trusted RTG conversion is separate in `kidi.converters.rtg` with the

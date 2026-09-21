@@ -27,7 +27,9 @@ The tested setup is Apple Silicon, macOS 26+, and standard CPython 3.12 or later
 Both Metal and YNNPACK CPU execution have been tested on an Apple M5 with 16 GiB
 of unified memory. That is not a guarantee of low memory pressure: runtime caches
 can use substantially more memory than the download size. Close memory-heavy
-applications and start with the 2048-token context below.
+applications. Gemma defaults to a 16,384-token context with up to 8,192 output
+tokens; for a smaller memory budget, override both with `--context-size 2048
+--max-new-tokens 256`.
 
 The examples rely on automatic backend selection: Metal when available, otherwise
 YNNPACK CPU. You still need a build or wheel for your OS and architecture; Linux
@@ -73,8 +75,6 @@ Run this from any directory. The `@` prefix means a Hugging Face model ID:
 python -m kidi chat \
   --model @google/gemma-4-E2B-it-qat-mobile-transformers \
   --threads 4 \
-  --context-size 2048 \
-  --max-new-tokens 256 \
   --system "Be helpful and concise."
 ```
 
@@ -126,8 +126,10 @@ python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers \
 Kidi uses Hugging Face's cache layout:
 `CACHE/models--google--gemma-4-E2B-it-qat-mobile-transformers/snapshots/COMMIT/`.
 The printed `Model ready` path is the resolved local package. Downloads are reused,
-and the generated `model.yaml` is written atomically without overwriting existing
-configuration. Do not move a snapshot directory alone: its files can link to the
+and the generated `model.yaml` is written atomically. Local generated configurations
+that exactly match the old 256-output/2048-context defaults are upgraded to
+8192/16384; customized configurations and downloaded manifests are preserved.
+Do not move a snapshot directory alone: its files can link to the
 cache's shared blobs. Copy the entire cache or use the manual download below.
 
 Without a revision, online launches resolve the repository's current default

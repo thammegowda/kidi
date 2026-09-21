@@ -4,13 +4,14 @@
 import argparse
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
 import yaml
 
 
-def configure(directory: Path) -> Path:
+def configure(directory: Path, *, upgrade_defaults: bool = False) -> Path:
     original = json.loads((directory / "config.json").read_text())
     model = original["text_config"]
     if original.get("model_type") != "gemma4" or model.get("enable_moe_block"):
@@ -31,16 +32,26 @@ def configure(directory: Path) -> Path:
         "weights_file": "model.safetensors",
         "tokenizer_file": "tokenizer.json",
         "model": model,
-        "decode": {"maximum_new_tokens": 256, "context_size": 2048},
+        "decode": {"maximum_new_tokens": 8192, "context_size": 16384},
     }
     destination = directory / "model.yaml"
+    replace = False
+    if destination.exists() and upgrade_defaults:
+        legacy = {**document, "decode": {"maximum_new_tokens": 256, "context_size": 2048}}
+        if yaml.safe_load(destination.read_text(encoding="utf-8")) != legacy:
+            return destination
+        replace = True
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
                                          prefix=".model.yaml.", delete=False) as output:
             temporary = Path(output.name)
             yaml.safe_dump(document, output, sort_keys=False)
-        os.link(temporary, destination)
+        if replace:
+            os.replace(temporary, destination)
+            print("[kidi] Updated generated Gemma defaults: 8192 output tokens, 16384 context tokens", file=sys.stderr)
+        else:
+            os.link(temporary, destination)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

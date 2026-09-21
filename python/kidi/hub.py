@@ -82,10 +82,11 @@ def resolve(reference: str, cache: str | Path = DEFAULT_CACHE) -> Path:
     lock_path = cache_dir / ".locks" / f"kidi-{repo_id.replace('/', '--')}-{directory.name}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(lock_path):
-        if not (directory / "model.yaml").is_file():
+        manifest = directory / "model.yaml"
+        if not manifest.is_file() or (gemma and not manifest.is_symlink() and (directory / "config.json").is_file()):
             from .converters.gemma4 import configure
 
-            configure(directory)
+            configure(directory, upgrade_defaults=True)
         _package_files(yaml.safe_load((directory / "model.yaml").read_text(encoding="utf-8")))
     print(f"[kidi] Model ready: {directory}", file=sys.stderr)
     return directory

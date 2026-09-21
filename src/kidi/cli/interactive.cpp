@@ -82,10 +82,8 @@ auto print_text(std::string_view text) -> void {
 
 auto memory_summary() -> std::string {
     std::optional<std::uint64_t> process_bytes, total;
-    std::string_view usage_label = "RSS";
 #if defined(__APPLE__)
     std::optional<int> headroom;
-    usage_label = "footprint";
     task_vm_info_data_t task{};
     mach_msg_type_number_t task_count = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&task), &task_count) == KERN_SUCCESS &&
@@ -123,17 +121,16 @@ auto memory_summary() -> std::string {
     std::optional<std::uint64_t> free;
 #endif
     constexpr double GIB = 1024. * 1024. * 1024.;
-    const auto used = process_bytes ? fmt::format("{:.2f} GiB", *process_bytes / GIB) : std::string("n/a");
+    const auto used = process_bytes ? fmt::format("{:.1f}GiB", *process_bytes / GIB) : std::string("n/a");
+    const auto capacity = total ? fmt::format("{:g}GiB", *total / GIB) : std::string("n/a");
 #if defined(__APPLE__)
     const auto remaining = headroom ? fmt::format("{}%", *headroom) : std::string("n/a");
-    const auto capacity = total ? fmt::format("{:.2f} GiB total", *total / GIB) : std::string("total n/a");
-    return fmt::format("{} {} | RAM headroom {} ({})", usage_label, used, remaining, capacity);
+    return fmt::format("RAM {} {} headroom {} total", used, remaining, capacity);
 #else
     const auto remaining = free && total && *total && *free <= *total
-                               ? fmt::format("{:.2f}/{:.2f} GiB ({:.1f}%)", *free / GIB, *total / GIB,
-                                             100. * static_cast<double>(*free) / *total)
+                               ? fmt::format("{:.0f}%", 100. * static_cast<double>(*free) / *total)
                                : std::string("n/a");
-    return fmt::format("{} {} | RAM free {}", usage_label, used, remaining);
+    return fmt::format("RAM {} {} free {} total", used, remaining, capacity);
 #endif
 }
 } // namespace
@@ -166,7 +163,7 @@ auto interactive_chat(inference::Generator& generator, inference::GenerationOpti
     clear();
     label("Kidi chat", "\033[1;36m");
     std::cout << "  /help for commands; Ctrl-C cancels a reply; Ctrl-D exits.\n";
-    label(fmt::format("[loaded in {:.2f} s | {}]\n", load_ns / 1e9, memory_summary()), "\033[2m");
+    label(fmt::format("[load {:.2f}s | {}]\n", load_ns / 1e9, memory_summary()), "\033[2m");
     while (std::cout) {
         interrupted = 0;
         label("You> ", "\033[1;32m");
@@ -268,11 +265,11 @@ auto interactive_chat(inference::Generator& generator, inference::GenerationOpti
             history.push_back({"assistant", std::move(completed->text)});
             const auto& stats = completed->stats;
             const auto decode_speed = stats.decode_tokens && stats.decode_ns
-                                          ? fmt::format("{:.1f} tok/s", stats.decode_tokens * 1e9 / stats.decode_ns)
-                                          : std::string("n/a");
-            label(fmt::format("[{} tokens | decode {} | first token {:.2f} s | total {:.2f} s | {}]\n",
-                              completed->generation.token_ids.size(), decode_speed, stats.time_to_first_token_ns / 1e9,
-                              stats.generation_ns / 1e9, memory_summary()),
+                                          ? fmt::format("{:.1f}tok/s", stats.decode_tokens * 1e9 / stats.decode_ns)
+                                          : std::string("n/a tok/s");
+            label(fmt::format("[{}tok @ {} | 1st {:.2f}s last {:.2f}s | {}]\n", completed->generation.token_ids.size(),
+                              decode_speed, stats.time_to_first_token_ns / 1e9, stats.generation_ns / 1e9,
+                              memory_summary()),
                   "\033[2m");
             if (arguments.get<bool>("profile"))
                 std::cerr << "kidi_chat|request_id=" << *queued << "|prompt_tokens=" << completed->stats.prompt_tokens
