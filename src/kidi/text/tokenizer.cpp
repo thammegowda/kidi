@@ -6,6 +6,7 @@
 #include <utility>
 
 #include <tokenizers/tokenizer.h>
+#include <tokenizers/tokenizer_config.h>
 #include <zlib.h>
 
 namespace kidi::text {
@@ -88,7 +89,46 @@ auto Tokenizer::load(const std::filesystem::path& path) -> Result<Tokenizer> {
             "cannot parse tokenizer " + path.string() + ": " + tokenizer.error().message(),
         });
     }
+    tokenizers::TokenizerConfig config;
+    const auto config_path = path.parent_path() / "tokenizer_config.json";
+    if (std::filesystem::is_regular_file(config_path)) {
+        auto loaded = tokenizers::TokenizerConfig::from_file(config_path.string());
+        if (!loaded) return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, loaded.error().message()});
+        config = std::move(*loaded);
+    }
+    const auto template_path = path.parent_path() / "chat_template.jinja";
+    if (std::filesystem::is_regular_file(template_path)) {
+        if (!std::filesystem::is_regular_file(config_path))
+            return std::unexpected(
+                Error{ErrorCode::INVALID_ARGUMENT, "chat_template.jinja requires tokenizer_config.json"});
+        auto source = read_plain(template_path);
+        if (!source) return std::unexpected(std::move(source.error()));
+        config.default_chat_template = std::move(*source);
+    }
+    tokenizer->with_config(std::move(config));
     return Tokenizer(std::make_unique<Impl>(std::move(*tokenizer)));
+}
+
+auto Tokenizer::format_chat(std::span<const ChatMessage> messages) const -> Result<std::string> {
+    if (messages.empty() || messages.back().role != "user")
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "messages must end with a user turn"});
+    std::vector<tokenizers::ChatMessage> conversation;
+    conversation.reserve(messages.size());
+    for (std::size_t index = 0; index < messages.size(); ++index) {
+        const auto& message = messages[index];
+        const bool instruction = message.role == "system" || message.role == "developer";
+        if ((instruction && index != 0) || (!instruction && message.role != "user" && message.role != "assistant"))
+            return std::unexpected(
+                Error{ErrorCode::INVALID_ARGUMENT, "supported roles: initial system/developer, user, assistant"});
+        conversation.push_back({message.role, message.content});
+    }
+    if (!impl_->value.has_chat_template())
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT, "chat requires tokenizer_config.json and a checkpoint chat template"});
+    auto result = impl_->value.apply_chat_template(conversation, true, "default", {{"enable_thinking", false}});
+    if (!result)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "chat template: " + result.error().message()});
+    return std::move(*result);
 }
 
 auto Tokenizer::encode(std::string_view text) const -> Result<std::vector<std::int32_t>> {

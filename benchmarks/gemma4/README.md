@@ -28,16 +28,21 @@ Finite multi-request generation uses the validated dense-cache admission schedul
 
 ```sh
 build-release/kidi generate -m ../models/gemma-4-E2B-it-qat-mobile-transformers \
-  --backend mps --input-lines prompts.txt --max-active 4 --queue-size 16 \
+  --backend mps --in requests.jsonl --max-active 4 --queue-size 16 \
   --context-size 2048 --cache-tokens 8192 --max-new-tokens 64 --profile
 ```
 
-Each output line is a JSON completion with a 1-based `request_id` matching the input
-line. Completion order may differ from input order. `-` reads finite stdin; it is
-not an interactive request protocol. Queue-based first-token/completion times start
+Each input line is a chat object such as
+`{"messages":[{"role":"user","content":"Hello"}],"id":"example"}`.
+Each output line has an assistant `message`, echoed `id`, and a 1-based `request_id`.
+Results preserve input order; completed-but-not-emitted results count against the
+admission bound. `-` reads finite stdin; it is not an interactive request protocol.
+Queue-based first-token/completion times start
 at enqueue, exclude time before reading that input line, and include preparation.
-Prefix reuse and repeated/warmup runs are not supported in line mode. Request IDs
-allow downstream consumers to restore input order without an unbounded CLI buffer.
+Prefix reuse is not exposed by the CLI. The benchmark driver sends repeated chat
+records with `--max-active 1 --queue-size 1`, discards warmup responses and reads
+serial timings from JSONL. This uses serving execution rather than the historical
+single-prompt path; do not treat new timings as the old binary's measurements.
 
 The historical [prefill follow-up](QAT.md#prefill-follow-up) measures contiguous cache writes
 and fused Metal calibration/casting across five fresh-process pairs per case.
@@ -190,7 +195,7 @@ Use a Python 3.12 environment for the optional benchmark dependencies:
 python3.12 -m venv .cache/gemma-venv
 .cache/gemma-venv/bin/pip install -r benchmarks/gemma4/requirements.txt
 .cache/gemma-venv/bin/hf download google/gemma-4-E2B-it \
-  config.json model.safetensors tokenizer.json \
+  config.json model.safetensors tokenizer.json tokenizer_config.json chat_template.jinja \
   --revision 3e22461f65e89153144f8adb70e3b8c2cc9845a7 \
   --local-dir ../models/gemma-4-E2B-it
 .cache/gemma-venv/bin/python tools/configure_gemma4.py ../models/gemma-4-E2B-it

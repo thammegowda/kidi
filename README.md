@@ -12,6 +12,61 @@ RTG translation accepts and returns Moses-tokenized UTF-8 text; normalization
 and detokenization remain outside that contract. Gemma 4 accepts ordinary UTF-8
 prompts and uses the original model tokenizer.
 
+## Python Installation
+
+The Python package requires Python 3.12+ and exposes the native CLI through
+nanobind. From a recursive clone, install with:
+
+```bash
+python -m pip install .
+python -m kidi --help
+kidi --version
+```
+
+Once these packaging files are present at the requested Git revision, direct
+Git installation also works; pip initializes the pinned submodules recursively:
+
+```bash
+python -m pip install "git+https://github.com/thammegowda/kidi.git"
+# Select a branch, tag or commit:
+python -m pip install "git+https://github.com/thammegowda/kidi.git@REVISION"
+```
+
+Local-directory and Git installs compile from source: a C++23 toolchain is
+required (plus Git for Git installs). Pip supplies CMake 3.26+, Ninja when needed,
+scikit-build-core and nanobind in its isolated build environment. Model weights
+are not included. On macOS the current CLI requires macOS 26+ because it uses
+the system libc++ floating-point `std::from_chars` implementation.
+
+For compiler-free distribution, build wheels on each target OS/architecture:
+
+```bash
+python -m pip wheel --no-deps . --wheel-dir dist
+# On a compatible machine, install the resulting wheel:
+python -m pip install dist/kidi-*.whl
+printf '%s\n' '{"messages":[{"role":"user","content":"Hello"}]}' | \
+  python -m kidi generate --model /path/to/model
+```
+
+Wheels contain the native extension and statically linked project dependencies;
+no separate `kidi` executable or checkout is required. CPython wheels use the
+3.12 stable ABI (`abi3`), so one platform wheel serves Python 3.12 and later
+standard CPython versions. OS system libraries/frameworks are still required;
+the wheel's platform tag records its minimum OS and architecture. Validate Linux
+wheel dependencies with auditwheel before publishing manylinux wheels.
+
+`python -m kidi` and the installed `kidi` command forward arguments and exit codes
+to the same C++ entry point as the native executable. For an in-process call,
+`kidi.main(["--version"])` returns the integer exit code; omit the argument to use
+`sys.argv[1:]`. The entry point uses native stdin/stdout/stderr, retains the GIL,
+and is a CLI bridge, not a tensor/model Python API.
+
+Installed-package smoke tests use only the standard library:
+
+```bash
+python -m unittest discover -s tests -p python_cli_test.py
+```
+
 ## Build
 
 The build requires CMake 3.25+, a C++23 compiler, Ninja, and Python 3.10+ for
@@ -46,7 +101,7 @@ On arm64 macOS, kidi detects CPU features through `sysctl` and enables
 YNNPACK's matching NEON, dot-product, BF16, I8MM, SME, and SME2 kernels at
 runtime. Unsupported instructions remain disabled, so the same binary can run
 on older Apple Silicon. `kidi inspect` prints the selected CPU features and
-`kidi predict --profile` includes both their names and YNNPACK bitmask.
+`kidi generate --profile` includes both their names and YNNPACK bitmask for RTG.
 
 YNNPACK is a CPU runtime and cannot dispatch work to Metal or the Apple Neural
 Engine. `--backend mps --beam-size 1` selects the eager Metal backend
@@ -161,29 +216,65 @@ on CPU, including for Metal execution.
 With the Hugging Face CLI and PyYAML installed:
 
 ```bash
-hf download google/gemma-4-E2B-it config.json model.safetensors tokenizer.json \
+hf download google/gemma-4-E2B-it config.json model.safetensors tokenizer.json tokenizer_config.json chat_template.jinja \
   --revision 3e22461f65e89153144f8adb70e3b8c2cc9845a7 \
   --local-dir ../models/gemma-4-E2B-it
 python tools/configure_gemma4.py ../models/gemma-4-E2B-it
 build-release/kidi inspect --model ../models/gemma-4-E2B-it
-build-release/kidi generate --model ../models/gemma-4-E2B-it --backend mps \
-  --prompt 'What is the capital of France?' --max-new-tokens 64 --profile
+printf '%s\n' '{"messages":[{"role":"user","content":"What is the capital of France?"}]}' | \
+  build-release/kidi generate --model ../models/gemma-4-E2B-it --backend mps \
+    --max-new-tokens 64 --profile
 ```
 
 Use `--backend ynnpack --threads 4` for CPU. The default backend is `auto`.
-Omitting `--prompt` reads a prompt from standard input. Single-user-turn chat
-formatting is applied by default, with thinking disabled; `--raw-prompt` accepts
-an already serialized prompt. Generation is greedy and batch size one. The
-current implementation is text-only: no image/audio encoders or speculative
+`generate` always reads one request per line and preserves input order. The model
+type determines the format: RTG uses Moses-tokenized text; Gemma 4 uses JSONL.
+Use `-i/--in FILE` and `-o/--out FILE`, or `-` for stdin/stdout (the defaults).
+Each JSON line contains a conversation in the common chat-message format:
+
+```json
+{"id":"example","messages":[{"role":"system","content":"Be concise."},{"role":"user","content":"Name a color."},{"role":"assistant","content":"Blue."},{"role":"user","content":"Name another.\nJust one word."}],"max_tokens":16}
+```
+
+`messages` is required and must end with a user turn. Supported roles are an
+optional initial `system` or `developer`, followed by `user`/`assistant` messages.
+Content is a string or an array of `{"type":"text","text":"..."}` parts.
+`id` is an optional string/integer, echoed in the response; absent IDs use the
+1-based input request number. `max_tokens` optionally overrides `--max-new-tokens`
+for that record. Unknown fields, tool calls, non-text content, blank JSON lines,
+and malformed records fail with a line-numbered diagnostic on stderr and exit 2.
+Already written results remain; outstanding work is not completed after an error.
+This is a text-chat message schema, not a full OpenAI HTTP API implementation.
+
+Each output line has `id`, `request_id`, an assistant `message` with `role` and
+`content`, `token_ids`, and `decoder_steps`. Newlines in content are JSON-escaped.
+The original checkpoint template is loaded from `chat_template.jinja`, or from
+`tokenizer_config.json` when embedded there, and rendered with thinking disabled.
+No role markers or chat templates are invented by the CLI.
+
+Chat requests execute with up to `--max-active` active slots (default 4, maximum
+16). `--queue-size` bounds all requests read but not emitted, including completed
+results waiting for earlier requests; `--cache-tokens` bounds active dense-cache
+reservations. A slow first request can delay later output and admission, but cannot
+cause an unbounded reorder buffer. Input is a finite file/stream, not an interactive
+chat server. RTG retains its ordered batching and blank-line preservation.
+
+Generation is greedy. The current implementation is text-only: no image/audio encoders or speculative
 decoding are loaded. E2B-it is verified on the 16 GiB Apple M5; E4B has not been
 validated end to end on this machine.
 
 `--context-size` and `--max-new-tokens` override the YAML decoding defaults
 (2048 and 256). `--prefill-chunk-size` defaults to 128. The prompt and requested
-generation must fit the context. `--runs`, `--warmups`, `--ignore-eos`, and
-`--profile` support repeatable performance measurements. Profile records separate
-prefill, recurrent decoding, and operator preparation; cold and warm numbers
-should not be mixed.
+generation must fit the context. `--profile` adds per-request timing fields and
+an aggregate serving record on stderr. Per-request decode/preparation time is
+reported only with `--max-active 1`; shared batch work is reported in aggregate.
+`--ignore-eos` is a benchmark option. Repeats and warmups are handled by the
+benchmark driver through repeated JSONL records, not CLI modes.
+
+The former `predict` subcommand is replaced by `generate`. `--prompt`,
+`--input-lines`, `--raw-prompt`, `--runs`, `--warmups`, and `--prefix-cache-bytes`
+are no longer CLI options. Prefix reuse and raw-token prompt APIs remain available
+internally; the CLI uses the ordered chat queue. Beam/scoring options remain RTG-only.
 
 Low-bit execution is opt-in: `--weight-bits 8` uses per-channel Q8 projections;
 `--weight-bits 4 --group-size 32` uses grouped Q4 MLPs and per-channel Q8 for
@@ -270,19 +361,19 @@ kidi inspect --model /path/to/model
 Predict Moses-tokenized text from standard input, one sentence per line:
 
 ```bash
-printf '%s\n' 'Comment allez @-@ vous ?' | kidi predict --model /path/to/model
+printf '%s\n' 'Comment allez @-@ vous ?' | kidi generate --model /path/to/model
 ```
 
 Read and write files explicitly:
 
 ```bash
-kidi predict --model /path/to/model --in source.txt --out translation.txt
+kidi generate --model /path/to/model --in source.txt --out translation.txt
 ```
 
 Override decoding defaults or append the normalized hypothesis score:
 
 ```bash
-kidi predict --beam-size 2 --max-extra-tokens 20 --length-penalty 0.6 --score \
+kidi generate --beam-size 2 --max-extra-tokens 20 --length-penalty 0.6 --score \
   --model /path/to/model --in source.txt --out translation.txt
 ```
 
@@ -291,8 +382,8 @@ kidi predict --beam-size 2 --max-extra-tokens 20 --length-penalty 0.6 --score \
 defaulting to batch size). Metal uses padding masks and independent per-row EOS;
 CPU currently processes the window serially. A final partial batch is supported.
 
-The default input type is `text`. `--inp-type jsonl` is reserved for future
-chat-model input and is not yet supported.
+RTG input and output are text lines. Chat models use JSONL automatically;
+there is no `--inp-type` override.
 
 Use `--stats` to emit exact input, translation, and generated target-token
 counts to stderr. Use `--profile` to emit aggregate package-load, graph-build,
@@ -300,7 +391,7 @@ encoder, decoder, generator, and host-search timings in nanoseconds. Both
 options leave translation output unchanged. `--threads N` sets total YNNPACK
 threads including the calling thread.
 
-Use `kidi --help` and `kidi predict --help` for the complete command syntax.
+Use `kidi --help` and `kidi generate --help` for the complete command syntax.
 
 Human-readable diagnostics use [spdlog](https://github.com/gabime/spdlog) on
 stderr; set `SPDLOG_LEVEL` to control their level. Translation output and

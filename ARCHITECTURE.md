@@ -67,6 +67,14 @@ CLI diagnostics use spdlog on stderr. Translation results and inspection output
 remain on stdout; machine-readable metric/profile records retain their unadorned
 format on stderr. `SPDLOG_LEVEL` controls the human-readable logger.
 
+The `generate` CLI dispatches by `model.type` and always processes lines in input
+order. RTG reads text lines; Gemma 4 reads JSONL `messages` arrays with optional
+`id` and `max_tokens`. `Tokenizer::format_chat` uses the original checkpoint's
+Jinja template and special-token configuration; `Generator::enqueue_chat` passes
+the serialized result to the existing raw-prompt enqueue path. Text messages may
+include system/developer instructions and user/assistant history. Tools and
+multimodal content are rejected. No generic model execution abstraction is added.
+
 ## Eager Contract
 
 `ops::Context` belongs to one device and one caller at a time. Inputs and outputs
@@ -431,6 +439,13 @@ Completion and cancellation release reservations. Cancellation has no completion
 event; unknown IDs are rejected. Drain or cancel requests before blocking generation
 or reconfiguration. A failed model step invalidates serving and requires reload.
 
+Serving events may finish out of order. The CLI retains completed records until
+their preceding input records are emitted, counting these retained completions
+against the same admission window as unfinished requests. Thus the reorder buffer
+is bounded by request count, not bytes, and a slow request backpressures input.
+Responses include the echoed input ID and an assistant message. Invalid JSONL
+stops processing with its physical input line number; JSON blank lines are invalid.
+
 Serving rejects prefix-cache options. Active K/V remains dense and independent;
 this is not direct paged attention or mixed prefill/decode in one model invocation.
 The optional single-request prefix cache retains one dense snapshot, sized to a
@@ -441,7 +456,8 @@ prefix reserved bytes equal the snapshot's K/V bytes, not the configured budget.
 
 Serving step timings report shared decode/prefill/preparation work. Per-request
 first-token and completion timestamps include queueing since enqueue; per-request
-decode time is not apportioned from shared batches. Static-batch first-token times
+decode time is not apportioned from shared batches. Serial admission additionally
+reports actual per-request decode and preparation time. Static-batch first-token times
 are readiness during sequential prefill, not streamed delivery. None of these
 batched/cache-hit rates substitutes for uncached batch-one latency comparisons.
 

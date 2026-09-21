@@ -4,6 +4,36 @@ Short progress notes for the current implementation. Measurements are explorator
 unless explicitly labelled as paired acceptance results. Historical comparisons
 remain in [QAT.md](QAT.md).
 
+## 2026-09-20: Ordered Chat JSONL
+
+- Unified CLI inference under `generate`, dispatching by model type. RTG keeps
+  ordered text lines and blank lines; Gemma 4 accepts common `messages` JSONL with
+  role/content objects, optional caller IDs and per-record `max_tokens`.
+- Text content parts, initial system/developer instructions and assistant history
+  use the original checkpoint chat template. Tools, non-text content and unknown
+  request fields fail explicitly. No fabricated chat-template or prompt-string
+  fallback is used by the CLI.
+- Completed responses wait for preceding input records. Completed-but-buffered
+  records count toward queue admission, preventing unbounded reordering storage.
+  Output carries an assistant `message`, echoed ID and physical request number.
+- Removed single-prompt/repeat/warmup CLI modes. The benchmark sends repeated
+  JSONL records with serial admission; per-request decode/preparation times are
+  reported only for serial execution. Historical timings use the older path.
+- Exact comparison with Transformers found that tokenizerspp dropped Jinja
+  comment whitespace controls, inserting an extra token after BOS. Fixed the
+  lexer rather than trimming model prompts. Its 83 focused chat/Jinja tests pass,
+  and native single/multi-turn Gemma formatting matches the reference strings.
+- Expected request, serving and I/O errors return CLI statuses directly. Tests
+  cover malformed JSON, unsupported messages and invalid admission limits, plus
+  mixed-length serial/concurrent equivalence, IDs, escaped newlines, CRLF and files.
+- All 16 native tests and both 50-sentence RTG regressions pass (chrF2 100).
+  The rebuilt Python wheel's CPU chat integration and native Metal chat integration
+  pass. The serial benchmark smoke test validates exact prompt/decode counts.
+
+The tokenizerspp lexer fix is a local, uncommitted dependency change. Before
+publishing Git-installable Kidi, publish that dependency fix and update its pinned
+revision. Local wheels include the fix; no repository commits or staging were made.
+
 ## 2026-09-20: Simplification Review
 
 The user reopened this checkpoint for naming and simplification, not another

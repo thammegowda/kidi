@@ -10,6 +10,7 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
 
 option(KIDI_BUILD_TESTS "Build kidi tests" ON)
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
+option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
 include(cmake/dependencies.cmake)
 include(cmake/ynnpack.cmake)
 
@@ -119,9 +120,28 @@ if(APPLE)
     endif()
 endif()
 
-add_executable(kidi_cli src/kidi/cli/main.cpp)
+add_library(kidi_cli_main STATIC src/kidi/cli/main.cpp)
+target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi spdlog::spdlog nlohmann_json::nlohmann_json)
+
+add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)
 set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
-target_link_libraries(kidi_cli PRIVATE kidi::argparse kidi::kidi spdlog::spdlog nlohmann_json::nlohmann_json)
+target_link_libraries(kidi_cli PRIVATE kidi_cli_main)
+
+if(KIDI_BUILD_PYTHON)
+    find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module Development.SABIModule)
+    find_package(nanobind CONFIG REQUIRED)
+    nanobind_add_module(_native STABLE_ABI python/bindings.cpp)
+    target_link_libraries(_native PRIVATE kidi_cli_main)
+    install(TARGETS _native LIBRARY DESTINATION kidi COMPONENT python)
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -c
+            "from importlib.metadata import distribution; package = distribution('nanobind'); print(next(package.locate_file(file) for file in package.files if file.name == 'LICENSE' and '.dist-info' in str(file)))"
+        OUTPUT_VARIABLE KIDI_NANOBIND_LICENSE
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        COMMAND_ERROR_IS_FATAL ANY
+    )
+    install(FILES "${KIDI_NANOBIND_LICENSE}" DESTINATION kidi/licenses/nanobind COMPONENT python)
+endif()
 
 include(CTest)
 

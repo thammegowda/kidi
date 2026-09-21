@@ -1,3 +1,4 @@
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -33,7 +34,26 @@ auto write_gzip(const std::filesystem::path& path, std::string_view contents) ->
 
 } // namespace
 
-auto main() -> int {
+auto main(int argc, char** argv) -> int {
+    const std::array conversation{
+        kidi::text::ChatMessage{"system", "Be brief."}, kidi::text::ChatMessage{"user", "Hi\nthere"},
+        kidi::text::ChatMessage{"assistant", "Hello"}, kidi::text::ChatMessage{"user", "Again"}};
+    if (argc == 2) {
+        auto checkpoint = kidi::text::Tokenizer::load(std::filesystem::path(argv[1]) / "tokenizer.json");
+        if (!checkpoint) return 1;
+        const std::array messages{kidi::text::ChatMessage{"user", "Hello"}};
+        auto rendered = checkpoint->format_chat(messages);
+        const std::string expected = "<bos><|turn>user\nHello<turn|>\n<|turn>model\n";
+        if (!rendered || *rendered != expected) {
+            std::cerr << "checkpoint chat mismatch: " << (rendered ? *rendered : rendered.error().message) << '\n';
+            return 1;
+        }
+        auto multi_turn = checkpoint->format_chat(conversation);
+        if (!multi_turn || *multi_turn !=
+                               "<bos><|turn>system\nBe brief.<turn|>\n<|turn>user\nHi\nthere<turn|>\n"
+                               "<|turn>model\nHello<turn|>\n<|turn>user\nAgain<turn|>\n<|turn>model\n")
+            return 1;
+    }
     const auto directory = std::filesystem::temp_directory_path() / "kidi-tokenizer-test";
     std::filesystem::remove_all(directory);
     std::filesystem::create_directories(directory);
@@ -63,6 +83,21 @@ auto main() -> int {
         std::cerr << "UTF-8 tokenizer round trip failed\n";
         return 1;
     }
+
+    if (plain->format_chat(conversation)) return 1;
+    std::ofstream(directory / "chat_template.jinja")
+        << "{{ bos_token }}{% for message in messages %}{{ message.role }}:{{ message.content }};{% endfor %}"
+           "{% if add_generation_prompt %}assistant:{% endif %}{% if enable_thinking %}thinking{% endif %}";
+    if (kidi::text::Tokenizer::load(plain_path)) return 1;
+    std::ofstream(directory / "tokenizer_config.json") << R"({"bos_token":"<bos>"})";
+    auto chat = kidi::text::Tokenizer::load(plain_path);
+    if (!chat) return 1;
+    auto formatted = chat->format_chat(conversation);
+    if (!formatted || *formatted != "<bos>system:Be brief.;user:Hi\nthere;assistant:Hello;user:Again;assistant:")
+        return 1;
+    if (chat->format_chat({}) || chat->format_chat(std::span(conversation).first(3))) return 1;
+    const std::array invalid{kidi::text::ChatMessage{"tool", "ignored"}, kidi::text::ChatMessage{"user", "Hi"}};
+    if (chat->format_chat(invalid)) return 1;
 
     std::filesystem::remove_all(directory);
     return 0;

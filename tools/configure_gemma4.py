@@ -13,9 +13,12 @@ def configure(directory: Path) -> Path:
     model = original["text_config"]
     if original.get("model_type") != "gemma4" or model.get("enable_moe_block"):
         raise ValueError("Expected a dense Gemma 4 checkpoint")
-    for filename in ("model.safetensors", "tokenizer.json"):
+    for filename in ("model.safetensors", "tokenizer.json", "tokenizer_config.json"):
         if not (directory / filename).is_file():
             raise ValueError(f"Missing {filename}")
+    tokenizer_config = json.loads((directory / "tokenizer_config.json").read_text())
+    if not tokenizer_config.get("chat_template") and not (directory / "chat_template.jinja").is_file():
+        raise ValueError("Missing chat_template.jinja or chat_template in tokenizer_config.json")
     model["type"] = "gemma4_text"
     if "quantization_config" in original:
         if original["quantization_config"].get("quant_method") != "gemma":

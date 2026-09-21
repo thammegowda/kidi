@@ -34,35 +34,36 @@ def run_kidi(args, prompt, tokenizer):
     command = [str(args.binary), "generate", "--model", str(args.model),
                "--backend", "ynnpack" if args.backend == "cpu" else "mps", "--threads", str(args.threads),
                "--context-size", str(args.context), "--max-new-tokens", str(args.decode + 1),
-               "--prefill-chunk-size", str(args.chunk), "--raw-prompt", "--ignore-eos", "--profile",
-               "--warmups", str(args.warmups), "--runs", str(args.runs), "--prompt", prompt]
+               "--prefill-chunk-size", str(args.chunk), "--ignore-eos", "--profile",
+               "--max-active", "1", "--queue-size", "1", "--cache-tokens", str(args.context)]
     if args.weight_bits:
         command += ["--weight-bits", str(args.weight_bits), "--group-size", str(args.group_size)]
     if args.packed_prefill:
         command += ["--packed-prefill"]
     if args.full_attention_cache:
         command += ["--full-attention-cache"]
+    content = prompt.removeprefix("<bos><|turn>user\n").removesuffix("<turn|>\n<|turn>model\n")
+    request = json.dumps({"messages": [{"role": "user", "content": content}]}) + "\n"
     started = time.perf_counter()
-    process = subprocess.run(command, text=True, capture_output=True)
+    process = subprocess.run(command, input=request * (args.warmups + args.runs), text=True, capture_output=True)
     if process.returncode:
         raise RuntimeError(f"Kidi failed ({process.returncode}): {process.stderr}")
     wall = time.perf_counter() - started
-    records = []
-    for line in process.stderr.splitlines():
-        if not line.startswith("kidi_generation|"):
-            continue
-        fields = dict(part.split("=", 1) for part in line.split("|")[1:])
-        record = {key: int(value) if value.isdigit() else value for key, value in fields.items()}
-        if bool(record.get("packed_prefill", 0)) != args.packed_prefill:
-            raise ValueError("Executed prefill policy does not match requested policy")
-        ids = [int(value) for value in fields["token_ids"].split(",") if value]
-        record["token_ids"] = ids
-        record["text"] = tokenizer.decode(ids, skip_special_tokens=False)
+    summary = next(line for line in process.stderr.splitlines() if line.startswith("kidi_serving|"))
+    fields = dict(part.split("=", 1) for part in summary.split("|")[1:])
+    if bool(int(fields["packed_prefill"])) != args.packed_prefill:
+        raise ValueError("Executed prefill policy does not match requested policy")
+    all_records = [json.loads(line) for line in process.stdout.splitlines()]
+    if len(all_records) != args.warmups + args.runs:
+        raise ValueError("Missing JSONL responses")
+    records = all_records[args.warmups:]
+    for index, record in enumerate(records):
+        record.update(run=index, native_qat=int(fields["native_qat"]), packed_prefill=args.packed_prefill,
+                      load_ns=int(fields["load_ns"]), text=record["message"]["content"])
         if record["prompt_tokens"] != args.prefill or record["decode_tokens"] != args.decode:
             raise ValueError(f"Kidi token count mismatch: {record}")
         record["decode_tokens_per_second"] = args.decode * 1e9 / record["decode_ns"] if args.decode else 0
         record["prefill_tokens_per_second"] = args.prefill * 1e9 / record["prefill_ns"]
-        records.append(record)
     if len(records) != args.runs:
         raise ValueError(f"Expected {args.runs} measurements, got {len(records)}")
     precision = "original BF16"
@@ -82,6 +83,7 @@ def run_kidi(args, prompt, tokenizer):
             "binary_sha256": binary_sha256,
             "peak_rss_bytes": resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
             "stderr": process.stderr, "weight_precision": precision,
+            "execution": "ordered JSONL, serial admission, checkpoint chat template",
             "prefill_precision": ("native QAT packed" if args.backend == "cpu" or args.packed_prefill else "native QAT cached FP16 matrices")
             if native_qat else "packed" if args.weight_bits and args.packed_prefill else "original floating (multi-row)"}
 

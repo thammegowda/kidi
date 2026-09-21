@@ -52,6 +52,8 @@ public:
         -> Result<GenerationBatch>;
     auto configure_serving(ServingOptions options) -> Result<void>;
     auto enqueue(std::string_view prompt, GenerationOptions options = {}) -> Result<std::uint64_t>;
+    auto enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options = {})
+        -> Result<std::uint64_t>;
     auto step() -> Result<GenerationStep>;
     auto cancel(std::uint64_t request_id) -> Result<void>;
     auto pending_requests() const -> std::size_t { return waiting_.size() + running_.size(); }

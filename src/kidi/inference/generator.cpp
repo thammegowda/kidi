@@ -278,6 +278,13 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
+auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options)
+    -> Result<std::uint64_t> {
+    auto prompt = tokenizer_.format_chat(messages);
+    if (!prompt) return std::unexpected(std::move(prompt.error()));
+    options.raw_prompt = true;
+    return enqueue(*prompt, options);
+}
 auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> Result<std::uint64_t> {
     try {
         if (!serving_ || serving_failed_ || pending_requests() >= serving_->maximum_requests ||
@@ -394,9 +401,14 @@ auto Generator::step() -> Result<GenerationStep> {
         }
         if (count) {
             const auto started = Clock::now();
+            const auto prepared = model_->preparation_ns();
             const auto selected =
                 require(model_->forward_batch_tokens(std::span(tokens).first(count), std::span(states).first(count)));
             result.decode_ns = elapsed(started);
+            if (serving_->maximum_active == 1) {
+                running_[rows[0]].stats.decode_ns += result.decode_ns;
+                running_[rows[0]].stats.preparation_ns += model_->preparation_ns() - prepared;
+            }
             for (std::size_t index = 0; index < count; ++index) accept(running_[rows[index]], selected[index]);
         }
         retire();

@@ -77,6 +77,7 @@ FetchContent_MakeAvailable(nlohmann_json uni_algo abseil-cpp)
 set(_KIDI_SKIP_INSTALL_RULES "${CMAKE_SKIP_INSTALL_RULES}")
 set(CMAKE_SKIP_INSTALL_RULES ON)
 FetchContent_MakeAvailable(re2)
+set_property(DIRECTORY "${KIDI_THIRD_PARTY_DIR}/re2" PROPERTY EXCLUDE_FROM_ALL TRUE)
 set(CMAKE_SKIP_INSTALL_RULES "${_KIDI_SKIP_INSTALL_RULES}")
 unset(_KIDI_SKIP_INSTALL_RULES)
 
