@@ -5,6 +5,7 @@
 #include <iostream>
 #include <limits>
 #include <span>
+#include <vector>
 
 #include <ynnpack.h>
 
@@ -28,6 +29,63 @@ auto run(kidi::runtime::ynn::Executable& executable, const kidi::tensor::Tensor&
     if (status) status = executable.invoke();
     if (!status) std::cerr << status.error().message << '\n';
     return status.has_value();
+}
+
+auto test_broadcast_dot(bool broadcast) -> bool {
+    constexpr std::size_t HEADS = 2, GROUPS = 2, LENGTH = 259, WIDTH = 40;
+    const auto right_groups = broadcast ? std::size_t{1} : GROUPS;
+    constexpr std::array<std::size_t, 5> LEFT_SHAPE{1, HEADS, GROUPS, 1, LENGTH};
+    const std::array<std::size_t, 3> right_shape{1, LENGTH, HEADS * right_groups * WIDTH};
+    const std::array<std::size_t, 5> right_reshape{1, LENGTH, HEADS, right_groups, WIDTH};
+    constexpr std::array<std::int32_t, 5> AXES{0, 2, 3, 1, 4};
+    auto graph = kidi::runtime::ynn::Graph::create(3);
+    if (!graph) return false;
+    const auto check = [](ynn_status status) {
+        if (status == ynn_status_success) return true;
+        std::cerr << "broadcast dot definition failed: " << status << '\n';
+        return false;
+    };
+    std::uint32_t left_id = 0, right_id = 1, output_id = 2;
+    auto reshaped = YNN_INVALID_VALUE_ID, transposed = YNN_INVALID_VALUE_ID;
+    if (!check(ynn_define_tensor(graph->get(), ynn_type_fp32, LEFT_SHAPE.size(), LEFT_SHAPE.data(), nullptr,
+                                 YNN_VALUE_FLAG_EXTERNAL_INPUT, &left_id)) ||
+        !check(ynn_define_tensor(graph->get(), ynn_type_fp32, right_shape.size(), right_shape.data(), nullptr,
+                                 YNN_VALUE_FLAG_EXTERNAL_INPUT, &right_id)) ||
+        !check(ynn_define_tensor(graph->get(), ynn_type_fp32, 0, nullptr, nullptr, YNN_VALUE_FLAG_EXTERNAL_OUTPUT,
+                                 &output_id)) ||
+        !check(ynn_define_static_reshape(graph->get(), right_reshape.size(), right_reshape.data(), right_id, &reshaped,
+                                         0)) ||
+        !check(ynn_define_static_transpose(graph->get(), AXES.size(), AXES.data(), reshaped, &transposed, 0)) ||
+        !check(ynn_define_dot(graph->get(), 1, left_id, transposed, YNN_INVALID_VALUE_ID, &output_id, 0)))
+        return false;
+    auto executable = std::move(*graph).compile(1);
+    if (!executable) {
+        std::cerr << executable.error().message << '\n';
+        return false;
+    }
+    std::array<float, HEADS * GROUPS * LENGTH> left{};
+    std::vector<float> right(LENGTH * HEADS * right_groups * WIDTH);
+    std::array<float, HEADS * GROUPS * WIDTH> output{};
+    for (std::size_t row = 0; row < HEADS * GROUPS; ++row) left[row * LENGTH + LENGTH - 1 - row] = 1.F;
+    for (std::size_t index = 0; index < right.size(); ++index) right[index] = static_cast<int>(index % 17) - 8;
+    auto status = executable->reshape();
+    if (status) status = executable->bind(left_id, left.data());
+    if (status) status = executable->bind(right_id, right.data());
+    if (status) status = executable->bind(output_id, output.data());
+    if (status) status = executable->invoke();
+    if (!status) {
+        std::cerr << status.error().message << '\n';
+        return false;
+    }
+    for (std::size_t index = 0; index < output.size(); ++index) {
+        const auto row = index / WIDTH, head = row / GROUPS, group = row % GROUPS;
+        const auto right_row = ((LENGTH - 1 - row) * HEADS + head) * right_groups + (broadcast ? 0 : group);
+        if (output[index] != right[right_row * WIDTH + index % WIDTH]) {
+            std::cerr << "broadcast dot mismatch at " << index << " broadcast=" << broadcast << '\n';
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -107,5 +165,6 @@ auto main() -> int {
         std::cerr << "unexpected output shape\n";
         return 1;
     }
+    if (!test_broadcast_dot(false) || !test_broadcast_dot(true)) return 1;
     return 0;
 }

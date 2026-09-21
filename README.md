@@ -241,6 +241,38 @@ ctest --preset debug
 All C and C++ dependencies are submodules under `third_party/`. Configuration
 does not download source code after the recursive clone.
 
+### Linux x86-64
+
+YNNPACK uses the pinned `cpuinfo` dependency to select supported x86 kernels
+at runtime, including AVX2 and AVX-512 on an Intel Xeon W-2175. Re-run the recursive
+submodule update above when updating an existing checkout.
+
+GCC 13.3 builds Debug and Release with local fixes in the XNNPACK checkout:
+missing generated kernel declarations, generation ordering, and intrinsic
+argument casts. A separate five-line runtime fix gives singleton RHS batch
+dimensions zero stride before dot iteration, preserving broadcast semantics.
+A direct YNNPACK regression reproduces the original null-pointer failure
+without model or attention code, using one-hot inputs and exact row-selection checks.
+These fixes are not yet part of the pinned dependency revision; a fresh clone
+of that revision still encounters the generator failure.
+
+Both builds pass all 16 native tests, including Gemma floating-point and QAT
+fixtures, grouped-query attention, and broadcast/nonbroadcast dot cases with
+the original failing shape. Full-model correctness
+and throughput have not been validated on this platform.
+
+To build an optimized executable with tests enabled:
+
+```bash
+cmake --preset release -DKIDI_BUILD_TESTS=ON
+cmake --build --preset release --parallel 8
+ctest --test-dir build-release --output-on-failure
+```
+
+The executable is `build-release/kidi`. Use `--backend ynnpack` for CPU
+inference. CUDA storage and transfers are separate from execution; NVIDIA
+GPU inference is not implemented yet.
+
 ### Apple Silicon
 
 On arm64 macOS, Kidi detects CPU features through `sysctl` and enables

@@ -30,6 +30,20 @@ if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
         set(YNN_ENABLE_ARM64_SME OFF CACHE BOOL "" FORCE)
         set(YNN_ENABLE_ARM64_SME2 OFF CACHE BOOL "" FORCE)
     endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86|x86)$")
+    kidi_require_submodule("cpuinfo" "cpuinfo/CMakeLists.txt")
+    set(CPUINFO_LIBRARY_TYPE static CACHE STRING "" FORCE)
+    set(CPUINFO_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(CPUINFO_BUILD_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+    set(CPUINFO_BUILD_MOCK_TESTS OFF CACHE BOOL "" FORCE)
+    set(CPUINFO_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(CPUINFO_BUILD_PKG_CONFIG OFF CACHE BOOL "" FORCE)
+    add_subdirectory(
+        "${KIDI_THIRD_PARTY_DIR}/cpuinfo"
+        "${PROJECT_BINARY_DIR}/third_party/cpuinfo"
+        EXCLUDE_FROM_ALL
+    )
+    set(YNN_ENABLE_CPUINFO ON CACHE BOOL "" FORCE)
 endif()
 
 # YNNPACK's code generators currently resolve helper scripts relative to the

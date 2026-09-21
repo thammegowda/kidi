@@ -29,3 +29,6 @@
 [submodule "third_party/spdlog"]
 	path = third_party/spdlog
 	url = https://github.com/gabime/spdlog.git
+[submodule "third_party/cpuinfo"]
+	path = third_party/cpuinfo
+	url = https://github.com/pytorch/cpuinfo.git
