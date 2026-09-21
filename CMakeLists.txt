@@ -25,10 +25,10 @@ add_library(kidi
     src/kidi/inference/generator.cpp
     src/kidi/inference/translator.cpp
     src/kidi/layers/position_encoding.cpp
-    src/kidi/layers/gemma.cpp
+    src/kidi/layers/gemma4.cpp
     src/kidi/layers/transformer.cpp
     src/kidi/model/config.cpp
-    src/kidi/model/gemma.cpp
+    src/kidi/model/gemma4.cpp
     src/kidi/model/package.cpp
     src/kidi/model/transformer.cpp
     src/kidi/model/weights.cpp
@@ -46,8 +46,8 @@ add_library(kidi
 add_library(kidi::kidi ALIAS kidi)
 
 if(KIDI_BUILD_BENCHMARKS)
-    add_executable(kidi_gemma_quality benchmarks/gemma/quality.cpp)
-    target_link_libraries(kidi_gemma_quality PRIVATE kidi::kidi)
+    add_executable(kidi_gemma4_quality benchmarks/gemma4/quality.cpp)
+    target_link_libraries(kidi_gemma4_quality PRIVATE kidi::kidi)
 endif()
 
 target_include_directories(kidi
@@ -121,7 +121,7 @@ endif()
 
 add_executable(kidi_cli src/kidi/cli/main.cpp)
 set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
-target_link_libraries(kidi_cli PRIVATE kidi::argparse kidi::kidi spdlog::spdlog)
+target_link_libraries(kidi_cli PRIVATE kidi::argparse kidi::kidi spdlog::spdlog nlohmann_json::nlohmann_json)
 
 include(CTest)
 

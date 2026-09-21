@@ -11,6 +11,10 @@
 #include <cmath>
 #include <optional>
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
+#include <unordered_set>
+#include <limits>
 
 namespace kidi::runtime {
 namespace {
@@ -20,17 +24,51 @@ using tensor::Tensor;
 struct Stream {
     std::optional<mps::CommandBatch> batch;
     std::vector<Tensor> pending;
-    std::size_t pending_count = 0;
-    Stream() { pending.reserve(512); }
-    auto retain(const Tensor& tensor) -> void {
-        if (pending_count == pending.size())
-            pending.push_back(tensor);
-        else {
-            const auto previous = tensor::metal_buffer(pending[pending_count]);
-            const auto current = tensor::metal_buffer(tensor);
-            if (!previous || !current || previous->handle != current->handle) pending[pending_count] = tensor;
+    OutputPool outputs;
+    AllocationStats output_allocations;
+    std::unordered_set<void*> output_buffers;
+    bool reuse_outputs = true;
+    std::size_t prefill_cache_limit = std::numeric_limits<std::size_t>::max();
+    bool profile_memory = std::getenv("KIDI_PROFILE_MEMORY") != nullptr;
+    std::size_t observed_device_bytes = 0, recommended_working_set_bytes = 0;
+    std::size_t peak_pending = 0, scratch_bytes = 0, peak_scratch_bytes = 0, expanded_bytes = 0;
+    Stream() {
+        pending.reserve(512);
+        if (const auto value = std::getenv("KIDI_METAL_REUSE_OUTPUTS")) reuse_outputs = std::string_view(value) != "0";
+        if (const auto value = std::getenv("KIDI_PREFILL_CACHE_BYTES")) {
+            char* end = nullptr;
+            const auto bytes = std::strtoull(value, &end, 10);
+            if (end == value || *end || bytes > (std::uint64_t{16} << 30))
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prefill cache bytes must be 0..16 GiB"});
+            prefill_cache_limit = bytes;
         }
-        ++pending_count;
+        if (prefill_cache_limit != std::numeric_limits<std::size_t>::max() && !reuse_outputs)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "bounded prefill weights require shared output reuse"});
+    }
+    ~Stream() {
+        if (profile_memory)
+            std::cerr << "kidi_metal_memory|reuse_outputs=" << reuse_outputs
+                      << "|prefill_cache_limit=" << prefill_cache_limit
+                      << "|output_allocations=" << output_allocations.count
+                      << "|output_allocated_bytes=" << output_allocations.bytes
+                      << "|peak_scratch_bytes=" << peak_scratch_bytes << "|expanded_weight_bytes=" << expanded_bytes
+                      << "|peak_external_owner_slots=" << peak_pending
+                      << "|observed_peak_device_bytes=" << observed_device_bytes
+                      << "|recommended_working_set_bytes=" << recommended_working_set_bytes << '\n';
+    }
+    auto acquire(std::span<const std::int64_t> shape, DType dtype, OutputPool& fallback) -> Tensor {
+        auto& pool = reuse_outputs ? outputs : fallback;
+        const auto before = pool.allocations();
+        auto output = pool.acquire(shape, dtype, tensor::Device::apple_gpu());
+        output_allocations.count += pool.allocations().count - before.count;
+        output_allocations.bytes += pool.allocations().bytes - before.bytes;
+        if (reuse_outputs) output_buffers.insert(require(tensor::metal_buffer(output)).handle);
+        return output;
+    }
+    auto retain(const Tensor& tensor) -> void {
+        if (reuse_outputs && output_buffers.contains(require(tensor::metal_buffer(tensor)).handle)) return;
+        pending.push_back(tensor);
+        peak_pending = std::max(peak_pending, pending.size());
     }
     auto commands() -> mps::CommandBatch& {
         if (!batch)
@@ -41,7 +79,12 @@ struct Stream {
     }
     auto synchronize() -> void {
         if (batch) require(batch->finish());
-        pending_count = 0;
+        if (profile_memory) {
+            const auto memory = tensor::metal_memory_stats();
+            observed_device_bytes = std::max(observed_device_bytes, memory.allocated_bytes);
+            recommended_working_set_bytes = memory.recommended_working_set_bytes;
+        }
+        pending.clear();
     }
 };
 class MetalOperator final : public Operator {
@@ -51,39 +94,66 @@ public:
     std::optional<mps::QuantizedLinear> quantized;
     Tensor packed_weight, packed_scales, packed_input;
     Tensor prefill_weight, prefill_output;
-    std::optional<mps::Executable> prefill_executable;
+    std::shared_ptr<const mps::Executable> prefill_executable;
     std::int32_t packed_bits = 0, packed_group = 0;
     float packed_input_scale = 0, packed_output_scale = 0;
     std::vector<std::int64_t> shape;
     DType dtype;
     std::size_t dynamic_count;
     bool scatter = false;
+    bool greedy = false;
+    bool vector_projection = false;
     bool eager = false;
     Operation operation;
     float epsilon = 0;
     OutputPool pool;
+    std::size_t scratch_bytes = 0;
     explicit MetalOperator(Stream& owner) : stream(owner) {}
+    ~MetalOperator() override { stream.scratch_bytes -= scratch_bytes; }
     auto run(TensorInputs inputs) -> Tensor override {
-        auto output = pool.acquire(shape, dtype, tensor::Device::apple_gpu());
-        if (eager)
+        auto output = stream.acquire(shape, dtype, pool);
+        if (greedy) {
+            const std::array temporary_shape{static_cast<std::int64_t>(output.numel()),
+                                             static_cast<std::int64_t>((inputs[0].size(-1) + 1023) / 1024),
+                                             std::int64_t{2}};
+            auto scratch = stream.acquire(temporary_shape, DType::F32, pool);
+            require(mps::encode_greedy_token(stream.commands(), inputs[0], scratch, output));
+        } else if (eager)
             require(mps::encode_eager(stream.commands(), operation, epsilon, inputs, output));
         else if (quantized)
             require(quantized->encode(stream.commands(), inputs[0], output));
         else if (packed_bits) {
-            if (packed_input.defined())
+            Tensor calibrated_input;
+            if (packed_input_scale > 0) {
+                calibrated_input =
+                    stream.reuse_outputs
+                        ? stream.acquire(inputs[0].shape(), prefill_executable ? DType::F16 : DType::F32, pool)
+                        : packed_input;
                 require(mps::encode_eager(stream.commands(), Operation::STATIC_ROUND, packed_input_scale,
-                                          inputs.first(1), packed_input));
+                                          inputs.first(1), calibrated_input));
+            }
             if (prefill_executable) {
-                const std::array feeds{packed_input.defined() ? packed_input : inputs[0], prefill_weight};
-                std::array outputs{prefill_output.defined() ? prefill_output : output};
+                auto weight = prefill_weight;
+                if (!weight.defined()) {
+                    const std::array<std::int64_t, 2> matrix_shape{static_cast<std::int64_t>(packed_weight.size(0)),
+                                                                   static_cast<std::int64_t>(inputs[0].size(-1))};
+                    weight = stream.acquire(matrix_shape, DType::F16, pool);
+                    require(mps::encode_expand_packed_weight(stream.commands(), packed_weight, packed_scales, weight,
+                                                             packed_bits, packed_group));
+                }
+                const std::array feeds{calibrated_input.defined() ? calibrated_input : inputs[0], weight};
+                auto projected = packed_output_scale > 0
+                                     ? (stream.reuse_outputs ? stream.acquire(shape, DType::F32, pool) : prefill_output)
+                                     : output;
+                std::array outputs{projected};
                 require(prefill_executable->encode(stream.commands(), feeds, outputs));
-                if (prefill_output.defined())
+                if (packed_output_scale > 0)
                     require(mps::encode_eager(stream.commands(), Operation::STATIC_ROUND, packed_output_scale,
-                                              {&prefill_output}, output));
+                                              {&projected}, output));
             } else {
-                require(mps::encode_packed_linear(stream.commands(), packed_input.defined() ? packed_input : inputs[0],
-                                                  packed_weight, packed_scales, output, packed_bits, packed_group, 0.F,
-                                                  packed_output_scale));
+                require(mps::encode_packed_linear(
+                    stream.commands(), calibrated_input.defined() ? calibrated_input : inputs[0], packed_weight,
+                    packed_scales, output, packed_bits, packed_group, 0.F, packed_output_scale, vector_projection));
             }
         } else {
             std::array outputs{output};
@@ -106,23 +176,40 @@ public:
         return destination;
     }
     auto run_pair(TensorInputs inputs) -> std::array<Tensor, 2> override {
-        auto normalized = pool.acquire(shape, dtype, tensor::Device::apple_gpu());
-        auto residual = pool.acquire(shape, dtype, tensor::Device::apple_gpu());
+        auto normalized = stream.acquire(shape, dtype, pool);
+        auto residual = stream.acquire(shape, dtype, pool);
         std::array outputs{normalized, residual};
         require(executable->encode(stream.commands(), inputs.first(dynamic_count), outputs));
         for (std::size_t index = 0; index < dynamic_count; ++index) stream.retain(inputs[index]);
         for (const auto& output : outputs) stream.retain(output);
         return {std::move(residual), std::move(normalized)};
     }
-    auto allocations() const -> AllocationStats override { return pool.allocations(); }
+    auto allocations() const -> AllocationStats override { return stream.output_allocations; }
 };
 class MetalBackend final : public OperatorBackend {
 public:
     auto synchronize() -> void override { stream_.synchronize(); }
+    auto release_cached_buffers() -> void override {
+        stream_.outputs = OutputPool{};
+        stream_.output_buffers.clear();
+    }
+    auto copy_slice_(Tensor& destination, const Tensor& source, std::size_t outer, std::size_t source_bytes,
+                     std::size_t destination_bytes, std::size_t offset_bytes) -> void override {
+        require(
+            stream_.commands().copy_slice_(source, destination, outer, source_bytes, destination_bytes, offset_bytes));
+        stream_.retain(source);
+        stream_.retain(destination);
+    }
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
         auto result = std::make_unique<MetalOperator>(stream_);
         result->scatter = spec.operation == Operation::SCATTER;
         result->dtype = spec.dtype;
+        if (spec.operation == Operation::GREEDY_TOKEN) {
+            result->greedy = true;
+            result->dynamic_count = 1;
+            result->shape = {static_cast<std::int64_t>(inputs[0].numel() / inputs[0].size(-1))};
+            return result;
+        }
         bool device_fp32 = true;
         for (std::size_t index = 0; index < inputs.size(); ++index)
             device_fp32 &= inputs[index].dtype() == DType::F32 && inputs[index].device() == tensor::Device::apple_gpu();
@@ -131,7 +218,8 @@ public:
             (std::ranges::equal(inputs[0].shape(), inputs[1].shape()) || inputs[1].numel() == 1 ||
              (inputs[0].dimensions() > 0 && inputs[1].dimensions() == 1 && inputs[1].size(0) == inputs[0].size(-1)));
         if (device_fp32 && (spec.operation == Operation::RMS_NORM || spec.operation == Operation::RMS_NORM_RESIDUAL ||
-                            spec.operation == Operation::ROTARY || spec.operation == Operation::TANH ||
+                            spec.operation == Operation::RMS_ROTARY || spec.operation == Operation::ROTARY ||
+                            spec.operation == Operation::GELU_MULTIPLY || spec.operation == Operation::TANH ||
                             spec.operation == Operation::STATIC_ROUND ||
                             (spec.operation == Operation::GELU && spec.attributes[0]) || simple_binary)) {
             result->eager = true;
@@ -154,57 +242,73 @@ public:
             return result;
         }
         if (spec.operation == Operation::PACKED_LINEAR) {
+            result->vector_projection = spec.vector_projection;
             result->dynamic_count = 1;
             result->packed_bits = spec.attributes[0];
             result->packed_group = spec.attributes[1];
             result->packed_input_scale = spec.epsilon;
             result->packed_output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]));
-            if (spec.epsilon > 0)
-                result->packed_input = require(Tensor::empty({inputs[0].shape().begin(), inputs[0].shape().end()},
-                                                             DType::F32, tensor::Device::apple_gpu()));
             result->packed_weight = require(inputs[1].to(tensor::Device::apple_gpu()));
             result->packed_scales = require(inputs[2].to(tensor::Device::apple_gpu()));
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
             result->shape.back() = inputs[1].size(0);
-            if (!spec.packed_prefill && inputs[0].numel() / inputs[0].size(-1) >= 4 &&
+            if (!spec.packed_prefill && !spec.vector_projection && inputs[0].numel() / inputs[0].size(-1) >= 4 &&
                 (result->packed_input_scale > 0 || result->packed_output_scale > 0)) {
+                const std::array<std::int64_t, 2> matrix_shape{static_cast<std::int64_t>(inputs[1].size(0)),
+                                                               static_cast<std::int64_t>(inputs[0].size(-1))};
                 const auto key =
                     std::tuple{require(inputs[1].host_bytes()).data(), require(inputs[2].host_bytes()).data(),
                                result->packed_bits, result->packed_group};
                 auto found = prefill_weights_.find(key);
-                if (found == prefill_weights_.end()) {
-                    const auto columns = inputs[1].size(0), width = inputs[0].size(-1);
-                    auto expanded =
-                        require(Tensor::empty({static_cast<std::int64_t>(columns), static_cast<std::int64_t>(width)},
-                                              DType::F16, tensor::Device::apple_gpu()));
-                    auto destination = reinterpret_cast<_Float16*>(require(expanded.host_bytes()).data());
-                    const auto source = require(inputs[1].data<std::uint8_t>());
-                    const auto scales = require(inputs[2].data<float>());
-                    const auto bits = result->packed_bits, per_byte = 8 / bits;
-                    const auto groups = width / result->packed_group;
-                    for (std::size_t column = 0; column < columns; ++column)
-                        for (std::size_t channel = 0; channel < width; ++channel) {
-                            const auto offset = column * width + channel;
-                            const auto raw =
-                                (source[offset / per_byte] >> ((offset % per_byte) * bits)) & ((1 << bits) - 1);
-                            const auto integer = (raw ^ (1 << (bits - 1))) - (1 << (bits - 1));
-                            destination[offset] = static_cast<_Float16>(
-                                integer * scales[column * groups + channel / result->packed_group]);
-                        }
-                    found =
-                        prefill_weights_.emplace(key, PrefillWeight{inputs[1], inputs[2], std::move(expanded)}).first;
+                const auto matrix_bytes =
+                    static_cast<std::size_t>(matrix_shape[0]) * matrix_shape[1] * sizeof(_Float16);
+                if (found != prefill_weights_.end() ||
+                    matrix_bytes <= stream_.prefill_cache_limit - stream_.expanded_bytes) {
+                    if (found == prefill_weights_.end()) {
+                        const auto columns = inputs[1].size(0), width = inputs[0].size(-1);
+                        auto expanded = require(
+                            Tensor::empty({static_cast<std::int64_t>(columns), static_cast<std::int64_t>(width)},
+                                          DType::F16, tensor::Device::apple_gpu()));
+                        stream_.retain(result->packed_weight);
+                        stream_.retain(result->packed_scales);
+                        stream_.retain(expanded);
+                        require(mps::encode_expand_packed_weight(stream_.commands(), result->packed_weight,
+                                                                 result->packed_scales, expanded, result->packed_bits,
+                                                                 result->packed_group));
+                        found = prefill_weights_.emplace(key, PrefillWeight{inputs[1], inputs[2], std::move(expanded)})
+                                    .first;
+                        stream_.expanded_bytes += found->second.value.nbytes();
+                    }
+                    result->prefill_weight = found->second.value;
                 }
-                result->prefill_weight = found->second.value;
-                auto graph = require(mps::Graph::create());
-                const std::array feeds{graph.placeholder(inputs[0].shape(), DType::F32),
-                                       graph.placeholder(result->prefill_weight.shape(), DType::F16)};
-                const auto hidden = graph.matmul(graph.cast(feeds[0], DType::F16), feeds[1], false, true);
-                const std::array outputs{graph.cast(hidden, DType::F32)};
-                result->prefill_executable = require(graph.compile(feeds, outputs));
-                if (result->packed_output_scale > 0)
+                std::vector<std::int64_t> program_key(inputs[0].shape().begin(), inputs[0].shape().end());
+                program_key.push_back(matrix_shape[0]);
+                program_key.push_back(spec.epsilon > 0);
+                auto program = prefill_programs_.find(program_key);
+                if (program == prefill_programs_.end()) {
+                    auto graph = require(mps::Graph::create());
+                    const std::array feeds{
+                        graph.placeholder(inputs[0].shape(), spec.epsilon > 0 ? DType::F16 : DType::F32),
+                        graph.placeholder(matrix_shape, DType::F16)};
+                    const auto hidden = graph.matmul(graph.cast(feeds[0], DType::F16), feeds[1], false, true);
+                    const std::array outputs{graph.cast(hidden, DType::F32)};
+                    auto executable = std::make_shared<mps::Executable>(require(graph.compile(feeds, outputs)));
+                    if (prefill_programs_.size() >= 128) prefill_programs_.clear();
+                    program = prefill_programs_.emplace(std::move(program_key), std::move(executable)).first;
+                }
+                result->prefill_executable = program->second;
+                if (result->packed_output_scale > 0 && !stream_.reuse_outputs)
                     result->prefill_output =
                         require(Tensor::empty(result->shape, DType::F32, tensor::Device::apple_gpu()));
             }
+            if (spec.epsilon > 0 && !stream_.reuse_outputs)
+                result->packed_input = require(Tensor::empty({inputs[0].shape().begin(), inputs[0].shape().end()},
+                                                             result->prefill_executable ? DType::F16 : DType::F32,
+                                                             tensor::Device::apple_gpu()));
+            result->scratch_bytes = (result->packed_input.defined() ? result->packed_input.nbytes() : 0) +
+                                    (result->prefill_output.defined() ? result->prefill_output.nbytes() : 0);
+            stream_.scratch_bytes += result->scratch_bytes;
+            stream_.peak_scratch_bytes = std::max(stream_.peak_scratch_bytes, stream_.scratch_bytes);
             return result;
         }
         auto graph = require(mps::Graph::create());
@@ -228,6 +332,12 @@ public:
         mps::Value residual;
         const std::array<std::int64_t, 1> axis{static_cast<std::int64_t>(inputs[0].dimensions()) - 1};
         switch (spec.operation) {
+            case Operation::GELU_MULTIPLY:
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "GELU multiplication requires direct kernel"});
+            case Operation::RMS_ROTARY:
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "RMS rotary requires direct kernel"});
+            case Operation::GREEDY_TOKEN:
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "greedy selection must use the direct kernel"});
             case Operation::ADD:
                 output = graph.add(operands[0], operands[1]);
                 break;
@@ -253,16 +363,18 @@ public:
                                                     index == 0 ? heads / key_heads : 1, head_width}),
                             axes);
                     };
-                    auto scores = graph.matmul(split(0), split(1), false, true);
-                    scores = graph.multiply(scores, graph.scalar(spec.epsilon, DType::F32));
+                    const auto query = split(0), key = split(1), value = split(2);
                     std::vector<std::int64_t> mask_shape(5 - inputs[3].dimensions(), 1);
                     mask_shape.insert(mask_shape.end(), inputs[3].shape().begin(), inputs[3].shape().end());
                     if (inputs[3].dimensions() == 4) {
                         mask_shape[0] = inputs[3].size(0);
                         mask_shape[1] = 1;
                     }
-                    scores = graph.add(scores, graph.reshape(operands[3], mask_shape));
-                    auto hidden = graph.matmul(graph.softmax(scores, 4), split(2));
+                    const auto mask = graph.reshape(operands[3], mask_shape);
+                    auto scores =
+                        graph.multiply(graph.matmul(query, key, false, true), graph.scalar(spec.epsilon, DType::F32));
+                    scores = graph.add(scores, mask);
+                    auto hidden = graph.matmul(graph.softmax(scores, 4), value);
                     const std::array<std::int64_t, 5> merge{0, 3, 1, 2, 4};
                     output = graph.reshape(graph.transpose(hidden, merge), inputs[0].shape());
                     break;
@@ -381,6 +493,7 @@ private:
     };
     std::map<std::tuple<const std::byte*, const std::byte*, std::int32_t, std::int32_t>, PrefillWeight>
         prefill_weights_;
+    std::map<std::vector<std::int64_t>, std::shared_ptr<const mps::Executable>> prefill_programs_;
     Stream stream_;
 };
 } // namespace

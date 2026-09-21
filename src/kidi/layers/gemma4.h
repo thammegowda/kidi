@@ -8,6 +8,8 @@ class RmsNormImpl : public Module {
 public:
     RmsNormImpl(std::int32_t width, float epsilon, bool learned = true);
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
+    auto forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine, const Tensor& sine) const
+        -> Tensor;
 
     auto forward_residual(ops::Context& context, const Tensor& input, const Tensor& residual,
                           const Tensor& output_scale = {}) const -> Tensor;
@@ -41,13 +43,21 @@ private:
     Linear gate_, up_, down_;
 };
 
-KIDI_MODULE(GemmaAttention);
-class GemmaAttentionImpl : public Module {
+KIDI_MODULE(Gemma4Attention);
+struct Gemma4AttentionSegment {
+    KeyValue* cache;
+    std::size_t position, length;
+    const Tensor* mask;
+    std::int64_t key_start = 0;
+};
+class Gemma4AttentionImpl : public Module {
 public:
-    GemmaAttentionImpl(std::int32_t hidden, std::int32_t heads, std::int32_t key_heads, std::int32_t head_width,
-                       float epsilon, bool shared, std::int32_t packed_bits = 0);
-    auto forward(ops::Context& context, const Tensor& input, KeyValue& cache, const Tensor& index, const Tensor& mask,
+    Gemma4AttentionImpl(std::int32_t hidden, std::int32_t heads, std::int32_t key_heads, std::int32_t head_width,
+                        float epsilon, bool shared, std::int32_t packed_bits = 0);
+    auto forward(ops::Context& context, const Tensor& input, KeyValue& cache, std::size_t position, const Tensor& mask,
                  const Tensor& cosine, const Tensor& sine, std::int64_t key_start = 0) const -> Tensor;
+    auto forward_segments(ops::Context& context, const Tensor& input, std::span<const Gemma4AttentionSegment> segments,
+                          const Tensor& cosine, const Tensor& sine, bool cache_only = false) const -> Tensor;
 
 private:
     Linear query_, key_{nullptr}, value_{nullptr}, output_;
@@ -56,18 +66,21 @@ private:
     std::int32_t heads_, key_heads_, head_width_;
 };
 
-KIDI_MODULE(GemmaBlock);
-class GemmaBlockImpl : public Module {
+KIDI_MODULE(Gemma4Block);
+class Gemma4BlockImpl : public Module {
 public:
-    GemmaBlockImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t heads, std::int32_t key_heads,
-                   std::int32_t head_width, std::int32_t per_layer_width, float epsilon, bool shared,
-                   std::int32_t mlp_bits = 0, std::int32_t attention_bits = 0, std::int32_t per_layer_bits = 0);
+    Gemma4BlockImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t heads, std::int32_t key_heads,
+                    std::int32_t head_width, std::int32_t per_layer_width, float epsilon, bool shared,
+                    std::int32_t mlp_bits = 0, std::int32_t attention_bits = 0, std::int32_t per_layer_bits = 0);
     auto forward(ops::Context& context, const Tensor& input, const Tensor& per_layer_input, KeyValue& cache,
-                 const Tensor& index, const Tensor& mask, const Tensor& cosine, const Tensor& sine,
+                 std::size_t position, const Tensor& mask, const Tensor& cosine, const Tensor& sine,
                  std::int64_t key_start = 0) const -> Tensor;
+    auto forward_segments(ops::Context& context, const Tensor& input, const Tensor& per_layer_input,
+                          std::span<const Gemma4AttentionSegment> segments, const Tensor& cosine, const Tensor& sine,
+                          bool cache_only = false) const -> Tensor;
 
 private:
-    GemmaAttention attention_;
+    Gemma4Attention attention_;
     GatedFeedForward feed_forward_;
     RmsNorm input_norm_, attention_norm_, pre_feed_forward_norm_, post_feed_forward_norm_, per_layer_norm_;
     Linear per_layer_gate_, per_layer_projection_;

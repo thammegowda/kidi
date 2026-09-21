@@ -6,6 +6,16 @@
 #include "kidi/tensor/tensor.h"
 
 namespace kidi::ops {
+class DecodeScope {
+public:
+    explicit DecodeScope(bool enabled);
+    ~DecodeScope();
+    DecodeScope(const DecodeScope&) = delete;
+    auto operator=(const DecodeScope&) -> DecodeScope& = delete;
+
+private:
+    bool previous_;
+};
 using tensor::Tensor;
 
 /// Execution mode for the current call; public operations scope and restore it.
@@ -62,10 +72,14 @@ public:
     auto packed_linear(const Tensor& input, const Tensor& weight, const Tensor& scales, std::int32_t bits,
                        std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F) -> Tensor;
     auto gelu(const Tensor& input, bool approximate = false) -> Tensor;
+    auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
     auto gelu_(Tensor& input, bool approximate = false) -> Tensor&;
     auto tanh(const Tensor& input) -> Tensor;
     auto static_round(const Tensor& input, float scale) -> Tensor;
+    auto greedy_token(const Tensor& logits) -> Tensor;
     auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
+    auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine, float epsilon)
+        -> Tensor;
     auto rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,
                            const Tensor& output_scale = {}) -> Tensor;
     auto layer_norm(const Tensor& input, const Tensor& scale, const Tensor& bias, float epsilon) -> Tensor;
@@ -80,6 +94,7 @@ public:
     auto concat(std::span<const Tensor> inputs, std::int64_t axis) -> Tensor;
     auto scatter(const Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor;
     auto scatter_(Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor&;
+    auto copy_slice_(Tensor& destination, const Tensor& source, std::int64_t axis, std::int64_t start) -> Tensor&;
     auto reshape(const Tensor& input, std::vector<std::int64_t> shape) -> Tensor;
 
 private:

@@ -9,7 +9,7 @@ Repository: [thammegowda/kidi](https://github.com/thammegowda/kidi).
 Kidi-owned code follows [CODING_GUIDELINES.md](CODING_GUIDELINES.md).
 
 RTG translation accepts and returns Moses-tokenized UTF-8 text; normalization
-and detokenization remain outside that contract. Gemma accepts ordinary UTF-8
+and detokenization remain outside that contract. Gemma 4 accepts ordinary UTF-8
 prompts and uses the original model tokenizer.
 
 ## Build
@@ -192,7 +192,7 @@ never rewritten. Embeddings stay at original precision. Multi-row prefill uses
 original floating weights by default, with `--packed-prefill` available for
 packed GEMM. Retaining original weights means this is not a low-bit-only memory
 footprint. Q4 changes predictions; BF16 remains the default, and Q8 is the more
-conservative tested low-bit option. See [the packed execution study](benchmarks/gemma/LOW_BIT.md)
+conservative tested low-bit option. See [the packed execution study](benchmarks/gemma4/LOW_BIT.md)
 for measured speed, memory, loading cost, and quality differences.
 
 CPU local attention skips old masked history in stable buckets. This improves
@@ -204,10 +204,10 @@ checkpoint is supported directly. Run the same config-only setup helper in its
 model directory, then use `kidi generate` without `--weight-bits`: trained mixed
 Q2/Q4/Q8 weights and activation/cache scales come from the checkpoint. The loader
 rejects PTQ precision overrides. Default GPU prefill caches expanded FP16 matrices;
-`--packed-prefill` avoids that cache but is slower. See [the native QAT report](benchmarks/gemma/QAT.md)
+`--packed-prefill` avoids that cache but is slower. See [the native QAT report](benchmarks/gemma4/QAT.md)
 for downloads, correctness checks, memory costs, and the remaining LiteRT-LM gap.
 
-See [the Gemma benchmark report](benchmarks/gemma/README.md) for measured CPU/GPU
+See [the Gemma 4 benchmark report](benchmarks/gemma4/README.md) for measured CPU/GPU
 comparisons with LiteRT-LM, including MTP, precision differences, and the applied
 executable-reuse optimization. LiteRT-LM remains faster in the measured cases.
 

@@ -1,4 +1,4 @@
-#include "kidi/layers/gemma.h"
+#include "kidi/layers/gemma4.h"
 
 #include <algorithm>
 #include <bit>
@@ -15,6 +15,10 @@ RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned) : epsi
 }
 auto RmsNormImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
     return context.rms_norm(input, weight_, epsilon_);
+}
+auto RmsNormImpl::forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
+                                 const Tensor& sine) const -> Tensor {
+    return context.rms_rotary(input, weight_, cosine, sine, epsilon_);
 }
 auto RmsNormImpl::forward_residual(ops::Context& context, const Tensor& input, const Tensor& residual,
                                    const Tensor& output_scale) const -> Tensor {
@@ -83,11 +87,10 @@ GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t int
     register_module("down_proj", down_);
 }
 auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    return down_->forward(
-        context, context.multiply(context.gelu(gate_->forward(context, input), true), up_->forward(context, input)));
+    return down_->forward(context, context.gelu_multiply(gate_->forward(context, input), up_->forward(context, input)));
 }
-GemmaAttentionImpl::GemmaAttentionImpl(std::int32_t hidden, std::int32_t heads, std::int32_t key_heads,
-                                       std::int32_t head_width, float epsilon, bool shared, std::int32_t packed_bits)
+Gemma4AttentionImpl::Gemma4AttentionImpl(std::int32_t hidden, std::int32_t heads, std::int32_t key_heads,
+                                         std::int32_t head_width, float epsilon, bool shared, std::int32_t packed_bits)
     : query_(hidden, heads * head_width, true, false, packed_bits),
       output_(heads * head_width, hidden, true, false, packed_bits),
       query_norm_(head_width, epsilon),
@@ -111,36 +114,85 @@ GemmaAttentionImpl::GemmaAttentionImpl(std::int32_t hidden, std::int32_t heads, 
         }
     }
 }
-auto GemmaAttentionImpl::forward(ops::Context& context, const Tensor& input, KeyValue& cache, const Tensor& index,
-                                 const Tensor& mask, const Tensor& cosine, const Tensor& sine,
-                                 std::int64_t key_start) const -> Tensor {
+auto Gemma4AttentionImpl::forward(ops::Context& context, const Tensor& input, KeyValue& cache, std::size_t position,
+                                  const Tensor& mask, const Tensor& cosine, const Tensor& sine,
+                                  std::int64_t key_start) const -> Tensor {
+    const std::array segments{Gemma4AttentionSegment{&cache, position, input.size(1), &mask, key_start}};
+    return forward_segments(context, input, segments, cosine, sine);
+}
+auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& input,
+                                           std::span<const Gemma4AttentionSegment> segments, const Tensor& cosine,
+                                           const Tensor& sine, bool cache_only) const -> Tensor {
     const auto length = static_cast<std::int64_t>(input.size(1));
+    std::size_t total = 0;
+    for (const auto& segment : segments) {
+        if (!segment.cache || !segment.mask || !segment.length || segment.length > input.size(1) - total ||
+            segment.position > segment.cache->key.size(1) ||
+            segment.length > segment.cache->key.size(1) - segment.position)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed attention segment"});
+        total += segment.length;
+    }
+    if (segments.empty() || total != input.size(1))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "attention segments do not cover input"});
     const auto reshape = [&](const Tensor& value, std::int32_t heads) {
         return context.reshape(value, {1, length, heads, head_width_});
     };
-    auto query =
-        context.rotary(query_norm_->forward(context, reshape(query_->forward(context, input), heads_)), cosine, sine);
+    Tensor query;
+    if (!cache_only)
+        query = query_norm_->forward_rotary(context, reshape(query_->forward(context, input), heads_), cosine, sine);
+    Tensor key, value;
     if (key_) {
-        auto key = context.rotary(key_norm_->forward(context, reshape(key_->forward(context, input), key_heads_)),
-                                  cosine, sine);
-        auto value = value_norm_->forward(context, reshape(value_->forward(context, input), key_heads_));
+        key = key_norm_->forward_rotary(context, reshape(key_->forward(context, input), key_heads_), cosine, sine);
+        value = value_norm_->forward(context, reshape(value_->forward(context, input), key_heads_));
         if (key_scale_.defined()) {
             key = context.static_round(key, require(key_scale_.data<float>())[0]);
             value = context.static_round(value, require(value_scale_.data<float>())[0]);
         }
-        context.scatter_(cache.key, context.reshape(key, {1, length, key_heads_ * head_width_}), index);
-        context.scatter_(cache.value, context.reshape(value, {1, length, key_heads_ * head_width_}), index);
+        key = context.reshape(key, {1, length, key_heads_ * head_width_});
+        value = context.reshape(value, {1, length, key_heads_ * head_width_});
     }
-    const auto extent = static_cast<std::int64_t>(mask.size(-1));
-    auto hidden = context.grouped_query_attention(
-        context.reshape(query, {1, length, heads_ * head_width_}), context.slice(cache.key, 1, 0, extent + key_start),
-        context.slice(cache.value, 1, 0, extent + key_start), heads_, key_heads_, mask, 1.F, key_start);
+    const auto prefix = [&](const Tensor& memory, std::int64_t extent) {
+        if (memory.dimensions() != 3 || memory.size(0) != 1)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Gemma 4 cache must contain one sequence"});
+        auto rows = require(memory.select(0, 0));
+        auto view = require(rows.narrow(0, 0, extent));
+        return context.reshape(view, {1, extent, static_cast<std::int64_t>(memory.size(2))});
+    };
+    if (!cache_only) query = context.reshape(query, {1, length, heads_ * head_width_});
+    std::vector<Tensor> outputs;
+    Tensor single_output;
+    if (segments.size() > 1) outputs.reserve(segments.size());
+    std::size_t offset = 0;
+    for (const auto& segment : segments) {
+        auto& cache = *segment.cache;
+        if (key_) {
+            const auto keys = context.slice(key, 1, offset, segment.length);
+            const auto values = context.slice(value, 1, offset, segment.length);
+            context.copy_slice_(cache.key, keys, 1, segment.position);
+            context.copy_slice_(cache.value, values, 1, segment.position);
+        }
+        if (cache_only) {
+            offset += segment.length;
+            continue;
+        }
+        const auto extent = static_cast<std::int64_t>(segment.mask->size(-1)) + segment.key_start;
+        auto attended = context.grouped_query_attention(context.slice(query, 1, offset, segment.length),
+                                                        prefix(cache.key, extent), prefix(cache.value, extent), heads_,
+                                                        key_heads_, *segment.mask, 1.F, segment.key_start);
+        if (segments.size() == 1)
+            single_output = std::move(attended);
+        else
+            outputs.push_back(std::move(attended));
+        offset += segment.length;
+    }
+    if (cache_only) return {};
+    auto hidden = segments.size() == 1 ? single_output : context.concat(outputs, 1);
     return output_->forward(context, hidden);
 }
-GemmaBlockImpl::GemmaBlockImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t heads,
-                               std::int32_t key_heads, std::int32_t head_width, std::int32_t per_layer_width,
-                               float epsilon, bool shared, std::int32_t mlp_bits, std::int32_t attention_bits,
-                               std::int32_t per_layer_bits)
+Gemma4BlockImpl::Gemma4BlockImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t heads,
+                                 std::int32_t key_heads, std::int32_t head_width, std::int32_t per_layer_width,
+                                 float epsilon, bool shared, std::int32_t mlp_bits, std::int32_t attention_bits,
+                                 std::int32_t per_layer_bits)
     : attention_(hidden, heads, key_heads, head_width, epsilon, shared, attention_bits),
       feed_forward_(hidden, intermediate, mlp_bits),
       input_norm_(hidden, epsilon),
@@ -162,17 +214,23 @@ GemmaBlockImpl::GemmaBlockImpl(std::int32_t hidden, std::int32_t intermediate, s
     register_parameter("layer_scalar", scalar_, {1}, tensor::DType::F32);
     if (scalar_.defined()) require(scalar_.data<float>())[0] = 1.F;
 }
-auto GemmaBlockImpl::forward(ops::Context& context, const Tensor& input, const Tensor& per_layer_input, KeyValue& cache,
-                             const Tensor& index, const Tensor& mask, const Tensor& cosine, const Tensor& sine,
-                             std::int64_t key_start) const -> Tensor {
-    auto hidden = attention_norm_->forward_residual(
-        context,
-        attention_->forward(context, input_norm_->forward(context, input), cache, index, mask, cosine, sine, key_start),
-        input);
+auto Gemma4BlockImpl::forward(ops::Context& context, const Tensor& input, const Tensor& per_layer_input,
+                              KeyValue& cache, std::size_t position, const Tensor& mask, const Tensor& cosine,
+                              const Tensor& sine, std::int64_t key_start) const -> Tensor {
+    const std::array segments{Gemma4AttentionSegment{&cache, position, input.size(1), &mask, key_start}};
+    return forward_segments(context, input, per_layer_input, segments, cosine, sine);
+}
+auto Gemma4BlockImpl::forward_segments(ops::Context& context, const Tensor& input, const Tensor& per_layer_input,
+                                       std::span<const Gemma4AttentionSegment> segments, const Tensor& cosine,
+                                       const Tensor& sine, bool cache_only) const -> Tensor {
+    auto attended =
+        attention_->forward_segments(context, input_norm_->forward(context, input), segments, cosine, sine, cache_only);
+    if (cache_only) return {};
+    auto hidden = attention_norm_->forward_residual(context, attended, input);
     hidden = post_feed_forward_norm_->forward_residual(
         context, feed_forward_->forward(context, pre_feed_forward_norm_->forward(context, hidden)), hidden);
-    auto gate = context.gelu(per_layer_gate_->forward(context, hidden), true);
-    auto projected = per_layer_projection_->forward(context, context.multiply(gate, per_layer_input));
+    auto gate = per_layer_gate_->forward(context, hidden);
+    auto projected = per_layer_projection_->forward(context, context.gelu_multiply(gate, per_layer_input));
     return per_layer_norm_->forward_residual(context, projected, hidden, scalar_);
 }
 } // namespace kidi::layers

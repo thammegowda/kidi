@@ -136,6 +136,41 @@ auto CommandBatch::copy_(const tensor::Tensor& source, tensor::Tensor& destinati
     [encoder endEncoding];
     return {};
 }
+auto CommandBatch::copy_slice_(const tensor::Tensor& source, tensor::Tensor& destination, std::size_t outer,
+                               std::size_t source_bytes, std::size_t destination_bytes, std::size_t offset_bytes)
+    -> Result<void> {
+    if (impl_->finished || source.device() != tensor::Device::apple_gpu() || source.dtype() != destination.dtype() ||
+        !source.is_contiguous() || !destination.is_contiguous() || !outer || !source_bytes || !destination_bytes ||
+        offset_bytes > destination_bytes || source_bytes > destination_bytes - offset_bytes ||
+        outer > destination.nbytes() / destination_bytes || outer > source.nbytes() / source_bytes)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Metal contiguous slice copy"});
+    auto writable = destination.host_bytes();
+    if (!writable) return std::unexpected(std::move(writable.error()));
+    auto from = tensor::metal_buffer(source), to = tensor::metal_buffer(destination);
+    if (!from) return std::unexpected(std::move(from.error()));
+    if (!to) return std::unexpected(std::move(to.error()));
+    tensor::Tensor snapshot;
+    if (from->handle == to->handle) {
+        auto temporary =
+            tensor::Tensor::empty({source.shape().begin(), source.shape().end()}, source.dtype(), source.device());
+        if (!temporary) return std::unexpected(std::move(temporary.error()));
+        snapshot = std::move(*temporary);
+        auto status = copy_(source, snapshot);
+        if (!status) return status;
+        from = tensor::metal_buffer(snapshot);
+        if (!from) return std::unexpected(std::move(from.error()));
+    }
+    auto encoder = [impl_->buffer blitCommandEncoder];
+    if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create slice copy encoder"});
+    for (std::size_t block = 0; block < outer; ++block)
+        [encoder copyFromBuffer:(__bridge id<MTLBuffer>)from->handle
+                   sourceOffset:from->offset_bytes + block * source_bytes
+                       toBuffer:(__bridge id<MTLBuffer>)to->handle
+              destinationOffset:to->offset_bytes + block * destination_bytes + offset_bytes
+                           size:source_bytes];
+    [encoder endEncoding];
+    return {};
+}
 auto CommandBatch::scatter_(tensor::Tensor& destination, const tensor::Tensor& updates, const tensor::Tensor& indices)
     -> Result<void> {
     if (impl_->finished || destination.dimensions() != 3 || updates.dimensions() != 3 ||

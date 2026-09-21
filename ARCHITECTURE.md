@@ -132,6 +132,13 @@ Decoder K/V updates now use `scatter_`. A copied `DecoderState` shares the mutab
 caches; create an independent state for another generation or branch. In-place
 operations affect activations and caches, not registered inference parameters.
 
+Gemma 4's sequential K/V updates use `copy_slice_(destination, source, axis, start)`.
+This operation accepts contiguous, same-device tensors with matching dtype and
+non-axis dimensions. Bounds and writability are checked before dispatch; overlaps
+are snapshotted. CPU copies contiguous blocks; Metal queues offset blits and
+retains their owners. The runtime offset does not create a prepared-cache entry.
+General scatter behavior, including duplicate-index handling, is unchanged.
+
 Linear and normalization parameters are fixed inference weights. Constant-weight
 prepared operators key parameter identity as well as dtype and shapes and retain
 owners. Same-device RMSNorm parameters and Metal linear parameters instead use
@@ -143,8 +150,12 @@ Do not mutate their storage after first use; replace registered parameters with
 may change between completed calls without recompilation. This is an inference
 API, not an autograd or optimizer framework.
 
-The prepared-operator cache is bounded at 1,024 entries; reaching the bound drains
-work and clears it. `preparation_ns()` reports cumulative operator preparation.
+The prepared-operator cache defaults to 4,096 entries with LRU replacement. Reaching
+the bound drains queued work, evicts the least-recent quarter, and releases pooled
+buffers; each entry owns its constant-parameter references. The bounded override
+`KIDI_OPERATOR_CACHE_CAPACITY=1..16384` supports working-set experiments. This is an
+entry limit, not a native-memory byte budget. `preparation_ns()` reports cumulative
+operator preparation, including eviction synchronization when required.
 
 ### Allocation and Ownership
 
@@ -162,26 +173,31 @@ their slab alive after arena/context destruction. Slots are reusable only when
 there are no caller or asynchronous-work owners. There is no blanket per-token
 reset that could invalidate user tensors.
 
-Metal output pools directly own separately backed slots. A shared-slab prototype
-using MPSNDArray offsets failed slice/attention correctness checks and was removed.
-The later retain-only arena was also removed: it did not suballocate or recycle
-Metal buffers and unnecessarily kept evicted operators' allocations alive.
-The previous eight-output cap caused recurring allocations while GPU work retained
-many outputs. Pools now grow to the observed high-water mark and retain all slots;
-subsequent fixed-shape calls reuse them. Paired residual/normalized outputs share
-one pool; a live first output prevents its slot from being selected for the second.
-CPU arena capacity remains grow-only until context destruction. Metal allocations
-can be released after pool eviction once pending work, reusable stream ownership
-slots, native bindings, and caller tensors no longer retain them. Neither backend
-promises a fixed-byte memory budget; externally retained outputs can grow memory.
+Metal uses a stream-owned output pool with separately backed, tracked buffers.
+An unaliased output may be recycled after its last consumer has been encoded:
+later writes are ordered after those reads on the same stream. The pool retains
+storage until the prepared cache is evicted or the context is destroyed. Caller
+aliases, including views, prevent reuse. Calibrated projection scratch uses the
+same pool; expanded prefill weights remain separately cached by weight identity.
+The pool must not service unordered queues or untracked resources without explicit
+dependency handling. No general host-write permission follows from queued reuse.
+
+External tensor owners are retained until successful completion and then released.
+Prepared-cache eviction drains work before releasing pooled storage; escaped
+tensors remain valid. Native binding objects may retain Metal buffers longer.
+Set `KIDI_METAL_REUSE_OUTPUTS=0` before context creation for the per-operator
+pool/scratch fallback. CPU arena capacity remains grow-only until destruction.
+Neither backend promises a fixed-byte budget; diverse shapes and externally
+retained outputs can increase memory. This is not slab allocation: all MPSGraph
+bindings still use zero-offset buffers.
 
 Decoder state preallocates its token embedding, causal mask, index, and K/V buffers
 before the token loop. `EmbeddingImpl::forward_` fills a supplied host-accessible
 device tensor; callers must ensure prior queued uses have completed. Generated
 token vectors reserve their configured limits before batched greedy search.
 
-Metal execution retains reusable ownership slots, updating owners only when the
-buffer changes. Binding caches hold buffer metadata and Metal data objects, not
+Metal execution retains non-pool tensor owners through completion. Binding caches
+hold buffer metadata and Metal data objects, not
 additional tensor leases; up to 64 binding sets are retained per executable.
 Command batches reuse completion tickets and scatter error storage after finishing.
 The native command buffer itself remains one-shot. Callback lifetime ownership
@@ -191,8 +207,37 @@ This removes identified Kidi allocation/refcount churn, not every allocation ins
 YNNPACK, MPSGraph, Objective-C descriptors, or cold preparation. Profiles distinguish
 output-slot allocations from those internal allocations. See
 [benchmarks/metal/ALLOCATION_REUSE.md](benchmarks/metal/ALLOCATION_REUSE.md) for results.
+With `KIDI_PROFILE_MEMORY=1`, Metal also reports cumulative explicit output
+allocations, prepared calibration scratch, expanded weights, external-owner slots,
+and native `currentAllocatedSize` sampled at completion boundaries. The observed
+native high-water mark can miss intra-batch transients and is not physical RSS or
+system swap usage. Current results are in the
+[Gemma 4 optimization journal](benchmarks/gemma4/JOURNAL.md).
 
 ## Backend Internals
+
+Gemma 4 query/key RMSNorm and RoPE share a direct Metal dispatch with the same
+reduction geometry and intermediate arithmetic order as the separate kernels.
+CPU composes the existing operators; `KIDI_SEPARATE_RMS_ROTARY=1` also restores
+that composition on Metal.
+
+Gemma 4 uses host-managed token lookup and positions with dense K/V storage on
+the execution device. Device-state, direct-paged attention and projection-replay
+experiments were removed after review; there is no alternate execution path or
+benchmark callback in the runtime.
+
+`Context::greedy_token` reduces each FP32 vocabulary row to an I32 token index.
+Equal maxima choose the lowest index; NaN, positive infinity, or an entirely
+negative-infinite row produces -1. Metal uses a two-stage reduction; CPU uses
+the same selection contract. Gemma 4's `forward_token` applies this to the actual
+post-softcap logits before the existing completion fence and rejects -1.
+The generic decoder accepts preselected tokens only for unscored greedy search,
+retaining the existing stop/length policy. GPU Gemma 4 generation enables this
+path by default; `KIDI_HOST_GREEDY=1` restores host selection. CPU selection is
+unchanged. The profile records `device_selection` and `generation_ns` (request
+start through text decoding), avoiding misleading comparisons when selection
+moves across the model-only timing boundary. This does not eliminate per-token
+synchronization or implement graph replay.
 
 YNNPACK and MPSGraph are graph-oriented libraries. Small operator-private
 executables are permitted, cached by input signatures, and reused without model
@@ -324,7 +369,12 @@ Request spans are borrowed for the callback only.
 `generate_batch` provides a host greedy loop with independent per-row EOS and
 limits. Its callback receives one current token per row and the generated step
 count. Finished rows remain in the batch with PAD inputs; their scores and output
-lengths no longer change. A fresh invocation resets all search state.
+lengths no longer change. `GreedyRequest::active_rows` lets adapters pack only live
+rows while returning results at original row indices. Preselected token vectors
+are accepted only for unscored greedy search with no simultaneous score values.
+`GreedyState` owns incremental per-request stopping/scoring state and copies its
+stop IDs, allowing independent retirement and admission. A fresh invocation resets
+all search state.
 
 Score callbacks return row-major FP32 logits or log probabilities, explicitly
 tagged. Returned spans must remain alive until the next callback. Results exclude
@@ -336,26 +386,72 @@ bounded length-sorted batching and restores original input order.
 tanh-GELU MLPs, grouped-query attention, local/global masks, proportional RoPE,
 shared K/V, per-layer embeddings, and logit softcapping. `inference::Generator`
 loads the original Hugging Face checkpoint and single tokenizer through the
-Gemma configuration path. `Package` remains the RTG two-tokenizer package API.
-Gemma key mapping and small BF16-to-FP32 normalization conversions happen at
+Gemma 4 configuration path. `Package` remains the RTG two-tokenizer package API.
+Gemma 4 key mapping and small BF16-to-FP32 normalization conversions happen at
 load time; there is no offline checkpoint conversion. Embeddings and the tied
 output projection retain CPU-mapped weights, with looked-up rows allocated on
 the execution device. Other projections execute on the selected backend.
 
-Gemma generation currently supports greedy, batch-one, text-only requests.
-Prefill is chunked and skips unused output projections between chunks. Its
+Gemma 4 generation supports greedy text-only requests, including packed independent
+decode rows through `forward_batch` and `forward_batch_tokens`. Projection and
+pointwise work share packed rows; each attention segment retains its own cache,
+length, position and mask. Scoped decode projection policy preserves packed-vector
+arithmetic rather than selecting calibrated FP16 prefill at four or more rows.
+Cache-only prefill stops at the final K/V-producing layer immediately after its
+K/V writes: it omits that layer's query/attention/MLP and all subsequent shared-K/V
+consumer layers. Those layers cannot affect retained history. Full all-token
+logit evaluation still traverses every block, and tests require byte-identical
+producer caches between both paths for the same input prefix. Native-QAT CPU
+last-logit calls additionally prefill all preceding tokens cache-only and run the
+full model for the final token. `KIDI_FULL_LAST_CHUNK=1` disables this CPU policy.
+The default native-QAT Metal matrix path
+evaluates the entire projected chunk through its K/V-producing blocks, then retains
+only the final four query rows for subsequent shared-K/V consumers when the chunk
+has at least 64 tokens. Consumer masks and rotary rows are sliced together; cache
+writes and final state positions remain unchanged. All-token logits, packed-only
+prefill and other precisions retain full-consumer execution. Disable this policy
+with `KIDI_SHARED_PREFILL_TAIL=0` or `KIDI_FULL_LAST_CHUNK=1`. Long fixtures and
+generated-token comparisons pass, though full-model logits are not universally
+bit-identical across query shapes. Profiles distinguish `last_token_prefill`
+and `shared_prefill_tail`. Prefill remains
+chunked at the inference layer. Its
 explicit fixed-capacity caches are shared by the configured later layers;
-copying `GemmaState` aliases mutable history. Start a new state for an independent
+copying `Gemma4State` aliases mutable history. Start a new state for an independent
 request. The generic decoder accepts additional stop IDs; disabling EOS stopping
 is an explicit benchmark option that retains generated special tokens.
 
-Gemma can prepare Q4/Q8 linear weights in memory through `set_checkpoint` runtime
+`Generator::generate_batch` accepts 1-16 prompts, prefills independently and retires
+decode rows through the shared decoder. `configure_serving`, `enqueue`, `step` and
+`cancel` expose a thread-confined incremental queue. Stable request IDs identify
+streamed token IDs and final text/results; callers may enqueue between steps.
+Outstanding requests, active slots (at most 16), and the sum of reserved dense-cache
+capacities are bounded. FIFO admission observes both slots and cache-token budget;
+ready requests decode each step before one bounded round-robin prefill chunk.
+Completion and cancellation release reservations. Cancellation has no completion
+event; unknown IDs are rejected. Drain or cancel requests before blocking generation
+or reconfiguration. A failed model step invalidates serving and requires reload.
+
+Serving rejects prefix-cache options. Active K/V remains dense and independent;
+this is not direct paged attention or mixed prefill/decode in one model invocation.
+The optional single-request prefix cache retains one dense snapshot, sized to a
+complete-chunk prefix within the byte budget. `fork_state` copies the matching
+prefix into independent request storage; subsequent writes cannot mutate the
+snapshot. Chunk-size and attention-policy changes invalidate reuse. Reported
+prefix reserved bytes equal the snapshot's K/V bytes, not the configured budget.
+
+Serving step timings report shared decode/prefill/preparation work. Per-request
+first-token and completion timestamps include queueing since enqueue; per-request
+decode time is not apportioned from shared batches. Static-batch first-token times
+are readiness during sequential prefill, not streamed delivery. None of these
+batched/cache-hit rates substitutes for uncached batch-one latency comparisons.
+
+Gemma 4 can prepare Q4/Q8 linear weights in memory through `set_checkpoint` runtime
 options. The registered state still holds original tensors. `ops::Context` owns
 derived packed bytes/scales and retains source handles, preventing address reuse;
 packing is shared across prefill/decode shapes. Q4 mode uses grouped MLP weights
 and per-channel Q8 for other projections. By default only single-row calls use
 packed weights; `packed_prefill` enables packed GEMM for multi-row calls too.
-Reloading a Gemma checkpoint resets its prepared context, so disabling quantization
+Reloading a Gemma 4 checkpoint resets its prepared context, so disabling quantization
 cannot reuse stale packed weights. There is no offline checkpoint rewrite.
 
 CPU packed operators use YNNPACK's integer dot path with dynamic INT8 activation
@@ -364,25 +460,25 @@ GEMM unpacks into bounded FP16 threadgroup tiles and accumulates in FP32. These
 are different compute policies and do not guarantee identical logits. Supported
 FP32 normalization, rotary, and pointwise operations use small Metal kernels;
 unsupported layouts retain their existing private MPSGraph implementation.
-Gemma attention bounds reads by 128-token active-prefix buckets while retaining
+Gemma 4 attention bounds reads by 128-token active-prefix buckets while retaining
 the explicit full-capacity cache. CPU additionally crops old masked local history
 inside prepared attention operators; global attention keeps the full active prefix.
 The lower bound preserves every token visible to the first query of a prefill
 chunk. GPU keeps its previous range because cropping did not improve measurements.
-`GemmaState::crop_local_attention = false` or CLI `--full-attention-cache` disables
+`Gemma4State::crop_local_attention = false` or CLI `--full-attention-cache` disables
 the CPU crop, which can otherwise change floating-point reduction order and
 quantized outputs. Local circular caches are not implemented.
 
 `ops::Context::rms_norm_residual` computes post-normalization, residual addition,
 and optional scalar output scaling in one operator. All operands are same-device
-FP32 tensors; no input is mutated. Gemma uses it for post-attention, post-MLP, and
+FP32 tensors; no input is mutated. Gemma 4 uses it for post-attention, post-MLP, and
 post-per-layer-input residuals. CPU and Metal implement the same equation without
 duplicating model topology or introducing model-level graphs.
 
 CUDA/QNN storage providers remain separate from execution; unsupported execution
 does not silently fall back to CPU.
 
-### Native Gemma Mobile QAT
+### Native Gemma 4 Mobile QAT
 
 The original `gemma` quantization policy is retained under `model.quantization_config`.
 Model construction resolves its supported per-module bit widths; registered packed
@@ -405,6 +501,22 @@ decode path. `Context(device, true)` and CLI `--packed-prefill` request packed
 prefill instead. These derived caches retain owners and are released with the
 context; there is no claim of a fixed-byte memory budget. Native QAT is a separately
 identified checkpoint path, not a silent replacement of BF16 or PTQ behavior.
+
+Expanded FP16 matrices are materialized by a GPU unpack kernel on the ordered
+stream, with source/destination owners retained through completion. Native matrix
+programs are shared by complete input shape, output width and feed dtype; matrix
+identity and calibration stay in the individual operator bindings. The backend
+keeps up to 128 geometry lookup entries, and live operators retain their program
+when that lookup cache is cleared. No weight values are captured in these programs.
+
+Metal can optionally bound retained expanded matrices with `KIDI_PREFILL_CACHE_BYTES`
+(0..16 GiB). Matrices beyond that budget are unpacked from the original packed
+weights into shared GPU scratch before the same FP16 matrix operator. This does
+not bound the packed model, transient/native workspace, or total process memory.
+The default retains all expanded matrices; the bounded path trades extra unpack
+work for lower residency. Set the budget to zero to stream every matrix. Bounded
+expansion requires the shared output pool. Each projection rounds its input into
+scratch; no calibrated-value cache or write-invalidation protocol is needed.
 
 ## Compatibility and Verification
 

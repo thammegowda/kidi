@@ -8,6 +8,8 @@
 #include <cstring>
 #include <numeric>
 #include <algorithm>
+#include <limits>
+#include <cstdlib>
 
 namespace kidi::runtime {
 namespace {
@@ -80,6 +82,39 @@ private:
 
     OutputPool pool_;
 };
+class GreedyToken final : public Operator {
+public:
+    explicit GreedyToken(tensor::Arena& arena) : pool_(&arena) {}
+    auto run(TensorInputs inputs) -> Tensor override {
+        const auto width = inputs[0].size(-1), rows = inputs[0].numel() / width;
+        const std::array shape{static_cast<std::int64_t>(rows)};
+        auto output = pool_.acquire(shape, DType::I32, tensor::Device::cpu());
+        const auto values = require(inputs[0].data<float>());
+        auto tokens = require(output.data<std::int32_t>());
+        for (std::size_t row = 0; row < rows; ++row) {
+            float best = -std::numeric_limits<float>::infinity();
+            std::int32_t token = -1;
+            bool invalid = false;
+            for (std::size_t column = 0; column < width; ++column) {
+                const auto value = values[row * width + column];
+                invalid |= std::isnan(value) || value == std::numeric_limits<float>::infinity();
+                if (value > best) {
+                    best = value;
+                    token = column;
+                }
+            }
+            tokens[row] = invalid ? -1 : token;
+        }
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "greedy selection is not an in-place operation"});
+    }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    OutputPool pool_;
+};
 class CpuOperator final : public Operator {
 public:
     CpuOperator(ynn::Executable executable, std::size_t count, std::size_t dynamic_count, DType dtype,
@@ -125,8 +160,24 @@ class CpuBackend final : public OperatorBackend {
 public:
     CpuBackend() { require(arena_.reserve(8 * 1024 * 1024)); }
     auto synchronize() -> void override {}
+    auto copy_slice_(Tensor& destination, const Tensor& source, std::size_t outer, std::size_t source_bytes,
+                     std::size_t destination_bytes, std::size_t offset_bytes) -> void override {
+        auto target = require(destination.host_bytes());
+        auto input = require(source.host_bytes());
+        std::vector<std::byte> snapshot;
+        const auto from = reinterpret_cast<std::uintptr_t>(input.data());
+        const auto to = reinterpret_cast<std::uintptr_t>(target.data());
+        if (from < to + target.size() && to < from + input.size()) {
+            snapshot.assign(input.begin(), input.end());
+            input = snapshot;
+        }
+        for (std::size_t block = 0; block < outer; ++block)
+            std::memcpy(target.data() + block * destination_bytes + offset_bytes, input.data() + block * source_bytes,
+                        source_bytes);
+    }
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
         if (spec.operation == Operation::SCATTER) return std::make_unique<Scatter>(arena_);
+        if (spec.operation == Operation::GREEDY_TOKEN) return std::make_unique<GreedyToken>(arena_);
         const auto flags = inputs[0].dtype() == DType::BF16 ? YNN_FLAG_NO_EXCESS_PRECISION : 0;
         const bool paired = spec.operation == Operation::RESIDUAL_NORM;
         auto graph = require(ynn::Graph::create(inputs.size() + (paired ? 2 : 1), flags));
@@ -315,10 +366,18 @@ public:
                     weight = YNN_INVALID_VALUE_ID;
                     check(ynn_define_static_transpose(native, 2, axes.data(), operands[1], &weight, 0));
                 }
-                check(::ynn::define_blockwise_dot(native, quantized, zero, scale, weight, YNN_INVALID_VALUE_ID,
-                                                  operands[2], packed ? spec.attributes[1] : inputs[1].size(0),
-                                                  packed ? YNN_INVALID_VALUE_ID : operands[3], ynn_type_fp32, result,
-                                                  0));
+                if (packed && spec.epsilon > 0 && spec.attributes[1] == inputs[0].size(-1) &&
+                    inputs[0].numel() > inputs[0].size(-1) && !std::getenv("KIDI_CPU_BLOCKWISE_PREFILL")) {
+                    const std::size_t columns = padded_columns;
+                    auto channel_scale = YNN_INVALID_VALUE_ID;
+                    check(ynn_define_static_reshape(native, 1, &columns, operands[2], &channel_scale, 0));
+                    check(ynn_define_dot(native, 1, quantized, weight, YNN_INVALID_VALUE_ID, &result, 0));
+                    result = binary(ynn_binary_multiply, binary(ynn_binary_multiply, result, channel_scale), scale);
+                } else
+                    check(::ynn::define_blockwise_dot(native, quantized, zero, scale, weight, YNN_INVALID_VALUE_ID,
+                                                      operands[2], packed ? spec.attributes[1] : inputs[1].size(0),
+                                                      packed ? YNN_INVALID_VALUE_ID : operands[3], ynn_type_fp32,
+                                                      result, 0));
                 if (packed) {
                     const auto output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]));
                     if (output_scale > 0) {
@@ -428,14 +487,28 @@ public:
             }
             case Operation::GATHER: {
                 const auto axis = static_cast<std::int32_t>(spec.attributes[0]);
+                auto indices = operands[1];
+                if (inputs[1].dimensions() == 1) {
+                    const auto normalized = axis < 0 ? axis + static_cast<std::int32_t>(inputs[0].dimensions()) : axis;
+                    if (normalized < 0 || static_cast<std::size_t>(normalized) >= inputs[0].dimensions())
+                        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "gather axis outside tensor rank"});
+                    std::vector<std::size_t> index_shape(inputs[0].dimensions(), 1);
+                    index_shape[normalized] = inputs[1].numel();
+                    indices = YNN_INVALID_VALUE_ID;
+                    check(ynn_define_static_reshape(native, index_shape.size(), index_shape.data(), operands[1],
+                                                    &indices, 0));
+                }
                 check(ynn_define_gather(native, 1, &axis, inputs[0].dimensions() + inputs[1].dimensions() - 1,
-                                        operands[0], operands[1], &result, 0));
+                                        operands[0], indices, &result, 0));
                 break;
             }
             case Operation::CONCAT:
                 check(ynn_define_concatenate(native, spec.attributes[0], operands.size(), operands.data(), &result, 0));
                 break;
             case Operation::SCATTER:
+            case Operation::GREEDY_TOKEN:
+            case Operation::RMS_ROTARY:
+            case Operation::GELU_MULTIPLY:
                 break;
         }
         auto output_id = static_cast<std::uint32_t>(inputs.size());

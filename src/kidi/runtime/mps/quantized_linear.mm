@@ -11,6 +11,7 @@
 #include <map>
 #include <tuple>
 #include <string>
+#include <utility>
 
 namespace kidi::runtime::mps {
 namespace {
@@ -178,6 +179,12 @@ inline float unpack_weight(device const uchar* weights, device const float* scal
     uint sign = 1u << (WEIGHT_BITS - 1);
     int value = int(raw ^ sign) - int(sign);
     return float(value) * scales[column * (geometry.width / WEIGHT_GROUP) + channel / WEIGHT_GROUP];
+}
+kernel void expand_packed_weight(device const uchar* weights [[buffer(0)]], device const float* scales [[buffer(1)]],
+                                  device half* output [[buffer(2)]], constant PackedGeometry& geometry [[buffer(3)]],
+                                  uint index [[thread_position_in_grid]]) {
+    if (index < geometry.width * geometry.columns)
+        output[index] = half(unpack_weight(weights, scales, index / geometry.width, index % geometry.width, geometry));
 }
 kernel void packed_gemv(device const float* input [[buffer(0)]],
                         device const uchar* weights [[buffer(1)]],
@@ -369,9 +376,65 @@ auto bind(id<MTLComputeCommandEncoder> encoder, const Tensor& tensor, NSUInteger
 }
 } // namespace
 
+auto encode_expand_packed_weight(CommandBatch& batch, const Tensor& weight, const Tensor& scales, Tensor& output,
+                                 std::int32_t bits, std::int32_t group_size) -> Result<void> {
+    if (output.dtype() != DType::F16 || output.dimensions() != 2 || output.numel() > UINT32_MAX ||
+        (bits != 2 && bits != 4 && bits != 8) || group_size <= 0 || output.size(1) % group_size ||
+        weight.dtype() != DType::U8 || weight.dimensions() != 2 || scales.dtype() != DType::F32 ||
+        scales.dimensions() != 2 || weight.size(0) != output.size(0) || weight.size(1) * (8 / bits) != output.size(1) ||
+        scales.size(0) != output.size(0) || scales.size(1) != output.size(1) / group_size)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid streamed packed weight geometry"});
+    static std::mutex mutex;
+    static std::map<std::pair<std::uint32_t, std::uint32_t>, id<MTLComputePipelineState>> cached;
+    id<MTLComputePipelineState> pipeline;
+    {
+        std::scoped_lock lock(mutex);
+        const auto key = std::pair<std::uint32_t, std::uint32_t>{bits, group_size};
+        if (const auto found = cached.find(key); found != cached.end())
+            pipeline = found->second;
+        else {
+            auto shared = pipelines();
+            if (!shared) return std::unexpected(std::move(shared.error()));
+            MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+            [constants setConstantValue:&key.first type:MTLDataTypeUInt atIndex:0];
+            [constants setConstantValue:&key.second type:MTLDataTypeUInt atIndex:1];
+            NSError* error = nil;
+            auto function = [(*shared)->library newFunctionWithName:@"expand_packed_weight"
+                                                     constantValues:constants
+                                                              error:&error];
+            pipeline = function ? [(*shared)->device newComputePipelineStateWithFunction:function error:&error] : nil;
+            if (!pipeline)
+                return std::unexpected(Error{ErrorCode::RUNTIME, "compile streamed packed weight expansion"});
+            cached.emplace(key, pipeline);
+        }
+    }
+    const struct {
+        std::uint32_t rows, width, columns, bits, group_size;
+        float input_scale, output_scale;
+    } geometry{1,
+               static_cast<std::uint32_t>(output.size(1)),
+               static_cast<std::uint32_t>(output.size(0)),
+               static_cast<std::uint32_t>(bits),
+               static_cast<std::uint32_t>(group_size),
+               0,
+               0};
+    MPSCommandBuffer* buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
+    auto encoder = [buffer computeCommandEncoder];
+    if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create streamed packed weight encoder"});
+    [encoder setComputePipelineState:pipeline];
+    auto result = bind(encoder, weight, 0);
+    if (result) result = bind(encoder, scales, 1);
+    if (result) result = bind(encoder, output, 2);
+    [encoder setBytes:&geometry length:sizeof(geometry) atIndex:3];
+    if (result)
+        [encoder dispatchThreads:MTLSizeMake(output.numel(), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder endEncoding];
+    return result;
+}
+
 auto encode_packed_linear(CommandBatch& batch, const Tensor& input, const Tensor& weight, const Tensor& scales,
                           Tensor& output, std::int32_t bits, std::int32_t group_size, float input_scale,
-                          float output_scale) -> Result<void> {
+                          float output_scale, bool vector_projection) -> Result<void> {
     auto shared = packed_pipelines(bits, group_size, input_scale > 0, output_scale > 0);
     if (!shared) return std::unexpected(std::move(shared.error()));
     if (input.numel() > UINT32_MAX || output.numel() > UINT32_MAX || weight.numel() > UINT32_MAX)
@@ -389,7 +452,7 @@ auto encode_packed_linear(CommandBatch& batch, const Tensor& input, const Tensor
     MPSCommandBuffer* buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
     id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
     if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create packed projection encoder"});
-    const bool tiled = geometry.rows >= 4;
+    const bool tiled = geometry.rows >= 4 && !vector_projection;
     const auto columns_per_group = tiled ? 32u : 4u;
     [encoder setComputePipelineState:tiled ? (*shared)->gemm : (*shared)->gemv];
     auto status = bind(encoder, input, 0);

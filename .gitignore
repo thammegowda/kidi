@@ -6,11 +6,17 @@ __pycache__/
 *.pyc
 /ynnpack
 
-/tests/data/*.out.txt
+/tests/**/.cache/
+/tests/**/*.log
+/tests/data/**/*.out.txt
 
-# Generated Metal benchmark output; keep source, reports, and corpus inputs.
-/benchmarks/metal/**/*.log
-/benchmarks/metal/**/*.quality.json
-/benchmarks/metal/**/*.jsonl
+# Generated benchmark output; keep source, reports, and corpus inputs.
+/benchmarks/**/.cache/
+/benchmarks/**/*.log
+/benchmarks/**/*.quality.json
+/benchmarks/**/*.jsonl
+/benchmarks/**/results.json
+/benchmarks/**/*-results.json
+/benchmarks/gemma4/prefill-policy-probes.json
 /benchmarks/metal/*-20[0-9]*/**/*.txt
 /benchmarks/metal/execution-study-*.txt

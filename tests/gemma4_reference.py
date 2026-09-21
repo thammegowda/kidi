@@ -102,7 +102,7 @@ def generate(destination: Path, qat: bool = False):
     print(f"Saved {len(weights)} parameters and {logits.numel()} reference logits in {destination}")
 
 
-def checkpoint_reference(directory: Path, destination: Path):
+def checkpoint_reference(directory: Path, destination: Path, prompt_tokens: Path | None = None):
     from transformers.integrations.gemma_quant import QuantizedEmbedding, QuantizedLinear, apply_srq
     from transformers.cache_utils import DynamicCache
 
@@ -159,7 +159,8 @@ def checkpoint_reference(directory: Path, destination: Path):
     from tokenizers import Tokenizer
     tokenizer = Tokenizer.from_file(str(directory / "tokenizer.json"))
     text = "<bos><|turn>user\nExplain why sunlight appears blue in the sky, then give a short Python function that adds two numbers.<turn|>\n<|turn>model\n"
-    tokens = torch.tensor([tokenizer.encode(text, add_special_tokens=False).ids])
+    token_ids = json.loads(prompt_tokens.read_text())["prompt_tokens"] if prompt_tokens else tokenizer.encode(text, add_special_tokens=False).ids
+    tokens = torch.tensor([token_ids])
     with torch.no_grad():
         logits = model(tokens, use_cache=True, past_key_values=cache).logits.contiguous()
     destination.mkdir(parents=True, exist_ok=True)
@@ -172,8 +173,9 @@ if __name__ == "__main__":
     parser.add_argument("destination", type=Path)
     parser.add_argument("--qat", action="store_true")
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--prompt-tokens", type=Path, help="benchmark JSON containing independent reference input IDs")
     args = parser.parse_args()
     if args.checkpoint:
-        checkpoint_reference(args.checkpoint, args.destination)
+        checkpoint_reference(args.checkpoint, args.destination, args.prompt_tokens)
     else:
         generate(args.destination, args.qat)

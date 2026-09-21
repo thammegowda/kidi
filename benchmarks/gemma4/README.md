@@ -1,6 +1,68 @@
 # Gemma 4 E2B: Kidi and LiteRT-LM
 
+Current implementation wins, failures, and course corrections are tracked in
+the [optimization journal](JOURNAL.md).
+
+At the pre-review checkpoint, [topology-level prefill pruning](prefill-pruning-results.json)
+and [shared-consumer trimming](shared-prefill-results.json) bring measured native-QAT
+prefill to 1358/1385 tokens/s CPU and 2397/3829 GPU at 128/1024 prompt tokens.
+The corresponding LiteRT measurements are 709/553 CPU and 2302/2616 GPU. Tested
+candidate continuations match their baselines, but logits are not universally
+bit-identical and the independent quality probe remains small. GPU decode and
+cold start still trail; short warm first-output latency is mixed. This is not
+overall leadership. Raw artifacts retain precision and phase-boundary qualifications.
+
+The simplification review keeps those production policies and removes unused
+device-state, paging, replay and external-kernel experiments. Prefix reuse now
+uses a bounded dense snapshot. The calibrated-input reuse cache was also removed:
+its roughly 1-2% measured benefit did not justify its lifetime/invalidation state.
+The rates above predate that tradeoff; they are not a new post-review benchmark.
+
+The existing `kidi_gemma4_quality MODEL cpu|gpu 0 128 generation-batch` probe now
+compares four serial requests with active-row batched generation, alternating
+execution order with two warmups and three measurements. `serving` checks live
+admission, streamed output parity, cancellation, backpressure and cache-token
+reservations. These are separate from the historical batch-one tables below.
+
+Finite multi-request generation uses the validated dense-cache admission scheduler:
+
+```sh
+build-release/kidi generate -m ../models/gemma-4-E2B-it-qat-mobile-transformers \
+  --backend mps --input-lines prompts.txt --max-active 4 --queue-size 16 \
+  --context-size 2048 --cache-tokens 8192 --max-new-tokens 64 --profile
+```
+
+Each output line is a JSON completion with a 1-based `request_id` matching the input
+line. Completion order may differ from input order. `-` reads finite stdin; it is
+not an interactive request protocol. Queue-based first-token/completion times start
+at enqueue, exclude time before reading that input line, and include preparation.
+Prefix reuse and repeated/warmup runs are not supported in line mode. Request IDs
+allow downstream consumers to restore input order without an unbounded CLI buffer.
+
+The historical [prefill follow-up](QAT.md#prefill-follow-up) measures contiguous cache writes
+and fused Metal calibration/casting across five fresh-process pairs per case.
+GPU prefill improves about 14-15%; CPU is unchanged and LiteRT remains faster.
+
+The initial [native mobile-QAT comparison](QAT.md) uses trained Q2/Q4/Q8
+Safetensors and verifies projection weights against the LiteRT bundle. It reaches
+the measured short-prompt CPU decode target, but not GPU or prefill parity.
+
+For the subsequent packed Q4/Q8 implementation, refreshed measurements, and
+quality tradeoffs, see [LOW_BIT.md](LOW_BIT.md). The results below describe the
+original BF16 implementation and its first executable-reuse optimization.
+
 ## Result
+
+### Kernel Checks
+
+Build `kidi_metal_packed_bench` with `KIDI_BUILD_BENCHMARKS=ON`. Its default mode
+checks production packed GEMV kernels; `prefill` checks packed GEMM and cached
+FP16 execution, and `cache` compares contiguous writes with generic scatter.
+Each mode checks numerical results as well as reporting timings. MLX, standalone
+XNNPACK and indirect-replay probes were retired; their findings remain in the
+journal and historical result files.
+
+### Historical Baseline
 
 Kidi now runs the original `google/gemma-4-E2B-it` Safetensors checkpoint on
 YNNPACK CPU and Metal GPU. LiteRT-LM remains faster in these batch-one tests.
@@ -30,7 +92,8 @@ offline quantization or rewritten checkpoint is required by Kidi.
   BOS during session setup, so its API receives the serialized prompt without
   the literal `<bos>` text. Effective input IDs and prefill counts agree exactly.
 - Kidi prefill chunks: 128 tokens. LiteRT chooses its own prefill implementation.
-  LiteRT GPU ring buffers are enabled; MTP is explicitly off or on as labelled.
+  LiteRT GPU ring buffers are requested; effective activation in the installed
+  runtime is not established. MTP is explicitly off or on as labelled.
 - Both receive a 65-token output budget. Kidi produces the first token from
   prefill logits and times 64 recurrent decoder calls. LiteRT reports 65 tokens
   in its decode phase. Prefill/decode phase boundaries therefore differ slightly.
@@ -125,7 +188,7 @@ Use a Python 3.12 environment for the optional benchmark dependencies:
 
 ```sh
 python3.12 -m venv .cache/gemma-venv
-.cache/gemma-venv/bin/pip install -r benchmarks/gemma/requirements.txt
+.cache/gemma-venv/bin/pip install -r benchmarks/gemma4/requirements.txt
 .cache/gemma-venv/bin/hf download google/gemma-4-E2B-it \
   config.json model.safetensors tokenizer.json \
   --revision 3e22461f65e89153144f8adb70e3b8c2cc9845a7 \
@@ -143,7 +206,7 @@ Run the configuration helper only once; it refuses to overwrite existing YAML.
 Do not run the following measurements concurrently:
 
 ```sh
-.cache/gemma-venv/bin/python benchmarks/gemma/run.py \
+.cache/gemma-venv/bin/python benchmarks/gemma4/run.py \
   --runtime kidi --backend cpu --prefill 128 --decode 64 \
   --output .cache/gemma-bench/kidi-cpu-128.json
 ```

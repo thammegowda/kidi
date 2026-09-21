@@ -135,6 +135,11 @@ private:
 
 auto make_metal_backend() -> std::shared_ptr<Backend> { return std::make_shared<MetalBackend>(); }
 
+auto metal_memory_stats() -> MetalMemoryStats {
+    auto device = MTLCreateSystemDefaultDevice();
+    return {device.currentAllocatedSize, device.recommendedMaxWorkingSetSize};
+}
+
 auto metal_buffer(const Tensor& tensor) -> Result<MetalBufferView> {
     if (!tensor.defined() || tensor.device().kind != DeviceKind::A_GPU || !tensor.is_contiguous()) {
         return std::unexpected(

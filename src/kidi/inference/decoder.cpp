@@ -46,6 +46,59 @@ auto normalized_score(float score, std::size_t length, float alpha) -> float {
     return score / (std::pow(5.0F + static_cast<float>(length), alpha) / std::pow(6.0F, alpha));
 }
 
+GreedyState::GreedyState(SearchOptions options)
+    : options_(options), stop_ids_(options.stop_ids.begin(), options.stop_ids.end()), token_(options.pad_id) {
+    options_.stop_ids = {};
+    result_.token_ids.reserve(options.maximum_steps);
+}
+auto GreedyState::create(SearchOptions options) -> Result<GreedyState> {
+    const auto valid = [&](auto token) {
+        return token >= 0 && static_cast<std::size_t>(token) < options.vocabulary_size;
+    };
+    if (!options.vocabulary_size || options.vocabulary_size > INT32_MAX || options.beam_size != 1 ||
+        !options.maximum_steps || !valid(options.end_id) || !valid(options.pad_id) ||
+        !std::ranges::all_of(options.stop_ids, valid) || !std::isfinite(options.length_penalty) ||
+        options.length_penalty < 0)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid greedy generation settings"});
+    return GreedyState(options);
+}
+auto GreedyState::accept(TokenScores scores) -> Result<void> {
+    if (finished_) return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "generation is already finished"});
+    if (!scores.greedy_tokens.empty() ||
+        (scores.greedy_token ? options_.compute_score || !scores.values.empty() || *scores.greedy_token < 0 ||
+                                   static_cast<std::size_t>(*scores.greedy_token) >= options_.vocabulary_size
+                             : scores.values.size() != options_.vocabulary_size))
+        return std::unexpected(Error{ErrorCode::RUNTIME, "invalid greedy scores or selected token"});
+    if (std::ranges::any_of(scores.values, [](float value) {
+            return std::isnan(value) || value == std::numeric_limits<float>::infinity();
+        }))
+        return std::unexpected(Error{ErrorCode::RUNTIME, "decoder returned invalid scores"});
+    const auto best = std::ranges::max_element(scores.values);
+    if (!scores.greedy_token && !std::isfinite(*best))
+        return std::unexpected(Error{ErrorCode::RUNTIME, "decoder has no finite token scores"});
+    token_ = scores.greedy_token ? *scores.greedy_token : static_cast<std::int32_t>(best - scores.values.begin());
+    if (options_.compute_score) {
+        if (scores.kind == ScoreKind::LOGITS) {
+            float sum = 0;
+            for (auto value : scores.values) sum += std::exp(value - *best);
+            result_.score -= std::log(sum);
+        } else
+            result_.score += *best;
+    }
+    ++result_.decoder_steps;
+    auto settings = options_;
+    settings.stop_ids = stop_ids_;
+    const bool ended = is_end(token_, settings);
+    if (!ended && (!options_.stop_on_eos || token_ != options_.pad_id)) result_.token_ids.push_back(token_);
+    finished_ = ended || result_.decoder_steps == options_.maximum_steps;
+    if (finished_) {
+        const auto length =
+            ended ? result_.decoder_steps : options_.unfinished_score_length.value_or(options_.maximum_steps);
+        result_.score = normalized_score(result_.score, length, options_.length_penalty);
+    }
+    return {};
+}
+
 auto Decoder::generate(std::span<const std::int32_t> prompt, const SearchOptions& options, const ScoreFunction& score,
                        InferenceStats* stats) -> Result<Generation> {
     const auto valid_token = [&](auto token) {
@@ -77,7 +130,12 @@ auto Decoder::generate(std::span<const std::int32_t> prompt, const SearchOptions
         auto scores = score({prefixes, active, beams.front().tokens.size(), step - 1});
         if (stats) stats->decoder_ns += elapsed(started);
         if (!scores) return std::unexpected(std::move(scores.error()));
-        if (scores->values.size() != active.size() * options.vocabulary_size)
+        if (!scores->greedy_tokens.empty())
+            return std::unexpected(Error{ErrorCode::RUNTIME, "single-request decoder cannot accept batched tokens"});
+        if (scores->greedy_token && (options.beam_size != 1 || options.compute_score || !scores->values.empty() ||
+                                     !valid_token(*scores->greedy_token)))
+            return std::unexpected(Error{ErrorCode::RUNTIME, "invalid preselected greedy token or search policy"});
+        if (!scores->greedy_token && scores->values.size() != active.size() * options.vocabulary_size)
             return std::unexpected(Error{ErrorCode::RUNTIME, "decoder returned an incompatible score shape"});
         if (std::ranges::any_of(scores->values, [](float value) {
                 return std::isnan(value) || value == std::numeric_limits<float>::infinity();
@@ -88,9 +146,10 @@ auto Decoder::generate(std::span<const std::int32_t> prompt, const SearchOptions
         started = Clock::now();
         if (options.beam_size == 1) {
             const auto best = std::ranges::max_element(scores->values);
-            if (!std::isfinite(*best))
+            if (!scores->greedy_token && !std::isfinite(*best))
                 return std::unexpected(Error{ErrorCode::RUNTIME, "decoder has no finite token scores"});
-            const auto token = static_cast<std::int32_t>(best - scores->values.begin());
+            const auto token =
+                scores->greedy_token ? *scores->greedy_token : static_cast<std::int32_t>(best - scores->values.begin());
             if (options.compute_score) {
                 if (scores->kind == ScoreKind::LOGITS) {
                     float sum = 0;
@@ -183,71 +242,54 @@ auto Decoder::generate_batch(std::span<const std::int32_t> initial_tokens, std::
     if (options.empty() || initial_tokens.size() != options.size() || !score)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid batch generation request"});
     const auto vocabulary = options.front().vocabulary_size;
+    std::vector<GreedyState> states;
+    states.reserve(options.size());
     for (std::size_t row = 0; row < options.size(); ++row) {
         const auto& settings = options[row];
-        if (!vocabulary || vocabulary > INT32_MAX || settings.vocabulary_size != vocabulary ||
-            settings.beam_size != 1 || settings.maximum_steps == 0 || initial_tokens[row] < 0 ||
-            static_cast<std::size_t>(initial_tokens[row]) >= vocabulary || settings.end_id < 0 ||
-            static_cast<std::size_t>(settings.end_id) >= vocabulary || settings.pad_id < 0 ||
-            static_cast<std::size_t>(settings.pad_id) >= vocabulary || !std::isfinite(settings.length_penalty) ||
-            settings.length_penalty < 0 ||
-            std::ranges::any_of(
-                settings.stop_ids,
-                [&](auto token) { return token < 0 || static_cast<std::size_t>(token) >= vocabulary; }))
+        if (settings.vocabulary_size != vocabulary || initial_tokens[row] < 0 ||
+            static_cast<std::size_t>(initial_tokens[row]) >= vocabulary)
             return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid batch generation settings"});
+        auto state = GreedyState::create(settings);
+        if (!state) return std::unexpected(std::move(state.error()));
+        states.push_back(std::move(*state));
     }
-    std::vector<Generation> results(options.size());
-    for (std::size_t row = 0; row < options.size(); ++row) results[row].token_ids.reserve(options[row].maximum_steps);
-    std::vector<bool> finished(options.size());
     std::vector<std::int32_t> tokens(initial_tokens.begin(), initial_tokens.end());
     std::size_t remaining = options.size();
+    std::vector<std::size_t> active;
+    active.reserve(options.size());
     for (std::size_t step = 0; remaining; ++step) {
+        active.clear();
+        for (std::size_t row = 0; row < options.size(); ++row)
+            if (!states[row].finished()) active.push_back(row);
         auto start = Clock::now();
-        auto scores = score({tokens, step});
+        auto scores = score({tokens, step, active});
         if (stats) {
             stats->decoder_ns += elapsed(start);
             ++stats->decoder_steps;
         }
         if (!scores) return std::unexpected(std::move(scores.error()));
-        if (scores->values.size() != options.size() * vocabulary)
+        const bool preselected = !scores->greedy_tokens.empty();
+        if (scores->greedy_token ||
+            (preselected ? scores->greedy_tokens.size() != options.size() || !scores->values.empty() ||
+                               std::ranges::any_of(options, [](const auto& settings) { return settings.compute_score; })
+                         : scores->values.size() != options.size() * vocabulary))
             return std::unexpected(Error{ErrorCode::RUNTIME, "batch decoder returned incompatible score shape"});
         start = Clock::now();
         for (std::size_t row = 0; row < options.size(); ++row) {
-            if (finished[row]) continue;
-            const auto values = scores->values.subspan(row * vocabulary, vocabulary);
-            if (std::ranges::any_of(values, [](float value) {
-                    return std::isnan(value) || value == std::numeric_limits<float>::infinity();
-                }))
-                return std::unexpected(Error{ErrorCode::RUNTIME, "batch decoder returned invalid scores"});
-            const auto best = std::ranges::max_element(values);
-            if (!std::isfinite(*best))
-                return std::unexpected(Error{ErrorCode::RUNTIME, "batch decoder has no finite scores"});
-            const auto token = static_cast<std::int32_t>(best - values.begin());
-            auto& result = results[row];
-            const auto& settings = options[row];
-            if (settings.compute_score) {
-                if (scores->kind == ScoreKind::LOGITS) {
-                    float sum = 0;
-                    for (auto value : values) sum += std::exp(value - *best);
-                    result.score -= std::log(sum);
-                } else
-                    result.score += *best;
-            }
-            ++result.decoder_steps;
-            if (!is_end(token, settings) && (!settings.stop_on_eos || token != settings.pad_id))
-                result.token_ids.push_back(token);
-            finished[row] = is_end(token, settings) || step + 1 == settings.maximum_steps;
-            tokens[row] = finished[row] ? settings.pad_id : token;
-            if (finished[row]) {
-                --remaining;
-                const auto length = is_end(token, settings)
-                                        ? step + 1
-                                        : settings.unfinished_score_length.value_or(settings.maximum_steps);
-                result.score = normalized_score(result.score, length, settings.length_penalty);
-            }
+            auto& state = states[row];
+            if (state.finished()) continue;
+            const auto accepted = state.accept(
+                preselected ? TokenScores{{}, scores->kind, scores->greedy_tokens[row]}
+                            : TokenScores{scores->values.subspan(row * vocabulary, vocabulary), scores->kind});
+            if (!accepted) return std::unexpected(accepted.error());
+            tokens[row] = state.finished() ? options[row].pad_id : state.token();
+            if (state.finished()) --remaining;
         }
         if (stats) stats->host_search_ns += elapsed(start);
     }
+    std::vector<Generation> results;
+    results.reserve(states.size());
+    for (auto& state : states) results.push_back(std::move(state).result());
     return results;
 }
 } // namespace kidi::inference

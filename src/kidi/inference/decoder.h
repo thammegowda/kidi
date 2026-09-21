@@ -17,6 +17,8 @@ enum class ScoreKind { LOGITS, LOG_PROBABILITIES };
 struct TokenScores {
     std::span<const float> values;
     ScoreKind kind = ScoreKind::LOGITS;
+    std::optional<std::int32_t> greedy_token;
+    std::span<const std::int32_t> greedy_tokens;
 };
 
 struct DecodeRequest {
@@ -48,9 +50,28 @@ struct Generation {
 struct GreedyRequest {
     std::span<const std::int32_t> tokens;
     std::size_t generated_steps;
+    std::span<const std::size_t> active_rows;
 };
 
 auto normalized_score(float score, std::size_t length, float alpha) -> float;
+
+class GreedyState {
+public:
+    static auto create(SearchOptions options) -> Result<GreedyState>;
+    auto accept(TokenScores scores) -> Result<void>;
+    auto finished() const -> bool { return finished_; }
+    auto token() const -> std::int32_t { return token_; }
+    auto result() const& -> const Generation& { return result_; }
+    auto result() && -> Generation { return std::move(result_); }
+
+private:
+    explicit GreedyState(SearchOptions options);
+    SearchOptions options_;
+    std::vector<std::int32_t> stop_ids_;
+    Generation result_{};
+    std::int32_t token_;
+    bool finished_ = false;
+};
 
 class Decoder {
 public:

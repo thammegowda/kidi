@@ -6,6 +6,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 #include <spdlog/cfg/env.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -95,12 +96,88 @@ auto inspect(const kidi::cli::Namespace& arguments) -> int {
     return 0;
 }
 
+auto generate_lines(kidi::inference::Generator& generator, const kidi::cli::Namespace& arguments,
+                    kidi::inference::GenerationOptions options) -> int {
+    try {
+        const kidi::inference::ServingOptions limits{.maximum_active = arguments.get<std::size_t>("max_active"),
+                                                     .maximum_requests = arguments.get<std::size_t>("queue_size"),
+                                                     .cache_token_budget = arguments.get<std::size_t>("cache_tokens"),
+                                                     .prefill_tokens_per_step = options.prefill_chunk_size};
+        kidi::ops::require(generator.configure_serving(limits));
+        const auto& input_path = arguments.get<std::string>("input_lines");
+        std::ifstream file;
+        std::istream* input = &std::cin;
+        if (input_path != "-") {
+            file.open(input_path);
+            if (!file) throw std::runtime_error("cannot open prompt lines: " + input_path);
+            input = &file;
+        }
+        bool ended = false;
+        std::uint64_t prefill_ns = 0, decode_ns = 0, preparation_ns = 0;
+        std::size_t completed = 0, peak_cache_tokens = 0;
+        const auto started = std::chrono::steady_clock::now();
+        while (!ended || generator.pending_requests()) {
+            while (!ended && generator.pending_requests() < limits.maximum_requests) {
+                std::string prompt;
+                if (!std::getline(*input, prompt)) {
+                    if (!input->eof()) throw std::runtime_error("failed reading prompt lines");
+                    ended = true;
+                    break;
+                }
+                kidi::ops::require(generator.enqueue(prompt, options));
+            }
+            if (!generator.pending_requests()) break;
+            const auto result = kidi::ops::require(generator.step());
+            prefill_ns += result.prefill_ns;
+            decode_ns += result.decode_ns;
+            preparation_ns += result.preparation_ns;
+            peak_cache_tokens = std::max(peak_cache_tokens, result.reserved_cache_tokens);
+            for (const auto& event : result.events) {
+                if (!event.completed) continue;
+                const auto& output = *event.completed;
+                nlohmann::json record{{"request_id", event.request_id},
+                                      {"text", output.text},
+                                      {"token_ids", output.generation.token_ids},
+                                      {"decoder_steps", output.generation.decoder_steps}};
+                if (arguments.get<bool>("profile")) {
+                    record["ttft_ns"] = output.stats.time_to_first_token_ns;
+                    record["generation_ns"] = output.stats.generation_ns;
+                    record["prompt_tokens"] = output.stats.prompt_tokens;
+                }
+                std::cout << record.dump() << '\n';
+                ++completed;
+            }
+            std::cout.flush();
+            if (!std::cout) throw std::runtime_error("failed writing generation results");
+        }
+        if (arguments.get<bool>("profile")) {
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started)
+                    .count();
+            std::cerr << "kidi_serving|requests=" << completed << "|max_active=" << limits.maximum_active
+                      << "|cache_tokens=" << limits.cache_token_budget
+                      << "|peak_reserved_cache_tokens=" << peak_cache_tokens << "|prefill_ns=" << prefill_ns
+                      << "|decode_ns=" << decode_ns << "|preparation_ns=" << preparation_ns
+                      << "|generation_ns=" << elapsed << '\n';
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
+        return 1;
+    }
+}
 auto generate(const kidi::cli::Namespace& arguments) -> int {
     const auto threads = arguments.get<std::int32_t>("threads");
     const auto runs = arguments.get<std::int32_t>("runs");
     const auto warmups = arguments.get<std::int32_t>("warmups");
     if (threads <= 0 || runs <= 0 || warmups < 0) {
         spdlog::error("threads and runs must be positive; warmups must be non-negative");
+        return 2;
+    }
+    const auto& input_lines = arguments.get<std::string>("input_lines");
+    if (!input_lines.empty() && (!arguments.get<std::string>("prompt").empty() || runs != 1 || warmups ||
+                                 arguments.get<std::size_t>("prefix_cache_bytes"))) {
+        spdlog::error("line generation cannot combine --prompt, repeats, warmups or prefix caching");
         return 2;
     }
     kidi::runtime::ynn::set_thread_count(threads);
@@ -120,14 +197,17 @@ auto generate(const kidi::cli::Namespace& arguments) -> int {
     const auto load_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
     auto prompt = arguments.get<std::string>("prompt");
-    if (prompt.empty()) prompt.assign(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
+    if (prompt.empty() && input_lines.empty())
+        prompt.assign(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
     const kidi::inference::GenerationOptions options{
         .maximum_new_tokens = arguments.get<std::size_t>("max_new_tokens"),
         .context_size = arguments.get<std::size_t>("context_size"),
         .prefill_chunk_size = arguments.get<std::size_t>("prefill_chunk_size"),
+        .prefix_cache_bytes = arguments.get<std::size_t>("prefix_cache_bytes"),
         .raw_prompt = arguments.get<bool>("raw_prompt"),
         .ignore_eos = arguments.get<bool>("ignore_eos"),
         .full_attention_cache = arguments.get<bool>("full_attention_cache")};
+    if (!input_lines.empty()) return generate_lines(*generator, arguments, options);
     for (std::int32_t run = -warmups; run < runs; ++run) {
         auto result = generator->generate(prompt, options);
         if (!result) {
@@ -140,16 +220,21 @@ auto generate(const kidi::cli::Namespace& arguments) -> int {
             const auto& stats = result->stats;
             std::cerr << "kidi_generation|backend=" << kidi::inference::to_string(backend)
                       << "|native_qat=" << generator->native_qat() << "|weight_bits=" << weight_bits
-                      << "|group_size=" << group_size << "|packed_prefill=" << packed_prefill
+                      << "|device_selection=" << stats.device_selection
+                      << "|last_token_prefill=" << stats.last_token_prefill << "|group_size=" << group_size
+                      << "|shared_prefill_tail=" << stats.shared_prefill_tail << "|packed_prefill=" << packed_prefill
                       << "|crop_local_attention="
                       << (device == kidi::tensor::Device::cpu() && !options.full_attention_cache)
                       << "|batch_size=1|threads=" << threads << "|run=" << run << "|load_ns=" << load_ns
                       << "|prompt_tokens=" << stats.prompt_tokens
+                      << "|reused_prompt_tokens=" << stats.reused_prompt_tokens
+                      << "|prefix_cache_bytes=" << stats.prefix_cache_bytes
+                      << "|prefix_reserved_bytes=" << stats.prefix_reserved_bytes
                       << "|generated_tokens=" << result->generation.decoder_steps
                       << "|decode_tokens=" << stats.decode_tokens << "|tokenize_ns=" << stats.tokenize_ns
                       << "|prefill_ns=" << stats.prefill_ns << "|decode_ns=" << stats.decode_ns
                       << "|preparation_ns=" << stats.preparation_ns << "|ttft_ns=" << stats.time_to_first_token_ns
-                      << "|token_ids=";
+                      << "|generation_ns=" << stats.generation_ns << "|token_ids=";
             for (auto token : result->generation.token_ids) std::cerr << token << ',';
             std::cerr << '\n';
         }
@@ -300,11 +385,25 @@ auto main(int argc, char** argv) -> int {
     auto& generate_parser = commands.add_parser("generate", "generate text with Gemma 4");
     generate_parser.add_argument("-m", "--model").type<std::filesystem::path>().required().metavar("DIR");
     generate_parser.add_argument("--prompt").default_value(std::string{}).help("prompt text; stdin when omitted");
+    generate_parser.add_argument("--input-lines")
+        .dest("input_lines")
+        .default_value(std::string{})
+        .help("finite prompt file, one per line (- for stdin); emit completion-order JSONL with 1-based request IDs");
+    generate_parser.add_argument("--max-active").dest("max_active").default_value<std::size_t>(4);
+    generate_parser.add_argument("--queue-size").dest("queue_size").default_value<std::size_t>(64);
+    generate_parser.add_argument("--cache-tokens")
+        .dest("cache_tokens")
+        .default_value<std::size_t>(8192)
+        .help("sum of reserved dense context capacities for line generation");
     generate_parser.add_argument("--backend").default_value(std::string("auto")).choices({"auto", "ynnpack", "mps"});
     generate_parser.add_argument("-j", "--threads").default_value<std::int32_t>(4);
     generate_parser.add_argument("--max-new-tokens").dest("max_new_tokens").default_value<std::size_t>(0);
     generate_parser.add_argument("--context-size").dest("context_size").default_value<std::size_t>(0);
     generate_parser.add_argument("--prefill-chunk-size").dest("prefill_chunk_size").default_value<std::size_t>(128);
+    generate_parser.add_argument("--prefix-cache-bytes")
+        .dest("prefix_cache_bytes")
+        .default_value<std::size_t>(0)
+        .help("opt-in one-entry prefix snapshot budget; 0 disables cross-request reuse");
     generate_parser.add_argument("--raw-prompt").dest("raw_prompt").action(kidi::cli::Action::STORE_TRUE);
     generate_parser.add_argument("--ignore-eos").dest("ignore_eos").action(kidi::cli::Action::STORE_TRUE);
     generate_parser.add_argument("--full-attention-cache")
@@ -320,12 +419,12 @@ auto main(int argc, char** argv) -> int {
     generate_parser.add_argument("--packed-prefill")
         .dest("packed_prefill")
         .action(kidi::cli::Action::STORE_TRUE)
-        .help("use packed GEMM for prefill too; default uses original floating weights");
+        .help("use packed GEMM for prefill; default may cache FP16 matrices for native QAT");
     generate_parser.add_argument("--runs").default_value<std::int32_t>(1);
     generate_parser.add_argument("--warmups").default_value<std::int32_t>(0);
 
     auto& inspect_parser = commands.add_parser("inspect", "inspect a model package");
-    inspect_parser.description("Inspect an RTG or Gemma model package.");
+    inspect_parser.description("Inspect an RTG or Gemma 4 model package.");
     inspect_parser.add_argument("-m", "--model")
         .type<std::filesystem::path>()
         .required()

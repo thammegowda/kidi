@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iostream>
 #include <thread>
+#include <limits>
 
 auto main() -> int {
     try {
@@ -45,6 +46,164 @@ auto main() -> int {
             }
             if (ops::require(escaped.data<float>())[0] != 6.F) return 1;
             ops::Context context(device);
+            for (const std::int64_t rows : {1, 8}) {
+                auto matrix = ops::require(tensor::Tensor::zeros({8, 8}, tensor::DType::F32));
+                auto entries = ops::require(matrix.data<float>());
+                for (std::size_t diagonal = 0; diagonal < 8; ++diagonal) entries[diagonal * 8 + diagonal] = 1.F;
+                auto weight = ops::require(ops::pack_weight(matrix, 8, 8));
+                auto operand = ops::require(tensor::Tensor::empty({rows, 8}, tensor::DType::F32, device));
+                std::ranges::fill(ops::require(operand.data<float>()), 0.5F);
+                auto increment = ops::require(tensor::Tensor::empty({rows, 8}, tensor::DType::F32, device));
+                std::ranges::fill(ops::require(increment.data<float>()), 0.25F);
+                const auto project = [&] {
+                    return context.packed_linear(operand, weight.values, weight.scales, 8, 8, 0.25F, 0.125F);
+                };
+                const auto first = project();
+                const auto repeated = project();
+                context.add_(operand, increment);
+                const auto updated = project();
+                context.copy_slice_(operand, increment, 0, 0);
+                const auto copied = project();
+                context.synchronize();
+                for (const auto& [output, expected] : std::array{std::pair{first, 0.5F}, std::pair{repeated, 0.5F},
+                                                                 std::pair{updated, 0.75F}, std::pair{copied, 0.25F}})
+                    for (auto value : ops::require(output.data<float>()))
+                        if (std::abs(value - expected) > 1e-6F) return 1;
+                std::ranges::fill(ops::require(operand.data<float>()), 1.F);
+                const auto host_changed = project();
+                context.synchronize();
+                for (auto value : ops::require(host_changed.data<float>()))
+                    if (std::abs(value - 1.F) > 1e-6F) return 1;
+            }
+            {
+                const std::array values{-100.F, -10.F, -3.F, -0.F, 0.25F, 3.F, 10.F, 100.F};
+                const std::array factors{-1.F, 0.F, 0.5F, 2.F, -0.75F, 1.25F, -2.F, 0.125F};
+                auto gate = ops::require(tensor::Tensor::from_host({2, 4}, std::span<const float>(values), device));
+                auto factor = ops::require(tensor::Tensor::from_host({2, 4}, std::span<const float>(factors), device));
+                auto separate = context.multiply(context.gelu(gate, true), factor);
+                auto fused = context.gelu_multiply(gate, factor);
+                context.synchronize();
+                if (!std::ranges::equal(ops::require(separate.data<float>()), ops::require(fused.data<float>())))
+                    return 1;
+                bool rejected = false;
+                try {
+                    context.gelu_multiply(gate, ops::require(factor.reshape({8})));
+                } catch (const ops::Failure&) {
+                    rejected = true;
+                }
+                if (!rejected) return 1;
+            }
+            for (const std::int64_t width : {40, 256, 512}) {
+                auto input = ops::require(tensor::Tensor::empty({2, 3, 4, width}, tensor::DType::F32, device));
+                auto scale = ops::require(tensor::Tensor::empty({width}, tensor::DType::F32, device));
+                auto cosine = ops::require(tensor::Tensor::empty({1, 3, 1, width / 2}, tensor::DType::F32, device));
+                auto sine = ops::require(tensor::Tensor::empty({1, 3, 1, width / 2}, tensor::DType::F32, device));
+                auto values = ops::require(input.data<float>());
+                for (std::size_t index = 0; index < values.size(); ++index)
+                    values[index] = (static_cast<int>(index % 29) - 14) * 0.137F;
+                auto scales = ops::require(scale.data<float>());
+                for (std::size_t index = 0; index < scales.size(); ++index)
+                    scales[index] = (static_cast<int>(index % 5) - 2) * 0.71F;
+                auto cosines = ops::require(cosine.data<float>()), sines = ops::require(sine.data<float>());
+                for (std::size_t index = 0; index < cosines.size(); ++index) {
+                    cosines[index] = std::cos(index * 0.071F);
+                    sines[index] = std::sin(index * 0.071F);
+                }
+                auto reference = context.rotary(context.rms_norm(input, scale, 1e-6F), cosine, sine);
+                auto fused = context.rms_rotary(input, scale, cosine, sine, 1e-6F);
+                context.synchronize();
+                const auto expected = ops::require(reference.data<float>()), actual = ops::require(fused.data<float>());
+                for (std::size_t index = 0; index < actual.size(); ++index)
+                    if (!std::isfinite(actual[index]) || std::abs(actual[index] - expected[index]) > 1e-6F) return 1;
+            }
+            if (device == tensor::Device::apple_gpu()) {
+                auto identity = ops::require(tensor::Tensor::zeros({8, 8}, tensor::DType::F32));
+                for (std::size_t index = 0; index < 8; ++index)
+                    ops::require(identity.data<float>())[index * 8 + index] = 1.F;
+                auto packed = ops::require(ops::pack_weight(identity, 2, 8));
+                std::vector<float> values;
+                const std::array row{-100.F, -1.25F, -0.75F, -0.25F, 0.25F, 0.75F, 1.25F, 100.F};
+                for (int index = 0; index < 4; ++index) values.insert(values.end(), row.begin(), row.end());
+                auto input = ops::require(tensor::Tensor::from_host({4, 8}, std::span<const float>(values), device));
+                auto output = context.packed_linear(input, packed.values, packed.scales, 2, 8, 0.F, 0.5F);
+                context.synchronize();
+                const std::array expected{-64.F, -1.F, -1.F, 0.F, 0.F, 1.F, 1.F, 63.5F};
+                const auto actual = ops::require(output.data<float>());
+                for (std::size_t index = 0; index < actual.size(); ++index)
+                    if (actual[index] != expected[index % 8]) {
+                        std::cerr << "calibrated epilogue mismatch " << tensor::to_string(device) << " at " << index
+                                  << ": " << actual[index] << " vs " << expected[index % 8] << '\n';
+                        return 1;
+                    }
+            }
+            for (const std::int64_t width : {7, 1027, 262144}) {
+                const auto infinity = std::numeric_limits<float>::infinity();
+                std::vector<float> scores(6 * width, -2.F);
+                scores[1] = scores[width - 1] = 4.F;
+                std::fill(scores.begin() + width, scores.begin() + 2 * width, -infinity);
+                scores[2 * width + width - 1] = std::numeric_limits<float>::quiet_NaN();
+                scores[3 * width + 1] = infinity;
+                scores[6 * width - 1] = 3.F;
+                auto logits =
+                    ops::require(tensor::Tensor::from_host({6, width}, std::span<const float>(scores), device));
+                auto selected = context.greedy_token(logits);
+                context.synchronize();
+                if (!std::ranges::equal(
+                        ops::require(selected.data<std::int32_t>()),
+                        std::array<std::int32_t, 6>{1, -1, -1, -1, 0, static_cast<std::int32_t>(width - 1)}))
+                    return 1;
+                auto finite = ops::require(
+                    tensor::Tensor::from_host({1, 3}, std::span<const float>(std::array{-3.F, 0.F, -0.F}), device));
+                auto queued = context.greedy_token(context.add(finite, finite));
+                context.synchronize();
+                if (ops::require(queued.data<std::int32_t>())[0] != 1) return 1;
+            }
+            bool invalid_selection = false;
+            try {
+                context.greedy_token(ops::require(tensor::Tensor::zeros({}, tensor::DType::F32, device)));
+            } catch (const ops::Failure&) {
+                invalid_selection = true;
+            }
+            if (!invalid_selection) return 1;
+            {
+                auto increment = ops::require(
+                    tensor::Tensor::from_host({1, 4}, std::span<const float>(std::array{1.F, 2.F, 3.F, 4.F}), device));
+                auto identity = ops::require(tensor::Tensor::from_host(
+                    {4, 4},
+                    std::span<const float>(
+                        std::array{1.F, 0.F, 0.F, 0.F, 0.F, 1.F, 0.F, 0.F, 0.F, 0.F, 1.F, 0.F, 0.F, 0.F, 0.F, 1.F}),
+                    device));
+                auto current = context.add(increment, increment);
+                auto retained = ops::require(ops::require(current.reshape({4})).narrow(0, 0, 2));
+                for (int iteration = 0; iteration < 64; ++iteration) {
+                    current = context.add(current, increment);
+                    current = context.matmul(current, identity);
+                }
+                context.synchronize();
+                if (!std::ranges::equal(ops::require(current.data<float>()), std::array{66.F, 132.F, 198.F, 264.F}) ||
+                    !std::ranges::equal(ops::require(retained.data<float>()), std::array{2.F, 4.F}))
+                    return 1;
+                if (device == tensor::Device::apple_gpu()) {
+                    ops::Context eviction(device);
+                    auto scale = ops::require(
+                        tensor::Tensor::from_host({4}, std::span<const float>(std::array{1.F, 1.F, 1.F, 1.F}), device));
+                    auto preserved = eviction.add(increment, increment);
+                    constexpr int ITERATIONS = 4102;
+                    for (int iteration = 0; iteration < ITERATIONS; ++iteration) {
+                        current = eviction.rms_norm(increment, scale, (iteration + 1) * 0.001F);
+                        const auto preparation = eviction.preparation_ns();
+                        eviction.add(increment, increment);
+                        if (eviction.preparation_ns() != preparation) return 1;
+                    }
+                    eviction.synchronize();
+                    if (!std::ranges::equal(ops::require(preserved.data<float>()), std::array{2.F, 4.F, 6.F, 8.F}))
+                        return 1;
+                    const auto actual = ops::require(current.data<float>());
+                    for (std::size_t channel = 0; channel < actual.size(); ++channel)
+                        if (std::abs(actual[channel] - (channel + 1) / std::sqrt(7.5F + ITERATIONS * 0.001F)) > 1e-5F)
+                            return 1;
+                }
+            }
             {
                 for (int bits : {2, 4, 8}) {
                     const std::array weights{0.F, -7.F, 7.F, 1.F, 0.F, 14.F, -14.F, 2.F,
@@ -327,6 +486,48 @@ auto main() -> int {
                 ops::require(immutable.data<float>())[3] != 8.F)
                 return 1;
             auto cache_alias = cache;
+            {
+                auto destination = ops::require(tensor::Tensor::zeros({2, 4, 2}, tensor::DType::F32, device));
+                auto source = ops::require(tensor::Tensor::from_host(
+                    {2, 2, 2}, std::span<const float>(std::array{1.F, 2.F, 3.F, 4.F, 5.F, 6.F, 7.F, 8.F}), device));
+                const auto alias = destination;
+                const auto address = ops::require(destination.host_bytes()).data();
+                if (&context.copy_slice_(destination, source, 1, 2) != &destination || ops::is_inplace) return 1;
+                context.synchronize();
+                const std::array expected{0.F, 0.F, 0.F, 0.F, 1.F, 2.F, 3.F, 4.F,
+                                          0.F, 0.F, 0.F, 0.F, 5.F, 6.F, 7.F, 8.F};
+                if (!std::ranges::equal(ops::require(alias.data<float>()), expected) ||
+                    ops::require(destination.host_bytes()).data() != address)
+                    return 1;
+                for (auto start : {std::int64_t{-1}, std::int64_t{3}, INT64_MAX}) {
+                    bool rejected = false;
+                    try {
+                        context.copy_slice_(destination, source, 1, start);
+                    } catch (const ops::Failure&) {
+                        rejected = true;
+                    }
+                    if (!rejected || ops::is_inplace ||
+                        !std::ranges::equal(ops::require(alias.data<float>()), expected))
+                        return 1;
+                }
+                auto storage = ops::require(tensor::Tensor::from_host(
+                    {8}, std::span<const float>(std::array{0.F, 1.F, 2.F, 3.F, 4.F, 5.F, 6.F, 7.F}), device));
+                auto view = ops::require(storage.narrow(0, 1, 6));
+                auto overlapping = ops::require(storage.narrow(0, 0, 4));
+                context.copy_slice_(view, overlapping, 0, 1);
+                context.synchronize();
+                if (!std::ranges::equal(ops::require(storage.data<float>()),
+                                        std::array{0.F, 1.F, 0.F, 1.F, 2.F, 3.F, 6.F, 7.F}))
+                    return 1;
+                {
+                    auto queued = context.add(source, source);
+                    context.copy_slice_(destination, queued, -2, 0);
+                }
+                auto consumed = context.add(destination, destination);
+                context.synchronize();
+                if (ops::require(consumed.data<float>())[0] != 4.F || ops::require(consumed.data<float>())[8] != 20.F)
+                    return 1;
+            }
             context.scatter_(cache, context.reshape(result, {1, 1, 4}), index);
             context.synchronize();
             if (ops::require(cache_alias.data<float>())[7] != 8.F || ops::is_inplace) return 1;
@@ -459,6 +660,13 @@ auto main() -> int {
                 bool rejected_readonly = false;
                 try {
                     context.add_(readonly, input);
+                } catch (const ops::Failure&) {
+                    rejected_readonly = true;
+                }
+                if (!rejected_readonly || ops::is_inplace || (*owner)[0] != 1.F) return 1;
+                rejected_readonly = false;
+                try {
+                    context.copy_slice_(readonly, input, 0, 0);
                 } catch (const ops::Failure&) {
                     rejected_readonly = true;
                 }
