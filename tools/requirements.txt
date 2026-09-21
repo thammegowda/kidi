@@ -1,3 +1,0 @@
-ruamel.yaml>=0.17
-safetensors>=0.4,<1
-torch>=1.9

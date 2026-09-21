@@ -25,7 +25,7 @@ greedy (`--beam-size 1`) so the benchmark isolates precision effects rather
 than beam-search branching.
 
 Target-token throughput comes directly from `Translation::token_ids` reported
-by `kidi predict --stats`. It excludes BOS, EOS, and PAD tokens and does not
+by `kidi generate --stats`. It excludes BOS, EOS, and PAD tokens and does not
 infer token counts from decoded whitespace. Throughput uses aggregate
 `Translator::translate` time from `--profile`, excluding package loading and
 graph compilation.

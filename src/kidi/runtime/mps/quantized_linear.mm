@@ -8,7 +8,10 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <map>
+#include <tuple>
 #include <string>
+#include <utility>
 
 namespace kidi::runtime::mps {
 namespace {
@@ -157,6 +160,137 @@ kernel void linear_a8w8_tiled(device const char* input [[buffer(0)]],
                 (input_scales[row] * weight_scales[column]) + bias[column];
     }
 }
+struct PackedGeometry { uint rows; uint width; uint columns; uint bits; uint group_size; float input_scale; float output_scale; };
+constant bool CALIBRATE_INPUT [[function_constant(2)]];
+constant bool CALIBRATE_OUTPUT [[function_constant(3)]];
+inline float calibrate(float value, float scale) {
+    return scale > 0 ? clamp(rint(value / scale), -128.0f, 127.0f) * scale : value;
+}
+inline float4 calibrate(float4 value, float scale) {
+    return scale > 0 ? clamp(rint(value / scale), -128.0f, 127.0f) * scale : value;
+}
+constant uint WEIGHT_BITS [[function_constant(0)]];
+constant uint WEIGHT_GROUP [[function_constant(1)]];
+inline float unpack_weight(device const uchar* weights, device const float* scales,
+                           uint column, uint channel, constant PackedGeometry& geometry) {
+    uint per_byte = 8 / WEIGHT_BITS;
+    uint raw = (weights[column * (geometry.width / per_byte) + channel / per_byte] >>
+                ((channel % per_byte) * WEIGHT_BITS)) & ((1u << WEIGHT_BITS) - 1);
+    uint sign = 1u << (WEIGHT_BITS - 1);
+    int value = int(raw ^ sign) - int(sign);
+    return float(value) * scales[column * (geometry.width / WEIGHT_GROUP) + channel / WEIGHT_GROUP];
+}
+kernel void expand_packed_weight(device const uchar* weights [[buffer(0)]], device const float* scales [[buffer(1)]],
+                                  device half* output [[buffer(2)]], constant PackedGeometry& geometry [[buffer(3)]],
+                                  uint index [[thread_position_in_grid]]) {
+    if (index < geometry.width * geometry.columns)
+        output[index] = half(unpack_weight(weights, scales, index / geometry.width, index % geometry.width, geometry));
+}
+kernel void packed_gemv(device const float* input [[buffer(0)]],
+                        device const uchar* weights [[buffer(1)]],
+                        device const float* scales [[buffer(2)]],
+                        device float* output [[buffer(3)]],
+                        constant PackedGeometry& geometry [[buffer(4)]],
+                        uint2 group [[threadgroup_position_in_grid]],
+                        uint2 lane [[thread_position_in_threadgroup]]) {
+    uint column = group.x * 4 + lane.y;
+    float sum = 0;
+    if (column < geometry.columns) {
+        if (WEIGHT_BITS == 2 && WEIGHT_GROUP % 16 == 0) {
+            device const uint* packed = (device const uint*)(weights + column * (geometry.width / 4));
+            for (uint channel = lane.x * 16; channel < geometry.width; channel += 512) {
+                uint word = packed[channel / 16];
+                float partial = 0;
+                for (uint part = 0; part < 4; ++part) {
+                    int4 weight = int4(((uint4(word) >> (uint4(0, 2, 4, 6) + part * 8)) & 3u) ^ 2u) - 2;
+                    float4 activation = *(device const float4*)(input + group.y * geometry.width + channel + part * 4);
+                    if (CALIBRATE_INPUT) activation = calibrate(activation, geometry.input_scale);
+                    partial += dot(activation, float4(weight));
+                }
+                sum += partial * scales[column * (geometry.width / WEIGHT_GROUP) + channel / WEIGHT_GROUP];
+            }
+        } else if (WEIGHT_BITS == 4 && WEIGHT_GROUP % 8 == 0) {
+            device const uint* packed = (device const uint*)(weights + column * (geometry.width / 2));
+            for (uint channel = lane.x * 8; channel < geometry.width; channel += 256) {
+                uint word = packed[channel / 8];
+                int4 lower = int4(((uint4(word) >> uint4(0, 4, 8, 12)) & 15u) ^ 8u) - 8;
+                int4 upper = int4(((uint4(word) >> uint4(16, 20, 24, 28)) & 15u) ^ 8u) - 8;
+                float4 first = *(device const float4*)(input + group.y * geometry.width + channel);
+                float4 second = *(device const float4*)(input + group.y * geometry.width + channel + 4);
+                if (CALIBRATE_INPUT) { first = calibrate(first, geometry.input_scale); second = calibrate(second, geometry.input_scale); }
+                float scale = scales[column * (geometry.width / WEIGHT_GROUP) + channel / WEIGHT_GROUP];
+                sum += (dot(first, float4(lower)) + dot(second, float4(upper))) * scale;
+            }
+        } else if (WEIGHT_BITS == 8 && WEIGHT_GROUP % 4 == 0) {
+            device const char4* packed = (device const char4*)(weights + column * geometry.width);
+            for (uint channel = lane.x * 4; channel < geometry.width; channel += 128) {
+                float4 activation = *(device const float4*)(input + group.y * geometry.width + channel);
+                if (CALIBRATE_INPUT) activation = calibrate(activation, geometry.input_scale);
+                float scale = scales[column * (geometry.width / WEIGHT_GROUP) + channel / WEIGHT_GROUP];
+                sum += dot(activation, float4(packed[channel / 4])) * scale;
+            }
+        } else {
+            for (uint channel = lane.x; channel < geometry.width; channel += 32) {
+                float activation = input[group.y * geometry.width + channel];
+                if (CALIBRATE_INPUT) activation = calibrate(activation, geometry.input_scale);
+                sum += activation * unpack_weight(weights, scales, column, channel, geometry);
+            }
+        }
+    }
+    sum = simd_sum(sum);
+    if (lane.x == 0 && column < geometry.columns) output[group.y * geometry.columns + column] = CALIBRATE_OUTPUT ? calibrate(sum, geometry.output_scale) : sum;
+}
+kernel void packed_gemm(device const float* input [[buffer(0)]],
+                        device const uchar* weights [[buffer(1)]],
+                        device const float* scales [[buffer(2)]],
+                        device float* output [[buffer(3)]],
+                        constant PackedGeometry& geometry [[buffer(4)]],
+                        uint2 group [[threadgroup_position_in_grid]],
+                        uint thread_index [[thread_index_in_threadgroup]],
+                        uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half activations[32 * 32];
+    threadgroup half matrix[32 * 32];
+    threadgroup float result[32 * 32];
+    uint row_base = group.y * 32, column_base = group.x * 32;
+    uint local_row = (simd_group / 2) * 16, local_column = (simd_group % 2) * 16;
+    simdgroup_float8x8 acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint base = 0; base < geometry.width; base += 32) {
+        for (uint index = thread_index; index < 1024; index += 128) {
+            uint row = row_base + index / 32, channel = base + index % 32;
+            float activation = row < geometry.rows && channel < geometry.width ? input[row * geometry.width + channel] : 0.0f;
+            activations[index] = half(CALIBRATE_INPUT ? calibrate(activation, geometry.input_scale) : activation);
+            channel = base + index / 32;
+            uint column = column_base + index % 32;
+            matrix[index] = column < geometry.columns && channel < geometry.width ?
+                half(unpack_weight(weights, scales, column, channel, geometry)) : half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint offset = 0; offset < 32; offset += 8) {
+            simdgroup_half8x8 left0, left1, right0, right1;
+            simdgroup_load(left0, activations + local_row * 32 + offset, 32);
+            simdgroup_load(left1, activations + (local_row + 8) * 32 + offset, 32);
+            simdgroup_load(right0, matrix + offset * 32 + local_column, 32);
+            simdgroup_load(right1, matrix + offset * 32 + local_column + 8, 32);
+            simdgroup_multiply_accumulate(acc00, left0, right0, acc00);
+            simdgroup_multiply_accumulate(acc01, left0, right1, acc01);
+            simdgroup_multiply_accumulate(acc10, left1, right0, acc10);
+            simdgroup_multiply_accumulate(acc11, left1, right1, acc11);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(acc00, result + local_row * 32 + local_column, 32);
+    simdgroup_store(acc01, result + local_row * 32 + local_column + 8, 32);
+    simdgroup_store(acc10, result + (local_row + 8) * 32 + local_column, 32);
+    simdgroup_store(acc11, result + (local_row + 8) * 32 + local_column + 8, 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint index = thread_index; index < 1024; index += 128) {
+        uint row = row_base + index / 32, column = column_base + index % 32;
+        if (row < geometry.rows && column < geometry.columns) output[row * geometry.columns + column] = CALIBRATE_OUTPUT ? calibrate(result[index], geometry.output_scale) : result[index];
+    }
+}
 )metal";
 
 struct Pipelines {
@@ -164,6 +298,7 @@ struct Pipelines {
     id<MTLComputePipelineState> quantize;
     id<MTLComputePipelineState> linear_packed;
     id<MTLComputePipelineState> linear_tiled;
+    id<MTLLibrary> library;
 };
 
 auto pipelines() -> Result<std::shared_ptr<Pipelines>> {
@@ -193,11 +328,45 @@ auto pipelines() -> Result<std::shared_ptr<Pipelines>> {
         result->linear_packed =
             [result->device newComputePipelineStateWithFunction:[library newFunctionWithName:@"linear_a8w8_packed"]
                                                           error:&error];
+        result->library = library;
         if (!result->quantize || !result->linear_tiled || !result->linear_packed)
             return std::unexpected(Error{ErrorCode::RUNTIME, "create INT8 Metal pipelines"});
         cached = result;
         return result;
     }
+}
+struct PackedPipelines {
+    id<MTLComputePipelineState> gemv, gemm;
+};
+auto packed_pipelines(std::uint32_t bits, std::uint32_t group_size, bool input_scale, bool output_scale)
+    -> Result<std::shared_ptr<PackedPipelines>> {
+    static std::mutex mutex;
+    static std::map<std::tuple<std::uint32_t, std::uint32_t, bool, bool>, std::shared_ptr<PackedPipelines>> cache;
+    std::scoped_lock lock(mutex);
+    const auto key = std::tuple{bits, group_size, input_scale, output_scale};
+    if (const auto found = cache.find(key); found != cache.end()) return found->second;
+    auto shared = pipelines();
+    if (!shared) return std::unexpected(std::move(shared.error()));
+    MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&bits type:MTLDataTypeUInt atIndex:0];
+    [constants setConstantValue:&group_size type:MTLDataTypeUInt atIndex:1];
+    [constants setConstantValue:&input_scale type:MTLDataTypeBool atIndex:2];
+    [constants setConstantValue:&output_scale type:MTLDataTypeBool atIndex:3];
+    NSError* error = nil;
+    auto result = std::make_shared<PackedPipelines>();
+    id<MTLFunction> gemv = [(*shared)->library newFunctionWithName:@"packed_gemv"
+                                                    constantValues:constants
+                                                             error:&error];
+    id<MTLFunction> gemm = [(*shared)->library newFunctionWithName:@"packed_gemm"
+                                                    constantValues:constants
+                                                             error:&error];
+    if (!gemv || !gemm) return std::unexpected(Error{ErrorCode::RUNTIME, "specialize packed Metal functions"});
+    result->gemv = [(*shared)->device newComputePipelineStateWithFunction:gemv error:&error];
+    result->gemm = [(*shared)->device newComputePipelineStateWithFunction:gemm error:&error];
+    if (!result->gemv || !result->gemm)
+        return std::unexpected(Error{ErrorCode::RUNTIME, "compile packed Metal pipelines"});
+    cache.emplace(key, result);
+    return result;
 }
 auto bind(id<MTLComputeCommandEncoder> encoder, const Tensor& tensor, NSUInteger index) -> Result<void> {
     auto buffer = tensor::metal_buffer(tensor);
@@ -206,6 +375,98 @@ auto bind(id<MTLComputeCommandEncoder> encoder, const Tensor& tensor, NSUInteger
     return {};
 }
 } // namespace
+
+auto encode_expand_packed_weight(CommandBatch& batch, const Tensor& weight, const Tensor& scales, Tensor& output,
+                                 std::int32_t bits, std::int32_t group_size) -> Result<void> {
+    if (output.dtype() != DType::F16 || output.dimensions() != 2 || output.numel() > UINT32_MAX ||
+        (bits != 2 && bits != 4 && bits != 8) || group_size <= 0 || output.size(1) % group_size ||
+        weight.dtype() != DType::U8 || weight.dimensions() != 2 || scales.dtype() != DType::F32 ||
+        scales.dimensions() != 2 || weight.size(0) != output.size(0) || weight.size(1) * (8 / bits) != output.size(1) ||
+        scales.size(0) != output.size(0) || scales.size(1) != output.size(1) / group_size)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid streamed packed weight geometry"});
+    static std::mutex mutex;
+    static std::map<std::pair<std::uint32_t, std::uint32_t>, id<MTLComputePipelineState>> cached;
+    id<MTLComputePipelineState> pipeline;
+    {
+        std::scoped_lock lock(mutex);
+        const auto key = std::pair<std::uint32_t, std::uint32_t>{bits, group_size};
+        if (const auto found = cached.find(key); found != cached.end())
+            pipeline = found->second;
+        else {
+            auto shared = pipelines();
+            if (!shared) return std::unexpected(std::move(shared.error()));
+            MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+            [constants setConstantValue:&key.first type:MTLDataTypeUInt atIndex:0];
+            [constants setConstantValue:&key.second type:MTLDataTypeUInt atIndex:1];
+            NSError* error = nil;
+            auto function = [(*shared)->library newFunctionWithName:@"expand_packed_weight"
+                                                     constantValues:constants
+                                                              error:&error];
+            pipeline = function ? [(*shared)->device newComputePipelineStateWithFunction:function error:&error] : nil;
+            if (!pipeline)
+                return std::unexpected(Error{ErrorCode::RUNTIME, "compile streamed packed weight expansion"});
+            cached.emplace(key, pipeline);
+        }
+    }
+    const struct {
+        std::uint32_t rows, width, columns, bits, group_size;
+        float input_scale, output_scale;
+    } geometry{1,
+               static_cast<std::uint32_t>(output.size(1)),
+               static_cast<std::uint32_t>(output.size(0)),
+               static_cast<std::uint32_t>(bits),
+               static_cast<std::uint32_t>(group_size),
+               0,
+               0};
+    MPSCommandBuffer* buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
+    auto encoder = [buffer computeCommandEncoder];
+    if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create streamed packed weight encoder"});
+    [encoder setComputePipelineState:pipeline];
+    auto result = bind(encoder, weight, 0);
+    if (result) result = bind(encoder, scales, 1);
+    if (result) result = bind(encoder, output, 2);
+    [encoder setBytes:&geometry length:sizeof(geometry) atIndex:3];
+    if (result)
+        [encoder dispatchThreads:MTLSizeMake(output.numel(), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder endEncoding];
+    return result;
+}
+
+auto encode_packed_linear(CommandBatch& batch, const Tensor& input, const Tensor& weight, const Tensor& scales,
+                          Tensor& output, std::int32_t bits, std::int32_t group_size, float input_scale,
+                          float output_scale, bool vector_projection) -> Result<void> {
+    auto shared = packed_pipelines(bits, group_size, input_scale > 0, output_scale > 0);
+    if (!shared) return std::unexpected(std::move(shared.error()));
+    if (input.numel() > UINT32_MAX || output.numel() > UINT32_MAX || weight.numel() > UINT32_MAX)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "packed Metal linear exceeds indexing bounds"});
+    const struct {
+        std::uint32_t rows, width, columns, bits, group_size;
+        float input_scale, output_scale;
+    } geometry{static_cast<std::uint32_t>(input.numel() / input.size(-1)),
+               static_cast<std::uint32_t>(input.size(-1)),
+               static_cast<std::uint32_t>(weight.size(0)),
+               static_cast<std::uint32_t>(bits),
+               static_cast<std::uint32_t>(group_size),
+               input_scale,
+               output_scale};
+    MPSCommandBuffer* buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
+    id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
+    if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create packed projection encoder"});
+    const bool tiled = geometry.rows >= 4 && !vector_projection;
+    const auto columns_per_group = tiled ? 32u : 4u;
+    [encoder setComputePipelineState:tiled ? (*shared)->gemm : (*shared)->gemv];
+    auto status = bind(encoder, input, 0);
+    if (status) status = bind(encoder, weight, 1);
+    if (status) status = bind(encoder, scales, 2);
+    if (status) status = bind(encoder, output, 3);
+    [encoder setBytes:&geometry length:sizeof(geometry) atIndex:4];
+    if (status)
+        [encoder dispatchThreadgroups:MTLSizeMake((geometry.columns + columns_per_group - 1) / columns_per_group,
+                                                  tiled ? (geometry.rows + 31) / 32 : geometry.rows, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+    [encoder endEncoding];
+    return status;
+}
 
 struct QuantizedLinear::Impl {
     std::shared_ptr<Pipelines> pipelines;

@@ -21,6 +21,8 @@ public:
     auto native_handle() const noexcept -> void*;
     auto track_completion() -> std::function<void(std::string)>;
     auto copy_(const tensor::Tensor& source, tensor::Tensor& destination) -> Result<void>;
+    auto copy_slice_(const tensor::Tensor& source, tensor::Tensor& destination, std::size_t outer,
+                     std::size_t source_bytes, std::size_t destination_bytes, std::size_t offset_bytes) -> Result<void>;
     auto scatter_(tensor::Tensor& destination, const tensor::Tensor& updates, const tensor::Tensor& indices)
         -> Result<void>;
 

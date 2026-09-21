@@ -242,9 +242,10 @@ def find_tokenizer_converter(explicit: Path | None) -> Path:
     candidates = []
     if explicit is not None:
         candidates.append(explicit)
-    repository = Path(__file__).resolve().parents[1]
+    repository = Path(__file__).resolve().parents[3]
     candidates.extend(
         [
+            Path(__file__).with_name("nlcodec_to_tokenizer_json.py"),
             repository / "third_party/tokenizerspp/tools/nlcodec_to_tokenizer_json.py",
             repository.parent / "tokenizerspp/tools/nlcodec_to_tokenizer_json.py",
         ]

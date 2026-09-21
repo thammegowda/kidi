@@ -10,6 +10,7 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
 
 option(KIDI_BUILD_TESTS "Build kidi tests" ON)
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
+option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
 include(cmake/dependencies.cmake)
 include(cmake/ynnpack.cmake)
 
@@ -22,14 +23,18 @@ add_library(kidi
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
     src/kidi/inference/decoder.cpp
+    src/kidi/inference/generator.cpp
     src/kidi/inference/translator.cpp
     src/kidi/layers/position_encoding.cpp
+    src/kidi/layers/gemma4.cpp
     src/kidi/layers/transformer.cpp
     src/kidi/model/config.cpp
+    src/kidi/model/gemma4.cpp
     src/kidi/model/package.cpp
     src/kidi/model/transformer.cpp
     src/kidi/model/weights.cpp
     src/kidi/ops/context.cpp
+    src/kidi/ops/quantization.cpp
     src/kidi/runtime/operator.cpp
     src/kidi/runtime/ynn/operators.cpp
     src/kidi/runtime/ynn/graph.cpp
@@ -40,6 +45,11 @@ add_library(kidi
     src/kidi/text/tokenizer.cpp
 )
 add_library(kidi::kidi ALIAS kidi)
+
+if(KIDI_BUILD_BENCHMARKS)
+    add_executable(kidi_gemma4_quality benchmarks/gemma4/quality.cpp)
+    target_link_libraries(kidi_gemma4_quality PRIVATE kidi::kidi)
+endif()
 
 target_include_directories(kidi
     PUBLIC
@@ -72,12 +82,14 @@ if(APPLE)
             src/kidi/runtime/mps/graph.mm
             src/kidi/runtime/mps/operators.cpp
             src/kidi/runtime/mps/quantized_linear.mm
+            src/kidi/runtime/mps/eager_kernels.mm
             src/kidi/tensor/metal_backend.mm
     )
     set_source_files_properties(
         src/kidi/runtime/mps/graph.mm
         src/kidi/runtime/mps/command_batch.mm
         src/kidi/runtime/mps/quantized_linear.mm
+        src/kidi/runtime/mps/eager_kernels.mm
         src/kidi/tensor/metal_backend.mm
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
     )
@@ -91,6 +103,9 @@ if(APPLE)
     )
 
     if(KIDI_BUILD_BENCHMARKS)
+        add_executable(kidi_metal_packed_bench benchmarks/metal/packed_linear_bench.mm)
+        set_source_files_properties(benchmarks/metal/packed_linear_bench.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_link_libraries(kidi_metal_packed_bench PRIVATE kidi::kidi ${KIDI_METAL_FRAMEWORK} ${KIDI_MPS_FRAMEWORK})
         add_executable(kidi_metal_int8_bench benchmarks/metal/int8_linear_bench.cpp)
         target_link_libraries(kidi_metal_int8_bench PRIVATE kidi::kidi)
         add_executable(kidi_metal_lowering_bench benchmarks/metal/lowering_bench.mm)
@@ -105,9 +120,30 @@ if(APPLE)
     endif()
 endif()
 
-add_executable(kidi_cli src/kidi/cli/main.cpp)
+add_library(kidi_cli_main STATIC src/kidi/cli/main.cpp src/kidi/cli/interactive.cpp)
+target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi spdlog::spdlog nlohmann_json::nlohmann_json)
+
+add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)
 set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
-target_link_libraries(kidi_cli PRIVATE kidi::argparse kidi::kidi spdlog::spdlog)
+target_link_libraries(kidi_cli PRIVATE kidi_cli_main)
+
+if(KIDI_BUILD_PYTHON)
+    find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module Development.SABIModule)
+    find_package(nanobind CONFIG REQUIRED)
+    nanobind_add_module(_native STABLE_ABI python/bindings.cpp)
+    target_link_libraries(_native PRIVATE kidi_cli_main)
+    install(TARGETS _native LIBRARY DESTINATION kidi COMPONENT python)
+    install(FILES "${KIDI_THIRD_PARTY_DIR}/tokenizerspp/tools/nlcodec_to_tokenizer_json.py"
+        DESTINATION kidi/converters COMPONENT python)
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -c
+            "from importlib.metadata import distribution; package = distribution('nanobind'); print(next(package.locate_file(file) for file in package.files if file.name == 'LICENSE' and '.dist-info' in str(file)))"
+        OUTPUT_VARIABLE KIDI_NANOBIND_LICENSE
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        COMMAND_ERROR_IS_FATAL ANY
+    )
+    install(FILES "${KIDI_NANOBIND_LICENSE}" DESTINATION kidi/licenses/nanobind COMPONENT python)
+endif()
 
 include(CTest)
 

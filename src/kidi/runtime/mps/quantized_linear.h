@@ -1,12 +1,17 @@
 #pragma once
 
 #include <memory>
-#include <functional>
 #include <string>
 #include "kidi/tensor/tensor.h"
 #include "kidi/runtime/mps/command_batch.h"
 
 namespace kidi::runtime::mps {
+auto encode_expand_packed_weight(CommandBatch& batch, const tensor::Tensor& weight, const tensor::Tensor& scales,
+                                 tensor::Tensor& output, std::int32_t bits, std::int32_t group_size) -> Result<void>;
+auto encode_packed_linear(CommandBatch& batch, const tensor::Tensor& input, const tensor::Tensor& weight,
+                          const tensor::Tensor& scales, tensor::Tensor& output, std::int32_t bits,
+                          std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F,
+                          bool vector_projection = false) -> Result<void>;
 
 class QuantizedLinear {
 public:

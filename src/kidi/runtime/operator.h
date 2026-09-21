@@ -52,13 +52,25 @@ enum class Operation {
     CONCAT,
     SCATTER,
     ATTENTION,
-    RESIDUAL_NORM
+    RESIDUAL_NORM,
+    RMS_NORM,
+    TANH,
+    ROTARY,
+    PACKED_LINEAR,
+    RMS_NORM_RESIDUAL,
+    STATIC_ROUND,
+    GREEDY_TOKEN,
+    RMS_ROTARY,
+    GELU_MULTIPLY
 };
 struct OperatorSpec {
     Operation operation;
     std::span<const std::int64_t> attributes;
     tensor::DType dtype = tensor::DType::F32;
     float epsilon = 0;
+    bool dynamic_parameters = false;
+    bool packed_prefill = false;
+    bool vector_projection = false;
 };
 
 struct AllocationStats {
@@ -81,6 +93,10 @@ public:
     virtual ~OperatorBackend() = default;
     virtual auto prepare(const OperatorSpec&, TensorInputs) -> std::unique_ptr<Operator> = 0;
     virtual auto synchronize() -> void = 0;
+    virtual auto release_cached_buffers() -> void {}
+    virtual auto copy_slice_(tensor::Tensor& destination, const tensor::Tensor& source, std::size_t outer,
+                             std::size_t source_bytes, std::size_t destination_bytes, std::size_t offset_bytes)
+        -> void = 0;
 };
 class OutputPool {
 public:

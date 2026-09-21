@@ -22,16 +22,19 @@ struct KeyValue {
 
 KIDI_MODULE(Linear);
 
-/// Affine projection over the final dimension with bound weights and bias.
+/// Affine projection over the final dimension with bound weights and optional bias.
 /// Supports FP32, BF16, and per-channel INT8 weight encodings.
 class LinearImpl : public Module {
 public:
-    LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose = false);
+    LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose = false, bool bias = true,
+               std::int32_t packed_bits = 0);
     auto forward(ops::Context&, const Tensor&) const -> Tensor;
 
 private:
     Tensor weight_, bias_, scale_;
-    bool transpose_;
+    Tensor input_scale_, output_scale_;
+    std::int32_t packed_bits_ = 0, input_size_ = 0;
+    bool transpose_, has_bias_;
 };
 
 KIDI_MODULE(LayerNorm);

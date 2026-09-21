@@ -1,0 +1,57 @@
+[build-system]
+requires = ["scikit-build-core>=0.12", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "kidi"
+dynamic = ["version"]
+description = "C++ inference for RTG translation and Gemma 4 text generation"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[project.optional-dependencies]
+hf = ["huggingface-hub>=1.0,<2", "PyYAML>=6", "filelock>=3.12"]
+convert = ["torch>=2", "ruamel.yaml>=0.17", "safetensors>=0.4,<1"]
+
+[project.urls]
+Repository = "https://github.com/thammegowda/kidi"
+
+[project.scripts]
+kidi = "kidi:main"
+
+[tool.scikit-build]
+cmake.version = ">=3.26"
+cmake.build-type = "Release"
+build.targets = ["_native"]
+build-dir = "build-python/{wheel_tag}"
+wheel.packages = ["python/kidi"]
+wheel.py-api = "cp312"
+wheel.license-files = [
+	"third_party/*/LICENSE*",
+	"third_party/*/COPYING*",
+	"third_party/*/NOTICE*",
+	"third_party/uni-algo/include/uni_algo/impl/LICENSE.txt",
+	"third_party/uni-algo/include/uni_algo/impl/data/LICENSE.txt",
+]
+install.components = ["python"]
+sdist.exclude = [
+	"third_party/**/.git",
+	"third_party/**/__pycache__/**",
+	"third_party/**/.cache/**",
+	"third_party/**/build/**",
+	"third_party/**/build-*/**",
+	"/dist/**",
+]
+
+[tool.scikit-build.cmake.define]
+KIDI_BUILD_PYTHON = "ON"
+KIDI_BUILD_TESTS = "OFF"
+KIDI_BUILD_BENCHMARKS = "OFF"
+BUILD_TESTING = "OFF"
+BUILD_SHARED_LIBS = "OFF"
+CMAKE_OSX_DEPLOYMENT_TARGET = "26.0"
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "CMakeLists.txt"
+regex = 'project\(kidi VERSION (?P<value>[0-9.]+)'

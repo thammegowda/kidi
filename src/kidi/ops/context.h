@@ -6,6 +6,16 @@
 #include "kidi/tensor/tensor.h"
 
 namespace kidi::ops {
+class DecodeScope {
+public:
+    explicit DecodeScope(bool enabled);
+    ~DecodeScope();
+    DecodeScope(const DecodeScope&) = delete;
+    auto operator=(const DecodeScope&) -> DecodeScope& = delete;
+
+private:
+    bool previous_;
+};
 using tensor::Tensor;
 
 /// Execution mode for the current call; public operations scope and restore it.
@@ -33,7 +43,7 @@ inline auto require(Result<void> result) -> void {
 /// In-place calls preserve shape, dtype, and storage. Synchronize before host reads on Metal.
 class Context {
 public:
-    explicit Context(tensor::Device device = tensor::Device::cpu());
+    explicit Context(tensor::Device device = tensor::Device::cpu(), bool packed_prefill = false);
     ~Context();
     Context(Context&&) noexcept;
     auto operator=(Context&&) noexcept -> Context&;
@@ -43,6 +53,8 @@ public:
     auto synchronize() -> void;
     auto preparation_ns() const noexcept -> std::uint64_t;
     auto profile_phase(std::string_view phase) -> void;
+    auto prepare_linear_weights(const Tensor& weight, std::int32_t bits, std::int32_t group_size = 128,
+                                bool packed_prefill = true) -> void;
     auto add(const Tensor& left, const Tensor& right) -> Tensor;
     auto add_(Tensor& left, const Tensor& right) -> Tensor&;
     auto multiply(const Tensor& left, const Tensor& right) -> Tensor;
@@ -51,10 +63,25 @@ public:
     auto matmul(const Tensor& left, const Tensor& right, bool transpose_right = false) -> Tensor;
     auto scaled_dot_product_attention(const Tensor& query, const Tensor& key, const Tensor& value, std::int32_t heads,
                                       const Tensor& mask = {}) -> Tensor;
+    auto grouped_query_attention(const Tensor& query, const Tensor& key, const Tensor& value, std::int32_t heads,
+                                 std::int32_t key_value_heads, const Tensor& mask, float scale = 1.F,
+                                 std::int64_t key_start = 0) -> Tensor;
+    auto rotary(const Tensor& input, const Tensor& cosine, const Tensor& sine) -> Tensor;
     auto linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight = false) -> Tensor;
     auto quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias) -> Tensor;
-    auto gelu(const Tensor& input) -> Tensor;
-    auto gelu_(Tensor& input) -> Tensor&;
+    auto packed_linear(const Tensor& input, const Tensor& weight, const Tensor& scales, std::int32_t bits,
+                       std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F) -> Tensor;
+    auto gelu(const Tensor& input, bool approximate = false) -> Tensor;
+    auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
+    auto gelu_(Tensor& input, bool approximate = false) -> Tensor&;
+    auto tanh(const Tensor& input) -> Tensor;
+    auto static_round(const Tensor& input, float scale) -> Tensor;
+    auto greedy_token(const Tensor& logits) -> Tensor;
+    auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
+    auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine, float epsilon)
+        -> Tensor;
+    auto rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,
+                           const Tensor& output_scale = {}) -> Tensor;
     auto layer_norm(const Tensor& input, const Tensor& scale, const Tensor& bias, float epsilon) -> Tensor;
     auto layer_norm_(Tensor& input, const Tensor& scale, const Tensor& bias, float epsilon) -> Tensor&;
     auto residual_layer_norm(const Tensor& input, const Tensor& residual, const Tensor& scale, const Tensor& bias,
@@ -67,6 +94,7 @@ public:
     auto concat(std::span<const Tensor> inputs, std::int64_t axis) -> Tensor;
     auto scatter(const Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor;
     auto scatter_(Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor&;
+    auto copy_slice_(Tensor& destination, const Tensor& source, std::int64_t axis, std::int64_t start) -> Tensor&;
     auto reshape(const Tensor& input, std::vector<std::int64_t> shape) -> Tensor;
 
 private:

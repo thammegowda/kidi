@@ -42,6 +42,18 @@ decode: {beam_size: 4}
         }
     }
     auto old_format = YAML::Clone(config);
+    auto gemma = YAML::Clone(config);
+    gemma["model"]["type"] = "gemma4_text";
+    gemma.remove("io");
+    gemma.remove("tokenizers");
+    gemma["tokenizer_file"] = "src.json";
+    write(directory / "gemma.yaml", YAML::Dump(gemma));
+    auto gemma_config = kidi::model::load_config(directory / "gemma.yaml");
+    if (!gemma_config || (*gemma_config)["tokenizer_file"].as<std::string>() != (directory / "src.json").string())
+        return 1;
+    gemma["tokenizer_file"] = "../outside";
+    write(directory / "invalid-gemma.yaml", YAML::Dump(gemma));
+    if (kidi::model::load_config(directory / "invalid-gemma.yaml")) return 1;
     old_format.remove("model");
     old_format["architecture"]["hidden_size"] = 768;
     write(directory / "old.yaml", YAML::Dump(old_format));

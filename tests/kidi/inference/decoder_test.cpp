@@ -21,8 +21,43 @@ auto main() -> int {
     if (!generated || !prefixes_valid || generated->token_ids != std::vector<std::int32_t>{4} ||
         generated->decoder_steps != 2)
         return 1;
+    const std::array<std::int32_t, 1> additional_stops{4};
+    auto multi_stop = greedy;
+    multi_stop.stop_ids = additional_stops;
+    auto stopped = Decoder::generate(std::array<std::int32_t, 2>{1, 2}, multi_stop, language_model);
+    if (!stopped || !stopped->token_ids.empty() || stopped->decoder_steps != 1) return 1;
+    multi_stop.stop_on_eos = false;
+    auto fixed = Decoder::generate(std::array<std::int32_t, 2>{1, 2}, multi_stop, language_model);
+    if (!fixed || fixed->token_ids != std::vector<std::int32_t>{4, 3, 3, 3} || fixed->decoder_steps != 4) return 1;
+    const auto selected_model = [](const DecodeRequest& request) -> kidi::Result<TokenScores> {
+        return TokenScores{{}, ScoreKind::LOGITS, request.generated_steps == 0 ? 4 : 3};
+    };
+    auto selected_stop = multi_stop;
+    selected_stop.stop_on_eos = true;
+    for (const auto& policy : {greedy, selected_stop, multi_stop}) {
+        auto unscored = policy;
+        unscored.compute_score = false;
+        const auto host = Decoder::generate(std::array<std::int32_t, 2>{1, 2}, unscored, language_model);
+        const auto selected = Decoder::generate(std::array<std::int32_t, 2>{1, 2}, unscored, selected_model);
+        if (!host || !selected || selected->token_ids != host->token_ids ||
+            selected->decoder_steps != host->decoder_steps)
+            return 1;
+    }
+    if (Decoder::generate(std::array<std::int32_t, 1>{2}, greedy, selected_model)) return 1;
+    auto unscored = greedy;
+    unscored.compute_score = false;
+    for (auto invalid : {-1, 5}) {
+        if (Decoder::generate(std::array<std::int32_t, 1>{2}, unscored,
+                              [invalid](const DecodeRequest&) -> kidi::Result<TokenScores> {
+                                  return TokenScores{{}, ScoreKind::LOGITS, invalid};
+                              }))
+            return 1;
+    }
     auto beam = greedy;
     beam.beam_size = 2;
+    auto selected_beam = beam;
+    selected_beam.compute_score = false;
+    if (Decoder::generate(std::array<std::int32_t, 1>{2}, selected_beam, selected_model)) return 1;
     const auto conditioned_model = [&](const DecodeRequest& request) -> kidi::Result<TokenScores> {
         values.assign(request.beam_indices.size() * 5, -std::numeric_limits<float>::infinity());
         for (std::size_t row = 0; row < request.beam_indices.size(); ++row) {
@@ -73,5 +108,39 @@ auto main() -> int {
             return 1;
     }
     std::cout << "generic conditioned/decoder-only search tests passed\n";
+    for (auto& settings_row : settings) settings_row.compute_score = false;
+    std::array<std::int32_t, 3> chosen{};
+    auto selected_batch =
+        Decoder::generate_batch(starts, settings, [&](const GreedyRequest& request) -> kidi::Result<TokenScores> {
+            const std::vector<std::size_t> expected_active =
+                request.generated_steps == 0   ? std::vector<std::size_t>{0, 1, 2}
+                : request.generated_steps == 1 ? std::vector<std::size_t>{1, 2}
+                                               : std::vector<std::size_t>{2};
+            if (!std::ranges::equal(request.active_rows, expected_active))
+                return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "wrong active rows"});
+            for (auto row : request.active_rows) {
+                const auto values = std::span(table).subspan(request.tokens[row] * 5, 5);
+                chosen[row] = std::ranges::max_element(values) - values.begin();
+            }
+            return TokenScores{{}, ScoreKind::LOGITS, {}, chosen};
+        });
+    if (!selected_batch || (*selected_batch)[0].token_ids != std::vector<std::int32_t>{1} ||
+        (*selected_batch)[1].token_ids != std::vector<std::int32_t>{1} ||
+        (*selected_batch)[2].token_ids != std::vector<std::int32_t>{4, 4, 4, 4})
+        return 1;
+    auto incremental = GreedyState::create(unscored);
+    if (!incremental || incremental->accept(TokenScores{{}, ScoreKind::LOGITS, -1}) ||
+        incremental->result().decoder_steps != 0 || !incremental->accept(TokenScores{{}, ScoreKind::LOGITS, 4}) ||
+        incremental->finished() || !incremental->accept(TokenScores{{}, ScoreKind::LOGITS, 3}) ||
+        !incremental->finished() || incremental->result().token_ids != std::vector<std::int32_t>{4} ||
+        incremental->accept(TokenScores{{}, ScoreKind::LOGITS, 4}))
+        return 1;
+    for (auto invalid : {-1, 5}) {
+        chosen.fill(invalid);
+        if (Decoder::generate_batch(starts, settings, [&](const GreedyRequest&) -> kidi::Result<TokenScores> {
+                return TokenScores{{}, ScoreKind::LOGITS, {}, chosen};
+            }))
+            return 1;
+    }
     return 0;
 }
