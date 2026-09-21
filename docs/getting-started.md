@@ -186,7 +186,7 @@ access, and `hf auth login` must authenticate that account.
 ```bash
 python -m kidi inspect -m @thammegowda/rtg-500eng-v1
 printf '%s\n' 'Comment allez @-@ vous ?' | \
-  python -m kidi generate -m @thammegowda/rtg-500eng-v1 \
+  python -m kidi translate -m @thammegowda/rtg-500eng-v1 \
     --beam-size 1
 ```
 

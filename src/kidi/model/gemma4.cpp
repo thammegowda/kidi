@@ -5,7 +5,6 @@
 #include <cmath>
 #include <numeric>
 #include <regex>
-#include <cstdlib>
 
 namespace kidi::model {
 using ops::require;
@@ -328,7 +327,7 @@ auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
     }
 }
 auto Gemma4Impl::forward(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits) -> Result<Tensor> {
-    return run(tokens, state, all_logits, true);
+    return project(tokens, state, all_logits, false);
 }
 auto Gemma4Impl::fork_state(const Gemma4State& source, std::size_t prefix_length, std::size_t capacity)
     -> Result<Gemma4State> {
@@ -361,7 +360,7 @@ auto Gemma4Impl::fork_state(const Gemma4State& source, std::size_t prefix_length
     }
 }
 auto Gemma4Impl::forward_token(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<std::int32_t> {
-    return selected_token(run(tokens, state, false, true, true));
+    return selected_token(project(tokens, state, false, true));
 }
 auto Gemma4Impl::forward_batch(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states) -> Result<Tensor> {
     return run_batch(tokens, states, false);
@@ -401,18 +400,124 @@ auto Gemma4Impl::run_batch(std::span<const std::int32_t> tokens, std::span<Gemma
                             {ErrorCode::INVALID_ARGUMENT, "batched requests must not alias mutable caches"});
             }
         }
-        return run(tokens, *states.front(), true, true, select, states);
+        return project(tokens, *states.front(), true, select, states);
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
 }
-auto Gemma4Impl::prefill(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void> {
-    auto result = run(tokens, state, false, false);
-    if (!result) return std::unexpected(std::move(result.error()));
-    return {};
+struct Gemma4Impl::Attention {
+    std::vector<std::array<Tensor, 2>> masks;
+    std::vector<std::array<std::size_t, 2>> key_starts;
+    std::array<std::array<Tensor, 2>, 2> angles;
+};
+
+auto Gemma4Impl::embed(std::span<const std::int32_t> tokens) -> std::array<Tensor, 2> {
+    auto& context = impl_->context;
+    const auto length = static_cast<std::int64_t>(tokens.size());
+    auto hidden = impl_->tokens->forward(context, tokens);
+    auto token_inputs = impl_->per_layer_tokens->forward(context, tokens);
+    auto projection = context.multiply(impl_->per_layer_projection->forward(context, hidden), impl_->projection_scale);
+    projection = context.reshape(projection, {1, length, impl_->layer_count, impl_->per_layer_width});
+    auto per_layer = context.multiply(
+        context.add(impl_->per_layer_norm->forward(context, projection),
+                    context.reshape(token_inputs, {1, length, impl_->layer_count, impl_->per_layer_width})),
+        impl_->combination_scale);
+    return {std::move(hidden), std::move(per_layer)};
 }
-auto Gemma4Impl::run(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits, bool project,
-                     bool select, std::span<Gemma4State*> batch_states) -> Result<Tensor> {
+
+auto Gemma4Impl::attention_inputs(Gemma4State& state, std::span<Gemma4State*> batch_states, std::size_t step_count)
+    -> Attention {
+    const auto requests = batch_states.empty() ? 1 : batch_states.size();
+    Attention result;
+    result.masks.resize(requests);
+    result.key_starts.resize(requests);
+    std::vector<std::array<std::array<Tensor, 2>, 2>> row_angles(requests);
+    for (std::size_t row = 0; row < requests; ++row) {
+        const auto& request = batch_states.empty() ? state : *batch_states[row];
+        const auto extent = std::min(request.capacity, ((request.position + step_count + 127) / 128) * 128);
+        result.key_starts[row] = {request.crop_local_attention && device() == tensor::Device::cpu() &&
+                                          request.position + 1 > static_cast<std::size_t>(impl_->window)
+                                      ? ((request.position + 1 - impl_->window) / 128) * 128
+                                      : 0,
+                                  0};
+        for (int type = 0; type < 2; ++type) {
+            const auto start = result.key_starts[row][type], count = extent - start;
+            std::vector<float> values(step_count * count, -1e9F);
+            for (std::size_t query = 0; query < step_count; ++query)
+                for (std::size_t column = start; column <= request.position + query; ++column)
+                    if (type == 1 || request.position + query - column < static_cast<std::size_t>(impl_->window))
+                        values[query * count + column - start] = 0.F;
+            result.masks[row][type] = require(
+                Tensor::from_host({1, 1, static_cast<std::int64_t>(step_count), static_cast<std::int64_t>(count)},
+                                  std::span<const float>(values), device()));
+            row_angles[row][type] = impl_->positions(type, request.position, step_count);
+        }
+    }
+    for (int type = 0; type < 2; ++type)
+        for (std::size_t component = 0; component < 2; ++component) {
+            if (requests == 1) {
+                result.angles[type][component] = row_angles[0][type][component];
+            } else {
+                std::vector<Tensor> pieces;
+                for (const auto& row : row_angles) pieces.push_back(row[type][component]);
+                result.angles[type][component] = impl_->context.concat(pieces, 1);
+            }
+        }
+    return result;
+}
+
+auto Gemma4Impl::per_layer_input(const Tensor& per_layer, int layer, std::int64_t length) -> Tensor {
+    auto& context = impl_->context;
+    if (length == 1)
+        return context.reshape(
+            require(context.reshape(per_layer, {impl_->layer_count, impl_->per_layer_width}).select(0, layer)),
+            {1, 1, impl_->per_layer_width});
+    return context.reshape(context.slice(per_layer, 2, layer, 1), {1, length, impl_->per_layer_width});
+}
+
+auto Gemma4Impl::head(const Tensor& hidden, bool select) -> Tensor {
+    auto& context = impl_->context;
+    auto logits = impl_->lm_head->forward(context, impl_->norm->forward(context, hidden));
+    logits = context.multiply(context.tanh(context.multiply(logits, impl_->inverse_logit_scale)), impl_->logit_scale);
+    return select ? context.greedy_token(logits) : logits;
+}
+
+auto Gemma4Impl::prefill(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void> {
+    try {
+        if (tokens.empty() || state.position > state.capacity || tokens.size() > state.capacity - state.position ||
+            state.layers.size() != static_cast<std::size_t>(impl_->shared_begin))
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 input or cache state"});
+        auto& context = impl_->context;
+        if (!state.profile_started) {
+            context.profile_phase("gemma4_request");
+            state.profile_started = true;
+        }
+        context.profile_phase(state.prefilling ? "prefill_embedding" : "decode_embedding");
+        const auto length = static_cast<std::int64_t>(tokens.size());
+        auto [hidden, per_layer] = embed(tokens);
+        auto attention = attention_inputs(state, {}, tokens.size());
+        context.profile_phase(state.prefilling ? "prefill_body" : "decode_body");
+        std::array<layers::Gemma4AttentionSegment, 1> segments;
+        for (int layer = 0; layer < impl_->shared_begin; ++layer) {
+            // The last producer layer only has to write its K/V slice; its output is never read.
+            const bool cache_only = layer + 1 == impl_->shared_begin;
+            const auto input = cache_only ? Tensor{} : per_layer_input(per_layer, layer, length);
+            const auto type = impl_->kind[layer];
+            segments[0] = {&state.layers[impl_->cache_layer[layer]], state.position, tokens.size(),
+                           &attention.masks[0][type], static_cast<std::int64_t>(attention.key_starts[0][type])};
+            hidden = impl_->layers->at(layer)->forward_segments(
+                context, hidden, input, segments, attention.angles[type][0], attention.angles[type][1], cache_only);
+        }
+        context.synchronize();
+        state.position += tokens.size();
+        return {};
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    }
+}
+
+auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits, bool select,
+                         std::span<Gemma4State*> batch_states) -> Result<Tensor> {
     const ops::DecodeScope decode_scope(!batch_states.empty());
     try {
         const std::size_t token_count = tokens.size();
@@ -420,12 +525,12 @@ auto Gemma4Impl::run(std::span<const std::int32_t> tokens, Gemma4State& state, b
         if (!token_count || state.position > state.capacity || step_count > state.capacity - state.position ||
             state.layers.size() != static_cast<std::size_t>(impl_->shared_begin))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 input or cache state"});
-        if (project && !all_logits && tokens.size() > 1 && last_token_prefill()) {
+        if (!all_logits && token_count > 1 && batch_states.empty() && last_token_prefill()) {
             for (auto token : tokens)
                 if (token < 0 || token >= impl_->vocabulary || token >= impl_->per_layer_vocabulary)
                     throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "embedding token outside vocabulary"});
-            require(prefill(tokens.first(tokens.size() - 1), state));
-            return run(tokens.last(1), state, false, true, select);
+            require(prefill(tokens.first(token_count - 1), state));
+            return project(tokens.last(1), state, false, select);
         }
         auto& context = impl_->context;
         if (!state.profile_started) {
@@ -434,106 +539,48 @@ auto Gemma4Impl::run(std::span<const std::int32_t> tokens, Gemma4State& state, b
         }
         context.profile_phase(state.prefilling ? "prefill_embedding" : "decode_embedding");
         const auto length = static_cast<std::int64_t>(token_count);
-        auto hidden = impl_->tokens->forward(context, tokens);
-        auto token_inputs = impl_->per_layer_tokens->forward(context, tokens);
-        auto projection =
-            context.multiply(impl_->per_layer_projection->forward(context, hidden), impl_->projection_scale);
-        projection = context.reshape(projection, {1, length, impl_->layer_count, impl_->per_layer_width});
-        auto per_layer = context.multiply(
-            context.add(impl_->per_layer_norm->forward(context, projection),
-                        context.reshape(token_inputs, {1, length, impl_->layer_count, impl_->per_layer_width})),
-            impl_->combination_scale);
-        const auto requests = batch_states.empty() ? 1 : batch_states.size();
-        std::vector<std::array<Tensor, 2>> masks(requests);
-        std::vector<std::array<std::array<Tensor, 2>, 2>> row_positions(requests);
-        std::vector<std::array<std::size_t, 2>> key_starts(requests);
-        std::array<std::array<Tensor, 2>, 2> positions;
-        for (std::size_t row = 0; row < requests; ++row) {
-            const auto& request = batch_states.empty() ? state : *batch_states[row];
-            const auto extent = std::min(request.capacity, ((request.position + step_count + 127) / 128) * 128);
-            key_starts[row] = {request.crop_local_attention && device() == tensor::Device::cpu() &&
-                                       request.position + 1 > static_cast<std::size_t>(impl_->window)
-                                   ? ((request.position + 1 - impl_->window) / 128) * 128
-                                   : 0,
-                               0};
-            for (int type = 0; type < 2; ++type) {
-                const auto start = key_starts[row][type], count = extent - start;
-                std::vector<float> values(step_count * count, -1e9F);
-                for (std::size_t query = 0; query < step_count; ++query)
-                    for (std::size_t column = start; column <= request.position + query; ++column)
-                        if (type == 1 || request.position + query - column < static_cast<std::size_t>(impl_->window))
-                            values[query * count + column - start] = 0.F;
-                masks[row][type] = require(
-                    Tensor::from_host({1, 1, static_cast<std::int64_t>(step_count), static_cast<std::int64_t>(count)},
-                                      std::span<const float>(values), device()));
-                row_positions[row][type] = impl_->positions(type, request.position, step_count);
-            }
-        }
-        for (int type = 0; type < 2; ++type) {
-            for (std::size_t component = 0; component < 2; ++component) {
-                if (requests == 1)
-                    positions[type][component] = row_positions[0][type][component];
-                else {
-                    std::vector<Tensor> pieces;
-                    for (const auto& row : row_positions) pieces.push_back(row[type][component]);
-                    positions[type][component] = context.concat(pieces, 1);
-                }
-            }
-        }
+        auto [hidden, per_layer] = embed(tokens);
+        auto attention = attention_inputs(state, batch_states, step_count);
         context.profile_phase(state.prefilling ? "prefill_body" : "decode_body");
+        const auto requests = batch_states.empty() ? 1 : batch_states.size();
         std::vector<layers::Gemma4AttentionSegment> segments(requests);
-        const auto evaluated_layers = project ? impl_->layer_count : impl_->shared_begin;
-        const bool shared_tail = project && !all_logits && batch_states.empty() && length >= 64 &&
+        // Only the final queries reach the shared-K/V layers when just the last logit is needed.
+        const bool shared_tail = !all_logits && batch_states.empty() && length >= 64 &&
                                  impl_->shared_begin < impl_->layer_count && shared_prefill_tail();
         std::size_t query_offset = 0;
         auto active_length = length;
-        for (int layer = 0; layer < evaluated_layers; ++layer) {
+        for (int layer = 0; layer < impl_->layer_count; ++layer) {
             if (shared_tail && layer == impl_->shared_begin) {
                 active_length = 4;
                 query_offset = length - active_length;
                 hidden = context.slice(hidden, 1, query_offset, active_length);
                 per_layer = context.slice(per_layer, 1, query_offset, active_length);
                 for (int type = 0; type < 2; ++type) {
-                    masks[0][type] = context.slice(masks[0][type], 2, query_offset, active_length);
-                    for (auto& component : positions[type])
+                    attention.masks[0][type] = context.slice(attention.masks[0][type], 2, query_offset, active_length);
+                    for (auto& component : attention.angles[type])
                         component = context.slice(component, 1, query_offset, active_length);
                 }
             }
-            const bool cache_only = !project && layer + 1 == evaluated_layers;
-            Tensor input;
-            if (!cache_only)
-                input = active_length == 1
-                            ? context.reshape(
-                                  require(context.reshape(per_layer, {impl_->layer_count, impl_->per_layer_width})
-                                              .select(0, layer)),
-                                  {1, 1, impl_->per_layer_width})
-                            : context.reshape(context.slice(per_layer, 2, layer, 1),
-                                              {1, active_length, impl_->per_layer_width});
+            const auto input = per_layer_input(per_layer, layer, active_length);
             const auto type = impl_->kind[layer];
             for (std::size_t row = 0; row < requests; ++row) {
                 auto& request = batch_states.empty() ? state : *batch_states[row];
                 segments[row] = {&request.layers[impl_->cache_layer[layer]], request.position + query_offset,
                                  batch_states.empty() ? static_cast<std::size_t>(active_length) : step_count,
-                                 &masks[row][type], static_cast<std::int64_t>(key_starts[row][type])};
+                                 &attention.masks[row][type],
+                                 static_cast<std::int64_t>(attention.key_starts[row][type])};
             }
-            hidden = impl_->layers->at(layer)->forward_segments(context, hidden, input, segments, positions[type][0],
-                                                                positions[type][1], cache_only);
+            hidden = impl_->layers->at(layer)->forward_segments(context, hidden, input, segments,
+                                                                attention.angles[type][0], attention.angles[type][1]);
         }
-        Tensor logits;
-        if (project) {
-            context.profile_phase(state.prefilling ? "prefill_head" : "decode_head");
-            if (!all_logits) hidden = context.slice(hidden, 1, active_length - 1, 1);
-            hidden = impl_->norm->forward(context, hidden);
-            logits = impl_->lm_head->forward(context, hidden);
-            logits = context.multiply(context.tanh(context.multiply(logits, impl_->inverse_logit_scale)),
-                                      impl_->logit_scale);
-            if (select) logits = context.greedy_token(logits);
-        }
+        context.profile_phase(state.prefilling ? "prefill_head" : "decode_head");
+        if (!all_logits) hidden = context.slice(hidden, 1, active_length - 1, 1);
+        auto logits = head(hidden, select);
         context.synchronize();
         for (std::size_t row = 0; row < requests; ++row) {
             auto& request = batch_states.empty() ? state : *batch_states[row];
             request.position += step_count;
-            if (project) request.prefilling = false;
+            request.prefilling = false;
         }
         return logits;
     } catch (const ops::Failure& error) {
@@ -541,13 +588,8 @@ auto Gemma4Impl::run(std::span<const std::int32_t> tokens, Gemma4State& state, b
     }
 }
 auto Gemma4Impl::preparation_ns() const -> std::uint64_t { return impl_->context.preparation_ns(); }
-auto Gemma4Impl::last_token_prefill() const -> bool {
-    return impl_->qat && device() == tensor::Device::cpu() && !std::getenv("KIDI_FULL_LAST_CHUNK");
-}
+auto Gemma4Impl::last_token_prefill() const -> bool { return impl_->qat && device() == tensor::Device::cpu(); }
 auto Gemma4Impl::shared_prefill_tail() const -> bool {
-    if (const auto value = std::getenv("KIDI_SHARED_PREFILL_TAIL"); value && std::string_view(value) == "0")
-        return false;
-    return impl_->qat && device() == tensor::Device::apple_gpu() && !impl_->packed_prefill &&
-           !std::getenv("KIDI_FULL_LAST_CHUNK");
+    return impl_->qat && device() == tensor::Device::apple_gpu() && !impl_->packed_prefill;
 }
 } // namespace kidi::model

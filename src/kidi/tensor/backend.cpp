@@ -72,9 +72,8 @@ BackendRegistry::BackendRegistry() {
     backends_.emplace(DeviceKind::A_GPU,
                       make_unavailable_backend(DeviceKind::A_GPU, "metal-mps", "Metal backend is not built"));
 #endif
-    backends_.emplace(DeviceKind::Q_NPU, make_unavailable_backend(DeviceKind::Q_NPU, "hexagon-qnn",
-                                                                  "no Qualcomm QNN/HTP provider is registered"));
-    backends_.emplace(DeviceKind::CUDA, make_cuda_backend());
+    backends_.emplace(DeviceKind::Q_NPU, make_unavailable_backend(DeviceKind::Q_NPU, "hexagon-qnn", "not implemented"));
+    backends_.emplace(DeviceKind::CUDA, make_unavailable_backend(DeviceKind::CUDA, "cuda-cudnn", "not implemented"));
 }
 
 auto BackendRegistry::register_backend(std::shared_ptr<Backend> backend) -> Result<void> {

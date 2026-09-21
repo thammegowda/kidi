@@ -40,7 +40,6 @@ add_library(kidi
     src/kidi/runtime/ynn/graph.cpp
     src/kidi/tensor/backend.cpp
     src/kidi/tensor/cpu_backend.cpp
-    src/kidi/tensor/cuda_backend.cpp
     src/kidi/tensor/tensor.cpp
     src/kidi/text/tokenizer.cpp
 )

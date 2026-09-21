@@ -332,13 +332,6 @@ Context::Context(tensor::Device device, bool packed_prefill) : impl_(std::make_u
     impl_->device = device;
     impl_->packed_prefill = packed_prefill;
     impl_->dispatch_key.reserve(128);
-    if (const auto capacity = std::getenv("KIDI_OPERATOR_CACHE_CAPACITY")) {
-        char* end = nullptr;
-        const auto value = std::strtoull(capacity, &end, 10);
-        if (end == capacity || *end || value < 1 || value > 16384)
-            throw Failure({ErrorCode::INVALID_ARGUMENT, "operator cache capacity must be between 1 and 16384"});
-        impl_->operator_capacity = value;
-    }
     const auto profile = std::getenv("KIDI_PROFILE_OPS");
     impl_->profiling = profile && (std::string_view(profile) == "host" || std::string_view(profile) == "sync");
     impl_->profile_requested = impl_->profiling;
@@ -455,8 +448,7 @@ auto Context::gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor {
     if (!gate.defined() || !value.defined() || gate.dtype() != tensor::DType::F32 ||
         value.dtype() != tensor::DType::F32 || !std::ranges::equal(gate.shape(), value.shape()))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "GELU multiplication requires matching FP32 tensors"});
-    if (device() != tensor::Device::apple_gpu() || std::getenv("KIDI_SEPARATE_GELU_MULTIPLY"))
-        return multiply(gelu(gate, true), value);
+    if (device() != tensor::Device::apple_gpu()) return multiply(gelu(gate, true), value);
     return impl_->run({Operation::GELU_MULTIPLY}, {&gate, &value});
 }
 auto Context::gelu_(Tensor& input, bool approximate) -> Tensor& {
@@ -500,8 +492,7 @@ auto Context::rms_rotary(const Tensor& input, const Tensor& scale, const Tensor&
         if (angle->dimensions() != 4 || angle->size(0) != 1 || angle->size(1) != input.size(1) || angle->size(2) != 1 ||
             angle->size(3) != input.size(3) / 2 || angle->dtype() != tensor::DType::F32)
             throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid RMS rotary angles"});
-    if (device() != tensor::Device::apple_gpu() || std::getenv("KIDI_SEPARATE_RMS_ROTARY"))
-        return rotary(rms_norm(input, scale, epsilon), cosine, sine);
+    if (device() != tensor::Device::apple_gpu()) return rotary(rms_norm(input, scale, epsilon), cosine, sine);
     return impl_->run({Operation::RMS_ROTARY, {}, tensor::DType::F32, epsilon}, {&input, &scale, &cosine, &sine});
 }
 auto Context::rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,

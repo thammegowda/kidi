@@ -14,20 +14,6 @@
 
 namespace kidi::inference {
 
-enum class InferenceBackend {
-    YNNPACK,
-    MPS,
-};
-
-constexpr auto to_string(InferenceBackend backend) noexcept -> std::string_view {
-    switch (backend) {
-        case InferenceBackend::YNNPACK:
-            return "ynnpack_cpu";
-        case InferenceBackend::MPS:
-            return "mps_gpu";
-    }
-}
-
 struct Translation {
     std::string text;
     std::vector<std::int32_t> token_ids;
@@ -49,9 +35,7 @@ public:
     Translator(const Translator&) = delete;
     auto operator=(const Translator&) -> Translator& = delete;
 
-    static auto load(const std::filesystem::path& model_directory, InferenceStats* stats = nullptr)
-        -> Result<Translator>;
-    static auto load(const std::filesystem::path& model_directory, InferenceBackend backend,
+    static auto load(const std::filesystem::path& model_directory, tensor::Device device,
                      InferenceStats* stats = nullptr, std::size_t batch_size = 1) -> Result<Translator>;
     auto translate(std::string_view source, DecodeOptions options = {}, InferenceStats* stats = nullptr)
         -> Result<Translation>;
@@ -59,11 +43,10 @@ public:
                          InferenceStats* stats = nullptr) -> Result<std::vector<Translation>>;
 
 private:
-    Translator(model::Package package, model::Transformer model, InferenceBackend backend) noexcept;
+    Translator(model::Package package, model::Transformer model) noexcept;
 
     model::Package package_;
     model::Transformer model_;
-    InferenceBackend backend_;
     std::size_t batch_size_ = 1;
 };
 

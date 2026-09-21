@@ -96,7 +96,8 @@ E4B and Linux/Windows builds have not been validated end to end here.
 | Command | Purpose | Input |
 |---|---|---|
 | `kidi chat -m MODEL` | Interactive, streaming conversation | Ordinary UTF-8 text |
-| `kidi generate -m MODEL -i INPUT -o OUTPUT` | Ordered generation or translation | Chat JSONL for Gemma 4; text lines for RTG |
+| `kidi translate -m MODEL -i INPUT -o OUTPUT` | Ordered RTG translation | Moses-tokenized text lines |
+| `kidi generate -m MODEL -i INPUT -o OUTPUT` | Ordered chat generation | JSONL `messages` requests |
 | `kidi inspect -m MODEL` | Inspect a package and available backends | A model path or supported Hub ID |
 
 `MODEL` is a local package directory or `@owner/model` with the pip-installed
@@ -143,7 +144,7 @@ Ready-made RTG packages work too:
 
 ```bash
 printf '%s\n' 'Comment allez @-@ vous ?' | \
-  python -m kidi generate -m @thammegowda/rtg-500eng-v1 --beam-size 1
+  python -m kidi translate -m @thammegowda/rtg-500eng-v1 --beam-size 1
 ```
 
 That repository is currently private and requires an authorized Hugging Face login.
@@ -246,7 +247,7 @@ On arm64 macOS, Kidi detects CPU features through `sysctl` and enables
 YNNPACK's matching NEON, dot-product, BF16, I8MM, SME, and SME2 kernels at
 runtime. Unsupported instructions remain disabled, so the same binary can run
 on older Apple Silicon. `kidi inspect` prints the selected CPU features and
-`kidi generate --profile` includes both their names and YNNPACK bitmask for RTG.
+`kidi translate --profile` includes both their names and YNNPACK bitmask for RTG.
 
 YNNPACK is a CPU runtime and cannot dispatch work to Metal or the Apple Neural
 Engine. `--backend mps --beam-size 1` selects the eager Metal backend
@@ -264,8 +265,8 @@ can move through `Tensor::to()` between these device kinds:
 |---|---|---|---|
 | `cpu:0` | YNNPACK | yes | yes |
 | `a_gpu:0` | Metal/MPS | yes on Apple platforms | FP32/BF16/INT8 greedy and beam; experimental |
-| `cuda:N` | CUDA/cuDNN | yes when both shared libraries and device `N` are available | not yet |
-| `q_npu:N` | Qualcomm QNN/Hexagon | provider slot; register an SDK-backed `Backend` | not yet |
+| `cuda:N` | CUDA/cuDNN | registered placeholder; fails with "not implemented" | not yet |
+| `q_npu:N` | Qualcomm QNN/Hexagon | registered placeholder; fails with "not implemented" | not yet |
 
 The backend registry never substitutes CPU execution silently. An unavailable
 device returns a structured `UNSUPPORTED` error, and a backend reports storage
@@ -588,19 +589,19 @@ kidi inspect --model /path/to/model
 Predict Moses-tokenized text from standard input, one sentence per line:
 
 ```bash
-printf '%s\n' 'Comment allez @-@ vous ?' | kidi generate --model /path/to/model
+printf '%s\n' 'Comment allez @-@ vous ?' | kidi translate --model /path/to/model
 ```
 
 Read and write files explicitly:
 
 ```bash
-kidi generate --model /path/to/model --in source.txt --out translation.txt
+kidi translate --model /path/to/model --in source.txt --out translation.txt
 ```
 
 Override decoding defaults or append the normalized hypothesis score:
 
 ```bash
-kidi generate --beam-size 2 --max-extra-tokens 20 --length-penalty 0.6 --score \
+kidi translate --beam-size 2 --max-extra-tokens 20 --length-penalty 0.6 --score \
   --model /path/to/model --in source.txt --out translation.txt
 ```
 
@@ -618,7 +619,7 @@ encoder, decoder, generator, and host-search timings in nanoseconds. Both
 options leave translation output unchanged. `--threads N` sets total YNNPACK
 threads including the calling thread.
 
-Use `kidi --help` and `kidi generate --help` for the complete command syntax.
+Use `kidi --help` and `kidi translate --help` for the complete command syntax.
 
 Human-readable diagnostics use [spdlog](https://github.com/gabime/spdlog) on
 stderr; set `SPDLOG_LEVEL` to control their level. Translation output and

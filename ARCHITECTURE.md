@@ -88,22 +88,28 @@ files. No downloaded Python code or pickled checkpoints execute during resolutio
 Explicit trusted RTG conversion is separate in `kidi.converters.rtg` with the
 `convert` extra; its NLCodec helper is bundled in wheels.
 
-The `generate` CLI dispatches by `model.type` and normally processes lines in input
-order. RTG reads text lines; Gemma 4 reads JSONL `messages` arrays with optional
-`id` and `max_tokens`. `Tokenizer::format_chat` uses the original checkpoint's
+Each model family has its own command rather than one command that branches on
+`model.type`. `translate` serves RTG and reads Moses-tokenized text lines;
+`generate` serves chat models and reads JSONL `messages` arrays with optional `id`
+and `max_tokens`; `chat` is the interactive terminal session. Both file commands
+process lines in input order. A command run against the other family's package
+fails with an explicit message, and options that belong to the other family are
+rejected by the argument parser rather than by a runtime cross-check.
+
+`Tokenizer::format_chat` uses the original checkpoint's
 Jinja template and special-token configuration; `Generator::enqueue_chat` passes
 the serialized result to the existing raw-prompt enqueue path. Text messages may
 include system/developer instructions and user/assistant history. Tools and
 multimodal content are rejected. No generic model execution abstraction is added.
 
-The dedicated `chat` command uses stdin/stdout and the same
+The `chat` command uses stdin/stdout and the same
 loaded `Generator` for a terminal chat session. The shell owns system/user/assistant
 history and configures one serving slot. Successful replies append assistant text;
 rejected or cancelled requests remove the pending user turn. Context overflow is
 reported without silently truncating history. Terminal commands, ANSI color policy
 and scoped SIGINT handling live in `cli/interactive.*`, outside inference code.
-Model/backend options are shared with `generate`; system/color options are
-chat-only, while file I/O and batching options are generate-only.
+`generate` and `chat` share model, backend and generation options; system/color
+options are chat-only, while file I/O and serving limits are generate-only.
 
 ## Eager Contract
 
@@ -190,8 +196,7 @@ API, not an autograd or optimizer framework.
 
 The prepared-operator cache defaults to 4,096 entries with LRU replacement. Reaching
 the bound drains queued work, evicts the least-recent quarter, and releases pooled
-buffers; each entry owns its constant-parameter references. The bounded override
-`KIDI_OPERATOR_CACHE_CAPACITY=1..16384` supports working-set experiments. This is an
+buffers; each entry owns its constant-parameter references. This is an
 entry limit, not a native-memory byte budget. `preparation_ns()` reports cumulative
 operator preparation, including eviction synchronization when required.
 
@@ -223,8 +228,7 @@ dependency handling. No general host-write permission follows from queued reuse.
 External tensor owners are retained until successful completion and then released.
 Prepared-cache eviction drains work before releasing pooled storage; escaped
 tensors remain valid. Native binding objects may retain Metal buffers longer.
-Set `KIDI_METAL_REUSE_OUTPUTS=0` before context creation for the per-operator
-pool/scratch fallback. CPU arena capacity remains grow-only until destruction.
+CPU arena capacity remains grow-only until destruction.
 Neither backend promises a fixed-byte budget; diverse shapes and externally
 retained outputs can increase memory. This is not slab allocation: all MPSGraph
 bindings still use zero-offset buffers.
@@ -256,8 +260,7 @@ system swap usage. Current results are in the
 
 Gemma 4 query/key RMSNorm and RoPE share a direct Metal dispatch with the same
 reduction geometry and intermediate arithmetic order as the separate kernels.
-CPU composes the existing operators; `KIDI_SEPARATE_RMS_ROTARY=1` also restores
-that composition on Metal.
+CPU composes the existing operators.
 
 Gemma 4 uses host-managed token lookup and positions with dense K/V storage on
 the execution device. Device-state, direct-paged attention and projection-replay
@@ -270,8 +273,8 @@ negative-infinite row produces -1. Metal uses a two-stage reduction; CPU uses
 the same selection contract. Gemma 4's `forward_token` applies this to the actual
 post-softcap logits before the existing completion fence and rejects -1.
 The generic decoder accepts preselected tokens only for unscored greedy search,
-retaining the existing stop/length policy. GPU Gemma 4 generation enables this
-path by default; `KIDI_HOST_GREEDY=1` restores host selection. CPU selection is
+retaining the existing stop/length policy. GPU Gemma 4 generation always uses this
+path; CPU selection is
 unchanged. The profile records `device_selection` and `generation_ns` (request
 start through text decoding), avoiding misleading comparisons when selection
 moves across the model-only timing boundary. This does not eliminate per-token
@@ -441,14 +444,14 @@ consumer layers. Those layers cannot affect retained history. Full all-token
 logit evaluation still traverses every block, and tests require byte-identical
 producer caches between both paths for the same input prefix. Native-QAT CPU
 last-logit calls additionally prefill all preceding tokens cache-only and run the
-full model for the final token. `KIDI_FULL_LAST_CHUNK=1` disables this CPU policy.
+full model for the final token.
 The default native-QAT Metal matrix path
 evaluates the entire projected chunk through its K/V-producing blocks, then retains
 only the final four query rows for subsequent shared-K/V consumers when the chunk
 has at least 64 tokens. Consumer masks and rotary rows are sliced together; cache
 writes and final state positions remain unchanged. All-token logits, packed-only
-prefill and other precisions retain full-consumer execution. Disable this policy
-with `KIDI_SHARED_PREFILL_TAIL=0` or `KIDI_FULL_LAST_CHUNK=1`. Long fixtures and
+prefill and other precisions retain full-consumer execution.
+Long fixtures and
 generated-token comparisons pass, though full-model logits are not universally
 bit-identical across query shapes. Profiles distinguish `last_token_prefill`
 and `shared_prefill_tail`. Prefill remains
@@ -532,8 +535,9 @@ FP32 tensors; no input is mutated. Gemma 4 uses it for post-attention, post-MLP,
 post-per-layer-input residuals. CPU and Metal implement the same equation without
 duplicating model topology or introducing model-level graphs.
 
-CUDA/QNN storage providers remain separate from execution; unsupported execution
-does not silently fall back to CPU.
+CUDA and QNN are registered placeholders: the device kinds and their integration
+points exist, but every operation fails with a "not implemented" error. Unsupported
+execution does not silently fall back to CPU.
 
 ### Native Gemma 4 Mobile QAT
 

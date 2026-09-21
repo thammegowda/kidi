@@ -27,61 +27,6 @@ auto main(int argc, char** argv) -> int {
             (bits != 0 && bits != 4 && bits != 8) || group <= 0 || chunk <= 0)
             return 2;
         runtime::ynn::set_thread_count(4);
-        if (argc == 6 && std::string_view(argv[5]) == "shared-tail") {
-            struct EnvironmentRestore {
-                std::optional<std::string> previous;
-                ~EnvironmentRestore() {
-                    if (previous)
-                        setenv("KIDI_SHARED_PREFILL_TAIL", previous->c_str(), 1);
-                    else
-                        unsetenv("KIDI_SHARED_PREFILL_TAIL");
-                }
-            } restore;
-            if (const auto previous = std::getenv("KIDI_SHARED_PREFILL_TAIL")) restore.previous = previous;
-            auto generator = ops::require(inference::Generator::load(directory, device, bits, group));
-            const std::array<std::string, 3> passages{
-                "A coastal town measured rainfall every morning. The records show wetter winters and dry summers. "
-                "Farmers store winter rain to irrigate their fields later. Explain the benefits and limitations of "
-                "this approach.",
-                "A train leaves a station at noon and travels sixty kilometers in an hour. Another train leaves thirty "
-                "minutes later at ninety kilometers per hour on the same route. Explain when the second train catches "
-                "the first, and check the answer.",
-                "def total_positive(values):\n    total = 0\n    for value in values:\n        if value > 0:\n         "
-                "   total += value\n    return total\nExplain this function and give examples with empty input, "
-                "negative values, and mixed values."};
-            inference::GenerationOptions options{
-                .maximum_new_tokens = 48, .context_size = 1024, .prefill_chunk_size = 256};
-            std::size_t equal = 0, count = 0;
-            std::cout << "{\"comparison\":\"shared_consumer_generations\",\"backend\":\"" << argv[2]
-                      << "\",\"records\":[";
-            for (auto repeats : {2, 4}) {
-                for (const auto& passage : passages) {
-                    std::string prompt;
-                    for (int repeat = 0; repeat < repeats; ++repeat) prompt += passage + "\n";
-                    std::array<inference::TextGeneration, 2> results;
-                    for (bool optimized : count % 2 ? std::array{true, false} : std::array{false, true}) {
-                        if (optimized)
-                            setenv("KIDI_SHARED_PREFILL_TAIL", "1", 1);
-                        else
-                            setenv("KIDI_SHARED_PREFILL_TAIL", "0", 1);
-                        results[optimized] = ops::require(generator.generate(prompt, options));
-                    }
-                    const auto& expected = results[0].generation.token_ids;
-                    const auto& actual = results[1].generation.token_ids;
-                    std::size_t first = 0;
-                    while (first < std::min(expected.size(), actual.size()) && expected[first] == actual[first])
-                        ++first;
-                    equal += expected == actual;
-                    if (count++) std::cout << ',';
-                    std::cout << "{\"prompt_tokens\":" << results[0].stats.prompt_tokens
-                              << ",\"exact\":" << (expected == actual ? "true" : "false")
-                              << ",\"common_output_prefix\":" << first << ",\"reference_tokens\":" << expected.size()
-                              << ",\"candidate_tokens\":" << actual.size() << '}';
-                }
-            }
-            std::cout << "],\"exact_requests\":" << equal << ",\"requests\":" << count << "}\n";
-            return 0;
-        }
         if (argc == 6 && std::string_view(argv[5]) == "serving") {
             auto generator = ops::require(inference::Generator::load(directory, device, bits, group));
             const std::array<std::string, 4> prompts{

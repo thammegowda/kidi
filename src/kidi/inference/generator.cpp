@@ -104,8 +104,7 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
                                    .stop_on_eos = !options.ignore_eos};
         tensor::Tensor storage;
         std::optional<std::int32_t> selected;
-        result.stats.device_selection =
-            model_->device() == tensor::Device::apple_gpu() && !std::getenv("KIDI_HOST_GREEDY");
+        result.stats.device_selection = model_->device() == tensor::Device::apple_gpu();
         const auto project = [&](std::span<const std::int32_t> input) -> Result<void> {
             if (result.stats.device_selection) {
                 auto token = model_->forward_token(input, state);

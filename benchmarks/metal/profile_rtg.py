@@ -40,7 +40,7 @@ def record_fields(stderr, prefix):
 
 def trial(args, sentences):
     command = [
-        str(args.binary.resolve()), "generate", "--model", str(args.model.resolve()),
+        str(args.binary.resolve()), "translate", "--model", str(args.model.resolve()),
         "--backend", args.backend, "--beam-size", "1", "--max-extra-tokens", "50",
         "--threads", "8", "--stats", "--profile",
         "--batch-size", str(args.batch_size),

@@ -27,11 +27,16 @@
 
 namespace {
 
-auto inference_backend(const kidi::cli::Namespace& arguments) -> kidi::inference::InferenceBackend {
+auto inference_device(const kidi::cli::Namespace& arguments) -> kidi::tensor::Device {
     const auto& backend = arguments.get<std::string>("backend");
     return backend == "mps" || (backend == "auto" && kidi::module_device == kidi::tensor::Device::apple_gpu())
-               ? kidi::inference::InferenceBackend::MPS
-               : kidi::inference::InferenceBackend::YNNPACK;
+               ? kidi::tensor::Device::apple_gpu()
+               : kidi::tensor::Device::cpu();
+}
+
+/// Stable label for machine-readable stderr records.
+auto backend_label(kidi::tensor::Device device) -> std::string_view {
+    return device == kidi::tensor::Device::apple_gpu() ? "mps_gpu" : "ynnpack_cpu";
 }
 
 auto inspect(const std::filesystem::path& directory) -> int {
@@ -137,31 +142,46 @@ auto chat_messages(const nlohmann::json& request) -> kidi::Result<std::vector<ki
     return messages;
 }
 
+struct ChatSession {
+    kidi::inference::Generator generator;
+    kidi::inference::GenerationOptions options;
+    std::int64_t load_ns;
+    kidi::tensor::Device device;
+};
+
+auto load_chat_session(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory)
+    -> kidi::Result<ChatSession> {
+    const auto device = inference_device(arguments);
+    const auto started = std::chrono::steady_clock::now();
+    auto loaded = kidi::inference::Generator::load(directory, device, arguments.get<std::int32_t>("weight_bits"),
+                                                   arguments.get<std::int32_t>("group_size"),
+                                                   arguments.get<bool>("packed_prefill"));
+    if (!loaded) return std::unexpected(std::move(loaded.error()));
+    const auto load_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
+    return ChatSession{std::move(*loaded),
+                       {.maximum_new_tokens = arguments.get<std::size_t>("max_new_tokens"),
+                        .context_size = arguments.get<std::size_t>("context_size"),
+                        .prefill_chunk_size = arguments.get<std::size_t>("prefill_chunk_size"),
+                        .ignore_eos = arguments.get<bool>("ignore_eos"),
+                        .full_attention_cache = arguments.get<bool>("full_attention_cache")},
+                       load_ns,
+                       device};
+}
+
 auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory, std::istream& input,
                    std::ostream& output) -> int {
     try {
-        const auto backend = inference_backend(arguments);
-        const auto device = backend == kidi::inference::InferenceBackend::MPS ? kidi::tensor::Device::apple_gpu()
-                                                                              : kidi::tensor::Device::cpu();
         const auto started = std::chrono::steady_clock::now();
-        auto loaded = kidi::inference::Generator::load(directory, device, arguments.get<std::int32_t>("weight_bits"),
-                                                       arguments.get<std::int32_t>("group_size"),
-                                                       arguments.get<bool>("packed_prefill"));
-        if (!loaded) {
-            spdlog::error("{}", loaded.error().message);
+        auto session = load_chat_session(arguments, directory);
+        if (!session) {
+            spdlog::error("{}", session.error().message);
             return 1;
         }
-        auto& generator = *loaded;
-        const auto load_ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-        const kidi::inference::GenerationOptions options{
-            .maximum_new_tokens = arguments.get<std::size_t>("max_new_tokens"),
-            .context_size = arguments.get<std::size_t>("context_size"),
-            .prefill_chunk_size = arguments.get<std::size_t>("prefill_chunk_size"),
-            .ignore_eos = arguments.get<bool>("ignore_eos"),
-            .full_attention_cache = arguments.get<bool>("full_attention_cache")};
-        if (arguments.get<std::string>("command") == "chat")
-            return kidi::cli::interactive_chat(generator, options, arguments, load_ns);
+        auto& generator = session->generator;
+        const auto& options = session->options;
+        const auto device = session->device;
+        const auto load_ns = session->load_ns;
         const kidi::inference::ServingOptions limits{.maximum_active = arguments.get<std::size_t>("max_active"),
                                                      .maximum_requests = arguments.get<std::size_t>("queue_size"),
                                                      .cache_token_budget = arguments.get<std::size_t>("cache_tokens"),
@@ -259,7 +279,7 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started)
                     .count();
             std::cerr << "kidi_serving|requests=" << completed << "|max_active=" << limits.maximum_active
-                      << "|backend=" << kidi::inference::to_string(backend) << "|load_ns=" << load_ns
+                      << "|backend=" << backend_label(device) << "|load_ns=" << load_ns
                       << "|native_qat=" << generator.native_qat()
                       << "|packed_prefill=" << arguments.get<bool>("packed_prefill")
                       << "|cache_tokens=" << limits.cache_token_budget
@@ -288,8 +308,8 @@ auto generate_translation(const kidi::cli::Namespace& arguments, const std::file
         return 2;
     }
     auto* profile_ptr = arguments.get<bool>("profile") ? &profile : nullptr;
-    const auto backend = inference_backend(arguments);
-    auto translator = kidi::inference::Translator::load(directory, backend, profile_ptr, batch_size);
+    const auto device = inference_device(arguments);
+    auto translator = kidi::inference::Translator::load(directory, device, profile_ptr, batch_size);
     if (!translator) {
         spdlog::error("{}", translator.error().message);
         return 1;
@@ -351,7 +371,7 @@ auto generate_translation(const kidi::cli::Namespace& arguments, const std::file
                   << "|target_tokens=" << target_tokens << '\n';
     }
     if (profile_ptr) {
-        std::cerr << "kidi_profile|backend=" << kidi::inference::to_string(backend)
+        std::cerr << "kidi_profile|backend=" << backend_label(device)
                   << "|threads=" << kidi::runtime::ynn::thread_count()
                   << "|ynn_arch_flags=" << kidi::runtime::ynn::supported_arch_flags()
                   << "|ynn_arch=" << kidi::runtime::ynn::supported_arch_names()
@@ -366,7 +386,9 @@ auto generate_translation(const kidi::cli::Namespace& arguments, const std::file
     return 0;
 }
 
-auto generate(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
+/// Validates the thread count and that the package holds the model family this command serves.
+auto prepare_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory,
+                     std::string_view expected_type) -> int {
     const auto threads = arguments.get<std::int32_t>("threads");
     if (threads <= 0) {
         spdlog::error("thread count must be positive");
@@ -379,33 +401,17 @@ auto generate(const kidi::cli::Namespace& arguments, const std::filesystem::path
         return 1;
     }
     const auto type = (*config)["model"]["type"].as<std::string>();
-    const bool chat = type == "gemma4_text";
-    const bool interactive = arguments.get<std::string>("command") == "chat";
-    if (interactive && !chat) {
-        spdlog::error("chat requires a chat model");
+    if (type != expected_type) {
+        spdlog::error("{} expects a {} model, but this package is {}", arguments.get<std::string>("command"),
+                      expected_type, type);
         return 2;
     }
-    if (!chat && type != "rtg_transformer_nmt") {
-        spdlog::error("unsupported model type: {}", type);
-        return 2;
-    }
-    if (interactive) return generate_chat(arguments, directory, std::cin, std::cout);
-    if (chat && (arguments.contains("beam_size") || arguments.contains("maximum_extra_tokens") ||
-                 arguments.contains("length_penalty") || arguments.get<bool>("score") || arguments.get<bool>("stats") ||
-                 arguments.get<std::int32_t>("batch_size") != 1 || arguments.contains("batch_window"))) {
-        spdlog::error("translation options are unsupported for chat models; use --max-active for concurrency");
-        return 2;
-    }
-    if (!chat &&
-        (arguments.get<std::size_t>("max_new_tokens") || arguments.get<std::size_t>("context_size") ||
-         arguments.get<bool>("ignore_eos") || arguments.get<bool>("full_attention_cache") ||
-         arguments.get<std::int32_t>("weight_bits") || arguments.get<bool>("packed_prefill") ||
-         arguments.get<std::size_t>("max_active") != 4 || arguments.get<std::size_t>("queue_size") != 64 ||
-         arguments.get<std::size_t>("cache_tokens") != 16384 ||
-         arguments.get<std::size_t>("prefill_chunk_size") != 128 || arguments.get<std::int32_t>("group_size") != 128)) {
-        spdlog::error("chat options are unsupported for RTG; use --max-extra-tokens and --batch-size");
-        return 2;
-    }
+    return 0;
+}
+
+/// Opens the -i/-o files, defaulting to standard input and output.
+auto run_with_streams(const kidi::cli::Namespace& arguments,
+                      const std::function<int(std::istream&, std::ostream&)>& body) -> int {
     const auto& input_path = arguments.get<std::string>("input");
     const auto& output_path = arguments.get<std::string>("output");
     if (input_path != "-" && output_path != "-" && std::filesystem::exists(output_path) &&
@@ -433,8 +439,31 @@ auto generate(const kidi::cli::Namespace& arguments, const std::filesystem::path
         }
         output = &output_file;
     }
-    return chat ? generate_chat(arguments, directory, *input, *output)
-                : generate_translation(arguments, directory, *input, *output);
+    return body(*input, *output);
+}
+
+auto translate_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
+    if (const auto status = prepare_command(arguments, directory, "rtg_transformer_nmt")) return status;
+    return run_with_streams(arguments, [&](std::istream& input, std::ostream& output) {
+        return generate_translation(arguments, directory, input, output);
+    });
+}
+
+auto generate_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
+    if (const auto status = prepare_command(arguments, directory, "gemma4_text")) return status;
+    return run_with_streams(arguments, [&](std::istream& input, std::ostream& output) {
+        return generate_chat(arguments, directory, input, output);
+    });
+}
+
+auto chat_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
+    if (const auto status = prepare_command(arguments, directory, "gemma4_text")) return status;
+    auto session = load_chat_session(arguments, directory);
+    if (!session) {
+        spdlog::error("{}", session.error().message);
+        return 1;
+    }
+    return kidi::cli::interactive_chat(session->generator, session->options, arguments, session->load_ns);
 }
 
 } // namespace
@@ -448,9 +477,10 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     kidi::cli::ArgumentParser parser("kidi", "Run translation and text generation models.");
     parser.version("kidi " + std::string(kidi::version()));
     auto& commands = parser.add_subparsers().required();
-    auto& generate_parser = commands.add_parser("generate", "generate one result per input line, in input order");
-    generate_parser.description(
-        "RTG reads Moses-tokenized text lines; chat models read JSONL messages. Output preserves input order.");
+    auto& translate_parser = commands.add_parser("translate", "translate one Moses-tokenized line per input line");
+    translate_parser.description("Translate with an RTG model. Output preserves input order.");
+    auto& generate_parser = commands.add_parser("generate", "generate one reply per JSONL chat request");
+    generate_parser.description("Generate with a chat model reading JSONL messages. Output preserves input order.");
     auto& chat_parser = commands.add_parser("chat", "interactive multi-turn chat with streaming replies");
     chat_parser.description("Chat in the terminal with a loaded model. Type /help for shell commands.");
     chat_parser.add_argument("--system").default_value(std::string{}).help("system instruction");
@@ -460,7 +490,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         .help("terminal colors; auto respects NO_COLOR");
     generate_parser.add_argument("--max-active").dest("max_active").default_value<std::size_t>(4);
     generate_parser.add_argument("--queue-size").dest("queue_size").default_value<std::size_t>(64);
-    for (auto* command_parser : {&generate_parser, &chat_parser}) {
+    for (auto* command_parser : {&translate_parser, &generate_parser, &chat_parser}) {
         command_parser->add_argument("-m", "--model")
             .type<std::filesystem::path>()
             .required()
@@ -470,14 +500,17 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             .type<std::filesystem::path>()
             .default_value(std::filesystem::path("~/.cache/kidi/model-hub"))
             .help("Hugging Face model cache directory");
-        command_parser->add_argument("--cache-tokens")
-            .dest("cache_tokens")
-            .default_value<std::size_t>(16384)
-            .help("budget for reserved dense context tokens");
         command_parser->add_argument("--backend")
             .default_value(std::string("auto"))
             .choices({"auto", "ynnpack", "mps"});
         command_parser->add_argument("-j", "--threads").default_value<std::int32_t>(4);
+        command_parser->add_argument("--profile").action(kidi::cli::Action::STORE_TRUE);
+    }
+    for (auto* command_parser : {&generate_parser, &chat_parser}) {
+        command_parser->add_argument("--cache-tokens")
+            .dest("cache_tokens")
+            .default_value<std::size_t>(16384)
+            .help("budget for reserved dense context tokens");
         command_parser->add_argument("--max-new-tokens").dest("max_new_tokens").default_value<std::size_t>(0);
         command_parser->add_argument("--context-size").dest("context_size").default_value<std::size_t>(0);
         command_parser->add_argument("--prefill-chunk-size").dest("prefill_chunk_size").default_value<std::size_t>(128);
@@ -486,7 +519,6 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             .dest("full_attention_cache")
             .action(kidi::cli::Action::STORE_TRUE)
             .help("disable CPU local-history cropping for the previous numerical path");
-        command_parser->add_argument("--profile").action(kidi::cli::Action::STORE_TRUE);
         command_parser->add_argument("--weight-bits")
             .dest("weight_bits")
             .default_value<std::int32_t>(0)
@@ -510,39 +542,41 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         .default_value(std::filesystem::path("~/.cache/kidi/model-hub"))
         .help("Hugging Face model cache directory");
 
-    generate_parser.add_argument("-b", "--beam-size").type<std::int32_t>().metavar("N").help("RTG beam size");
-    generate_parser.add_argument("-x", "--max-extra-tokens")
+    translate_parser.add_argument("-b", "--beam-size").type<std::int32_t>().metavar("N").help("RTG beam size");
+    translate_parser.add_argument("-x", "--max-extra-tokens")
         .dest("maximum_extra_tokens")
         .type<std::int32_t>()
         .metavar("N")
         .help("maximum target tokens beyond source length");
-    generate_parser.add_argument("-a", "--length-penalty")
+    translate_parser.add_argument("-a", "--length-penalty")
         .type<float>()
         .metavar("ALPHA")
         .help("Wu length penalty exponent");
-    generate_parser.add_argument("--score").action(kidi::cli::Action::STORE_TRUE).help("append RTG hypothesis score");
-    generate_parser.add_argument("--stats")
+    translate_parser.add_argument("--score").action(kidi::cli::Action::STORE_TRUE).help("append RTG hypothesis score");
+    translate_parser.add_argument("--stats")
         .action(kidi::cli::Action::STORE_TRUE)
         .help("emit machine-readable generation stats to stderr");
-    generate_parser.add_argument("--batch-size")
+    translate_parser.add_argument("--batch-size")
         .type<std::int32_t>()
         .default_value(std::int32_t{1})
         .metavar("N")
         .help("independent sentences per batch (1 to 256; CPU executes serially)");
-    generate_parser.add_argument("--batch-window")
+    translate_parser.add_argument("--batch-window")
         .type<std::int32_t>()
         .metavar("N")
         .help("bounded input window for length grouping (default: batch-size; maximum 4096)");
-    generate_parser.add_argument("-i", "--in")
-        .dest("input")
-        .default_value(std::string("-"))
-        .metavar("FILE")
-        .help("input file, or '-' for stdin");
-    generate_parser.add_argument("-o", "--out")
-        .dest("output")
-        .default_value(std::string("-"))
-        .metavar("FILE")
-        .help("output file, or '-' for stdout");
+    for (auto* command_parser : {&translate_parser, &generate_parser}) {
+        command_parser->add_argument("-i", "--in")
+            .dest("input")
+            .default_value(std::string("-"))
+            .metavar("FILE")
+            .help("input file, or '-' for stdin");
+        command_parser->add_argument("-o", "--out")
+            .dest("output")
+            .default_value(std::string("-"))
+            .metavar("FILE")
+            .help("output file, or '-' for stdout");
+    }
 
     try {
         const auto arguments = parser.parse_args(argc, argv);
@@ -567,7 +601,9 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             directory = std::move(*resolved);
         }
         if (command == "inspect") return inspect(directory);
-        if (command == "generate" || command == "chat") return generate(arguments, directory);
+        if (command == "translate") return translate_command(arguments, directory);
+        if (command == "generate") return generate_command(arguments, directory);
+        if (command == "chat") return chat_command(arguments, directory);
         throw std::logic_error("unhandled command: " + command);
     } catch (const kidi::cli::ParseError& error) {
         std::cerr << error.usage();

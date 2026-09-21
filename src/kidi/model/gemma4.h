@@ -36,11 +36,18 @@ public:
     auto shared_prefill_tail() const -> bool;
 
 private:
+    struct State;
+    struct Attention;
+    auto embed(std::span<const std::int32_t> tokens) -> std::array<tensor::Tensor, 2>;
+    auto attention_inputs(Gemma4State& state, std::span<Gemma4State*> batch_states, std::size_t step_count)
+        -> Attention;
+    auto per_layer_input(const tensor::Tensor& per_layer, int layer, std::int64_t length) -> tensor::Tensor;
+    auto head(const tensor::Tensor& hidden, bool select) -> tensor::Tensor;
     auto run_batch(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states, bool select)
         -> Result<tensor::Tensor>;
-    auto run(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits, bool project,
-             bool select = false, std::span<Gemma4State*> batch_states = {}) -> Result<tensor::Tensor>;
-    struct State;
+    /// Runs every layer and the output head; `batch_states` decodes one token per request.
+    auto project(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits, bool select,
+                 std::span<Gemma4State*> batch_states = {}) -> Result<tensor::Tensor>;
     std::unique_ptr<State> impl_;
 };
 } // namespace kidi::model
