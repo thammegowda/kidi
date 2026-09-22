@@ -92,7 +92,11 @@ auto Tokenizer::load(const std::filesystem::path& path) -> Result<Tokenizer> {
     tokenizers::TokenizerConfig config;
     const auto config_path = path.parent_path() / "tokenizer_config.json";
     if (std::filesystem::is_regular_file(config_path)) {
-        auto loaded = tokenizers::TokenizerConfig::from_file(config_path.string());
+        auto source = read_plain(config_path);
+        if (!source) return std::unexpected(std::move(source.error()));
+        if (source->empty())
+            return std::unexpected(Error{ErrorCode::IO, "empty tokenizer config read: " + config_path.string()});
+        auto loaded = tokenizers::TokenizerConfig::from_json(*source);
         if (!loaded) return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, loaded.error().message()});
         config = std::move(*loaded);
     }

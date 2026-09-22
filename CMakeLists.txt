@@ -11,6 +11,21 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
 option(KIDI_BUILD_TESTS "Build kidi tests" ON)
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
+if(EMSCRIPTEN)
+    option(KIDI_WASM_THREADS "Enable WebAssembly pthreads" ON)
+    option(KIDI_WASM_LARGE_MEMORY "Use 64-bit pointers lowered to wasm32 for models above 2 GiB" ON)
+    add_compile_options(-msimd128 -fexceptions)
+    add_link_options(-msimd128 -fexceptions -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=2MB)
+    if(KIDI_WASM_LARGE_MEMORY)
+        add_compile_options(-sMEMORY64=2)
+        add_link_options(-sMEMORY64=2)
+    endif()
+    if(KIDI_WASM_THREADS)
+        add_compile_options(-pthread)
+        add_link_options(-pthread -sPTHREAD_POOL_SIZE=7)
+    endif()
+    set(YNNPACK_TARGET_PROCESSOR wasm CACHE STRING "" FORCE)
+endif()
 include(cmake/dependencies.cmake)
 include(cmake/ynnpack.cmake)
 
@@ -44,6 +59,17 @@ add_library(kidi
     src/kidi/text/tokenizer.cpp
 )
 add_library(kidi::kidi ALIAS kidi)
+
+if(EMSCRIPTEN)
+    add_executable(kidi_wasm src/kidi/web/bindings.cpp)
+    target_link_libraries(kidi_wasm PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
+    set_target_properties(kidi_wasm PROPERTIES OUTPUT_NAME kidi SUFFIX .mjs)
+    target_link_options(kidi_wasm PRIVATE
+        --no-entry -sMODULARIZE=1 -sEXPORT_NAME=createKidi -sENVIRONMENT=web,worker,node
+        -sFORCE_FILESYSTEM=1 -sINITIAL_MEMORY=64MB
+        "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8']"
+        "-sEXPORTED_FUNCTIONS=['_malloc']")
+endif()
 
 if(KIDI_BUILD_BENCHMARKS)
     add_executable(kidi_gemma4_quality benchmarks/gemma4/quality.cpp)

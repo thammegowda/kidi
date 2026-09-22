@@ -98,6 +98,18 @@ auto thread_count() noexcept -> std::size_t {
     return configured == 0 ? std::max(1U, std::thread::hardware_concurrency()) : configured;
 }
 
+auto reserve_thread_pool(std::size_t total_threads) -> Result<void> {
+    static std::mutex mutex;
+    static std::unordered_map<std::size_t, std::shared_ptr<ThreadPool>> reservations;
+    if (total_threads == 0) total_threads = thread_count();
+    std::scoped_lock lock(mutex);
+    if (reservations.contains(total_threads)) return {};
+    auto pool = default_thread_pool(total_threads);
+    if (!pool) return std::unexpected(std::move(pool.error()));
+    reservations.emplace(total_threads, std::move(*pool));
+    return {};
+}
+
 auto supported_arch_flags() noexcept -> std::uint64_t { return ::ynn::get_supported_arch_flags(); }
 
 auto supported_arch_names() -> std::string {

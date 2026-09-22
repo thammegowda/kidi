@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f3f6f4">
+    <title>Kidi / Gemma 4 E2B</title>
+    <script src="./coi-serviceworker.js"></script>
+    <link rel="icon" href="./icons/kidi-logo.png" type="image/png">
+    <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+    <div class="app-shell">
+        <aside id="history-panel" class="history-panel" aria-label="Chat history">
+            <div class="rail-heading">
+                <a class="brand" href="./" aria-label="Kidi"><img src="./icons/kidi-logo.png" alt="" width="72" height="72"></a>
+                <button id="close-history" class="icon rail-close" type="button" title="Close history" aria-label="Close history"><img src="./icons/x.svg" alt=""></button>
+            </div>
+            <button id="new-chat" class="new-chat" type="button"><img src="./icons/plus.svg" alt="">New chat</button>
+            <p class="section-label">Recent</p>
+            <nav id="chat-history" class="chat-history" aria-label="Recent chats"></nav>
+            <div class="rail-footer">
+                <button id="open-settings" class="runtime-button" type="button">
+                    <span id="runtime-dot" class="status-dot" aria-hidden="true"></span>
+                    <span class="runtime-copy"><strong id="runtime-label">Model offline</strong><small id="runtime-detail">Gemma 4 E2B IT</small></span>
+                    <img src="./icons/settings.svg" alt="" aria-hidden="true">
+                </button>
+            </div>
+        </aside>
+        <button id="history-backdrop" class="history-backdrop" type="button" aria-label="Close history"></button>
+        <main class="workspace">
+            <header class="chat-header">
+                <button id="open-history" class="icon history-toggle" type="button" title="Open history" aria-label="Open history"><img src="./icons/panel-left.svg" alt=""></button>
+                <div class="title-block"><h1 id="chat-title">New chat</h1><p>Gemma 4 E2B IT</p></div>
+                <button id="header-settings" class="runtime-chip" type="button"><span class="status-dot" aria-hidden="true"></span><span id="runtime-badge">Offline</span><img src="./icons/settings.svg" alt="" aria-hidden="true"></button>
+            </header>
+            <section id="messages" class="messages" aria-label="Conversation" aria-live="polite"></section>
+            <div class="composer-region">
+                <form id="compose">
+                    <label class="sr-only" for="prompt">Message</label>
+                    <textarea id="prompt" rows="1" placeholder="Message Gemma" required></textarea>
+                    <div class="compose-actions">
+                        <span id="generation-stats">9,216-token context</span>
+                        <button id="stop" class="icon stop" type="button" title="Stop generation" aria-label="Stop generation" hidden><img src="./icons/square.svg" alt=""></button>
+                        <button id="send" class="icon primary" type="submit" title="Send message" aria-label="Send message" disabled><img src="./icons/send-horizontal.svg" alt=""></button>
+                    </div>
+                </form>
+            </div>
+        </main>
+    </div>
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
+        <div class="dialog-shell">
+            <header class="dialog-heading"><h2 id="settings-title">Model settings</h2><button id="close-settings" class="icon" type="button" title="Close settings" aria-label="Close settings"><img src="./icons/x.svg" alt=""></button></header>
+            <div class="model-summary"><span class="model-logo"><img src="./icons/kidi-logo.png" alt="" width="64" height="64"></span><div><strong>Gemma 4 E2B IT</strong><small>QAT mixed 2 / 4 / 8-bit</small></div></div>
+            <div class="settings-grid">
+                <label class="numeric-setting" for="threads">CPU threads<input id="threads" type="number" min="1" max="8" value="4"></label>
+                <label class="numeric-setting" for="tokens">Output tokens<input id="tokens" type="number" min="1" max="8192" value="1024"></label>
+                <label class="full" for="manifest">Model source<textarea id="manifest" rows="4" wrap="soft" spellcheck="false" autocomplete="off" autocapitalize="none" inputmode="url">https://huggingface.co/google/gemma-4-E2B-it-qat-mobile-transformers/resolve/dd693ff40353f057ca5f07e945ad867f4afbf2ec/config.json</textarea></label>
+            </div>
+            <section class="runtime" aria-label="Runtime status">
+                <div class="runtime-toolbar">
+                    <div class="runtime-heading"><span id="dialog-status-dot" class="status-dot" aria-hidden="true"></span><p id="status" role="status">Not loaded</p></div>
+                    <button id="load" class="primary load-model" type="button"><img src="./icons/download.svg" alt="">Load model</button>
+                </div>
+                <progress id="progress" value="0" max="1" hidden></progress>
+                <dl><dt>Download</dt><dd id="download">0 MB</dd><dt>From cache</dt><dd id="cached">0 MB</dd><dt>Load time</dt><dd id="load-time">--</dd><dt>Wasm memory</dt><dd id="memory">--</dd></dl>
+                <p id="warning" role="alert"></p>
+                <button id="clear-cache" class="subtle" type="button"><img src="./icons/trash-2.svg" alt="">Clear model cache</button>
+            </section>
+        </div>
+    </dialog>
+    <script type="module" src="./app.mjs"></script>
+</body>
+</html>

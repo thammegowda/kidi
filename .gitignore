@@ -6,6 +6,7 @@
 __pycache__/
 *.pyc
 /ynnpack
+/web/node_modules/
 
 /tests/**/.cache/
 /tests/**/*.log
