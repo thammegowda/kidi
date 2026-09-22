@@ -9,7 +9,7 @@ implemented and tested. They exercise the toolkit; they do not define the scope
 of its core tensor, layer, and inference APIs. New architectures require a model
 implementation and weight-loading support, not just a different checkpoint URL.
 
-[Getting Started](docs/getting-started.md) | [Installation](#python-installation) |
+[Getting Started](docs/getting-started.md) | [WebAssembly](web/README.md) | [Installation](#python-installation) |
 [Chat](#interactive-chat) | [Translation](#rtg-model-package) |
 [Build](#build) | [Architecture](ARCHITECTURE.md) | [Benchmarks](#benchmark)
 
@@ -240,6 +240,26 @@ ctest --preset debug
 
 All C and C++ dependencies are submodules under `third_party/`. Configuration
 does not download source code after the recursive clone.
+
+### WebAssembly
+
+Kidi includes a browser chat demo for the native Gemma 4 E2B mobile-QAT
+checkpoint. It builds WebAssembly SIMD modules for single-thread and pthread
+CPU execution while reusing the same C++ model and layer code. The browser
+downloads Google's pinned checkpoint directly and caches it for later reloads.
+
+```bash
+brew install emscripten node
+make wasm # node web/build.mjs build-web
+make serve # python -m http.server 8080 --directory build-web
+```
+
+Open `http://localhost:8080`. A bundled service worker enables pthread isolation
+on plain static servers, including GitHub Pages; the first visit may reload.
+See the [WebAssembly guide](web/README.md) for Pages deployment, browser and
+memory requirements, direct Hub loading, and validation. Node.js is needed for
+building, not for serving the finished app. Web dependencies are vendored in
+`src/web/libs/`; no npm install is required.
 
 ### Apple Silicon
 

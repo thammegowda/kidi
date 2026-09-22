@@ -18,6 +18,7 @@ class ThreadPool;
 
 auto set_thread_count(std::size_t total_threads) noexcept -> void;
 auto thread_count() noexcept -> std::size_t;
+auto reserve_thread_pool(std::size_t total_threads) -> Result<void>;
 auto supported_arch_flags() noexcept -> std::uint64_t;
 auto supported_arch_names() -> std::string;
 

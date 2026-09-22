@@ -258,6 +258,12 @@ auto Gemma4Impl::set_checkpoint(const Weights& weights, std::int32_t weight_bits
                 const auto module = name.substr(0, name.size() - suffix.size());
                 const auto bits = quant_bits(impl_->construction_config,
                                              module == "lm_head" ? module : "model.language_model." + module);
+                if (impl_->construction_config["packed_weights_signed"].as<bool>(false)) {
+                    if (!bits || value.dtype() != DType::U8)
+                        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "signed packed weights must use U8 storage"});
+                    state.emplace(name, value);
+                    continue;
+                }
                 if (!bits || (bits < 8 && value.dtype() != DType::U8) || (bits == 8 && value.dtype() != DType::I8))
                     throw ops::Failure(
                         {ErrorCode::INVALID_ARGUMENT, "QAT weight storage does not match configured precision"});

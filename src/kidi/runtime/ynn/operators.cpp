@@ -528,6 +528,12 @@ public:
             check(ynn_define_copy(native, residual, &residual_id, 0));
         }
         std::size_t operator_threads = 0;
+#if defined(__EMSCRIPTEN__)
+        const bool small_packed_projection = spec.operation == Operation::PACKED_LINEAR &&
+                                             inputs[0].numel() == inputs[0].size(-1) &&
+                                             inputs[1].nbytes() <= 512 * 1024;
+        if (small_packed_projection) operator_threads = 1;
+#endif
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
         const bool small_projection = spec.operation == Operation::QUANTIZED_LINEAR &&
                                       inputs[0].numel() == inputs[0].size(-1) && inputs[1].numel() <= 4 * 1024 * 1024;
