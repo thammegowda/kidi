@@ -1,0 +1,89 @@
+name: WebAssembly Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  EMSCRIPTEN_VERSION: 6.0.9
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source and dependencies
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install build tools
+        run: |
+          sudo -n apt-get update
+          sudo -n apt-get install --yes cmake ninja-build
+
+      - name: Install Emscripten
+        run: |
+          git clone --depth 1 --branch "$EMSCRIPTEN_VERSION" https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          "$RUNNER_TEMP/emsdk/emsdk" install "$EMSCRIPTEN_VERSION"
+          "$RUNNER_TEMP/emsdk/emsdk" activate "$EMSCRIPTEN_VERSION"
+
+      - name: Test browser model loader
+        run: node --test tests/web/model_cache_test.mjs
+
+      - name: Build single-thread and pthread WebAssembly
+        shell: bash
+        run: |
+          source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
+          make wasm WEB_DIR=build-pages
+
+      - name: Verify site artifact
+        shell: bash
+        run: |
+          test -f build-pages/.nojekyll
+          for file in index.html coi-serviceworker.js single/kidi.mjs single/kidi.wasm threads/kidi.mjs threads/kidi.wasm; do
+            test -s "build-pages/$file"
+          done
+          test -z "$(find build-pages -type l -print -quit)"
+          test -z "$(find build-pages -name '*.safetensors' -print -quit)"
+
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: build-pages
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
