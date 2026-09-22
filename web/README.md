@@ -145,10 +145,26 @@ to one thread. HTTPS is required except on localhost/loopback.
 
 ### GitHub Pages
 
-Build to a fresh app-only directory and publish its contents as a Pages artifact:
+The [WebAssembly Pages workflow](../.github/workflows/pages.yml) tests the browser
+loader and builds both Wasm variants on pull requests and pushes to `main`.
+Only `main` deploys, using the `github-pages` environment and GitHub's Pages
+artifact service. It can also be run manually from the Actions tab on `main`.
+The Linux build uses Emscripten 6.0.9 and Node.js 24; npm is not required.
+
+One-time repository setup:
+
+1. Open [Settings > Pages](https://github.com/thammegowda/kidi/settings/pages).
+2. Set **Build and deployment > Source** to **GitHub Actions**.
+3. Push the workflow to `main`, or run **WebAssembly Pages** from Actions.
+
+After a successful deployment, the app is served at
+[thammegowda.github.io/kidi/](https://thammegowda.github.io/kidi/).
+No access token or Hugging Face secret needs to be configured.
+
+To build the same app-only artifact locally:
 
 ```bash
-node web/build.mjs build-pages
+make wasm WEB_DIR=build-pages
 ```
 
 Publish `build-pages/`, not source, build tools, or an old `build-web/model/`

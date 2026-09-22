@@ -47,6 +47,8 @@ button img { width: 18px; height: 18px; }
 .history-item:hover .history-delete, .history-delete:focus-visible { opacity: .68; }
 .history-delete:hover { color: var(--danger); background: #f4e9e6; opacity: 1; }
 .rail-footer { padding: 14px; border-top: 1px solid var(--line); }
+.repo-link { display: inline-flex; align-items: center; min-height: 28px; margin: 4px 8px 0; color: var(--muted); font-size: 11px; text-underline-offset: 3px; }
+.repo-link:hover { color: var(--ink); }
 .runtime-button { width: 100%; min-width: 0; padding: 9px 8px; border: 0; border-radius: 6px; background: transparent; display: grid; grid-template-columns: 10px minmax(0, 1fr) 18px; gap: 10px; align-items: center; text-align: left; }
 .runtime-button:hover { background: #e9efeb; }
 .runtime-button > img { opacity: .62; }

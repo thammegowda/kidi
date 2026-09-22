@@ -177,20 +177,19 @@ Python code or unpickles RTG training checkpoints.
 
 ## RTG Translation from Hugging Face
 
-The ready-made RTG package is
+The public, ready-made RTG package is
 [thammegowda/rtg-500eng-v1](https://huggingface.co/thammegowda/rtg-500eng-v1).
 It already includes `model.yaml` and compressed tokenizers, so no conversion is
-needed. This repository is currently private: your Hugging Face account must have
-access, and `hf auth login` must authenticate that account.
+needed. With Kidi's `hf` extra installed, the first command downloads the model
+automatically; later runs reuse the cache. No Hugging Face login is required.
 
 ```bash
-python -m kidi inspect -m @thammegowda/rtg-500eng-v1
 printf '%s\n' 'Comment allez @-@ vous ?' | \
   python -m kidi translate -m @thammegowda/rtg-500eng-v1 \
     --beam-size 1
 ```
 
-RTG uses `generate`, not `chat`, and expects Moses-tokenized text, one sentence per
+RTG uses `translate`, not `chat`, and expects Moses-tokenized text, one sentence per
 line. The same `--cache` and offline options apply. Kidi downloads the declared
 Safetensors and tokenizer files, preserving the repository's configuration.
 
