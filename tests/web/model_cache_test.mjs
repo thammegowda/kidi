@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {loadModel} from '../../web/model-cache.mjs';
+import {isModelCached, loadModel} from '../../web/model-cache.mjs';
 import {unsignedHeapIndices} from '../../web/wasm-glue.mjs';
 
 test('large-memory glue fixes direct and pthread heap indices without changing arithmetic shifts', () => {
@@ -33,6 +33,7 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
     const requests = [];
     const originalFetch = globalThis.fetch, originalCaches = globalThis.caches;
     globalThis.caches = {open: async () => ({match: async key => cache.get(String(key))?.clone(),
+        keys: async () => [...cache.keys()].map(url => ({url})),
         put: async (key, response) => cache.set(String(key), response.clone()),
         delete: async key => cache.delete(String(key))})};
     globalThis.fetch = async (url, options) => {
@@ -54,6 +55,9 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
         }};
     };
     try {
+        assert.equal(await isModelCached(source), false);
+        await assert.rejects(loadModel(runtime(), source, () => {}, {cacheOnly: true}), /cache incomplete/);
+        assert.equal(requests.length, 0);
         const first = runtime();
         const metrics = await loadModel(first, source, () => {});
         assert.equal(metrics.cachedBytes, 0);
@@ -77,14 +81,31 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
         const rangeKey = [...cache.keys()].find(key => key.endsWith('kidi_range=0-8388607'));
         assert.deepEqual(new Uint8Array(await cache.get(rangeKey).clone().arrayBuffer()), upstream.subarray(0, width));
         const count = requests.length;
+        assert.equal(await isModelCached(source), true);
+        const lastRange = [...cache.keys()].find(key => key.includes(`kidi_range=${width}-`));
+        const savedRange = cache.get(lastRange);
+        cache.delete(lastRange);
+        assert.equal(await isModelCached(source), false);
+        await assert.rejects(loadModel(runtime(), source, () => {}, {cacheOnly: true}), /cache incomplete/);
+        cache.set(lastRange, savedRange);
+        const templateKey = new URL('chat_template.jinja', source).href;
+        const savedTemplate = cache.get(templateKey);
+        cache.delete(templateKey);
+        assert.equal(await isModelCached(source), false);
+        cache.set(templateKey, savedTemplate);
+        assert.equal(await isModelCached(source), true);
+        assert.equal(requests.length, count);
         const second = runtime();
-        const reloaded = await loadModel(second, source, () => {});
+        const reloaded = await loadModel(second, source, () => {}, {cacheOnly: true});
         assert.equal(requests.length, count);
         assert.equal(reloaded.downloadedBytes, 0);
         assert.deepEqual(second.files.get('/model/model.safetensors').contents, mapped.contents);
         const corrupted = new Uint8Array(await cache.get(rangeKey).clone().arrayBuffer());
         corrupted[4096] ^= 1;
         cache.set(rangeKey, new Response(corrupted, {headers: cache.get(rangeKey).headers}));
+        await assert.rejects(loadModel(runtime(), source, () => {}, {cacheOnly: true}), /cache incomplete or damaged/);
+        assert.equal(requests.length, count);
+        assert.equal(await isModelCached(source), false);
         await loadModel(runtime(), source, () => {});
         assert.equal(requests.length, count + 1);
         await assert.rejects(loadModel(runtime(), source.replace('a'.repeat(40), 'main'), () => {}), /commit SHA/);
@@ -96,6 +117,8 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
         globalThis.fetch = (url, options) => String(url).includes('model.safetensors')
             ? Promise.resolve(new Response(upstream)) : validFetch(url, options);
         await assert.rejects(loadModel(runtime(), source, () => {}), /Invalid byte-range response/);
+        globalThis.caches = {open: async () => { throw new Error('Storage unavailable'); }};
+        assert.equal(await isModelCached(source), false);
     } finally {
         globalThis.fetch = originalFetch;
         if (originalCaches === undefined) delete globalThis.caches;

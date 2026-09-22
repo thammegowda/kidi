@@ -1,7 +1,9 @@
-import {clearModelCache} from './model-cache.mjs';
+import {clearModelCache, isModelCached} from './model-cache.mjs';
+import {renderMarkdown} from './markdown.mjs';
 
 const CHAT_STORAGE = 'kidi-chats-v1';
 const ACTIVE_CHAT_STORAGE = 'kidi-active-chat-v1';
+const MODEL_STORAGE = 'kidi-model-source-v1';
 const NEW_CHAT = '__new__';
 const element = id => document.getElementById(id);
 const megabytes = bytes => `${(bytes / 1e6).toFixed(1)} MB`;
@@ -12,6 +14,15 @@ let busy = false;
 let stopping = false;
 let loading = false;
 let reply;
+let runtimeVersion = 0;
+let currentStats;
+let generationStarted;
+let liveTimer;
+
+try {
+    const source = localStorage.getItem(MODEL_STORAGE);
+    if (source) element('manifest').value = source;
+} catch {}
 
 function loadChats() {
     try {
@@ -65,8 +76,8 @@ function saveCurrentChat() {
 function settleInterruptedTurn() {
     const chat = currentChat();
     if (!chat || !reply) return;
-    const partial = reply.textContent.trim();
-    if (partial) conversation.push({role: 'assistant', content: partial});
+    const partial = reply.text.trim();
+    if (partial) conversation.push({role: 'assistant', content: partial, stats: currentStats});
     else if (conversation.at(-1)?.role === 'user') conversation.pop();
     reply = null;
     if (conversation.length) saveCurrentChat();
@@ -94,32 +105,42 @@ function emptyState() {
     empty.append(logo, heading, detail);
     return empty;
 }
-function addMessage(role, content) {
+function showMessageStats(footer, stats) {
+    const valid = stats && ['tokenCount', 'elapsedMs', 'decodeMs', 'decodeTokens']
+        .every(key => Number.isFinite(stats[key]) && stats[key] >= 0);
+    footer.hidden = !valid;
+    if (!valid) return;
+    const speed = stats.decodeMs > 0 && stats.decodeTokens > 0
+        ? `${(stats.decodeTokens * 1000 / stats.decodeMs).toFixed(1)} tok/s` : '-- tok/s';
+    footer.textContent = `${stats.tokenCount} tokens | ${(stats.elapsedMs / 1000).toFixed(1)} s | ${speed}`;
+    footer.title = `Decode speed excludes prompt preparation.${Number.isFinite(stats.firstTokenMs)
+        ? ` First token: ${(stats.firstTokenMs / 1000).toFixed(2)} s.` : ''}`;
+}
+function addMessage(role, content, stats) {
     element('empty')?.remove();
     const article = document.createElement('article');
     article.className = `message ${role}`;
     const inner = document.createElement('div');
     inner.className = 'message-inner';
-    const avatar = document.createElement('span');
-    avatar.className = 'message-avatar';
-    avatar.textContent = role === 'user' ? 'Y' : 'K';
-    const body = document.createElement('div');
     const name = document.createElement('p');
     name.className = 'role';
     name.textContent = role === 'user' ? 'You' : 'Gemma';
-    const text = document.createElement('p');
+    const text = document.createElement('div');
     text.className = 'content';
-    text.textContent = content;
-    body.append(name, text);
-    inner.append(avatar, body);
+    renderMarkdown(text, content);
+    inner.append(name, text);
+    const footer = document.createElement('p');
+    footer.className = 'message-stats';
+    showMessageStats(footer, stats);
+    if (role === 'assistant') inner.append(footer);
     article.append(inner);
     element('messages').append(article);
-    return text;
+    return {element: text, text: content, footer};
 }
 function renderMessages() {
     element('messages').replaceChildren();
     if (!conversation.length) element('messages').append(emptyState());
-    else for (const message of conversation) addMessage(message.role, message.content);
+    else for (const message of conversation) addMessage(message.role, message.content, message.stats);
     element('chat-title').textContent = currentChat()?.title || 'New chat';
     element('messages').scrollTop = element('messages').scrollHeight;
 }
@@ -188,6 +209,14 @@ function setRuntimeState(state, label, detail, badge) {
     element('runtime-detail').textContent = detail;
     element('runtime-badge').textContent = badge;
 }
+function updateMemory(bytes) {
+    const known = Number.isSafeInteger(bytes) && bytes >= 0;
+    const gibibytes = value => `${(value / 2 ** 30).toFixed(2)} GiB`;
+    element('heap-used').textContent = known ? gibibytes(bytes) : '--';
+    element('heap-headroom').textContent = known ? gibibytes(Math.max(0, 2 ** 32 - bytes)) : '--';
+    element('memory').textContent = known ? gibibytes(bytes) : '--';
+    element('memory-stats').classList.toggle('tight', known && bytes > 3.75 * 2 ** 30);
+}
 function controls() {
     element('send').disabled = !ready || busy;
     element('stop').hidden = !busy;
@@ -198,14 +227,28 @@ function controls() {
     for (const id of ['threads', 'manifest']) element(id).disabled = busy || loading;
     for (const button of document.querySelectorAll('.history-open, .history-delete')) button.disabled = busy || loading;
 }
-function finish() { busy = false; stopping = false; controls(); }
+function updateLiveStats() {
+    const speed = currentStats?.decodeTokens > 0 && currentStats.decodeMs > 0
+        ? `${(currentStats.decodeTokens * 1000 / currentStats.decodeMs).toFixed(1)} tok/s`
+        : currentStats?.tokenCount ? 'Decoding' : 'Preparing prompt';
+    element('live-speed').textContent = speed;
+    element('live-detail').textContent = `${currentStats?.tokenCount || 0} tokens | ${((performance.now() - generationStarted) / 1000).toFixed(1)} s`;
+}
+function stopLiveStats() {
+    clearInterval(liveTimer);
+    element('live-generation').hidden = true;
+}
+function finish() { busy = false; stopping = false; stopLiveStats(); controls(); }
 function restart() {
+    runtimeVersion++;
     worker?.terminate();
     worker = null;
     ready = false;
     busy = false;
     loading = false;
     stopping = false;
+    stopLiveStats();
+    updateMemory();
     element('status').textContent = 'Not loaded';
     setRuntimeState('', 'Model offline', 'Gemma 4 E2B IT', 'Offline');
     renderMessages();
@@ -247,29 +290,40 @@ element('new-chat').addEventListener('click', newChat);
 settingsDialog.addEventListener('click', event => { if (event.target === settingsDialog) closeSettings(); });
 element('tokens').addEventListener('input', outputTokenLimit);
 
-element('load').addEventListener('click', async () => {
+async function loadRuntime(cacheOnly = false) {
+    if (loading || busy) return;
     const threads = Number(element('threads').value);
     if (!Number.isInteger(threads) || threads < 1 || threads > Number(element('threads').max)) return;
+    let manifest;
+    try { manifest = new URL(element('manifest').value, location.href).href; }
+    catch { element('warning').textContent = 'Enter a valid model source URL'; openSettings(); return; }
     restart();
+    const version = runtimeVersion;
     loading = true;
     controls();
     element('warning').textContent = '';
     element('status').textContent = 'Starting runtime';
     element('progress').hidden = false;
     setRuntimeState('loading', 'Starting runtime', 'Gemma 4 E2B IT', 'Loading');
-    try { await navigator.storage?.persist(); } catch {}
-    worker = new Worker(new URL('./inference-worker.mjs', import.meta.url), {type: 'module'});
-    worker.onerror = event => {
+    if (!cacheOnly) { try { await navigator.storage?.persist(); } catch {} }
+    if (version !== runtimeVersion) return;
+    const failed = event => {
         element('warning').textContent = event.message;
         element('status').textContent = 'Runtime failed';
         loading = false;
         ready = false;
+        element('progress').hidden = true;
         setRuntimeState('error', 'Runtime failed', event.message, 'Error');
         openSettings();
         finish();
     };
+    try { worker = new Worker(new URL('./inference-worker.mjs', import.meta.url), {type: 'module'}); }
+    catch (error) { failed(error); return; }
+    worker.onerror = failed;
     worker.onmessage = ({data}) => {
         document.dispatchEvent(new CustomEvent('kidi:runtime', {detail: data}));
+        if (data.heapBytes !== undefined) updateMemory(data.heapBytes);
+        if (busy && data.stats) { currentStats = data.stats; updateLiveStats(); }
         if (data.type === 'progress') {
             const percent = (data.loadedBytes / data.totalBytes * 100).toFixed(0);
             element('progress').value = data.loadedBytes / data.totalBytes;
@@ -282,12 +336,12 @@ element('load').addEventListener('click', async () => {
             element('status').textContent = 'Initializing Gemma';
             setRuntimeState('loading', 'Initializing Gemma', 'Preparing operators', 'Loading');
         } else if (data.type === 'ready') {
+            try { localStorage.setItem(MODEL_STORAGE, manifest); } catch {}
             ready = true;
             loading = false;
             const backend = 'Wasm CPU';
             element('status').textContent = `${backend} / ${data.threads} thread${data.threads === 1 ? '' : 's'} / Ready`;
             element('load-time').textContent = `${(data.loadMs / 1000).toFixed(1)} s`;
-            element('memory').textContent = `${(data.heapBytes / 2 ** 30).toFixed(2)} GiB`;
             element('progress').hidden = true;
             setRuntimeState('ready', 'Model ready', `${backend} / ${data.threads} thread${data.threads === 1 ? '' : 's'}`,
                 `CPU ${data.threads}T`);
@@ -295,19 +349,25 @@ element('load').addEventListener('click', async () => {
             closeSettings();
             controls();
         } else if (data.type === 'step') {
+            const messages = element('messages');
+            const follow = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 100;
             for (const generationEvent of data.events) {
-                if (generationEvent.text) reply.textContent += generationEvent.text;
+                if (generationEvent.text) reply.text += generationEvent.text;
                 if (generationEvent.completed) {
-                    reply.textContent = generationEvent.completed.text;
-                    conversation.push({role: 'assistant', content: generationEvent.completed.text});
+                    renderMarkdown(reply.element, generationEvent.completed.text);
+                    const result = generationEvent.completed;
+                    const stats = {...currentStats, tokenCount: result.token_ids.length, elapsedMs: result.generation_ms,
+                        decodeTokens: result.decode_tokens, decodeMs: result.decode_ms};
+                    showMessageStats(reply.footer, stats);
+                    conversation.push({role: 'assistant', content: result.text, stats});
                     reply = null;
                     saveCurrentChat();
-                    const result = generationEvent.completed;
                     element('generation-stats').textContent = `${result.token_ids.length} tokens / ${(result.generation_ms / 1000).toFixed(1)} s${result.decode_tokens ? ` / ${(result.decode_tokens * 1000 / result.decode_ms).toFixed(1)} tok/s decode` : ''}`;
                     finish();
                 }
             }
-            element('messages').scrollTop = element('messages').scrollHeight;
+            if (reply) renderMarkdown(reply.element, reply.text, {streaming: true});
+            if (follow) messages.scrollTop = messages.scrollHeight;
         } else if (data.type === 'cancelled') {
             settleInterruptedTurn();
             renderMessages();
@@ -328,9 +388,19 @@ element('load').addEventListener('click', async () => {
             finish();
         }
     };
-    worker.postMessage({type: 'load', manifest: new URL(element('manifest').value, location.href).href,
-        threads});
-});
+    worker.postMessage({type: 'load', manifest, threads, cacheOnly});
+}
+element('load').addEventListener('click', () => loadRuntime());
+
+async function restoreCachedModel() {
+    const version = runtimeVersion;
+    const source = element('manifest').value;
+    try {
+        if (await isModelCached(new URL(source, location.href).href) && version === runtimeVersion &&
+            source === element('manifest').value && !worker && !loading && !busy)
+            await loadRuntime(true);
+    } catch {}
+}
 
 element('compose').addEventListener('submit', event => {
     event.preventDefault();
@@ -350,10 +420,16 @@ element('compose').addEventListener('submit', event => {
     chat.updatedAt = Date.now();
     saveCurrentChat();
     busy = true;
+    currentStats = null;
+    generationStarted = performance.now();
+    element('live-generation').hidden = false;
+    updateLiveStats();
+    liveTimer = setInterval(updateLiveStats, 250);
     controls();
     element('warning').textContent = '';
     addMessage('user', prompt);
     reply = addMessage('assistant', '');
+    element('messages').scrollTop = element('messages').scrollHeight;
     element('generation-stats').textContent = 'Generating';
     element('prompt').value = '';
     element('prompt').style.height = '';
@@ -377,6 +453,7 @@ element('stop').addEventListener('click', () => {
     worker.postMessage({type: 'cancel'});
 });
 element('clear-cache').addEventListener('click', async () => {
+    runtimeVersion++;
     try {
         await clearModelCache();
         element('cached').textContent = '0 MB';
@@ -384,6 +461,8 @@ element('clear-cache').addEventListener('click', async () => {
     } catch (error) { element('warning').textContent = error.message; }
 });
 addEventListener('pagehide', () => {
+    runtimeVersion++;
+    stopLiveStats();
     if (busy) {
         worker?.postMessage({type: 'cancel'});
         settleInterruptedTurn();
@@ -391,8 +470,9 @@ addEventListener('pagehide', () => {
     worker?.terminate();
     worker = null;
 });
-addEventListener('pageshow', event => { if (event.persisted) restart(); });
+addEventListener('pageshow', event => { if (event.persisted) { restart(); restoreCachedModel(); } });
 
 renderHistory();
 renderMessages();
 controls();
+restoreCachedModel();

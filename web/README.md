@@ -83,6 +83,32 @@ New chat creates a blank conversation; completed chats are stored in local
 browser storage and can be reopened or deleted from the history rail. Chat
 content is not sent to a server.
 
+On startup, a fully cached model loads automatically. The last successfully
+loaded source is remembered. Empty, partial, or unavailable caches leave the
+model offline; automatic loading never downloads missing model data. Use Load
+model to repair an incomplete or corrupt cache.
+
+Messages render Markdown, including lists, links, tables, and fenced code,
+using vendored Marked and DOMPurify. Raw Markdown is kept in chat history and
+model requests. Executable HTML, embedded media, and remote images are removed.
+Long completed replies have Show more / Show less controls; active streams stay
+expanded. Fenced code uses Highlight.js common languages, with plain-text fallback.
+Mermaid fences render after completion using a lazy-loaded local bundle in a
+sandbox with network access blocked. Diagrams retain a source disclosure and
+fall back to source when invalid or too large to preview.
+
+Each new assistant reply keeps a small token-count, elapsed-time, and decode-speed
+footer in saved history. Cancelled partial replies keep their available stats.
+Older saved replies without timing data do not show invented measurements.
+During generation, the header shows live decode speed, output token count, and
+elapsed time. Speed excludes prompt preparation; final summaries use the native
+runtime counters. First-token latency is available in the footer tooltip.
+
+The header shows allocated Wasm linear memory and growth headroom below the
+4 GiB limit, refreshed during loading and generation. These are not process
+RAM or free device memory, and headroom does not include reusable space already
+inside the heap or guarantee that the browser can allocate more memory.
+
 Output defaults to 1,024 tokens and can be set from 1 to 8,192. The formatted
 conversation and requested output must fit within a shared 9,216-token context.
 At the maximum output setting, 1,024 tokens remain for the formatted conversation.

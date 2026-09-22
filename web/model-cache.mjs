@@ -3,6 +3,38 @@ const CHUNK_BYTES = 8 * 1024 * 1024;
 const hex = bytes => Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
 const digest = async data => hex(await crypto.subtle.digest('SHA-256', data));
 
+export async function isModelCached(source) {
+    try {
+        const url = new URL(source);
+        const cache = await caches.open(CACHE_NAME);
+        const keys = new Set((await cache.keys()).map(request => request.url));
+        if (!keys.has(url.href)) return false;
+        if (url.pathname.endsWith('/config.json')) {
+            if (url.origin !== 'https://huggingface.co' || url.search || url.hash ||
+                !/^\/[^/]+\/[^/]+\/resolve\/[a-f0-9]{40}\/config\.json$/.test(url.pathname)) return false;
+            for (const name of ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'])
+                if (!keys.has(new URL(name, url).href)) return false;
+            const key = new URL('model.safetensors', url);
+            key.searchParams.set('kidi_range', `0-${CHUNK_BYTES - 1}`);
+            const first = await cache.match(key.href);
+            const size = Number(first?.headers.get('X-Kidi-Size'));
+            first?.body?.cancel().catch(() => {});
+            if (!Number.isSafeInteger(size) || size <= 0 || size >= 2 ** 32) return false;
+            for (let start = CHUNK_BYTES; start < size; start += CHUNK_BYTES) {
+                key.searchParams.set('kidi_range', `${start}-${Math.min(size, start + CHUNK_BYTES) - 1}`);
+                if (!keys.has(key.href)) return false;
+            }
+            return true;
+        }
+        const manifest = await (await cache.match(url.href)).json();
+        if (manifest.version !== 1 || !Array.isArray(manifest.files) || !/^[a-f0-9]{64}$/.test(manifest.id)) return false;
+        for (const name of ['model.yaml', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json'])
+            if (!manifest.files.some(file => file.name === name)) return false;
+        return manifest.files.every(file => Array.isArray(file.chunks) && file.chunks.length &&
+            file.chunks.every(chunk => keys.has(new URL(`./__kidi_chunks__/${chunk.sha256}`, url).href)));
+    } catch { return false; }
+}
+
 function allocateWeights(module, size) {
     if (!Number.isSafeInteger(size) || size <= 0 || size >= 2 ** 32)
         throw new Error('Checkpoint exceeds the Wasm32 address space');
@@ -69,7 +101,7 @@ function normalizationPlan(config, header, dataBytes) {
     return ranges.filter(range => range.mask);
 }
 
-async function loadHubModel(module, source, progress, cache, warning) {
+async function loadHubModel(module, source, progress, cache, warning, cacheOnly) {
     const configUrl = new URL(source);
     if (configUrl.origin !== 'https://huggingface.co' || configUrl.search || configUrl.hash ||
         !/^\/[^/]+\/[^/]+\/resolve\/[a-f0-9]{40}\/config\.json$/.test(configUrl.pathname))
@@ -99,6 +131,7 @@ async function loadHubModel(module, source, progress, cache, warning) {
             }
             await cache.delete(key.href);
         }
+        if (cacheOnly) throw new Error('Model cache incomplete or damaged. Click Load model to download missing data.');
         const response = await fetch(key, {mode: 'cors', credentials: 'omit',
             headers: ranged ? {Range: `bytes=${start}-${end}`} : {}, signal: AbortSignal.timeout(120000)});
         let total;
@@ -174,15 +207,18 @@ async function loadHubModel(module, source, progress, cache, warning) {
     return {...metrics, warning, model: 'Gemma 4 E2B IT', precision: 'QAT mixed 2/4/8-bit', id: configUrl.href};
 }
 
-export async function loadModel(module, manifestUrl, progress) {
+export async function loadModel(module, manifestUrl, progress, {cacheOnly = false} = {}) {
     let cache;
     let warning = '';
     try { cache = await caches.open(CACHE_NAME); }
     catch (error) { warning = `Persistent cache unavailable: ${error.message}`; }
     if (new URL(manifestUrl).pathname.endsWith('/config.json'))
-        return loadHubModel(module, manifestUrl, progress, cache, warning);
+        return loadHubModel(module, manifestUrl, progress, cache, warning, cacheOnly);
     let response;
-    try {
+    if (cacheOnly) {
+        response = cache && await cache.match(manifestUrl);
+        if (!response) throw new Error('Model cache incomplete. Click Load model to download missing data.');
+    } else try {
         response = await fetch(manifestUrl, {cache: 'no-cache'});
         if (!response.ok) throw new Error(`Manifest HTTP ${response.status}`);
         if (cache) await cache.put(manifestUrl, response.clone()).catch(error => { warning = error.message; });
@@ -226,6 +262,7 @@ export async function loadModel(module, manifestUrl, progress) {
                 if (!await verify(data)) { await cache.delete(key); cached = null; data = null; }
             }
             if (!cached) {
+                if (cacheOnly) throw new Error('Model cache incomplete or damaged. Click Load model to download missing data.');
                 const downloaded = await fetch(new URL(chunk.url, manifestUrl));
                 if (!downloaded.ok) throw new Error(`Model download HTTP ${downloaded.status}`);
                 data = await downloaded.arrayBuffer();

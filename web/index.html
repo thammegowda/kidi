@@ -32,7 +32,17 @@
             <header class="chat-header">
                 <button id="open-history" class="icon history-toggle" type="button" title="Open history" aria-label="Open history"><img src="./icons/panel-left.svg" alt=""></button>
                 <div class="title-block"><h1 id="chat-title">New chat</h1><p>Gemma 4 E2B IT</p></div>
-                <button id="header-settings" class="runtime-chip" type="button"><span class="status-dot" aria-hidden="true"></span><span id="runtime-badge">Offline</span><img src="./icons/settings.svg" alt="" aria-hidden="true"></button>
+                <div class="header-metrics">
+                    <div id="live-generation" class="live-generation" title="Live decode speed excludes prompt preparation" role="group" aria-label="Generation statistics" hidden>
+                        <strong id="live-speed">Preparing prompt</strong><span id="live-detail">0 tokens | 0.0 s</span>
+                    </div>
+                    <div id="memory-stats" class="memory-stats" tabindex="0" aria-label="WebAssembly memory" aria-describedby="memory-description">
+                    <span>Wasm heap <strong id="heap-used">--</strong></span>
+                    <span>Headroom <strong id="heap-headroom">--</strong></span>
+                    <span id="memory-description" role="tooltip">Allocated linear memory and growth remaining below the 4 GiB Wasm limit. Not total browser RAM or free device memory.</span>
+                    </div>
+                </div>
+                <button id="header-settings" class="runtime-chip" type="button" title="Model settings" aria-label="Model settings"><span class="status-dot" aria-hidden="true"></span><span id="runtime-badge">Offline</span><img src="./icons/settings.svg" alt="" aria-hidden="true"></button>
             </header>
             <section id="messages" class="messages" aria-label="Conversation" aria-live="polite"></section>
             <div class="composer-region">
@@ -40,11 +50,11 @@
                     <label class="sr-only" for="prompt">Message</label>
                     <textarea id="prompt" rows="1" placeholder="Message Gemma" required></textarea>
                     <div class="compose-actions">
-                        <span id="generation-stats">9,216-token context</span>
                         <button id="stop" class="icon stop" type="button" title="Stop generation" aria-label="Stop generation" hidden><img src="./icons/square.svg" alt=""></button>
                         <button id="send" class="icon primary" type="submit" title="Send message" aria-label="Send message" disabled><img src="./icons/send-horizontal.svg" alt=""></button>
                     </div>
                 </form>
+                <p id="generation-stats">9,216-token context</p>
             </div>
         </main>
     </div>
@@ -63,7 +73,7 @@
                     <button id="load" class="primary load-model" type="button"><img src="./icons/download.svg" alt="">Load model</button>
                 </div>
                 <progress id="progress" value="0" max="1" hidden></progress>
-                <dl><dt>Download</dt><dd id="download">0 MB</dd><dt>From cache</dt><dd id="cached">0 MB</dd><dt>Load time</dt><dd id="load-time">--</dd><dt>Wasm memory</dt><dd id="memory">--</dd></dl>
+                <dl><dt>Download</dt><dd id="download">0 MB</dd><dt>From cache</dt><dd id="cached">0 MB</dd><dt>Load time</dt><dd id="load-time">--</dd><dt>Wasm heap</dt><dd id="memory">--</dd></dl>
                 <p id="warning" role="alert"></p>
                 <button id="clear-cache" class="subtle" type="button"><img src="./icons/trash-2.svg" alt="">Clear model cache</button>
             </section>

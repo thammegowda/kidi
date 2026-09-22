@@ -23,8 +23,13 @@ for (const [name, threads] of [['single', 'OFF'], ['threads', 'ON']]) {
     const glue = join(destination, name, 'kidi.mjs');
     await writeFile(glue, unsignedHeapIndices(await readFile(glue, 'utf8')));
 }
-for (const file of ['index.html', 'app.mjs', 'style.css', 'inference-worker.mjs', 'model-cache.mjs'])
+for (const file of ['index.html', 'app.mjs', 'style.css', 'inference-worker.mjs', 'model-cache.mjs', 'markdown.mjs', 'mermaid.mjs'])
     await copyFile(join(root, 'web', file), join(destination, file));
+for (const name of ['marked', 'dompurify', 'highlightjs', 'mermaid']) {
+    await mkdir(join(destination, 'libs', name), {recursive: true});
+    for (const file of await readdir(join(libraries, name)))
+        await copyFile(join(libraries, name, file), join(destination, 'libs', name, file));
+}
 await copyFile(join(libraries, 'coi-serviceworker/coi-serviceworker.js'),
     join(destination, 'coi-serviceworker.js'));
 await copyFile(join(libraries, 'coi-serviceworker/LICENSE'),
