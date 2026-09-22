@@ -4,6 +4,7 @@ import {renderMarkdown} from './markdown.mjs';
 const CHAT_STORAGE = 'kidi-chats-v1';
 const ACTIVE_CHAT_STORAGE = 'kidi-active-chat-v1';
 const MODEL_STORAGE = 'kidi-model-source-v1';
+const SETTINGS_STORAGE = 'kidi-settings-v1';
 const NEW_CHAT = '__new__';
 const element = id => document.getElementById(id);
 const megabytes = bytes => `${(bytes / 1e6).toFixed(1)} MB`;
@@ -18,6 +19,27 @@ let runtimeVersion = 0;
 let currentStats;
 let generationStarted;
 let liveTimer;
+const preferences = {};
+
+try {
+    const saved = JSON.parse(localStorage.getItem(SETTINGS_STORAGE) || '{}');
+    for (const id of ['threads', 'tokens']) {
+        const input = element(id);
+        const value = saved?.[id];
+        if (Number.isInteger(value) && value >= Number(input.min) && value <= Number(input.max)) {
+            preferences[id] = value;
+            input.value = String(value);
+        }
+    }
+} catch {}
+
+function savePreference(id) {
+    const input = element(id);
+    const value = Number(input.value);
+    if (!Number.isInteger(value) || value < Number(input.min) || value > Number(input.max)) return;
+    preferences[id] = value;
+    try { localStorage.setItem(SETTINGS_STORAGE, JSON.stringify(preferences)); } catch {}
+}
 
 try {
     const source = localStorage.getItem(MODEL_STORAGE);
@@ -35,7 +57,8 @@ function loadChats() {
     } catch { return []; }
 }
 let chats = loadChats();
-const storedActiveChat = localStorage.getItem(ACTIVE_CHAT_STORAGE);
+let storedActiveChat = null;
+try { storedActiveChat = localStorage.getItem(ACTIVE_CHAT_STORAGE); } catch {}
 let currentChatId = storedActiveChat === NEW_CHAT ? null : storedActiveChat;
 if (currentChatId && !chats.some(chat => chat.id === currentChatId)) currentChatId = chats[0]?.id || null;
 if (storedActiveChat === null) currentChatId = chats[0]?.id || null;
@@ -282,6 +305,7 @@ function outputTokenLimit() {
 if (!crossOriginIsolated) element('threads').value = '1';
 if (!crossOriginIsolated) element('threads').max = '1';
 for (const id of ['threads', 'manifest']) element(id).addEventListener('change', restart);
+for (const id of ['threads', 'tokens']) element(id).addEventListener('input', () => savePreference(id));
 for (const id of ['open-settings', 'header-settings']) element(id).addEventListener('click', openSettings);
 element('close-settings').addEventListener('click', closeSettings);
 element('open-history').addEventListener('click', openHistory);

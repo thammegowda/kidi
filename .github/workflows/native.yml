@@ -1,0 +1,104 @@
+name: Native and Python Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native.yml'
+      - '.gitmodules'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'cmake/**'
+      - 'src/kidi/**'
+      - 'third_party/**'
+      - 'python/**'
+      - 'pyproject.toml'
+      - 'tests/kidi/**'
+      - 'tests/data/**'
+      - 'tests/python_cli_test.py'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/native.yml'
+      - '.gitmodules'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'cmake/**'
+      - 'src/kidi/**'
+      - 'third_party/**'
+      - 'python/**'
+      - 'pyproject.toml'
+      - 'tests/kidi/**'
+      - 'tests/data/**'
+      - 'tests/python_cli_test.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache-native
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 500M
+      CMAKE_BUILD_PARALLEL_LEVEL: '3'
+      CMAKE_ARGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache
+    steps:
+      - name: Check out source and dependencies
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install build tools
+        run: brew install ninja ccache
+
+      - name: Restore compiled objects
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-macos26-${{ github.sha }}
+          restore-keys: |
+            native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-macos26-
+
+      - name: Build native unit tests
+        run: |
+          ccache --zero-stats
+          cmake --preset debug \
+            -DKIDI_BUILD_PYTHON=OFF -DKIDI_BUILD_BENCHMARKS=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache
+          cmake --build --preset debug
+
+      - name: Run native unit tests
+        run: ctest --preset debug
+
+      - name: Build and install Python wheel
+        shell: bash
+        run: |
+          python -m pip wheel --no-deps . --wheel-dir dist
+          wheels=(dist/kidi-*.whl)
+          python -m pip install "${wheels[0]}[hf]"
+
+      - name: Test installed Python package without model downloads
+        run: python -m unittest discover -s tests -p python_cli_test.py
+
+      - name: Report compiler cache statistics
+        if: always()
+        run: ccache --show-stats

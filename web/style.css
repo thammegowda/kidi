@@ -136,7 +136,8 @@ textarea { width: 100%; min-height: 54px; max-height: 170px; padding: 15px 16px 
 #send { background: var(--blue); border-color: var(--blue); }
 #send:disabled { opacity: 1; background: #e3e7ed; border-color: #e3e7ed; }
 #send:disabled img { filter: none; opacity: .45; }
-#generation-stats { width: min(880px, 100%); min-height: 15px; margin: 5px auto 0; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; text-align: right; font-variant-numeric: tabular-nums; }
+.composer-footer { width: min(880px, 100%); margin: 5px auto 0; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; color: var(--muted); font-size: 10px; }
+#generation-stats { min-height: 15px; margin: 0 0 0 auto; overflow-wrap: anywhere; text-align: right; font-variant-numeric: tabular-nums; }
 .primary { border-color: var(--green); background: var(--green); color: white; }
 .primary:hover:not(:disabled) { border-color: var(--green-dark); background: var(--green-dark); }
 .primary img { filter: invert(1); }

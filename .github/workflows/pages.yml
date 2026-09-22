@@ -3,8 +3,30 @@ name: WebAssembly Pages
 on:
   push:
     branches: [main]
+    paths:
+      - '.github/workflows/pages.yml'
+      - '.gitmodules'
+      - 'CMakeLists.txt'
+      - 'Makefile'
+      - 'cmake/**'
+      - 'src/**'
+      - 'third_party/**'
+      - 'web/**'
+      - 'tests/web/**'
+      - 'docs/kidi-logo-small.png'
   pull_request:
     branches: [main]
+    paths:
+      - '.github/workflows/pages.yml'
+      - '.gitmodules'
+      - 'CMakeLists.txt'
+      - 'Makefile'
+      - 'cmake/**'
+      - 'src/**'
+      - 'third_party/**'
+      - 'web/**'
+      - 'tests/web/**'
+      - 'docs/kidi-logo-small.png'
   workflow_dispatch:
 
 permissions:
@@ -12,7 +34,7 @@ permissions:
 
 concurrency:
   group: pages-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   EMSCRIPTEN_VERSION: 6.0.9
@@ -21,6 +43,12 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache-wasm
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 500M
+      EM_COMPILER_WRAPPER: ccache
     steps:
       - name: Check out source and dependencies
         uses: actions/checkout@v6
@@ -36,12 +64,31 @@ jobs:
       - name: Install build tools
         run: |
           sudo -n apt-get update
-          sudo -n apt-get install --yes cmake ninja-build
+          sudo -n apt-get install --yes cmake ninja-build ccache
+
+      - name: Restore Emscripten SDK and system libraries
+        id: emsdk
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/emsdk
+          key: emsdk-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-${{ env.EMSCRIPTEN_VERSION }}
+
+      - name: Restore compiled objects
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: wasm-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            wasm-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-
 
       - name: Install Emscripten
+        if: steps.emsdk.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch "$EMSCRIPTEN_VERSION" https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
           "$RUNNER_TEMP/emsdk/emsdk" install "$EMSCRIPTEN_VERSION"
+
+      - name: Activate Emscripten
+        run: |
           "$RUNNER_TEMP/emsdk/emsdk" activate "$EMSCRIPTEN_VERSION"
 
       - name: Test browser model loader
@@ -51,7 +98,12 @@ jobs:
         shell: bash
         run: |
           source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
+          ccache --zero-stats
           make wasm WEB_DIR=build-pages
+
+      - name: Report compiler cache statistics
+        if: always()
+        run: ccache --show-stats
 
       - name: Verify site artifact
         shell: bash

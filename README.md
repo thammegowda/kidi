@@ -237,6 +237,9 @@ promise of performance on other systems.
 ### Development
 
 The [Pages workflow](.github/workflows/pages.yml) tests and builds both Wasm
-variants on pull requests to `main`; merges to `main` deploy the browser app.
+variants for relevant changes, reusing SDK and compiler caches; merges to `main`
+deploy the browser app. The separate [native workflow](.github/workflows/native.yml)
+runs native unit tests and installed Python wheel smoke tests on macOS 26,
+without downloading models. It does not block Pages deployment.
 Model weights are downloaded by the browser, not included in the site artifact.
 See the [deployment guide](web/README.md#github-pages) for the one-time Pages setup.

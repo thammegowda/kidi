@@ -79,6 +79,10 @@ model/layer equations and YNNPACK operators are shared with native CPU execution
 
 The main screen reserves the viewport for messages and the bottom composer.
 Model source, thread count, cache and token controls live in the runtime settings dialog.
+Valid thread-count and output-token changes are remembered in local storage.
+If isolation is unavailable, the current session uses one thread without replacing
+the saved thread preference. The composer identifies inference as running locally
+inside the browser.
 New chat creates a blank conversation; completed chats are stored in local
 browser storage and can be reopened or deleted from the history rail. Chat
 content is not sent to a server.
@@ -146,10 +150,19 @@ to one thread. HTTPS is required except on localhost/loopback.
 ### GitHub Pages
 
 The [WebAssembly Pages workflow](../.github/workflows/pages.yml) tests the browser
-loader and builds both Wasm variants on pull requests and pushes to `main`.
+loader and builds both Wasm variants for relevant pull requests and pushes to `main`.
 Only `main` deploys, using the `github-pages` environment and GitHub's Pages
 artifact service. It can also be run manually from the Actions tab on `main`.
 The Linux build uses Emscripten 6.0.9 and Node.js 24; npm is not required.
+
+The workflow caches the versioned Emscripten SDK (including system libraries)
+and up to 500 MB of compiler objects through `ccache`. The first build is cold;
+later runs reuse matching objects, but still configure and link both variants.
+All runtime sources remain included. Python bindings, native tests, and
+benchmarks are disabled for the Pages build. Native unit tests and Python wheel
+checks run independently in the [native workflow](../.github/workflows/native.yml).
+Python-only and top-level documentation changes do not trigger Pages; stale PR
+builds are cancelled, while deployments are allowed to finish.
 
 One-time repository setup:
 

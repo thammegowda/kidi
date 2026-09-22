@@ -11,7 +11,9 @@ for (const [name, threads] of [['single', 'OFF'], ['threads', 'ON']]) {
     const build = join(root, name === 'single' ? 'build-wasm' : 'build-wasm-threads');
     for (const [command, args] of [
         ['emcmake', ['cmake', '-S', root, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
-            '-DKIDI_BUILD_TESTS=OFF', '-DKIDI_WASM_LARGE_MEMORY=ON', '-DCMAKE_EXE_LINKER_FLAGS=',
+            '-DBUILD_TESTING=OFF', '-DKIDI_BUILD_TESTS=OFF',
+            '-DKIDI_BUILD_BENCHMARKS=OFF', '-DKIDI_BUILD_PYTHON=OFF',
+            '-DKIDI_WASM_LARGE_MEMORY=ON', '-DCMAKE_EXE_LINKER_FLAGS=',
             `-DKIDI_WASM_THREADS=${threads}`]],
         ['cmake', ['--build', build, '--target', 'kidi_wasm', '-j8']]]) {
         const result = spawnSync(command, args, {stdio: 'inherit'});
