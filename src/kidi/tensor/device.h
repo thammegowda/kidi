@@ -11,6 +11,7 @@ enum class DeviceKind {
     Q_NPU,
     CUDA,
     A_GPU,
+    WEB_GPU,
 };
 
 struct Device {
@@ -25,6 +26,8 @@ struct Device {
 
     static constexpr auto apple_gpu(std::int32_t index = 0) noexcept -> Device { return {DeviceKind::A_GPU, index}; }
 
+    static constexpr auto web_gpu(std::int32_t index = 0) noexcept -> Device { return {DeviceKind::WEB_GPU, index}; }
+
     friend auto operator==(const Device&, const Device&) -> bool = default;
 };
 
@@ -38,6 +41,8 @@ constexpr auto to_string(DeviceKind kind) noexcept -> std::string_view {
             return "cuda";
         case DeviceKind::A_GPU:
             return "a_gpu";
+        case DeviceKind::WEB_GPU:
+            return "web_gpu";
     }
 }
 

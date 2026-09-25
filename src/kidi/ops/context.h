@@ -59,13 +59,13 @@ public:
     auto add_(Tensor& left, const Tensor& right) -> Tensor&;
     auto multiply(const Tensor& left, const Tensor& right) -> Tensor;
     auto multiply_(Tensor& left, const Tensor& right) -> Tensor&;
-    auto cast(const Tensor& input, tensor::DType dtype) -> Tensor;
+    auto cast(const Tensor& input, tensor::DType dtype, float scale = 0) -> Tensor;
     auto matmul(const Tensor& left, const Tensor& right, bool transpose_right = false) -> Tensor;
     auto scaled_dot_product_attention(const Tensor& query, const Tensor& key, const Tensor& value, std::int32_t heads,
                                       const Tensor& mask = {}) -> Tensor;
     auto grouped_query_attention(const Tensor& query, const Tensor& key, const Tensor& value, std::int32_t heads,
                                  std::int32_t key_value_heads, const Tensor& mask, float scale = 1.F,
-                                 std::int64_t key_start = 0) -> Tensor;
+                                 std::int64_t key_start = 0, float key_scale = 0, float value_scale = 0) -> Tensor;
     auto rotary(const Tensor& input, const Tensor& cosine, const Tensor& sine) -> Tensor;
     auto linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight = false) -> Tensor;
     auto quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias) -> Tensor;
@@ -77,6 +77,8 @@ public:
     auto tanh(const Tensor& input) -> Tensor;
     auto static_round(const Tensor& input, float scale) -> Tensor;
     auto greedy_token(const Tensor& logits) -> Tensor;
+    auto embedding(const Tensor& indices, const Tensor& weight, const Tensor& scales, std::int32_t width,
+                   std::int32_t bits, float multiplier) -> Tensor;
     auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
     auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine, float epsilon)
         -> Tensor;

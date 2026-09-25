@@ -16,8 +16,10 @@ struct Shape {
 };
 
 /// Projected keys and values, each shaped [batch, sequence, hidden].
+/// An INT8 cache carries the scales its rows were rounded with, so layers sharing it need no scales of their own.
 struct KeyValue {
     Tensor key, value;
+    float key_scale = 0, value_scale = 0;
 };
 
 KIDI_MODULE(Linear);

@@ -49,7 +49,8 @@ auto operation_name(Operation operation) -> std::string_view {
                                "tanh",          "rotary",
                                "packed_linear", "rms_norm_residual",
                                "static_round",  "greedy_token",
-                               "rms_rotary",    "gelu_multiply"};
+                               "rms_rotary",    "gelu_multiply",
+                               "embedding"};
     return names.at(static_cast<std::size_t>(operation));
 }
 struct OperatorProfile {
@@ -111,7 +112,7 @@ struct Context::Impl {
         spec.vector_projection = decode_projections && spec.operation == Operation::PACKED_LINEAR &&
                                  device == tensor::Device::apple_gpu() && inputs[0].dimensions() > 0 &&
                                  inputs[0].size(-1) && inputs[0].numel() / inputs[0].size(-1) >= 4;
-        if (is_inplace) require(destination->host_bytes());
+        if (is_inplace && device != tensor::Device::web_gpu()) require(destination->host_bytes());
         const auto entered = profiling ? Clock::now() : Clock::time_point{};
         const auto preparation_before = preparation;
         auto& key = dispatch_key;
@@ -124,10 +125,14 @@ struct Context::Impl {
         const bool constant_parameters =
             spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
             spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RESIDUAL_NORM ||
-            spec.operation == Operation::RMS_NORM || spec.operation == Operation::PACKED_LINEAR;
+            spec.operation == Operation::RMS_NORM || spec.operation == Operation::PACKED_LINEAR ||
+            spec.operation == Operation::EMBEDDING;
         const std::size_t parameter_start = spec.operation == Operation::RESIDUAL_NORM ? 2 : 1;
-        spec.dynamic_parameters = spec.operation == Operation::RMS_NORM ||
-                                  (spec.operation == Operation::LINEAR && device == tensor::Device::apple_gpu());
+        // Packed projections bake an interleaved copy of their weights, so each weight needs its own program.
+        spec.dynamic_parameters =
+            spec.operation == Operation::RMS_NORM ||
+            (spec.operation == Operation::LINEAR && device == tensor::Device::apple_gpu()) ||
+            (constant_parameters && spec.operation != Operation::PACKED_LINEAR && device == tensor::Device::web_gpu());
         for (std::size_t index = parameter_start; index < inputs.size(); ++index)
             spec.dynamic_parameters = spec.dynamic_parameters && inputs[index].device() == device;
         key.push_back(spec.dynamic_parameters);
@@ -141,7 +146,8 @@ struct Context::Impl {
             key.push_back(input.dimensions());
             key.insert(key.end(), input.shape().begin(), input.shape().end());
             if (constant_parameters && !spec.dynamic_parameters && index >= parameter_start)
-                key.push_back(reinterpret_cast<std::intptr_t>(require(input.host_bytes()).data()));
+                key.insert(key.end(),
+                           {reinterpret_cast<std::intptr_t>(input.storage_identity()), input.storage_offset()});
         }
         const auto invalid = [](bool condition, const char* message) {
             if (condition) throw Failure({ErrorCode::INVALID_ARGUMENT, message});
@@ -185,10 +191,16 @@ struct Context::Impl {
                         (key.size(0) != 1 && key.size(0) != input.size(0)),
                     "attention shape mismatch");
             for (std::size_t index = 0; index < inputs.size(); ++index)
-                invalid(inputs[index].dtype() != tensor::DType::F32, "attention expects FP32 tensors");
+                invalid(inputs[index].dtype() != tensor::DType::F32 &&
+                            !((index == 1 || index == 2) && inputs[index].dtype() == tensor::DType::I8),
+                        "attention expects FP32 tensors or an INT8 key/value cache");
+            invalid(key.dtype() != value.dtype(), "attention key and value must share a dtype");
+            invalid(key.dtype() == tensor::DType::I8 &&
+                        (device != tensor::Device::web_gpu() || spec.attributes.size() != 5),
+                    "INT8 attention requires WebGPU and explicit cache scales");
             if (inputs.size() == 4) {
                 const auto key_length =
-                    spec.attributes.size() == 4 ? static_cast<std::size_t>(spec.attributes[3]) : key.size(1);
+                    spec.attributes.size() >= 4 ? static_cast<std::size_t>(spec.attributes[3]) : key.size(1);
                 const std::array<std::size_t, 4> scores{input.size(0), static_cast<std::size_t>(heads), input.size(1),
                                                         key_length};
                 const auto& mask = inputs[3];
@@ -339,6 +351,10 @@ Context::Context(tensor::Device device, bool packed_prefill) : impl_(std::make_u
     if (impl_->skip_requests) impl_->profiling = false;
     impl_->synchronize_operators = profile && std::string_view(profile) == "sync";
     if (device == tensor::Device::cpu()) impl_->backend = runtime::cpu_operators();
+#if defined(KIDI_HAS_WEBGPU)
+    else if (device == tensor::Device::web_gpu())
+        impl_->backend = runtime::web_gpu_operators();
+#endif
 #if defined(KIDI_HAS_METAL)
     else if (device == tensor::Device::apple_gpu())
         impl_->backend = runtime::metal_operators();
@@ -371,6 +387,16 @@ auto Context::add(const Tensor& left, const Tensor& right) -> Tensor {
 auto Context::greedy_token(const Tensor& logits) -> Tensor {
     return impl_->run({Operation::GREEDY_TOKEN, {}, tensor::DType::I32}, {&logits});
 }
+auto Context::embedding(const Tensor& indices, const Tensor& weight, const Tensor& scales, std::int32_t width,
+                        std::int32_t bits, float multiplier) -> Tensor {
+    if (indices.dtype() != tensor::DType::I32 || indices.dimensions() != 1 || weight.dimensions() != 2 || width <= 0 ||
+        (bits != 0 && bits != 2 && bits != 4 && bits != 8) || !std::isfinite(multiplier))
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid embedding operands"});
+    const std::array<std::int64_t, 3> attributes{width, bits, bits ? static_cast<std::int64_t>(scales.size(1)) : 1};
+    const OperatorSpec spec{Operation::EMBEDDING, attributes, tensor::DType::F32, multiplier};
+    if (bits) return impl_->run(spec, {&indices, &weight, &scales});
+    return impl_->run(spec, {&indices, &weight});
+}
 auto Context::add_(Tensor& left, const Tensor& right) -> Tensor& {
     impl_->run({Operation::ADD}, {&left, &right}, nullptr, &left);
     return left;
@@ -382,11 +408,17 @@ auto Context::multiply_(Tensor& left, const Tensor& right) -> Tensor& {
     impl_->run({Operation::MULTIPLY}, {&left, &right}, nullptr, &left);
     return left;
 }
-auto Context::cast(const Tensor& input, tensor::DType dtype) -> Tensor {
+auto Context::cast(const Tensor& input, tensor::DType dtype, float scale) -> Tensor {
     if (!input.defined() || input.device() != device())
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid cast operand"});
+    if (scale != 0) {
+        if (!std::isfinite(scale) || scale < 0 || dtype != tensor::DType::I8 || input.dtype() != tensor::DType::F32)
+            throw Failure({ErrorCode::INVALID_ARGUMENT, "a scaled cast rounds FP32 into INT8 with a positive scale"});
+        if (device() != tensor::Device::web_gpu())
+            throw Failure({ErrorCode::UNSUPPORTED, "scaled INT8 casts require WebGPU"});
+    }
     if (input.dtype() == dtype) return input;
-    return impl_->run({Operation::CAST, {}, dtype}, {&input});
+    return impl_->run({Operation::CAST, {}, dtype, scale}, {&input});
 }
 auto Context::matmul(const Tensor& left, const Tensor& right, bool transpose_right) -> Tensor {
     const std::array<std::int64_t, 1> attributes{transpose_right};
@@ -448,7 +480,8 @@ auto Context::gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor {
     if (!gate.defined() || !value.defined() || gate.dtype() != tensor::DType::F32 ||
         value.dtype() != tensor::DType::F32 || !std::ranges::equal(gate.shape(), value.shape()))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "GELU multiplication requires matching FP32 tensors"});
-    if (device() != tensor::Device::apple_gpu()) return multiply(gelu(gate, true), value);
+    if (device() != tensor::Device::apple_gpu() && device() != tensor::Device::web_gpu())
+        return multiply(gelu(gate, true), value);
     return impl_->run({Operation::GELU_MULTIPLY}, {&gate, &value});
 }
 auto Context::gelu_(Tensor& input, bool approximate) -> Tensor& {
@@ -469,15 +502,25 @@ auto Context::rotary(const Tensor& input, const Tensor& cosine, const Tensor& si
 }
 auto Context::grouped_query_attention(const Tensor& query, const Tensor& key, const Tensor& value, std::int32_t heads,
                                       std::int32_t key_value_heads, const Tensor& mask, float scale,
-                                      std::int64_t key_start) -> Tensor {
+                                      std::int64_t key_start, float key_scale, float value_scale) -> Tensor {
     if (!std::isfinite(scale) || scale <= 0 || !mask.defined() || !mask.dimensions() || key.dimensions() != 3 ||
         key_start < 0 || static_cast<std::size_t>(key_start) > key.size(1) || !mask.size(-1) ||
         mask.size(-1) > key.size(1) - key_start)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "grouped attention requires a mask and positive scale"});
+    const auto quantized = key.dtype() == tensor::DType::I8;
+    if (quantized && device() != tensor::Device::web_gpu())
+        throw Failure({ErrorCode::UNSUPPORTED, "INT8 attention caches require WebGPU"});
+    if (!std::isfinite(key_scale) || !std::isfinite(value_scale) ||
+        (quantized ? key_scale <= 0 || value_scale <= 0 : key_scale != 0 || value_scale != 0))
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "an INT8 attention cache requires positive scales"});
     const auto key_length = !key_start && mask.size(-1) == 1 ? key.size(1) : mask.size(-1);
-    const std::array<std::int64_t, 4> attributes{heads, key_value_heads, key_start,
-                                                 static_cast<std::int64_t>(key_length)};
-    return impl_->run({Operation::ATTENTION, attributes, tensor::DType::F32, scale}, {&query, &key, &value, &mask});
+    // The key scale is a constant factor on every score, so it folds into the softmax scale.
+    const std::array<std::int64_t, 5> attributes{
+        heads, key_value_heads, key_start, static_cast<std::int64_t>(key_length),
+        quantized ? static_cast<std::int64_t>(std::bit_cast<std::uint32_t>(value_scale)) : 0};
+    return impl_->run({Operation::ATTENTION, std::span{attributes}.first(quantized ? 5 : 4), tensor::DType::F32,
+                       quantized ? scale * key_scale : scale},
+                      {&query, &key, &value, &mask});
 }
 auto Context::rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor {
     return impl_->run({Operation::RMS_NORM, {}, tensor::DType::F32, epsilon}, {&input, &scale});
@@ -492,7 +535,8 @@ auto Context::rms_rotary(const Tensor& input, const Tensor& scale, const Tensor&
         if (angle->dimensions() != 4 || angle->size(0) != 1 || angle->size(1) != input.size(1) || angle->size(2) != 1 ||
             angle->size(3) != input.size(3) / 2 || angle->dtype() != tensor::DType::F32)
             throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid RMS rotary angles"});
-    if (device() != tensor::Device::apple_gpu()) return rotary(rms_norm(input, scale, epsilon), cosine, sine);
+    if (device() != tensor::Device::apple_gpu() && device() != tensor::Device::web_gpu())
+        return rotary(rms_norm(input, scale, epsilon), cosine, sine);
     return impl_->run({Operation::RMS_ROTARY, {}, tensor::DType::F32, epsilon}, {&input, &scale, &cosine, &sine});
 }
 auto Context::rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,
@@ -534,7 +578,9 @@ auto Context::transpose(const Tensor& input, std::span<const std::int64_t> axes)
 auto Context::slice(const Tensor& input, std::int64_t axis, std::int64_t start, std::int64_t length) -> Tensor {
     if (input.device() != device()) throw Failure({ErrorCode::INVALID_ARGUMENT, "slice operand device mismatch"});
     auto view = require(input.narrow(axis, start, length));
-    if (view.is_contiguous() && (device() == tensor::Device::cpu() || view.storage_offset() == 0)) return view;
+    if (view.is_contiguous() &&
+        (device() == tensor::Device::cpu() || device() == tensor::Device::web_gpu() || view.storage_offset() == 0))
+        return view;
     const std::array attributes{axis, start, length};
     return impl_->run({Operation::SLICE, attributes, input.dtype()}, {&input});
 }
@@ -571,7 +617,7 @@ auto Context::copy_slice_(Tensor& destination, const Tensor& source, std::int64_
     for (std::int64_t dimension = 0; dimension < rank; ++dimension)
         if (dimension != axis && destination.size(dimension) != source.size(dimension))
             throw Failure({ErrorCode::INVALID_ARGUMENT, "slice copy shape mismatch"});
-    require(destination.host_bytes());
+    if (device() != tensor::Device::web_gpu()) require(destination.host_bytes());
     if (!source.numel()) return destination;
     std::size_t outer = 1, inner = tensor::element_size(source.dtype());
     for (std::int64_t dimension = 0; dimension < axis; ++dimension) outer *= source.size(dimension);

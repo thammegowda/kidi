@@ -510,6 +510,8 @@ public:
             case Operation::RMS_ROTARY:
             case Operation::GELU_MULTIPLY:
                 break;
+            case Operation::EMBEDDING:
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "device embedding is not implemented by this backend"});
         }
         auto output_id = static_cast<std::uint32_t>(inputs.size());
         if (pad_columns) {

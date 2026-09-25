@@ -26,8 +26,10 @@ LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool t
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed linear construction"});
         register_parameter("weight", weight_, {output_size, input_size / (8 / packed_bits)}, tensor::DType::U8);
         register_parameter("weight_scale", scale_, {output_size, 1}, tensor::DType::F32);
-        register_parameter("input_activation_scale", input_scale_, {}, tensor::DType::F32);
-        register_parameter("output_activation_scale", output_scale_, {}, tensor::DType::F32);
+        register_parameter("input_activation_scale", input_scale_, {}, tensor::DType::F32, allocate_parameters,
+                           tensor::Device::cpu());
+        register_parameter("output_activation_scale", output_scale_, {}, tensor::DType::F32, allocate_parameters,
+                           tensor::Device::cpu());
         return;
     }
     check_precision(module_dtype);

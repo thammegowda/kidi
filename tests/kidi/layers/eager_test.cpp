@@ -46,6 +46,23 @@ auto main() -> int {
             }
             if (ops::require(escaped.data<float>())[0] != 6.F) return 1;
             ops::Context context(device);
+            {
+                const std::array values{1.F, 2.F, -1.F, -2.F};
+                const auto input = ops::require(tensor::Tensor::from_host({4}, std::span<const float>(values), device));
+                const auto bytes = context.cast(input, tensor::DType::I8);
+                const auto unchanged = context.cast(bytes, tensor::DType::I8);
+                context.synchronize();
+                if (!std::ranges::equal(ops::require(bytes.data<std::int8_t>()), std::array{1, 2, -1, -2}) ||
+                    unchanged.storage_identity() != bytes.storage_identity())
+                    return 1;
+                bool rejected = false;
+                try {
+                    context.cast(input, tensor::DType::I8, 0.25F);
+                } catch (const ops::Failure& error) {
+                    rejected = error.error().code == ErrorCode::UNSUPPORTED;
+                }
+                if (!rejected) return 1;
+            }
             for (const std::int64_t rows : {1, 8}) {
                 auto matrix = ops::require(tensor::Tensor::zeros({8, 8}, tensor::DType::F32));
                 auto entries = ops::require(matrix.data<float>());

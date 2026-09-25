@@ -10,6 +10,13 @@ constexpr std::size_t CONTEXT_TOKENS = 9216;
 std::optional<kidi::inference::Generator> generator;
 std::string response;
 int configured_threads;
+#ifdef KIDI_HAS_WEBGPU
+constexpr auto DEVICE = kidi::tensor::Device::web_gpu();
+constexpr auto BACKEND = "webgpu";
+#else
+constexpr auto DEVICE = kidi::tensor::Device::cpu();
+constexpr auto BACKEND = "wasm-cpu";
+#endif
 
 template <typename Function>
 auto answer(Function&& function) -> const char* {
@@ -42,20 +49,19 @@ EMSCRIPTEN_KEEPALIVE auto kidi_configure(int threads) -> const char* {
         kidi::runtime::ynn::set_thread_count(threads);
         kidi::ops::require(kidi::runtime::ynn::reserve_thread_pool(threads));
         configured_threads = threads;
-        return {{"configured", true}, {"threads", threads}, {"backend", "wasm-cpu"}};
+        return {{"configured", true}, {"threads", threads}, {"backend", BACKEND}};
     });
 }
 
 EMSCRIPTEN_KEEPALIVE auto kidi_load(const char* directory) -> const char* {
     return answer([&]() -> nlohmann::json {
         if (!configured_threads) throw std::runtime_error("Configure the runtime before loading the model");
-        generator.emplace(
-            kidi::ops::require(kidi::inference::Generator::load(directory, kidi::tensor::Device::cpu(), 0, 128, true)));
+        generator.emplace(kidi::ops::require(kidi::inference::Generator::load(directory, DEVICE, 0, 128, true)));
         kidi::ops::require(generator->configure_serving({1, 1, CONTEXT_TOKENS, 32}));
         return {{"ready", true},
                 {"native_qat", generator->native_qat()},
                 {"threads", configured_threads},
-                {"backend", "wasm-cpu"}};
+                {"backend", BACKEND}};
     });
 }
 

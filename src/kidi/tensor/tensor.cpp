@@ -174,6 +174,11 @@ auto Tensor::to(Device target) const -> Result<Tensor> {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "cannot transfer an undefined tensor"});
     }
     if (target == device()) return *this;
+    if (is_host_accessible()) {
+        auto bytes = host_bytes();
+        if (!bytes) return std::unexpected(std::move(bytes.error()));
+        return from_bytes({shape_.begin(), shape_.end()}, dtype_, *bytes, target);
+    }
     auto host = copy_to_host();
     if (!host) return std::unexpected(std::move(host.error()));
     return from_bytes({shape_.begin(), shape_.end()}, dtype_, *host, target);
@@ -257,8 +262,7 @@ auto Tensor::empty(std::vector<std::int64_t> shape, DType dtype, Device device) 
 auto Tensor::zeros(std::vector<std::int64_t> shape, DType dtype, Device device) -> Result<Tensor> {
     auto tensor = empty(std::move(shape), dtype, device);
     if (!tensor) return std::unexpected(std::move(tensor.error()));
-    std::vector<std::byte> zeros(tensor->nbytes());
-    auto status = tensor->backend_->copy_from_host(*tensor->storage_, 0, zeros);
+    auto status = tensor->backend_->clear(*tensor->storage_);
     if (!status) return std::unexpected(std::move(status.error()));
     return tensor;
 }

@@ -58,6 +58,7 @@ public:
                  const Tensor& cosine, const Tensor& sine, std::int64_t key_start = 0) const -> Tensor;
     auto forward_segments(ops::Context& context, const Tensor& input, std::span<const Gemma4AttentionSegment> segments,
                           const Tensor& cosine, const Tensor& sine, bool cache_only = false) const -> Tensor;
+    auto has_cache_scales() const -> bool;
 
 private:
     Linear query_, key_{nullptr}, value_{nullptr}, output_;
@@ -78,6 +79,7 @@ public:
     auto forward_segments(ops::Context& context, const Tensor& input, const Tensor& per_layer_input,
                           std::span<const Gemma4AttentionSegment> segments, const Tensor& cosine, const Tensor& sine,
                           bool cache_only = false) const -> Tensor;
+    auto has_cache_scales() const -> bool { return attention_->has_cache_scales(); }
 
 private:
     Gemma4Attention attention_;

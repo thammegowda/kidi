@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Kidi WebGPU Checks</title>
+    <link rel="stylesheet" href="../../web/style.css">
+    <style>
+        body { display: block; overflow: auto; }
+        main { max-width: 960px; margin: 0 auto; padding: 24px; }
+        header { display: flex; align-items: center; gap: 16px; }
+        h1 { font-size: 24px; }
+        button { margin: 20px 0; padding: 8px 16px; }
+        pre { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+    </style>
+</head>
+<body>
+    <main>
+        <header><img src="../../docs/kidi-logo-small.png" width="48" height="48" alt="Kidi"><h1>WebGPU Backend Checks</h1></header>
+        <button id="run" class="primary" type="button">Run Checks</button>
+        <button id="benchmark" type="button">Benchmark Projections</button>
+        <p id="status" role="status">Ready</p>
+        <pre id="results" role="log" aria-live="polite"></pre>
+    </main>
+    <script type="module">
+        const button=document.getElementById('run');
+        const status=document.getElementById('status');
+        const results=document.getElementById('results');
+        const log=text=>{results.textContent+=text+'\n';};
+        async function run() {
+            button.disabled=true;
+            results.textContent='';
+            status.textContent='Loading test runtime';
+            delete document.body.dataset.result;
+            let gpu;
+            try {
+                const {default:create}=await import('../../build-webgpu/kidi_webgpu_test.mjs?run='+Date.now());
+                const {createWebGpu}=await import('../../web/webgpu.mjs');
+                const {makeProgram}=await import('../../web/webgpu-kernels.mjs');
+                for (const spec of [
+                    {operation:'add',dtype:10,epsilon:0,attributes:[],inputs:[{shape:[4],dtype:10},{shape:[4],dtype:10}]},
+                    {operation:'packed_linear',dtype:11,epsilon:0.25,attributes:[2,32,0],
+                        inputs:[{shape:[1,512],dtype:11},{shape:[1,128],dtype:1},{shape:[1,16],dtype:11}]},
+                ]) {
+                    let rejected=false;
+                    try {makeProgram(spec,new Set());} catch {rejected=true;}
+                    if(!rejected)throw new Error(`Unsupported precision accepted by ${spec.operation}`);
+                }
+                const module=await create({print:log,printErr:log});
+                module.FS.mkdir('/fixtures');
+                for(const fixture of ['gemma4','gemma4-qat']) {
+                    module.FS.mkdir('/fixtures/'+fixture);
+                    for(const file of ['model.yaml','model.safetensors','reference.safetensors']) {
+                        const response=await fetch('../data/'+fixture+'/'+file);
+                        if(!response.ok)throw new Error(`Fixture HTTP ${response.status}: ${fixture}/${file}`);
+                        module.FS.writeFile('/fixtures/'+fixture+'/'+file,new Uint8Array(await response.arrayBuffer()));
+                    }
+                }
+                gpu=await createWebGpu(module);
+                log(`Adapter: ${gpu.adapter.vendor} / ${gpu.adapter.architecture}`);
+                status.textContent='Running C++ numerical checks';
+                const started=performance.now();
+                const result=await module._kidi_gpu_test();
+                if(result!==0)throw new Error(`Backend checks returned ${result}: ${gpu.failure||'see output'}`);
+                const count=65536*128, bytes=count*4;
+                const input=gpu.allocate(bytes), output=gpu.allocate(bytes);
+                const program=await gpu.prepare({operation:'add',dtype:11,epsilon:0,attributes:[],
+                    inputs:[{shape:[count],dtype:11},{shape:[count],dtype:11}]});
+                try {
+                    gpu.upload(input,0,new Uint8Array(new Float32Array(count).fill(1).buffer));
+                    gpu.run(program,new Uint32Array([input,0,input,0,output,0]));
+                    const destination=Number(module._malloc(4));
+                    for(const index of [0,count/2-1,count/2,count-1]) {
+                        await gpu.read(output,index*4,destination,4);
+                        if(new DataView(module.HEAPU8.buffer).getFloat32(destination,true)!==2)
+                            throw new Error(`Large dispatch missed element ${index}`);
+                    }
+                } finally {gpu.releaseProgram(program);gpu.release(input);gpu.release(output);}
+                log('Two-dimensional dispatch boundary passed');
+                const buffers=Array.from({length:3},()=>gpu.allocate(64*1024*1024));
+                for(const handle of buffers)gpu.clear(handle);
+                for(const handle of buffers)gpu.release(handle);
+                await gpu.synchronize();
+                if(gpu.stats.pooledBytes>128*1024*1024)throw new Error('Idle GPU pool exceeded its budget');
+                log('Pending buffer lifetime and pool budget passed');
+                log(`Completed in ${((performance.now()-started)/1000).toFixed(2)} seconds`);
+                log(`GPU submissions: ${gpu.stats.submissions}; readback: ${gpu.stats.readBytes} bytes`);
+                status.textContent='All checks passed';
+                document.body.dataset.result='passed';
+            } catch(error) {
+                status.textContent='Checks failed';
+                log(error.stack||String(error));
+                document.body.dataset.result='failed';
+            } finally {gpu?.dispose();button.disabled=false;}
+        }
+        button.addEventListener('click',run);
+        document.getElementById('benchmark').addEventListener('click',async()=>{
+            const benchmark=document.getElementById('benchmark');
+            button.disabled=benchmark.disabled=true;
+            results.textContent='';
+            status.textContent='Benchmarking real projection geometries';
+            let gpu;
+            try{
+                const {createWebGpu}=await import('../../web/webgpu.mjs');
+                gpu=await createWebGpu({HEAPU8:new Uint8Array(4)},{profile:true});
+                if(!gpu.stats.gpuMilliseconds)throw new Error('GPU timestamp queries unavailable');
+                const measurements=[];
+                for(const [width,columns,bits,inputScale] of [[1536,262144,2,0],[1536,262144,2,0.25],[1536,12288,2,0.25],[12288,1536,2,0.25],[1536,6144,4,0.25]]){
+                    const handles=[gpu.allocate(width*4),gpu.allocate(width*columns*bits/8),gpu.allocate(columns*4),gpu.allocate(columns*4)];
+                    const inputs=Float32Array.from({length:width},(_,index)=>(index%31-15)*0.125);
+                    const weights=new Uint8Array(width*columns*bits/8);
+                    for(let index=0;index<weights.length;index++)weights[index]=(index*71+37)&255;
+                    const scales=new Float32Array(columns).fill(0.125);
+                    gpu.upload(handles[0],0,new Uint8Array(inputs.buffer));gpu.upload(handles[1],0,weights);gpu.upload(handles[2],0,new Uint8Array(scales.buffer));
+                    const program=await gpu.prepare({operation:'packed_linear',dtype:11,epsilon:inputScale,attributes:[bits,width,0],inputs:[{shape:[1,width],dtype:11},{shape:[columns,width*bits/8],dtype:1},{shape:[columns,1],dtype:11}]});
+                    const bindings=new Uint32Array(handles.flatMap(handle=>[handle,0]));
+                    gpu.run(program,bindings);await gpu.synchronize();
+                    const before={...gpu.stats.gpuMilliseconds};
+                    const started=performance.now();
+                    for(let repeat=0;repeat<8;repeat++)gpu.run(program,bindings);
+                    await gpu.synchronize();
+                    const label=gpu.programs.get(program).label;
+                    const kernelMs=(gpu.stats.gpuMilliseconds[label]-(before[label]||0))/8;
+                    const wallMs=(performance.now()-started)/8;
+                    const row={width,columns,bits,inputScale,kernelMs,wallMs};measurements.push(row);
+                    log(`Q${bits} ${inputScale?'INT8':'FP32'} ${width} -> ${columns}: kernel ${kernelMs.toFixed(3)} ms; batched wall ${wallMs.toFixed(3)} ms`);
+                    gpu.releaseProgram(program);handles.forEach(handle=>gpu.release(handle));
+                }
+                globalThis.projectionMeasurements=measurements;
+                status.textContent='Projection benchmark complete';
+            }catch(error){status.textContent='Benchmark failed';log(error.stack||String(error));}
+            finally{gpu?.dispose();button.disabled=benchmark.disabled=false;}
+        });
+        if(new URLSearchParams(location.search).has('run'))run();
+    </script>
+</body>
+</html>

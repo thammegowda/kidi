@@ -28,16 +28,18 @@ auto Module::register_parameter(std::string name, tensor::Tensor& parameter) -> 
             &parameter, {parameter.shape().begin(), parameter.shape().end()}, parameter.dtype(), parameter.device()});
 }
 auto Module::register_parameter(std::string name, tensor::Tensor& parameter, std::vector<std::int64_t> shape,
-                                tensor::DType dtype, bool allocate) -> void {
+                                tensor::DType dtype, bool allocate, std::optional<tensor::Device> storage_device)
+    -> void {
     check_name(name);
     if (std::ranges::any_of(shape, [](auto extent) { return extent <= 0; }))
         throw std::invalid_argument("parameter dimensions must be positive: " + name);
     if (allocate) {
-        auto value = tensor::Tensor::zeros(shape, dtype, device_);
+        auto value = tensor::Tensor::zeros(shape, dtype, storage_device.value_or(device_));
         if (!value) throw std::runtime_error(value.error().message);
         parameter = std::move(*value);
     }
-    parameters_.emplace(std::move(name), Parameter{&parameter, std::move(shape), dtype, device_});
+    parameters_.emplace(std::move(name),
+                        Parameter{&parameter, std::move(shape), dtype, storage_device.value_or(device_)});
 }
 auto Module::contains(const Module* module) const -> bool {
     if (this == module) return true;
