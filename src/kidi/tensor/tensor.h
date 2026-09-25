@@ -61,6 +61,7 @@ private:
 } // namespace detail
 
 struct MetalBufferView;
+struct WebGpuBufferView;
 
 class Tensor {
 public:
@@ -80,6 +81,7 @@ public:
     auto is_contiguous() const noexcept -> bool;
     auto is_host_accessible() const noexcept -> bool;
     auto owns_unique_storage() const noexcept -> bool { return storage_ && storage_.use_count() == 1; }
+    auto storage_identity() const noexcept -> const void* { return storage_.get(); }
 
     auto host_bytes() -> Result<std::span<std::byte>>;
     auto host_bytes() const -> Result<std::span<const std::byte>>;
@@ -129,6 +131,7 @@ private:
            detail::Dimensions strides, std::int64_t storage_offset) noexcept;
 
     friend auto metal_buffer(const Tensor& tensor) -> Result<MetalBufferView>;
+    friend auto web_gpu_buffer(const Tensor& tensor) -> Result<WebGpuBufferView>;
     friend class Arena;
 
     std::shared_ptr<Backend> backend_;

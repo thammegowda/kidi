@@ -104,7 +104,7 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
                                    .stop_on_eos = !options.ignore_eos};
         tensor::Tensor storage;
         std::optional<std::int32_t> selected;
-        result.stats.device_selection = model_->device() == tensor::Device::apple_gpu();
+        result.stats.device_selection = model_->device() != tensor::Device::cpu();
         const auto project = [&](std::span<const std::int32_t> input) -> Result<void> {
             if (result.stats.device_selection) {
                 auto token = model_->forward_token(input, state);
@@ -316,7 +316,7 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         GenerationStats stats;
         stats.tokenize_ns = elapsed(started);
         stats.prompt_tokens = tokens.size();
-        stats.device_selection = model_->device() == tensor::Device::apple_gpu();
+        stats.device_selection = model_->device() != tensor::Device::cpu();
         stats.last_token_prefill = model_->last_token_prefill();
         stats.shared_prefill_tail = model_->shared_prefill_tail();
         waiting_.push_back(

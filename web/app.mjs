@@ -23,6 +23,10 @@ const preferences = {};
 
 try {
     const saved = JSON.parse(localStorage.getItem(SETTINGS_STORAGE) || '{}');
+    if (['cpu', 'webgpu'].includes(saved?.backend)) {
+        preferences.backend = saved.backend;
+        element('backend').value = saved.backend;
+    }
     for (const id of ['threads', 'tokens']) {
         const input = element(id);
         const value = saved?.[id];
@@ -247,7 +251,8 @@ function controls() {
     element('load').disabled = busy || loading;
     element('clear-cache').disabled = busy || loading;
     element('new-chat').disabled = busy || loading;
-    for (const id of ['threads', 'manifest']) element(id).disabled = busy || loading;
+    for (const id of ['backend', 'threads', 'manifest']) element(id).disabled = busy || loading;
+    element('threads').disabled ||= element('backend').value === 'webgpu';
     for (const button of document.querySelectorAll('.history-open, .history-delete')) button.disabled = busy || loading;
 }
 function updateLiveStats() {
@@ -272,6 +277,7 @@ function restart() {
     stopping = false;
     stopLiveStats();
     updateMemory();
+    element('gpu-memory').textContent = '--';
     element('status').textContent = 'Not loaded';
     setRuntimeState('', 'Model offline', 'Gemma 4 E2B IT', 'Offline');
     renderMessages();
@@ -305,6 +311,11 @@ function outputTokenLimit() {
 if (!crossOriginIsolated) element('threads').value = '1';
 if (!crossOriginIsolated) element('threads').max = '1';
 for (const id of ['threads', 'manifest']) element(id).addEventListener('change', restart);
+element('backend').addEventListener('change', () => {
+    preferences.backend = element('backend').value;
+    try { localStorage.setItem(SETTINGS_STORAGE, JSON.stringify(preferences)); } catch {}
+    restart();
+});
 for (const id of ['threads', 'tokens']) element(id).addEventListener('input', () => savePreference(id));
 for (const id of ['open-settings', 'header-settings']) element(id).addEventListener('click', openSettings);
 element('close-settings').addEventListener('click', closeSettings);
@@ -316,7 +327,8 @@ element('tokens').addEventListener('input', outputTokenLimit);
 
 async function loadRuntime(cacheOnly = false) {
     if (loading || busy) return;
-    const threads = Number(element('threads').value);
+    const backend = element('backend').value;
+    const threads = backend === 'webgpu' ? 1 : Number(element('threads').value);
     if (!Number.isInteger(threads) || threads < 1 || threads > Number(element('threads').max)) return;
     let manifest;
     try { manifest = new URL(element('manifest').value, location.href).href; }
@@ -347,6 +359,7 @@ async function loadRuntime(cacheOnly = false) {
     worker.onmessage = ({data}) => {
         document.dispatchEvent(new CustomEvent('kidi:runtime', {detail: data}));
         if (data.heapBytes !== undefined) updateMemory(data.heapBytes);
+        if (data.gpuStats) element('gpu-memory').textContent = megabytes(data.gpuStats.allocatedBytes);
         if (busy && data.stats) { currentStats = data.stats; updateLiveStats(); }
         if (data.type === 'progress') {
             const percent = (data.loadedBytes / data.totalBytes * 100).toFixed(0);
@@ -363,12 +376,12 @@ async function loadRuntime(cacheOnly = false) {
             try { localStorage.setItem(MODEL_STORAGE, manifest); } catch {}
             ready = true;
             loading = false;
-            const backend = 'Wasm CPU';
-            element('status').textContent = `${backend} / ${data.threads} thread${data.threads === 1 ? '' : 's'} / Ready`;
+            const backend = data.backend === 'webgpu' ? 'WebGPU' : 'Wasm CPU';
+            const detail = data.backend === 'webgpu' ? backend : `${backend} / ${data.threads} thread${data.threads === 1 ? '' : 's'}`;
+            element('status').textContent = `${detail} / Ready`;
             element('load-time').textContent = `${(data.loadMs / 1000).toFixed(1)} s`;
             element('progress').hidden = true;
-            setRuntimeState('ready', 'Model ready', `${backend} / ${data.threads} thread${data.threads === 1 ? '' : 's'}`,
-                `CPU ${data.threads}T`);
+            setRuntimeState('ready', 'Model ready', detail, data.backend === 'webgpu' ? 'GPU' : `CPU ${data.threads}T`);
             renderMessages();
             closeSettings();
             controls();
@@ -412,7 +425,7 @@ async function loadRuntime(cacheOnly = false) {
             finish();
         }
     };
-    worker.postMessage({type: 'load', manifest, threads, cacheOnly});
+    worker.postMessage({type: 'load', manifest, threads, backend, cacheOnly});
 }
 element('load').addEventListener('click', () => loadRuntime());
 

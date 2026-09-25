@@ -321,11 +321,16 @@ auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 cache capacity"});
         Gemma4State result;
         result.capacity = capacity;
+        // The QAT path already rounds cache rows onto an INT8 grid, so bytes cost no accuracy and a quarter the reads.
+        auto byte_cache = impl_->qat && device() == tensor::Device::web_gpu() && impl_->shared_begin > 0;
+        for (int index = 0; byte_cache && index < impl_->shared_begin; ++index)
+            byte_cache = impl_->layers->at(static_cast<std::size_t>(index))->has_cache_scales();
+        const auto cache_dtype = byte_cache ? DType::I8 : DType::F32;
         for (int index = 0; index < impl_->shared_begin; ++index) {
             const std::vector<std::int64_t> shape{1, static_cast<std::int64_t>(capacity),
                                                   impl_->key_heads * impl_->head_width[impl_->kind[index]]};
-            result.layers.push_back({require(Tensor::zeros(shape, DType::F32, device())),
-                                     require(Tensor::zeros(shape, DType::F32, device()))});
+            result.layers.push_back({require(Tensor::zeros(shape, cache_dtype, device())),
+                                     require(Tensor::zeros(shape, cache_dtype, device()))});
         }
         return result;
     } catch (const ops::Failure& error) {
@@ -343,11 +348,16 @@ auto Gemma4Impl::fork_state(const Gemma4State& source, std::size_t prefix_length
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 prefix snapshot"});
         for (std::size_t layer = 0; layer < source.layers.size(); ++layer)
             for (const auto* tensor : {&source.layers[layer].key, &source.layers[layer].value})
-                if (!tensor->defined() || tensor->device() != device() || tensor->dtype() != DType::F32 ||
-                    tensor->dimensions() != 3 || tensor->size(0) != 1 || tensor->size(1) != source.capacity ||
+                if (!tensor->defined() || tensor->device() != device() ||
+                    (tensor->dtype() != DType::F32 && tensor->dtype() != DType::I8) || tensor->dimensions() != 3 ||
+                    tensor->size(0) != 1 || tensor->size(1) != source.capacity ||
                     tensor->size(2) != impl_->key_heads * impl_->head_width[impl_->kind[layer]])
                     throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 snapshot cache geometry"});
         auto result = require(create_state(capacity));
+        for (std::size_t layer = 0; layer < source.layers.size(); ++layer) {
+            result.layers[layer].key_scale = source.layers[layer].key_scale;
+            result.layers[layer].value_scale = source.layers[layer].value_scale;
+        }
         impl_->context.synchronize();
         if (prefix_length) {
             for (std::size_t layer = 0; layer < source.layers.size(); ++layer) {
@@ -393,15 +403,16 @@ auto Gemma4Impl::run_batch(std::span<const std::int32_t> tokens, std::span<Gemma
                 throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid batched decode state"});
             for (std::size_t producer = 0; producer < state->layers.size(); ++producer) {
                 for (const auto* tensor : {&state->layers[producer].key, &state->layers[producer].value})
-                    if (!tensor->defined() || tensor->device() != device() || tensor->dtype() != DType::F32 ||
-                        tensor->dimensions() != 3 || tensor->size(0) != 1 || tensor->size(1) != state->capacity ||
+                    if (!tensor->defined() || tensor->device() != device() ||
+                        (tensor->dtype() != DType::F32 && tensor->dtype() != DType::I8) || tensor->dimensions() != 3 ||
+                        tensor->size(0) != 1 || tensor->size(1) != state->capacity ||
                         tensor->size(2) != impl_->key_heads * impl_->head_width[impl_->kind[producer]])
                         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid batched cache geometry"});
                 for (std::size_t previous = 0; previous < row; ++previous)
-                    if (require(state->layers[producer].key.host_bytes()).data() ==
-                            require(states[previous]->layers[producer].key.host_bytes()).data() ||
-                        require(state->layers[producer].value.host_bytes()).data() ==
-                            require(states[previous]->layers[producer].value.host_bytes()).data())
+                    if (state->layers[producer].key.storage_identity() ==
+                            states[previous]->layers[producer].key.storage_identity() ||
+                        state->layers[producer].value.storage_identity() ==
+                            states[previous]->layers[producer].value.storage_identity())
                         throw ops::Failure(
                             {ErrorCode::INVALID_ARGUMENT, "batched requests must not alias mutable caches"});
             }

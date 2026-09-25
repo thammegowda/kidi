@@ -61,7 +61,8 @@ enum class Operation {
     STATIC_ROUND,
     GREEDY_TOKEN,
     RMS_ROTARY,
-    GELU_MULTIPLY
+    GELU_MULTIPLY,
+    EMBEDDING
 };
 struct OperatorSpec {
     Operation operation;
@@ -111,4 +112,5 @@ private:
 };
 auto cpu_operators() -> std::unique_ptr<OperatorBackend>;
 auto metal_operators() -> std::unique_ptr<OperatorBackend>;
+auto web_gpu_operators() -> std::unique_ptr<OperatorBackend>;
 } // namespace kidi::runtime

@@ -37,6 +37,7 @@ public:
         -> Result<std::shared_ptr<Storage>> = 0;
     virtual auto wrap_host(Device device, std::span<const std::byte> bytes, std::shared_ptr<const void> owner) const
         -> Result<std::shared_ptr<Storage>> = 0;
+    virtual auto clear(Storage& storage) const -> Result<void>;
     virtual auto copy_from_host(Storage& destination, std::size_t destination_offset,
                                 std::span<const std::byte> source) const -> Result<void> = 0;
     virtual auto copy_to_host(const Storage& source, std::size_t source_offset, std::span<std::byte> destination) const
@@ -75,6 +76,7 @@ private:
 
 auto make_ynnpack_backend() -> std::shared_ptr<Backend>;
 auto make_metal_backend() -> std::shared_ptr<Backend>;
+auto make_web_gpu_backend() -> std::shared_ptr<Backend>;
 auto make_unavailable_backend(DeviceKind kind, std::string name, std::string reason) -> std::shared_ptr<Backend>;
 
 } // namespace kidi::tensor

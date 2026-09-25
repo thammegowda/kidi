@@ -27,7 +27,7 @@ auto main() -> int {
     using kidi::tensor::Tensor;
 
     const auto backends = BackendRegistry::instance().backends();
-    if (!require(backends.size() == 4, "expected four tensor backend families")) return 1;
+    if (!require(backends.size() == 5, "expected five tensor backend families")) return 1;
     if (!require(backends[0].device_kind == DeviceKind::CPU && backends[0].storage_available &&
                      backends[0].execution_available && backends[0].name == "ynnpack",
                  "CPU must use the available YNNPACK backend")) {

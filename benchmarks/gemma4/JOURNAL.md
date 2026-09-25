@@ -4,6 +4,384 @@ Short progress notes for the current implementation. Measurements are explorator
 unless explicitly labelled as paired acceptance results. Historical comparisons
 remain in [QAT.md](QAT.md).
 
+## 2026-09-23: WebGPU Implementation In Progress
+
+The new backend has an explicit `web_gpu` tensor device and runs in the inference
+worker through JSPI. An actual C++ storage/view/readback test passes with
+`MEMORY64=2`. JavaScript exception trampolines cannot safely run during C++ static
+initialization with JSPI; this variant uses native Wasm exceptions instead. The
+existing single-thread and pthread CPU variants retain their current settings.
+
+Prepared GPU operators use reusable, uniform-driven pipelines and pooled GPU and
+readback buffers. Packed Q2/Q4/Q8 projection inputs are calibrated once into packed
+INT8 scratch, then reused across output columns through signed integer dot
+products. Final calibration is fused into the projection. GPU token selection
+queues its four-byte readback in the model command batch; completion waits on that
+readback without an additional queue fence.
+
+Verified in the real browser: C++ tensor views and mutation, calibrated one/four-row
+projection parity with YNNPACK, RMSNorm, softmax, grouped attention, and both
+existing Gemma float/QAT fixtures. All full-prefix reference logits meet the
+existing `2e-4` tolerance and incremental selected tokens match. GPU embedding
+lookup, fused RMS/rotary, residual normalization, and shared K/V run through the
+same C++ model implementation.
+
+Browser CPU/WebGPU selection is implemented and live generation/stop/restart have
+been tested visibly. All 16 native tests passed at this checkpoint. Full-checkpoint
+testing caught two errors absent from tiny fixtures: overflow in packed embedding
+bit addresses for tables over 512 MiB, and NaNs from WGSL tanh on large GELU
+arguments. Word/remainder indexing and FP32-saturated tanh fixed these; real first
+block error fell from 9.8 to 1.9e-6. Device-side cache clearing also removed roughly
+340 MB of redundant host zero uploads per request.
+
+The user requested near-native throughput, not stopping at the intermediate
+12 tokens/s. Fresh Release CLI measurements use the same pinned mobile-QAT model,
+17-token binary-search prompt, 32-token output limit, 9216-token context, chunk 32,
+four CPU threads, and serial admission. Three warm native CPU rates were
+61.20/60.98/61.16 tokens/s; Metal was 81.42/83.11/80.98. Raw records and commands
+are in the local `.cache/native-webgpu-baseline.json`. Runs were sequential with
+the browser model unloaded; these are one-machine observations, not confidence
+intervals or a quality-equivalent cross-backend claim.
+
+An intermediate visible WebGPU run reached 12.2 tokens/s, with coherent but not
+CPU-identical continuation. Timestamp attribution identified the vocabulary head
+as dominant. A calibrated microbenchmark was initially misleading: the actual
+head's input/output activation scales are both zero. Preserve its FP32 input
+policy. Full-word Q2/Q4 unpacking, vector dot products, and contiguous lane loads
+reduced the representative FP32-input head kernel to 5.85 ms from about 44 ms in
+the preceding model profile. These are different measurement contexts; the next
+gate is matched full-model timing. Calibrated matrix prefill now shares activation
+and weight tiles across rows. Tests cover both calibrated and uncalibrated packed
+projections. The browser test page displays numerical checks and projection timings
+without screenshots.
+
+### Optimization Pass Toward Native Decode
+
+Warm decode on the same visible workload improved 12.2 -> 16.7 -> 22.5 -> 32.5
+tokens/s in three steps, with byte-identical generated tokens at every step. The
+32-token reply fell from 3.07 s to 1.20 s. Each step was accepted only after the
+browser numerical checks passed.
+
+1. *Trained head precision.* The vocabulary head's activation scales are zero, so
+   it keeps FP32 inputs; optimizing the path it actually uses, rather than the
+   calibrated one, was the first correction.
+2. *Host dispatch cost.* Timestamps showed the GPU busy only 780 ms of 1273 ms
+   wall. Each of roughly 1012 dispatches per token created a compute pass, a bind
+   group, and a uniform write. Dispatches now share one compute pass, bind groups
+   are cached by pooled buffer identity, and all uniforms go to one buffer with
+   dynamic offsets written once per submit. GPU-busy share rose to 683 ms of
+   843 ms. WebGPU orders dispatches inside a pass and makes each write visible to
+   the next; the Gemma fixtures exercise that dependency chain and stayed exact.
+3. *Projection kernels.* Each workgroup previously read 6 KB of activations to
+   consume 1.5 KB of weights. Workgroups now cover 32 columns with 8 lanes each,
+   stage the shared activation row once in workgroup memory, and read it as
+   vectors. Per-column scales are hoisted out of the accumulation loop only on the
+   staged path; the fallback still scales inside its loop, and the uncalibrated
+   test caught that distinction. The representative FP32 head kernel fell from
+   5.85 ms to 2.87 ms.
+
+Fresh Release CLI reference on the same prompt, model and limits: warm native CPU
+61 tokens/s and Metal 81 tokens/s. Browser Wasm CPU with four threads decodes at
+about 3.5 tokens/s on the same page. WebGPU is therefore roughly 9x the browser
+CPU path and about 40% of native Metal. These are one-machine warm medians for a
+single short prompt, not a matched quality comparison; WebGPU and CPU continuations
+share a prefix and then diverge.
+
+Attention is now the largest remaining kernel item at roughly 8 ms per token
+across three dispatches per layer, whose cost is launch latency rather than
+arithmetic. A fused single-dispatch decode attention with online softmax is the
+next candidate, followed by reducing the roughly 30 dispatches per layer. The
+Metal backend previously removed a calibrated-input reuse cache for a 1-2% gain,
+so shared quantization scratch should be measured before adopting it here.
+
+### Fused Decode Attention and Interleaved Packed Weights
+
+Warm decode improved again from 32.5 to 37.7 tokens/s, measured immediately after
+the change on an otherwise idle machine. Both steps kept every browser numerical
+check passing.
+
+1. *Fused decode attention.* Single-query attention now runs as one dispatch per
+   layer instead of three, using an online (flash-style) softmax that keeps a
+   running maximum and total while walking the keys in chunks of 256. This removes
+   the score buffer round-trip and about 70 dispatches per token, taking
+   dispatches from roughly 1012 to 943. Profiled attention cost fell from about
+   8 ms to 4.7 ms per token. Prefill keeps the original three-stage path, and the
+   existing parity check covers both because it exercises one and three queries.
+2. *Interleaved packed weights.* Decoding four 2-bit weights into the four bytes a
+   dot product needs previously took about fourteen bit operations per group.
+   Packed weights are now permuted once on upload so value `k` sits at bit
+   `8 * (k % 4) + bits * (k / 4)`; the shader recovers a group with one shift and
+   one mask. The word size is unchanged, so there is no memory cost. The Q2
+   1536 -> 12288 projection went from roughly 38 to 49 GB/s of weight traffic.
+
+Two findings were worth more than the speed. First, `web/build.mjs` reconfigures
+`build-webgpu` with tests off, which deletes the `kidi_webgpu_test` target and
+leaves a stale binary that still loads and reports success. The browser checks had
+therefore been validating older C++ for several rounds. Second, that stale binary
+was hiding a real defect: packed weights the checkpoint had already placed on the
+device skipped the upload path entirely and so were never interleaved. Packed
+projections are now excluded from `dynamic_parameters` on WebGPU so each weight
+gets its own program with a baked interleaved copy, and the interleave reads
+through `copy_to_host` so it works wherever the weight lives. The isolated
+projection check now covers widths 8, 64 and 256, which exercise the fallback,
+staged and tiled kernels, and packed embedding gather gained a direct parity check.
+
+One experiment failed. Raising the staged projection from 8 lanes to 32 so a full
+subgroup reads one contiguous weight run dropped decode to 26.3 tokens/s: the loss
+of activation-tile reuse, from 32 columns per workgroup down to 8, outweighs the
+coalescing gain. The change was reverted.
+
+Per-token decode after this round, from timestamp queries: Q2 1536 -> 12288 MLP
+3.8 ms, attention 4.7 ms, Q2 12288 -> 1536 1.9 ms, vocabulary head 1.8 ms,
+Q4 1536 -> 6144 1.8 ms, RMS norms about 2 ms. The projections are memory bound at
+roughly 49 GB/s against a device peak near 120 GB/s, and native Metal reaches an
+effective 97 GB/s, so the remaining gap is weight-read efficiency rather than
+dispatch overhead.
+
+A mid-session re-measurement read 28.5 tokens/s from identical files and native
+runs appeared to hang. Both readings spanned a twelve-hour machine suspend and are
+invalid. After resume, five warm runs gave 37.6, 37.6, 37.6 and 37.3 tokens/s, and
+native Metal re-measured at exactly its recorded 81 tokens/s, so WebGPU is now
+about 46% of native Metal. Note that `kidi generate` reads JSONL requests from
+stdin: invoking it without `--in` looks like a hang while it waits for input.
+
+Remaining parent scope: further closing the gap toward native decode,
+longer-context and failure-path checks, bounded resource review, and
+documentation. No default-backend change or near-native performance claim has
+been accepted. The existing CPU fallback remains available and selectable.
+
+### Long-Context Decode and Split Attention
+
+The benchmark used a seventeen-token prompt, which is about fifty keys. Measuring
+across context lengths showed that number was hiding almost everything: decode
+fell from 37.1 to 14.0 to 7.0 to 4.4 tokens/s at 17, 1413, 4088 and 6993 prompt
+tokens. An eight-fold collapse means attention, not the projections, dominates any
+realistic conversation.
+
+Two attempts were measured before the cause was found.
+
+1. *Coalescing the score loop.* Each thread walked a whole key row, so the
+   thirty-two threads of a subgroup read addresses a kilobyte apart. Rewriting it
+   so thirty-two lanes share a key and read consecutive channels was slower at
+   every length: 34.5, 11.2 and 5.1 tokens/s. The reduction needs six workgroup
+   barriers per eight keys, and that costs more than the wasted bandwidth saves.
+   Reverted.
+2. *Occupancy.* The real cause is that one workgroup per head launches only
+   `batch * heads`, or eight workgroups, so most of the device idles no matter how
+   the reads are arranged. Decode attention now splits the key range across
+   `floor(keys / 256)` workgroups, capped at thirty-two, each producing an
+   unnormalised sum with the maximum and total it was scaled by; a second small
+   dispatch rescales and combines them. Below 256 keys the split count is one and
+   the generated shader is exactly the previous one, so short prompts are
+   unaffected.
+
+| Prompt tokens | Before | After |
+| --- | --- | --- |
+| 17 | 37.6 | 37.4 |
+| 1413 | 14.0 | 27.6 |
+| 4088 | 7.0 | 15.0 |
+
+Splitting every 256 keys beat every 512 (27.6 against 25.5, and 15.0 against
+14.1). GPU memory stayed at 3534 MiB across repeated long runs, so the per-program
+partial buffers are not leaking.
+
+Instrumenting the split between command encoding and waiting was what redirected
+this work: encoding costs 0.40 ms per token against 25.70 ms waiting, so the
+earlier dispatch-batching work had already removed host overhead as a factor and
+only kernel time was left. Those two counters are now reported in `gpuStats`.
+
+The existing attention parity check uses seven keys, so it could never reach the
+split path; a 2200-key case with a masked tail now covers it.
+
+Remaining ideas, in the order the evidence supports: the key/value cache is FP32
+and at 4088 keys costs about 587 MB of reads per token, so an INT8 cache would cut
+the dominant long-context traffic; norms and activation quantisation are still
+separate dispatches and could fuse; and the sampled token still round-trips to the
+host every step, which a lagged readback could hide.
+
+### INT8 Key/Value Cache
+
+The QAT path already rounds every cache row through `calibrated`, which clamps to
+[-128, 127] and multiplies back by the scale, so cached values were already exactly
+on an INT8 grid. Storing them as bytes is therefore a storage change rather than a
+new approximation, and it removes three quarters of the long-context read traffic.
+
+The cache is allocated as `DType::I8` only when the model reports usable cache
+scales on every layer and the device is WebGPU, so native backends are untouched.
+Because a constant factor on every score survives the softmax unchanged, the key
+scale folds into the softmax scale and costs nothing; only the value scale needs
+carrying, as a bit-cast attribute applied to the attention output. Scales live on
+`KeyValue` itself rather than on the attention module, because layers that share a
+cache have no key projection and so no scales of their own.
+
+| Prompt tokens | Split attention | INT8 cache |
+| --- | --- | --- |
+| 17 | 37.4 | 40.1 |
+| 1413 | 27.6 | 30.3 |
+| 4088 | 15.0 | 19.2 |
+
+Two steps were needed to get there. The first attempt stored bytes but read them
+through the shared `load` helper, which dispatches on dtype at runtime: four
+consecutive channels live in one word, so the kernel re-read the same word four
+times behind four branches and the traffic saving was cancelled, leaving decode
+flat. Reading the word once and unpacking four bytes recovered the win. The second
+step removed the now redundant `static_round`: a scaled cast already rounds and
+clamps, so the separate rounding pass was pure cost, and dropping it is why short
+prompts improved as well rather than regressing.
+
+### Two Optimisations Measured and Declined
+
+*Fusing activation quantisation.* Timestamp queries put every `quantize/` dispatch
+at 0.89 ms per token in total. Only the duplicates are removable — the three
+attention projections share one normalised input, and the two feed-forward
+projections share another — so the ceiling is roughly 0.4 ms, or 1.7%. That matches
+the 1-2% the Metal backend measured before deleting its equivalent cache. Not worth
+the cross-operator coupling, so it was not implemented.
+
+*Fusing the norms.* RMS norms cost 3.4 ms per token across about 105 dispatches, or
+32 microseconds each for 6 KB of data, so they are latency-bound on reduction
+barriers rather than bandwidth-bound. Caching the row in registers to avoid the
+second read risks spilling a dynamically indexed private array to scratch memory,
+which on this device is likely to cost more than the re-read that already hits L1.
+Left alone pending a measurement that separates barrier cost from read cost.
+
+### Burst Decoding: Design and Precondition
+
+Every decode step still ends in a four-byte readback so the host can test for EOS,
+which forces a full queue flush and a map round trip per token. The fix is to let
+the GPU run a burst of steps, feeding each sampled token straight into the next
+embedding lookup on the device, while the host trails behind, scans the burst for
+EOS and discards anything past it.
+
+The precondition was checked and holds: of everything that changes between decode
+steps — cache write offset, attention mask, rotary angles, `state.position` — none
+depends on the *value* of the sampled token. Only the token embedding and the
+per-layer embedding do. So a burst is sound, and rolling back is just resetting
+`state.position`; cache rows past EOS are overwritten by the next generation.
+
+What it needs: `greedy_token` must stop forcing a readback, which means the
+`selected_` flag in `GpuOperator` becomes an attribute rather than a property of the
+operation; `TokenEmbeddingImpl::forward` needs an overload taking a device tensor of
+indices instead of a host span; and the generator must accept tokens in bursts while
+keeping streaming, stop sequences and statistics correct. That last part is where
+the risk sits, so it was left for a dedicated session rather than started here.
+
+### Measurement Hazards Worth Recording
+
+Two readings in this session were invalid for environmental reasons, both caught
+only because the numbers disagreed with unchanged code. A twelve-hour machine
+suspend produced 28.5 tokens/s and apparently hung native runs. Later, decode read
+21-25 tokens/s against a known 40.1 until `sysctl vm.swapusage` showed 9.9 GB of a
+10.2 GB swap file in use: sixteen gigabytes of memory, two browser tabs each holding
+the model, and a 5 GB GPU footprint had put the machine into thrashing. Always
+confirm a regression against a second, independent signal before believing it.
+
+That 5 GB figure is itself a finding. GPU memory starts at 2790 MiB and reaches
+5076 MiB at 4088 context, because a distinct key length produces a distinct program
+and each split-attention program allocates its own partial buffer that lives until
+the operator is released. Bucketing key lengths, or sharing one partial buffer
+across programs, would bound it.
+
+### Threads and JSPI Are Not Actually Exclusive
+
+The build refused `KIDI_WASM_WEBGPU` together with `KIDI_WASM_THREADS` through a
+`FATAL_ERROR` reading "WebGPU owns its inference worker". That was an assumption,
+never a measurement. Configuring and linking both together succeeds: the resulting
+glue contains `SharedArrayBuffer`, `PThread` and `new Worker`, none of which appear
+in the single-threaded WebGPU build. The guard is now a warning, because the
+combination compiles but has never been *run*.
+
+It probably should not be used yet regardless. A second thread cannot touch the
+device — WebGPU objects are neither transferable nor shareable through a
+`SharedArrayBuffer`, which is why Emscripten proxies GPU calls to the owning worker
+— and `mapAsync` still resolves on the producer's event loop, so the producer must
+yield for a token to reach shared memory either way. Threads would let the consumer
+scan for EOS concurrently, but that scan is microseconds. The work to overlap is
+waiting on GPU completion, which is I/O-shaped, not CPU-parallel.
+
+The producer/consumer split already exists in another form: `inference-worker.mjs`
+owns every WebGPU call and the main thread owns the UI, communicating by message.
+What remains is only that the producer blocks once per token, and the fix for that
+is pipeline depth, not parallelism.
+
+### Session Summary
+
+Decode on the visible workload, measured on an idle machine with one tab holding
+the model:
+
+| Prompt tokens | Session start | Session end |
+| --- | --- | --- |
+| 17 | 12.2 | 40.1 |
+| 1413 | not measured | 30.3 |
+| 4088 | not measured | 19.2 |
+| 6993 | 4.4 | not re-measured |
+
+Native Metal on the same prompt and limits remains 81 tokens/s, so short-prompt
+decode is about half of native. No default-backend change has been made and the CPU
+fallback remains selectable.
+
+## 2026-09-23: WebGPU Feasibility Reassessment
+
+The previous WebGPU result is evidence against that implementation, not against
+GPU inference in browsers. Do not repeat a full backend implementation merely to
+establish GPU residency: the earlier effort already reached that milestone.
+
+### Previous Attempt
+
+Recovered session `04913d2a-21af-4d77-8eb1-38767686d6aa`, turns 13-17, records two
+implementations. The first offloaded projections with a CPU round trip per
+projection. Its replacement had a first-class GPU device, resident parameters,
+activations and K/V, and a command batch for a complete Gemma step. Its recorded
+warm decode was 12.1 tokens/s versus 15.1 for CPU4; cold shader decode was 1.7.
+These are historical session reports, not rerun measurements or a matched
+comparison with WebLLM.
+
+The resident implementation still repeated input quantization for each output
+column, generated roughly 800 compute passes/bind groups per token, serialized
+commands between workers, waited before a separate readback, and baked changing
+shapes/offsets into shader variants. The relative cost of each needs measurement;
+the dispatch count alone does not establish the bottleneck.
+
+### Verified Support
+
+Fresh probes used this machine's VS Code integrated browser, Chromium
+150.0.7871.250 / Electron 43.6.0, with a non-fallback Apple `metal-3` adapter:
+
+- Packed signed Q2 and Q4 dot-product probes each matched 32 CPU reference rows.
+- FP16 arithmetic and a 64-invocation subgroup reduction passed validation.
+- A dedicated worker executed `dot4I8Packed` with the expected signed result.
+- `shader-f16`, `subgroups`, and `timestamp-query` were advertised. Only the first
+  two were exercised; GPU timestamp measurement was not implemented in this study.
+- `WebAssembly.Suspending` and `WebAssembly.promising` exist in the worker. This
+  is not yet a test of JSPI with Kidi's `MEMORY64=2` or pthread builds.
+
+The demo site's CSP blocked a temporary blob worker; the same probe passed on a
+loopback research page. This was a hosting-policy restriction, not a WebGPU
+failure. These small probes establish primitives, not full Gemma numerical
+correctness, sustained performance, model-memory capacity, or other browsers.
+
+
+### Proposed Decision Gates
+
+1. Benchmark exact Gemma projection geometries, including the large vocabulary
+   head, with trained quantization semantics. Quantize each activation once and
+   reuse it; compare packed-integer and other numerically acceptable kernels.
+   Separate shader compilation, GPU execution, host encoding and readback time.
+2. Benchmark one resident decoder block and the real asynchronous Wasm boundary.
+   Use cached pipelines, uniforms for changing positions, reusable storage, and
+   no per-operation worker messages or host reads. Test the actual build's memory
+   and threading configuration before committing to an interop design.
+3. Proceed to a full backend only when measured block/head costs plus overhead
+   leave meaningful room to beat matched Wasm CPU. Keep shared C++ model equations
+   and backend-owned kernels; do not introduce a second model implementation.
+4. Require full-checkpoint correctness, short/long-context warm throughput,
+   cold first-token latency, memory, cancellation and device-loss checks before
+   changing defaults. A kernel speedup alone is not an accepted inference gain.
+
+This is a research checkpoint, not a backend implementation or a new speedup
+claim. Support is demonstrated on one environment; integration cost and the
+achievable end-to-end speedup remain to be established by the bounded prototype.
+
 ## 2026-09-20: Longer Replies and Compact Status
 
 Gemma setup now defaults to 8192 output tokens and a 16384-token context; the

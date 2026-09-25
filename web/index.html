@@ -64,6 +64,7 @@
             <header class="dialog-heading"><h2 id="settings-title">Model settings</h2><button id="close-settings" class="icon" type="button" title="Close settings" aria-label="Close settings"><img src="./icons/x.svg" alt=""></button></header>
             <div class="model-summary"><span class="model-logo"><img src="./icons/kidi-logo.png" alt="" width="64" height="64"></span><div><strong>Gemma 4 E2B IT</strong><small>QAT mixed 2 / 4 / 8-bit</small></div></div>
             <div class="settings-grid">
+                <label class="full" for="backend">Execution backend<select id="backend"><option value="cpu">WebAssembly CPU</option><option value="webgpu">WebGPU</option></select></label>
                 <label class="numeric-setting" for="threads">CPU threads<input id="threads" type="number" min="1" max="8" value="4"></label>
                 <label class="numeric-setting" for="tokens">Output tokens<input id="tokens" type="number" min="1" max="8192" value="1024"></label>
                 <label class="full" for="manifest">Model source<textarea id="manifest" rows="4" wrap="soft" spellcheck="false" autocomplete="off" autocapitalize="none" inputmode="url">https://huggingface.co/google/gemma-4-E2B-it-qat-mobile-transformers/resolve/dd693ff40353f057ca5f07e945ad867f4afbf2ec/config.json</textarea></label>
@@ -74,7 +75,7 @@
                     <button id="load" class="primary load-model" type="button"><img src="./icons/download.svg" alt="">Load model</button>
                 </div>
                 <progress id="progress" value="0" max="1" hidden></progress>
-                <dl><dt>Download</dt><dd id="download">0 MB</dd><dt>From cache</dt><dd id="cached">0 MB</dd><dt>Load time</dt><dd id="load-time">--</dd><dt>Wasm heap</dt><dd id="memory">--</dd></dl>
+                <dl><dt>Download</dt><dd id="download">0 MB</dd><dt>From cache</dt><dd id="cached">0 MB</dd><dt>Load time</dt><dd id="load-time">--</dd><dt>Wasm heap</dt><dd id="memory">--</dd><dt>GPU buffers</dt><dd id="gpu-memory">--</dd></dl>
                 <p id="warning" role="alert"></p>
                 <button id="clear-cache" class="subtle" type="button"><img src="./icons/trash-2.svg" alt="">Clear model cache</button>
             </section>

@@ -59,6 +59,11 @@ auto make_unavailable_backend(DeviceKind kind, std::string name, std::string rea
     return std::make_shared<UnavailableBackend>(kind, std::move(name), std::move(reason));
 }
 
+auto Backend::clear(Storage& storage) const -> Result<void> {
+    const std::vector<std::byte> zeros(storage.size_bytes());
+    return copy_from_host(storage, 0, zeros);
+}
+
 auto BackendRegistry::instance() -> BackendRegistry& {
     static BackendRegistry registry;
     return registry;
@@ -74,6 +79,12 @@ BackendRegistry::BackendRegistry() {
 #endif
     backends_.emplace(DeviceKind::Q_NPU, make_unavailable_backend(DeviceKind::Q_NPU, "hexagon-qnn", "not implemented"));
     backends_.emplace(DeviceKind::CUDA, make_unavailable_backend(DeviceKind::CUDA, "cuda-cudnn", "not implemented"));
+#if defined(KIDI_HAS_WEBGPU)
+    backends_.emplace(DeviceKind::WEB_GPU, make_web_gpu_backend());
+#else
+    backends_.emplace(DeviceKind::WEB_GPU,
+                      make_unavailable_backend(DeviceKind::WEB_GPU, "webgpu", "WebGPU backend is not built"));
+#endif
 }
 
 auto BackendRegistry::register_backend(std::shared_ptr<Backend> backend) -> Result<void> {
@@ -98,7 +109,8 @@ auto BackendRegistry::backend(Device device) const -> Result<std::shared_ptr<Bac
 }
 
 auto BackendRegistry::backends(std::int32_t device_index) const -> std::vector<BackendInfo> {
-    constexpr std::array KINDS = {DeviceKind::CPU, DeviceKind::A_GPU, DeviceKind::Q_NPU, DeviceKind::CUDA};
+    constexpr std::array KINDS = {DeviceKind::CPU, DeviceKind::A_GPU, DeviceKind::Q_NPU, DeviceKind::CUDA,
+                                  DeviceKind::WEB_GPU};
     std::vector<BackendInfo> result;
     result.reserve(KINDS.size());
     std::scoped_lock lock(mutex_);

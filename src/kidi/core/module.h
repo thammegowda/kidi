@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <cstddef>
 #include <map>
 #include <stdexcept>
@@ -91,7 +92,8 @@ public:
 protected:
     auto register_parameter(std::string name, tensor::Tensor& parameter) -> void;
     auto register_parameter(std::string name, tensor::Tensor& parameter, std::vector<std::int64_t> shape,
-                            tensor::DType dtype = module_dtype, bool allocate = allocate_parameters) -> void;
+                            tensor::DType dtype = module_dtype, bool allocate = allocate_parameters,
+                            std::optional<tensor::Device> storage_device = {}) -> void;
     auto register_module(std::string name, std::shared_ptr<Module> module) -> void;
     template <typename Implementation>
     auto register_module(std::string name, const ModuleHolder<Implementation>& module) -> void {

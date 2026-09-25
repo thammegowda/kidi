@@ -11,7 +11,10 @@ RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned) : epsi
         register_parameter("weight", weight_, {width}, tensor::DType::F32);
     else
         weight_ = require(Tensor::empty({width}, tensor::DType::F32, device()));
-    if (weight_.defined()) std::ranges::fill(require(weight_.data<float>()), 1.F);
+    if (weight_.defined()) {
+        const std::vector<float> ones(width, 1.F);
+        weight_ = require(Tensor::from_host({width}, std::span<const float>(ones), device()));
+    }
 }
 auto RmsNormImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
     return context.rms_norm(input, weight_, epsilon_);
@@ -46,6 +49,11 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int
         if (token < 0 || static_cast<std::size_t>(token) >= weight_.size(0))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "embedding token outside vocabulary"});
     const auto width = static_cast<std::size_t>(width_);
+    if (context.device() == tensor::Device::web_gpu()) {
+        const auto indices =
+            require(Tensor::from_host({static_cast<std::int64_t>(tokens.size())}, tokens, context.device()));
+        return context.embedding(indices, weight_, quantization_scale_, width_, packed_bits_, scale_);
+    }
     auto output = require(Tensor::empty({1, static_cast<std::int64_t>(tokens.size()), static_cast<std::int64_t>(width)},
                                         tensor::DType::F32, context.device()));
     const auto bytes = require(weight_.host_bytes());
@@ -109,8 +117,10 @@ Gemma4AttentionImpl::Gemma4AttentionImpl(std::int32_t hidden, std::int32_t heads
         register_module("v_proj", value_);
         register_module("k_norm", key_norm_);
         if (packed_bits) {
-            register_parameter("k_cache_scale", key_scale_, {}, tensor::DType::F32);
-            register_parameter("v_cache_scale", value_scale_, {}, tensor::DType::F32);
+            register_parameter("k_cache_scale", key_scale_, {}, tensor::DType::F32, allocate_parameters,
+                               tensor::Device::cpu());
+            register_parameter("v_cache_scale", value_scale_, {}, tensor::DType::F32, allocate_parameters,
+                               tensor::Device::cpu());
         }
     }
 }
@@ -119,6 +129,11 @@ auto Gemma4AttentionImpl::forward(ops::Context& context, const Tensor& input, Ke
                                   std::int64_t key_start) const -> Tensor {
     const std::array segments{Gemma4AttentionSegment{&cache, position, input.size(1), &mask, key_start}};
     return forward_segments(context, input, segments, cosine, sine);
+}
+auto Gemma4AttentionImpl::has_cache_scales() const -> bool {
+    if (!key_ || !key_scale_.defined() || !value_scale_.defined()) return false;
+    const auto key_scale = key_scale_.data<float>(), value_scale = value_scale_.data<float>();
+    return key_scale && value_scale && (*key_scale)[0] > 0 && (*value_scale)[0] > 0;
 }
 auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& input,
                                            std::span<const Gemma4AttentionSegment> segments, const Tensor& cosine,
@@ -141,12 +156,19 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
     if (!cache_only)
         query = query_norm_->forward_rotary(context, reshape(query_->forward(context, input), heads_), cosine, sine);
     Tensor key, value;
+    float key_scale = 0, value_scale = 0;
+    // A byte cache rounds and clamps inside its own cast, so the separate rounding pass would be redundant.
+    const auto byte_cache = segments.front().cache->key.dtype() == tensor::DType::I8;
     if (key_) {
         key = key_norm_->forward_rotary(context, reshape(key_->forward(context, input), key_heads_), cosine, sine);
         value = value_norm_->forward(context, reshape(value_->forward(context, input), key_heads_));
         if (key_scale_.defined()) {
-            key = context.static_round(key, require(key_scale_.data<float>())[0]);
-            value = context.static_round(value, require(value_scale_.data<float>())[0]);
+            key_scale = require(key_scale_.data<float>())[0];
+            value_scale = require(value_scale_.data<float>())[0];
+            if (!byte_cache) {
+                key = context.static_round(key, key_scale);
+                value = context.static_round(value, value_scale);
+            }
         }
         key = context.reshape(key, {1, length, key_heads_ * head_width_});
         value = context.reshape(value, {1, length, key_heads_ * head_width_});
@@ -166,8 +188,14 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
     for (const auto& segment : segments) {
         auto& cache = *segment.cache;
         if (key_) {
-            const auto keys = context.slice(key, 1, offset, segment.length);
-            const auto values = context.slice(value, 1, offset, segment.length);
+            auto keys = context.slice(key, 1, offset, segment.length);
+            auto values = context.slice(value, 1, offset, segment.length);
+            if (byte_cache) {
+                keys = context.cast(keys, tensor::DType::I8, key_scale);
+                values = context.cast(values, tensor::DType::I8, value_scale);
+                cache.key_scale = key_scale;
+                cache.value_scale = value_scale;
+            }
             context.copy_slice_(cache.key, keys, 1, segment.position);
             context.copy_slice_(cache.value, values, 1, segment.position);
         }
@@ -176,9 +204,9 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
             continue;
         }
         const auto extent = static_cast<std::int64_t>(segment.mask->size(-1)) + segment.key_start;
-        auto attended = context.grouped_query_attention(context.slice(query, 1, offset, segment.length),
-                                                        prefix(cache.key, extent), prefix(cache.value, extent), heads_,
-                                                        key_heads_, *segment.mask, 1.F, segment.key_start);
+        auto attended = context.grouped_query_attention(
+            context.slice(query, 1, offset, segment.length), prefix(cache.key, extent), prefix(cache.value, extent),
+            heads_, key_heads_, *segment.mask, 1.F, segment.key_start, cache.key_scale, cache.value_scale);
         if (segments.size() == 1)
             single_output = std::move(attended);
         else
@@ -212,7 +240,7 @@ Gemma4BlockImpl::Gemma4BlockImpl(std::int32_t hidden, std::int32_t intermediate,
     register_module("per_layer_input_gate", per_layer_gate_);
     register_module("per_layer_projection", per_layer_projection_);
     register_parameter("layer_scalar", scalar_, {1}, tensor::DType::F32);
-    if (scalar_.defined()) require(scalar_.data<float>())[0] = 1.F;
+    if (scalar_.defined()) scalar_ = require(Tensor::from_host({1}, std::span<const float>(std::array{1.F}), device()));
 }
 auto Gemma4BlockImpl::forward(ops::Context& context, const Tensor& input, const Tensor& per_layer_input,
                               KeyValue& cache, std::size_t position, const Tensor& mask, const Tensor& cosine,
