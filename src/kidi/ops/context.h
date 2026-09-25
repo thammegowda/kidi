@@ -18,6 +18,12 @@ private:
 };
 using tensor::Tensor;
 
+struct BlockwiseQuantization {
+    std::vector<float> scales;
+    std::vector<std::int32_t> zero_points;
+    std::size_t block_size = 0;
+};
+
 /// Execution mode for the current call; public operations scope and restore it.
 extern thread_local bool is_inplace;
 
@@ -65,7 +71,8 @@ public:
                                       const Tensor& mask = {}) -> Tensor;
     auto grouped_query_attention(const Tensor& query, const Tensor& key, const Tensor& value, std::int32_t heads,
                                  std::int32_t key_value_heads, const Tensor& mask, float scale = 1.F,
-                                 std::int64_t key_start = 0, float key_scale = 0, float value_scale = 0) -> Tensor;
+                                 std::int64_t key_start = 0, const BlockwiseQuantization& key_quantization = {},
+                                 const BlockwiseQuantization& value_quantization = {}) -> Tensor;
     auto rotary(const Tensor& input, const Tensor& cosine, const Tensor& sine) -> Tensor;
     auto linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight = false) -> Tensor;
     auto quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias) -> Tensor;
@@ -73,6 +80,10 @@ public:
                        std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F) -> Tensor;
     auto gelu(const Tensor& input, bool approximate = false) -> Tensor;
     auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
+    auto gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
+                            const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
+                            std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
+                            float gate_up_output_scale, float down_input_scale, float down_output_scale) -> Tensor;
     auto gelu_(Tensor& input, bool approximate = false) -> Tensor&;
     auto tanh(const Tensor& input) -> Tensor;
     auto static_round(const Tensor& input, float scale) -> Tensor;

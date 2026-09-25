@@ -161,6 +161,13 @@ public:
             {"dtype", static_cast<int>(spec.dtype)},
             {"epsilon", spec.epsilon},
             {"attributes", std::vector<std::int64_t>(spec.attributes.begin(), spec.attributes.end())}};
+        description["quantization"] = nlohmann::json::array();
+        for (const auto& quantization : spec.quantization)
+            description["quantization"].push_back(
+                {{"scales", std::vector<float>(quantization.scales.begin(), quantization.scales.end())},
+                 {"zero_points",
+                  std::vector<std::int32_t>(quantization.zero_points.begin(), quantization.zero_points.end())},
+                 {"block_size", quantization.block_size}});
         description["inputs"] = nlohmann::json::array();
         std::vector<tensor::Tensor> constants(inputs.size());
         for (std::size_t index = 0; index < inputs.size(); ++index) {

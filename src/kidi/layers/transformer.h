@@ -8,6 +8,7 @@
 namespace kidi::layers {
 
 using tensor::Tensor;
+class GatedFeedForwardImpl;
 
 /// Transformer widths, attention head count, and layer-normalization epsilon.
 struct Shape {
@@ -16,10 +17,10 @@ struct Shape {
 };
 
 /// Projected keys and values, each shaped [batch, sequence, hidden].
-/// An INT8 cache carries the scales its rows were rounded with, so layers sharing it need no scales of their own.
+/// An INT8 cache carries its blockwise affine quantization metadata.
 struct KeyValue {
     Tensor key, value;
-    float key_scale = 0, value_scale = 0;
+    ops::BlockwiseQuantization key_quantization, value_quantization;
 };
 
 KIDI_MODULE(Linear);
@@ -33,6 +34,7 @@ public:
     auto forward(ops::Context&, const Tensor&) const -> Tensor;
 
 private:
+    friend class GatedFeedForwardImpl;
     Tensor weight_, bias_, scale_;
     Tensor input_scale_, output_scale_;
     std::int32_t packed_bits_ = 0, input_size_ = 0;

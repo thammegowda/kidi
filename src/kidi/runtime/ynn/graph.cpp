@@ -57,6 +57,9 @@ public:
     }
 
     auto get() const noexcept -> ynn_threadpool_t { return handle_; }
+    auto parallel_for(std::size_t size, std::function<void(std::size_t)> body) -> void {
+        reinterpret_cast<slinky::thread_pool*>(handle_)->parallel_for(size, std::move(body));
+    }
 
 private:
     explicit ThreadPool(int worker_count) : scheduler_(worker_count) {}
@@ -107,6 +110,13 @@ auto reserve_thread_pool(std::size_t total_threads) -> Result<void> {
     auto pool = default_thread_pool(total_threads);
     if (!pool) return std::unexpected(std::move(pool.error()));
     reservations.emplace(total_threads, std::move(*pool));
+    return {};
+}
+
+auto parallel_for(std::size_t size, std::function<void(std::size_t)> body) -> Result<void> {
+    auto pool = default_thread_pool(0);
+    if (!pool) return std::unexpected(std::move(pool.error()));
+    (*pool)->parallel_for(size, std::move(body));
     return {};
 }
 

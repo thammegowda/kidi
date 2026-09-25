@@ -2,9 +2,18 @@
 
 #include <algorithm>
 #include <bit>
+#include <limits>
 
 namespace kidi::layers {
 using ops::require;
+
+namespace {
+auto gate_up_width(std::int32_t intermediate) -> std::int32_t {
+    if (intermediate <= 0 || intermediate > std::numeric_limits<std::int32_t>::max() / 2)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid gated feed-forward width"});
+    return 2 * intermediate;
+}
+} // namespace
 
 RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned) : epsilon_(epsilon) {
     if (learned)
@@ -87,15 +96,37 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int
     return output;
 }
 GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t packed_bits)
-    : gate_(hidden, intermediate, true, false, packed_bits),
-      up_(hidden, intermediate, true, false, packed_bits),
+    : gate_up_(hidden, gate_up_width(intermediate), true, false, packed_bits),
       down_(intermediate, hidden, true, false, packed_bits) {
-    register_module("gate_proj", gate_);
-    register_module("up_proj", up_);
+    register_module("gate_up_proj", gate_up_);
     register_module("down_proj", down_);
 }
 auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    return down_->forward(context, context.gelu_multiply(gate_->forward(context, input), up_->forward(context, input)));
+    const auto rows = input.numel() / input.size(-1);
+    if (context.device() == tensor::Device::cpu() && rows >= 32 && gate_up_->packed_bits_ &&
+        gate_up_->packed_bits_ == down_->packed_bits_) {
+        const Tensor& gate_input = gate_up_->input_scale_;
+        const Tensor& gate_output = gate_up_->output_scale_;
+        const Tensor& down_input = down_->input_scale_;
+        const Tensor& down_output = down_->output_scale_;
+        const auto gate_input_scale = require(gate_input.data<float>())[0];
+        const auto gate_output_scale = require(gate_output.data<float>())[0];
+        const auto down_input_scale = require(down_input.data<float>())[0];
+        const auto down_output_scale = require(down_output.data<float>())[0];
+        if (gate_input_scale > 0 && gate_output_scale > 0 && down_input_scale > 0 && down_output_scale > 0) {
+            const auto output =
+                context.gated_feed_forward(input, gate_up_->weight_, gate_up_->scale_, down_->weight_, down_->scale_,
+                                           gate_up_->packed_bits_, gate_up_->input_size_, down_->input_size_,
+                                           gate_input_scale, gate_output_scale, down_input_scale, down_output_scale);
+            return output;
+        }
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "fused feed-forward requires positive trained scales"});
+    }
+    const auto projected = gate_up_->forward(context, input);
+    const auto intermediate = static_cast<std::int64_t>(projected.size(-1) / 2);
+    const auto gate = context.slice(projected, -1, 0, intermediate);
+    const auto up = context.slice(projected, -1, intermediate, intermediate);
+    return down_->forward(context, context.gelu_multiply(gate, up));
 }
 Gemma4AttentionImpl::Gemma4AttentionImpl(std::int32_t hidden, std::int32_t heads, std::int32_t key_heads,
                                          std::int32_t head_width, float epsilon, bool shared, std::int32_t packed_bits)
@@ -156,15 +187,17 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
     if (!cache_only)
         query = query_norm_->forward_rotary(context, reshape(query_->forward(context, input), heads_), cosine, sine);
     Tensor key, value;
-    float key_scale = 0, value_scale = 0;
+    ops::BlockwiseQuantization key_quantization, value_quantization;
     // A byte cache rounds and clamps inside its own cast, so the separate rounding pass would be redundant.
     const auto byte_cache = segments.front().cache->key.dtype() == tensor::DType::I8;
     if (key_) {
         key = key_norm_->forward_rotary(context, reshape(key_->forward(context, input), key_heads_), cosine, sine);
         value = value_norm_->forward(context, reshape(value_->forward(context, input), key_heads_));
         if (key_scale_.defined()) {
-            key_scale = require(key_scale_.data<float>())[0];
-            value_scale = require(value_scale_.data<float>())[0];
+            const auto key_scale = require(key_scale_.data<float>())[0];
+            const auto value_scale = require(value_scale_.data<float>())[0];
+            key_quantization = {{key_scale}, {0}, static_cast<std::size_t>(head_width_)};
+            value_quantization = {{value_scale}, {0}, static_cast<std::size_t>(head_width_)};
             if (!byte_cache) {
                 key = context.static_round(key, key_scale);
                 value = context.static_round(value, value_scale);
@@ -191,10 +224,10 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
             auto keys = context.slice(key, 1, offset, segment.length);
             auto values = context.slice(value, 1, offset, segment.length);
             if (byte_cache) {
-                keys = context.cast(keys, tensor::DType::I8, key_scale);
-                values = context.cast(values, tensor::DType::I8, value_scale);
-                cache.key_scale = key_scale;
-                cache.value_scale = value_scale;
+                keys = context.cast(keys, tensor::DType::I8, key_quantization.scales[0]);
+                values = context.cast(values, tensor::DType::I8, value_quantization.scales[0]);
+                cache.key_quantization = key_quantization;
+                cache.value_quantization = value_quantization;
             }
             context.copy_slice_(cache.key, keys, 1, segment.position);
             context.copy_slice_(cache.value, values, 1, segment.position);
@@ -204,9 +237,10 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
             continue;
         }
         const auto extent = static_cast<std::int64_t>(segment.mask->size(-1)) + segment.key_start;
-        auto attended = context.grouped_query_attention(
-            context.slice(query, 1, offset, segment.length), prefix(cache.key, extent), prefix(cache.value, extent),
-            heads_, key_heads_, *segment.mask, 1.F, segment.key_start, cache.key_scale, cache.value_scale);
+        auto attended =
+            context.grouped_query_attention(context.slice(query, 1, offset, segment.length), prefix(cache.key, extent),
+                                            prefix(cache.value, extent), heads_, key_heads_, *segment.mask, 1.F,
+                                            segment.key_start, cache.key_quantization, cache.value_quantization);
         if (segments.size() == 1)
             single_output = std::move(attended);
         else

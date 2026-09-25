@@ -40,7 +40,7 @@ public:
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
 
 private:
-    Linear gate_, up_, down_;
+    Linear gate_up_, down_;
 };
 
 KIDI_MODULE(Gemma4Attention);

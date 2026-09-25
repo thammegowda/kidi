@@ -1,6 +1,7 @@
 #include "kidi/model/gemma4.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 
@@ -27,7 +28,30 @@ auto main() -> int {
                 const ModuleScope construction(tensor::DType::F32, false, device);
                 auto model = ops::require(model::Gemma4Impl::create(config));
                 ops::require(model->set_checkpoint(checkpoint));
+                const auto parameters = model->state_dict();
+                for (const auto& [name, parameter] : parameters)
+                    if (name.find(".mlp.gate_proj.") != std::string::npos ||
+                        name.find(".mlp.up_proj.") != std::string::npos)
+                        return 1;
+                for (int layer = 0; layer < config["num_hidden_layers"].as<int>(); ++layer) {
+                    const auto prefix = "layers." + std::to_string(layer) + ".mlp.";
+                    const auto gate =
+                        ops::require(checkpoint.tensor("model.language_model." + prefix + "gate_proj.weight"));
+                    const auto& combined = parameters.at(prefix + "gate_up_proj.weight");
+                    if (combined.size(0) != 2 * gate.size(0) || combined.size(1) != gate.size(1)) return 1;
+                }
                 auto full = ops::require(model->create_state(8));
+                const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
+                const auto& capabilities = tensor::DEVICE_CAPABILITIES[device.kind];
+                const auto cache_dtype =
+                    fixture == std::string_view("gemma4-qat") &&
+                            (cache_override == nullptr || std::string_view(cache_override) != "0") &&
+                            capabilities.calibrated_int8_cast && capabilities.blockwise_int8_attention &&
+                            8 <= capabilities.blockwise_int8_attention_max_tokens
+                        ? tensor::DType::I8
+                        : tensor::DType::F32;
+                for (const auto& cache : full.layers)
+                    if (cache.key.dtype() != cache_dtype || cache.value.dtype() != cache_dtype) return 1;
                 auto prefill = ops::require(model->forward(tokens, full, true));
                 const auto prefill_values = ops::require(prefill.data<float>());
                 if (prefill_values.size() != values.size()) return 1;
@@ -164,6 +188,16 @@ auto main() -> int {
                     for (std::size_t index = 0; index < sequence.size(); ++index)
                         sequence[index] = tokens[index % tokens.size()];
                     auto prefix_state = ops::require(extended->create_state(capacity));
+                    const auto extended_cache_dtype =
+                        fixture == std::string_view("gemma4-qat") &&
+                                (cache_override == nullptr || std::string_view(cache_override) != "0") &&
+                                capabilities.calibrated_int8_cast && capabilities.blockwise_int8_attention &&
+                                capacity <= capabilities.blockwise_int8_attention_max_tokens
+                            ? tensor::DType::I8
+                            : tensor::DType::F32;
+                    for (const auto& cache : prefix_state.layers)
+                        if (cache.key.dtype() != extended_cache_dtype || cache.value.dtype() != extended_cache_dtype)
+                            return 1;
                     const auto prefix = ops::require(extended->forward(sequence, prefix_state));
                     auto oracle_state = ops::require(extended->create_state(capacity));
                     const auto all_logits = ops::require(extended->forward(sequence, oracle_state, true));

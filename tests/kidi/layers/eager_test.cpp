@@ -55,13 +55,10 @@ auto main() -> int {
                 if (!std::ranges::equal(ops::require(bytes.data<std::int8_t>()), std::array{1, 2, -1, -2}) ||
                     unchanged.storage_identity() != bytes.storage_identity())
                     return 1;
-                bool rejected = false;
-                try {
-                    context.cast(input, tensor::DType::I8, 0.25F);
-                } catch (const ops::Failure& error) {
-                    rejected = error.error().code == ErrorCode::UNSUPPORTED;
-                }
-                if (!rejected) return 1;
+                const auto calibrated = context.cast(input, tensor::DType::I8, 0.25F);
+                context.synchronize();
+                if (!std::ranges::equal(ops::require(calibrated.data<std::int8_t>()), std::array{4, 8, -4, -8}))
+                    return 1;
             }
             for (const std::int64_t rows : {1, 8}) {
                 auto matrix = ops::require(tensor::Tensor::zeros({8, 8}, tensor::DType::F32));
@@ -403,6 +400,44 @@ auto main() -> int {
                 if (std::abs(attention_values[head * 2] - probability) > 1e-5F ||
                     std::abs(attention_values[head * 2 + 1] - (1.F - probability)) > 1e-5F)
                     return 1;
+            if (tensor::DEVICE_CAPABILITIES[device.kind].blockwise_int8_attention) {
+                constexpr std::int64_t HEADS = 4, KEY_HEADS = 2, WIDTH = 40, QUERIES = 3, KEYS = 259, START = 5;
+                constexpr float KEY_SCALE = 0.05F, VALUE_SCALE = 0.02F;
+                std::vector<float> query_values(QUERIES * HEADS * WIDTH);
+                std::vector<float> key_values(KEYS * KEY_HEADS * WIDTH);
+                std::vector<float> value_values(key_values.size());
+                std::vector<float> mask_values(QUERIES * (KEYS - START));
+                for (std::size_t index = 0; index < query_values.size(); ++index)
+                    query_values[index] = std::sin(float(index) * 0.37F);
+                for (std::size_t index = 0; index < key_values.size(); ++index) {
+                    key_values[index] = std::sin(float(index) * 0.011F) * 0.8F;
+                    value_values[index] = std::cos(float(index) * 0.017F);
+                }
+                auto test_query = ops::require(tensor::Tensor::from_host({1, QUERIES, HEADS * WIDTH},
+                                                                         std::span<const float>(query_values), device));
+                auto test_key = ops::require(tensor::Tensor::from_host({1, KEYS, KEY_HEADS * WIDTH},
+                                                                       std::span<const float>(key_values), device));
+                auto test_value = ops::require(tensor::Tensor::from_host({1, KEYS, KEY_HEADS * WIDTH},
+                                                                         std::span<const float>(value_values), device));
+                auto test_mask = ops::require(tensor::Tensor::from_host({1, 1, QUERIES, KEYS - START},
+                                                                        std::span<const float>(mask_values), device));
+                auto rounded_key = context.static_round(test_key, KEY_SCALE);
+                auto rounded_value = context.static_round(test_value, VALUE_SCALE);
+                auto byte_key = context.cast(test_key, tensor::DType::I8, KEY_SCALE);
+                auto byte_value = context.cast(test_value, tensor::DType::I8, VALUE_SCALE);
+                const ops::BlockwiseQuantization key_quantization{{KEY_SCALE}, {0}, WIDTH};
+                const ops::BlockwiseQuantization value_quantization{{VALUE_SCALE}, {0}, WIDTH};
+                auto expected = context.grouped_query_attention(test_query, rounded_key, rounded_value, HEADS,
+                                                                KEY_HEADS, test_mask, 1.F, START);
+                auto actual =
+                    context.grouped_query_attention(test_query, byte_key, byte_value, HEADS, KEY_HEADS, test_mask, 1.F,
+                                                    START, key_quantization, value_quantization);
+                context.synchronize();
+                const auto expected_values = ops::require(expected.data<float>());
+                const auto actual_values = ops::require(actual.data<float>());
+                for (std::size_t index = 0; index < expected_values.size(); ++index)
+                    if (std::abs(actual_values[index] - expected_values[index]) > 1e-4F) return 1;
+            }
             auto saved = result;
             {
                 constexpr std::int64_t HEADS = 4, KEY_HEADS = 2, WIDTH = 40, LENGTH = 259;

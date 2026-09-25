@@ -158,10 +158,12 @@ extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_test() -> int {
                 context.cast(ops::require(rounded_key.to(tensor::Device::web_gpu())), tensor::DType::I8, key_scale);
             auto byte_value =
                 context.cast(ops::require(rounded_value.to(tensor::Device::web_gpu())), tensor::DType::I8, value_scale);
+            const ops::BlockwiseQuantization key_quantization{{key_scale}, {0}, head_width};
+            const ops::BlockwiseQuantization value_quantization{{value_scale}, {0}, head_width};
             compare(cpu.grouped_query_attention(query, rounded_key, rounded_value, heads, key_heads, mask),
                     context.grouped_query_attention(
                         ops::require(query.to(tensor::Device::web_gpu())), byte_key, byte_value, heads, key_heads,
-                        ops::require(mask.to(tensor::Device::web_gpu())), 1.F, 0, key_scale, value_scale),
+                        ops::require(mask.to(tensor::Device::web_gpu())), 1.F, 0, key_quantization, value_quantization),
                     1e-4F);
         }
         auto token = context.greedy_token(tensor);

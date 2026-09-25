@@ -50,7 +50,7 @@ auto operation_name(Operation operation) -> std::string_view {
                                "packed_linear", "rms_norm_residual",
                                "static_round",  "greedy_token",
                                "rms_rotary",    "gelu_multiply",
-                               "embedding"};
+                               "embedding",     "gated_feed_forward"};
     return names.at(static_cast<std::size_t>(operation));
 }
 struct OperatorProfile {
@@ -122,11 +122,18 @@ struct Context::Impl {
         key.push_back(spec.vector_projection);
         key.push_back(spec.attributes.size());
         key.insert(key.end(), spec.attributes.begin(), spec.attributes.end());
+        for (const auto& quantization : spec.quantization) {
+            key.push_back(quantization.block_size);
+            key.push_back(quantization.scales.size());
+            for (const auto scale : quantization.scales) key.push_back(std::bit_cast<std::int32_t>(scale));
+            key.push_back(quantization.zero_points.size());
+            key.insert(key.end(), quantization.zero_points.begin(), quantization.zero_points.end());
+        }
         const bool constant_parameters =
             spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
             spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RESIDUAL_NORM ||
             spec.operation == Operation::RMS_NORM || spec.operation == Operation::PACKED_LINEAR ||
-            spec.operation == Operation::EMBEDDING;
+            spec.operation == Operation::EMBEDDING || spec.operation == Operation::GATED_FEED_FORWARD;
         const std::size_t parameter_start = spec.operation == Operation::RESIDUAL_NORM ? 2 : 1;
         // Packed projections bake an interleaved copy of their weights, so each weight needs its own program.
         spec.dynamic_parameters =
@@ -168,6 +175,29 @@ struct Context::Impl {
                         inputs[2].size(1) != input.size(-1) / group,
                     "packed linear shape or dtype mismatch");
         }
+        if (spec.operation == Operation::GATED_FEED_FORWARD) {
+            invalid(spec.attributes.size() != 6, "invalid gated feed-forward attributes");
+            const auto bits = spec.attributes[0], input_size = spec.attributes[1], intermediate = spec.attributes[2];
+            invalid((bits != 2 && bits != 4 && bits != 8) || input_size <= 0 || intermediate <= 0 ||
+                        input.dtype() != tensor::DType::F32 || input.dimensions() != 3 || input.size(-1) != input_size,
+                    "invalid gated feed-forward input or attributes");
+            invalid(inputs.size() != 5 || inputs[1].dtype() != tensor::DType::U8 || inputs[1].dimensions() != 2 ||
+                        inputs[1].size(0) != 2 * intermediate || inputs[1].size(1) != input_size / (8 / bits) ||
+                        inputs[2].dtype() != tensor::DType::F32 || inputs[2].dimensions() != 2 ||
+                        inputs[2].size(0) != 2 * intermediate || inputs[2].size(1) != 1 ||
+                        inputs[3].dtype() != tensor::DType::U8 || inputs[3].dimensions() != 2 ||
+                        inputs[3].size(0) != input_size || inputs[3].size(1) != intermediate / (8 / bits) ||
+                        inputs[4].dtype() != tensor::DType::F32 || inputs[4].dimensions() != 2 ||
+                        inputs[4].size(0) != input_size || inputs[4].size(1) != 1,
+                    "gated feed-forward parameter shape or dtype mismatch");
+            invalid(input_size % (8 / bits) || intermediate % (8 / bits) || !std::isfinite(spec.epsilon) ||
+                        spec.epsilon <= 0,
+                    "invalid gated feed-forward precision or calibration");
+            for (std::size_t index = 3; index < spec.attributes.size(); ++index) {
+                const auto scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[index]));
+                invalid(!std::isfinite(scale) || scale <= 0, "invalid gated feed-forward calibration");
+            }
+        }
         if (spec.operation == Operation::ROTARY) {
             invalid(input.dimensions() != 4 || input.dtype() != tensor::DType::F32 || input.size(3) % 2,
                     "rotary expects FP32 [batch, sequence, heads, even width]");
@@ -195,9 +225,17 @@ struct Context::Impl {
                             !((index == 1 || index == 2) && inputs[index].dtype() == tensor::DType::I8),
                         "attention expects FP32 tensors or an INT8 key/value cache");
             invalid(key.dtype() != value.dtype(), "attention key and value must share a dtype");
-            invalid(key.dtype() == tensor::DType::I8 &&
-                        (device != tensor::Device::web_gpu() || spec.attributes.size() != 5),
-                    "INT8 attention requires WebGPU and explicit cache scales");
+            if (key.dtype() == tensor::DType::I8) {
+                invalid(!tensor::DEVICE_CAPABILITIES[device.kind].blockwise_int8_attention,
+                        "INT8 attention requires a supported backend");
+                const auto head_width = key.size(2) / key_heads;
+                for (const auto& quantization : spec.quantization)
+                    invalid(quantization.block_size == 0 || quantization.scales.empty() ||
+                                quantization.scales.size() != quantization.zero_points.size() ||
+                                quantization.scales.size() <
+                                    (head_width + quantization.block_size - 1) / quantization.block_size,
+                            "INT8 attention requires complete blockwise quantization metadata");
+            }
             if (inputs.size() == 4) {
                 const auto key_length =
                     spec.attributes.size() >= 4 ? static_cast<std::size_t>(spec.attributes[3]) : key.size(1);
@@ -414,8 +452,8 @@ auto Context::cast(const Tensor& input, tensor::DType dtype, float scale) -> Ten
     if (scale != 0) {
         if (!std::isfinite(scale) || scale < 0 || dtype != tensor::DType::I8 || input.dtype() != tensor::DType::F32)
             throw Failure({ErrorCode::INVALID_ARGUMENT, "a scaled cast rounds FP32 into INT8 with a positive scale"});
-        if (device() != tensor::Device::web_gpu())
-            throw Failure({ErrorCode::UNSUPPORTED, "scaled INT8 casts require WebGPU"});
+        if (!tensor::DEVICE_CAPABILITIES[device().kind].calibrated_int8_cast)
+            throw Failure({ErrorCode::UNSUPPORTED, "scaled INT8 casts are unsupported by this backend"});
     }
     if (input.dtype() == dtype) return input;
     return impl_->run({Operation::CAST, {}, dtype, scale}, {&input});
@@ -480,9 +518,21 @@ auto Context::gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor {
     if (!gate.defined() || !value.defined() || gate.dtype() != tensor::DType::F32 ||
         value.dtype() != tensor::DType::F32 || !std::ranges::equal(gate.shape(), value.shape()))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "GELU multiplication requires matching FP32 tensors"});
-    if (device() != tensor::Device::apple_gpu() && device() != tensor::Device::web_gpu())
-        return multiply(gelu(gate, true), value);
     return impl_->run({Operation::GELU_MULTIPLY}, {&gate, &value});
+}
+auto Context::gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
+                                 const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
+                                 std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
+                                 float gate_up_output_scale, float down_input_scale, float down_output_scale)
+    -> Tensor {
+    const std::array<std::int64_t, 6> attributes{bits,
+                                                 input_size,
+                                                 intermediate_size,
+                                                 std::bit_cast<std::int32_t>(gate_up_output_scale),
+                                                 std::bit_cast<std::int32_t>(down_input_scale),
+                                                 std::bit_cast<std::int32_t>(down_output_scale)};
+    return impl_->run({Operation::GATED_FEED_FORWARD, attributes, tensor::DType::F32, gate_up_input_scale},
+                      {&input, &gate_up_weight, &gate_up_scales, &down_weight, &down_scales});
 }
 auto Context::gelu_(Tensor& input, bool approximate) -> Tensor& {
     const std::array<std::int64_t, 1> attributes{approximate};
@@ -502,25 +552,30 @@ auto Context::rotary(const Tensor& input, const Tensor& cosine, const Tensor& si
 }
 auto Context::grouped_query_attention(const Tensor& query, const Tensor& key, const Tensor& value, std::int32_t heads,
                                       std::int32_t key_value_heads, const Tensor& mask, float scale,
-                                      std::int64_t key_start, float key_scale, float value_scale) -> Tensor {
+                                      std::int64_t key_start, const BlockwiseQuantization& key_quantization,
+                                      const BlockwiseQuantization& value_quantization) -> Tensor {
     if (!std::isfinite(scale) || scale <= 0 || !mask.defined() || !mask.dimensions() || key.dimensions() != 3 ||
         key_start < 0 || static_cast<std::size_t>(key_start) > key.size(1) || !mask.size(-1) ||
         mask.size(-1) > key.size(1) - key_start)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "grouped attention requires a mask and positive scale"});
     const auto quantized = key.dtype() == tensor::DType::I8;
-    if (quantized && device() != tensor::Device::web_gpu())
-        throw Failure({ErrorCode::UNSUPPORTED, "INT8 attention caches require WebGPU"});
-    if (!std::isfinite(key_scale) || !std::isfinite(value_scale) ||
-        (quantized ? key_scale <= 0 || value_scale <= 0 : key_scale != 0 || value_scale != 0))
-        throw Failure({ErrorCode::INVALID_ARGUMENT, "an INT8 attention cache requires positive scales"});
+    if (quantized && !tensor::DEVICE_CAPABILITIES[device().kind].blockwise_int8_attention)
+        throw Failure({ErrorCode::UNSUPPORTED, "INT8 attention caches are unsupported by this backend"});
+    const auto valid_quantization = [&](const BlockwiseQuantization& metadata) {
+        return metadata.block_size > 0 && !metadata.scales.empty() &&
+               metadata.scales.size() == metadata.zero_points.size() &&
+               std::ranges::all_of(metadata.scales, [](float value) { return std::isfinite(value) && value > 0; });
+    };
+    if (quantized != (valid_quantization(key_quantization) && valid_quantization(value_quantization)) ||
+        (!quantized && (!key_quantization.scales.empty() || !value_quantization.scales.empty())))
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid attention cache quantization metadata"});
     const auto key_length = !key_start && mask.size(-1) == 1 ? key.size(1) : mask.size(-1);
-    // The key scale is a constant factor on every score, so it folds into the softmax scale.
-    const std::array<std::int64_t, 5> attributes{
-        heads, key_value_heads, key_start, static_cast<std::int64_t>(key_length),
-        quantized ? static_cast<std::int64_t>(std::bit_cast<std::uint32_t>(value_scale)) : 0};
-    return impl_->run({Operation::ATTENTION, std::span{attributes}.first(quantized ? 5 : 4), tensor::DType::F32,
-                       quantized ? scale * key_scale : scale},
-                      {&query, &key, &value, &mask});
+    const std::array<std::int64_t, 4> attributes{heads, key_value_heads, key_start,
+                                                 static_cast<std::int64_t>(key_length)};
+    OperatorSpec spec{Operation::ATTENTION, attributes, tensor::DType::F32, scale};
+    spec.quantization = {{{key_quantization.scales, key_quantization.zero_points, key_quantization.block_size},
+                          {value_quantization.scales, value_quantization.zero_points, value_quantization.block_size}}};
+    return impl_->run(spec, {&query, &key, &value, &mask});
 }
 auto Context::rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor {
     return impl_->run({Operation::RMS_NORM, {}, tensor::DType::F32, epsilon}, {&input, &scale});

@@ -1,0 +1,41 @@
+{
+    "files.watcherExclude": {
+        "**/.cache/**": true,
+        "**/build/**": true,
+        "**/build-*/**": true,
+        "**/__pycache__/**": true,
+        "**/third_party/abseil-cpp/**": true,
+        "**/third_party/nlohmann-json/**": true,
+        "**/third_party/re2/**": true,
+        "**/third_party/spdlog/**": true,
+        "**/third_party/tokenizerspp/**": true,
+        "**/third_party/uni-algo/**": true,
+        "**/third_party/yaml-cpp/**": true,
+        "**/third_party/ynnpack-dev/third_party/**": true,
+        "**/third_party/zlib/**": true
+    },
+    "search.exclude": {
+        "**/.cache/**": true,
+        "**/build/**": true,
+        "**/build-*/**": true,
+        "**/__pycache__/**": true,
+        "**/third_party/ynnpack-dev/third_party/**": true
+    },
+    "python.analysis.exclude": [
+        ".cache/**",
+        "build/**",
+        "build-*/**",
+        "third_party/abseil-cpp/**",
+        "third_party/nlohmann-json/**",
+        "third_party/re2/**",
+        "third_party/spdlog/**",
+        "third_party/tokenizerspp/**",
+        "third_party/uni-algo/**",
+        "third_party/yaml-cpp/**",
+        "third_party/ynnpack-dev/third_party/**",
+        "third_party/zlib/**"
+    ],
+    "js/ts.tsserver.automaticTypeAcquisition.enabled": false,
+    "js/ts.tsserver.maxMemory": 768,
+    "js/ts.tsserver.useSyntaxServer": "never"
+}

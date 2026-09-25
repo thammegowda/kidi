@@ -247,17 +247,29 @@ if(lane==0u){${final?'output[param(8u)/4u+block]=bitcast<u32>(select(indices[0],
         uniforms[26]=maskShape.at(-2)??1;uniforms[27]=maskShape.at(-1)??1;
         uniforms[28]=maskShape.length>=3?maskShape.at(-3):1;uniforms[29]=maskShape.length>=4?maskShape.at(-4):1;
         if(width%4)throw new Error('WebGPU attention head width must divide four');
-        // An INT8 cache folds its key scale into the softmax scale, so only the value scale is left to apply.
-        const valueScale=attributes[4]?`*bitcast<f32>(${attributes[4]>>>0}u)`:'';
         // Four cached channels share one word, so read it once rather than through four dtype-dispatching loads.
         const byteKeys=operands[1].dtype===2;
+        const quantizationFunction=(name,metadata) => {
+            if(!metadata?.scales?.length)return `fn ${name}_scale(channel:u32)->f32{return 1.0;}fn ${name}_zero(channel:u32)->f32{return 0.0;}`;
+            if(metadata.block_size<=0||metadata.scales.length!==metadata.zero_points.length)
+                throw new Error(`Invalid ${name} blockwise quantization`);
+            const scaleCases=metadata.scales.map((value,index)=>`case ${index}u:{return ${Number(value).toPrecision(9)};}`).join('');
+            const zeroCases=metadata.zero_points.map((value,index)=>`case ${index}u:{return ${Number(value).toFixed(1)};}`).join('');
+            return `fn ${name}_scale(channel:u32)->f32{switch(channel/${metadata.block_size}u){${scaleCases}default:{return ${Number(metadata.scales.at(-1)).toPrecision(9)};}}}
+fn ${name}_zero(channel:u32)->f32{switch(channel/${metadata.block_size}u){${zeroCases}default:{return ${Number(metadata.zero_points.at(-1)).toFixed(1)};}}}`;
+        };
+        const quantizationCode=quantizationFunction('key',spec.quantization?.[0])+quantizationFunction('value',spec.quantization?.[1]);
         const keyQuad=byteKeys
             ?`let word=input1[(param(1u)+source+c)/4u];
-let second=vec4<f32>(f32(bitcast<i32>(word<<24u)>>24u),f32(bitcast<i32>(word<<16u)>>24u),f32(bitcast<i32>(word<<8u)>>24u),f32(bitcast<i32>(word)>>24u));`
+let raw=vec4<f32>(f32(bitcast<i32>(word<<24u)>>24u),f32(bitcast<i32>(word<<16u)>>24u),f32(bitcast<i32>(word<<8u)>>24u),f32(bitcast<i32>(word)>>24u));
+let second=(raw-vec4<f32>(key_zero(c),key_zero(c+1u),key_zero(c+2u),key_zero(c+3u)))*vec4<f32>(key_scale(c),key_scale(c+1u),key_scale(c+2u),key_scale(c+3u));`
             :`let second=vec4<f32>(load1(source+c),load1(source+c+1u),load1(source+c+2u),load1(source+c+3u));`;
         const valueAt=operands[2].dtype===2
-            ?'f32(bitcast<i32>(input2[(param(2u)+source+channel)/4u]<<((3u-(param(2u)+source+channel)%4u)*8u))>>24u)'
+            ?'(f32(bitcast<i32>(input2[(param(2u)+source+channel)/4u]<<((3u-(param(2u)+source+channel)%4u)*8u))>>24u)-value_zero(channel))*value_scale(channel)'
             :'load2(source+channel)';
+        const stagedValueAt=operands[2].dtype===2
+            ?'(f32(bitcast<i32>(input1[(param(1u)+source+channel)/4u]<<((3u-(param(1u)+source+channel)%4u)*8u))>>24u)-value_zero(channel))*value_scale(channel)'
+            :'load1(source+channel)';
         const keyBase='(((batch%param(25u))*param(21u)+KEY+param(22u))*param(18u)+keyHead)*width';
         if(queries===1){
             // Decode keeps scores in workgroup memory and rescales an online softmax, so one dispatch covers a head.
@@ -314,12 +326,12 @@ workgroupBarrier();}
 `;
             if(splits===1){
                 bindings=operands.length;
-                code=header(operands.length)+scan+
-`for(var p=0u;p<${perThread}u;p++){let channel=thread+p*256u;if(channel<width){store(queryBase+channel,acc[p]/total${valueScale});}}}`;
+                code=header(operands.length)+quantizationCode+scan+
+`for(var p=0u;p<${perThread}u;p++){let channel=thread+p*256u;if(channel<width){store(queryBase+channel,acc[p]/total);}}}`;
                 groups=batch*heads;
             } else {
                 // Each piece stores its unnormalised sum with the running maximum and total it was scaled by.
-                stages=[{code:header(operands.length)+scan+
+                stages=[{code:header(operands.length)+quantizationCode+scan+
 `let store_base=block*${slot}u;
 for(var p=0u;p<${perThread}u;p++){let channel=thread+p*256u;if(channel<width){store(store_base+channel,acc[p]);}}
 if(thread==0u){store(store_base+width,maximum);store(store_base+width+1u,total);}}`,
@@ -346,23 +358,23 @@ var sum=0.0;
 for(var piece=0u;piece<${splits}u;piece++){
 let head_slot=(block*${splits}u+piece)*${slot}u;
 if(load0(head_slot+width+1u)>0.0){sum+=load0(head_slot+channel)*exp(load0(head_slot+width)-maximum);}}
-store(block*width+channel,sum/total${valueScale});}}}`;
+store(block*width+channel,sum/total);}}}`;
                 groups=batch*heads;
             }
         } else {
-            const scoreCode=header(operands.length)+`@compute @workgroup_size(128) fn main(@builtin(global_invocation_id) id:vec3<u32>){let index=invocation_index(id);let keys=param(20u);let queries=param(19u);let heads=param(17u);let width=param(16u);if(index>=param(23u)*heads*queries*keys){return;}
+            const scoreCode=header(operands.length)+quantizationCode+`@compute @workgroup_size(128) fn main(@builtin(global_invocation_id) id:vec3<u32>){let index=invocation_index(id);let keys=param(20u);let queries=param(19u);let heads=param(17u);let width=param(16u);if(index>=param(23u)*heads*queries*keys){return;}
 let key=index%keys;let query=(index/keys)%queries;let head=(index/keys/queries)%heads;let batch=index/keys/queries/heads;let keyHead=head/(heads/param(18u));
 let queryBase=((batch*queries+query)*heads+head)*width;let keyBase=${keyBase.replace('KEY','key')};var sum=0.0;
-for(var channel=0u;channel<width;channel+=4u){let first=vec4<f32>(load0(queryBase+channel),load0(queryBase+channel+1u),load0(queryBase+channel+2u),load0(queryBase+channel+3u));let second=vec4<f32>(load1(keyBase+channel),load1(keyBase+channel+1u),load1(keyBase+channel+2u),load1(keyBase+channel+3u));sum+=dot(first,second);}
+for(var channel=0u;channel<width;channel+=4u){let first=vec4<f32>(load0(queryBase+channel),load0(queryBase+channel+1u),load0(queryBase+channel+2u),load0(queryBase+channel+3u));let source=keyBase;let c=channel;${keyQuad}sum+=dot(first,second);}
 store(index,sum*scalar(24u)${operands.length===4?'+load3((((batch%param(29u))*param(28u)+head%param(28u))*param(26u)+query%param(26u))*param(27u)+key%param(27u))':''});}`;
             const softUniforms=new Uint32Array(64);softUniforms[9]=11;softUniforms[16]=keyLength;softUniforms[17]=rows;
             stages=[{code:scoreCode,uniforms:new Uint32Array(uniforms),groups:Math.ceil(rows*keyLength/128),inputs:operands.map((_,index)=>index),bytes:rows*keyLength*4},
                 {code:softmax(1,false),uniforms:softUniforms,groups:rows,inputs:['previous'],bytes:rows*keyLength*4}];
             uniforms[9]=11;uniforms[10]=operands[2].dtype;
             bindings=2;
-            code=header(2)+`@compute @workgroup_size(128) fn main(@builtin(global_invocation_id) id:vec3<u32>){let index=invocation_index(id);let width=param(16u);let heads=param(17u);let queries=param(19u);let keys=param(20u);if(index>=param(23u)*queries*heads*width){return;}
+            code=header(2)+quantizationCode+`@compute @workgroup_size(128) fn main(@builtin(global_invocation_id) id:vec3<u32>){let index=invocation_index(id);let width=param(16u);let heads=param(17u);let queries=param(19u);let keys=param(20u);if(index>=param(23u)*queries*heads*width){return;}
 let channel=index%width;let head=(index/width)%heads;let query=(index/width/heads)%queries;let batch=index/width/heads/queries;let scores=((batch*heads+head)*queries+query)*keys;let keyHead=head/(heads/param(18u));var sum=0.0;
-for(var key=0u;key<keys;key++){let base=${keyBase.replace('KEY','key')};sum+=load0(scores+key)*load1(base+channel);}store(index,sum${valueScale});}`;
+for(var key=0u;key<keys;key++){let source=${keyBase.replace('KEY','key')};sum+=load0(scores+key)*${stagedValueAt};}store(index,sum);}`;
             groups=Math.ceil(product(shape)/128);
         }
     } else if(operation==='concat') {
