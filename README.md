@@ -21,8 +21,9 @@ layers for developers building other architectures.
   runtime memory are separate; sizes vary by build.
 - **Interactive or scripted.** Streaming chat, cancellation, file processing,
   and translation share the same runtime.
-- **One implementation across backends.** YNNPACK handles CPU execution, Metal
-  handles Apple GPUs, and the browser uses WebAssembly SIMD with optional threads.
+- **One implementation across backends.** The
+  [ynnpack-dev](third_party/ynnpack-dev/README.md) runtime handles CPU execution,
+  Metal handles Apple GPUs, and the browser uses WebAssembly SIMD with optional threads.
 
 ## What Works Today
 
@@ -173,8 +174,10 @@ cmake --build --preset release --target kidi_cli
 build-release/kidi --help
 ```
 
-C/C++ dependencies are pinned submodules under `third_party/`. To build a Python
-wheel on the target OS/architecture:
+C/C++ dependencies are pinned submodules under `third_party/`.
+[ynnpack-dev](https://github.com/thammegowda/ynnpack-dev) owns its nested Slinky,
+cpuinfo, GoogleTest, and Google Benchmark dependencies; the recursive update above
+initializes them too. To build a Python wheel on the target OS/architecture:
 
 ```bash
 python -m pip wheel --no-deps . --wheel-dir dist

@@ -5,7 +5,6 @@
 .DS_Store
 __pycache__/
 *.pyc
-/ynnpack
 /web/node_modules/
 
 /tests/**/.cache/

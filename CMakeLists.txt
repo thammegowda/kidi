@@ -35,10 +35,8 @@ if(EMSCRIPTEN)
         add_compile_options(-pthread)
         add_link_options(-pthread -sPTHREAD_POOL_SIZE=7)
     endif()
-    set(YNNPACK_TARGET_PROCESSOR wasm CACHE STRING "" FORCE)
 endif()
 include(cmake/dependencies.cmake)
-include(cmake/ynnpack.cmake)
 
 add_library(kidi_argparse src/kidi/cli/argparse.cpp)
 add_library(kidi::argparse ALIAS kidi_argparse)
@@ -108,14 +106,13 @@ target_include_directories(kidi
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
         $<INSTALL_INTERFACE:include>
-    PRIVATE
-        ${KIDI_THIRD_PARTY_DIR}/xnnpack
 )
 
 target_compile_features(kidi PUBLIC cxx_std_23)
 target_link_libraries(kidi
     PUBLIC
-        kidi::ynnpack
+        ynnpack
+        ynnpack_composites
         yaml-cpp::yaml-cpp
     PRIVATE
         tokenizerpp
