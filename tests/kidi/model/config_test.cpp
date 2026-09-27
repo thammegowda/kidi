@@ -54,6 +54,18 @@ decode: {beam_size: 4}
     gemma["tokenizer_file"] = "../outside";
     write(directory / "invalid-gemma.yaml", YAML::Dump(gemma));
     if (kidi::model::load_config(directory / "invalid-gemma.yaml")) return 1;
+    write(directory / "config.json", R"({"model_type":"whisper","d_model":384})");
+    write(directory / "tokenizer.json");
+    write(directory / "preprocessor_config.json");
+    write(directory / "generation_config.json");
+    auto whisper = kidi::model::load_whisper_config(directory);
+    if (!whisper || (*whisper)["model"]["type"].as<std::string>() != "whisper" ||
+        (*whisper)["model"]["d_model"].as<int>() != 384 ||
+        (*whisper)["model_file"].as<std::string>() != (directory / "model.safetensors").string() ||
+        (*whisper)["tokenizer_file"].as<std::string>() != (directory / "tokenizer.json").string())
+        return 1;
+    std::filesystem::remove(directory / "generation_config.json");
+    if (kidi::model::load_whisper_config(directory)) return 1;
     old_format.remove("model");
     old_format["architecture"]["hidden_size"] = 768;
     write(directory / "old.yaml", YAML::Dump(old_format));

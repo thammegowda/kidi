@@ -2,6 +2,8 @@
 
 Current implementation wins, failures, and course corrections are tracked in
 the [optimization journal](JOURNAL.md).
+The updateable plan for new work is the
+[active optimization journal](OPTIMIZATION_ROADMAP.md).
 
 At the pre-review checkpoint, [topology-level prefill pruning](prefill-pruning-results.json)
 and [shared-consumer trimming](shared-prefill-results.json) bring measured native-QAT

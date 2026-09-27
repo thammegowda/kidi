@@ -62,7 +62,13 @@ enum class Operation {
     GREEDY_TOKEN,
     RMS_ROTARY,
     GELU_MULTIPLY,
-    EMBEDDING
+    EMBEDDING,
+    GATED_FEED_FORWARD
+};
+struct BlockwiseQuantizationSpec {
+    std::span<const float> scales;
+    std::span<const std::int32_t> zero_points;
+    std::size_t block_size = 0;
 };
 struct OperatorSpec {
     Operation operation;
@@ -72,6 +78,7 @@ struct OperatorSpec {
     bool dynamic_parameters = false;
     bool packed_prefill = false;
     bool vector_projection = false;
+    std::array<BlockwiseQuantizationSpec, 2> quantization;
 };
 
 struct AllocationStats {

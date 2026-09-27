@@ -6,11 +6,37 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
+import platform
 import resource
 import subprocess
+import sys
 import time
 
 from tokenizers import Tokenizer
+
+
+def round_metrics(value):
+    if isinstance(value, float):
+        return round(value, 5)
+    if isinstance(value, dict):
+        return {key: round_metrics(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [round_metrics(item) for item in value]
+    return value
+
+
+def memory_snapshot():
+    if sys.platform != "darwin":
+        return None
+    report = subprocess.check_output(["vm_stat"], text=True)
+    counters = {}
+    for line in report.splitlines():
+        name, _, value = line.partition(":")
+        if name in ("Swapins", "Swapouts"):
+            counters[name.lower()] = int(value.strip().rstrip("."))
+    return {"timestamp_ns": time.time_ns(), **counters,
+            "page_bytes": int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"], text=True)),
+            "swap_usage": subprocess.check_output(["sysctl", "vm.swapusage"], text=True).strip()}
 
 
 def make_prompt(tokenizer, count):
@@ -57,7 +83,7 @@ def run_kidi(args, prompt, tokenizer):
     if len(all_records) != args.warmups + args.runs:
         raise ValueError("Missing JSONL responses")
     records = all_records[args.warmups:]
-    for index, record in enumerate(records):
+    for index, record in enumerate(all_records, start=-args.warmups):
         record.update(run=index, native_qat=int(fields["native_qat"]), packed_prefill=args.packed_prefill,
                       load_ns=int(fields["load_ns"]), text=record["message"]["content"])
         if record["prompt_tokens"] != args.prefill or record["decode_tokens"] != args.decode:
@@ -79,7 +105,8 @@ def run_kidi(args, prompt, tokenizer):
         precision = "per-channel Q8 PTQ"
     with args.binary.open("rb") as binary:
         binary_sha256 = hashlib.file_digest(binary, "sha256").hexdigest()
-    return {"records": records, "process_wall_seconds": wall,
+        return {"records": records, "warmup_records": all_records[:args.warmups],
+            "command": command, "process_wall_seconds": wall,
             "binary_sha256": binary_sha256,
             "peak_rss_bytes": resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
             "stderr": process.stderr, "weight_precision": precision,
@@ -159,7 +186,9 @@ def main():
     args.cache.mkdir(parents=True, exist_ok=True)
     tokenizer = Tokenizer.from_file(str(args.model / "tokenizer.json"))
     prompt, tokens = make_prompt(tokenizer, args.prefill)
+    before = memory_snapshot()
     result = run_kidi(args, prompt, tokenizer) if args.runtime == "kidi" else run_litert(args, prompt, tokens)
+    result["environment"] = {"platform": platform.platform(), "before": before, "after": memory_snapshot()}
     result.update({"runtime": args.runtime, "backend": args.backend, "batch_size": 1, "threads": args.threads,
                    "prefill_tokens": args.prefill, "decode_target": args.decode, "context": args.context,
                    "warmups": args.warmups, "prompt": prompt, "prompt_tokens": tokens,
@@ -167,7 +196,7 @@ def main():
                    "model_config_sha256": hashlib.sha256((args.model / "config.json").read_bytes()).hexdigest(),
                    "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()})
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    args.output.write_text(json.dumps(round_metrics(result), indent=2) + "\n")
     for record in result["records"]:
         print(f"{args.runtime}/{args.backend}: prefill {record['prefill_tokens_per_second']:.2f}, "
               f"decode {record['decode_tokens_per_second']:.2f} tokens/s")

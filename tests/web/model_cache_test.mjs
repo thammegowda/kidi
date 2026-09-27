@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {isModelCached, loadModel} from '../../web/model-cache.mjs';
+import {deleteCachedModel, isModelCached, listCachedModels, loadModel, resolveModelSource} from '../../web/model-cache.mjs';
 import {unsignedHeapIndices} from '../../web/wasm-glue.mjs';
 
 test('large-memory glue fixes direct and pthread heap indices without changing arithmetic shifts', () => {
@@ -10,15 +10,81 @@ test('large-memory glue fixes direct and pthread heap indices without changing a
     assert.equal(unsignedHeapIndices(fixed), fixed);
 });
 
-test('Hub ranges normalize once in owned memory and preserve the upstream cache and modality tensors', async () => {
+test('model IDs resolve latest Hub revisions and retain an offline pinned mapping', async () => {
+    const cache = new Map();
+    const originalFetch = globalThis.fetch, originalCaches = globalThis.caches;
+    globalThis.caches = {open: async () => ({
+        match: async key => cache.get(String(key))?.clone(),
+        put: async (key, response) => cache.set(String(key), response.clone())
+    })};
+    let revision = 'a'.repeat(40);
+    let requests = 0;
+    globalThis.fetch = async url => {
+        requests++;
+        assert.equal(String(url), 'https://huggingface.co/api/models/google/test/revision/main');
+        return new Response(JSON.stringify({sha: revision}));
+    };
+    try {
+        assert.equal(await resolveModelSource('google/test'),
+            `https://huggingface.co/google/test/resolve/${revision}/config.json`);
+        revision = 'b'.repeat(40);
+        assert.equal(await resolveModelSource('google/test'),
+            `https://huggingface.co/google/test/resolve/${revision}/config.json`);
+        globalThis.fetch = async () => { throw new Error('offline'); };
+        assert.equal(await resolveModelSource('google/test', {cacheOnly: true}),
+            `https://huggingface.co/google/test/resolve/${revision}/config.json`);
+        assert.equal(requests, 2);
+        await assert.rejects(resolveModelSource('missing/model', {cacheOnly: true}), /no resolved revision/);
+    } finally {
+        globalThis.fetch = originalFetch;
+        if (originalCaches === undefined) delete globalThis.caches;
+        else globalThis.caches = originalCaches;
+    }
+});
+
+test('cache inventory exposes partial model files and selectively deletes one model', async () => {
+    const cache = new Map();
+    const originalCaches = globalThis.caches;
+    const revision = 'c'.repeat(40);
+    const modelId = 'openai/whisper-tiny';
+    const source = `https://huggingface.co/${modelId}/resolve/${revision}/config.json`;
+    const config = JSON.stringify({model_type: 'whisper', architectures: ['WhisperForConditionalGeneration']});
+    const store = async (key, body, headers = {}) => cache.set(key, new Response(body, {headers}));
+    await store(`https://kidi.invalid/__model_refs__/${encodeURIComponent(modelId)}`,
+        JSON.stringify({modelId, revision, url: source}));
+    await store(source, config);
+    await store(new URL('tokenizer.json', source).href, '{}', {'X-Kidi-Size': '2'});
+    globalThis.caches = {open: async () => ({
+        match: async key => cache.get(typeof key === 'string' ? key : key.url)?.clone(),
+        keys: async () => [...cache.keys()].map(url => ({url})),
+        delete: async key => cache.delete(typeof key === 'string' ? key : key.url)
+    })};
+    try {
+        const models = await listCachedModels();
+        assert.equal(models.length, 1);
+        assert.equal(models[0].name, modelId);
+        assert.equal(models[0].kind, 'Speech');
+        assert.equal(models[0].complete, false);
+        assert.deepEqual(models[0].files,
+            [{name: 'config.json', bytes: config.length}, {name: 'tokenizer.json', bytes: 2}]);
+        assert.equal(await deleteCachedModel(models[0].id), true);
+        assert.equal((await listCachedModels()).length, 0);
+        assert.equal(cache.size, 0);
+    } finally {
+        if (originalCaches === undefined) delete globalThis.caches;
+        else globalThis.caches = originalCaches;
+    }
+});
+
+test('Hub ranges normalize once in owned memory and preserve the upstream cache and checkpoint tensors', async () => {
     const source = `https://huggingface.co/google/test/resolve/${'a'.repeat(40)}/config.json`;
     const width = 8 * 1024 * 1024;
     const headerBytes = 2048;
     const header = {
         'model.language_model.test.weight': {dtype: 'U8', shape: [1, width], data_offsets: [0, width]},
         'lm_head.weight': {dtype: 'U8', shape: [1, 8], data_offsets: [width, width + 8]},
-        'model.audio_tower.test.weight': {dtype: 'I8', shape: [1, 8], data_offsets: [width + 8, width + 16]},
-        'model.vision_tower.test.weight': {dtype: 'BF16', shape: [1, 4], data_offsets: [width + 16, width + 24]}
+        'model.language_model.test_eight_bit.weight': {dtype: 'I8', shape: [1, 8], data_offsets: [width + 8, width + 16]},
+        'model.language_model.test_float.weight': {dtype: 'BF16', shape: [1, 4], data_offsets: [width + 16, width + 24]}
     };
     const upstream = new Uint8Array(8 + headerBytes + width + 24);
     new DataView(upstream.buffer).setBigUint64(0, BigInt(headerBytes), true);
@@ -27,7 +93,7 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
     upstream.fill(0x12, 8 + headerBytes);
     const config = {model_type: 'gemma4', text_config: {enable_moe_block: false}, quantization_config: {
         quant_method: 'gemma', quantize_embeddings: true, num_bits: 4, modules_to_not_convert: [],
-        module_quant_configs: {'^lm_head$': {num_bits: 2}, audio_tower: {num_bits: 8}}
+        module_quant_configs: {'^lm_head$': {num_bits: 2}, test_eight_bit: {num_bits: 8}}
     }};
     const cache = new Map();
     const requests = [];
@@ -72,8 +138,8 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
         assert.equal(data[width + 8], 0x12);
         assert.deepEqual(data.subarray(width + 16), upstream.subarray(upstream.length - 8));
         const normalized = JSON.parse(new TextDecoder().decode(mapped.contents.subarray(8, 8 + headerBytes)));
-        assert.equal(normalized['model.audio_tower.test.weight'].dtype, 'U8');
-        assert.equal(normalized['model.vision_tower.test.weight'].dtype, 'BF16');
+        assert.equal(normalized['model.language_model.test_eight_bit.weight'].dtype, 'U8');
+        assert.equal(normalized['model.language_model.test_float.weight'].dtype, 'BF16');
         assert.deepEqual(Object.keys(normalized), Object.keys(header));
         const descriptor = JSON.parse(first.files.get('/model/model.yaml'));
         assert.equal(descriptor.model.packed_weights_signed, true);

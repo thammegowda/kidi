@@ -590,19 +590,19 @@ auto Executable::encode(CommandBatch& batch, TensorInputs inputs, std::span<tens
                 impl_->bindings.push_back({std::move(input_views), std::move(output_views), input_data, output_data});
                 found = impl_->bindings.end() - 1;
             }
-            MPSGraphExecutableExecutionDescriptor* descriptor = [MPSGraphExecutableExecutionDescriptor new];
-            descriptor.waitUntilCompleted = NO;
-            completion = batch.track_completion();
-            descriptor.completionHandler = ^(NSArray<MPSGraphTensorData*>*, NSError* error) {
-              completion(error ? std::string(error.localizedDescription.UTF8String) : std::string{});
-            };
+                        MPSGraphExecutableExecutionDescriptor* descriptor = [MPSGraphExecutableExecutionDescriptor new];
+                        descriptor.waitUntilCompleted = NO;
+                        completion = batch.track_completion();
+                        descriptor.completionHandler = ^(NSArray<MPSGraphTensorData*>*, NSError* error) {
+                            completion(error ? std::string(error.localizedDescription.UTF8String) : std::string{});
+                        };
             MPSCommandBuffer* command_buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
             NSArray<MPSGraphTensorData*>* results = [impl_->executable encodeToCommandBuffer:command_buffer
                                                                                  inputsArray:found->input_data
                                                                                 resultsArray:found->output_data
-                                                                         executionDescriptor:descriptor];
+                                                                                                                                                 executionDescriptor:descriptor];
             if (results.count != outputs.size()) {
-                completion("MPSGraph returned an unexpected result count");
+                                                                                        completion("MPSGraph returned an unexpected result count");
                 return std::unexpected(Error{ErrorCode::RUNTIME, "MPSGraph returned an unexpected result count"});
             }
             return {};

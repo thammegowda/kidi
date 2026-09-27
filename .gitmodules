@@ -1,10 +1,4 @@
 
-[submodule "third_party/xnnpack"]
-	path = third_party/xnnpack
-	url = https://github.com/thammegowda/XNNPACK.git
-[submodule "third_party/slinky"]
-	path = third_party/slinky
-	url = https://github.com/dsharlet/slinky.git
 [submodule "third_party/tokenizerspp"]
 	path = third_party/tokenizerspp
 	url = https://github.com/thammegowda/tokenizerspp
@@ -29,3 +23,6 @@
 [submodule "third_party/spdlog"]
 	path = third_party/spdlog
 	url = https://github.com/gabime/spdlog.git
+[submodule "third_party/ynnpack-dev"]
+	path = third_party/ynnpack-dev
+	url = https://github.com/thammegowda/ynnpack-dev.git

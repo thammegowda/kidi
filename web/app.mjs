@@ -1,13 +1,17 @@
-import {clearModelCache, isModelCached} from './model-cache.mjs';
+import {clearModelCache, deleteCachedModel, isModelCached, listCachedModels} from './model-cache.mjs';
 import {renderMarkdown} from './markdown.mjs';
+import {resampleAudio} from './speech.mjs';
 
 const CHAT_STORAGE = 'kidi-chats-v1';
 const ACTIVE_CHAT_STORAGE = 'kidi-active-chat-v1';
 const MODEL_STORAGE = 'kidi-model-source-v1';
 const SETTINGS_STORAGE = 'kidi-settings-v1';
+const MODEL_ID = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const NEW_CHAT = '__new__';
 const element = id => document.getElementById(id);
 const megabytes = bytes => `${(bytes / 1e6).toFixed(1)} MB`;
+const cacheSize = bytes => bytes < 1024 ? `${bytes} B` :
+    bytes < 1024 ** 2 ? `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB` : megabytes(bytes);
 const settingsDialog = element('settings-dialog');
 let worker;
 let ready = false;
@@ -19,6 +23,10 @@ let runtimeVersion = 0;
 let currentStats;
 let generationStarted;
 let liveTimer;
+let recording;
+let recordingTimer;
+let recordingDeadline;
+let speechWorker;
 const preferences = {};
 
 try {
@@ -35,6 +43,10 @@ try {
             input.value = String(value);
         }
     }
+    if (typeof saved?.speechModel === 'string' && MODEL_ID.test(saved.speechModel)) {
+        preferences.speechModel = saved.speechModel;
+        element('speech-model').value = saved.speechModel;
+    }
 } catch {}
 
 function savePreference(id) {
@@ -47,7 +59,10 @@ function savePreference(id) {
 
 try {
     const source = localStorage.getItem(MODEL_STORAGE);
-    if (source) element('manifest').value = source;
+    if (source) {
+        const pinned = /^https:\/\/huggingface\.co\/([^/]+\/[^/]+)\/resolve\/[a-f0-9]{40}\/config\.json$/.exec(source);
+        element('manifest').value = pinned?.[1] || source;
+    }
 } catch {}
 
 function loadChats() {
@@ -245,15 +260,24 @@ function updateMemory(bytes) {
     element('memory-stats').classList.toggle('tight', known && bytes > 3.75 * 2 ** 30);
 }
 function controls() {
-    element('send').disabled = !ready || busy;
+    const isRecording = Boolean(recording);
+    element('send').disabled = !ready || busy || isRecording;
     element('stop').hidden = !busy;
     element('stop').disabled = stopping;
-    element('load').disabled = busy || loading;
-    element('clear-cache').disabled = busy || loading;
-    element('new-chat').disabled = busy || loading;
-    for (const id of ['backend', 'threads', 'manifest']) element(id).disabled = busy || loading;
+    element('mic').disabled = busy || loading;
+    element('mic').classList.toggle('recording', isRecording);
+    element('mic').setAttribute('aria-pressed', String(isRecording));
+    element('mic').title = isRecording ? 'Stop recording' : 'Record speech';
+    element('mic').setAttribute('aria-label', element('mic').title);
+    element('prompt').disabled = isRecording;
+    element('load').disabled = busy || loading || isRecording;
+    element('clear-cache').disabled = busy || loading || isRecording;
+    element('new-chat').disabled = busy || loading || isRecording;
+    for (const id of ['backend', 'threads', 'manifest', 'speech-model'])
+        element(id).disabled = busy || loading || isRecording;
     element('threads').disabled ||= element('backend').value === 'webgpu';
     for (const button of document.querySelectorAll('.history-open, .history-delete')) button.disabled = busy || loading;
+    for (const button of document.querySelectorAll('.cache-delete')) button.disabled = busy || loading || isRecording;
 }
 function updateLiveStats() {
     const speed = currentStats?.decodeTokens > 0 && currentStats.decodeMs > 0
@@ -266,8 +290,26 @@ function stopLiveStats() {
     clearInterval(liveTimer);
     element('live-generation').hidden = true;
 }
-function finish() { busy = false; stopping = false; stopLiveStats(); controls(); }
+function finish() {
+    busy = false;
+    stopping = false;
+    stopLiveStats();
+    controls();
+}
+function releaseRecording(session = recording) {
+    if (!session) return;
+    clearInterval(recordingTimer);
+    clearTimeout(recordingDeadline);
+    session.node.port.onmessage = null;
+    try { session.source.disconnect(); session.node.disconnect(); session.sink.disconnect(); } catch {}
+    for (const track of session.stream.getTracks()) track.stop();
+    session.context.close().catch(() => {});
+    if (recording === session) recording = null;
+}
 function restart() {
+    releaseRecording();
+    speechWorker?.terminate();
+    speechWorker = null;
     runtimeVersion++;
     worker?.terminate();
     worker = null;
@@ -284,7 +326,7 @@ function restart() {
     controls();
 }
 function newChat() {
-    if (busy || loading) return;
+    if (busy || loading || recording) return;
     currentChatId = null;
     conversation = [];
     persistChats();
@@ -296,7 +338,10 @@ function newChat() {
 }
 function openHistory() { document.body.classList.add('history-visible'); }
 function closeHistory() { document.body.classList.remove('history-visible'); }
-function openSettings() { if (!settingsDialog.open) settingsDialog.showModal(); }
+function openSettings() {
+    if (!settingsDialog.open) settingsDialog.showModal();
+    refreshCachedModels();
+}
 function closeSettings() { if (settingsDialog.open) settingsDialog.close(); }
 function outputTokenLimit() {
     const input = element('tokens');
@@ -308,9 +353,233 @@ function outputTokenLimit() {
     return valid ? value : null;
 }
 
+async function refreshCachedModels() {
+    const container = element('cache-models');
+    container.replaceChildren();
+    const loading = document.createElement('p');
+    loading.className = 'cache-empty';
+    loading.textContent = 'Reading cache';
+    container.append(loading);
+    try {
+        const models = await listCachedModels();
+        container.replaceChildren();
+        element('cache-total').textContent = megabytes(models.reduce((sum, model) => sum + model.bytes, 0));
+        if (!models.length) {
+            const empty = document.createElement('p');
+            empty.className = 'cache-empty';
+            empty.textContent = 'No cached models';
+            container.append(empty);
+            return;
+        }
+        for (const model of models.sort((left, right) => right.bytes - left.bytes)) {
+            const article = document.createElement('article');
+            article.className = 'cache-model';
+            const header = document.createElement('div');
+            header.className = 'cache-model-heading';
+            const identity = document.createElement('div');
+            const name = document.createElement('strong');
+            name.textContent = model.name;
+            const meta = document.createElement('small');
+            const revision = /^[a-f0-9]{40}$/.test(model.revision) ? model.revision.slice(0, 8) : 'package';
+            meta.textContent = `${model.kind} · ${megabytes(model.bytes)} · ${revision} · ${model.complete ? 'Ready' : 'Partial'}`;
+            identity.append(name, meta);
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'cache-delete';
+            remove.title = `Delete ${model.name} from cache`;
+            remove.setAttribute('aria-label', remove.title);
+            const icon = document.createElement('img');
+            icon.src = './icons/trash-2.svg';
+            icon.alt = '';
+            remove.append(icon, document.createTextNode('Delete'));
+            remove.addEventListener('click', async () => {
+                remove.disabled = true;
+                try {
+                    await deleteCachedModel(model.id);
+                    element('warning').textContent = `Deleted cached files for ${model.name}`;
+                    await refreshCachedModels();
+                } catch (error) {
+                    remove.disabled = false;
+                    element('warning').textContent = error.message;
+                }
+            });
+            header.append(identity, remove);
+            const details = document.createElement('details');
+            const summary = document.createElement('summary');
+            summary.textContent = `${model.files.length} files`;
+            const files = document.createElement('ul');
+            for (const file of model.files) {
+                const item = document.createElement('li');
+                const fileName = document.createElement('span');
+                fileName.textContent = file.name;
+                const size = document.createElement('span');
+                size.textContent = cacheSize(file.bytes);
+                item.append(fileName, size);
+                files.append(item);
+            }
+            details.append(summary, files);
+            article.append(header, details);
+            container.append(article);
+        }
+        controls();
+    } catch (error) {
+        container.replaceChildren();
+        const failed = document.createElement('p');
+        failed.className = 'cache-empty error';
+        failed.textContent = error.message;
+        container.append(failed);
+        element('cache-total').textContent = '--';
+    }
+}
+
+async function startRecording() {
+    if (recording || busy || loading) return;
+    if (!navigator.mediaDevices?.getUserMedia || !globalThis.AudioWorkletNode) {
+        element('warning').textContent = 'This browser does not support microphone capture';
+        return;
+    }
+    let session;
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true,
+            noiseSuppression: true, autoGainControl: true}});
+        const context = new AudioContext({sampleRate: 16000, latencyHint: 'interactive'});
+        await context.audioWorklet.addModule(new URL('./audio-capture-worklet.mjs', location.href));
+        const source = context.createMediaStreamSource(stream);
+        const node = new AudioWorkletNode(context, 'kidi-audio-capture');
+        const sink = context.createGain();
+        sink.gain.value = 0;
+        const modelId = element('speech-model').value.trim();
+        if (!MODEL_ID.test(modelId)) throw new Error('Enter a Hugging Face speech model ID such as openai/whisper-tiny');
+        session = {stream, context, source, node, sink, chunks: [], started: performance.now(), modelId,
+            ready: false, transcribing: false, lastDraftRequest: 0, draftText: '', finalAudio: null};
+        node.port.onmessage = ({data}) => {
+            if (recording === session && data instanceof ArrayBuffer) session.chunks.push(new Float32Array(data));
+        };
+        source.connect(node).connect(sink).connect(context.destination);
+        await context.resume();
+        recording = session;
+        startSpeechWorker(session);
+        element('warning').textContent = '';
+        const update = () => {
+            const seconds = Math.min(30, (performance.now() - session.started) / 1000);
+            if (session.ready && seconds >= 0.8 && performance.now() - session.lastDraftRequest >= 1200)
+                requestSpeech(session, false);
+            element('generation-stats').textContent = session.status || `Recording ${seconds.toFixed(1)} s`;
+        };
+        update();
+        recordingTimer = setInterval(update, 200);
+        recordingDeadline = setTimeout(() => finishRecording(), 30000);
+        controls();
+    } catch (error) {
+        releaseRecording(session);
+        element('warning').textContent = error.name === 'NotAllowedError' ? 'Microphone permission was denied' :
+            `Unable to record speech: ${error.message}`;
+    }
+}
+
+function updateDraft(text) {
+    element('prompt').value = text.trim();
+    element('prompt').dispatchEvent(new Event('input'));
+}
+
+function failSpeech(session, error) {
+    if (session.worker) session.worker.terminate();
+    if (speechWorker === session.worker) speechWorker = null;
+    session.worker = null;
+    if (recording === session) releaseRecording(session);
+    element('warning').textContent = error;
+    finish();
+}
+
+function requestSpeech(session, final) {
+    if (!session.ready || session.transcribing) return;
+    const audio = final ? session.finalAudio : resampleAudio(session.chunks, session.context.sampleRate);
+    if (!audio || audio.length < 1600) return;
+    session.transcribing = true;
+    session.lastDraftRequest = performance.now();
+    session.requestId = final ? 'final' : 'draft';
+    session.status = final ? 'Refining transcript' : 'Updating draft transcript';
+    session.worker.postMessage({type: 'transcribe', requestId: session.requestId, audio: audio.buffer,
+        language: 'auto', maximumTokens: 128}, [audio.buffer]);
+}
+
+function startSpeechWorker(session) {
+    const worker = new Worker(new URL('./asr-worker.mjs', import.meta.url), {type: 'module'});
+    session.worker = worker;
+    speechWorker = worker;
+    worker.onerror = event => failSpeech(session, event.message);
+    worker.onmessage = ({data}) => {
+        if (session.worker !== worker) return;
+        if (data.type === 'progress') {
+            const percent = data.totalBytes ? (data.loadedBytes / data.totalBytes * 100).toFixed(0) : '0';
+            session.status = `Loading ${session.modelId} ${percent}%`;
+        } else if (data.type === 'ready') {
+            session.ready = true;
+            refreshCachedModels();
+            session.status = recording === session ? 'Listening' : 'Preparing final transcript';
+            requestSpeech(session, Boolean(session.finalAudio));
+        } else if (data.type === 'result') {
+            session.transcribing = false;
+            const transcript = data.text.trim();
+            if (data.requestId === 'draft' && !session.finalAudio) {
+                session.draftText = transcript;
+                updateDraft(transcript);
+                session.status = `Draft transcript / ${data.language}`;
+            } else if (session.finalAudio && data.requestId !== 'final') {
+                requestSpeech(session, true);
+            } else {
+                updateDraft(transcript);
+                element('generation-stats').textContent = transcript ?
+                    `Transcript ready / ${data.language} / ${(data.encode_ms + data.decode_ms).toFixed(0)} ms` :
+                    'No speech recognized';
+                if (!transcript) element('warning').textContent = 'No speech was recognized';
+                session.worker = null;
+                if (speechWorker === worker) speechWorker = null;
+                worker.terminate();
+                finish();
+                element('prompt').focus();
+            }
+        } else if (data.type === 'error') {
+            failSpeech(session, data.error);
+        }
+    };
+    const threads = crossOriginIsolated ? Number(element('threads').value) : 1;
+    worker.postMessage({type: 'load', source: session.modelId, threads});
+}
+
+function finishRecording() {
+    const session = recording;
+    if (!session) return;
+    recording = null;
+    const audio = resampleAudio(session.chunks, session.context.sampleRate);
+    releaseRecording(session);
+    if (audio.length < 1600) {
+        session.worker?.terminate();
+        session.worker = null;
+        if (speechWorker) speechWorker = null;
+        element('warning').textContent = 'Speech recording was too short';
+        element('generation-stats').textContent = '9,216-token context';
+        controls();
+        return;
+    }
+    session.finalAudio = audio;
+    session.status = 'Preparing final transcript';
+    busy = true;
+    controls();
+    element('warning').textContent = '';
+    element('generation-stats').textContent = session.status;
+    if (session.ready && !session.transcribing) requestSpeech(session, true);
+}
+
 if (!crossOriginIsolated) element('threads').value = '1';
 if (!crossOriginIsolated) element('threads').max = '1';
 for (const id of ['threads', 'manifest']) element(id).addEventListener('change', restart);
+element('speech-model').addEventListener('change', () => {
+    const value = element('speech-model').value.trim();
+    if (!MODEL_ID.test(value)) return;
+    preferences.speechModel = value;
+    try { localStorage.setItem(SETTINGS_STORAGE, JSON.stringify(preferences)); } catch {}
+});
 element('backend').addEventListener('change', () => {
     preferences.backend = element('backend').value;
     try { localStorage.setItem(SETTINGS_STORAGE, JSON.stringify(preferences)); } catch {}
@@ -330,9 +599,12 @@ async function loadRuntime(cacheOnly = false) {
     const backend = element('backend').value;
     const threads = backend === 'webgpu' ? 1 : Number(element('threads').value);
     if (!Number.isInteger(threads) || threads < 1 || threads > Number(element('threads').max)) return;
-    let manifest;
-    try { manifest = new URL(element('manifest').value, location.href).href; }
-    catch { element('warning').textContent = 'Enter a valid model source URL'; openSettings(); return; }
+    const manifest = element('manifest').value.trim();
+    if (!MODEL_ID.test(manifest)) {
+        element('warning').textContent = 'Enter a Hugging Face model ID such as google/gemma-4-E2B-it-qat-mobile-transformers';
+        openSettings();
+        return;
+    }
     restart();
     const version = runtimeVersion;
     loading = true;
@@ -384,6 +656,7 @@ async function loadRuntime(cacheOnly = false) {
             setRuntimeState('ready', 'Model ready', detail, data.backend === 'webgpu' ? 'GPU' : `CPU ${data.threads}T`);
             renderMessages();
             closeSettings();
+            refreshCachedModels();
             controls();
         } else if (data.type === 'step') {
             const messages = element('messages');
@@ -433,7 +706,7 @@ async function restoreCachedModel() {
     const version = runtimeVersion;
     const source = element('manifest').value;
     try {
-        if (await isModelCached(new URL(source, location.href).href) && version === runtimeVersion &&
+        if (await isModelCached(source) && version === runtimeVersion &&
             source === element('manifest').value && !worker && !loading && !busy)
             await loadRuntime(true);
     } catch {}
@@ -482,8 +755,17 @@ element('prompt').addEventListener('keydown', event => {
         element('compose').requestSubmit();
     }
 });
+element('mic').addEventListener('click', () => recording ? finishRecording() : startRecording());
 element('stop').addEventListener('click', () => {
-    if (!worker || !busy || stopping) return;
+    if (!busy || stopping) return;
+    if (speechWorker) {
+        speechWorker.terminate();
+        speechWorker = null;
+        element('generation-stats').textContent = 'Transcription cancelled';
+        finish();
+        return;
+    }
+    if (!worker) return;
     stopping = true;
     element('generation-stats').textContent = 'Stopping after current model step';
     controls();
@@ -495,10 +777,14 @@ element('clear-cache').addEventListener('click', async () => {
         await clearModelCache();
         element('cached').textContent = '0 MB';
         element('warning').textContent = 'Model cache cleared';
+        await refreshCachedModels();
     } catch (error) { element('warning').textContent = error.message; }
 });
 addEventListener('pagehide', () => {
     runtimeVersion++;
+    releaseRecording();
+    speechWorker?.terminate();
+    speechWorker = null;
     stopLiveStats();
     if (busy) {
         worker?.postMessage({type: 'cancel'});
@@ -512,4 +798,5 @@ addEventListener('pageshow', event => { if (event.persisted) { restart(); restor
 renderHistory();
 renderMessages();
 controls();
+refreshCachedModels();
 restoreCachedModel();

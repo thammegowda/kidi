@@ -97,6 +97,7 @@ public:
     bool greedy = false;
     bool vector_projection = false;
     bool eager = false;
+    bool quantize_int8 = false;
     Operation operation;
     float epsilon = 0;
     explicit MetalOperator(Stream& owner) : stream(owner) {}
@@ -108,6 +109,8 @@ public:
                                              std::int64_t{2}};
             auto scratch = stream.acquire(temporary_shape, DType::F32);
             require(mps::encode_greedy_token(stream.commands(), inputs[0], scratch, output));
+        } else if (quantize_int8) {
+            require(mps::encode_quantize_int8(stream.commands(), epsilon, inputs[0], output));
         } else if (eager)
             require(mps::encode_eager(stream.commands(), operation, epsilon, inputs, output));
         else if (quantized)
@@ -193,6 +196,13 @@ public:
             result->greedy = true;
             result->dynamic_count = 1;
             result->shape = {static_cast<std::int64_t>(inputs[0].numel() / inputs[0].size(-1))};
+            return result;
+        }
+        if (spec.operation == Operation::CAST && spec.dtype == DType::I8 && spec.epsilon > 0) {
+            result->quantize_int8 = true;
+            result->epsilon = spec.epsilon;
+            result->dynamic_count = 1;
+            result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
             return result;
         }
         bool device_fp32 = true;

@@ -1,18 +1,148 @@
 const CACHE_NAME = 'kidi-model-v1';
 const CHUNK_BYTES = 8 * 1024 * 1024;
+const MODEL_ID = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const hex = bytes => Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
 const digest = async data => hex(await crypto.subtle.digest('SHA-256', data));
 
+const referenceKey = modelId => `https://kidi.invalid/__model_refs__/${encodeURIComponent(modelId)}`;
+const configUrl = (modelId, revision) => `https://huggingface.co/${modelId}/resolve/${revision}/config.json`;
+
+async function resolveReference(source, cache, cacheOnly) {
+    const value = String(source).trim();
+    if (!MODEL_ID.test(value)) return new URL(value).href;
+    const key = referenceKey(value);
+    const cached = cache && await cache.match(key);
+    const cachedUrl = async () => {
+        if (!cached) return null;
+        const metadata = await cached.json();
+        const expected = configUrl(value, metadata.revision);
+        return /^[a-f0-9]{40}$/.test(metadata.revision) && metadata.url === expected ? expected : null;
+    };
+    if (cacheOnly) {
+        const resolved = await cachedUrl();
+        if (!resolved) throw new Error('Model cache has no resolved revision. Click Load model while online.');
+        return resolved;
+    }
+    try {
+        const path = value.split('/').map(encodeURIComponent).join('/');
+        const response = await fetch(`https://huggingface.co/api/models/${path}/revision/main`,
+            {mode: 'cors', credentials: 'omit', cache: 'no-cache', signal: AbortSignal.timeout(30000)});
+        if (!response.ok) throw new Error(`Hugging Face model lookup HTTP ${response.status}`);
+        const metadata = await response.json();
+        if (!/^[a-f0-9]{40}$/.test(metadata.sha || '')) throw new Error('Hugging Face returned an invalid revision');
+        const url = configUrl(value, metadata.sha);
+        if (cache) await cache.put(key, new Response(JSON.stringify({modelId: value, revision: metadata.sha, url}),
+            {headers: {'Content-Type': 'application/json'}}));
+        return url;
+    } catch (error) {
+        const resolved = await cachedUrl();
+        if (resolved) return resolved;
+        throw error;
+    }
+}
+
+export async function resolveModelSource(source, {cacheOnly = false} = {}) {
+    const cache = await caches.open(CACHE_NAME);
+    return resolveReference(source, cache, cacheOnly);
+}
+
+function hubFile(url) {
+    const match = /^\/([^/]+)\/([^/]+)\/resolve\/([a-f0-9]{40})\/([^/]+)$/.exec(url.pathname);
+    return match && {modelId: `${match[1]}/${match[2]}`, revision: match[3], name: match[4]};
+}
+
+async function cachedBytes(response, url) {
+    const sizeHeader = response.headers.get('X-Kidi-Size');
+    const total = sizeHeader === null ? NaN : Number(sizeHeader);
+    const range = /^(\d+)-(\d+)$/.exec(url.searchParams.get('kidi_range') || '');
+    if (range && Number.isSafeInteger(total) && total > 0) {
+        const start = Number(range[1]), end = Number(range[2]);
+        return Math.max(0, Math.min(end + 1, total) - start);
+    }
+    if (Number.isSafeInteger(total) && total >= 0) return total;
+    const lengthHeader = response.headers.get('Content-Length');
+    const length = lengthHeader === null ? NaN : Number(lengthHeader);
+    if (Number.isSafeInteger(length) && length >= 0) return length;
+    return (await response.arrayBuffer()).byteLength;
+}
+
+async function cacheInventory() {
+    const cache = await caches.open(CACHE_NAME);
+    const requests = await cache.keys();
+    const references = new Map();
+    const hubs = new Map();
+    for (const request of requests) {
+        const url = new URL(request.url);
+        if (url.origin === 'https://kidi.invalid' && url.pathname.startsWith('/__model_refs__/')) {
+            try {
+                const metadata = await (await cache.match(request)).json();
+                if (MODEL_ID.test(metadata.modelId) && /^[a-f0-9]{40}$/.test(metadata.revision) &&
+                    metadata.url === configUrl(metadata.modelId, metadata.revision))
+                    references.set(metadata.url, {modelId: metadata.modelId, key: request.url});
+            } catch {}
+            continue;
+        }
+        const file = url.origin === 'https://huggingface.co' && hubFile(url);
+        if (file) {
+            const source = configUrl(file.modelId, file.revision);
+            let model = hubs.get(source);
+            if (!model) {
+                model = {id: source, source, modelId: file.modelId, revision: file.revision,
+                    files: new Map(), cacheKeys: new Set(), config: null};
+                hubs.set(source, model);
+            }
+            const response = await cache.match(request);
+            const record = model.files.get(file.name) || {name: file.name, bytes: 0};
+            record.bytes += await cachedBytes(response.clone(), url);
+            model.files.set(file.name, record);
+            model.cacheKeys.add(request.url);
+            if (file.name === 'config.json' && !url.search) {
+                try { model.config = await response.json(); } catch {}
+            }
+        }
+    }
+    const models = [];
+    for (const model of hubs.values()) {
+        const reference = references.get(model.source);
+        if (reference) model.cacheKeys.add(reference.key);
+        const files = [...model.files.values()].sort((left, right) => right.bytes - left.bytes);
+        const kind = model.config?.model_type === 'whisper' ? 'Speech' :
+            model.config?.model_type === 'gemma4' ? 'Chat' : 'Model';
+        models.push({...model, name: reference?.modelId || model.modelId, kind, files,
+            bytes: files.reduce((sum, file) => sum + file.bytes, 0), complete: await isModelCached(model.source)});
+    }
+    return {cache, models};
+}
+
+export async function listCachedModels() {
+    const {models} = await cacheInventory();
+    return models.map(({cacheKeys, ...model}) => model);
+}
+
+export async function deleteCachedModel(id) {
+    const {cache, models} = await cacheInventory();
+    const target = models.find(model => model.id === id);
+    if (!target) return false;
+    for (const key of target.cacheKeys) await cache.delete(key);
+    return true;
+}
+
 export async function isModelCached(source) {
     try {
-        const url = new URL(source);
         const cache = await caches.open(CACHE_NAME);
+        const url = new URL(await resolveReference(source, cache, true));
         const keys = new Set((await cache.keys()).map(request => request.url));
         if (!keys.has(url.href)) return false;
         if (url.pathname.endsWith('/config.json')) {
             if (url.origin !== 'https://huggingface.co' || url.search || url.hash ||
                 !/^\/[^/]+\/[^/]+\/resolve\/[a-f0-9]{40}\/config\.json$/.test(url.pathname)) return false;
-            for (const name of ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'])
+            const response = await cache.match(url.href);
+            const config = await response.json();
+            const required = config.model_type === 'whisper' &&
+                config.architectures?.includes('WhisperForConditionalGeneration')
+                ? ['tokenizer.json', 'preprocessor_config.json', 'generation_config.json']
+                : ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
+            for (const name of required)
                 if (!keys.has(new URL(name, url).href)) return false;
             const key = new URL('model.safetensors', url);
             key.searchParams.set('kidi_range', `0-${CHUNK_BYTES - 1}`);
@@ -58,9 +188,11 @@ function mountWeights(module, pointer, size) {
 
 function normalizationPlan(config, header, dataBytes) {
     const quantization = config.quantization_config;
-    if (config.model_type !== 'gemma4' || quantization?.quant_method !== 'gemma' ||
-        !quantization.quantize_embeddings || !config.text_config || config.text_config.enable_moe_block)
-        throw new Error('Expected a dense Gemma 4 mobile-QAT checkpoint');
+    const gemma = config.model_type === 'gemma4' && quantization?.quant_method === 'gemma' &&
+        quantization.quantize_embeddings && config.text_config && !config.text_config.enable_moe_block;
+    const whisper = config.model_type === 'whisper' &&
+        config.architectures?.includes('WhisperForConditionalGeneration');
+    if (!gemma && !whisper) throw new Error('Expected a supported Gemma 4 or Whisper checkpoint');
     const widths = {BOOL: 1, U8: 1, I8: 1, U16: 2, I16: 2, F16: 2, BF16: 2,
         U32: 4, I32: 4, F32: 4, U64: 8, I64: 8, F64: 8};
     const ranges = [];
@@ -77,7 +209,7 @@ function normalizationPlan(config, header, dataBytes) {
             start < 0 || end < start || end > dataBytes || end - start !== elements * widths[tensor.dtype] ||
             start % widths[tensor.dtype]) throw new Error(`Invalid tensor range: ${name}`);
         let mask = 0;
-        if (/\.(weight|embedding_quantized)$/.test(name) && ['U8', 'I8'].includes(tensor.dtype)) {
+        if (gemma && /\.(weight|embedding_quantized)$/.test(name) && ['U8', 'I8'].includes(tensor.dtype)) {
             const module = name.replace(/\.(weight|embedding_quantized)$/, '');
             if (quantization.modules_to_not_convert.some(excluded => module.includes(excluded)))
                 throw new Error(`Unexpected quantized excluded tensor: ${name}`);
@@ -158,6 +290,8 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly)
     };
     const configData = await get(configUrl);
     const config = JSON.parse(new TextDecoder().decode(configData.bytes));
+    const whisper = config.model_type === 'whisper' &&
+        config.architectures?.includes('WhisperForConditionalGeneration');
     const weightsUrl = new URL('model.safetensors', configUrl);
     const first = await get(weightsUrl, 0, CHUNK_BYTES - 1);
     const size = first.total;
@@ -192,19 +326,24 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly)
     module.HEAPU8.set(normalizedHeader, pointer + 8);
     module.FS.mkdir('/model');
     mountWeights(module, pointer, size);
-    for (const name of ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja']) {
+    if (whisper) module.FS.writeFile('/model/config.json', new Uint8Array(configData.bytes));
+    const metadata = whisper ? ['tokenizer.json', 'preprocessor_config.json', 'generation_config.json']
+        : ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
+    for (const name of metadata) {
         const file = await get(new URL(name, configUrl));
         module.FS.writeFile(`/model/${name}`, new Uint8Array(file.bytes));
         metrics.totalBytes += file.bytes.byteLength;
         metrics.loadedBytes += file.bytes.byteLength;
         report(name);
     }
-    module.FS.writeFile('/model/model.yaml', JSON.stringify({format_version: 1,
+    if (!whisper) module.FS.writeFile('/model/model.yaml', JSON.stringify({format_version: 1,
         weights_file: 'model.safetensors', tokenizer_file: 'tokenizer.json',
         model: {...config.text_config, type: 'gemma4_text', packed_weights_signed: true,
             quantization_config: config.quantization_config},
         decode: {maximum_new_tokens: 1024, context_size: 9216}}));
-    return {...metrics, warning, model: 'Gemma 4 E2B IT', precision: 'QAT mixed 2/4/8-bit', id: configUrl.href};
+    const modelName = whisper ? (config._name_or_path?.split('/').at(-1) || 'Whisper') : 'Gemma 4 E2B IT';
+    return {...metrics, warning, model: modelName,
+        precision: whisper ? 'FP32' : 'QAT mixed 2/4/8-bit', id: configUrl.href};
 }
 
 export async function loadModel(module, manifestUrl, progress, {cacheOnly = false} = {}) {
@@ -212,6 +351,7 @@ export async function loadModel(module, manifestUrl, progress, {cacheOnly = fals
     let warning = '';
     try { cache = await caches.open(CACHE_NAME); }
     catch (error) { warning = `Persistent cache unavailable: ${error.message}`; }
+    manifestUrl = await resolveReference(manifestUrl, cache, cacheOnly);
     if (new URL(manifestUrl).pathname.endsWith('/config.json'))
         return loadHubModel(module, manifestUrl, progress, cache, warning, cacheOnly);
     let response;

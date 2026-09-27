@@ -9,6 +9,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
 
 option(KIDI_BUILD_TESTS "Build kidi tests" ON)
+option(KIDI_BUILD_INTEGRATION_TESTS "Register Python, browser, and model regression tests" OFF)
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
 if(EMSCRIPTEN)
@@ -35,10 +36,8 @@ if(EMSCRIPTEN)
         add_compile_options(-pthread)
         add_link_options(-pthread -sPTHREAD_POOL_SIZE=7)
     endif()
-    set(YNNPACK_TARGET_PROCESSOR wasm CACHE STRING "" FORCE)
 endif()
 include(cmake/dependencies.cmake)
-include(cmake/ynnpack.cmake)
 
 add_library(kidi_argparse src/kidi/cli/argparse.cpp)
 add_library(kidi::argparse ALIAS kidi_argparse)
@@ -46,18 +45,22 @@ target_include_directories(kidi_argparse PUBLIC $<BUILD_INTERFACE:${CMAKE_CURREN
 target_compile_features(kidi_argparse PUBLIC cxx_std_23)
 
 add_library(kidi
+    src/kidi/audio/whisper.cpp
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
     src/kidi/inference/decoder.cpp
     src/kidi/inference/generator.cpp
+    src/kidi/inference/transcriber.cpp
     src/kidi/inference/translator.cpp
     src/kidi/layers/position_encoding.cpp
     src/kidi/layers/gemma4.cpp
     src/kidi/layers/transformer.cpp
+    src/kidi/layers/whisper.cpp
     src/kidi/model/config.cpp
     src/kidi/model/gemma4.cpp
     src/kidi/model/package.cpp
     src/kidi/model/transformer.cpp
+    src/kidi/model/whisper.cpp
     src/kidi/model/weights.cpp
     src/kidi/ops/context.cpp
     src/kidi/ops/quantization.cpp
@@ -85,7 +88,8 @@ if(EMSCRIPTEN)
         --no-entry -sMODULARIZE=1 -sEXPORT_NAME=createKidi -sENVIRONMENT=web,worker,node
         -sFORCE_FILESYSTEM=1 -sINITIAL_MEMORY=64MB
         "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8']"
-        "-sEXPORTED_FUNCTIONS=['_malloc']")
+        "-sEXPORTED_FUNCTIONS=['_malloc','_free']"
+    )
     if(KIDI_WASM_WEBGPU)
         target_link_options(kidi_wasm PRIVATE "-sJSPI_EXPORTS=['kidi_configure','kidi_load','kidi_enqueue','kidi_step','kidi_cancel']")
         if(KIDI_BUILD_TESTS)
@@ -102,20 +106,21 @@ endif()
 if(KIDI_BUILD_BENCHMARKS)
     add_executable(kidi_gemma4_quality benchmarks/gemma4/quality.cpp)
     target_link_libraries(kidi_gemma4_quality PRIVATE kidi::kidi)
+    add_executable(kidi_whisper_quality benchmarks/whisper/quality.cpp)
+    target_link_libraries(kidi_whisper_quality PRIVATE kidi::kidi)
 endif()
 
 target_include_directories(kidi
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
         $<INSTALL_INTERFACE:include>
-    PRIVATE
-        ${KIDI_THIRD_PARTY_DIR}/xnnpack
 )
 
 target_compile_features(kidi PUBLIC cxx_std_23)
 target_link_libraries(kidi
     PUBLIC
-        kidi::ynnpack
+        ynnpack
+        ynnpack_composites
         yaml-cpp::yaml-cpp
     PRIVATE
         tokenizerpp

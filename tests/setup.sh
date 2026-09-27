@@ -9,11 +9,11 @@ environment="$root/.cache/test-venv"
 requirements="$root/tests/requirements.txt"
 flag="$environment/._OK"
 
-if [[ -x "$environment/bin/python" && -f "$flag" ]] && cmp -s "$requirements" "$flag"; then
+if [[ -x "$environment/bin/python" && -f "$flag" ]] && cmp -s "$requirements" "$flag" &&
+    "$environment/bin/python" -c 'import sys; raise SystemExit(sys.version_info < (3, 12))'; then
     printf 'Skipping Python test setup: %s\n' "$flag"
 else
-    mkdir -p "$environment"
-    rm -f "$flag"
+    rm -rf "$environment"
     "${PYTHON:-python3}" -m venv "$environment"
     "$environment/bin/python" -m pip install --disable-pip-version-check -r "$requirements"
     cp "$requirements" "$flag"

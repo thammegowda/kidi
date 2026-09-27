@@ -31,6 +31,30 @@ auto type(DType dtype) -> ynn_type {
     }
 }
 auto check(ynn_status status) -> void { require(ynn::check_status(status, "eager CPU operator")); }
+auto transpose_packed_tile(const Tensor& input, std::int32_t bits, std::size_t row_start, std::size_t row_count,
+                           std::size_t column_start, std::size_t column_count) -> std::vector<std::uint8_t> {
+    const auto values_per_byte = static_cast<std::size_t>(8 / bits);
+    const auto logical_columns = input.size(1) * values_per_byte;
+    if (input.dtype() != DType::U8 || input.dimensions() != 2 || row_start + row_count > input.size(0) ||
+        column_start + column_count > logical_columns || row_count % values_per_byte)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed feed-forward tile"});
+    const auto& source_tensor = input;
+    const auto source = require(source_tensor.data<std::uint8_t>());
+    const auto destination_row_bytes = row_count / values_per_byte;
+    std::vector<std::uint8_t> destination(column_count * destination_row_bytes);
+    const auto mask = static_cast<std::uint8_t>((1 << bits) - 1);
+    for (std::size_t row = 0; row < row_count; ++row)
+        for (std::size_t column = 0; column < column_count; ++column) {
+            const auto source_column = column_start + column;
+            const auto value = static_cast<std::uint8_t>(
+                (source[(row_start + row) * input.size(1) + source_column / values_per_byte] >>
+                 ((source_column % values_per_byte) * bits)) &
+                mask);
+            destination[column * destination_row_bytes + row / values_per_byte] |=
+                static_cast<std::uint8_t>(value << ((row % values_per_byte) * bits));
+        }
+    return destination;
+}
 class Scatter final : public Operator {
 public:
     explicit Scatter(tensor::Arena& arena) : pool_(&arena) {}
@@ -115,6 +139,123 @@ public:
 private:
     OutputPool pool_;
 };
+class QuantizeInt8 final : public Operator {
+public:
+    QuantizeInt8(float scale, tensor::Arena& arena) : scale_(scale), pool_(&arena) {}
+    auto run(TensorInputs inputs) -> Tensor override {
+        const auto& input = inputs[0];
+        auto output = pool_.acquire(input.shape(), DType::I8, tensor::Device::cpu());
+        const auto source = require(input.data<float>());
+        auto destination = require(output.data<std::int8_t>());
+        for (std::size_t index = 0; index < source.size(); ++index) {
+            const auto rounded = std::nearbyint(source[index] / scale_);
+            destination[index] = static_cast<std::int8_t>(std::clamp(rounded, -128.F, 127.F));
+        }
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "quantization cannot run in place"});
+    }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    float scale_;
+    OutputPool pool_;
+};
+class QuantizedAttention final : public Operator {
+public:
+    QuantizedAttention(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
+        : heads_(static_cast<std::size_t>(spec.attributes[0])),
+          key_heads_(static_cast<std::size_t>(spec.attributes[1])),
+          key_start_(static_cast<std::size_t>(spec.attributes[2])),
+          key_length_(static_cast<std::size_t>(spec.attributes[3])),
+          scale_(spec.epsilon),
+          key_scales_(spec.quantization[0].scales.begin(), spec.quantization[0].scales.end()),
+          key_zero_points_(spec.quantization[0].zero_points.begin(), spec.quantization[0].zero_points.end()),
+          key_block_size_(spec.quantization[0].block_size),
+          value_scales_(spec.quantization[1].scales.begin(), spec.quantization[1].scales.end()),
+          value_zero_points_(spec.quantization[1].zero_points.begin(), spec.quantization[1].zero_points.end()),
+          value_block_size_(spec.quantization[1].block_size),
+          batch_size_(inputs[0].size(0)),
+          query_length_(inputs[0].size(1)),
+          head_dim_(inputs[0].size(2) / heads_),
+          key_batch_stride_(inputs[1].size(0) == 1 ? 0 : inputs[1].size(1) * inputs[1].size(2)),
+          pool_(&arena) {
+        const auto& mask = inputs[3];
+        std::array<std::size_t, 4> strides{};
+        std::size_t stride = 1;
+        for (std::size_t source_axis = mask.dimensions(); source_axis-- > 0;) {
+            const auto target_axis = 4 - mask.dimensions() + source_axis;
+            strides[target_axis] = mask.size(source_axis) == 1 ? 0 : stride;
+            stride *= mask.size(source_axis);
+        }
+        mask_batch_stride_ = strides[0];
+        mask_head_stride_ = strides[1];
+        mask_query_stride_ = strides[2];
+        mask_key_stride_ = strides[3];
+        const auto params = parameters();
+        work_items_ = ::ynn::quantized_attention_f32_work_items(params);
+        tasks_ = std::min(ynn::thread_count(), work_items_);
+        task_scratch_bytes_ = ::ynn::quantized_attention_f32_scratch_size(params);
+        scratch_.resize(tasks_ * task_scratch_bytes_);
+    }
+    auto run(TensorInputs inputs) -> Tensor override {
+        const auto& query = inputs[0];
+        auto output = pool_.acquire(query.shape(), DType::F32, tensor::Device::cpu());
+        const auto params = parameters();
+        const auto query_data = require(query.data<float>());
+        const auto key_data = require(inputs[1].data<std::int8_t>());
+        const auto value_data = require(inputs[2].data<std::int8_t>());
+        const auto mask_data = require(inputs[3].data<float>());
+        auto output_data = require(output.data<float>());
+        const auto rows_per_task = (work_items_ + tasks_ - 1) / tasks_;
+        require(ynn::parallel_for(tasks_, [&](std::size_t task) {
+            const auto row_start = task * rows_per_task;
+            const auto row_end = std::min(row_start + rows_per_task, work_items_);
+            ::ynn::quantized_attention_f32(params, query_data.data(), key_data.data(), value_data.data(),
+                                           mask_data.data(), output_data.data(), row_start, row_end,
+                                           scratch_.data() + task * task_scratch_bytes_);
+        }));
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "attention is not an in-place operation"});
+    }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto parameters() const -> ::ynn::quantized_attention_f32_params {
+        return {
+            .batch_size = batch_size_,
+            .query_length = query_length_,
+            .query_heads = heads_,
+            .key_value_heads = key_heads_,
+            .key_start = key_start_,
+            .key_length = key_length_,
+            .head_dim = head_dim_,
+            .key_batch_stride = key_batch_stride_,
+            .mask_batch_stride = mask_batch_stride_,
+            .mask_head_stride = mask_head_stride_,
+            .mask_query_stride = mask_query_stride_,
+            .mask_key_stride = mask_key_stride_,
+            .scale = scale_,
+            .key_quantization = {key_scales_.data(), key_zero_points_.data(), key_block_size_, key_scales_.size()},
+            .value_quantization = {value_scales_.data(), value_zero_points_.data(), value_block_size_,
+                                   value_scales_.size()},
+        };
+    }
+
+    std::size_t heads_, key_heads_, key_start_, key_length_;
+    std::size_t mask_batch_stride_, mask_head_stride_, mask_query_stride_, mask_key_stride_;
+    std::size_t batch_size_, query_length_, head_dim_, key_batch_stride_;
+    float scale_;
+    std::vector<float> key_scales_, value_scales_;
+    std::vector<std::int32_t> key_zero_points_, value_zero_points_;
+    std::size_t key_block_size_, value_block_size_;
+    std::size_t work_items_, tasks_, task_scratch_bytes_;
+    std::vector<std::byte> scratch_;
+    OutputPool pool_;
+};
 class CpuOperator final : public Operator {
 public:
     CpuOperator(ynn::Executable executable, std::size_t count, std::size_t dynamic_count, DType dtype,
@@ -178,14 +319,23 @@ public:
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
         if (spec.operation == Operation::SCATTER) return std::make_unique<Scatter>(arena_);
         if (spec.operation == Operation::GREEDY_TOKEN) return std::make_unique<GreedyToken>(arena_);
+        if (spec.operation == Operation::CAST && spec.dtype == DType::I8 && spec.epsilon > 0)
+            return std::make_unique<QuantizeInt8>(spec.epsilon, arena_);
+        if (spec.operation == Operation::ATTENTION) {
+            const bool byte_cache = inputs[1].dtype() == DType::I8 && !spec.quantization[0].scales.empty() &&
+                                    !spec.quantization[1].scales.empty();
+            if (byte_cache && inputs[0].dtype() == DType::F32 && inputs[2].dtype() == inputs[1].dtype())
+                return std::make_unique<QuantizedAttention>(spec, inputs, arena_);
+        }
         const auto flags = inputs[0].dtype() == DType::BF16 ? YNN_FLAG_NO_EXCESS_PRECISION : 0;
         const bool paired = spec.operation == Operation::RESIDUAL_NORM;
         auto graph = require(ynn::Graph::create(inputs.size() + (paired ? 2 : 1), flags));
         auto native = graph.get();
-        const auto constant = !spec.dynamic_parameters &&
-                              (spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
-                               spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RMS_NORM ||
-                               spec.operation == Operation::PACKED_LINEAR || paired);
+        const auto constant =
+            !spec.dynamic_parameters &&
+            (spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
+             spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RMS_NORM ||
+             spec.operation == Operation::PACKED_LINEAR || spec.operation == Operation::GATED_FEED_FORWARD || paired);
         const std::size_t dynamic_count = constant ? (paired ? 2 : 1) : inputs.size();
         const std::size_t column_alignment = spec.operation == Operation::PACKED_LINEAR ? 8 / spec.attributes[0] : 1;
         const auto padded_columns =
@@ -199,7 +349,8 @@ public:
             std::vector<std::size_t> shape(inputs[index].shape().begin(), inputs[index].shape().end());
             const bool parameter = index >= dynamic_count;
             if (parameter) id = YNN_INVALID_VALUE_ID;
-            const bool packed = spec.operation == Operation::PACKED_LINEAR && index == 1;
+            const bool packed = (spec.operation == Operation::PACKED_LINEAR && index == 1) ||
+                                (spec.operation == Operation::GATED_FEED_FORWARD && (index == 1 || index == 3));
             if (packed) shape[1] *= 8 / spec.attributes[0];
             const auto dtype = packed ? (spec.attributes[0] == 2   ? ynn_type_int2
                                          : spec.attributes[0] == 4 ? ynn_type_int4
@@ -390,8 +541,56 @@ public:
                 }
                 break;
             }
+            case Operation::GATED_FEED_FORWARD: {
+                const auto bits = static_cast<std::int32_t>(spec.attributes[0]);
+                const auto input_size = static_cast<std::size_t>(spec.attributes[1]);
+                const auto intermediate = static_cast<std::size_t>(spec.attributes[2]);
+                const auto gate_output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[3]));
+                const auto down_input_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[4]));
+                const auto down_output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[5]));
+                constexpr std::size_t TILE_SIZE = 2048;
+                const auto tiles = (intermediate + TILE_SIZE - 1) / TILE_SIZE;
+                std::vector<std::uint32_t> gate_weight_ids(tiles), gate_scale_ids(tiles), up_weight_ids(tiles),
+                    up_scale_ids(tiles), down_weight_ids(tiles);
+                const auto define_weight = [&](const Tensor& weight, std::size_t row_start, std::size_t row_count,
+                                               std::size_t column_start, std::size_t column_count) {
+                    const auto bytes =
+                        transpose_packed_tile(weight, bits, row_start, row_count, column_start, column_count);
+                    const std::array<std::size_t, 2> shape{column_count, row_count};
+                    auto id = YNN_INVALID_VALUE_ID;
+                    const auto dtype = bits == 2 ? ynn_type_int2 : bits == 4 ? ynn_type_int4 : ynn_type_int8;
+                    check(ynn_define_tensor(native, dtype, shape.size(), shape.data(), bytes.data(),
+                                            YNN_VALUE_FLAG_COPY_DATA, &id));
+                    return id;
+                };
+                const auto& scales_tensor = inputs[2];
+                const auto scales = require(scales_tensor.data<float>());
+                const auto define_scales = [&](std::size_t start, std::size_t length) {
+                    const std::array<std::size_t, 2> shape{length, 1};
+                    auto id = YNN_INVALID_VALUE_ID;
+                    check(ynn_define_tensor(native, ynn_type_fp32, shape.size(), shape.data(), scales.data() + start,
+                                            YNN_VALUE_FLAG_COPY_DATA, &id));
+                    return id;
+                };
+                for (std::size_t tile = 0; tile < tiles; ++tile) {
+                    const auto begin = tile * TILE_SIZE;
+                    const auto length = std::min(TILE_SIZE, intermediate - begin);
+                    gate_weight_ids[tile] = define_weight(inputs[1], begin, length, 0, input_size);
+                    gate_scale_ids[tile] = define_scales(begin, length);
+                    up_weight_ids[tile] = define_weight(inputs[1], intermediate + begin, length, 0, input_size);
+                    up_scale_ids[tile] = define_scales(intermediate + begin, length);
+                    down_weight_ids[tile] = define_weight(inputs[3], 0, input_size, begin, length);
+                }
+                check(::ynn::define_packed_feed_forward(
+                    native, operands[0], scalar(spec.epsilon), gate_weight_ids.data(), gate_scale_ids.data(),
+                    up_weight_ids.data(), up_scale_ids.data(), scalar(gate_output_scale), down_weight_ids.data(),
+                    operands[4], scalar(down_input_scale), scalar(down_output_scale), input_size, intermediate,
+                    TILE_SIZE, true, result));
+                break;
+            }
+            case Operation::GELU_MULTIPLY:
             case Operation::GELU: {
-                if (spec.attributes[0]) {
+                if (spec.operation == Operation::GELU_MULTIPLY || spec.attributes[0]) {
                     auto square = binary(ynn_binary_multiply, operands[0], operands[0]);
                     auto cubic = binary(ynn_binary_multiply, square, operands[0]);
                     auto inner =
@@ -402,6 +601,8 @@ public:
                               binary(ynn_binary_multiply, inner, scalar(std::sqrt(2.F / 3.14159265358979323846F)))));
                     result = binary(ynn_binary_multiply, binary(ynn_binary_multiply, operands[0], scalar(0.5F)),
                                     probability);
+                    if (spec.operation == Operation::GELU_MULTIPLY)
+                        result = binary(ynn_binary_multiply, result, operands[1]);
                     break;
                 }
                 auto normalized = binary(ynn_binary_multiply, operands[0], scalar(std::sqrt(2.0F) / 2.0F));
@@ -508,7 +709,6 @@ public:
             case Operation::SCATTER:
             case Operation::GREEDY_TOKEN:
             case Operation::RMS_ROTARY:
-            case Operation::GELU_MULTIPLY:
                 break;
             case Operation::EMBEDDING:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "device embedding is not implemented by this backend"});

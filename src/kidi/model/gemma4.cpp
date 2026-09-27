@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <numeric>
 #include <regex>
 
@@ -54,6 +55,22 @@ auto float_parameter(const Tensor& input) -> Tensor {
     auto values = require(output.data<float>());
     for (std::size_t index = 0; index < values.size(); ++index)
         values[index] = std::bit_cast<float>(static_cast<std::uint32_t>(source[index]) << 16);
+    return output;
+}
+auto concatenate_projection_rows(const Tensor& first, const Tensor& second) -> Tensor {
+    if (first.dimensions() != 2 || second.dimensions() != 2 || first.dtype() != second.dtype() ||
+        !std::ranges::equal(first.shape(), second.shape()))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "gate/up projection shape or dtype mismatch"});
+    auto shape = std::vector<std::int64_t>(first.shape().begin(), first.shape().end());
+    shape[0] *= 2;
+    auto output = require(Tensor::empty(shape, first.dtype()));
+    auto destination = require(output.host_bytes());
+    const auto first_host = require(first.to(tensor::Device::cpu()));
+    const auto second_host = require(second.to(tensor::Device::cpu()));
+    const auto first_bytes = require(first_host.host_bytes());
+    const auto second_bytes = require(second_host.host_bytes());
+    std::ranges::copy(first_bytes, destination.begin());
+    std::ranges::copy(second_bytes, destination.begin() + first_bytes.size());
     return output;
 }
 } // namespace
@@ -242,7 +259,11 @@ auto Gemma4Impl::set_checkpoint(const Weights& weights, std::int32_t weight_bits
             constexpr std::string_view PREFIX = "model.language_model.";
             if (!key.starts_with(PREFIX) && !(impl_->qat && key.starts_with("lm_head."))) continue;
             const auto name = key.starts_with(PREFIX) ? key.substr(PREFIX.size()) : key;
-            if (!declared.contains(name)) {
+            auto declaration = name;
+            for (const auto marker : {std::string_view(".mlp.gate_proj."), std::string_view(".mlp.up_proj.")})
+                if (const auto position = name.find(marker); position != std::string::npos)
+                    declaration.replace(position, marker.size(), ".mlp.gate_up_proj.");
+            if (!declared.contains(declaration)) {
                 if (name.starts_with("layers.") &&
                     (name.find(".self_attn.k_proj.") != std::string::npos ||
                      name.find(".self_attn.v_proj.") != std::string::npos ||
@@ -255,9 +276,7 @@ auto Gemma4Impl::set_checkpoint(const Weights& weights, std::int32_t weight_bits
             if (impl_->qat && (value.dtype() == DType::U8 || value.dtype() == DType::I8)) {
                 const auto suffix = name.ends_with(".embedding_quantized") ? std::string(".embedding_quantized")
                                                                            : std::string(".weight");
-                const auto module = name.substr(0, name.size() - suffix.size());
-                const auto bits = quant_bits(impl_->construction_config,
-                                             module == "lm_head" ? module : "model.language_model." + module);
+                const auto bits = quant_bits(impl_->construction_config, key.substr(0, key.size() - suffix.size()));
                 if (impl_->construction_config["packed_weights_signed"].as<bool>(false)) {
                     if (!bits || value.dtype() != DType::U8)
                         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "signed packed weights must use U8 storage"});
@@ -275,18 +294,48 @@ auto Gemma4Impl::set_checkpoint(const Weights& weights, std::int32_t weight_bits
                     destination[offset] = std::to_integer<std::uint8_t>(source[offset]) ^ sign_mask;
                 state.emplace(name, std::move(converted));
             } else {
-                if (impl_->qat && name.ends_with("scale")) {
+                const bool quantization_scale = name.ends_with("weight_scale") || name.ends_with("embedding_scale") ||
+                                                name.ends_with("input_activation_scale") ||
+                                                name.ends_with("output_activation_scale") ||
+                                                name.ends_with("k_cache_scale") || name.ends_with("v_cache_scale");
+                if (impl_->qat && quantization_scale) {
                     const auto scales = require(value.data<float>());
-                    const bool positive = name.ends_with("weight_scale") || name.ends_with("embedding_scale");
-                    if (std::ranges::any_of(scales, [&](float scale) {
-                            return !std::isfinite(scale) || (positive ? scale <= 0 : scale < 0);
-                        }))
+                    if (std::ranges::any_of(scales, [](float scale) { return !std::isfinite(scale) || scale <= 0; }))
                         throw ops::Failure(
                             {ErrorCode::INVALID_ARGUMENT, "invalid trained quantization scale: " + name});
                 }
                 state.emplace(name, name.ends_with("norm.weight") || name.ends_with("layer_scalar")
                                         ? float_parameter(value)
                                         : value);
+            }
+        }
+        for (std::int32_t layer = 0; layer < impl_->layer_count; ++layer) {
+            const auto prefix = "layers." + std::to_string(layer) + ".mlp.";
+            for (const auto suffix :
+                 {std::string_view("weight"), std::string_view("weight_scale"),
+                  std::string_view("input_activation_scale"), std::string_view("output_activation_scale")}) {
+                if (!impl_->qat && suffix != "weight") continue;
+                const auto gate_name = prefix + "gate_proj." + std::string(suffix);
+                const auto up_name = prefix + "up_proj." + std::string(suffix);
+                const auto gate = state.find(gate_name), up = state.find(up_name);
+                if (gate == state.end() || up == state.end())
+                    throw ops::Failure(
+                        {ErrorCode::INVALID_ARGUMENT, "missing gate/up checkpoint parameter: " + prefix});
+                Tensor combined;
+                if (suffix.ends_with("activation_scale")) {
+                    const auto& gate_scale = gate->second;
+                    const auto& up_scale = up->second;
+                    if (gate_scale.numel() != 1 || up_scale.numel() != 1 ||
+                        require(gate_scale.data<float>())[0] != require(up_scale.data<float>())[0])
+                        throw ops::Failure({ErrorCode::UNSUPPORTED,
+                                            "gate/up activation scales must match for a fused linear: " + prefix});
+                    combined = gate->second;
+                } else {
+                    combined = concatenate_projection_rows(gate->second, up->second);
+                }
+                state.emplace(prefix + "gate_up_proj." + std::string(suffix), std::move(combined));
+                state.erase(gate);
+                state.erase(up);
             }
         }
         if (weight_bits)
@@ -322,7 +371,11 @@ auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
         Gemma4State result;
         result.capacity = capacity;
         // The QAT path already rounds cache rows onto an INT8 grid, so bytes cost no accuracy and a quarter the reads.
-        auto byte_cache = impl_->qat && device() == tensor::Device::web_gpu() && impl_->shared_begin > 0;
+        const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
+        const auto& capabilities = tensor::DEVICE_CAPABILITIES[device().kind];
+        auto byte_cache = (cache_override == nullptr || std::string_view(cache_override) != "0") && impl_->qat &&
+                          capabilities.calibrated_int8_cast && capabilities.blockwise_int8_attention &&
+                          capacity <= capabilities.blockwise_int8_attention_max_tokens && impl_->shared_begin > 0;
         for (int index = 0; byte_cache && index < impl_->shared_begin; ++index)
             byte_cache = impl_->layers->at(static_cast<std::size_t>(index))->has_cache_scales();
         const auto cache_dtype = byte_cache ? DType::I8 : DType::F32;
@@ -355,8 +408,8 @@ auto Gemma4Impl::fork_state(const Gemma4State& source, std::size_t prefix_length
                     throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 snapshot cache geometry"});
         auto result = require(create_state(capacity));
         for (std::size_t layer = 0; layer < source.layers.size(); ++layer) {
-            result.layers[layer].key_scale = source.layers[layer].key_scale;
-            result.layers[layer].value_scale = source.layers[layer].value_scale;
+            result.layers[layer].key_quantization = source.layers[layer].key_quantization;
+            result.layers[layer].value_quantization = source.layers[layer].value_quantization;
         }
         impl_->context.synchronize();
         if (prefix_length) {
@@ -500,6 +553,9 @@ auto Gemma4Impl::head(const Tensor& hidden, bool select) -> Tensor {
 }
 
 auto Gemma4Impl::prefill(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void> {
+    return prefill_impl(tokens, state);
+}
+auto Gemma4Impl::prefill_impl(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void> {
     try {
         if (tokens.empty() || state.position > state.capacity || tokens.size() > state.capacity - state.position ||
             state.layers.size() != static_cast<std::size_t>(impl_->shared_begin))
@@ -546,7 +602,7 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
             for (auto token : tokens)
                 if (token < 0 || token >= impl_->vocabulary || token >= impl_->per_layer_vocabulary)
                     throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "embedding token outside vocabulary"});
-            require(prefill(tokens.first(token_count - 1), state));
+            require(prefill_impl(tokens.first(token_count - 1), state));
             return project(tokens.last(1), state, false, select);
         }
         auto& context = impl_->context;

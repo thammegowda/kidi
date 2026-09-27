@@ -5,7 +5,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "kidi"
 dynamic = ["version"]
-description = "C++ inference for RTG translation and Gemma 4 text generation"
+description = "C++ inference for Whisper transcription, RTG translation, and Gemma 4 text generation"
 readme = "README.md"
 requires-python = ">=3.12"
 

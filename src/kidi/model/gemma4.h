@@ -45,6 +45,7 @@ private:
     auto head(const tensor::Tensor& hidden, bool select) -> tensor::Tensor;
     auto run_batch(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states, bool select)
         -> Result<tensor::Tensor>;
+    auto prefill_impl(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void>;
     /// Runs every layer and the output head; `batch_states` decodes one token per request.
     auto project(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits, bool select,
                  std::span<Gemma4State*> batch_states = {}) -> Result<tensor::Tensor>;

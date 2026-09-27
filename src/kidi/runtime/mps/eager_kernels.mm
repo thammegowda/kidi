@@ -13,6 +13,7 @@ constexpr const char* SOURCE = R"metal(
 #include <metal_stdlib>
 using namespace metal;
 struct Geometry { uint count, width, other, heads, mode; float epsilon; };
+struct Quantization { uint count; float scale; };
 struct Candidate { float value; int token; };
 struct Selection { uint width, parts, final; };
 kernel void greedy_token(device const float* input [[buffer(0)]], device Candidate* candidates [[buffer(1)]],
@@ -57,6 +58,11 @@ kernel void round_to_half(device const float* input [[buffer(0)]], device half* 
                           constant Geometry& geometry [[buffer(4)]], uint index [[thread_position_in_grid]]) {
     if (index < geometry.count)
         output[index] = half(clamp(rint(input[index] / geometry.epsilon), -128.0f, 127.0f) * geometry.epsilon);
+}
+kernel void quantize_int8(device const float* input [[buffer(0)]], device char* output [[buffer(1)]],
+                          constant Quantization& geometry [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if (index < geometry.count)
+        output[index] = char(clamp(rint(input[index] / geometry.scale), -128.0f, 127.0f));
 }
 kernel void rms(device const float* input [[buffer(0)]], device const float* scale [[buffer(1)]],
                 device const float* residual [[buffer(2)]], device const float* output_scale [[buffer(5)]],
@@ -119,7 +125,7 @@ kernel void pointwise(device const float* input [[buffer(0)]], device const floa
 }
 )metal";
 struct Pipelines {
-    id<MTLComputePipelineState> rms, pointwise, round_to_half, greedy_token;
+    id<MTLComputePipelineState> rms, pointwise, round_to_half, greedy_token, quantize_int8;
 };
 auto pipelines() -> Result<std::shared_ptr<Pipelines>> {
     static std::mutex mutex;
@@ -145,7 +151,10 @@ auto pipelines() -> Result<std::shared_ptr<Pipelines>> {
             [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"round_to_half"] error:&error];
         result->greedy_token = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"greedy_token"]
                                                                      error:&error];
-        if (!result->rms || !result->pointwise || !result->round_to_half || !result->greedy_token)
+        result->quantize_int8 =
+            [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"quantize_int8"] error:&error];
+        if (!result->rms || !result->pointwise || !result->round_to_half || !result->greedy_token ||
+            !result->quantize_int8)
             return std::unexpected(Error{ErrorCode::RUNTIME, "create eager Metal pipelines"});
         cached = result;
         return result;
@@ -179,6 +188,28 @@ auto encode_greedy_token(CommandBatch& batch, const tensor::Tensor& input, tenso
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [encoder endEncoding];
     }
+    return {};
+}
+auto encode_quantize_int8(CommandBatch& batch, float scale, const tensor::Tensor& input, tensor::Tensor& output)
+    -> Result<void> {
+    auto shared = pipelines();
+    if (!shared) return std::unexpected(std::move(shared.error()));
+    auto source = tensor::metal_buffer(input), target = tensor::metal_buffer(output);
+    if (!source) return std::unexpected(std::move(source.error()));
+    if (!target) return std::unexpected(std::move(target.error()));
+    const struct {
+        std::uint32_t count;
+        float scale;
+    } geometry{static_cast<std::uint32_t>(input.numel()), scale};
+    MPSCommandBuffer* buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
+    id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
+    if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create INT8 quantization encoder"});
+    [encoder setComputePipelineState:(*shared)->quantize_int8];
+    [encoder setBuffer:(__bridge id<MTLBuffer>)source->handle offset:source->offset_bytes atIndex:0];
+    [encoder setBuffer:(__bridge id<MTLBuffer>)target->handle offset:target->offset_bytes atIndex:1];
+    [encoder setBytes:&geometry length:sizeof(geometry) atIndex:2];
+    [encoder dispatchThreads:MTLSizeMake(input.numel(), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder endEncoding];
     return {};
 }
 auto encode_eager(CommandBatch& batch, Operation operation, float epsilon, TensorInputs inputs, tensor::Tensor& output)

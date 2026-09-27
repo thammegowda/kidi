@@ -22,6 +22,7 @@
 #include "kidi/model/config.h"
 #include "kidi/inference/translator.h"
 #include "kidi/inference/generator.h"
+#include "kidi/inference/transcriber.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/tensor/backend.h"
 
@@ -40,6 +41,38 @@ auto backend_label(kidi::tensor::Device device) -> std::string_view {
 }
 
 auto inspect(const std::filesystem::path& directory) -> int {
+    if (!std::filesystem::is_regular_file(directory / "model.yaml")) {
+        auto config = kidi::model::load_whisper_config(directory);
+        if (!config) {
+            spdlog::error("{}", config.error().message);
+            return 1;
+        }
+        auto validation = kidi::model::WhisperImpl::validate_config((*config)["model"]);
+        if (!validation) {
+            spdlog::error("{}", validation.error().message);
+            return 1;
+        }
+        auto weights = kidi::model::Weights::load((*config)["model_file"].as<std::string>());
+        if (!weights) {
+            spdlog::error("{}", weights.error().message);
+            return 1;
+        }
+        const auto parameter = weights->tensor("model.encoder.conv1.weight");
+        if (!parameter) {
+            spdlog::error("{}", parameter.error().message);
+            return 1;
+        }
+        std::cout << "format: huggingface\n"
+                  << "model: whisper\n"
+                  << "weights: " << (*config)["model_file"].as<std::string>() << '\n'
+                  << "weight tensors: " << weights->size() << '\n'
+                  << "weight dtype: " << kidi::tensor::to_string(parameter->dtype()) << '\n'
+                  << "encoder layers: " << (*config)["model"]["encoder_layers"].as<int>() << '\n'
+                  << "decoder layers: " << (*config)["model"]["decoder_layers"].as<int>() << '\n'
+                  << "vocabulary: " << (*config)["model"]["vocab_size"].as<int>() << '\n'
+                  << "execution device: cpu\n";
+        return 0;
+    }
     auto document = kidi::model::load_config(directory / "model.yaml");
     if (!document) {
         spdlog::error("{}", document.error().message);
@@ -119,7 +152,7 @@ auto chat_messages(const nlohmann::json& request) -> kidi::Result<std::vector<ki
     if (request.contains("max_tokens") &&
         (!request["max_tokens"].is_number_integer() || request["max_tokens"] <= 0 || request["max_tokens"] > INT32_MAX))
         return invalid("max_tokens must be a positive integer within int32 bounds");
-    std::vector<kidi::text::ChatMessage> messages;
+    std::vector<kidi::text::ChatMessage> result;
     for (const auto& message : request["messages"]) {
         if (!message.is_object() || message.size() != 2 || !message.contains("role") || !message["role"].is_string() ||
             !message.contains("content"))
@@ -129,17 +162,20 @@ auto chat_messages(const nlohmann::json& request) -> kidi::Result<std::vector<ki
             content = message["content"].get<std::string>();
         } else if (message["content"].is_array()) {
             for (const auto& part : message["content"]) {
-                if (!part.is_object() || part.size() != 2 || !part.contains("type") || part["type"] != "text" ||
-                    !part.contains("text") || !part["text"].is_string())
-                    return invalid("content parts must be text objects; multimodal input is unsupported");
-                content += part["text"].get<std::string>();
+                if (!part.is_object() || part.size() != 2 || !part.contains("type"))
+                    return invalid("content parts must be text objects");
+                if (part["type"] == "text" && part.contains("text") && part["text"].is_string()) {
+                    content += part["text"].get<std::string>();
+                } else {
+                    return invalid("content parts must contain text");
+                }
             }
         } else {
             return invalid("content must be a string or an array of text parts");
         }
-        messages.push_back({message["role"].get<std::string>(), std::move(content)});
+        result.push_back({message["role"].get<std::string>(), std::move(content)});
     }
-    return messages;
+    return result;
 }
 
 struct ChatSession {
@@ -466,6 +502,64 @@ auto chat_command(const kidi::cli::Namespace& arguments, const std::filesystem::
     return kidi::cli::interactive_chat(session->generator, session->options, arguments, session->load_ns);
 }
 
+auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
+    const auto threads = arguments.get<std::int32_t>("threads");
+    if (threads <= 0) {
+        spdlog::error("thread count must be positive");
+        return 2;
+    }
+    if (arguments.get<std::string>("backend") == "mps") {
+        spdlog::error("Whisper currently requires the YNNPACK backend");
+        return 2;
+    }
+    kidi::runtime::ynn::set_thread_count(threads);
+    const auto started = std::chrono::steady_clock::now();
+    auto transcriber = kidi::inference::Transcriber::load(directory, kidi::tensor::Device::cpu());
+    if (!transcriber) {
+        spdlog::error("{}", transcriber.error().message);
+        return 1;
+    }
+    const auto load_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
+    auto waveform = kidi::audio::load_wav(arguments.get<std::filesystem::path>("input"));
+    if (!waveform) {
+        spdlog::error("{}", waveform.error().message);
+        return 2;
+    }
+    const kidi::inference::TranscriptionOptions options{
+        .language = arguments.get<std::string>("language"),
+        .task = arguments.get<std::string>("task"),
+        .maximum_tokens = arguments.get<std::size_t>("max_new_tokens"),
+    };
+    auto result = transcriber->transcribe(waveform->samples, waveform->sample_rate, options);
+    if (!result) {
+        spdlog::error("{}", result.error().message);
+        return result.error().code == kidi::ErrorCode::INVALID_ARGUMENT ? 2 : 1;
+    }
+    std::ofstream file;
+    std::ostream* output = &std::cout;
+    const auto& output_path = arguments.get<std::string>("output");
+    if (output_path != "-") {
+        file.open(output_path);
+        if (!file) {
+            spdlog::error("cannot open output file: {}", output_path);
+            return 1;
+        }
+        output = &file;
+    }
+    *output << result->text << '\n';
+    if (!*output) {
+        spdlog::error("cannot write transcription: {}", output_path);
+        return 1;
+    }
+    if (arguments.get<bool>("profile"))
+        std::cerr << "kidi_profile|backend=ynnpack|threads=" << threads << "|model_load_ns=" << load_ns
+                  << "|feature_ns=" << result->stats.feature_ns << "|encoder_ns=" << result->stats.encode_ns
+                  << "|decode_ns=" << result->stats.decode_ns << "|preparation_ns=" << result->stats.preparation_ns
+                  << "|tokens=" << result->token_ids.size() << "|language=" << result->language << '\n';
+    return 0;
+}
+
 } // namespace
 
 auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& resolve_model) -> int {
@@ -474,7 +568,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     spdlog::set_default_logger(std::move(logger));
     spdlog::set_pattern("[%n] [%l] %v");
     spdlog::cfg::load_env_levels();
-    kidi::cli::ArgumentParser parser("kidi", "Run translation and text generation models.");
+    kidi::cli::ArgumentParser parser("kidi", "Run translation, transcription and text generation models.");
     parser.version("kidi " + std::string(kidi::version()));
     auto& commands = parser.add_subparsers().required();
     auto& translate_parser = commands.add_parser("translate", "translate one Moses-tokenized line per input line");
@@ -483,6 +577,9 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     generate_parser.description("Generate with a chat model reading JSONL messages. Output preserves input order.");
     auto& chat_parser = commands.add_parser("chat", "interactive multi-turn chat with streaming replies");
     chat_parser.description("Chat in the terminal with a loaded model. Type /help for shell commands.");
+    auto& transcribe_parser = commands.add_parser("transcribe", "transcribe a 16 kHz WAV file with Whisper");
+    transcribe_parser.description(
+        "Transcribe or translate speech with an untouched Hugging Face Whisper Tiny, Base, or Small model.");
     chat_parser.add_argument("--system").default_value(std::string{}).help("system instruction");
     chat_parser.add_argument("--color")
         .default_value(std::string("auto"))
@@ -490,7 +587,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         .help("terminal colors; auto respects NO_COLOR");
     generate_parser.add_argument("--max-active").dest("max_active").default_value<std::size_t>(4);
     generate_parser.add_argument("--queue-size").dest("queue_size").default_value<std::size_t>(64);
-    for (auto* command_parser : {&translate_parser, &generate_parser, &chat_parser}) {
+    for (auto* command_parser : {&translate_parser, &generate_parser, &chat_parser, &transcribe_parser}) {
         command_parser->add_argument("-m", "--model")
             .type<std::filesystem::path>()
             .required()
@@ -506,6 +603,22 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         command_parser->add_argument("-j", "--threads").default_value<std::int32_t>(4);
         command_parser->add_argument("--profile").action(kidi::cli::Action::STORE_TRUE);
     }
+    transcribe_parser.add_argument("-i", "--in")
+        .dest("input")
+        .type<std::filesystem::path>()
+        .required()
+        .metavar("WAV")
+        .help("16 kHz PCM WAV input");
+    transcribe_parser.add_argument("-o", "--out")
+        .dest("output")
+        .default_value(std::string("-"))
+        .metavar("FILE")
+        .help("transcript file, or '-' for stdout");
+    transcribe_parser.add_argument("--language").default_value(std::string("auto")).metavar("CODE");
+    transcribe_parser.add_argument("--task")
+        .default_value(std::string("transcribe"))
+        .choices({"transcribe", "translate"});
+    transcribe_parser.add_argument("--max-new-tokens").dest("max_new_tokens").default_value<std::size_t>(128);
     for (auto* command_parser : {&generate_parser, &chat_parser}) {
         command_parser->add_argument("--cache-tokens")
             .dest("cache_tokens")
@@ -531,7 +644,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     }
 
     auto& inspect_parser = commands.add_parser("inspect", "inspect a model package");
-    inspect_parser.description("Inspect an RTG or Gemma 4 model package.");
+    inspect_parser.description("Inspect an RTG, Gemma 4, or direct Whisper model package.");
     inspect_parser.add_argument("-m", "--model")
         .type<std::filesystem::path>()
         .required()
@@ -604,6 +717,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         if (command == "translate") return translate_command(arguments, directory);
         if (command == "generate") return generate_command(arguments, directory);
         if (command == "chat") return chat_command(arguments, directory);
+        if (command == "transcribe") return transcribe_command(arguments, directory);
         throw std::logic_error("unhandled command: " + command);
     } catch (const kidi::cli::ParseError& error) {
         std::cerr << error.usage();

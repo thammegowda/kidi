@@ -55,4 +55,34 @@ auto load_config(const std::filesystem::path& path) -> Result<YAML::Node> {
     }
 }
 
+auto load_whisper_config(const std::filesystem::path& directory) -> Result<YAML::Node> {
+    try {
+        const auto root = std::filesystem::absolute(directory).lexically_normal();
+        if (!std::filesystem::is_directory(root))
+            return std::unexpected(Error{ErrorCode::IO, "not a model directory: " + directory.string()});
+        const auto config_path = root / "config.json";
+        if (!std::filesystem::is_regular_file(config_path))
+            return std::unexpected(Error{ErrorCode::IO, "config does not exist: " + config_path.string()});
+        auto model = YAML::LoadFile(config_path.string());
+        if (!model.IsMap() || model["model_type"].as<std::string>() != "whisper")
+            return std::unexpected(Error{ErrorCode::UNSUPPORTED, "checkpoint is not a Hugging Face Whisper model"});
+
+        YAML::Node config;
+        config["model"] = model;
+        config["model"]["type"] = "whisper";
+        for (const auto* name :
+             {"model.safetensors", "tokenizer.json", "preprocessor_config.json", "generation_config.json"}) {
+            auto resolved = resolve_file(root, YAML::Node(name));
+            if (!resolved) return std::unexpected(std::move(resolved.error()));
+            config[std::filesystem::path(name).stem().string() + "_file"] = resolved->string();
+        }
+        return config;
+    } catch (const YAML::Exception& error) {
+        return std::unexpected(
+            Error{ErrorCode::INVALID_MANIFEST, "invalid Whisper config: " + std::string(error.what())});
+    } catch (const std::filesystem::filesystem_error& error) {
+        return std::unexpected(Error{ErrorCode::IO, error.what()});
+    }
+}
+
 } // namespace kidi::model

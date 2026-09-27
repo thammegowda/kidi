@@ -5,7 +5,7 @@ tensors. There is no Kidi model graph, symbolic value type, generic compiler,
 lowerer, graph partitioner, or recorded control flow.
 
 ```text
-inference::Decoder -> model::{Transformer, Gemma4} -> layers -> ops::Context -> backend
+inference::{Decoder, Transcriber} -> model::{Transformer, Gemma4, Whisper} -> layers -> ops::Context -> backend
 ```
 
 ## Ownership
@@ -31,7 +31,8 @@ operators, not duplicated Transformer equations.
 Configuration stays in `YAML::Node`; there are no model-specific configuration
 structs or mirrored manifest types. `model::load_config` reads `model.yaml`,
 checks package structure and file paths, and resolves file paths relative to
-the package. `Package::config()` exposes that document.
+the package. `model::load_whisper_config` instead validates and resolves the untouched Hugging Face files in memory;
+it does not generate a manifest. `Package::config()` exposes RTG package documents.
 
 `config["model"]` is self-contained: `type`, architecture fields,
 and `source_tokens` live together. The package derives source padding and decoder
@@ -81,7 +82,8 @@ paths; unsupported or escaping paths are rejected. Dense Gemma 4 snapshots witho
 Kidi YAML use `kidi.converters.gemma4.configure`, under a per-snapshot lock, with an
 atomic no-overwrite config install. A local generated config exactly matching the
 old 256-output/2048-context defaults is atomically upgraded to 8192/16384 under
-that lock; customized configs and downloaded manifests are left alone. Original
+that lock; customized configs and downloaded manifests are left alone. Whisper conditional-generation snapshots
+download their original config, Safetensors, tokenizer, preprocessor, and generation metadata without modification. Original
 weights and tokenizer files remain unchanged. Incomplete
 caches fail rather than being marked ready; `HF_HUB_OFFLINE=1` requires cached
 files. No downloaded Python code or pickled checkpoints execute during resolution.
@@ -91,7 +93,7 @@ Explicit trusted RTG conversion is separate in `kidi.converters.rtg` with the
 Each model family has its own command rather than one command that branches on
 `model.type`. `translate` serves RTG and reads Moses-tokenized text lines;
 `generate` serves chat models and reads JSONL `messages` arrays with optional `id`
-and `max_tokens`; `chat` is the interactive terminal session. Both file commands
+and `max_tokens`; `chat` is the interactive terminal session; `transcribe` serves Whisper WAV input. Text file commands
 process lines in input order. A command run against the other family's package
 fails with an explicit message, and options that belong to the other family are
 rejected by the argument parser rather than by a runtime cross-check.
@@ -99,8 +101,8 @@ rejected by the argument parser rather than by a runtime cross-check.
 `Tokenizer::format_chat` uses the original checkpoint's
 Jinja template and special-token configuration; `Generator::enqueue_chat` passes
 the serialized result to the existing raw-prompt enqueue path. Text messages may
-include system/developer instructions and user/assistant history. Tools and
-multimodal content are rejected. No generic model execution abstraction is added.
+include system/developer instructions and user/assistant history. Multimodal content
+and tools are rejected. No generic model execution abstraction is added.
 
 The `chat` command uses stdin/stdout and the same
 loaded `Generator` for a terminal chat session. The shell owns system/user/assistant
@@ -110,6 +112,13 @@ reported without silently truncating history. Terminal commands, ANSI color poli
 and scoped SIGINT handling live in `cli/interactive.*`, outside inference code.
 `generate` and `chat` share model, backend and generation options; system/color
 options are chat-only, while file I/O and serving limits are generate-only.
+
+`model::Whisper` registers the upstream encoder/decoder hierarchy directly, including separate biasless key projections,
+learned decoder positions, fixed checkpoint encoder positions, and a tied output head. The 400-point Hann/STFT path uses
+the checkpoint's embedded 80-bin mel bank. Conv1D is expressed as im2col plus the existing optimized linear operation;
+attention, normalization, cache mutation, and projection remain ordinary eager operations. `inference::Transcriber` owns
+language detection, task/no-timestamp prefixes, token suppression, and greedy ASR policy. Native and browser Whisper are
+CPU-only and process one padded/truncated 30-second segment per call.
 
 ## Eager Contract
 
@@ -433,7 +442,7 @@ load time; there is no offline checkpoint conversion. Embeddings and the tied
 output projection retain CPU-mapped weights, with looked-up rows allocated on
 the execution device. Other projections execute on the selected backend.
 
-Gemma 4 generation supports greedy text-only requests, including packed independent
+Gemma 4 generation supports greedy text requests, including packed independent
 decode rows through `forward_batch` and `forward_batch_tokens`. Projection and
 pointwise work share packed rows; each attention segment retains its own cache,
 length, position and mask. Scoped decode projection policy preserves packed-vector

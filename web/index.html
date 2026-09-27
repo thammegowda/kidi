@@ -51,6 +51,7 @@
                     <label class="sr-only" for="prompt">Message</label>
                     <textarea id="prompt" rows="1" placeholder="Message Gemma" required></textarea>
                     <div class="compose-actions">
+                        <button id="mic" class="icon mic" type="button" title="Record speech" aria-label="Record speech" aria-pressed="false"><img src="./icons/mic.svg" alt=""></button>
                         <button id="stop" class="icon stop" type="button" title="Stop generation" aria-label="Stop generation" hidden><img src="./icons/square.svg" alt=""></button>
                         <button id="send" class="icon primary" type="submit" title="Send message" aria-label="Send message" disabled><img src="./icons/send-horizontal.svg" alt=""></button>
                     </div>
@@ -67,7 +68,9 @@
                 <label class="full" for="backend">Execution backend<select id="backend"><option value="cpu">WebAssembly CPU</option><option value="webgpu">WebGPU</option></select></label>
                 <label class="numeric-setting" for="threads">CPU threads<input id="threads" type="number" min="1" max="8" value="4"></label>
                 <label class="numeric-setting" for="tokens">Output tokens<input id="tokens" type="number" min="1" max="8192" value="1024"></label>
-                <label class="full" for="manifest">Model source<textarea id="manifest" rows="4" wrap="soft" spellcheck="false" autocomplete="off" autocapitalize="none" inputmode="url">https://huggingface.co/google/gemma-4-E2B-it-qat-mobile-transformers/resolve/dd693ff40353f057ca5f07e945ad867f4afbf2ec/config.json</textarea></label>
+                <label class="full" for="manifest">Chat model ID<input id="manifest" type="text" spellcheck="false" autocomplete="off" autocapitalize="none" value="google/gemma-4-E2B-it-qat-mobile-transformers"></label>
+                <label class="full" for="speech-model">Speech model ID<input id="speech-model" type="text" list="speech-models" spellcheck="false" autocomplete="off" autocapitalize="none" value="openai/whisper-tiny"></label>
+                <datalist id="speech-models"><option value="openai/whisper-tiny"><option value="openai/whisper-base"><option value="openai/whisper-small"></datalist>
             </div>
             <section class="runtime" aria-label="Runtime status">
                 <div class="runtime-toolbar">
@@ -77,7 +80,11 @@
                 <progress id="progress" value="0" max="1" hidden></progress>
                 <dl><dt>Download</dt><dd id="download">0 MB</dd><dt>From cache</dt><dd id="cached">0 MB</dd><dt>Load time</dt><dd id="load-time">--</dd><dt>Wasm heap</dt><dd id="memory">--</dd><dt>GPU buffers</dt><dd id="gpu-memory">--</dd></dl>
                 <p id="warning" role="alert"></p>
-                <button id="clear-cache" class="subtle" type="button"><img src="./icons/trash-2.svg" alt="">Clear model cache</button>
+                <section class="cache-manager" aria-labelledby="cache-title">
+                    <div class="cache-heading"><h3 id="cache-title">Cached models</h3><span id="cache-total">--</span></div>
+                    <div id="cache-models" class="cache-models" aria-live="polite"><p class="cache-empty">Reading cache</p></div>
+                    <button id="clear-cache" class="subtle" type="button"><img src="./icons/trash-2.svg" alt="">Clear all cached models</button>
+                </section>
             </section>
         </div>
     </dialog>

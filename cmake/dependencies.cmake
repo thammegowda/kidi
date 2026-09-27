@@ -20,6 +20,13 @@ kidi_require_submodule("RE2" "re2/CMakeLists.txt")
 kidi_require_submodule("tokenizerspp" "tokenizerspp/CMakeLists.txt")
 kidi_require_submodule("zlib" "zlib/zlib.h")
 kidi_require_submodule("spdlog" "spdlog/CMakeLists.txt")
+kidi_require_submodule("ynnpack-dev" "ynnpack-dev/CMakeLists.txt")
+
+add_subdirectory(
+    "${KIDI_THIRD_PARTY_DIR}/ynnpack-dev"
+    "${PROJECT_BINARY_DIR}/third_party/ynnpack-dev"
+    EXCLUDE_FROM_ALL
+)
 
 set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
 set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)

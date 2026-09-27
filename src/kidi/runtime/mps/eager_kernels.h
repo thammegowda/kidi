@@ -6,6 +6,8 @@
 namespace kidi::runtime::mps {
 auto encode_greedy_token(CommandBatch& batch, const tensor::Tensor& input, tensor::Tensor& scratch,
                          tensor::Tensor& output) -> Result<void>;
+auto encode_quantize_int8(CommandBatch& batch, float scale, const tensor::Tensor& input, tensor::Tensor& output)
+    -> Result<void>;
 auto encode_eager(CommandBatch& batch, Operation operation, float epsilon, TensorInputs inputs, tensor::Tensor& output)
     -> Result<void>;
 } // namespace kidi::runtime::mps
