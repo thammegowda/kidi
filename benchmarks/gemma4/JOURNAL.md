@@ -4,6 +4,162 @@ Short progress notes for the current implementation. Measurements are explorator
 unless explicitly labelled as paired acceptance results. Historical comparisons
 remain in [QAT.md](QAT.md).
 
+## 2026-09-25: Fusion Review and Fresh Baselines
+
+Goal: establish reproducible inference baselines before changing kernels. This
+entry tracks evidence, measurements, unsuccessful experiments, and next steps;
+the older entries below are history, not measurements of today's checkout.
+No inference optimization is included in this baseline pass.
+
+### Starting Point
+
+- Kidi: `b9b5214eba5855d987ada9810a2fb60ac70db232`, initially clean worktree.
+- YNNPACK: `2214cd93a6d2d259801b3511aa12984232c80eb8`.
+- Incoming review: WebGPU decode attention is flash-style, prefill is not;
+  MLP fusion is pointwise only; whole attention is not fused. CPU and Metal
+  express attention through backend graphs, which does not establish what their
+  compilers fuse. Treat native dispatch counts as unknown until profiled.
+
+### Structural Baseline
+
+The controlling WebGPU implementation is
+[`makeProgram`](../../web/webgpu-kernels.mjs). Initial source inspection gives:
+
+| Attention core | Dispatches | Global intermediate storage, excluding output |
+| --- | ---: | --- |
+| Decode, one query, 1-511 keys | 1 | No score/probability buffers |
+| Decode, one query, 512+ keys | 2 | `4 * B * H * S * (D + 2)` bytes of partial results |
+| Prefill, multiple queries | 3 | Two FP32 buffers, each `4 * B * H * Q * K` bytes |
+
+`B` is batch size, `H` query heads, `D` head width, `Q` query length, and `K`
+the active key length. `S = max(1, min(32, floor(K / 256)))`. The split threshold
+is **512 keys**, although each split targets roughly 256 keys. Decode uses online
+softmax; split decode combines rescaled partial sums in the second dispatch.
+Prefill separately computes scores, softmax, and the value product. These are
+attention-core counts, not counts for a layer, compute pass, or queue submission.
+
+The supplied review also identifies these boundaries to retain in the baseline:
+
+- [`GatedFeedForwardImpl`](../../src/kidi/layers/gemma4.cpp) calls gate and up
+  projections, `gelu_multiply`, then the down projection. Three separate linears
+  are not a fused MLP.
+- [`Context`](../../src/kidi/ops/context.cpp) dispatches the pointwise GELU/product
+  fusion on Metal/WebGPU; CPU uses separate operations.
+- Q/K/V projections, RMSNorm/RoPE, cache writes, attention core, and output
+  projection remain separate model operations. Fused RMSNorm/RoPE and
+  RMSNorm/residual do not imply whole-attention fusion.
+- Packed WebGPU projections fuse unpacking, dot products, scaling, and output
+  calibration. Calibrated input quantization remains a preceding dispatch.
+
+First falsifiable check: instantiate `makeProgram` at 255/256/511/512/2200 keys
+and for multi-query prefill, count scratch/stage/final dispatches, and inspect
+intermediate bytes. This checks program construction without a GPU; it does not
+validate WGSL compilation, numerical parity, or runtime timing. Existing browser
+numerical checks live in [backend_test.html](../../tests/web/backend_test.html).
+The check passed for all six cases: decode temporary bytes were 0 / 0 / 0 /
+16512 / 66048 at eight query heads and width 256; prefill at `B=1, H=8, Q=128,
+K=4096` requested 33554432 bytes (32 MiB). The first probe used the wrong spec
+field (`operands`); correcting it to `inputs` made the unchanged builder pass.
+Permanent dispatch-count regression coverage is still pending; baseline counts
+must be updated deliberately when a future optimization reduces them.
+
+### Measurement Protocol
+
+Use the existing [driver](run.py), the native mobile-QAT checkpoint, and a freshly
+built Release CLI. Do not compare cached binaries to a new source revision.
+
+- Native CPU/YNNPACK and Metal run sequentially, batch one, four CPU threads,
+  serial admission, context capacity 9216, and prefill chunks of 128.
+- Fixed synthetic prompt lengths: 128, 1024, and 4096 tokens. Generate 65 tokens:
+  one from prefill and 64 recurrent decode calls, greedy, ignoring EOS.
+- One warmup plus three measured requests in each loaded process. Report warm
+  medians and ranges, preserve individual records and generated output. Repeated
+  requests in one process are not independent process trials.
+- Record prefill tokens/s, recurrent decode tokens/s, first-token latency,
+  preparation time, load time, peak RSS, binary/model/prompt hashes, and the
+  executed precision policy. RSS is not total GPU/unified-memory usage.
+- Keep backend precision differences explicit: CPU uses native packed QAT;
+  default Metal prefill may use cached FP16 matrices. This is a shipped-policy
+  baseline, not a precision-matched CPU/GPU contest.
+- Unload browser models; avoid concurrent inference/builds and machine suspend.
+  Record hardware, OS, and swap state. Discard contaminated measurements.
+- WebGPU needs its own cold/warm runs and actual token counts. Historical
+  17/1413/4088-token browser results below are not interchangeable with this
+  native matrix. Record browser/GPU adapter, dispatches, GPU timestamps,
+  encoding/wait time, and memory before claiming a browser improvement.
+
+Reproduction template (run one case at a time):
+
+```sh
+cmake --preset release
+cmake --build --preset release --target kidi_cli
+.cache/gemma-venv/bin/python benchmarks/gemma4/run.py \
+  --runtime kidi --backend cpu \
+  --model ../models/gemma-4-E2B-it-qat-mobile-transformers \
+  --prefill 128 --decode 64 --context 9216 --chunk 128 --threads 4 \
+  --warmups 1 --runs 3 \
+  --output benchmarks/gemma4/baseline-2026-09-25/cpu-128.json
+```
+
+Repeat for `--backend gpu` and `--prefill 1024` / `4096`. Keep the raw JSON as
+the source of truth; do not fill a table from historical journal rates.
+
+### First Native Measurements: Contaminated by Paging
+
+Release configure/build succeeded. Environment: Apple M5, 10 CPU cores, 16 GiB
+RAM, macOS 26.6.2 (25G83), Apple clang 21.0.0, Python 3.12.14, tokenizers 0.23.2.
+Build flags were `-O3 -DNDEBUG`. Identity (SHA256):
+
+| Artifact | SHA256 |
+| --- | --- |
+| Release CLI | `02b94909b76d7fc7e772819e4ac82d316e481937379a553a9e03070fe682b1ec` |
+| QAT model.safetensors | `efab429012b97ab986c4d4838a46ff3ad95d618b42ce514771ca40fadc76a9a4` |
+| model.yaml | `2a2308457fcf39ce3cddca71ea4b0e78e16f33217246cadb96e9bbd089c12e7e` |
+| config.json | `cf6d7dc22738b5e6beb364bac833d78b869f5a6ffd57dfc96c6be3f2abc80424` |
+| tokenizer.json | `cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f` |
+
+Run order: CPU 128/1024/4096, then Metal 128/1024/4096. All six cases used this
+binary and checkpoint. Each raw file retains the prompt IDs/hash, output token
+IDs/text, three measured records, load time, process peak RSS, and CLI summary.
+Values below are warm median [minimum, maximum], in tokens/s.
+
+| Backend | Prompt | Prefill | Decode | Raw records |
+| --- | ---: | --- | --- | --- |
+| CPU | 128 | 1339.20 [1091.43, 1342.74] | 56.40 [55.61, 56.68] | [JSON](baseline-2026-09-25/cpu-128.json) |
+| CPU | 1024 | 1517.40 [1453.48, 1517.66] | 50.61 [50.60, 50.64] | [JSON](baseline-2026-09-25/cpu-1024.json) |
+| CPU | 4096 | 1335.87 [1319.53, 1392.41] | 39.85 [37.64, 39.90] | [JSON](baseline-2026-09-25/cpu-4096.json) |
+| Metal | 128 | 2267.96 [2239.30, 2401.70] | 81.66 [80.12, 87.56] | [JSON](baseline-2026-09-25/gpu-128.json) |
+| Metal | 1024 | 3714.77 [3387.07, 3774.12] | 83.90 [78.08, 84.11] | [JSON](baseline-2026-09-25/gpu-1024.json) |
+| Metal | 4096 | 3093.36 [2560.95, 3110.49] | 69.03 [64.84, 69.04] | [JSON](baseline-2026-09-25/gpu-4096.json) |
+
+All 18 measured requests reported zero operator preparation. Generated text was
+stable within each case but differed between CPU and Metal at every prompt
+length. Cross-backend parity or equivalent quality is not established. The driver
+verified exact prompt counts and 64 recurrent decode calls. Prefill/decode rates
+time model calls, not end-to-end generation. `ttft_ns` starts at enqueue and
+includes tokenization/admission; load time is separate.
+
+The environment invalidates these runs as an acceptance baseline: swap usage rose
+from 13996.56 to 17017.75 MiB. Between the pre/post snapshots, 16-KiB-page swap-in
+counters rose from 24407896 to 24449839, and swap-outs from 39678783 to 39912607.
+These are system-wide counters across the matrix, not per-request attribution.
+Normal memory-pressure status (`1`) at both endpoints did not imply no paging.
+The widest prefill range was 23%; small fusion wins cannot be assessed here.
+Keep the raw observations, but do not use them to claim a regression or speedup.
+A bounded repeat with two warmups and per-case paging counters is next.
+
+### Progress and Next Steps
+
+1. WebGPU attention dispatch/allocation construction check passed, including the
+  exact split boundary. GPU execution/numerical checks were not rerun.
+2. Fresh Release native matrix completed; paging makes it unsuitable for
+  acceptance. Repeat once with per-case environment observations.
+3. Fresh WebGPU timing and native kernel attribution remain separate follow-up
+   gates; no full-model bottleneck ranking is established by dispatch counts.
+4. After baselines, select one measured bottleneck, make one bounded change,
+   rerun existing numerical checks, then repeat the identical workload. Keep
+   changes only with a repeatable gain and explicitly assessed output parity.
+
 ## 2026-09-23: WebGPU Implementation In Progress
 
 The new backend has an explicit `web_gpu` tensor device and runs in the inference

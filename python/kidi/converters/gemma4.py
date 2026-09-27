@@ -38,7 +38,8 @@ def configure(directory: Path, *, upgrade_defaults: bool = False) -> Path:
     replace = False
     if destination.exists() and upgrade_defaults:
         legacy = {**document, "decode": {"maximum_new_tokens": 256, "context_size": 2048}}
-        if yaml.safe_load(destination.read_text(encoding="utf-8")) != legacy:
+        current = yaml.safe_load(destination.read_text(encoding="utf-8"))
+        if current not in (document, legacy):
             return destination
         replace = True
     temporary = None
@@ -61,8 +62,10 @@ def configure(directory: Path, *, upgrade_defaults: bool = False) -> Path:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
+    parser.add_argument("--upgrade-defaults", action="store_true",
+                        help="upgrade an unchanged generated manifest with current defaults")
     args = parser.parse_args()
-    print(configure(args.directory))
+    print(configure(args.directory, upgrade_defaults=args.upgrade_defaults))
 
 
 if __name__ == "__main__":

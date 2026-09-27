@@ -276,9 +276,7 @@ auto Gemma4Impl::set_checkpoint(const Weights& weights, std::int32_t weight_bits
             if (impl_->qat && (value.dtype() == DType::U8 || value.dtype() == DType::I8)) {
                 const auto suffix = name.ends_with(".embedding_quantized") ? std::string(".embedding_quantized")
                                                                            : std::string(".weight");
-                const auto module = name.substr(0, name.size() - suffix.size());
-                const auto bits = quant_bits(impl_->construction_config,
-                                             module == "lm_head" ? module : "model.language_model." + module);
+                const auto bits = quant_bits(impl_->construction_config, key.substr(0, key.size() - suffix.size()));
                 if (impl_->construction_config["packed_weights_signed"].as<bool>(false)) {
                     if (!bits || value.dtype() != DType::U8)
                         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "signed packed weights must use U8 storage"});
@@ -296,12 +294,13 @@ auto Gemma4Impl::set_checkpoint(const Weights& weights, std::int32_t weight_bits
                     destination[offset] = std::to_integer<std::uint8_t>(source[offset]) ^ sign_mask;
                 state.emplace(name, std::move(converted));
             } else {
-                if (impl_->qat && name.ends_with("scale")) {
+                const bool quantization_scale = name.ends_with("weight_scale") || name.ends_with("embedding_scale") ||
+                                                name.ends_with("input_activation_scale") ||
+                                                name.ends_with("output_activation_scale") ||
+                                                name.ends_with("k_cache_scale") || name.ends_with("v_cache_scale");
+                if (impl_->qat && quantization_scale) {
                     const auto scales = require(value.data<float>());
-                    const bool positive = name.ends_with("weight_scale") || name.ends_with("embedding_scale");
-                    if (std::ranges::any_of(scales, [&](float scale) {
-                            return !std::isfinite(scale) || (positive ? scale <= 0 : scale < 0);
-                        }))
+                    if (std::ranges::any_of(scales, [](float scale) { return !std::isfinite(scale) || scale <= 0; }))
                         throw ops::Failure(
                             {ErrorCode::INVALID_ARGUMENT, "invalid trained quantization scale: " + name});
                 }
@@ -554,6 +553,9 @@ auto Gemma4Impl::head(const Tensor& hidden, bool select) -> Tensor {
 }
 
 auto Gemma4Impl::prefill(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void> {
+    return prefill_impl(tokens, state);
+}
+auto Gemma4Impl::prefill_impl(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void> {
     try {
         if (tokens.empty() || state.position > state.capacity || tokens.size() > state.capacity - state.position ||
             state.layers.size() != static_cast<std::size_t>(impl_->shared_begin))
@@ -600,7 +602,7 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
             for (auto token : tokens)
                 if (token < 0 || token >= impl_->vocabulary || token >= impl_->per_layer_vocabulary)
                     throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "embedding token outside vocabulary"});
-            require(prefill(tokens.first(token_count - 1), state));
+            require(prefill_impl(tokens.first(token_count - 1), state));
             return project(tokens.last(1), state, false, select);
         }
         auto& context = impl_->context;

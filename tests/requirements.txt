@@ -1,2 +1,3 @@
 huggingface-hub==1.8.0
+PyYAML==6.0.3
 sacrebleu==2.6.0

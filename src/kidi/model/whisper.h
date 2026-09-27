@@ -1,0 +1,42 @@
+#pragma once
+
+#include <yaml-cpp/yaml.h>
+
+#include "kidi/audio/whisper.h"
+#include "kidi/layers/whisper.h"
+#include "kidi/model/weights.h"
+
+namespace kidi::model {
+
+struct WhisperEncoderState {
+    tensor::Tensor convolution;
+    tensor::Tensor hidden;
+    std::vector<layers::KeyValue> layers;
+};
+
+struct WhisperDecoderState {
+    std::vector<layers::KeyValue> layers;
+    tensor::Tensor mask, index;
+    std::size_t position = 0, capacity = 0;
+};
+
+KIDI_MODULE(Whisper);
+class WhisperImpl : public Module {
+public:
+    explicit WhisperImpl(const YAML::Node& config);
+    ~WhisperImpl();
+    static auto validate_config(const YAML::Node& config) -> Result<void>;
+    static auto create(const YAML::Node& config) -> Result<Whisper>;
+    auto set_checkpoint(const Weights& weights) -> Result<void>;
+    auto encode(const audio::WhisperFeatures& features) -> Result<WhisperEncoderState>;
+    auto create_state(std::size_t capacity) -> Result<WhisperDecoderState>;
+    auto forward(const WhisperEncoderState& source, std::span<const std::int32_t> tokens, WhisperDecoderState& state)
+        -> Result<tensor::Tensor>;
+    auto preparation_ns() const -> std::uint64_t;
+
+private:
+    struct State;
+    std::unique_ptr<State> impl_;
+};
+
+} // namespace kidi::model

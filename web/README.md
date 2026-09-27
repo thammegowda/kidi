@@ -1,6 +1,6 @@
 # Kidi WebAssembly Demo
 
-This directory builds a self-contained browser chat app for Gemma 4 E2B IT.
+This directory builds a self-contained browser chat app for Gemma 4 E2B IT with Whisper microphone dictation.
 It uses the released `google/gemma-4-E2B-it-qat-mobile-transformers` checkpoint,
 keeps its trained mixed 2/4/8-bit values, and runs Kidi's existing C++ Gemma
 model through WebAssembly.
@@ -42,7 +42,7 @@ The JavaScript files have distinct roles:
 
 | Files | Run in | Purpose |
 |---|---|---|
-| `app.mjs`, `inference-worker.mjs`, `model-cache.mjs` | Browser | Chat UI, Wasm execution, Hub downloads and cache |
+| `app.mjs`, `inference-worker.mjs`, `asr-worker.mjs`, `model-cache.mjs` | Browser | Chat UI, isolated Gemma/Whisper Wasm execution, Hub downloads and cache |
 | `build.mjs`, `wasm-glue.mjs` | Node.js during build | Compile/package Wasm and fix large-memory generated glue |
 | `src/web/libs/` | Build inputs | Pinned isolation helper, selected icons, and JavaScript parser dependencies |
 
@@ -52,19 +52,22 @@ JavaScript that runs in the browser. No Node server or model-export step is used
 
 ## Model Source
 
-The default source is Google's public upstream checkpoint pinned to revision
-`dd693ff40353f057ca5f07e945ad867f4afbf2ec`. No local model, export, HF token, or
-republished weights are required. The browser downloads the original Safetensors
+The default chat model ID is `google/gemma-4-E2B-it-qat-mobile-transformers`. No local model, export, HF token, or
+republished weights are required. Load resolves the Hub repository's current `main` revision to an immutable commit,
+then the browser downloads the original Safetensors
 file in 8 MiB HTTP ranges, caches those original bytes, and normalizes the packed
 integer representation once in the final Wasm buffer. This is lossless, not
 re-quantization. All checkpoint tensors, including vision/audio weights, are
 preserved; inference currently supports text only.
 
-Model source accepts a public Hub URL of the form
-`https://huggingface.co/OWNER/REPO/resolve/COMMIT_SHA/config.json` for a compatible
-single-file mobile-QAT checkpoint. Previously exported manifests remain readable
-for compatibility, but no export tooling is shipped. Mutable Hub
-revisions such as `main` are rejected so cached ranges cannot mix revisions.
+Settings accept a public `OWNER/REPO` Hub model ID. The resolved commit is cached separately from the mutable ID so
+byte ranges from different revisions cannot mix. Automatic startup remains offline: it reuses the last resolved commit
+only when every required file is cached. Previously exported manifests and pinned config URLs remain readable for
+compatibility, but are not shown in settings.
+
+Microphone dictation accepts `openai/whisper-tiny`, `openai/whisper-base`, or `openai/whisper-small`. The browser caches
+the selected model's five upstream files without conversion or a generated manifest. Whisper runs in an on-demand CPU
+Wasm worker with its own linear heap, including when Gemma uses WebGPU.
 
 ## Execution Modes
 
@@ -86,6 +89,10 @@ inside the browser.
 New chat creates a blank conversation; completed chats are stored in local
 browser storage and can be reopened or deleted from the history rail. Chat
 content is not sent to a server.
+
+The microphone button records at most 30 seconds, resamples captured mono PCM to 16 kHz, and transfers snapshots to the
+isolated Whisper worker. Automatic language detection is enabled. While recording, replaceable draft hypotheses appear
+in the composer; stopping runs a final pass that may refine them. The transcript is not sent to Gemma until submitted.
 
 On startup, a fully cached model loads automatically. The last successfully
 loaded source is remembered. Empty, partial, or unavailable caches leave the
@@ -203,7 +210,11 @@ revision. Previously exported manifests supply expected SHA-256 hashes for
 their chunks. Reloads fetch only missing or corrupt parts. The app requests
 persistent storage and shows cached versus downloaded bytes; browser quota and
 eviction policy still apply. Cache Storage belongs to the app origin, so changing
-hostname or port starts a separate cache. The trash button clears both formats.
+hostname or port starts a separate cache. Model settings lists each cached Hub
+revision, its files and sizes, and whether the download is complete. Delete
+removes one Hub model; Clear all also removes legacy manifest caches. Deleting a
+loaded model does not interrupt the current runtime, but the next load downloads
+it again.
 
 No checkpoint code or pickle data is executed. The browser reads YAML/JSON,
 Safetensors, tokenizer data, and static Wasm/JavaScript assets.

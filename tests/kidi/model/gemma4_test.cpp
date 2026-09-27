@@ -19,7 +19,10 @@ auto main() -> int {
             const auto values = ops::require(expected.data<float>());
             auto invalid_config = YAML::Clone(config);
             invalid_config.remove("global_head_dim");
-            if (model::Gemma4Impl::create(invalid_config)) return 1;
+            if (model::Gemma4Impl::create(invalid_config)) {
+                std::cerr << "Gemma accepted a configuration without global_head_dim\n";
+                return 1;
+            }
             std::vector devices{tensor::Device::cpu()};
 #if defined(__APPLE__)
             devices.push_back(tensor::Device::apple_gpu());

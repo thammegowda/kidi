@@ -1,4 +1,5 @@
 #include "kidi/inference/generator.h"
+#include "kidi/inference/transcriber.h"
 #include "kidi/runtime/ynn/graph.h"
 
 #include <emscripten.h>
@@ -8,6 +9,7 @@ namespace {
 constexpr int MAXIMUM_OUTPUT_TOKENS = 8192;
 constexpr std::size_t CONTEXT_TOKENS = 9216;
 std::optional<kidi::inference::Generator> generator;
+std::optional<kidi::inference::Transcriber> transcriber;
 std::string response;
 int configured_threads;
 #ifdef KIDI_HAS_WEBGPU
@@ -35,6 +37,26 @@ auto answer(Function&& function) -> const char* {
 auto loaded() -> kidi::inference::Generator& {
     if (!generator) throw std::runtime_error("Load a model first");
     return *generator;
+}
+auto loaded_transcriber() -> kidi::inference::Transcriber& {
+    if (!transcriber) throw std::runtime_error("Load a speech model first");
+    return *transcriber;
+}
+auto messages(const char* messages_json) -> std::vector<kidi::text::ChatMessage> {
+    std::vector<kidi::text::ChatMessage> result;
+    for (const auto& message : nlohmann::json::parse(messages_json))
+        result.push_back({message.at("role").get<std::string>(), message.at("content").get<std::string>()});
+    return result;
+}
+auto options(int maximum_tokens) -> kidi::inference::GenerationOptions {
+    if (maximum_tokens < 1 || maximum_tokens > MAXIMUM_OUTPUT_TOKENS)
+        throw std::runtime_error("Output tokens must be between 1 and 8192");
+    kidi::inference::GenerationOptions result;
+    result.maximum_new_tokens = maximum_tokens;
+    result.context_size = CONTEXT_TOKENS;
+    result.prefill_chunk_size = 32;
+    result.stream_text = true;
+    return result;
 }
 } // namespace
 
@@ -67,18 +89,38 @@ EMSCRIPTEN_KEEPALIVE auto kidi_load(const char* directory) -> const char* {
 
 EMSCRIPTEN_KEEPALIVE auto kidi_enqueue(const char* messages_json, int maximum_tokens) -> const char* {
     return answer([&]() -> nlohmann::json {
-        if (maximum_tokens < 1 || maximum_tokens > MAXIMUM_OUTPUT_TOKENS)
-            throw std::runtime_error("Output tokens must be between 1 and 8192");
-        std::vector<kidi::text::ChatMessage> messages;
-        for (const auto& message : nlohmann::json::parse(messages_json))
-            messages.push_back({message.at("role").get<std::string>(), message.at("content").get<std::string>()});
-        kidi::inference::GenerationOptions options;
-        options.maximum_new_tokens = maximum_tokens;
-        options.context_size = CONTEXT_TOKENS;
-        options.prefill_chunk_size = 32;
-        options.stream_text = true;
-        auto id = kidi::ops::require(loaded().enqueue_chat(messages, options));
+        auto id = kidi::ops::require(loaded().enqueue_chat(messages(messages_json), options(maximum_tokens)));
         return {{"request_id", id}};
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_load_asr(const char* directory) -> const char* {
+    return answer([&]() -> nlohmann::json {
+        if (!configured_threads) throw std::runtime_error("Configure the runtime before loading the speech model");
+        transcriber.emplace(
+            kidi::ops::require(kidi::inference::Transcriber::load(directory, kidi::tensor::Device::cpu())));
+        return {{"ready", true}, {"threads", configured_threads}, {"backend", "wasm-cpu"}};
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_transcribe(std::uint32_t samples_address, std::uint32_t sample_count,
+                                          const char* language, int maximum_tokens) -> const char* {
+    return answer([&]() -> nlohmann::json {
+        if (!samples_address || !sample_count || sample_count > 480000)
+            throw std::runtime_error("Speech must contain 1 to 480000 samples");
+        if (maximum_tokens < 1 || maximum_tokens > 444)
+            throw std::runtime_error("Speech output tokens must be between 1 and 444");
+        const auto samples = std::span(reinterpret_cast<const float*>(static_cast<std::uintptr_t>(samples_address)),
+                                       static_cast<std::size_t>(sample_count));
+        auto result = kidi::ops::require(loaded_transcriber().transcribe(
+            samples, 16000,
+            {.language = language, .task = "transcribe", .maximum_tokens = static_cast<std::size_t>(maximum_tokens)}));
+        return {{"text", result.text},
+                {"language", result.language},
+                {"token_ids", result.token_ids},
+                {"feature_ms", result.stats.feature_ns / 1e6},
+                {"encode_ms", result.stats.encode_ns / 1e6},
+                {"decode_ms", result.stats.decode_ns / 1e6}};
     });
 }
 

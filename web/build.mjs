@@ -1,5 +1,5 @@
 import {spawnSync} from 'node:child_process';
-import {mkdir, copyFile, readdir, readFile, writeFile} from 'node:fs/promises';
+import {mkdir, copyFile, readdir, readFile, rm, writeFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {resolve, join} from 'node:path';
 import {unsignedHeapIndices} from './wasm-glue.mjs';
@@ -7,6 +7,7 @@ import {unsignedHeapIndices} from './wasm-glue.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const libraries = join(root, 'src/web/libs');
 const destination = resolve(process.argv[2] || join(root, 'build-web'));
+await rm(destination, {recursive: true, force: true});
 for (const [name, threads, gpu] of [['single', 'OFF', 'OFF'], ['threads', 'ON', 'OFF'], ['gpu', 'OFF', 'ON']]) {
     const build = join(root, name === 'single' ? 'build-wasm' : name === 'gpu' ? 'build-webgpu' : 'build-wasm-threads');
     for (const [command, args] of [
@@ -25,7 +26,9 @@ for (const [name, threads, gpu] of [['single', 'OFF', 'OFF'], ['threads', 'ON', 
     const glue = join(destination, name, 'kidi.mjs');
     await writeFile(glue, unsignedHeapIndices(await readFile(glue, 'utf8')));
 }
-for (const file of ['index.html', 'app.mjs', 'style.css', 'inference-worker.mjs', 'model-cache.mjs', 'markdown.mjs', 'mermaid.mjs', 'webgpu.mjs', 'webgpu-kernels.mjs'])
+for (const file of ['index.html', 'app.mjs', 'style.css', 'inference-worker.mjs', 'asr-worker.mjs',
+    'audio-capture-worklet.mjs', 'speech.mjs', 'model-cache.mjs', 'markdown.mjs', 'mermaid.mjs',
+    'webgpu.mjs', 'webgpu-kernels.mjs'])
     await copyFile(join(root, 'web', file), join(destination, file));
 for (const name of ['marked', 'dompurify', 'highlightjs', 'mermaid']) {
     await mkdir(join(destination, 'libs', name), {recursive: true});
@@ -40,7 +43,7 @@ await writeFile(join(destination, '.nojekyll'), '');
 await mkdir(join(destination, 'icons'), {recursive: true});
 await copyFile(join(libraries, 'lucide-static/LICENSE'), join(destination, 'icons/LICENSE.txt'));
 for (const icon of ['send-horizontal', 'square', 'download', 'trash-2', 'plus', 'settings', 'x', 'panel-left',
-    'message-square'])
+    'message-square', 'mic'])
     await copyFile(join(libraries, 'lucide-static/icons', `${icon}.svg`), join(destination, 'icons', `${icon}.svg`));
 await copyFile(join(root, 'docs/kidi-logo-small.png'), join(destination, 'icons/kidi-logo.png'));
 console.log(`Browser app: ${destination}`);

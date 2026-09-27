@@ -4,11 +4,11 @@
 
 Kidi ("spark" in Kannada) is a lightweight C++23 inference toolkit. The same
 model code runs on CPU, Apple Metal, and WebAssembly CPU. It currently supports
-Gemma 4 text generation and RTG translation, with reusable tensors and neural
+Whisper transcription, Gemma 4 text generation, and RTG translation, with reusable tensors and neural
 layers for developers building other architectures.
 
 [Quick Start](#quick-start) | [Browser](#webassembly) | [Chat](#interactive-chat) |
-[Translation](#rtg-model-package) | [For Developers](#for-developers) |
+[Transcription](#whisper-transcription) | [Translation](#rtg-model-package) | [For Developers](#for-developers) |
 [Getting Started Guide](docs/getting-started.md)
 
 ## Why Kidi?
@@ -29,6 +29,7 @@ layers for developers building other architectures.
 
 | Model | Capabilities |
 |---|---|
+| Whisper Tiny/Base/Small | Multilingual speech transcription/translation from untouched Hugging Face FP32 checkpoints |
 | Gemma 4 E2B-it | Text chat and JSONL generation; original floating-point and mixed 2/4/8-bit mobile QAT checkpoints |
 | RTG Transformer | Translation with greedy or beam decoding; FP32, BF16, and INT8 packages |
 
@@ -38,8 +39,9 @@ in current 64-bit Chromium. Native Linux/Windows and Gemma E4B have not been
 validated end to end here.
 
 Model support is explicit: an arbitrary Hugging Face URL does not make a new
-architecture compatible. Chat is currently text-only and greedy; image/audio
-inference, tool execution, CUDA, and Apple Neural Engine execution are not implemented.
+architecture compatible. Whisper currently executes on YNNPACK CPU or Wasm CPU and accepts up to 30 seconds of
+16 kHz audio per request. Terminal chat and JSONL generation remain text-only and greedy. Image input, tool execution,
+CUDA, and Apple Neural Engine execution are not implemented.
 
 ## Quick Start
 
@@ -108,7 +110,7 @@ truncated. See the [chat guide](docs/getting-started.md#2-start-chat) for more.
 ### WebAssembly
 
 The browser app runs Gemma E2B locally, with streaming replies, saved chats,
-Markdown, code highlighting, diagrams, and generation statistics. It downloads
+Markdown, code highlighting, diagrams, generation statistics, and local microphone dictation through Whisper. It downloads
 the original pinned Google mobile-QAT checkpoint and caches it in the browser.
 Once the complete model is cached, it loads automatically on later visits.
 
@@ -131,6 +133,29 @@ context between the conversation and reply. Its cache is separate from the CLI's
 The [WebAssembly guide](web/README.md) covers browser requirements, static hosting,
 GitHub Pages deployment, caching, and measured performance.
 
+### Whisper Transcription
+
+Whisper Tiny, Base, and Small load directly from their original Hugging Face directories; no GGML/GGUF export or Kidi
+manifest is created.
+Input must be a mono or multichannel 16 kHz PCM WAV of at most 30 seconds. Channels are averaged to mono.
+
+```bash
+python -m kidi transcribe \
+  --model @openai/whisper-tiny \
+  --in speech.wav \
+  --language auto
+```
+
+Use an ISO language code such as `en`, `es`, `de`, `ja`, or `hi` to bypass detection. `--task translate` translates
+supported speech into English; the default task transcribes in the detected or selected language. Whisper is currently
+CPU-only, so use `--backend ynnpack` rather than Metal. The required checkpoint files are `config.json`,
+`model.safetensors`, `tokenizer.json`, `preprocessor_config.json`, and `generation_config.json`.
+
+The browser settings accept Hugging Face model IDs rather than file URLs. Loading resolves the repository's current
+`main` revision to an immutable commit before downloading. The speech model field offers `openai/whisper-tiny`,
+`openai/whisper-base`, and `openai/whisper-small`; larger models trade substantially more download, memory, and latency
+for accuracy. During recording, the composer shows replaceable draft text and runs a final refinement after stop.
+
 ### RTG Model Package
 
 The public [RTG 500 model](https://huggingface.co/thammegowda/rtg-500eng-v1)
@@ -146,7 +171,7 @@ login or manual conversion is required. Use `-m /path/to/rtg-model` for an
 existing local package. Text normalization and detokenization remain separate
 steps; see the [translation guide](docs/getting-started.md#rtg-translation-from-hugging-face).
 
-### Gemma 4 Text Generation
+### Gemma 4 Generation
 
 For scripts, `generate` reads chat requests as JSONL and returns one JSON response
 per input line, in order:
@@ -221,12 +246,15 @@ ctest --preset debug
 Browser loader and generated-glue tests use Node's built-in runner:
 
 ```bash
-node --test tests/web/model_cache_test.mjs
+node --test tests/web/*.mjs
 ```
 
-`make test` additionally builds the release CLI and runs the 50-sentence RTG
-regression, downloading a pinned public model on the first run. No Hub login
-is required. See [test fixtures and methodology](tests/data/README.md).
+`make test` builds every required artifact first, then runs the native,
+installed-wheel Python, browser, and 50-sentence RTG regression suites through
+one CTest invocation and summary. The pinned public model is downloaded on the
+first run; no Hub login is required. Each suite is also available as
+`native-test`, `python-test`, `web-test`, or `regression-test`. See [test
+fixtures and methodology](tests/data/README.md).
 
 ### Benchmark
 

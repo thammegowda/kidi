@@ -1,6 +1,8 @@
 /build*/
 /dist/
 /.cache/
+/.venv/
+/uv.lock
 /compile_commands.json
 .DS_Store
 __pycache__/
@@ -21,3 +23,4 @@ __pycache__/
 /benchmarks/gemma4/prefill-policy-probes.json
 /benchmarks/metal/*-20[0-9]*/**/*.txt
 /benchmarks/metal/execution-study-*.txt
+/benchmarks/**/baseline-20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/

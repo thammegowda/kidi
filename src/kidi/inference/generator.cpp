@@ -320,7 +320,7 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         stats.last_token_prefill = model_->last_token_prefill();
         stats.shared_prefill_tail = model_->shared_prefill_tail();
         waiting_.push_back(
-            {next_request_id_, std::move(tokens), capacity, options, std::move(search), {}, stats, started});
+            {next_request_id_, std::move(tokens), capacity, options, std::move(search), {}, stats, started, {}});
         return next_request_id_++;
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
@@ -434,10 +434,11 @@ auto Generator::step() -> Result<GenerationStep> {
             const auto started = Clock::now();
             const auto prepared = model_->preparation_ns();
             std::optional<std::int32_t> selected;
-            if (final_chunk)
+            if (final_chunk) {
                 selected = require(model_->forward_token(input, *request.state));
-            else
+            } else {
                 require(model_->prefill(input, *request.state));
+            }
             result.prefill_ns = elapsed(started);
             request.stats.prefill_ns += result.prefill_ns;
             request.stats.preparation_ns += model_->preparation_ns() - prepared;

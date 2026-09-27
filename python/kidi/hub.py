@@ -50,6 +50,7 @@ def resolve(reference: str, cache: str | Path = DEFAULT_CACHE) -> Path:
                                       allow_patterns=["model.yaml", "config.json"]))
     manifest = metadata / "model.yaml"
     document = None
+    direct = False
     if manifest.is_file():
         document = yaml.safe_load(manifest.read_text(encoding="utf-8"))
         files = _package_files(document)
@@ -60,13 +61,32 @@ def resolve(reference: str, cache: str | Path = DEFAULT_CACHE) -> Path:
             raise ValueError("Repository has neither a Kidi model.yaml nor a supported Gemma 4 config.json")
         original = json.loads(config_path.read_text(encoding="utf-8"))
         text = original.get("text_config", {})
-        if original.get("model_type") != "gemma4" or not isinstance(text, dict) or not text or text.get("enable_moe_block"):
-            raise ValueError("Automatic setup supports dense Gemma 4 checkpoints or ready-made Kidi packages only")
-        quantization = original.get("quantization_config")
-        if quantization and quantization.get("quant_method") != "gemma":
-            raise ValueError("Only native Gemma mobile QAT or original floating-point checkpoints are supported")
-        files = ["config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"]
-        gemma = True
+        if original.get("model_type") == "gemma4" and isinstance(text, dict) and text and not text.get("enable_moe_block"):
+            quantization = original.get("quantization_config")
+            if quantization and quantization.get("quant_method") != "gemma":
+                raise ValueError("Only native Gemma mobile QAT or original floating-point checkpoints are supported")
+            files = ["config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"]
+            gemma = True
+        elif (original.get("model_type") == "whisper"
+              and original.get("architectures") == ["WhisperForConditionalGeneration"]
+              and (original.get("d_model"), original.get("encoder_layers"), original.get("decoder_layers"),
+                   original.get("encoder_attention_heads"), original.get("decoder_attention_heads"),
+                   original.get("encoder_ffn_dim"), original.get("decoder_ffn_dim")) in {
+                       (384, 4, 4, 6, 6, 1536, 1536),
+                       (512, 6, 6, 8, 8, 2048, 2048),
+                       (768, 12, 12, 12, 12, 3072, 3072),
+                   }
+              and original.get("num_mel_bins") == 80
+              and original.get("vocab_size") == 51865):
+            files = ["config.json", "model.safetensors", "tokenizer.json", "preprocessor_config.json",
+                     "generation_config.json"]
+            gemma = False
+            direct = True
+        else:
+            raise ValueError(
+                "Automatic setup supports dense Gemma 4, Whisper conditional-generation checkpoints, "
+                "or ready-made Kidi packages only"
+            )
 
     optional = []
     if gemma:
@@ -82,11 +102,12 @@ def resolve(reference: str, cache: str | Path = DEFAULT_CACHE) -> Path:
     lock_path = cache_dir / ".locks" / f"kidi-{repo_id.replace('/', '--')}-{directory.name}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(lock_path):
-        manifest = directory / "model.yaml"
-        if not manifest.is_file() or (gemma and not manifest.is_symlink() and (directory / "config.json").is_file()):
-            from .converters.gemma4 import configure
+        if not direct:
+            manifest = directory / "model.yaml"
+            if not manifest.is_file() or (gemma and not manifest.is_symlink() and (directory / "config.json").is_file()):
+                from .converters.gemma4 import configure
 
-            configure(directory, upgrade_defaults=True)
-        _package_files(yaml.safe_load((directory / "model.yaml").read_text(encoding="utf-8")))
+                configure(directory, upgrade_defaults=True)
+            _package_files(yaml.safe_load((directory / "model.yaml").read_text(encoding="utf-8")))
     print(f"[kidi] Model ready: {directory}", file=sys.stderr)
     return directory
