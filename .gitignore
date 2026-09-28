@@ -44,7 +44,6 @@ __pycache__/
 *.wav
 !/tests/data/**/*.safetensors
 !/tests/data/**/*.wav
-!/benchmarks/android/speech.wav
 
 /tests/**/.cache/
 /tests/**/*.log
@@ -61,3 +60,5 @@ __pycache__/
 /benchmarks/metal/*-20[0-9]*/**/*.txt
 /benchmarks/metal/execution-study-*.txt
 /benchmarks/**/baseline-20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+/benchmarks/android/*.json
+/benchmarks/android/JOURNAL.md

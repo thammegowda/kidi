@@ -1,0 +1,65 @@
+#version 450
+
+#ifdef USE_SUBGROUP
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+#ifdef USE_DOT
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4450)
+int packedDot(int left, int right, spirv_literal int format);
+#endif
+#ifndef LOCAL_SIZE
+#define LOCAL_SIZE 128
+#endif
+
+layout(local_size_x = LOCAL_SIZE) in;
+layout(set = 0, binding = 0, std430) readonly buffer Activations { float activation[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Weights { uint packed[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Scales { float scale[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer Results { float result[]; };
+layout(push_constant) uniform Dimensions { uint width; uint rows; } dimensions;
+shared float partial[LOCAL_SIZE];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= dimensions.rows) return;
+#ifdef USE_DOT
+    int sum = 0;
+    for (uint channel = lane * 4; channel < dimensions.width; channel += LOCAL_SIZE * 4) {
+        uint offset = row * dimensions.width + channel;
+        uint raw = packed[offset / 8] >> (4 * (offset % 8));
+        uint activationWord = 0;
+        uint weightWord = 0;
+        for (uint element = 0; element < 4; ++element) {
+            int weight = int(((raw >> (element * 4)) & 15) ^ 8) - 8;
+            int value = int(round(activation[channel + element] * 16.0));
+            activationWord |= (uint(value) & 255) << (element * 8);
+            weightWord |= (uint(weight) & 255) << (element * 8);
+        }
+        sum += packedDot(int(activationWord), int(weightWord), 0);
+    }
+    int total = subgroupAdd(sum);
+    if (lane == 0) result[row] = float(total) * 0.0625 * scale[row];
+#else
+    float sum = 0.0;
+    for (uint channel = lane; channel < dimensions.width; channel += LOCAL_SIZE) {
+        uint offset = row * dimensions.width + channel;
+        uint raw = (packed[offset / 8] >> (4 * (offset % 8))) & 15;
+        int weight = int(raw ^ 8) - 8;
+        sum += activation[channel] * float(weight);
+    }
+#ifdef USE_SUBGROUP
+    float total = subgroupAdd(sum);
+    if (lane == 0) result[row] = total * scale[row];
+#else
+    partial[lane] = sum;
+    barrier();
+    for (uint stride = LOCAL_SIZE / 2; stride > 0; stride /= 2) {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        barrier();
+    }
+    if (lane == 0) result[row] = partial[0] * scale[row];
+#endif
+#endif
+}
