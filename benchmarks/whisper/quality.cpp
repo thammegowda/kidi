@@ -82,6 +82,13 @@ auto main(int argc, char** argv) -> int {
         const auto actual_logits = require(logits.data<float>());
         const auto expected_logits = read_f32(reference / "logits.f32");
         compare("logits", actual_logits, expected_logits);
+        auto prefixed_state = require(model->create_state(32));
+        const std::array<std::int32_t, 3> prefix{50258, 50259, 50359};
+        require(model->prefill(source, prefix, prefixed_state));
+        const std::int32_t final_prefix = 50363;
+        const auto prefixed_logits = require(model->forward(source, std::span(&final_prefix, 1), prefixed_state));
+        if (!std::ranges::equal(actual_logits, require(prefixed_logits.data<float>())))
+            throw std::runtime_error("Whisper prefix-only decoding changed logits");
         if (std::ranges::max_element(actual_logits) - actual_logits.begin() !=
             std::ranges::max_element(expected_logits) - expected_logits.begin())
             throw std::runtime_error("Whisper top logit differs from reference");

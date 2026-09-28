@@ -60,6 +60,19 @@ auto main() -> int {
         for (std::size_t index = 0; index < actual_values.size(); ++index)
             if (!std::isfinite(actual_values[index]) || std::abs(actual_values[index] - expected_values[index]) > 0.02F)
                 return 1;
+        const auto quiet = require(Tensor::zeros({1, 4, 2}, kidi::tensor::DType::F32));
+        const auto repeated = quantized->forward(context, quiet);
+        const auto repeated_values = require(repeated.data<float>()), bias_values = require(bias.data<float>());
+        for (std::size_t index = 0; index < repeated_values.size(); ++index)
+            if (std::abs(repeated_values[index] - bias_values[index % 3]) > 1e-6F) return 1;
+        for (const std::int64_t length : {17, 33, 3}) {
+            const auto varying = require(Tensor::zeros({1, length, 2}, kidi::tensor::DType::F32));
+            const auto resized = quantized->forward(context, varying);
+            if (resized.size(1) != static_cast<std::size_t>(length)) return 1;
+            const auto values = require(resized.data<float>());
+            for (std::size_t index = 0; index < values.size(); ++index)
+                if (std::abs(values[index] - bias_values[index % 3]) > 1e-6F) return 1;
+        }
     }
     return 0;
 }

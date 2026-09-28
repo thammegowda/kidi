@@ -40,6 +40,18 @@ auto main() -> int {
     if (!features || features->bins != 80 || features->frames != 3000 || features->values.size() != 240000) return 1;
     for (auto value : features->values)
         if (value != -1.5F) return 1;
+    for (const std::size_t length : {1, 159, 160, 201, 401}) {
+        std::vector<float> signal(length);
+        for (std::size_t index = 0; index < length; ++index)
+            signal[index] = static_cast<float>(static_cast<int>(index % 17) - 8) / 16.F;
+        const auto short_features = extractor->extract(signal, 16000);
+        signal.resize(480000, 0.F);
+        const auto padded_features = extractor->extract(signal, 16000);
+        if (!short_features || !padded_features || short_features->values != padded_features->values) {
+            std::cerr << "short audio features differ from explicit 30-second zero padding\n";
+            return 1;
+        }
+    }
     if (extractor->extract(silence, 8000) || extractor->extract({}, 16000) ||
         extractor->extract(std::vector<float>(480001), 16000))
         return 1;

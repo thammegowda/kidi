@@ -13,6 +13,7 @@ public:
 
 private:
     Tensor weight_, bias_, scale_;
+    mutable Tensor columns_;
     std::int32_t input_channels_, output_channels_, stride_;
 };
 

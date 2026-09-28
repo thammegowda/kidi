@@ -214,6 +214,7 @@ auto benchmark_whisper(const std::filesystem::path& directory, const std::filesy
                   {"wall_ms", rounded(milliseconds)},
                   {"real_time_factor", rounded(milliseconds / 1000 / seconds)},
                   {"feature_ms", rounded(result.stats.feature_ns / 1e6)},
+                  {"preparation_ms", rounded(result.stats.preparation_ns / 1e6)},
                   {"encode_ms", rounded(result.stats.encode_ns / 1e6)},
                   {"decode_ms", rounded(result.stats.decode_ns / 1e6)},
                   {"token_ids", result.token_ids},

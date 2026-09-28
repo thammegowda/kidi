@@ -232,13 +232,13 @@ auto WhisperImpl::encode(const audio::WhisperFeatures& features) -> Result<Whisp
         if (device() != tensor::Device::cpu() || features.bins != 80 || features.frames != 3000 ||
             features.values.size() != features.bins * features.frames)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Whisper requires 80 x 3000 CPU features"});
-        std::vector<float> time_major(features.values.size());
+        auto input = require(
+            Tensor::empty({1, static_cast<std::int64_t>(features.frames), static_cast<std::int64_t>(features.bins)},
+                          DType::F32, device()));
+        auto time_major = require(input.data<float>());
         for (std::size_t frame = 0; frame < features.frames; ++frame)
             for (std::size_t bin = 0; bin < features.bins; ++bin)
                 time_major[frame * features.bins + bin] = features.values[bin * features.frames + frame];
-        auto input = require(
-            Tensor::from_host({1, static_cast<std::int64_t>(features.frames), static_cast<std::int64_t>(features.bins)},
-                              std::span<const float>(time_major), device()));
         auto convolution = impl_->encoder->convolve(impl_->context, input);
         auto hidden = impl_->encoder->encode(impl_->context, convolution);
         WhisperEncoderState result{convolution, hidden, impl_->decoder->project_source(impl_->context, hidden)};
@@ -270,19 +270,37 @@ auto WhisperImpl::create_state(std::size_t capacity) -> Result<WhisperDecoderSta
 
 auto WhisperImpl::forward(const WhisperEncoderState& source, std::span<const std::int32_t> tokens,
                           WhisperDecoderState& state) -> Result<Tensor> {
+    if (tokens.size() != 1)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "Whisper forward expects one token"});
+    return decode(source, tokens.front(), state, true);
+}
+
+auto WhisperImpl::prefill(const WhisperEncoderState& source, std::span<const std::int32_t> tokens,
+                          WhisperDecoderState& state) -> Result<void> {
+    if (tokens.empty() || state.position > state.capacity || tokens.size() > state.capacity - state.position)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Whisper prefix length"});
+    for (const auto token : tokens) {
+        auto hidden = decode(source, token, state, false);
+        if (!hidden) return std::unexpected(hidden.error());
+    }
+    return {};
+}
+
+auto WhisperImpl::decode(const WhisperEncoderState& source, std::int32_t token, WhisperDecoderState& state,
+                         bool project) -> Result<Tensor> {
     try {
-        if (tokens.size() != 1 || state.position >= state.capacity ||
+        if (state.position >= state.capacity ||
             source.layers.size() != static_cast<std::size_t>(impl_->decoder_layers) ||
             state.layers.size() != static_cast<std::size_t>(impl_->decoder_layers))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Whisper decoder input"});
         require(state.mask.data<float>())[state.position] = 0.F;
         require(state.index.data<std::int32_t>())[0] = static_cast<std::int32_t>(state.position);
-        auto hidden = impl_->decoder->forward(impl_->context, tokens, state.position, source.layers, state.mask,
-                                              state.layers, state.index);
-        auto logits = impl_->output->forward(impl_->context, hidden);
+        auto hidden = impl_->decoder->forward(impl_->context, std::span(&token, 1), state.position, source.layers,
+                                              state.mask, state.layers, state.index);
+        auto output = project ? impl_->output->forward(impl_->context, hidden) : hidden;
         impl_->context.synchronize();
         ++state.position;
-        return logits;
+        return output;
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }

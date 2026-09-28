@@ -123,13 +123,13 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
             result.language = found->first;
             language_token = found->second;
         }
-        for (const auto token :
-             {language_token, task.as<std::int32_t>(), generation_["no_timestamps_token_id"].as<std::int32_t>()})
-            logits = require(model_->forward(source, std::span(&token, 1), state));
+        const std::array prefix{language_token, task.as<std::int32_t>()};
+        require(model_->prefill(source, prefix, state));
+        const auto no_timestamps = generation_["no_timestamps_token_id"].as<std::int32_t>();
+        logits = require(model_->forward(source, std::span(&no_timestamps, 1), state));
 
         const auto vocabulary = config_["model"]["vocab_size"].as<std::size_t>();
         const auto end = generation_["eos_token_id"].as<std::int32_t>();
-        const auto no_timestamps = generation_["no_timestamps_token_id"].as<std::int32_t>();
         std::string emitted;
         for (std::size_t step = 0; step < options.maximum_tokens; ++step) {
             scores = require(logits.data<float>());
@@ -150,7 +150,8 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
                 const auto delta = require(tokenizer_.decode_delta(result.token_ids, emitted));
                 if (!delta.empty()) options.on_partial(emitted, result.language);
             }
-            logits = require(model_->forward(source, std::span(&selected, 1), state));
+            if (step + 1 < options.maximum_tokens)
+                logits = require(model_->forward(source, std::span(&selected, 1), state));
         }
         result.stats.decode_ns = elapsed(decode_start);
         result.stats.preparation_ns = model_->preparation_ns() - preparation;

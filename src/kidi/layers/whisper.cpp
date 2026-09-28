@@ -1,6 +1,7 @@
 #include "kidi/layers/whisper.h"
 
 #include <cmath>
+#include <bit>
 
 namespace kidi::layers {
 using ops::require;
@@ -22,22 +23,31 @@ auto WhisperConv1dImpl::forward(ops::Context& context, const Tensor& input) cons
         throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper convolution requires FP32 CPU input"});
     const auto batch = input.size(0), length = input.size(1);
     const auto output_length = (length - 1) / static_cast<std::size_t>(stride_) + 1;
-    std::vector<float> columns(batch * output_length * input_channels_ * 3);
+    const std::vector<std::int64_t> shape{static_cast<std::int64_t>(batch), static_cast<std::int64_t>(output_length),
+                                          input_channels_ * 3};
+    const auto required = batch * output_length * input_channels_ * 3;
+    if (!columns_.defined() || columns_.numel() < required)
+        columns_ =
+            require(Tensor::empty({static_cast<std::int64_t>(std::bit_ceil(std::max<std::size_t>(64, required)))},
+                                  tensor::DType::F32, context.device()));
+    auto columns = require(columns_.data<float>());
     const auto values = require(input.data<float>());
     for (std::size_t row = 0; row < batch; ++row)
         for (std::size_t output = 0; output < output_length; ++output)
             for (std::int32_t kernel = 0; kernel < 3; ++kernel) {
                 const auto source = static_cast<std::int64_t>(output * stride_ + kernel) - 1;
-                if (source < 0 || static_cast<std::size_t>(source) >= length) continue;
-                const auto source_offset = (row * length + static_cast<std::size_t>(source)) * input_channels_;
                 const auto destination = (row * output_length + output) * input_channels_ * 3;
+                if (source < 0 || static_cast<std::size_t>(source) >= length) {
+                    for (std::int32_t channel = 0; channel < input_channels_; ++channel)
+                        columns[destination + channel * 3 + kernel] = 0.F;
+                    continue;
+                }
+                const auto source_offset = (row * length + static_cast<std::size_t>(source)) * input_channels_;
                 for (std::int32_t channel = 0; channel < input_channels_; ++channel)
                     columns[destination + channel * 3 + kernel] = values[source_offset + channel];
             }
-    auto unfolded = require(Tensor::from_host(
-        {static_cast<std::int64_t>(batch), static_cast<std::int64_t>(output_length), input_channels_ * 3},
-        std::span<const float>(columns), context.device()));
     auto weight = context.reshape(weight_, {output_channels_, input_channels_ * 3});
+    const auto unfolded = context.reshape(context.slice(columns_, 0, 0, required), shape);
     if (weight_.dtype() == tensor::DType::I8) return context.quantized_linear(unfolded, weight, scale_, bias_, true);
     return context.linear(unfolded, weight, bias_, true);
 }
