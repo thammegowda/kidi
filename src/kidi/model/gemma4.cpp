@@ -299,8 +299,12 @@ auto Gemma4Impl::set_checkpoint(const Weights& weights, std::int32_t weight_bits
                                                 name.ends_with("output_activation_scale") ||
                                                 name.ends_with("k_cache_scale") || name.ends_with("v_cache_scale");
                 if (impl_->qat && quantization_scale) {
+                    const bool activation_scale =
+                        name.ends_with("input_activation_scale") || name.ends_with("output_activation_scale");
                     const auto scales = require(value.data<float>());
-                    if (std::ranges::any_of(scales, [](float scale) { return !std::isfinite(scale) || scale <= 0; }))
+                    if (std::ranges::any_of(scales, [&](float scale) {
+                            return !std::isfinite(scale) || scale < 0 || (!activation_scale && scale == 0);
+                        }))
                         throw ops::Failure(
                             {ErrorCode::INVALID_ARGUMENT, "invalid trained quantization scale: " + name});
                 }
