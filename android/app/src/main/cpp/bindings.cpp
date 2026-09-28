@@ -12,6 +12,7 @@
 namespace {
 constexpr int MAXIMUM_OUTPUT_TOKENS = 8192;
 constexpr std::size_t CONTEXT_TOKENS = 9216;
+constexpr std::size_t PREFIX_CACHE_BYTES = 512 * 1024 * 1024;
 
 std::mutex runtime_mutex;
 std::optional<kidi::inference::Generator> generator;
@@ -78,6 +79,7 @@ auto options(int maximum_tokens) -> kidi::inference::GenerationOptions {
     result.maximum_new_tokens = maximum_tokens;
     result.context_size = CONTEXT_TOKENS;
     result.prefill_chunk_size = 32;
+    result.prefix_cache_bytes = PREFIX_CACHE_BYTES;
     result.stream_text = true;
     return result;
 }
@@ -140,6 +142,11 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_step(JNIEnv* 
                 const auto& result = *event.completed;
                 item["completed"] = {{"text", result.text},
                                      {"prompt_tokens", result.stats.prompt_tokens},
+                                     {"reused_prompt_tokens", result.stats.reused_prompt_tokens},
+                                     {"prefix_cache_bytes", result.stats.prefix_cache_bytes},
+                                     {"prefix_reserved_bytes", result.stats.prefix_reserved_bytes},
+                                     {"prefill_ms", result.stats.prefill_ns / 1e6},
+                                     {"first_token_ms", result.stats.time_to_first_token_ns / 1e6},
                                      {"output_tokens", result.generation.token_ids.size()},
                                      {"generation_ms", result.stats.generation_ns / 1e6},
                                      {"decode_ms", result.stats.decode_ns / 1e6},

@@ -67,6 +67,21 @@ The CPU runner generates the JSON report with thermal/battery snapshots, source/
 and three warm repeats after one warmup. A repeated four-thread anchor helps expose drift. Process peak RSS is cumulative
 and includes mapped pages, not just live heap allocations. Keep results local rather than committing dated report files.
 
+## Multi-Turn Cache Check
+
+Use the optimized native harness to compare the same second turn with and without prefix reuse. It keeps the model
+and prepared operators loaded, verifies exact token/text parity and streamed output, and reports prefill, first-token,
+and completion latency separately. KV retention is capped at 512 MiB. Results remain local:
+
+```sh
+"$ADB" -s SERIAL shell "timeout 90 $REMOTE/runner chat $REMOTE/models/gemma4 4 1" \
+  > benchmarks/android/.cache/chat-turns.jsonl
+```
+
+The first turn includes cold operator preparation; do not compare it directly with the cached second turn. Compare the
+`cached` and `uncached` records, which use identical conversation input and generation limits in the same process.
+This checks the same shared serving core used by the app, not Compose/UI overhead or debug-build inference performance.
+
 ## Optional Vulkan Probe
 
 This standalone projection microbenchmark is not an app backend or a full-model speed comparison.

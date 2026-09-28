@@ -58,6 +58,15 @@ The app uses CPU inference with 1-8 threads, a shared 9,216-token context, and a
 Generation is streamed one bounded native step at a time and can be stopped between steps. The current conversation and
 runtime preferences are stored locally.
 
+Completed and stopped chat turns retain one in-memory KV cache, up to 512 MiB. A subsequent turn reuses the matching
+token prefix, including processed assistant tokens, and evaluates only the remaining input. Reuse moves the existing
+buffers instead of copying them. Changed history reuses only its unchanged prefix; incompatible runtime settings,
+model reload, or process exit discard the cache. This is one recent conversation prefix, not a KV cache for every saved
+thread. Stored chat history is independent of this temporary optimization. First turns still require ordinary prefill.
+
+JNI completion records expose `reused_prompt_tokens`, `prefix_cache_bytes`, `prefix_reserved_bytes`, `prefill_ms`, and
+`first_token_ms` so cache hits and first-response latency can be measured independently of decode speed.
+
 ### Speech Dictation
 
 The default speech model is **Whisper Small INT8**, from `openai/whisper-small`. Existing user-selected Tiny/Base models

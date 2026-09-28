@@ -503,8 +503,8 @@ quadratic cumulative decode work in output length, a conservative tradeoff for
 short interactive replies; JSONL does not enable it. Deltas concatenate to the
 ordinary final text. Cancellation destroys the request's decoder state too.
 The terminal flushes deltas after each model step. Cancellation is cooperative
-between steps, not GPU preemption. No cross-turn KV retention or new coroutine
-abstraction is introduced; weights and prepared operators remain loaded.
+between steps, not GPU preemption. Weights and prepared operators remain loaded;
+cross-turn KV retention is opt-in through the existing prefix-cache byte budget.
 
 Serving events may finish out of order. The CLI retains completed records until
 their preceding input records are emitted, counting these retained completions
@@ -513,9 +513,25 @@ is bounded by request count, not bytes, and a slow request backpressures input.
 Responses include the echoed input ID and an assistant message. Invalid JSONL
 stops processing with its physical input line number; JSON blank lines are invalid.
 
-Serving rejects prefix-cache options. Active K/V remains dense and independent;
-this is not direct paged attention or mixed prefill/decode in one model invocation.
-The optional single-request prefix cache retains one dense snapshot, sized to a
+Serving may retain one completed or cancelled request's dense KV storage when
+`prefix_cache_bytes` covers its full allocation. It records only tokens actually
+processed by the model, including processed output tokens, not the last sampled
+token that has not entered KV. Admission moves compatible storage into exactly one
+new request and resumes its longest identical token prefix, leaving at least one
+prompt token to produce logits. No KV copy or fresh allocation is needed on this
+path. Other active requests retain independent storage; this is not paged attention
+or mixed prefill/decode in one model invocation.
+
+Capacity, effective prefill chunk, attention policy, or insufficient byte budget
+invalidate serving reuse. Divergent text reuses only the identical prefix. Disabled
+caching, reconfiguration, model unload, failed execution, or entry to blocking
+generation discard the retained state. One idle allocation may exist in addition
+to active cache-token reservations; it is bounded by the retiring request's byte
+budget. Completion metrics distinguish valid-prefix bytes from the full retained
+allocation. Android enables a 512 MiB cap; this retains the existing request
+allocation rather than allocating a second copy of the conversation cache.
+
+The separate blocking `generate()` prefix cache retains one dense snapshot, sized to a
 complete-chunk prefix within the byte budget. `fork_state` copies the matching
 prefix into independent request storage; subsequent writes cannot mutate the
 snapshot. Chunk-size and attention-policy changes invalidate reuse. Reported

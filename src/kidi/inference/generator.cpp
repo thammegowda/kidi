@@ -55,6 +55,7 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
         if (pending_requests() || serving_failed_)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
                                 "drain serving requests before serial generation; reload after a serving failure"});
+        serving_prefix_.reset();
         const auto started = Clock::now();
         const auto preparation = model_->preparation_ns();
         TextGeneration result;
@@ -171,6 +172,7 @@ auto Generator::generate_batch(std::span<const std::string> prompts, GenerationO
         if (pending_requests() || serving_failed_)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
                                 "drain serving requests before batch generation; reload after a serving failure"});
+        serving_prefix_.reset();
         if (prompts.empty() || prompts.size() > 16 || options.prefix_cache_bytes || !options.prefill_chunk_size)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
                                 "batch generation supports 1-16 prompts, positive chunks and no prefix-cache policy"});
@@ -268,6 +270,7 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
             throw ops::Failure(
                 {ErrorCode::INVALID_ARGUMENT, "invalid serving limits, outstanding requests or failed engine"});
         prefix_.reset();
+        serving_prefix_.reset();
         running_.reserve(options.maximum_active);
         serving_ = options;
         return {};
@@ -294,17 +297,16 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
                                                         : config_["decode"]["maximum_new_tokens"].as<std::size_t>();
         const auto capacity =
             options.context_size ? options.context_size : config_["decode"]["context_size"].as<std::size_t>();
-        if (!maximum || !options.prefill_chunk_size || options.prefix_cache_bytes || !capacity ||
-            capacity > serving_->cache_token_budget ||
+        if (!maximum || !options.prefill_chunk_size || !capacity || capacity > serving_->cache_token_budget ||
             capacity > config_["model"]["max_position_embeddings"].as<std::size_t>())
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
-                                "request exceeds serving context budget or uses unsupported prefix caching"});
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "request exceeds serving context budget"});
         const auto serialized = options.raw_prompt
                                     ? std::string(prompt)
                                     : "<bos><|turn>user\n" + std::string(prompt) + "<turn|>\n<|turn>model\n";
         auto tokens = require(tokenizer_.encode(serialized));
         if (tokens.empty() || tokens.size() >= capacity || maximum > capacity - tokens.size())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prompt and generation must fit the reserved context"});
+        if (options.prefix_cache_bytes) tokens.reserve(capacity);
         const std::array extra_stops{special_[1]};
         auto search = require(GreedyState::create({.vocabulary_size = tokenizer_.vocabulary_size(),
                                                    .end_id = special_[0],
@@ -328,6 +330,30 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
+auto Generator::retain_serving_prefix(QueuedGeneration& request) -> void {
+    serving_prefix_.reset();
+    if (!request.options.prefix_cache_bytes || !request.state || !request.state->position) return;
+    std::size_t bytes = 0;
+    for (const auto& layer : request.state->layers) bytes += layer.key.nbytes() + layer.value.nbytes();
+    if (bytes > request.options.prefix_cache_bytes) return;
+    const auto position = request.state->position;
+    const auto& generated = request.search.result().token_ids;
+    if (position > request.prompt.size() + generated.size()) return;
+    auto tokens = std::move(request.prompt);
+    if (position > tokens.size()) {
+        const auto count = position - tokens.size();
+        tokens.insert(tokens.end(), generated.begin(), generated.begin() + count);
+    } else {
+        tokens.resize(position);
+    }
+    request.stats.prefix_cache_bytes = bytes / request.capacity * position;
+    request.stats.prefix_reserved_bytes = bytes;
+    const auto chunk = std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step);
+    serving_prefix_.emplace(
+        PrefixEntry{std::move(tokens), std::move(*request.state), bytes, chunk, !request.options.full_attention_cache});
+    request.state.reset();
+}
+
 auto Generator::cancel(std::uint64_t request_id) -> Result<void> {
     const auto waiting = std::ranges::find(waiting_, request_id, &QueuedGeneration::id);
     if (waiting != waiting_.end()) {
@@ -336,6 +362,7 @@ auto Generator::cancel(std::uint64_t request_id) -> Result<void> {
     }
     const auto running = std::ranges::find(running_, request_id, &QueuedGeneration::id);
     if (running != running_.end()) {
+        retain_serving_prefix(*running);
         reserved_cache_tokens_ -= running->capacity;
         running_.erase(running);
         return {};
@@ -354,7 +381,19 @@ auto Generator::step() -> Result<GenerationStep> {
             while (!waiting_.empty() && running_.size() < serving_->maximum_active &&
                    waiting_.front().capacity <= serving_->cache_token_budget - reserved_cache_tokens_) {
                 auto& request = waiting_.front();
-                request.state = require(model_->create_state(request.capacity));
+                const auto chunk = std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step);
+                if (serving_prefix_ && request.options.prefix_cache_bytes >= serving_prefix_->bytes &&
+                    request.capacity == serving_prefix_->state.capacity && chunk == serving_prefix_->chunk_size &&
+                    serving_prefix_->crop_local_attention == !request.options.full_attention_cache) {
+                    const auto limit = std::min(serving_prefix_->tokens.size(), request.prompt.size() - 1);
+                    std::size_t common = 0;
+                    while (common < limit && serving_prefix_->tokens[common] == request.prompt[common]) ++common;
+                    request.stats.reused_prompt_tokens = common;
+                    request.state.emplace(std::move(serving_prefix_->state));
+                    request.state->position = common;
+                }
+                serving_prefix_.reset();
+                if (!request.state) request.state = require(model_->create_state(request.capacity));
                 request.state->crop_local_attention = !request.options.full_attention_cache;
                 running_.push_back(std::move(request));
                 reserved_cache_tokens_ += running_.back().capacity;
@@ -379,6 +418,7 @@ auto Generator::step() -> Result<GenerationStep> {
                 event.text = require(tokenizer_.decode_delta(request.search.result().token_ids, request.streamed_text,
                                                              request.search.finished()));
             if (request.search.finished()) {
+                retain_serving_prefix(request);
                 TextGeneration completed;
                 completed.generation = std::move(request.search).result();
                 completed.text = require(tokenizer_.decode(completed.generation.token_ids));
@@ -452,12 +492,14 @@ auto Generator::step() -> Result<GenerationStep> {
         return result;
     } catch (const ops::Failure& error) {
         serving_failed_ = true;
+        serving_prefix_.reset();
         waiting_.clear();
         running_.clear();
         reserved_cache_tokens_ = 0;
         return std::unexpected(error.error());
     } catch (const std::exception& error) {
         serving_failed_ = true;
+        serving_prefix_.reset();
         waiting_.clear();
         running_.clear();
         reserved_cache_tokens_ = 0;

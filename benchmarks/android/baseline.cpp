@@ -100,6 +100,62 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
     }
 }
 
+auto benchmark_chat_turns(const std::filesystem::path& directory, int threads, int repeats) -> void {
+    auto generator = require(kidi::inference::Generator::load(directory, kidi::tensor::Device::cpu(), 0, 128, true));
+    require(generator.configure_serving({1, 1, CONTEXT, CHUNK}));
+    kidi::inference::GenerationOptions options;
+    options.maximum_new_tokens = 16;
+    options.context_size = CONTEXT;
+    options.prefill_chunk_size = CHUNK;
+    options.stream_text = true;
+    const auto run = [&](const auto& messages, std::size_t budget, const char* phase, int iteration) {
+        options.prefix_cache_bytes = budget;
+        require(generator.enqueue_chat(messages, options));
+        std::optional<kidi::inference::TextGeneration> completed;
+        std::string streamed;
+        while (generator.pending_requests()) {
+            auto step = require(generator.step());
+            for (auto& event : step.events) {
+                streamed += event.text;
+                if (event.completed) completed = std::move(event.completed);
+            }
+        }
+        if (!completed || streamed != completed->text) throw std::runtime_error("incomplete streamed chat turn");
+        const auto& stats = completed->stats;
+        emit({{"stage", "chat_turn"},
+              {"phase", phase},
+              {"iteration", iteration},
+              {"prompt_tokens", stats.prompt_tokens},
+              {"reused_prompt_tokens", stats.reused_prompt_tokens},
+              {"prefix_cache_bytes", stats.prefix_cache_bytes},
+              {"prefix_reserved_bytes", stats.prefix_reserved_bytes},
+              {"prefill_ms", rounded(stats.prefill_ns / 1e6)},
+              {"first_token_ms", rounded(stats.time_to_first_token_ns / 1e6)},
+              {"generation_ms", rounded(stats.generation_ns / 1e6)},
+              {"token_ids", completed->generation.token_ids}},
+             threads);
+        return std::move(*completed);
+    };
+    constexpr std::size_t BUDGET = 512 * 1024 * 1024;
+    for (int iteration = 0; iteration < repeats; ++iteration) {
+        require(generator.configure_serving({1, 1, CONTEXT, CHUNK}));
+        std::vector<kidi::text::ChatMessage> conversation{
+            {"user",
+             "Binary search repeatedly halves a sorted search range. It is useful for lookup and boundary finding. "
+             "In a production application the array can contain duplicate values, and callers need the first matching "
+             "index rather than an arbitrary match. Briefly explain the main idea."}};
+        const auto first = run(conversation, BUDGET, "first", iteration);
+        conversation.push_back({"assistant", first.text});
+        conversation.push_back({"user", "How should I handle duplicate values?"});
+        const auto cached = run(conversation, BUDGET, "cached", iteration);
+        const auto fresh = run(conversation, 0, "uncached", iteration);
+        if (!cached.stats.reused_prompt_tokens || cached.stats.prefix_reserved_bytes > BUDGET ||
+            fresh.stats.reused_prompt_tokens || cached.generation.token_ids != fresh.generation.token_ids ||
+            cached.text != fresh.text)
+            throw std::runtime_error("cached chat did not preserve tokens or the memory bound");
+    }
+}
+
 auto benchmark_whisper(const std::filesystem::path& directory, const std::filesystem::path& wav, int threads,
                        int repeats) -> void {
     const auto waveform = require(kidi::audio::load_wav(wav));
@@ -136,7 +192,7 @@ auto benchmark_whisper(const std::filesystem::path& directory, const std::filesy
 
 auto main(int argc, char** argv) -> int {
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
-        std::cout << "usage: kidi_android_baseline gemma|whisper MODEL THREADS REPEATS [WAV]\n";
+        std::cout << "usage: kidi_android_baseline gemma|chat|whisper MODEL THREADS REPEATS [WAV]\n";
         return 0;
     }
     try {
@@ -144,7 +200,7 @@ auto main(int argc, char** argv) -> int {
         const std::string mode(argv[1]);
         const auto threads = std::stoi(argv[3]), repeats = std::stoi(argv[4]);
         if (threads < 1 || threads > 8 || repeats < 1 || repeats > 20 ||
-            !((mode == "gemma" && argc == 5) || (mode == "whisper" && argc == 6)))
+            !(((mode == "gemma" || mode == "chat") && argc == 5) || (mode == "whisper" && argc == 6)))
             throw std::runtime_error("invalid mode, thread count, repeat count, or WAV argument");
         kidi::runtime::ynn::set_thread_count(threads);
         require(kidi::runtime::ynn::reserve_thread_pool(threads));
@@ -155,6 +211,8 @@ auto main(int argc, char** argv) -> int {
              threads);
         if (mode == "gemma")
             benchmark_gemma(argv[2], threads, repeats);
+        else if (mode == "chat")
+            benchmark_chat_turns(argv[2], threads, repeats);
         else
             benchmark_whisper(argv[2], argv[5], threads, repeats);
         return 0;

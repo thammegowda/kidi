@@ -74,6 +74,7 @@ private:
         bool crop_local_attention = true;
     };
     std::optional<PrefixEntry> prefix_;
+    std::optional<PrefixEntry> serving_prefix_;
     struct QueuedGeneration {
         std::uint64_t id;
         std::vector<std::int32_t> prompt;
@@ -85,6 +86,7 @@ private:
         std::chrono::steady_clock::time_point enqueued;
         std::string streamed_text;
     };
+    auto retain_serving_prefix(QueuedGeneration& request) -> void;
     std::optional<ServingOptions> serving_;
     std::deque<QueuedGeneration> waiting_;
     std::vector<QueuedGeneration> running_;
