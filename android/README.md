@@ -109,6 +109,37 @@ The composer respects keyboard insets, and conversation width is constrained on 
 Lato is bundled for offline typography under the [SIL Open Font License](app/src/main/res/raw/lato_license.txt).
 Markdown uses [Markwon](https://github.com/noties/Markwon), licensed under Apache 2.0.
 
+## Chat History and Storage
+
+The header logo opens the left chat drawer. It initially reads 30 recent thread summaries, then loads the next page
+as the list scrolls. Search uses an on-device full-text index over all saved message bodies, not just the visible page;
+words support prefix matching. Opening a thread reads its latest 50 messages, with earlier messages fetched on demand.
+Starting a new chat preserves the previous thread. The formerly saved single conversation is imported once on startup;
+conversations discarded by older app versions cannot be recovered.
+
+The SQLite database is private to the app and uses foreign keys, transactions, and write-ahead logging:
+
+| Record | Ownership and purpose |
+|---|---|
+| `threads` | Stable ID, title, last-message preview, creation/activity timestamps |
+| `participants` | User or agent identity, display name, optional model ID |
+| `thread_participants` | Thread membership; multiple agents can belong to a thread |
+| `messages` | Individual message ID, stable ordering, thread, sender, text, completion status, generation metrics |
+| `attachments` | Message-owned ordered image/document/audio/video references, MIME type, name, size, optional dimensions/duration |
+| `message_search` | Transactionally maintained full-text index |
+| `app_state` | Active thread and one-time legacy-import marker |
+
+Messages are appended individually, not serialized as one growing conversation blob. A sender must belong to the
+thread; participant kind/model identity cannot silently change. Thread deletion cascades to message and attachment
+metadata and the search index. Thread and message pagination use stable cursors rather than large SQL offsets.
+
+Attachment rows reference local `content://` or `file://` URIs; media bytes do not live in message/database rows.
+This is the storage foundation, not a file picker or media ingestion/viewing implementation. A future attachment
+importer must own file copies, persisted URI permissions, and file deletion. Current inference remains text-only and
+rejects attachment-bearing model input explicitly. Agent membership records identify actual senders; they do not
+implement automatic agent scheduling. The current UI sends to the loaded agent, preserving previous agent identities
+when a different model is used in the same thread. Failed/stopped replies remain in history.
+
 ## Physical Hardware
 
 Read-only inspection on 2026-09-27 identified a Motorola Razr Ultra 2025 running Android 16/API 36:

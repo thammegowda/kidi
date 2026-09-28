@@ -55,6 +55,7 @@ import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -75,6 +76,9 @@ import androidx.compose.material3.rememberTooltipState
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -91,6 +95,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -100,6 +105,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.ImeAction
@@ -109,6 +115,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
 
 @Composable
 internal fun KidiApp(viewModel: ChatViewModel = viewModel()) {
@@ -154,6 +161,11 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
         onStop = viewModel::stop,
         onRecord = startRecording,
         onStopRecording = viewModel::stopRecording,
+        onHistoryOpen = viewModel::refreshHistory,
+        onHistoryQuery = viewModel::searchHistory,
+        onOpenChat = viewModel::openChat,
+        onMoreHistory = viewModel::loadMoreHistory,
+        onOlderMessages = viewModel::loadOlderMessages,
     )
 
     if (settingsOpen) {
@@ -204,10 +216,10 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
 }
 
 private val KidiUiState.runtimeBusy: Boolean
-    get() = generating || recording || transcribing || loadingModel || loadingSpeech
+    get() = generating || recording || transcribing || loadingModel || loadingSpeech || loadingChat
 
 private val KidiUiState.chatBusy: Boolean
-    get() = generating || recording || transcribing || loadingModel
+    get() = generating || recording || transcribing || loadingModel || loadingChat
 
 private fun modelLabel(modelId: String) = when (modelId) {
     "google/gemma-4-E2B-it-qat-mobile-transformers" -> "Gemma 4 E2B"
@@ -228,29 +240,46 @@ internal fun ChatWorkspace(
     onStop: () -> Unit,
     onRecord: () -> Unit,
     onStopRecording: () -> Unit,
+    onHistoryOpen: () -> Unit = {},
+    onHistoryQuery: (String) -> Unit = {},
+    onOpenChat: (String) -> Unit = {},
+    onMoreHistory: () -> Unit = {},
+    onOlderMessages: () -> Unit = {},
 ) {
-    Scaffold(
-        modifier = Modifier.fillMaxSize().imePadding(),
-        containerColor = MaterialTheme.colorScheme.background,
-        contentWindowInsets = WindowInsets(0, 0, 0, 0),
-        snackbarHost = { SnackbarHost(snackbar) },
-        topBar = { KidiHeader(state, onNewChat, onSettings) },
-        bottomBar = {
-            Composer(state, onTextChange, onSend, onStop, onRecord, onStopRecording, onSettings)
+    val drawer = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+    val closeHistory: () -> Unit = { scope.launch { drawer.close() }; Unit }
+    val canSwitch = !state.generating && !state.recording && !state.transcribing && !state.loadingChat
+    ModalNavigationDrawer(
+        drawerState = drawer,
+        gesturesEnabled = drawer.isOpen,
+        drawerContent = {
+            ChatHistoryDrawer(state, drawer.isOpen, canSwitch, onHistoryQuery, onMoreHistory, onHistoryOpen,
+                onSelect = { id -> if (canSwitch) { onOpenChat(id); closeHistory() } },
+                onNewChat = { if (canSwitch) { onNewChat(); closeHistory() } }, onClose = closeHistory)
         },
-    ) { padding ->
-        Box(
-            Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding),
-            contentAlignment = Alignment.TopCenter,
-        ) {
-            Conversation(state, onSettings, onTextChange, Modifier.widthIn(max = 760.dp).fillMaxSize())
+    ) {
+        Scaffold(
+            modifier = Modifier.fillMaxSize().imePadding(),
+            containerColor = MaterialTheme.colorScheme.background,
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
+            snackbarHost = { SnackbarHost(snackbar) },
+            topBar = { KidiHeader(state, onNewChat, onSettings) {
+                onHistoryOpen()
+                scope.launch { drawer.open() }
+            } },
+            bottomBar = { Composer(state, onTextChange, onSend, onStop, onRecord, onStopRecording, onSettings) },
+        ) { padding ->
+            Box(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding), contentAlignment = Alignment.TopCenter) {
+                Conversation(state, onSettings, onTextChange, Modifier.widthIn(max = 760.dp).fillMaxSize(), onOlderMessages)
+            }
         }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ToolButton(
+internal fun ToolButton(
     icon: ImageVector,
     label: String,
     onClick: () -> Unit,
@@ -269,13 +298,15 @@ private fun ToolButton(
 }
 
 @Composable
-private fun KidiHeader(state: KidiUiState, onNewChat: () -> Unit, onSettings: () -> Unit) {
+private fun KidiHeader(state: KidiUiState, onNewChat: () -> Unit, onSettings: () -> Unit, onHistory: () -> Unit) {
     Column(Modifier.background(MaterialTheme.colorScheme.surface).statusBarsPadding()) {
         Row(
             modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(start = 20.dp, end = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Image(painterResource(R.drawable.kidi_logo), null, Modifier.size(34.dp))
+            IconButton(onClick = onHistory, modifier = Modifier.size(48.dp)) {
+                Image(painterResource(R.drawable.kidi_logo), "Chat history", Modifier.size(34.dp))
+            }
             Spacer(Modifier.width(10.dp))
             Text("Kidi", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
             ToolButton(Icons.Default.AddComment, "New chat", onNewChat, !state.chatBusy)
@@ -321,6 +352,7 @@ private fun Conversation(
     onSettings: () -> Unit,
     onPrompt: (String) -> Unit,
     modifier: Modifier = Modifier,
+    onOlderMessages: () -> Unit = {},
 ) {
     val listState = rememberLazyListState()
     var followResponse by remember { mutableStateOf(true) }
@@ -329,8 +361,9 @@ private fun Conversation(
             (scrolling, canScroll) -> if (scrolling) followResponse = !canScroll
         }
     }
-    val itemCount = state.messages.size + if (state.generating) 1 else 0
-    LaunchedEffect(itemCount, state.draft) {
+    val itemCount = state.messages.size + (if (state.generating) 1 else 0) + (if (state.hasOlderMessages) 1 else 0)
+    LaunchedEffect(state.activeChatId) { followResponse = true }
+    LaunchedEffect(state.activeChatId, state.messages.lastOrNull()?.id, state.draft) {
         if (itemCount > 0 && followResponse) listState.scrollToItem(itemCount - 1)
     }
     if (state.messages.isEmpty() && !state.generating) {
@@ -344,8 +377,14 @@ private fun Conversation(
             contentPadding = PaddingValues(horizontal = 20.dp, vertical = 24.dp),
             verticalArrangement = Arrangement.spacedBy(24.dp),
         ) {
-            items(state.messages.size) { index -> MessageRow(state.messages[index]) }
-            if (state.generating) item {
+            if (state.hasOlderMessages) item(key = "earlier") {
+                TextButton(onClick = onOlderMessages, enabled = !state.loadingOlderMessages && !state.chatBusy,
+                    modifier = Modifier.fillMaxWidth()) {
+                    Text(if (state.loadingOlderMessages) "Loading messages" else "Earlier messages")
+                }
+            }
+            items(state.messages.size, key = { state.messages[it].id }) { index -> MessageRow(state.messages[index]) }
+            if (state.generating) item(key = "draft") {
                 MessageRow(ChatMessage(MessageRole.ASSISTANT, state.draft), active = true)
             }
         }
@@ -420,7 +459,7 @@ private fun MessageRow(message: ChatMessage, active: Boolean = false) {
         ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (!user) Image(painterResource(R.drawable.kidi_logo), null, Modifier.size(22.dp))
-                Text(if (user) "You" else "Kidi", style = MaterialTheme.typography.labelMedium,
+                Text(message.sender.name, style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Spacer(Modifier.height(10.dp))
@@ -428,8 +467,20 @@ private fun MessageRow(message: ChatMessage, active: Boolean = false) {
                 MarkdownReply(message.content, Modifier.fillMaxWidth())
             } else {
                 SelectionContainer {
-                    Text(message.content.ifEmpty { if (active) "Thinking..." else "" },
+                    Text(message.content.ifEmpty { when {
+                        active -> "Thinking..."
+                        message.status == MessageStatus.STOPPED -> "Response stopped"
+                        message.status == MessageStatus.FAILED -> "Response failed"
+                        else -> if (user) "" else "Empty response"
+                    } },
                         style = MaterialTheme.typography.bodyLarge)
+                }
+            }
+            message.attachments.forEach { attachment ->
+                Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Icon(Icons.Default.AttachFile, attachment.kind.name, Modifier.size(18.dp))
+                    Text(attachment.name, Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis)
                 }
             }
             message.stats?.let { stats ->
@@ -509,8 +560,8 @@ private fun Composer(
                     TextField(
                         value = state.composerText,
                         onValueChange = onTextChange,
-                        modifier = Modifier.fillMaxWidth(),
-                        readOnly = state.recording || state.transcribing,
+                        modifier = Modifier.fillMaxWidth().testTag("message-composer"),
+                        readOnly = state.recording || state.transcribing || state.loadingChat,
                         placeholder = { Text(if (state.recording) "Listening..." else "Message Kidi") },
                         maxLines = 6,
                         textStyle = MaterialTheme.typography.bodyLarge,

@@ -2,14 +2,18 @@ package ai.gowda.kidi
 
 import android.Manifest
 import android.app.Application
+import android.os.SystemClock
+import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -25,25 +29,19 @@ import java.util.concurrent.atomic.AtomicBoolean
 private const val DEFAULT_MODEL_ID = "google/gemma-4-E2B-it-qat-mobile-transformers"
 private const val DEFAULT_SPEECH_MODEL_ID = "openai/whisper-small"
 
-internal enum class MessageRole { USER, ASSISTANT }
-
-internal data class MessageStats(
-    val tokens: Int,
-    val elapsedMs: Double,
-    val decodeMs: Double,
-    val decodeTokens: Int,
-)
-
-internal data class ChatMessage(
-    val role: MessageRole,
-    val content: String,
-    val stats: MessageStats? = null,
-)
-
 internal data class KidiUiState(
     val modelId: String = DEFAULT_MODEL_ID,
     val modelRevision: String? = null,
     val messages: List<ChatMessage> = emptyList(),
+    val activeChatId: String? = null,
+    val loadingChat: Boolean = false,
+    val hasOlderMessages: Boolean = false,
+    val loadingOlderMessages: Boolean = false,
+    val history: List<ChatSummary> = emptyList(),
+    val historyQuery: String = "",
+    val historyLoading: Boolean = false,
+    val historyHasMore: Boolean = false,
+    val historyError: String? = null,
     val draft: String = "",
     val composerText: String = "",
     val modelReady: Boolean = false,
@@ -70,6 +68,7 @@ internal data class KidiUiState(
 internal class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences(PREFERENCES, 0)
     private val repository = ModelRepository(application)
+    private val chats = ChatRepository(application)
     private val speechRecorder = SpeechRecorder()
     private val runtimeExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "kidi-runtime") }
     private val runtimeDispatcher: CoroutineDispatcher = runtimeExecutor.asCoroutineDispatcher()
@@ -78,7 +77,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             modelId = preferences.getString(MODEL_ID_KEY, DEFAULT_MODEL_ID) ?: DEFAULT_MODEL_ID,
             speechModelId = preferences.getString(SPEECH_MODEL_ID_KEY, DEFAULT_SPEECH_MODEL_ID)
                 ?: DEFAULT_SPEECH_MODEL_ID,
-            messages = readMessages(),
+            loadingChat = true,
             threadCount = preferences.getInt(THREADS_KEY, defaultThreadCount()).coerceIn(1, 8),
             maximumTokens = preferences.getInt(TOKENS_KEY, 1024).coerceIn(1, 8192),
         ),
@@ -91,8 +90,25 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     private var modelJob: Job? = null
     private var speechJob: Job? = null
     private var recordingJob: Job? = null
+    private var historyJob: Job? = null
+    private var responseAgent = ChatParticipant.LEGACY_AGENT
 
     init {
+        viewModelScope.launch {
+            val started = SystemClock.elapsedRealtime()
+            try {
+                val restored = withContext(Dispatchers.IO) {
+                    chats.restore(preferences.getString(MESSAGES_KEY, null))
+                }
+                _state.update { it.copy(activeChatId = restored?.id, messages = restored?.page?.messages.orEmpty(),
+                    hasOlderMessages = restored?.page?.hasMore ?: false, loadingChat = false) }
+                Log.i("KidiStartup", "history_ready ms=${SystemClock.elapsedRealtime() - started}")
+                preferences.edit { remove(MESSAGES_KEY) }
+                refreshHistory()
+            } catch (error: Exception) {
+                _state.update { it.copy(loadingChat = false, error = "Unable to restore chats: ${error.userMessage()}") }
+            }
+        }
         val installed = repository.installed()
         if (installed != null) load(installed)
         val installedSpeech = repository.installedSpeech()
@@ -221,8 +237,11 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     fun send(content: String) {
         val prompt = content.trim()
         val current = _state.value
-        if (prompt.isEmpty() || !current.modelReady || current.generating || current.loadingModel) return
-        val messages = current.messages + ChatMessage(MessageRole.USER, prompt)
+        if (prompt.isEmpty() || !current.modelReady || current.generating || current.loadingModel || current.loadingChat ||
+            current.recording || current.transcribing) return
+        val pending = ChatMessage(MessageRole.USER, prompt)
+        val messages = current.messages + pending
+        responseAgent = ChatParticipant.agent(current.modelId)
         _state.update {
             it.copy(
                 messages = messages,
@@ -234,12 +253,23 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 error = null,
             )
         }
-        persistMessages(messages)
         stopRequested.set(false)
         viewModelScope.launch(runtimeDispatcher) {
             var completed = false
             try {
-                val enqueue = checked(NativeRuntime.enqueue(messages.toNativeJson().toString(), _state.value.maximumTokens))
+                val (threadId, saved) = withContext(Dispatchers.IO) {
+                    val id = current.activeChatId ?: chats.createThread(listOf(ChatParticipant.USER, responseAgent))
+                    chats.addParticipant(id, responseAgent)
+                    val message = chats.append(id, pending)
+                    chats.select(id)
+                    id to message
+                }
+                _state.update { it.copy(activeChatId = threadId, messages = it.messages.map { message ->
+                    if (message.id == saved.id) saved else message
+                }) }
+                refreshHistory()
+                val enqueue = checked(NativeRuntime.enqueue(messages.textGenerationContext()
+                    .toNativeJson().toString(), _state.value.maximumTokens))
                 requestId = enqueue.getLong("request_id")
                 while (true) {
                     val step = checked(NativeRuntime.step())
@@ -399,11 +429,89 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun newChat() {
-        if (_state.value.generating || _state.value.loadingModel ||
+        if (_state.value.generating || _state.value.loadingChat ||
             _state.value.recording || _state.value.transcribing)
             return
-        persistMessages(emptyList())
-        _state.update { it.copy(messages = emptyList(), draft = "", status = readyStatus(it), error = null) }
+        _state.update { it.copy(loadingChat = true) }
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { chats.select(null) }
+                _state.update { it.copy(activeChatId = null, messages = emptyList(), draft = "", composerText = "",
+                    hasOlderMessages = false, loadingOlderMessages = false, loadingChat = false,
+                    status = readyStatus(it), error = null) }
+            } catch (error: Exception) {
+                _state.update { it.copy(loadingChat = false, error = error.userMessage()) }
+            }
+        }
+    }
+
+    fun openChat(id: String) {
+        val current = _state.value
+        if (current.generating || current.recording || current.transcribing || current.loadingChat || id == current.activeChatId) return
+        _state.update { it.copy(loadingChat = true) }
+        viewModelScope.launch {
+            try {
+                val saved = withContext(Dispatchers.IO) {
+                    requireNotNull(chats.load(id)) { "Chat no longer exists" }.also { chats.select(id) }
+                }
+                _state.update { it.copy(activeChatId = id, messages = saved.page.messages, hasOlderMessages = saved.page.hasMore,
+                    draft = "", composerText = "", loadingChat = false, loadingOlderMessages = false, error = null) }
+            } catch (error: Exception) {
+                _state.update { it.copy(loadingChat = false, error = error.userMessage()) }
+            }
+        }
+    }
+
+    fun loadOlderMessages() {
+        val current = _state.value
+        val id = current.activeChatId ?: return
+        if (!current.hasOlderMessages || current.loadingOlderMessages || current.loadingChat || current.generating) return
+        val before = current.messages.firstOrNull()?.sequence ?: return
+        _state.update { it.copy(loadingOlderMessages = true) }
+        viewModelScope.launch {
+            try {
+                val page = withContext(Dispatchers.IO) { chats.messages(id, before) }
+                _state.update {
+                    if (it.activeChatId == id) it.copy(messages = (page.messages + it.messages).distinctBy { message -> message.id },
+                        hasOlderMessages = page.hasMore, loadingOlderMessages = false) else it
+                }
+            } catch (error: Exception) {
+                _state.update { if (it.activeChatId == id) it.copy(loadingOlderMessages = false, error = error.userMessage()) else it }
+            }
+        }
+    }
+
+    fun searchHistory(query: String) {
+        _state.update { it.copy(historyQuery = query) }
+        requestHistory(false)
+    }
+
+    fun refreshHistory() {
+        viewModelScope.launch { requestHistory(false) }
+    }
+
+    fun loadMoreHistory() = requestHistory(true)
+
+    private fun requestHistory(more: Boolean) {
+        val current = _state.value
+        if (more && (current.historyLoading || !current.historyHasMore)) return
+        historyJob?.cancel()
+        val query = current.historyQuery
+        val after = if (more) current.history.lastOrNull() else null
+        _state.update { it.copy(historyLoading = true, historyError = null,
+            history = if (more) it.history else emptyList(), historyHasMore = if (more) it.historyHasMore else false) }
+        historyJob = viewModelScope.launch {
+            try {
+                if (!more && query.isNotBlank()) delay(200)
+                val page = withContext(Dispatchers.IO) { chats.recent(query, after) }
+                _state.update { it.copy(history = if (more) it.history + page.chats else page.chats,
+                    historyHasMore = page.hasMore, historyLoading = false) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                _state.update { it.copy(historyLoading = false, historyError = error.userMessage()) }
+            }
+        }
     }
 
     fun removeModel() {
@@ -447,11 +555,17 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     private fun load(model: InstalledModel) {
+        val queued = SystemClock.elapsedRealtime()
         viewModelScope.launch(runtimeDispatcher) {
+            val started = SystemClock.elapsedRealtime()
+            Log.i("KidiStartup", "gemma_start queue_ms=${started - queued}")
             _state.update { it.copy(loadingModel = true, status = "Loading model", error = null) }
             runCatching {
                 checked(NativeRuntime.configure(_state.value.threadCount))
-                checked(NativeRuntime.load(model.directory.absolutePath))
+                val configured = SystemClock.elapsedRealtime()
+                checked(NativeRuntime.load(model.directory.absolutePath)).also {
+                    Log.i("KidiStartup", "gemma_ready configure_ms=${configured - started} native_ms=${it.optDouble("load_ms")} stages=${it.optJSONObject("stages_ms")}")
+                }
             }.onSuccess {
                 _state.update {
                     it.copy(
@@ -464,6 +578,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     )
                 }
             }.onFailure { error ->
+                Log.e("KidiStartup", "gemma_failed elapsed_ms=${SystemClock.elapsedRealtime() - started}")
                 _state.update {
                     it.copy(modelReady = false, loadingModel = false, status = "Model offline", error = error.userMessage())
                 }
@@ -472,12 +587,18 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     private fun loadSpeech(model: InstalledModel) {
+        val queued = SystemClock.elapsedRealtime()
         viewModelScope.launch(runtimeDispatcher) {
+            val started = SystemClock.elapsedRealtime()
+            Log.i("KidiStartup", "whisper_start queue_ms=${started - queued}")
             val int8 = model.modelId == DEFAULT_SPEECH_MODEL_ID
             _state.update { it.copy(loadingSpeech = true, status = if (int8) "Preparing Whisper Small INT8" else "Loading speech model", error = null) }
             runCatching {
                 checked(NativeRuntime.configure(_state.value.threadCount))
-                checked(NativeRuntime.loadAsr(model.directory.absolutePath, int8))
+                val configured = SystemClock.elapsedRealtime()
+                checked(NativeRuntime.loadAsr(model.directory.absolutePath, int8)).also {
+                    Log.i("KidiStartup", "whisper_ready configure_ms=${configured - started} native_ms=${it.optDouble("load_ms")} stages=${it.optJSONObject("stages_ms")}")
+                }
             }.onSuccess {
                 _state.update {
                     it.copy(
@@ -498,11 +619,12 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                         error = error.userMessage(),
                     )
                 }
+                Log.e("KidiStartup", "whisper_failed elapsed_ms=${SystemClock.elapsedRealtime() - started}")
             }
         }
     }
 
-    private fun finish(result: JSONObject) {
+    private suspend fun finish(result: JSONObject) {
         val stats = MessageStats(
             tokens = result.optInt("output_tokens"),
             elapsedMs = result.optDouble("generation_ms"),
@@ -510,33 +632,27 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             decodeTokens = result.optInt("decode_tokens"),
         )
         val finalText = result.optString("text").ifBlank { _state.value.draft }
-        val messages = _state.value.messages + ChatMessage(MessageRole.ASSISTANT, finalText, stats)
-        persistMessages(messages)
+        val message = saveReply(ChatMessage(MessageRole.ASSISTANT, finalText, stats, sender = responseAgent))
+        val messages = _state.value.messages + message
         _state.update {
             it.copy(messages = messages, draft = "", generating = false, stopping = false, status = readyStatus(it))
         }
     }
 
-    private fun finishPartial() {
+    private suspend fun finishPartial() {
         val current = _state.value
-        val messages = if (current.draft.isBlank()) {
-            current.messages.dropLastWhile { it.role == MessageRole.USER }.takeIf { it.size < current.messages.size }
-                ?: current.messages
-        } else {
-            current.messages + ChatMessage(MessageRole.ASSISTANT, current.draft)
-        }
-        persistMessages(messages)
+        val message = saveReply(ChatMessage(MessageRole.ASSISTANT, current.draft, sender = responseAgent, status = MessageStatus.STOPPED))
+        val messages = current.messages + message
         _state.update {
             it.copy(messages = messages, draft = "", generating = false, stopping = false, status = readyStatus(it))
         }
     }
 
-    private fun failGeneration(error: Throwable) {
+    private suspend fun failGeneration(error: Throwable) {
         val current = _state.value
-        val messages = if (current.draft.isBlank()) current.messages.dropLast(1) else {
-            current.messages + ChatMessage(MessageRole.ASSISTANT, current.draft)
-        }
-        persistMessages(messages)
+        val failed = ChatMessage(MessageRole.ASSISTANT, current.draft, sender = responseAgent, status = MessageStatus.FAILED)
+        val message = runCatching { saveReply(failed) }.getOrDefault(failed)
+        val messages = current.messages + message
         _state.update {
             it.copy(
                 messages = messages,
@@ -549,23 +665,11 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
-    private fun readMessages(): List<ChatMessage> = runCatching {
-        val source = JSONArray(preferences.getString(MESSAGES_KEY, "[]"))
-        buildList {
-            for (index in 0 until source.length()) {
-                val item = source.getJSONObject(index)
-                val role = MessageRole.valueOf(item.getString("role"))
-                add(ChatMessage(role, item.getString("content")))
-            }
-        }.takeLast(MAXIMUM_SAVED_MESSAGES)
-    }.getOrDefault(emptyList())
-
-    private fun persistMessages(messages: List<ChatMessage>) {
-        val value = JSONArray()
-        messages.takeLast(MAXIMUM_SAVED_MESSAGES).forEach { message ->
-            value.put(JSONObject().put("role", message.role.name).put("content", message.content))
-        }
-        preferences.edit { putString(MESSAGES_KEY, value.toString()) }
+    private suspend fun saveReply(message: ChatMessage): ChatMessage {
+        val id = requireNotNull(_state.value.activeChatId)
+        val saved = withContext(Dispatchers.IO) { chats.append(id, message) }
+        refreshHistory()
+        return saved
     }
 
     private fun List<ChatMessage>.toNativeJson() = JSONArray().also { result ->
@@ -599,6 +703,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             if (id != null) runCatching { NativeRuntime.cancel(id) }
             NativeRuntime.unloadAsr()
             NativeRuntime.unload()
+            chats.close()
         }
         runtimeExecutor.shutdown()
         super.onCleared()
@@ -614,7 +719,6 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         const val THREADS_KEY = "threads"
         const val TOKENS_KEY = "tokens"
         const val MESSAGES_KEY = "messages"
-        const val MAXIMUM_SAVED_MESSAGES = 100
         const val MINIMUM_DRAFT_SAMPLES = 12800
         const val DRAFT_INTERVAL_SAMPLES = 19200
     }

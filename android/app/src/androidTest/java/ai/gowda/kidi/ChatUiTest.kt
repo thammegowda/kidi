@@ -8,12 +8,15 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
-import androidx.compose.ui.test.hasSetTextAction
+import androidx.compose.ui.test.assertIsNotDisplayed
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextReplacement
 import androidx.test.espresso.Espresso.onView
 import androidx.test.espresso.action.ViewActions.longClick
@@ -46,13 +49,13 @@ class ChatUiTest {
                 )
             }
         }
-        compose.onNode(hasSetTextAction()).performTextReplacement("Existing draft")
+        compose.onNodeWithTag("message-composer").performTextReplacement("Existing draft")
         compose.onNodeWithContentDescription("Send message").assertIsNotEnabled()
         compose.onNodeWithContentDescription("Set up dictation").performClick()
         compose.runOnIdle {
             state.value = state.value.copy(loadingModel = true, loadingSpeech = true)
         }
-        compose.onNode(hasSetTextAction()).performTextReplacement("Typing during model loading")
+        compose.onNodeWithTag("message-composer").performTextReplacement("Typing during model loading")
         compose.onNodeWithContentDescription("Send message").assertIsNotEnabled()
         compose.runOnIdle {
             state.value = state.value.copy(modelReady = true, loadingModel = false)
@@ -109,5 +112,34 @@ class ChatUiTest {
         onView(withText("A selectable response.")).perform(longClick())
         val device = UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
         assertNotNull(device.wait(Until.findObject(By.text("Copy")), 5000))
+    }
+
+    @Test
+    fun logoOpensSearchableHistoryAndScrollingRequestsAnotherPage() {
+        val state = mutableStateOf(KidiUiState(history = (0 until 30).map {
+            ChatSummary("chat-$it", "Conversation $it", "Preview $it", 1_000_000L + it)
+        }, historyHasMore = true))
+        var opened = false
+        var moreRequested = false
+        var selected = ""
+        compose.setContent {
+            KidiTheme {
+                ChatWorkspace(state = state.value, snackbar = SnackbarHostState(), onNewChat = {}, onSettings = {},
+                    onTextChange = {}, onSend = {}, onStop = {}, onRecord = {}, onStopRecording = {},
+                    onHistoryOpen = { opened = true },
+                    onHistoryQuery = { query -> state.value = state.value.copy(historyQuery = query,
+                        history = listOf(ChatSummary("old-chat", "Older astronomy chat", "Found in all chats", 1)), historyHasMore = false) },
+                    onOpenChat = { selected = it },
+                    onMoreHistory = { moreRequested = true; state.value = state.value.copy(historyHasMore = false) })
+            }
+        }
+        compose.onNodeWithContentDescription("Chat history").performClick()
+        compose.onNodeWithText("Search chats").assertIsDisplayed()
+        compose.onNodeWithTag("chat-history-list").performScrollToNode(hasText("Conversation 29"))
+        compose.runOnIdle { assertEquals(true, opened); assertEquals(true, moreRequested) }
+        compose.onNodeWithTag("chat-history-search").performTextReplacement("astro")
+        compose.onNodeWithText("Older astronomy chat").performClick()
+        compose.runOnIdle { assertEquals("astro", state.value.historyQuery); assertEquals("old-chat", selected) }
+        compose.onNodeWithText("Search chats").assertIsNotDisplayed()
     }
 }
