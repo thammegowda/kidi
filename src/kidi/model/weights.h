@@ -34,6 +34,7 @@ public:
 
     static auto load(const std::filesystem::path& path, std::span<const StateMappingSpec> mappings = {})
         -> Result<Weights>;
+    static auto save(const std::filesystem::path& path, const StateDict& state) -> Result<void>;
 
     auto contains(std::string_view name) const -> bool;
     auto size() const noexcept -> std::size_t;

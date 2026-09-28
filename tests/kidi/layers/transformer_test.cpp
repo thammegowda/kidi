@@ -93,10 +93,11 @@ auto main() -> int {
             std::thread worker([&] {
                 isolated = module_dtype == tensor::DType::F32 && allocate_parameters && module_device == default_device;
                 const ModuleScope local(tensor::DType::I8, true, tensor::Device::cpu());
-                layers::LinearImpl child(4, 3);
+                layers::LinearImpl child(4, 3, true);
                 const auto state = child.state_dict();
-                isolated = isolated && state.at("weight").dtype() == tensor::DType::I8 && state.at("scale").defined() &&
-                           child.device() == tensor::Device::cpu();
+                isolated = isolated && state.at("weight").dtype() == tensor::DType::I8 &&
+                           state.at("weight").size(0) == 3 && state.at("weight").size(1) == 4 &&
+                           state.at("scale").defined() && child.device() == tensor::Device::cpu();
             });
             worker.join();
             if (!isolated || module_dtype != tensor::DType::BF16 || allocate_parameters ||
@@ -104,7 +105,7 @@ auto main() -> int {
                 return 1;
             bool rejected = false;
             try {
-                const ModuleScope failure(tensor::DType::I8, true, tensor::Device::cpu());
+                const ModuleScope failure(tensor::DType::F16, true, tensor::Device::cpu());
                 layers::LinearImpl invalid(4, 3, true);
             } catch (const ops::Failure&) {
                 rejected = true;

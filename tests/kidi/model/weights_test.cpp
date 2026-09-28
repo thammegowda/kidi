@@ -90,6 +90,22 @@ auto main() -> int {
         return 1;
     }
 
+    const auto saved_path = std::filesystem::temp_directory_path() / "kidi-weights-roundtrip.safetensors";
+    const auto state = weights->state_dict();
+    if (!state || !kidi::model::Weights::save(saved_path, *state) || kidi::model::Weights::save(saved_path, *state)) {
+        std::cerr << "checkpoint serialization or no-overwrite contract failed\n";
+        return 1;
+    }
+    const auto reloaded = kidi::model::Weights::load(saved_path);
+    if (!reloaded || reloaded->size() != state->size()) return 1;
+    for (const auto& [name, expected] : *state) {
+        const auto actual = reloaded->tensor(name);
+        if (!actual || actual->dtype() != expected.dtype() || !std::ranges::equal(actual->shape(), expected.shape()))
+            return 1;
+        const auto expected_bytes = expected.host_bytes(), actual_bytes = actual->host_bytes();
+        if (!expected_bytes || !actual_bytes || !std::ranges::equal(*expected_bytes, *actual_bytes)) return 1;
+    }
+    std::filesystem::remove(saved_path);
     std::filesystem::remove(path);
     return 0;
 }

@@ -47,9 +47,11 @@ TokenEmbeddingImpl::TokenEmbeddingImpl(std::int32_t vocabulary, std::int32_t wid
         register_parameter("embedding_scale", quantization_scale_, {vocabulary, scale_groups}, tensor::DType::F32);
         return;
     }
-    if (module_dtype != tensor::DType::F32 && module_dtype != tensor::DType::BF16)
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "token embeddings require FP32 or BF16 weights"});
+    if (module_dtype != tensor::DType::F32 && module_dtype != tensor::DType::BF16 && module_dtype != tensor::DType::I8)
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "token embeddings require FP32, BF16, or INT8 weights"});
     register_parameter("weight", weight_, {vocabulary, width});
+    if (module_dtype == tensor::DType::I8)
+        register_parameter("scale", quantization_scale_, {vocabulary, 1}, tensor::DType::F32);
 }
 auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int32_t> tokens) const -> Tensor {
     if (!weight_.defined() || tokens.empty())
@@ -59,6 +61,8 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "embedding token outside vocabulary"});
     const auto width = static_cast<std::size_t>(width_);
     if (context.device() == tensor::Device::web_gpu()) {
+        if (weight_.dtype() == tensor::DType::I8)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "unpacked INT8 embedding is not supported on WebGPU"});
         const auto indices =
             require(Tensor::from_host({static_cast<std::int64_t>(tokens.size())}, tokens, context.device()));
         return context.embedding(indices, weight_, quantization_scale_, width_, packed_bits_, scale_);
@@ -80,6 +84,15 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int
                 values[index * width + channel] =
                     integer * scales[tokens[index] * groups + channel / group_width] * scale_;
             }
+        return output;
+    }
+    if (weight_.dtype() == tensor::DType::I8) {
+        const auto scales = require(quantization_scale_.data<float>());
+        const auto integers = reinterpret_cast<const std::int8_t*>(bytes.data());
+        for (std::size_t index = 0; index < tokens.size(); ++index)
+            for (std::size_t channel = 0; channel < width; ++channel)
+                values[index * width + channel] = integers[static_cast<std::size_t>(tokens[index]) * width + channel] *
+                                                  scales[tokens[index]] * scale_;
         return output;
     }
     for (std::size_t index = 0; index < tokens.size(); ++index)

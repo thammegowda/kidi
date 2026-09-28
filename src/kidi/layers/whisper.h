@@ -12,7 +12,7 @@ public:
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
 
 private:
-    Tensor weight_, bias_;
+    Tensor weight_, bias_, scale_;
     std::int32_t input_channels_, output_channels_, stride_;
 };
 

@@ -8,16 +8,18 @@ using ops::require;
 WhisperConv1dImpl::WhisperConv1dImpl(std::int32_t input_channels, std::int32_t output_channels, std::int32_t stride)
     : input_channels_(input_channels), output_channels_(output_channels), stride_(stride) {
     if (input_channels <= 0 || output_channels <= 0 || (stride != 1 && stride != 2) ||
-        module_dtype != tensor::DType::F32)
+        (module_dtype != tensor::DType::F32 && module_dtype != tensor::DType::I8))
         throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported Whisper convolution"});
     register_parameter("weight", weight_, {output_channels, input_channels, 3});
-    register_parameter("bias", bias_, {output_channels});
+    register_parameter("bias", bias_, {output_channels}, tensor::DType::F32);
+    if (module_dtype == tensor::DType::I8)
+        register_parameter("scale", scale_, {output_channels, 1}, tensor::DType::F32);
 }
 
 auto WhisperConv1dImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
     if (context.device() != tensor::Device::cpu() || input.device() != context.device() ||
         input.dtype() != tensor::DType::F32 || input.dimensions() != 3 || input.size(2) != input_channels_)
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper convolution currently requires FP32 CPU input"});
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper convolution requires FP32 CPU input"});
     const auto batch = input.size(0), length = input.size(1);
     const auto output_length = (length - 1) / static_cast<std::size_t>(stride_) + 1;
     std::vector<float> columns(batch * output_length * input_channels_ * 3);
@@ -36,11 +38,12 @@ auto WhisperConv1dImpl::forward(ops::Context& context, const Tensor& input) cons
         {static_cast<std::int64_t>(batch), static_cast<std::int64_t>(output_length), input_channels_ * 3},
         std::span<const float>(columns), context.device()));
     auto weight = context.reshape(weight_, {output_channels_, input_channels_ * 3});
+    if (weight_.dtype() == tensor::DType::I8) return context.quantized_linear(unfolded, weight, scale_, bias_, true);
     return context.linear(unfolded, weight, bias_, true);
 }
 
 WhisperPositionEmbeddingImpl::WhisperPositionEmbeddingImpl(std::int32_t positions, std::int32_t width) {
-    register_parameter("weight", weight_, {positions, width});
+    register_parameter("weight", weight_, {positions, width}, tensor::DType::F32);
 }
 
 auto WhisperPositionEmbeddingImpl::forward(ops::Context& context, std::size_t start, std::size_t length) const
@@ -139,7 +142,10 @@ auto WhisperDecoderBlockImpl::forward(ops::Context& context, const Tensor& input
 WhisperEncoderImpl::WhisperEncoderImpl(std::int32_t mel_bins, std::int32_t hidden, std::int32_t intermediate,
                                        std::int32_t heads, std::int32_t layer_count, std::int32_t positions,
                                        float epsilon)
-    : first_conv_(mel_bins, hidden, 1),
+    : first_conv_([&] {
+          const ModuleScope scope(tensor::DType::F32);
+          return WhisperConv1d(mel_bins, hidden, 1);
+      }()),
       second_conv_(hidden, hidden, 2),
       positions_(positions, hidden),
       norm_(hidden, epsilon) {

@@ -27,6 +27,7 @@ public:
     ~WhisperImpl();
     static auto validate_config(const YAML::Node& config) -> Result<void>;
     static auto create(const YAML::Node& config) -> Result<Whisper>;
+    static auto prepare_int8(const std::filesystem::path& directory) -> Result<std::filesystem::path>;
     auto set_checkpoint(const Weights& weights) -> Result<void>;
     auto encode(const audio::WhisperFeatures& features) -> Result<WhisperEncoderState>;
     auto create_state(std::size_t capacity) -> Result<WhisperDecoderState>;

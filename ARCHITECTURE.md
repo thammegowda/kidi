@@ -117,8 +117,22 @@ options are chat-only, while file I/O and serving limits are generate-only.
 learned decoder positions, fixed checkpoint encoder positions, and a tied output head. The 400-point Hann/STFT path uses
 the checkpoint's embedded 80-bin mel bank. Conv1D is expressed as im2col plus the existing optimized linear operation;
 attention, normalization, cache mutation, and projection remain ordinary eager operations. `inference::Transcriber` owns
-language detection, task/no-timestamp prefixes, token suppression, and greedy ASR policy. Native and browser Whisper are
-CPU-only and process one padded/truncated 30-second segment per call.
+language detection, task/no-timestamp prefixes, token suppression, and greedy ASR policy. Whisper processes one
+padded/truncated 30-second segment per call. Encoder and decoder share one CPU context; Android uses the same YNNPACK
+operators as native CPU inference. No Qualcomm SDK, calibration pass, or DSP graph cache is required.
+
+Whisper INT8 binds per-output-channel signed weights and FP32 scales to the existing quantized linear operation, including
+transposed checkpoint layouts, the im2col convolution, and a tied INT8 embedding/output table. The small input convolution
+and numerically sensitive non-weight parameters remain FP32. CPU projection inputs are dynamically quantized per row.
+`WhisperImpl::prepare_int8` writes a separate versioned cache atomically, retaining the original checkpoint and checking
+its size/mtime on reuse. Tensor dtype in the encoder FFN determines stored precision; no duplicated manifest precision
+flag is required. `Weights::save` writes exclusive Safetensors with aligned payload order and never overwrites a file.
+
+`TranscriptionOptions::on_partial` optionally receives the accumulated UTF-8 text and detected language synchronously
+on the inference caller's thread. It uses the tokenizer's existing incremental decoder and leaves final tokens/text
+unchanged. Callbacks must be lightweight and must not reenter the same transcriber or JNI runtime. Android transports
+partial snapshots as ASCII-escaped JSON, updates the composer only for the matching draft/refinement phase, and reports
+callback failures through the existing error result. Streaming starts after encoding; it does not make the encoder causal.
 
 ## Eager Contract
 

@@ -254,7 +254,7 @@ struct Context::Impl {
             spec.operation == Operation::QUANTIZED_LINEAR) {
             const auto& weight = inputs[1];
             invalid(input.dimensions() < 2 || weight.dimensions() < 2, "matrix operations require rank two or higher");
-            const bool transpose = spec.operation != Operation::QUANTIZED_LINEAR && spec.attributes[0];
+            const bool transpose = !spec.attributes.empty() && spec.attributes[0];
             invalid(input.size(-1) != weight.size(transpose ? -1 : -2), "matrix contraction dimensions differ");
             if (constant_parameters) {
                 invalid(weight.dimensions() != 2, "linear weights require rank two");
@@ -269,7 +269,8 @@ struct Context::Impl {
         if (spec.operation == Operation::QUANTIZED_LINEAR)
             invalid(input.dtype() != tensor::DType::F32 || inputs[1].dtype() != tensor::DType::I8 ||
                         inputs[2].dtype() != tensor::DType::F32 || inputs[2].dimensions() != 2 ||
-                        inputs[2].size(0) != inputs[1].size(1) || inputs[2].size(1) != 1,
+                        inputs[2].size(0) != inputs[1].size(!spec.attributes.empty() && spec.attributes[0] ? 0 : 1) ||
+                        inputs[2].size(1) != 1,
                     "quantized linear parameter mismatch");
         if (spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RESIDUAL_NORM ||
             spec.operation == Operation::RMS_NORM) {
@@ -498,9 +499,10 @@ auto Context::prepare_linear_weights(const Tensor& weight, std::int32_t bits, st
     packed.scales = require(packed.scales.to(device()));
     impl_->packed_weights.emplace(address, Impl::PackedBinding{weight, std::move(packed), packed_prefill});
 }
-auto Context::quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias)
-    -> Tensor {
-    return impl_->run({Operation::QUANTIZED_LINEAR}, {&input, &weight, &scale, &bias});
+auto Context::quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias,
+                               bool transpose_weight) -> Tensor {
+    const std::array<std::int64_t, 1> attributes{transpose_weight};
+    return impl_->run({Operation::QUANTIZED_LINEAR, attributes}, {&input, &weight, &scale, &bias});
 }
 auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Tensor& scales, std::int32_t bits,
                             std::int32_t group_size, float input_scale, float output_scale) -> Tensor {

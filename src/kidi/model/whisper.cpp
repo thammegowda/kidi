@@ -1,6 +1,13 @@
 #include "kidi/model/whisper.h"
+#include "kidi/ops/quantization.h"
+#include "kidi/model/config.h"
 
 #include <cmath>
+#include <fstream>
+#include <mutex>
+#include <numeric>
+#include <random>
+#include <nlohmann/json.hpp>
 
 namespace kidi::model {
 using ops::require;
@@ -13,6 +20,7 @@ struct WhisperImpl::State {
     layers::WhisperEncoder encoder;
     layers::WhisperDecoder decoder;
     layers::Linear output;
+    DType precision = module_dtype;
 
     explicit State(const YAML::Node& config)
         : context(module_device),
@@ -83,6 +91,7 @@ WhisperImpl::WhisperImpl(const YAML::Node& config) {
     register_module("decoder", impl_->decoder);
     register_module("proj_out", impl_->output);
     tie_parameter("proj_out.weight", "decoder.embed_tokens.weight");
+    if (impl_->precision == DType::I8) tie_parameter("proj_out.scale", "decoder.embed_tokens.scale");
 }
 
 WhisperImpl::~WhisperImpl() = default;
@@ -97,6 +106,81 @@ auto WhisperImpl::create(const YAML::Node& config) -> Result<Whisper> {
     }
 }
 
+auto WhisperImpl::prepare_int8(const std::filesystem::path& directory) -> Result<std::filesystem::path> {
+    static std::mutex conversion_mutex;
+    std::scoped_lock lock(conversion_mutex);
+    std::filesystem::path temporary;
+    try {
+        auto config = require(load_whisper_config(directory));
+        require(validate_config(config["model"]));
+        const auto source_path = std::filesystem::path(config["model_file"].as<std::string>());
+        const auto source_size = std::filesystem::file_size(source_path);
+        const auto source_time = std::filesystem::last_write_time(source_path).time_since_epoch().count();
+        const auto destination = directory / "kidi-int8-v2";
+        constexpr std::array files{"config.json", "tokenizer.json", "preprocessor_config.json",
+                                   "generation_config.json"};
+        if (std::filesystem::exists(destination)) {
+            std::ifstream stream(destination / "quantization.json");
+            const auto metadata = nlohmann::json::parse(stream);
+            if (metadata.value("format", "") != "kidi-whisper-int8-v2" || metadata.at("source_bytes") != source_size ||
+                metadata.at("source_mtime") != source_time ||
+                metadata.at("model_bytes") != std::filesystem::file_size(destination / "model.safetensors"))
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
+                                    "stale or incomplete Whisper INT8 cache; remove kidi-int8-v2 and retry"});
+            for (const auto* name : files)
+                if (!std::filesystem::is_regular_file(destination / name))
+                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "incomplete Whisper INT8 cache"});
+            return destination;
+        }
+        const ModuleScope construction(DType::I8, false, tensor::Device::cpu());
+        auto model = require(create(config["model"]));
+        auto weights = require(Weights::load(source_path));
+        require(model->set_checkpoint(weights));
+        StateDict checkpoint;
+        for (const auto& [name, value] : model->state_dict())
+            if (!name.starts_with("proj_out.")) checkpoint.emplace("model." + name, value);
+        const auto bytes =
+            std::accumulate(checkpoint.begin(), checkpoint.end(), std::uint64_t{0},
+                            [](std::uint64_t total, const auto& item) { return total + item.second.nbytes(); });
+        if (std::filesystem::space(directory).available < bytes + 16 * 1024 * 1024)
+            throw ops::Failure({ErrorCode::RUNTIME, "not enough storage for the Whisper INT8 cache"});
+        std::random_device random;
+        for (int attempt = 0; attempt < 8 && temporary.empty(); ++attempt) {
+            auto candidate = directory / (".kidi-int8-v2-" + std::to_string(random()));
+            if (std::filesystem::create_directory(candidate)) temporary = std::move(candidate);
+        }
+        if (temporary.empty()) throw ops::Failure({ErrorCode::RUNTIME, "cannot create Whisper INT8 staging directory"});
+        require(Weights::save(temporary / "model.safetensors", checkpoint));
+        for (const auto* name : files) std::filesystem::copy_file(directory / name, temporary / name);
+        const auto metadata = nlohmann::json{
+            {"format", "kidi-whisper-int8-v2"},
+            {"source_bytes", source_size},
+            {"source_mtime", source_time},
+            {"model_bytes", std::filesystem::file_size(temporary / "model.safetensors")},
+            {"weight_precision", "signed-int8-per-output-channel"},
+            {"fp32_parameters", "input convolution, normalization, positions, biases, quantization scales"}};
+        std::ofstream stream(temporary / "quantization.json");
+        stream << metadata.dump(2) << '\n';
+        stream.close();
+        if (!stream) throw ops::Failure({ErrorCode::RUNTIME, "failed to write Whisper quantization metadata"});
+        std::filesystem::rename(temporary, destination);
+        temporary.clear();
+        return destination;
+    } catch (const ops::Failure& error) {
+        if (!temporary.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove_all(temporary, ignored);
+        }
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        if (!temporary.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove_all(temporary, ignored);
+        }
+        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
+    }
+}
+
 auto WhisperImpl::set_checkpoint(const Weights& weights) -> Result<void> {
     try {
         const auto checkpoint = require(weights.state_dict());
@@ -105,7 +189,36 @@ auto WhisperImpl::set_checkpoint(const Weights& weights) -> Result<void> {
             constexpr std::string_view PREFIX = "model.";
             if (!key.starts_with(PREFIX))
                 return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "unknown Whisper parameter: " + key});
-            state.emplace(key.substr(PREFIX.size()), value);
+            const auto name = key.substr(PREFIX.size());
+            const bool projection =
+                name.ends_with(".weight") &&
+                (name.starts_with("encoder.conv2") || name.ends_with("_proj.weight") || name.ends_with(".fc1.weight") ||
+                 name.ends_with(".fc2.weight") || name == "decoder.embed_tokens.weight");
+            if (impl_->precision == DType::I8 && projection && value.dtype() == DType::F32) {
+                const auto rows = static_cast<std::int64_t>(value.size(0));
+                const auto width = static_cast<std::int64_t>(value.numel() / value.size(0));
+                const auto matrix = require(value.reshape({rows, width}));
+                const auto packed = require(ops::pack_weight(matrix, 8, static_cast<std::int32_t>(width)));
+                const auto bytes = require(packed.values.host_bytes());
+                auto quantized = require(
+                    Tensor::from_host(std::vector<std::int64_t>(value.shape().begin(), value.shape().end()),
+                                      std::span(reinterpret_cast<const std::int8_t*>(bytes.data()), bytes.size()),
+                                      tensor::Device::cpu()));
+                state.emplace(name, std::move(quantized));
+                state.emplace(name.substr(0, name.size() - 7) + ".scale", packed.scales);
+            } else {
+                state.emplace(name, value);
+            }
+        }
+        for (const auto& [name, value] : state) {
+            if (impl_->precision == DType::I8 && name.ends_with(".scale")) {
+                if (value.dtype() != DType::F32)
+                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Whisper INT8 scale must be FP32: " + name});
+                for (const auto scale : require(value.data<float>()))
+                    if (!std::isfinite(scale) || scale <= 0)
+                        throw ops::Failure(
+                            {ErrorCode::INVALID_ARGUMENT, "Whisper INT8 scale must be positive and finite: " + name});
+            }
         }
         require(set_state(state));
         return {};

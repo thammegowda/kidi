@@ -64,7 +64,7 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
             if (!valid_token(generation[name].as<std::int32_t>()))
                 throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Whisper special token is outside vocabulary"});
         auto weights = require(model::Weights::load(config["model_file"].as<std::string>()));
-        const auto parameter = require(weights.tensor("model.encoder.conv1.weight"));
+        const auto parameter = require(weights.tensor("model.encoder.layers.0.fc1.weight"));
         const ModuleScope construction(parameter.dtype(), false, device);
         auto whisper = require(model::WhisperImpl::create(config["model"]));
         require(whisper->set_checkpoint(weights));
@@ -130,6 +130,7 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
         const auto vocabulary = config_["model"]["vocab_size"].as<std::size_t>();
         const auto end = generation_["eos_token_id"].as<std::int32_t>();
         const auto no_timestamps = generation_["no_timestamps_token_id"].as<std::int32_t>();
+        std::string emitted;
         for (std::size_t step = 0; step < options.maximum_tokens; ++step) {
             scores = require(logits.data<float>());
             const auto suppress = [&](std::int32_t token) {
@@ -145,11 +146,16 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
             const auto selected = static_cast<std::int32_t>(std::ranges::max_element(scores) - scores.begin());
             if (selected == end) break;
             result.token_ids.push_back(selected);
+            if (options.on_partial) {
+                const auto delta = require(tokenizer_.decode_delta(result.token_ids, emitted));
+                if (!delta.empty()) options.on_partial(emitted, result.language);
+            }
             logits = require(model_->forward(source, std::span(&selected, 1), state));
         }
         result.stats.decode_ns = elapsed(decode_start);
         result.stats.preparation_ns = model_->preparation_ns() - preparation;
         result.text = require(tokenizer_.decode(result.token_ids));
+        if (options.on_partial && result.text != emitted) options.on_partial(result.text, result.language);
         return result;
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());

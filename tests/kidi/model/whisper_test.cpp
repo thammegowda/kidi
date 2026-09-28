@@ -1,4 +1,5 @@
 #include <iostream>
+#include <cmath>
 
 #include "kidi/model/whisper.h"
 
@@ -33,5 +34,32 @@ auto main() -> int {
     if (!kidi::model::WhisperImpl::validate_config(config)) return 1;
     config["d_model"] = 1024;
     if (kidi::model::WhisperImpl::validate_config(config)) return 1;
+    {
+        using kidi::ops::require;
+        using kidi::tensor::Tensor;
+        const std::array<std::int8_t, 18> bytes{0, 8, 0, 0, 0, 0, 0, 0, 0, 0, -8, 0, 4, 0, -4, 0, 4, 0};
+        const std::array<float, 3> scales{0.125F, 0.25F, 0.5F};
+        std::array<float, 18> floating;
+        for (std::size_t index = 0; index < bytes.size(); ++index) floating[index] = bytes[index] * scales[index / 6];
+        const auto input = require(Tensor::from_host(
+            {1, 4, 2}, std::span<const float>(std::array{-1.F, 0.F, 0.5F, 1.F, -0.5F, 0.5F, 1.F, -1.F})));
+        const auto bias = require(Tensor::from_host({3}, std::span<const float>(std::array{0.5F, -0.25F, 0.F})));
+        kidi::layers::WhisperConv1d reference(2, 3, 1);
+        require(reference->set_state(
+            {{"weight", require(Tensor::from_host({3, 2, 3}, std::span<const float>(floating)))}, {"bias", bias}}));
+        const kidi::ModuleScope int8(kidi::tensor::DType::I8, false);
+        kidi::layers::WhisperConv1d quantized(2, 3, 1);
+        require(quantized->set_state(
+            {{"weight", require(Tensor::from_host({3, 2, 3}, std::span<const std::int8_t>(bytes)))},
+             {"bias", bias},
+             {"scale", require(Tensor::from_host({3, 1}, std::span<const float>(scales)))}}));
+        kidi::ops::Context context;
+        const auto expected = reference->forward(context, input);
+        const auto actual = quantized->forward(context, input);
+        const auto expected_values = require(expected.data<float>()), actual_values = require(actual.data<float>());
+        for (std::size_t index = 0; index < actual_values.size(); ++index)
+            if (!std::isfinite(actual_values[index]) || std::abs(actual_values[index] - expected_values[index]) > 0.02F)
+                return 1;
+    }
     return 0;
 }

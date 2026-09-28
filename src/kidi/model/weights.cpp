@@ -1,6 +1,10 @@
 #include "kidi/model/weights.h"
 
 #include <algorithm>
+#include <bit>
+#include <fstream>
+#include <limits>
+#include <nlohmann/json.hpp>
 #include <cctype>
 #include <cstring>
 #include <optional>
@@ -53,6 +57,58 @@ struct RawTensorView {
 };
 
 } // namespace
+
+auto Weights::save(const std::filesystem::path& path, const StateDict& state) -> Result<void> {
+    if (std::endian::native != std::endian::little || state.empty())
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT, "checkpoint writing requires nonempty little-endian tensors"});
+    try {
+        nlohmann::json header = nlohmann::json::object();
+        std::uint64_t offset = 0;
+        std::vector<const StateDict::value_type*> ordered;
+        ordered.reserve(state.size());
+        for (const auto& item : state) ordered.push_back(&item);
+        std::stable_sort(ordered.begin(), ordered.end(), [](const auto* left, const auto* right) {
+            return tensor::element_size(left->second.dtype()) > tensor::element_size(right->second.dtype());
+        });
+        constexpr std::array names{"BOOL", "U8",  "I8",   "U16", "I16", "U32",     "I32",    "U64",
+                                   "I64",  "F16", "BF16", "F32", "F64", "F8_E4M3", "F8_E5M2"};
+        for (const auto* item : ordered) {
+            const auto& [name, tensor] = *item;
+            const auto dtype = std::ranges::find_if(
+                names, [&](const char* value) { return parse_data_type(value) == tensor.dtype(); });
+            if (name.empty() || name == "__metadata__" || !tensor.defined() || !tensor.is_contiguous() ||
+                dtype == names.end() || tensor.nbytes() > std::numeric_limits<std::uint64_t>::max() - offset ||
+                tensor.nbytes() > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max()))
+                return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid checkpoint tensor: " + name});
+            const auto bytes = tensor.host_bytes();
+            if (!bytes) return std::unexpected(bytes.error());
+            header[name] = {{"dtype", *dtype},
+                            {"shape", std::vector<std::int64_t>(tensor.shape().begin(), tensor.shape().end())},
+                            {"data_offsets", {offset, offset + tensor.nbytes()}}};
+            offset += tensor.nbytes();
+        }
+        auto serialized = header.dump();
+        serialized.append((8 - serialized.size() % 8) % 8, ' ');
+        const std::uint64_t length = serialized.size();
+        std::ofstream stream(path, std::ios::binary | std::ios::out | std::ios::noreplace);
+        if (!stream)
+            return std::unexpected(Error{ErrorCode::RUNTIME, "cannot exclusively create checkpoint: " + path.string()});
+        stream.write(reinterpret_cast<const char*>(&length), sizeof(length));
+        stream.write(serialized.data(), serialized.size());
+        for (const auto* item : ordered) {
+            const auto& [name, tensor] = *item;
+            const auto bytes = tensor.host_bytes();
+            if (!bytes) return std::unexpected(bytes.error());
+            stream.write(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+        }
+        stream.close();
+        if (!stream) return std::unexpected(Error{ErrorCode::RUNTIME, "failed to write checkpoint: " + path.string()});
+        return {};
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
+    }
+}
 
 struct Weights::Impl {
     explicit Impl(const std::filesystem::path& path) : checkpoint(path.string()) {}
