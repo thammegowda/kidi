@@ -82,6 +82,31 @@ The first turn includes cold operator preparation; do not compare it directly wi
 `cached` and `uncached` records, which use identical conversation input and generation limits in the same process.
 This checks the same shared serving core used by the app, not Compose/UI overhead or debug-build inference performance.
 
+## Image Chat Check
+
+Place a JPEG/PNG test image in the ignored cache and stage it on the device. The image mode asks for a short description,
+then a color follow-up; the second turn must reuse KV and encoded image features. It uses the checkpoint's existing
+vision weights and does not download another model:
+
+```sh
+"$ADB" -s SERIAL push benchmarks/android/.cache/photo.jpg "$REMOTE/photo.jpg"
+"$ADB" -s SERIAL shell "timeout 150 $REMOTE/runner image $REMOTE/models/gemma4 4 1 $REMOTE/photo.jpg" \
+  > benchmarks/android/.cache/image-chat.jsonl
+```
+
+With the existing PyTorch/Transformers reference environment, generate small numerical fixtures locally:
+
+```sh
+python tests/gemma4_reference.py tests/.cache/gemma4-vision --vision
+python tests/gemma4_reference.py tests/.cache/gemma4-vision-qat --vision --qat
+cmake --build --preset debug --target kidi_gemma4_image_test
+build-debug/kidi_gemma4_image_test tests/.cache/gemma4-vision
+build-debug/kidi_gemma4_image_test tests/.cache/gemma4-vision-qat qat
+```
+
+These compare projected image features independently of the real model's natural-language answer. Generated tensors,
+photos, and reports remain ignored and are not committed.
+
 ## Optional Vulkan Probe
 
 This standalone projection microbenchmark is not an app backend or a full-model speed comparison.

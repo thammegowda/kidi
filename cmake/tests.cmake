@@ -14,6 +14,7 @@ set_tests_properties(kidi_argparse_test PROPERTIES LABELS native)
 
 kidi_add_test(kidi_manifest_test tests/kidi/model/config_test.cpp)
 kidi_add_test(kidi_whisper_audio_test tests/kidi/audio/whisper_test.cpp)
+kidi_add_test(kidi_gemma4_image_test tests/kidi/image/gemma4_test.cpp TahomaVision::Vision)
 kidi_add_test(kidi_tokenizer_test tests/kidi/text/tokenizer_test.cpp ZLIB::ZLIB)
 kidi_add_test(kidi_rtg_package_test tests/kidi/model/package_test.cpp)
 kidi_add_test(kidi_gemma4_test tests/kidi/model/gemma4_test.cpp)

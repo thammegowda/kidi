@@ -1,10 +1,12 @@
 package ai.gowda.kidi
 
 import android.Manifest
+import android.net.Uri
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.BorderStroke
@@ -56,6 +58,8 @@ import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -134,6 +138,14 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
     var confirmSpeechDelete by remember { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
     val context = LocalContext.current
+    var captureUri by rememberSaveable { mutableStateOf<String?>(null) }
+    val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { captured ->
+        captureUri?.let { viewModel.finishCapture(Uri.parse(it), captured) }
+        captureUri = null
+    }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        uri?.let(viewModel::attachImage)
+    }
     val microphonePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) viewModel.startRecording()
         else viewModel.reportError("Microphone permission is required for speech dictation")
@@ -166,6 +178,24 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
         onOpenChat = viewModel::openChat,
         onMoreHistory = viewModel::loadMoreHistory,
         onOlderMessages = viewModel::loadOlderMessages,
+        onPickImage = {
+            runCatching { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
+                .onFailure { viewModel.reportError("Photo picker is unavailable") }
+        },
+        onTakePhoto = {
+            if (captureUri == null) {
+                runCatching {
+                    val uri = viewModel.captureImageUri()
+                    captureUri = uri.toString()
+                    camera.launch(uri)
+                }.onFailure {
+                    captureUri?.let { viewModel.finishCapture(Uri.parse(it), false) }
+                    captureUri = null
+                    viewModel.reportError("No camera app is available")
+                }
+            }
+        },
+        onRemoveImage = viewModel::removePendingImage,
     )
 
     if (settingsOpen) {
@@ -216,10 +246,10 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
 }
 
 private val KidiUiState.runtimeBusy: Boolean
-    get() = generating || recording || transcribing || loadingModel || loadingSpeech || loadingChat
+    get() = generating || recording || transcribing || loadingModel || loadingSpeech || loadingChat || importingImage
 
 private val KidiUiState.chatBusy: Boolean
-    get() = generating || recording || transcribing || loadingModel || loadingChat
+    get() = generating || recording || transcribing || loadingModel || loadingChat || importingImage
 
 private fun modelLabel(modelId: String) = when (modelId) {
     "google/gemma-4-E2B-it-qat-mobile-transformers" -> "Gemma 4 E2B"
@@ -245,6 +275,9 @@ internal fun ChatWorkspace(
     onOpenChat: (String) -> Unit = {},
     onMoreHistory: () -> Unit = {},
     onOlderMessages: () -> Unit = {},
+    onPickImage: () -> Unit = {},
+    onTakePhoto: () -> Unit = {},
+    onRemoveImage: () -> Unit = {},
 ) {
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -268,7 +301,8 @@ internal fun ChatWorkspace(
                 onHistoryOpen()
                 scope.launch { drawer.open() }
             } },
-            bottomBar = { Composer(state, onTextChange, onSend, onStop, onRecord, onStopRecording, onSettings) },
+            bottomBar = { Composer(state, onTextChange, onSend, onStop, onRecord, onStopRecording, onSettings,
+                onPickImage, onTakePhoto, onRemoveImage) },
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding), contentAlignment = Alignment.TopCenter) {
                 Conversation(state, onSettings, onTextChange, Modifier.widthIn(max = 760.dp).fillMaxSize(), onOlderMessages)
@@ -477,10 +511,14 @@ private fun MessageRow(message: ChatMessage, active: Boolean = false) {
                 }
             }
             message.attachments.forEach { attachment ->
+                if (attachment.kind == AttachmentKind.IMAGE) {
+                    PhotoPreview(attachment, Modifier.fillMaxWidth().height(220.dp).padding(vertical = 8.dp))
+                } else {
                 Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Icon(Icons.Default.AttachFile, attachment.kind.name, Modifier.size(18.dp))
                     Text(attachment.name, Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
                 }
             }
             message.stats?.let { stats ->
@@ -513,9 +551,14 @@ private fun Composer(
     onRecord: () -> Unit,
     onStopRecording: () -> Unit,
     onSettings: () -> Unit,
+    onPickImage: () -> Unit,
+    onTakePhoto: () -> Unit,
+    onRemoveImage: () -> Unit,
 ) {
     val keyboard = LocalSoftwareKeyboardController.current
-    val canSend = state.modelReady && !state.chatBusy && state.composerText.isNotBlank()
+    val canSend = state.modelReady && !state.chatBusy &&
+        (state.composerText.isNotBlank() || state.pendingImages.isNotEmpty()) &&
+        (state.pendingImages.isEmpty() || state.visionReady)
     val submit = {
         if (canSend) {
             keyboard?.hide()
@@ -536,6 +579,14 @@ private fun Composer(
                     else MaterialTheme.colorScheme.outlineVariant),
             ) {
                 Column {
+                    if (state.importingImage) LinearProgressIndicator(Modifier.fillMaxWidth())
+                    state.pendingImages.forEach { image ->
+                        Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            PhotoPreview(image, Modifier.size(width = 112.dp, height = 84.dp))
+                            Spacer(Modifier.weight(1f))
+                            ToolButton(Icons.Default.Close, "Remove photo", onRemoveImage, !state.importingImage)
+                        }
+                    }
                     if (state.recording || state.transcribing || state.generating) {
                         Row(
                             Modifier.fillMaxWidth().padding(start = 16.dp, end = 12.dp, top = 12.dp),
@@ -550,7 +601,7 @@ private fun Composer(
                                     state.recording -> "Listening · ${"%.1f".format(state.recordingSeconds)} s"
                                     state.transcribing -> "Refining transcript"
                                     state.stopping -> "Stopping"
-                                    else -> "Generating"
+                                    else -> state.status
                                 },
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.primary,
@@ -576,6 +627,8 @@ private fun Composer(
                         Modifier.fillMaxWidth().padding(start = 4.dp, end = 8.dp, bottom = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        ToolButton(Icons.Default.PhotoCamera, "Take photo", onTakePhoto, state.visionReady && !state.chatBusy)
+                        ToolButton(Icons.Default.PhotoLibrary, "Choose photo", onPickImage, state.visionReady && !state.chatBusy)
                         ToolButton(
                             if (state.recording) Icons.Default.Stop else Icons.Default.Mic,
                             if (state.recording) "Stop recording" else if (state.speechReady) "Dictate message" else "Set up dictation",

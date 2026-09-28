@@ -11,6 +11,13 @@
         android:label="Kidi"
         android:roundIcon="@mipmap/ic_launcher"
         android:theme="@style/Theme.Kidi">
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.images"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/image_paths" />
+        </provider>
         <activity
             android:name=".MainActivity"
             android:windowSoftInputMode="adjustResize"

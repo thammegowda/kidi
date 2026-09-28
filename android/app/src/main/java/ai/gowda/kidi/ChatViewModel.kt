@@ -2,6 +2,7 @@ package ai.gowda.kidi
 
 import android.Manifest
 import android.app.Application
+import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.RequiresPermission
@@ -44,6 +45,9 @@ internal data class KidiUiState(
     val historyError: String? = null,
     val draft: String = "",
     val composerText: String = "",
+    val pendingImages: List<MessageAttachment> = emptyList(),
+    val importingImage: Boolean = false,
+    val visionReady: Boolean = false,
     val modelReady: Boolean = false,
     val loadingModel: Boolean = false,
     val generating: Boolean = false,
@@ -70,6 +74,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     private val repository = ModelRepository(application)
     private val chats = ChatRepository(application)
     private val speechRecorder = SpeechRecorder()
+    private val imageStore = ImageStore(application)
     private val runtimeExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "kidi-runtime") }
     private val runtimeDispatcher: CoroutineDispatcher = runtimeExecutor.asCoroutineDispatcher()
     private val _state = MutableStateFlow(
@@ -125,6 +130,36 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun setComposerText(value: String) {
         _state.update { it.copy(composerText = value) }
+    }
+
+    fun captureImageUri(): Uri = imageStore.captureUri()
+
+    fun finishCapture(uri: Uri, captured: Boolean) {
+        if (captured) attachImage(uri) else imageStore.removeCapture(uri)
+    }
+
+    fun attachImage(uri: Uri) {
+        val current = _state.value
+        if (current.generating || current.recording || current.transcribing || current.importingImage) return
+        _state.update { it.copy(importingImage = true, error = null) }
+        viewModelScope.launch {
+            try {
+                val image = withContext(Dispatchers.IO) { imageStore.import(uri) }
+                withContext(Dispatchers.IO) { current.pendingImages.forEach(imageStore::removeDraft) }
+                _state.update { it.copy(pendingImages = listOf(image), importingImage = false) }
+            } catch (error: Exception) {
+                _state.update { it.copy(importingImage = false, error = "Unable to import photo: ${error.userMessage()}") }
+            } finally {
+                imageStore.removeCapture(uri)
+            }
+        }
+    }
+
+    fun removePendingImage() {
+        if (_state.value.importingImage || _state.value.generating) return
+        val pending = _state.value.pendingImages
+        _state.update { it.copy(pendingImages = emptyList()) }
+        viewModelScope.launch(Dispatchers.IO) { pending.forEach(imageStore::removeDraft) }
     }
 
     fun setThreadCount(value: Int) {
@@ -235,11 +270,15 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun send(content: String) {
-        val prompt = content.trim()
         val current = _state.value
+        val prompt = content.trim().ifEmpty { if (current.pendingImages.isNotEmpty()) "What is in this image?" else "" }
         if (prompt.isEmpty() || !current.modelReady || current.generating || current.loadingModel || current.loadingChat ||
-            current.recording || current.transcribing) return
-        val pending = ChatMessage(MessageRole.USER, prompt)
+            current.recording || current.transcribing || current.importingImage) return
+        if (current.pendingImages.isNotEmpty() && !current.visionReady) {
+            reportError("The loaded model does not support images")
+            return
+        }
+        val pending = ChatMessage(MessageRole.USER, prompt, attachments = current.pendingImages)
         val messages = current.messages + pending
         responseAgent = ChatParticipant.agent(current.modelId)
         _state.update {
@@ -247,9 +286,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 messages = messages,
                 draft = "",
                 composerText = "",
+                pendingImages = emptyList(),
                 generating = true,
                 stopping = false,
-                status = "Preparing prompt",
+                status = if (messages.any { it.attachments.isNotEmpty() }) "Analyzing image" else "Preparing prompt",
                 error = null,
             )
         }
@@ -429,9 +469,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun newChat() {
-        if (_state.value.generating || _state.value.loadingChat ||
+        if (_state.value.generating || _state.value.loadingChat || _state.value.importingImage ||
             _state.value.recording || _state.value.transcribing)
             return
+        removePendingImage()
         _state.update { it.copy(loadingChat = true) }
         viewModelScope.launch {
             try {
@@ -447,7 +488,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun openChat(id: String) {
         val current = _state.value
-        if (current.generating || current.recording || current.transcribing || current.loadingChat || id == current.activeChatId) return
+        if (current.generating || current.recording || current.transcribing || current.loadingChat || current.importingImage || id == current.activeChatId) return
+        removePendingImage()
         _state.update { it.copy(loadingChat = true) }
         viewModelScope.launch {
             try {
@@ -566,12 +608,13 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 checked(NativeRuntime.load(model.directory.absolutePath)).also {
                     Log.i("KidiStartup", "gemma_ready configure_ms=${configured - started} native_ms=${it.optDouble("load_ms")} stages=${it.optJSONObject("stages_ms")}")
                 }
-            }.onSuccess {
+            }.onSuccess { loaded ->
                 _state.update {
                     it.copy(
                         modelId = model.modelId,
                         modelRevision = model.revision,
                         modelReady = true,
+                        visionReady = loaded.optBoolean("vision"),
                         loadingModel = false,
                         progress = 1f,
                         status = "Ready on device",
@@ -677,7 +720,12 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             result.put(
                 JSONObject()
                     .put("role", if (message.role == MessageRole.USER) "user" else "assistant")
-                    .put("content", message.content),
+                    .put("content", message.content)
+                    .put("images", JSONArray().also { images ->
+                        message.attachments.filter { it.kind == AttachmentKind.IMAGE }.forEach { image ->
+                            images.put(requireNotNull(Uri.parse(image.localUri).path))
+                        }
+                    }),
             )
         }
     }

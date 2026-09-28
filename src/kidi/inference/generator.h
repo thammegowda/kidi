@@ -2,6 +2,7 @@
 
 #include "kidi/inference/decoder.h"
 #include "kidi/model/gemma4.h"
+#include "kidi/model/gemma4_vision.h"
 #include "kidi/text/tokenizer.h"
 #include <chrono>
 #include <deque>
@@ -60,18 +61,26 @@ public:
     auto cancel(std::uint64_t request_id) -> Result<void>;
     auto pending_requests() const -> std::size_t { return waiting_.size() + running_.size(); }
     auto native_qat() const -> bool { return static_cast<bool>(config_["model"]["quantization_config"]); }
+    auto vision_supported() const -> bool { return static_cast<bool>(config_["vision"]); }
 
 private:
     Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model, std::array<std::int32_t, 3> special);
     YAML::Node config_;
     text::Tokenizer tokenizer_;
     model::Gemma4 model_;
+    model::Gemma4Vision vision_{nullptr};
+    struct CachedImage {
+        std::string encoded;
+        tensor::Tensor embeddings;
+    };
+    std::vector<CachedImage> images_;
     std::array<std::int32_t, 3> special_;
     struct PrefixEntry {
         std::vector<std::int32_t> tokens;
         model::Gemma4State state;
         std::size_t bytes = 0, chunk_size = 0;
         bool crop_local_attention = true;
+        std::string image_key;
     };
     std::optional<PrefixEntry> prefix_;
     std::optional<PrefixEntry> serving_prefix_;
@@ -85,6 +94,8 @@ private:
         GenerationStats stats;
         std::chrono::steady_clock::time_point enqueued;
         std::string streamed_text;
+        std::vector<model::Gemma4ImageTokens> images;
+        std::string image_key;
     };
     auto retain_serving_prefix(QueuedGeneration& request) -> void;
     std::optional<ServingOptions> serving_;

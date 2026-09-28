@@ -134,6 +134,25 @@ unchanged. Callbacks must be lightweight and must not reenter the same transcrib
 partial snapshots as ASCII-escaped JSON, updates the composer only for the matching draft/refinement phase, and reports
 callback failures through the existing error result. Streaming starts after encoding; it does not make the encoder causal.
 
+## Image Input
+
+`image::prepare_gemma4` owns bounded Tahoma Vision decoding, aspect-preserving antialiased bicubic resizing, and RGB
+patch layout. `model::Gemma4Vision` binds the checkpoint vision tower/projector and composes existing eager operators
+for axial rotary attention, RMS normalization, gated feed-forward layers, and spatial pooling. The default mobile
+checkpoint uses trained INT8 vision projections; FP32 and QAT tiny fixtures are checked against Transformers.
+
+Chat messages may supply local image paths. `Generator::enqueue_chat` lazily loads the vision module, expands the
+checkpoint's image markers, and attaches positioned image vectors to the request. The text model uses PAD token lookup
+for image positions' per-layer token embeddings, inserts projected image vectors before the per-layer model projection,
+and uses the supported model's normal causal mask. Encoded images and features are bounded to the current request's
+eight-image/32-MiB limit. Exact encoded content joins the serving prefix compatibility key; matching placeholder IDs
+alone never permit image KV reuse. Image features and the vision module remain reusable while the generator is loaded.
+
+Android owns camera/picker permissions and app-private image files; native model equations and preprocessing are not
+implemented in Kotlin. Text-only APIs and unsupported image checkpoints retain explicit failure boundaries. The pinned
+Tahoma submodule is unchanged; the consumer CMake hook supplies the external JPEG cross-toolchain and the NDK's
+experimental stop-token feature required by pigzpp. Optional PDF/SVG dependencies are disabled.
+
 ## Eager Contract
 
 `ops::Context` belongs to one device and one caller at a time. Inputs and outputs

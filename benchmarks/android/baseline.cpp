@@ -156,6 +156,41 @@ auto benchmark_chat_turns(const std::filesystem::path& directory, int threads, i
     }
 }
 
+auto benchmark_image(const std::filesystem::path& directory, const std::filesystem::path& image, int threads) -> void {
+    const auto start = Clock::now();
+    auto generator = require(kidi::inference::Generator::load(directory, kidi::tensor::Device::cpu(), 0, 128, true));
+    require(generator.configure_serving({1, 1, CONTEXT, CHUNK}));
+    emit({{"stage", "load"}, {"vision", generator.vision_supported()}, {"ms", rounded(elapsed_ms(start))}}, threads);
+    kidi::inference::GenerationOptions options;
+    options.maximum_new_tokens = 48;
+    options.context_size = CONTEXT;
+    options.prefill_chunk_size = CHUNK;
+    options.prefix_cache_bytes = 512 * 1024 * 1024;
+    options.stream_text = true;
+    std::vector messages{kidi::text::ChatMessage{"user", "What is in this photo? Give a short answer.", {image}}};
+    for (int turn = 0; turn < 2; ++turn) {
+        const auto encoded = Clock::now();
+        require(generator.enqueue_chat(messages, options));
+        emit({{"stage", "image_encoded"}, {"turn", turn}, {"ms", rounded(elapsed_ms(encoded))}}, threads);
+        while (generator.pending_requests()) {
+            const auto step = require(generator.step());
+            for (const auto& event : step.events)
+                if (event.completed) {
+                    if (turn && !event.completed->stats.reused_prompt_tokens)
+                        throw std::runtime_error("image follow-up lost KV reuse");
+                    emit({{"stage", "answer"},
+                          {"turn", turn},
+                          {"text", event.completed->text},
+                          {"reused_prompt_tokens", event.completed->stats.reused_prompt_tokens},
+                          {"ms", rounded(elapsed_ms(encoded))}},
+                         threads);
+                    messages.push_back({"assistant", event.completed->text});
+                }
+        }
+        messages.push_back({"user", "What color is it? Answer briefly."});
+    }
+}
+
 auto benchmark_whisper(const std::filesystem::path& directory, const std::filesystem::path& wav, int threads,
                        int repeats) -> void {
     const auto waveform = require(kidi::audio::load_wav(wav));
@@ -192,7 +227,7 @@ auto benchmark_whisper(const std::filesystem::path& directory, const std::filesy
 
 auto main(int argc, char** argv) -> int {
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
-        std::cout << "usage: kidi_android_baseline gemma|chat|whisper MODEL THREADS REPEATS [WAV]\n";
+        std::cout << "usage: kidi_android_baseline gemma|chat|whisper|image MODEL THREADS REPEATS [MEDIA]\n";
         return 0;
     }
     try {
@@ -200,7 +235,8 @@ auto main(int argc, char** argv) -> int {
         const std::string mode(argv[1]);
         const auto threads = std::stoi(argv[3]), repeats = std::stoi(argv[4]);
         if (threads < 1 || threads > 8 || repeats < 1 || repeats > 20 ||
-            !(((mode == "gemma" || mode == "chat") && argc == 5) || (mode == "whisper" && argc == 6)))
+            !(((mode == "gemma" || mode == "chat") && argc == 5) ||
+              ((mode == "whisper" || mode == "image") && argc == 6)))
             throw std::runtime_error("invalid mode, thread count, repeat count, or WAV argument");
         kidi::runtime::ynn::set_thread_count(threads);
         require(kidi::runtime::ynn::reserve_thread_pool(threads));
@@ -213,6 +249,8 @@ auto main(int argc, char** argv) -> int {
             benchmark_gemma(argv[2], threads, repeats);
         else if (mode == "chat")
             benchmark_chat_turns(argv[2], threads, repeats);
+        else if (mode == "image")
+            benchmark_image(argv[2], argv[5], threads);
         else
             benchmark_whisper(argv[2], argv[5], threads, repeats);
         return 0;

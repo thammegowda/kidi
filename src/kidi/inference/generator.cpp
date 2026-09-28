@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
+#include <fstream>
 
 namespace kidi::inference {
 using ops::require;
@@ -37,6 +38,15 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
         if (!tokenizer.token_id("<bos>") || !tokenizer.token_id("<|turn>"))
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Gemma 4 tokenizer lacks chat delimiters"});
         auto weights = require(model::Weights::load(config["weights_file"].as<std::string>()));
+        if (std::filesystem::is_regular_file(directory / "config.json") &&
+            weights.contains("model.vision_tower.patch_embedder.input_proj.weight") &&
+            weights.contains("model.embed_vision.embedding_projection.weight")) {
+            const auto upstream = YAML::LoadFile((directory / "config.json").string());
+            if (upstream["vision_config"] && !config["model"]["use_bidirectional_attention"].IsScalar()) {
+                config["vision"] = upstream["vision_config"];
+                config["image_token_id"] = upstream["image_token_id"];
+            }
+        }
         const auto parameter = require(weights.tensor(config["model"]["quantization_config"]
                                                           ? "model.language_model.norm.weight"
                                                           : "model.language_model.embed_tokens.weight"));
@@ -282,10 +292,87 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
 }
 auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options)
     -> Result<std::uint64_t> {
-    auto prompt = tokenizer_.format_chat(messages);
-    if (!prompt) return std::unexpected(std::move(prompt.error()));
-    options.raw_prompt = true;
-    return enqueue(*prompt, options);
+    try {
+        std::vector<text::ChatMessage> expanded(messages.begin(), messages.end());
+        std::vector<CachedImage> current;
+        std::string image_key;
+        for (auto& message : expanded) {
+            std::string placeholders;
+            for (const auto& path : message.images) {
+                if (!vision_supported())
+                    throw ops::Failure({ErrorCode::UNSUPPORTED, "this checkpoint has no supported vision tower"});
+                if (message.role != "user" || current.size() >= 8)
+                    throw ops::Failure(
+                        {ErrorCode::INVALID_ARGUMENT, "images require user messages, at most eight per context"});
+                const auto size = std::filesystem::file_size(path);
+                if (!size || size > 32 * 1024 * 1024 || image_key.size() + size > 32 * 1024 * 1024)
+                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "images exceed the 32 MiB request limit"});
+                std::ifstream stream(path, std::ios::binary);
+                std::string encoded(size, '\0');
+                if (!stream.read(encoded.data(), encoded.size()) || stream.peek() != std::char_traits<char>::eof())
+                    throw ops::Failure({ErrorCode::IO, "unable to read complete image"});
+                auto cached = std::ranges::find(images_, encoded, &CachedImage::encoded);
+                tensor::Tensor embeddings;
+                if (cached != images_.end()) {
+                    embeddings = cached->embeddings;
+                } else {
+                    if (!vision_) {
+                        const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
+                        auto vision = model::Gemma4Vision(config_["vision"], config_["model"]["hidden_size"].as<int>(),
+                                                          native_qat());
+                        auto weights = require(model::Weights::load(config_["weights_file"].as<std::string>()));
+                        require(vision->set_checkpoint(weights));
+                        vision_ = std::move(vision);
+                    }
+                    const auto pixels = require(image::prepare_gemma4(
+                        std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size())));
+                    embeddings = require(require(vision_->forward(pixels)).to(model_->device()));
+                }
+                placeholders += "<|image>";
+                for (std::size_t index = 0; index < embeddings.size(1); ++index) placeholders += "<|image|>";
+                placeholders += "<image|>";
+                image_key += std::to_string(encoded.size()) + ":" + encoded;
+                current.push_back({std::move(encoded), std::move(embeddings)});
+            }
+            message.images.clear();
+            message.content = placeholders + message.content;
+        }
+        const auto prompt = require(tokenizer_.format_chat(expanded));
+        std::vector<model::Gemma4ImageTokens> positions;
+        if (!current.empty()) {
+            const auto ids = require(tokenizer_.encode(prompt));
+            const auto image_token = config_["image_token_id"].as<std::int32_t>();
+            std::size_t image_index = 0;
+            for (std::size_t position = 0; position < ids.size();) {
+                if (ids[position] != image_token) {
+                    ++position;
+                    continue;
+                }
+                if (image_index >= current.size())
+                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "extra image placeholders"});
+                const auto& embeddings = current[image_index++].embeddings;
+                const auto count = embeddings.size(1);
+                if (count > ids.size() - position ||
+                    !std::ranges::all_of(std::span(ids).subspan(position, count),
+                                         [&](auto token) { return token == image_token; }))
+                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "image token count mismatch"});
+                positions.push_back({position, embeddings});
+                position += count;
+            }
+            if (image_index != current.size())
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "missing image placeholders"});
+        }
+        options.raw_prompt = true;
+        const auto id = require(enqueue(prompt, options));
+        waiting_.back().images = std::move(positions);
+        waiting_.back().image_key = std::move(image_key);
+        images_ = std::move(current);
+        return id;
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
+    }
 }
 auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> Result<std::uint64_t> {
     try {
@@ -349,8 +436,8 @@ auto Generator::retain_serving_prefix(QueuedGeneration& request) -> void {
     request.stats.prefix_cache_bytes = bytes / request.capacity * position;
     request.stats.prefix_reserved_bytes = bytes;
     const auto chunk = std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step);
-    serving_prefix_.emplace(
-        PrefixEntry{std::move(tokens), std::move(*request.state), bytes, chunk, !request.options.full_attention_cache});
+    serving_prefix_.emplace(PrefixEntry{std::move(tokens), std::move(*request.state), bytes, chunk,
+                                        !request.options.full_attention_cache, std::move(request.image_key)});
     request.state.reset();
 }
 
@@ -383,6 +470,7 @@ auto Generator::step() -> Result<GenerationStep> {
                 auto& request = waiting_.front();
                 const auto chunk = std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step);
                 if (serving_prefix_ && request.options.prefix_cache_bytes >= serving_prefix_->bytes &&
+                    request.image_key == serving_prefix_->image_key &&
                     request.capacity == serving_prefix_->state.capacity && chunk == serving_prefix_->chunk_size &&
                     serving_prefix_->crop_local_attention == !request.options.full_attention_cache) {
                     const auto limit = std::min(serving_prefix_->tokens.size(), request.prompt.size() - 1);
@@ -394,6 +482,7 @@ auto Generator::step() -> Result<GenerationStep> {
                 }
                 serving_prefix_.reset();
                 if (!request.state) request.state = require(model_->create_state(request.capacity));
+                request.state->images = request.images;
                 request.state->crop_local_attention = !request.options.full_attention_cache;
                 running_.push_back(std::move(request));
                 reserved_cache_tokens_ += running_.back().capacity;

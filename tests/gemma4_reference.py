@@ -168,14 +168,53 @@ def checkpoint_reference(directory: Path, destination: Path, prompt_tokens: Path
     print(f"Saved full QAT reference for {tokens.numel()} positions in {destination}")
 
 
+def generate_vision(destination: Path, qat: bool = False):
+    from transformers import Gemma4VisionConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionModel, Gemma4MultimodalEmbedder
+
+    torch.manual_seed(173)
+    torch.set_num_threads(1)
+    config = Gemma4VisionConfig(hidden_size=16, intermediate_size=24, num_hidden_layers=2,
+        num_attention_heads=2, num_key_value_heads=2, head_dim=8, global_head_dim=8,
+        patch_size=16, pooling_kernel_size=3, position_embedding_size=16, standardize=False,
+        use_clipped_linears=False, rope_parameters={"rope_type": "axial", "rope_theta": 100.0},
+        attn_implementation="eager")
+    tower = Gemma4VisionModel(config).float().eval()
+    projection = Gemma4MultimodalEmbedder(config, Gemma4TextConfig(hidden_size=20)).float().eval()
+    if qat:
+        from transformers.integrations.gemma_quant import QuantizedLinear
+        for name, module in list(tower.named_modules()):
+            if isinstance(module, torch.nn.Linear) and not name.startswith("patch_embedder"):
+                replacement = QuantizedLinear(module.in_features, module.out_features, num_bits=8)
+                with torch.no_grad():
+                    replacement.weight.copy_(torch.randint(-127, 128, replacement.weight.shape, dtype=torch.int8))
+                    replacement.weight_scale.fill_(0.001)
+                    replacement.input_activation_scale.fill_(0.012731)
+                    replacement.output_activation_scale.fill_(0.009173)
+                tower.set_submodule(name, replacement)
+    patches = torch.rand(1, 54, 768)
+    positions = torch.stack(torch.meshgrid(torch.arange(9), torch.arange(6), indexing="xy"), dim=-1).reshape(1, 54, 2)
+    with torch.no_grad():
+        features = projection(tower(patches, positions).last_hidden_state).reshape(1, 6, 20).contiguous()
+    weights = {"model.vision_tower." + name: value.contiguous() for name, value in tower.state_dict().items()}
+    weights.update({"model.embed_vision." + name: value.contiguous() for name, value in projection.state_dict().items()})
+    destination.mkdir(parents=True, exist_ok=True)
+    save_file(weights, destination / "model.safetensors")
+    save_file({"patches": patches, "features": features}, destination / "reference.safetensors")
+    (destination / "config.yaml").write_text(yaml.safe_dump(config.to_dict()))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("destination", type=Path)
     parser.add_argument("--qat", action="store_true")
+    parser.add_argument("--vision", action="store_true")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--prompt-tokens", type=Path, help="benchmark JSON containing independent reference input IDs")
     args = parser.parse_args()
-    if args.checkpoint:
+    if args.vision:
+        generate_vision(args.destination, args.qat)
+    elif args.checkpoint:
         checkpoint_reference(args.checkpoint, args.destination, args.prompt_tokens)
     else:
         generate(args.destination, args.qat)

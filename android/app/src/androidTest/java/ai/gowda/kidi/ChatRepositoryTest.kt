@@ -10,6 +10,42 @@ import java.util.UUID
 
 class ChatRepositoryTest {
     @Test
+    fun importedPhotoSurvivesSourceRemovalAndChatReload() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val source = java.io.File.createTempFile("picked-image-", ".png", context.cacheDir)
+        val name = "image-chat-test-${UUID.randomUUID()}.db"
+        val store = ImageStore(context)
+        var attachment: MessageAttachment? = null
+        try {
+            val bitmap = android.graphics.Bitmap.createBitmap(24, 16, android.graphics.Bitmap.Config.ARGB_8888)
+            bitmap.eraseColor(android.graphics.Color.RED)
+            source.outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+            bitmap.recycle()
+            val image = store.import(android.net.Uri.fromFile(source))
+            attachment = image
+            source.delete()
+            assertTrue(java.io.File(requireNotNull(android.net.Uri.parse(image.localUri).path)).isFile)
+            val thread = ChatRepository(context, name).use { repository ->
+                val id = repository.createThread(listOf(ChatParticipant.USER, ChatParticipant.LEGACY_AGENT))
+                repository.append(id, ChatMessage(MessageRole.USER, "What is this?", attachments = listOf(image)))
+                id
+            }
+            ChatRepository(context, name).use { repository ->
+                val message = requireNotNull(repository.load(thread)).page.messages.single()
+                assertEquals(image, message.attachments.single())
+                assertEquals(listOf(image), listOf(message).textGenerationContext().single().attachments)
+            }
+            val capture = store.captureUri()
+            assertEquals("${context.packageName}.images", capture.authority)
+            store.removeCapture(capture)
+        } finally {
+            attachment?.let(store::removeDraft)
+            source.delete()
+            context.deleteDatabase(name)
+        }
+    }
+
+    @Test
     fun modelContextKeepsStoredHistoryButSkipsUnansweredTurns() {
         val history = listOf(
             ChatMessage(MessageRole.USER, "Unanswered"),

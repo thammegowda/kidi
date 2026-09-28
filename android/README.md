@@ -67,6 +67,27 @@ thread. Stored chat history is independent of this temporary optimization. First
 JNI completion records expose `reused_prompt_tokens`, `prefix_cache_bytes`, `prefix_reserved_bytes`, `prefill_ms`, and
 `first_token_ms` so cache hits and first-response latency can be measured independently of decode speed.
 
+### Photos
+
+With the default Gemma 4 mobile model loaded, the composer offers camera and photo-picker actions. Capture through the
+system camera app or select an image through Android's photo picker, inspect/remove the preview, and send a question.
+Sending only a photo uses "What is in this image?". Tap a photo in the conversation to view it larger.
+
+The app copies selected images into private storage, applies orientation/color conversion, and bounds them to a
+2048-pixel longest edge before saving JPEG. No broad photo-library permission is requested; camera capture uses a
+temporary, narrowly shared FileProvider URI. The private copy stays with the message when reopening a chat. Audio,
+video, and document attachments are not model inputs yet.
+
+Tahoma Vision decodes JPEG/PNG in the shared C++ core. Gemma's vision tower, image projection, and text-model image
+embeddings run on device using the vision weights already present in the default checkpoint. The tower loads lazily,
+so text-only startup does not pay its cost. Image features are reused for follow-up questions, and exact image content
+is part of KV-cache compatibility. A changed photo cannot reuse KV from a different image with identical placeholders.
+The native request limit is eight images and 32 MiB of encoded input. Only supported causal Gemma vision configurations
+are enabled; this does not add remote vision inference or restore Gemma audio input.
+
+The APK bundles the Tahoma Vision and codec redistribution notices. PDF/SVG, codec command-line tools, and Python
+bindings are disabled in the embedded dependency build.
+
 ### Speech Dictation
 
 The default speech model is **Whisper Small INT8**, from `openai/whisper-small`. Existing user-selected Tiny/Base models
@@ -143,9 +164,8 @@ thread; participant kind/model identity cannot silently change. Thread deletion 
 metadata and the search index. Thread and message pagination use stable cursors rather than large SQL offsets.
 
 Attachment rows reference local `content://` or `file://` URIs; media bytes do not live in message/database rows.
-This is the storage foundation, not a file picker or media ingestion/viewing implementation. A future attachment
-importer must own file copies, persisted URI permissions, and file deletion. Current inference remains text-only and
-rejects attachment-bearing model input explicitly. Agent membership records identify actual senders; they do not
+Image imports own private file copies; removing an unsent photo deletes that copy. Other attachment types remain
+storage-only and are rejected as model input. Agent membership records identify actual senders; they do not
 implement automatic agent scheduling. The current UI sends to the loaded agent, preserving previous agent identities
 when a different model is used in the same thread. Failed/stopped replies remain in history.
 

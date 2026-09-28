@@ -50,7 +50,7 @@ internal fun List<ChatMessage>.textGenerationContext(): List<ChatMessage> {
     val result = mutableListOf<ChatMessage>()
     var pendingUser: ChatMessage? = null
     for (message in takeLast(50)) {
-        require(message.attachments.isEmpty()) { "This model currently supports text-only messages" }
+        require(message.attachments.all { it.kind == AttachmentKind.IMAGE }) { "Only image attachments are supported by this model" }
         if (message.role == MessageRole.USER) {
             pendingUser = message
         } else if (message.status != MessageStatus.FAILED && message.content.isNotBlank()) {

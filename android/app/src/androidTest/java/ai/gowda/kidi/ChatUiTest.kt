@@ -34,6 +34,37 @@ class ChatUiTest {
     @get:Rule val compose = createComposeRule()
 
     @Test
+    fun photoControlsRespectVisionCapabilityAndAllowImageOnlySend() {
+        val image = MessageAttachment(kind = AttachmentKind.IMAGE, localUri = "file:///unavailable-test-photo.jpg",
+            name = "Photo", mimeType = "image/jpeg", sizeBytes = 123)
+        val state = mutableStateOf(KidiUiState(modelReady = true))
+        var captured = false
+        var sent = false
+        compose.setContent {
+            KidiTheme {
+                ChatWorkspace(state = state.value, snackbar = SnackbarHostState(), onNewChat = {}, onSettings = {},
+                    onTextChange = {}, onSend = { sent = true }, onStop = {}, onRecord = {}, onStopRecording = {},
+                    onTakePhoto = { captured = true },
+                    onPickImage = { state.value = state.value.copy(pendingImages = listOf(image)) },
+                    onRemoveImage = { state.value = state.value.copy(pendingImages = emptyList()) })
+            }
+        }
+        compose.onNodeWithContentDescription("Take photo").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("Choose photo").assertIsNotEnabled()
+        compose.runOnIdle { state.value = state.value.copy(visionReady = true) }
+        compose.onNodeWithContentDescription("Take photo").performClick()
+        compose.runOnIdle { assertEquals(true, captured) }
+        compose.onNodeWithContentDescription("Choose photo").performClick()
+        compose.onNodeWithContentDescription("Remove photo").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Send message").assertIsEnabled().performClick()
+        compose.runOnIdle { assertEquals(true, sent) }
+        compose.onNodeWithContentDescription("Remove photo").performClick()
+        compose.onNodeWithContentDescription("Send message").assertIsNotEnabled()
+        compose.runOnIdle { state.value = state.value.copy(importingImage = true) }
+        compose.onNodeWithContentDescription("Choose photo").assertIsNotEnabled()
+    }
+
+    @Test
     fun draftsRemainVisibleAndSendRequiresReadyIdleRuntime() {
         val state = mutableStateOf(KidiUiState())
         var sent = ""

@@ -67,8 +67,12 @@ auto loaded_transcriber() -> kidi::inference::Transcriber& {
 
 auto messages(std::string_view source) -> std::vector<kidi::text::ChatMessage> {
     std::vector<kidi::text::ChatMessage> result;
-    for (const auto& message : nlohmann::json::parse(source))
-        result.push_back({message.at("role").get<std::string>(), message.at("content").get<std::string>()});
+    for (const auto& message : nlohmann::json::parse(source)) {
+        kidi::text::ChatMessage value{message.at("role").get<std::string>(), message.at("content").get<std::string>()};
+        if (message.contains("images"))
+            for (const auto& image : message.at("images")) value.images.emplace_back(image.get<std::string>());
+        result.push_back(std::move(value));
+    }
     return result;
 }
 
@@ -110,6 +114,7 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_load(JNIEnv* 
         return {
             {"ready", true},
             {"native_qat", generator->native_qat()},
+            {"vision", generator->vision_supported()},
             {"backend", "android-cpu"},
             {"load_ms", std::chrono::duration<double, std::milli>(ready_at - started).count()},
             {"stages_ms",

@@ -52,6 +52,7 @@ android {
         compose = true
     }
     packaging.jniLibs.useLegacyPackaging = true
+    sourceSets.getByName("main").res.srcDir(layout.buildDirectory.dir("generated/visionNotices"))
     ndkVersion = "28.0.13004108"
     externalNativeBuild {
         cmake {
@@ -78,3 +79,20 @@ dependencies {
     androidTestImplementation("androidx.test.uiautomator:uiautomator:2.3.0")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
+
+val visionNotices by tasks.registering(Sync::class) {
+    into(layout.buildDirectory.dir("generated/visionNotices/raw"))
+    val notices = mapOf(
+        "LICENSE" to "vision_tahoma_license.txt",
+        "NOTICES.md" to "vision_notices.txt",
+        "libs/pigzpp/LICENSE" to "vision_pigzpp_license.txt",
+        "libs/pigzpp/third_party/zlib-ng/LICENSE.md" to "vision_zlib_ng_license.txt",
+        "libs/pigzpp/third_party/zopfli/COPYING" to "vision_zopfli_license.txt",
+        "libs/libjpeg-turbo/LICENSE.md" to "vision_jpeg_license.txt",
+        "libs/libjpeg-turbo/README.ijg" to "vision_ijg_license.txt",
+    )
+    notices.forEach { (source, target) ->
+        from(rootProject.file("../third_party/tahoma-vision/$source")) { rename { target } }
+    }
+}
+tasks.named("preBuild") { dependsOn(visionNotices) }

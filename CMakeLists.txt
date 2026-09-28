@@ -48,6 +48,7 @@ add_library(kidi
     src/kidi/audio/whisper.cpp
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
+    src/kidi/image/gemma4.cpp
     src/kidi/inference/decoder.cpp
     src/kidi/inference/generator.cpp
     src/kidi/inference/transcriber.cpp
@@ -58,6 +59,7 @@ add_library(kidi
     src/kidi/layers/whisper.cpp
     src/kidi/model/config.cpp
     src/kidi/model/gemma4.cpp
+    src/kidi/model/gemma4_vision.cpp
     src/kidi/model/package.cpp
     src/kidi/model/transformer.cpp
     src/kidi/model/whisper.cpp
@@ -132,6 +134,7 @@ target_link_libraries(kidi
         yaml-cpp::yaml-cpp
     PRIVATE
         tokenizerpp
+        TahomaVision::Vision
         ZLIB::ZLIB
         ${CMAKE_DL_LIBS}
 )
