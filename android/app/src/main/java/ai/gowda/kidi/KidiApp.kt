@@ -2,6 +2,7 @@ package ai.gowda.kidi
 
 import android.Manifest
 import android.net.Uri
+import android.os.SystemClock
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -14,6 +15,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -34,6 +37,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -95,10 +99,12 @@ import androidx.compose.material3.TabRow
 import androidx.compose.material3.Slider
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
@@ -113,6 +119,14 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -120,6 +134,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 
 @Composable
 internal fun KidiApp(viewModel: ChatViewModel = viewModel()) {
@@ -257,6 +272,14 @@ private fun modelLabel(modelId: String) = when (modelId) {
     "openai/whisper-base" -> "Whisper Base"
     "openai/whisper-small" -> "Whisper Small INT8"
     else -> modelId.substringAfterLast('/')
+}
+
+private fun modelDownloadSize(modelId: String) = when (modelId) {
+    "google/gemma-4-E2B-it-qat-mobile-transformers" -> "About 2.5 GB download; allow 3 GB free storage."
+    "openai/whisper-small" -> "About 970 MB download; allow 1.3 GB free storage."
+    "openai/whisper-base" -> "About 290 MB download."
+    "openai/whisper-tiny" -> "About 150 MB download."
+    else -> "Download size depends on the selected repository."
 }
 
 @Composable
@@ -445,11 +468,18 @@ private fun EmptyConversation(
         if (!state.modelReady) {
             Text(if (state.loadingModel) "Preparing model" else "No chat model loaded",
                 style = MaterialTheme.typography.titleMedium)
+            if (!state.loadingModel) {
+                Spacer(Modifier.height(8.dp))
+                Text(modelDownloadSize(state.modelId), style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Source: Hugging Face", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             Spacer(Modifier.height(12.dp))
             Button(onClick = onSettings, shape = RoundedCornerShape(8.dp)) {
-                Icon(Icons.Default.Memory, null, Modifier.size(18.dp))
+                Icon(Icons.Outlined.Download, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("Manage models")
+                Text(if (state.loadingModel) "Model settings" else "Set up models")
             }
         } else {
             val prompts = listOf(
@@ -534,10 +564,6 @@ private fun MessageRow(message: ChatMessage, active: Boolean = false) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            if (active && message.content.isNotEmpty()) {
-                Spacer(Modifier.height(8.dp))
-                LinearProgressIndicator(modifier = Modifier.width(72.dp))
-            }
         }
     }
 }
@@ -587,7 +613,9 @@ private fun Composer(
                             ToolButton(Icons.Default.Close, "Remove photo", onRemoveImage, !state.importingImage)
                         }
                     }
-                    if (state.recording || state.transcribing || state.generating) {
+                    if (state.generating) {
+                        GenerationProgress(state)
+                    } else if (state.recording || state.transcribing) {
                         Row(
                             Modifier.fillMaxWidth().padding(start = 16.dp, end = 12.dp, top = 12.dp),
                             verticalAlignment = Alignment.CenterVertically,
@@ -600,7 +628,6 @@ private fun Composer(
                                 when {
                                     state.recording -> "Listening · ${"%.1f".format(state.recordingSeconds)} s"
                                     state.transcribing -> "Refining transcript"
-                                    state.stopping -> "Stopping"
                                     else -> state.status
                                 },
                                 style = MaterialTheme.typography.labelMedium,
@@ -608,21 +635,8 @@ private fun Composer(
                             )
                         }
                     }
-                    TextField(
-                        value = state.composerText,
-                        onValueChange = onTextChange,
-                        modifier = Modifier.fillMaxWidth().testTag("message-composer"),
-                        readOnly = state.recording || state.transcribing || state.loadingChat,
-                        placeholder = { Text(if (state.recording) "Listening..." else "Message Kidi") },
-                        maxLines = 6,
-                        textStyle = MaterialTheme.typography.bodyLarge,
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                        keyboardActions = KeyboardActions(onSend = { submit() }),
-                        colors = TextFieldDefaults.colors(
-                            focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent,
-                            focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent,
-                        ),
-                    )
+                    ComposerInput(state.composerText, state.provisionalTextStart,
+                        state.recording || state.transcribing, state.loadingChat, canSend, onTextChange, onSend)
                     Row(
                         Modifier.fillMaxWidth().padding(start = 4.dp, end = 8.dp, bottom = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -672,6 +686,89 @@ private fun Composer(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ComposerInput(
+    text: String,
+    provisionalStart: Int?,
+    dictating: Boolean,
+    loadingChat: Boolean,
+    canSend: Boolean,
+    onTextChange: (String) -> Unit,
+    onSend: (String) -> Unit,
+) {
+    val keyboard = LocalSoftwareKeyboardController.current
+    var editor by remember { mutableStateOf(TextFieldValue(text, TextRange(text.length))) }
+    val value = if (editor.text == text) editor else editor.copy(text = text,
+        selection = if (dictating) TextRange(text.length) else editor.selection)
+    SideEffect { if (editor != value) editor = value }
+    val transformation = remember(provisionalStart) {
+        ProvisionalTranscriptTransformation(provisionalStart, Color(0xFF929292))
+    }
+    TextField(
+        value = value,
+        onValueChange = {
+            editor = it
+            if (it.text != text) onTextChange(it.text)
+        },
+        modifier = Modifier.fillMaxWidth().testTag("message-composer"),
+        readOnly = dictating || loadingChat,
+        visualTransformation = transformation,
+        placeholder = { Text(if (dictating) "Listening..." else "Message Kidi") },
+        minLines = 3,
+        maxLines = 3,
+        textStyle = MaterialTheme.typography.bodyLarge,
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+        keyboardActions = KeyboardActions(onSend = { if (canSend) { keyboard?.hide(); onSend(text) } }),
+        colors = TextFieldDefaults.colors(
+            focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent,
+            focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent,
+        ),
+    )
+}
+
+internal class ProvisionalTranscriptTransformation(private val start: Int?, private val color: Color) : VisualTransformation {
+    override fun filter(text: AnnotatedString): TransformedText {
+        val value = if (start == null || start !in 0 until text.length) text else buildAnnotatedString {
+            append(text)
+            addStyle(SpanStyle(color = color), start, text.length)
+        }
+        return TransformedText(value, OffsetMapping.Identity)
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+internal fun GenerationProgress(state: KidiUiState) {
+    val elapsed by produceState(0L, state.generationStartedAtMs) {
+        if (state.generationStartedAtMs > 0) {
+            while (true) {
+                value = (SystemClock.elapsedRealtime() - state.generationStartedAtMs).coerceAtLeast(0)
+                delay(250)
+            }
+        }
+    }
+    Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 4.dp)
+        .testTag("generation-progress"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Box(Modifier.size(6.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
+            Text(if (state.stopping) "Stopping" else state.status, Modifier.weight(1f),
+                style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            Text("%.1f s".format(elapsed / 1000.0), style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalArrangement = Arrangement.spacedBy(2.dp),
+            modifier = Modifier.fillMaxWidth().heightIn(min = 18.dp)) {
+            Text("${state.generationTokens} tokens", style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            val speed = if (state.generationDecodeTokens > 0 && state.generationDecodeMs > 0)
+                "%.1f tok/s".format(state.generationDecodeTokens * 1000.0 / state.generationDecodeMs) else "-- tok/s"
+            Text(speed, style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -758,6 +855,23 @@ private fun ModelSection(
     deleteLabel: String,
 ) {
     var detailsOpen by rememberSaveable { mutableStateOf(false) }
+    var confirmDownload by remember { mutableStateOf(false) }
+    if (confirmDownload) {
+        AlertDialog(
+            onDismissRequest = { confirmDownload = false },
+            title = { Text("Download ${modelLabel(modelId)}?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(modelDownloadSize(modelId))
+                    Text("Downloads from huggingface.co using your internet connection. Wi-Fi recommended.")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { confirmDownload = false; onInstall() }, enabled = !busy) { Text("Download") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDownload = false }) { Text("Not now") } },
+        )
+    }
     val downloading = loading && file.isNotEmpty() && progress < 1f
     Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -812,10 +926,10 @@ private fun ModelSection(
                     LinearProgressIndicator(Modifier.fillMaxWidth())
                 }
             }
-            !ready -> Button(onClick = onInstall, enabled = !busy, shape = RoundedCornerShape(8.dp)) {
+            !ready -> Button(onClick = { confirmDownload = true }, enabled = !busy, shape = RoundedCornerShape(8.dp)) {
                 Icon(Icons.Outlined.Download, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(if (title == "Voice") "Load speech model" else "Load chat model")
+                Text(if (title == "Voice") "Download speech model" else "Download chat model")
             }
         }
     }

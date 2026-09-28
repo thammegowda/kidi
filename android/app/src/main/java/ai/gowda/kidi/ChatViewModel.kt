@@ -45,12 +45,17 @@ internal data class KidiUiState(
     val historyError: String? = null,
     val draft: String = "",
     val composerText: String = "",
+    val provisionalTextStart: Int? = null,
     val pendingImages: List<MessageAttachment> = emptyList(),
     val importingImage: Boolean = false,
     val visionReady: Boolean = false,
     val modelReady: Boolean = false,
     val loadingModel: Boolean = false,
     val generating: Boolean = false,
+    val generationStartedAtMs: Long = 0,
+    val generationTokens: Int = 0,
+    val generationDecodeTokens: Int = 0,
+    val generationDecodeMs: Double = 0.0,
     val stopping: Boolean = false,
     val progressFile: String = "",
     val progress: Float = 0f,
@@ -68,6 +73,11 @@ internal data class KidiUiState(
     val speechProgressFile: String = "",
     val speechProgress: Float = 0f,
 )
+
+internal fun KidiUiState.withProvisionalTranscript(text: String, start: Int, complete: Boolean = false): KidiUiState {
+    if (text == composerText || (!complete && text.length < composerText.length)) return this
+    return copy(composerText = text, provisionalTextStart = start.takeIf { it < text.length })
+}
 
 internal class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences(PREFERENCES, 0)
@@ -129,7 +139,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun setComposerText(value: String) {
-        _state.update { it.copy(composerText = value) }
+        _state.update { it.copy(composerText = value, provisionalTextStart = null) }
     }
 
     fun captureImageUri(): Uri = imageStore.captureUri()
@@ -286,8 +296,13 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 messages = messages,
                 draft = "",
                 composerText = "",
+                provisionalTextStart = null,
                 pendingImages = emptyList(),
                 generating = true,
+                generationStartedAtMs = SystemClock.elapsedRealtime(),
+                generationTokens = 0,
+                generationDecodeTokens = 0,
+                generationDecodeMs = 0.0,
                 stopping = false,
                 status = if (messages.any { it.attachments.isNotEmpty() }) "Analyzing image" else "Preparing prompt",
                 error = null,
@@ -311,14 +326,26 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 val enqueue = checked(NativeRuntime.enqueue(messages.textGenerationContext()
                     .toNativeJson().toString(), _state.value.maximumTokens))
                 requestId = enqueue.getLong("request_id")
+                _state.update { it.copy(status = if (it.stopping) it.status else "Preparing response") }
+                var generatedTokens = 0
+                var decodeTokens = 0
+                var decodeMs = 0.0
                 while (true) {
                     val step = checked(NativeRuntime.step())
+                    val stepDecodeMs = step.optDouble("decode_ms", 0.0)
+                    decodeMs += stepDecodeMs
                     val events = step.getJSONArray("events")
                     for (index in 0 until events.length()) {
                         val event = events.getJSONObject(index)
                         val text = event.optString("text")
-                        if (text.isNotEmpty()) {
-                            _state.update { it.copy(draft = it.draft + text, status = "Generating") }
+                        if (event.has("token")) {
+                            generatedTokens++
+                            if (stepDecodeMs > 0) decodeTokens++
+                        }
+                        if (text.isNotEmpty() || event.has("token")) {
+                            _state.update { it.copy(draft = it.draft + text, generationTokens = generatedTokens,
+                                generationDecodeTokens = decodeTokens, generationDecodeMs = decodeMs,
+                                status = if (it.stopping) it.status else "Responding") }
                         }
                         if (event.has("completed")) {
                             finish(event.getJSONObject("completed"))
@@ -372,12 +399,14 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             val mergeTranscript = { transcript: String ->
                 listOf(composerPrefix, transcript.trim()).filter(String::isNotEmpty).joinToString(" ")
             }
-            fun publishPartial(payload: String, draft: Boolean) {
+            fun publishPartial(payload: String, draft: Boolean, complete: Boolean = false) {
                 val partial = checked(payload)
+                val text = mergeTranscript(partial.optString("text"))
+                val start = if (composerPrefix.isEmpty()) 0 else composerPrefix.length + 1
                 _state.update { state ->
                     if ((draft && state.recording) || (!draft && state.transcribing)) {
-                        state.copy(
-                            composerText = mergeTranscript(partial.optString("text")),
+                        val updated = state.withProvisionalTranscript(text, start, complete)
+                        if (updated === state) state else updated.copy(
                             status = if (draft) "Draft transcript · ${partial.optString("language")}" else "Refining transcript",
                         )
                     } else state
@@ -401,17 +430,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     onSnapshot = { snapshot ->
                         viewModelScope.launch(runtimeDispatcher) {
                             try {
-                                val draft = checked(NativeRuntime.transcribe(snapshot, "auto", 128) { payload ->
+                                val draft = NativeRuntime.transcribe(snapshot, "auto", 128) { payload ->
                                     publishPartial(payload, true)
-                                })
-                                if (_state.value.recording) {
-                                    _state.update {
-                                        it.copy(
-                                            composerText = mergeTranscript(draft.optString("text")),
-                                            status = "Draft transcript · ${draft.optString("language")}",
-                                        )
-                                    }
                                 }
+                                publishPartial(draft, true, complete = true)
                             } catch (error: CancellationException) {
                                 throw error
                             } catch (error: Throwable) {
@@ -435,6 +457,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 _state.update {
                     it.copy(
                         composerText = mergeTranscript(transcript),
+                        provisionalTextStart = null,
                         recording = false,
                         transcribing = false,
                         recordingSeconds = 0f,
@@ -478,6 +501,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             try {
                 withContext(Dispatchers.IO) { chats.select(null) }
                 _state.update { it.copy(activeChatId = null, messages = emptyList(), draft = "", composerText = "",
+                    provisionalTextStart = null,
                     hasOlderMessages = false, loadingOlderMessages = false, loadingChat = false,
                     status = readyStatus(it), error = null) }
             } catch (error: Exception) {
@@ -497,7 +521,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     requireNotNull(chats.load(id)) { "Chat no longer exists" }.also { chats.select(id) }
                 }
                 _state.update { it.copy(activeChatId = id, messages = saved.page.messages, hasOlderMessages = saved.page.hasMore,
-                    draft = "", composerText = "", loadingChat = false, loadingOlderMessages = false, error = null) }
+                    draft = "", composerText = "", provisionalTextStart = null, loadingChat = false, loadingOlderMessages = false, error = null) }
             } catch (error: Exception) {
                 _state.update { it.copy(loadingChat = false, error = error.userMessage()) }
             }

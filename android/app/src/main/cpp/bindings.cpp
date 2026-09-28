@@ -159,7 +159,7 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_step(JNIEnv* 
             }
             events.push_back(std::move(item));
         }
-        return {{"events", events}, {"pending", loaded().pending_requests()}};
+        return {{"events", events}, {"pending", loaded().pending_requests()}, {"decode_ms", step.decode_ns / 1e6}};
     });
 }
 

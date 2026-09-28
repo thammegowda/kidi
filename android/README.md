@@ -42,6 +42,12 @@ packages only `arm64-v8a`. Gemma 4 needs a 64-bit device with several gigabytes 
 
 ## Model and Privacy
 
+A published APK does not require sideloaded model files. On a clean install, **Set up models** opens the in-app model
+downloads. Each download requires confirmation and displays an approximate transfer/storage size; the app does not
+silently start multi-gigabyte downloads on launch. The default public repositories work without a Hugging Face account.
+Chat and optional dictation downloads are separate. Internet is needed for setup; already installed models reopen
+offline. ADB commands in the development instructions are for building/testing, not the user installation flow.
+
 The default chat model is `google/gemma-4-E2B-it-qat-mobile-transformers`. Model settings accepts another public dense
 Gemma 4 repository with the same supported file layout. Loading performs these steps:
 
@@ -126,6 +132,19 @@ recording continues and the final pass is still attempted. The first text still 
 The transcript is never sent to Gemma automatically. Audio
 remains in memory only for the current transcription and is not uploaded or saved.
 
+Provisional speech is light gray in the composer, including while the final pass is decoding. Text typed before dictation
+keeps its normal color. Successful finalization restores the normal text color; a failed final pass leaves its draft
+provisional until the user edits or sends it.
+Repeated hypotheses do not replace the editor value. A new decoding pass retains the existing draft until it catches up;
+completed corrections may replace it. The composer uses a fixed three-line, internally scrollable viewport and a remembered
+text transformation, so timer updates and shorter hypotheses do not resize or reset the input field.
+
+ASR skips FFT/mel work for the mathematically zero padded tail while retaining the same 80-by-3000 feature tensor.
+Convolution writes into a reusable im2col buffer with power-of-two capacity growth; feature transposition writes directly
+into its tensor. Forced decoder-prefix tokens populate KV without unnecessary vocabulary projections. Decoder self-KV
+and projected encoder K/V are already reused within one transcription. They are not reused across changing audio, since
+Whisper's encoder is bidirectional. The full fixed-length encoder remains the main latency cost.
+
 ## Interface
 
 The chat interface follows the system light/dark theme and uses the canonical Kidi logo. A model-status strip opens
@@ -133,6 +152,9 @@ settings, which separates model management from inference controls. Repository d
 expandable, and downloads are distinguished from native model preparation.
 
 Replies render Markdown, with selectable text and Android's contextual Copy action instead of permanent copy icons.
+During generation, a fixed status strip shows the current phase, elapsed time, generated tokens, and live decode tok/s.
+It does not imply a completion percentage or use the small bouncing response bar. Live decode speed excludes image
+analysis and prompt prefill; elapsed time includes them. Final per-message metrics remain available after completion.
 Remote images are not loaded. Recording status stays above the composer so live transcript text remains readable.
 The composer respects keyboard insets, and conversation width is constrained on larger displays.
 

@@ -27,11 +27,76 @@ import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertSame
 import org.junit.Rule
 import org.junit.Test
 
 class ChatUiTest {
     @get:Rule val compose = createComposeRule()
+
+    @Test
+    fun provisionalTranscriptStylesOnlySpeechAndPreservesOffsets() {
+        val source = androidx.compose.ui.text.AnnotatedString("Typed prefix spoken draft")
+        val draft = ProvisionalTranscriptTransformation(13, androidx.compose.ui.graphics.Color.Gray).filter(source)
+        assertEquals(source.text, draft.text.text)
+        assertEquals(13, draft.text.spanStyles.single().start)
+        assertEquals(source.length, draft.text.spanStyles.single().end)
+        assertEquals(14, draft.offsetMapping.originalToTransformed(14))
+        val finalized = ProvisionalTranscriptTransformation(null, androidx.compose.ui.graphics.Color.Gray).filter(source)
+        assertEquals(source, finalized.text)
+        val state = KidiUiState(composerText = source.text, provisionalTextStart = 13)
+        assertSame(state, state.withProvisionalTranscript(source.text, 13))
+        assertSame(state, state.withProvisionalTranscript("Typed prefix spoken", 13))
+        val corrected = state.withProvisionalTranscript("Typed prefix correction", 13, complete = true)
+        assertEquals("Typed prefix correction", corrected.composerText)
+        assertEquals(13, corrected.provisionalTextStart)
+    }
+
+    @Test
+    fun responseStatusShowsLiveTokensAndDecodeSpeedUntilCompletion() {
+        val state = mutableStateOf(KidiUiState(modelReady = true, generating = true, status = "Preparing response"))
+        compose.setContent {
+            KidiTheme {
+                ChatWorkspace(state = state.value, snackbar = SnackbarHostState(), onNewChat = {}, onSettings = {},
+                    onTextChange = {}, onSend = {}, onStop = { state.value = state.value.copy(stopping = true) },
+                    onRecord = {}, onStopRecording = {})
+            }
+        }
+        compose.onNodeWithText("Preparing response").assertIsDisplayed()
+        compose.onNodeWithText("-- tok/s").assertIsDisplayed()
+        compose.runOnIdle {
+            state.value = state.value.copy(draft = "Streaming response", status = "Responding", generationTokens = 21,
+                generationDecodeTokens = 20, generationDecodeMs = 1000.0)
+        }
+        compose.onNodeWithText("Responding").assertIsDisplayed()
+        compose.onNodeWithText("21 tokens").assertIsDisplayed()
+        compose.onNodeWithText("%.1f tok/s".format(20.0)).assertIsDisplayed()
+        compose.onNodeWithContentDescription("Stop generation").performClick()
+        compose.onNodeWithText("Stopping").assertIsDisplayed()
+        compose.runOnIdle { state.value = state.value.copy(generating = false, stopping = false) }
+        compose.onNodeWithTag("generation-progress").assertDoesNotExist()
+    }
+
+    @Test
+    fun modelDownloadRequiresExplicitConfirmation() {
+        var downloads = 0
+        compose.setContent {
+            KidiTheme {
+                SettingsSheet(state = KidiUiState(), onDismiss = {}, onModelId = {}, onSpeechModelId = {},
+                    onThreads = {}, onTokens = {}, onInstall = { downloads++ }, onCancelChat = {},
+                    onInstallSpeech = {}, onCancelSpeech = {}, onDelete = {}, onDeleteSpeech = {})
+            }
+        }
+        compose.runOnIdle { assertEquals(0, downloads) }
+        compose.onNodeWithText("Download chat model").performScrollTo().performClick()
+        compose.onNodeWithText("About 2.5 GB download; allow 3 GB free storage.").assertIsDisplayed()
+        compose.runOnIdle { assertEquals(0, downloads) }
+        compose.onNodeWithText("Not now").performClick()
+        compose.runOnIdle { assertEquals(0, downloads) }
+        compose.onNodeWithText("Download chat model").performClick()
+        compose.onNodeWithText("Download", useUnmergedTree = true).performClick()
+        compose.runOnIdle { assertEquals(1, downloads) }
+    }
 
     @Test
     fun photoControlsRespectVisionCapabilityAndAllowImageOnlySend() {
@@ -96,15 +161,24 @@ class ChatUiTest {
         compose.runOnIdle {
             assertEquals(true, settingsOpened)
             state.value = state.value.copy(modelReady = true, speechReady = true, loadingSpeech = false, recording = true,
-                composerText = "Existing draft with live speech", recordingSeconds = 4.2f)
+                composerText = "Existing draft with live speech", provisionalTextStart = 15, recordingSeconds = 4.2f)
         }
         compose.onNodeWithText("Existing draft with live speech").assertIsDisplayed()
+        val composerHeight = compose.onNodeWithTag("message-composer").fetchSemanticsNode().boundsInRoot.height
+        compose.runOnIdle {
+            state.value = state.value.copy(recordingSeconds = 5.2f,
+                composerText = "Existing draft\nwith several\nlines of live\nspeech that scrolls\ninside the composer")
+        }
+        assertEquals(composerHeight, compose.onNodeWithTag("message-composer").fetchSemanticsNode().boundsInRoot.height, 0f)
+        compose.runOnIdle { state.value = state.value.copy(composerText = "Short correction") }
+        assertEquals(composerHeight, compose.onNodeWithTag("message-composer").fetchSemanticsNode().boundsInRoot.height, 0f)
         compose.onNodeWithContentDescription("Send message").assertIsNotEnabled()
         compose.onNodeWithContentDescription("Stop recording").assertIsEnabled().performClick()
         compose.onNodeWithText("Refining transcript").assertIsDisplayed()
+        assertEquals(composerHeight, compose.onNodeWithTag("message-composer").fetchSemanticsNode().boundsInRoot.height, 0f)
         compose.onNodeWithContentDescription("Send message").assertIsNotEnabled()
         compose.runOnIdle {
-            state.value = state.value.copy(transcribing = false, composerText = "Corrected transcript")
+            state.value = state.value.copy(transcribing = false, composerText = "Corrected transcript", provisionalTextStart = null)
         }
         compose.onNodeWithContentDescription("Send message").assertIsEnabled().performClick()
         compose.runOnIdle { assertEquals("Corrected transcript", sent) }
