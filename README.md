@@ -1,13 +1,13 @@
 # Kidi <a href="docs/kidi-logo.png"><img src="docs/kidi-logo-small.png" alt="Kidi logo" width="48" height="48"></a>
 
-**Run neural models locally, from a terminal, a browser, or C++.**
+**Run neural models locally, from Android, a terminal, a browser, or C++.**
 
 Kidi ("spark" in Kannada) is a lightweight C++23 inference toolkit. The same
 model code runs on CPU, Apple Metal, and WebAssembly CPU. It currently supports
 Whisper transcription, Gemma 4 text generation, and RTG translation, with reusable tensors and neural
 layers for developers building other architectures.
 
-[Quick Start](#quick-start) | [Browser](#webassembly) | [Chat](#interactive-chat) |
+[Quick Start](#quick-start) | [Android](#android) | [Browser](#webassembly) | [Chat](#interactive-chat) |
 [Transcription](#whisper-transcription) | [Translation](#rtg-model-package) | [For Developers](#for-developers) |
 [Getting Started Guide](docs/getting-started.md)
 
@@ -132,6 +132,25 @@ context between the conversation and reply. Its cache is separate from the CLI's
 
 The [WebAssembly guide](web/README.md) covers browser requirements, static hosting,
 GitHub Pages deployment, caching, and measured performance.
+
+### Android
+
+The native Android app provides private, streaming Gemma 4 chat and live Whisper microphone dictation on ARM64 devices. It
+links the same C++ models and YNNPACK CPU runtime through JNI; prompts, audio, transcripts, and generated text do not
+leave the device. The app resolves public Hugging Face models to immutable commits, resumes interrupted downloads,
+verifies LFS SHA-256 hashes, and keeps model files in app-private external storage.
+
+Build the debug APK from a recursive checkout with JDK 17 and the Android SDK/NDK installed:
+
+```bash
+export JAVA_HOME=/path/to/jdk-17
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+./android/gradlew -p android :app:assembleDebug
+```
+
+The application ID is `ai.gowda.kidi`, the minimum Android version is API 29, and the current build targets ARM64.
+The default model download is about 2.49 GB and is not embedded in the APK. See the [Android guide](android/README.md)
+for exact tool versions, installation, device testing, and runtime behavior.
 
 ### Whisper Transcription
 
