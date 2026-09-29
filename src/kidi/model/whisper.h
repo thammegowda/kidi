@@ -4,7 +4,9 @@
 
 #include "kidi/audio/whisper.h"
 #include "kidi/layers/whisper.h"
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
+#include "kidi/checkpoint/config.h"
+#include "kidi/checkpoint/prepare.h"
 
 namespace kidi::model {
 
@@ -27,8 +29,10 @@ public:
     ~WhisperImpl();
     static auto validate_config(const YAML::Node& config) -> Result<void>;
     static auto create(const YAML::Node& config) -> Result<Whisper>;
-    static auto prepare_int8(const std::filesystem::path& directory) -> Result<std::filesystem::path>;
-    auto set_checkpoint(const Weights& weights) -> Result<void>;
+    static auto checkpoint_config() -> checkpoint::ConfigAdapter;
+    static auto int8_preparation(const YAML::Node& config) -> Result<checkpoint::Preparation>;
+    static auto int8_checkpoint(const YAML::Node& config, const checkpoint::Weights& weights) -> Result<StateDict>;
+    auto set_checkpoint(const checkpoint::Weights& weights) -> Result<void>;
     auto encode(const audio::WhisperFeatures& features) -> Result<WhisperEncoderState>;
     auto create_state(std::size_t capacity) -> Result<WhisperDecoderState>;
     auto forward(const WhisperEncoderState& source, std::span<const std::int32_t> tokens, WhisperDecoderState& state)

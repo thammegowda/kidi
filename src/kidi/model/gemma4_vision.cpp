@@ -184,7 +184,7 @@ Gemma4VisionImpl::Gemma4VisionImpl(const YAML::Node& config, std::int32_t text_w
 }
 Gemma4VisionImpl::~Gemma4VisionImpl() = default;
 
-auto Gemma4VisionImpl::set_checkpoint(const Weights& weights) -> Result<void> {
+auto Gemma4VisionImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
     try {
         StateDict state;
         for (const auto& [name, declaration] : state_dict()) {

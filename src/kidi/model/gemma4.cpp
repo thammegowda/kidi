@@ -243,7 +243,7 @@ auto Gemma4Impl::create(const YAML::Node& config) -> Result<Gemma4> {
         return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
     }
 }
-auto Gemma4Impl::set_checkpoint(const Weights& weights, std::int32_t weight_bits, std::int32_t group_size,
+auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t weight_bits, std::int32_t group_size,
                                 bool packed_prefill) -> Result<void> {
     try {
         if ((weight_bits != 0 && weight_bits != 4 && weight_bits != 8) || group_size <= 0)

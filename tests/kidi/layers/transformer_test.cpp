@@ -10,7 +10,7 @@
 #include <string>
 #include <thread>
 
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
 #include "kidi/tensor/tensor.h"
 
 namespace {
@@ -161,7 +161,7 @@ auto main() -> int {
         if (!unbound_rejected) return 1;
         const auto path = std::filesystem::temp_directory_path() / "kidi-transformer-builder-test.safetensors";
         write_weights(path);
-        auto weights = ops::require(model::Weights::load(path));
+        auto weights = ops::require(checkpoint::Weights::load(path));
         ModuleList<DeferredParameter> deferred;
         deferred->push_back(ModuleHolder<DeferredParameter>(false));
         deferred->push_back(ModuleHolder<DeferredParameter>(false));
@@ -195,9 +195,9 @@ auto main() -> int {
         modules->insert("projections", projections);
         modules->insert("norm", norm);
         if (projections->at(0).get() != first.get() || modules->at("norm").get() != norm.get()) return 1;
-        const std::array mappings{model::StateMappingSpec{{R"(ff\.w_1\.(weight|bias))"}, "projections.0.$1"},
-                                  model::StateMappingSpec{{R"(ff\.w_2\.(weight|bias))"}, "projections.1.$1"}};
-        auto mapped = ops::require(model::Weights::load(path, mappings));
+        const std::array mappings{checkpoint::StateMappingSpec{{R"(ff\.w_1\.(weight|bias))"}, "projections.0.$1"},
+                                  checkpoint::StateMappingSpec{{R"(ff\.w_2\.(weight|bias))"}, "projections.1.$1"}};
+        auto mapped = ops::require(checkpoint::Weights::load(path, mappings));
         ops::require(modules->set_state(mapped));
         const auto snapshot = modules->state_dict();
         if (snapshot.size() != 6 || !snapshot.contains("projections.0.weight") || !snapshot.contains("norm.bias"))

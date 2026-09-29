@@ -177,7 +177,7 @@ for accuracy. During recording, the composer shows replaceable draft text and ru
 
 ### GGML and GGUF Import
 
-`model::Weights::load` also reads little-endian GGUF v2/v3 and the legacy
+`checkpoint::Weights::load` also reads little-endian GGUF v2/v3 and the legacy
 Whisper GGML container, detected by file magic rather than extension. Supported
 tensor encodings are F32, F16, BF16 (GGUF), Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0.
 Unsupported encodings, malformed shapes/offsets, overlapping GGUF tensors and
@@ -211,8 +211,14 @@ and supports the existing state-mapping API. It does not execute GGML kernels
 or keep GGML block quantization for inference. Android/browser download defaults
 and Hub resolution remain unchanged; this change adds the shared native reader.
 
-The small adapted [reference codec](src/kidi/model/ggml_dequantize.h) lives beside
+The small adapted [reference codec](src/kidi/checkpoint/ggml/dequantize.h) lives beside
 the reader, with upstream credits, revision and the MIT license in its header.
+Format readers have their own directories under `src/kidi/checkpoint/`: `ggml/`
+and `safetensors/`. Shared I/O and atomic checkpoint preparation live in
+`kidi::checkpoint`. Model classes supply metadata/configuration and preparation
+callbacks; Whisper owns its sidecar requirements, GGML compatibility and INT8
+export policy. Other models can provide their own hooks without adding a
+model-specific preparation module to the checkpoint framework.
 No GGML runtime, backend, submodule or
 build system is linked. Smaller model downloads come from quantization, not
 from GGML/GGUF container overhead versus Safetensors.

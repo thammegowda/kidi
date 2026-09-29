@@ -1,5 +1,5 @@
 #include "kidi/model/gemma4.h"
-#include "kidi/model/safetensors/mapped.h"
+#include "kidi/checkpoint/safetensors/mapped.h"
 #include "kidi/inference/generator.h"
 
 #include <cmath>
@@ -119,8 +119,8 @@ auto main() -> int {
         for (const auto* fixture : {"gemma4", "gemma4-qat"}) {
             const auto directory = std::filesystem::path(KIDI_GEMMA4_FIXTURE).parent_path() / fixture;
             const auto config = YAML::LoadFile((directory / "model.yaml").string())["model"];
-            auto checkpoint = ops::require(model::Weights::load(directory / "model.safetensors"));
-            auto reference = ops::require(model::Weights::load(directory / "reference.safetensors"));
+            auto checkpoint = ops::require(checkpoint::Weights::load(directory / "model.safetensors"));
+            auto reference = ops::require(checkpoint::Weights::load(directory / "reference.safetensors"));
             if (fixture == std::string_view("gemma4-qat")) {
                 const auto sentinel_path =
                     std::filesystem::temp_directory_path() / "kidi-gemma4-zero-scale.safetensors";
@@ -128,7 +128,7 @@ auto main() -> int {
                                            std::filesystem::copy_options::overwrite_existing);
                 std::array<std::streamoff, 2> offsets;
                 {
-                    const safetensors::MappedCheckpoint mapped(sentinel_path.string());
+                    const kidi::checkpoint::safetensors::MappedCheckpoint mapped(sentinel_path.string());
                     const auto base = mapped.owner()->data();
                     offsets = {
                         mapped.at("lm_head.input_activation_scale").data - base,
@@ -143,7 +143,7 @@ auto main() -> int {
                         output.write(reinterpret_cast<const char*>(&ZERO), sizeof(ZERO));
                     }
                 }
-                auto sentinel_checkpoint = ops::require(model::Weights::load(sentinel_path));
+                auto sentinel_checkpoint = ops::require(checkpoint::Weights::load(sentinel_path));
                 const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
                 auto sentinel_model = ops::require(model::Gemma4Impl::create(config));
                 ops::require(sentinel_model->set_checkpoint(sentinel_checkpoint));

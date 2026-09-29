@@ -8,7 +8,7 @@
 
 #include <ynnpack.h>
 
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
 
 namespace {
 
@@ -42,7 +42,7 @@ auto check(ynn_status status, std::string_view operation) -> bool {
 auto main() -> int {
     const auto path = std::filesystem::temp_directory_path() / "kidi-ynnpack-weights.safetensors";
     write_weights(path);
-    auto weights = kidi::model::Weights::load(path);
+    auto weights = kidi::checkpoint::Weights::load(path);
     auto weight =
         weights ? weights->tensor("weight") : kidi::Result<kidi::tensor::Tensor>{std::unexpected(weights.error())};
     if (!weight) {

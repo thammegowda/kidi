@@ -10,7 +10,7 @@
 
 #include "kidi/tensor/tensor.h"
 
-namespace kidi::model {
+namespace kidi::checkpoint::ggml {
 
 inline constexpr std::uint32_t GGUF_MAGIC = 0x46554747;
 inline constexpr std::uint32_t GGML_MAGIC = 0x67676d6c;
@@ -35,4 +35,4 @@ private:
     std::optional<std::array<std::int32_t, 11>> whisper_;
 };
 
-} // namespace kidi::model
+} // namespace kidi::checkpoint::ggml

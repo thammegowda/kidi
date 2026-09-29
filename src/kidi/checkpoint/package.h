@@ -3,11 +3,11 @@
 #include <filesystem>
 
 #include "kidi/core/error.h"
-#include "kidi/model/config.h"
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/config.h"
+#include "kidi/checkpoint/weights.h"
 #include "kidi/text/tokenizer.h"
 
-namespace kidi::model {
+namespace kidi::checkpoint {
 
 class Package {
 public:
@@ -20,18 +20,18 @@ public:
     static auto load(const std::filesystem::path& model_directory) -> Result<Package>;
 
     auto config() const noexcept -> const YAML::Node&;
-    auto weights() const noexcept -> const model::Weights&;
+    auto weights() const noexcept -> const checkpoint::Weights&;
     auto source_tokenizer() const noexcept -> const text::Tokenizer&;
     auto target_tokenizer() const noexcept -> const text::Tokenizer&;
 
 private:
-    Package(YAML::Node config, model::Weights weights, text::Tokenizer source_tokenizer,
+    Package(YAML::Node config, checkpoint::Weights weights, text::Tokenizer source_tokenizer,
             text::Tokenizer target_tokenizer);
 
     YAML::Node config_;
-    model::Weights weights_;
+    checkpoint::Weights weights_;
     text::Tokenizer source_tokenizer_;
     text::Tokenizer target_tokenizer_;
 };
 
-} // namespace kidi::model
+} // namespace kidi::checkpoint

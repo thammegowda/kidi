@@ -4,7 +4,8 @@
 #include <chrono>
 #include <limits>
 
-#include "kidi/model/config.h"
+#include "kidi/checkpoint/config.h"
+#include "kidi/checkpoint/prepare.h"
 
 namespace kidi::inference {
 using ops::require;
@@ -36,9 +37,11 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
     try {
         if (device != tensor::Device::cpu())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper currently requires the CPU backend"});
-        auto config = require(model::load_whisper_config(directory));
+        const auto adapter = model::WhisperImpl::checkpoint_config();
+        auto config = require(checkpoint::load_config(directory, adapter));
         if (config["weights_format"].as<std::string>("") == "whisper_ggml")
-            config = require(model::load_whisper_config(require(model::WhisperImpl::prepare_int8(directory))));
+            config = require(checkpoint::load_config(
+                require(checkpoint::prepare(directory, adapter, model::WhisperImpl::int8_preparation)), adapter));
         require(model::WhisperImpl::validate_config(config["model"]));
         auto tokenizer = require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
         if (tokenizer.vocabulary_size() != config["model"]["vocab_size"].as<std::size_t>())
@@ -65,7 +68,7 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
         for (const auto* name : {"decoder_start_token_id", "eos_token_id", "no_timestamps_token_id"})
             if (!valid_token(generation[name].as<std::int32_t>()))
                 throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Whisper special token is outside vocabulary"});
-        auto weights = require(model::Weights::load(config["model_file"].as<std::string>()));
+        auto weights = require(checkpoint::Weights::load(config["model_file"].as<std::string>()));
         const auto parameter = require(weights.tensor("model.encoder.layers.0.fc1.weight"));
         const ModuleScope construction(parameter.dtype(), false, device);
         auto whisper = require(model::WhisperImpl::create(config["model"]));

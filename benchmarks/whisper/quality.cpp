@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "kidi/audio/whisper.h"
-#include "kidi/model/config.h"
+#include "kidi/checkpoint/config.h"
 #include "kidi/model/whisper.h"
 
 namespace {
@@ -57,14 +57,14 @@ auto main(int argc, char** argv) -> int {
     }
     try {
         const std::filesystem::path directory(argv[1]), reference(argv[3]);
-        auto config = require(kidi::model::load_whisper_config(directory));
+        auto config = require(kidi::checkpoint::load_config(directory, kidi::model::WhisperImpl::checkpoint_config()));
         auto extractor =
             require(kidi::audio::WhisperFeatureExtractor::load(config["preprocessor_config_file"].as<std::string>()));
         auto waveform = require(kidi::audio::load_wav(argv[2]));
         auto features = require(extractor.extract(waveform.samples, waveform.sample_rate));
         compare("features", features.values, read_f32(reference / "features.f32"));
 
-        auto weights = require(kidi::model::Weights::load(config["model_file"].as<std::string>()));
+        auto weights = require(kidi::checkpoint::Weights::load(config["model_file"].as<std::string>()));
         const kidi::ModuleScope construction(kidi::tensor::DType::F32, false, kidi::tensor::Device::cpu());
         auto model = require(kidi::model::WhisperImpl::create(config["model"]));
         require(model->set_checkpoint(weights));

@@ -1,4 +1,4 @@
-#include "kidi/model/package.h"
+#include "kidi/checkpoint/package.h"
 #include "kidi/model/transformer.h"
 
 #include <array>
@@ -7,7 +7,7 @@
 #include <string_view>
 #include <utility>
 
-namespace kidi::model {
+namespace kidi::checkpoint {
 namespace {
 
 constexpr std::string_view MANIFEST_FILENAME = "model.yaml";
@@ -43,7 +43,7 @@ auto tokenizer_tokens(const text::Tokenizer& tokenizer, std::int32_t expected_si
 
 } // namespace
 
-Package::Package(YAML::Node config, model::Weights weights, text::Tokenizer source_tokenizer,
+Package::Package(YAML::Node config, checkpoint::Weights weights, text::Tokenizer source_tokenizer,
                  text::Tokenizer target_tokenizer)
     : config_(std::move(config)),
       weights_(std::move(weights)),
@@ -60,7 +60,7 @@ auto Package::load(const std::filesystem::path& model_directory) -> Result<Packa
             return std::unexpected(std::move(config.error()));
         }
         auto weights =
-            model::Weights::load((*config)["weights_file"].as<std::string>(), TransformerImpl::state_mapping_specs());
+            checkpoint::Weights::load((*config)["weights_file"].as<std::string>(), model::TransformerImpl::state_mapping_specs());
         if (!weights) {
             return std::unexpected(std::move(weights.error()));
         }
@@ -93,10 +93,10 @@ auto Package::load(const std::filesystem::path& model_directory) -> Result<Packa
 
 auto Package::config() const noexcept -> const YAML::Node& { return config_; }
 
-auto Package::weights() const noexcept -> const model::Weights& { return weights_; }
+auto Package::weights() const noexcept -> const checkpoint::Weights& { return weights_; }
 
 auto Package::source_tokenizer() const noexcept -> const text::Tokenizer& { return source_tokenizer_; }
 
 auto Package::target_tokenizer() const noexcept -> const text::Tokenizer& { return target_tokenizer_; }
 
-} // namespace kidi::model
+} // namespace kidi::checkpoint

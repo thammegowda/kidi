@@ -1,5 +1,5 @@
 #include "kidi/inference/generator.h"
-#include "kidi/model/config.h"
+#include "kidi/checkpoint/config.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -22,7 +22,7 @@ Generator::Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4
 auto Generator::load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits,
                      std::int32_t group_size, bool packed_prefill) -> Result<Generator> {
     try {
-        auto config = require(model::load_config(directory / "model.yaml"));
+        auto config = require(checkpoint::load_config(directory / "model.yaml"));
         require(model::Gemma4Impl::validate_config(config["model"]));
         auto tokenizer = require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
         if (tokenizer.vocabulary_size() != config["model"]["vocab_size"].as<std::size_t>())
@@ -37,7 +37,7 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
         }
         if (!tokenizer.token_id("<bos>") || !tokenizer.token_id("<|turn>"))
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Gemma 4 tokenizer lacks chat delimiters"});
-        auto weights = require(model::Weights::load(config["weights_file"].as<std::string>()));
+        auto weights = require(checkpoint::Weights::load(config["weights_file"].as<std::string>()));
         if (std::filesystem::is_regular_file(directory / "config.json") &&
             weights.contains("model.vision_tower.patch_embedder.input_proj.weight") &&
             weights.contains("model.embed_vision.embedding_projection.weight")) {
@@ -320,7 +320,7 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, Genera
                         const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
                         auto vision = model::Gemma4Vision(config_["vision"], config_["model"]["hidden_size"].as<int>(),
                                                           native_qat());
-                        auto weights = require(model::Weights::load(config_["weights_file"].as<std::string>()));
+                        auto weights = require(checkpoint::Weights::load(config_["weights_file"].as<std::string>()));
                         require(vision->set_checkpoint(weights));
                         vision_ = std::move(vision);
                     }

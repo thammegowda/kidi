@@ -1,3 +1,4 @@
+#include "kidi/checkpoint/prepare.h"
 #include "kidi/inference/generator.h"
 #include "kidi/inference/transcriber.h"
 #include "kidi/runtime/ynn/graph.h"
@@ -187,7 +188,9 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_loadAsr(JNIEn
             stages[stage] = std::chrono::duration<double, std::milli>(now - stage_start).count();
             stage_start = now;
         };
-        const auto model_directory = int8 ? kidi::ops::require(kidi::model::WhisperImpl::prepare_int8(path.get()))
+        const auto model_directory = int8 ? kidi::ops::require(kidi::checkpoint::prepare(
+                                                path.get(), kidi::model::WhisperImpl::checkpoint_config(),
+                                                kidi::model::WhisperImpl::int8_preparation))
                                           : std::filesystem::path(path.get());
         mark("int8_cache_validation");
         auto loaded =

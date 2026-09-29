@@ -96,9 +96,9 @@ auto TransformerImpl::create(const YAML::Node& config) -> Result<Transformer> {
         return std::unexpected(error.error());
     }
 }
-auto TransformerImpl::state_mapping_specs() -> std::span<const StateMappingSpec> {
+auto TransformerImpl::state_mapping_specs() -> std::span<const checkpoint::StateMappingSpec> {
     static const auto specs = [] {
-        std::vector<StateMappingSpec> result;
+        std::vector<checkpoint::StateMappingSpec> result;
         const auto add = [&](std::string source, std::string target) {
             for (const auto& [suffix, destination] :
                  std::array{std::pair{R"(\.weight)", ".weight"}, std::pair{R"(\.bias)", ".bias"},

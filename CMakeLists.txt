@@ -46,6 +46,11 @@ target_compile_features(kidi_argparse PUBLIC cxx_std_23)
 
 add_library(kidi
     src/kidi/audio/whisper.cpp
+    src/kidi/checkpoint/config.cpp
+    src/kidi/checkpoint/ggml/reader.cpp
+    src/kidi/checkpoint/package.cpp
+    src/kidi/checkpoint/prepare.cpp
+    src/kidi/checkpoint/weights.cpp
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
     src/kidi/image/gemma4.cpp
@@ -57,14 +62,10 @@ add_library(kidi
     src/kidi/layers/gemma4.cpp
     src/kidi/layers/transformer.cpp
     src/kidi/layers/whisper.cpp
-    src/kidi/model/config.cpp
-    src/kidi/model/ggml.cpp
     src/kidi/model/gemma4.cpp
     src/kidi/model/gemma4_vision.cpp
-    src/kidi/model/package.cpp
     src/kidi/model/transformer.cpp
     src/kidi/model/whisper.cpp
-    src/kidi/model/weights.cpp
     src/kidi/ops/context.cpp
     src/kidi/ops/quantization.cpp
     src/kidi/runtime/operator.cpp
@@ -213,7 +214,7 @@ if(KIDI_BUILD_PYTHON)
         COMMAND_ERROR_IS_FATAL ANY
     )
     install(FILES "${KIDI_NANOBIND_LICENSE}" DESTINATION kidi/licenses/nanobind COMPONENT python)
-    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/model/ggml.LICENSE"
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/checkpoint/ggml/LICENSE"
         DESTINATION kidi/licenses/ggml RENAME LICENSE COMPONENT python)
 endif()
 

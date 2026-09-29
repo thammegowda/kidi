@@ -13,7 +13,7 @@
 #include "kidi/core/module.h"
 #include "kidi/tensor/tensor.h"
 
-namespace kidi::model {
+namespace kidi::checkpoint {
 
 using DataType = tensor::DType;
 
@@ -49,4 +49,4 @@ private:
     std::shared_ptr<Impl> impl_;
 };
 
-} // namespace kidi::model
+} // namespace kidi::checkpoint

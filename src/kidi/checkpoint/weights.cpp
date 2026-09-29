@@ -1,4 +1,4 @@
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
 
 #include <algorithm>
 #include <bit>
@@ -16,11 +16,11 @@
 #include <utility>
 #include <vector>
 
-#include "kidi/model/safetensors/mapped.h"
-#include "kidi/model/ggml.h"
+#include "kidi/checkpoint/safetensors/mapped.h"
+#include "kidi/checkpoint/ggml/reader.h"
 #include "kidi/ops/context.h"
 
-namespace kidi::model {
+namespace kidi::checkpoint {
 namespace {
 
 auto parse_data_type(std::string_view value) -> std::optional<DataType> {
@@ -117,14 +117,14 @@ struct Weights::Impl {
         std::ifstream stream(path, std::ios::binary);
         std::uint32_t magic = 0;
         stream.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-        if (magic == GGUF_MAGIC || magic == GGML_MAGIC)
-            imported = std::make_unique<GgmlFile>(ops::require(GgmlFile::open(path)));
+        if (magic == ggml::GGUF_MAGIC || magic == ggml::GGML_MAGIC)
+            imported = std::make_unique<ggml::GgmlFile>(ops::require(ggml::GgmlFile::open(path)));
         else
             checkpoint = std::make_unique<safetensors::MappedCheckpoint>(path.string());
     }
 
     std::unique_ptr<safetensors::MappedCheckpoint> checkpoint;
-    std::unique_ptr<GgmlFile> imported;
+    std::unique_ptr<ggml::GgmlFile> imported;
     std::unordered_map<std::string, OwnedTensor> transformed;
     std::unordered_map<std::string, std::string> aliases;
     std::unordered_set<std::string> hidden;
@@ -355,4 +355,4 @@ auto Weights::tensor(std::string_view name) const -> Result<tensor::Tensor> {
                                      raw.bytes, std::move(owner));
 }
 
-} // namespace kidi::model
+} // namespace kidi::checkpoint

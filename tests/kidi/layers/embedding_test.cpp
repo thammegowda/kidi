@@ -8,7 +8,7 @@
 #include <iostream>
 #include <string>
 
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
 
 namespace {
 
@@ -35,7 +35,7 @@ auto main() -> int {
     try {
         const auto path = std::filesystem::temp_directory_path() / "kidi-embedding-test.safetensors";
         write_weights(path);
-        auto weights = ops::require(model::Weights::load(path));
+        auto weights = ops::require(checkpoint::Weights::load(path));
         const ModuleScope construction(tensor::DType::F32, false);
         layers::Embedding embedding(3, 4, 8);
         ops::require(embedding->set_state(StateDict{{"weight", ops::require(weights.tensor("embedding"))}}));

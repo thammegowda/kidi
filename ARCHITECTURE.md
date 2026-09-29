@@ -16,7 +16,8 @@ inference::{Decoder, Transcriber} -> model::{Transformer, Gemma4, Whisper} -> la
 | `core::Module` | Shared module ownership, named parameter/child registration, state dictionaries |
 | `ops::Context` | Immediate operator dispatch, validation, bounded prepared-operator cache |
 | `layers` | Bound parameters and reusable neural equations |
-| `model` | Package format, Transformer topology, source and decoder state |
+| `checkpoint` | Configuration/package I/O, format readers, serialization and generic cache preparation |
+| `model` | Neural network topology, parameter binding, checkpoint policies, source and decoder state |
 | `inference` | Generic generation/search, translation application, profiling |
 | `runtime/ynn` | Private prepared CPU operators and YNNPACK ownership |
 | `runtime/mps` | Private prepared Metal operators, command batches, INT8 kernels |
@@ -26,13 +27,44 @@ RTG is an import/package format, not the owner of general modeling code. Do not
 add independent CPU and GPU model implementations. Backend fusion belongs in
 operators, not duplicated Transformer equations.
 
+`kidi::model` contains Gemma 4, its vision tower, Transformer and Whisper model
+implementations. Model-specific validation, parameter binding and checkpoint
+customizations stay with the model. Models define metadata layout, required
+sidecars, source compatibility, conversion/export rules and cache identity.
+`kidi::checkpoint` invokes those hooks while owning filesystem access, source
+inspection, locking, cache validation, staging, serialization and atomic writes.
+Do not place format readers or filesystem/cache orchestration in model classes,
+or add model-specific conversion branches to generic preparation code.
+The format implementations have matching subdirectories and namespaces:
+`checkpoint/ggml` (`kidi::checkpoint::ggml`) and `checkpoint/safetensors`
+(`kidi::checkpoint::safetensors`). Shared `Weights`, `Package` and configuration
+APIs live at the checkpoint root; applications normally use those APIs rather
+than a particular format reader. There are no compatibility aliases in `model`.
+
 ## Configuration
 
 Configuration stays in `YAML::Node`; there are no model-specific configuration
-structs or mirrored manifest types. `model::load_config` reads `model.yaml`,
+structs or mirrored manifest types. `checkpoint::load_config` reads `model.yaml`,
 checks package structure and file paths, and resolves file paths relative to
-the package. `model::load_whisper_config` instead validates and resolves the untouched Hugging Face files in memory;
-it does not generate a manifest. `Package::config()` exposes RTG package documents.
+the package. The `load_config(path, ConfigAdapter)` overload reads the adapter's
+metadata filename and invokes its model-supplied configuration callback.
+`ConfigSource` supplies the parsed YAML/JSON document and checked file/weight
+resolution; it does not encode a model's required files or dimensions.
+`WhisperImpl::checkpoint_config()` supplies the Hugging Face layout and GGML
+header compatibility rules without writing a manifest. `Package::config()`
+exposes RTG package documents.
+
+`checkpoint::prepare` takes a config adapter and model-owned preparation hook.
+The returned `Preparation` describes the source, cache directory/version,
+sidecars, metadata labels and conversion callback. These are persistence
+descriptors, not copies of model architecture fields. No registry or new model
+base class is required to supply a different model's hooks:
+
+```cpp
+const auto adapter = model::WhisperImpl::checkpoint_config();
+auto config = ops::require(checkpoint::load_config(directory, adapter));
+auto prepared = ops::require(checkpoint::prepare(directory, adapter, model::WhisperImpl::int8_preparation));
+```
 
 `config["model"]` is self-contained: `type`, architecture fields,
 and `source_tokens` live together. The package derives source padding and decoder
@@ -132,8 +164,12 @@ operators as native CPU inference. No Qualcomm SDK, calibration pass, or DSP gra
 Whisper INT8 binds per-output-channel signed weights and FP32 scales to the existing quantized linear operation, including
 transposed checkpoint layouts, the im2col convolution, and a tied INT8 embedding/output table. The small input convolution
 and numerically sensitive non-weight parameters remain FP32. CPU projection inputs are dynamically quantized per row.
-`WhisperImpl::prepare_int8` writes a separate versioned cache atomically, retaining the original checkpoint and checking
-its size/mtime on reuse. Tensor dtype in the encoder FFN determines stored precision; no duplicated manifest precision
+`WhisperImpl::int8_preparation` defines its cache identity/sidecars and selects
+`WhisperImpl::int8_checkpoint`, which constructs the INT8 model, binds source
+weights and exports state without the duplicate tied output head. Generic
+`checkpoint::prepare` writes the cache atomically, retains the source and checks
+its size/mtime on reuse. Existing cache names, version strings and serialized
+weights remain compatible. Tensor dtype in the encoder FFN determines stored precision; no duplicated manifest precision
 flag is required. `Weights::save` writes exclusive Safetensors with aligned payload order and never overwrites a file.
 
 Whisper can also load a legacy GGML file with matching HF sidecars in its parent

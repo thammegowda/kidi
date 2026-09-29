@@ -9,7 +9,7 @@
 #include <iostream>
 #include <string>
 
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
 #include "kidi/layers/position_encoding.h"
 #if defined(__APPLE__)
 #include "kidi/runtime/mps/quantized_linear.h"
@@ -64,8 +64,8 @@ auto main() -> int {
     try {
         const auto path = std::filesystem::temp_directory_path() / "kidi-int8-precision-test.safetensors";
         write_int8_weights(path);
-        const std::array mappings{model::StateMappingSpec{{R"(linear\.weight\.scale)"}, "linear.scale"}};
-        auto weights = require(model::Weights::load(path, mappings));
+        const std::array mappings{checkpoint::StateMappingSpec{{R"(linear\.weight\.scale)"}, "linear.scale"}};
+        auto weights = require(checkpoint::Weights::load(path, mappings));
         const ModuleScope construction(tensor::DType::I8, false);
         layers::Linear linear(4, 3);
         ModuleMap<> modules;
@@ -163,7 +163,7 @@ auto main() -> int {
         std::filesystem::remove(path);
         const auto embedding_path = std::filesystem::temp_directory_path() / "kidi-int8-embedding-test.safetensors";
         write_int8_embeddings(embedding_path);
-        auto embedding_weights = require(model::Weights::load(embedding_path));
+        auto embedding_weights = require(checkpoint::Weights::load(embedding_path));
         layers::Embedding embedding(3, 4, 2);
         require(embedding->set_state(StateDict{{"weight", require(embedding_weights.tensor("embedding"))},
                                                {"scale", require(embedding_weights.tensor("embedding.scale"))}}));

@@ -8,7 +8,7 @@
 #include <iostream>
 #include <string>
 
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
 
 namespace {
 
@@ -44,7 +44,7 @@ auto main() -> int {
     try {
         const auto path = std::filesystem::temp_directory_path() / "kidi-bf16-precision-test.safetensors";
         write_bf16_weights(path);
-        auto weights = ops::require(model::Weights::load(path));
+        auto weights = ops::require(checkpoint::Weights::load(path));
         const ModuleScope construction(tensor::DType::BF16, false);
         layers::Linear linear(4, 3);
         ops::require(linear->set_state(StateDict{{"weight", ops::require(weights.tensor("linear.weight"))},

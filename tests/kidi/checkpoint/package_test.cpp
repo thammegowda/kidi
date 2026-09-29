@@ -7,7 +7,7 @@
 #include <string>
 #include <string_view>
 
-#include "kidi/model/package.h"
+#include "kidi/checkpoint/package.h"
 #include "kidi/model/transformer.h"
 #include "kidi/inference/translator.h"
 
@@ -78,7 +78,7 @@ auto main() -> int {
     write(directory / "tokenizer.tgt.json", TOKENIZER_JSON);
     write(directory / "model.yaml", MANIFEST_YAML);
 
-    auto package = kidi::model::Package::load(directory);
+    auto package = kidi::checkpoint::Package::load(directory);
     if (!package || package->source_tokenizer().token_id("<s>") != 2 ||
         package->target_tokenizer().vocabulary_size() != 5 ||
         package->config()["model"]["source_pad_id"].as<int>() != 0 ||
@@ -87,7 +87,7 @@ auto main() -> int {
         std::cerr << "valid RTG package was rejected\n";
         return 1;
     }
-    if (kidi::model::Package::load(directory / "model.yaml")) {
+    if (kidi::checkpoint::Package::load(directory / "model.yaml")) {
         std::cerr << "manifest path was accepted as a model directory\n";
         return 1;
     }
@@ -138,7 +138,7 @@ auto main() -> int {
     reordered.replace(reordered.find(vocabulary), vocabulary.size(),
                       R"("<pad>": 4, "<unk>": 0, "<s>": 1, "</s>": 2, "hi": 3)");
     write(directory / "tokenizer.tgt.json", reordered);
-    auto different_ids = kidi::model::Package::load(directory);
+    auto different_ids = kidi::checkpoint::Package::load(directory);
     if (!different_ids || different_ids->config()["model"]["source_pad_id"].as<int>() != 0 ||
         different_ids->config()["decode"]["source_end_id"].as<int>() != 3 ||
         different_ids->config()["decode"]["begin_id"].as<int>() != 1 ||
@@ -148,7 +148,7 @@ auto main() -> int {
     auto missing = original;
     missing.replace(missing.find("<s>"), 3, "<missing>");
     write(directory / "tokenizer.tgt.json", missing);
-    if (kidi::model::Package::load(directory)) return 1;
+    if (kidi::checkpoint::Package::load(directory)) return 1;
 
     std::filesystem::remove_all(directory);
     return 0;

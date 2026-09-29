@@ -1,5 +1,5 @@
 #include "kidi/core/module.h"
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -77,7 +77,7 @@ auto Module::state_dict() const -> StateDict {
 auto Module::set_state(const StateDict& state, bool strict) -> Result<void> {
     return assign_state(state, strict, false);
 }
-auto Module::set_state(const model::Weights& weights, bool strict) -> Result<void> {
+auto Module::set_state(const checkpoint::Weights& weights, bool strict) -> Result<void> {
     auto state = weights.state_dict();
     if (!state) return std::unexpected(std::move(state.error()));
     return set_state(*state, strict);

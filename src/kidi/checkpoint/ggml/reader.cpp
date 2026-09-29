@@ -1,4 +1,4 @@
-#include "kidi/model/ggml.h"
+#include "kidi/checkpoint/ggml/reader.h"
 
 #include <algorithm>
 #include <bit>
@@ -9,9 +9,9 @@
 #include <set>
 #include <stdexcept>
 
-#include "kidi/model/ggml_dequantize.h"
+#include "kidi/checkpoint/ggml/dequantize.h"
 
-namespace kidi::model {
+namespace kidi::checkpoint::ggml {
 namespace {
 
 class Reader {
@@ -129,7 +129,7 @@ auto decode_blocks(Reader& reader, std::span<float> output) -> void {
         const auto count = std::min(blocks.size(), (output.size() - offset) / 32);
         reader.read(blocks.data(), count * sizeof(Block));
         for (std::size_t index = 0; index < count; ++index)
-            ggml_read::dequantize(blocks[index], output.data() + offset + index * 32);
+            detail::dequantize(blocks[index], output.data() + offset + index * 32);
         offset += count * 32;
     }
 }
@@ -259,20 +259,20 @@ auto GgmlFile::tensor(std::string_view name) const -> Result<tensor::Tensor> {
                 reader.read(buffer.data(), count * sizeof(std::uint16_t));
                 for (std::size_t index = 0; index < count; ++index)
                     (*values)[offset + index] =
-                        entry.type == 1 ? ggml_read::fp16_to_fp32(buffer[index])
+                        entry.type == 1 ? detail::fp16_to_fp32(buffer[index])
                                         : std::bit_cast<float>(static_cast<std::uint32_t>(buffer[index]) << 16);
                 offset += count;
             }
         } else if (entry.type == 2)
-            decode_blocks<ggml_read::block_q4_0>(reader, *values);
+            decode_blocks<detail::block_q4_0>(reader, *values);
         else if (entry.type == 3)
-            decode_blocks<ggml_read::block_q4_1>(reader, *values);
+            decode_blocks<detail::block_q4_1>(reader, *values);
         else if (entry.type == 6)
-            decode_blocks<ggml_read::block_q5_0>(reader, *values);
+            decode_blocks<detail::block_q5_0>(reader, *values);
         else if (entry.type == 7)
-            decode_blocks<ggml_read::block_q5_1>(reader, *values);
+            decode_blocks<detail::block_q5_1>(reader, *values);
         else if (entry.type == 8)
-            decode_blocks<ggml_read::block_q8_0>(reader, *values);
+            decode_blocks<detail::block_q8_0>(reader, *values);
         if (!std::ranges::all_of(*values, [](float value) { return std::isfinite(value); }))
             throw std::runtime_error("non-finite GGML tensor: " + std::string(name));
         return result;
@@ -283,4 +283,4 @@ auto GgmlFile::tensor(std::string_view name) const -> Result<tensor::Tensor> {
     }
 }
 
-} // namespace kidi::model
+} // namespace kidi::checkpoint::ggml

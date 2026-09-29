@@ -1,13 +1,7 @@
 #include "kidi/model/whisper.h"
 #include "kidi/ops/quantization.h"
-#include "kidi/model/config.h"
 
 #include <cmath>
-#include <fstream>
-#include <mutex>
-#include <numeric>
-#include <random>
-#include <nlohmann/json.hpp>
 
 namespace kidi::model {
 using ops::require;
@@ -106,86 +100,70 @@ auto WhisperImpl::create(const YAML::Node& config) -> Result<Whisper> {
     }
 }
 
-auto WhisperImpl::prepare_int8(const std::filesystem::path& directory) -> Result<std::filesystem::path> {
-    static std::mutex conversion_mutex;
-    std::scoped_lock lock(conversion_mutex);
-    std::filesystem::path temporary;
+auto WhisperImpl::checkpoint_config() -> checkpoint::ConfigAdapter {
+    return {
+        "config.json", [](const checkpoint::ConfigSource& source) -> Result<YAML::Node> {
+            const auto& model = source.document;
+            if (!model.IsMap() || model["model_type"].as<std::string>() != "whisper")
+                return std::unexpected(Error{ErrorCode::UNSUPPORTED, "checkpoint is not a Hugging Face Whisper model"});
+            YAML::Node config;
+            config["model"] = YAML::Clone(model);
+            config["model"]["type"] = "whisper";
+            constexpr std::array<std::string_view, 2> candidates{"model.safetensors", "ggml-model.bin"};
+            const auto weights = require(source.weights(candidates));
+            config["model_file"] = weights["path"];
+            if (weights["format"].as<std::string>() == "ggml") {
+                constexpr std::array keys{
+                    "vocab_size",     "max_source_positions", "d_model", "encoder_attention_heads",
+                    "encoder_layers", "max_target_positions", "d_model", "decoder_attention_heads",
+                    "decoder_layers", "num_mel_bins"};
+                for (std::size_t index = 0; index < keys.size(); ++index)
+                    if (model[keys[index]].as<std::int32_t>() != weights["ggml_header"][index].as<std::int32_t>())
+                        return std::unexpected(
+                            Error{ErrorCode::INVALID_MANIFEST,
+                                  "Whisper GGML header disagrees with config: " + std::string(keys[index])});
+                config["weights_format"] = "whisper_ggml";
+            } else if (weights["format"].as<std::string>() == "gguf") {
+                return std::unexpected(Error{ErrorCode::UNSUPPORTED,
+                                             "Whisper GGUF model mapping is not supported; use legacy Whisper GGML"});
+            }
+            for (const auto* name : {"tokenizer.json", "preprocessor_config.json", "generation_config.json"})
+                config[std::filesystem::path(name).stem().string() + "_file"] = require(source.file(name)).string();
+            return config;
+        }};
+}
+
+auto WhisperImpl::int8_preparation(const YAML::Node& config) -> Result<checkpoint::Preparation> {
+    auto valid = validate_config(config["model"]);
+    if (!valid) return std::unexpected(valid.error());
+    const auto source = std::filesystem::path(config["model_file"].as<std::string>());
+    const bool imported = config["weights_format"].as<std::string>("") == "whisper_ggml";
+    return checkpoint::Preparation{
+        .source = source,
+        .cache_directory = imported ? source.filename().string() + ".kidi-int8-v1" : "kidi-int8-v2",
+        .format = imported ? "kidi-whisper-ggml-int8-v1" : "kidi-whisper-int8-v2",
+        .files = {"config.json", "tokenizer.json", "preprocessor_config.json", "generation_config.json"},
+        .metadata = {{"weight_precision", "signed-int8-per-output-channel"},
+                     {"fp32_parameters", "input convolution, normalization, positions, biases, quantization scales"}},
+        .convert = int8_checkpoint,
+    };
+}
+
+auto WhisperImpl::int8_checkpoint(const YAML::Node& config, const checkpoint::Weights& weights) -> Result<StateDict> {
     try {
-        auto config = require(load_whisper_config(directory));
-        require(validate_config(config["model"]));
-        const auto source_path = std::filesystem::path(config["model_file"].as<std::string>());
-        const auto source_size = std::filesystem::file_size(source_path);
-        const auto source_time = std::filesystem::last_write_time(source_path).time_since_epoch().count();
-        const auto root = source_path.parent_path();
-        const bool imported = config["weights_format"].as<std::string>("") == "whisper_ggml";
-        const std::string format = imported ? "kidi-whisper-ggml-int8-v1" : "kidi-whisper-int8-v2";
-        const auto destination = root / (imported ? source_path.filename().string() + ".kidi-int8-v1" : "kidi-int8-v2");
-        constexpr std::array files{"config.json", "tokenizer.json", "preprocessor_config.json",
-                                   "generation_config.json"};
-        if (std::filesystem::exists(destination)) {
-            std::ifstream stream(destination / "quantization.json");
-            const auto metadata = nlohmann::json::parse(stream);
-            if (metadata.value("format", "") != format || metadata.at("source_bytes") != source_size ||
-                metadata.at("source_mtime") != source_time ||
-                metadata.at("model_bytes") != std::filesystem::file_size(destination / "model.safetensors"))
-                throw ops::Failure(
-                    {ErrorCode::INVALID_ARGUMENT, "stale or incomplete Whisper INT8 cache: " + destination.string()});
-            for (const auto* name : files)
-                if (!std::filesystem::is_regular_file(destination / name))
-                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "incomplete Whisper INT8 cache"});
-            return destination;
-        }
         const ModuleScope construction(DType::I8, false, tensor::Device::cpu());
-        auto model = require(create(config["model"]));
-        auto weights = require(Weights::load(source_path));
+        auto model = require(create(config));
         require(model->set_checkpoint(weights));
-        StateDict checkpoint;
+        StateDict result;
         for (const auto& [name, value] : model->state_dict())
-            if (!name.starts_with("proj_out.")) checkpoint.emplace("model." + name, value);
-        const auto bytes =
-            std::accumulate(checkpoint.begin(), checkpoint.end(), std::uint64_t{0},
-                            [](std::uint64_t total, const auto& item) { return total + item.second.nbytes(); });
-        if (std::filesystem::space(root).available < bytes + 16 * 1024 * 1024)
-            throw ops::Failure({ErrorCode::RUNTIME, "not enough storage for the Whisper INT8 cache"});
-        std::random_device random;
-        for (int attempt = 0; attempt < 8 && temporary.empty(); ++attempt) {
-            auto candidate = root / (".kidi-int8-v2-" + std::to_string(random()));
-            if (std::filesystem::create_directory(candidate)) temporary = std::move(candidate);
-        }
-        if (temporary.empty()) throw ops::Failure({ErrorCode::RUNTIME, "cannot create Whisper INT8 staging directory"});
-        require(Weights::save(temporary / "model.safetensors", checkpoint));
-        for (const auto* name : files) std::filesystem::copy_file(root / name, temporary / name);
-        const auto metadata = nlohmann::json{
-            {"format", format},
-            {"source_file", source_path.filename().string()},
-            {"source_bytes", source_size},
-            {"source_mtime", source_time},
-            {"model_bytes", std::filesystem::file_size(temporary / "model.safetensors")},
-            {"weight_precision", "signed-int8-per-output-channel"},
-            {"fp32_parameters", "input convolution, normalization, positions, biases, quantization scales"}};
-        std::ofstream stream(temporary / "quantization.json");
-        stream << metadata.dump(2) << '\n';
-        stream.close();
-        if (!stream) throw ops::Failure({ErrorCode::RUNTIME, "failed to write Whisper quantization metadata"});
-        std::filesystem::rename(temporary, destination);
-        temporary.clear();
-        return destination;
+            if (!name.starts_with("proj_out.")) result.emplace("model." + name, value);
+        return result;
     } catch (const ops::Failure& error) {
-        if (!temporary.empty()) {
-            std::error_code ignored;
-            std::filesystem::remove_all(temporary, ignored);
-        }
         return std::unexpected(error.error());
-    } catch (const std::exception& error) {
-        if (!temporary.empty()) {
-            std::error_code ignored;
-            std::filesystem::remove_all(temporary, ignored);
-        }
-        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
     }
 }
 
-auto WhisperImpl::set_checkpoint(const Weights& weights) -> Result<void> {
+auto WhisperImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
     try {
         StateDict state;
         for (const auto& key : weights.names()) {

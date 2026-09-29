@@ -69,7 +69,7 @@ auto resolve_options(const YAML::Node& config, const DecodeOptions& options) -> 
 
 } // namespace
 
-Translator::Translator(model::Package package, model::Transformer model) noexcept
+Translator::Translator(checkpoint::Package package, model::Transformer model) noexcept
     : package_(std::move(package)), model_(std::move(model)) {}
 
 auto Translator::load(const std::filesystem::path& model_directory, tensor::Device device, InferenceStats* stats,
@@ -80,7 +80,7 @@ auto Translator::load(const std::filesystem::path& model_directory, tensor::Devi
     if (batch_size == 0 || batch_size > 256)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "batch size must be between 1 and 256"});
     auto package =
-        measure(stats ? &stats->package_load_ns : nullptr, [&] { return model::Package::load(model_directory); });
+        measure(stats ? &stats->package_load_ns : nullptr, [&] { return checkpoint::Package::load(model_directory); });
     if (!package) return std::unexpected(std::move(package.error()));
     auto defaults = resolve_options(package->config()["decode"], {});
     if (!defaults) return std::unexpected(std::move(defaults.error()));

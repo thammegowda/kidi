@@ -46,7 +46,7 @@
 #define SAFETENSORS_MAX_METADATA_SIZE (2ULL << 22)  // 4 MiB
 #endif
 
-namespace safetensors {
+namespace kidi::checkpoint::safetensors {
 
 class SafetensorsException : public std::runtime_error {
 public:
@@ -584,6 +584,6 @@ inline MappedCheckpoint load_mapped(const std::string& path) {
     return MappedCheckpoint(path);
 }
 
-}  // namespace safetensors
+}  // namespace kidi::checkpoint::safetensors
 
 #endif  // SAFETENSORS_MAPPED_HPP

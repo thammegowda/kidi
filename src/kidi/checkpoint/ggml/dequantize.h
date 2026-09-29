@@ -40,7 +40,7 @@ SOFTWARE.
 #include <cstdint>
 #include <cstring>
 
-namespace ggml_read {
+namespace kidi::checkpoint::ggml::detail {
 
 inline float fp16_to_fp32(uint16_t h) {
     const uint32_t w = (uint32_t)h << 16;
@@ -133,4 +133,4 @@ inline void dequantize(const block_q8_0& x, float* y) {
     for (int j = 0; j < 32; j++) y[j] = x.qs[j] * d;
 }
 
-} // namespace ggml_read
+} // namespace kidi::checkpoint::ggml::detail

@@ -17,7 +17,7 @@
     class NAME##Impl;     \
     using NAME = ::kidi::core::ModuleHolder<NAME##Impl>
 
-namespace kidi::model {
+namespace kidi::checkpoint {
 class Weights;
 }
 
@@ -86,7 +86,7 @@ public:
 
     auto state_dict() const -> StateDict;
     auto set_state(const StateDict& state, bool strict = true) -> Result<void>;
-    auto set_state(const model::Weights& weights, bool strict = true) -> Result<void>;
+    auto set_state(const checkpoint::Weights& weights, bool strict = true) -> Result<void>;
     auto load_state_dict(const StateDict& state, bool strict = true) -> Result<void>;
 
 protected:

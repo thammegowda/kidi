@@ -13,8 +13,8 @@ auto main(int argc, char** argv) -> int {
             using kidi::ops::require;
             const std::filesystem::path directory(argv[1]);
             const auto config = YAML::LoadFile((directory / "config.yaml").string());
-            const auto weights = require(kidi::model::Weights::load(directory / "model.safetensors"));
-            const auto reference = require(kidi::model::Weights::load(directory / "reference.safetensors"));
+            const auto weights = require(kidi::checkpoint::Weights::load(directory / "model.safetensors"));
+            const auto reference = require(kidi::checkpoint::Weights::load(directory / "reference.safetensors"));
             const kidi::ModuleScope scope(kidi::tensor::DType::F32, false, kidi::tensor::Device::cpu());
             auto model = kidi::model::Gemma4Vision(config, 20, argc == 3);
             require(model->set_checkpoint(weights));

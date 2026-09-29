@@ -1,7 +1,7 @@
 #pragma once
 #include <memory>
 #include "kidi/layers/transformer.h"
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
 #include <yaml-cpp/yaml.h>
 #include "kidi/inference/profile.h"
 
@@ -24,7 +24,7 @@ public:
     ~TransformerImpl();
     static auto validate_config(const YAML::Node& config) -> Result<void>;
     static auto create(const YAML::Node& config) -> Result<Transformer>;
-    static auto state_mapping_specs() -> std::span<const StateMappingSpec>;
+    static auto state_mapping_specs() -> std::span<const checkpoint::StateMappingSpec>;
     auto encode(std::span<const std::vector<std::int32_t>> sources, inference::InferenceStats* = nullptr)
         -> Result<EncoderState>;
     auto create_state(std::size_t batch, std::size_t capacity) -> Result<DecoderState>;

@@ -1,5 +1,5 @@
 #include "kidi/model/gemma4.h"
-#include "kidi/model/config.h"
+#include "kidi/checkpoint/config.h"
 #include "kidi/text/tokenizer.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/inference/generator.h"
@@ -215,9 +215,9 @@ auto main(int argc, char** argv) -> int {
                       << ",\"cached_bytes\":" << hit.stats.prefix_cache_bytes << ",\"exact_outputs\":true}\n";
             return 0;
         }
-        const auto config = ops::require(model::load_config(directory / "model.yaml"));
+        const auto config = ops::require(checkpoint::load_config(directory / "model.yaml"));
         const auto tokenizer = ops::require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
-        const auto weights = ops::require(model::Weights::load(config["weights_file"].as<std::string>()));
+        const auto weights = ops::require(checkpoint::Weights::load(config["weights_file"].as<std::string>()));
         const auto embedding = ops::require(weights.tensor(config["model"]["quantization_config"]
                                                                ? "model.language_model.norm.weight"
                                                                : "model.language_model.embed_tokens.weight"));
@@ -376,7 +376,7 @@ auto main(int argc, char** argv) -> int {
         }
         std::vector<std::vector<float>> baseline;
         if (reference_probe) {
-            const auto reference = ops::require(model::Weights::load(argv[5]));
+            const auto reference = ops::require(checkpoint::Weights::load(argv[5]));
             const auto token_tensor = ops::require(reference.tensor("tokens"));
             const auto expected = ops::require(reference.tensor("logits"));
             const auto ids = ops::require(token_tensor.data<std::int32_t>());

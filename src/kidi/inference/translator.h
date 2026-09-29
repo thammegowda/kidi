@@ -9,7 +9,7 @@
 
 #include "kidi/core/error.h"
 #include "kidi/model/transformer.h"
-#include "kidi/model/package.h"
+#include "kidi/checkpoint/package.h"
 #include "kidi/inference/profile.h"
 
 namespace kidi::inference {
@@ -43,9 +43,9 @@ public:
                          InferenceStats* stats = nullptr) -> Result<std::vector<Translation>>;
 
 private:
-    Translator(model::Package package, model::Transformer model) noexcept;
+    Translator(checkpoint::Package package, model::Transformer model) noexcept;
 
-    model::Package package_;
+    checkpoint::Package package_;
     model::Transformer model_;
     std::size_t batch_size_ = 1;
 };
