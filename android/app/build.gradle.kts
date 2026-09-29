@@ -6,13 +6,14 @@ plugins {
 
 android {
     namespace = "ai.gowda.kidi"
-    compileSdk = 35
+    compileSdk = 36
+    buildToolsVersion = "36.0.0"
 
     defaultConfig {
         applicationId = "ai.gowda.kidi"
         minSdk = 29
-        targetSdk = 35
-        versionCode = 1
+        targetSdk = 36
+        versionCode = 2
         versionName = "0.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -53,6 +54,7 @@ android {
     }
     packaging.jniLibs.useLegacyPackaging = true
     sourceSets.getByName("main").res.srcDir(layout.buildDirectory.dir("generated/visionNotices"))
+    sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/legalDocuments"))
     ndkVersion = "28.0.13004108"
     externalNativeBuild {
         cmake {
@@ -71,6 +73,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("io.noties.markwon:core:4.6.2")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation(platform("androidx.compose:compose-bom:2025.04.01"))
@@ -96,4 +100,8 @@ val visionNotices by tasks.registering(Sync::class) {
     }
     from(rootProject.file("../src/kidi/checkpoint/ggml/LICENSE")) { rename { "ggml_license.txt" } }
 }
-tasks.named("preBuild") { dependsOn(visionNotices) }
+val legalDocuments by tasks.registering(Sync::class) {
+    from(rootProject.file("PRIVACY.md"), rootProject.file("TERMS.md"))
+    into(layout.buildDirectory.dir("generated/legalDocuments/legal"))
+}
+tasks.named("preBuild") { dependsOn(visionNotices, legalDocuments) }

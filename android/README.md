@@ -9,7 +9,7 @@ second implementation of either model.
 
 - a recursive Kidi checkout;
 - JDK 17;
-- Android SDK Platform 35 and Build Tools 35.0.0;
+- Android SDK Platform 36 and Build Tools 36.0.0;
 - Android NDK 28.0.13004108;
 - Android CMake 3.31.6.
 
@@ -19,12 +19,53 @@ Android Studio can install those SDK packages. With the Android command-line too
 brew install openjdk@17 android-commandlinetools
 export JAVA_HOME="$(brew --prefix openjdk@17)/libexec/openjdk.jdk/Contents/Home"
 sdkmanager --sdk_root="$HOME/Library/Android/sdk" \
-	'platforms;android-35' 'build-tools;35.0.0' 'cmake;3.31.6' 'ndk;28.0.13004108'
+	'platforms;android-36' 'build-tools;36.0.0' 'cmake;3.31.6' 'ndk;28.0.13004108'
 ```
 
 ## Build and Run
 
+For distribution through Google Play, follow the
+[developer release guide](../README-dev.md#google-play-releases). It covers signed
+app bundles, tester enrollment, updates, and Play-readiness checks.
+
 From the repository root:
+
+```bash
+make apk
+```
+
+This performs a clean optimized release build and lint, aligns/signs/verifies the
+APK, and writes `dist/kidi-release.apk`. It does not install anything or change
+phone data. By default it uses your existing `~/.android/debug.keystore`, so this
+is a release-mode APK signed for **local testing**, not public distribution.
+If that key does not exist, build `assembleDebug` once using the commands below.
+
+For an APK signed with your private release/upload key:
+
+```bash
+make apk-release
+```
+
+This defaults to `~/.local/share/kidi/keys/upload.keystore`, alias `kidi-upload`,
+and prompts for its password in the terminal. It never falls back to the debug
+key. The verified output is `dist/kidi-release-signed.apk`, kept separate from
+the local-testing APK. Override the key with `APK_KEYSTORE` and `APK_KEY_ALIAS`.
+An upload-key-signed APK is for direct distribution; it does not necessarily
+match Google's app signing key. Google Play's new-app workflow uses a signed
+AAB, not this APK; follow the developer release guide above.
+
+On macOS the script finds Homebrew JDK 17 (or a registered JDK 17) and defaults
+to `~/Library/Android/sdk`. Set `JAVA_HOME` and `ANDROID_HOME` to override these;
+`ANDROID_SDK_ROOT` is also accepted when `ANDROID_HOME` is unset. Build Tools
+default to 36.0.0, overridable with `ANDROID_BUILD_TOOLS_VERSION`.
+
+For your own signing key, set `APK_KEYSTORE` and `APK_KEY_ALIAS`. Optional exported
+`APK_STORE_PASSWORD` and `APK_KEY_PASSWORD` are read by `apksigner` from the
+environment; otherwise it prompts in the terminal. Do not commit signing keys or
+passwords. Installing with `adb install -r dist/kidi-release.apk` preserves data
+only when the signing key matches the installed app.
+
+For a debuggable build and installation:
 
 ```bash
 export JAVA_HOME=/path/to/jdk-17
@@ -37,10 +78,15 @@ The APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`. Open 
 IDE workflow. The Gradle project references the repository root, so moving only the `android/` directory is not a
 supported build layout.
 
-The application ID and Kotlin namespace are `ai.gowda.kidi`. The app requires Android 10/API 29 or newer and currently
+The application ID and Kotlin namespace are `ai.gowda.kidi`. The app targets Android 16/API 36, requires Android 10/API 29 or newer, and currently
 packages only `arm64-v8a`. Gemma 4 needs a 64-bit device with several gigabytes of available storage and memory.
 
 ## Model and Privacy
+
+See the [Android Privacy Policy](PRIVACY.md) for data handling, permissions,
+third-party downloads, and deletion, and the [Terms of Use](TERMS.md) for AI
+limitations and responsible use. AI-generated content can be wrong; verify
+important information before relying on it.
 
 A published APK does not require sideloaded model files. On a clean install, **Set up models** opens the in-app model
 downloads. Each download requires confirmation and displays an approximate transfer/storage size; the app does not
@@ -59,6 +105,26 @@ Gemma 4 repository with the same supported file layout. Loading performs these s
 The default download is about 2.49 GB. Download progress can be cancelled and resumed. Removing the local model deletes
 the downloaded files but preserves the current conversation. Android removes the app-private model directory when the
 application is uninstalled. Prompts, responses, and model files are not sent to a Kidi server.
+
+File downloads retry transient network failures up to three attempts, resuming
+the saved `.part` file with a validated HTTP range. Idle reads time out after
+30 seconds. Settings show Connecting, Downloading, Verifying and Retrying phases;
+checksum verification is cancellable and remains visible after transfer reaches
+100%. Failed chat and speech operations retain separate, selectable errors in
+their model sections, rather than relying on a snackbar behind the settings
+sheet. Download again to resume valid saved progress; corrupt partial files are
+discarded after checksum failure.
+
+Downloads currently run in the app process, not a persistent background service.
+Keep the app in the foreground for large downloads. If Android terminates it,
+open settings and start the download again; downloaded partial bytes are retained.
+This retry handling does not guarantee continuation through process death.
+
+The current permission set is `INTERNET` and runtime `RECORD_AUDIO`. App-private
+model/image storage needs no shared-storage permission. The system photo picker
+and camera activity use URI grants, so Kidi does not request broad gallery access
+or direct camera permission. Adding storage permissions will not fix a slow or
+interrupted multi-GB transfer.
 
 The app uses CPU inference with 1-8 threads, a shared 9,216-token context, and a configurable output limit.
 Generation is streamed one bounded native step at a time and can be stopped between steps. The current conversation and
@@ -157,6 +223,13 @@ It does not imply a completion percentage or use the small bouncing response bar
 analysis and prompt prefill; elapsed time includes them. Final per-message metrics remain available after completion.
 Remote images are not loaded. Recording status stays above the composer so live transcript text remains readable.
 The composer respects keyboard insets, and conversation width is constrained on larger displays.
+
+The chat footer and the bottom of settings show an experimental-AI notice with
+Privacy and Terms links. Both documents open in a scrollable, selectable in-app
+reader and are bundled from [PRIVACY.md](PRIVACY.md) and [TERMS.md](TERMS.md), so
+they remain available offline. Links between those policies stay inside the app;
+external links open only when selected. The notice sets expectations, not a
+guarantee of accuracy, safety, legal protection, or user consent to new data uses.
 
 Lato is bundled for offline typography under the [SIL Open Font License](app/src/main/res/raw/lato_license.txt).
 Markdown uses [Markwon](https://github.com/noties/Markwon), licensed under Apache 2.0.

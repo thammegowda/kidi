@@ -8,7 +8,9 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
@@ -21,8 +23,9 @@ import io.noties.markwon.MarkwonConfiguration
 import io.noties.markwon.core.MarkwonTheme
 
 @Composable
-internal fun MarkdownReply(text: String, modifier: Modifier = Modifier) {
+internal fun MarkdownReply(text: String, modifier: Modifier = Modifier, onLink: ((String) -> Boolean)? = null) {
     val context = LocalContext.current
+    val handleLink by rememberUpdatedState(onLink)
     val colors = MaterialTheme.colorScheme
     val foreground = colors.onSurface.toArgb()
     val codeBackground = colors.surfaceContainer.toArgb()
@@ -38,6 +41,7 @@ internal fun MarkdownReply(text: String, modifier: Modifier = Modifier) {
 
             override fun configureConfiguration(builder: MarkwonConfiguration.Builder) {
                 builder.linkResolver { view, link ->
+                    if (handleLink?.invoke(link) == true) return@linkResolver
                     val uri = Uri.parse(link)
                     if (uri.scheme in listOf("https", "http", "mailto")) {
                         try {

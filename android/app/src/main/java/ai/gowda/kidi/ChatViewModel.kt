@@ -59,6 +59,8 @@ internal data class KidiUiState(
     val stopping: Boolean = false,
     val progressFile: String = "",
     val progress: Float = 0f,
+    val progressPhase: ModelDownloadPhase = ModelDownloadPhase.CONNECTING,
+    val modelError: String? = null,
     val status: String = "Model offline",
     val error: String? = null,
     val threadCount: Int = defaultThreadCount(),
@@ -72,6 +74,8 @@ internal data class KidiUiState(
     val recordingSeconds: Float = 0f,
     val speechProgressFile: String = "",
     val speechProgress: Float = 0f,
+    val speechProgressPhase: ModelDownloadPhase = ModelDownloadPhase.CONNECTING,
+    val speechModelError: String? = null,
 )
 
 internal fun KidiUiState.withProvisionalTranscript(text: String, start: Int, complete: Boolean = false): KidiUiState {
@@ -131,11 +135,11 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun setModelId(value: String) {
-        _state.update { it.copy(modelId = value, error = null) }
+        _state.update { it.copy(modelId = value, error = null, modelError = null) }
     }
 
     fun setSpeechModelId(value: String) {
-        _state.update { it.copy(speechModelId = value, error = null) }
+        _state.update { it.copy(speechModelId = value, error = null, speechModelError = null) }
     }
 
     fun setComposerText(value: String) {
@@ -203,7 +207,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         preferences.edit { putString(MODEL_ID_KEY, modelId) }
         modelJob = viewModelScope.launch {
             _state.update {
-                it.copy(loadingModel = true, modelReady = false, progress = 0f, status = "Resolving model", error = null)
+                it.copy(loadingModel = true, modelReady = false, progress = 0f, progressFile = "",
+                    status = "Resolving model", error = null, modelError = null)
             }
             try {
                 val model = repository.prepare(modelId) { update ->
@@ -212,7 +217,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                         it.copy(
                             progressFile = update.file,
                             progress = ratio.coerceIn(0f, 1f),
-                            status = "Downloading ${(ratio * 100).toInt()}%",
+                            progressPhase = update.phase,
+                            status = "${update.phase.label} chat ${(ratio * 100).toInt()}%",
                         )
                     }
                 }
@@ -221,8 +227,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 _state.update { it.copy(loadingModel = false, status = "Model offline", progressFile = "") }
                 throw error
             } catch (error: Throwable) {
+                val message = "Chat download failed: ${error.userMessage()}"
+                Log.e("KidiDownload", message)
                 _state.update {
-                    it.copy(loadingModel = false, status = "Model offline", error = error.userMessage())
+                    it.copy(loadingModel = false, status = "Model offline", error = message, modelError = message)
                 }
             } finally {
                 modelJob = null
@@ -246,6 +254,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     loadingSpeech = true,
                     speechReady = false,
                     speechProgress = 0f,
+                    speechProgressFile = "",
+                    speechModelError = null,
                     status = "Resolving speech model",
                     error = null,
                 )
@@ -257,7 +267,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                         it.copy(
                             speechProgressFile = update.file,
                             speechProgress = ratio.coerceIn(0f, 1f),
-                            status = "Downloading speech ${(ratio * 100).toInt()}%",
+                            speechProgressPhase = update.phase,
+                            status = "${update.phase.label} speech ${(ratio * 100).toInt()}%",
                         )
                     }
                 }
@@ -266,8 +277,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 _state.update { it.copy(loadingSpeech = false, status = readyStatus(it), speechProgressFile = "") }
                 throw error
             } catch (error: Throwable) {
+                val message = "Speech download failed: ${error.userMessage()}"
+                Log.e("KidiDownload", message)
                 _state.update {
-                    it.copy(loadingSpeech = false, status = readyStatus(it), error = error.userMessage())
+                    it.copy(loadingSpeech = false, status = readyStatus(it), error = message, speechModelError = message)
                 }
             } finally {
                 speechJob = null
@@ -625,7 +638,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch(runtimeDispatcher) {
             val started = SystemClock.elapsedRealtime()
             Log.i("KidiStartup", "gemma_start queue_ms=${started - queued}")
-            _state.update { it.copy(loadingModel = true, status = "Loading model", error = null) }
+            _state.update { it.copy(loadingModel = true, progressFile = "", status = "Loading model",
+                error = null, modelError = null) }
             runCatching {
                 checked(NativeRuntime.configure(_state.value.threadCount))
                 val configured = SystemClock.elapsedRealtime()
@@ -646,8 +660,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 }
             }.onFailure { error ->
                 Log.e("KidiStartup", "gemma_failed elapsed_ms=${SystemClock.elapsedRealtime() - started}")
+                val message = "Chat model could not load: ${error.userMessage()}"
                 _state.update {
-                    it.copy(modelReady = false, loadingModel = false, status = "Model offline", error = error.userMessage())
+                    it.copy(modelReady = false, loadingModel = false, status = "Model offline", error = message,
+                        modelError = message)
                 }
             }
         }
@@ -659,7 +675,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             val started = SystemClock.elapsedRealtime()
             Log.i("KidiStartup", "whisper_start queue_ms=${started - queued}")
             val int8 = model.modelId == DEFAULT_SPEECH_MODEL_ID
-            _state.update { it.copy(loadingSpeech = true, status = if (int8) "Preparing Whisper Small INT8" else "Loading speech model", error = null) }
+            _state.update { it.copy(loadingSpeech = true, speechProgressFile = "", speechModelError = null,
+                status = if (int8) "Preparing Whisper Small INT8" else "Loading speech model", error = null) }
             runCatching {
                 checked(NativeRuntime.configure(_state.value.threadCount))
                 val configured = SystemClock.elapsedRealtime()
@@ -678,12 +695,14 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     )
                 }
             }.onFailure { error ->
+                val message = "Speech model could not load: ${error.userMessage()}"
                 _state.update {
                     it.copy(
                         speechReady = false,
                         loadingSpeech = false,
                         status = if (it.generating) it.status else readyStatus(it),
-                        error = error.userMessage(),
+                        error = message,
+                        speechModelError = message,
                     )
                 }
                 Log.e("KidiStartup", "whisper_failed elapsed_ms=${SystemClock.elapsedRealtime() - started}")

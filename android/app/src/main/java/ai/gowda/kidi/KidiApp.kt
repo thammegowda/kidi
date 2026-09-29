@@ -15,8 +15,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -171,10 +169,12 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
         else
             microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
     }
-    LaunchedEffect(state.error) {
-        state.error?.let {
-            snackbar.showSnackbar(it)
-            viewModel.clearError()
+    LaunchedEffect(state.error, settingsOpen) {
+        if (!settingsOpen) {
+            state.error?.let {
+                snackbar.showSnackbar(it)
+                viewModel.clearError()
+            }
         }
     }
 
@@ -371,8 +371,8 @@ private fun KidiHeader(state: KidiUiState, onNewChat: () -> Unit, onSettings: ()
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
         Row(
-            Modifier.fillMaxWidth().clickable(onClick = onSettings).heightIn(min = 44.dp)
-                .padding(horizontal = 20.dp, vertical = 8.dp),
+            Modifier.fillMaxWidth().clickable(onClick = onSettings).heightIn(min = 28.dp)
+                .padding(horizontal = 20.dp, vertical = 2.dp).testTag("model-status"),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
@@ -389,7 +389,8 @@ private fun KidiHeader(state: KidiUiState, onNewChat: () -> Unit, onSettings: ()
                     state.modelReady -> "On device"
                     else -> "Offline"
                 },
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
             )
             if (state.speechReady) {
                 Icon(Icons.Default.Mic, "Speech ready", Modifier.size(15.dp), tint = MaterialTheme.colorScheme.primary)
@@ -686,6 +687,7 @@ private fun Composer(
                     }
                 }
             }
+            LegalFooter(Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
         }
     }
 }
@@ -740,7 +742,6 @@ internal class ProvisionalTranscriptTransformation(private val start: Int?, priv
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun GenerationProgress(state: KidiUiState) {
     val elapsed by produceState(0L, state.generationStartedAtMs) {
@@ -751,25 +752,21 @@ internal fun GenerationProgress(state: KidiUiState) {
             }
         }
     }
-    Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 4.dp)
-        .testTag("generation-progress"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Box(Modifier.size(6.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
-            Text(if (state.stopping) "Stopping" else state.status, Modifier.weight(1f),
-                style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-            Text("%.1f s".format(elapsed / 1000.0), style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalArrangement = Arrangement.spacedBy(2.dp),
-            modifier = Modifier.fillMaxWidth().heightIn(min = 18.dp)) {
-            Text("${state.generationTokens} tokens", style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-            val speed = if (state.generationDecodeTokens > 0 && state.generationDecodeMs > 0)
-                "%.1f tok/s".format(state.generationDecodeTokens * 1000.0 / state.generationDecodeMs) else "-- tok/s"
-            Text(speed, style = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum"),
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
+    val metricsStyle = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum")
+    val speed = if (state.generationDecodeTokens > 0 && state.generationDecodeMs > 0)
+        "%.1f tok/s".format(state.generationDecodeTokens * 1000.0 / state.generationDecodeMs) else "-- tok/s"
+    Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 2.dp)
+        .heightIn(min = 20.dp).testTag("generation-progress"), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(Modifier.size(5.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
+        Text(if (state.stopping) "Stopping" else state.status, Modifier.weight(1f),
+            style = metricsStyle, color = MaterialTheme.colorScheme.primary,
+            maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text("%.1f s".format(elapsed / 1000.0), style = metricsStyle,
+            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+        Text("${state.generationTokens} tokens", style = metricsStyle,
+            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+        Text(speed, style = metricsStyle, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
     }
 }
 
@@ -809,6 +806,13 @@ internal fun SettingsSheet(
                     Tab(selected = selectedTab == index, onClick = { selectedTab = index }, text = { Text(label) })
                 }
             }
+            state.error?.takeUnless { it == state.modelError || it == state.speechModelError }?.let { error ->
+                SelectionContainer {
+                    Text(error, Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp)
+                        .testTag("settings-error"), color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodyMedium)
+                }
+            }
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
                 if (selectedTab == 0) {
                     ModelSection(
@@ -816,6 +820,7 @@ internal fun SettingsSheet(
                         modelId = state.modelId, revision = state.modelRevision,
                         ready = state.modelReady, loading = state.loadingModel,
                         progress = state.progress, file = state.progressFile, busy = state.runtimeBusy,
+                        phase = state.progressPhase, error = state.modelError,
                         onModelId = onModelId, onInstall = onInstall, onCancel = onCancelChat,
                         onDelete = onDelete, deleteLabel = "Remove local model",
                     )
@@ -825,13 +830,14 @@ internal fun SettingsSheet(
                         modelId = state.speechModelId, revision = state.speechModelRevision,
                         ready = state.speechReady, loading = state.loadingSpeech,
                         progress = state.speechProgress, file = state.speechProgressFile, busy = state.runtimeBusy,
+                        phase = state.speechProgressPhase, error = state.speechModelError,
                         onModelId = onSpeechModelId, onInstall = onInstallSpeech, onCancel = onCancelSpeech,
                         onDelete = onDeleteSpeech, deleteLabel = "Remove speech model",
                     )
                 } else {
                     InferenceSettings(state, onThreads, onTokens)
                 }
-                Spacer(Modifier.height(24.dp))
+                LegalFooter(Modifier.padding(horizontal = 24.dp, vertical = 16.dp))
             }
         }
     }
@@ -847,6 +853,8 @@ private fun ModelSection(
     loading: Boolean,
     progress: Float,
     file: String,
+    phase: ModelDownloadPhase,
+    error: String?,
     busy: Boolean,
     onModelId: (String) -> Unit,
     onInstall: () -> Unit,
@@ -872,13 +880,13 @@ private fun ModelSection(
             dismissButton = { TextButton(onClick = { confirmDownload = false }) { Text("Not now") } },
         )
     }
-    val downloading = loading && file.isNotEmpty() && progress < 1f
+    val downloading = loading && file.isNotEmpty()
     Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Icon(icon, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
             Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
             Text(
-                when { loading -> if (downloading) "Downloading" else "Preparing"; ready -> "Ready"; else -> "Not loaded" },
+                when { loading -> if (downloading) phase.label else "Preparing"; ready -> "Ready"; else -> "Not loaded" },
                 style = MaterialTheme.typography.labelMedium,
                 color = if (ready) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -912,10 +920,18 @@ private fun ModelSection(
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
+        error?.let {
+            SelectionContainer {
+                Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.testTag("$title-model-error"))
+            }
+        }
         when {
             loading -> {
                 if (downloading) {
-                    LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+                    if (phase == ModelDownloadPhase.CONNECTING || phase == ModelDownloadPhase.RETRYING)
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                    else LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(file, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
                             maxLines = 1, overflow = TextOverflow.Ellipsis)

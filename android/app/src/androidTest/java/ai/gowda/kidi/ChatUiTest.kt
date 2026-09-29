@@ -14,6 +14,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
@@ -21,6 +22,8 @@ import androidx.compose.ui.test.performTextReplacement
 import androidx.test.espresso.Espresso.onView
 import androidx.test.espresso.action.ViewActions.longClick
 import androidx.test.espresso.matcher.ViewMatchers.withText
+import androidx.test.espresso.assertion.ViewAssertions.matches
+import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
@@ -30,9 +33,39 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertSame
 import org.junit.Rule
 import org.junit.Test
+import org.hamcrest.Matchers.containsString
 
 class ChatUiTest {
     @get:Rule val compose = createComposeRule()
+
+    @Test
+    fun legalFooterOpensBundledPoliciesAndReturnsToChat() {
+        compose.setContent {
+            KidiTheme {
+                ChatWorkspace(state = KidiUiState(), snackbar = SnackbarHostState(), onNewChat = {}, onSettings = {},
+                    onTextChange = {}, onSend = {}, onStop = {}, onRecord = {}, onStopRecording = {})
+            }
+        }
+        compose.onNodeWithText(AI_NOTICE).assertIsDisplayed()
+        val noticeBounds = compose.onNodeWithText(AI_NOTICE).fetchSemanticsNode().boundsInRoot
+        val privacyBounds = compose.onNodeWithText("Privacy").fetchSemanticsNode().boundsInRoot
+        val termsBounds = compose.onNodeWithText("Terms").fetchSemanticsNode().boundsInRoot
+        assertEquals(noticeBounds.center.y, privacyBounds.center.y, 1f)
+        assertEquals(noticeBounds.center.y, termsBounds.center.y, 1f)
+        compose.onNodeWithText("Privacy").performClick()
+        compose.onNodeWithText("Privacy Policy").assertIsDisplayed()
+        compose.waitUntil(5000) { compose.onAllNodesWithTag("legal-document-content").fetchSemanticsNodes().isNotEmpty() }
+        onView(withText(containsString("Kidi Android Privacy Policy"))).check(matches(isDisplayed()))
+        compose.onNodeWithText("Terms of Use").performClick()
+        compose.waitUntil(5000) { compose.onAllNodesWithTag("legal-document-content").fetchSemanticsNodes().isNotEmpty() }
+        onView(withText(containsString("Kidi is experimental software"))).check(matches(isDisplayed()))
+        compose.onNodeWithContentDescription("Close legal document").performClick()
+        compose.onNodeWithTag("legal-document-content").assertDoesNotExist()
+        compose.onNodeWithText("Terms").performClick()
+        compose.onNodeWithText("Terms of Use").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Close legal document").performClick()
+        compose.onNodeWithTag("message-composer").assertIsDisplayed()
+    }
 
     @Test
     fun provisionalTranscriptStylesOnlySpeechAndPreservesOffsets() {
@@ -71,10 +104,55 @@ class ChatUiTest {
         compose.onNodeWithText("Responding").assertIsDisplayed()
         compose.onNodeWithText("21 tokens").assertIsDisplayed()
         compose.onNodeWithText("%.1f tok/s".format(20.0)).assertIsDisplayed()
+        val phaseBounds = compose.onNodeWithText("Responding").fetchSemanticsNode().boundsInRoot
+        val tokenBounds = compose.onNodeWithText("21 tokens").fetchSemanticsNode().boundsInRoot
+        val speedBounds = compose.onNodeWithText("%.1f tok/s".format(20.0)).fetchSemanticsNode().boundsInRoot
+        assertEquals(phaseBounds.center.y, tokenBounds.center.y, 1f)
+        assertEquals(phaseBounds.center.y, speedBounds.center.y, 1f)
+        org.junit.Assert.assertTrue(phaseBounds.right <= tokenBounds.left)
+        org.junit.Assert.assertTrue(tokenBounds.right <= speedBounds.left)
         compose.onNodeWithContentDescription("Stop generation").performClick()
         compose.onNodeWithText("Stopping").assertIsDisplayed()
         compose.runOnIdle { state.value = state.value.copy(generating = false, stopping = false) }
         compose.onNodeWithTag("generation-progress").assertDoesNotExist()
+    }
+
+    @Test
+    fun modelDownloadFailureIsVisibleInsideSettings() {
+        val message = "Chat download failed: connection timed out. Retry to resume."
+        val state = mutableStateOf(KidiUiState(error = message, modelError = message))
+        compose.setContent {
+            KidiTheme {
+                SettingsSheet(state = state.value, onDismiss = {}, onModelId = {}, onSpeechModelId = {},
+                    onThreads = {}, onTokens = {}, onInstall = {}, onCancelChat = {}, onInstallSpeech = {},
+                    onCancelSpeech = {}, onDelete = {}, onDeleteSpeech = {})
+            }
+        }
+        compose.onNodeWithTag("Chat-model-error").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText(message).assertIsDisplayed()
+        compose.runOnIdle { state.value = state.value.copy(error = null, speechReady = true) }
+        compose.onNodeWithText(message).assertIsDisplayed()
+        compose.onNodeWithText("Download chat model").performScrollTo().assertIsEnabled()
+    }
+
+    @Test
+    fun verificationAndRetriesRemainVisibleAndCancellable() {
+        val state = mutableStateOf(KidiUiState(loadingModel = true, progress = 1f,
+            progressFile = "model.safetensors", progressPhase = ModelDownloadPhase.VERIFYING))
+        var cancelled = false
+        compose.setContent {
+            KidiTheme {
+                SettingsSheet(state = state.value, onDismiss = {}, onModelId = {}, onSpeechModelId = {},
+                    onThreads = {}, onTokens = {}, onInstall = {}, onCancelChat = { cancelled = true },
+                    onInstallSpeech = {}, onCancelSpeech = {}, onDelete = {}, onDeleteSpeech = {})
+            }
+        }
+        compose.onNodeWithText("Verifying").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Cancel Chat download").performScrollTo().assertIsEnabled()
+        compose.runOnIdle { state.value = state.value.copy(progressPhase = ModelDownloadPhase.RETRYING) }
+        compose.onNodeWithText("Retrying").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Cancel Chat download").performClick()
+        compose.runOnIdle { assertEquals(true, cancelled) }
     }
 
     @Test

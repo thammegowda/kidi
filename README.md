@@ -1,57 +1,56 @@
 # Kidi <a href="docs/kidi-logo.png"><img src="docs/kidi-logo-small.png" alt="Kidi logo" width="48" height="48"></a>
 
-**Run neural models locally, from Android, a terminal, a browser, or C++.**
+**Local AI chat, image questions, speech transcription, and translation.**
 
-Kidi ("spark" in Kannada) is a lightweight C++23 inference toolkit. The same
-model code runs on CPU, Apple Metal, and WebAssembly CPU. It currently supports
-Whisper transcription, Gemma 4 text generation, and RTG translation, with reusable tensors and neural
-layers for developers building other architectures.
+Kidi ("spark" in Kannada) runs models on your device. Use the Android app for
+chat, photos, and dictation, the browser app for local chat and dictation, or
+the command line for chat, audio files, and translation.
 
 [Quick Start](#quick-start) | [Android](#android) | [Browser](#webassembly) | [Chat](#interactive-chat) |
-[Transcription](#whisper-transcription) | [Translation](#rtg-model-package) | [For Developers](#for-developers) |
+[Transcription](#whisper-transcription) | [Translation](#rtg-model-package) | [Developer Guide](README-dev.md) |
 [Getting Started Guide](docs/getting-started.md)
 
 ## Why Kidi?
 
-- **Local inference.** Models run on your device; prompts are not sent to an
-  inference server. Download compatible models from Hugging Face or load local files.
-- **A small runtime.** One native executable or Python wheel, without PyTorch or
-  Transformers for inference. Measured macOS arm64 release sizes are **8.16 MiB**
-  for the executable and **2.46 MiB** for the wheel download. Model weights and
-  runtime memory are separate; sizes vary by build.
-- **Interactive or scripted.** Streaming chat, cancellation, file processing,
-  and translation share the same runtime.
-- **One implementation across backends.** The
-  [ynnpack-dev](third_party/ynnpack-dev/README.md) runtime handles CPU execution,
-  Metal handles Apple GPUs, and the browser uses WebAssembly SIMD with optional threads.
+- **Private inference.** Prompts are processed locally, not sent to a remote
+  inference server. Internet is needed to download models, not to run them afterward.
+- **Chat and more.** Stream replies, ask follow-up questions, dictate a message,
+  or ask about a photo in the Android app.◊
+- **No heavyweight inference install.** Running Kidi does not require PyTorch or
+  Transformers. Model downloads and memory requirements are separate from app size.
+- **Interactive or scripted.** Use a chat interface or process text and audio
+  files from the command line.
 
 ## What Works Today
 
 | Model | Capabilities |
 |---|---|
-| Whisper Tiny/Base/Small | Multilingual speech transcription/translation from Hugging Face or legacy Whisper GGML checkpoints |
-| Gemma 4 E2B-it | Text chat and JSONL generation; original floating-point and mixed 2/4/8-bit mobile QAT checkpoints |
-| RTG Transformer | Translation with greedy or beam decoding; FP32, BF16, and INT8 packages |
+| Gemma 4 E2B-it | Text chat and generation; Android photo questions with the default mobile model |
+| Whisper Tiny/Base/Small | Multilingual speech transcription and speech-to-English translation |
+| RTG Transformer | Text translation, including the public 500-language-to-English model |
 
-The tested native setup is **Apple Silicon, macOS 26+, and Python 3.12+**.
+The tested command-line setup is **Apple Silicon, macOS 26+, and Python 3.12+**.
 Gemma E2B has been tested on a 16 GiB Apple M5. Browser inference has been tested
 in current 64-bit Chromium. Native Linux/Windows and Gemma E4B have not been
 validated end to end here.
 
 Model support is explicit: an arbitrary Hugging Face URL does not make a new
-architecture compatible. Whisper currently executes on YNNPACK CPU or Wasm CPU and accepts up to 30 seconds of
-16 kHz audio per request. Terminal chat and JSONL generation remain text-only and greedy. Image input, tool execution,
-CUDA, and Apple Neural Engine execution are not implemented.
+architecture compatible. Terminal chat and JSONL generation are currently
+text-only and greedy. Photo input is available in the Android app, not every
+interface. Tool execution, video/document input, CUDA, and Apple Neural Engine
+execution are not supported. Whisper runs on CPU and accepts at most 30 seconds
+of 16 kHz audio per request.
 
 ## Quick Start
 
-Install from source in an activated Python 3.12+ environment. You need Git and a
-C++23 compiler; on macOS, use current Xcode Command Line Tools.
+For the command line, use Python 3.12 or later. The Git installation below
+compiles Kidi, so it also needs Git and a C++23 compiler; on macOS, install
+current Xcode Command Line Tools. It does not install PyTorch or Transformers.
 
 ```bash
-git clone --recurse-submodules https://github.com/thammegowda/kidi.git
-cd kidi
-python -m pip install '.[hf]'
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install "kidi[hf] @ git+https://github.com/thammegowda/kidi.git@main"
 python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers
 ```
 
@@ -68,16 +67,9 @@ authentication, pinned revisions, offline use, and troubleshooting.
 
 ### Python Installation
 
-The installed `kidi` command and `python -m kidi` expose the same CLI.
-The `hf` extra enables Hub downloads. For local model files only, use
-`python -m pip install .` from the checkout.
-
-You can also install directly from Git, optionally replacing `main` with a tag
-or commit. This still compiles from source:
-
-```bash
-python -m pip install "kidi[hf] @ git+https://github.com/thammegowda/kidi.git@main"
-```
+The installed `kidi` command and `python -m kidi` expose the same CLI. The `hf`
+extra enables Hugging Face downloads. Replace `python3.12` with your installed
+Python 3.12+ executable as needed. These shell examples use bash/zsh syntax.
 
 If you have a compatible prebuilt wheel, install it without a compiler:
 
@@ -85,10 +77,11 @@ If you have a compatible prebuilt wheel, install it without a compiler:
 python -m pip install '/path/to/kidi.whl[hf]'
 ```
 
-Use the actual wheel filename for your OS and architecture. Source installs
-include build dependencies through pip; wheels still require compatible OS
-libraries. The standalone C++ executable needs neither Python nor a separate
-inference runtime, but accepts local model paths only.
+Use the actual wheel filename for your OS and architecture; availability depends
+on the build you received. Wheels still require compatible OS libraries. The
+standalone executable needs no Python but accepts local model paths only.
+For checkout installation and building your own wheel, see the
+[developer guide](README-dev.md#python-package).
 
 ### Interactive Chat
 
@@ -109,48 +102,50 @@ truncated. See the [chat guide](docs/getting-started.md#2-start-chat) for more.
 
 ### WebAssembly
 
-The browser app runs Gemma E2B locally, with streaming replies, saved chats,
-Markdown, code highlighting, diagrams, generation statistics, and local microphone dictation through Whisper. It downloads
-the original pinned Google mobile-QAT checkpoint and caches it in the browser.
+The self-hosted browser app runs Gemma E2B locally, with streaming replies, saved
+chats, Markdown, code highlighting, diagrams, and Whisper microphone dictation.
+In a hosted instance, open Model settings and download the chat model; speech
+dictation has a separate model download. Models are cached in your browser.
 Once the complete model is cached, it loads automatically on later visits.
 
-Build and serve it from the checkout:
-
-```bash
-brew install emscripten node  # macOS; CMake, Ninja, and Python are also required
-make wasm
-make serve
-```
-
-Open **http://localhost:8080/**. Node and Emscripten are build-time dependencies;
-the finished app needs only static hosting. No npm install is required.
+Microphone access requires permission and a secure browser context (HTTPS or
+localhost). Clearing site data removes downloaded models and saved browser data.
+To run your own instance, follow the [browser build instructions](README-dev.md#browser).
 
 Use a current 64-bit Chromium browser with ample memory. The Wasm heap can
 approach its **4 GiB limit**, and long generations may exhaust it. The browser
 defaults to 1,024 output tokens, allows up to 8,192, and shares a 9,216-token
 context between the conversation and reply. Its cache is separate from the CLI's.
 
-The [WebAssembly guide](web/README.md) covers browser requirements, static hosting,
-GitHub Pages deployment, caching, and measured performance.
+See the [browser guide](web/README.md) for detailed requirements and caching behavior.
 
 ### Android
 
-The native Android app provides private, streaming Gemma 4 chat and live Whisper microphone dictation on ARM64 devices. It
-links the same C++ models and YNNPACK CPU runtime through JNI; prompts, audio, transcripts, and generated text do not
-leave the device. The app resolves public Hugging Face models to immutable commits, resumes interrupted downloads,
-verifies LFS SHA-256 hashes, and keeps model files in app-private external storage.
+The Android app supports streaming chat, searchable conversation history, camera
+and photo-picker questions, and microphone dictation. It needs an **ARM64 phone
+running Android 10 or later**, enough RAM for the selected model, and several GB
+of free storage. Not every compatible phone will have the same performance.
 
-Build the debug APK from a recursive checkout with JDK 17 and the Android SDK/NDK installed:
+Use an APK or Google Play testing invitation supplied by the maintainer. A Play
+test requires joining with the invited Google account; do not assume the beta
+is available through public store search.
 
-```bash
-export JAVA_HOME=/path/to/jdk-17
-export ANDROID_HOME="$HOME/Library/Android/sdk"
-./android/gradlew -p android :app:assembleDebug
-```
+1. Open **Set up models** and download the default chat model (about **2.49 GB**).
+2. Start a chat, or attach a photo from the camera or image picker.
+3. Optionally download speech and allow microphone access to dictate. The current
+  Whisper Small download is about **970 MB**, with a separate **249 MB** prepared
+  cache. Existing Tiny/Base selections are not automatically replaced.
+4. Tap the logo to find earlier conversations. After setup, installed models
+  reopen offline.
 
-The application ID is `ai.gowda.kidi`, the minimum Android version is API 29, and the current build targets ARM64.
-The default model download is about 2.49 GB and is not embedded in the APK. See the [Android guide](android/README.md)
-for exact tool versions, installation, device testing, and runtime behavior.
+Downloads require confirmation; model weights are not bundled in the APK. Keep
+the app open during initial downloads. Chats and copied photos are stored
+locally. Uninstalling or clearing app data removes local conversations and model
+downloads. A differently signed APK may require uninstalling an existing build,
+so check with the maintainer before replacing one.
+
+For more about the app, see the [Android guide](android/README.md). Building APKs
+and publishing Play test releases are covered in [README-dev.md](README-dev.md#android).
 
 ### Whisper Transcription
 
@@ -167,61 +162,14 @@ python -m kidi transcribe \
 
 Use an ISO language code such as `en`, `es`, `de`, `ja`, or `hi` to bypass detection. `--task translate` translates
 supported speech into English; the default task transcribes in the detected or selected language. Whisper is currently
-CPU-only, so use `--backend ynnpack` rather than Metal. The required checkpoint files are `config.json`,
-`model.safetensors`, `tokenizer.json`, `preprocessor_config.json`, and `generation_config.json`.
+CPU-only, so use `--backend ynnpack` rather than Metal. Hub downloads handle the
+required files for you. Advanced local-checkpoint import is documented in
+[README-dev.md](README-dev.md#ggml-and-gguf-import).
 
 The browser settings accept Hugging Face model IDs rather than file URLs. Loading resolves the repository's current
 `main` revision to an immutable commit before downloading. The speech model field offers `openai/whisper-tiny`,
 `openai/whisper-base`, and `openai/whisper-small`; larger models trade substantially more download, memory, and latency
 for accuracy. During recording, the composer shows replaceable draft text and runs a final refinement after stop.
-
-### GGML and GGUF Import
-
-`checkpoint::Weights::load` also reads little-endian GGUF v2/v3 and the legacy
-Whisper GGML container, detected by file magic rather than extension. Supported
-tensor encodings are F32, F16, BF16 (GGUF), Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0.
-Unsupported encodings, malformed shapes/offsets, overlapping GGUF tensors and
-non-finite decoded values are rejected. Tensors are decoded individually to F32
-on demand; Safetensors retains its existing zero-copy mapping.
-
-For Whisper, download `ggml-small-q8_0.bin` from `ggerganov/whisper.cpp` and place
-the matching `openai/whisper-small` sidecars beside it: `config.json`,
-`tokenizer.json`, `preprocessor_config.json`, and `generation_config.json`.
-Pass the binary file directly, or name it `ggml-model.bin` in a model directory
-without `model.safetensors`:
-
-```bash
-build-release/kidi transcribe --model ./models/whisper-small/ggml-small-q8_0.bin \
-  --in speech.wav --language en
-```
-
-The first load validates dimensions against the HF config, converts one tensor
-at a time into Kidi's existing per-output-channel INT8 layout, and atomically
-writes `<filename>.kidi-int8-v1/`. Subsequent loads reuse that cache. The source
-file is retained. For Small Q8, weights are about 264.5 MB downloaded plus small
-sidecars, with a 248.7 MB derived checkpoint: roughly 519 MB total storage with
-both metadata copies, not 249 MB total. No 967 MB FP32 checkpoint is needed.
-Requantization may change outputs; this is not a lossless conversion or a broad
-ASR quality guarantee. Changing source size/mtime invalidates the cache; stale
-caches fail explicitly rather than silently loading mismatched weights.
-
-GGUF container support does not automatically add architecture/tokenizer
-mappings for Gemma or arbitrary models. The importer retains GGUF tensor names
-and supports the existing state-mapping API. It does not execute GGML kernels
-or keep GGML block quantization for inference. Android/browser download defaults
-and Hub resolution remain unchanged; this change adds the shared native reader.
-
-The small adapted [reference codec](src/kidi/checkpoint/ggml/dequantize.h) lives beside
-the reader, with upstream credits, revision and the MIT license in its header.
-Format readers have their own directories under `src/kidi/checkpoint/`: `ggml/`
-and `safetensors/`. Shared I/O and atomic checkpoint preparation live in
-`kidi::checkpoint`. Model classes supply metadata/configuration and preparation
-callbacks; Whisper owns its sidecar requirements, GGML compatibility and INT8
-export policy. Other models can provide their own hooks without adding a
-model-specific preparation module to the checkpoint framework.
-No GGML runtime, backend, submodule or
-build system is linked. Smaller model downloads come from quantization, not
-from GGML/GGUF container overhead versus Safetensors.
 
 ### RTG Model Package
 
@@ -254,90 +202,13 @@ for RTG. Run either command with `--help` for decoding and batching options.
 
 ## For Developers
 
-### Build
+Build instructions, C++ architecture, checkpoint formats, tests, benchmarks,
+and release workflows are in [README-dev.md](README-dev.md).
 
-Native builds require **CMake 3.25+, Ninja, a C++23 compiler, and Python 3.10+**
-for YNNPACK's source generators. From a checkout:
+## AI Notice
 
-```bash
-git submodule update --init --recursive
-cmake --preset release
-cmake --build --preset release --target kidi_cli
-build-release/kidi --help
-```
+Kidi is experimental. AI-generated responses, photo interpretations, and speech
+transcriptions can be wrong. Double-check important information against reliable
+sources; do not rely on Kidi for professional advice or emergencies.
 
-C/C++ dependencies are pinned submodules under `third_party/`.
-[ynnpack-dev](https://github.com/thammegowda/ynnpack-dev) owns its nested Slinky,
-cpuinfo, GoogleTest, and Google Benchmark dependencies; the recursive update above
-initializes them too. To build a Python wheel on the target OS/architecture:
-
-```bash
-python -m pip wheel --no-deps . --wheel-dir dist
-```
-
-Wheels use CPython's 3.12 stable ABI (`abi3`). The Python package exposes the CLI
-and model converters, not a Python tensor API. See
-[the architecture](ARCHITECTURE.md) for the runtime interfaces.
-
-### Extend the Toolkit
-
-```text
-Model -> Neural Layers -> Eager Tensor Operations -> CPU / Metal Backend
-```
-
-Models are ordinary C++ composed from reusable layers and concrete tensors.
-There is no model graph export or separate conversion pipeline. Safetensors
-weights are memory-mapped; backend-specific operator preparation is internal.
-
-Adding an architecture requires its model implementation and weight mapping.
-Gemma and RTG are working examples, not the limits of the tensor/layer APIs.
-
-- [Architecture](ARCHITECTURE.md): module ownership, eager execution, state, and backend contracts.
-- [Coding guidelines](CODING_GUIDELINES.md): APIs, naming, formatting, and tests.
-- [Getting started](docs/getting-started.md#optional-manual-setup): local Gemma setup and converter entry points.
-
-Gemma setup writes configuration only; original weights and tokenizers are not
-rewritten. Legacy RTG conversion needs the `convert` extra and a **trusted**
-training export because PyTorch checkpoints can contain executable pickle data.
-
-### Tests
-
-Run the native unit tests without downloading a model:
-
-```bash
-cmake --preset debug
-cmake --build --preset debug
-ctest --preset debug
-```
-
-Browser loader and generated-glue tests use Node's built-in runner:
-
-```bash
-node --test tests/web/*.mjs
-```
-
-`make test` builds every required artifact first, then runs the native,
-installed-wheel Python, browser, and 50-sentence RTG regression suites through
-one CTest invocation and summary. The pinned public model is downloaded on the
-first run; no Hub login is required. Each suite is also available as
-`native-test`, `python-test`, `web-test`, or `regression-test`. See [test
-fixtures and methodology](tests/data/README.md).
-
-### Benchmark
-
-Results are specific to hardware, precision, and workload; they are not a
-promise of performance on other systems.
-
-- [Gemma 4](benchmarks/gemma4/README.md): CPU/Metal comparisons with LiteRT-LM, quality, and memory.
-- [RTG](benchmarks/rtg/README.md): FP32/BF16/INT8 translation benchmarks.
-- [Apple Metal](benchmarks/metal/README.md): backend measurements and execution studies.
-
-### Development
-
-The [Pages workflow](.github/workflows/pages.yml) tests and builds both Wasm
-variants for relevant changes, reusing SDK and compiler caches; merges to `main`
-deploy the browser app. The separate [native workflow](.github/workflows/native.yml)
-runs native unit tests and installed Python wheel smoke tests on macOS 26,
-without downloading models. It does not block Pages deployment.
-Model weights are downloaded by the browser, not included in the site artifact.
-See the [deployment guide](web/README.md#github-pages) for the one-time Pages setup.
+[Android Privacy Policy](android/PRIVACY.md) | [Android Terms of Use](android/TERMS.md)

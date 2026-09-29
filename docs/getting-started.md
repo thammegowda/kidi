@@ -243,4 +243,4 @@ Safetensors and tokenizer files, preserving the repository's configuration.
 
 Once cached, inference runs locally; use `HF_HUB_OFFLINE=1` to disable Hub lookups.
 For ordered JSONL file processing instead of a terminal conversation,
-see [`kidi generate`](../README.md#gemma-4-text-generation).
+see [`kidi generate`](../README.md#gemma-4-generation).

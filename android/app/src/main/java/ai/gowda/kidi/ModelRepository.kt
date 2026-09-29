@@ -10,13 +10,11 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.security.MessageDigest
 import kotlin.coroutines.coroutineContext
 
 internal data class InstalledModel(
@@ -29,6 +27,7 @@ internal data class ModelDownloadProgress(
     val file: String,
     val completedBytes: Long,
     val totalBytes: Long,
+    val phase: ModelDownloadPhase = ModelDownloadPhase.DOWNLOADING,
 )
 
 internal class ModelRepository(context: Context) {
@@ -38,6 +37,7 @@ internal class ModelRepository(context: Context) {
     private val root = File(context.getExternalFilesDir(null) ?: context.filesDir, "models")
     private val storageManager = context.getSystemService(StorageManager::class.java)
     private val prepareMutex = Mutex()
+    private val downloader = ModelDownloader()
 
     fun installed(): InstalledModel? = installed(CURRENT_FILE, CHAT_FILES + "model.yaml")
 
@@ -74,7 +74,7 @@ internal class ModelRepository(context: Context) {
                 require(MODEL_ID.matches(modelId)) { "Enter a Hugging Face model ID such as $DEFAULT_MODEL_ID" }
                 val revision = resolve(modelId, requiredFiles)
                 val directory = modelDirectory(modelId, revision.sha)
-                directory.mkdirs()
+                check(directory.isDirectory || directory.mkdirs()) { "Unable to create model storage" }
 
                 val totalBytes = revision.files.sumOf(RemoteFile::size)
                 val ready = readReady(directory)
@@ -104,8 +104,11 @@ internal class ModelRepository(context: Context) {
                 var completedBytes = 0L
                 for (file in revision.files) {
                     coroutineContext.ensureActive()
-                    download(modelId, revision.sha, directory, file) { fileBytes ->
-                        progress(ModelDownloadProgress(file.name, completedBytes + fileBytes, totalBytes))
+                    downloader.download(fileUrl(modelId, revision.sha, file.name), File(directory, file.name),
+                        file.size, file.sha256) { update ->
+                        val label = if (update.phase == ModelDownloadPhase.RETRYING)
+                            "${file.name} (attempt ${update.attempt})" else file.name
+                        progress(ModelDownloadProgress(label, completedBytes + update.bytes, totalBytes, update.phase))
                     }
                     completedBytes += file.size
                     progress(ModelDownloadProgress(file.name, completedBytes, totalBytes))
@@ -149,61 +152,6 @@ internal class ModelRepository(context: Context) {
             RemoteFile(name, size, item.optJSONObject("lfs")?.optString("sha256")?.takeIf(SHA256::matches))
         }
         return Revision(modelId, revision, files)
-    }
-
-    private suspend fun download(
-        modelId: String,
-        revision: String,
-        directory: File,
-        metadata: RemoteFile,
-        progress: (Long) -> Unit,
-    ) {
-        val target = File(directory, metadata.name)
-        if (target.length() == metadata.size && verify(target, metadata.sha256)) return
-        if (target.exists()) target.delete()
-
-        val partial = File(directory, "${metadata.name}.part")
-        if (partial.length() > metadata.size) partial.delete()
-        var offset = partial.length()
-        progress(offset)
-        var connection = connect(fileUrl(modelId, revision, metadata.name), offset)
-        if (offset > 0 && connection.responseCode != HttpURLConnection.HTTP_PARTIAL) {
-            connection.disconnect()
-            partial.delete()
-            offset = 0
-            connection = connect(fileUrl(modelId, revision, metadata.name), 0)
-        }
-        try {
-            require(connection.responseCode == if (offset > 0) HttpURLConnection.HTTP_PARTIAL else HttpURLConnection.HTTP_OK) {
-                "Download ${metadata.name} failed with HTTP ${connection.responseCode}"
-            }
-            if (offset > 0) {
-                val start = CONTENT_RANGE.find(connection.getHeaderField("Content-Range").orEmpty())
-                    ?.groupValues?.get(1)?.toLongOrNull()
-                require(start == offset) { "Invalid resume response for ${metadata.name}" }
-            }
-            connection.inputStream.use { input ->
-                FileOutputStream(partial, offset > 0).use { output ->
-                    val buffer = ByteArray(BUFFER_BYTES)
-                    var downloaded = offset
-                    while (true) {
-                        coroutineContext.ensureActive()
-                        val count = input.read(buffer)
-                        if (count < 0) break
-                        output.write(buffer, 0, count)
-                        downloaded += count
-                        require(downloaded <= metadata.size) { "Download exceeded expected size for ${metadata.name}" }
-                        progress(downloaded)
-                    }
-                    output.fd.sync()
-                }
-            }
-        } finally {
-            connection.disconnect()
-        }
-        require(partial.length() == metadata.size) { "Download was truncated for ${metadata.name}" }
-        require(verify(partial, metadata.sha256)) { "Checksum mismatch for ${metadata.name}" }
-        move(partial, target)
     }
 
     private fun createManifest(directory: File) {
@@ -286,20 +234,6 @@ internal class ModelRepository(context: Context) {
         }
     }
 
-    private fun verify(file: File, expected: String?): Boolean {
-        if (expected == null) return true
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().buffered().use { input ->
-            val buffer = ByteArray(BUFFER_BYTES)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                digest.update(buffer, 0, count)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) } == expected
-    }
-
     private fun readReady(directory: File): String? = runCatching {
         JSONObject(File(directory, READY_FILE).readText()).getString("revision")
     }.getOrNull()
@@ -339,7 +273,6 @@ internal class ModelRepository(context: Context) {
         val MODEL_ID = Regex("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
         val REVISION = Regex("[a-f0-9]{40}")
         val SHA256 = Regex("[a-f0-9]{64}")
-        val CONTENT_RANGE = Regex("bytes (\\d+)-\\d+/\\d+")
         val CHAT_FILES = listOf(
             "config.json",
             "model.safetensors",
@@ -363,10 +296,9 @@ internal class ModelRepository(context: Context) {
         const val READY_FILE = "ready.json"
         const val CURRENT_FILE = "current.json"
         const val SPEECH_CURRENT_FILE = "speech-current.json"
-        const val BUFFER_BYTES = 1024 * 1024
         const val DOWNLOAD_HEADROOM_BYTES = 256L * 1024 * 1024
         const val CONNECT_TIMEOUT_MS = 30_000
-        const val READ_TIMEOUT_MS = 120_000
+        const val READ_TIMEOUT_MS = 30_000
         const val MAX_REDIRECTS = 8
     }
 }
