@@ -94,5 +94,6 @@ val visionNotices by tasks.registering(Sync::class) {
     notices.forEach { (source, target) ->
         from(rootProject.file("../third_party/tahoma-vision/$source")) { rename { target } }
     }
+    from(rootProject.file("../src/kidi/model/ggml.LICENSE")) { rename { "ggml_license.txt" } }
 }
 tasks.named("preBuild") { dependsOn(visionNotices) }

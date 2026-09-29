@@ -1,14 +1,100 @@
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 
+#include "kidi/model/ggml.h"
 #include "kidi/model/weights.h"
 
 namespace {
+
+auto write_import_fixture(const std::filesystem::path& path, std::uint32_t type, bool legacy = false)
+    -> std::pair<std::array<float, 32>, std::streamoff> {
+    std::ofstream output(path, std::ios::binary);
+    const auto write = [&](auto value) { output.write(reinterpret_cast<const char*>(&value), sizeof(value)); };
+    std::streamoff type_offset;
+    if (legacy) {
+        write(kidi::model::GGML_MAGIC);
+        for (const std::int32_t value : {51865, 1500, 384, 6, 4, 448, 384, 6, 4, 80, 2007}) write(value);
+        write(std::uint32_t{80});
+        write(std::uint32_t{201});
+        for (int index = 0; index < 80 * 201; ++index) write(0.F);
+        write(std::uint32_t{1});
+        write(std::uint32_t{1});
+        output.put('a');
+        const std::string name = "encoder.blocks.0.attn.query.weight";
+        write(std::uint32_t{2});
+        write(static_cast<std::uint32_t>(name.size()));
+        type_offset = output.tellp();
+        write(type);
+        write(std::int32_t{32});
+        write(std::int32_t{1});
+        output.write(name.data(), name.size());
+    } else {
+        const auto string = [&](std::string_view value) {
+            write(static_cast<std::uint64_t>(value.size()));
+            output.write(value.data(), value.size());
+        };
+        write(kidi::model::GGUF_MAGIC);
+        write(std::uint32_t{3});
+        write(std::uint64_t{1});
+        write(std::uint64_t{2});
+        string("general.alignment");
+        write(std::uint32_t{4});
+        write(std::uint32_t{64});
+        string("test.array");
+        write(std::uint32_t{9});
+        write(std::uint32_t{8});
+        write(std::uint64_t{2});
+        string("metadata");
+        string("");
+        string("weight");
+        write(std::uint32_t{2});
+        write(std::uint64_t{32});
+        write(std::uint64_t{1});
+        type_offset = output.tellp();
+        write(type);
+        write(std::uint64_t{0});
+        while (static_cast<std::uint64_t>(output.tellp()) % 64) output.put('\0');
+    }
+    std::array<float, 32> expected;
+    if (type == 0) {
+        for (std::size_t index = 0; index < 32; ++index) write(expected[index] = static_cast<float>(index) - 16.F);
+    } else if (type == 1 || type == 30) {
+        const std::array<std::uint16_t, 4> bits{static_cast<std::uint16_t>(type == 1 ? 0x3c00 : 0x3f80), 0xc000, 1,
+                                                0x8000};
+        const std::array<float, 4> values{1.F, -2.F, std::ldexp(1.F, type == 1 ? -24 : -133), -0.F};
+        for (std::size_t index = 0; index < 32; ++index) {
+            write(bits[index % 4]);
+            expected[index] = values[index % 4];
+        }
+    } else {
+        write(std::uint16_t{0x3800});
+        const float minimum = type == 3 || type == 7 ? 1.F : 0.F;
+        if (minimum) write(std::uint16_t{0x3c00});
+        if (type == 6 || type == 7) write(std::uint32_t{0xaaaa5555});
+        if (type == 8) {
+            for (int index = 0; index < 32; ++index) {
+                write(static_cast<std::int8_t>(index - 16));
+                expected[index] = (index - 16) * 0.5F;
+            }
+        } else {
+            for (int index = 0; index < 16; ++index) write(static_cast<std::uint8_t>(index | ((15 - index) << 4)));
+            for (std::size_t index = 0; index < 32; ++index) {
+                int value = index < 16 ? static_cast<int>(index) : 31 - static_cast<int>(index);
+                if (type == 6 || type == 7) value += ((0xaaaa5555U >> index) & 1U) * 16;
+                if (type == 2) value -= 8;
+                if (type == 6) value -= 16;
+                expected[index] = value * 0.5F + minimum;
+            }
+        }
+    }
+    return {expected, type_offset};
+}
 
 auto write_fixture(const std::filesystem::path& path) -> void {
     std::string header = R"({"bf16":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]},)"
@@ -44,7 +130,91 @@ auto write_fixture(const std::filesystem::path& path) -> void {
 
 } // namespace
 
-auto main() -> int {
+auto main(int argc, char** argv) -> int {
+    if (argc == 3) {
+        const auto weights = kidi::model::Weights::load(argv[1]);
+        if (!weights) {
+            std::cerr << weights.error().message << '\n';
+            return 1;
+        }
+        const auto value = weights->tensor(argv[2]);
+        if (!value) {
+            std::cerr << value.error().message << '\n';
+            return 1;
+        }
+        std::cout << "tensors=" << weights->size() << " values=" << value->numel() << '\n';
+        for (const auto sample : value->data<float>()->first(std::min<std::size_t>(32, value->numel())))
+            std::cout << sample << ' ';
+        std::cout << '\n';
+        return 0;
+    }
+    const auto gguf_path = std::filesystem::temp_directory_path() / "kidi-weights-test.gguf";
+    for (const bool legacy : {false, true}) {
+        for (const std::uint32_t type : {0, 1, 2, 3, 6, 7, 8, 30}) {
+            if (legacy && type == 30) continue;
+            const auto [expected, type_offset] = write_import_fixture(gguf_path, type, legacy);
+            const std::string name = legacy ? "model.encoder.layers.0.self_attn.q_proj.weight" : "weight";
+            auto imported = kidi::model::Weights::load(gguf_path);
+            if (!imported || imported->names() != std::vector<std::string>{name}) return 1;
+            const auto value = imported->tensor(name);
+            const auto data =
+                value ? value->data<float>() : kidi::Result<std::span<const float>>{std::unexpected(value.error())};
+            if (!data || value->size(0) != 1 || value->size(1) != 32 || !std::ranges::equal(*data, expected)) return 1;
+            const std::array concat = {kidi::model::StateMappingSpec{{"^" + name + "$", name}, "fused", 0}};
+            auto mapped = kidi::model::Weights::load(gguf_path, concat);
+            const auto fused =
+                mapped ? mapped->tensor("fused") : kidi::Result<kidi::tensor::Tensor>{std::unexpected(mapped.error())};
+            if (!fused || mapped->size() != 1 || mapped->contains(name) || fused->size(0) != 2 ||
+                !std::ranges::equal(fused->data<float>()->first(32), expected) ||
+                !std::ranges::equal(fused->data<float>()->subspan(32), expected))
+                return 1;
+            {
+                std::fstream stream(gguf_path, std::ios::binary | std::ios::in | std::ios::out);
+                stream.seekp(type_offset);
+                const std::uint32_t unsupported = 999;
+                stream.write(reinterpret_cast<const char*>(&unsupported), sizeof(unsupported));
+            }
+            if (kidi::model::Weights::load(gguf_path)) return 1;
+        }
+    }
+    const auto overwrite = [&](std::streamoff offset, auto value) {
+        std::fstream stream(gguf_path, std::ios::binary | std::ios::in | std::ios::out);
+        stream.seekp(offset);
+        stream.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    };
+    for (const std::uint64_t dimension : {std::uint64_t{0}, std::uint64_t{31}, UINT64_MAX}) {
+        const auto [expected, type_offset] = write_import_fixture(gguf_path, 8);
+        overwrite(type_offset - 16, dimension);
+        if (kidi::model::Weights::load(gguf_path)) return 1;
+    }
+    {
+        const auto [expected, type_offset] = write_import_fixture(gguf_path, 8);
+        overwrite(type_offset + 4, std::uint64_t{1} << 63);
+        if (kidi::model::Weights::load(gguf_path)) return 1;
+    }
+    {
+        const auto [expected, type_offset] = write_import_fixture(gguf_path, 8);
+        overwrite((type_offset + 12 + 63) / 64 * 64, std::uint16_t{0x7c00});
+        auto imported = kidi::model::Weights::load(gguf_path);
+        if (!imported || imported->tensor("weight")) return 1;
+    }
+    {
+        const auto [expected, type_offset] = write_import_fixture(gguf_path, 8, true);
+        const auto offset = type_offset - 8;
+        std::vector<char> duplicate(std::filesystem::file_size(gguf_path) - offset);
+        std::ifstream input(gguf_path, std::ios::binary);
+        input.seekg(offset);
+        input.read(duplicate.data(), duplicate.size());
+        input.close();
+        std::ofstream output(gguf_path, std::ios::binary | std::ios::app);
+        output.write(duplicate.data(), duplicate.size());
+        output.close();
+        if (kidi::model::Weights::load(gguf_path)) return 1;
+    }
+    write_import_fixture(gguf_path, 8);
+    std::filesystem::resize_file(gguf_path, std::filesystem::file_size(gguf_path) - 1);
+    if (kidi::model::Weights::load(gguf_path)) return 1;
+    std::filesystem::remove(gguf_path);
     const auto path = std::filesystem::temp_directory_path() / "kidi-weights-test.safetensors";
     write_fixture(path);
 

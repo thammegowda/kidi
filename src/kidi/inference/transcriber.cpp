@@ -37,6 +37,8 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
         if (device != tensor::Device::cpu())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper currently requires the CPU backend"});
         auto config = require(model::load_whisper_config(directory));
+        if (config["weights_format"].as<std::string>("") == "whisper_ggml")
+            config = require(model::load_whisper_config(require(model::WhisperImpl::prepare_int8(directory))));
         require(model::WhisperImpl::validate_config(config["model"]));
         auto tokenizer = require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
         if (tokenizer.vocabulary_size() != config["model"]["vocab_size"].as<std::size_t>())

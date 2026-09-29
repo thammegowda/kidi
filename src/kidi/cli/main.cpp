@@ -579,7 +579,8 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     chat_parser.description("Chat in the terminal with a loaded model. Type /help for shell commands.");
     auto& transcribe_parser = commands.add_parser("transcribe", "transcribe a 16 kHz WAV file with Whisper");
     transcribe_parser.description(
-        "Transcribe or translate speech with an untouched Hugging Face Whisper Tiny, Base, or Small model.");
+        "Transcribe or translate speech with Whisper Tiny, Base, or Small: Hugging Face directory or GGML file with HF "
+        "sidecars.");
     chat_parser.add_argument("--system").default_value(std::string{}).help("system instruction");
     chat_parser.add_argument("--color")
         .default_value(std::string("auto"))

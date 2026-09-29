@@ -17,6 +17,8 @@
 #include <vector>
 
 #include "kidi/model/safetensors/mapped.h"
+#include "kidi/model/ggml.h"
+#include "kidi/ops/context.h"
 
 namespace kidi::model {
 namespace {
@@ -111,9 +113,18 @@ auto Weights::save(const std::filesystem::path& path, const StateDict& state) ->
 }
 
 struct Weights::Impl {
-    explicit Impl(const std::filesystem::path& path) : checkpoint(path.string()) {}
+    explicit Impl(const std::filesystem::path& path) {
+        std::ifstream stream(path, std::ios::binary);
+        std::uint32_t magic = 0;
+        stream.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        if (magic == GGUF_MAGIC || magic == GGML_MAGIC)
+            imported = std::make_unique<GgmlFile>(ops::require(GgmlFile::open(path)));
+        else
+            checkpoint = std::make_unique<safetensors::MappedCheckpoint>(path.string());
+    }
 
-    safetensors::MappedCheckpoint checkpoint;
+    std::unique_ptr<safetensors::MappedCheckpoint> checkpoint;
+    std::unique_ptr<GgmlFile> imported;
     std::unordered_map<std::string, OwnedTensor> transformed;
     std::unordered_map<std::string, std::string> aliases;
     std::unordered_set<std::string> hidden;
@@ -156,15 +167,28 @@ auto tensor_view(const Storage& impl, std::string_view name) -> RawTensorView {
         };
     }
     if (const auto alias = impl.aliases.find(std::string(name)); alias != impl.aliases.end()) {
-        return mapped_tensor_view(impl.checkpoint.at(alias->second));
+        return mapped_tensor_view(impl.checkpoint->at(alias->second));
     }
-    return mapped_tensor_view(impl.checkpoint.at(std::string(name)));
+    return mapped_tensor_view(impl.checkpoint->at(std::string(name)));
 }
 
 template <typename Storage>
 auto contains_tensor(const Storage& impl, std::string_view name) -> bool {
     return impl.transformed.contains(std::string(name)) || impl.aliases.contains(std::string(name)) ||
-           (!impl.hidden.contains(std::string(name)) && impl.checkpoint.contains(std::string(name)));
+           (!impl.hidden.contains(std::string(name)) &&
+            (impl.imported ? impl.imported->tensors().contains(std::string(name))
+                           : impl.checkpoint->contains(std::string(name))));
+}
+
+template <typename Storage>
+auto base_names(const Storage& impl) -> std::vector<std::string> {
+    std::vector<std::string> keys;
+    if (impl.imported) {
+        for (const auto& [name, unused] : impl.imported->tensors()) keys.push_back(name);
+    } else {
+        for (const auto& [name, unused] : impl.checkpoint->tensors()) keys.push_back(name);
+    }
+    return keys;
 }
 
 auto concatenate_tensors(const std::vector<RawTensorView>& inputs, std::int64_t axis) -> OwnedTensor {
@@ -217,12 +241,7 @@ template <typename Storage>
 auto apply_state_mappings(Storage& impl, const std::vector<StateMappingSpec>& specs) -> void {
     for (const auto& spec : specs) {
         const std::regex anchor(spec.sources.front());
-        std::vector<std::string> keys;
-        keys.reserve(impl.checkpoint.tensors().size());
-        for (const auto& [name, tensor] : impl.checkpoint.tensors()) {
-            static_cast<void>(tensor);
-            keys.push_back(name);
-        }
+        const auto keys = base_names(impl);
         for (const auto& key : keys) {
             std::smatch match;
             if (!std::regex_match(key, match, anchor)) continue;
@@ -247,7 +266,18 @@ auto apply_state_mappings(Storage& impl, const std::vector<StateMappingSpec>& sp
 
             std::vector<RawTensorView> tensors;
             tensors.reserve(sources.size());
-            for (const auto& source : sources) tensors.push_back(tensor_view(impl, source));
+            std::vector<tensor::Tensor> imported;
+            imported.reserve(sources.size());
+            for (const auto& source : sources) {
+                if (impl.imported && !impl.transformed.contains(source)) {
+                    const auto alias = impl.aliases.find(source);
+                    imported.push_back(
+                        ops::require(impl.imported->tensor(alias == impl.aliases.end() ? source : alias->second)));
+                    const auto& value = imported.back();
+                    tensors.push_back({value.dtype(), value.shape(), ops::require(value.host_bytes())});
+                } else
+                    tensors.push_back(tensor_view(impl, source));
+            }
             impl.transformed.emplace(destination, concatenate_tensors(tensors, spec.concat_axis));
             impl.hidden.insert(sources.begin(), sources.end());
         }
@@ -266,10 +296,15 @@ auto Weights::load(const std::filesystem::path& path, std::span<const StateMappi
         auto impl = std::make_shared<Impl>(path);
         apply_state_mappings(*impl, std::vector<StateMappingSpec>(mappings.begin(), mappings.end()));
         return Weights(std::move(impl));
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::runtime_error& error) {
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT, "cannot load weights " + path.string() + ": " + error.what()});
     } catch (const std::exception& error) {
         return std::unexpected(Error{
             ErrorCode::INVALID_ARGUMENT,
-            "cannot load Safetensors weights " + path.string() + ": " + error.what(),
+            "cannot load weights " + path.string() + ": " + error.what(),
         });
     }
 }
@@ -278,28 +313,37 @@ auto Weights::contains(std::string_view name) const -> bool { return contains_te
 
 auto Weights::state_dict() const -> Result<StateDict> {
     StateDict result;
-    const auto append = [&](const auto& tensors) -> Result<void> {
-        for (const auto& [name, unused] : tensors) {
-            if (!contains(name)) continue;
-            auto value = tensor(name);
-            if (!value) return std::unexpected(std::move(value.error()));
-            result.emplace(name, std::move(*value));
-        }
-        return {};
-    };
-    for (auto status : {append(impl_->checkpoint.tensors()), append(impl_->aliases), append(impl_->transformed)})
-        if (!status) return std::unexpected(std::move(status.error()));
+    for (const auto& name : names()) {
+        auto value = tensor(name);
+        if (!value) return std::unexpected(std::move(value.error()));
+        result.emplace(name, std::move(*value));
+    }
+    return result;
+}
+
+auto Weights::names() const -> std::vector<std::string> {
+    auto result = base_names(*impl_);
+    std::erase_if(result, [&](const auto& name) {
+        return impl_->hidden.contains(name) || impl_->transformed.contains(name) || impl_->aliases.contains(name);
+    });
+    for (const auto& [name, unused] : impl_->aliases) result.push_back(name);
+    for (const auto& [name, unused] : impl_->transformed) result.push_back(name);
+    std::ranges::sort(result);
     return result;
 }
 
 auto Weights::size() const noexcept -> std::size_t {
-    return impl_->checkpoint.tensors().size() - impl_->hidden.size() + impl_->transformed.size() +
-           impl_->aliases.size();
+    return (impl_->imported ? impl_->imported->tensors().size() : impl_->checkpoint->tensors().size()) -
+           impl_->hidden.size() + impl_->transformed.size() + impl_->aliases.size();
 }
 
 auto Weights::tensor(std::string_view name) const -> Result<tensor::Tensor> {
     if (!contains(name)) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "weight tensor not found: " + std::string(name)});
+    }
+    if (impl_->imported && !impl_->transformed.contains(std::string(name))) {
+        const auto alias = impl_->aliases.find(std::string(name));
+        return impl_->imported->tensor(alias == impl_->aliases.end() ? name : std::string_view(alias->second));
     }
     const auto raw = tensor_view(*impl_, name);
     if (reinterpret_cast<std::uintptr_t>(raw.bytes.data()) % data_type_size(raw.data_type) != 0) {

@@ -116,17 +116,20 @@ auto WhisperImpl::prepare_int8(const std::filesystem::path& directory) -> Result
         const auto source_path = std::filesystem::path(config["model_file"].as<std::string>());
         const auto source_size = std::filesystem::file_size(source_path);
         const auto source_time = std::filesystem::last_write_time(source_path).time_since_epoch().count();
-        const auto destination = directory / "kidi-int8-v2";
+        const auto root = source_path.parent_path();
+        const bool imported = config["weights_format"].as<std::string>("") == "whisper_ggml";
+        const std::string format = imported ? "kidi-whisper-ggml-int8-v1" : "kidi-whisper-int8-v2";
+        const auto destination = root / (imported ? source_path.filename().string() + ".kidi-int8-v1" : "kidi-int8-v2");
         constexpr std::array files{"config.json", "tokenizer.json", "preprocessor_config.json",
                                    "generation_config.json"};
         if (std::filesystem::exists(destination)) {
             std::ifstream stream(destination / "quantization.json");
             const auto metadata = nlohmann::json::parse(stream);
-            if (metadata.value("format", "") != "kidi-whisper-int8-v2" || metadata.at("source_bytes") != source_size ||
+            if (metadata.value("format", "") != format || metadata.at("source_bytes") != source_size ||
                 metadata.at("source_mtime") != source_time ||
                 metadata.at("model_bytes") != std::filesystem::file_size(destination / "model.safetensors"))
-                throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
-                                    "stale or incomplete Whisper INT8 cache; remove kidi-int8-v2 and retry"});
+                throw ops::Failure(
+                    {ErrorCode::INVALID_ARGUMENT, "stale or incomplete Whisper INT8 cache: " + destination.string()});
             for (const auto* name : files)
                 if (!std::filesystem::is_regular_file(destination / name))
                     throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "incomplete Whisper INT8 cache"});
@@ -142,18 +145,19 @@ auto WhisperImpl::prepare_int8(const std::filesystem::path& directory) -> Result
         const auto bytes =
             std::accumulate(checkpoint.begin(), checkpoint.end(), std::uint64_t{0},
                             [](std::uint64_t total, const auto& item) { return total + item.second.nbytes(); });
-        if (std::filesystem::space(directory).available < bytes + 16 * 1024 * 1024)
+        if (std::filesystem::space(root).available < bytes + 16 * 1024 * 1024)
             throw ops::Failure({ErrorCode::RUNTIME, "not enough storage for the Whisper INT8 cache"});
         std::random_device random;
         for (int attempt = 0; attempt < 8 && temporary.empty(); ++attempt) {
-            auto candidate = directory / (".kidi-int8-v2-" + std::to_string(random()));
+            auto candidate = root / (".kidi-int8-v2-" + std::to_string(random()));
             if (std::filesystem::create_directory(candidate)) temporary = std::move(candidate);
         }
         if (temporary.empty()) throw ops::Failure({ErrorCode::RUNTIME, "cannot create Whisper INT8 staging directory"});
         require(Weights::save(temporary / "model.safetensors", checkpoint));
-        for (const auto* name : files) std::filesystem::copy_file(directory / name, temporary / name);
+        for (const auto* name : files) std::filesystem::copy_file(root / name, temporary / name);
         const auto metadata = nlohmann::json{
-            {"format", "kidi-whisper-int8-v2"},
+            {"format", format},
+            {"source_file", source_path.filename().string()},
             {"source_bytes", source_size},
             {"source_mtime", source_time},
             {"model_bytes", std::filesystem::file_size(temporary / "model.safetensors")},
@@ -183,9 +187,9 @@ auto WhisperImpl::prepare_int8(const std::filesystem::path& directory) -> Result
 
 auto WhisperImpl::set_checkpoint(const Weights& weights) -> Result<void> {
     try {
-        const auto checkpoint = require(weights.state_dict());
         StateDict state;
-        for (const auto& [key, value] : checkpoint) {
+        for (const auto& key : weights.names()) {
+            const auto value = require(weights.tensor(key));
             constexpr std::string_view PREFIX = "model.";
             if (!key.starts_with(PREFIX))
                 return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "unknown Whisper parameter: " + key});

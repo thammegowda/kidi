@@ -58,6 +58,7 @@ add_library(kidi
     src/kidi/layers/transformer.cpp
     src/kidi/layers/whisper.cpp
     src/kidi/model/config.cpp
+    src/kidi/model/ggml.cpp
     src/kidi/model/gemma4.cpp
     src/kidi/model/gemma4_vision.cpp
     src/kidi/model/package.cpp
@@ -212,6 +213,8 @@ if(KIDI_BUILD_PYTHON)
         COMMAND_ERROR_IS_FATAL ANY
     )
     install(FILES "${KIDI_NANOBIND_LICENSE}" DESTINATION kidi/licenses/nanobind COMPONENT python)
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/model/ggml.LICENSE"
+        DESTINATION kidi/licenses/ggml RENAME LICENSE COMPONENT python)
 endif()
 
 include(CTest)

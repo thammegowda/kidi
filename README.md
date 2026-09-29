@@ -29,7 +29,7 @@ layers for developers building other architectures.
 
 | Model | Capabilities |
 |---|---|
-| Whisper Tiny/Base/Small | Multilingual speech transcription/translation from untouched Hugging Face FP32 checkpoints |
+| Whisper Tiny/Base/Small | Multilingual speech transcription/translation from Hugging Face or legacy Whisper GGML checkpoints |
 | Gemma 4 E2B-it | Text chat and JSONL generation; original floating-point and mixed 2/4/8-bit mobile QAT checkpoints |
 | RTG Transformer | Translation with greedy or beam decoding; FP32, BF16, and INT8 packages |
 
@@ -154,7 +154,7 @@ for exact tool versions, installation, device testing, and runtime behavior.
 
 ### Whisper Transcription
 
-Whisper Tiny, Base, and Small load directly from their original Hugging Face directories; no GGML/GGUF export or Kidi
+Whisper Tiny, Base, and Small load directly from their original Hugging Face directories; no export or Kidi
 manifest is created.
 Input must be a mono or multichannel 16 kHz PCM WAV of at most 30 seconds. Channels are averaged to mono.
 
@@ -174,6 +174,48 @@ The browser settings accept Hugging Face model IDs rather than file URLs. Loadin
 `main` revision to an immutable commit before downloading. The speech model field offers `openai/whisper-tiny`,
 `openai/whisper-base`, and `openai/whisper-small`; larger models trade substantially more download, memory, and latency
 for accuracy. During recording, the composer shows replaceable draft text and runs a final refinement after stop.
+
+### GGML and GGUF Import
+
+`model::Weights::load` also reads little-endian GGUF v2/v3 and the legacy
+Whisper GGML container, detected by file magic rather than extension. Supported
+tensor encodings are F32, F16, BF16 (GGUF), Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0.
+Unsupported encodings, malformed shapes/offsets, overlapping GGUF tensors and
+non-finite decoded values are rejected. Tensors are decoded individually to F32
+on demand; Safetensors retains its existing zero-copy mapping.
+
+For Whisper, download `ggml-small-q8_0.bin` from `ggerganov/whisper.cpp` and place
+the matching `openai/whisper-small` sidecars beside it: `config.json`,
+`tokenizer.json`, `preprocessor_config.json`, and `generation_config.json`.
+Pass the binary file directly, or name it `ggml-model.bin` in a model directory
+without `model.safetensors`:
+
+```bash
+build-release/kidi transcribe --model ./models/whisper-small/ggml-small-q8_0.bin \
+  --in speech.wav --language en
+```
+
+The first load validates dimensions against the HF config, converts one tensor
+at a time into Kidi's existing per-output-channel INT8 layout, and atomically
+writes `<filename>.kidi-int8-v1/`. Subsequent loads reuse that cache. The source
+file is retained. For Small Q8, weights are about 264.5 MB downloaded plus small
+sidecars, with a 248.7 MB derived checkpoint: roughly 519 MB total storage with
+both metadata copies, not 249 MB total. No 967 MB FP32 checkpoint is needed.
+Requantization may change outputs; this is not a lossless conversion or a broad
+ASR quality guarantee. Changing source size/mtime invalidates the cache; stale
+caches fail explicitly rather than silently loading mismatched weights.
+
+GGUF container support does not automatically add architecture/tokenizer
+mappings for Gemma or arbitrary models. The importer retains GGUF tensor names
+and supports the existing state-mapping API. It does not execute GGML kernels
+or keep GGML block quantization for inference. Android/browser download defaults
+and Hub resolution remain unchanged; this change adds the shared native reader.
+
+The small adapted [reference codec](src/kidi/model/ggml_dequantize.h) lives beside
+the reader, with upstream credits, revision and the MIT license in its header.
+No GGML runtime, backend, submodule or
+build system is linked. Smaller model downloads come from quantization, not
+from GGML/GGUF container overhead versus Safetensors.
 
 ### RTG Model Package
 

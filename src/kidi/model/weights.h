@@ -38,6 +38,7 @@ public:
 
     auto contains(std::string_view name) const -> bool;
     auto size() const noexcept -> std::size_t;
+    auto names() const -> std::vector<std::string>;
     auto tensor(std::string_view name) const -> Result<tensor::Tensor>;
     auto state_dict() const -> Result<StateDict>;
 

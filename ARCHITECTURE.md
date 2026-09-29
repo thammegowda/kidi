@@ -56,7 +56,15 @@ caps on beam size or extra tokens. It checks positive counts and finite,
 non-negative penalties. Actual positional capacity and allocation failures remain
 runtime constraints. Typed tensors and search requests remain runtime values,
 not config types.
-Safetensors is the checkpoint format. The inference loader derives the construction
+Safetensors is the native memory-mapped checkpoint format. `Weights` also indexes
+little-endian GGUF v2/v3 and legacy Whisper GGML files, decoding supported tensors
+to owned F32 buffers on demand. `names()` enumerates metadata without expanding
+the checkpoint; Whisper uses it to bound import scratch space to one tensor.
+The small adapted GGML reference codecs live beside the reader, with upstream
+credits and the MIT license in their header. They do not introduce a runtime or a model
+execution path. GGUF tensor names remain unchanged; architecture/tokenizer
+mapping is still the model loader's responsibility, not a side effect of reading
+a container. The inference loader derives the construction
 dtype from the checkpoint. Layer constructors declare matching shapes/dtypes and
 required INT8 scale parameters without reading weights. `set_state` validates them
 before assignment. There is no separate encoding enum or YAML precision setting.
@@ -127,6 +135,15 @@ and numerically sensitive non-weight parameters remain FP32. CPU projection inpu
 `WhisperImpl::prepare_int8` writes a separate versioned cache atomically, retaining the original checkpoint and checking
 its size/mtime on reuse. Tensor dtype in the encoder FFN determines stored precision; no duplicated manifest precision
 flag is required. `Weights::save` writes exclusive Safetensors with aligned payload order and never overwrites a file.
+
+Whisper can also load a legacy GGML file with matching HF sidecars in its parent
+directory (or `ggml-model.bin` when a directory has no Safetensors). Dimensions
+are checked against the GGML header. `Transcriber::load` prepares and reuses a
+separate `<filename>.kidi-int8-v1` cache through the same native quantization
+path. Unsupported legacy quantization versions fail explicitly. Source files
+are retained, and cache metadata binds source size/mtime and importer version.
+No GGML graph/backend or model equations are vendored; generic GGUF-to-Whisper
+architecture mapping is not implemented.
 
 `TranscriptionOptions::on_partial` optionally receives the accumulated UTF-8 text and detected language synchronously
 on the inference caller's thread. It uses the tokenizer's existing incremental decoder and leaves final tokens/text
