@@ -48,10 +48,9 @@ private:
 
 inline constexpr EnumMap<DeviceKind, DeviceCapabilities, static_cast<std::size_t>(DeviceKind::COUNT)>
     DEVICE_CAPABILITIES{std::array{
-        std::pair{DeviceKind::CPU,
-              DeviceCapabilities{.calibrated_int8_cast = true,
-                         .blockwise_int8_attention = true,
-                         .blockwise_int8_attention_max_tokens = 512}},
+        std::pair{DeviceKind::CPU, DeviceCapabilities{.calibrated_int8_cast = true,
+                                                      .blockwise_int8_attention = true,
+                                                      .blockwise_int8_attention_max_tokens = 512}},
         std::pair{DeviceKind::Q_NPU, DeviceCapabilities{}},
         std::pair{DeviceKind::CUDA, DeviceCapabilities{}},
         std::pair{DeviceKind::A_GPU, DeviceCapabilities{.calibrated_int8_cast = true}},

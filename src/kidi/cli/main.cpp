@@ -18,8 +18,8 @@
 #include "kidi/cli/main.h"
 #include "kidi/cli/interactive.h"
 #include "kidi/core/version.h"
-#include "kidi/model/package.h"
-#include "kidi/model/config.h"
+#include "kidi/checkpoint/package.h"
+#include "kidi/checkpoint/config.h"
 #include "kidi/inference/translator.h"
 #include "kidi/inference/generator.h"
 #include "kidi/inference/transcriber.h"
@@ -42,7 +42,7 @@ auto backend_label(kidi::tensor::Device device) -> std::string_view {
 
 auto inspect(const std::filesystem::path& directory) -> int {
     if (!std::filesystem::is_regular_file(directory / "model.yaml")) {
-        auto config = kidi::model::load_whisper_config(directory);
+        auto config = kidi::checkpoint::load_config(directory, kidi::model::WhisperImpl::checkpoint_config());
         if (!config) {
             spdlog::error("{}", config.error().message);
             return 1;
@@ -52,7 +52,7 @@ auto inspect(const std::filesystem::path& directory) -> int {
             spdlog::error("{}", validation.error().message);
             return 1;
         }
-        auto weights = kidi::model::Weights::load((*config)["model_file"].as<std::string>());
+        auto weights = kidi::checkpoint::Weights::load((*config)["model_file"].as<std::string>());
         if (!weights) {
             spdlog::error("{}", weights.error().message);
             return 1;
@@ -73,7 +73,7 @@ auto inspect(const std::filesystem::path& directory) -> int {
                   << "execution device: cpu\n";
         return 0;
     }
-    auto document = kidi::model::load_config(directory / "model.yaml");
+    auto document = kidi::checkpoint::load_config(directory / "model.yaml");
     if (!document) {
         spdlog::error("{}", document.error().message);
         return 1;
@@ -84,7 +84,7 @@ auto inspect(const std::filesystem::path& directory) -> int {
             spdlog::error("{}", validation.error().message);
             return 1;
         }
-        auto weights = kidi::model::Weights::load((*document)["weights_file"].as<std::string>());
+        auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
         if (!weights) {
             spdlog::error("{}", weights.error().message);
             return 1;
@@ -107,7 +107,7 @@ auto inspect(const std::filesystem::path& directory) -> int {
                   << "default device: " << kidi::tensor::to_string(kidi::module_device) << '\n';
         return 0;
     }
-    auto package = kidi::model::Package::load(directory);
+    auto package = kidi::checkpoint::Package::load(directory);
     if (!package) {
         spdlog::error("{}", package.error().message);
         return 1;
@@ -431,7 +431,7 @@ auto prepare_command(const kidi::cli::Namespace& arguments, const std::filesyste
         return 2;
     }
     kidi::runtime::ynn::set_thread_count(threads);
-    auto config = kidi::model::load_config(directory / "model.yaml");
+    auto config = kidi::checkpoint::load_config(directory / "model.yaml");
     if (!config) {
         spdlog::error("{}", config.error().message);
         return 1;
@@ -579,7 +579,8 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     chat_parser.description("Chat in the terminal with a loaded model. Type /help for shell commands.");
     auto& transcribe_parser = commands.add_parser("transcribe", "transcribe a 16 kHz WAV file with Whisper");
     transcribe_parser.description(
-        "Transcribe or translate speech with an untouched Hugging Face Whisper Tiny, Base, or Small model.");
+        "Transcribe or translate speech with Whisper Tiny, Base, or Small: Hugging Face directory or GGML file with HF "
+        "sidecars.");
     chat_parser.add_argument("--system").default_value(std::string{}).help("system instruction");
     chat_parser.add_argument("--color")
         .default_value(std::string("auto"))

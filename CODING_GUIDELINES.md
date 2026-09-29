@@ -69,9 +69,16 @@ to kidi-owned C++ code. Code under `third_party/` follows its upstream project.
 - Directory structure mirrors namespaces. For example,
   `src/kidi/runtime/ynn/graph.h` declares names in `kidi::runtime::ynn`.
 - Use the module ownership rules in [ARCHITECTURE.md](ARCHITECTURE.md): tensor
-  storage, eager ops, shared layers, model topology, inference policy, and
-  backend runtime are distinct concerns. Do not add a namespace for an import
-  format or duplicate model/layer equations for each backend.
+  storage, checkpoint I/O, eager ops, shared layers, model topology, inference
+  policy, and backend runtime are distinct concerns. Put format readers,
+  configuration/package loading, and derived checkpoint caches under
+  `kidi::checkpoint`; format-specific implementations use matching subdirectories
+  and namespaces there. Model classes own checkpoint schema/compatibility rules,
+  conversion/export policy and cache identity through callbacks invoked by the
+  framework. Keep file I/O, staging, cache checks and atomic writes generic in
+  `kidi::checkpoint`; do not hard-code a model or precision there. Model code also
+  owns network definitions, validation and parameter binding. Do not duplicate
+  model/layer equations for each backend.
 - Model/layer code operates on concrete tensors. Do not reintroduce a symbolic
   model graph, generic lowerer, lazy fallback, or recorded generation loop.
   Backend-private prepared operators are allowed and must remain invisible to

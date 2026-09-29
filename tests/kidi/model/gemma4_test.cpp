@@ -1,9 +1,117 @@
 #include "kidi/model/gemma4.h"
+#include "kidi/checkpoint/safetensors/mapped.h"
+#include "kidi/inference/generator.h"
 
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+
+namespace {
+auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node& config, kidi::tensor::Device device)
+    -> void {
+    using kidi::ops::require;
+    const auto directory = std::filesystem::temp_directory_path() / "kidi-serving-cache-test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    std::filesystem::copy_file(fixture / "model.safetensors", directory / "model.safetensors");
+    YAML::Node manifest;
+    manifest["format_version"] = 1;
+    manifest["weights_file"] = "model.safetensors";
+    manifest["tokenizer_file"] = "tokenizer.json";
+    manifest["model"] = YAML::Clone(config);
+    manifest["decode"]["maximum_new_tokens"] = 3;
+    manifest["decode"]["context_size"] = 16;
+    std::ofstream(directory / "model.yaml") << manifest;
+    std::ofstream(directory / "tokenizer.json") << R"({
+      "version":"1.0", "pre_tokenizer":{"type":"WhitespaceSplit"},
+      "decoder":{"type":"WordPiece","prefix":"##","cleanup":false},
+      "model":{"type":"WordLevel","unk_token":"<unk>","vocab":{
+        "<pad>":0,"<eos>":1,"<bos>":2,"<turn|>":3,"<|turn>":4,"<unk>":5,
+        "alpha":6,"beta":7,"gamma":8,"delta":9,"theta":10,"zeta":11,"eta":12,"iota":13,"kappa":14,"lambda":15}}
+    })";
+    auto cached = require(kidi::inference::Generator::load(directory, device));
+    auto plain = require(kidi::inference::Generator::load(directory, device));
+    require(cached.configure_serving({1, 4, 16, 2}));
+    require(plain.configure_serving({1, 4, 16, 2}));
+    kidi::inference::GenerationOptions options;
+    options.maximum_new_tokens = 3;
+    options.context_size = 16;
+    options.prefill_chunk_size = 2;
+    options.prefix_cache_bytes = 1024 * 1024;
+    options.raw_prompt = true;
+    options.ignore_eos = true;
+    const auto run = [&](auto& generator, std::string_view prompt, auto settings) {
+        require(generator.enqueue(prompt, settings));
+        std::optional<kidi::inference::TextGeneration> completed;
+        while (generator.pending_requests())
+            for (auto& event : require(generator.step()).events)
+                if (event.completed) completed = std::move(event.completed);
+        if (!completed) throw std::runtime_error("missing serving completion");
+        return std::move(*completed);
+    };
+    const auto check = [&](std::string_view prompt, auto settings, std::size_t reused) {
+        const auto actual = run(cached, prompt, settings);
+        settings.prefix_cache_bytes = 0;
+        const auto expected = run(plain, prompt, settings);
+        if (actual.generation.token_ids != expected.generation.token_ids || actual.text != expected.text ||
+            actual.stats.reused_prompt_tokens != reused)
+            throw std::runtime_error("serving prefix reuse changed output or reused the wrong token count");
+        return actual;
+    };
+    const auto first = check("alpha beta gamma delta", options, 0);
+    if (!first.stats.prefix_cache_bytes || first.stats.prefix_reserved_bytes > options.prefix_cache_bytes)
+        throw std::runtime_error("serving cache did not retain bounded KV storage");
+    const std::array words{"<pad>", "<eos>", "<bos>", "<turn|>", "<|turn>", "<unk>", "alpha", "beta",
+                           "gamma", "delta", "theta", "zeta",    "eta",     "iota",  "kappa", "lambda"};
+    std::string continuation = "alpha beta gamma delta";
+    for (const auto token : first.generation.token_ids) continuation += " " + std::string(words.at(token));
+    continuation += " beta";
+    check(continuation, options, 6);
+    check("alpha beta theta delta", options, 2);
+    check("zeta eta", options, 0);
+    auto too_small = options;
+    too_small.prefix_cache_bytes = 1;
+    if (check("zeta eta", too_small, 0).stats.prefix_reserved_bytes)
+        throw std::runtime_error("serving cache exceeded its byte budget");
+    check("alpha beta gamma delta", options, 0);
+    require(cached.configure_serving({1, 4, 16, 2}));
+    check("alpha beta gamma delta", options, 0);
+    auto uncached = options;
+    uncached.prefix_cache_bytes = 0;
+    check("alpha beta gamma delta", uncached, 0);
+    const auto cancelled = require(cached.enqueue("alpha beta gamma delta", options));
+    require(cached.step());
+    require(cached.cancel(cancelled));
+    check("alpha beta gamma delta", options, 2);
+    auto smaller_context = options;
+    smaller_context.context_size = 8;
+    check("alpha beta gamma delta", smaller_context, 0);
+    auto full_attention = options;
+    full_attention.full_attention_cache = true;
+    check("alpha beta gamma delta", full_attention, 0);
+    check("alpha beta gamma delta", options, 0);
+    auto different_chunk = options;
+    different_chunk.prefill_chunk_size = 1;
+    check("alpha beta gamma delta", different_chunk, 0);
+    require(cached.configure_serving({2, 4, 32, 2}));
+    check("alpha beta gamma delta", options, 0);
+    const std::array prompts{"alpha beta gamma delta", "zeta eta gamma"};
+    const std::array ids{require(cached.enqueue(prompts[0], options)), require(cached.enqueue(prompts[1], options))};
+    std::array<std::optional<kidi::inference::TextGeneration>, 2> results;
+    while (cached.pending_requests())
+        for (auto& event : require(cached.step()).events)
+            if (event.completed) results[event.request_id == ids[0] ? 0 : 1] = std::move(event.completed);
+    for (std::size_t index = 0; index < results.size(); ++index) {
+        const auto expected = run(plain, prompts[index], uncached);
+        if (!results[index] || results[index]->generation.token_ids != expected.generation.token_ids ||
+            results[index]->stats.reused_prompt_tokens != (index == 0 ? 3 : 0))
+            throw std::runtime_error("queued requests shared or lost streaming KV state");
+    }
+    std::filesystem::remove_all(directory);
+}
+} // namespace
 
 auto main() -> int {
     using namespace kidi;
@@ -11,8 +119,36 @@ auto main() -> int {
         for (const auto* fixture : {"gemma4", "gemma4-qat"}) {
             const auto directory = std::filesystem::path(KIDI_GEMMA4_FIXTURE).parent_path() / fixture;
             const auto config = YAML::LoadFile((directory / "model.yaml").string())["model"];
-            auto checkpoint = ops::require(model::Weights::load(directory / "model.safetensors"));
-            auto reference = ops::require(model::Weights::load(directory / "reference.safetensors"));
+            auto checkpoint = ops::require(checkpoint::Weights::load(directory / "model.safetensors"));
+            auto reference = ops::require(checkpoint::Weights::load(directory / "reference.safetensors"));
+            if (fixture == std::string_view("gemma4-qat")) {
+                const auto sentinel_path =
+                    std::filesystem::temp_directory_path() / "kidi-gemma4-zero-scale.safetensors";
+                std::filesystem::copy_file(directory / "model.safetensors", sentinel_path,
+                                           std::filesystem::copy_options::overwrite_existing);
+                std::array<std::streamoff, 2> offsets;
+                {
+                    const kidi::checkpoint::safetensors::MappedCheckpoint mapped(sentinel_path.string());
+                    const auto base = mapped.owner()->data();
+                    offsets = {
+                        mapped.at("lm_head.input_activation_scale").data - base,
+                        mapped.at("lm_head.output_activation_scale").data - base,
+                    };
+                }
+                {
+                    std::fstream output(sentinel_path, std::ios::binary | std::ios::in | std::ios::out);
+                    constexpr float ZERO = 0.F;
+                    for (const auto offset : offsets) {
+                        output.seekp(offset);
+                        output.write(reinterpret_cast<const char*>(&ZERO), sizeof(ZERO));
+                    }
+                }
+                auto sentinel_checkpoint = ops::require(checkpoint::Weights::load(sentinel_path));
+                const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
+                auto sentinel_model = ops::require(model::Gemma4Impl::create(config));
+                ops::require(sentinel_model->set_checkpoint(sentinel_checkpoint));
+                std::filesystem::remove(sentinel_path);
+            }
             const auto token_tensor = ops::require(reference.tensor("tokens"));
             const auto expected = ops::require(reference.tensor("logits"));
             const auto tokens = ops::require(token_tensor.data<std::int32_t>());
@@ -28,6 +164,7 @@ auto main() -> int {
             devices.push_back(tensor::Device::apple_gpu());
 #endif
             for (auto device : devices) {
+                check_serving_cache(directory, config, device);
                 const ModuleScope construction(tensor::DType::F32, false, device);
                 auto model = ops::require(model::Gemma4Impl::create(config));
                 ops::require(model->set_checkpoint(checkpoint));

@@ -512,7 +512,7 @@ public:
                 check(ynn_define_quantize(native, operands[0], ynn_type_int8, zero, scale, &quantized, 0));
                 auto weight = operands[1];
                 const bool packed = spec.operation == Operation::PACKED_LINEAR;
-                if (packed) {
+                if (packed || (!spec.attributes.empty() && spec.attributes[0])) {
                     const std::array<std::int32_t, 2> axes{1, 0};
                     weight = YNN_INVALID_VALUE_ID;
                     check(ynn_define_static_transpose(native, 2, axes.data(), operands[1], &weight, 0));
@@ -526,7 +526,7 @@ public:
                     result = binary(ynn_binary_multiply, binary(ynn_binary_multiply, result, channel_scale), scale);
                 } else
                     check(::ynn::define_blockwise_dot(native, quantized, zero, scale, weight, YNN_INVALID_VALUE_ID,
-                                                      operands[2], packed ? spec.attributes[1] : inputs[1].size(0),
+                                                      operands[2], packed ? spec.attributes[1] : inputs[0].size(-1),
                                                       packed ? YNN_INVALID_VALUE_ID : operands[3], ynn_type_fp32,
                                                       result, 0));
                 if (packed) {

@@ -27,7 +27,8 @@ auto main() -> int {
     using kidi::tensor::Tensor;
 
     const auto backends = BackendRegistry::instance().backends();
-    if (!require(backends.size() == 5, "expected five tensor backend families")) return 1;
+    if (!require(backends.size() == static_cast<std::size_t>(DeviceKind::COUNT), "missing tensor backend family"))
+        return 1;
     if (!require(backends[0].device_kind == DeviceKind::CPU && backends[0].storage_available &&
                      backends[0].execution_available && backends[0].name == "ynnpack",
                  "CPU must use the available YNNPACK backend")) {
@@ -124,7 +125,6 @@ auto main() -> int {
             return 1;
         }
     }
-
     auto blob_owner = std::make_shared<std::array<float, 2>>(std::array<float, 2>{7, 8});
     auto blob = Tensor::from_blob({2}, DType::F32, std::as_bytes(std::span<const float>(*blob_owner)), blob_owner);
     blob_owner.reset();

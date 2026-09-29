@@ -75,7 +75,8 @@ public:
                                  const BlockwiseQuantization& value_quantization = {}) -> Tensor;
     auto rotary(const Tensor& input, const Tensor& cosine, const Tensor& sine) -> Tensor;
     auto linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight = false) -> Tensor;
-    auto quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias) -> Tensor;
+    auto quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias,
+                          bool transpose_weight = false) -> Tensor;
     auto packed_linear(const Tensor& input, const Tensor& weight, const Tensor& scales, std::int32_t bits,
                        std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F) -> Tensor;
     auto gelu(const Tensor& input, bool approximate = false) -> Tensor;

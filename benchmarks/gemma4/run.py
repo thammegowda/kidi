@@ -5,6 +5,7 @@ import argparse
 from dataclasses import asdict
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import resource
@@ -115,6 +116,56 @@ def run_kidi(args, prompt, tokenizer):
             if native_qat else "packed" if args.weight_bits and args.packed_prefill else "original floating (multi-row)"}
 
 
+def run_llama(args):
+    phases = {}
+    commands = []
+    logs = []
+    started = time.perf_counter()
+    for phase in ("prefill", "decode"):
+        if phase == "decode" and not args.decode:
+            continue
+        command = [str(args.llama_binary), "-m", str(args.gguf), "-o", "json",
+                   "-r", str(args.warmups + args.runs), "--no-warmup",
+                   "-t", str(args.threads), "-b", str(args.chunk), "-ub", str(args.chunk),
+                   "-ngl", "0" if args.backend == "cpu" else "99", "-fa", "on",
+                   "-p", str(args.prefill if phase == "prefill" else 0),
+                   "-n", str(args.decode if phase == "decode" else 0),
+                   "-d", str(args.prefill if phase == "decode" else 0)]
+        if args.backend == "cpu":
+            command += ["-dev", "none", "-nkvo", "1", "-nopo", "1"]
+        process = subprocess.run(command, text=True, capture_output=True, timeout=600)
+        if process.returncode:
+            raise RuntimeError(f"llama-bench failed ({process.returncode}): {process.stderr}")
+        results = json.loads(process.stdout)
+        if len(results) != 1:
+            raise ValueError(f"Expected one llama-bench {phase} result, got {len(results)}")
+        result = results[0]
+        expected = (args.prefill, 0, 0) if phase == "prefill" else (0, args.decode, args.prefill)
+        actual = tuple(result[key] for key in ("n_prompt", "n_gen", "n_depth"))
+        if actual != expected or len(result["samples_ns"]) != args.warmups + args.runs:
+            raise ValueError(f"llama-bench token/repetition count mismatch: {result}")
+        phases[phase] = result
+        commands.append(command)
+        logs.append(process.stderr)
+    records = []
+    for index in range(args.warmups + args.runs):
+        prefill_ns = phases["prefill"]["samples_ns"][index]
+        decode_ns = phases["decode"]["samples_ns"][index] if args.decode else 0
+        records.append({"run": index - args.warmups, "prefill_ns": prefill_ns, "decode_ns": decode_ns,
+                        "prefill_tokens_per_second": args.prefill * 1e9 / prefill_ns,
+                        "decode_tokens_per_second": args.decode * 1e9 / decode_ns if args.decode else 0})
+    with args.llama_binary.open("rb") as binary:
+        binary_sha256 = hashlib.file_digest(binary, "sha256").hexdigest()
+    return {"records": records[args.warmups:], "warmup_records": records[:args.warmups],
+            "commands": commands, "process_wall_seconds": time.perf_counter() - started,
+            "binary_sha256": binary_sha256, "gguf": str(args.gguf), "gguf_bytes": args.gguf.stat().st_size,
+            "peak_rss_bytes": resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
+            "stderr": logs, "raw_phases": phases, "weight_precision": phases["prefill"]["model_type"],
+            "execution": "llama-bench synthetic tokens; separate prefill and context-conditioned decode; no sampling",
+            "warmup_policy": "discard initial full phase repetitions; built-in short warmup disabled",
+            "context_policy": "llama-bench allocates from prompt + generation + depth, rounded by runtime"}
+
+
 def run_litert(args, prompt, tokens):
     import litert_lm
 
@@ -161,12 +212,15 @@ def run_litert(args, prompt, tokens):
 def main():
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runtime", choices=["kidi", "litert", "litert-mtp"], required=True)
+    parser.add_argument("--runtime", choices=["kidi", "llama", "litert", "litert-mtp"], required=True)
     parser.add_argument("--backend", choices=["cpu", "gpu"], required=True)
     parser.add_argument("--model", type=Path, default=root.parent / "models/gemma-4-E2B-it")
     parser.add_argument("--reference-model", type=Path,
                         default=root.parent / "models/gemma-4-E2B-it-litert-lm/gemma-4-E2B-it.litertlm")
     parser.add_argument("--binary", type=Path, default=root / "build-release/kidi")
+    parser.add_argument("--llama-binary", type=Path,
+                        default=root / ".cache/llama.cpp-bench/build/bin/llama-bench")
+    parser.add_argument("--gguf", type=Path, help="GGUF weights for --runtime llama")
     parser.add_argument("--cache", type=Path, default=root / ".cache/gemma-litert")
     parser.add_argument("--prefill", type=int, default=128)
     parser.add_argument("--decode", type=int, default=64, help="recurrent tokens after the first; 0 measures first-output latency")
@@ -183,18 +237,34 @@ def main():
     args = parser.parse_args()
     if min(args.prefill, args.context, args.chunk, args.threads, args.runs) <= 0 or min(args.warmups, args.decode) < 0:
         parser.error("counts must be positive; warmups and recurrent decode tokens must be non-negative")
+    if args.runtime == "llama" and (args.gguf is None or not args.gguf.is_file()):
+        parser.error("--runtime llama requires an existing --gguf checkpoint")
+    if args.runtime == "llama" and (args.weight_bits or args.packed_prefill or args.full_attention_cache):
+        parser.error("Kidi precision/cache overrides do not apply to llama-bench")
     args.cache.mkdir(parents=True, exist_ok=True)
-    tokenizer = Tokenizer.from_file(str(args.model / "tokenizer.json"))
-    prompt, tokens = make_prompt(tokenizer, args.prefill)
+    tokenizer = None
+    prompt, tokens = None, None
+    if args.runtime != "llama":
+        tokenizer = Tokenizer.from_file(str(args.model / "tokenizer.json"))
+        prompt, tokens = make_prompt(tokenizer, args.prefill)
     before = memory_snapshot()
-    result = run_kidi(args, prompt, tokenizer) if args.runtime == "kidi" else run_litert(args, prompt, tokens)
-    result["environment"] = {"platform": platform.platform(), "before": before, "after": memory_snapshot()}
+    if args.runtime == "llama":
+        result = run_llama(args)
+    else:
+        result = run_kidi(args, prompt, tokenizer) if args.runtime == "kidi" else run_litert(args, prompt, tokens)
+    result["environment"] = {"platform": platform.platform(), "before": before, "after": memory_snapshot(),
+                             "veclib_maximum_threads": os.environ.get("VECLIB_MAXIMUM_THREADS"),
+                             "power": subprocess.check_output(["pmset", "-g", "batt"], text=True).strip()
+                             if sys.platform == "darwin" else None}
     result.update({"runtime": args.runtime, "backend": args.backend, "batch_size": 1, "threads": args.threads,
-                   "prefill_tokens": args.prefill, "decode_target": args.decode, "context": args.context,
+                   "prefill_tokens": args.prefill, "decode_target": args.decode,
+                   "context": None if args.runtime == "llama" else args.context,
                    "warmups": args.warmups, "prompt": prompt, "prompt_tokens": tokens,
+                   "prompt_used": args.runtime != "llama",
                    "prefill_chunk_size": args.chunk, "packed_prefill": args.packed_prefill,
-                   "model_config_sha256": hashlib.sha256((args.model / "config.json").read_bytes()).hexdigest(),
-                   "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()})
+                   "model_config_sha256": hashlib.sha256((args.model / "config.json").read_bytes()).hexdigest()
+                   if args.runtime != "llama" else None,
+                   "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest() if prompt is not None else None})
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(round_metrics(result), indent=2) + "\n")
     for record in result["records"]:

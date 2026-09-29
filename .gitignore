@@ -9,6 +9,42 @@ __pycache__/
 *.pyc
 /web/node_modules/
 
+# Android and Gradle build state; keep gradle/wrapper committed.
+/android/.gradle/
+/android/.kotlin/
+/android/.idea/
+/android/local.properties
+/android/**/build/
+/android/**/.cxx/
+/android/**/.externalNativeBuild/
+/android/captures/
+/android/**/*.iml
+
+# Compiled artifacts and local signing material, not the Gradle bootstrap.
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.class
+*.dex
+*.apk
+*.aab
+*.aar
+*.jar
+*.spv
+*.hprof
+*.jks
+*.keystore
+!/android/gradle/wrapper/gradle-wrapper.jar
+
+# Local model/audio exports; retain deliberate, small test fixtures.
+*.safetensors
+*.wav
+!/tests/data/**/*.safetensors
+!/tests/data/**/*.wav
+
 /tests/**/.cache/
 /tests/**/*.log
 /tests/data/**/*.out.txt
@@ -24,3 +60,5 @@ __pycache__/
 /benchmarks/metal/*-20[0-9]*/**/*.txt
 /benchmarks/metal/execution-study-*.txt
 /benchmarks/**/baseline-20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+/benchmarks/android/*.json
+/benchmarks/android/JOURNAL.md

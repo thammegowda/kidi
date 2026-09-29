@@ -191,23 +191,21 @@ auto WhisperFeatureExtractor::extract(std::span<const float> waveform, std::uint
     if (waveform.size() > SAMPLE_COUNT)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "Whisper audio exceeds the 30-second limit"});
     const auto count = waveform.size();
-    std::vector<float> samples(SAMPLE_COUNT);
-    std::ranges::copy(waveform.first(count), samples.begin());
-    std::vector<float> padded(SAMPLE_COUNT + FFT_SIZE);
-    std::ranges::copy(samples, padded.begin() + FFT_SIZE / 2);
-    for (std::size_t index = 0; index < FFT_SIZE / 2; ++index) {
-        padded[FFT_SIZE / 2 - 1 - index] = samples[1 + index];
-        padded[FFT_SIZE / 2 + SAMPLE_COUNT + index] = samples[SAMPLE_COUNT - 2 - index];
-    }
-
     WhisperFeatures result{{}, MEL_BINS, FRAME_COUNT};
-    result.values.resize(MEL_BINS * FRAME_COUNT);
+    result.values.assign(MEL_BINS * FRAME_COUNT, -10.F);
     std::array<float, FFT_SIZE * 2> fft_input{};
     std::array<float, FFT_SIZE * 8> fft_output{};
     std::array<float, FREQUENCY_BINS> power{};
-    for (std::size_t frame = 0; frame < FRAME_COUNT; ++frame) {
-        for (std::size_t index = 0; index < FFT_SIZE; ++index)
-            fft_input[index] = FFT_CACHE.hann[index] * padded[frame * HOP_LENGTH + index];
+    const auto active_frames = std::min(FRAME_COUNT, (count + FFT_SIZE / 2 + HOP_LENGTH - 1) / HOP_LENGTH);
+    for (std::size_t frame = 0; frame < active_frames; ++frame) {
+        for (std::size_t index = 0; index < FFT_SIZE; ++index) {
+            auto source =
+                static_cast<std::int64_t>(frame * HOP_LENGTH + index) - static_cast<std::int64_t>(FFT_SIZE / 2);
+            if (source < 0) source = -source;
+            if (source >= static_cast<std::int64_t>(SAMPLE_COUNT)) source = 2 * SAMPLE_COUNT - 2 - source;
+            fft_input[index] =
+                FFT_CACHE.hann[index] * (static_cast<std::size_t>(source) < count ? waveform[source] : 0.F);
+        }
         fft(fft_input.data(), FFT_SIZE, fft_output.data());
         for (std::size_t frequency = 0; frequency < FREQUENCY_BINS; ++frequency) {
             const auto real = fft_output[2 * frequency], imaginary = fft_output[2 * frequency + 1];

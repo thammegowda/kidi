@@ -15,6 +15,7 @@ namespace kidi::text {
 
 struct ChatMessage {
     std::string role, content;
+    std::vector<std::filesystem::path> images;
 };
 
 class Tokenizer {

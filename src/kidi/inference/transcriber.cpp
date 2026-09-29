@@ -4,7 +4,8 @@
 #include <chrono>
 #include <limits>
 
-#include "kidi/model/config.h"
+#include "kidi/checkpoint/config.h"
+#include "kidi/checkpoint/prepare.h"
 
 namespace kidi::inference {
 using ops::require;
@@ -36,7 +37,11 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
     try {
         if (device != tensor::Device::cpu())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper currently requires the CPU backend"});
-        auto config = require(model::load_whisper_config(directory));
+        const auto adapter = model::WhisperImpl::checkpoint_config();
+        auto config = require(checkpoint::load_config(directory, adapter));
+        if (config["weights_format"].as<std::string>("") == "whisper_ggml")
+            config = require(checkpoint::load_config(
+                require(checkpoint::prepare(directory, adapter, model::WhisperImpl::int8_preparation)), adapter));
         require(model::WhisperImpl::validate_config(config["model"]));
         auto tokenizer = require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
         if (tokenizer.vocabulary_size() != config["model"]["vocab_size"].as<std::size_t>())
@@ -63,8 +68,8 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
         for (const auto* name : {"decoder_start_token_id", "eos_token_id", "no_timestamps_token_id"})
             if (!valid_token(generation[name].as<std::int32_t>()))
                 throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Whisper special token is outside vocabulary"});
-        auto weights = require(model::Weights::load(config["model_file"].as<std::string>()));
-        const auto parameter = require(weights.tensor("model.encoder.conv1.weight"));
+        auto weights = require(checkpoint::Weights::load(config["model_file"].as<std::string>()));
+        const auto parameter = require(weights.tensor("model.encoder.layers.0.fc1.weight"));
         const ModuleScope construction(parameter.dtype(), false, device);
         auto whisper = require(model::WhisperImpl::create(config["model"]));
         require(whisper->set_checkpoint(weights));
@@ -123,13 +128,14 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
             result.language = found->first;
             language_token = found->second;
         }
-        for (const auto token :
-             {language_token, task.as<std::int32_t>(), generation_["no_timestamps_token_id"].as<std::int32_t>()})
-            logits = require(model_->forward(source, std::span(&token, 1), state));
+        const std::array prefix{language_token, task.as<std::int32_t>()};
+        require(model_->prefill(source, prefix, state));
+        const auto no_timestamps = generation_["no_timestamps_token_id"].as<std::int32_t>();
+        logits = require(model_->forward(source, std::span(&no_timestamps, 1), state));
 
         const auto vocabulary = config_["model"]["vocab_size"].as<std::size_t>();
         const auto end = generation_["eos_token_id"].as<std::int32_t>();
-        const auto no_timestamps = generation_["no_timestamps_token_id"].as<std::int32_t>();
+        std::string emitted;
         for (std::size_t step = 0; step < options.maximum_tokens; ++step) {
             scores = require(logits.data<float>());
             const auto suppress = [&](std::int32_t token) {
@@ -145,11 +151,17 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
             const auto selected = static_cast<std::int32_t>(std::ranges::max_element(scores) - scores.begin());
             if (selected == end) break;
             result.token_ids.push_back(selected);
-            logits = require(model_->forward(source, std::span(&selected, 1), state));
+            if (options.on_partial) {
+                const auto delta = require(tokenizer_.decode_delta(result.token_ids, emitted));
+                if (!delta.empty()) options.on_partial(emitted, result.language);
+            }
+            if (step + 1 < options.maximum_tokens)
+                logits = require(model_->forward(source, std::span(&selected, 1), state));
         }
         result.stats.decode_ns = elapsed(decode_start);
         result.stats.preparation_ns = model_->preparation_ns() - preparation;
         result.text = require(tokenizer_.decode(result.token_ids));
+        if (options.on_partial && result.text != emitted) options.on_partial(result.text, result.language);
         return result;
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());

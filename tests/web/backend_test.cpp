@@ -1,7 +1,7 @@
 #include "kidi/tensor/web_gpu.h"
 #include "kidi/ops/context.h"
 #include "kidi/model/gemma4.h"
-#include "kidi/model/config.h"
+#include "kidi/checkpoint/config.h"
 #include "kidi/text/tokenizer.h"
 #include <emscripten.h>
 #include <iostream>
@@ -173,8 +173,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_test() -> int {
         for (const auto* fixture : {"gemma4", "gemma4-qat"}) {
             const auto directory = std::filesystem::path("/fixtures") / fixture;
             const auto config = YAML::LoadFile((directory / "model.yaml").string())["model"];
-            auto weights = ops::require(model::Weights::load(directory / "model.safetensors"));
-            auto reference = ops::require(model::Weights::load(directory / "reference.safetensors"));
+            auto weights = ops::require(checkpoint::Weights::load(directory / "model.safetensors"));
+            auto reference = ops::require(checkpoint::Weights::load(directory / "reference.safetensors"));
             const auto token_storage = ops::require(reference.tensor("tokens"));
             const auto tokens = ops::require(token_storage.data<std::int32_t>());
             const auto expected = ops::require(reference.tensor("logits"));
@@ -205,8 +205,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_test() -> int {
 extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_diagnose() -> int {
     try {
         using namespace kidi;
-        const auto config = ops::require(model::load_config("/model/model.yaml"));
-        auto weights = ops::require(model::Weights::load("/model/model.safetensors"));
+        const auto config = ops::require(checkpoint::load_config("/model/model.yaml"));
+        auto weights = ops::require(checkpoint::Weights::load("/model/model.safetensors"));
         auto tokenizer = ops::require(text::Tokenizer::load("/model/tokenizer.json"));
         const std::array messages{text::ChatMessage{"user", "Name three practical uses of binary search."}};
         auto tokens = ops::require(tokenizer.encode(ops::require(tokenizer.format_chat(messages))));

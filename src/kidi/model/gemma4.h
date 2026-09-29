@@ -1,12 +1,17 @@
 #pragma once
 
 #include "kidi/layers/gemma4.h"
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
 #include <yaml-cpp/yaml.h>
 
 namespace kidi::model {
+struct Gemma4ImageTokens {
+    std::size_t position;
+    tensor::Tensor embeddings;
+};
 struct Gemma4State {
     std::vector<layers::KeyValue> layers;
+    std::vector<Gemma4ImageTokens> images;
     std::size_t position = 0, capacity = 0;
     bool crop_local_attention = true;
     bool prefilling = true;
@@ -20,7 +25,7 @@ public:
     ~Gemma4Impl();
     static auto validate_config(const YAML::Node& config) -> Result<void>;
     static auto create(const YAML::Node& config) -> Result<Gemma4>;
-    auto set_checkpoint(const Weights& weights, std::int32_t weight_bits = 0, std::int32_t group_size = 128,
+    auto set_checkpoint(const checkpoint::Weights& weights, std::int32_t weight_bits = 0, std::int32_t group_size = 128,
                         bool packed_prefill = false) -> Result<void>;
     auto create_state(std::size_t capacity) -> Result<Gemma4State>;
     auto fork_state(const Gemma4State& source, std::size_t prefix_length, std::size_t capacity) -> Result<Gemma4State>;
@@ -38,7 +43,8 @@ public:
 private:
     struct State;
     struct Attention;
-    auto embed(std::span<const std::int32_t> tokens) -> std::array<tensor::Tensor, 2>;
+    auto embed(std::span<const std::int32_t> tokens, std::span<const Gemma4ImageTokens> images = {},
+               std::size_t position = 0) -> std::array<tensor::Tensor, 2>;
     auto attention_inputs(Gemma4State& state, std::span<Gemma4State*> batch_states, std::size_t step_count)
         -> Attention;
     auto per_layer_input(const tensor::Tensor& per_layer, int layer, std::int64_t length) -> tensor::Tensor;

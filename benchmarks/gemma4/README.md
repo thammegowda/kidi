@@ -1,4 +1,8 @@
-# Gemma 4 E2B: Kidi and LiteRT-LM
+# Gemma 4 E2B Benchmarks
+
+The [GGML/llama.cpp comparison](#ggmlllamacpp-comparison-2026-09-28) below measures
+current CPU and Metal execution. The earlier sections retain the historical
+LiteRT-LM comparisons; their measurements are not substituted for fresh runs.
 
 Current implementation wins, failures, and course corrections are tracked in
 the [optimization journal](JOURNAL.md).
@@ -224,3 +228,126 @@ Repeat with `--backend gpu`, `--runtime litert`, `--runtime litert-mtp`, and
 and a 2048-token context. The pinned LiteRT-LM source checkout is tag `v0.17.1`,
 commit `5e58e9a0aef7abf7091207a8b1d1063a1c800f08`; execution uses its 0.17.1 Python
 distribution and bundled native runtime.
+
+## GGML/llama.cpp Comparison (2026-09-28)
+
+GGML is a credible alternative compute library, but this experiment does not
+justify replacing YNNPACK. At four threads Kidi's deployed mobile model is faster
+on these cases; GGML scales better to all ten CPU cores. This measures complete
+engines, not the isolated cost of their operator libraries. Kidi's GPU backend
+is its own Metal implementation, not YNNPACK.
+
+### Warm Throughput
+
+Apple M5, 4 performance + 6 efficiency CPU cores, 16 GiB unified memory,
+macOS 26.6.2. Battery power throughout (100% to 98%); energy was not measured.
+Batch one, no speculative decoding, two discarded full warmups and five measured
+samples, median tokens/second. Decode is 64 recurrent steps starting at the
+listed prompt depth. All cases ran sequentially after Release builds finished.
+
+| Device | Prompt | Kidi Prefill | GGML Prefill | Kidi Decode | GGML Decode |
+|---|---:|---:|---:|---:|---:|
+| CPU, 4 threads | 128 | 1522.68 | 270.35 | 56.71 | 44.82 |
+| CPU, 4 threads | 1024 | 1618.23 | 226.92 | 51.32 | 41.44 |
+| Metal, 4 host threads | 128 | 2413.42 | 1760.95 | 79.45 | 73.71 |
+| Metal, 4 host threads | 1024 | 3862.28 | 1913.92 | 77.71 | 72.49 |
+
+All ten CPU cores are not automatically better:
+
+| Engine, 10 Threads | Prefill 128 | Prefill 1024 | Decode at 128 | Decode at 1024 |
+|---|---:|---:|---:|---:|
+| Kidi | 1328.43 | 1538.89 | 39.94 | 34.10 |
+| llama.cpp/GGML | 326.96 | 307.40 | 58.14 | 52.57 |
+
+Four threads is the better tested Kidi setting. GGML's ten-thread decode roughly
+matches Kidi's four-thread decode. Increasing GGML prefill batches from 128 to
+512 improved long-prompt Metal prefill from 1629.15 to 1913.92 tokens/s; it did
+not materially improve CPU prefill. Tables use 128-token Kidi chunks and
+512-token GGML logical/micro batches, with `VECLIB_MAXIMUM_THREADS` set to the
+requested thread count. This is a small tuning check, not an exhaustive search.
+
+### Qualifications and Provenance
+
+- **Not precision-matched:** Kidi uses the trained mobile mixed Q2/Q4/Q8
+  checkpoint; GGML uses the public Q4_0 GGUF. Their weights, quantization and
+  activation/cache policies differ. Quality equivalence was not established.
+- Kidi uses repeated educational text checked to tokenize to exactly 128/1024
+  tokens. Upstream `llama-bench` uses random synthetic token IDs and excludes
+  sampling/tokenization. Kidi's decode timer also excludes token selection.
+  Input token IDs and generated continuations are not matched across engines.
+- GGML measures prefill and depth-conditioned decode in separate processes.
+  Its context allocation follows prompt + generation + depth (runtime-rounded),
+  while Kidi uses capacity 2048. GGML uses F16 KV caches and flash attention;
+  Kidi retains its native checkpoint/backend policy. Startup, loading and warmup
+  are excluded from the warm rates. These are not end-to-end chat latency rates.
+- Final Kidi Metal/1024 process coincided with 17,464 global 16-KiB swap-outs
+  (272.88 MiB), including loading and warmup. Other main final cases had no
+  swap-outs but small swap-ins. Do not call these swap-free measurements or
+  infer statistical significance from small GPU decode gaps. Kidi Metal/1024
+  decode ranged 76.26-78.60 tokens/s; GGML ranged 72.35-72.55.
+- The initial Kidi short GPU prefill samples were variable; the final table uses
+  the explicitly named repeat runs with two warmups/five measurements, retaining
+  the initial files. Process RSS is retained in JSON, not treated as a uniform
+  measurement of total GPU/unified-memory consumption.
+- Both GGML CPU and Metal completion checks returned `Paris` for a city-only
+  France-capital question. Verbose logs confirm CPU-only buffers versus 36/36
+  layers offloaded to GPU (some host buffers remain). This is a load/generation
+  sanity check, not a quality corpus or numerical-parity gate.
+- Kidi native source: `2876e6fb489e431cef6731c91cb328b218c9519f`.
+  llama.cpp: `680a036285273a3ff56032ec5d7f3352609eba4f` (GGML 0.25.3), Release,
+  native ARM features including SME, Accelerate BLAS, embedded Metal kernels.
+- Kidi model: `google/gemma-4-E2B-it-qat-mobile-transformers`, revision
+  `dd693ff40353f057ca5f07e945ad867f4afbf2ec`, 2,458,111,846-byte Safetensors.
+  GGUF: `ggml-org/gemma-4-E2B-it-GGUF`, revision
+  `b4243c156154b6dca9324415f8c7ccc098b4aed1`, `gemma-4-E2B-it-Q4_0.gguf`,
+  2,841,481,184 bytes. Neither is a model-quality substitute for the other by
+  virtue of its file size.
+
+Raw outputs, initial runs, tuning runs and the progress journal are generated
+locally under `benchmarks/gemma4/.cache/ggml-comparison/` and ignored by Git.
+Final CPU Kidi files end in `-t4-repeat.json`, GPU Kidi in `-repeat.json`, and
+GGML in `-b512.json`; ten-thread files are explicitly suffixed. No GGML code was
+added to the app or its dependency graph.
+
+### Reproduce GGML Runs
+
+Use the benchmark Python environment described above, with `huggingface_hub`
+installed. Keep the upstream checkout, models and generated outputs ignored:
+
+```sh
+git clone --depth 1 https://github.com/ggml-org/llama.cpp .cache/llama.cpp-bench
+git -C .cache/llama.cpp-bench fetch --depth 1 origin 680a036285273a3ff56032ec5d7f3352609eba4f
+git -C .cache/llama.cpp-bench checkout --detach FETCH_HEAD
+cmake -S .cache/llama.cpp-bench -B .cache/llama.cpp-bench/build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_BLAS=ON \
+  -DGGML_METAL_NDEBUG=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF
+cmake --build .cache/llama.cpp-bench/build --target llama-bench llama-completion -j 6
+.cache/gemma-venv/bin/hf download ggml-org/gemma-4-E2B-it-GGUF \
+  gemma-4-E2B-it-Q4_0.gguf .src_sha \
+  --revision b4243c156154b6dca9324415f8c7ccc098b4aed1 \
+  --local-dir benchmarks/gemma4/.cache/ggml-comparison/model
+```
+
+For a newer-model experiment, resolve `main` and record its SHA instead of
+silently labelling new weights as this historical run. Reuse an existing checkout
+only after checking its revision and local changes.
+
+```sh
+for backend in cpu gpu; do
+  for prefill in 128 1024; do
+    VECLIB_MAXIMUM_THREADS=4 .cache/gemma-venv/bin/python benchmarks/gemma4/run.py \
+      --runtime llama --backend "$backend" \
+      --gguf benchmarks/gemma4/.cache/ggml-comparison/model/gemma-4-E2B-it-Q4_0.gguf \
+      --prefill "$prefill" --decode 64 --threads 4 --chunk 512 --warmups 2 --runs 5 \
+      --output "benchmarks/gemma4/.cache/ggml-comparison/llama-$backend-$prefill-b512.json"
+  done
+done
+```
+
+For Kidi, build `kidi_cli` in Release and use the same runner with `--runtime kidi`,
+`--model ../models/gemma-4-E2B-it-qat-mobile-transformers`, `--chunk 128`,
+`--context 2048`, and distinct output filenames. To test ten CPU threads, change
+both `--threads` and `VECLIB_MAXIMUM_THREADS` to 10. Do not run cases concurrently.
+The runner validates phase/depth/sample counts and preserves raw upstream results,
+commands, binary hash, memory snapshots and precision labels. GGUF-only runs do
+not require a Safetensors model directory; synthetic runs record no text prompt.

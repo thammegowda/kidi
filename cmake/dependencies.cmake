@@ -121,3 +121,21 @@ if(UNIX)
     target_compile_definitions(kidi_zlib PRIVATE HAVE_UNISTD_H)
 endif()
 add_library(ZLIB::ZLIB ALIAS kidi_zlib)
+
+kidi_require_submodule("tahoma-vision" "tahoma-vision/CMakeLists.txt")
+set(TAHOMA_VISION_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(TAHOMA_VISION_INSTALL OFF CACHE BOOL "" FORCE)
+set(TAHOMA_VISION_PDF OFF CACHE BOOL "" FORCE)
+set(TAHOMA_VISION_SVG OFF CACHE BOOL "" FORCE)
+set(PIGZPP_BUILD_CLI OFF CACHE BOOL "" FORCE)
+set(PIGZPP_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+set(PIGZPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(PIGZPP_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(PIGZPP_INSTALL OFF CACHE BOOL "" FORCE)
+set(CMAKE_PROJECT_TahomaVision_INCLUDE "${CMAKE_CURRENT_LIST_DIR}/tahoma_vision.cmake")
+add_subdirectory(
+    "${KIDI_THIRD_PARTY_DIR}/tahoma-vision"
+    "${PROJECT_BINARY_DIR}/third_party/tahoma-vision"
+    EXCLUDE_FROM_ALL
+)
+unset(CMAKE_PROJECT_TahomaVision_INCLUDE)

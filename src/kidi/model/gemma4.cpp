@@ -243,7 +243,7 @@ auto Gemma4Impl::create(const YAML::Node& config) -> Result<Gemma4> {
         return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
     }
 }
-auto Gemma4Impl::set_checkpoint(const Weights& weights, std::int32_t weight_bits, std::int32_t group_size,
+auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t weight_bits, std::int32_t group_size,
                                 bool packed_prefill) -> Result<void> {
     try {
         if ((weight_bits != 0 && weight_bits != 4 && weight_bits != 8) || group_size <= 0)
@@ -299,8 +299,12 @@ auto Gemma4Impl::set_checkpoint(const Weights& weights, std::int32_t weight_bits
                                                 name.ends_with("output_activation_scale") ||
                                                 name.ends_with("k_cache_scale") || name.ends_with("v_cache_scale");
                 if (impl_->qat && quantization_scale) {
+                    const bool activation_scale =
+                        name.ends_with("input_activation_scale") || name.ends_with("output_activation_scale");
                     const auto scales = require(value.data<float>());
-                    if (std::ranges::any_of(scales, [](float scale) { return !std::isfinite(scale) || scale <= 0; }))
+                    if (std::ranges::any_of(scales, [&](float scale) {
+                            return !std::isfinite(scale) || scale < 0 || (!activation_scale && scale == 0);
+                        }))
                         throw ops::Failure(
                             {ErrorCode::INVALID_ARGUMENT, "invalid trained quantization scale: " + name});
                 }
@@ -422,6 +426,7 @@ auto Gemma4Impl::fork_state(const Gemma4State& source, std::size_t prefix_length
             impl_->context.synchronize();
         }
         result.position = prefix_length;
+        result.images = source.images;
         result.crop_local_attention = source.crop_local_attention;
         return result;
     } catch (const ops::Failure& error) {
@@ -481,11 +486,33 @@ struct Gemma4Impl::Attention {
     std::array<std::array<Tensor, 2>, 2> angles;
 };
 
-auto Gemma4Impl::embed(std::span<const std::int32_t> tokens) -> std::array<Tensor, 2> {
+auto Gemma4Impl::embed(std::span<const std::int32_t> tokens, std::span<const Gemma4ImageTokens> images,
+                       std::size_t position) -> std::array<Tensor, 2> {
     auto& context = impl_->context;
     const auto length = static_cast<std::int64_t>(tokens.size());
+    std::vector<std::int32_t> text_tokens;
+    if (!images.empty()) {
+        text_tokens.assign(tokens.begin(), tokens.end());
+        for (const auto& image : images) {
+            if (!image.embeddings.defined() || image.embeddings.dimensions() != 3 || image.embeddings.size(0) != 1 ||
+                image.embeddings.size(2) != impl_->hidden || image.embeddings.dtype() != DType::F32 ||
+                image.embeddings.device() != device())
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid image token embeddings"});
+            const auto start = std::max(position, image.position);
+            const auto end = std::min(position + tokens.size(), image.position + image.embeddings.size(1));
+            for (auto index = start; index < end; ++index) text_tokens[index - position] = 0;
+        }
+        tokens = text_tokens;
+    }
     auto hidden = impl_->tokens->forward(context, tokens);
     auto token_inputs = impl_->per_layer_tokens->forward(context, tokens);
+    for (const auto& image : images) {
+        const auto start = std::max(position, image.position);
+        const auto end = std::min(position + tokens.size(), image.position + image.embeddings.size(1));
+        if (start < end)
+            context.copy_slice_(hidden, context.slice(image.embeddings, 1, start - image.position, end - start), 1,
+                                start - position);
+    }
     auto projection = context.multiply(impl_->per_layer_projection->forward(context, hidden), impl_->projection_scale);
     projection = context.reshape(projection, {1, length, impl_->layer_count, impl_->per_layer_width});
     auto per_layer = context.multiply(
@@ -567,7 +594,7 @@ auto Gemma4Impl::prefill_impl(std::span<const std::int32_t> tokens, Gemma4State&
         }
         context.profile_phase(state.prefilling ? "prefill_embedding" : "decode_embedding");
         const auto length = static_cast<std::int64_t>(tokens.size());
-        auto [hidden, per_layer] = embed(tokens);
+        auto [hidden, per_layer] = embed(tokens, state.images, state.position);
         auto attention = attention_inputs(state, {}, tokens.size());
         context.profile_phase(state.prefilling ? "prefill_body" : "decode_body");
         std::array<layers::Gemma4AttentionSegment, 1> segments;
@@ -612,7 +639,10 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
         }
         context.profile_phase(state.prefilling ? "prefill_embedding" : "decode_embedding");
         const auto length = static_cast<std::int64_t>(token_count);
-        auto [hidden, per_layer] = embed(tokens);
+        auto [hidden, per_layer] = embed(tokens,
+                                         batch_states.empty() ? std::span<const Gemma4ImageTokens>(state.images)
+                                                              : std::span<const Gemma4ImageTokens>{},
+                                         state.position);
         auto attention = attention_inputs(state, batch_states, step_count);
         context.profile_phase(state.prefilling ? "prefill_body" : "decode_body");
         const auto requests = batch_states.empty() ? 1 : batch_states.size();

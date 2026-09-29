@@ -120,6 +120,8 @@ auto Tokenizer::format_chat(std::span<const ChatMessage> messages) const -> Resu
     conversation.reserve(messages.size());
     for (std::size_t index = 0; index < messages.size(); ++index) {
         const auto& message = messages[index];
+        if (!message.images.empty())
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "image messages require multimodal generation"});
         const bool instruction = message.role == "system" || message.role == "developer";
         if ((instruction && index != 0) || (!instruction && message.role != "user" && message.role != "assistant"))
             return std::unexpected(

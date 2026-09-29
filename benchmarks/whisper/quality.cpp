@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "kidi/audio/whisper.h"
-#include "kidi/model/config.h"
+#include "kidi/checkpoint/config.h"
 #include "kidi/model/whisper.h"
 
 namespace {
@@ -57,14 +57,14 @@ auto main(int argc, char** argv) -> int {
     }
     try {
         const std::filesystem::path directory(argv[1]), reference(argv[3]);
-        auto config = require(kidi::model::load_whisper_config(directory));
+        auto config = require(kidi::checkpoint::load_config(directory, kidi::model::WhisperImpl::checkpoint_config()));
         auto extractor =
             require(kidi::audio::WhisperFeatureExtractor::load(config["preprocessor_config_file"].as<std::string>()));
         auto waveform = require(kidi::audio::load_wav(argv[2]));
         auto features = require(extractor.extract(waveform.samples, waveform.sample_rate));
         compare("features", features.values, read_f32(reference / "features.f32"));
 
-        auto weights = require(kidi::model::Weights::load(config["model_file"].as<std::string>()));
+        auto weights = require(kidi::checkpoint::Weights::load(config["model_file"].as<std::string>()));
         const kidi::ModuleScope construction(kidi::tensor::DType::F32, false, kidi::tensor::Device::cpu());
         auto model = require(kidi::model::WhisperImpl::create(config["model"]));
         require(model->set_checkpoint(weights));
@@ -82,6 +82,13 @@ auto main(int argc, char** argv) -> int {
         const auto actual_logits = require(logits.data<float>());
         const auto expected_logits = read_f32(reference / "logits.f32");
         compare("logits", actual_logits, expected_logits);
+        auto prefixed_state = require(model->create_state(32));
+        const std::array<std::int32_t, 3> prefix{50258, 50259, 50359};
+        require(model->prefill(source, prefix, prefixed_state));
+        const std::int32_t final_prefix = 50363;
+        const auto prefixed_logits = require(model->forward(source, std::span(&final_prefix, 1), prefixed_state));
+        if (!std::ranges::equal(actual_logits, require(prefixed_logits.data<float>())))
+            throw std::runtime_error("Whisper prefix-only decoding changed logits");
         if (std::ranges::max_element(actual_logits) - actual_logits.begin() !=
             std::ranges::max_element(expected_logits) - expected_logits.begin())
             throw std::runtime_error("Whisper top logit differs from reference");

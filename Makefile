@@ -11,7 +11,7 @@ TEST_DIST := .cache/test-dist
 
 export KIDI_HUB PYTHON
 
-.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test regression-test test wasm serve
+.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test regression-test test wasm serve apk apk-release
 
 setup-test:
 	bash tests/setup.sh
@@ -53,3 +53,9 @@ wasm:
 
 serve:
 	$(PYTHON) -m http.server "$(PORT)" --bind 127.0.0.1 --directory "$(WEB_DIR)"
+
+apk:
+	bash scripts/build-apk.sh
+
+apk-release:
+	bash scripts/build-apk.sh --release

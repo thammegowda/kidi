@@ -8,7 +8,7 @@
 #include <iostream>
 #include <string>
 
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
 
 namespace {
 
@@ -73,9 +73,9 @@ auto main() -> int {
     try {
         const auto path = std::filesystem::temp_directory_path() / "kidi-attention-test.safetensors";
         write_weights(path);
-        const std::array mappings{model::StateMappingSpec{{R"(attn\.qkv\.(weight|bias))"}, "qkv.$1"},
-                                  model::StateMappingSpec{{R"(attn\.out\.(weight|bias))"}, "attention.output.$1"}};
-        auto weights = ops::require(model::Weights::load(path, mappings));
+        const std::array mappings{checkpoint::StateMappingSpec{{R"(attn\.qkv\.(weight|bias))"}, "qkv.$1"},
+                                  checkpoint::StateMappingSpec{{R"(attn\.out\.(weight|bias))"}, "attention.output.$1"}};
+        auto weights = ops::require(checkpoint::Weights::load(path, mappings));
         const ModuleScope construction(tensor::DType::F32, false);
         layers::Linear qkv(4, 12);
         layers::Attention attention(layers::Shape{4, 8, 2, 1e-5F});

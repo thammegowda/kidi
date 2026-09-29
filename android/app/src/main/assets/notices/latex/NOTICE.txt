@@ -1,0 +1,16 @@
+Kidi Android math rendering
+
+Markwon core, inline-parser and ext-latex 4.6.2
+https://github.com/noties/Markwon/tree/v4.6.2
+License: Apache-2.0; see MARKWON-LICENSE.txt.
+
+JLaTeXMath Android 0.2.0 (unmodified dependency)
+https://github.com/noties/jlatexmath-android/tree/v0.2.0
+Source revision: cc2a83dcf695028b5588f91a90734d94eb5bd02b
+License: GPL version 2 or later with the upstream independent-module linking
+exception. See JLATEXMATH-LICENSE.txt and JLATEXMATH-COPYING.txt for full terms.
+The exception does not remove the library's own license/source obligations.
+
+Fonts and their notices are supplied by the dependency under
+assets/org/scilab/forge/jlatexmath/fonts/licences/.
+The optional Greek/Cyrillic font modules are not added by Kidi.

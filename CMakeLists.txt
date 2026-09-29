@@ -46,8 +46,14 @@ target_compile_features(kidi_argparse PUBLIC cxx_std_23)
 
 add_library(kidi
     src/kidi/audio/whisper.cpp
+    src/kidi/checkpoint/config.cpp
+    src/kidi/checkpoint/ggml/reader.cpp
+    src/kidi/checkpoint/package.cpp
+    src/kidi/checkpoint/prepare.cpp
+    src/kidi/checkpoint/weights.cpp
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
+    src/kidi/image/gemma4.cpp
     src/kidi/inference/decoder.cpp
     src/kidi/inference/generator.cpp
     src/kidi/inference/transcriber.cpp
@@ -56,12 +62,10 @@ add_library(kidi
     src/kidi/layers/gemma4.cpp
     src/kidi/layers/transformer.cpp
     src/kidi/layers/whisper.cpp
-    src/kidi/model/config.cpp
     src/kidi/model/gemma4.cpp
-    src/kidi/model/package.cpp
+    src/kidi/model/gemma4_vision.cpp
     src/kidi/model/transformer.cpp
     src/kidi/model/whisper.cpp
-    src/kidi/model/weights.cpp
     src/kidi/ops/context.cpp
     src/kidi/ops/quantization.cpp
     src/kidi/runtime/operator.cpp
@@ -108,6 +112,14 @@ if(KIDI_BUILD_BENCHMARKS)
     target_link_libraries(kidi_gemma4_quality PRIVATE kidi::kidi)
     add_executable(kidi_whisper_quality benchmarks/whisper/quality.cpp)
     target_link_libraries(kidi_whisper_quality PRIVATE kidi::kidi)
+    if(UNIX)
+        add_executable(kidi_android_baseline benchmarks/android/baseline.cpp)
+        target_link_libraries(kidi_android_baseline PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
+    endif()
+    if(ANDROID)
+        add_executable(kidi_vulkan_probe benchmarks/android/vulkan_probe.cpp)
+        target_link_libraries(kidi_vulkan_probe PRIVATE vulkan nlohmann_json::nlohmann_json)
+    endif()
 endif()
 
 target_include_directories(kidi
@@ -124,6 +136,7 @@ target_link_libraries(kidi
         yaml-cpp::yaml-cpp
     PRIVATE
         tokenizerpp
+        TahomaVision::Vision
         ZLIB::ZLIB
         ${CMAKE_DL_LIBS}
 )
@@ -201,6 +214,8 @@ if(KIDI_BUILD_PYTHON)
         COMMAND_ERROR_IS_FATAL ANY
     )
     install(FILES "${KIDI_NANOBIND_LICENSE}" DESTINATION kidi/licenses/nanobind COMPONENT python)
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/checkpoint/ggml/LICENSE"
+        DESTINATION kidi/licenses/ggml RENAME LICENSE COMPONENT python)
 endif()
 
 include(CTest)

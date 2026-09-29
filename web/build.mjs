@@ -39,6 +39,7 @@ await copyFile(join(libraries, 'coi-serviceworker/coi-serviceworker.js'),
     join(destination, 'coi-serviceworker.js'));
 await copyFile(join(libraries, 'coi-serviceworker/LICENSE'),
     join(destination, 'coi-serviceworker.LICENSE.txt'));
+await copyFile(join(root, 'src/kidi/checkpoint/ggml/LICENSE'), join(destination, 'ggml.LICENSE.txt'));
 await writeFile(join(destination, '.nojekyll'), '');
 await mkdir(join(destination, 'icons'), {recursive: true});
 await copyFile(join(libraries, 'lucide-static/LICENSE'), join(destination, 'icons/LICENSE.txt'));

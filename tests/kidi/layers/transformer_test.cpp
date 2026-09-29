@@ -10,7 +10,7 @@
 #include <string>
 #include <thread>
 
-#include "kidi/model/weights.h"
+#include "kidi/checkpoint/weights.h"
 #include "kidi/tensor/tensor.h"
 
 namespace {
@@ -93,10 +93,11 @@ auto main() -> int {
             std::thread worker([&] {
                 isolated = module_dtype == tensor::DType::F32 && allocate_parameters && module_device == default_device;
                 const ModuleScope local(tensor::DType::I8, true, tensor::Device::cpu());
-                layers::LinearImpl child(4, 3);
+                layers::LinearImpl child(4, 3, true);
                 const auto state = child.state_dict();
-                isolated = isolated && state.at("weight").dtype() == tensor::DType::I8 && state.at("scale").defined() &&
-                           child.device() == tensor::Device::cpu();
+                isolated = isolated && state.at("weight").dtype() == tensor::DType::I8 &&
+                           state.at("weight").size(0) == 3 && state.at("weight").size(1) == 4 &&
+                           state.at("scale").defined() && child.device() == tensor::Device::cpu();
             });
             worker.join();
             if (!isolated || module_dtype != tensor::DType::BF16 || allocate_parameters ||
@@ -104,7 +105,7 @@ auto main() -> int {
                 return 1;
             bool rejected = false;
             try {
-                const ModuleScope failure(tensor::DType::I8, true, tensor::Device::cpu());
+                const ModuleScope failure(tensor::DType::F16, true, tensor::Device::cpu());
                 layers::LinearImpl invalid(4, 3, true);
             } catch (const ops::Failure&) {
                 rejected = true;
@@ -160,7 +161,7 @@ auto main() -> int {
         if (!unbound_rejected) return 1;
         const auto path = std::filesystem::temp_directory_path() / "kidi-transformer-builder-test.safetensors";
         write_weights(path);
-        auto weights = ops::require(model::Weights::load(path));
+        auto weights = ops::require(checkpoint::Weights::load(path));
         ModuleList<DeferredParameter> deferred;
         deferred->push_back(ModuleHolder<DeferredParameter>(false));
         deferred->push_back(ModuleHolder<DeferredParameter>(false));
@@ -194,9 +195,9 @@ auto main() -> int {
         modules->insert("projections", projections);
         modules->insert("norm", norm);
         if (projections->at(0).get() != first.get() || modules->at("norm").get() != norm.get()) return 1;
-        const std::array mappings{model::StateMappingSpec{{R"(ff\.w_1\.(weight|bias))"}, "projections.0.$1"},
-                                  model::StateMappingSpec{{R"(ff\.w_2\.(weight|bias))"}, "projections.1.$1"}};
-        auto mapped = ops::require(model::Weights::load(path, mappings));
+        const std::array mappings{checkpoint::StateMappingSpec{{R"(ff\.w_1\.(weight|bias))"}, "projections.0.$1"},
+                                  checkpoint::StateMappingSpec{{R"(ff\.w_2\.(weight|bias))"}, "projections.1.$1"}};
+        auto mapped = ops::require(checkpoint::Weights::load(path, mappings));
         ops::require(modules->set_state(mapped));
         const auto snapshot = modules->state_dict();
         if (snapshot.size() != 6 || !snapshot.contains("projections.0.weight") || !snapshot.contains("norm.bias"))

@@ -33,8 +33,6 @@ LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool t
         return;
     }
     check_precision(module_dtype);
-    if (module_dtype == tensor::DType::I8 && transpose)
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "INT8 linear requires input-output weight layout"});
     register_parameter("weight", weight_,
                        transpose ? std::vector<std::int64_t>{output_size, input_size}
                                  : std::vector<std::int64_t>{input_size, output_size});
@@ -54,7 +52,8 @@ auto LinearImpl::forward(ops::Context& context, const Tensor& input) const -> Te
         return context.packed_linear(input, weight_, scale_, packed_bits_, input_size_,
                                      require(input_scale_.data<float>())[0], require(output_scale_.data<float>())[0]);
     }
-    if (weight_.dtype() == tensor::DType::I8) return context.quantized_linear(input, weight_, scale_, bias_);
+    if (weight_.dtype() == tensor::DType::I8)
+        return context.quantized_linear(input, weight_, scale_, bias_, transpose_);
     return context.linear(input, weight_, bias_, transpose_);
 }
 LayerNormImpl::LayerNormImpl(std::int32_t hidden_size, float epsilon) : epsilon_(epsilon) {

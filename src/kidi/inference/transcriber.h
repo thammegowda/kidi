@@ -1,8 +1,10 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <string>
+#include <string_view>
 
 #include <yaml-cpp/yaml.h>
 
@@ -16,6 +18,7 @@ struct TranscriptionOptions {
     std::string language = "auto";
     std::string task = "transcribe";
     std::size_t maximum_tokens = 128;
+    std::function<void(std::string_view, std::string_view)> on_partial;
 };
 
 struct TranscriptionStats {
