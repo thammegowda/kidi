@@ -162,22 +162,33 @@ bindings are disabled in the embedded dependency build.
 
 ### Speech Dictation
 
-The default speech model is **Whisper Small INT8**, from `openai/whisper-small`. Existing user-selected Tiny/Base models
-are not automatically replaced. Runtime settings can independently download `openai/whisper-tiny`, `openai/whisper-base`, or
-`openai/whisper-small`. The app pins and verifies the untouched Hugging Face config, Safetensors, tokenizer,
-preprocessor config, and generation config. Chat and speech model downloads have separate progress, cancellation,
-restore, and removal controls.
+The default speech model is **Whisper Small INT8**. Selecting `openai/whisper-small`
+downloads `ggml-small-q8_0.bin` from `ggerganov/whisper.cpp`, plus the original
+config, tokenizer, preprocessor and generation JSON from `openai/whisper-small`.
+No FP32 weight file is downloaded. Both repositories resolve `main` to immutable
+revisions, and both revisions are retained in the installation identity. The
+Q8 file is verified and stored locally as `ggml-model.bin`.
 
-Small's first load builds a separate `kidi-int8-v2` cache in the C++ core. The compact checkpoint is about 249 MB;
-the roughly 967 MB upstream checkpoint is retained unchanged. Subsequent loads reuse the cache. Removing the model
-also removes its cache. Allow roughly 1.3 GB for download and conversion. The input convolution, normalization,
+The download is about **267 MB** including metadata. First load imports the
+GGML weights into a separate `ggml-model.bin.kidi-int8-v1` native cache of about
+249 MB. Source and cache are retained, totaling about 519 MB; allow **600 MB**
+free for installation. Subsequent loads reuse the cache, and removing the model
+removes that installation and its cache. The input convolution, normalization,
 positions, biases, and scales remain FP32; other weights, including the tied embedding/output table, are INT8.
-YNNPACK dynamically quantizes projection inputs and executes integer math on CPU. Tiny and Base retain FP32 loading.
-This is not merely INT8 storage expanded to FP16.
+YNNPACK dynamically quantizes projection inputs and executes integer math on CPU.
+This is not merely INT8 storage expanded to FP16. GGML block scales are repacked
+to the native per-output-channel layout; numerical quality is not guaranteed to
+be identical to the original checkpoint.
 
-Small INT8 matched Small FP32 quality on a 40-clip/776-word English clean-speech confirmation sample (2.32% versus
+Already-installed FP32 Small and its `kidi-int8-v2` cache remain loadable and are
+not deleted or redownloaded automatically. Remove that speech model and download
+Small again to switch formats. Existing Tiny/Base selections are unchanged and
+continue to use their original Safetensors files. Chat and speech downloads have
+separate progress, cancellation, restore and removal controls.
+
+The earlier FP32-to-INT8 Small path matched Small FP32 quality on a 40-clip/776-word English clean-speech confirmation sample (2.32% versus
 2.45% word error rate; Tiny 9.79%). This small sample does not establish multilingual, noisy-speech, or accent coverage.
-Small is slower than Tiny: four-thread phone runs averaged roughly 2.75 seconds per complete segment versus 0.82 seconds
+Those measurements do not certify GGML Q8 re-quantization. Small is slower than Tiny: earlier four-thread phone runs averaged roughly 2.75 seconds per complete segment versus 0.82 seconds
 for Tiny. Live dictation still replaces drafts with one inference in flight; draft latency is model-dependent.
 
 All Android inference uses CPU; no vendor accelerator SDK, calibration audio, or device graph caches are needed.
@@ -190,7 +201,9 @@ editable during model loading, and sending is enabled once chat is ready even wh
 remain serialized.
 
 The microphone button requests `RECORD_AUDIO` permission when first used. Recording captures mono PCM at 16 kHz for at
-most 30 seconds. Tap the stop control to finish earlier. Kidi automatically detects the language and runs one native
+most 30 seconds. During recording, the bottom-right send button becomes a red stop control; tap it to finish earlier.
+It returns to Send after transcript refinement, while generation uses the same button to stop the response.
+Kidi automatically detects the language and runs one native
 Whisper prefix transcription at a time on the shared runtime thread. Partial text is published during token decoding and
 replaces the dictation suffix in the composer while recording. The final pass after Stop also publishes partial text,
 then replaces it with the completed transcript. A draft failure is shown as an error rather than silently hiding updates;
@@ -218,10 +231,15 @@ settings, which separates model management from inference controls. Repository d
 expandable, and downloads are distinguished from native model preparation.
 
 Replies render Markdown, with selectable text and Android's contextual Copy action instead of permanent copy icons.
+During generation, reply text and token counters are batched at 100 ms intervals, with an immediate flush on completion,
+stop or failure. Inference does not wait for the UI interval. Closed LaTeX equations render while the response streams;
+unfinished equations remain text. Existing math drawables are retained as later text arrives, avoiding repeated
+placeholder/layout changes. Theme and text-size changes rebuild the renderer and its drawables.
 During generation, a fixed status strip shows the current phase, elapsed time, generated tokens, and live decode tok/s.
 It does not imply a completion percentage or use the small bouncing response bar. Live decode speed excludes image
 analysis and prompt prefill; elapsed time includes them. Final per-message metrics remain available after completion.
 Remote images are not loaded. Recording status stays above the composer so live transcript text remains readable.
+The microphone has a larger glyph and a 48 dp touch target; model names and device-status text are not repeated beside it.
 The composer respects keyboard insets, and conversation width is constrained on larger displays.
 
 The chat footer and the bottom of settings show an experimental-AI notice with

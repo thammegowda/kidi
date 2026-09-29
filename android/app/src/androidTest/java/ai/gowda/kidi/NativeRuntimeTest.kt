@@ -1,17 +1,96 @@
 package ai.gowda.kidi
 
+import android.content.ContextWrapper
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.UUID
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 class NativeRuntimeTest {
+    @Test
+    fun restoresLegacyAndQuantizedSpeechLayouts() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val directory = File(context.cacheDir, "speech-layout-${UUID.randomUUID()}").apply { mkdirs() }
+        val scopedContext = object : ContextWrapper(context) {
+            override fun getExternalFilesDir(type: String?): File = directory
+        }
+        val repository = ModelRepository(scopedContext)
+        val root = File(directory, "models").apply { mkdirs() }
+        val revision = "a".repeat(40)
+        val weightsRevision = "b".repeat(40)
+        fun fixture(name: String, weights: String): File = File(root, "openai-whisper-small/$name").apply {
+            mkdirs()
+            listOf(weights, "config.json", "tokenizer.json", "preprocessor_config.json", "generation_config.json")
+                .forEach { File(this, it).writeText("fixture") }
+            File(this, "ready.json").writeText(JSONObject().put("revision", revision).toString())
+        }
+        try {
+            val legacy = fixture(revision, "model.safetensors")
+            val current = JSONObject().put("model_id", "openai/whisper-small").put("revision", revision)
+            File(root, "speech-current.json").writeText(current.toString())
+            assertEquals(legacy, repository.installedSpeech()?.directory)
+            val quantized = fixture("$revision-ggml-$weightsRevision", "ggml-model.bin")
+            current.put("weights_revision", weightsRevision)
+            File(root, "speech-current.json").writeText(current.toString())
+            assertEquals(quantized, repository.installedSpeech()?.directory)
+            File(quantized, "ggml-model.bin").delete()
+            assertNull(repository.installedSpeech())
+            File(quantized, "ggml-model.bin").writeText("fixture")
+            repository.removeInstalledSpeech()
+            assertFalse(quantized.exists())
+            assertTrue(File(legacy, "model.safetensors").isFile)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun downloadsAndLoadsQuantizedSmall() = runBlocking {
+        assumeTrue("Optional real network download", InstrumentationRegistry.getArguments()
+            .getString("downloadWhisperSmall") == "true")
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val directory = File(context.cacheDir, "speech-download-${UUID.randomUUID()}").apply { mkdirs() }
+        val scopedContext = object : ContextWrapper(context) {
+            override fun getExternalFilesDir(type: String?): File = directory
+        }
+        try {
+            val repository = ModelRepository(scopedContext)
+            var downloadedBytes = 0L
+            val installed = repository.prepareSpeech("openai/whisper-small") { update ->
+                downloadedBytes = update.totalBytes
+                assertFalse("FP32 checkpoint must not be downloaded", update.file.contains("model.safetensors"))
+            }
+            assertTrue("Expected compact Small Q8 download, got $downloadedBytes", downloadedBytes in 265_000_000L..275_000_000L)
+            assertFalse(File(installed.directory, "model.safetensors").exists())
+            assertTrue(File(installed.directory, "ggml-model.bin").length() in 260_000_000L..270_000_000L)
+            val restored = ModelRepository(scopedContext).installedSpeech()
+            assertEquals(installed.directory, restored?.directory)
+            assertTrue(JSONObject(NativeRuntime.configure(4)).getBoolean("configured"))
+            val loaded = JSONObject(NativeRuntime.loadAsr(installed.directory.absolutePath, true))
+            assertTrue(loaded.toString(), loaded.optBoolean("ready"))
+            assertEquals("int8", loaded.getString("precision"))
+            assertTrue(loaded.getLong("model_bytes") in 240_000_000L..260_000_000L)
+            val cache = File(installed.directory, "ggml-model.bin.kidi-int8-v1/model.safetensors")
+            assertTrue(cache.isFile)
+            val timestamp = cache.lastModified()
+            NativeRuntime.unloadAsr()
+            assertTrue(JSONObject(NativeRuntime.loadAsr(installed.directory.absolutePath, true)).getBoolean("ready"))
+            assertEquals(timestamp, cache.lastModified())
+        } finally {
+            NativeRuntime.unloadAsr()
+            directory.deleteRecursively()
+        }
+    }
+
     @Test
     fun configuresAndroidCpuRuntime() {
         val result = JSONObject(NativeRuntime.configure(1))
@@ -54,7 +133,9 @@ class NativeRuntimeTest {
             assertEquals("int8", loaded.getString("precision"))
             assertEquals("android-cpu", loaded.getString("backend"))
             assertTrue(loaded.getLong("model_bytes") in 240_000_000L..260_000_000L)
-            val cache = File(modelDirectory, "kidi-int8-v2/model.safetensors")
+            val cacheName = if (File(modelDirectory, "ggml-model.bin").isFile)
+                "ggml-model.bin.kidi-int8-v1" else "kidi-int8-v2"
+            val cache = File(modelDirectory, "$cacheName/model.safetensors")
             val timestamp = cache.lastModified()
             val draft = JSONObject(NativeRuntime.transcribe(samples.copyOfRange(0, 32000), "auto", 128))
             assertEquals("the capital of France's Paris.", draft.getString("text").trim())

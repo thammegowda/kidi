@@ -20,6 +20,8 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextReplacement
 import androidx.test.espresso.Espresso.onView
+import androidx.test.espresso.UiController
+import androidx.test.espresso.ViewAction
 import androidx.test.espresso.action.ViewActions.longClick
 import androidx.test.espresso.matcher.ViewMatchers.withText
 import androidx.test.espresso.assertion.ViewAssertions.matches
@@ -30,13 +32,134 @@ import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
 import org.junit.Rule
 import org.junit.Test
 import org.hamcrest.Matchers.containsString
+import org.hamcrest.Matcher
+import androidx.test.espresso.matcher.ViewMatchers.isAssignableFrom
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
+import android.view.View
+import android.widget.TextView
+import android.text.Spanned
+import io.noties.markwon.ext.latex.JLatexAsyncDrawableSpan
+import org.junit.Assert.assertTrue
 
 class ChatUiTest {
     @get:Rule val compose = createComposeRule()
+
+    @Test
+    fun streamingMathKeepsCompletedEquationsStable() {
+        val state = mutableStateOf(KidiUiState(modelReady = true, generating = true))
+        compose.setContent {
+            KidiTheme {
+                ChatWorkspace(state = state.value, snackbar = SnackbarHostState(), onNewChat = {}, onSettings = {},
+                    onTextChange = {}, onSend = {}, onStop = {}, onRecord = {}, onStopRecording = {})
+            }
+        }
+        fun reply(): TextView {
+            var textView: TextView? = null
+            onView(withText(containsString("Math response"))).perform(object : ViewAction {
+                override fun getConstraints(): Matcher<View> = isAssignableFrom(TextView::class.java)
+                override fun getDescription(): String = "Capture the streamed math reply"
+                override fun perform(uiController: UiController, view: View) { textView = view as TextView }
+            })
+            return requireNotNull(textView)
+        }
+        fun spans(view: TextView) = (view.text as Spanned)
+            .getSpans(0, view.text.length, JLatexAsyncDrawableSpan::class.java)
+        fun awaitRendering(view: TextView, count: Int) {
+            compose.waitUntil(5000) {
+                var rendered = false
+                compose.runOnIdle { rendered = spans(view).size == count && spans(view).all { it.getDrawable().hasResult() } }
+                rendered
+            }
+        }
+        val inline = "Math response **bold** \$x^2\$ and \$x^2\$"
+        val block = "$inline\n\n\$\$\n\\frac{1}{2}\n\$\$"
+        for (stopped in listOf(false, true)) {
+            compose.runOnIdle {
+                state.value = state.value.copy(generating = true, messages = emptyList(), draft = inline)
+            }
+            val streamingView = reply()
+            awaitRendering(streamingView, 2)
+            val inlineSpans = spans(streamingView)
+            assertNotSame(inlineSpans[0], inlineSpans[1])
+            for (draft in listOf("$inline\n\n\$\$\n\\frac{1}{", "$inline\n\n\$\$\n\\frac{1}{2}")) {
+                compose.runOnIdle { state.value = state.value.copy(draft = draft) }
+                compose.runOnIdle {
+                    assertEquals(2, spans(streamingView).size)
+                    inlineSpans.zip(spans(streamingView)).forEach { (before, after) -> assertSame(before, after) }
+                    assertTrue(streamingView.text.contains("Math response bold"))
+                    assertTrue(streamingView.text.contains("\$\$"))
+                }
+            }
+            compose.runOnIdle { state.value = state.value.copy(draft = block) }
+            awaitRendering(streamingView, 3)
+            val completedSpans = spans(streamingView)
+            val bounds = completedSpans.map { android.graphics.Rect(it.getDrawable().bounds) }
+            for (suffix in listOf("\n\nMore", " text", " while generating.", " Incomplete \\(\\frac{1}{")) {
+                compose.runOnIdle { state.value = state.value.copy(draft = state.value.draft + suffix) }
+                compose.runOnIdle {
+                    assertEquals(3, spans(streamingView).size)
+                    completedSpans.zip(spans(streamingView)).forEach { (before, after) -> assertSame(before, after) }
+                    assertEquals(bounds, spans(streamingView).map { it.getDrawable().bounds })
+                }
+            }
+            compose.runOnIdle {
+                val message = ChatMessage(MessageRole.ASSISTANT, state.value.draft)
+                state.value = state.value.copy(generating = false, draft = "",
+                    messages = listOf(if (stopped) message.copy(status = MessageStatus.STOPPED) else message))
+            }
+            awaitRendering(reply(), 3)
+        }
+    }
+
+    @Test
+    fun mathRendersOfflineInLightAndDarkThemes() {
+        val dark = mutableStateOf(false)
+        val source = mutableStateOf("Inline \$x^2\$.\n\n\$\$\n\\frac{1}{2}\n\$\$")
+        var textView: TextView? = null
+        compose.setContent {
+            MaterialTheme(colorScheme = if (dark.value) darkColorScheme() else lightColorScheme()) {
+                MarkdownReply(source.value, Modifier.padding(16.dp))
+            }
+        }
+        onView(isAssignableFrom(TextView::class.java)).perform(object : ViewAction {
+            override fun getConstraints(): Matcher<View> = isAssignableFrom(TextView::class.java)
+            override fun getDescription(): String = "Capture the math-rendering TextView"
+            override fun perform(uiController: UiController, view: View) { textView = view as TextView }
+        })
+        fun spans() = (textView!!.text as Spanned).getSpans(0, textView!!.text.length, JLatexAsyncDrawableSpan::class.java)
+        fun awaitRendering() {
+            compose.waitUntil(5000) {
+                var ready = false
+                compose.runOnIdle { ready = spans().size == 2 && spans().all { it.getDrawable().hasResult() } }
+                ready
+            }
+            compose.runOnIdle {
+                spans().forEach { span ->
+                    assertEquals(textView!!.currentTextColor, span.color())
+                    assertTrue(span.getDrawable().getResult().bounds.width() > 0)
+                    assertTrue(span.getDrawable().getResult().bounds.height() > 0)
+                }
+            }
+        }
+        awaitRendering()
+        val retained = spans()
+        compose.runOnIdle { source.value += "\n\nMore text after the equations." }
+        compose.runOnIdle {
+            assertEquals(retained.size, spans().size)
+            retained.zip(spans()).forEach { (before, after) -> assertSame(before, after) }
+        }
+        compose.runOnIdle { dark.value = true }
+        awaitRendering()
+        compose.runOnIdle { source.value = "Incomplete \\(\\frac{1}{" }
+        compose.runOnIdle { assertEquals(0, spans().size) }
+    }
 
     @Test
     fun legalFooterOpensBundledPoliciesAndReturnsToChat() {
@@ -250,9 +373,16 @@ class ChatUiTest {
         assertEquals(composerHeight, compose.onNodeWithTag("message-composer").fetchSemanticsNode().boundsInRoot.height, 0f)
         compose.runOnIdle { state.value = state.value.copy(composerText = "Short correction") }
         assertEquals(composerHeight, compose.onNodeWithTag("message-composer").fetchSemanticsNode().boundsInRoot.height, 0f)
-        compose.onNodeWithContentDescription("Send message").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("Send message").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Dictate message").assertIsNotEnabled()
+        compose.onNodeWithText("On-device AI").assertDoesNotExist()
+        val stopBounds = compose.onNodeWithContentDescription("Stop recording").fetchSemanticsNode().boundsInRoot
+        val micBounds = compose.onNodeWithContentDescription("Dictate message").fetchSemanticsNode().boundsInRoot
+        assertTrue(stopBounds.left >= micBounds.right)
         compose.onNodeWithContentDescription("Stop recording").assertIsEnabled().performClick()
         compose.onNodeWithText("Refining transcript").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Stop recording").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Send message").assertIsNotEnabled()
         assertEquals(composerHeight, compose.onNodeWithTag("message-composer").fetchSemanticsNode().boundsInRoot.height, 0f)
         compose.onNodeWithContentDescription("Send message").assertIsNotEnabled()
         compose.runOnIdle {

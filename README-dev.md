@@ -242,8 +242,9 @@ size/mtime invalidate the cache, and stale caches fail explicitly.
 GGUF container support does **not** automatically provide Gemma or other model
 architecture/tokenizer mappings. GGUF tensor names are retained, with the
 existing state-mapping API available to loaders. This importer does not execute
-GGML kernels or retain GGML block quantization for inference. Android/browser
-download defaults and Hub resolution are unchanged by reader support.
+GGML kernels or retain GGML block quantization for inference. Android Small
+downloads now combine GGML Q8 weights with matching HF sidecars, with both
+repository revisions tracked; the browser and Python Hub paths remain unchanged.
 
 The small adapted [reference codec](src/kidi/checkpoint/ggml/dequantize.h)
 contains upstream credits, revision and MIT terms. No GGML runtime, backend,

@@ -133,7 +133,7 @@ is available through public store search.
 1. Open **Set up models** and download the default chat model (about **2.49 GB**).
 2. Start a chat, or attach a photo from the camera or image picker.
 3. Optionally download speech and allow microphone access to dictate. The current
-  Whisper Small download is about **970 MB**, with a separate **249 MB** prepared
+  Whisper Small Q8 download is about **267 MB**, with a separate **249 MB** prepared
   cache. Existing Tiny/Base selections are not automatically replaced.
 4. Tap the logo to find earlier conversations. After setup, installed models
   reopen offline.

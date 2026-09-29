@@ -83,6 +83,26 @@ internal fun KidiUiState.withProvisionalTranscript(text: String, start: Int, com
     return copy(composerText = text, provisionalTextStart = start.takeIf { it < text.length })
 }
 
+internal class ReplyUpdateBuffer(private val clockMs: () -> Long, private val publish: (String) -> Unit) {
+    private val content = StringBuilder()
+    private var lastPublishedAt = clockMs()
+    private var pending = false
+
+    fun append(text: String) {
+        content.append(text)
+        pending = true
+    }
+
+    fun flush(force: Boolean = false) {
+        if (!pending) return
+        val now = clockMs()
+        if (!force && now - lastPublishedAt < 100L) return
+        publish(content.toString())
+        pending = false
+        lastPublishedAt = now
+    }
+}
+
 internal class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences(PREFERENCES, 0)
     private val repository = ModelRepository(application)
@@ -324,6 +344,14 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         stopRequested.set(false)
         viewModelScope.launch(runtimeDispatcher) {
             var completed = false
+            var generatedTokens = 0
+            var decodeTokens = 0
+            var decodeMs = 0.0
+            val reply = ReplyUpdateBuffer(SystemClock::elapsedRealtime) { text ->
+                _state.update { it.copy(draft = text, generationTokens = generatedTokens,
+                    generationDecodeTokens = decodeTokens, generationDecodeMs = decodeMs,
+                    status = if (it.stopping) it.status else "Responding") }
+            }
             try {
                 val (threadId, saved) = withContext(Dispatchers.IO) {
                     val id = current.activeChatId ?: chats.createThread(listOf(ChatParticipant.USER, responseAgent))
@@ -340,9 +368,6 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     .toNativeJson().toString(), _state.value.maximumTokens))
                 requestId = enqueue.getLong("request_id")
                 _state.update { it.copy(status = if (it.stopping) it.status else "Preparing response") }
-                var generatedTokens = 0
-                var decodeTokens = 0
-                var decodeMs = 0.0
                 while (true) {
                     val step = checked(NativeRuntime.step())
                     val stepDecodeMs = step.optDouble("decode_ms", 0.0)
@@ -356,17 +381,18 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                             if (stepDecodeMs > 0) decodeTokens++
                         }
                         if (text.isNotEmpty() || event.has("token")) {
-                            _state.update { it.copy(draft = it.draft + text, generationTokens = generatedTokens,
-                                generationDecodeTokens = decodeTokens, generationDecodeMs = decodeMs,
-                                status = if (it.stopping) it.status else "Responding") }
+                            reply.append(text)
+                            reply.flush()
                         }
                         if (event.has("completed")) {
+                            reply.flush(force = true)
                             finish(event.getJSONObject("completed"))
                             completed = true
                         }
                     }
                     if (stopRequested.getAndSet(false) && step.getInt("pending") > 0) {
                         checked(NativeRuntime.cancel(requireNotNull(requestId)))
+                        reply.flush(force = true)
                         finishPartial()
                         completed = true
                         break
@@ -374,8 +400,12 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     if (step.getInt("pending") == 0) break
                     yield()
                 }
-                if (!completed) finishPartial()
+                if (!completed) {
+                    reply.flush(force = true)
+                    finishPartial()
+                }
             } catch (error: Throwable) {
+                reply.flush(force = true)
                 failGeneration(error)
             } finally {
                 requestId = null

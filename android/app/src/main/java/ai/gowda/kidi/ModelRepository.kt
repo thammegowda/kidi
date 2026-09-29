@@ -31,8 +31,9 @@ internal data class ModelDownloadProgress(
 )
 
 internal class ModelRepository(context: Context) {
-    private data class RemoteFile(val name: String, val size: Long, val sha256: String?)
-    private data class Revision(val modelId: String, val sha: String, val files: List<RemoteFile>)
+    private data class RemoteFile(val name: String, val size: Long, val sha256: String?, val url: URL)
+    private data class Revision(val modelId: String, val sha: String, val files: List<RemoteFile>,
+        val weightsRevision: String? = null)
 
     private val root = File(context.getExternalFilesDir(null) ?: context.filesDir, "models")
     private val storageManager = context.getSystemService(StorageManager::class.java)
@@ -50,8 +51,12 @@ internal class ModelRepository(context: Context) {
             val value = JSONObject(current.readText())
             val modelId = value.getString("model_id")
             val revision = value.getString("revision")
-            val directory = modelDirectory(modelId, revision)
-            if (!File(directory, READY_FILE).isFile || requiredFiles.any { !File(directory, it).isFile }) return null
+            val weightsRevision = value.optString("weights_revision").takeIf { it.isNotEmpty() }
+            if (weightsRevision != null && !REVISION.matches(weightsRevision)) return null
+            val directory = modelDirectory(modelId, revision, weightsRevision)
+            val files = if (currentName == SPEECH_CURRENT_FILE && weightsRevision != null)
+                SPEECH_METADATA_FILES + "ggml-model.bin" else requiredFiles
+            if (!File(directory, READY_FILE).isFile || files.any { !File(directory, it).isFile }) return null
             InstalledModel(modelId, revision, directory)
         }.getOrNull()
     }
@@ -60,7 +65,7 @@ internal class ModelRepository(context: Context) {
         prepareModel(modelId, CHAT_FILES, CURRENT_FILE, ::createManifest, progress)
 
     suspend fun prepareSpeech(modelId: String, progress: (ModelDownloadProgress) -> Unit): InstalledModel =
-        prepareModel(modelId, SPEECH_FILES, SPEECH_CURRENT_FILE, ::validateSpeechModel, progress)
+        prepareModel(modelId, SPEECH_FILES, SPEECH_CURRENT_FILE, ::validateSpeechModel, progress, ::resolveSpeech)
 
     private suspend fun prepareModel(
         modelId: String,
@@ -68,19 +73,20 @@ internal class ModelRepository(context: Context) {
         currentName: String,
         configure: (File) -> Unit,
         progress: (ModelDownloadProgress) -> Unit,
+        resolver: (String, List<String>) -> Revision = ::resolve,
     ): InstalledModel =
         prepareMutex.withLock {
             withContext(Dispatchers.IO) {
                 require(MODEL_ID.matches(modelId)) { "Enter a Hugging Face model ID such as $DEFAULT_MODEL_ID" }
-                val revision = resolve(modelId, requiredFiles)
-                val directory = modelDirectory(modelId, revision.sha)
+                val revision = resolver(modelId, requiredFiles)
+                val directory = modelDirectory(modelId, revision.sha, revision.weightsRevision)
                 check(directory.isDirectory || directory.mkdirs()) { "Unable to create model storage" }
 
                 val totalBytes = revision.files.sumOf(RemoteFile::size)
                 val ready = readReady(directory)
                 if (ready == revision.sha && revision.files.all { File(directory, it.name).length() == it.size }) {
                     progress(ModelDownloadProgress("Model ready", totalBytes, totalBytes))
-                    writeCurrent(currentName, modelId, revision.sha)
+                    writeCurrent(currentName, modelId, revision.sha, revision.weightsRevision)
                     return@withContext InstalledModel(modelId, revision.sha, directory)
                 }
 
@@ -104,7 +110,7 @@ internal class ModelRepository(context: Context) {
                 var completedBytes = 0L
                 for (file in revision.files) {
                     coroutineContext.ensureActive()
-                    downloader.download(fileUrl(modelId, revision.sha, file.name), File(directory, file.name),
+                    downloader.download(file.url, File(directory, file.name),
                         file.size, file.sha256) { update ->
                         val label = if (update.phase == ModelDownloadPhase.RETRYING)
                             "${file.name} (attempt ${update.attempt})" else file.name
@@ -114,8 +120,9 @@ internal class ModelRepository(context: Context) {
                     progress(ModelDownloadProgress(file.name, completedBytes, totalBytes))
                 }
                 configure(directory)
-                writeAtomically(File(directory, READY_FILE), JSONObject().put("revision", revision.sha).toString())
-                writeCurrent(currentName, modelId, revision.sha)
+                writeAtomically(File(directory, READY_FILE), JSONObject().put("revision", revision.sha)
+                    .put("weights_revision", revision.weightsRevision).toString())
+                writeCurrent(currentName, modelId, revision.sha, revision.weightsRevision)
                 InstalledModel(modelId, revision.sha, directory)
             }
         }
@@ -131,6 +138,16 @@ internal class ModelRepository(context: Context) {
     private fun removeInstalled(currentName: String, requiredFiles: List<String>) {
         installed(currentName, requiredFiles)?.directory?.deleteRecursively()
         File(root, currentName).delete()
+    }
+
+    private fun resolveSpeech(modelId: String, requiredFiles: List<String>): Revision {
+        if (modelId != "openai/whisper-small") return resolve(modelId, requiredFiles)
+        val metadata = resolve(modelId, SPEECH_METADATA_FILES)
+        val quantized = resolve("ggerganov/whisper.cpp", listOf("ggml-small-q8_0.bin"))
+        return metadata.copy(
+            files = metadata.files + quantized.files.single().copy(name = "ggml-model.bin"),
+            weightsRevision = quantized.sha,
+        )
     }
 
     private fun resolve(modelId: String, requiredFiles: List<String>): Revision {
@@ -149,7 +166,8 @@ internal class ModelRepository(context: Context) {
             val item = requireNotNull(available[name]) { "Model is missing $name" }
             val size = item.getLong("size")
             require(size > 0) { "Model file $name is empty" }
-            RemoteFile(name, size, item.optJSONObject("lfs")?.optString("sha256")?.takeIf(SHA256::matches))
+            RemoteFile(name, size, item.optJSONObject("lfs")?.optString("sha256")?.takeIf(SHA256::matches),
+                fileUrl(modelId, revision, name))
         }
         return Revision(modelId, revision, files)
     }
@@ -238,11 +256,12 @@ internal class ModelRepository(context: Context) {
         JSONObject(File(directory, READY_FILE).readText()).getString("revision")
     }.getOrNull()
 
-    private fun writeCurrent(currentName: String, modelId: String, revision: String) {
+    private fun writeCurrent(currentName: String, modelId: String, revision: String, weightsRevision: String? = null) {
         root.mkdirs()
         writeAtomically(
             File(root, currentName),
-            JSONObject().put("model_id", modelId).put("revision", revision).toString(),
+            JSONObject().put("model_id", modelId).put("revision", revision)
+                .put("weights_revision", weightsRevision).toString(),
         )
     }
 
@@ -261,8 +280,9 @@ internal class ModelRepository(context: Context) {
         }
     }
 
-    private fun modelDirectory(modelId: String, revision: String) =
-        File(root, "${modelId.replace('/', '-')}/$revision")
+    private fun modelDirectory(modelId: String, revision: String, weightsRevision: String? = null) =
+        File(root, "${modelId.replace('/', '-')}/" +
+            if (weightsRevision == null) revision else "$revision-ggml-$weightsRevision")
 
     private fun fileUrl(modelId: String, revision: String, name: String) =
         URL("https://huggingface.co/$modelId/resolve/$revision/$name")
@@ -280,13 +300,13 @@ internal class ModelRepository(context: Context) {
             "tokenizer_config.json",
             "chat_template.jinja",
         )
-        val SPEECH_FILES = listOf(
+        val SPEECH_METADATA_FILES = listOf(
             "config.json",
-            "model.safetensors",
             "tokenizer.json",
             "preprocessor_config.json",
             "generation_config.json",
         )
+        val SPEECH_FILES = SPEECH_METADATA_FILES + "model.safetensors"
         val SUPPORTED_WHISPER_SIGNATURES = setOf(
             listOf(384, 4, 4, 6, 6, 1536, 1536),
             listOf(512, 6, 6, 8, 8, 2048, 2048),

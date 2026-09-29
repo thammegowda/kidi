@@ -126,6 +126,7 @@ import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -276,7 +277,7 @@ private fun modelLabel(modelId: String) = when (modelId) {
 
 private fun modelDownloadSize(modelId: String) = when (modelId) {
     "google/gemma-4-E2B-it-qat-mobile-transformers" -> "About 2.5 GB download; allow 3 GB free storage."
-    "openai/whisper-small" -> "About 970 MB download; allow 1.3 GB free storage."
+    "openai/whisper-small" -> "About 267 MB download; allow 600 MB free storage."
     "openai/whisper-base" -> "About 290 MB download."
     "openai/whisper-tiny" -> "About 150 MB download."
     else -> "Download size depends on the selected repository."
@@ -342,6 +343,7 @@ internal fun ToolButton(
     onClick: () -> Unit,
     enabled: Boolean = true,
     tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+    iconSize: Dp = 22.dp,
 ) {
     TooltipBox(
         positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
@@ -349,7 +351,7 @@ internal fun ToolButton(
         state = rememberTooltipState(),
     ) {
         IconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(48.dp)) {
-            Icon(icon, label, Modifier.size(22.dp), tint = if (enabled) tint else tint.copy(alpha = 0.38f))
+            Icon(icon, label, Modifier.size(iconSize), tint = if (enabled) tint else tint.copy(alpha = 0.38f))
         }
     }
 }
@@ -645,44 +647,38 @@ private fun Composer(
                         ToolButton(Icons.Default.PhotoCamera, "Take photo", onTakePhoto, state.visionReady && !state.chatBusy)
                         ToolButton(Icons.Default.PhotoLibrary, "Choose photo", onPickImage, state.visionReady && !state.chatBusy)
                         ToolButton(
-                            if (state.recording) Icons.Default.Stop else Icons.Default.Mic,
-                            if (state.recording) "Stop recording" else if (state.speechReady) "Dictate message" else "Set up dictation",
+                            Icons.Default.Mic,
+                            if (state.speechReady) "Dictate message" else "Set up dictation",
                             {
                                 keyboard?.hide()
-                                when {
-                                    state.recording -> onStopRecording()
-                                    state.speechReady -> onRecord()
-                                    else -> onSettings()
-                                }
+                                if (state.speechReady) onRecord() else onSettings()
                             },
-                            enabled = state.recording || !state.runtimeBusy,
-                            tint = if (state.recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                            enabled = !state.runtimeBusy,
+                            iconSize = 28.dp,
                         )
-                        Text(
-                            when {
-                                state.recording -> modelLabel(state.speechModelId)
-                                state.transcribing -> "Final pass"
-                                state.loadingModel -> "Preparing chat"
-                                state.loadingSpeech -> "Preparing speech"
-                                state.modelReady -> "On-device AI"
-                                else -> "Model offline"
-                            },
-                            Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                        Spacer(Modifier.weight(1f))
                         FilledIconButton(
-                            onClick = if (state.generating) onStop else submit,
-                            enabled = if (state.generating) !state.stopping else canSend,
+                            onClick = when {
+                                state.recording -> onStopRecording
+                                state.generating -> onStop
+                                else -> submit
+                            },
+                            enabled = state.recording || if (state.generating) !state.stopping else canSend,
                             modifier = Modifier.size(48.dp),
                             shape = RoundedCornerShape(8.dp),
                             colors = IconButtonDefaults.filledIconButtonColors(
-                                containerColor = MaterialTheme.colorScheme.primary,
-                                contentColor = MaterialTheme.colorScheme.onPrimary,
+                                containerColor = if (state.recording) MaterialTheme.colorScheme.errorContainer
+                                    else MaterialTheme.colorScheme.primary,
+                                contentColor = if (state.recording) MaterialTheme.colorScheme.error
+                                    else MaterialTheme.colorScheme.onPrimary,
                             ),
                         ) {
-                            Icon(if (state.generating) Icons.Default.Stop else Icons.Default.ArrowUpward,
-                                if (state.generating) "Stop generation" else "Send message", Modifier.size(22.dp))
+                            Icon(if (state.recording || state.generating) Icons.Default.Stop else Icons.Default.ArrowUpward,
+                                when {
+                                    state.recording -> "Stop recording"
+                                    state.generating -> "Stop generation"
+                                    else -> "Send message"
+                                }, Modifier.size(if (state.recording || state.generating) 28.dp else 22.dp))
                         }
                     }
                 }
@@ -871,6 +867,8 @@ private fun ModelSection(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(modelDownloadSize(modelId))
+                    if (title == "Voice" && modelId == "openai/whisper-small")
+                        Text("Q8 weights from ggerganov/whisper.cpp; tokenizer and configuration from openai/whisper-small.")
                     Text("Downloads from huggingface.co using your internet connection. Wi-Fi recommended.")
                 }
             },

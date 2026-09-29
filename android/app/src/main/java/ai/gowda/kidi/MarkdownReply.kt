@@ -3,6 +3,7 @@ package ai.gowda.kidi
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
+import android.text.Spannable
 import android.util.TypedValue
 import android.widget.TextView
 import android.widget.Toast
@@ -21,9 +22,21 @@ import io.noties.markwon.AbstractMarkwonPlugin
 import io.noties.markwon.Markwon
 import io.noties.markwon.MarkwonConfiguration
 import io.noties.markwon.core.MarkwonTheme
+import io.noties.markwon.ext.latex.JLatexMathPlugin
+import io.noties.markwon.inlineparser.MarkwonInlineParserPlugin
+import org.commonmark.parser.Parser
+import java.util.concurrent.Executors
+
+private val mathExecutor = Executors.newFixedThreadPool(2) { runnable ->
+    Thread(runnable, "kidi-math").apply { isDaemon = true }
+}
 
 @Composable
-internal fun MarkdownReply(text: String, modifier: Modifier = Modifier, onLink: ((String) -> Boolean)? = null) {
+internal fun MarkdownReply(
+    text: String,
+    modifier: Modifier = Modifier,
+    onLink: ((String) -> Boolean)? = null,
+) {
     val context = LocalContext.current
     val handleLink by rememberUpdatedState(onLink)
     val colors = MaterialTheme.colorScheme
@@ -31,8 +44,19 @@ internal fun MarkdownReply(text: String, modifier: Modifier = Modifier, onLink: 
     val codeBackground = colors.surfaceContainer.toArgb()
     val linkColor = colors.primary.toArgb()
     val textSize = with(LocalDensity.current) { MaterialTheme.typography.bodyLarge.fontSize.toPx() }
-    val markwon = remember(context, codeBackground, linkColor) {
-        Markwon.builder(context).bufferType(TextView.BufferType.SPANNABLE).usePlugin(object : AbstractMarkwonPlugin() {
+    val markwon = remember(context, codeBackground, linkColor, foreground, textSize) {
+        Markwon.builder(context).bufferType(TextView.BufferType.SPANNABLE)
+            .usePlugin(MarkwonInlineParserPlugin.create(mathInlineParserFactory()))
+            .usePlugin(object : AbstractMarkwonPlugin() {
+                override fun configureParser(builder: Parser.Builder) {
+                    builder.customBlockParserFactory(ClosedMathBlockParser.Factory())
+                }
+            })
+            .usePlugin(JLatexMathPlugin.create(textSize) { builder ->
+                builder.inlinesEnabled(true).executorService(mathExecutor).errorHandler { _, _ -> null }
+                builder.theme().textColor(foreground)
+            })
+            .usePlugin(object : AbstractMarkwonPlugin() {
             override fun configureTheme(builder: MarkwonTheme.Builder) {
                 builder.codeBackgroundColor(codeBackground).codeBlockBackgroundColor(codeBackground)
                     .linkColor(linkColor).headingBreakHeight(0)
@@ -69,7 +93,11 @@ internal fun MarkdownReply(text: String, modifier: Modifier = Modifier, onLink: 
             view.setTextSize(TypedValue.COMPLEX_UNIT_PX, textSize)
             val version = text to markwon
             if (view.tag != version) {
-                markwon.setMarkdown(view, text)
+                val parsed = markwon.toMarkdown(text)
+                val previous = view.text as? Spannable
+                val markdown = if (previous != null && (view.tag as? Pair<*, *>)?.second === markwon)
+                    reuseMathSpans(previous, parsed) else parsed
+                markwon.setParsedMarkdown(view, markdown)
                 view.setTextIsSelectable(true)
                 view.isLongClickable = true
                 view.tag = version
