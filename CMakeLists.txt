@@ -117,6 +117,59 @@ if(KIDI_BUILD_BENCHMARKS)
         target_link_libraries(kidi_android_baseline PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
     endif()
     if(ANDROID)
+        set(KIDI_QNN_SDK "" CACHE PATH "Optional local QAIRT SDK root; enables the low-bit benchmark NPU backend")
+        find_program(KIDI_GLSLC glslc
+            HINTS "${ANDROID_NDK}/shader-tools/${ANDROID_NDK_HOST_SYSTEM_NAME}"
+            REQUIRED
+        )
+        set(KIDI_LOWBIT_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/android/lowbit/lowbit.comp)
+        set(KIDI_LOWBIT_SPIRV_DIR ${CMAKE_CURRENT_BINARY_DIR}/lowbit_spirv)
+        set(KIDI_LOWBIT_SPIRV)
+        foreach(kernel gemv gemm)
+            string(TOUPPER ${kernel} kernel_define)
+            foreach(bits 8 4 2)
+                set(spirv ${KIDI_LOWBIT_SPIRV_DIR}/${kernel}_bits${bits}.inc)
+                add_custom_command(
+                    OUTPUT ${spirv}
+                    COMMAND ${CMAKE_COMMAND} -E make_directory ${KIDI_LOWBIT_SPIRV_DIR}
+                    COMMAND ${KIDI_GLSLC} --target-env=vulkan1.3 -O -mfmt=num -DBITS=${bits}
+                        -DKERNEL_${kernel_define}=1 ${KIDI_LOWBIT_SHADER} -o ${spirv}
+                    DEPENDS ${KIDI_LOWBIT_SHADER}
+                    VERBATIM
+                )
+                list(APPEND KIDI_LOWBIT_SPIRV ${spirv})
+            endforeach()
+        endforeach()
+        set(KIDI_GELU_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/android/lowbit/gelu_multiply.comp)
+        add_custom_command(
+            OUTPUT ${KIDI_LOWBIT_SPIRV_DIR}/gelu_multiply.inc
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${KIDI_LOWBIT_SPIRV_DIR}
+            COMMAND ${KIDI_GLSLC} --target-env=vulkan1.3 -O -mfmt=num ${KIDI_GELU_SHADER}
+                -o ${KIDI_LOWBIT_SPIRV_DIR}/gelu_multiply.inc
+            DEPENDS ${KIDI_GELU_SHADER}
+            VERBATIM
+        )
+        list(APPEND KIDI_LOWBIT_SPIRV ${KIDI_LOWBIT_SPIRV_DIR}/gelu_multiply.inc)
+        add_executable(kidi_lowbit_bench
+            benchmarks/android/lowbit/main.cpp
+            benchmarks/android/lowbit/cpu.cpp
+            benchmarks/android/lowbit/gpu.cpp
+            benchmarks/android/lowbit/npu.cpp
+            benchmarks/android/lowbit/vulkan.cpp
+            benchmarks/android/lowbit/qnn.cpp
+            benchmarks/android/lowbit/ffn.cpp
+            benchmarks/android/lowbit/ffn_cpu.cpp
+            benchmarks/android/lowbit/ffn_gpu.cpp
+            benchmarks/android/lowbit/ffn_npu.cpp
+            ${KIDI_LOWBIT_SPIRV}
+        )
+        target_include_directories(kidi_lowbit_bench PRIVATE ${KIDI_LOWBIT_SPIRV_DIR})
+        target_link_libraries(kidi_lowbit_bench PRIVATE kidi::kidi vulkan nlohmann_json::nlohmann_json)
+        if(KIDI_QNN_SDK)
+            target_include_directories(kidi_lowbit_bench SYSTEM PRIVATE ${KIDI_QNN_SDK}/include/QNN)
+            target_compile_definitions(kidi_lowbit_bench PRIVATE KIDI_BENCH_QNN=1)
+            target_link_libraries(kidi_lowbit_bench PRIVATE ${CMAKE_DL_LIBS})
+        endif()
         add_executable(kidi_vulkan_probe benchmarks/android/vulkan_probe.cpp)
         target_link_libraries(kidi_vulkan_probe PRIVATE vulkan nlohmann_json::nlohmann_json)
     endif()

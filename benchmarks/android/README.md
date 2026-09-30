@@ -1,6 +1,6 @@
 # Android Hardware Benchmarks
 
-Standalone CPU inference benchmarks and an optional Vulkan projection probe for ARM64 Android devices.
+Standalone CPU inference benchmarks and optional accelerator benchmarks for ARM64 Android devices.
 These measure native Release executables, not APK startup or UI latency. Only source and setup instructions belong
 in Git; generated audio, model downloads, shaders, logs, and measurement reports stay in the ignored `.cache/` directory.
 
@@ -106,6 +106,79 @@ build-debug/kidi_gemma4_image_test tests/.cache/gemma4-vision-qat qat
 
 These compare projected image features independently of the real model's natural-language answer. Generated tensors,
 photos, and reports remain ignored and are not committed.
+
+## Low-Bit CPU, GPU, and NPU Projections
+
+`kidi_lowbit_bench` measures one quantized projection at the precisions Kidi models use: INT8 activations times W8
+(Whisper Small) or W4/W2 (Gemma 4 QAT) weights with per-channel scales, INT32 accumulation, and INT8 requantization with
+a static output scale. Every backend receives the same deterministic data and is checked against an exact integer
+reference: CPU and GPU must match exactly, and HTP may differ by one quantum from its requantization rounding. A backend
+never falls back to another processor.
+
+- CPU: Kidi's YNNPACK graph wrapper and thread pool with native INT8 x INT8/INT4/INT2 dot kernels.
+- GPU: Vulkan compute on Adreno with hardware packed INT8 dot products. Weights stay packed in memory and are
+  sign-extended in registers. The NDK `glslc` compiles the shaders, which are embedded at build time.
+- NPU: QNN HTP loaded with `dlopen`; nothing links against the SDK. Each graph is prepared once into a context binary,
+  and measurements load it from a runtime-only directory without the 81 MB `libQnnHtpPrepare.so`.
+
+NPU support is optional and needs a local QAIRT SDK in the ignored cache; SDK files are never committed. Add
+`-DKIDI_QNN_SDK="$PWD/benchmarks/android/.cache/qairt/2.50.0.260828"` to the Android configure command above, then:
+
+```sh
+cmake --build build-android-baseline --target kidi_lowbit_bench -j 8
+"$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" \
+  -o build-android-baseline/kidi_lowbit_bench.stripped build-android-baseline/kidi_lowbit_bench
+python benchmarks/android/lowbit.py SERIAL benchmarks/android/.cache/lowbit-results.json \
+  --binary build-android-baseline/kidi_lowbit_bench.stripped \
+  --qnn-sdk benchmarks/android/.cache/qairt/2.50.0.260828
+```
+
+The runner covers the Whisper Small FFN (1,500 encoder rows and single-row decoding) and the Gemma 4 E2B MLPs
+(single-row decoding and 128-row prefill). Gemma gate and up projections share an input and run as one concatenated
+projection. The CPU uses the app's default 4 threads; pass `--threads 8` for its maximum. Use `--cases` to filter and
+omit `--qnn-sdk` to skip the NPU. The JSON report includes thermal snapshots, context binary sizes, and whether the
+prepare library was loaded.
+
+A context binary only loads in a runtime at least as new as the SDK that prepared it. The SM8750 test phone ships QNN
+2.29 in `/vendor/lib64`, which rejects 2.50 contexts, so an app must ship the matching runtime (about 17 MB for V79:
+`libQnnHtp.so`, the stub, and the skel) or prepare with an SDK no newer than every target device's runtime.
+
+### Captured Decode FFN Stack
+
+`--workload ffn` measures launch overhead for autoregressive decoding: the Gemma 4 E2B decode FFN stack (35 MLPs;
+W4 with intermediate 6144 in layers 0-14, W2 with 12288 in layers 15-34; 495 MB of packed weights) for one token. Each
+MLP runs gate/up, GELU-multiply, and down with INT8 activations. Every mode uses preallocated buffers; the host rewrites
+the input in place between steps and nothing is reallocated or rebound.
+
+| Mode | Backends | Launches per step |
+|---|---|---|
+| `eager` | all | one per operator (105), each completed before the next |
+| `eager-async` | GPU | one submission per operator, one wait per step |
+| `encode` | GPU | the step re-recorded into one command buffer every step |
+| `replay` | all | the step captured once: one YNNPACK graph, one Vulkan command buffer, or chained HTP graphs |
+| `replay-queued` | GPU | several captured steps submitted back to back behind one fence |
+
+NPU steps are captured as HTP graphs in a context binary and bound to registered FastRPC shared memory, so executions
+copy nothing. The prepare library runs out of memory finalizing all 35 MLPs as one graph, so replay captures
+`--npu-graph-layers` (default 18) layers per graph and chains them through dedicated shared buffers.
+
+```sh
+python benchmarks/android/lowbit.py SERIAL benchmarks/android/.cache/ffn-replay-results.json --workload ffn \
+  --binary build-android-baseline/kidi_lowbit_bench.stripped \
+  --qnn-sdk benchmarks/android/.cache/qairt/2.50.0.260828
+```
+
+Modes repeat round-robin (`--repeats`, default 3) and report the median and range. Weights are synthetic but sampled from
+the checkpoint's measured W4/W2 code histograms; activation scales are calibrated statically. The stack omits attention,
+normalization, and residuals, so its values are a numerical fixture: without RMSNorm the gated product squares
+activation magnitude and deep stacks decay toward zero. Correctness is therefore gated as follows:
+
+- CPU and GPU must match the integer reference exactly at full depth.
+- Replay must be bit-identical to eager and must distinguish two inputs on a live 2-layer stack for every backend.
+- HTP rounding differs from the reference, so each eager HTP graph is compared with the reference applied to its own
+  inputs and must stay within one INT8 quantum RMS. `KIDI_FFN_DIAGNOSE=1` also reports accumulated error per stage.
+
+This is a benchmark prototype. Kidi's runtime remains eager; see [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## Optional Vulkan Probe
 
