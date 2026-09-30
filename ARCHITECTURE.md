@@ -1,8 +1,9 @@
 # Eager Architecture
 
 Kidi has one model execution path: ordinary C++ functions operating on concrete
-tensors. There is no Kidi model graph, symbolic value type, generic compiler,
-lowerer, graph partitioner, or recorded control flow.
+tensors. There is no symbolic value type, model compiler, graph partitioner, or
+recorded control flow. A fixed-shape step may be captured from that same eager
+code and replayed (see [Captured Steps](#captured-steps)).
 
 ```text
 inference::{Decoder, Transcriber} -> model::{Transformer, Gemma4, Whisper} -> layers -> ops::Context -> backend
@@ -14,7 +15,8 @@ inference::{Decoder, Transcriber} -> model::{Transformer, Gemma4, Whisper} -> la
 |---|---|
 | `tensor` | Storage, dtype, device, views, explicit transfers |
 | `core::Module` | Shared module ownership, named parameter/child registration, state dictionaries |
-| `ops::Context` | Immediate operator dispatch, validation, bounded prepared-operator cache |
+| `ops::Context` | Immediate operator dispatch, validation, bounded prepared-operator cache, step replay |
+| `graph` | Captured fixed-shape steps: recorded operators, structural validation, input rebinding, replay |
 | `layers` | Bound parameters and reusable neural equations |
 | `checkpoint` | Configuration/package I/O, format readers, serialization and generic cache preparation |
 | `model` | Neural network topology, parameter binding, checkpoint policies, source and decoder state |
@@ -392,12 +394,87 @@ Other platforms retain default scheduling. See the
 [matched scheduling comparison](benchmarks/metal/scheduling-20260919/README.md),
 including preparation costs and quality differences from the old graph runtime.
 
-No model graph, capture mode, lazy fallback, compiler IR, or alternate generation
-policy is retained. The former graph comparison benchmark was removed; its raw
+No model graph, lazy fallback, compiler IR, or alternate generation policy is
+retained; captured steps are recorded from eager code as described below. The former graph comparison benchmark was removed; its raw
 measurements and report remain historical documentation. The superseded fusion
 prototype benchmark was also removed; production fused operators and numerical
 tests remain. CPU wrappers no longer maintain unused dynamic-shape or concurrency
 query APIs; the eager cache prepares a separate executable for each signature.
+
+## Captured Steps
+
+`Context::replay(key, inputs, step)` runs one fixed-shape step, such as a decoder
+token, as ordinary eager code. The first two calls with a key run `step` while
+recording every dispatched operator, its prepared executable, and where each
+operand's storage comes from: a step input, an earlier recorded output, or a fixed
+external tensor such as a parameter or cache. The two recordings must match
+structurally. This rejects temporaries created on the host each call, operator
+arguments that change per call, and `copy_slice_` offsets; such values must be
+written into step inputs or state that aliases them. Later calls skip `step`,
+rebind any changed inputs (views are rebuilt at the same offsets), and run the
+recorded operators into their retained, pointer-stable buffers. Outputs belong to
+the captured step and are overwritten by the next call with the same key.
+
+Model code stays eager: a step reads its inputs, parameters, and fixed-storage
+state; host work that changes per call, such as token embedding lookups, masks, and
+cache indices, is written in place before the call. Capture never changes device,
+partitions a step, records host control flow, or falls back silently. Backends
+declare support through `OperatorBackend::supports_replay` and implement
+`Operator::run_into`; other backends, or `KIDI_REPLAY=0`, run `step` eagerly
+every call with identical results.
+
+Per-call values such as token IDs and positions are I32 tensors, so a step can
+keep them on its device: `TokenEmbedding` looks up token tensors with the
+`embedding` operator (CPU and WebGPU; Metal reads them on the host), and a step's
+selected token can feed the next step without a host read
+(`Gemma4Impl::forward_token(const Tensor&, ...)`).
+
+Whisper decoding replays one step per decoder capacity: token, mask, and position
+index inputs, with positions gathered by index and caches written by `scatter_`.
+Gemma 4 single-request decoding replays one step per cache capacity, 128-position
+key extent, and local-attention crop, using the same extents as eager decoding;
+host-built masks and rotary angles are written into `Gemma4State::step`. Batched
+decoding and WebGPU keep the eager path. Replay matches eager bit for bit in unit
+tests and real-model runs.
+
+The CPU backend replays prepared YNNPACK executables and custom kernels in order.
+Eager dispatch was about 0.75% of Whisper Small decode time on an Apple M5 (about
+0.4 us per operator), so CPU replay is time-neutral: Gemma 4 E2B QAT and Whisper
+Small INT8 decode rates stayed within noise on the M5 and on an SM8750 phone with
+identical token IDs. Captured steps exist so launch-bound accelerators can replay
+a whole step at once. Lowering a captured step to one YNNPACK subgraph is deferred
+until profiling shows a CPU benefit.
+
+### Accelerators and Step Compilers
+
+Devices with a full eager backend (CPU, Metal, WebGPU, Vulkan) run every operator
+and replay captured steps on themselves. An accelerator without eager operators,
+such as the Qualcomm NPU, is a `runtime::StepCompiler` attached to a CPU context
+with `ops::StepCompilerScope` while a model is constructed. After a step's two
+captures match, `Context::replay` asks the compiler to compile the recorded graph;
+later calls run the returned `StepExecutable` with the step inputs and the
+captured output buffers, and the CPU intermediates are released. A compiler may
+decline a step, which keeps CPU replay. A compiler whose `compiles_in_background()`
+is true compiles a copy of the graph on a worker thread while CPU replay keeps
+serving the step, so a slow first compile (tens of seconds on the NPU) does not
+stall generation; the executable takes over on the first call after it is ready,
+and a failed background compile logs `kidi_step|...|fallback=cpu` and keeps CPU
+replay. `KIDI_BACKGROUND_COMPILE=0` compiles synchronously, which benchmarks use
+to measure the accelerated steady state. Its `key_extent` and
+`crop_local_attention` policies let models choose few, coarse step shapes, for
+example power-of-two attention extents. With a compiler attached, Gemma 4 also
+captures full power-of-two prefill chunks (producer layers writing K/V, no
+outputs); prompt tails stay eager on the CPU. A compiler may raise the preferred
+prefill chunk; QNN uses 128 rows. Completed prefill executables are evicted before
+decode so their HTP body weights do not coexist in memory, while their context
+binaries remain cached on disk.
+
+`inference::select_device` maps "auto", "cpu", "gpu", and "npu" to a device.
+"auto" prefers the NPU, then Metal on Apple, then the CPU for Gemma, and the CPU
+for Whisper; Vulkan is an explicit, experimental choice until it measures faster
+than the CPU. Explicit choices fail when unavailable. `Generator::load` with
+`Device::qualcomm_npu()` keeps Gemma on the CPU with the NPU step compiler, and
+`Generator::execution()` reports the result (e.g. `cpu+qnn-htp`).
 
 ## Models and Generation
 

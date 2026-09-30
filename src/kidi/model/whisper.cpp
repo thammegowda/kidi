@@ -2,6 +2,7 @@
 #include "kidi/ops/quantization.h"
 
 #include <cmath>
+#include <utility>
 
 namespace kidi::model {
 using ops::require;
@@ -15,6 +16,7 @@ struct WhisperImpl::State {
     layers::WhisperDecoder decoder;
     layers::Linear output;
     DType precision = module_dtype;
+    std::vector<Tensor> step_inputs;
 
     explicit State(const YAML::Node& config)
         : context(module_device),
@@ -240,6 +242,7 @@ auto WhisperImpl::create_state(std::size_t capacity) -> Result<WhisperDecoderSta
         result.mask = require(Tensor::empty({1, 1, 1, static_cast<std::int64_t>(capacity)}, DType::F32, device()));
         std::ranges::fill(require(result.mask.data<float>()), -1e9F);
         result.index = require(Tensor::empty({1}, DType::I32, device()));
+        result.tokens = require(Tensor::empty({1}, DType::I32, device()));
         const std::vector<std::int64_t> shape{1, static_cast<std::int64_t>(capacity), impl_->hidden};
         for (std::int32_t layer = 0; layer < impl_->decoder_layers; ++layer)
             result.layers.push_back({require(Tensor::zeros(shape, DType::F32, device())),
@@ -275,12 +278,33 @@ auto WhisperImpl::decode(const WhisperEncoderState& source, std::int32_t token, 
             source.layers.size() != static_cast<std::size_t>(impl_->decoder_layers) ||
             state.layers.size() != static_cast<std::size_t>(impl_->decoder_layers))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Whisper decoder input"});
+        auto& context = impl_->context;
         require(state.mask.data<float>())[state.position] = 0.F;
         require(state.index.data<std::int32_t>())[0] = static_cast<std::int32_t>(state.position);
-        auto hidden = impl_->decoder->forward(impl_->context, std::span(&token, 1), state.position, source.layers,
-                                              state.mask, state.layers, state.index);
-        auto output = project ? impl_->output->forward(impl_->context, hidden) : hidden;
-        impl_->context.synchronize();
+        require(state.tokens.data<std::int32_t>())[0] = token;
+        Tensor output;
+        if (project) {
+            // Step inputs: tokens, mask, index, then source and self-attention key/value pairs per layer.
+            auto& inputs = impl_->step_inputs;
+            inputs.assign({state.tokens, state.mask, state.index});
+            for (const auto* layers : {&source.layers, &std::as_const(state.layers)})
+                for (const auto& layer : *layers) inputs.insert(inputs.end(), {layer.key, layer.value});
+            const auto count = static_cast<std::size_t>(impl_->decoder_layers);
+            output = context.replay(
+                "whisper_decode_" + std::to_string(state.capacity), inputs, [&](std::span<const Tensor> step) {
+                    std::vector<layers::KeyValue> memory, cache;
+                    for (std::size_t layer = 0; layer < count; ++layer) {
+                        memory.push_back({step[3 + 2 * layer], step[4 + 2 * layer]});
+                        cache.push_back({step[3 + 2 * (count + layer)], step[4 + 2 * (count + layer)]});
+                    }
+                    const auto hidden = impl_->decoder->forward(context, step[0], memory, step[1], cache, step[2]);
+                    return std::vector{impl_->output->forward(context, hidden)};
+                })[0];
+        } else {
+            output =
+                impl_->decoder->forward(context, state.tokens, source.layers, state.mask, state.layers, state.index);
+        }
+        context.synchronize();
         ++state.position;
         return output;
     } catch (const ops::Failure& error) {

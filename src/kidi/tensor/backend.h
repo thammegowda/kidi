@@ -27,6 +27,7 @@ public:
     virtual ~Backend() = default;
 
     virtual auto name() const noexcept -> std::string_view = 0;
+    virtual auto device_name(Device) const -> std::string { return std::string(name()); }
     virtual auto device_kind() const noexcept -> DeviceKind = 0;
     virtual auto is_available(Device device) const noexcept -> bool = 0;
     virtual auto is_host_accessible(Device device) const noexcept -> bool = 0;
@@ -50,6 +51,7 @@ public:
 struct BackendInfo {
     DeviceKind device_kind;
     std::string name;
+    std::string device_name;
     bool storage_available;
     bool execution_available;
     std::string unavailable_reason;
@@ -77,6 +79,7 @@ private:
 auto make_ynnpack_backend() -> std::shared_ptr<Backend>;
 auto make_metal_backend() -> std::shared_ptr<Backend>;
 auto make_web_gpu_backend() -> std::shared_ptr<Backend>;
+auto make_vulkan_backend() -> std::shared_ptr<Backend>;
 auto make_unavailable_backend(DeviceKind kind, std::string name, std::string reason) -> std::shared_ptr<Backend>;
 
 } // namespace kidi::tensor

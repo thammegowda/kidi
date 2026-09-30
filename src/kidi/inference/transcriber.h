@@ -38,6 +38,9 @@ public:
     auto transcribe(std::span<const float> waveform, std::uint32_t sample_rate,
                     const TranscriptionOptions& options = {}) -> Result<Transcription>;
 
+    /// Where transcription runs, e.g. "cpu".
+    auto execution() const -> std::string { return std::string(tensor::to_string(model_->device().kind)); }
+
 private:
     Transcriber(YAML::Node config, YAML::Node generation, audio::WhisperFeatureExtractor extractor,
                 text::Tokenizer tokenizer, model::Whisper model, std::map<std::string, std::int32_t> languages,

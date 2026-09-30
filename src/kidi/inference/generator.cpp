@@ -1,7 +1,10 @@
 #include "kidi/inference/generator.h"
+#include "kidi/runtime/operator.h"
+#include "kidi/tensor/backend.h"
 #include "kidi/checkpoint/config.h"
 
 #include <chrono>
+#include <optional>
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
@@ -50,6 +53,11 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
         const auto parameter = require(weights.tensor(config["model"]["quantization_config"]
                                                           ? "model.language_model.norm.weight"
                                                           : "model.language_model.embed_tokens.weight"));
+        std::optional<ops::StepCompilerScope> accelerator;
+        if (device.kind == tensor::DeviceKind::Q_NPU) {
+            accelerator.emplace(require(runtime::npu_step_compiler()));
+            device = tensor::Device::cpu();
+        }
         const ModuleScope construction(parameter.dtype(), false, device);
         auto model = require(model::Gemma4Impl::create(config["model"]));
         require(model->set_checkpoint(weights, weight_bits, group_size, packed_prefill));
@@ -60,8 +68,47 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
+auto select_device(std::string_view accelerator, bool speech) -> Result<tensor::Device> {
+    const auto gpu = [] {
+#if defined(__APPLE__)
+        return tensor::Device::apple_gpu();
+#else
+        return tensor::Device::vulkan();
+#endif
+    }();
+    const auto available = [](tensor::Device device) {
+        for (const auto& backend : tensor::BackendRegistry::instance().backends(device.index))
+            if (backend.device_kind == device.kind) return backend.execution_available;
+        return false;
+    };
+    if (accelerator == "cpu") return tensor::Device::cpu();
+    if (accelerator == "gpu") {
+        if (!available(gpu))
+            return std::unexpected(Error{ErrorCode::UNSUPPORTED, "no GPU backend is available on this device"});
+        return gpu;
+    }
+    if (accelerator == "npu") {
+        auto compiler = runtime::npu_step_compiler();
+        if (!compiler) return std::unexpected(std::move(compiler.error()));
+        return tensor::Device::qualcomm_npu();
+    }
+    if (accelerator != "auto")
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "accelerator must be auto, cpu, gpu, or npu"});
+    if (speech) return tensor::Device::cpu();
+    if (runtime::npu_step_compiler()) return tensor::Device::qualcomm_npu();
+    // Vulkan is an explicit, experimental choice until it measures faster than the CPU; Metal is Apple's default.
+    if (gpu.kind != tensor::DeviceKind::VULKAN && available(gpu)) return gpu;
+    return tensor::Device::cpu();
+}
+auto Generator::execution() const -> std::string {
+    const auto accelerator = model_->accelerator();
+    auto result = std::string(tensor::to_string(model_->device().kind));
+    if (!accelerator.empty()) result += "+" + std::string(accelerator);
+    return result;
+}
 auto Generator::generate(std::string_view prompt, GenerationOptions options) -> Result<TextGeneration> {
     try {
+        options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
         if (pending_requests() || serving_failed_)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
                                 "drain serving requests before serial generation; reload after a serving failure"});
@@ -99,6 +146,7 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
                          ? require(model_->fork_state(prefix_->state, result.stats.reused_prompt_tokens, capacity))
                          : require(model_->create_state(capacity));
         state.crop_local_attention = !options.full_attention_cache;
+        state.capture_prefill = model_->accelerator() != "qnn-htp" || tokens.size() >= 2048;
         std::size_t bytes_per_token = 0;
         for (const auto& layer : state.layers)
             bytes_per_token += (layer.key.nbytes() + layer.value.nbytes()) / capacity;
@@ -179,6 +227,7 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
 auto Generator::generate_batch(std::span<const std::string> prompts, GenerationOptions options)
     -> Result<GenerationBatch> {
     try {
+        options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
         if (pending_requests() || serving_failed_)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
                                 "drain serving requests before batch generation; reload after a serving failure"});
@@ -222,6 +271,7 @@ auto Generator::generate_batch(std::span<const std::string> prompts, GenerationO
             seeds[row] = tokens.back();
             states.push_back(require(model_->create_state(capacity)));
             states.back().crop_local_attention = !options.full_attention_cache;
+            states.back().capture_prefill = model_->accelerator() != "qnn-htp" || tokens.size() >= 2048;
             const auto preparation = model_->preparation_ns();
             const auto prefill_start = Clock::now();
             std::size_t offset = 0;
@@ -274,6 +324,7 @@ auto Generator::generate_batch(std::span<const std::string> prompts, GenerationO
 }
 auto Generator::configure_serving(ServingOptions options) -> Result<void> {
     try {
+        options.prefill_tokens_per_step = model_->prefill_chunk_size(options.prefill_tokens_per_step);
         if (pending_requests() || serving_failed_ || !options.maximum_active || options.maximum_active > 16 ||
             options.maximum_requests < options.maximum_active || !options.cache_token_budget ||
             !options.prefill_tokens_per_step)
@@ -376,6 +427,7 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, Genera
 }
 auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> Result<std::uint64_t> {
     try {
+        options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
         if (!serving_ || serving_failed_ || pending_requests() >= serving_->maximum_requests ||
             next_request_id_ == std::numeric_limits<std::uint64_t>::max())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "serving queue is unavailable or full"});
@@ -484,6 +536,7 @@ auto Generator::step() -> Result<GenerationStep> {
                 if (!request.state) request.state = require(model_->create_state(request.capacity));
                 request.state->images = request.images;
                 request.state->crop_local_attention = !request.options.full_attention_cache;
+                request.state->capture_prefill = model_->accelerator() != "qnn-htp" || request.prompt.size() >= 2048;
                 running_.push_back(std::move(request));
                 reserved_cache_tokens_ += running_.back().capacity;
                 waiting_.pop_front();
@@ -533,8 +586,12 @@ auto Generator::step() -> Result<GenerationStep> {
         if (count) {
             const auto started = Clock::now();
             const auto prepared = model_->preparation_ns();
-            const auto selected =
-                require(model_->forward_batch_tokens(std::span(tokens).first(count), std::span(states).first(count)));
+            std::vector<std::int32_t> selected;
+            if (count == 1)
+                selected.push_back(require(model_->forward_token(std::span(tokens).first(1), *states[0])));
+            else
+                selected = require(
+                    model_->forward_batch_tokens(std::span(tokens).first(count), std::span(states).first(count)));
             result.decode_ns = elapsed(started);
             if (serving_->maximum_active == 1) {
                 running_[rows[0]].stats.decode_ns += result.decode_ns;

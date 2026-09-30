@@ -53,6 +53,7 @@ add_library(kidi
     src/kidi/checkpoint/weights.cpp
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
+    src/kidi/graph/graph.cpp
     src/kidi/image/gemma4.cpp
     src/kidi/inference/decoder.cpp
     src/kidi/inference/generator.cpp

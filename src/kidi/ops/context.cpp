@@ -1,7 +1,9 @@
 #include "kidi/ops/context.h"
+#include "kidi/graph/graph.h"
 #include "kidi/runtime/operator.h"
 #include "kidi/ops/quantization.h"
 #include <array>
+#include <optional>
 #include <bit>
 #include <chrono>
 #include <map>
@@ -9,8 +11,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 namespace kidi::ops {
@@ -21,6 +25,7 @@ using runtime::OperatorSpec;
 using runtime::TensorInputs;
 namespace {
 thread_local bool decode_projections = false;
+thread_local std::shared_ptr<runtime::StepCompiler> default_compiler;
 class InplaceScope {
 public:
     explicit InplaceScope(bool enabled) noexcept : previous_(std::exchange(is_inplace, enabled)) {}
@@ -36,23 +41,7 @@ using Clock = std::chrono::steady_clock;
 auto nanoseconds(Clock::time_point start) -> std::uint64_t {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
 }
-auto operation_name(Operation operation) -> std::string_view {
-    constexpr std::array names{"add",           "multiply",
-                               "cast",          "matmul",
-                               "linear",        "quantized_linear",
-                               "gelu",          "layer_norm",
-                               "softmax",       "log_softmax",
-                               "transpose",     "slice",
-                               "gather",        "concat",
-                               "scatter",       "attention",
-                               "residual_norm", "rms_norm",
-                               "tanh",          "rotary",
-                               "packed_linear", "rms_norm_residual",
-                               "static_round",  "greedy_token",
-                               "rms_rotary",    "gelu_multiply",
-                               "embedding",     "gated_feed_forward"};
-    return names.at(static_cast<std::size_t>(operation));
-}
+using runtime::operation_name;
 struct OperatorProfile {
     std::uint64_t calls = 0, prepare_ns = 0, dispatch_ns = 0, run_ns = 0, wait_ns = 0;
     std::uint64_t allocations = 0, allocated_bytes = 0, output_bytes = 0;
@@ -60,6 +49,9 @@ struct OperatorProfile {
 } // namespace
 DecodeScope::DecodeScope(bool enabled) : previous_(std::exchange(decode_projections, enabled)) {}
 DecodeScope::~DecodeScope() { decode_projections = previous_; }
+StepCompilerScope::StepCompilerScope(std::shared_ptr<runtime::StepCompiler> compiler)
+    : previous_(std::exchange(default_compiler, std::move(compiler))) {}
+StepCompilerScope::~StepCompilerScope() { default_compiler = std::move(previous_); }
 struct Context::Impl {
     tensor::Device device;
     bool packed_prefill = false;
@@ -67,7 +59,7 @@ struct Context::Impl {
     using DispatchKey = std::vector<std::int64_t>;
     std::list<const DispatchKey*> recent;
     struct Prepared {
-        std::unique_ptr<runtime::Operator> operation;
+        std::shared_ptr<runtime::Operator> operation;
         std::vector<Tensor> parameters;
         std::list<const DispatchKey*>::iterator recency;
     };
@@ -88,6 +80,22 @@ struct Context::Impl {
     std::string phase = "unspecified";
     std::map<std::string, OperatorProfile> profiles;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> synchronization;
+    bool replay_enabled = false;
+    graph::Recorder* recorder = nullptr;
+    std::shared_ptr<runtime::StepCompiler> compiler;
+    struct Captured {
+        std::optional<graph::Graph> first, graph;
+        std::unique_ptr<runtime::StepExecutable> executable;
+        std::future<std::unique_ptr<runtime::StepExecutable>> pending;
+        std::vector<Tensor> outputs;
+        std::uint64_t used = 0;
+    };
+    bool background_compile = true;
+    // Captured steps retain their buffers, so only the most recently used shapes are kept.
+    static constexpr std::size_t STEP_CAPACITY = 8;
+    std::map<std::string, Captured, std::less<>> steps;
+    std::uint64_t step_clock = 0;
+    std::vector<Tensor> eager_outputs;
     ~Impl() {
         try {
             if (backend) backend->synchronize();
@@ -317,7 +325,8 @@ struct Context::Impl {
         auto found = operators.find(key);
         if (found == operators.end()) {
             auto start = std::chrono::steady_clock::now();
-            auto prepared = backend->prepare(spec, inputs);
+            auto prepared = compiler ? compiler->prepare_operator(spec, inputs) : nullptr;
+            if (!prepared) prepared = backend->prepare(spec, inputs);
             if (operators.size() >= operator_capacity) {
                 backend->synchronize();
                 for (std::size_t count = 0; count < std::max(std::size_t{1}, operator_capacity / 4); ++count) {
@@ -344,7 +353,18 @@ struct Context::Impl {
             *residual = std::move(outputs[0]);
             return std::move(outputs[1]);
         };
-        if (!profiling) return execute();
+        const auto captured = [&](Tensor output) -> Tensor {
+            if (!recorder) return output;
+            if (is_inplace)
+                recorder->record(spec, found->second.operation, graph::Mode::IN_PLACE, inputs, {destination, 1});
+            else if (residual)
+                recorder->record(spec, found->second.operation, graph::Mode::PAIR, inputs,
+                                 std::array<Tensor, 2>{*residual, output});
+            else
+                recorder->record(spec, found->second.operation, graph::Mode::RESULT, inputs, {&output, 1});
+            return output;
+        };
+        if (!profiling) return captured(execute());
         const auto dispatch_ns = nanoseconds(entered) - (preparation - preparation_before);
         const auto allocations_before = found->second.operation->allocations();
         auto started = Clock::now();
@@ -376,7 +396,7 @@ struct Context::Impl {
         profile.allocations += allocations_after.count - allocations_before.count;
         profile.allocated_bytes += allocations_after.bytes - allocations_before.bytes;
         profile.output_bytes += output.nbytes() + (residual ? residual->nbytes() : 0);
-        return output;
+        return captured(std::move(output));
     }
 };
 Context::Context(tensor::Device device, bool packed_prefill) : impl_(std::make_unique<Impl>()) {
@@ -389,10 +409,15 @@ Context::Context(tensor::Device device, bool packed_prefill) : impl_(std::make_u
     if (const auto skip = std::getenv("KIDI_PROFILE_OPS_SKIP")) impl_->skip_requests = std::strtoull(skip, nullptr, 10);
     if (impl_->skip_requests) impl_->profiling = false;
     impl_->synchronize_operators = profile && std::string_view(profile) == "sync";
+    const auto replay = std::getenv("KIDI_REPLAY");
     if (device == tensor::Device::cpu()) impl_->backend = runtime::cpu_operators();
 #if defined(KIDI_HAS_WEBGPU)
     else if (device == tensor::Device::web_gpu())
         impl_->backend = runtime::web_gpu_operators();
+#endif
+#if defined(KIDI_HAS_VULKAN)
+    else if (device == tensor::Device::vulkan())
+        impl_->backend = runtime::vulkan_operators();
 #endif
 #if defined(KIDI_HAS_METAL)
     else if (device == tensor::Device::apple_gpu())
@@ -400,6 +425,10 @@ Context::Context(tensor::Device device, bool packed_prefill) : impl_(std::make_u
 #endif
     else
         throw Failure({ErrorCode::UNSUPPORTED, "no eager backend for requested device"});
+    impl_->replay_enabled = impl_->backend->supports_replay() && !(replay && std::string_view(replay) == "0");
+    if (device == tensor::Device::cpu() && impl_->replay_enabled) impl_->compiler = default_compiler;
+    const auto background = std::getenv("KIDI_BACKGROUND_COMPILE");
+    impl_->background_compile = !(background && std::string_view(background) == "0");
 }
 Context::~Context() = default;
 Context::Context(Context&&) noexcept = default;
@@ -420,6 +449,118 @@ auto Context::profile_phase(std::string_view phase) -> void {
     impl_->phase = phase;
 }
 auto Context::preparation_ns() const noexcept -> std::uint64_t { return impl_->preparation; }
+auto Context::replay_enabled() const noexcept -> bool { return impl_->replay_enabled; }
+auto Context::clear_replays() -> void { impl_->steps.clear(); }
+auto Context::clear_replays(std::string_view prefix) -> void {
+    std::erase_if(impl_->steps, [&](const auto& entry) { return entry.first.starts_with(prefix); });
+}
+auto Context::accelerator() const noexcept -> std::string_view {
+    return impl_->compiler ? impl_->compiler->name() : std::string_view{};
+}
+auto Context::step_compiler() const noexcept -> std::shared_ptr<runtime::StepCompiler> { return impl_->compiler; }
+auto Context::step_extent(std::size_t required, std::size_t capacity) const -> std::size_t {
+    return impl_->compiler ? impl_->compiler->key_extent(required, capacity)
+                           : std::min(capacity, (required + 127) / 128 * 128);
+}
+auto Context::crop_local_attention() const noexcept -> bool {
+    return !impl_->compiler || impl_->compiler->crop_local_attention();
+}
+auto Context::prefill_chunk_size(std::size_t requested) const -> std::size_t {
+    return impl_->compiler ? impl_->compiler->prefill_chunk_size(requested) : requested;
+}
+auto Context::replay(std::string_view key, std::span<const Tensor> inputs, const Step& step)
+    -> std::span<const Tensor> {
+    auto& impl = *impl_;
+    if (impl.recorder) throw Failure({ErrorCode::INVALID_ARGUMENT, "captured steps cannot be nested"});
+    if (!impl.replay_enabled) {
+        impl.eager_outputs = step(inputs);
+        return impl.eager_outputs;
+    }
+    auto found = impl.steps.find(key);
+    if (found == impl.steps.end()) {
+        if (impl.steps.size() >= Impl::STEP_CAPACITY)
+            impl.steps.erase(
+                std::ranges::min_element(impl.steps, {}, [](const auto& item) { return item.second.used; }));
+        found = impl.steps.try_emplace(std::string(key)).first;
+    }
+    auto& entry = found->second;
+    entry.used = ++impl.step_clock;
+    const auto started = impl.profiling ? Clock::now() : Clock::time_point{};
+    const auto account = [&](std::string_view mode) {
+        if (!impl.profiling) return;
+        auto& profile = impl.profiles["phase=" + impl.phase + "|op=" + std::string(mode) + "|step=" + std::string(key)];
+        ++profile.calls;
+        profile.run_ns += nanoseconds(started);
+    };
+    // The accelerator owns a compiled step; keep only the output buffers and release the CPU intermediates.
+    const auto adopt = [&](std::unique_ptr<runtime::StepExecutable> executable) {
+        if (!executable) return;
+        entry.executable = std::move(executable);
+        entry.outputs.assign(entry.graph->outputs().begin(), entry.graph->outputs().end());
+        entry.graph.reset();
+    };
+    if (entry.pending.valid() && entry.pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        const auto fallback = [&](std::string_view reason) {
+            std::cerr << "kidi_step|key=" << key << "|accelerator=" << impl.compiler->name()
+                      << "|fallback=cpu|error=" << reason << '\n';
+        };
+        // A background compile failure must never fail generation: the step keeps CPU replay.
+        try {
+            adopt(entry.pending.get());
+        } catch (const Failure& error) {
+            fallback(error.what());
+        } catch (const std::exception& error) {
+            fallback(error.what());
+        } catch (...) {
+            fallback("unknown error");
+        }
+    }
+    if (entry.executable) {
+        entry.executable->run(inputs, entry.outputs);
+        account("accelerated");
+        return entry.outputs;
+    }
+    if (entry.graph) {
+        const auto outputs = entry.graph->replay(inputs);
+        account("replay");
+        return outputs;
+    }
+    graph::Recorder recorder(inputs);
+    impl.recorder = &recorder;
+    struct Reset {
+        graph::Recorder*& active;
+        ~Reset() { active = nullptr; }
+    } reset{impl.recorder};
+    const auto outputs = step(inputs);
+    impl.recorder = nullptr;
+    auto graph = std::move(recorder).finish(outputs);
+    if (!entry.first) {
+        entry.first = std::move(graph);
+        account("capture");
+        return entry.first->outputs();
+    }
+    graph::require_same_structure(*entry.first, graph, key);
+    entry.first.reset();
+    entry.graph = std::move(graph);
+    account("capture");
+    if (impl.compiler && impl.background_compile && impl.compiler->compiles_in_background(*entry.graph, key)) {
+        // The compiler reads its own copy: replay may rebind the live graph's operands meanwhile. Both share buffers.
+        std::promise<std::unique_ptr<runtime::StepExecutable>> result;
+        entry.pending = result.get_future();
+        std::thread([compiler = impl.compiler, snapshot = *entry.graph, name = std::string(key),
+                     result = std::move(result)]() mutable {
+            try {
+                result.set_value(compiler->compile(snapshot, name));
+            } catch (...) {
+                result.set_exception(std::current_exception());
+            }
+        }).detach();
+    } else if (impl.compiler) {
+        adopt(impl.compiler->compile(*entry.graph, key));
+        if (entry.executable) return entry.outputs;
+    }
+    return entry.graph->outputs();
+}
 auto Context::add(const Tensor& left, const Tensor& right) -> Tensor {
     return impl_->run({Operation::ADD}, {&left, &right});
 }
@@ -592,7 +733,8 @@ auto Context::rms_rotary(const Tensor& input, const Tensor& scale, const Tensor&
         if (angle->dimensions() != 4 || angle->size(0) != 1 || angle->size(1) != input.size(1) || angle->size(2) != 1 ||
             angle->size(3) != input.size(3) / 2 || angle->dtype() != tensor::DType::F32)
             throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid RMS rotary angles"});
-    if (device() != tensor::Device::apple_gpu() && device() != tensor::Device::web_gpu())
+    if (device() != tensor::Device::apple_gpu() && device() != tensor::Device::web_gpu() &&
+        device() != tensor::Device::vulkan())
         return rotary(rms_norm(input, scale, epsilon), cosine, sine);
     return impl_->run({Operation::RMS_ROTARY, {}, tensor::DType::F32, epsilon}, {&input, &scale, &cosine, &sine});
 }
@@ -635,8 +777,8 @@ auto Context::transpose(const Tensor& input, std::span<const std::int64_t> axes)
 auto Context::slice(const Tensor& input, std::int64_t axis, std::int64_t start, std::int64_t length) -> Tensor {
     if (input.device() != device()) throw Failure({ErrorCode::INVALID_ARGUMENT, "slice operand device mismatch"});
     auto view = require(input.narrow(axis, start, length));
-    if (view.is_contiguous() &&
-        (device() == tensor::Device::cpu() || device() == tensor::Device::web_gpu() || view.storage_offset() == 0))
+    if (view.is_contiguous() && (device() == tensor::Device::cpu() || device() == tensor::Device::web_gpu() ||
+                                 device() == tensor::Device::vulkan() || view.storage_offset() == 0))
         return view;
     const std::array attributes{axis, start, length};
     return impl_->run({Operation::SLICE, attributes, input.dtype()}, {&input});
@@ -661,6 +803,9 @@ auto Context::scatter_(Tensor& input, const Tensor& updates, const Tensor& indic
     return input;
 }
 auto Context::copy_slice_(Tensor& destination, const Tensor& source, std::int64_t axis, std::int64_t start) -> Tensor& {
+    if (impl_->recorder)
+        throw Failure({ErrorCode::INVALID_ARGUMENT,
+                       "copy_slice_ bakes its offset into a captured step; use scatter_ with an index input"});
     const InplaceScope mode(true);
     const auto rank = static_cast<std::int64_t>(destination.dimensions());
     if (axis < 0) axis += rank;

@@ -25,6 +25,8 @@ public:
     TokenEmbeddingImpl(std::int32_t vocabulary, std::int32_t width, float scale, std::int32_t packed_bits = 0,
                        std::int32_t scale_groups = 1);
     auto forward(ops::Context& context, std::span<const std::int32_t> tokens) const -> Tensor;
+    /// Embeds an I32 `[tokens]` tensor as `[1, tokens, width]`, on the device where supported.
+    auto forward(ops::Context& context, const Tensor& tokens) const -> Tensor;
 
 private:
     Tensor weight_;
@@ -49,6 +51,9 @@ struct Gemma4AttentionSegment {
     std::size_t position, length;
     const Tensor* mask;
     std::int64_t key_start = 0;
+    /// When set, K/V rows are written at these I32 cache positions with `scatter_`, so the offset can change
+    /// between replays of a captured step; `position` then only validates the write.
+    const Tensor* index = nullptr;
 };
 class Gemma4AttentionImpl : public Module {
 public:

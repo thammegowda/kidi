@@ -3,6 +3,7 @@
 #include "kidi/ops/context.h"
 #include "ynnpack/composites/composites.h"
 #include <array>
+#include <functional>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -71,6 +72,12 @@ public:
         write_updates(inputs, destination);
         return destination;
     }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override {
+        auto target = require(outputs[0].host_bytes());
+        const auto original = require(inputs[0].host_bytes());
+        std::memcpy(target.data(), original.data(), original.size());
+        write_updates(inputs, outputs[0]);
+    }
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
@@ -110,10 +117,21 @@ class GreedyToken final : public Operator {
 public:
     explicit GreedyToken(tensor::Arena& arena) : pool_(&arena) {}
     auto run(TensorInputs inputs) -> Tensor override {
-        const auto width = inputs[0].size(-1), rows = inputs[0].numel() / width;
-        const std::array shape{static_cast<std::int64_t>(rows)};
+        const std::array shape{static_cast<std::int64_t>(inputs[0].numel() / inputs[0].size(-1))};
         auto output = pool_.acquire(shape, DType::I32, tensor::Device::cpu());
-        const auto values = require(inputs[0].data<float>());
+        select(inputs[0], output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "greedy selection is not an in-place operation"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { select(inputs[0], outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    static auto select(const Tensor& logits, Tensor& output) -> void {
+        const auto width = logits.size(-1), rows = logits.numel() / width;
+        const auto values = require(logits.data<float>());
         auto tokens = require(output.data<std::int32_t>());
         for (std::size_t row = 0; row < rows; ++row) {
             float best = -std::numeric_limits<float>::infinity();
@@ -129,37 +147,250 @@ public:
             }
             tokens[row] = invalid ? -1 : token;
         }
-        return output;
     }
-    auto run_(TensorInputs, Tensor&) -> Tensor override {
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "greedy selection is not an in-place operation"});
-    }
-    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
-private:
     OutputPool pool_;
 };
 class QuantizeInt8 final : public Operator {
 public:
     QuantizeInt8(float scale, tensor::Arena& arena) : scale_(scale), pool_(&arena) {}
     auto run(TensorInputs inputs) -> Tensor override {
-        const auto& input = inputs[0];
-        auto output = pool_.acquire(input.shape(), DType::I8, tensor::Device::cpu());
+        auto output = pool_.acquire(inputs[0].shape(), DType::I8, tensor::Device::cpu());
+        quantize(inputs[0], output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "quantization cannot run in place"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { quantize(inputs[0], outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto quantize(const Tensor& input, Tensor& output) const -> void {
         const auto source = require(input.data<float>());
         auto destination = require(output.data<std::int8_t>());
         for (std::size_t index = 0; index < source.size(); ++index) {
             const auto rounded = std::nearbyint(source[index] / scale_);
             destination[index] = static_cast<std::int8_t>(std::clamp(rounded, -128.F, 127.F));
         }
+    }
+
+    float scale_;
+    OutputPool pool_;
+};
+/// Token rows gathered from FP32/BF16 tables, or signed 2/4/8-bit tables with per-row group scales, times a multiplier.
+/// Splits `rows` across the thread pool in contiguous blocks; small problems run on the calling thread.
+auto for_rows(std::size_t rows, std::size_t row_work, const std::function<void(std::size_t, std::size_t)>& body)
+    -> void {
+    const auto tasks = rows * row_work < 32768 ? std::size_t{1} : std::min(ynn::thread_count(), rows);
+    if (tasks <= 1) return body(0, rows);
+    const auto block = (rows + tasks - 1) / tasks;
+    require(ynn::parallel_for(tasks, [&](std::size_t task) {
+        const auto begin = task * block;
+        if (begin < rows) body(begin, std::min(rows, begin + block));
+    }));
+}
+
+/// Rotary embedding of `[batch, rows, heads, width]` by `[batch or 1, rows, 1, width / 2]` angles in one pass.
+class Rotary final : public Operator {
+public:
+    explicit Rotary(tensor::Arena& arena) : pool_(&arena) {}
+    static auto supports(TensorInputs inputs) -> bool {
+        if (inputs.size() != 3) return false;
+        const auto &input = inputs[0], &cosine = inputs[1], &sine = inputs[2];
+        return input.dtype() == DType::F32 && cosine.dtype() == DType::F32 && sine.dtype() == DType::F32 &&
+               input.dimensions() == 4 && cosine.dimensions() == 4 && input.is_contiguous() && cosine.is_contiguous() &&
+               sine.is_contiguous() && std::ranges::equal(cosine.shape(), sine.shape()) && input.size(3) % 2 == 0 &&
+               cosine.size(3) == input.size(3) / 2 && cosine.size(2) == 1 && cosine.size(1) == input.size(1) &&
+               (cosine.size(0) == input.size(0) || cosine.size(0) == 1);
+    }
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
+        apply(inputs, output);
         return output;
     }
-    auto run_(TensorInputs, Tensor&) -> Tensor override {
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "quantization cannot run in place"});
+    auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
+        apply(inputs, destination);
+        return destination;
     }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
-    float scale_;
+    static auto apply(TensorInputs inputs, Tensor& output) -> void {
+        const auto &input = inputs[0], &cosine = inputs[1];
+        const auto rows = input.size(1), heads = input.size(2), width = input.size(3), half = width / 2;
+        const auto shared_angles = cosine.size(0) == 1;
+        const auto* source = require(input.data<float>()).data();
+        const auto* cosines = require(cosine.data<float>()).data();
+        const auto* sines = require(inputs[2].data<float>()).data();
+        auto* target = require(output.data<float>()).data();
+        for_rows(input.size(0) * rows, heads * width, [&](std::size_t begin, std::size_t end) {
+        // Matches the separate multiply, subtract, and add of the graph path: no fused multiply-add.
+#pragma clang fp contract(off)
+            for (auto row = begin; row < end; ++row) {
+                const auto angle = (shared_angles ? row % rows : row) * half;
+                const auto* c = cosines + angle;
+                const auto* s = sines + angle;
+                for (std::size_t head = 0; head < heads; ++head) {
+                    const auto* x = source + (row * heads + head) * width;
+                    auto* y = target + (row * heads + head) * width;
+                    for (std::size_t index = 0; index < half; ++index) {
+                        const auto first = x[index], second = x[index + half];
+                        y[index] = first * c[index] - second * s[index];
+                        y[index + half] = second * c[index] + first * s[index];
+                    }
+                }
+            }
+        });
+    }
+    OutputPool pool_;
+};
+
+/// RMS normalization over the last axis with a per-channel weight; the residual form adds `inputs[2]` and optionally
+/// scales by the scalar `inputs[3]`.
+class RmsNorm final : public Operator {
+public:
+    RmsNorm(const OperatorSpec& spec, tensor::Arena& arena)
+        : epsilon_(spec.epsilon), residual_(spec.operation == Operation::RMS_NORM_RESIDUAL), pool_(&arena) {}
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) -> bool {
+        const bool residual = spec.operation == Operation::RMS_NORM_RESIDUAL;
+        if (inputs.size() < 2 || inputs.size() > (residual ? 4U : 2U) || (residual && inputs.size() < 3)) return false;
+        const auto &input = inputs[0], &weight = inputs[1];
+        if (input.dtype() != DType::F32 || weight.dtype() != DType::F32 || !input.is_contiguous() ||
+            !weight.is_contiguous() || input.dimensions() == 0 || weight.numel() != input.size(-1) ||
+            weight.numel() != weight.size(-1))
+            return false;
+        if (!residual) return true;
+        return inputs[2].dtype() == DType::F32 && inputs[2].is_contiguous() &&
+               std::ranges::equal(inputs[2].shape(), input.shape()) &&
+               (inputs.size() == 3 || (inputs[3].dtype() == DType::F32 && inputs[3].numel() == 1));
+    }
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
+        apply(inputs, destination);
+        return destination;
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(TensorInputs inputs, Tensor& output) const -> void {
+        const auto width = inputs[0].size(-1), rows = inputs[0].numel() / width;
+        const auto* source = require(inputs[0].data<float>()).data();
+        const auto* weight = require(inputs[1].data<float>()).data();
+        const auto* residual = residual_ ? require(inputs[2].data<float>()).data() : nullptr;
+        const auto scale = residual_ && inputs.size() == 4 ? require(inputs[3].data<float>())[0] : 1.F;
+        const bool scaled = residual_ && inputs.size() == 4;
+        auto* target = require(output.data<float>()).data();
+        const auto reciprocal = 1.F / static_cast<float>(width);
+        for_rows(rows, width, [&](std::size_t begin, std::size_t end) {
+#pragma clang fp contract(off)
+            for (auto row = begin; row < end; ++row) {
+                const auto* x = source + row * width;
+                auto* y = target + row * width;
+                std::array<float, 8> partial{};
+                std::size_t index = 0;
+                for (; index + 8 <= width; index += 8)
+                    for (std::size_t lane = 0; lane < 8; ++lane) partial[lane] += x[index + lane] * x[index + lane];
+                auto sum = 0.F;
+                for (; index < width; ++index) sum += x[index] * x[index];
+                for (const auto value : partial) sum += value;
+                const auto inverse = 1.F / std::sqrt(sum * reciprocal + epsilon_);
+                if (!residual_) {
+                    for (index = 0; index < width; ++index) y[index] = x[index] * inverse * weight[index];
+                    continue;
+                }
+                const auto* r = residual + row * width;
+                for (index = 0; index < width; ++index) {
+                    const auto value = r[index] + x[index] * inverse * weight[index];
+                    y[index] = scaled ? value * scale : value;
+                }
+            }
+        });
+    }
+    float epsilon_;
+    bool residual_;
+    OutputPool pool_;
+};
+
+class Embedding final : public Operator {
+public:
+    Embedding(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
+        : width_(static_cast<std::size_t>(spec.attributes[0])),
+          bits_(static_cast<int>(spec.attributes[1])),
+          groups_(static_cast<std::size_t>(spec.attributes[2])),
+          multiplier_(spec.epsilon),
+          pool_(&arena) {
+        const auto& weight = inputs[1];
+        const bool packed = bits_ != 0;
+        const auto stored = packed ? width_ / (8 / bits_) : width_;
+        if (weight.size(1) != stored || (packed && width_ % (8 / bits_)) ||
+            (packed ? (weight.dtype() != DType::U8 && !(bits_ == 8 && weight.dtype() == DType::I8)) ||
+                          inputs.size() != 3 || inputs[2].dtype() != DType::F32 || inputs[2].dimensions() != 2 ||
+                          inputs[2].size(0) != weight.size(0) || inputs[2].size(1) != groups_ || !groups_ ||
+                          width_ % groups_
+                    : weight.dtype() != DType::F32 && weight.dtype() != DType::BF16))
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid embedding table layout"});
+    }
+    auto run(TensorInputs inputs) -> Tensor override {
+        const std::array shape{std::int64_t{1}, static_cast<std::int64_t>(inputs[0].numel()),
+                               static_cast<std::int64_t>(width_)};
+        auto output = pool_.acquire(shape, DType::F32, tensor::Device::cpu());
+        lookup(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "embedding is not an in-place operation"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { lookup(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto lookup(TensorInputs inputs, Tensor& output) const -> void {
+        const auto tokens = require(inputs[0].data<std::int32_t>());
+        const auto& weight = inputs[1];
+        const auto bytes = require(weight.host_bytes());
+        auto values = require(output.data<float>());
+        for (const auto token : tokens)
+            if (token < 0 || static_cast<std::size_t>(token) >= weight.size(0))
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "embedding token outside vocabulary"});
+        if (bits_) {
+            const auto scales = require(inputs[2].data<float>());
+            const auto group_width = width_ / groups_, per_byte = static_cast<std::size_t>(8 / bits_);
+            const auto data = reinterpret_cast<const std::uint8_t*>(bytes.data());
+            const auto sign = 1 << (bits_ - 1);
+            for (std::size_t row = 0; row < tokens.size(); ++row)
+                for (std::size_t channel = 0; channel < width_; ++channel) {
+                    const auto offset = static_cast<std::size_t>(tokens[row]) * width_ + channel;
+                    const auto raw = (data[offset / per_byte] >> ((offset % per_byte) * bits_)) & ((1 << bits_) - 1);
+                    const auto integer = (raw ^ sign) - sign;
+                    values[row * width_ + channel] =
+                        integer * scales[tokens[row] * groups_ + channel / group_width] * multiplier_;
+                }
+            return;
+        }
+        for (std::size_t row = 0; row < tokens.size(); ++row)
+            for (std::size_t channel = 0; channel < width_; ++channel) {
+                const auto offset = static_cast<std::size_t>(tokens[row]) * width_ + channel;
+                const auto value =
+                    weight.dtype() == DType::BF16
+                        ? std::bit_cast<float>(
+                              static_cast<std::uint32_t>(reinterpret_cast<const std::uint16_t*>(bytes.data())[offset])
+                              << 16)
+                        : reinterpret_cast<const float*>(bytes.data())[offset];
+                values[row * width_ + channel] = value * multiplier_;
+            }
+    }
+
+    std::size_t width_;
+    int bits_;
+    std::size_t groups_;
+    float multiplier_;
     OutputPool pool_;
 };
 class QuantizedAttention final : public Operator {
@@ -200,8 +431,19 @@ public:
         scratch_.resize(tasks_ * task_scratch_bytes_);
     }
     auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
+        attend(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "attention is not an in-place operation"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { attend(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto attend(TensorInputs inputs, Tensor& output) -> void {
         const auto& query = inputs[0];
-        auto output = pool_.acquire(query.shape(), DType::F32, tensor::Device::cpu());
         const auto params = parameters();
         const auto query_data = require(query.data<float>());
         const auto key_data = require(inputs[1].data<std::int8_t>());
@@ -216,14 +458,7 @@ public:
                                            mask_data.data(), output_data.data(), row_start, row_end,
                                            scratch_.data() + task * task_scratch_bytes_);
         }));
-        return output;
     }
-    auto run_(TensorInputs, Tensor&) -> Tensor override {
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "attention is not an in-place operation"});
-    }
-    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
-
-private:
     auto parameters() const -> ::ynn::quantized_attention_f32_params {
         return {
             .batch_size = batch_size_,
@@ -288,6 +523,12 @@ public:
         auto normalized = run(inputs);
         return {std::move(residual), std::move(normalized)};
     }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override {
+        for (std::size_t index = 0; index < dynamic_count_; ++index) require(executable_.bind(index, inputs[index]));
+        require(executable_.bind(count_, outputs.back()));
+        if (outputs.size() == 2) require(executable_.bind(count_ + 1, outputs.front()));
+        require(executable_.invoke());
+    }
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
@@ -301,6 +542,7 @@ class CpuBackend final : public OperatorBackend {
 public:
     CpuBackend() { require(arena_.reserve(8 * 1024 * 1024)); }
     auto synchronize() -> void override {}
+    auto supports_replay() const noexcept -> bool override { return true; }
     auto copy_slice_(Tensor& destination, const Tensor& source, std::size_t outer, std::size_t source_bytes,
                      std::size_t destination_bytes, std::size_t offset_bytes) -> void override {
         auto target = require(destination.host_bytes());
@@ -319,6 +561,11 @@ public:
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
         if (spec.operation == Operation::SCATTER) return std::make_unique<Scatter>(arena_);
         if (spec.operation == Operation::GREEDY_TOKEN) return std::make_unique<GreedyToken>(arena_);
+        if (spec.operation == Operation::EMBEDDING) return std::make_unique<Embedding>(spec, inputs, arena_);
+        if (spec.operation == Operation::ROTARY && Rotary::supports(inputs)) return std::make_unique<Rotary>(arena_);
+        if ((spec.operation == Operation::RMS_NORM || spec.operation == Operation::RMS_NORM_RESIDUAL) &&
+            RmsNorm::supports(spec, inputs))
+            return std::make_unique<RmsNorm>(spec, arena_);
         if (spec.operation == Operation::CAST && spec.dtype == DType::I8 && spec.epsilon > 0)
             return std::make_unique<QuantizeInt8>(spec.epsilon, arena_);
         if (spec.operation == Operation::ATTENTION) {
@@ -709,9 +956,8 @@ public:
             case Operation::SCATTER:
             case Operation::GREEDY_TOKEN:
             case Operation::RMS_ROTARY:
-                break;
             case Operation::EMBEDDING:
-                throw ops::Failure({ErrorCode::UNSUPPORTED, "device embedding is not implemented by this backend"});
+                break;
         }
         auto output_id = static_cast<std::uint32_t>(inputs.size());
         if (pad_columns) {

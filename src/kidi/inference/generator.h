@@ -46,10 +46,19 @@ struct GenerationStep {
     std::uint64_t prefill_ns = 0, decode_ns = 0, preparation_ns = 0;
     std::size_t active_requests = 0, waiting_requests = 0, reserved_cache_tokens = 0;
 };
+/// Resolves an accelerator preference ("auto", "cpu", "gpu", or "npu") to a device. "auto" picks the Qualcomm NPU,
+/// then a GPU, then the CPU, by availability; an explicit choice fails when that accelerator is unavailable.
+/// `speech` selects the policy for Whisper, whose "auto" stays on the CPU INT8 path.
+auto select_device(std::string_view accelerator, bool speech = false) -> Result<tensor::Device>;
+
 class Generator {
 public:
+    /// Loads Gemma 4 on `device`; the Qualcomm NPU device keeps the model on the CPU and compiles captured
+    /// decoding steps for the NPU.
     static auto load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits = 0,
                      std::int32_t group_size = 128, bool packed_prefill = false) -> Result<Generator>;
+    /// Where text generation runs, e.g. "cpu", "vulkan", or "cpu+qnn-htp".
+    auto execution() const -> std::string;
     auto generate(std::string_view prompt, GenerationOptions options = {}) -> Result<TextGeneration>;
     auto generate_batch(std::span<const std::string> prompts, GenerationOptions options = {})
         -> Result<GenerationBatch>;

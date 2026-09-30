@@ -15,6 +15,7 @@ enum class DeviceKind {
     CUDA,
     A_GPU,
     WEB_GPU,
+    VULKAN,
     COUNT,
 };
 
@@ -22,6 +23,8 @@ struct DeviceCapabilities {
     bool calibrated_int8_cast = false;
     bool blockwise_int8_attention = false;
     std::size_t blockwise_int8_attention_max_tokens = 0;
+    /// Token embedding lookups run on the device from I32 token tensors.
+    bool device_embedding = false;
 };
 
 template <typename Key, typename Value, std::size_t Size>
@@ -50,14 +53,20 @@ inline constexpr EnumMap<DeviceKind, DeviceCapabilities, static_cast<std::size_t
     DEVICE_CAPABILITIES{std::array{
         std::pair{DeviceKind::CPU, DeviceCapabilities{.calibrated_int8_cast = true,
                                                       .blockwise_int8_attention = true,
-                                                      .blockwise_int8_attention_max_tokens = 512}},
+                                                      .blockwise_int8_attention_max_tokens = 512,
+                                                      .device_embedding = true}},
         std::pair{DeviceKind::Q_NPU, DeviceCapabilities{}},
         std::pair{DeviceKind::CUDA, DeviceCapabilities{}},
         std::pair{DeviceKind::A_GPU, DeviceCapabilities{.calibrated_int8_cast = true}},
         std::pair{DeviceKind::WEB_GPU,
                   DeviceCapabilities{.calibrated_int8_cast = true,
                                      .blockwise_int8_attention = true,
-                                     .blockwise_int8_attention_max_tokens = std::numeric_limits<std::size_t>::max()}},
+                                     .blockwise_int8_attention_max_tokens = std::numeric_limits<std::size_t>::max(),
+                                     .device_embedding = true}},
+        std::pair{DeviceKind::VULKAN, DeviceCapabilities{.calibrated_int8_cast = true,
+                                                         .blockwise_int8_attention = true,
+                                                         .blockwise_int8_attention_max_tokens = 512,
+                                                         .device_embedding = true}},
     }};
 
 struct Device {
@@ -74,6 +83,8 @@ struct Device {
 
     static constexpr auto web_gpu(std::int32_t index = 0) noexcept -> Device { return {DeviceKind::WEB_GPU, index}; }
 
+    static constexpr auto vulkan(std::int32_t index = 0) noexcept -> Device { return {DeviceKind::VULKAN, index}; }
+
     friend auto operator==(const Device&, const Device&) -> bool = default;
 };
 
@@ -89,6 +100,8 @@ constexpr auto to_string(DeviceKind kind) noexcept -> std::string_view {
             return "a_gpu";
         case DeviceKind::WEB_GPU:
             return "web_gpu";
+        case DeviceKind::VULKAN:
+            return "vulkan";
         case DeviceKind::COUNT:
             return "unknown";
     }

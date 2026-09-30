@@ -56,43 +56,30 @@ TokenEmbeddingImpl::TokenEmbeddingImpl(std::int32_t vocabulary, std::int32_t wid
 auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int32_t> tokens) const -> Tensor {
     if (!weight_.defined() || tokens.empty())
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "uninitialized embedding or empty tokens"});
+    if (tensor::DEVICE_CAPABILITIES[context.device().kind].device_embedding)
+        return forward(
+            context, require(Tensor::from_host({static_cast<std::int64_t>(tokens.size())}, tokens, context.device())));
     for (auto token : tokens)
         if (token < 0 || static_cast<std::size_t>(token) >= weight_.size(0))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "embedding token outside vocabulary"});
     const auto width = static_cast<std::size_t>(width_);
-    if (context.device() == tensor::Device::web_gpu()) {
-        if (weight_.dtype() == tensor::DType::I8)
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "unpacked INT8 embedding is not supported on WebGPU"});
-        const auto indices =
-            require(Tensor::from_host({static_cast<std::int64_t>(tokens.size())}, tokens, context.device()));
-        return context.embedding(indices, weight_, quantization_scale_, width_, packed_bits_, scale_);
-    }
     auto output = require(Tensor::empty({1, static_cast<std::int64_t>(tokens.size()), static_cast<std::int64_t>(width)},
                                         tensor::DType::F32, context.device()));
     const auto bytes = require(weight_.host_bytes());
     auto values = require(output.data<float>());
-    if (packed_bits_) {
+    if (packed_bits_ || weight_.dtype() == tensor::DType::I8) {
+        const auto bits = packed_bits_ ? packed_bits_ : 8;
         const auto scales = require(quantization_scale_.data<float>());
         const auto groups = quantization_scale_.size(1), group_width = width / groups;
         const auto data = reinterpret_cast<const std::uint8_t*>(bytes.data());
         for (std::size_t index = 0; index < tokens.size(); ++index)
             for (std::size_t channel = 0; channel < width; ++channel) {
                 const auto offset = static_cast<std::size_t>(tokens[index]) * width + channel;
-                const auto raw = (data[offset / (8 / packed_bits_)] >> ((offset % (8 / packed_bits_)) * packed_bits_)) &
-                                 ((1 << packed_bits_) - 1);
-                const auto integer = (raw ^ (1 << (packed_bits_ - 1))) - (1 << (packed_bits_ - 1));
+                const auto raw = (data[offset / (8 / bits)] >> ((offset % (8 / bits)) * bits)) & ((1 << bits) - 1);
+                const auto integer = (raw ^ (1 << (bits - 1))) - (1 << (bits - 1));
                 values[index * width + channel] =
                     integer * scales[tokens[index] * groups + channel / group_width] * scale_;
             }
-        return output;
-    }
-    if (weight_.dtype() == tensor::DType::I8) {
-        const auto scales = require(quantization_scale_.data<float>());
-        const auto integers = reinterpret_cast<const std::int8_t*>(bytes.data());
-        for (std::size_t index = 0; index < tokens.size(); ++index)
-            for (std::size_t channel = 0; channel < width; ++channel)
-                values[index * width + channel] = integers[static_cast<std::size_t>(tokens[index]) * width + channel] *
-                                                  scales[tokens[index]] * scale_;
         return output;
     }
     for (std::size_t index = 0; index < tokens.size(); ++index)
@@ -108,6 +95,18 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int
         }
     return output;
 }
+auto TokenEmbeddingImpl::forward(ops::Context& context, const Tensor& tokens) const -> Tensor {
+    if (!weight_.defined() || tokens.dtype() != tensor::DType::I32 || tokens.dimensions() != 1 || !tokens.numel())
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "token embeddings require a nonempty I32 token vector"});
+    if (!tensor::DEVICE_CAPABILITIES[context.device().kind].device_embedding) {
+        context.synchronize();
+        return forward(context, require(tokens.data<std::int32_t>()));
+    }
+    if (weight_.dtype() == tensor::DType::I8 && context.device() == tensor::Device::web_gpu())
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "unpacked INT8 embedding is not supported on WebGPU"});
+    const auto bits = packed_bits_ ? packed_bits_ : weight_.dtype() == tensor::DType::I8 ? 8 : 0;
+    return context.embedding(tokens, weight_, quantization_scale_, width_, bits, scale_);
+}
 GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t packed_bits)
     : gate_up_(hidden, gate_up_width(intermediate), true, false, packed_bits),
       down_(intermediate, hidden, true, false, packed_bits) {
@@ -116,8 +115,8 @@ GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t int
 }
 auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
     const auto rows = input.numel() / input.size(-1);
-    if (context.device() == tensor::Device::cpu() && rows >= 32 && gate_up_->packed_bits_ &&
-        gate_up_->packed_bits_ == down_->packed_bits_) {
+    if ((context.device() == tensor::Device::cpu() || context.device() == tensor::Device::vulkan()) && rows >= 32 &&
+        gate_up_->packed_bits_ && gate_up_->packed_bits_ == down_->packed_bits_) {
         const Tensor& gate_input = gate_up_->input_scale_;
         const Tensor& gate_output = gate_up_->output_scale_;
         const Tensor& down_input = down_->input_scale_;
@@ -242,8 +241,13 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
                 cache.key_quantization = key_quantization;
                 cache.value_quantization = value_quantization;
             }
-            context.copy_slice_(cache.key, keys, 1, segment.position);
-            context.copy_slice_(cache.value, values, 1, segment.position);
+            if (segment.index) {
+                context.scatter_(cache.key, keys, *segment.index);
+                context.scatter_(cache.value, values, *segment.index);
+            } else {
+                context.copy_slice_(cache.key, keys, 1, segment.position);
+                context.copy_slice_(cache.value, values, 1, segment.position);
+            }
         }
         if (cache_only) {
             offset += segment.length;

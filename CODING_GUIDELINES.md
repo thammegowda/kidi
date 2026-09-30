@@ -80,9 +80,12 @@ to kidi-owned C++ code. Code under `third_party/` follows its upstream project.
   owns network definitions, validation and parameter binding. Do not duplicate
   model/layer equations for each backend.
 - Model/layer code operates on concrete tensors. Do not reintroduce a symbolic
-  model graph, generic lowerer, lazy fallback, or recorded generation loop.
+  model graph, model compiler, lazy fallback, or recorded generation loop.
   Backend-private prepared operators are allowed and must remain invisible to
-  model definitions. Use `ops::Failure` within eager computation; translate it
+  model definitions. Capture fixed-shape steps with `Context::replay`: pass
+  per-call values such as token IDs and positions as tensors, write remaining
+  host values into step inputs, write caches with `scatter_` and index inputs,
+  and never read computed tensors on the host inside a step. Use `ops::Failure` within eager computation; translate it
   to `Result<T>` at model/application boundaries. Synchronize before host reads.
 - Keep implementation details in unnamed namespaces in `.cpp` files.
 - Prefer a focused free function over a new class when no state or lifetime is

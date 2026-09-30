@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "kidi/inference/generator.h"
 #include "kidi/inference/transcriber.h"
 #include "kidi/runtime/ynn/graph.h"
@@ -32,17 +33,25 @@ auto peak_rss_kib() -> long {
 #endif
 }
 
+/// Gemma device from KIDI_ACCELERATOR (auto, cpu, gpu, or npu); defaults to cpu for reproducible baselines.
+auto gemma_device() -> kidi::tensor::Device {
+    const auto* accelerator = std::getenv("KIDI_ACCELERATOR");
+    return require(kidi::inference::select_device(accelerator ? accelerator : "cpu"));
+}
+
 auto emit(nlohmann::json record, int threads) -> void {
     record["threads"] = threads;
+    if (const auto* accelerator = std::getenv("KIDI_ACCELERATOR")) record["accelerator"] = accelerator;
     record["peak_rss_kib"] = peak_rss_kib();
     std::cout << record.dump() << std::endl;
 }
 
 auto benchmark_gemma(const std::filesystem::path& directory, int threads, int repeats) -> void {
     const auto started = Clock::now();
-    auto generator = require(kidi::inference::Generator::load(directory, kidi::tensor::Device::cpu(), 0, 128, true));
+    auto generator = require(kidi::inference::Generator::load(directory, gemma_device(), 0, 128, true));
     require(generator.configure_serving({1, 1, CONTEXT, CHUNK}));
     emit({{"stage", "load"},
+          {"execution", generator.execution()},
           {"model", "gemma"},
           {"ms", rounded(elapsed_ms(started))},
           {"native_qat", generator.native_qat()}},
@@ -101,7 +110,7 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
 }
 
 auto benchmark_chat_turns(const std::filesystem::path& directory, int threads, int repeats) -> void {
-    auto generator = require(kidi::inference::Generator::load(directory, kidi::tensor::Device::cpu(), 0, 128, true));
+    auto generator = require(kidi::inference::Generator::load(directory, gemma_device(), 0, 128, true));
     require(generator.configure_serving({1, 1, CONTEXT, CHUNK}));
     kidi::inference::GenerationOptions options;
     options.maximum_new_tokens = 16;
@@ -158,7 +167,7 @@ auto benchmark_chat_turns(const std::filesystem::path& directory, int threads, i
 
 auto benchmark_image(const std::filesystem::path& directory, const std::filesystem::path& image, int threads) -> void {
     const auto start = Clock::now();
-    auto generator = require(kidi::inference::Generator::load(directory, kidi::tensor::Device::cpu(), 0, 128, true));
+    auto generator = require(kidi::inference::Generator::load(directory, gemma_device(), 0, 128, true));
     require(generator.configure_serving({1, 1, CONTEXT, CHUNK}));
     emit({{"stage", "load"}, {"vision", generator.vision_supported()}, {"ms", rounded(elapsed_ms(start))}}, threads);
     kidi::inference::GenerationOptions options;

@@ -16,9 +16,10 @@ struct WhisperEncoderState {
     std::vector<layers::KeyValue> layers;
 };
 
+/// Decoder state written in place each step; `tokens`, `mask`, and `index` are the per-token step inputs.
 struct WhisperDecoderState {
     std::vector<layers::KeyValue> layers;
-    tensor::Tensor mask, index;
+    tensor::Tensor tokens, mask, index;
     std::size_t position = 0, capacity = 0;
 };
 

@@ -85,6 +85,12 @@ BackendRegistry::BackendRegistry() {
     backends_.emplace(DeviceKind::WEB_GPU,
                       make_unavailable_backend(DeviceKind::WEB_GPU, "webgpu", "WebGPU backend is not built"));
 #endif
+#if defined(KIDI_HAS_VULKAN)
+    backends_.emplace(DeviceKind::VULKAN, make_vulkan_backend());
+#else
+    backends_.emplace(DeviceKind::VULKAN,
+                      make_unavailable_backend(DeviceKind::VULKAN, "vulkan", "Vulkan backend is not built"));
+#endif
 }
 
 auto BackendRegistry::register_backend(std::shared_ptr<Backend> backend) -> Result<void> {
@@ -109,8 +115,8 @@ auto BackendRegistry::backend(Device device) const -> Result<std::shared_ptr<Bac
 }
 
 auto BackendRegistry::backends(std::int32_t device_index) const -> std::vector<BackendInfo> {
-    constexpr std::array KINDS = {DeviceKind::CPU, DeviceKind::A_GPU, DeviceKind::Q_NPU, DeviceKind::CUDA,
-                                  DeviceKind::WEB_GPU};
+    constexpr std::array KINDS = {DeviceKind::CPU,  DeviceKind::A_GPU,   DeviceKind::Q_NPU,
+                                  DeviceKind::CUDA, DeviceKind::WEB_GPU, DeviceKind::VULKAN};
     std::vector<BackendInfo> result;
     result.reserve(KINDS.size());
     std::scoped_lock lock(mutex_);
@@ -119,8 +125,8 @@ auto BackendRegistry::backends(std::int32_t device_index) const -> std::vector<B
         if (found == backends_.end()) continue;
         const Device device{kind, device_index};
         const bool storage_available = found->second->is_available(device);
-        result.push_back({kind, std::string(found->second->name()), storage_available,
-                          storage_available && found->second->supports_execution(),
+        result.push_back({kind, std::string(found->second->name()), found->second->device_name(device),
+                          storage_available, storage_available && found->second->supports_execution(),
                           storage_available ? std::string{} : found->second->unavailable_reason(device)});
     }
     return result;
