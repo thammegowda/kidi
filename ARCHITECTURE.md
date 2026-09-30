@@ -723,9 +723,10 @@ FP32 tensors; no input is mutated. Gemma 4 uses it for post-attention, post-MLP,
 post-per-layer-input residuals. CPU and Metal implement the same equation without
 duplicating model topology or introducing model-level graphs.
 
-CUDA and QNN are registered placeholders: the device kinds and their integration
-points exist, but every operation fails with a "not implemented" error. Unsupported
-execution does not silently fall back to CPU.
+CUDA is a registered placeholder: the device kind and integration points exist,
+but operations fail with a "not implemented" error. QNN is implemented as the
+captured-step compiler described below. Unsupported execution does not silently
+fall back to CPU.
 
 ### Native Gemma 4 Mobile QAT
 
@@ -800,3 +801,46 @@ Gemma feed-forward blocks using Adreno integer dot-product compute shaders; weig
 operator, while activations and outputs use reusable mapped buffers for the fixed prepared shape.  This keeps Gemma text
 decode functional while leaving broader batching, descriptor reuse, device-local allocation, and full attention/native
 pointwise coverage as backend optimization work.
+
+## Qualcomm NPU Captured-Step Compiler
+
+When Kidi is built with `KIDI_ENABLE_QNN=ON` and a QAIRT SDK,
+`runtime::npu_step_compiler()` loads the Qualcomm QNN HTP runtime with `dlopen`
+and attaches a `StepCompiler` to CPU Gemma 4 contexts selected with
+`Device::qualcomm_npu()`. Model code records its normal operators twice; the
+compiler then lowers the entire captured prefill or decode step to chained QNN
+graphs. There is no operator-by-operator CPU/NPU alternation in accelerated
+steady state.
+
+The whole-step lowering covers packed 2/4/8-bit embeddings, calibrated
+projections and feed-forwards, RMS norms and residuals, rotary embeddings,
+grouped-query causal attention, KV writes, the 262K 2-bit vocabulary head, and
+greedy selection. Packed embedding tables reside in shared FastRPC memory and
+are gathered, unpacked, and scaled on HTP. KV caches use their trained INT8
+grids in registered shared memory; the host synchronizes an existing prefix
+once when a new 512/1024/2048/... attention bucket is selected, and copies only
+the newly produced KV rows back for model-state compatibility. Per-call host
+work is limited to binding inputs, cache-prefix synchronization, graph launches,
+and reading the selected token.
+
+Low-bit FC weights use 8-bit containers with bit-width axis scales because this
+HTP release rejects packed SFIXED2/SFIXED4 constants. Graphs are split by an
+unpacked-weight budget (256 MiB by default) to keep `libQnnHtpPrepare` memory
+bounded. On the tested Gemma 4 E2B model this produces five prefill graphs and
+eleven decode graphs. Prefill and decode share a single FastRPC copy of the
+packed embedding tables.
+
+Whole-step context binaries and JSON binding metadata are cached under
+`KIDI_QNN_CACHE_DIR`, keyed by step shape, sampled model content, lowering
+version, and QNN build ID. The measured 128-row/512-key prefill context is
+319 MiB and the 512-key decode context is 804 MiB; cold compilation takes about
+114 and 92 seconds, while reload takes about 4 and 8 seconds. Compilation runs
+in the background by default, so CPU replay remains usable until the context is
+ready.
+
+The Android APK packages the matching HTP runtime and prepare libraries, V79
+stub/skel, and QNN System library. Prepare is 81 MiB installed but about 35 MiB
+compressed in the APK; it is required only for an uncached shape. The skel is
+extracted to the APK native-library directory because FastRPC cannot read it
+from normal app data. Kidi requests the sustained-performance HTP power vote
+when available.

@@ -109,8 +109,13 @@ if(EMSCRIPTEN)
 endif()
 
 option(KIDI_ENABLE_VULKAN "Build the Vulkan GPU backend" ${ANDROID})
+option(KIDI_ENABLE_QNN "Build the Qualcomm NPU step compiler (loads QNN at runtime)" ${ANDROID})
+set(KIDI_QNN_SDK "" CACHE PATH "QAIRT SDK root providing QNN headers for the NPU backend and benchmarks")
 if(KIDI_ENABLE_VULKAN)
     include(cmake/vulkan.cmake)
+endif()
+if(KIDI_ENABLE_QNN)
+    include(cmake/qnn.cmake)
 endif()
 
 if(KIDI_BUILD_BENCHMARKS)
@@ -121,9 +126,10 @@ if(KIDI_BUILD_BENCHMARKS)
     if(UNIX)
         add_executable(kidi_android_baseline benchmarks/android/baseline.cpp)
         target_link_libraries(kidi_android_baseline PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
+        add_executable(kidi_npu_prefill benchmarks/android/npu_prefill.cpp)
+        target_link_libraries(kidi_npu_prefill PRIVATE kidi::kidi)
     endif()
     if(ANDROID)
-        set(KIDI_QNN_SDK "" CACHE PATH "Optional local QAIRT SDK root; enables the low-bit benchmark NPU backend")
         find_program(KIDI_GLSLC glslc
             HINTS "${ANDROID_NDK}/shader-tools/${ANDROID_NDK_HOST_SYSTEM_NAME}"
             REQUIRED
