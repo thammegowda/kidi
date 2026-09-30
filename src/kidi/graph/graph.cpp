@@ -62,16 +62,6 @@ auto same_layout(const Tensor& first, const Tensor& second) -> bool {
 }
 } // namespace
 
-auto Node::spec() const -> runtime::OperatorSpec {
-    runtime::OperatorSpec result{operation, attributes, dtype, epsilon};
-    result.dynamic_parameters = dynamic_parameters;
-    result.packed_prefill = packed_prefill;
-    result.vector_projection = vector_projection;
-    for (std::size_t index = 0; index < result.quantization.size(); ++index)
-        result.quantization[index] = {scales[index], zero_points[index], block_sizes[index]};
-    return result;
-}
-
 auto Graph::bind(std::size_t slot, const Tensor& input) -> void {
     auto& current = inputs_[slot];
     if (input.storage_identity() == current.storage_identity() && input.storage_offset() == current.storage_offset() &&

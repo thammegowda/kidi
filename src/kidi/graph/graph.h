@@ -15,7 +15,7 @@ namespace kidi::graph {
 using tensor::Tensor;
 
 /// How a recorded operator writes its outputs.
-enum class Mode { RESULT, IN_PLACE, PAIR };
+enum class Mode { RESULT, IN_PLACE };
 
 /// Where an operand's storage comes from: a step input, an earlier node output, or a fixed external tensor.
 struct Source {
@@ -42,7 +42,6 @@ struct Node {
     std::size_t input_count = 0;
     std::vector<Source> sources; // one per operand
 
-    auto spec() const -> runtime::OperatorSpec;
     auto inputs() const -> std::span<const Tensor> { return {operands.data(), input_count}; }
     auto outputs() const -> std::span<const Tensor> { return std::span(operands).subspan(input_count); }
 };

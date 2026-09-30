@@ -358,7 +358,7 @@ struct Context::Impl {
             if (is_inplace)
                 recorder->record(spec, found->second.operation, graph::Mode::IN_PLACE, inputs, {destination, 1});
             else if (residual)
-                recorder->record(spec, found->second.operation, graph::Mode::PAIR, inputs,
+                recorder->record(spec, found->second.operation, graph::Mode::RESULT, inputs,
                                  std::array<Tensor, 2>{*residual, output});
             else
                 recorder->record(spec, found->second.operation, graph::Mode::RESULT, inputs, {&output, 1});
