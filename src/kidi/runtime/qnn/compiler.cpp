@@ -120,7 +120,7 @@ auto cache_directory() -> std::filesystem::path {
     return std::filesystem::path(".kidi-qnn-cache");
 }
 
-auto append_adsp_path(const std::string& directory) -> void {
+auto prepend_adsp_paths(const std::string& directory) -> void {
 #if defined(__ANDROID__)
     constexpr char SEPARATOR = ';';
 #else
@@ -132,15 +132,27 @@ auto append_adsp_path(const std::string& directory) -> void {
         additions.push_back(directory);
         additions.push_back((std::filesystem::path(directory).parent_path() / "hexagon-v79" / "unsigned").string());
     }
-    if (additions.empty()) return;
+#if defined(__ANDROID__)
+    additions.insert(additions.end(), {"/vendor/lib/rfsa/adsp", "/vendor/dsp/cdsp", "/vendor/dsp"});
+#endif
+    const auto current = getenv_string("ADSP_LIBRARY_PATH");
     std::string combined;
+    const auto contains = [](std::string_view paths, std::string_view path) {
+        for (std::size_t start = 0; start <= paths.size();) {
+            const auto end = paths.find(SEPARATOR, start);
+            if (paths.substr(start, end - start) == path) return true;
+            if (end == std::string_view::npos) break;
+            start = end + 1;
+        }
+        return false;
+    };
     for (const auto& path : additions) {
-        if (path.empty()) continue;
+        if (path.empty() || contains(current, path) || contains(combined, path)) continue;
         if (!combined.empty()) combined += SEPARATOR;
         combined += path;
     }
     if (combined.empty()) return;
-    if (const char* current = std::getenv("ADSP_LIBRARY_PATH"); current && *current) {
+    if (!current.empty()) {
         combined += SEPARATOR;
         combined += current;
     }
@@ -194,7 +206,7 @@ class QnnRuntime final {
 public:
     QnnRuntime() {
         library_dir_ = getenv_string("KIDI_QNN_LIBRARY_DIR");
-        append_adsp_path(library_dir_);
+        prepend_adsp_paths(library_dir_);
         const auto load = [&](const char* name, int flags = RTLD_NOW | RTLD_LOCAL) {
             auto* result = try_dlopen(name, flags);
             return result ? result : try_dlopen(join_path(library_dir_, name), flags);

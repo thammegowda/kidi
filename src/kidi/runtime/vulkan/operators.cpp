@@ -145,6 +145,28 @@ struct GpuBuffer {
     }
 };
 
+class DescriptorPool {
+public:
+    DescriptorPool(VkDevice device, std::uint32_t descriptors, std::uint32_t sets) : device_(device) {
+        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptors};
+        VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        info.maxSets = sets;
+        info.poolSizeCount = 1;
+        info.pPoolSizes = &size;
+        check(vkCreateDescriptorPool(device_, &info, nullptr, &pool_), "create Vulkan descriptor pool");
+    }
+    ~DescriptorPool() {
+        if (pool_) vkDestroyDescriptorPool(device_, pool_, nullptr);
+    }
+    DescriptorPool(const DescriptorPool&) = delete;
+    auto operator=(const DescriptorPool&) -> DescriptorPool& = delete;
+    auto get() const noexcept -> VkDescriptorPool { return pool_; }
+
+private:
+    VkDevice device_;
+    VkDescriptorPool pool_{};
+};
+
 class GpuContext {
 public:
     static auto instance() -> GpuContext& {
@@ -219,87 +241,39 @@ public:
                         std::uint32_t input_width, std::uint32_t intermediate, std::uint32_t columns,
                         float gate_up_scale, float inverse_hidden_scale, float down_output_scale) -> void {
         std::scoped_lock lock(mutex_);
-        VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10};
-        VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pool_info.maxSets = 3;
-        pool_info.poolSizeCount = 1;
-        pool_info.pPoolSizes = &pool_size;
-        VkDescriptorPool pool{};
-        check(vkCreateDescriptorPool(device_, &pool_info, nullptr, &pool), "create Vulkan descriptor pool");
+        DescriptorPool pool(device_, 10, 3);
         const auto gate_set =
-            descriptor_set(pool, set_layout_, {&activations, &gate_up_weights, &gate_up_factors, &gate_up});
-        const auto gelu_set = descriptor_set(pool, gelu_set_layout_, {&gate_up, &hidden});
-        const auto down_set = descriptor_set(pool, set_layout_, {&hidden, &down_weights, &down_factors, &output});
+            descriptor_set(pool.get(), set_layout_, {&activations, &gate_up_weights, &gate_up_factors, &gate_up});
+        const auto gelu_set = descriptor_set(pool.get(), gelu_set_layout_, {&gate_up, &hidden});
+        const auto down_set =
+            descriptor_set(pool.get(), set_layout_, {&hidden, &down_weights, &down_factors, &output});
 
-        check(vkResetCommandPool(device_, commands_, 0), "reset Vulkan command pool");
-        auto command = command_buffer();
-        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        check(vkBeginCommandBuffer(command, &begin), "begin Vulkan command buffer");
-        const auto projection = rows < 4 ? Kernel::GEMV_I8 : Kernel::GEMM_I8;
-        encode_projection(command, projection, bits, gate_set, rows, input_width, 2 * intermediate, 0.F);
-        compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        encode_gelu(command, gelu_set, rows, intermediate, gate_up_scale, inverse_hidden_scale);
-        compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        encode_projection(command, rows < 4 ? Kernel::GEMV : Kernel::GEMM, bits, down_set, rows, intermediate, columns,
-                          down_output_scale);
-        compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT, VK_PIPELINE_STAGE_HOST_BIT);
-        check(vkEndCommandBuffer(command), "end Vulkan command buffer");
-        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &command;
-        check(vkQueueSubmit(queue_, 1, &submit, fence_), "submit Vulkan work");
-        check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, 60'000'000'000ULL), "wait for Vulkan work");
-        check(vkResetFences(device_, 1, &fence_), "reset Vulkan fence");
-        vkDestroyDescriptorPool(device_, pool, nullptr);
+        submit([&](VkCommandBuffer command) {
+            const auto projection = rows < 4 ? Kernel::GEMV_I8 : Kernel::GEMM_I8;
+            encode_projection(command, projection, bits, gate_set, rows, input_width, 2 * intermediate, 0.F);
+            compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            encode_gelu(command, gelu_set, rows, intermediate, gate_up_scale, inverse_hidden_scale);
+            compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            encode_projection(command, rows < 4 ? Kernel::GEMV : Kernel::GEMM, bits, down_set, rows, intermediate,
+                             columns, down_output_scale);
+            compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT, VK_PIPELINE_STAGE_HOST_BIT);
+        });
     }
 
     auto dispatch(Kernel kernel, int bits, const GpuBuffer& activations, const GpuBuffer& weights,
                   const GpuBuffer& factors, GpuBuffer& output, std::uint32_t rows, std::uint32_t width,
                   std::uint32_t columns, float output_scale) -> void {
         std::scoped_lock lock(mutex_);
-        VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
-        VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pool_info.maxSets = 1;
-        pool_info.poolSizeCount = 1;
-        pool_info.pPoolSizes = &pool_size;
-        VkDescriptorPool pool{};
-        check(vkCreateDescriptorPool(device_, &pool_info, nullptr, &pool), "create Vulkan descriptor pool");
-        VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        allocate.descriptorPool = pool;
-        allocate.descriptorSetCount = 1;
-        allocate.pSetLayouts = &set_layout_;
-        VkDescriptorSet set{};
-        check(vkAllocateDescriptorSets(device_, &allocate, &set), "allocate Vulkan descriptor set");
-        const std::array<const GpuBuffer*, 4> buffers{&activations, &weights, &factors, &output};
-        std::array<VkDescriptorBufferInfo, 4> infos{};
-        std::array<VkWriteDescriptorSet, 4> writes{};
-        for (std::uint32_t index = 0; index < buffers.size(); ++index) {
-            infos[index] = {buffers[index]->buffer, 0, buffers[index]->size};
-            writes[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            writes[index].dstSet = set;
-            writes[index].dstBinding = index;
-            writes[index].descriptorCount = 1;
-            writes[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[index].pBufferInfo = &infos[index];
-        }
-        vkUpdateDescriptorSets(device_, writes.size(), writes.data(), 0, nullptr);
-
-        check(vkResetCommandPool(device_, commands_, 0), "reset Vulkan command pool");
-        auto command = command_buffer();
-        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        check(vkBeginCommandBuffer(command, &begin), "begin Vulkan command buffer");
-        encode_projection(command, kernel, bits, set, rows, width, columns, output_scale);
-        compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT, VK_PIPELINE_STAGE_HOST_BIT);
-        check(vkEndCommandBuffer(command), "end Vulkan command buffer");
-        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &command;
-        check(vkQueueSubmit(queue_, 1, &submit, fence_), "submit Vulkan work");
-        check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, 60'000'000'000ULL), "wait for Vulkan work");
-        check(vkResetFences(device_, 1, &fence_), "reset Vulkan fence");
-        vkDestroyDescriptorPool(device_, pool, nullptr);
+        DescriptorPool pool(device_, 4, 1);
+        const auto set = descriptor_set(pool.get(), set_layout_, {&activations, &weights, &factors, &output});
+        submit([&](VkCommandBuffer command) {
+            encode_projection(command, kernel, bits, set, rows, width, columns, output_scale);
+            compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT, VK_PIPELINE_STAGE_HOST_BIT);
+        });
     }
 
 private:
@@ -327,6 +301,22 @@ private:
         }
         vkUpdateDescriptorSets(device_, writes.size(), writes.data(), 0, nullptr);
         return set;
+    }
+
+    template <typename Encode>
+    auto submit(Encode&& encode) -> void {
+        check(vkResetCommandPool(device_, commands_, 0), "reset Vulkan command pool");
+        auto command = command_buffer();
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        check(vkBeginCommandBuffer(command, &begin), "begin Vulkan command buffer");
+        std::forward<Encode>(encode)(command);
+        check(vkEndCommandBuffer(command), "end Vulkan command buffer");
+        VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        info.commandBufferCount = 1;
+        info.pCommandBuffers = &command;
+        check(vkQueueSubmit(queue_, 1, &info, fence_), "submit Vulkan work");
+        check(vkWaitForFences(device_, 1, &fence_, VK_TRUE, 60'000'000'000ULL), "wait for Vulkan work");
+        check(vkResetFences(device_, 1, &fence_), "reset Vulkan fence");
     }
 
     auto command_buffer() -> VkCommandBuffer {

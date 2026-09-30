@@ -227,10 +227,6 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_setDataDirect
         setenv("KIDI_QNN_LIBRARY_DIR", libraries.c_str(), 0);
         setenv("KIDI_QNN_CACHE_DIR", cache.c_str(), 0);
         if (!dsp_directory_value.empty()) setenv("KIDI_QNN_SKEL_DIR", dsp_directory_value.c_str(), 1);
-        const auto* dsp = std::getenv("ADSP_LIBRARY_PATH");
-        const auto search = (dsp_directory_value.empty() ? std::string{} : dsp_directory_value + ';') +
-                            libraries.string() + ";/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp;/vendor/dsp";
-        setenv("ADSP_LIBRARY_PATH", dsp ? (search + ';' + dsp).c_str() : search.c_str(), 1);
         return {{"qnn_library_dir", libraries.string()},
                 {"qnn_cache_dir", cache.string()},
                 {"qnn_skel_dir", dsp_directory_value}};

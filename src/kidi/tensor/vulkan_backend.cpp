@@ -14,6 +14,11 @@
 namespace kidi::tensor {
 namespace {
 
+auto check(VkResult result, std::string_view operation) -> void {
+    if (result != VK_SUCCESS)
+        throw Error{ErrorCode::RUNTIME, std::string(operation) + " failed with VkResult " + std::to_string(result)};
+}
+
 class VulkanHostStorage final : public Storage {
 public:
     VulkanHostStorage(Device device, std::size_t size_bytes, std::size_t alignment)
@@ -63,18 +68,8 @@ public:
     auto get() const noexcept -> VkInstance { return instance_; }
 
 private:
-    static auto check(VkResult result, std::string_view operation) -> void {
-        if (result != VK_SUCCESS)
-            throw Error{ErrorCode::RUNTIME, std::string(operation) + " failed with VkResult " + std::to_string(result)};
-    }
-
     VkInstance instance_{};
 };
-
-auto check(VkResult result, std::string_view operation) -> void {
-    if (result != VK_SUCCESS)
-        throw Error{ErrorCode::RUNTIME, std::string(operation) + " failed with VkResult " + std::to_string(result)};
-}
 
 auto probe_device() -> std::string {
     Instance instance;
