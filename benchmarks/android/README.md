@@ -259,3 +259,28 @@ SM8750 / Gemma 4 E2B QAT steady-state results (four CPU threads):
 The first 16 generated tokens after NPU prefill and NPU decode matched CPU
 exactly. The 512-key prefill/decode contexts are 319/804 MiB, compile in about
 114/92 seconds, and reload in about 4/8 seconds.
+
+### Kidi HTP op package (fused RMSNorm and GELU*up)
+
+`src/kidi/runtime/qnn/htp/KidiOpsPackage` builds the custom HTP operators that
+keep Kidi's CPU fusions on the NPU. The DSP library needs the Hexagon SDK 6.3
+toolchain (x86-64 Linux); the host library uses the NDK:
+
+```sh
+cd src/kidi/runtime/qnn/htp/KidiOpsPackage
+make all sim-fused-test   # build/hexagon-v79/libQnnKidiOpsHtp.so + V79 simulator checks
+make aarch64              # build/aarch64-android/libQnnKidiOps.so
+```
+
+Push `libQnnKidiOpsHtp.so` next to the V79 skel (on `ADSP_LIBRARY_PATH`) and
+`libQnnKidiOps.so` on `LD_LIBRARY_PATH`, then add
+`KIDI_QNN_OP_PACKAGE=libQnnKidiOps.so KIDI_QNN_OP_PACKAGE_HTP=libQnnKidiOpsHtp.so`
+to the run. With a 384-token prompt and a 9216-token cache,
+`kidi_npu_prefill MODEL_DIR 384 128 20` measured:
+
+| Workload | Stock QNN lowering | KidiOps fused | Speedup |
+| --- | ---: | ---: | ---: |
+| Prefill, steady 128-token chunk | 179.4 ms | 63.7 ms | 2.8x |
+| Decode | 28.3 tok/s | 33.2 tok/s | 1.17x |
+
+All 20 greedy tokens matched the CPU run.

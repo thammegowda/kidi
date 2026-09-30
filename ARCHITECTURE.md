@@ -844,3 +844,30 @@ compressed in the APK; it is required only for an uncached shape. The skel is
 extracted to the APK native-library directory because FastRPC cannot read it
 from normal app data. Kidi requests the sustained-performance HTP power vote
 when available.
+
+### Kidi HTP Op Package
+
+QNN does not re-fuse Kidi's fused operators: stock lowering expands each gated
+feed-forward into about 18 QNN operators and each RMS norm into 12-14. A profile
+of a 128-token INT8-KV prefill step found element-wise work dominating (GELU-tanh
+chain 30%, other multiply/add 26%, quantize/dequantize 20%, RMS norms 10%), while
+HMX matmuls were 3.6% and attention 1%.
+
+`src/kidi/runtime/qnn/htp/KidiOpsPackage` is a QNN HTP op package (QHPI,
+multithreaded HVX) that restores those fusions on the NPU. `GeluMultiply` maps
+the UINT8 gate/up projection output directly to the UINT8 input of the down
+projection in one pass, and `RmsNorm` covers plain and residual norms with an
+output scale. The package ships as a host library for graph preparation
+(`libQnnKidiOps.so`) and a V79 DSP library (`libQnnKidiOpsHtp.so`); the
+compiler registers them when `KIDI_QNN_OP_PACKAGE` and
+`KIDI_QNN_OP_PACKAGE_HTP` name them, keys cached contexts on whether fused ops
+are in use, and keeps the stock lowering when registration fails
+(`KIDI_QNN_FUSED_OPS=0` also disables them). On SM8750 at a 9216-token cache,
+fused ops cut a steady 128-token prefill chunk from 179 ms to 64 ms and raised
+decode from 28.3 to 33.2 tokens/s with identical greedy tokens; prefill
+compilation dropped from 114 to 34-45 seconds.
+
+The package also contains `StructuredAttention`, a causal/sliding-window
+attention kernel that skips masked key tiles and reads INT8 caches. It measured
+slower than QNN's attention, so it is opt-in (`KIDI_QNN_CUSTOM_ATTENTION=1`).
+Experimental HMX and Crouton-layout helpers are kept unregistered.

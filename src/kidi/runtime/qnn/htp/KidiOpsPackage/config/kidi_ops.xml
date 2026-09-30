@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OpDefCollection PackageName="KidiOps" Domain="aisw" Version="1.0">
+    <OpDefList>
+        <OpDef>
+            <Name>StructuredAttention</Name>
+            <Description>
+                <Content>Batch-one causal or sliding-window attention over an INT8 contiguous KV cache.</Content>
+            </Description>
+            <Input><Name>query</Name><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype><Shape><Rank>4D</Rank><Layout>NHWC</Layout></Shape></Input>
+            <Input><Name>current_key</Name><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype><Shape><Rank>4D</Rank><Layout>NHWC</Layout></Shape></Input>
+            <Input><Name>current_value</Name><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype><Shape><Rank>4D</Rank><Layout>NHWC</Layout></Shape></Input>
+            <Input><Name>key_cache</Name><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype><Shape><Rank>4D</Rank><Layout>NHWC</Layout></Shape></Input>
+            <Input><Name>value_cache</Name><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype><Shape><Rank>4D</Rank><Layout>NHWC</Layout></Shape></Input>
+            <Input><Name>positions</Name><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_INT_32</Datatype><Shape><Rank>4D</Rank><Layout>NHWC</Layout></Shape></Input>
+            <Input><Name>scale</Name><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_32</Datatype><Shape><Rank>4D</Rank><Layout>NHWC</Layout></Shape></Input>
+            <Input><Name>window</Name><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_INT_32</Datatype><Shape><Rank>4D</Rank><Layout>NHWC</Layout></Shape></Input>
+            <Output><Name>output</Name><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype><Shape><Rank>4D</Rank><Layout>NHWC</Layout></Shape></Output>
+            <SupportedBackend>HTP</SupportedBackend>
+        </OpDef>
+    </OpDefList>
+</OpDefCollection>
