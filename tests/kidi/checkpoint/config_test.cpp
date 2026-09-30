@@ -123,9 +123,9 @@ decode: {beam_size: 4}
         return 1;
     if (!prepare_fixture() || FixtureModel::conversions != 1) return 1;
     std::filesystem::last_write_time(source, std::filesystem::last_write_time(source) + std::chrono::seconds(1));
-    if (prepare_fixture() || FixtureModel::conversions != 1) return 1;
+    if (!prepare_fixture() || FixtureModel::conversions != 2) return 1;
     write(directory / "fixture.json", R"({"cache":"failed-fixture","fail":true})");
-    if (prepare_fixture() || std::filesystem::exists(directory / "failed-fixture") || FixtureModel::conversions != 2)
+    if (prepare_fixture() || std::filesystem::exists(directory / "failed-fixture") || FixtureModel::conversions != 3)
         return 1;
     for (const auto& entry : std::filesystem::directory_iterator(directory))
         if (entry.path().filename().string().starts_with(".kidi-checkpoint-")) return 1;
