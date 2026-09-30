@@ -96,7 +96,6 @@ class BenchmarkActivity : ComponentActivity() {
             state.value = BenchmarkState(running = true, current = "Preparing")
             val outcome = runCatching { withContext(runtimeExecutor) { benchmark() } }
             outcome.onFailure { error ->
-                NativeRuntime.setDiagnosticLogging(false)
                 state.update { it.copy(running = false, current = "", error = error.message ?: "Benchmark failed") }
             }
         }
@@ -107,6 +106,14 @@ class BenchmarkActivity : ComponentActivity() {
         NativeRuntime.unloadAsr()
         checked(NativeRuntime.configure(4))
         checked(NativeRuntime.setDiagnosticLogging(true))
+        try {
+            runAcceleratorBenchmarks()
+        } finally {
+            checked(NativeRuntime.setDiagnosticLogging(false))
+        }
+    }
+
+    private fun runAcceleratorBenchmarks() {
         checked(NativeRuntime.setDataDirectory(filesDir.absolutePath, applicationInfo.nativeLibraryDir))
         val model = ModelRepository(this).installed() ?: error("Install the chat model before benchmarking")
         val paragraph = "Rivers move water sediment and nutrients, connect wetlands, support wildlife and " +
@@ -139,7 +146,6 @@ class BenchmarkActivity : ComponentActivity() {
                     NativeRuntime.unload()
                 }
             }.getOrElse { error ->
-                NativeRuntime.unload()
                 BenchmarkResult(accelerator = accelerator, error = error.message ?: "Unavailable")
             }
             results += result
@@ -152,7 +158,6 @@ class BenchmarkActivity : ComponentActivity() {
                 "error=${result.error.orEmpty()}")
             state.update { it.copy(results = results.toList()) }
         }
-        checked(NativeRuntime.setDiagnosticLogging(false))
         state.value = BenchmarkState(results = results)
     }
 

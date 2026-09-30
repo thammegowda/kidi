@@ -90,8 +90,8 @@ internal data class KidiUiState(
     val status: String = "Model offline",
     val error: String? = null,
     val threadCount: Int = defaultThreadCount(),
-    val chatAccelerator: String = "auto",
-    val speechAccelerator: String = "auto",
+    val chatAccelerator: String = DEFAULT_ACCELERATOR,
+    val speechAccelerator: String = DEFAULT_ACCELERATOR,
     val chatExecution: String = "",
     val speechExecution: String = "",
     val cpuDiagnostic: HardwareDiagnostic? = null,
@@ -152,9 +152,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             loadingChat = true,
             threadCount = preferences.getInt(THREADS_KEY, defaultThreadCount()).coerceIn(1, 8),
             maximumTokens = preferences.getInt(TOKENS_KEY, 1024).coerceIn(1, 8192),
-            chatAccelerator = preferences.getString(CHAT_ACCELERATOR_KEY, "auto")?.takeIf { it in ACCELERATORS } ?: "auto",
-            speechAccelerator = preferences.getString(SPEECH_ACCELERATOR_KEY, "auto")?.takeIf { it in ACCELERATORS }
-                ?: "auto",
+            chatAccelerator = preferences.getString(CHAT_ACCELERATOR_KEY, null)
+                ?.takeIf { it in ACCELERATOR_LABELS } ?: DEFAULT_ACCELERATOR,
+            speechAccelerator = preferences.getString(SPEECH_ACCELERATOR_KEY, null)
+                ?.takeIf { it in ACCELERATOR_LABELS } ?: DEFAULT_ACCELERATOR,
         ),
     )
     val state: StateFlow<KidiUiState> = _state.asStateFlow()
@@ -276,14 +277,14 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun setChatAccelerator(value: String) {
-        if (value !in ACCELERATORS || value == _state.value.chatAccelerator || busy()) return
+        if (value !in ACCELERATOR_LABELS || value == _state.value.chatAccelerator || busy()) return
         preferences.edit { putString(CHAT_ACCELERATOR_KEY, value) }
         _state.update { it.copy(chatAccelerator = value) }
         repository.installed()?.let(::load)
     }
 
     fun setSpeechAccelerator(value: String) {
-        if (value !in ACCELERATORS || value == _state.value.speechAccelerator || busy()) return
+        if (value !in ACCELERATOR_LABELS || value == _state.value.speechAccelerator || busy()) return
         preferences.edit { putString(SPEECH_ACCELERATOR_KEY, value) }
         _state.update { it.copy(speechAccelerator = value) }
         repository.installedSpeech()?.let(::loadSpeech)
@@ -741,15 +742,27 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     private fun load(model: InstalledModel) {
         val queued = SystemClock.elapsedRealtime()
+        val threads = _state.value.threadCount
+        val accelerator = _state.value.chatAccelerator
+        _state.update {
+            it.copy(
+                modelReady = false,
+                visionReady = false,
+                loadingModel = true,
+                progressFile = "",
+                chatExecution = "",
+                status = "Loading model",
+                error = null,
+                modelError = null,
+            )
+        }
         viewModelScope.launch(runtimeDispatcher) {
             val started = SystemClock.elapsedRealtime()
             Log.i("KidiStartup", "gemma_start queue_ms=${started - queued}")
-            _state.update { it.copy(loadingModel = true, progressFile = "", status = "Loading model",
-                error = null, modelError = null) }
             runCatching {
-                checked(NativeRuntime.configure(_state.value.threadCount))
+                checked(NativeRuntime.configure(threads))
                 val configured = SystemClock.elapsedRealtime()
-                checked(NativeRuntime.load(model.directory.absolutePath, _state.value.chatAccelerator)).also {
+                checked(NativeRuntime.load(model.directory.absolutePath, accelerator)).also {
                     Log.i("KidiStartup", "gemma_ready configure_ms=${configured - started} native_ms=${it.optDouble("load_ms")} stages=${it.optJSONObject("stages_ms")}")
                 }
             }.onSuccess { loaded ->
@@ -778,16 +791,27 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     private fun loadSpeech(model: InstalledModel) {
         val queued = SystemClock.elapsedRealtime()
+        val int8 = model.modelId == DEFAULT_SPEECH_MODEL_ID
+        val threads = _state.value.threadCount
+        val accelerator = _state.value.speechAccelerator
+        _state.update {
+            it.copy(
+                speechReady = false,
+                loadingSpeech = true,
+                speechProgressFile = "",
+                speechExecution = "",
+                speechModelError = null,
+                status = if (int8) "Preparing Whisper Small INT8" else "Loading speech model",
+                error = null,
+            )
+        }
         viewModelScope.launch(runtimeDispatcher) {
             val started = SystemClock.elapsedRealtime()
             Log.i("KidiStartup", "whisper_start queue_ms=${started - queued}")
-            val int8 = model.modelId == DEFAULT_SPEECH_MODEL_ID
-            _state.update { it.copy(loadingSpeech = true, speechProgressFile = "", speechModelError = null,
-                status = if (int8) "Preparing Whisper Small INT8" else "Loading speech model", error = null) }
             runCatching {
-                checked(NativeRuntime.configure(_state.value.threadCount))
+                checked(NativeRuntime.configure(threads))
                 val configured = SystemClock.elapsedRealtime()
-                checked(NativeRuntime.loadAsr(model.directory.absolutePath, int8, _state.value.speechAccelerator)).also {
+                checked(NativeRuntime.loadAsr(model.directory.absolutePath, int8, accelerator)).also {
                     Log.i("KidiStartup", "whisper_ready configure_ms=${configured - started} native_ms=${it.optDouble("load_ms")} stages=${it.optJSONObject("stages_ms")}")
                 }
             }.onSuccess { loaded ->
@@ -919,7 +943,6 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         const val TOKENS_KEY = "tokens"
         const val CHAT_ACCELERATOR_KEY = "chat-accelerator"
         const val SPEECH_ACCELERATOR_KEY = "speech-accelerator"
-        val ACCELERATORS = listOf("auto", "cpu", "gpu", "npu")
         const val MESSAGES_KEY = "messages"
         const val MINIMUM_DRAFT_SAMPLES = 12800
         const val DRAFT_INTERVAL_SAMPLES = 19200
