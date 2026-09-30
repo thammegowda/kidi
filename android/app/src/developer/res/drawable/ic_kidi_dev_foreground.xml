@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <inset
+            android:drawable="@drawable/kidi_logo"
+            android:inset="18dp" />
+    </item>
+    <item
+        android:width="38dp"
+        android:height="38dp"
+        android:bottom="10dp"
+        android:end="10dp"
+        android:gravity="bottom|end">
+        <inset
+            android:drawable="@drawable/ic_kidi_dev_badge"
+            android:inset="0dp" />
+    </item>
+</layer-list>

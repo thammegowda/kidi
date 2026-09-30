@@ -88,15 +88,18 @@ Override signing with `APK_KEYSTORE` and `APK_KEY_ALIAS`. Enter passwords in the
 terminal, or provide them securely using the documented environment variables;
 never commit keys or passwords. Back up release/upload keys securely.
 
-For Android debugging:
+For an optimized side-by-side developer install:
 
 ```bash
-./android/gradlew -p android :app:assembleDebug
-./android/gradlew -p android :app:installDebug
+./android/gradlew -p android :app:assembleDeveloper
+./android/gradlew -p android :app:installDeveloper
 ```
 
-Use a matching debug app and AndroidTest pair for instrumentation; do not install
-debug tests over a minified release. Restore the optimized build after testing.
+This variant is signed by the standard debug key, uses `ai.gowda.kidi.dev`, and
+otherwise inherits the optimized/minified Release configuration. `assembleDebug` is reserved for Java/Kotlin
+debugger sessions and uses the separate `ai.gowda.kidi.debug` package; it is not
+a performance build. Use matching developer app and AndroidTest APKs for
+instrumentation; do not install test APKs over a minified release.
 See [android/README.md](android/README.md) for SDK setup, JNI behavior, device
 tests and model storage. Moving only the Android directory is not supported:
 the project builds the shared repository C++ core.

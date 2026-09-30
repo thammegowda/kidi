@@ -4,6 +4,21 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val qnnSdk = (project.findProperty("kidi.qnnSdk") as String?)
+    ?: rootProject.file("../benchmarks/android/.cache/qairt/2.50.0.260828")
+        .takeIf { it.isDirectory }?.absolutePath
+val stageQnnRuntime = tasks.register<Sync>("stageQnnRuntime") {
+    qnnSdk?.let { sdk ->
+        from(file("$sdk/lib/aarch64-android")) {
+            include("libQnnHtp.so", "libQnnHtpPrepare.so", "libQnnHtpV79Stub.so", "libQnnSystem.so")
+        }
+        from(file("$sdk/lib/hexagon-v79/unsigned")) {
+            include("libQnnHtpV79Skel.so")
+        }
+    }
+    into(layout.buildDirectory.dir("generated/qnnJniLibs/arm64-v8a"))
+}
+
 android {
     namespace = "ai.gowda.kidi"
     compileSdk = 36
@@ -29,16 +44,31 @@ android {
                     "-DKIDI_BUILD_BENCHMARKS=OFF",
                     "-DKIDI_BUILD_PYTHON=OFF",
                     "-DBUILD_TESTING=OFF",
+                    "-DKIDI_ENABLE_VULKAN=ON",
+                    "-DKIDI_ENABLE_QNN=ON",
                 )
+                // QNN headers compile the backend; the matching runtime and first-use compiler are packaged below.
+                if (qnnSdk != null) arguments += "-DKIDI_QNN_SDK=$qnnSdk"
             }
         }
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+        create("developer") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".dev"
+            versionNameSuffix = "-dev"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
         }
     }
 
@@ -53,8 +83,10 @@ android {
         compose = true
     }
     packaging.jniLibs.useLegacyPackaging = true
+    packaging.jniLibs.keepDebugSymbols += "**/libQnnHtpV79Skel.so"
     sourceSets.getByName("main").res.srcDir(layout.buildDirectory.dir("generated/visionNotices"))
     sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/legalDocuments"))
+    sourceSets.getByName("main").jniLibs.srcDir(layout.buildDirectory.dir("generated/qnnJniLibs"))
     ndkVersion = "28.0.13004108"
     externalNativeBuild {
         cmake {
@@ -63,6 +95,8 @@ android {
         }
     }
 }
+
+tasks.named("preBuild").configure { dependsOn(stageQnnRuntime) }
 
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2025.04.01"))
