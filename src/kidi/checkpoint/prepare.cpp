@@ -13,8 +13,8 @@
 namespace kidi::checkpoint {
 using ops::require;
 
-auto prepare(const std::filesystem::path& path, const ConfigAdapter& adapter, PreparationHook customize)
-    -> Result<std::filesystem::path> {
+auto prepare(const std::filesystem::path& path, const ConfigAdapter& adapter,
+             PreparationHook customize) -> Result<std::filesystem::path> {
     static std::mutex conversion_mutex;
     std::scoped_lock lock(conversion_mutex);
     std::filesystem::path temporary;

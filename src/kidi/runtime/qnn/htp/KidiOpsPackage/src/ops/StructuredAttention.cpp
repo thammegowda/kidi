@@ -102,8 +102,8 @@ auto make_view(std::uint32_t num_outputs, QHPI_Tensor** outputs, std::uint32_t n
     return true;
 }
 
-auto task_range(std::uint32_t tasks, std::uint32_t slices, std::uint32_t slice)
-    -> std::pair<std::uint32_t, std::uint32_t> {
+auto task_range(std::uint32_t tasks, std::uint32_t slices,
+                std::uint32_t slice) -> std::pair<std::uint32_t, std::uint32_t> {
     if (slices <= 1) return {0, tasks};
     const auto first = static_cast<std::uint32_t>((static_cast<std::uint64_t>(tasks) * slice) / slices);
     const auto end = static_cast<std::uint32_t>((static_cast<std::uint64_t>(tasks) * (slice + 1)) / slices);
@@ -217,15 +217,15 @@ auto structured_attention_crouton_kernel(QHPI_RuntimeHandle* handle, std::uint32
 #endif
 }
 
-auto structured_attention_hvx_matches(const QHPI_Op*, std::uint32_t num_inputs, const QHPI_Tensor* const* inputs)
-    -> std::uint32_t {
+auto structured_attention_hvx_matches(const QHPI_Op*, std::uint32_t num_inputs,
+                                      const QHPI_Tensor* const* inputs) -> std::uint32_t {
     if (num_inputs != 8 || !inputs) return 0;
     const auto query_shape = qhpi_tensor_shape(inputs[0]);
     return query_shape.rank == 4 && (query_shape.dims[3] == 256 || query_shape.dims[3] == 512);
 }
 
-auto structured_attention_cost(QHPI_RuntimeHandle*, std::uint32_t num_inputs, const QHPI_Tensor* const* inputs)
-    -> float {
+auto structured_attention_cost(QHPI_RuntimeHandle*, std::uint32_t num_inputs,
+                               const QHPI_Tensor* const* inputs) -> float {
     if (num_inputs != 8 || !inputs) return 1.0f;
     const auto query = qhpi_tensor_shape(inputs[0]);
     const auto cache = qhpi_tensor_shape(inputs[3]);

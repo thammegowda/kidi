@@ -245,21 +245,18 @@ public:
         const auto gate_set =
             descriptor_set(pool.get(), set_layout_, {&activations, &gate_up_weights, &gate_up_factors, &gate_up});
         const auto gelu_set = descriptor_set(pool.get(), gelu_set_layout_, {&gate_up, &hidden});
-        const auto down_set =
-            descriptor_set(pool.get(), set_layout_, {&hidden, &down_weights, &down_factors, &output});
+        const auto down_set = descriptor_set(pool.get(), set_layout_, {&hidden, &down_weights, &down_factors, &output});
 
         submit([&](VkCommandBuffer command) {
             const auto projection = rows < 4 ? Kernel::GEMV_I8 : Kernel::GEMM_I8;
             encode_projection(command, projection, bits, gate_set, rows, input_width, 2 * intermediate, 0.F);
-            compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT,
-                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             encode_gelu(command, gelu_set, rows, intermediate, gate_up_scale, inverse_hidden_scale);
-            compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT,
-                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             encode_projection(command, rows < 4 ? Kernel::GEMV : Kernel::GEMM, bits, down_set, rows, intermediate,
-                             columns, down_output_scale);
+                              columns, down_output_scale);
             compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT, VK_PIPELINE_STAGE_HOST_BIT);
         });
     }
@@ -611,8 +608,8 @@ auto load_word(const std::byte* source) -> std::uint32_t {
     return result;
 }
 
-auto gemv_weights(const Tensor& weight, int bits, std::size_t columns, std::size_t width)
-    -> std::vector<std::uint32_t> {
+auto gemv_weights(const Tensor& weight, int bits, std::size_t columns,
+                  std::size_t width) -> std::vector<std::uint32_t> {
     const auto bytes = require(weight.host_bytes());
     const auto bytes_per_row = width / (8 / bits);
     const auto words_per_column = width * static_cast<std::size_t>(bits) / 32;
@@ -624,8 +621,8 @@ auto gemv_weights(const Tensor& weight, int bits, std::size_t columns, std::size
     return result;
 }
 
-auto gemm_weights(const Tensor& weight, int bits, std::size_t columns, std::size_t width)
-    -> std::vector<std::uint32_t> {
+auto gemm_weights(const Tensor& weight, int bits, std::size_t columns,
+                  std::size_t width) -> std::vector<std::uint32_t> {
     const auto bytes = require(weight.host_bytes());
     const auto bytes_per_row = width / (8 / bits);
     const auto parts = static_cast<std::size_t>(bits / 2);
@@ -649,8 +646,8 @@ auto factors(const Tensor& scales, float input_scale, float output_scale = 0.F) 
     return result;
 }
 
-auto quantize_words(const Tensor& input, std::uint32_t rows, std::uint32_t width, float scale)
-    -> std::vector<std::uint32_t> {
+auto quantize_words(const Tensor& input, std::uint32_t rows, std::uint32_t width,
+                    float scale) -> std::vector<std::uint32_t> {
     const auto values = require(input.data<float>());
     std::vector<std::uint32_t> result(static_cast<std::size_t>(rows) * width / 4);
     for (std::size_t row = 0; row < rows; ++row)
@@ -848,8 +845,8 @@ auto broadcast_shape(const Tensor& left, const Tensor& right) -> std::vector<std
     return result;
 }
 
-auto inferred_outputs(const OperatorSpec& spec, TensorInputs inputs)
-    -> std::pair<std::vector<std::vector<std::int64_t>>, std::vector<DType>> {
+auto inferred_outputs(const OperatorSpec& spec,
+                      TensorInputs inputs) -> std::pair<std::vector<std::vector<std::int64_t>>, std::vector<DType>> {
     auto shape = tensor_shape(inputs[0]);
     auto dtype = spec.dtype;
     switch (spec.operation) {

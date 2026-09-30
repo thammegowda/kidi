@@ -192,8 +192,8 @@ auto hardware_info() -> nlohmann::json {
 }
 } // namespace
 
-extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_configure(JNIEnv* environment, jobject, jint threads)
-    -> jstring {
+extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_configure(JNIEnv* environment, jobject,
+                                                                             jint threads) -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
         std::scoped_lock lock(runtime_mutex);
         if (threads < 1 || threads > 8) throw std::runtime_error("Threads must be between 1 and 8");
@@ -270,8 +270,8 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_load(JNIEnv* 
 }
 
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_enqueue(JNIEnv* environment, jobject,
-                                                                           jstring messages_json, jint maximum_tokens)
-    -> jstring {
+                                                                           jstring messages_json,
+                                                                           jint maximum_tokens) -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
         JavaString source(environment, messages_json);
         std::scoped_lock lock(runtime_mutex);

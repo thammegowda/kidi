@@ -249,10 +249,10 @@ public:
             // A missing or incompatible package only disables the fused lowering; dense QNN graphs still work.
             const auto host_status =
                 api_.backendRegisterOpPackage(backend_, package.c_str(), "KidiOpsInterfaceProvider", "CPU");
-            const auto htp_status = host_status == QNN_SUCCESS
-                                        ? api_.backendRegisterOpPackage(backend_, htp_package.c_str(),
-                                                                        "KidiOpsInterfaceProvider", "HTP")
-                                        : host_status;
+            const auto htp_status =
+                host_status == QNN_SUCCESS
+                    ? api_.backendRegisterOpPackage(backend_, htp_package.c_str(), "KidiOpsInterfaceProvider", "HTP")
+                    : host_status;
             custom_ops_ = host_status == QNN_SUCCESS && htp_status == QNN_SUCCESS;
             diagnostic_log("kidi_qnn_op_package|name=KidiOps|host=" + package + "|htp=" + htp_package +
                            "|host_status=" + std::to_string(qnn_error(host_status)) +
@@ -531,8 +531,8 @@ auto qnn_dims(const Tensor& tensor) -> std::vector<std::uint32_t> {
     return result;
 }
 
-auto make_tensor(const char* name, Qnn_TensorType_t type, Qnn_DataType_t data_type, std::vector<std::uint32_t>& dims)
-    -> Qnn_Tensor_t {
+auto make_tensor(const char* name, Qnn_TensorType_t type, Qnn_DataType_t data_type,
+                 std::vector<std::uint32_t>& dims) -> Qnn_Tensor_t {
     Qnn_Tensor_t tensor = QNN_TENSOR_INIT;
     tensor.version = QNN_TENSOR_VERSION_1;
     tensor.v1.name = name;
@@ -851,8 +851,8 @@ public:
         return static_weight(suffix, weights, weight_tensor.size(0), logical_columns);
     }
 
-    auto static_weight(const std::string& suffix, Weights& weights, std::size_t rows, std::size_t columns)
-        -> Qnn_Tensor_t {
+    auto static_weight(const std::string& suffix, Weights& weights, std::size_t rows,
+                       std::size_t columns) -> Qnn_Tensor_t {
         dims_.push_back({static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(columns)});
         names_.push_back(prefix_ + suffix);
         auto result = make_tensor(names_.back().c_str(), QNN_TENSOR_TYPE_STATIC, weights.data_type, dims_.back());
@@ -894,8 +894,8 @@ struct BuiltPartition {
     std::uint32_t output_id = 0;
 };
 
-auto build_projection_graph(QnnContext& context, const std::string& name, const Node& node, const PartitionPlan& plan)
-    -> BuiltPartition {
+auto build_projection_graph(QnnContext& context, const std::string& name, const Node& node,
+                            const PartitionPlan& plan) -> BuiltPartition {
     const auto graph = context.create_graph(name);
     GraphBuilder builder(context, graph, name + "/");
     const auto rows = node.inputs()[0].numel() / plan.input_width;
@@ -1098,8 +1098,8 @@ struct Metadata {
     std::vector<BuiltPartition> partitions;
 };
 
-auto save_metadata(const std::filesystem::path& path, std::string_view id, std::span<const BuiltPartition> partitions)
-    -> void {
+auto save_metadata(const std::filesystem::path& path, std::string_view id,
+                   std::span<const BuiltPartition> partitions) -> void {
     std::ostringstream out;
     out << CACHE_VERSION << '\n' << id << '\n' << partitions.size() << '\n';
     for (const auto& partition : partitions) {
@@ -2306,8 +2306,8 @@ public:
         return executable();
     }
 
-    auto load(std::span<const std::uint8_t> binary, const std::filesystem::path& metadata_path, std::string_view id)
-        -> std::unique_ptr<StepExecutable> {
+    auto load(std::span<const std::uint8_t> binary, const std::filesystem::path& metadata_path,
+              std::string_view id) -> std::unique_ptr<StepExecutable> {
         const auto document = nlohmann::json::parse(read_file(metadata_path));
         if (document.value("version", "") != CACHE_VERSION || document.value("id", "") != id ||
             document.value("prefill", !prefill_) != prefill_)
@@ -2806,8 +2806,8 @@ private:
         return entry;
     }
 
-    auto constant(const Tensor& source, std::size_t source_node, Qnn_DataType_t type, std::vector<std::uint32_t> dims)
-        -> Value {
+    auto constant(const Tensor& source, std::size_t source_node, Qnn_DataType_t type,
+                  std::vector<std::uint32_t> dims) -> Value {
         const auto identity = source.storage_identity();
         std::size_t index = 0;
         if (const auto found = constant_of_.find(identity); found != constant_of_.end()) {

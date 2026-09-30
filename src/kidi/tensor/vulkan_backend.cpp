@@ -143,8 +143,8 @@ public:
         return "Vulkan device " + device_name_ + " is available only as vulkan:0";
     }
 
-    auto allocate(Device device, std::size_t size_bytes, std::size_t alignment) const
-        -> Result<std::shared_ptr<Storage>> override {
+    auto allocate(Device device, std::size_t size_bytes,
+                  std::size_t alignment) const -> Result<std::shared_ptr<Storage>> override {
         if (!is_available(device)) return std::unexpected(Error{ErrorCode::UNSUPPORTED, unavailable_reason(device)});
         alignment = std::max<std::size_t>(alignment, 64);
         if ((alignment & (alignment - 1)) != 0)
@@ -156,16 +156,16 @@ public:
         }
     }
 
-    auto wrap_host(Device device, std::span<const std::byte> bytes, std::shared_ptr<const void> owner) const
-        -> Result<std::shared_ptr<Storage>> override {
+    auto wrap_host(Device device, std::span<const std::byte> bytes,
+                   std::shared_ptr<const void> owner) const -> Result<std::shared_ptr<Storage>> override {
         if (!is_available(device)) return std::unexpected(Error{ErrorCode::UNSUPPORTED, unavailable_reason(device)});
         if (!owner && !bytes.empty())
             return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "external tensor storage requires an owner"});
         return std::shared_ptr<Storage>(new VulkanHostStorage(device, bytes, std::move(owner)));
     }
 
-    auto copy_from_host(Storage& destination, std::size_t destination_offset, std::span<const std::byte> source) const
-        -> Result<void> override {
+    auto copy_from_host(Storage& destination, std::size_t destination_offset,
+                        std::span<const std::byte> source) const -> Result<void> override {
         auto storage = vulkan_storage(destination);
         if (!storage) return std::unexpected(std::move(storage.error()));
         if (!(*storage)->writable())
@@ -176,8 +176,8 @@ public:
         return {};
     }
 
-    auto copy_to_host(const Storage& source, std::size_t source_offset, std::span<std::byte> destination) const
-        -> Result<void> override {
+    auto copy_to_host(const Storage& source, std::size_t source_offset,
+                      std::span<std::byte> destination) const -> Result<void> override {
         auto storage = vulkan_storage(source);
         if (!storage) return std::unexpected(std::move(storage.error()));
         auto bounds = check_bounds((*storage)->size_bytes(), source_offset, destination.size());

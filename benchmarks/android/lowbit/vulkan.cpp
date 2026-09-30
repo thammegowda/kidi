@@ -52,8 +52,8 @@ auto spirv(Kernel kernel, int bits) -> std::span<const std::uint32_t> {
     }
 }
 
-auto pack_weights(std::span<const std::int8_t> weights, std::uint32_t n, std::uint32_t k, int bits, bool k_major)
-    -> std::vector<std::uint32_t> {
+auto pack_weights(std::span<const std::int8_t> weights, std::uint32_t n, std::uint32_t k, int bits,
+                  bool k_major) -> std::vector<std::uint32_t> {
     const auto values_per_word = static_cast<std::uint32_t>(32 / bits);
     const auto words_per_column = k / values_per_word;
     const auto mask = (1U << bits) - 1;

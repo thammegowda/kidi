@@ -229,8 +229,8 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
-auto Generator::generate_batch(std::span<const std::string> prompts, GenerationOptions options)
-    -> Result<GenerationBatch> {
+auto Generator::generate_batch(std::span<const std::string> prompts,
+                               GenerationOptions options) -> Result<GenerationBatch> {
     try {
         options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
         if (pending_requests() || serving_failed_)
@@ -346,8 +346,8 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
-auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options)
-    -> Result<std::uint64_t> {
+auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
+                             GenerationOptions options) -> Result<std::uint64_t> {
     try {
         std::vector<text::ChatMessage> expanded(messages.begin(), messages.end());
         std::vector<CachedImage> current;
@@ -541,8 +541,7 @@ auto Generator::step() -> Result<GenerationStep> {
                 if (!request.state) request.state = require(model_->create_state(request.capacity));
                 request.state->images = request.images;
                 request.state->crop_local_attention = !request.options.full_attention_cache;
-                request.state->capture_prefill =
-                    should_capture_prefill(model_->accelerator(), request.prompt.size());
+                request.state->capture_prefill = should_capture_prefill(model_->accelerator(), request.prompt.size());
                 running_.push_back(std::move(request));
                 reserved_cache_tokens_ += running_.back().capacity;
                 waiting_.pop_front();

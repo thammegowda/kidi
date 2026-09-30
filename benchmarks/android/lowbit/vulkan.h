@@ -24,8 +24,8 @@ auto spirv(Kernel kernel, int bits) -> std::span<const std::uint32_t>;
 // Packs [n][k] signed values into words of 32 / bits consecutive K values of one column. Byte `b` of a word holds
 // values b, b + 4, b + 8, ... so masking whole bytes yields consecutive INT8x4 groups. GEMV stores words column-major
 // ([column][word]); GEMM stores them K-major ([word][column]) so lanes load adjacent columns.
-auto pack_weights(std::span<const std::int8_t> weights, std::uint32_t n, std::uint32_t k, int bits, bool k_major)
-    -> std::vector<std::uint32_t>;
+auto pack_weights(std::span<const std::int8_t> weights, std::uint32_t n, std::uint32_t k, int bits,
+                  bool k_major) -> std::vector<std::uint32_t>;
 
 struct Buffer {
     VkBuffer buffer{};

@@ -166,8 +166,8 @@ auto Session::retrieve_graph(const std::string& name) -> Qnn_GraphHandle_t {
     return graph;
 }
 
-auto Session::register_memory(int fd, std::span<const std::uint32_t> dims, Qnn_DataType_t data_type)
-    -> Qnn_MemHandle_t {
+auto Session::register_memory(int fd, std::span<const std::uint32_t> dims,
+                              Qnn_DataType_t data_type) -> Qnn_MemHandle_t {
     Qnn_MemDescriptor_t descriptor = QNN_MEM_DESCRIPTOR_INIT;
     descriptor.memShape = {static_cast<std::uint32_t>(dims.size()), const_cast<std::uint32_t*>(dims.data()), nullptr};
     descriptor.dataType = data_type;
@@ -178,8 +178,8 @@ auto Session::register_memory(int fd, std::span<const std::uint32_t> dims, Qnn_D
     return handle;
 }
 
-auto make_tensor(const char* name, Qnn_TensorType_t type, Qnn_DataType_t data_type, std::vector<std::uint32_t>& dims)
-    -> Qnn_Tensor_t {
+auto make_tensor(const char* name, Qnn_TensorType_t type, Qnn_DataType_t data_type,
+                 std::vector<std::uint32_t>& dims) -> Qnn_Tensor_t {
     Qnn_Tensor_t tensor = QNN_TENSOR_INIT;
     tensor.version = QNN_TENSOR_VERSION_1;
     tensor.v1.name = name;

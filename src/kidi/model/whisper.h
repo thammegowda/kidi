@@ -36,15 +36,15 @@ public:
     auto set_checkpoint(const checkpoint::Weights& weights) -> Result<void>;
     auto encode(const audio::WhisperFeatures& features) -> Result<WhisperEncoderState>;
     auto create_state(std::size_t capacity) -> Result<WhisperDecoderState>;
-    auto forward(const WhisperEncoderState& source, std::span<const std::int32_t> tokens, WhisperDecoderState& state)
-        -> Result<tensor::Tensor>;
-    auto prefill(const WhisperEncoderState& source, std::span<const std::int32_t> tokens, WhisperDecoderState& state)
-        -> Result<void>;
+    auto forward(const WhisperEncoderState& source, std::span<const std::int32_t> tokens,
+                 WhisperDecoderState& state) -> Result<tensor::Tensor>;
+    auto prefill(const WhisperEncoderState& source, std::span<const std::int32_t> tokens,
+                 WhisperDecoderState& state) -> Result<void>;
     auto preparation_ns() const -> std::uint64_t;
 
 private:
-    auto decode(const WhisperEncoderState& source, std::int32_t token, WhisperDecoderState& state, bool project)
-        -> Result<tensor::Tensor>;
+    auto decode(const WhisperEncoderState& source, std::int32_t token, WhisperDecoderState& state,
+                bool project) -> Result<tensor::Tensor>;
     struct State;
     std::unique_ptr<State> impl_;
 };

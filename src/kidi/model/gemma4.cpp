@@ -44,8 +44,8 @@ auto quant_bits(const YAML::Node& config, const std::string& name) -> std::int32
     if (bits != 2 && bits != 4 && bits != 8) throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported QAT bit width"});
     return bits;
 }
-auto embedding(std::int32_t vocabulary, std::int32_t width, float scale, std::int32_t bits = 0, std::int32_t groups = 1)
-    -> layers::TokenEmbedding {
+auto embedding(std::int32_t vocabulary, std::int32_t width, float scale, std::int32_t bits = 0,
+               std::int32_t groups = 1) -> layers::TokenEmbedding {
     const ModuleScope storage(tensor::Device::cpu());
     return layers::TokenEmbedding(vocabulary, width, scale, bits, groups);
 }
@@ -412,8 +412,8 @@ auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
 auto Gemma4Impl::forward(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits) -> Result<Tensor> {
     return project(tokens, state, all_logits, false);
 }
-auto Gemma4Impl::fork_state(const Gemma4State& source, std::size_t prefix_length, std::size_t capacity)
-    -> Result<Gemma4State> {
+auto Gemma4Impl::fork_state(const Gemma4State& source, std::size_t prefix_length,
+                            std::size_t capacity) -> Result<Gemma4State> {
     try {
         if (prefix_length > source.position || source.position > source.capacity || prefix_length > capacity ||
             source.layers.size() != static_cast<std::size_t>(impl_->shared_begin))
@@ -477,8 +477,8 @@ auto Gemma4Impl::forward_token(const Tensor& token, Gemma4State& state) -> Resul
 auto Gemma4Impl::forward_batch(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states) -> Result<Tensor> {
     return run_batch(tokens, states, false);
 }
-auto Gemma4Impl::forward_batch_tokens(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states)
-    -> Result<std::vector<std::int32_t>> {
+auto Gemma4Impl::forward_batch_tokens(std::span<const std::int32_t> tokens,
+                                      std::span<Gemma4State*> states) -> Result<std::vector<std::int32_t>> {
     auto output = run_batch(tokens, states, true);
     if (!output) return std::unexpected(std::move(output.error()));
     auto selected = output->data<std::int32_t>();
@@ -487,8 +487,8 @@ auto Gemma4Impl::forward_batch_tokens(std::span<const std::int32_t> tokens, std:
         return std::unexpected(Error{ErrorCode::RUNTIME, "batched Gemma 4 returned invalid token scores"});
     return std::vector<std::int32_t>(selected->begin(), selected->end());
 }
-auto Gemma4Impl::run_batch(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states, bool select)
-    -> Result<Tensor> {
+auto Gemma4Impl::run_batch(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states,
+                           bool select) -> Result<Tensor> {
     try {
         if (tokens.empty() || tokens.size() != states.size())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "batched decode requires one token per state"});
@@ -560,8 +560,8 @@ auto Gemma4Impl::embed(std::span<const std::int32_t> tokens, std::span<const Gem
     return {std::move(hidden), std::move(per_layer)};
 }
 
-auto Gemma4Impl::attention_inputs(Gemma4State& state, std::span<Gemma4State*> batch_states, std::size_t step_count)
-    -> Attention {
+auto Gemma4Impl::attention_inputs(Gemma4State& state, std::span<Gemma4State*> batch_states,
+                                  std::size_t step_count) -> Attention {
     const auto requests = batch_states.empty() ? 1 : batch_states.size();
     Attention result;
     result.masks.resize(requests);

@@ -129,8 +129,8 @@ public:
         node(graph, prefix + "multiply_op", QNN_OP_ELEMENT_WISE_MULTIPLY, {activated, up}, output);
     }
 
-    auto down(Qnn_GraphHandle_t graph, std::size_t index, const Qnn_Tensor_t& input, const Qnn_Tensor_t& output)
-        -> void {
+    auto down(Qnn_GraphHandle_t graph, std::size_t index, const Qnn_Tensor_t& input,
+              const Qnn_Tensor_t& output) -> void {
         const auto& layer = stack_.layers[index];
         const auto values = ffn_weights(stack_, index, 1);
         projection(graph, "l" + std::to_string(index) + "_down", input, values, layer.down_weight_scale, layer, output);
@@ -176,8 +176,8 @@ private:
 };
 
 // Builds and finalizes one planned graph, returning its boundary tensor IDs (inputs then outputs).
-auto build_graph(qnn::Session& session, GraphBuilder& builder, const FfnStack& stack, const GraphPlan& plan)
-    -> std::vector<std::uint32_t> {
+auto build_graph(qnn::Session& session, GraphBuilder& builder, const FfnStack& stack,
+                 const GraphPlan& plan) -> std::vector<std::uint32_t> {
     const auto graph = session.create_graph(plan.name);
     std::vector<Qnn_Tensor_t> inputs, outputs;
     for (const auto& io : plan.inputs)
