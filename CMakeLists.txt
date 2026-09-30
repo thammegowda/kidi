@@ -108,6 +108,11 @@ if(EMSCRIPTEN)
     endif()
 endif()
 
+option(KIDI_ENABLE_VULKAN "Build the Vulkan GPU backend" ${ANDROID})
+if(KIDI_ENABLE_VULKAN)
+    include(cmake/vulkan.cmake)
+endif()
+
 if(KIDI_BUILD_BENCHMARKS)
     add_executable(kidi_gemma4_quality benchmarks/gemma4/quality.cpp)
     target_link_libraries(kidi_gemma4_quality PRIVATE kidi::kidi)

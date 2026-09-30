@@ -1,0 +1,33 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer GateUp { uint gateUp[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Hidden { uint hidden[]; };
+layout(push_constant) uniform Parameters {
+    uint m;
+    uint intermediate;
+    float gateUpScale;
+    float inverseHiddenScale;
+}
+parameters;
+
+float dequantize(uint word, uint lane) { return float(int(word << (24u - 8u * lane)) >> 24) * parameters.gateUpScale; }
+
+void main() {
+    uint words = parameters.intermediate / 4u;
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= parameters.m * words) return;
+    uint row = index / words;
+    uint word = index % words;
+    uint gate = gateUp[row * 2u * words + word];
+    uint up = gateUp[row * 2u * words + words + word];
+    uint result = 0u;
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        float g = dequantize(gate, lane);
+        float u = dequantize(up, lane);
+        float activated = 0.5 * g * (1.0 + tanh(0.7978845608 * (g + 0.044715 * g * g * g)));
+        float value = clamp(roundEven(activated * u * parameters.inverseHiddenScale), -128.0, 127.0);
+        result |= (uint(int(value)) & 255u) << (8u * lane);
+    }
+    hidden[row * words + word] = result;
+}

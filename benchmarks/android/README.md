@@ -208,3 +208,19 @@ Device-free runner checks:
 ```sh
 python -m unittest discover -s tests -p android_benchmark_test.py -v
 ```
+
+## Vulkan GPU backend
+
+Build the Android benchmark with `KIDI_ENABLE_VULKAN=ON` (the Android default) and run Gemma with
+`KIDI_ACCELERATOR=gpu` to select `Device::vulkan()` when the phone reports accelerated packed signed INT8 dot products:
+
+```sh
+LD_LIBRARY_PATH=/data/local/tmp/kidi-vk \
+KIDI_ACCELERATOR=gpu \
+/data/local/tmp/kidi-vk/kidi_android_baseline gemma /data/local/tmp/kidi-baseline/models/gemma4 4 3
+```
+
+`kidi_vulkan_operator_test` exercises the Vulkan eager backend and skips successfully when no suitable device is
+available.  The current backend keeps all tensors host-visible for captured-step input updates and accelerates calibrated
+packed projections/fused Gemma MLPs with Vulkan compute; unsupported operators execute through the CPU bridge on the same
+Vulkan tensor storage.

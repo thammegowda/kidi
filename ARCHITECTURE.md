@@ -785,3 +785,18 @@ are retained for scripts, despite the removal of their old graph implementations
 See [benchmarks/metal/EAGER_MIGRATION.md](benchmarks/metal/EAGER_MIGRATION.md) for
 actual corpus and performance results. The eager migration is not claimed to be
 bit-identical for INT8. Non-Apple builds have not been run in this environment.
+
+## Vulkan GPU Backend
+
+When built with `KIDI_ENABLE_VULKAN=ON`, the Vulkan backend registers `Device::vulkan()` only on Vulkan 1.3 compute
+devices that expose accelerated signed packed INT8 dot products and 64-lane arithmetic subgroups.  Tensor storage is
+host-visible and persistently mapped so Gemma captured-step inputs (tokens, masks, rotary tables, and scatter indices)
+remain writable by the host between replays.
+
+The eager backend supports captured-step replay through `Operator::run_into` for every operation.  Operations without a
+native Vulkan kernel execute through the CPU operator implementation over host-visible Vulkan storage and copy results
+back to Vulkan tensors.  Native Vulkan kernels currently cover calibrated signed packed projections and fused calibrated
+Gemma feed-forward blocks using Adreno integer dot-product compute shaders; weights are uploaded once by the prepared
+operator, while activations and outputs use reusable mapped buffers for the fixed prepared shape.  This keeps Gemma text
+decode functional while leaving broader batching, descriptor reuse, device-local allocation, and full attention/native
+pointwise coverage as backend optimization work.
