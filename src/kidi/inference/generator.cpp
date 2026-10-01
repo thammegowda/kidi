@@ -349,6 +349,9 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
 auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
                              GenerationOptions options) -> Result<std::uint64_t> {
     try {
+        if (options.image_max_pixels < image::MIN_RESIZED_PIXELS ||
+            options.image_max_pixels > image::MAX_RESIZED_PIXELS)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "image resize limit must be 161280 to 3000000 pixels"});
         std::vector<text::ChatMessage> expanded(messages.begin(), messages.end());
         std::vector<CachedImage> current;
         std::string image_key;
@@ -367,28 +370,40 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
                 std::string encoded(size, '\0');
                 if (!stream.read(encoded.data(), encoded.size()) || stream.peek() != std::char_traits<char>::eof())
                     throw ops::Failure({ErrorCode::IO, "unable to read complete image"});
-                auto cached = std::ranges::find(images_, encoded, &CachedImage::encoded);
+                auto cached = std::ranges::find_if(images_, [&](const CachedImage& image) {
+                    return image.encoded == encoded && image.tokens == options.image_tokens &&
+                           image.max_pixels == options.image_max_pixels;
+                });
                 tensor::Tensor embeddings;
                 if (cached != images_.end()) {
                     embeddings = cached->embeddings;
                 } else {
+                    if (options.on_image_progress) options.on_image_progress("Preparing image pixels");
+                    const auto pixels = require(image::prepare_gemma4(
+                        std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()),
+                        options.image_tokens, options.image_max_pixels));
                     if (!vision_) {
-                        const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
+                        if (options.on_image_progress) options.on_image_progress("Preparing image model");
+                        const auto device = model_->device() == tensor::Device::web_gpu() ? tensor::Device::web_gpu()
+                                                                                          : tensor::Device::cpu();
+                        const ModuleScope construction(tensor::DType::F32, false, device);
                         auto vision = model::Gemma4Vision(config_["vision"], config_["model"]["hidden_size"].as<int>(),
                                                           native_qat());
                         auto weights = require(checkpoint::Weights::load(config_["weights_file"].as<std::string>()));
                         require(vision->set_checkpoint(weights));
                         vision_ = std::move(vision);
                     }
-                    const auto pixels = require(image::prepare_gemma4(
-                        std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size())));
+                    if (options.on_image_progress) options.on_image_progress("Encoding images");
                     embeddings = require(require(vision_->forward(pixels)).to(model_->device()));
+                    if (options.on_image_progress) options.on_image_progress("Image encoded");
                 }
                 placeholders += "<|image>";
                 for (std::size_t index = 0; index < embeddings.size(1); ++index) placeholders += "<|image|>";
                 placeholders += "<image|>";
-                image_key += std::to_string(encoded.size()) + ":" + encoded;
-                current.push_back({std::move(encoded), std::move(embeddings)});
+                image_key += std::to_string(options.image_tokens) + ":" + std::to_string(options.image_max_pixels) +
+                             ":" + std::to_string(encoded.size()) + ":" + encoded;
+                current.push_back(
+                    {std::move(encoded), std::move(embeddings), options.image_tokens, options.image_max_pixels});
             }
             message.images.clear();
             message.content = placeholders + message.content;
@@ -439,7 +454,7 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         const auto started = Clock::now();
         const auto maximum = options.maximum_new_tokens ? options.maximum_new_tokens
                                                         : config_["decode"]["maximum_new_tokens"].as<std::size_t>();
-        const auto capacity =
+        auto capacity =
             options.context_size ? options.context_size : config_["decode"]["context_size"].as<std::size_t>();
         if (!maximum || !options.prefill_chunk_size || !capacity || capacity > serving_->cache_token_budget ||
             capacity > config_["model"]["max_position_embeddings"].as<std::size_t>())
@@ -450,6 +465,13 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         auto tokens = require(tokenizer_.encode(serialized));
         if (tokens.empty() || tokens.size() >= capacity || maximum > capacity - tokens.size())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prompt and generation must fit the reserved context"});
+        if (serving_->compact_cache) {
+            auto required = tokens.size() + maximum;
+            const auto byte_cache_limit =
+                tensor::DEVICE_CAPABILITIES[model_->device().kind].blockwise_int8_attention_max_tokens;
+            if (capacity > byte_cache_limit) required = std::max(required, byte_cache_limit + 1);
+            capacity = std::min(capacity, required + (128 - required % 128) % 128);
+        }
         if (options.prefix_cache_bytes) tokens.reserve(capacity);
         const std::array extra_stops{special_[1]};
         auto search = require(GreedyState::create({.vocabulary_size = tokenizer_.vocabulary_size(),

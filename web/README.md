@@ -1,6 +1,6 @@
 # Kidi WebAssembly Demo
 
-This directory builds a self-contained browser chat app for Gemma 4 E2B IT with Whisper microphone dictation.
+This directory builds a self-contained browser chat app for Gemma 4 E2B IT with image input and Whisper microphone dictation.
 It uses the released `google/gemma-4-E2B-it-qat-mobile-transformers` checkpoint,
 keeps its trained mixed 2/4/8-bit values, and runs Kidi's existing C++ Gemma
 model through WebAssembly.
@@ -42,7 +42,7 @@ The JavaScript files have distinct roles:
 
 | Files | Run in | Purpose |
 |---|---|---|
-| `app.mjs`, `inference-worker.mjs`, `asr-worker.mjs`, `model-cache.mjs` | Browser | Chat UI, isolated Gemma/Whisper Wasm execution, Hub downloads and cache |
+| `app.mjs`, `inference-worker.mjs`, `asr-worker.mjs`, `model-cache.mjs`, `images.mjs` | Browser | Chat UI, local image attachments, isolated Gemma/Whisper execution, Hub downloads and cache |
 | `build.mjs`, `wasm-glue.mjs` | Node.js during build | Compile/package Wasm and fix large-memory generated glue |
 | `src/web/libs/` | Build inputs | Pinned isolation helper, selected icons, and JavaScript parser dependencies |
 
@@ -58,7 +58,8 @@ then the browser downloads the original Safetensors
 file in 8 MiB HTTP ranges, caches those original bytes, and normalizes the packed
 integer representation once in the final Wasm buffer. This is lossless, not
 re-quantization. All checkpoint tensors, including vision/audio weights, are
-preserved; inference currently supports text only.
+preserved. Supported vision checkpoints accept images through the shared C++ core; audio
+input remains the separate Whisper dictation workflow.
 
 Settings accept a public `OWNER/REPO` Hub model ID. The resolved commit is cached separately from the mutable ID so
 byte ranges from different revisions cannot mix. Automatic startup remains offline: it reuses the last resolved commit
@@ -74,9 +75,24 @@ Wasm worker with its own linear heap, including when Gemma uses WebGPU.
 - **WebAssembly CPU, one thread:** uses the single-thread SIMD module.
 - **WebAssembly CPU, 2-8 threads:** uses pthreads and the YNNPACK/Slinky
   scheduler. The selected count includes the calling thread.
+- **WebGPU:** uses the hardware GPU through the single-thread WASM/JSPI bridge.
+  It requires WebGPU and WebAssembly JSPI support. Captured decode steps reuse
+  prepared operators and GPU output buffers; per-call inputs upload explicitly.
 
-Four-thread Wasm CPU is the recommended mode on the tested system. Gemma's
-model/layer equations and YNNPACK operators are shared with native CPU execution.
+Calibrated packed WebGPU FFNs with aligned decode shapes use three dispatches:
+input quantization, fused gate/up projection plus GELU-product/requantization,
+and down projection. The fused middle stage writes INT8 activations directly.
+Prefill keeps the existing projection path because the measured fused prefill
+kernel was slower. Unsupported fusion shapes and uncalibrated models retain
+their existing operators. The backend test page's **Benchmark FFN** control
+compares both paths with exact output checks and GPU timestamps.
+On the tested Apple GPU, the full-model short-prompt comparison improved warm
+decode from 36.85 to 40.04 tokens/s with identical output tokens. A 145-token
+prompt's single sample was unchanged; this is not a general throughput guarantee.
+
+Gemma's model/layer equations are shared with native execution. CPU WASM uses
+the native YNNPACK operators. Backend support is checked explicitly; WebGPU
+does not silently fall back to CPU.
 
 ## Browser Workflow
 
@@ -89,6 +105,44 @@ inside the browser.
 New chat creates a blank conversation; completed chats are stored in local
 browser storage and can be reopened or deleted from the history rail. Chat
 content is not sent to a server.
+
+### Images
+
+With a supported Gemma vision checkpoint loaded, the plus button
+attaches JPEG or PNG files. Paste and drop into the composer are also
+supported. Previews can be removed before sending or opened at a larger size.
+Messages may contain an image alone or text with images. Later turns retain
+the conversation's images; missing locally cached data is reported explicitly.
+
+The browser stores and transfers the original image bytes unchanged. It does
+not resize, re-encode, or generate model features. The same C++ code used by
+Android, Python, and the CLI decodes through Tahoma Vision, applies orientation
+and pixel conversion, resizes for Gemma, and builds patches. The shared vision
+tower produces image embeddings, which enter the normal text decoder.
+Image features are reused for unchanged images and the same image-token budget.
+The common default is 280 soft image tokens. Kidi configures Tahoma's existing
+decode options with `max_pixels = 24'000'000` and a 96,000,000-byte decoded
+limit, allowing four-channel input. JPEG and PNG enforce those limits before pixel allocation. The existing
+16,384-pixel axis guard runs after decoding and before resize scratch allocation.
+These are shared C++ resource limits, not UI resizing rules. CPU WASM still has a 4 GiB heap ceiling and may
+run out of memory with a full model and image input.
+
+**Image resize limit (pixels)** in Model settings defaults to 3,000,000 and can
+be reduced to 161,280. It is saved locally and sent with each request; C++
+validates the value and selects the largest supported token budget that fits
+both the pixel ceiling and the requested token budget. The ceiling does not
+force upscaling: the default 280-token budget uses at most 645,120 pixels.
+For example, a 500,000-pixel ceiling reduces that budget to 140 tokens. Changed
+limits invalidate reusable image features and image-dependent prefix state.
+
+At most eight images and 32 MiB of original image data are allowed per
+conversation. Image data lives in
+a separate local Cache Storage cache, not in chat JSON or the model cache.
+Deleting chats or removing drafts removes unreferenced attachments. Model-cache
+deletion does not delete chat images. Temporary files in the WASM filesystem
+are removed after request admission, including on errors. Images are never
+uploaded to Hugging Face or another inference service. Browser storage eviction
+and memory limits still apply.
 
 The microphone button records at most 30 seconds, resamples captured mono PCM to 16 kHz, and transfers snapshots to the
 isolated Whisper worker. Automatic language detection is enabled. While recording, replaceable draft hypotheses appear
@@ -123,8 +177,10 @@ inside the heap or guarantee that the browser can allocate more memory.
 Output defaults to 1,024 tokens and can be set from 1 to 8,192. The formatted
 conversation and requested output must fit within a shared 9,216-token context.
 At the maximum output setting, 1,024 tokens remain for the formatted conversation.
-The runtime reserves the full context cache for each generation, so even short
-responses need the corresponding memory headroom.
+The runtime reserves prompt plus requested output capacity in 128-token
+buckets, capped by the context limit. It preserves the requested context's
+cache precision policy. Short requests no longer reserve all 9,216 positions;
+large output limits and conversations still require corresponding memory.
 
 During generation, the send button becomes a square stop control. Stop is
 cooperative at the next model-step boundary; a long prefill can therefore take
@@ -157,14 +213,14 @@ to one thread. HTTPS is required except on localhost/loopback.
 ### GitHub Pages
 
 The [WebAssembly Pages workflow](../.github/workflows/pages.yml) tests the browser
-loader and builds both Wasm variants for relevant pull requests and pushes to `main`.
+loader and builds the single-thread, pthread, and WebGPU variants for relevant pull requests and pushes to `main`.
 Only `main` deploys, using the `github-pages` environment and GitHub's Pages
 artifact service. It can also be run manually from the Actions tab on `main`.
 The Linux build uses Emscripten 6.0.9 and Node.js 24; npm is not required.
 
 The workflow caches the versioned Emscripten SDK (including system libraries)
 and up to 500 MB of compiler objects through `ccache`. The first build is cold;
-later runs reuse matching objects, but still configure and link both variants.
+later runs reuse matching objects, but still configure and link all three variants.
 All runtime sources remain included. Python bindings, native tests, and
 benchmarks are disabled for the Pages build. Native unit tests and Python wheel
 checks run independently in the [native workflow](../.github/workflows/native.yml).
@@ -220,6 +276,28 @@ No checkpoint code or pickle data is executed. The browser reads YAML/JSON,
 Safetensors, tokenizer data, and static Wasm/JavaScript assets.
 
 ## Validation
+
+### Current Backend Checks
+
+Run `make web-test` for loader, cache, generated-glue, and speech-resampling checks.
+After `make wasm`, explicitly rebuild the C++ WebGPU check; the app build disables
+test targets and an older test binary can otherwise remain on disk:
+
+```bash
+emcmake cmake -S . -B build-webgpu -DKIDI_BUILD_TESTS=ON \
+  -DKIDI_WASM_WEBGPU=ON -DKIDI_WASM_THREADS=OFF
+cmake --build build-webgpu --target kidi_webgpu_test -j8
+python3 -m http.server 8081 --bind 127.0.0.1 --directory .
+```
+
+Open `http://127.0.0.1:8081/tests/web/backend_test.html?run=1` in the integrated
+browser. Disable HTTP caching when iterating on shader modules. Checks cover
+packed projections, attention, float/QAT Gemma references, replay rebinding,
+token readback, cache scatter aliasing and errors, and buffer lifetime/budgets.
+Full-model observations and performance limitations are recorded in the
+[optimization journal](../benchmarks/gemma4/JOURNAL.md).
+
+### Historical CPU Measurements
 
 Validated on 2026-09-21 with Emscripten 6.0.9, Chromium 148, and an Apple M5
 with 16 GiB RAM. The prompt was `What is the capital of France? Answer briefly.`

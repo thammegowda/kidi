@@ -433,9 +433,19 @@ Whisper decoding replays one step per decoder capacity: token, mask, and positio
 index inputs, with positions gathered by index and caches written by `scatter_`.
 Gemma 4 single-request decoding replays one step per cache capacity, 128-position
 key extent, and local-attention crop, using the same extents as eager decoding;
-host-built masks and rotary angles are written into `Gemma4State::step`. Batched
-decoding and WebGPU keep the eager path. Replay matches eager bit for bit in unit
-tests and real-model runs.
+host-built masks and rotary angles are written into `Gemma4State::step`. WebGPU
+uploads these small inputs explicitly and rebinds them on replay; captured
+outputs and KV caches stay on the GPU. Batched decoding keeps the eager path.
+WebGPU scatter updates cache rows without copying the whole cache and reports
+invalid indices at synchronization. Replay preserves reference logits within
+the backend's numerical tolerance and generated token IDs in the tested runs.
+
+Serving can opt into `ServingOptions::compact_cache` to reserve prompt plus
+maximum output length in 128-token buckets rather than the full context limit.
+The reservation stays on the same side of the backend's INT8-cache threshold
+as the requested limit, preserving its precision policy. Native callers retain
+full reservations by default; the browser enables compact reservations to
+reduce pressure on its 4 GiB linear heap.
 
 The CPU backend replays prepared YNNPACK executables and custom kernels in order.
 Eager dispatch was about 0.75% of Whisper Small decode time on an Apple M5 (about

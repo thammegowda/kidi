@@ -25,6 +25,7 @@ auto scalar(float value, tensor::Device device) -> Tensor {
 }
 /// Reuses `tensor` as a step input when its layout matches, reallocating only when the shape changes.
 auto step_input(Tensor& tensor, std::vector<std::int64_t> shape, DType dtype, tensor::Device device) -> Tensor& {
+    if (device == tensor::Device::web_gpu()) device = tensor::Device::cpu();
     if (!tensor.defined() || tensor.dtype() != dtype || tensor.device() != device ||
         !std::ranges::equal(tensor.shape(), shape))
         tensor = require(Tensor::empty(std::move(shape), dtype, device));
@@ -620,11 +621,9 @@ auto Gemma4Impl::head(const Tensor& hidden, bool select) -> Tensor {
 }
 
 auto Gemma4Impl::can_decode_step(const Gemma4State& state) const -> bool {
-    // WebGPU tensors are not host-writable, so its single-token steps keep freshly uploaded inputs.
-    return device() != tensor::Device::web_gpu() &&
-           std::ranges::none_of(state.images, [&](const Gemma4ImageTokens& image) {
-               return image.position <= state.position && state.position < image.position + image.embeddings.size(1);
-           });
+    return std::ranges::none_of(state.images, [&](const Gemma4ImageTokens& image) {
+        return image.position <= state.position && state.position < image.position + image.embeddings.size(1);
+    });
 }
 
 auto Gemma4Impl::decode_step(const Tensor& token, Gemma4State& state, bool select) -> Tensor {
@@ -672,6 +671,8 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
     auto& step = impl_->step_inputs;
     step.assign({tokens, inputs.index, inputs.masks[0], inputs.masks[1], inputs.angles[0][0], inputs.angles[0][1],
                  inputs.angles[1][0], inputs.angles[1][1]});
+    for (auto& input : step)
+        if (input.device() != device) input = require(input.to(device));
     for (const auto& cache : state.layers) step.insert(step.end(), {cache.key, cache.value});
     const auto key = std::string(prefill ? "gemma4_prefill:" : "gemma4_decode:") + std::to_string(length) + ':' +
                      std::to_string(state.capacity) + ':' + std::to_string(extent) + ':' +

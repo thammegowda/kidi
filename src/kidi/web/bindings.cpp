@@ -12,6 +12,11 @@ std::optional<kidi::inference::Generator> generator;
 std::optional<kidi::inference::Transcriber> transcriber;
 std::string response;
 int configured_threads;
+// clang-format off
+EM_JS(void, image_progress, (const char* stage), {
+    self.postMessage({type: 'encoding-images', stage: UTF8ToString(Number(stage)), heapBytes: HEAPU8.byteLength});
+});
+// clang-format on
 #ifdef KIDI_HAS_WEBGPU
 constexpr auto DEVICE = kidi::tensor::Device::web_gpu();
 constexpr auto BACKEND = "webgpu";
@@ -44,8 +49,12 @@ auto loaded_transcriber() -> kidi::inference::Transcriber& {
 }
 auto messages(const char* messages_json) -> std::vector<kidi::text::ChatMessage> {
     std::vector<kidi::text::ChatMessage> result;
-    for (const auto& message : nlohmann::json::parse(messages_json))
-        result.push_back({message.at("role").get<std::string>(), message.at("content").get<std::string>()});
+    for (const auto& message : nlohmann::json::parse(messages_json)) {
+        kidi::text::ChatMessage item{message.at("role").get<std::string>(), message.at("content").get<std::string>()};
+        if (message.contains("images"))
+            for (const auto& image : message.at("images")) item.images.emplace_back(image.get<std::string>());
+        result.push_back(std::move(item));
+    }
     return result;
 }
 auto options(int maximum_tokens) -> kidi::inference::GenerationOptions {
@@ -56,6 +65,7 @@ auto options(int maximum_tokens) -> kidi::inference::GenerationOptions {
     result.context_size = CONTEXT_TOKENS;
     result.prefill_chunk_size = 32;
     result.stream_text = true;
+    result.on_image_progress = [](std::string_view stage) { image_progress(std::string(stage).c_str()); };
     return result;
 }
 } // namespace
@@ -79,17 +89,22 @@ EMSCRIPTEN_KEEPALIVE auto kidi_load(const char* directory) -> const char* {
     return answer([&]() -> nlohmann::json {
         if (!configured_threads) throw std::runtime_error("Configure the runtime before loading the model");
         generator.emplace(kidi::ops::require(kidi::inference::Generator::load(directory, DEVICE, 0, 128, true)));
-        kidi::ops::require(generator->configure_serving({1, 1, CONTEXT_TOKENS, 32}));
+        kidi::ops::require(generator->configure_serving({1, 1, CONTEXT_TOKENS, 32, true}));
         return {{"ready", true},
                 {"native_qat", generator->native_qat()},
+                {"vision_supported", generator->vision_supported()},
                 {"threads", configured_threads},
                 {"backend", BACKEND}};
     });
 }
 
-EMSCRIPTEN_KEEPALIVE auto kidi_enqueue(const char* messages_json, int maximum_tokens) -> const char* {
+EMSCRIPTEN_KEEPALIVE auto kidi_enqueue(const char* messages_json, int maximum_tokens, int image_max_pixels) -> const
+    char* {
     return answer([&]() -> nlohmann::json {
-        auto id = kidi::ops::require(loaded().enqueue_chat(messages(messages_json), options(maximum_tokens)));
+        const auto request = messages(messages_json);
+        auto settings = options(maximum_tokens);
+        settings.image_max_pixels = static_cast<std::size_t>(image_max_pixels);
+        auto id = kidi::ops::require(loaded().enqueue_chat(request, settings));
         return {{"request_id", id}};
     });
 }

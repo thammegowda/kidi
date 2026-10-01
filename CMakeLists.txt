@@ -91,7 +91,7 @@ if(EMSCRIPTEN)
     set_target_properties(kidi_wasm PROPERTIES OUTPUT_NAME kidi SUFFIX .mjs)
     target_link_options(kidi_wasm PRIVATE
         --no-entry -sMODULARIZE=1 -sEXPORT_NAME=createKidi -sENVIRONMENT=web,worker,node
-        -sFORCE_FILESYSTEM=1 -sINITIAL_MEMORY=64MB
+        -sFORCE_FILESYSTEM=1 -sINITIAL_MEMORY=64MB -sEXCEPTION_STACK_TRACES=1
         "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8']"
         "-sEXPORTED_FUNCTIONS=['_malloc','_free']"
     )

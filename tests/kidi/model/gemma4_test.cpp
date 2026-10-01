@@ -176,6 +176,29 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
             results[index]->stats.reused_prompt_tokens != (index == 0 ? 3 : 0))
             throw std::runtime_error("queued requests shared or lost streaming KV state");
     }
+    manifest["model"]["max_position_embeddings"] = 1024;
+    std::ofstream(directory / "model.yaml") << manifest;
+    auto compact = require(kidi::inference::Generator::load(directory, device));
+    auto full = require(kidi::inference::Generator::load(directory, device));
+    require(compact.configure_serving({1, 1, 1024, 2, true}));
+    require(full.configure_serving({1, 1, 1024, 2}));
+    auto bounded = uncached;
+    bounded.context_size = 1024;
+    require(compact.enqueue(prompts[0], bounded));
+    const auto step = require(compact.step());
+    const auto byte_limit = kidi::tensor::DEVICE_CAPABILITIES[device.kind].blockwise_int8_attention_max_tokens;
+    const auto expected_capacity = byte_limit < 1024 ? ((byte_limit + 128) / 128) * 128 : 128;
+    if (step.reserved_cache_tokens != expected_capacity)
+        throw std::runtime_error("compact reservation changed the cache precision policy or exceeded its bucket");
+    std::optional<kidi::inference::TextGeneration> compact_result;
+    while (compact.pending_requests())
+        for (auto& event : require(compact.step()).events)
+            if (event.completed) compact_result = std::move(event.completed);
+    const auto full_result = run(full, prompts[0], bounded);
+    if (!compact_result || compact_result->generation.token_ids != full_result.generation.token_ids)
+        throw std::runtime_error("compact cache reservation changed generated tokens");
+    bounded.maximum_new_tokens = 1024;
+    if (compact.enqueue(prompts[0], bounded)) throw std::runtime_error("compact cache accepted context overflow");
     std::filesystem::remove_all(directory);
 }
 } // namespace

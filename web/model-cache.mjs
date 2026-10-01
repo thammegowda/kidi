@@ -326,7 +326,7 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly)
     module.HEAPU8.set(normalizedHeader, pointer + 8);
     module.FS.mkdir('/model');
     mountWeights(module, pointer, size);
-    if (whisper) module.FS.writeFile('/model/config.json', new Uint8Array(configData.bytes));
+    module.FS.writeFile('/model/config.json', new Uint8Array(configData.bytes));
     const metadata = whisper ? ['tokenizer.json', 'preprocessor_config.json', 'generation_config.json']
         : ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
     for (const name of metadata) {

@@ -1,4 +1,5 @@
 import {loadModel} from './model-cache.mjs';
+import {stageImages} from './images.mjs';
 
 let module;
 let active = false;
@@ -89,7 +90,14 @@ self.onmessage = async ({data}) => {
             cancelRequested = false;
             generationStarted = performance.now();
             generation = {tokenCount: 0, elapsedMs: 0, decodeMs: 0, decodeTokens: 0, firstTokenMs: null};
-            const result = await call('kidi_enqueue', ['string', 'number'], [JSON.stringify(data.messages), data.maximumTokens]);
+            const staged = await stageImages(module, data.messages);
+            let result;
+            try {
+                if (staged.messages.some(message => message.images.length))
+                    self.postMessage({type: 'encoding-images'});
+                result = await call('kidi_enqueue', ['string', 'number', 'number'],
+                    [JSON.stringify(staged.messages), data.maximumTokens, data.imageMaxPixels ?? 3000000]);
+            } finally { staged.dispose(); }
             requestId = result.request_id;
             inFlight = false;
             setTimeout(step, 0);

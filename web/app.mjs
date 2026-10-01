@@ -1,6 +1,7 @@
 import {clearModelCache, deleteCachedModel, isModelCached, listCachedModels} from './model-cache.mjs';
 import {renderMarkdown} from './markdown.mjs';
 import {resampleAudio} from './speech.mjs';
+import {storeImage, readImage, removeUnusedImages, MAX_IMAGES, MAX_IMAGE_BYTES} from './images.mjs';
 
 const CHAT_STORAGE = 'kidi-chats-v1';
 const ACTIVE_CHAT_STORAGE = 'kidi-active-chat-v1';
@@ -27,6 +28,11 @@ let recording;
 let recordingTimer;
 let recordingDeadline;
 let speechWorker;
+let visionSupported = false;
+let draftImages = [];
+let preparingImages = false;
+let encodingImages = '';
+const imageUrls = new Map();
 const preferences = {};
 
 try {
@@ -35,7 +41,7 @@ try {
         preferences.backend = saved.backend;
         element('backend').value = saved.backend;
     }
-    for (const id of ['threads', 'tokens']) {
+    for (const id of ['threads', 'tokens', 'image-pixels']) {
         const input = element(id);
         const value = saved?.[id];
         if (Number.isInteger(value) && value >= Number(input.min) && value <= Number(input.max)) {
@@ -83,6 +89,75 @@ if (currentChatId && !chats.some(chat => chat.id === currentChatId)) currentChat
 if (storedActiveChat === null) currentChatId = chats[0]?.id || null;
 let conversation = chats.find(chat => chat.id === currentChatId)?.messages || [];
 
+function attachmentError(message = '') {
+    element('attachment-error').textContent = message;
+    element('attachment-error').hidden = !message;
+}
+async function pruneImages() {
+    if (preparingImages) return;
+    const retained = [...draftImages, ...chats.flatMap(chat => chat.messages.flatMap(message => message.images || []))];
+    try {
+        await removeUnusedImages(retained);
+        const ids = new Set(retained.map(image => image.id));
+        for (const [id, url] of imageUrls) if (!ids.has(id)) { URL.revokeObjectURL(url); imageUrls.delete(id); }
+    } catch (error) { attachmentError(error.message); }
+}
+async function imageUrl(image) {
+    if (imageUrls.has(image.id)) return imageUrls.get(image.id);
+    const blob = await readImage(image);
+    if (!imageUrls.has(image.id)) imageUrls.set(image.id, URL.createObjectURL(blob));
+    return imageUrls.get(image.id);
+}
+function renderImages(container, images, removable = false) {
+    container.replaceChildren();
+    container.hidden = !images.length;
+    for (const image of images) {
+        const item = document.createElement('figure');item.className = 'attachment';
+        const preview = document.createElement('button');preview.type = 'button';preview.className = 'attachment-preview';
+        preview.title = `View ${image.name}`;
+        const picture = document.createElement('img');picture.alt = image.name;
+        preview.append(picture);item.append(preview);
+        imageUrl(image).then(url => { if (picture.isConnected) picture.src = url; }).catch(error => {
+            if (picture.isConnected) { picture.alt = 'Image unavailable'; preview.disabled = true; preview.title = error.message; }
+        });
+        preview.addEventListener('click', async () => {
+            try { element('image-preview').src = await imageUrl(image);element('image-preview').alt = image.name;element('image-dialog').showModal(); }
+            catch (error) { attachmentError(error.message); }
+        });
+        if (removable) {
+            const remove = document.createElement('button');remove.type = 'button';remove.className = 'icon remove-image';
+            remove.title = `Remove ${image.name}`;remove.setAttribute('aria-label', remove.title);
+            const icon = document.createElement('img');icon.src = './icons/x.svg';icon.alt = '';remove.append(icon);
+            remove.addEventListener('click', () => {
+                if (busy || preparingImages) return;
+                draftImages = draftImages.filter(candidate => candidate !== image);
+                renderImages(element('attachments'), draftImages, true);attachmentError();pruneImages();controls();
+            });
+            item.append(remove);
+        }
+        container.append(item);
+    }
+}
+async function attachImages(files) {
+    if (busy || preparingImages || recording) return;
+    if (!ready || !visionSupported) { attachmentError('Load a model with image support first');return; }
+    const selected = [...files];
+    const existing = [...draftImages, ...conversation.flatMap(message => message.images || [])];
+    if (existing.length + selected.length > MAX_IMAGES) { attachmentError('At most eight images per conversation');return; }
+    preparingImages = true;controls();attachmentError();
+    const added = [];
+    try {
+        let bytes = existing.reduce((sum, image) => sum + image.size, 0);
+        for (const file of selected) {
+            const image = await storeImage(file, file.name);added.push(image);bytes += image.size;
+            if (bytes > MAX_IMAGE_BYTES) throw new Error('Images exceed the 32 MiB conversation limit');
+        }
+        draftImages.push(...added);
+        renderImages(element('attachments'), draftImages, true);
+    } catch (error) { attachmentError(error.message || 'Unable to attach image'); }
+    finally { preparingImages = false;controls();await pruneImages(); }
+}
+
 function currentChat() { return chats.find(chat => chat.id === currentChatId); }
 function chatTitle(prompt) {
     const title = prompt.replace(/\s+/g, ' ').trim();
@@ -120,7 +195,14 @@ function settleInterruptedTurn() {
     if (!chat || !reply) return;
     const partial = reply.text.trim();
     if (partial) conversation.push({role: 'assistant', content: partial, stats: currentStats});
-    else if (conversation.at(-1)?.role === 'user') conversation.pop();
+    else if (conversation.at(-1)?.role === 'user') {
+        const rejected = conversation.pop();
+        if (rejected.images?.length) {
+            draftImages = [...rejected.images];
+            if (!element('prompt').value) element('prompt').value = rejected.content;
+            renderImages(element('attachments'), draftImages, true);
+        }
+    }
     reply = null;
     if (conversation.length) saveCurrentChat();
     else {
@@ -158,7 +240,7 @@ function showMessageStats(footer, stats) {
     footer.title = `Decode speed excludes prompt preparation.${Number.isFinite(stats.firstTokenMs)
         ? ` First token: ${(stats.firstTokenMs / 1000).toFixed(2)} s.` : ''}`;
 }
-function addMessage(role, content, stats) {
+function addMessage(role, content, stats, images = []) {
     element('empty')?.remove();
     const article = document.createElement('article');
     article.className = `message ${role}`;
@@ -171,6 +253,11 @@ function addMessage(role, content, stats) {
     text.className = 'content';
     renderMarkdown(text, content);
     inner.append(name, text);
+    if (images.length) {
+        const attachments = document.createElement('div');attachments.className = 'message-images';
+        inner.insertBefore(attachments, text);renderImages(attachments, images);
+    }
+    text.hidden = role === 'user' && !content;
     const footer = document.createElement('p');
     footer.className = 'message-stats';
     showMessageStats(footer, stats);
@@ -182,21 +269,23 @@ function addMessage(role, content, stats) {
 function renderMessages() {
     element('messages').replaceChildren();
     if (!conversation.length) element('messages').append(emptyState());
-    else for (const message of conversation) addMessage(message.role, message.content, message.stats);
+    else for (const message of conversation) addMessage(message.role, message.content, message.stats, message.images);
     element('chat-title').textContent = currentChat()?.title || 'New chat';
     element('messages').scrollTop = element('messages').scrollHeight;
 }
 function selectChat(id) {
-    if (busy || loading) return;
+    if (busy || loading || preparingImages) return;
+    draftImages = [];renderImages(element('attachments'), draftImages, true);attachmentError();
     currentChatId = id;
     conversation = currentChat()?.messages || [];
     persistChats();
     renderHistory();
     renderMessages();
     closeHistory();
+    pruneImages();
 }
 function deleteChat(id) {
-    if (busy || loading) return;
+    if (busy || loading || preparingImages) return;
     chats = chats.filter(chat => chat.id !== id);
     if (currentChatId === id) {
         currentChatId = chats[0]?.id || null;
@@ -205,6 +294,7 @@ function deleteChat(id) {
     }
     persistChats();
     renderHistory();
+    pruneImages();
 }
 function renderHistory() {
     const container = element('chat-history');
@@ -261,28 +351,33 @@ function updateMemory(bytes) {
 }
 function controls() {
     const isRecording = Boolean(recording);
-    element('send').disabled = !ready || busy || isRecording;
+    element('send').disabled = !ready || busy || isRecording || preparingImages;
+    element('attach').disabled = !ready || !visionSupported || busy || isRecording || preparingImages;
+    element('attach').title = ready && !visionSupported
+        ? 'This model does not support images'
+        : 'Attach image';
+    for (const button of document.querySelectorAll('.remove-image')) button.disabled = busy || preparingImages;
     element('stop').hidden = !busy;
     element('stop').disabled = stopping;
-    element('mic').disabled = busy || loading;
+    element('mic').disabled = busy || loading || preparingImages;
     element('mic').classList.toggle('recording', isRecording);
     element('mic').setAttribute('aria-pressed', String(isRecording));
     element('mic').title = isRecording ? 'Stop recording' : 'Record speech';
     element('mic').setAttribute('aria-label', element('mic').title);
     element('prompt').disabled = isRecording;
-    element('load').disabled = busy || loading || isRecording;
+    element('load').disabled = busy || loading || isRecording || preparingImages;
     element('clear-cache').disabled = busy || loading || isRecording;
-    element('new-chat').disabled = busy || loading || isRecording;
-    for (const id of ['backend', 'threads', 'manifest', 'speech-model'])
-        element(id).disabled = busy || loading || isRecording;
+    element('new-chat').disabled = busy || loading || isRecording || preparingImages;
+    for (const id of ['backend', 'threads', 'manifest', 'speech-model', 'image-pixels'])
+        element(id).disabled = busy || loading || isRecording || preparingImages;
     element('threads').disabled ||= element('backend').value === 'webgpu';
-    for (const button of document.querySelectorAll('.history-open, .history-delete')) button.disabled = busy || loading;
+    for (const button of document.querySelectorAll('.history-open, .history-delete')) button.disabled = busy || loading || preparingImages;
     for (const button of document.querySelectorAll('.cache-delete')) button.disabled = busy || loading || isRecording;
 }
 function updateLiveStats() {
-    const speed = currentStats?.decodeTokens > 0 && currentStats.decodeMs > 0
+    const speed = encodingImages || (currentStats?.decodeTokens > 0 && currentStats.decodeMs > 0
         ? `${(currentStats.decodeTokens * 1000 / currentStats.decodeMs).toFixed(1)} tok/s`
-        : currentStats?.tokenCount ? 'Decoding' : 'Preparing prompt';
+        : currentStats?.tokenCount ? 'Decoding' : 'Preparing prompt');
     element('live-speed').textContent = speed;
     element('live-detail').textContent = `${currentStats?.tokenCount || 0} tokens | ${((performance.now() - generationStarted) / 1000).toFixed(1)} s`;
 }
@@ -293,6 +388,7 @@ function stopLiveStats() {
 function finish() {
     busy = false;
     stopping = false;
+    encodingImages = '';
     stopLiveStats();
     controls();
 }
@@ -314,6 +410,7 @@ function restart() {
     worker?.terminate();
     worker = null;
     ready = false;
+    visionSupported = false;
     busy = false;
     loading = false;
     stopping = false;
@@ -326,7 +423,8 @@ function restart() {
     controls();
 }
 function newChat() {
-    if (busy || loading || recording) return;
+    if (busy || loading || recording || preparingImages) return;
+    draftImages = [];renderImages(element('attachments'), draftImages, true);attachmentError();
     currentChatId = null;
     conversation = [];
     persistChats();
@@ -335,6 +433,7 @@ function newChat() {
     element('generation-stats').textContent = '9,216-token context';
     closeHistory();
     element('prompt').focus();
+    pruneImages();
 }
 function openHistory() { document.body.classList.add('history-visible'); }
 function closeHistory() { document.body.classList.remove('history-visible'); }
@@ -585,7 +684,7 @@ element('backend').addEventListener('change', () => {
     try { localStorage.setItem(SETTINGS_STORAGE, JSON.stringify(preferences)); } catch {}
     restart();
 });
-for (const id of ['threads', 'tokens']) element(id).addEventListener('input', () => savePreference(id));
+for (const id of ['threads', 'tokens', 'image-pixels']) element(id).addEventListener('input', () => savePreference(id));
 for (const id of ['open-settings', 'header-settings']) element(id).addEventListener('click', openSettings);
 element('close-settings').addEventListener('click', closeSettings);
 element('open-history').addEventListener('click', openHistory);
@@ -647,6 +746,7 @@ async function loadRuntime(cacheOnly = false) {
         } else if (data.type === 'ready') {
             try { localStorage.setItem(MODEL_STORAGE, manifest); } catch {}
             ready = true;
+            visionSupported = data.vision_supported === true;
             loading = false;
             const backend = data.backend === 'webgpu' ? 'WebGPU' : 'Wasm CPU';
             const detail = data.backend === 'webgpu' ? backend : `${backend} / ${data.threads} thread${data.threads === 1 ? '' : 's'}`;
@@ -658,7 +758,12 @@ async function loadRuntime(cacheOnly = false) {
             closeSettings();
             refreshCachedModels();
             controls();
+        } else if (data.type === 'encoding-images') {
+            encodingImages = data.stage || 'Encoding images';
+            element('live-speed').textContent = encodingImages;
+            element('generation-stats').textContent = encodingImages;
         } else if (data.type === 'step') {
+            encodingImages = '';
             const messages = element('messages');
             const follow = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 100;
             for (const generationEvent of data.events) {
@@ -686,6 +791,7 @@ async function loadRuntime(cacheOnly = false) {
         } else if (data.type === 'error') {
             if (busy) settleInterruptedTurn();
             element('warning').textContent = data.error;
+            attachmentError(data.error);
             if (data.fatal) {
                 ready = false;
                 element('status').textContent = 'Runtime failed';
@@ -715,7 +821,10 @@ async function restoreCachedModel() {
 element('compose').addEventListener('submit', event => {
     event.preventDefault();
     const prompt = element('prompt').value.trim();
-    if (!prompt || !ready || busy) return;
+    if ((!prompt && !draftImages.length) || !ready || busy || preparingImages) return;
+    if (!visionSupported && (draftImages.length || conversation.some(message => message.images?.length))) {
+        attachmentError('This model does not support images');return;
+    }
     const maximumTokens = outputTokenLimit();
     if (maximumTokens === null) {
         const message = element('tokens').validationMessage;
@@ -725,8 +834,16 @@ element('compose').addEventListener('submit', event => {
         element('tokens').reportValidity();
         return;
     }
-    const chat = ensureChat(prompt);
-    conversation.push({role: 'user', content: prompt});
+    const imageLimit = element('image-pixels');
+    if (!imageLimit.checkValidity() || !Number.isInteger(imageLimit.valueAsNumber)) {
+        element('warning').textContent = imageLimit.validationMessage || 'Enter an image resize limit';
+        openSettings();imageLimit.reportValidity();return;
+    }
+    const imageMaxPixels = imageLimit.valueAsNumber;
+    const images = draftImages;
+    const chat = ensureChat(prompt || images[0].name);
+    conversation.push({role: 'user', content: prompt, ...(images.length ? {images} : {})});
+    draftImages = [];renderImages(element('attachments'), draftImages, true);attachmentError();
     chat.updatedAt = Date.now();
     saveCurrentChat();
     busy = true;
@@ -737,18 +854,35 @@ element('compose').addEventListener('submit', event => {
     liveTimer = setInterval(updateLiveStats, 250);
     controls();
     element('warning').textContent = '';
-    addMessage('user', prompt);
+    addMessage('user', prompt, undefined, images);
     reply = addMessage('assistant', '');
     element('messages').scrollTop = element('messages').scrollHeight;
     element('generation-stats').textContent = 'Generating';
     element('prompt').value = '';
     element('prompt').style.height = '';
-    worker.postMessage({type: 'generate', messages: conversation, maximumTokens});
+    worker.postMessage({type: 'generate', messages: conversation, maximumTokens, imageMaxPixels});
 });
 element('prompt').addEventListener('input', event => {
     event.target.style.height = 'auto';
     event.target.style.height = `${Math.min(event.target.scrollHeight, 170)}px`;
 });
+element('attach').addEventListener('click', () => element('image-files').click());
+element('image-files').addEventListener('change', event => {
+    attachImages(event.target.files);event.target.value = '';
+});
+element('prompt').addEventListener('paste', event => {
+    const files = [...(event.clipboardData?.files || [])];
+    if (files.length) { event.preventDefault();attachImages(files); }
+});
+element('compose').addEventListener('dragover', event => {
+    if (event.dataTransfer.types.includes('Files')) event.preventDefault();
+});
+element('compose').addEventListener('drop', event => {
+    if (event.dataTransfer.files.length) { event.preventDefault();attachImages(event.dataTransfer.files); }
+});
+element('close-image').addEventListener('click', () => element('image-dialog').close());
+element('image-dialog').addEventListener('click', event => { if (event.target === element('image-dialog')) event.target.close(); });
+element('image-dialog').addEventListener('close', () => element('image-preview').removeAttribute('src'));
 element('prompt').addEventListener('keydown', event => {
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
         event.preventDefault();

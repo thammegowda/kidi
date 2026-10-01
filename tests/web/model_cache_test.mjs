@@ -3,6 +3,43 @@ import assert from 'node:assert/strict';
 import {deleteCachedModel, isModelCached, listCachedModels, loadModel, resolveModelSource} from '../../web/model-cache.mjs';
 import {unsignedHeapIndices} from '../../web/wasm-glue.mjs';
 
+test('image attachments persist outside chat text and stage bounded temporary request files', async () => {
+    const {storeImage, readImage, stageImages, removeUnusedImages} = await import('../../web/images.mjs');
+    const previous = globalThis.caches;
+    const saved = new Map(), files = new Map();
+    globalThis.caches = {open: async () => ({
+        put: async (key, response) => saved.set(key, response),
+        match: async key => saved.get(key)?.clone(),
+        keys: async () => [...saved.keys()].map(url => ({url})),
+        delete: async key => saved.delete(typeof key === 'string' ? key : key.url)
+    })};
+    const module = {FS: {mkdirTree: () => {}, writeFile: (path, bytes) => files.set(path, bytes),
+        unlink: path => files.delete(path)}};
+    try {
+        const image = await storeImage(new Blob(['image bytes'], {type: 'image/jpeg'}), 'photo.jpg');
+        assert.equal(await (await readImage(image)).text(), 'image bytes');
+        const staged = await stageImages(module, [{role: 'user', content: 'Describe', images: [image]}]);
+        assert.deepEqual(staged.messages[0].images, ['/images/0.jpg']);
+        assert.deepEqual(files.get('/images/0.jpg'), new TextEncoder().encode('image bytes'));
+        assert.equal(files.size, 1);
+        staged.dispose();
+        assert.equal(files.size, 0);
+        const original = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 255, 128, 42]);
+        const png = await storeImage(new Blob([original], {type: 'image/png'}), 'original.png');
+        const pngRequest = await stageImages(module, [{role: 'user', content: '', images: [png]}]);
+        assert.deepEqual(files.get('/images/0.png'), original);
+        pngRequest.dispose();
+        assert.equal(files.size, 0);
+        await assert.rejects(stageImages(module, [{role: 'assistant', content: '', images: [image]}]), /user messages/);
+        await assert.rejects(stageImages(module, [{role: 'user', content: '', images: Array(9).fill(image)}]), /at most eight/);
+        assert.equal(files.size, 0);
+        await removeUnusedImages([image]);
+        assert.equal(saved.size, 1);
+        await removeUnusedImages([]);
+        await assert.rejects(stageImages(module, [{role: 'user', content: '', images: [image]}]), /Image unavailable/);
+        await assert.rejects(readImage({id: '../../model/model.yaml'}), /Invalid image/);
+    } finally { globalThis.caches = previous; }
+});
 test('large-memory glue fixes direct and pthread heap indices without changing arithmetic shifts', () => {
     const source = 'HEAP32[ptr >> 2] = 1; (growMemViews(), HEAPU64)[addr >> 3] = 2n; const signed = value >> 3;';
     const fixed = unsignedHeapIndices(source);
@@ -91,7 +128,8 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
     upstream.fill(32, 8, 8 + headerBytes);
     upstream.set(new TextEncoder().encode(JSON.stringify(header)), 8);
     upstream.fill(0x12, 8 + headerBytes);
-    const config = {model_type: 'gemma4', text_config: {enable_moe_block: false}, quantization_config: {
+    const config = {model_type: 'gemma4', text_config: {enable_moe_block: false},
+        vision_config: {hidden_size: 768}, image_token_id: 42, quantization_config: {
         quant_method: 'gemma', quantize_embeddings: true, num_bits: 4, modules_to_not_convert: [],
         module_quant_configs: {'^lm_head$': {num_bits: 2}, test_eight_bit: {num_bits: 8}}
     }};
@@ -142,6 +180,7 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
         assert.equal(normalized['model.language_model.test_float.weight'].dtype, 'BF16');
         assert.deepEqual(Object.keys(normalized), Object.keys(header));
         const descriptor = JSON.parse(first.files.get('/model/model.yaml'));
+        assert.deepEqual(JSON.parse(new TextDecoder().decode(first.files.get('/model/config.json'))), config);
         assert.equal(descriptor.model.packed_weights_signed, true);
         assert.deepEqual(descriptor.decode, {maximum_new_tokens: 1024, context_size: 9216});
         const rangeKey = [...cache.keys()].find(key => key.endsWith('kidi_range=0-8388607'));
@@ -166,6 +205,7 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
         assert.equal(requests.length, count);
         assert.equal(reloaded.downloadedBytes, 0);
         assert.deepEqual(second.files.get('/model/model.safetensors').contents, mapped.contents);
+        assert.deepEqual(second.files.get('/model/config.json'), first.files.get('/model/config.json'));
         const corrupted = new Uint8Array(await cache.get(rangeKey).clone().arrayBuffer());
         corrupted[4096] ^= 1;
         cache.set(rangeKey, new Response(corrupted, {headers: cache.get(rangeKey).headers}));

@@ -6,6 +6,7 @@
 #include "kidi/text/tokenizer.h"
 #include <chrono>
 #include <deque>
+#include <functional>
 
 namespace kidi::inference {
 struct GenerationOptions {
@@ -13,6 +14,9 @@ struct GenerationOptions {
     std::size_t prefix_cache_bytes = 0;
     bool raw_prompt = false, ignore_eos = false, full_attention_cache = false;
     bool stream_text = false;
+    std::int32_t image_tokens = 280;
+    std::size_t image_max_pixels = image::MAX_RESIZED_PIXELS;
+    std::function<void(std::string_view)> on_image_progress;
 };
 struct GenerationStats {
     bool device_selection = false;
@@ -34,6 +38,7 @@ struct GenerationBatch {
 };
 struct ServingOptions {
     std::size_t maximum_active = 4, maximum_requests = 64, cache_token_budget = 16384, prefill_tokens_per_step = 128;
+    bool compact_cache = false;
 };
 struct GenerationEvent {
     std::uint64_t request_id;
@@ -81,6 +86,8 @@ private:
     struct CachedImage {
         std::string encoded;
         tensor::Tensor embeddings;
+        std::int32_t tokens;
+        std::size_t max_pixels;
     };
     std::vector<CachedImage> images_;
     std::array<std::int32_t, 3> special_;

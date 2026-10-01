@@ -157,7 +157,7 @@ public:
 } // namespace
 
 struct Gemma4VisionImpl::State {
-    ops::Context context{tensor::Device::cpu(), true};
+    ops::Context context{module_device, true};
     int hidden, heads, head_width, positions;
     float theta;
     VisionTower tower;
@@ -173,7 +173,8 @@ struct Gemma4VisionImpl::State {
 };
 
 Gemma4VisionImpl::Gemma4VisionImpl(const YAML::Node& config, std::int32_t text_width, bool quantized) {
-    if (module_device != tensor::Device::cpu() || config["patch_size"].as<int>() != 16 ||
+    if ((module_device != tensor::Device::cpu() && module_device != tensor::Device::web_gpu()) ||
+        config["patch_size"].as<int>() != 16 ||
         config["pooling_kernel_size"].as<int>() != 3 || config["standardize"].as<bool>(false) ||
         config["use_clipped_linears"].as<bool>(false) || config["head_dim"].as<int>() % 4 ||
         config["num_key_value_heads"].as<int>() != config["num_attention_heads"].as<int>())
@@ -204,7 +205,7 @@ auto Gemma4VisionImpl::set_checkpoint(const checkpoint::Weights& weights) -> Res
                 value = require(Tensor::from_host(
                     std::vector<std::int64_t>(value.shape().begin(), value.shape().end()),
                     std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()), device()));
-            } else if (value.dtype() != DType::F32) {
+            } else if (value.dtype() != DType::F32 && value.dtype() != DType::U8) {
                 value = impl_->context.cast(require(value.to(device())), DType::F32);
             }
             state.emplace(name, std::move(value));
@@ -226,7 +227,8 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image) -> Result<Tensor
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma image patches"});
         std::vector<float> pixels(image.patches.size()), position(length * state.hidden);
         std::ranges::transform(image.patches, pixels.begin(), [](float value) { return 2.F * (value - 0.5F); });
-        const auto table = require(std::as_const(state.tower->patch->positions).data<float>());
+        const auto table_storage = require(state.tower->patch->positions.to(tensor::Device::cpu()));
+        const auto table = require(table_storage.data<float>());
         for (std::int64_t patch = 0; patch < length; ++patch)
             for (int channel = 0; channel < state.hidden; ++channel)
                 position[patch * state.hidden + channel] =
@@ -234,8 +236,8 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image) -> Result<Tensor
                     table[(state.positions + patch / image.patch_columns) * state.hidden + channel];
         auto hidden =
             context.add(state.tower->patch->projection->forward(
-                            context, require(Tensor::from_host({1, length, 768}, std::span<const float>(pixels)))),
-                        require(Tensor::from_host({1, length, state.hidden}, std::span<const float>(position))));
+                            context, require(Tensor::from_host({1, length, 768}, std::span<const float>(pixels), device()))),
+                        require(Tensor::from_host({1, length, state.hidden}, std::span<const float>(position), device())));
         std::vector<float> cosine(2 * length * (state.head_width / 4)), sine(cosine.size());
         for (std::int64_t patch = 0; patch < length; ++patch)
             for (int axis = 0; axis < 2; ++axis)
@@ -247,12 +249,14 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image) -> Result<Tensor
                     sine[offset] = std::sin(coordinate * frequency);
                 }
         const auto cos =
-            require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(cosine)));
-        const auto sin = require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(sine)));
-        const auto mask = require(Tensor::zeros({1, 1, length, length}, DType::F32));
+            require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(cosine), device()));
+        const auto sin = require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(sine), device()));
+        const auto mask = require(Tensor::zeros({1, 1, length, length}, DType::F32, device()));
         for (const auto& layer : *state.tower->encoder->layers)
             hidden = layer->forward(context, hidden, cos, sin, mask);
-        const auto values = require(hidden.data<float>());
+        context.synchronize();
+        const auto host_hidden = require(hidden.to(tensor::Device::cpu()));
+        const auto values = require(host_hidden.data<float>());
         std::vector<float> pooled(length / 9 * state.hidden, 0.F);
         for (std::int64_t patch = 0; patch < length; ++patch) {
             const auto group =
@@ -264,7 +268,7 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image) -> Result<Tensor
         auto output = state.projection->projection->forward(
             context,
             state.projection->norm->forward(
-                context, require(Tensor::from_host({1, length / 9, state.hidden}, std::span<const float>(pooled)))));
+                context, require(Tensor::from_host({1, length / 9, state.hidden}, std::span<const float>(pooled), device()))));
         context.synchronize();
         return output;
     } catch (const ops::Failure& error) {

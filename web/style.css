@@ -131,6 +131,17 @@ button img { width: 18px; height: 18px; }
 #empty h2 { margin: 18px 0 5px; font-size: 20px; line-height: 1.3; font-weight: 600; }
 #empty p { margin: 0; color: var(--muted); font-size: 12px; }
 .composer-region { padding: 10px 24px 12px; background: linear-gradient(180deg, #ffffff00, #fff 12px); }
+.attachments, .message-images { display: flex; flex-wrap: wrap; gap: 8px; }
+.attachments { width: min(880px, 100%); margin: 0 auto 8px; max-height: 184px; overflow-y: auto; }
+.message-images { max-width: 100%; margin-bottom: 6px; }
+.attachment { position: relative; margin: 0; width: 120px; height: 90px; flex: 0 0 120px; }
+.attachment-preview { width: 100%; height: 100%; padding: 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: #f1f3f5; }
+.attachment-preview img { display: block; width: 100%; height: 100%; object-fit: contain; font-size: 11px; overflow-wrap: anywhere; }
+.attachment .remove-image { position: absolute; top: 3px; right: 3px; width: 26px; height: 26px; min-width: 26px; padding: 5px; }
+#attachment-error { width: min(880px, 100%); margin: 0 auto 8px; color: var(--danger); font-size: 12px; overflow-wrap: anywhere; }
+#image-dialog { width: min(960px, calc(100% - 24px)); padding: 44px 12px 12px; }
+#close-image { position: absolute; top: 6px; right: 6px; width: 32px; height: 32px; min-width: 32px; padding: 7px; }
+#image-preview { display: block; width: 100%; height: auto; max-height: calc(100dvh - 120px); object-fit: contain; }
 #compose { width: min(880px, 100%); margin: 0 auto; border: 1px solid #cdd3dd; border-radius: 8px; background: #fff; display: flex; align-items: flex-end; }
 #compose:focus-within { border-color: #6497d8; box-shadow: 0 0 0 2px #0865d512; }
 textarea { width: 100%; min-height: 54px; max-height: 170px; padding: 15px 16px 8px; border: 0; outline: 0; resize: none; background: transparent; color: var(--ink); line-height: 1.5; }

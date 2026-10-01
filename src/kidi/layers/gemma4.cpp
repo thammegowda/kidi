@@ -115,7 +115,10 @@ GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t int
 }
 auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
     const auto rows = input.numel() / input.size(-1);
-    if ((context.device() == tensor::Device::cpu() || context.device() == tensor::Device::vulkan()) && rows >= 32 &&
+    const bool web_fusion = context.device() == tensor::Device::web_gpu() && rows < 4 &&
+                            gate_up_->input_size_ % 128 == 0 && down_->input_size_ % 32 == 0;
+    if ((((context.device() == tensor::Device::cpu() || context.device() == tensor::Device::vulkan()) && rows >= 32) ||
+         web_fusion) &&
         gate_up_->packed_bits_ && gate_up_->packed_bits_ == down_->packed_bits_) {
         const Tensor& gate_input = gate_up_->input_scale_;
         const Tensor& gate_output = gate_up_->output_scale_;
@@ -132,7 +135,8 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
                                            gate_input_scale, gate_output_scale, down_input_scale, down_output_scale);
             return output;
         }
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "fused feed-forward requires positive trained scales"});
+        if (!web_fusion)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "fused feed-forward requires positive trained scales"});
     }
     const auto projected = gate_up_->forward(context, input);
     const auto intermediate = static_cast<std::int64_t>(projected.size(-1) / 2);

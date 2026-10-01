@@ -147,7 +147,8 @@ struct Context::Impl {
         spec.dynamic_parameters =
             spec.operation == Operation::RMS_NORM ||
             (spec.operation == Operation::LINEAR && device == tensor::Device::apple_gpu()) ||
-            (constant_parameters && spec.operation != Operation::PACKED_LINEAR && device == tensor::Device::web_gpu());
+            (constant_parameters && spec.operation != Operation::PACKED_LINEAR &&
+             spec.operation != Operation::GATED_FEED_FORWARD && device == tensor::Device::web_gpu());
         for (std::size_t index = parameter_start; index < inputs.size(); ++index)
             spec.dynamic_parameters = spec.dynamic_parameters && inputs[index].device() == device;
         key.push_back(spec.dynamic_parameters);

@@ -27,7 +27,7 @@ for (const [name, threads, gpu] of [['single', 'OFF', 'OFF'], ['threads', 'ON', 
     await writeFile(glue, unsignedHeapIndices(await readFile(glue, 'utf8')));
 }
 for (const file of ['index.html', 'app.mjs', 'style.css', 'inference-worker.mjs', 'asr-worker.mjs',
-    'audio-capture-worklet.mjs', 'speech.mjs', 'model-cache.mjs', 'markdown.mjs', 'mermaid.mjs',
+    'audio-capture-worklet.mjs', 'speech.mjs', 'images.mjs', 'model-cache.mjs', 'markdown.mjs', 'mermaid.mjs',
     'webgpu.mjs', 'webgpu-kernels.mjs'])
     await copyFile(join(root, 'web', file), join(destination, file));
 for (const name of ['marked', 'dompurify', 'highlightjs', 'mermaid']) {
