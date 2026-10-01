@@ -40,7 +40,7 @@
                     <div id="memory-stats" class="memory-stats" tabindex="0" aria-label="WebAssembly memory" aria-describedby="memory-description">
                     <span>Wasm heap <strong id="heap-used">--</strong></span>
                     <span>Headroom <strong id="heap-headroom">--</strong></span>
-                    <span id="memory-description" role="tooltip">Allocated linear memory and growth remaining below the 4 GiB Wasm limit. Not total browser RAM or free device memory.</span>
+                    <span id="memory-description" role="tooltip">Allocated linear memory and growth remaining below the 8 GiB Wasm limit. Not total browser RAM or free device memory.</span>
                     </div>
                 </div>
                 <button id="header-settings" class="runtime-chip" type="button" title="Model settings" aria-label="Model settings"><span class="status-dot" aria-hidden="true"></span><span id="runtime-badge">Offline</span><img src="./icons/settings.svg" alt="" aria-hidden="true"></button>
@@ -50,11 +50,13 @@
                 <div id="attachments" class="attachments" aria-label="Image attachments" hidden></div>
                 <p id="attachment-error" role="status" hidden></p>
                 <form id="compose">
+                    <div class="compose-actions">
+                        <input id="image-files" type="file" accept="image/jpeg,image/png" multiple hidden>
+                        <button id="attach" class="icon image-attach" type="button" title="Attach image" aria-label="Attach image" disabled><span aria-hidden="true">&#x1F5BC;&#xFE0F;</span></button>
+                    </div>
                     <label class="sr-only" for="prompt">Message</label>
                     <textarea id="prompt" rows="1" placeholder="Message Gemma"></textarea>
                     <div class="compose-actions">
-                        <input id="image-files" type="file" accept="image/jpeg,image/png" multiple hidden>
-                        <button id="attach" class="icon" type="button" title="Attach image" aria-label="Attach image" disabled><img src="./icons/plus.svg" alt=""></button>
                         <button id="mic" class="icon mic" type="button" title="Record speech" aria-label="Record speech" aria-pressed="false"><img src="./icons/mic.svg" alt=""></button>
                         <button id="stop" class="icon stop" type="button" title="Stop generation" aria-label="Stop generation" hidden><img src="./icons/square.svg" alt=""></button>
                         <button id="send" class="icon primary" type="submit" title="Send message" aria-label="Send message" disabled><img src="./icons/send-horizontal.svg" alt=""></button>

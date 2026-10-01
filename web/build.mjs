@@ -1,8 +1,7 @@
 import {spawnSync} from 'node:child_process';
-import {mkdir, copyFile, readdir, readFile, rm, writeFile} from 'node:fs/promises';
+import {mkdir, copyFile, readdir, rm, writeFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {resolve, join} from 'node:path';
-import {unsignedHeapIndices} from './wasm-glue.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const libraries = join(root, 'src/web/libs');
@@ -14,7 +13,7 @@ for (const [name, threads, gpu] of [['single', 'OFF', 'OFF'], ['threads', 'ON', 
         ['emcmake', ['cmake', '-S', root, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
             '-DBUILD_TESTING=OFF', '-DKIDI_BUILD_TESTS=OFF',
             '-DKIDI_BUILD_BENCHMARKS=OFF', '-DKIDI_BUILD_PYTHON=OFF',
-            '-DKIDI_WASM_LARGE_MEMORY=ON', '-DCMAKE_EXE_LINKER_FLAGS=',
+            '-DCMAKE_EXE_LINKER_FLAGS=',
             `-DKIDI_WASM_THREADS=${threads}`, `-DKIDI_WASM_WEBGPU=${gpu}`]],
         ['cmake', ['--build', build, '--target', 'kidi_wasm', '-j8']]]) {
         const result = spawnSync(command, args, {stdio: 'inherit'});
@@ -23,8 +22,6 @@ for (const [name, threads, gpu] of [['single', 'OFF', 'OFF'], ['threads', 'ON', 
     await mkdir(join(destination, name), {recursive: true});
     for (const file of await readdir(build))
         if (/^kidi.*\.(wasm|mjs|js)$/.test(file)) await copyFile(join(build, file), join(destination, name, file));
-    const glue = join(destination, name, 'kidi.mjs');
-    await writeFile(glue, unsignedHeapIndices(await readFile(glue, 'utf8')));
 }
 for (const file of ['index.html', 'app.mjs', 'style.css', 'inference-worker.mjs', 'asr-worker.mjs',
     'audio-capture-worklet.mjs', 'speech.mjs', 'images.mjs', 'model-cache.mjs', 'markdown.mjs', 'mermaid.mjs',

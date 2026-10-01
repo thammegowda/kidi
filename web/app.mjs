@@ -1,4 +1,4 @@
-import {clearModelCache, deleteCachedModel, isModelCached, listCachedModels} from './model-cache.mjs';
+import {clearModelCache, deleteCachedModel, isModelCached, listCachedModels, MAX_WASM_MEMORY} from './model-cache.mjs';
 import {renderMarkdown} from './markdown.mjs';
 import {resampleAudio} from './speech.mjs';
 import {storeImage, readImage, removeUnusedImages, MAX_IMAGES, MAX_IMAGE_BYTES} from './images.mjs';
@@ -345,9 +345,9 @@ function updateMemory(bytes) {
     const known = Number.isSafeInteger(bytes) && bytes >= 0;
     const gibibytes = value => `${(value / 2 ** 30).toFixed(2)} GiB`;
     element('heap-used').textContent = known ? gibibytes(bytes) : '--';
-    element('heap-headroom').textContent = known ? gibibytes(Math.max(0, 2 ** 32 - bytes)) : '--';
+    element('heap-headroom').textContent = known ? gibibytes(Math.max(0, MAX_WASM_MEMORY - bytes)) : '--';
     element('memory').textContent = known ? gibibytes(bytes) : '--';
-    element('memory-stats').classList.toggle('tight', known && bytes > 3.75 * 2 ** 30);
+    element('memory-stats').classList.toggle('tight', known && MAX_WASM_MEMORY - bytes < 256 * 1024 ** 2);
 }
 function controls() {
     const isRecording = Boolean(recording);
@@ -870,8 +870,12 @@ element('attach').addEventListener('click', () => element('image-files').click()
 element('image-files').addEventListener('change', event => {
     attachImages(event.target.files);event.target.value = '';
 });
-element('prompt').addEventListener('paste', event => {
-    const files = [...(event.clipboardData?.files || [])];
+element('compose').addEventListener('paste', event => {
+    const clipboard = event.clipboardData;
+    let files = [...(clipboard?.items || [])]
+        .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+        .map(item => item.getAsFile()).filter(Boolean);
+    if (!files.length) files = [...(clipboard?.files || [])].filter(file => file.type.startsWith('image/'));
     if (files.length) { event.preventDefault();attachImages(files); }
 });
 element('compose').addEventListener('dragover', event => {

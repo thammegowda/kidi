@@ -148,6 +148,7 @@ textarea { width: 100%; min-height: 54px; max-height: 170px; padding: 15px 16px 
 #prompt { min-width: 0; min-height: 44px; padding: 11px 12px; font-size: 14px; }
 .compose-actions { flex: 0 0 auto; padding: 5px; display: flex; align-items: center; gap: 5px; }
 .compose-actions .icon { width: 34px; height: 34px; min-width: 34px; padding: 8px; }
+.compose-actions .image-attach { padding: 5px; font-size: 20px; line-height: 1; }
 #send { background: var(--blue); border-color: var(--blue); }
 #send:disabled { opacity: 1; background: #e3e7ed; border-color: #e3e7ed; }
 #send:disabled img { filter: none; opacity: .45; }

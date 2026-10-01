@@ -43,7 +43,7 @@ The JavaScript files have distinct roles:
 | Files | Run in | Purpose |
 |---|---|---|
 | `app.mjs`, `inference-worker.mjs`, `asr-worker.mjs`, `model-cache.mjs`, `images.mjs` | Browser | Chat UI, local image attachments, isolated Gemma/Whisper execution, Hub downloads and cache |
-| `build.mjs`, `wasm-glue.mjs` | Node.js during build | Compile/package Wasm and fix large-memory generated glue |
+| `build.mjs` | Node.js during build | Compile/package native wasm64 variants |
 | `src/web/libs/` | Build inputs | Pinned isolation helper, selected icons, and JavaScript parser dependencies |
 
 Only browser assets and their licenses are copied to the deployment directory.
@@ -124,7 +124,7 @@ The common default is 280 soft image tokens. Kidi configures Tahoma's existing
 decode options with `max_pixels = 24'000'000` and a 96,000,000-byte decoded
 limit, allowing four-channel input. JPEG and PNG enforce those limits before pixel allocation. The existing
 16,384-pixel axis guard runs after decoding and before resize scratch allocation.
-These are shared C++ resource limits, not UI resizing rules. CPU WASM still has a 4 GiB heap ceiling and may
+These are shared C++ resource limits, not UI resizing rules. WASM has an 8 GiB growth ceiling and may
 run out of memory with a full model and image input.
 
 **Image resize limit (pixels)** in Model settings defaults to 3,000,000 and can
@@ -170,7 +170,7 @@ elapsed time. Speed excludes prompt preparation; final summaries use the native
 runtime counters. First-token latency is available in the footer tooltip.
 
 The header shows allocated Wasm linear memory and growth headroom below the
-4 GiB limit, refreshed during loading and generation. These are not process
+8 GiB limit, refreshed during loading and generation. These are not process
 RAM or free device memory, and headroom does not include reusable space already
 inside the heap or guarantee that the browser can allocate more memory.
 
@@ -188,17 +188,24 @@ several seconds to yield. A partial assistant response is retained only if text
 was emitted. Closing or navigating away from the page sends cancellation and
 terminates the inference worker immediately.
 
-The E2B live Wasm heap crosses 2 GiB. Builds therefore use Emscripten's 64-bit
-pointer compatibility lowering (`MEMORY64=2`), a 4 GiB maximum memory, and a
-2 MiB stack. Pthread control blocks are reserved before the model occupies high
-addresses. A generation can grow the Wasm heap to roughly 3.9 GiB; use a
-64-bit current Chromium browser and a machine with ample available memory.
-Long generations can still exhaust the 4 GiB limit as working buffers grow.
-The direct loader accepts checkpoints over 2 GiB, subject to that total memory
-budget. The build also fixes signed heap indexing in Emscripten 6.0.9's generated
-`MEMORY64=2` JavaScript, including pthread heap-view wrappers. Without that fix,
-mapping bookkeeping above 2 GiB can return an incorrect pointer. This transform
-is limited to generated glue; native C++ and dependency sources are unchanged.
+All browser variants use native wasm64 (`-m64`), an 8 GiB maximum linear memory,
+a 64 MiB initial memory, and a 2 MiB stack. There is no wasm32 or small-memory
+build option. Use a current browser with native WebAssembly memory64 support;
+WebGPU additionally requires JSPI. Pthread control blocks are reserved before
+model loading. The memory ceiling is not an upfront allocation or a guarantee
+of available RAM. Long requests and simultaneous model workers can still
+exhaust memory or cause swapping.
+
+Generated Emscripten glue is used unchanged; the old 32-bit heap-index rewrite
+has been removed. Allocation wrappers use JavaScript numbers, and `ccall`
+pointer arguments use its `pointer` type rather than 32-bit integer parameters.
+The direct loader accepts checkpoints above 4 GiB subject to the 8 GiB budget
+and room for runtime workspaces. Test the built single-thread ABI with a sparse
+allocation that crosses 4 GiB:
+
+```bash
+KIDI_TEST_WASM=build-web/single/kidi.mjs node --test tests/web/model_cache_test.mjs
+```
 
 ## Hosting and Cache
 
