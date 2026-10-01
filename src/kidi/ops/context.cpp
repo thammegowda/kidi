@@ -113,8 +113,8 @@ struct Context::Impl {
         } catch (...) {
         }
     }
-    auto run(OperatorSpec spec, TensorInputs inputs, Tensor* residual = nullptr, Tensor* destination = nullptr)
-        -> Tensor {
+    auto run(OperatorSpec spec, TensorInputs inputs, Tensor* residual = nullptr,
+             Tensor* destination = nullptr) -> Tensor {
         const InplaceScope mode(destination != nullptr);
         spec.packed_prefill = packed_prefill;
         spec.vector_projection = decode_projections && spec.operation == Operation::PACKED_LINEAR &&
@@ -358,7 +358,7 @@ struct Context::Impl {
             if (is_inplace)
                 recorder->record(spec, found->second.operation, graph::Mode::IN_PLACE, inputs, {destination, 1});
             else if (residual)
-                recorder->record(spec, found->second.operation, graph::Mode::PAIR, inputs,
+                recorder->record(spec, found->second.operation, graph::Mode::RESULT, inputs,
                                  std::array<Tensor, 2>{*residual, output});
             else
                 recorder->record(spec, found->second.operation, graph::Mode::RESULT, inputs, {&output, 1});
@@ -468,8 +468,8 @@ auto Context::crop_local_attention() const noexcept -> bool {
 auto Context::prefill_chunk_size(std::size_t requested) const -> std::size_t {
     return impl_->compiler ? impl_->compiler->prefill_chunk_size(requested) : requested;
 }
-auto Context::replay(std::string_view key, std::span<const Tensor> inputs, const Step& step)
-    -> std::span<const Tensor> {
+auto Context::replay(std::string_view key, std::span<const Tensor> inputs,
+                     const Step& step) -> std::span<const Tensor> {
     auto& impl = *impl_;
     if (impl.recorder) throw Failure({ErrorCode::INVALID_ARGUMENT, "captured steps cannot be nested"});
     if (!impl.replay_enabled) {
@@ -666,8 +666,8 @@ auto Context::gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor {
 auto Context::gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
                                  const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
                                  std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
-                                 float gate_up_output_scale, float down_input_scale, float down_output_scale)
-    -> Tensor {
+                                 float gate_up_output_scale, float down_input_scale,
+                                 float down_output_scale) -> Tensor {
     const std::array<std::int64_t, 6> attributes{bits,
                                                  input_size,
                                                  intermediate_size,

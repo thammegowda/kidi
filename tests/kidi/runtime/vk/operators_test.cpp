@@ -32,18 +32,18 @@ auto tensor(std::vector<std::int64_t> shape, std::span<const float> values, Devi
     return require(Tensor::from_host(std::move(shape), values, device));
 }
 
-auto integers(std::vector<std::int64_t> shape, std::span<const std::int32_t> values, Device device = Device::cpu())
-    -> Tensor {
+auto integers(std::vector<std::int64_t> shape, std::span<const std::int32_t> values,
+              Device device = Device::cpu()) -> Tensor {
     return require(Tensor::from_host(std::move(shape), values, device));
 }
 
-auto bytes(std::vector<std::int64_t> shape, std::span<const std::uint8_t> values, Device device = Device::cpu())
-    -> Tensor {
+auto bytes(std::vector<std::int64_t> shape, std::span<const std::uint8_t> values,
+           Device device = Device::cpu()) -> Tensor {
     return require(Tensor::from_host(std::move(shape), values, device));
 }
 
-auto signed_bytes(std::vector<std::int64_t> shape, std::span<const std::int8_t> values, Device device = Device::cpu())
-    -> Tensor {
+auto signed_bytes(std::vector<std::int64_t> shape, std::span<const std::int8_t> values,
+                  Device device = Device::cpu()) -> Tensor {
     return require(Tensor::from_host(std::move(shape), values, device));
 }
 
@@ -67,8 +67,8 @@ auto byte_values(const Tensor& input) -> std::vector<std::int8_t> {
     return {span.begin(), span.end()};
 }
 
-auto assert_close(std::string_view name, const Tensor& expected, const Tensor& actual, float tolerance = 2e-4F)
-    -> void {
+auto assert_close(std::string_view name, const Tensor& expected, const Tensor& actual,
+                  float tolerance = 2e-4F) -> void {
     const auto left = values(expected), right = values(actual);
     if (left.size() != right.size()) throw std::runtime_error(std::string(name) + " size mismatch");
     for (std::size_t index = 0; index < left.size(); ++index)
@@ -88,8 +88,8 @@ auto make_sequence(std::size_t count, float scale = 0.03125F) -> std::vector<flo
     return result;
 }
 
-auto packed(std::span<const std::int8_t> unpacked, std::size_t rows, std::size_t columns, int bits)
-    -> std::vector<std::uint8_t> {
+auto packed(std::span<const std::int8_t> unpacked, std::size_t rows, std::size_t columns,
+            int bits) -> std::vector<std::uint8_t> {
     const auto per_byte = static_cast<std::size_t>(8 / bits);
     const auto mask = static_cast<std::uint8_t>((1 << bits) - 1);
     std::vector<std::uint8_t> result(rows * columns / per_byte);
@@ -335,8 +335,8 @@ auto last_row_margin(std::span<const float> logits, std::size_t vocabulary, std:
     return last_row_value(logits, vocabulary, token) - second;
 }
 
-auto compare_last_row(std::span<const float> expected, std::span<const float> actual, std::size_t vocabulary)
-    -> std::pair<double, double> {
+auto compare_last_row(std::span<const float> expected, std::span<const float> actual,
+                      std::size_t vocabulary) -> std::pair<double, double> {
     if (expected.size() < vocabulary || actual.size() < vocabulary) throw std::runtime_error("invalid logits");
     expected = expected.last(vocabulary);
     actual = actual.last(vocabulary);

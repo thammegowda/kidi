@@ -15,8 +15,8 @@ namespace {
 class DecliningCompiler final : public kidi::runtime::StepCompiler {
 public:
     auto name() const -> std::string_view override { return "declining"; }
-    auto compile(const kidi::graph::Graph&, std::string_view key)
-        -> std::unique_ptr<kidi::runtime::StepExecutable> override {
+    auto compile(const kidi::graph::Graph&,
+                 std::string_view key) -> std::unique_ptr<kidi::runtime::StepExecutable> override {
         keys.emplace_back(key);
         return nullptr;
     }
@@ -76,8 +76,8 @@ auto fixture_directory(std::string_view fixture) -> std::filesystem::path {
     return base.filename() == std::filesystem::path(fixture) ? base : base / fixture;
 }
 
-auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node& config, kidi::tensor::Device device)
-    -> void {
+auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node& config,
+                         kidi::tensor::Device device) -> void {
     using kidi::ops::require;
     const auto directory = std::filesystem::temp_directory_path() / "kidi-serving-cache-test";
     std::filesystem::remove_all(directory);

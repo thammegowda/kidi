@@ -192,8 +192,8 @@ auto hardware_info() -> nlohmann::json {
 }
 } // namespace
 
-extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_configure(JNIEnv* environment, jobject, jint threads)
-    -> jstring {
+extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_configure(JNIEnv* environment, jobject,
+                                                                             jint threads) -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
         std::scoped_lock lock(runtime_mutex);
         if (threads < 1 || threads > 8) throw std::runtime_error("Threads must be between 1 and 8");
@@ -227,10 +227,6 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_setDataDirect
         setenv("KIDI_QNN_LIBRARY_DIR", libraries.c_str(), 0);
         setenv("KIDI_QNN_CACHE_DIR", cache.c_str(), 0);
         if (!dsp_directory_value.empty()) setenv("KIDI_QNN_SKEL_DIR", dsp_directory_value.c_str(), 1);
-        const auto* dsp = std::getenv("ADSP_LIBRARY_PATH");
-        const auto search = (dsp_directory_value.empty() ? std::string{} : dsp_directory_value + ';') +
-                            libraries.string() + ";/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp;/vendor/dsp";
-        setenv("ADSP_LIBRARY_PATH", dsp ? (search + ';' + dsp).c_str() : search.c_str(), 1);
         return {{"qnn_library_dir", libraries.string()},
                 {"qnn_cache_dir", cache.string()},
                 {"qnn_skel_dir", dsp_directory_value}};
@@ -274,8 +270,8 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_load(JNIEnv* 
 }
 
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_enqueue(JNIEnv* environment, jobject,
-                                                                           jstring messages_json, jint maximum_tokens)
-    -> jstring {
+                                                                           jstring messages_json,
+                                                                           jint maximum_tokens) -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
         JavaString source(environment, messages_json);
         std::scoped_lock lock(runtime_mutex);

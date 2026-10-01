@@ -217,8 +217,8 @@ public:
     explicit BackgroundCompiler(bool fail) : fail_(fail) {}
     auto name() const -> std::string_view override { return "background-test"; }
     auto compiles_in_background() const -> bool override { return true; }
-    auto compile(const kidi::graph::Graph& graph, std::string_view)
-        -> std::unique_ptr<kidi::runtime::StepExecutable> override {
+    auto compile(const kidi::graph::Graph& graph,
+                 std::string_view) -> std::unique_ptr<kidi::runtime::StepExecutable> override {
         ++compiles;
         released_.wait();
         ++completed;

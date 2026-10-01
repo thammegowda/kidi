@@ -35,8 +35,8 @@ auto operation_name(Operation operation) -> std::string_view {
     return names.at(static_cast<std::size_t>(operation));
 }
 
-auto OutputPool::acquire(std::span<const std::int64_t> shape, tensor::DType dtype, tensor::Device device)
-    -> tensor::Tensor {
+auto OutputPool::acquire(std::span<const std::int64_t> shape, tensor::DType dtype,
+                         tensor::Device device) -> tensor::Tensor {
     for (const auto& buffer : buffers_)
         if (buffer.owns_unique_storage() && buffer.dtype() == dtype && buffer.device() == device &&
             std::ranges::equal(buffer.shape(), shape))

@@ -13,8 +13,8 @@
 namespace kidi::checkpoint {
 using ops::require;
 
-auto prepare(const std::filesystem::path& path, const ConfigAdapter& adapter, PreparationHook customize)
-    -> Result<std::filesystem::path> {
+auto prepare(const std::filesystem::path& path, const ConfigAdapter& adapter,
+             PreparationHook customize) -> Result<std::filesystem::path> {
     static std::mutex conversion_mutex;
     std::scoped_lock lock(conversion_mutex);
     std::filesystem::path temporary;
@@ -38,19 +38,21 @@ auto prepare(const std::filesystem::path& path, const ConfigAdapter& adapter, Pr
             require(source.file(name));
         }
         if (std::filesystem::exists(destination)) {
-            bool valid = false;
-            try {
-                std::ifstream stream(destination / "quantization.json");
-                const auto metadata = nlohmann::json::parse(stream);
-                valid = metadata.value("format", "") == policy.format && metadata.at("source_bytes") == source_size &&
-                        metadata.at("source_mtime") == source_time &&
-                        metadata.at("model_bytes") == std::filesystem::file_size(destination / "model.safetensors") &&
-                        std::ranges::all_of(policy.files, [&](const auto& name) {
-                            return std::filesystem::is_regular_file(destination / name);
-                        });
-            } catch (const std::exception&) {
-                valid = false;
-            }
+            const auto valid = [&] {
+                try {
+                    std::ifstream stream(destination / "quantization.json");
+                    const auto metadata = nlohmann::json::parse(stream);
+                    return metadata.value("format", "") == policy.format &&
+                           metadata.at("source_bytes") == source_size && metadata.at("source_mtime") == source_time &&
+                           metadata.at("model_bytes") ==
+                               std::filesystem::file_size(destination / "model.safetensors") &&
+                           std::ranges::all_of(policy.files, [&](const auto& name) {
+                               return std::filesystem::is_regular_file(destination / name);
+                           });
+                } catch (const std::exception&) {
+                    return false;
+                }
+            }();
             if (valid) return destination;
             std::cerr << "kidi_checkpoint_cache|path=" << destination << "|action=rebuild|reason=stale_or_incomplete\n";
             std::error_code removal_error;

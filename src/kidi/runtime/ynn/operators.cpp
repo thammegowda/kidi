@@ -180,8 +180,8 @@ private:
 };
 /// Token rows gathered from FP32/BF16 tables, or signed 2/4/8-bit tables with per-row group scales, times a multiplier.
 /// Splits `rows` across the thread pool in contiguous blocks; small problems run on the calling thread.
-auto for_rows(std::size_t rows, std::size_t row_work, const std::function<void(std::size_t, std::size_t)>& body)
-    -> void {
+auto for_rows(std::size_t rows, std::size_t row_work,
+              const std::function<void(std::size_t, std::size_t)>& body) -> void {
     const auto tasks = rows * row_work < 32768 ? std::size_t{1} : std::min(ynn::thread_count(), rows);
     if (tasks <= 1) return body(0, rows);
     const auto block = (rows + tasks - 1) / tasks;

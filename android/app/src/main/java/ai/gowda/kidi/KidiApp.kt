@@ -1050,8 +1050,6 @@ private fun HardwareDiagnosticRow(title: String, diagnostic: HardwareDiagnostic?
     }
 }
 
-private val ACCELERATOR_LABELS = mapOf("auto" to "Auto", "cpu" to "CPU", "gpu" to "GPU (experimental)", "npu" to "NPU")
-
 /** Chooses auto, CPU, GPU, or NPU; shows where the loaded model actually runs. */
 @Composable
 private fun AcceleratorSetting(

@@ -56,8 +56,8 @@ WhisperPositionEmbeddingImpl::WhisperPositionEmbeddingImpl(std::int32_t position
     register_parameter("weight", weight_, {positions, width}, tensor::DType::F32);
 }
 
-auto WhisperPositionEmbeddingImpl::forward(ops::Context& context, std::size_t start, std::size_t length) const
-    -> Tensor {
+auto WhisperPositionEmbeddingImpl::forward(ops::Context& context, std::size_t start,
+                                           std::size_t length) const -> Tensor {
     if (!length || start > weight_.size(0) || length > weight_.size(0) - start)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Whisper position is outside the checkpoint table"});
     return context.reshape(context.slice(weight_, 0, start, length),
@@ -146,8 +146,8 @@ auto WhisperDecoderBlockImpl::project_source(ops::Context& context, const Tensor
 }
 
 auto WhisperDecoderBlockImpl::forward(ops::Context& context, const Tensor& input, const KeyValue& source,
-                                      const Tensor& self_mask, KeyValue& cache, const Tensor& cache_index) const
-    -> Tensor {
+                                      const Tensor& self_mask, KeyValue& cache,
+                                      const Tensor& cache_index) const -> Tensor {
     auto hidden = context.add(input, self_attention_->forward(context, self_norm_->forward(context, input), nullptr,
                                                               self_mask, &cache, cache_index));
     hidden = context.add(hidden, cross_attention_->forward(context, cross_norm_->forward(context, hidden), &source));
@@ -211,8 +211,8 @@ auto WhisperDecoderImpl::project_source(ops::Context& context, const Tensor& inp
 }
 
 auto WhisperDecoderImpl::forward(ops::Context& context, const Tensor& tokens, std::span<const KeyValue> source,
-                                 const Tensor& self_mask, std::span<KeyValue> cache, const Tensor& cache_index) const
-    -> Tensor {
+                                 const Tensor& self_mask, std::span<KeyValue> cache,
+                                 const Tensor& cache_index) const -> Tensor {
     if (source.size() != layers_->size() || cache.size() != layers_->size())
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Whisper decoder state"});
     auto hidden = context.add(tokens_->forward(context, tokens), positions_->gather(context, cache_index));

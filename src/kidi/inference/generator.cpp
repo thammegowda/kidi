@@ -14,8 +14,13 @@ namespace kidi::inference {
 using ops::require;
 namespace {
 using Clock = std::chrono::steady_clock;
+constexpr std::size_t QNN_PREFILL_CAPTURE_TOKENS = 2048;
+
 auto elapsed(Clock::time_point start) -> std::uint64_t {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+}
+auto should_capture_prefill(std::string_view accelerator, std::size_t prompt_tokens) -> bool {
+    return accelerator != "qnn-htp" || prompt_tokens >= QNN_PREFILL_CAPTURE_TOKENS;
 }
 } // namespace
 
@@ -146,7 +151,7 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
                          ? require(model_->fork_state(prefix_->state, result.stats.reused_prompt_tokens, capacity))
                          : require(model_->create_state(capacity));
         state.crop_local_attention = !options.full_attention_cache;
-        state.capture_prefill = model_->accelerator() != "qnn-htp" || tokens.size() >= 2048;
+        state.capture_prefill = should_capture_prefill(model_->accelerator(), tokens.size());
         std::size_t bytes_per_token = 0;
         for (const auto& layer : state.layers)
             bytes_per_token += (layer.key.nbytes() + layer.value.nbytes()) / capacity;
@@ -224,8 +229,8 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
-auto Generator::generate_batch(std::span<const std::string> prompts, GenerationOptions options)
-    -> Result<GenerationBatch> {
+auto Generator::generate_batch(std::span<const std::string> prompts,
+                               GenerationOptions options) -> Result<GenerationBatch> {
     try {
         options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
         if (pending_requests() || serving_failed_)
@@ -271,7 +276,7 @@ auto Generator::generate_batch(std::span<const std::string> prompts, GenerationO
             seeds[row] = tokens.back();
             states.push_back(require(model_->create_state(capacity)));
             states.back().crop_local_attention = !options.full_attention_cache;
-            states.back().capture_prefill = model_->accelerator() != "qnn-htp" || tokens.size() >= 2048;
+            states.back().capture_prefill = should_capture_prefill(model_->accelerator(), tokens.size());
             const auto preparation = model_->preparation_ns();
             const auto prefill_start = Clock::now();
             std::size_t offset = 0;
@@ -341,8 +346,8 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
-auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options)
-    -> Result<std::uint64_t> {
+auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
+                             GenerationOptions options) -> Result<std::uint64_t> {
     try {
         std::vector<text::ChatMessage> expanded(messages.begin(), messages.end());
         std::vector<CachedImage> current;
@@ -536,7 +541,7 @@ auto Generator::step() -> Result<GenerationStep> {
                 if (!request.state) request.state = require(model_->create_state(request.capacity));
                 request.state->images = request.images;
                 request.state->crop_local_attention = !request.options.full_attention_cache;
-                request.state->capture_prefill = model_->accelerator() != "qnn-htp" || request.prompt.size() >= 2048;
+                request.state->capture_prefill = should_capture_prefill(model_->accelerator(), request.prompt.size());
                 running_.push_back(std::move(request));
                 reserved_cache_tokens_ += running_.back().capacity;
                 waiting_.pop_front();

@@ -8,8 +8,8 @@ class RmsNormImpl : public Module {
 public:
     RmsNormImpl(std::int32_t width, float epsilon, bool learned = true);
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
-    auto forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine, const Tensor& sine) const
-        -> Tensor;
+    auto forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
+                        const Tensor& sine) const -> Tensor;
 
     auto forward_residual(ops::Context& context, const Tensor& input, const Tensor& residual,
                           const Tensor& output_scale = {}) const -> Tensor;

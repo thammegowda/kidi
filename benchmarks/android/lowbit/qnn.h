@@ -50,8 +50,8 @@ private:
     std::uint32_t power_{};
 };
 
-auto make_tensor(const char* name, Qnn_TensorType_t type, Qnn_DataType_t data_type, std::vector<std::uint32_t>& dims)
-    -> Qnn_Tensor_t;
+auto make_tensor(const char* name, Qnn_TensorType_t type, Qnn_DataType_t data_type,
+                 std::vector<std::uint32_t>& dims) -> Qnn_Tensor_t;
 auto per_tensor(float scale, std::int32_t offset) -> Qnn_QuantizeParams_t;
 
 // Static signed weights with per-channel scales along `axis`. Sub-byte weights use either the documented 8-bit
