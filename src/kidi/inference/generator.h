@@ -6,6 +6,7 @@
 #include "kidi/text/tokenizer.h"
 #include <chrono>
 #include <deque>
+#include <functional>
 
 namespace kidi::inference {
 struct GenerationOptions {
@@ -13,6 +14,9 @@ struct GenerationOptions {
     std::size_t prefix_cache_bytes = 0;
     bool raw_prompt = false, ignore_eos = false, full_attention_cache = false;
     bool stream_text = false;
+    std::int32_t image_tokens = 280;
+    std::size_t image_max_pixels = image::MAX_RESIZED_PIXELS;
+    std::function<void(std::string_view)> on_image_progress;
 };
 struct GenerationStats {
     bool device_selection = false;
@@ -34,6 +38,7 @@ struct GenerationBatch {
 };
 struct ServingOptions {
     std::size_t maximum_active = 4, maximum_requests = 64, cache_token_budget = 16384, prefill_tokens_per_step = 128;
+    bool compact_cache = false;
 };
 struct GenerationEvent {
     std::uint64_t request_id;
@@ -46,17 +51,26 @@ struct GenerationStep {
     std::uint64_t prefill_ns = 0, decode_ns = 0, preparation_ns = 0;
     std::size_t active_requests = 0, waiting_requests = 0, reserved_cache_tokens = 0;
 };
+/// Resolves an accelerator preference ("auto", "cpu", "gpu", or "npu") to a device. "auto" picks the Qualcomm NPU,
+/// then a GPU, then the CPU, by availability; an explicit choice fails when that accelerator is unavailable.
+/// `speech` selects the policy for Whisper, whose "auto" stays on the CPU INT8 path.
+auto select_device(std::string_view accelerator, bool speech = false) -> Result<tensor::Device>;
+
 class Generator {
 public:
+    /// Loads Gemma 4 on `device`; the Qualcomm NPU device keeps the model on the CPU and compiles captured
+    /// decoding steps for the NPU.
     static auto load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits = 0,
                      std::int32_t group_size = 128, bool packed_prefill = false) -> Result<Generator>;
+    /// Where text generation runs, e.g. "cpu", "vulkan", or "cpu+qnn-htp".
+    auto execution() const -> std::string;
     auto generate(std::string_view prompt, GenerationOptions options = {}) -> Result<TextGeneration>;
-    auto generate_batch(std::span<const std::string> prompts, GenerationOptions options = {})
-        -> Result<GenerationBatch>;
+    auto generate_batch(std::span<const std::string> prompts,
+                        GenerationOptions options = {}) -> Result<GenerationBatch>;
     auto configure_serving(ServingOptions options) -> Result<void>;
     auto enqueue(std::string_view prompt, GenerationOptions options = {}) -> Result<std::uint64_t>;
-    auto enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options = {})
-        -> Result<std::uint64_t>;
+    auto enqueue_chat(std::span<const text::ChatMessage> messages,
+                      GenerationOptions options = {}) -> Result<std::uint64_t>;
     auto step() -> Result<GenerationStep>;
     auto cancel(std::uint64_t request_id) -> Result<void>;
     auto pending_requests() const -> std::size_t { return waiting_.size() + running_.size(); }
@@ -72,6 +86,8 @@ private:
     struct CachedImage {
         std::string encoded;
         tensor::Tensor embeddings;
+        std::int32_t tokens;
+        std::size_t max_pixels;
     };
     std::vector<CachedImage> images_;
     std::array<std::int32_t, 3> special_;

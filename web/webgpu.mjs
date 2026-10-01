@@ -54,6 +54,8 @@ class WebGpu {
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
         this.uniformIndex = 0;
         this.queryLabels = [];
+        this.validationBuffer = null;
+        this.validationPending = false;
         this.stats = {allocatedBytes: 0, pooledBytes: 0, submissions: 0, readBytes: 0, uploadBytes: 0, dispatches: 0};
         device.addEventListener('uncapturederror', event => { this.failure = event.error.message; });
         device.lost.then(info => { this.failure = `WebGPU device lost: ${info.message || info.reason}`; });
@@ -64,17 +66,18 @@ class WebGpu {
     computePass() { return this.currentPass ??= this.commands().beginComputePass(); }
     endPass() { this.currentPass?.end(); this.currentPass = null; }
     transferCommands() { this.endPass(); return this.commands(); }
-    async pipeline(code, inputs) {
+    async pipeline(code, inputs, validation = false) {
         if (!this.pipelines.has(code)) {
             const shader = this.device.createShaderModule({code});
             const entries=Array.from({length:inputs+2},(_,binding)=>({binding,visibility:GPUShaderStage.COMPUTE,
                 buffer:binding<inputs?{type:'read-only-storage'}:binding===inputs?{type:'storage'}
                     :{type:'uniform',hasDynamicOffset:true,minBindingSize:256}}));
+                    if(validation)entries.push({binding:inputs+2,visibility:GPUShaderStage.COMPUTE,buffer:{type:'storage'}});
             const group=this.device.createBindGroupLayout({entries});
             const layout=this.device.createPipelineLayout({bindGroupLayouts:[group]});
             const id=this.nextPipeline++;
             this.pipelines.set(code, this.device.createComputePipelineAsync({layout, compute:{module:shader, entryPoint:'main'}})
-                .then(pipeline=>({pipeline,group,id})).catch(async error => {
+                .then(pipeline=>({pipeline,group,id,validation})).catch(async error => {
                 const messages=(await shader.getCompilationInfo()).messages.filter(message=>message.type==='error');
                 throw new Error(messages.map(message=>`${message.lineNum}:${message.linePos} ${message.message}`).join('\n') || error.message);
             }));
@@ -84,7 +87,7 @@ class WebGpu {
     async prepare(spec) {
         const plan = makeProgram(spec, this.device.features);
         plan.label=`${spec.operation}/${spec.attributes[0]??''}/${spec.inputs.map(input=>input.shape.join('x')).join(';')}`;
-        plan.pipeline = await this.pipeline(plan.code, plan.bindings ?? spec.inputs.length);
+        plan.pipeline = await this.pipeline(plan.code, plan.bindings ?? spec.inputs.length, plan.validatesIndices);
         if (plan.scratch) {
             plan.scratch.pipeline = await this.pipeline(plan.scratch.code,1);
         }
@@ -107,12 +110,19 @@ class WebGpu {
         uniforms[63]=gridX;
         this.uniformData.set(uniforms, slot * this.uniformWords);
         const records = [...inputs,output].map(binding=>this.buffer(binding.handle));
+        if(program.validation){
+            this.validationBuffer ??= this.allocate(4);
+            this.buffer(this.validationBuffer).epoch=this.epoch;
+            this.validationPending=true;
+        }
         let key = String(program.id);
         for (const record of records) key += ':' + record.id;
         let group = this.bindGroups.get(key);
         if (!group) {
             const entries = records.map((record,binding)=>({binding,resource:{buffer:record.buffer}}));
             entries.push({binding:records.length,resource:{buffer:this.uniformBuffer,offset:0,size:256}});
+            if(program.validation)entries.push({binding:records.length+1,
+                resource:{buffer:this.buffer(this.validationBuffer).buffer}});
             group = this.device.createBindGroup({layout:program.group,entries});
             if (this.bindGroups.size >= 4096) this.bindGroups.clear();
             this.bindGroups.set(key, group);
@@ -279,12 +289,19 @@ class WebGpu {
     }
     async synchronize() {
         this.check();
+        if(this.validationPending){
+            this.readLater(this.validationBuffer,0,null,4);
+            this.validationPending=false;
+        }
         const labels = this.submitPending();
         if (!labels) { this.trimBuffers(); return; }
         const pending = this.readbacks.splice(0), staging = this.staging.splice(0);
         const reads=pending.map(async item => {
             await item.staging.mapAsync(GPUMapMode.READ, 0, item.size);
-            this.module.HEAPU8.set(new Uint8Array(item.staging.getMappedRange(0, item.size), item.extra, item.bytes), item.destination);
+            const mapped=item.staging.getMappedRange(0,item.size);
+            if(item.destination===null){
+                if(new Uint32Array(mapped)[0])this.failure='WebGPU scatter index outside cache';
+            }else this.module.HEAPU8.set(new Uint8Array(mapped,item.extra,item.bytes),item.destination);
             item.staging.unmap();
             if (this.readPool.length < 4) this.readPool.push(item.staging); else item.staging.destroy();
         });

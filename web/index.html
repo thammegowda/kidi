@@ -40,16 +40,22 @@
                     <div id="memory-stats" class="memory-stats" tabindex="0" aria-label="WebAssembly memory" aria-describedby="memory-description">
                     <span>Wasm heap <strong id="heap-used">--</strong></span>
                     <span>Headroom <strong id="heap-headroom">--</strong></span>
-                    <span id="memory-description" role="tooltip">Allocated linear memory and growth remaining below the 4 GiB Wasm limit. Not total browser RAM or free device memory.</span>
+                    <span id="memory-description" role="tooltip">Allocated linear memory and growth remaining below the 8 GiB Wasm limit. Not total browser RAM or free device memory.</span>
                     </div>
                 </div>
                 <button id="header-settings" class="runtime-chip" type="button" title="Model settings" aria-label="Model settings"><span class="status-dot" aria-hidden="true"></span><span id="runtime-badge">Offline</span><img src="./icons/settings.svg" alt="" aria-hidden="true"></button>
             </header>
             <section id="messages" class="messages" aria-label="Conversation" aria-live="polite"></section>
             <div class="composer-region">
+                <div id="attachments" class="attachments" aria-label="Image attachments" hidden></div>
+                <p id="attachment-error" role="status" hidden></p>
                 <form id="compose">
+                    <div class="compose-actions">
+                        <input id="image-files" type="file" accept="image/jpeg,image/png" multiple hidden>
+                        <button id="attach" class="icon image-attach" type="button" title="Attach image" aria-label="Attach image" disabled><span aria-hidden="true">&#x1F5BC;&#xFE0F;</span></button>
+                    </div>
                     <label class="sr-only" for="prompt">Message</label>
-                    <textarea id="prompt" rows="1" placeholder="Message Gemma" required></textarea>
+                    <textarea id="prompt" rows="1" placeholder="Message Gemma"></textarea>
                     <div class="compose-actions">
                         <button id="mic" class="icon mic" type="button" title="Record speech" aria-label="Record speech" aria-pressed="false"><img src="./icons/mic.svg" alt=""></button>
                         <button id="stop" class="icon stop" type="button" title="Stop generation" aria-label="Stop generation" hidden><img src="./icons/square.svg" alt=""></button>
@@ -60,6 +66,10 @@
             </div>
         </main>
     </div>
+    <dialog id="image-dialog" aria-label="Image preview">
+        <button id="close-image" class="icon" type="button" title="Close image" aria-label="Close image"><img src="./icons/x.svg" alt=""></button>
+        <img id="image-preview" alt="">
+    </dialog>
     <dialog id="settings-dialog" aria-labelledby="settings-title">
         <div class="dialog-shell">
             <header class="dialog-heading"><h2 id="settings-title">Model settings</h2><button id="close-settings" class="icon" type="button" title="Close settings" aria-label="Close settings"><img src="./icons/x.svg" alt=""></button></header>
@@ -68,8 +78,10 @@
                 <label class="full" for="backend">Execution backend<select id="backend"><option value="cpu">WebAssembly CPU</option><option value="webgpu">WebGPU</option></select></label>
                 <label class="numeric-setting" for="threads">CPU threads<input id="threads" type="number" min="1" max="8" value="4"></label>
                 <label class="numeric-setting" for="tokens">Output tokens<input id="tokens" type="number" min="1" max="8192" value="1024"></label>
+                <label class="full numeric-setting" for="image-pixels">Image resize limit (pixels)<input id="image-pixels" type="number" min="161280" max="3000000" step="1" value="3000000"></label>
                 <label class="full" for="manifest">Chat model ID<input id="manifest" type="text" spellcheck="false" autocomplete="off" autocapitalize="none" value="google/gemma-4-E2B-it-qat-mobile-transformers"></label>
                 <label class="full" for="speech-model">Speech model ID<input id="speech-model" type="text" list="speech-models" spellcheck="false" autocomplete="off" autocapitalize="none" value="openai/whisper-tiny"></label>
+                <p id="speech-status" class="full speech-status" role="status">Loading speech model</p>
                 <datalist id="speech-models"><option value="openai/whisper-tiny"><option value="openai/whisper-base"><option value="openai/whisper-small"></datalist>
             </div>
             <section class="runtime" aria-label="Runtime status">

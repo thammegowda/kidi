@@ -56,12 +56,19 @@ WhisperPositionEmbeddingImpl::WhisperPositionEmbeddingImpl(std::int32_t position
     register_parameter("weight", weight_, {positions, width}, tensor::DType::F32);
 }
 
-auto WhisperPositionEmbeddingImpl::forward(ops::Context& context, std::size_t start, std::size_t length) const
-    -> Tensor {
+auto WhisperPositionEmbeddingImpl::forward(ops::Context& context, std::size_t start,
+                                           std::size_t length) const -> Tensor {
     if (!length || start > weight_.size(0) || length > weight_.size(0) - start)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Whisper position is outside the checkpoint table"});
     return context.reshape(context.slice(weight_, 0, start, length),
                            {1, static_cast<std::int64_t>(length), static_cast<std::int64_t>(weight_.size(1))});
+}
+
+auto WhisperPositionEmbeddingImpl::gather(ops::Context& context, const Tensor& positions) const -> Tensor {
+    if (positions.dtype() != tensor::DType::I32 || positions.dimensions() != 1 || !positions.size(0))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Whisper positions must be a nonempty I32 vector"});
+    return context.reshape(context.gather(weight_, positions), {1, static_cast<std::int64_t>(positions.size(0)),
+                                                                static_cast<std::int64_t>(weight_.size(1))});
 }
 
 WhisperAttentionImpl::WhisperAttentionImpl(std::int32_t hidden, std::int32_t heads)
@@ -139,8 +146,8 @@ auto WhisperDecoderBlockImpl::project_source(ops::Context& context, const Tensor
 }
 
 auto WhisperDecoderBlockImpl::forward(ops::Context& context, const Tensor& input, const KeyValue& source,
-                                      const Tensor& self_mask, KeyValue& cache, const Tensor& cache_index) const
-    -> Tensor {
+                                      const Tensor& self_mask, KeyValue& cache,
+                                      const Tensor& cache_index) const -> Tensor {
     auto hidden = context.add(input, self_attention_->forward(context, self_norm_->forward(context, input), nullptr,
                                                               self_mask, &cache, cache_index));
     hidden = context.add(hidden, cross_attention_->forward(context, cross_norm_->forward(context, hidden), &source));
@@ -203,12 +210,12 @@ auto WhisperDecoderImpl::project_source(ops::Context& context, const Tensor& inp
     return result;
 }
 
-auto WhisperDecoderImpl::forward(ops::Context& context, std::span<const std::int32_t> tokens, std::size_t position,
-                                 std::span<const KeyValue> source, const Tensor& self_mask, std::span<KeyValue> cache,
+auto WhisperDecoderImpl::forward(ops::Context& context, const Tensor& tokens, std::span<const KeyValue> source,
+                                 const Tensor& self_mask, std::span<KeyValue> cache,
                                  const Tensor& cache_index) const -> Tensor {
-    if (tokens.empty() || source.size() != layers_->size() || cache.size() != layers_->size())
+    if (source.size() != layers_->size() || cache.size() != layers_->size())
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Whisper decoder state"});
-    auto hidden = context.add(tokens_->forward(context, tokens), positions_->forward(context, position, tokens.size()));
+    auto hidden = context.add(tokens_->forward(context, tokens), positions_->gather(context, cache_index));
     for (std::size_t layer = 0; layer < layers_->size(); ++layer)
         hidden = layers_->at(layer)->forward(context, hidden, source[layer], self_mask, cache[layer], cache_index);
     return norm_->forward(context, hidden);

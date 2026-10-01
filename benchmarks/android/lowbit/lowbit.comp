@@ -1,0 +1,178 @@
+#version 450
+// Low-bit projection: INT8 activations x signed BITS-bit weights -> INT32 -> per-channel scale -> INT8.
+// Weight words hold 32 / BITS values of one output column. Values are arranged so that masking each byte
+// yields consecutive K values, which are sign-extended per byte and fed to packed INT8 dot products.
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_spirv_intrinsics : require
+
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4450)
+int packedDot(int left, int right, spirv_literal int format);
+
+#if BITS != 2 && BITS != 4 && BITS != 8
+#error BITS must be 2, 4, or 8
+#endif
+#define SUBWORDS (8 / BITS)
+
+#ifdef KERNEL_GEMV
+layout(set = 0, binding = 0, std430) readonly buffer Activations { int activation[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Weights { uint weights[]; };
+#else
+layout(set = 0, binding = 0, std430) readonly buffer Activations { ivec4 activation[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Weights { uvec4 weights[]; };
+#endif
+layout(set = 0, binding = 2, std430) readonly buffer Factors { float factor[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer Outputs { uint outputs[]; };
+layout(push_constant) uniform Shape {
+    uint m;
+    uint k;
+    uint n;
+} shape;
+
+void unpack(uint packed, out int words[SUBWORDS]) {
+#if BITS == 8
+    words[0] = int(packed);
+#elif BITS == 4
+    uint low = packed & 0x0F0F0F0Fu;
+    uint high = (packed >> 4) & 0x0F0F0F0Fu;
+    words[0] = int(low | ((low & 0x08080808u) * 0x1Eu));
+    words[1] = int(high | ((high & 0x08080808u) * 0x1Eu));
+#else
+    for (int part = 0; part < 4; ++part) {
+        uint value = (packed >> (2 * part)) & 0x03030303u;
+        words[part] = int(value | ((value & 0x02020202u) * 0x7Fu));
+    }
+#endif
+}
+
+uint quantize4(ivec4 accumulator, uint column) {
+    uint word = 0u;
+    for (int lane = 0; lane < 4; ++lane) {
+        float value = clamp(roundEven(float(accumulator[lane]) * factor[column + lane]), -128.0, 127.0);
+        word |= (uint(int(value)) & 255u) << (8 * lane);
+    }
+    return word;
+}
+
+#ifdef KERNEL_GEMV
+// One 64-lane subgroup computes 8 output columns for up to 4 activation rows.
+#define ROWS 4
+#define COLUMNS 8
+layout(local_size_x = 64) in;
+
+void main() {
+    uint column0 = gl_WorkGroupID.x * COLUMNS;
+    uint activationWords = shape.k / 4;
+    uint packedWords = shape.k * BITS / 32;
+    int accumulator[ROWS][COLUMNS];
+    for (int row = 0; row < ROWS; ++row)
+        for (int column = 0; column < COLUMNS; ++column) accumulator[row][column] = 0;
+
+    for (uint index = gl_LocalInvocationID.x; index < packedWords; index += 64u) {
+        int unpacked[COLUMNS][SUBWORDS];
+        for (int column = 0; column < COLUMNS; ++column)
+            unpack(weights[(column0 + column) * packedWords + index], unpacked[column]);
+        for (uint row = 0u; row < ROWS; ++row) {
+            if (row >= shape.m) break;
+            for (int part = 0; part < SUBWORDS; ++part) {
+                int packedInput = activation[row * activationWords + index * SUBWORDS + part];
+                for (int column = 0; column < COLUMNS; ++column)
+                    accumulator[row][column] += packedDot(packedInput, unpacked[column][part], 0);
+            }
+        }
+    }
+    for (uint row = 0u; row < ROWS; ++row) {
+        if (row >= shape.m) break;
+        ivec4 low, high;
+        for (int column = 0; column < 4; ++column) {
+            low[column] = subgroupAdd(accumulator[row][column]);
+            high[column] = subgroupAdd(accumulator[row][column + 4]);
+        }
+        if (gl_LocalInvocationID.x == 0u) {
+            uint base = (row * shape.n + column0) / 4u;
+            outputs[base] = quantize4(low, column0);
+            outputs[base + 1u] = quantize4(high, column0 + 4u);
+        }
+    }
+}
+#endif
+
+#ifdef KERNEL_GEMM
+// A 64-lane workgroup computes 16 x 256 outputs; each lane owns 4 adjacent columns for 16 rows.
+// Weights are K-major ([packed word][column]) so one uvec4 load fetches a packed word for 4 adjacent columns
+// and lanes read contiguous memory. Every lane reads the same activation ivec4 (16 INT8 inputs), which the cache
+// broadcasts, giving 16 packed dot products per load. Shared memory is intentionally unused: on Adreno 830 a
+// 1 KiB window of a 16-byte-element shared array read back corrupted values. Accumulators are named variables
+// because dynamically indexed private arrays spilled to scratch memory.
+#define ROWS 16u
+layout(local_size_x = 64) in;
+
+int signExtend(uint bytes) {
+#if BITS == 4
+    return int(bytes | ((bytes & 0x08080808u) * 0x1Eu));
+#elif BITS == 2
+    return int(bytes | ((bytes & 0x02020202u) * 0x7Fu));
+#else
+    return int(bytes);
+#endif
+}
+
+// 16 consecutive K values of one column as four INT8x4 words, from its BITS / 2 packed words.
+ivec4 expand(uint p0, uint p1, uint p2, uint p3) {
+#if BITS == 8
+    return ivec4(p0, p1, p2, p3);
+#elif BITS == 4
+    return ivec4(signExtend(p0 & 0x0F0F0F0Fu), signExtend((p0 >> 4) & 0x0F0F0F0Fu), signExtend(p1 & 0x0F0F0F0Fu),
+                 signExtend((p1 >> 4) & 0x0F0F0F0Fu));
+#else
+    return ivec4(signExtend(p0 & 0x03030303u), signExtend((p0 >> 2) & 0x03030303u),
+                 signExtend((p0 >> 4) & 0x03030303u), signExtend((p0 >> 6) & 0x03030303u));
+#endif
+}
+
+int dot16(ivec4 a, ivec4 b) {
+    return packedDot(a.x, b.x, 0) + packedDot(a.y, b.y, 0) + packedDot(a.z, b.z, 0) + packedDot(a.w, b.w, 0);
+}
+
+#define FOR_ROWS(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15)
+#define DECLARE(r) ivec4 acc##r = ivec4(0);
+#define UPDATE(r)                                                                                                   \
+    {                                                                                                               \
+        ivec4 a = activation[min(row0 + (r), last) * groups + group];                                               \
+        acc##r += ivec4(dot16(a, w0), dot16(a, w1), dot16(a, w2), dot16(a, w3));                                    \
+    }
+#define STORE(r)                                                                                                    \
+    if (row0 + (r) < shape.m) outputs[((row0 + (r)) * shape.n + column) / 4u] = quantize4(acc##r, column);
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.y * ROWS;
+    uint last = shape.m - 1u; // rows past M recompute the last row; their results are not stored
+    uint column = gl_WorkGroupID.x * 256u + lane * 4u;
+    uint groups = shape.k / 16u; // ivec4 activation groups per row
+    uint stride = shape.n / 4u;  // uvec4 weight groups per packed K word
+    FOR_ROWS(DECLARE)
+    for (uint group = 0u; group < groups; ++group) {
+        uint base = group * (BITS / 2u) * stride + column / 4u;
+        uvec4 q0 = weights[base];
+#if BITS >= 4
+        uvec4 q1 = weights[base + stride];
+#else
+        uvec4 q1 = uvec4(0u);
+#endif
+#if BITS == 8
+        uvec4 q2 = weights[base + 2u * stride];
+        uvec4 q3 = weights[base + 3u * stride];
+#else
+        uvec4 q2 = uvec4(0u);
+        uvec4 q3 = uvec4(0u);
+#endif
+        ivec4 w0 = expand(q0.x, q1.x, q2.x, q3.x);
+        ivec4 w1 = expand(q0.y, q1.y, q2.y, q3.y);
+        ivec4 w2 = expand(q0.z, q1.z, q2.z, q3.z);
+        ivec4 w3 = expand(q0.w, q1.w, q2.w, q3.w);
+        FOR_ROWS(UPDATE)
+    }
+    FOR_ROWS(STORE)
+}
+#endif

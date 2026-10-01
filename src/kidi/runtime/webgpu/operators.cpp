@@ -78,15 +78,21 @@ auto interleave_packed(const tensor::Tensor& weight, std::int32_t bits) -> tenso
 
 class GpuOperator final : public Operator {
 public:
-    GpuOperator(int program, std::vector<tensor::Tensor> constants, bool selected)
-        : program_(program), constants_(std::move(constants)), selected_(selected) {
+    GpuOperator(int program, std::vector<tensor::Tensor> constants, bool selected, bool direct_inplace)
+        : program_(program), constants_(std::move(constants)), selected_(selected), direct_inplace_(direct_inplace) {
         dtype_ = static_cast<tensor::DType>(output_dimension(program_, -2));
         for (int axis = 0; axis < output_dimension(program_, -1); ++axis)
             shape_.push_back(output_dimension(program_, axis));
     }
     ~GpuOperator() override { release_program(program_); }
     auto run(TensorInputs inputs) -> tensor::Tensor override {
-        auto output = pool_.acquire(shape_, dtype_, tensor::Device::web_gpu());
+        auto output = selected_ ? host_pool_.acquire(shape_, dtype_, tensor::Device::cpu())
+                                : pool_.acquire(shape_, dtype_, tensor::Device::web_gpu());
+        run_into(inputs, {&output, 1});
+        return output;
+    }
+    auto run_into(TensorInputs inputs, std::span<tensor::Tensor> outputs) -> void override {
+        auto output = selected_ ? pool_.acquire(shape_, dtype_, tensor::Device::web_gpu()) : outputs.front();
         std::array<std::uint32_t, 32> bindings{};
         if (inputs.size() > 8) throw ops::Failure({ErrorCode::UNSUPPORTED, "too many WebGPU operands"});
         for (std::size_t index = 0; index < inputs.size(); ++index) {
@@ -99,14 +105,29 @@ public:
         bindings[inputs.size() * 2] = destination.handle;
         bindings[inputs.size() * 2 + 1] = destination.offset_bytes;
         if (run_gpu(program_, bindings.data(), (inputs.size() + 1) * 2)) throw ops::Failure(tensor::web_gpu_error());
-        if (!selected_) return output;
-        auto host = host_pool_.acquire(shape_, dtype_, tensor::Device::cpu());
-        auto bytes = require(host.host_bytes());
+        if (!selected_) return;
+        auto bytes = require(outputs.front().host_bytes());
         if (read_later(destination.handle, destination.offset_bytes, bytes.data(), bytes.size()))
             throw ops::Failure(tensor::web_gpu_error());
-        return host;
     }
     auto run_(TensorInputs inputs, tensor::Tensor& destination) -> tensor::Tensor override {
+        if (direct_inplace_) {
+            std::array rebound{inputs[0], inputs[1], inputs[2]};
+            for (std::size_t index = 1; index < rebound.size(); ++index) {
+                if (rebound[index].storage_identity() != destination.storage_identity()) continue;
+                const auto source = require(tensor::web_gpu_buffer(rebound[index]));
+                auto snapshot =
+                    require(tensor::Tensor::empty({rebound[index].shape().begin(), rebound[index].shape().end()},
+                                                  rebound[index].dtype(), tensor::Device::web_gpu()));
+                const auto target = require(tensor::web_gpu_buffer(snapshot));
+                if (copy_gpu(source.handle, source.offset_bytes, target.handle, target.offset_bytes,
+                             (snapshot.nbytes() + 3) / 4 * 4))
+                    throw ops::Failure(tensor::web_gpu_error());
+                rebound[index] = std::move(snapshot);
+            }
+            run_into(rebound, {&destination, 1});
+            return destination;
+        }
         auto result = run(inputs);
         if (result.dtype() != destination.dtype() || !std::ranges::equal(result.shape(), destination.shape()))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "in-place WebGPU operation changes shape or dtype"});
@@ -123,11 +144,12 @@ private:
     std::vector<tensor::Tensor> constants_;
     std::vector<std::int64_t> shape_;
     tensor::DType dtype_;
-    bool selected_;
+    bool selected_, direct_inplace_;
     OutputPool pool_, host_pool_;
 };
 class GpuBackend final : public OperatorBackend {
 public:
+    auto supports_replay() const noexcept -> bool override { return true; }
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
         static const std::map<Operation, std::string> names{{Operation::ADD, "add"},
                                                             {Operation::MULTIPLY, "multiply"},
@@ -155,9 +177,12 @@ public:
                                                             {Operation::GREEDY_TOKEN, "greedy_token"},
                                                             {Operation::RMS_ROTARY, "rms_rotary"},
                                                             {Operation::GELU_MULTIPLY, "gelu_multiply"},
-                                                            {Operation::EMBEDDING, "embedding"}};
+                                                            {Operation::EMBEDDING, "embedding"},
+                                                            {Operation::GATED_FEED_FORWARD, "gated_feed_forward"}};
+        const bool direct_inplace = spec.operation == Operation::SCATTER && ops::is_inplace;
         nlohmann::json description{
             {"operation", names.at(spec.operation)},
+            {"inplace", direct_inplace},
             {"dtype", static_cast<int>(spec.dtype)},
             {"epsilon", spec.epsilon},
             {"attributes", std::vector<std::int64_t>(spec.attributes.begin(), spec.attributes.end())}};
@@ -176,7 +201,9 @@ public:
                 {{"shape", std::vector<std::int64_t>(input.shape().begin(), input.shape().end())},
                  {"dtype", static_cast<int>(input.dtype())}});
             const auto packed_bits =
-                spec.operation == Operation::PACKED_LINEAR && index == 1 && !spec.attributes.empty()
+                ((spec.operation == Operation::PACKED_LINEAR && index == 1) ||
+                 (spec.operation == Operation::GATED_FEED_FORWARD && (index == 1 || index == 3))) &&
+                        !spec.attributes.empty()
                     ? static_cast<std::int32_t>(spec.attributes[0])
                     : 0;
             const auto interleaved = packed_bits == 2 || packed_bits == 4 ? packed_bits : 0;
@@ -196,7 +223,8 @@ public:
         }
         const auto program = prepare_gpu(description.dump().c_str());
         if (!program) throw ops::Failure(tensor::web_gpu_error());
-        return std::make_unique<GpuOperator>(program, std::move(constants), spec.operation == Operation::GREEDY_TOKEN);
+        return std::make_unique<GpuOperator>(program, std::move(constants), spec.operation == Operation::GREEDY_TOKEN,
+                                             direct_inplace);
     }
     auto synchronize() -> void override { require(tensor::web_gpu_synchronize()); }
     auto copy_slice_(tensor::Tensor& destination, const tensor::Tensor& source, std::size_t outer,

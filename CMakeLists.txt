@@ -14,23 +14,18 @@ option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
 if(EMSCRIPTEN)
     option(KIDI_WASM_THREADS "Enable WebAssembly pthreads" ON)
-    option(KIDI_WASM_LARGE_MEMORY "Use 64-bit pointers lowered to wasm32 for models above 2 GiB" ON)
     option(KIDI_WASM_WEBGPU "Build the WebGPU execution backend with JSPI" OFF)
     if(KIDI_WASM_WEBGPU AND KIDI_WASM_THREADS)
         message(WARNING "WebGPU with pthreads is experimental; JSPI and pthreads are otherwise never combined")
     endif()
-    add_compile_options(-msimd128)
-    add_link_options(-msimd128 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=2MB)
+    add_compile_options(-m64 -msimd128)
+    add_link_options(-m64 -msimd128 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=8GB -sSTACK_SIZE=2MB)
     if(KIDI_WASM_WEBGPU)
         add_compile_options(-fwasm-exceptions)
         add_link_options(-fwasm-exceptions)
     else()
         add_compile_options(-fexceptions)
         add_link_options(-fexceptions)
-    endif()
-    if(KIDI_WASM_LARGE_MEMORY)
-        add_compile_options(-sMEMORY64=2)
-        add_link_options(-sMEMORY64=2)
     endif()
     if(KIDI_WASM_THREADS)
         add_compile_options(-pthread)
@@ -53,6 +48,7 @@ add_library(kidi
     src/kidi/checkpoint/weights.cpp
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
+    src/kidi/graph/graph.cpp
     src/kidi/image/gemma4.cpp
     src/kidi/inference/decoder.cpp
     src/kidi/inference/generator.cpp
@@ -90,7 +86,7 @@ if(EMSCRIPTEN)
     set_target_properties(kidi_wasm PROPERTIES OUTPUT_NAME kidi SUFFIX .mjs)
     target_link_options(kidi_wasm PRIVATE
         --no-entry -sMODULARIZE=1 -sEXPORT_NAME=createKidi -sENVIRONMENT=web,worker,node
-        -sFORCE_FILESYSTEM=1 -sINITIAL_MEMORY=64MB
+        -sFORCE_FILESYSTEM=1 -sINITIAL_MEMORY=64MB -sEXCEPTION_STACK_TRACES=1
         "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8']"
         "-sEXPORTED_FUNCTIONS=['_malloc','_free']"
     )
@@ -107,6 +103,16 @@ if(EMSCRIPTEN)
     endif()
 endif()
 
+option(KIDI_ENABLE_VULKAN "Build the Vulkan GPU backend" ${ANDROID})
+option(KIDI_ENABLE_QNN "Build the Qualcomm NPU step compiler (loads QNN at runtime)" ${ANDROID})
+set(KIDI_QNN_SDK "" CACHE PATH "QAIRT SDK root providing QNN headers for the NPU backend and benchmarks")
+if(KIDI_ENABLE_VULKAN)
+    include(cmake/vulkan.cmake)
+endif()
+if(KIDI_ENABLE_QNN)
+    include(cmake/qnn.cmake)
+endif()
+
 if(KIDI_BUILD_BENCHMARKS)
     add_executable(kidi_gemma4_quality benchmarks/gemma4/quality.cpp)
     target_link_libraries(kidi_gemma4_quality PRIVATE kidi::kidi)
@@ -115,8 +121,62 @@ if(KIDI_BUILD_BENCHMARKS)
     if(UNIX)
         add_executable(kidi_android_baseline benchmarks/android/baseline.cpp)
         target_link_libraries(kidi_android_baseline PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
+        add_executable(kidi_npu_prefill benchmarks/android/npu_prefill.cpp)
+        target_link_libraries(kidi_npu_prefill PRIVATE kidi::kidi)
     endif()
     if(ANDROID)
+        find_program(KIDI_GLSLC glslc
+            HINTS "${ANDROID_NDK}/shader-tools/${ANDROID_NDK_HOST_SYSTEM_NAME}"
+            REQUIRED
+        )
+        set(KIDI_LOWBIT_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/android/lowbit/lowbit.comp)
+        set(KIDI_LOWBIT_SPIRV_DIR ${CMAKE_CURRENT_BINARY_DIR}/lowbit_spirv)
+        set(KIDI_LOWBIT_SPIRV)
+        foreach(kernel gemv gemm)
+            string(TOUPPER ${kernel} kernel_define)
+            foreach(bits 8 4 2)
+                set(spirv ${KIDI_LOWBIT_SPIRV_DIR}/${kernel}_bits${bits}.inc)
+                add_custom_command(
+                    OUTPUT ${spirv}
+                    COMMAND ${CMAKE_COMMAND} -E make_directory ${KIDI_LOWBIT_SPIRV_DIR}
+                    COMMAND ${KIDI_GLSLC} --target-env=vulkan1.3 -O -mfmt=num -DBITS=${bits}
+                        -DKERNEL_${kernel_define}=1 ${KIDI_LOWBIT_SHADER} -o ${spirv}
+                    DEPENDS ${KIDI_LOWBIT_SHADER}
+                    VERBATIM
+                )
+                list(APPEND KIDI_LOWBIT_SPIRV ${spirv})
+            endforeach()
+        endforeach()
+        set(KIDI_GELU_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/android/lowbit/gelu_multiply.comp)
+        add_custom_command(
+            OUTPUT ${KIDI_LOWBIT_SPIRV_DIR}/gelu_multiply.inc
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${KIDI_LOWBIT_SPIRV_DIR}
+            COMMAND ${KIDI_GLSLC} --target-env=vulkan1.3 -O -mfmt=num ${KIDI_GELU_SHADER}
+                -o ${KIDI_LOWBIT_SPIRV_DIR}/gelu_multiply.inc
+            DEPENDS ${KIDI_GELU_SHADER}
+            VERBATIM
+        )
+        list(APPEND KIDI_LOWBIT_SPIRV ${KIDI_LOWBIT_SPIRV_DIR}/gelu_multiply.inc)
+        add_executable(kidi_lowbit_bench
+            benchmarks/android/lowbit/main.cpp
+            benchmarks/android/lowbit/cpu.cpp
+            benchmarks/android/lowbit/gpu.cpp
+            benchmarks/android/lowbit/npu.cpp
+            benchmarks/android/lowbit/vulkan.cpp
+            benchmarks/android/lowbit/qnn.cpp
+            benchmarks/android/lowbit/ffn.cpp
+            benchmarks/android/lowbit/ffn_cpu.cpp
+            benchmarks/android/lowbit/ffn_gpu.cpp
+            benchmarks/android/lowbit/ffn_npu.cpp
+            ${KIDI_LOWBIT_SPIRV}
+        )
+        target_include_directories(kidi_lowbit_bench PRIVATE ${KIDI_LOWBIT_SPIRV_DIR})
+        target_link_libraries(kidi_lowbit_bench PRIVATE kidi::kidi vulkan nlohmann_json::nlohmann_json)
+        if(KIDI_QNN_SDK)
+            target_include_directories(kidi_lowbit_bench SYSTEM PRIVATE ${KIDI_QNN_SDK}/include/QNN)
+            target_compile_definitions(kidi_lowbit_bench PRIVATE KIDI_BENCH_QNN=1)
+            target_link_libraries(kidi_lowbit_bench PRIVATE ${CMAKE_DL_LIBS})
+        endif()
         add_executable(kidi_vulkan_probe benchmarks/android/vulkan_probe.cpp)
         target_link_libraries(kidi_vulkan_probe PRIVATE vulkan nlohmann_json::nlohmann_json)
     endif()

@@ -27,21 +27,22 @@ public:
     virtual ~Backend() = default;
 
     virtual auto name() const noexcept -> std::string_view = 0;
+    virtual auto device_name(Device) const -> std::string { return std::string(name()); }
     virtual auto device_kind() const noexcept -> DeviceKind = 0;
     virtual auto is_available(Device device) const noexcept -> bool = 0;
     virtual auto is_host_accessible(Device device) const noexcept -> bool = 0;
     virtual auto supports_execution() const noexcept -> bool = 0;
     virtual auto unavailable_reason(Device device) const -> std::string = 0;
 
-    virtual auto allocate(Device device, std::size_t size_bytes, std::size_t alignment) const
-        -> Result<std::shared_ptr<Storage>> = 0;
-    virtual auto wrap_host(Device device, std::span<const std::byte> bytes, std::shared_ptr<const void> owner) const
-        -> Result<std::shared_ptr<Storage>> = 0;
+    virtual auto allocate(Device device, std::size_t size_bytes,
+                          std::size_t alignment) const -> Result<std::shared_ptr<Storage>> = 0;
+    virtual auto wrap_host(Device device, std::span<const std::byte> bytes,
+                           std::shared_ptr<const void> owner) const -> Result<std::shared_ptr<Storage>> = 0;
     virtual auto clear(Storage& storage) const -> Result<void>;
     virtual auto copy_from_host(Storage& destination, std::size_t destination_offset,
                                 std::span<const std::byte> source) const -> Result<void> = 0;
-    virtual auto copy_to_host(const Storage& source, std::size_t source_offset, std::span<std::byte> destination) const
-        -> Result<void> = 0;
+    virtual auto copy_to_host(const Storage& source, std::size_t source_offset,
+                              std::span<std::byte> destination) const -> Result<void> = 0;
     virtual auto host_view(Storage& storage) const -> Result<std::span<std::byte>> = 0;
     virtual auto host_view(const Storage& storage) const -> Result<std::span<const std::byte>> = 0;
     virtual auto synchronize(Device device) const -> Result<void> = 0;
@@ -50,6 +51,7 @@ public:
 struct BackendInfo {
     DeviceKind device_kind;
     std::string name;
+    std::string device_name;
     bool storage_available;
     bool execution_available;
     std::string unavailable_reason;
@@ -77,6 +79,7 @@ private:
 auto make_ynnpack_backend() -> std::shared_ptr<Backend>;
 auto make_metal_backend() -> std::shared_ptr<Backend>;
 auto make_web_gpu_backend() -> std::shared_ptr<Backend>;
+auto make_vulkan_backend() -> std::shared_ptr<Backend>;
 auto make_unavailable_backend(DeviceKind kind, std::string name, std::string reason) -> std::shared_ptr<Backend>;
 
 } // namespace kidi::tensor

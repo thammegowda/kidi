@@ -1,4 +1,5 @@
 const CACHE_NAME = 'kidi-model-v1';
+export const MAX_WASM_MEMORY = 8 * 1024 ** 3;
 const CHUNK_BYTES = 8 * 1024 * 1024;
 const MODEL_ID = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const hex = bytes => Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
@@ -149,7 +150,7 @@ export async function isModelCached(source) {
             const first = await cache.match(key.href);
             const size = Number(first?.headers.get('X-Kidi-Size'));
             first?.body?.cancel().catch(() => {});
-            if (!Number.isSafeInteger(size) || size <= 0 || size >= 2 ** 32) return false;
+            if (!Number.isSafeInteger(size) || size <= 0 || size >= MAX_WASM_MEMORY) return false;
             for (let start = CHUNK_BYTES; start < size; start += CHUNK_BYTES) {
                 key.searchParams.set('kidi_range', `${start}-${Math.min(size, start + CHUNK_BYTES) - 1}`);
                 if (!keys.has(key.href)) return false;
@@ -166,8 +167,8 @@ export async function isModelCached(source) {
 }
 
 function allocateWeights(module, size) {
-    if (!Number.isSafeInteger(size) || size <= 0 || size >= 2 ** 32)
-        throw new Error('Checkpoint exceeds the Wasm32 address space');
+    if (!Number.isSafeInteger(size) || size <= 0 || size >= MAX_WASM_MEMORY)
+        throw new Error('Checkpoint exceeds the WebAssembly memory budget');
     const pointer = Number(module._malloc(size));
     if (!Number.isSafeInteger(pointer) || pointer <= 0 || pointer + size > module.HEAPU8.byteLength)
         throw new Error('Not enough WebAssembly memory for model weights');
@@ -281,7 +282,7 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly)
         }
         const bytes = await response.arrayBuffer();
         total ??= bytes.byteLength;
-        if (!Number.isSafeInteger(total) || total <= 0 || total >= 2 ** 32 ||
+        if (!Number.isSafeInteger(total) || total <= 0 || total >= MAX_WASM_MEMORY ||
             (ranged && bytes.byteLength !== Math.min(end + 1, total) - start))
             throw new Error('Truncated or oversized model response');
         metrics.downloadedBytes += bytes.byteLength;
@@ -326,7 +327,7 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly)
     module.HEAPU8.set(normalizedHeader, pointer + 8);
     module.FS.mkdir('/model');
     mountWeights(module, pointer, size);
-    if (whisper) module.FS.writeFile('/model/config.json', new Uint8Array(configData.bytes));
+    module.FS.writeFile('/model/config.json', new Uint8Array(configData.bytes));
     const metadata = whisper ? ['tokenizer.json', 'preprocessor_config.json', 'generation_config.json']
         : ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
     for (const name of metadata) {
@@ -373,7 +374,7 @@ export async function loadModel(module, manifestUrl, progress, {cacheOnly = fals
     const allowed = new Set(['model.yaml', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja']);
     for (const file of manifest.files) {
         if (!allowed.has(file.name) || names.has(file.name) || !Number.isSafeInteger(file.size) || file.size <= 0 ||
-            file.size >= (file.name === 'model.safetensors' ? 2 ** 32 : 64 * 1024 * 1024) ||
+            file.size >= (file.name === 'model.safetensors' ? MAX_WASM_MEMORY : 64 * 1024 * 1024) ||
             !Array.isArray(file.chunks) || file.chunks.reduce((sum, chunk) => sum + chunk.size, 0) !== file.size)
             throw new Error('Invalid model file');
         names.add(file.name);

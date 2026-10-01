@@ -7,6 +7,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
 import kotlinx.coroutines.runBlocking
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -16,6 +17,50 @@ import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 class NativeRuntimeTest {
+    private data class GenerationMeasurement(
+        val backend: String,
+        val prefillMs: Double,
+        val firstTokenMs: Double,
+        val decodeTokens: Int,
+        val decodeMs: Double,
+    ) {
+        val decodeTps: Double get() = decodeTokens * 1000.0 / decodeMs
+    }
+
+    private fun generate(messages: JSONArray, maximumTokens: Int): JSONObject {
+        val request = JSONObject(NativeRuntime.enqueue(messages.toString(), maximumTokens)).getLong("request_id")
+        assertTrue(request > 0)
+        for (stepIndex in 0 until 1024) {
+            val step = JSONObject(NativeRuntime.step())
+            val events = step.getJSONArray("events")
+            for (index in 0 until events.length()) {
+                val event = events.getJSONObject(index)
+                if (event.has("completed")) return event.getJSONObject("completed")
+            }
+            if (step.getInt("pending") == 0) break
+        }
+        throw AssertionError("Generation did not complete")
+    }
+
+    private fun measureGeneration(directory: String, accelerator: String, warmup: JSONArray, measured: JSONArray)
+        : GenerationMeasurement {
+        val loaded = JSONObject(NativeRuntime.load(directory, accelerator))
+        assertTrue(loaded.toString(), loaded.optBoolean("ready"))
+        try {
+            generate(warmup, 16)
+            val result = generate(measured, 64)
+            return GenerationMeasurement(
+                backend = loaded.getString("backend"),
+                prefillMs = result.getDouble("prefill_ms"),
+                firstTokenMs = result.getDouble("first_token_ms"),
+                decodeTokens = result.getInt("decode_tokens"),
+                decodeMs = result.getDouble("decode_ms"),
+            )
+        } finally {
+            NativeRuntime.unload()
+        }
+    }
+
     @Test
     fun restoresLegacyAndQuantizedSpeechLayouts() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -98,6 +143,14 @@ class NativeRuntimeTest {
         assertTrue(result.getBoolean("configured"))
         assertEquals(1, result.getInt("threads"))
         assertEquals("android-cpu", result.getString("backend"))
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        JSONObject(NativeRuntime.setDataDirectory(
+            context.filesDir.absolutePath, context.applicationInfo.nativeLibraryDir))
+        val devices = JSONObject(NativeRuntime.deviceInfo())
+        assertTrue(devices.getJSONObject("cpu").getBoolean("available"))
+        assertTrue(devices.getJSONObject("cpu").getString("name").isNotBlank())
+        assertTrue(devices.has("gpu"))
+        assertTrue(devices.has("npu"))
 
         val missingModel = "/does-not-exist/kidi-\uD83C\uDF99-model"
         val load = JSONObject(NativeRuntime.load(missingModel))
@@ -109,6 +162,110 @@ class NativeRuntimeTest {
 
         val transcribe = JSONObject(NativeRuntime.transcribe(floatArrayOf(0f), "auto", 1))
         assertTrue(transcribe.getString("error").contains("Load a speech model first"))
+    }
+
+    @Test
+    fun selectsAccelerators() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        assertTrue(JSONObject(NativeRuntime.setDataDirectory(context.filesDir.absolutePath)).has("qnn_cache_dir"))
+        val invalid = JSONObject(NativeRuntime.load("/does-not-exist/kidi-model", "tpu"))
+        assertTrue(invalid.getString("error").contains("accelerator must be"))
+        // Whisper stays on CPU in auto mode and rejects accelerators it cannot use instead of silently falling back.
+        val speech = JSONObject(NativeRuntime.loadAsr("/does-not-exist/kidi-speech-model", false, "cpu"))
+        assertTrue(speech.getString("error").contains("not a model directory"))
+        val directory = InstrumentationRegistry.getArguments().getString("gemmaDirectory")
+        assumeTrue("Optional staged Gemma model", directory != null)
+        try {
+            for (accelerator in listOf("cpu", "auto", "gpu", "npu")) {
+                val loaded = JSONObject(NativeRuntime.load(requireNotNull(directory), accelerator))
+                if (accelerator == "cpu" || accelerator == "auto")
+                    assertTrue(loaded.toString(), loaded.optBoolean("ready"))
+                if (!loaded.optBoolean("ready")) {
+                    assertTrue(loaded.toString(), loaded.has("error"))
+                    continue
+                }
+                val backend = loaded.getString("backend")
+                when (accelerator) {
+                    "cpu" -> assertEquals("cpu", backend)
+                    "gpu" -> assertEquals("vulkan", backend)
+                    "npu" -> assertTrue(backend, backend.contains("qnn"))
+                }
+                NativeRuntime.unload()
+            }
+        } finally {
+            NativeRuntime.unload()
+        }
+    }
+
+    @Test
+    fun generatesWithNpu() {
+        val arguments = InstrumentationRegistry.getArguments()
+        assumeTrue("Optional staged NPU Gemma run", arguments.getString("runNpuGemma") == "true")
+        val directory = requireNotNull(arguments.getString("gemmaDirectory"))
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        try {
+            assertTrue(JSONObject(NativeRuntime.configure(4)).getBoolean("configured"))
+            assertTrue(JSONObject(NativeRuntime.setDataDirectory(
+                context.filesDir.absolutePath, context.applicationInfo.nativeLibraryDir))
+                .has("qnn_cache_dir"))
+            val npu = JSONObject(NativeRuntime.deviceInfo()).getJSONObject("npu")
+            assertTrue(npu.toString(), npu.getBoolean("recognized"))
+            assertTrue(npu.toString(), npu.getBoolean("available"))
+            val loaded = JSONObject(NativeRuntime.load(directory, "auto"))
+            assertTrue(loaded.toString(), loaded.optBoolean("ready"))
+            assertTrue(loaded.getString("backend"), loaded.getString("backend").contains("qnn"))
+            val paragraph = "Rivers move water sediment and nutrients, connect wetlands, support wildlife and " +
+                "communities, and respond to dams restoration forests floods seasons and changing climate. "
+            val prompt = buildString { repeat(7) { append(paragraph) } }
+            val messages = JSONArray().put(JSONObject().put("role", "user").put("content", prompt))
+            val request = JSONObject(NativeRuntime.enqueue(messages.toString(), 8)).getLong("request_id")
+            assertTrue(request > 0)
+            var tokens = 0
+            var completed = false
+            for (stepIndex in 0 until 256) {
+                val step = JSONObject(NativeRuntime.step())
+                val events = step.getJSONArray("events")
+                for (index in 0 until events.length()) {
+                    val event = events.getJSONObject(index)
+                    if (event.has("token")) tokens++
+                    if (event.has("completed")) completed = true
+                }
+                if (step.getInt("pending") == 0) break
+            }
+            assertTrue("NPU request did not complete", completed)
+            assertTrue("NPU request emitted no tokens", tokens > 0)
+        } finally {
+            NativeRuntime.unload()
+        }
+    }
+
+    @Test
+    fun comparesCpuAndNpuThroughput() {
+        val arguments = InstrumentationRegistry.getArguments()
+        assumeTrue("Optional CPU/NPU benchmark", arguments.getString("benchmarkAccelerators") == "true")
+        val directory = requireNotNull(arguments.getString("gemmaDirectory"))
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        assertTrue(JSONObject(NativeRuntime.configure(4)).getBoolean("configured"))
+        JSONObject(NativeRuntime.setDataDirectory(
+            context.filesDir.absolutePath, context.applicationInfo.nativeLibraryDir))
+        val paragraph = "Rivers move water sediment and nutrients, connect wetlands, support wildlife and " +
+            "communities, and respond to dams restoration forests floods seasons and changing climate. "
+        val warmup = JSONArray().put(JSONObject().put("role", "user")
+            .put("content", "Warm up this runtime. " + buildString { repeat(7) { append(paragraph) } }))
+        val measured = JSONArray().put(JSONObject().put("role", "user")
+            .put("content", "Write a long numbered analysis. " + buildString { repeat(7) { append(paragraph) } }))
+        val cpu = measureGeneration(directory, "cpu", warmup, measured)
+        val npu = measureGeneration(directory, "npu", warmup, measured)
+        println("KIDI_APP_BENCH cpu_backend=${cpu.backend} cpu_prefill_ms=${cpu.prefillMs} " +
+            "cpu_first_token_ms=${cpu.firstTokenMs} cpu_decode_tokens=${cpu.decodeTokens} " +
+            "cpu_decode_ms=${cpu.decodeMs} cpu_decode_tps=${cpu.decodeTps}")
+        println("KIDI_APP_BENCH npu_backend=${npu.backend} npu_prefill_ms=${npu.prefillMs} " +
+            "npu_first_token_ms=${npu.firstTokenMs} npu_decode_tokens=${npu.decodeTokens} " +
+            "npu_decode_ms=${npu.decodeMs} npu_decode_tps=${npu.decodeTps} speedup=${npu.decodeTps / cpu.decodeTps}")
+        assertTrue("CPU produced too few measured decode tokens: $cpu", cpu.decodeTokens >= 8)
+        assertTrue("NPU produced too few measured decode tokens: $npu", npu.decodeTokens >= 8)
+        assertTrue("Expected an NPU backend, got ${npu.backend}", npu.backend.contains("qnn"))
+        assertTrue("NPU did not beat CPU: CPU=$cpu NPU=$npu", npu.decodeTps > cpu.decodeTps)
     }
 
     @Test
@@ -131,7 +288,7 @@ class NativeRuntimeTest {
             val loaded = JSONObject(NativeRuntime.loadAsr(modelDirectory, true))
             assertTrue(loaded.toString(), loaded.optBoolean("ready"))
             assertEquals("int8", loaded.getString("precision"))
-            assertEquals("android-cpu", loaded.getString("backend"))
+            assertEquals("cpu", loaded.getString("backend"))
             assertTrue(loaded.getLong("model_bytes") in 240_000_000L..260_000_000L)
             val cacheName = if (File(modelDirectory, "ggml-model.bin").isFile)
                 "ggml-model.bin.kidi-int8-v1" else "kidi-int8-v2"

@@ -4,6 +4,180 @@ Short progress notes for the current implementation. Measurements are explorator
 unless explicitly labelled as paired acceptance results. Historical comparisons
 remain in [QAT.md](QAT.md).
 
+## 2026-10-01: Native wasm64 and Vision Memory
+
+- All three browser variants now use native `-m64` unconditionally, with an
+  8 GiB growth ceiling, 64 MiB initial memory, and 2 MiB stack. Removed the
+  large-memory toggle, wasm32 fallback, and generated-JavaScript heap patcher.
+  Tahoma's consumer build forwards `-m64`; the submodule remains unmodified.
+- Loader bounds and heap headroom now use 8 GiB. Speech input uses a native
+  pointer argument and `ccall`'s pointer conversion rather than uint32_t.
+- The real built single-thread module allocated past 4 GiB and read/wrote at
+  address 4,297,849,912. Sparse probe peak RSS was about 64 MiB, not 4 GiB.
+  The first probe incorrectly assumed a following small allocation could not
+  reuse a low free block; corrected it to test inside the large allocation.
+  Repeatable test: `KIDI_TEST_WASM=build-web/single/kidi.mjs node --test tests/web/model_cache_test.mjs`.
+- Common vision code now uses 32-row projection/FFN/query workspaces and a
+  broadcast attention mask, retaining every key/value and the image resolution.
+  RMSNorm residual additions use the existing fused operation. This bounds
+  execution; it is not a claim of single-kernel whole-FFN/attention fusion.
+- CPU text and vision prepared workspaces are released at new-image boundaries,
+  while weights and live tensor owners remain valid. Graph lifetime/recapture,
+  Gemma and image tests pass. Independent Transformers FP32 and QAT vision
+  feature comparisons both have maximum error 1.78814e-7.
+- Bounded workspaces alone still reproduced the 4 GiB CPU failure. After the
+  wasm64 switch, the user's original 4288x2848 JPEG passed in the single visible
+  integrated-browser tab on CPU / four threads, after a text warmup, with the
+  normal 280-token image budget, 3M resize ceiling and 1024 output-token limit.
+  Reply: `The image shows a butterfly resting on a flower.` Heap reached
+  4,814,798,848 bytes (4.48 GiB), with 3.52 GiB headroom. The reported generation
+  time was 7514.95501 ms and decode 667.32109 ms; image preparation is outside
+  the generation counter, so these are not total image latency measurements.
+- No duplicate browser/model session was used. Native wasm64 requires a recent
+  memory64-capable engine; larger address space does not eliminate real RAM or
+  swap limits. WebGPU final parity and follow-up verification are in progress.
+
+## 2026-09-30: Browser Image Input
+
+- Browser loader now retains upstream `config.json`, allowing the existing
+  native loader to detect the vision tower. The WASM bridge passes image paths
+  and reports runtime vision capability. Worker staging is bounded and removes
+  temporary files after admission or failure.
+- Local JPEG/PNG attachments preserve original bytes in a separate Cache Storage cache.
+  Chat JSON stores references, not image bytes. Picker/paste/drop, previews,
+  removal, image-only requests, history, and explicit missing-image errors are
+  implemented. No external image upload is added.
+- Browser-normalized QAT weights use U8 storage. The vision loader previously
+  tried to cast them to FP32; preserve them and let state binding validate the
+  parameter. A native regression covers an unallocated vision model.
+- Added shared vision execution on WebGPU: explicit input transfers and host
+  pooling, no second set of model equations. FP32/QAT feature parity against
+  CPU passes in the integrated browser. Tahoma PNG/JPEG preprocessing passes
+  there too. Native Gemma/image tests and six browser unit tests pass.
+- Full-model image requests initially crashed during preprocessing. Reducing
+  the image budget and moving vision to GPU did not fix that crash. Progress
+  callbacks localized it to pixel preparation. JPEG's generated configuration
+  incorrectly cached `SIZEOF_SIZE_T=4` during its first configure, before the
+  wasm64 flags arrived. Forwarding C flags into that first configure now
+  generates `SIZEOF_SIZE_T=8`. The ABI fix did not change third-party sources.
+- The first interpretation as generic vision memory pressure was incomplete;
+  do not attribute the decoder ABI fix to a GPU optimization.
+- User-directed simplification: removed JavaScript canvas resizing/re-encoding,
+  the WASM-only 70-token override, and the browser-only CPU vision restriction.
+  All entry points use the same generator, Tahoma decode, Gemma preprocessing,
+  image embeddings, and text decoder. Browser code handles UI/cache/byte transport.
+- Per user direction, reverted the Tahoma decoder API/codec edits. The dependency
+  remains unchanged. Kidi uses its existing `max_pixels = 24'000'000`
+  and `max_decoded_bytes = 96'000'000` options. JPEG/PNG check these before
+  allocating pixels; Kidi's existing 16,384-pixel axis guard remains after decode
+  and before resizing. Core axis-boundary and oversized-PNG-header tests pass.
+- The existing attachment test now checks exact original JPEG/PNG bytes in the
+  WASM filesystem. No browser decoder/feature implementation is retained.
+- Added shared `GenerationOptions::image_max_pixels`, default 3,000,000; C++
+  bounds it to 161,280-3,000,000 and lowers the selected soft-token budget when
+  necessary. The 280-token default is otherwise unchanged. The new browser
+  settings field persists the ceiling and forwards it through the worker/WASM
+  bridge, without pixel processing in JS. Feature and prefix keys include the
+  ceiling. Core tests cover 3M/1M/0.5M/minimum budgets and invalid values.
+- Final full-model image/follow-up and UI history/mobile checks are pending.
+
+## 2026-09-30: Browser Replay Compatibility
+
+Scope: restore all browser builds, verify CPU WASM and WebGPU in VS Code's
+integrated browser, then measure eager versus captured decode on the same model.
+
+- `make wasm` initially failed because the external JPEG library was wasm32
+  while Kidi used `MEMORY64=2`. Forwarding pointer/threading ABI flags through
+  the existing Tahoma consumer hook fixed all three browser variants.
+- Fresh integrated-browser eager checks passed on Apple / metal-3: packed
+  Q2/Q4/Q8 projections, attention, float/QAT Gemma reference logits and tokens,
+  tensor views, large dispatch boundaries, and pooled-buffer lifetimes.
+- WebGPU had neither replay output binding nor a scatter kernel. Added
+  `run_into` and indexed cache writes, with word-aligned in-place scatter
+  touching only updated rows. A five-call regression verifies two captures,
+  subsequent replay, input/cache rebinding, and host token readback.
+- Gemma explicitly excluded WebGPU captured decode. Its small host-written
+  step inputs now upload explicitly and rebind through the shared graph path;
+  both float and QAT fixture token checks pass with this enabled.
+- Failed probes: the missing scatter kernel caused a secondary WASM abort;
+  a suspected TLS issue was disproven and the probe reverted. Browser HTTP
+  caching initially retained the old shader module; disable caching during
+  development checks. The test page now includes the original GPU error.
+- All three browser variants rebuilt. One/four-thread CPU UI tests at the normal
+  1,024-token output limit both returned `4` (token 236812): cold generation
+  18.08487 / 2.19563 s, heap 4,243,652,608 / 4,250,075,136 bytes. These are smoke
+  checks, not throughput results; CPU remains close to the 4 GiB memory ceiling.
+- Replaced the temporary CPU context cap with opt-in compact serving reservations:
+  prompt plus output in 128-token buckets, preserving the requested cache's
+  precision-policy threshold. Native defaults are unchanged. Reservation-size,
+  token-parity, and context-overflow checks pass.
+- Actual WebGPU UI cached reload, generation, cancellation, and a request after
+  cancellation pass. Replay and preserved eager builds produced identical 48
+  tokens. Warm decode times: replay 1277.650 / 1236.655 / 1225.965 ms; eager
+  1403.160 / 1383.030 / 1196.160 ms. Overlapping ranges do not support a broad
+  speedup claim. Compact reservations reduce short-request GPU allocation from
+  about 3.012 GB to 2.845 GB.
+- A medium-context attempt crashed the renderer during prefill under memory
+  pressure (swap rose from zero to 2.5 GB). No long-context throughput claim.
+  Fixture wall time is not an inference performance result.
+
+### WebGPU FFN Fusion
+
+- Added a calibrated Q2/Q4/Q8 FFN program: input quantization, paired gate/up
+  projection with fused calibrated GELU-product and INT8 output, then down
+  projection consuming those packed bytes. Uses the existing projection tiles
+  and packed-weight interleaving; no FP32 gate/up or activation intermediate.
+- Exact fused/unfused GPU parity passes for 1/3/4/32/33 rows, host/device weights,
+  different per-channel scales, and replay with changing inputs. Both existing
+  Gemma fixtures and native graph/Gemma tests pass.
+- Alternating isolated kernel measurements on Apple / metal-3, two discarded
+  rounds then six measured rounds, four FFNs per submission, timestamp profiling:
+
+| Bits | Rows | Hidden / FFN | Unfused GPU ms | Fused GPU ms | Dispatches |
+| --- | ---: | --- | ---: | ---: | --- |
+| Q2 | 1 | 1536 / 6144 | 0.22938 | 0.22118 | 5 -> 3 |
+| Q2 | 1 | 1536 / 12288 | 0.31130 | 0.30310 | 5 -> 3 |
+| Q4 | 1 | 1536 / 6144 | 0.21299 | 0.20480 | 5 -> 3 |
+| Q2 | 32 | 1536 / 6144 | 3.84205 | 3.94854 | 7 -> 3 |
+| Q2 | 32 | 1536 / 12288 | 7.47930 | 7.78240 | 7 -> 3 |
+| Q4 | 32 | 1536 / 6144 | 3.77651 | 3.85024 | 7 -> 3 |
+
+- Prefill fusion regressed despite fewer dispatches. Production therefore uses
+  fusion only for fewer than four rows, hidden width divisible by 128, FFN width
+  divisible by 32, matching packed bit widths and positive trained scales.
+  Other shapes, FP32 models, and sentinel scales retain the original path.
+  The prefill implementation remains testable through the operator/benchmark.
+- Full-model comparison against `.cache/web-before-fused-ffn` (already replay
+  plus compact cache) completed in the integrated browser with the locally
+  cached mobile-QAT checkpoint, revision `dd693ff40353f057ca5f07e945ad867f4afbf2ec`.
+  Both builds used 48 output tokens, five identical short requests (first two
+  discarded), then one longer prompt. All six pairs returned identical token
+  IDs and no runtime errors. No builds ran during timed requests.
+
+| Metric | Unfused | Fused |
+| --- | ---: | ---: |
+| 17-token prompt, warm decode median ms / 47 steps | 1275.59500 | 1173.78500 |
+| Warm decode tokens/s | 36.84555 | 40.04140 |
+| Warm decode range ms | 1274.92500-1276.59000 | 1169.71500-1193.16500 |
+| GPU dispatches / complete short request | 46492 | 39912 |
+| GPU allocated bytes after repeated short requests | 2844538872 | 2831022072 |
+| WASM heap bytes | 2970091520 | 2970091520 |
+| 145-token prompt, one decode sample ms | 1343.92000 | 1350.18500 |
+
+- Observed short-context throughput gain: 8.67365%; dispatch count down 14.15297%.
+  This is a single-machine sequential comparison, not a cross-device guarantee.
+  The longer single sample is effectively unchanged and is not a median claim.
+  Initial longer repeated test completed seven requests but crashed on the
+  eighth under high swap pressure; its timings are excluded from the table.
+- Reproduce isolated FFN geometry checks with **Benchmark FFN** on the backend
+  test page. Full-model inputs were `Name three practical uses of binary search.`
+  and that prompt preceded by 16 repetitions of
+  `A sorted list supports quick lookups. `. Comparison records are retained
+  in the test origin's `kidi-ffn-benchmark-before/after` local-storage entries.
+- Production prefill is intentionally unchanged. Further prefill fusion work
+  needs a faster tile, not merely fewer dispatches. Long-context memory limits
+  noted above remain outside the claims for this kernel change.
+
 ## 2026-09-25: Fusion Review and Fresh Baselines
 
 Goal: establish reproducible inference baselines before changing kernels. This

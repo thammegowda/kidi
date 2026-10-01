@@ -1,6 +1,8 @@
 #include "kidi/model/gemma4.h"
 #include "kidi/checkpoint/safetensors/mapped.h"
 #include "kidi/inference/generator.h"
+#include "kidi/runtime/operator.h"
+#include "kidi/tensor/backend.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -9,8 +11,73 @@
 #include <iostream>
 
 namespace {
-auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node& config, kidi::tensor::Device device)
-    -> void {
+/// A step compiler that declines every step, so accelerator-shaped steps (captured prefill chunks) replay on CPU.
+class DecliningCompiler final : public kidi::runtime::StepCompiler {
+public:
+    auto name() const -> std::string_view override { return "declining"; }
+    auto compile(const kidi::graph::Graph&,
+                 std::string_view key) -> std::unique_ptr<kidi::runtime::StepExecutable> override {
+        keys.emplace_back(key);
+        return nullptr;
+    }
+    std::vector<std::string> keys;
+};
+
+/// Captured prefill chunks and decode steps under a step compiler match eager execution bit for bit.
+auto check_captured_prefill(const YAML::Node& config, const kidi::checkpoint::Weights& checkpoint,
+                            std::span<const std::int32_t> tokens) -> bool {
+    using kidi::ops::require;
+    auto extended = YAML::Clone(config);
+    extended["max_position_embeddings"] = 128;
+    auto compiler = std::make_shared<DecliningCompiler>();
+    std::optional<kidi::model::Gemma4> captured;
+    {
+        const kidi::ops::StepCompilerScope scope(compiler);
+        captured = require(kidi::model::Gemma4Impl::create(extended));
+    }
+    auto eager = require(kidi::model::Gemma4Impl::create(extended));
+    require((*captured)->set_checkpoint(checkpoint));
+    require(eager->set_checkpoint(checkpoint));
+    if ((*captured)->accelerator() != "declining" || !eager->accelerator().empty()) {
+        std::cerr << "step compiler was not attached to the captured model\n";
+        return false;
+    }
+    std::vector<std::int32_t> sequence(80);
+    for (std::size_t index = 0; index < sequence.size(); ++index) sequence[index] = tokens[index % tokens.size()];
+    auto captured_state = require((*captured)->create_state(128));
+    auto eager_state = require(eager->create_state(128));
+    for (std::size_t offset = 0; offset < 64; offset += 16) {
+        require((*captured)->prefill(std::span(sequence).subspan(offset, 16), captured_state));
+        require(eager->prefill(std::span(sequence).subspan(offset, 16), eager_state));
+    }
+    for (std::size_t position = 64; position < sequence.size(); ++position) {
+        const auto token = std::span(sequence).subspan(position, 1);
+        const auto actual = require((*captured)->forward(token, captured_state));
+        const auto expected = require(eager->forward(token, eager_state));
+        if (!std::ranges::equal(require(actual.data<float>()), require(expected.data<float>()))) {
+            std::cerr << "captured prefill or decode differs from eager at " << position << '\n';
+            return false;
+        }
+    }
+    const auto compiled = [&](std::string_view prefix) {
+        return std::ranges::any_of(compiler->keys, [&](const std::string& key) { return key.starts_with(prefix); });
+    };
+    if (compiled("gemma4_prefill:16:") && compiled("gemma4_decode:1:")) return true;
+    std::cerr << "expected captured prefill and decode steps; compiled:";
+    for (const auto& key : compiler->keys) std::cerr << ' ' << key;
+    std::cerr << '\n';
+    return false;
+}
+
+auto fixture_directory(std::string_view fixture) -> std::filesystem::path {
+    const auto* configured = std::getenv("KIDI_GEMMA4_FIXTURE_DIR");
+    const auto base =
+        configured ? std::filesystem::path(configured) : std::filesystem::path(KIDI_GEMMA4_FIXTURE).parent_path();
+    return base.filename() == std::filesystem::path(fixture) ? base : base / fixture;
+}
+
+auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node& config,
+                         kidi::tensor::Device device) -> void {
     using kidi::ops::require;
     const auto directory = std::filesystem::temp_directory_path() / "kidi-serving-cache-test";
     std::filesystem::remove_all(directory);
@@ -109,6 +176,29 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
             results[index]->stats.reused_prompt_tokens != (index == 0 ? 3 : 0))
             throw std::runtime_error("queued requests shared or lost streaming KV state");
     }
+    manifest["model"]["max_position_embeddings"] = 1024;
+    std::ofstream(directory / "model.yaml") << manifest;
+    auto compact = require(kidi::inference::Generator::load(directory, device));
+    auto full = require(kidi::inference::Generator::load(directory, device));
+    require(compact.configure_serving({1, 1, 1024, 2, true}));
+    require(full.configure_serving({1, 1, 1024, 2}));
+    auto bounded = uncached;
+    bounded.context_size = 1024;
+    require(compact.enqueue(prompts[0], bounded));
+    const auto step = require(compact.step());
+    const auto byte_limit = kidi::tensor::DEVICE_CAPABILITIES[device.kind].blockwise_int8_attention_max_tokens;
+    const auto expected_capacity = byte_limit < 1024 ? ((byte_limit + 128) / 128) * 128 : 128;
+    if (step.reserved_cache_tokens != expected_capacity)
+        throw std::runtime_error("compact reservation changed the cache precision policy or exceeded its bucket");
+    std::optional<kidi::inference::TextGeneration> compact_result;
+    while (compact.pending_requests())
+        for (auto& event : require(compact.step()).events)
+            if (event.completed) compact_result = std::move(event.completed);
+    const auto full_result = run(full, prompts[0], bounded);
+    if (!compact_result || compact_result->generation.token_ids != full_result.generation.token_ids)
+        throw std::runtime_error("compact cache reservation changed generated tokens");
+    bounded.maximum_new_tokens = 1024;
+    if (compact.enqueue(prompts[0], bounded)) throw std::runtime_error("compact cache accepted context overflow");
     std::filesystem::remove_all(directory);
 }
 } // namespace
@@ -117,7 +207,7 @@ auto main() -> int {
     using namespace kidi;
     try {
         for (const auto* fixture : {"gemma4", "gemma4-qat"}) {
-            const auto directory = std::filesystem::path(KIDI_GEMMA4_FIXTURE).parent_path() / fixture;
+            const auto directory = fixture_directory(fixture);
             const auto config = YAML::LoadFile((directory / "model.yaml").string())["model"];
             auto checkpoint = ops::require(checkpoint::Weights::load(directory / "model.safetensors"));
             auto reference = ops::require(checkpoint::Weights::load(directory / "reference.safetensors"));
@@ -163,6 +253,9 @@ auto main() -> int {
 #if defined(__APPLE__)
             devices.push_back(tensor::Device::apple_gpu());
 #endif
+            const auto vulkan = tensor::BackendRegistry::instance().backend(tensor::Device::vulkan());
+            if (vulkan && (*vulkan)->is_available(tensor::Device::vulkan()) && (*vulkan)->supports_execution())
+                devices.push_back(tensor::Device::vulkan());
             for (auto device : devices) {
                 check_serving_cache(directory, config, device);
                 const ModuleScope construction(tensor::DType::F32, false, device);
@@ -218,6 +311,44 @@ auto main() -> int {
                         }
                 }
                 if (incremental.position != tokens.size() || full.position != tokens.size()) return 1;
+                {
+                    // Replayed decode steps match eagerly executed steps bit for bit.
+                    setenv("KIDI_REPLAY", "0", 1);
+                    auto eager_model = ops::require(model::Gemma4Impl::create(config));
+                    unsetenv("KIDI_REPLAY");
+                    ops::require(eager_model->set_checkpoint(checkpoint));
+                    auto replayed = ops::require(model->create_state(8));
+                    auto eager = ops::require(eager_model->create_state(8));
+                    for (std::size_t position = 0; position < tokens.size(); ++position) {
+                        const auto token = std::span(tokens).subspan(position, 1);
+                        const auto actual = ops::require(model->forward(token, replayed));
+                        const auto expected = ops::require(eager_model->forward(token, eager));
+                        if (!std::ranges::equal(ops::require(actual.data<float>()),
+                                                ops::require(expected.data<float>()))) {
+                            std::cerr << "replayed Gemma decode differs from eager at " << position << '\n';
+                            return 1;
+                        }
+                    }
+                    // Token tensors fed back from the previous step decode like host token IDs.
+                    auto fed = ops::require(model->create_state(8));
+                    auto integer = ops::require(model->create_state(8));
+                    auto token = ops::require(tensor::Tensor::from_host({1}, tokens.first(1), device));
+                    auto next = tokens[0];
+                    for (std::size_t step = 0; step + 1 < fed.capacity; ++step) {
+                        const auto selected = ops::require(model->forward_token(token, fed));
+                        next = ops::require(model->forward_token(std::span(&next, 1), integer));
+                        if (ops::require(selected.data<std::int32_t>())[0] != next) {
+                            std::cerr << "Gemma token tensor feedback differs at step " << step << '\n';
+                            return 1;
+                        }
+                        token = selected;
+                    }
+                    if (model->forward_token(ops::require(tensor::Tensor::from_host({2}, tokens.first(2), device)),
+                                             fed))
+                        return 1;
+                    if (device == tensor::Device::cpu() && !check_captured_prefill(config, checkpoint, tokens))
+                        return 1;
+                }
                 for (const std::size_t batch_size : {2, 4}) {
                     std::vector<model::Gemma4State> batch, serial;
                     std::vector<std::size_t> order;

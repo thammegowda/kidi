@@ -28,7 +28,7 @@ self.onmessage = async ({data}) => {
                 throw new Error('Unable to allocate speech input in WebAssembly memory');
             try {
                 new Float32Array(module.HEAPU8.buffer, pointer, audio.length).set(audio);
-                const result = await call('kidi_transcribe', ['number', 'number', 'string', 'number'],
+                const result = await call('kidi_transcribe', ['pointer', 'number', 'string', 'number'],
                     [pointer, audio.length, data.language, data.maximumTokens]);
                 self.postMessage({type: 'result', requestId: data.requestId, ...result});
             } finally { module._free(pointer); }

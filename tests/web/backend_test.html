@@ -19,6 +19,7 @@
         <header><img src="../../docs/kidi-logo-small.png" width="48" height="48" alt="Kidi"><h1>WebGPU Backend Checks</h1></header>
         <button id="run" class="primary" type="button">Run Checks</button>
         <button id="benchmark" type="button">Benchmark Projections</button>
+        <button id="benchmark-ffn" type="button">Benchmark FFN</button>
         <p id="status" role="status">Ready</p>
         <pre id="results" role="log" aria-live="polite"></pre>
     </main>
@@ -48,6 +49,14 @@
                 }
                 const module=await create({print:log,printErr:log});
                 module.FS.mkdir('/fixtures');
+                const logo=await fetch('../../docs/kidi-logo-small.png');
+                const bitmap=await createImageBitmap(await logo.blob());
+                const canvas=new OffscreenCanvas(bitmap.width,bitmap.height);
+                canvas.getContext('2d').drawImage(bitmap,0,0);bitmap.close();
+                for(const format of ['png','jpeg']){
+                    const blob=await canvas.convertToBlob({type:`image/${format}`});
+                    module.FS.writeFile(`/fixtures/image.${format}`,new Uint8Array(await blob.arrayBuffer()));
+                }
                 for(const fixture of ['gemma4','gemma4-qat']) {
                     module.FS.mkdir('/fixtures/'+fixture);
                     for(const file of ['model.yaml','model.safetensors','reference.safetensors']) {
@@ -83,12 +92,31 @@
                 await gpu.synchronize();
                 if(gpu.stats.pooledBytes>128*1024*1024)throw new Error('Idle GPU pool exceeded its budget');
                 log('Pending buffer lifetime and pool budget passed');
+                const scatterBuffers=[gpu.allocate(12),gpu.allocate(8),gpu.allocate(8)];
+                gpu.upload(scatterBuffers[0],0,new Uint8Array(new Float32Array([1,2,3]).buffer));
+                gpu.upload(scatterBuffers[1],0,new Uint8Array(new Float32Array([7,9]).buffer));
+                gpu.upload(scatterBuffers[2],0,new Uint8Array(new Int32Array([0,3]).buffer));
+                const scatter=await gpu.prepare({operation:'scatter',dtype:11,inplace:true,attributes:[],
+                    inputs:[{shape:[1,3,1],dtype:11},{shape:[1,2,1],dtype:11},{shape:[2],dtype:6}]});
+                gpu.run(scatter,new Uint32Array([...scatterBuffers,scatterBuffers[0]].flatMap(handle=>[handle,0])));
+                const validationOutput=Number(module._malloc(12));
+                gpu.readLater(scatterBuffers[0],0,validationOutput,12);
+                let rejected=false;
+                try{await gpu.synchronize();}catch(error){
+                    if(!String(error).includes('scatter index outside cache'))throw error;
+                    rejected=true;
+                }
+                const unchanged=new Float32Array(module.HEAPU8.buffer,validationOutput,3);
+                if(!rejected||unchanged.some((value,index)=>value!==index+1))
+                    throw new Error('Invalid scatter did not preserve the cache and report an error');
+                log('Invalid scatter rejected without partial cache writes');
                 log(`Completed in ${((performance.now()-started)/1000).toFixed(2)} seconds`);
                 log(`GPU submissions: ${gpu.stats.submissions}; readback: ${gpu.stats.readBytes} bytes`);
                 status.textContent='All checks passed';
                 document.body.dataset.result='passed';
             } catch(error) {
                 status.textContent='Checks failed';
+                if(gpu?.failure)log(gpu.failure);
                 log(error.stack||String(error));
                 document.body.dataset.result='failed';
             } finally {gpu?.dispose();button.disabled=false;}
@@ -130,6 +158,73 @@
                 status.textContent='Projection benchmark complete';
             }catch(error){status.textContent='Benchmark failed';log(error.stack||String(error));}
             finally{gpu?.dispose();button.disabled=benchmark.disabled=false;}
+        });
+        document.getElementById('benchmark-ffn').addEventListener('click',async()=>{
+            const controls=[...document.querySelectorAll('button')];controls.forEach(control=>control.disabled=true);
+            results.textContent='';status.textContent='Benchmarking fused FFN';
+            globalThis.ffnMeasurements=[];
+            let gpu;
+            try{
+                const {createWebGpu}=await import('../../web/webgpu.mjs');
+                const module={HEAPU8:new Uint8Array(32*1536*8)};
+                gpu=await createWebGpu(module,{profile:true});
+                const floatBits=value=>new Uint32Array(new Float32Array([value]).buffer)[0];
+                const operand=(shape,dtype=11)=>({shape,dtype});
+                for(const [bits,intermediate] of [[2,6144],[2,12288],[4,6144]])for(const rows of [1,32]){
+                    const width=1536,shape=[1,rows,width],hidden=[1,rows,intermediate],projected=[1,rows,2*intermediate];
+                    const specs=[operand(shape),operand([2*intermediate,width*bits/8],1),operand([2*intermediate,1]),
+                        operand([width,intermediate*bits/8],1),operand([width,1])];
+                    const sizes=[rows*width*4,2*intermediate*width*bits/8,2*intermediate*4,
+                        width*intermediate*bits/8,width*4,rows*width*4,rows*2*intermediate*4,
+                        rows*intermediate*4,rows*intermediate*4,rows*intermediate*4,rows*width*4];
+                    const handles=sizes.map(bytes=>gpu.allocate(bytes)),programs=[];
+                    const prepare=async spec=>{const id=await gpu.prepare(spec);programs.push(id);return id;};
+                    const bind=indices=>new Uint32Array(indices.flatMap(index=>[handles[index],0]));
+                    try{
+                        for(const index of [1,3]){
+                            const bytes=new Uint8Array(sizes[index]);for(let offset=0;offset<bytes.length;offset++)bytes[offset]=(offset*71+37)&255;
+                            gpu.upload(handles[index],0,bytes);
+                        }
+                        for(const index of [2,4])gpu.upload(handles[index],0,new Uint8Array(new Float32Array(sizes[index]/4).fill(1/128).buffer));
+                        gpu.upload(handles[0],0,new Uint8Array(Float32Array.from({length:rows*width},(_,index)=>(index%31-15)*0.125).buffer));
+                        const fused=await prepare({operation:'gated_feed_forward',dtype:11,epsilon:0.25,
+                            attributes:[bits,width,intermediate,floatBits(0.125),floatBits(0.25),floatBits(0.125)],inputs:specs});
+                        const gate=await prepare({operation:'packed_linear',dtype:11,epsilon:0.25,
+                            attributes:[bits,width,floatBits(0.125)],inputs:specs.slice(0,3)});
+                        const slices=[];for(const start of [0,intermediate])slices.push(await prepare({operation:'slice',dtype:11,
+                            attributes:[2,start,intermediate],inputs:[operand(projected)]}));
+                        const activation=await prepare({operation:'gelu_multiply',dtype:11,epsilon:0,attributes:[],inputs:[operand(hidden),operand(hidden)]});
+                        const down=await prepare({operation:'packed_linear',dtype:11,epsilon:0.25,
+                            attributes:[bits,intermediate,floatBits(0.125)],inputs:[operand(hidden),specs[3],specs[4]]});
+                        const execute=fusion=>{
+                            if(fusion){gpu.run(fused,bind([0,1,2,3,4,5]));return;}
+                            gpu.run(gate,bind([0,1,2,6]));
+                            if(rows===1)gpu.run(activation,new Uint32Array([handles[6],0,handles[6],intermediate*4,handles[9],0]));
+                            else{gpu.run(slices[0],bind([6,7]));gpu.run(slices[1],bind([6,8]));gpu.run(activation,bind([7,8,9]));}
+                            gpu.run(down,bind([9,3,4,10]));
+                        };
+                        execute(false);execute(true);
+                        const bytes=rows*width*4;gpu.readLater(handles[5],0,0,bytes);gpu.readLater(handles[10],0,bytes,bytes);await gpu.synchronize();
+                        const actual=new Float32Array(module.HEAPU8.buffer,0,rows*width),expected=new Float32Array(module.HEAPU8.buffer,bytes,rows*width);
+                        if(actual.some((value,index)=>value!==expected[index]))throw new Error('Real-shape FFN parity failed');
+                        const samples={fused:[],unfused:[]};
+                        for(let round=0;round<8;round++)for(const fusion of round%2?[true,false]:[false,true]){
+                            const before=Object.values(gpu.stats.gpuMilliseconds||{}).reduce((sum,value)=>sum+value,0),dispatches=gpu.stats.dispatches;
+                            const started=performance.now();for(let repeat=0;repeat<4;repeat++)execute(fusion);await gpu.synchronize();
+                            const elapsed=(performance.now()-started)/4;
+                            const gpuMs=(Object.values(gpu.stats.gpuMilliseconds||{}).reduce((sum,value)=>sum+value,0)-before)/4;
+                            if(round>=2)samples[fusion?'fused':'unfused'].push({wallMs:elapsed,gpuMs,dispatches:(gpu.stats.dispatches-dispatches)/4});
+                        }
+                        const median=values=>{const sorted=[...values].sort((left,right)=>left-right);return (sorted[2]+sorted[3])/2;};
+                        const record={bits,rows,width,intermediate,samples,...Object.fromEntries(Object.entries(samples).map(([name,values])=>
+                            [name,{wallMs:median(values.map(value=>value.wallMs)),gpuMs:median(values.map(value=>value.gpuMs)),dispatches:values[0].dispatches}]))};
+                        ffnMeasurements.push(record);
+                        log(`Q${bits} ${rows}x${width} -> ${intermediate}: GPU ${record.unfused.gpuMs.toFixed(3)} -> ${record.fused.gpuMs.toFixed(3)} ms; dispatches ${record.unfused.dispatches} -> ${record.fused.dispatches}; exact parity`);
+                    }finally{programs.forEach(id=>gpu.releaseProgram(id));handles.forEach(handle=>gpu.release(handle));}
+                }
+                status.textContent='FFN benchmark complete';
+            }catch(error){status.textContent='FFN benchmark failed';log(error.stack||String(error));}
+            finally{gpu?.dispose();controls.forEach(control=>control.disabled=false);}
         });
         if(new URLSearchParams(location.search).has('run'))run();
     </script>

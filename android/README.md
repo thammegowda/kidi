@@ -38,7 +38,7 @@ This performs a clean optimized release build and lint, aligns/signs/verifies th
 APK, and writes `dist/kidi-release.apk`. It does not install anything or change
 phone data. By default it uses your existing `~/.android/debug.keystore`, so this
 is a release-mode APK signed for **local testing**, not public distribution.
-If that key does not exist, build `assembleDebug` once using the commands below.
+If that key does not exist, build `assembleDeveloper` once using the commands below.
 
 For an APK signed with your private release/upload key:
 
@@ -65,21 +65,36 @@ environment; otherwise it prompts in the terminal. Do not commit signing keys or
 passwords. Installing with `adb install -r dist/kidi-release.apk` preserves data
 only when the signing key matches the installed app.
 
-For a debuggable build and installation:
+For the optimized developer build and installation:
 
 ```bash
 export JAVA_HOME=/path/to/jdk-17
 export ANDROID_HOME=/path/to/Android/sdk
-./android/gradlew -p android :app:assembleDebug
-./android/gradlew -p android :app:installDebug
+./android/gradlew -p android :app:assembleDeveloper
+./android/gradlew -p android :app:installDeveloper
 ```
 
-The APK is written to `android/app/build/outputs/apk/debug/app-debug.apk`. Open `android/` in Android Studio for the
-IDE workflow. The Gradle project references the repository root, so moving only the `android/` directory is not a
-supported build layout.
+The APK is written to
+`android/app/build/outputs/apk/developer/app-developer.apk`. It uses
+the same optimized/minified configuration as Release; only its package identity,
+launcher resources, version suffix, and debug-key signing differ.
 
-The application ID and Kotlin namespace are `ai.gowda.kidi`. The app targets Android 16/API 36, requires Android 10/API 29 or newer, and currently
-packages only `arm64-v8a`. Gemma 4 needs a 64-bit device with several gigabytes of available storage and memory.
+Developer builds use the standard Android debug key and application ID
+`ai.gowda.kidi.dev`, so `installDeveloper` installs beside the release app
+without replacing it. The launcher identifies it as **Kidi Dev** with an amber
+icon and a red `!` badge. Release builds remain `ai.gowda.kidi` with the normal
+Kidi icon.
+
+For Java/Kotlin debugger sessions, `assembleDebug` produces the deliberately
+unoptimized `ai.gowda.kidi.debug` variant. Do not use that variant for model
+startup or throughput measurements. Open `android/` in Android Studio for the
+IDE workflow. The Gradle project references the repository root, so moving only
+the `android/` directory is not a supported build layout.
+
+The Kotlin namespace is `ai.gowda.kidi`. The app targets Android 16/API 36,
+requires Android 10/API 29 or newer, and currently packages only `arm64-v8a`.
+Gemma 4 needs a 64-bit device with several gigabytes of available storage and
+memory.
 
 ## Model and Privacy
 
@@ -191,7 +206,7 @@ The earlier FP32-to-INT8 Small path matched Small FP32 quality on a 40-clip/776-
 Those measurements do not certify GGML Q8 re-quantization. Small is slower than Tiny: earlier four-thread phone runs averaged roughly 2.75 seconds per complete segment versus 0.82 seconds
 for Tiny. Live dictation still replaces drafts with one inference in flight; draft latency is model-dependent.
 
-All Android inference uses CPU; no vendor accelerator SDK, calibration audio, or device graph caches are needed.
+Speech runs on the CPU INT8 path in Auto mode; see [Accelerators](#accelerators) for chat.
 Release builds enable R8/resource shrinking and discard unused native dependency sections while preserving JNI
 entry points and partial-transcript callbacks.
 
@@ -295,9 +310,63 @@ Read-only inspection on 2026-09-27 identified a Motorola Razr Ultra 2025 running
 | GPU | Adreno 830 v2; Vulkan 1.3.284, FP16/INT8 shaders and integer dot products |
 | GPU limits | 64-lane subgroups, 32 KiB workgroup memory, 2,147,483,647-byte storage-buffer range |
 
-The Android app executes on CPU, regardless of which vendor libraries the phone exposes. Small INT8 JNI inference,
-cache reuse, partial transcripts, and error recovery are checked on the physical phone. Direct microphone/UI testing
-requires an unlocked screen. Standalone benchmark setup is documented in [benchmarks/android](../benchmarks/android/README.md).
+Small INT8 JNI inference, cache reuse, partial transcripts, and error recovery are checked on the physical phone.
+Direct microphone/UI testing requires an unlocked screen. Standalone benchmark setup is documented in
+[benchmarks/android](../benchmarks/android/README.md).
+
+## Accelerators
+
+Settings > Inference has **Chat accelerator** and **Speech accelerator**: Auto (default), CPU, GPU, or NPU. The
+selection persists, reloads the affected model, and each row shows where the loaded model actually runs. All inference
+work is in C++ (`inference::select_device`, `Generator::load`); the app only passes the preference.
+
+The same page includes **Hardware diagnostics** with the detected SoC/CPU and
+YNNPACK features, Vulkan physical-device name, and Hexagon HTP generation.
+GPU/NPU rows explicitly report Available, Recognized (but unavailable), or Not
+recognized so backend-selection failures are distinguishable from unknown
+hardware.
+
+**Run accelerator benchmark** opens an in-app benchmark that unloads normal
+chat/speech models, runs identical warmup and measured requests on CPU, GPU, and
+NPU, and reports model-load time, prompt tokens, prefill time/rate, time to first
+token, incremental decode time/rate, app PSS, system memory headroom, backend
+errors, and relative decode speedup. Returning to chat recreates the main
+activity so its models reload normally.
+
+Example from the SM8750 test phone with a 204-token prompt and 63 measured
+incremental tokens:
+
+| Backend | Prefill | Time to first token | Incremental decode | System memory headroom |
+| --- | ---: | ---: | ---: | ---: |
+| CPU | 192.0 tok/s | 1.06 s | 19.20 tok/s | 6.43 GiB |
+| Vulkan GPU | 225.1 tok/s | 0.91 s | 8.82 tok/s | 6.49 GiB |
+| QNN HTP NPU | 51.6 tok/s | 3.95 s | 40.11 tok/s | 3.11 GiB |
+
+Thus the current app path delivers **2.09x CPU incremental decode** on NPU.
+Short-prompt NPU prefill and first-token latency are still worse because loading
+the large cached HTP decode context consumes time and memory; the benchmark
+reports this rather than folding it into the decode rate. Long, steady 128-token
+NPU prefill graphs separately measure about 1,000 tok/s, but that advantage is
+not yet representative of a short interactive request.
+
+- **Auto** tries the Qualcomm NPU, then the CPU for chat, falling back only when loading fails. Speech stays on the
+  quality-checked CPU INT8 path.
+- **CPU, GPU, NPU** are explicit: if that accelerator is unavailable or fails to load, the error is shown and the
+  model stays offline rather than silently running elsewhere.
+- **GPU (experimental)** runs Gemma 4 on Adreno through Kidi's Vulkan backend (built into the APK; no extra files).
+  It is currently slower than the CPU and its greedy output can drift from the CPU's, so Auto never picks it.
+- **NPU** records Gemma 4 steps on the CPU, then runs complete 128-token prefill
+  and single-token decode graphs on Hexagon through QNN. Packed embeddings, all
+  transformer layers, attention/KV updates, vocabulary projection, and argmax
+  execute on HTP. The APK includes the matching runtime, prepare library, stub,
+  system library, and V79 skel. Prepare is 81 MiB installed but compresses to
+  about 35 MiB in the APK; it is what makes a fresh install able to compile its
+  first graph without manual provisioning.
+
+  Compilation runs in the background while CPU replay remains available.
+  Matching context binaries are persistent: measured reload is about 4 seconds
+  for prefill and 8 seconds for decode. The 512-key prefill/decode caches consume
+  about 319/804 MiB.
 
 ## Validation
 
@@ -312,8 +381,18 @@ The test loads `libkidi_android.so`, initializes the YNNPACK thread pool, and ch
 boundaries, including non-BMP Unicode round-tripping. Keep the app and test APK variants matched; do not install debug
 instrumentation over a minified release app. Run Android lint and the release build with:
 
+The opt-in real NPU chat test needs an app-accessible Gemma directory and a build
+configured with the local QAIRT SDK:
+
 ```bash
-./android/gradlew -p android :app:lintDebug :app:assembleRelease
+./android/gradlew -p android :app:connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=ai.gowda.kidi.NativeRuntimeTest#generatesWithNpu \
+  -Pandroid.testInstrumentationRunnerArguments.runNpuGemma=true \
+  -Pandroid.testInstrumentationRunnerArguments.gemmaDirectory=/sdcard/Android/data/ai.gowda.kidi/files/models/gemma4
+```
+
+```bash
+./android/gradlew -p android :app:lintDeveloper :app:assembleRelease
 ```
 
 `NativeRuntimeTest.transcribesCachedSmallInt8` is opt-in: pass instrumentation arguments `whisperSmallDirectory` and

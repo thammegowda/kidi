@@ -13,6 +13,7 @@ public:
     ~Gemma4VisionImpl();
     auto set_checkpoint(const checkpoint::Weights& weights) -> Result<void>;
     auto forward(const image::Gemma4Image& image) -> Result<tensor::Tensor>;
+    auto release_workspaces() -> void;
 
 private:
     struct State;

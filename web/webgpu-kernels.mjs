@@ -43,7 +43,7 @@ export function makeProgram(spec, features) {
     const operands = spec.inputs, inputShape = operands[0].shape, attributes = spec.attributes;
     const uniforms = new Uint32Array(64);
     operands.forEach((operand, index) => { uniforms[9 + index] = operand.dtype; });
-    let shape = [...inputShape], dtype = spec.dtype, code, groups, scratch, stages, bindings, finalInputs;
+    let shape = [...inputShape], dtype = spec.dtype, code, groups, scratch, stages, bindings, finalInputs, validatesIndices;
     const operation = spec.operation;
     const elementwise = ['add','multiply','gelu','tanh','static_round','gelu_multiply'];
     if (elementwise.includes(operation)) {
@@ -94,6 +94,22 @@ ${value}store(index,value);}}`;
     ${bytes?`var packed=0u;for(var component=0u;component<4u;component++){if(index*4u+component<param(16u)){let value=i32(${spec.epsilon>0?'round_even(clamp(load0(index*4u+component)/scalar(20u),-128.0,127.0))':'clamp(load0(index*4u+component),-128.0,127.0)'});packed|=(u32(value)&255u)<<(component*8u);}}output[param(8u)/4u+index]=packed;`
 :packed?`let first=load0(index*2u);var second=0.0;if(index*2u+1u<param(16u)){second=load0(index*2u+1u);}output[index]=${dtype===10?'bf16(first)|(bf16(second)<<16u)':'pack2x16float(vec2<f32>(first,second))'};`:'store(index,load0(index));'}}`;
         groups=Math.ceil(count/(bytes?512:packed?256:128));
+    } else if(operation==='gated_feed_forward') {
+        const [bits,width,intermediate,gateOutput,downInput,downOutput]=attributes;
+        const asFloat=value=>new Float32Array(new Uint32Array([value]).buffer)[0];
+        const downScale=asFloat(downInput);
+        if(![2,4,8].includes(bits)||width%128||intermediate%32||width<=0||intermediate<=0||
+            ![spec.epsilon,asFloat(gateOutput),downScale,asFloat(downOutput)].every(value=>Number.isFinite(value)&&value>0))
+            throw new Error('WebGPU fused FFN requires aligned calibrated projections');
+        const gate=makeProgram({operation:'packed_linear',dtype:11,epsilon:spec.epsilon,
+            attributes:[bits,width,gateOutput],inputs:operands.slice(0,3),ffnGate:downInput},features);
+        const hiddenShape=[...inputShape];hiddenShape[hiddenShape.length-1]=intermediate;
+        const down=makeProgram({operation:'packed_linear',dtype:11,epsilon:downScale,
+            attributes:[bits,intermediate,downOutput],inputs:[{shape:hiddenShape,dtype:2},operands[3],operands[4]],
+            prequantized:true},features);
+        return {...down,operation,scratch:gate.scratch,bindings:3,
+            stages:[{code:gate.code,groups:gate.groups,uniforms:gate.uniforms,bytes:product(hiddenShape),inputs:[0,1,2]}],
+            finalInputs:['previous',3,4]};
     } else if (operation==='packed_linear') {
         const width=inputShape.at(-1), rows=product(inputShape)/width, columns=operands[1].shape[0];
         const [bits, group]=attributes;
@@ -101,9 +117,11 @@ ${value}store(index,value);}}`;
         uniforms[16]=width;uniforms[17]=columns;uniforms[18]=rows;uniforms[19]=group;
         uniforms[20]=floatBits(spec.epsilon);uniforms[21]=attributes[2]>>>0;
         const quantized=spec.epsilon>0;
+        const ffnGate=spec.ffnGate!==undefined;
+        if(ffnGate)uniforms[25]=spec.ffnGate>>>0;
         if(quantized&&group!==width)throw new Error('WebGPU calibrated projections require one scale per output channel');
         const paddedWidth=Math.ceil(width/4)*4;uniforms[22]=paddedWidth;
-        if(quantized){
+        if(quantized&&!spec.prequantized){
             const quantUniforms=new Uint32Array(uniforms);
             scratch={bytes:rows*paddedWidth,uniforms:quantUniforms,groups:Math.ceil(rows*paddedWidth/512),code:header(1)+`
 @compute @workgroup_size(128) fn main(@builtin(global_invocation_id) id:vec3<u32>){let index=invocation_index(id);let row=index/(param(22u)/4u);let first=(index%(param(22u)/4u))*4u;if(row>=param(18u)){return;}var packed=0u;
@@ -117,7 +135,8 @@ for(var component=0u;component<4u;component++){var value=0i;if(first+component<p
             `var packed=0u;for(var component=0u;component<4u;component++){if(channel+component<width){packed|=(u32(weight(column*width+channel+component))&255u)<<(component*8u);}}` :
             `let offset=column*width+channel;let expanded=(input1[param(1u)/4u+offset/${32/bits}u]>>(${bits}u*((offset%${32/bits}u)/4u)))&${laneMask};let packed=${signExtension};`;
         const perLane=32/bits, parts=8/bits, lanes=8, groupThreads=256, columnsPerGroup=groupThreads/lanes;
-        const chunk=Math.min(width,2048);
+        let chunk=Math.min(width,2048);
+        if(ffnGate&&width%chunk)chunk=128;
         const staged=width%chunk===0&&chunk%(lanes*perLane)===0&&(quantized||group%perLane===0);
         const singleScale=!quantized&&group>=width;
         const tileEntries=chunk/4;
@@ -147,22 +166,33 @@ workgroupBarrier();
             ?`for(var channel=lane*4u;channel<width;channel+=128u){${packFour}sum+=dot4I8Packed(input0[param(0u)/4u+(row*param(22u)+channel)/4u],packed);}`
             :`for(var channel=lane;channel<width;channel+=32u){sum+=load0(row*width+channel)*f32(weight(column*width+channel))*load2(column*(width/param(19u))+channel/param(19u));}`}}`;
         const threads=staged?groupThreads:128, laneCount=staged?lanes:32;
+        const gatedByte=ffnGate?`fn gated_byte(gate:f32,up:f32)->u32{
+    let value=0.5*gate*(1.0+stable_tanh(0.7978845608028654*(gate+0.044715*gate*gate*gate)))*up;
+    return u32(i32(round_even(clamp(value/scalar(25u),-128.0,127.0))))&255u;}`:'';
         const declarations=`${quantized?`var<workgroup> partial:array<i32,${threads}>;`:`var<workgroup> partial:array<f32,${threads}>;`}${staged?`var<workgroup> tile:array<${quantized?'u32':'vec4<f32>'},${tileEntries}>;`:''}`;
-        code=header(3,`${quantized?'requires packed_4x8_integer_dot_product;':''}${subgroups&&!staged?'enable subgroups;':''}`)+declarations+`
+        code=header(3,`${quantized?'requires packed_4x8_integer_dot_product;':''}${subgroups&&!staged?'enable subgroups;':''}`)+declarations+gatedByte+`
 fn weight(index:u32)->i32 {let word=input1[param(1u)/4u+index/${32/bits}u];let slot=index%${32/bits}u;return i32(((word>>(8u*(slot%4u)+${bits}u*(slot/4u)))&${(1<<bits)-1}u)<<${32-bits}u)>>${32-bits}u;}
 @compute @workgroup_size(${threads}) fn main(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index) thread:u32${subgroups&&!staged?',@builtin(subgroup_size) subgroup_width:u32':''}){
 let width=param(16u);let columns=param(17u);let block=group_index(group);let per_row=param(24u);
-let row=block/per_row;let column=(block%per_row)*${staged?columnsPerGroup:4}u+thread/${laneCount}u;let lane=thread%${laneCount}u;
+let row=block/per_row;let logical_column=(block%per_row)*${staged?columnsPerGroup:4}u+thread/${laneCount}u;
+let column=${ffnGate?'(logical_column/32u)*16u+logical_column%16u+select(0u,columns/2u,(logical_column%32u)>=16u)':'logical_column'};let lane=thread%${laneCount}u;
 var sum=${quantized?'0i':'0.0'};
 ${staged?stagedLoop:fallback}
 ${subgroups&&!staged?'if(subgroup_width==32u){sum=subgroupAdd(sum);}else{':''}
 partial[thread]=sum;workgroupBarrier();for(var step=${laneCount/2}u;step>0u;step/=2u){if(lane<step){partial[thread]+=partial[thread+step];}workgroupBarrier();}sum=partial[thread];${subgroups&&!staged?'}':''}
-if(lane==0u&&column<columns){let value=${quantized?'f32(sum)*scalar(20u)*load2(column)':staged&&singleScale?'sum*load2(column)':'sum'};store(row*columns+column,calibrated(value,scalar(21u)));}}`;
+${ffnGate?`if(thread<4u){var packed=0u;let base=(block%per_row)*16u;
+for(var component=0u;component<4u;component++){let channel=thread*4u+component;
+let gate=calibrated(f32(partial[channel*8u])*scalar(20u)*load2(base+channel),scalar(21u));
+let up=calibrated(f32(partial[(channel+16u)*8u])*scalar(20u)*load2(columns/2u+base+channel),scalar(21u));
+packed|=gated_byte(gate,up)<<(component*8u);}
+output[param(8u)/4u+row*(columns/8u)+base/4u+thread]=packed;}`:
+`if(lane==0u&&column<columns){let value=${quantized?'f32(sum)*scalar(20u)*load2(column)':staged&&singleScale?'sum*load2(column)':'sum'};store(row*columns+column,calibrated(value,scalar(21u)));}`} }`;
         groups=rows*uniforms[24];
         if(quantized && rows>=4){
             uniforms[23]=Math.ceil(columns/32);
-            code=header(3,'requires packed_4x8_integer_dot_product;')+`
+            code=header(3,'requires packed_4x8_integer_dot_product;')+gatedByte+`
 var<workgroup> activation_tile:array<u32,256>;var<workgroup> weight_tile:array<u32,1024>;
+${ffnGate?'var<workgroup> ffn_values:array<f32,256>;':''}
 fn weight(index:u32)->i32 {let word=input1[param(1u)/4u+index/${32/bits}u];let slot=index%${32/bits}u;return i32(((word>>(8u*(slot%4u)+${bits}u*(slot/4u)))&${(1<<bits)-1}u)<<${32-bits}u)>>${32-bits}u;}
 @compute @workgroup_size(256) fn main(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index) lane:u32){
 let tile=group_index(group);let row_start=(tile/param(23u))*8u;let column_start=(tile%param(23u))*32u;
@@ -170,15 +200,21 @@ let local_row=lane/32u;let local_column=lane%32u;let width=param(16u);var sum=0i
 for(var base=0u;base<width;base+=128u){
     let input_row=row_start+local_row;let input_channel=base+local_column*4u;
     var input_word=0u;if(input_row<param(18u)&&input_channel<width){input_word=input0[param(0u)/4u+(input_row*param(22u)+input_channel)/4u];}activation_tile[lane]=input_word;
-    for(var index=lane;index<1024u;index+=256u){let column=column_start+index/32u;let channel=base+(index%32u)*4u;var word=0u;
+    for(var index=lane;index<1024u;index+=256u){let logical_column=column_start+index/32u;
+        let column=${ffnGate?'(logical_column/32u)*16u+logical_column%16u+select(0u,param(17u)/2u,(logical_column%32u)>=16u)':'logical_column'};let channel=base+(index%32u)*4u;var word=0u;
         if(column<param(17u)&&channel<width){${packFour}word=packed;}weight_tile[index]=word;
     }
     workgroupBarrier();
     for(var inner=0u;inner<32u;inner++){sum+=dot4I8Packed(activation_tile[local_row*32u+inner],weight_tile[local_column*32u+inner]);}
     workgroupBarrier();
 }
-let row=row_start+local_row;let column=column_start+local_column;
-if(row<param(18u)&&column<param(17u)){store(row*param(17u)+column,calibrated(f32(sum)*scalar(20u)*load2(column),scalar(21u)));}}`;
+let row=row_start+local_row;let logical_column=column_start+local_column;
+let column=${ffnGate?'(logical_column/32u)*16u+logical_column%16u+select(0u,param(17u)/2u,(logical_column%32u)>=16u)':'logical_column'};
+${ffnGate?`ffn_values[lane]=calibrated(f32(sum)*scalar(20u)*load2(column),scalar(21u));workgroupBarrier();
+if(row<param(18u)&&local_column<4u){var packed=0u;for(var component=0u;component<4u;component++){
+let index=local_row*32u+local_column*4u+component;packed|=gated_byte(ffn_values[index],ffn_values[index+16u])<<(component*8u);}
+output[param(8u)/4u+row*(param(17u)/8u)+column_start/8u+local_column]=packed;}`:
+`if(row<param(18u)&&column<param(17u)){store(row*param(17u)+column,calibrated(f32(sum)*scalar(20u)*load2(column),scalar(21u)));}`} }`;
             groups=Math.ceil(rows/8)*Math.ceil(columns/32);
         }
     } else if (operation==='linear') {
@@ -377,6 +413,38 @@ let channel=index%width;let head=(index/width)%heads;let query=(index/width/head
 for(var key=0u;key<keys;key++){let source=${keyBase.replace('KEY','key')};sum+=load0(scores+key)*${stagedValueAt};}store(index,sum);}`;
             groups=Math.ceil(product(shape)/128);
         }
+    } else if(operation==='scatter') {
+        const bytes=dtype===2||dtype===1?1:dtype===9||dtype===10?2:dtype===11||dtype===6?4:0;
+        if(!bytes)throw new Error('Unsupported WebGPU scatter dtype');
+        const [batches,capacity,width]=shape, updates=operands[1].shape[1];
+        uniforms[16]=capacity;uniforms[17]=width;uniforms[18]=updates;
+        validatesIndices=true;
+        const validation=count=>`@group(0) @binding(${count+2}) var<storage,read_write> failure:atomic<u32>;
+    fn valid_indices()->bool{for(var row=0u;row<param(18u);row++){if(input${count-1}[param(${count-1}u)/4u+row]>=param(16u)){atomicStore(&failure,1u);return false;}}return true;}`;
+        if(spec.inplace&&width*bytes%4===0){
+            bindings=2;finalInputs=[1,2];
+            uniforms[19]=width*bytes/4;uniforms[20]=batches*updates*uniforms[19];
+            code=header(2)+validation(2)+`@compute @workgroup_size(128) fn main(@builtin(global_invocation_id) id:vec3<u32>){
+let index=invocation_index(id);if(index>=param(20u)||!valid_indices()){return;}let word=index%param(19u);let row=(index/param(19u))%param(18u);let batch=index/param(19u)/param(18u);
+let position=input1[param(1u)/4u+row];if(position>=param(16u)){return;}
+for(var later=row+1u;later<param(18u);later++){if(input1[param(1u)/4u+later]==position){return;}}
+output[param(8u)/4u+(batch*param(16u)+position)*param(19u)+word]=input0[param(0u)/4u+index];}`;
+            groups=Math.ceil(uniforms[20]/128);
+        }else{
+            if(spec.inplace){bindings=2;finalInputs=[1,2];}
+            const count=spec.inplace?2:3, update=spec.inplace?0:1, indices=count-1;
+            uniforms[19]=product(shape);uniforms[20]=Math.ceil(product(shape)*bytes/4);
+            code=header(count)+validation(count)+`@compute @workgroup_size(128) fn main(@builtin(global_invocation_id) id:vec3<u32>){
+let word=invocation_index(id);if(word>=param(20u)||!valid_indices()){return;}var packed=${spec.inplace?'output[param(8u)/4u+word]':'0u'};
+for(var component=0u;component<${4/bytes}u;component++){let index=word*${4/bytes}u+component;if(index>=param(19u)){break;}
+let channel=index%param(17u);let position=(index/param(17u))%param(16u);let batch=index/param(17u)/param(16u);
+let original=param(${spec.inplace?8:0}u)+index*${bytes}u;var value=${spec.inplace?'output':'input0'}[original/4u]>>((original%4u)*8u);
+for(var row=0u;row<param(18u);row++){if(input${indices}[param(${indices}u)/4u+row]==position){let source=param(${update}u)+((batch*param(18u)+row)*param(17u)+channel)*${bytes}u;value=input${update}[source/4u]>>((source%4u)*8u);}}
+let mask=${bytes===4?'0xffffffffu':bytes===2?'65535u':'255u'};let shift=component*${bytes*8}u;
+packed=(packed&~(mask<<shift))|((value&mask)<<shift);}
+output[param(8u)/4u+word]=packed;}`;
+            groups=Math.ceil(uniforms[20]/128);
+        }
     } else if(operation==='concat') {
         if(dtype!==11)throw new Error('WebGPU concatenation requires FP32 output');
         const axis=(attributes[0]+shape.length)%shape.length;
@@ -388,7 +456,7 @@ for(var key=0u;key<keys;key++){let source=${keyBase.replace('KEY','key')};sum+=l
     coordinate-=param(${20+index}u);`).join('\n')}}`;
         groups=Math.ceil(product(shape)/128);
     } else throw new Error(`WebGPU operator ${operation} is not implemented`);
-    return {shape,dtype,code,groups,uniforms,scratch,stages,operation,bindings,finalInputs};
+    return {shape,dtype,code,groups,uniforms,scratch,stages,operation,bindings,finalInputs,validatesIndices};
 }
 
 function softmax(count, logarithmic) {

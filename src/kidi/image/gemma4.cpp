@@ -42,14 +42,25 @@ auto filters(std::int32_t input, std::int32_t output) -> std::vector<Filter> {
 }
 } // namespace
 
-auto prepare_gemma4(std::span<const std::uint8_t> encoded, std::int32_t soft_tokens) -> Result<Gemma4Image> {
+auto prepare_gemma4(std::span<const std::uint8_t> encoded, std::int32_t soft_tokens, std::size_t max_resized_pixels)
+    -> Result<Gemma4Image> {
     constexpr std::array allowed{70, 140, 280, 560, 1120};
     if (encoded.empty() || encoded.size() > 32 * 1024 * 1024 ||
         std::ranges::find(allowed, soft_tokens) == allowed.end())
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid image size or Gemma image token budget"});
+    if (max_resized_pixels < MIN_RESIZED_PIXELS || max_resized_pixels > MAX_RESIZED_PIXELS)
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT, "image resize limit must be 161280 to 3000000 pixels"});
+    std::int32_t budget = 0;
+    for (const auto candidate : allowed)
+        if (candidate <= soft_tokens && static_cast<std::size_t>(candidate) * 48 * 48 <= max_resized_pixels)
+            budget = candidate;
+    soft_tokens = budget;
     try {
-        const auto decoded =
-            tahoma::vision::decode(encoded, {.max_pixels = 64 * 1024 * 1024, .max_decoded_bytes = 192 * 1024 * 1024});
+        const auto decoded = tahoma::vision::decode(
+            encoded, {.max_pixels = MAX_IMAGE_PIXELS, .max_decoded_bytes = MAX_IMAGE_PIXELS * 4});
+        if (static_cast<std::uint64_t>(decoded.width) * decoded.height > MAX_IMAGE_PIXELS)
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "image exceeds 24000000 pixels"});
         if (decoded.width > 16384 || decoded.height > 16384)
             return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "image dimensions exceed 16384 pixels"});
         const auto factor =

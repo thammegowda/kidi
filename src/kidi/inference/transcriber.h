@@ -33,10 +33,13 @@ struct Transcription {
 
 class Transcriber {
 public:
-    static auto load(const std::filesystem::path& directory, tensor::Device device = tensor::Device::cpu())
-        -> Result<Transcriber>;
+    static auto load(const std::filesystem::path& directory,
+                     tensor::Device device = tensor::Device::cpu()) -> Result<Transcriber>;
     auto transcribe(std::span<const float> waveform, std::uint32_t sample_rate,
                     const TranscriptionOptions& options = {}) -> Result<Transcription>;
+
+    /// Where transcription runs, e.g. "cpu".
+    auto execution() const -> std::string { return std::string(tensor::to_string(model_->device().kind)); }
 
 private:
     Transcriber(YAML::Node config, YAML::Node generation, audio::WhisperFeatureExtractor extractor,

@@ -2,8 +2,14 @@
 
 #include <memory>
 #include <array>
+#include <functional>
 #include <stdexcept>
+#include <string_view>
 #include "kidi/tensor/tensor.h"
+
+namespace kidi::runtime {
+class StepCompiler;
+}
 
 namespace kidi::ops {
 class DecodeScope {
@@ -15,6 +21,18 @@ public:
 
 private:
     bool previous_;
+};
+/// Attaches `compiler` to CPU contexts constructed on this thread while the scope is alive, so their captured
+/// steps run on an accelerator. Scopes nest and restore the previous compiler.
+class StepCompilerScope {
+public:
+    explicit StepCompilerScope(std::shared_ptr<runtime::StepCompiler> compiler);
+    ~StepCompilerScope();
+    StepCompilerScope(const StepCompilerScope&) = delete;
+    auto operator=(const StepCompilerScope&) -> StepCompilerScope& = delete;
+
+private:
+    std::shared_ptr<runtime::StepCompiler> previous_;
 };
 using tensor::Tensor;
 
@@ -49,6 +67,9 @@ inline auto require(Result<void> result) -> void {
 /// In-place calls preserve shape, dtype, and storage. Synchronize before host reads on Metal.
 class Context {
 public:
+    /// One fixed-shape step body: ordinary eager operations over `inputs`, returning the step outputs.
+    using Step = std::function<std::vector<Tensor>(std::span<const Tensor> inputs)>;
+
     explicit Context(tensor::Device device = tensor::Device::cpu(), bool packed_prefill = false);
     ~Context();
     Context(Context&&) noexcept;
@@ -59,6 +80,28 @@ public:
     auto synchronize() -> void;
     auto preparation_ns() const noexcept -> std::uint64_t;
     auto profile_phase(std::string_view phase) -> void;
+
+    /// Runs `step`, capturing its operators the first two times `key` is used and replaying them afterwards.
+    /// A step reads only `inputs`, parameters, and tensors whose storage stays fixed; values that change per call
+    /// are written into `inputs` before calling. The two captures must match, which rejects host-computed
+    /// temporaries and per-call operator arguments. Replay may rebind inputs of the same shape and dtype. Outputs
+    /// belong to the captured step and are overwritten by the next call with the same key. Backends without replay,
+    /// or `KIDI_REPLAY=0`, run `step` eagerly on every call.
+    auto replay(std::string_view key, std::span<const Tensor> inputs, const Step& step) -> std::span<const Tensor>;
+    auto replay_enabled() const noexcept -> bool;
+    auto clear_replays() -> void;
+    auto release_workspaces() -> void;
+    /// Evicts captured steps whose key begins with `prefix`, for example completed prefill shapes before decode.
+    auto clear_replays(std::string_view prefix) -> void;
+    /// Name of the accelerator compiling captured steps, or empty when steps replay on this context's device.
+    auto accelerator() const noexcept -> std::string_view;
+    /// The attached step compiler, e.g. to keep it when a model re-creates its context.
+    auto step_compiler() const noexcept -> std::shared_ptr<runtime::StepCompiler>;
+    /// Attention key extent for a captured step needing `required` keys from a cache of `capacity`.
+    auto step_extent(std::size_t required, std::size_t capacity) const -> std::size_t;
+    /// Whether captured steps may crop local-attention keys (each crop offset is a separate step shape).
+    auto crop_local_attention() const noexcept -> bool;
+    auto prefill_chunk_size(std::size_t requested) const -> std::size_t;
     auto prepare_linear_weights(const Tensor& weight, std::int32_t bits, std::int32_t group_size = 128,
                                 bool packed_prefill = true) -> void;
     auto add(const Tensor& left, const Tensor& right) -> Tensor;
@@ -92,8 +135,8 @@ public:
     auto embedding(const Tensor& indices, const Tensor& weight, const Tensor& scales, std::int32_t width,
                    std::int32_t bits, float multiplier) -> Tensor;
     auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
-    auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine, float epsilon)
-        -> Tensor;
+    auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
+                    float epsilon) -> Tensor;
     auto rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,
                            const Tensor& output_scale = {}) -> Tensor;
     auto layer_norm(const Tensor& input, const Tensor& scale, const Tensor& bias, float epsilon) -> Tensor;

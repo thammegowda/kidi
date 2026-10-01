@@ -22,6 +22,8 @@ class WhisperPositionEmbeddingImpl : public Module {
 public:
     WhisperPositionEmbeddingImpl(std::int32_t positions, std::int32_t width);
     auto forward(ops::Context& context, std::size_t start, std::size_t length) const -> Tensor;
+    /// Position rows selected by an I32 `[length]` index tensor, as `[1, length, width]`.
+    auto gather(ops::Context& context, const Tensor& positions) const -> Tensor;
 
 private:
     Tensor weight_;
@@ -88,9 +90,9 @@ public:
     WhisperDecoderImpl(std::int32_t vocabulary, std::int32_t hidden, std::int32_t intermediate, std::int32_t heads,
                        std::int32_t layer_count, std::int32_t positions, float epsilon);
     auto project_source(ops::Context& context, const Tensor& input) const -> std::vector<KeyValue>;
-    auto forward(ops::Context& context, std::span<const std::int32_t> tokens, std::size_t position,
-                 std::span<const KeyValue> source, const Tensor& self_mask, std::span<KeyValue> cache,
-                 const Tensor& cache_index) const -> Tensor;
+    /// Decodes I32 `tokens` at the positions in `cache_index`, which also selects the self-attention cache rows.
+    auto forward(ops::Context& context, const Tensor& tokens, std::span<const KeyValue> source, const Tensor& self_mask,
+                 std::span<KeyValue> cache, const Tensor& cache_index) const -> Tensor;
 
 private:
     TokenEmbedding tokens_;

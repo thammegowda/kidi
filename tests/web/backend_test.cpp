@@ -1,15 +1,25 @@
 #include "kidi/tensor/web_gpu.h"
 #include "kidi/ops/context.h"
 #include "kidi/model/gemma4.h"
+#include "kidi/model/gemma4_vision.h"
 #include "kidi/checkpoint/config.h"
 #include "kidi/text/tokenizer.h"
 #include <emscripten.h>
 #include <iostream>
 #include <cmath>
+#include <fstream>
 
 extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_test() -> int {
     try {
         using namespace kidi;
+        for (const auto* format : {"png", "jpeg"}) {
+            std::ifstream stream(std::string("/fixtures/image.") + format, std::ios::binary);
+            const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+            const auto image = ops::require(image::prepare_gemma4(bytes, 70));
+            if (image.patch_rows * image.patch_columns / 9 > 70 || image.patches.empty())
+                throw std::runtime_error("invalid browser image patches");
+        }
+        std::cout << "Tahoma PNG/JPEG browser preprocessing passed\n";
         const std::array values{1.F, -2.F, 3.F, 4.F};
         auto tensor =
             ops::require(tensor::Tensor::from_host({4}, std::span<const float>(values), tensor::Device::web_gpu()));
@@ -170,6 +180,185 @@ extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_test() -> int {
         context.synchronize();
         if (ops::require(token.data<std::int32_t>())[0] != 3) return 6;
         std::cout << "RMSNorm, softmax, grouped attention and device selection passed\n";
+        {
+            if (!context.replay_enabled()) throw std::runtime_error("WebGPU replay is disabled");
+            int captures = 0;
+            for (int iteration = 0; iteration < 5; ++iteration) {
+                const std::array row_values{1.F, static_cast<float>(iteration + 2), 3.F, 4.F};
+                auto row = ops::require(tensor::Tensor::from_host({1, 1, 4}, std::span<const float>(row_values),
+                                                                  tensor::Device::web_gpu()));
+                const std::array<std::int32_t, 1> position{iteration % 3};
+                auto indices = ops::require(
+                    tensor::Tensor::from_host({1}, std::span<const std::int32_t>(position), tensor::Device::web_gpu()));
+                const std::array<float, 12> zeros{};
+                auto cache = ops::require(
+                    tensor::Tensor::from_host({1, 3, 4}, std::span<const float>(zeros), tensor::Device::web_gpu()));
+                const auto outputs = context.replay("webgpu_rebind", std::array{row, cache, indices},
+                                                    [&](std::span<const tensor::Tensor> inputs) {
+                                                        ++captures;
+                                                        auto squared = context.add(inputs[0], inputs[0]);
+                                                        context.multiply_(squared, inputs[0]);
+                                                        auto destination = inputs[1];
+                                                        context.scatter_(destination, squared, inputs[2]);
+                                                        return std::vector{destination, context.greedy_token(squared)};
+                                                    });
+                context.synchronize();
+                std::array<float, 12> expected_values{};
+                for (std::size_t channel = 0; channel < row_values.size(); ++channel)
+                    expected_values[position[0] * 4 + channel] = 2.F * row_values[channel] * row_values[channel];
+                auto expected_cache =
+                    ops::require(tensor::Tensor::from_host({1, 3, 4}, std::span<const float>(expected_values)));
+                compare(expected_cache, outputs[0], 0.F);
+                const auto expected_token = std::ranges::max_element(row_values) - row_values.begin();
+                if (ops::require(outputs[1].data<std::int32_t>())[0] != expected_token)
+                    throw std::runtime_error("replayed token readback mismatch");
+            }
+            if (captures != 2) throw std::runtime_error("WebGPU did not reuse the captured step");
+            std::cout << "Replay input rebinding, cache mutation and token readback passed\n";
+        }
+        for (const int width : {4, 5}) {
+            std::vector<std::int8_t> initial(6 * width), updates(6 * width);
+            for (std::size_t index = 0; index < initial.size(); ++index) {
+                initial[index] = static_cast<std::int8_t>(index - 15);
+                updates[index] = static_cast<std::int8_t>(31 - index);
+            }
+            const std::array<std::int32_t, 3> positions{2, 0, 2};
+            auto host_cache =
+                ops::require(tensor::Tensor::from_host({2, 3, width}, std::span<const std::int8_t>(initial)));
+            auto host_updates =
+                ops::require(tensor::Tensor::from_host({2, 3, width}, std::span<const std::int8_t>(updates)));
+            auto host_indices = ops::require(tensor::Tensor::from_host({3}, std::span<const std::int32_t>(positions)));
+            auto expected = ops::require(cpu.scatter(host_cache, host_updates, host_indices).copy_to_host());
+            auto device_cache = ops::require(host_cache.to(tensor::Device::web_gpu()));
+            auto device_updates = ops::require(host_updates.to(tensor::Device::web_gpu()));
+            auto device_indices = ops::require(host_indices.to(tensor::Device::web_gpu()));
+            auto separate = context.scatter(device_cache, device_updates, device_indices);
+            context.scatter_(device_cache, device_updates, device_indices);
+            context.synchronize();
+            if (ops::require(separate.copy_to_host()) != expected ||
+                ops::require(device_cache.copy_to_host()) != expected)
+                throw std::runtime_error("packed scatter mismatch");
+        }
+        {
+            const std::array initial{1.F, 2.F, 3.F};
+            auto cache = ops::require(
+                tensor::Tensor::from_host({1, 3, 1}, std::span<const float>(initial), tensor::Device::web_gpu()));
+            auto updates = context.reshape(ops::require(context.reshape(cache, {3}).narrow(0, 0, 2)), {1, 2, 1});
+            const std::array<std::int32_t, 2> positions{1, 2};
+            auto indices = ops::require(
+                tensor::Tensor::from_host({2}, std::span<const std::int32_t>(positions), tensor::Device::web_gpu()));
+            context.scatter_(cache, updates, indices);
+            const std::array expected{1.F, 1.F, 2.F};
+            compare(ops::require(tensor::Tensor::from_host({1, 3, 1}, std::span<const float>(expected))), cache, 0.F);
+        }
+        std::cout << "Packed, duplicate-index and overlapping scatter parity passed\n";
+        for (const int bits : {2, 4, 8}) {
+            const int width = 128, intermediate = 160;
+            const auto packed = [&](int columns, int channels, int seed) {
+                std::vector<std::uint8_t> bytes(columns * channels * bits / 8);
+                for (std::size_t index = 0; index < bytes.size(); ++index)
+                    bytes[index] = static_cast<std::uint8_t>(index * 71 + seed);
+                return ops::require(
+                    tensor::Tensor::from_host({columns, channels * bits / 8}, std::span<const std::uint8_t>(bytes)));
+            };
+            const auto scales = [&](int columns) {
+                std::vector<float> values(columns);
+                for (std::size_t index = 0; index < values.size(); ++index) values[index] = (index % 5 + 1) / 512.F;
+                return ops::require(tensor::Tensor::from_host({columns, 1}, std::span<const float>(values)));
+            };
+            for (const bool device_weights : {false, true}) {
+                const auto weight_device = device_weights ? tensor::Device::web_gpu() : tensor::Device::cpu();
+                auto gate_weight = ops::require(packed(intermediate * 2, width, 37).to(weight_device));
+                auto down_weight = ops::require(packed(width, intermediate, 93).to(weight_device));
+                auto gate_scale = ops::require(scales(intermediate * 2).to(weight_device));
+                auto down_scale = ops::require(scales(width).to(weight_device));
+                for (const int rows : {1, 3, 4, 32, 33}) {
+                    int captures = 0;
+                    for (int iteration = 0; iteration < 4; ++iteration) {
+                        std::vector<float> values(rows * width);
+                        for (std::size_t index = 0; index < values.size(); ++index)
+                            values[index] = (static_cast<int>((index * 17 + iteration * 7) % 67) - 33) * 0.125F;
+                        auto input = ops::require(tensor::Tensor::from_host(
+                            {1, rows, width}, std::span<const float>(values), tensor::Device::web_gpu()));
+                        const auto projected =
+                            context.packed_linear(input, gate_weight, gate_scale, bits, width, 0.25F, 0.0625F);
+                        const auto hidden =
+                            context.gelu_multiply(context.slice(projected, -1, 0, intermediate),
+                                                  context.slice(projected, -1, intermediate, intermediate));
+                        const auto expected = context.packed_linear(hidden, down_weight, down_scale, bits, intermediate,
+                                                                    0.125F, 0.03125F);
+                        const auto outputs =
+                            context.replay("ffn", std::array{input}, [&](std::span<const tensor::Tensor> operands) {
+                                ++captures;
+                                return std::vector{context.gated_feed_forward(
+                                    operands[0], gate_weight, gate_scale, down_weight, down_scale, bits, width,
+                                    intermediate, 0.25F, 0.0625F, 0.125F, 0.03125F)};
+                            });
+                        context.synchronize();
+                        compare(ops::require(expected.to(tensor::Device::cpu())), outputs[0], 0.F);
+                    }
+                    if (captures != 2) throw std::runtime_error("fused FFN did not replay");
+                    context.clear_replays("ffn");
+                }
+            }
+        }
+        std::cout << "Fused Q2/Q4/Q8 FFN decode/prefill and replay parity passed\n";
+        {
+            std::ifstream stream("/fixtures/image.jpeg", std::ios::binary);
+            const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+            ops::require(image::prepare_gemma4(bytes, 70));
+            std::cout << "Tahoma JPEG preprocessing after JSPI resume passed\n";
+        }
+        for (const bool quantized : {false, true}) {
+            const auto config = YAML::Load(R"(
+hidden_size: 8
+intermediate_size: 16
+num_hidden_layers: 1
+num_attention_heads: 2
+num_key_value_heads: 2
+head_dim: 4
+patch_size: 16
+pooling_kernel_size: 3
+position_embedding_size: 32
+rms_norm_eps: 0.000001
+rope_parameters: {rope_theta: 10000}
+)");
+            StateDict parameters;
+            {
+                const ModuleScope scope(tensor::DType::F32, true, tensor::Device::cpu());
+                const auto vision = model::Gemma4Vision(config, 20, quantized);
+                for (auto [name, value] : vision->state_dict()) {
+                    if (value.dtype() == tensor::DType::U8) {
+                        auto values = ops::require(value.data<std::uint8_t>());
+                        for (std::size_t index = 0; index < values.size(); ++index)
+                            values[index] = static_cast<std::uint8_t>(static_cast<int>(index % 5) - 2);
+                    } else {
+                        auto values = ops::require(value.data<float>());
+                        for (std::size_t index = 0; index < values.size(); ++index)
+                            values[index] = name.ends_with("scale") ? 0.125F : (static_cast<int>(index % 13) - 5) * 0.02F;
+                    }
+                    parameters.emplace("model." + name, std::move(value));
+                }
+            }
+            const auto path = quantized ? "/fixtures/vision-qat.safetensors" : "/fixtures/vision.safetensors";
+            ops::require(checkpoint::Weights::save(path, parameters));
+            const auto weights = ops::require(checkpoint::Weights::load(path));
+            image::Gemma4Image pixels{6, 9, std::vector<float>(6 * 9 * 768)};
+            for (std::size_t index = 0; index < pixels.patches.size(); ++index)
+                pixels.patches[index] = static_cast<float>(index % 251) / 255.F;
+            tensor::Tensor expected;
+            {
+                const ModuleScope scope(tensor::DType::F32, false, tensor::Device::cpu());
+                const auto vision = model::Gemma4Vision(config, 20, quantized);
+                ops::require(vision->set_checkpoint(weights));
+                expected = ops::require(vision->forward(pixels));
+            }
+            const ModuleScope scope(tensor::DType::F32, false, tensor::Device::web_gpu());
+            const auto vision = model::Gemma4Vision(config, 20, quantized);
+            ops::require(vision->set_checkpoint(weights));
+            compare(expected, ops::require(vision->forward(pixels)), 2e-4F);
+        }
+        std::cout << "FP32 and QAT vision encoder CPU/WebGPU feature parity passed\n";
         for (const auto* fixture : {"gemma4", "gemma4-qat"}) {
             const auto directory = std::filesystem::path("/fixtures") / fixture;
             const auto config = YAML::LoadFile((directory / "model.yaml").string())["model"];

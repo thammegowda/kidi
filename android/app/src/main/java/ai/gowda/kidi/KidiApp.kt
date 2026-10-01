@@ -1,6 +1,7 @@
 package ai.gowda.kidi
 
 import android.Manifest
+import android.content.Intent
 import android.net.Uri
 import android.os.SystemClock
 import android.annotation.SuppressLint
@@ -221,6 +222,8 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
             onModelId = viewModel::setModelId,
             onSpeechModelId = viewModel::setSpeechModelId,
             onThreads = viewModel::setThreadCount,
+            onChatAccelerator = viewModel::setChatAccelerator,
+            onSpeechAccelerator = viewModel::setSpeechAccelerator,
             onTokens = viewModel::setMaximumTokens,
             onInstall = viewModel::installModel,
             onCancelChat = viewModel::cancelModelInstall,
@@ -781,6 +784,8 @@ internal fun SettingsSheet(
     onCancelSpeech: () -> Unit,
     onDelete: () -> Unit,
     onDeleteSpeech: () -> Unit,
+    onChatAccelerator: (String) -> Unit = {},
+    onSpeechAccelerator: (String) -> Unit = {},
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var selectedTab by rememberSaveable { mutableStateOf(0) }
@@ -831,7 +836,7 @@ internal fun SettingsSheet(
                         onDelete = onDeleteSpeech, deleteLabel = "Remove speech model",
                     )
                 } else {
-                    InferenceSettings(state, onThreads, onTokens)
+                    InferenceSettings(state, onThreads, onChatAccelerator, onSpeechAccelerator, onTokens)
                 }
                 LegalFooter(Modifier.padding(horizontal = 24.dp, vertical = 16.dp))
             }
@@ -950,7 +955,13 @@ private fun ModelSection(
 }
 
 @Composable
-private fun InferenceSettings(state: KidiUiState, onThreads: (Int) -> Unit, onTokens: (Int) -> Unit) {
+private fun InferenceSettings(
+    state: KidiUiState,
+    onThreads: (Int) -> Unit,
+    onChatAccelerator: (String) -> Unit,
+    onSpeechAccelerator: (String) -> Unit,
+    onTokens: (Int) -> Unit,
+) {
     var threads by remember(state.threadCount) { mutableStateOf(state.threadCount.toFloat()) }
     var outputMenu by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
@@ -982,14 +993,96 @@ private fun InferenceSettings(state: KidiUiState, onThreads: (Int) -> Unit, onTo
             }
         }
         HorizontalDivider()
+        AcceleratorSetting("Chat accelerator", state.chatAccelerator, state.chatExecution, !state.runtimeBusy,
+            onChatAccelerator)
+        AcceleratorSetting("Speech accelerator", state.speechAccelerator, state.speechExecution, !state.runtimeBusy,
+            onSpeechAccelerator)
+        HorizontalDivider()
+        Text("Hardware diagnostics", style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        HardwareDiagnosticRow("CPU", state.cpuDiagnostic)
+        HardwareDiagnosticRow("GPU", state.gpuDiagnostic)
+        HardwareDiagnosticRow("NPU", state.npuDiagnostic)
+        val context = LocalContext.current
+        Button(
+            onClick = { context.startActivity(Intent(context, BenchmarkActivity::class.java)) },
+            enabled = !state.runtimeBusy,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Run accelerator benchmark")
+        }
+        Text("Temporarily unloads the models and runs the same prompt on CPU, GPU, and NPU.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        HorizontalDivider()
         Text("Runtime", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Row {
             Text("Context window", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
             Text("9,216 tokens", style = MaterialTheme.typography.bodyMedium)
         }
-        Row {
-            Text("Backend", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-            Text("YNNPACK CPU", style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+@Composable
+private fun HardwareDiagnosticRow(title: String, diagnostic: HardwareDiagnostic?) {
+    val status = when {
+        diagnostic == null -> "Detecting"
+        diagnostic.available -> "Available"
+        diagnostic.recognized -> "Recognized"
+        else -> "Not recognized"
+    }
+    val statusColor = when {
+        diagnostic?.available == true -> MaterialTheme.colorScheme.primary
+        diagnostic?.recognized == false -> MaterialTheme.colorScheme.error
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleSmall)
+            Text(diagnostic?.name ?: "Reading device information", style = MaterialTheme.typography.bodyMedium)
+            diagnostic?.let {
+                val details = listOf(it.backend, it.detail).filter { value -> value.isNotBlank() }.joinToString(" · ")
+                if (details.isNotEmpty())
+                    Text(details, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        Text(status, style = MaterialTheme.typography.labelMedium, color = statusColor)
+    }
+}
+
+/** Chooses auto, CPU, GPU, or NPU; shows where the loaded model actually runs. */
+@Composable
+private fun AcceleratorSetting(
+    title: String, selected: String, execution: String, enabled: Boolean, onSelect: (String) -> Unit,
+) {
+    var menu by remember { mutableStateOf(false) }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            if (execution.isNotEmpty())
+                Text("Running on ${executionLabel(execution)}", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Box {
+            TextButton(onClick = { menu = true }, enabled = enabled) {
+                Text(ACCELERATOR_LABELS[selected] ?: selected)
+                Icon(Icons.Default.ExpandMore, null, Modifier.size(20.dp))
+            }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                ACCELERATOR_LABELS.forEach { (value, label) ->
+                    DropdownMenuItem(text = { Text(label) }, onClick = {
+                        onSelect(value)
+                        menu = false
+                    })
+                }
+            }
         }
     }
+}
+
+internal fun executionLabel(execution: String) = when {
+    execution.contains("qnn") -> "NPU (Hexagon) with CPU"
+    execution.startsWith("vulkan") -> "GPU (Vulkan)"
+    execution.startsWith("cpu") -> "CPU (YNNPACK)"
+    else -> execution
 }
