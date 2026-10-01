@@ -28,6 +28,10 @@ let recording;
 let recordingTimer;
 let recordingDeadline;
 let speechWorker;
+let speechSession;
+let speechReady = false;
+let speechModel = '';
+let speechThreads = 0;
 let visionSupported = false;
 let draftImages = [];
 let preparingImages = false;
@@ -404,8 +408,6 @@ function releaseRecording(session = recording) {
 }
 function restart() {
     releaseRecording();
-    speechWorker?.terminate();
-    speechWorker = null;
     runtimeVersion++;
     worker?.terminate();
     worker = null;
@@ -582,8 +584,7 @@ function updateDraft(text) {
 }
 
 function failSpeech(session, error) {
-    if (session.worker) session.worker.terminate();
-    if (speechWorker === session.worker) speechWorker = null;
+    disposeSpeechWorker();
     session.worker = null;
     if (recording === session) releaseRecording(session);
     element('warning').textContent = error;
@@ -602,22 +603,55 @@ function requestSpeech(session, final) {
         language: 'auto', maximumTokens: 128}, [audio.buffer]);
 }
 
-function startSpeechWorker(session) {
-    const worker = new Worker(new URL('./asr-worker.mjs', import.meta.url), {type: 'module'});
-    session.worker = worker;
+function disposeSpeechWorker() {
+    speechWorker?.terminate();
+    speechWorker = null;
+    speechReady = false;
+    if (speechSession) speechSession.worker = null;
+    speechSession = null;
+}
+
+function preloadSpeech() {
+    const modelId = element('speech-model').value.trim();
+    const threads = crossOriginIsolated ? Number(element('threads').value) : 1;
+    if (!MODEL_ID.test(modelId) || !Number.isInteger(threads) || threads < 1 || threads > 8) return null;
+    if (speechWorker && speechModel === modelId && speechThreads === threads) return speechWorker;
+    disposeSpeechWorker();
+    speechModel = modelId;
+    speechThreads = threads;
+    const status = element('speech-status');
+    status.textContent = 'Loading speech model';
+    status.classList.remove('error');
+    let worker;
+    const failed = error => {
+        const session = speechSession;
+        disposeSpeechWorker();
+        status.textContent = `Speech unavailable: ${error}`;
+        status.classList.add('error');
+        if (session) failSpeech(session, error);
+    };
+    try { worker = new Worker(new URL('./asr-worker.mjs', import.meta.url), {type: 'module'}); }
+    catch (error) { failed(error.message);return null; }
     speechWorker = worker;
-    worker.onerror = event => failSpeech(session, event.message);
+    worker.onerror = event => { if (speechWorker === worker) failed(event.message); };
     worker.onmessage = ({data}) => {
-        if (session.worker !== worker) return;
+        if (speechWorker !== worker) return;
+        document.dispatchEvent(new CustomEvent('kidi:speech', {detail: data}));
+        const session = speechSession;
         if (data.type === 'progress') {
             const percent = data.totalBytes ? (data.loadedBytes / data.totalBytes * 100).toFixed(0) : '0';
-            session.status = `Loading ${session.modelId} ${percent}%`;
+            status.textContent = `Loading speech model ${percent}%`;
+            if (session) session.status = status.textContent;
         } else if (data.type === 'ready') {
-            session.ready = true;
+            speechReady = true;
+            status.textContent = 'Speech ready';
             refreshCachedModels();
-            session.status = recording === session ? 'Listening' : 'Preparing final transcript';
-            requestSpeech(session, Boolean(session.finalAudio));
-        } else if (data.type === 'result') {
+            if (session) {
+                session.ready = true;
+                session.status = recording === session ? 'Listening' : 'Preparing final transcript';
+                requestSpeech(session, Boolean(session.finalAudio));
+            }
+        } else if (data.type === 'result' && session && session.worker === worker) {
             session.transcribing = false;
             const transcript = data.text.trim();
             if (data.requestId === 'draft' && !session.finalAudio) {
@@ -633,17 +667,24 @@ function startSpeechWorker(session) {
                     'No speech recognized';
                 if (!transcript) element('warning').textContent = 'No speech was recognized';
                 session.worker = null;
-                if (speechWorker === worker) speechWorker = null;
-                worker.terminate();
+                speechSession = null;
                 finish();
                 element('prompt').focus();
             }
         } else if (data.type === 'error') {
-            failSpeech(session, data.error);
+            failed(data.error);
         }
     };
-    const threads = crossOriginIsolated ? Number(element('threads').value) : 1;
-    worker.postMessage({type: 'load', source: session.modelId, threads});
+    worker.postMessage({type: 'load', source: modelId, threads});
+    return worker;
+}
+
+function startSpeechWorker(session) {
+    session.worker = preloadSpeech();
+    if (!session.worker) throw new Error('Speech runtime is unavailable');
+    speechSession = session;
+    session.ready = speechReady;
+    session.status = speechReady ? 'Listening' : element('speech-status').textContent;
 }
 
 function finishRecording() {
@@ -653,9 +694,9 @@ function finishRecording() {
     const audio = resampleAudio(session.chunks, session.context.sampleRate);
     releaseRecording(session);
     if (audio.length < 1600) {
-        session.worker?.terminate();
         session.worker = null;
-        if (speechWorker) speechWorker = null;
+        speechSession = null;
+        if (session.transcribing) { disposeSpeechWorker();preloadSpeech(); }
         element('warning').textContent = 'Speech recording was too short';
         element('generation-stats').textContent = '9,216-token context';
         controls();
@@ -673,11 +714,13 @@ function finishRecording() {
 if (!crossOriginIsolated) element('threads').value = '1';
 if (!crossOriginIsolated) element('threads').max = '1';
 for (const id of ['threads', 'manifest']) element(id).addEventListener('change', restart);
+element('threads').addEventListener('change', preloadSpeech);
 element('speech-model').addEventListener('change', () => {
     const value = element('speech-model').value.trim();
     if (!MODEL_ID.test(value)) return;
     preferences.speechModel = value;
     try { localStorage.setItem(SETTINGS_STORAGE, JSON.stringify(preferences)); } catch {}
+    preloadSpeech();
 });
 element('backend').addEventListener('change', () => {
     preferences.backend = element('backend').value;
@@ -906,11 +949,11 @@ element('prompt').addEventListener('keydown', event => {
 element('mic').addEventListener('click', () => recording ? finishRecording() : startRecording());
 element('stop').addEventListener('click', () => {
     if (!busy || stopping) return;
-    if (speechWorker) {
-        speechWorker.terminate();
-        speechWorker = null;
+    if (speechSession) {
+        disposeSpeechWorker();
         element('generation-stats').textContent = 'Transcription cancelled';
         finish();
+        preloadSpeech();
         return;
     }
     if (!worker) return;
@@ -931,8 +974,7 @@ element('clear-cache').addEventListener('click', async () => {
 addEventListener('pagehide', () => {
     runtimeVersion++;
     releaseRecording();
-    speechWorker?.terminate();
-    speechWorker = null;
+    disposeSpeechWorker();
     stopLiveStats();
     if (busy) {
         worker?.postMessage({type: 'cancel'});
@@ -941,7 +983,7 @@ addEventListener('pagehide', () => {
     worker?.terminate();
     worker = null;
 });
-addEventListener('pageshow', event => { if (event.persisted) { restart(); restoreCachedModel(); } });
+addEventListener('pageshow', event => { if (event.persisted) { restart(); restoreCachedModel(); preloadSpeech(); } });
 
 renderHistory();
 renderMessages();
@@ -949,3 +991,4 @@ controls();
 refreshCachedModels();
 const backendSelection = selectDefaultBackend();
 restoreCachedModel();
+preloadSpeech();

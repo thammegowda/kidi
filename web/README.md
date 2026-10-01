@@ -62,15 +62,21 @@ preserved. Supported vision checkpoints accept images through the shared C++ cor
 input remains the separate Whisper dictation workflow.
 
 Settings accept a public `OWNER/REPO` Hub model ID. The resolved commit is cached separately from the mutable ID so
-byte ranges from different revisions cannot mix. Automatic startup remains offline: it reuses the last resolved commit
+byte ranges from different revisions cannot mix. Automatic chat startup remains offline: it reuses the last resolved commit
 only when every required file is cached. Previously exported manifests and pinned config URLs remain readable for
 compatibility, but are not shown in settings.
 
 Microphone dictation accepts `openai/whisper-tiny`, `openai/whisper-base`, or `openai/whisper-small`. The browser caches
-the selected model's five upstream files without conversion or a generated manifest. Whisper runs in an on-demand CPU
-Wasm worker with its own linear heap, including when Gemma uses WebGPU.
+the selected model's five upstream files without conversion or a generated manifest. The selected speech model
+(default `openai/whisper-tiny`) loads at startup, downloading missing files as needed. Whisper runs in one reusable CPU
+Wasm worker with its own linear heap, including when Gemma uses WebGPU. Model settings shows speech loading, ready,
+or error status. Preloading does not request microphone permission; permission is requested only when recording starts.
+Changing the speech model or CPU thread count replaces that worker; chat-backend changes and completed recordings retain it.
 
 ## Execution Modes
+
+On first use, the app selects WebGPU when a hardware adapter and WebAssembly JSPI are available; otherwise it uses CPU.
+An explicitly selected backend is saved and takes precedence on later visits.
 
 - **WebAssembly CPU, one thread:** uses the single-thread SIMD module.
 - **WebAssembly CPU, 2-8 threads:** uses pthreads and the YNNPACK/Slinky
@@ -148,10 +154,11 @@ The microphone button records at most 30 seconds, resamples captured mono PCM to
 isolated Whisper worker. Automatic language detection is enabled. While recording, replaceable draft hypotheses appear
 in the composer; stopping runs a final pass that may refine them. The transcript is not sent to Gemma until submitted.
 
-On startup, a fully cached model loads automatically. The last successfully
+On startup, a fully cached chat model loads automatically. The last successfully
 loaded source is remembered. Empty, partial, or unavailable caches leave the
-model offline; automatic loading never downloads missing model data. Use Load
-model to repair an incomplete or corrupt cache.
+chat model offline; automatic chat loading never downloads missing model data.
+Use Load model to repair an incomplete or corrupt chat cache. Speech preloading
+is independent and can download its selected model at startup.
 
 Messages render Markdown, including lists, links, tables, and fenced code,
 using vendored Marked and DOMPurify. Raw Markdown is kept in chat history and
