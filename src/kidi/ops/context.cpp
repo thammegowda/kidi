@@ -452,6 +452,15 @@ auto Context::profile_phase(std::string_view phase) -> void {
 auto Context::preparation_ns() const noexcept -> std::uint64_t { return impl_->preparation; }
 auto Context::replay_enabled() const noexcept -> bool { return impl_->replay_enabled; }
 auto Context::clear_replays() -> void { impl_->steps.clear(); }
+auto Context::release_workspaces() -> void {
+    if (impl_->recorder) throw Failure({ErrorCode::INVALID_ARGUMENT, "cannot release workspaces inside a captured step"});
+    synchronize();
+    impl_->steps.clear();
+    impl_->eager_outputs.clear();
+    impl_->operators.clear();
+    impl_->recent.clear();
+    impl_->backend->release_cached_buffers();
+}
 auto Context::clear_replays(std::string_view prefix) -> void {
     std::erase_if(impl_->steps, [&](const auto& entry) { return entry.first.starts_with(prefix); });
 }

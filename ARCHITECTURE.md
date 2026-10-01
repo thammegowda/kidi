@@ -445,7 +445,7 @@ maximum output length in 128-token buckets rather than the full context limit.
 The reservation stays on the same side of the backend's INT8-cache threshold
 as the requested limit, preserving its precision policy. Native callers retain
 full reservations by default; the browser enables compact reservations to
-reduce pressure on its 4 GiB linear heap.
+reduce pressure on its native wasm64 linear heap (8 GiB growth ceiling).
 
 The CPU backend replays prepared YNNPACK executables and custom kernels in order.
 Eager dispatch was about 0.75% of Whisper Small decode time on an Apple M5 (about

@@ -694,6 +694,7 @@ settingsDialog.addEventListener('click', event => { if (event.target === setting
 element('tokens').addEventListener('input', outputTokenLimit);
 
 async function loadRuntime(cacheOnly = false) {
+    await backendSelection;
     if (loading || busy) return;
     const backend = element('backend').value;
     const threads = backend === 'webgpu' ? 1 : Number(element('threads').value);
@@ -818,6 +819,15 @@ async function restoreCachedModel() {
     } catch {}
 }
 
+async function selectDefaultBackend() {
+    if (preferences.backend || !navigator.gpu || !WebAssembly.Suspending || !WebAssembly.promising) return;
+    try {
+        const adapter = await navigator.gpu.requestAdapter({powerPreference: 'high-performance'});
+        if (adapter && !adapter.info.isFallbackAdapter && !preferences.backend) element('backend').value = 'webgpu';
+    } catch {}
+    controls();
+}
+
 element('compose').addEventListener('submit', event => {
     event.preventDefault();
     const prompt = element('prompt').value.trim();
@@ -937,4 +947,5 @@ renderHistory();
 renderMessages();
 controls();
 refreshCachedModels();
+const backendSelection = selectDefaultBackend();
 restoreCachedModel();

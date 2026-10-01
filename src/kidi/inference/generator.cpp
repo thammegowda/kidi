@@ -378,6 +378,10 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
                 if (cached != images_.end()) {
                     embeddings = cached->embeddings;
                 } else {
+                    if (model_->device() == tensor::Device::cpu()) {
+                        model_->release_workspaces();
+                        if (vision_) vision_->release_workspaces();
+                    }
                     if (options.on_image_progress) options.on_image_progress("Preparing image pixels");
                     const auto pixels = require(image::prepare_gemma4(
                         std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()),
@@ -394,7 +398,9 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
                         vision_ = std::move(vision);
                     }
                     if (options.on_image_progress) options.on_image_progress("Encoding images");
-                    embeddings = require(require(vision_->forward(pixels)).to(model_->device()));
+                    auto features = vision_->forward(pixels);
+                    if (vision_->device() == tensor::Device::cpu()) vision_->release_workspaces();
+                    embeddings = require(require(std::move(features)).to(model_->device()));
                     if (options.on_image_progress) options.on_image_progress("Image encoded");
                 }
                 placeholders += "<|image>";

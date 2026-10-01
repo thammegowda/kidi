@@ -1,7 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {deleteCachedModel, isModelCached, listCachedModels, loadModel, resolveModelSource} from '../../web/model-cache.mjs';
-import {unsignedHeapIndices} from '../../web/wasm-glue.mjs';
+
+test('built wasm64 runtime addresses memory above 4 GiB', {skip: !process.env.KIDI_TEST_WASM}, async () => {
+    const {pathToFileURL} = await import('node:url');
+    const {resolve} = await import('node:path');
+    const {default: create} = await import(pathToFileURL(resolve(process.env.KIDI_TEST_WASM)).href);
+    const module = await create();
+    const base = module._malloc(2 ** 32 + 64);
+    assert.ok(base > 0);
+    try {
+        const high = base + 2 ** 32;
+        module.HEAPU8[high] = 137;
+        module.HEAPU8[high + 31] = 251;
+        assert.equal(module.HEAPU8[high], 137);
+        assert.equal(module.HEAPU8[high + 31], 251);
+        assert.ok(module.HEAPU8.byteLength > 2 ** 32);
+        const result = JSON.parse(module.ccall('kidi_transcribe', 'string',
+            ['pointer', 'number', 'string', 'number'], [high, 0, 'en', 1]));
+        assert.match(result.error, /Speech must contain/);
+    } finally { module._free(base); }
+});
 
 test('image attachments persist outside chat text and stage bounded temporary request files', async () => {
     const {storeImage, readImage, stageImages, removeUnusedImages} = await import('../../web/images.mjs');
@@ -40,13 +59,6 @@ test('image attachments persist outside chat text and stage bounded temporary re
         await assert.rejects(readImage({id: '../../model/model.yaml'}), /Invalid image/);
     } finally { globalThis.caches = previous; }
 });
-test('large-memory glue fixes direct and pthread heap indices without changing arithmetic shifts', () => {
-    const source = 'HEAP32[ptr >> 2] = 1; (growMemViews(), HEAPU64)[addr >> 3] = 2n; const signed = value >> 3;';
-    const fixed = unsignedHeapIndices(source);
-    assert.equal(fixed, 'HEAP32[ptr >>> 2] = 1; (growMemViews(), HEAPU64)[addr >>> 3] = 2n; const signed = value >> 3;');
-    assert.equal(unsignedHeapIndices(fixed), fixed);
-});
-
 test('model IDs resolve latest Hub revisions and retain an offline pinned mapping', async () => {
     const cache = new Map();
     const originalFetch = globalThis.fetch, originalCaches = globalThis.caches;

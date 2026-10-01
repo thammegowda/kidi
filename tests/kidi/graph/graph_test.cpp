@@ -66,8 +66,16 @@ auto replay_matches_eager() -> bool {
         if (!expect(values(outputs[0]) == values(expected), "replayed values match eager execution")) return false;
         storage.push_back(outputs[0].storage_identity());
     }
-    return expect(calls == 2, "a step body runs only for its two captures") &&
-           expect(storage[2] == storage[4], "replay writes pointer-stable outputs") && context.replay_enabled();
+    if (!expect(calls == 2, "a step body runs only for its two captures") ||
+        !expect(storage[2] == storage[4], "replay writes pointer-stable outputs"))
+        return false;
+    const auto retained = context.replay("affine", inputs, step)[0];
+    const auto saved = values(retained);
+    context.release_workspaces();
+    const auto fresh = context.replay("affine", inputs, step)[0];
+    return expect(values(retained) == saved, "workspace release preserves externally owned tensor storage") &&
+           expect(values(fresh) == saved, "operators rebuild correctly after workspace release") &&
+           expect(calls == 3, "workspace release discards the old captured step") && context.replay_enabled();
 }
 
 auto replay_rebinds_inputs_and_views() -> bool {

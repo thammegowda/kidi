@@ -118,15 +118,14 @@ EMSCRIPTEN_KEEPALIVE auto kidi_load_asr(const char* directory) -> const char* {
     });
 }
 
-EMSCRIPTEN_KEEPALIVE auto kidi_transcribe(std::uint32_t samples_address, std::uint32_t sample_count,
+EMSCRIPTEN_KEEPALIVE auto kidi_transcribe(const float* samples_address, std::uint32_t sample_count,
                                           const char* language, int maximum_tokens) -> const char* {
     return answer([&]() -> nlohmann::json {
         if (!samples_address || !sample_count || sample_count > 480000)
             throw std::runtime_error("Speech must contain 1 to 480000 samples");
         if (maximum_tokens < 1 || maximum_tokens > 444)
             throw std::runtime_error("Speech output tokens must be between 1 and 444");
-        const auto samples = std::span(reinterpret_cast<const float*>(static_cast<std::uintptr_t>(samples_address)),
-                                       static_cast<std::size_t>(sample_count));
+        const auto samples = std::span(samples_address, static_cast<std::size_t>(sample_count));
         auto result = kidi::ops::require(loaded_transcriber().transcribe(
             samples, 16000,
             {.language = language, .task = "transcribe", .maximum_tokens = static_cast<std::size_t>(maximum_tokens)}));

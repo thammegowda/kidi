@@ -90,6 +90,7 @@ public:
     auto replay(std::string_view key, std::span<const Tensor> inputs, const Step& step) -> std::span<const Tensor>;
     auto replay_enabled() const noexcept -> bool;
     auto clear_replays() -> void;
+    auto release_workspaces() -> void;
     /// Evicts captured steps whose key begins with `prefix`, for example completed prefill shapes before decode.
     auto clear_replays(std::string_view prefix) -> void;
     /// Name of the accelerator compiling captured steps, or empty when steps replay on this context's device.

@@ -16,7 +16,7 @@ No package-manager installation is required to build Kidi's browser app.
 
 Each directory includes its upstream `LICENSE`. The build copies the service
 worker, selected icons, and Markdown modules, with their licenses, into the deployment directory.
-Acorn and its walker are build-only and are not deployed.
+Acorn and its walker are retained from the retired wasm32 glue patcher and are not used or deployed.
 
 To update, replace only these files from the new release archives, retain their
 licenses, update the versions above, and run:
@@ -26,5 +26,4 @@ node --test tests/web/model_cache_test.mjs
 node web/build.mjs build-web
 ```
 
-Keep vendored files unmodified. Kidi's large-memory glue transform lives in
-`web/wasm-glue.mjs`, outside these upstream sources.
+Keep vendored files unmodified. Native wasm64 builds use Emscripten's generated glue unchanged.

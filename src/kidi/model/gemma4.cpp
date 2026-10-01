@@ -856,6 +856,7 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
     }
 }
 auto Gemma4Impl::preparation_ns() const -> std::uint64_t { return impl_->context.preparation_ns(); }
+auto Gemma4Impl::release_workspaces() -> void { impl_->context.release_workspaces(); }
 auto Gemma4Impl::accelerator() const -> std::string_view { return impl_->context.accelerator(); }
 auto Gemma4Impl::prefill_chunk_size(std::size_t requested) const -> std::size_t {
     return impl_->context.prefill_chunk_size(requested);

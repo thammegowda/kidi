@@ -49,6 +49,7 @@ public:
     auto forward_batch_tokens(std::span<const std::int32_t> tokens,
                               std::span<Gemma4State*> states) -> Result<std::vector<std::int32_t>>;
     auto preparation_ns() const -> std::uint64_t;
+    auto release_workspaces() -> void;
     /// Accelerator compiling this model's captured steps, or empty.
     auto accelerator() const -> std::string_view;
     auto prefill_chunk_size(std::size_t requested) const -> std::size_t;

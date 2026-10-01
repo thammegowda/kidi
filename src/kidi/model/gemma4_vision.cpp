@@ -10,6 +10,23 @@ using tensor::DType;
 using tensor::Tensor;
 
 namespace {
+constexpr std::int64_t VISION_ROWS = 32;
+
+auto project_rows(ops::Context& context, const layers::Linear& layer, const Tensor& input) -> Tensor {
+    const auto length = static_cast<std::int64_t>(input.size(1));
+    if (length <= VISION_ROWS) return layer->forward(context, input);
+    Tensor output;
+    for (std::int64_t start = 0; start < length; start += VISION_ROWS) {
+        const auto count = std::min(VISION_ROWS, length - start);
+        const auto part = layer->forward(context, context.slice(input, 1, start, count));
+        if (!output.defined())
+            output = require(Tensor::empty({1, length, static_cast<std::int64_t>(part.size(2))}, part.dtype(),
+                                            context.device()));
+        context.copy_slice_(output, part, 1, start);
+    }
+    return output;
+}
+
 KIDI_MODULE(VisionAttention);
 class VisionAttentionImpl : public Module {
 public:
@@ -42,13 +59,20 @@ public:
                                             context.slice(cosine, 0, axis, 1), context.slice(sine, 0, axis, 1));
             return context.reshape(context.concat(axes, 3), {1, length, heads_ * width_});
         };
-        const auto query = rotary(query_->forward(context, input), query_norm_);
-        const auto key = rotary(key_->forward(context, input), key_norm_);
+        const auto query = rotary(project_rows(context, query_, input), query_norm_);
+        const auto key = rotary(project_rows(context, key_, input), key_norm_);
         const auto value =
             context.reshape(value_norm_->forward(
-                                context, context.reshape(value_->forward(context, input), {1, length, heads_, width_})),
+                                context, context.reshape(project_rows(context, value_, input), {1, length, heads_, width_})),
                             {1, length, heads_ * width_});
-        return output_->forward(context, context.grouped_query_attention(query, key, value, heads_, heads_, mask, 1.F));
+        auto attended = require(Tensor::empty({1, length, heads_ * width_}, DType::F32, context.device()));
+        for (std::int64_t start = 0; start < length; start += VISION_ROWS) {
+            const auto count = std::min(VISION_ROWS, length - start);
+            const auto part = context.grouped_query_attention(context.slice(query, 1, start, count), key, value,
+                                                              heads_, heads_, mask, 1.F);
+            context.copy_slice_(attended, part, 1, start);
+        }
+        return project_rows(context, output_, attended);
     }
 
 private:
@@ -70,8 +94,17 @@ public:
         register_module("down_proj", down_);
     }
     auto forward(ops::Context& context, const Tensor& input) -> Tensor {
-        return down_->forward(context,
-                              context.gelu_multiply(gate_->forward(context, input), up_->forward(context, input)));
+        const auto length = static_cast<std::int64_t>(input.size(1));
+        auto output = require(Tensor::empty({1, length, static_cast<std::int64_t>(input.size(2))}, input.dtype(),
+                                            context.device()));
+        for (std::int64_t start = 0; start < length; start += VISION_ROWS) {
+            const auto count = std::min(VISION_ROWS, length - start);
+            const auto rows = context.slice(input, 1, start, count);
+            const auto part = down_->forward(context,
+                context.gelu_multiply(gate_->forward(context, rows), up_->forward(context, rows)));
+            context.copy_slice_(output, part, 1, start);
+        }
+        return output;
     }
 
 private:
@@ -97,11 +130,10 @@ public:
     }
     auto forward(ops::Context& context, const Tensor& input, const Tensor& cosine, const Tensor& sine,
                  const Tensor& mask) -> Tensor {
-        const auto hidden = context.add(
-            input, attention_norm_->forward(context, attention_->forward(context, input_norm_->forward(context, input),
-                                                                         cosine, sine, mask)));
-        return context.add(hidden, output_norm_->forward(
-                                       context, mlp_->forward(context, feed_forward_norm_->forward(context, hidden))));
+        const auto hidden = attention_norm_->forward_residual(
+            context, attention_->forward(context, input_norm_->forward(context, input), cosine, sine, mask), input);
+        return output_norm_->forward_residual(
+            context, mlp_->forward(context, feed_forward_norm_->forward(context, hidden)), hidden);
     }
 
 private:
@@ -184,6 +216,7 @@ Gemma4VisionImpl::Gemma4VisionImpl(const YAML::Node& config, std::int32_t text_w
     register_module("embed_vision", impl_->projection);
 }
 Gemma4VisionImpl::~Gemma4VisionImpl() = default;
+auto Gemma4VisionImpl::release_workspaces() -> void { impl_->context.release_workspaces(); }
 
 auto Gemma4VisionImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
     try {
@@ -235,8 +268,8 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image) -> Result<Tensor
                     table[(patch % image.patch_columns) * state.hidden + channel] +
                     table[(state.positions + patch / image.patch_columns) * state.hidden + channel];
         auto hidden =
-            context.add(state.tower->patch->projection->forward(
-                            context, require(Tensor::from_host({1, length, 768}, std::span<const float>(pixels), device()))),
+            context.add(project_rows(context, state.tower->patch->projection,
+                            require(Tensor::from_host({1, length, 768}, std::span<const float>(pixels), device()))),
                         require(Tensor::from_host({1, length, state.hidden}, std::span<const float>(position), device())));
         std::vector<float> cosine(2 * length * (state.head_width / 4)), sine(cosine.size());
         for (std::int64_t patch = 0; patch < length; ++patch)
@@ -251,7 +284,7 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image) -> Result<Tensor
         const auto cos =
             require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(cosine), device()));
         const auto sin = require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(sine), device()));
-        const auto mask = require(Tensor::zeros({1, 1, length, length}, DType::F32, device()));
+        const auto mask = require(Tensor::zeros({1, 1, 1, length}, DType::F32, device()));
         for (const auto& layer : *state.tower->encoder->layers)
             hidden = layer->forward(context, hidden, cos, sin, mask);
         context.synchronize();

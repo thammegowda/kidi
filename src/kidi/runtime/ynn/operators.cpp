@@ -542,6 +542,7 @@ class CpuBackend final : public OperatorBackend {
 public:
     CpuBackend() { require(arena_.reserve(8 * 1024 * 1024)); }
     auto synchronize() -> void override {}
+    auto release_cached_buffers() -> void override { arena_ = tensor::Arena{}; }
     auto supports_replay() const noexcept -> bool override { return true; }
     auto copy_slice_(Tensor& destination, const Tensor& source, std::size_t outer, std::size_t source_bytes,
                      std::size_t destination_bytes, std::size_t offset_bytes) -> void override {

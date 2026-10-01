@@ -4,6 +4,39 @@ Short progress notes for the current implementation. Measurements are explorator
 unless explicitly labelled as paired acceptance results. Historical comparisons
 remain in [QAT.md](QAT.md).
 
+## 2026-10-01: Native wasm64 and Vision Memory
+
+- All three browser variants now use native `-m64` unconditionally, with an
+  8 GiB growth ceiling, 64 MiB initial memory, and 2 MiB stack. Removed the
+  large-memory toggle, wasm32 fallback, and generated-JavaScript heap patcher.
+  Tahoma's consumer build forwards `-m64`; the submodule remains unmodified.
+- Loader bounds and heap headroom now use 8 GiB. Speech input uses a native
+  pointer argument and `ccall`'s pointer conversion rather than uint32_t.
+- The real built single-thread module allocated past 4 GiB and read/wrote at
+  address 4,297,849,912. Sparse probe peak RSS was about 64 MiB, not 4 GiB.
+  The first probe incorrectly assumed a following small allocation could not
+  reuse a low free block; corrected it to test inside the large allocation.
+  Repeatable test: `KIDI_TEST_WASM=build-web/single/kidi.mjs node --test tests/web/model_cache_test.mjs`.
+- Common vision code now uses 32-row projection/FFN/query workspaces and a
+  broadcast attention mask, retaining every key/value and the image resolution.
+  RMSNorm residual additions use the existing fused operation. This bounds
+  execution; it is not a claim of single-kernel whole-FFN/attention fusion.
+- CPU text and vision prepared workspaces are released at new-image boundaries,
+  while weights and live tensor owners remain valid. Graph lifetime/recapture,
+  Gemma and image tests pass. Independent Transformers FP32 and QAT vision
+  feature comparisons both have maximum error 1.78814e-7.
+- Bounded workspaces alone still reproduced the 4 GiB CPU failure. After the
+  wasm64 switch, the user's original 4288x2848 JPEG passed in the single visible
+  integrated-browser tab on CPU / four threads, after a text warmup, with the
+  normal 280-token image budget, 3M resize ceiling and 1024 output-token limit.
+  Reply: `The image shows a butterfly resting on a flower.` Heap reached
+  4,814,798,848 bytes (4.48 GiB), with 3.52 GiB headroom. The reported generation
+  time was 7514.95501 ms and decode 667.32109 ms; image preparation is outside
+  the generation counter, so these are not total image latency measurements.
+- No duplicate browser/model session was used. Native wasm64 requires a recent
+  memory64-capable engine; larger address space does not eliminate real RAM or
+  swap limits. WebGPU final parity and follow-up verification are in progress.
+
 ## 2026-09-30: Browser Image Input
 
 - Browser loader now retains upstream `config.json`, allowing the existing

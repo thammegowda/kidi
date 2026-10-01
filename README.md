@@ -112,8 +112,8 @@ Microphone access requires permission and a secure browser context (HTTPS or
 localhost). Clearing site data removes downloaded models and saved browser data.
 To run your own instance, follow the [browser build instructions](README-dev.md#browser).
 
-Use a current 64-bit Chromium browser with ample memory. The Wasm heap can
-approach its **4 GiB limit**, and long generations may exhaust it. The browser
+Use a current Chromium browser with native WebAssembly memory64 support and ample memory. The Wasm heap can
+grow up to **8 GiB**, and long generations may exhaust available memory. The browser
 defaults to 1,024 output tokens, allows up to 8,192, and shares a 9,216-token
 context between the conversation and reply. Its cache is separate from the CLI's.
 

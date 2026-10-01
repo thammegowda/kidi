@@ -1,7 +1,5 @@
 if(EMSCRIPTEN)
-    if(KIDI_WASM_LARGE_MEMORY)
-        string(APPEND CMAKE_C_FLAGS " -sMEMORY64=2")
-    endif()
+    string(APPEND CMAKE_C_FLAGS " -m64")
     if(KIDI_WASM_THREADS)
         string(APPEND CMAKE_C_FLAGS " -pthread")
     endif()
