@@ -247,7 +247,10 @@ architecture/tokenizer mappings. GGUF tensor names are retained, with the
 existing state-mapping API available to loaders. This importer does not execute
 GGML kernels or retain GGML block quantization for inference. Android Small
 downloads now combine GGML Q8 weights with matching HF sidecars, with both
-repository revisions tracked; the browser and Python Hub paths remain unchanged.
+repository revisions tracked. The browser does the same for Tiny, Base and Small,
+converting in its in-memory file system on first load and then keeping the
+converted checkpoint in Cache Storage instead of the GGML file; the Python Hub
+path remains unchanged.
 
 The small adapted [reference codec](src/kidi/checkpoint/ggml/dequantize.h)
 contains upstream credits, revision and MIT terms. No GGML runtime, backend,

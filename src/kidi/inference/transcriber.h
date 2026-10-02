@@ -18,6 +18,9 @@ struct TranscriptionOptions {
     std::string language = "auto";
     std::string task = "transcribe";
     std::size_t maximum_tokens = 128;
+    /// Encodes the audio plus at least one second of silence, rounded up to whole encoder slices, instead of the full
+    /// 30-second window. Short dictation encodes several times faster; the margin keeps Whisper from repeating text.
+    bool fit_audio = false;
     std::function<void(std::string_view, std::string_view)> on_partial;
 };
 
@@ -37,6 +40,8 @@ public:
                      tensor::Device device = tensor::Device::cpu()) -> Result<Transcriber>;
     auto transcribe(std::span<const float> waveform, std::uint32_t sample_rate,
                     const TranscriptionOptions& options = {}) -> Result<Transcription>;
+    /// Transcribes a second of silence so weights are packed and operators prepared before the first request.
+    auto warm_up() -> Result<void>;
 
     /// Where transcription runs, e.g. "cpu".
     auto execution() const -> std::string { return std::string(tensor::to_string(model_->device().kind)); }

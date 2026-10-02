@@ -4,6 +4,58 @@ Short progress notes for the current implementation. Measurements are explorator
 unless explicitly labelled as paired acceptance results. Historical comparisons
 remain in [QAT.md](QAT.md).
 
+## 2026-10-02: Faster Reloads
+
+Measured with the app's own workers in headless Edge (Apple M5), Hugging Face requests served from local hub caches,
+from worker start to ready. Before:
+
+| Model | Reload | Main costs |
+|---|---:|---|
+| Gemma, WebGPU | 4.0-4.3 s | Cache Storage reads 0.9 s, SHA-256 of every range 0.93 s, sign-bit mask 0.86 s, GPU interleave 0.21 s, tokenizer 0.53 s |
+| Gemma, CPU 1/4 threads | 6.1-6.3 s | the same data steps (2.9 s), tokenizer 1.9 s, warm-up 0.8-1.2 s |
+| Whisper Small | 2.4 s | GGML to INT8 0.81 s, warm-up 0.87 s, tokenizer and config 0.26 s, reads 0.35 s |
+
+- The CPU builds parsed the same tokenizer 3.5x slower than the WebGPU build: only the WebGPU build used native Wasm
+  exceptions, and with Emscripten's JavaScript fallback every call that may throw goes through an `invoke_*` trampoline
+  (`invoke_vji`, `getWasmTableEntry` and `wasm-to-js` filled the profile). The CPU variants kept the fallback only
+  because they predated that change; all variants now use `-fwasm-exceptions`. Same CPU replies.
+- Cached Hub ranges are checked by size only; hashing 2.5 GB on every load bought detection of altered cache bytes.
+- Gemma ranges are sign-flipped before caching (`X-Kidi-Layout: gemma-signed-v1`); older upstream-byte entries are
+  rewritten once on the next load.
+- Whisper: after the first load converts the GGML weights (native `checkpoint::prepare` in MEMFS), the worker stores the
+  converted `model.safetensors` (251 MB for Small) in Cache Storage and deletes the GGML ranges; reloads map it into
+  the heap. `asr_probe.mjs` now times a first load and a reload.
+- Not cacheable: YNNPACK keeps packed weights only in an in-memory constant cache keyed by data pointers, with no
+  serialization API; Chromium already caches compiled shaders, whose CPU cost was about 2 ms.
+- After: Gemma WebGPU 2.2-2.6 s, CPU 4 threads 2.7-2.8 s, CPU 1 thread 2.9 s; Whisper Small 1.07-1.21 s (Node:
+  conversion and warm-up 2.3 s first, warm-up 0.75 s on reload). The app reports speech ready 1.5-2 s after opening.
+- Harness note: the reload harness first lost the worker's load message: a wrapper that imports a module worker with
+  top-level `await` must buffer messages that arrive before the real `onmessage` is installed.
+
+## 2026-10-02: Browser Whisper Small
+
+- The browser default speech model is `openai/whisper-small`. Like Android, all three sizes download whisper.cpp's
+  Q8_0 GGML weights (Small 264 MB instead of 967 MB FP32) plus the model repository's sidecars, and run as INT8. The
+  browser has no persistent file system, so `Transcriber::load(..., cache_conversion = false)` quantizes while binding
+  instead of writing the native `.kidi-int8-v1` cache.
+- Whisper encodes a fixed 30 s window: about 340 GFLOP for Small, 2.1-2.5 s with four Wasm threads whatever the
+  recording length. `TranscriptionOptions::fit_audio` encodes the audio plus at least 1 s of silence, in 256-frame
+  steps. Without the margin, one utterance looped ("I painted the eyes red for anger." repeated, 22% WER); with it, 43
+  LibriSpeech clean utterances gave Small 2.46% WER (full window 2.58%). Tiny still repeated two sentences, so output
+  where over a third of token 4-grams repeat is decoded again over the full window: Tiny 8.09% (full 8.68%). Encode
+  per utterance (7.6 s average) 2,075 -> 550-620 ms.
+- Retained memory: every prepared operator keeps its output buffers, and each encoder layer's projections are separate
+  operators, so a 1,500-position encode kept 1.4 GiB and each new length added more (several lengths exhausted the
+  4 GiB heap). Encoder inputs now run in 128-row slices like the CPU vision encoder, and only the current source
+  length's captured decoder step is kept (a captured step retains its encoder keys and values, 57-85 MB). Heap after
+  any mix of lengths: 0.66-0.76 GiB (FP32 full window: 3.29 GiB).
+- Load: `pack_weight` used a libm `round` and a dtype branch per element (0.86 s single-threaded for Small); exact
+  truncation-based rounding and hoisted branches: 0.55 s. Load plus warm-up 2.2 s in Node; the app reports speech ready
+  3 s after opening with a cached model in Edge. A first version also fell back on output reaching the token limit,
+  which re-ran the one-token warm-up over the full window and made loading 8.5 s.
+- Tooling note: in headless Edge, workers created after a cold 267 MB download in the same page ran about 3x slower
+  until the page was reopened; measurements use a fresh page per run.
+
 ## 2026-10-02: Simplification Before Commit
 
 - Removed paths that neither the Wasm CPU nor the WebGPU app uses: per-operator memory tracing (`kidi_trace_memory`,

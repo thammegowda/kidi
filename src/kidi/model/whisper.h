@@ -34,7 +34,8 @@ public:
     static auto int8_preparation(const YAML::Node& config) -> Result<checkpoint::Preparation>;
     static auto int8_checkpoint(const YAML::Node& config, const checkpoint::Weights& weights) -> Result<StateDict>;
     auto set_checkpoint(const checkpoint::Weights& weights) -> Result<void>;
-    auto encode(const audio::WhisperFeatures& features) -> Result<WhisperEncoderState>;
+    /// Encodes the first `frames` feature frames (all when zero); an even count up to the 30-second window.
+    auto encode(const audio::WhisperFeatures& features, std::size_t frames = 0) -> Result<WhisperEncoderState>;
     auto create_state(std::size_t capacity) -> Result<WhisperDecoderState>;
     auto forward(const WhisperEncoderState& source, std::span<const std::int32_t> tokens,
                  WhisperDecoderState& state) -> Result<tensor::Tensor>;

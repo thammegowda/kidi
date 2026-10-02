@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <set>
 
 #include "kidi/checkpoint/config.h"
 #include "kidi/checkpoint/prepare.h"
@@ -13,6 +14,15 @@ namespace {
 using Clock = std::chrono::steady_clock;
 auto elapsed(Clock::time_point start) -> std::uint64_t {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+}
+/// True when over a third of four-token sequences repeat (a sentence decoded twice, for example), the signature of
+/// Whisper's decoding loops; ordinary speech rarely repeats one.
+auto repetitive(std::span<const std::int32_t> tokens) -> bool {
+    if (tokens.size() < 24) return false;
+    std::set<std::array<std::int32_t, 4>> seen;
+    for (std::size_t index = 0; index + 4 <= tokens.size(); ++index)
+        seen.insert({tokens[index], tokens[index + 1], tokens[index + 2], tokens[index + 3]});
+    return seen.size() * 3 < (tokens.size() - 3) * 2;
 }
 auto token_list(const YAML::Node& node) -> std::vector<std::int32_t> {
     std::vector<std::int32_t> result;
@@ -91,6 +101,13 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
     }
 }
 
+auto Transcriber::warm_up() -> Result<void> {
+    const std::vector<float> silence(16000, 0.F);
+    auto result = transcribe(silence, 16000, {.language = "en", .maximum_tokens = 1, .fit_audio = true});
+    if (!result) return std::unexpected(result.error());
+    return {};
+}
+
 auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t sample_rate,
                              const TranscriptionOptions& options) -> Result<Transcription> {
     try {
@@ -99,68 +116,90 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
         const auto maximum_position = config_["model"]["max_target_positions"].as<std::size_t>();
         if (!options.maximum_tokens || options.maximum_tokens + 4 > maximum_position)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Whisper output token limit is outside model capacity"});
-        Transcription result;
         const auto feature_start = Clock::now();
-        auto features = require(extractor_.extract(waveform, sample_rate));
-        result.stats.feature_ns = elapsed(feature_start);
-        const auto preparation = model_->preparation_ns();
-        const auto encode_start = Clock::now();
-        auto source = require(model_->encode(features));
-        result.stats.encode_ns = elapsed(encode_start);
-        auto state = require(model_->create_state(options.maximum_tokens + 4));
-        const auto decode_start = Clock::now();
-        const auto start_token = generation_["decoder_start_token_id"].as<std::int32_t>();
-        auto logits = require(model_->forward(source, std::span(&start_token, 1), state));
-        auto scores = require(logits.data<float>());
-        std::int32_t language_token = -1;
-        if (options.language == "auto") {
-            auto best = -std::numeric_limits<float>::infinity();
-            for (const auto& [language, token] : languages_)
-                if (scores[token] > best) {
-                    best = scores[token];
-                    result.language = language;
-                    language_token = token;
-                }
-        } else {
-            const auto found = languages_.find(options.language);
-            if (found == languages_.end())
-                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "unsupported Whisper language: " + options.language});
-            result.language = found->first;
-            language_token = found->second;
-        }
-        const std::array prefix{language_token, task.as<std::int32_t>()};
-        require(model_->prefill(source, prefix, state));
-        const auto no_timestamps = generation_["no_timestamps_token_id"].as<std::int32_t>();
-        logits = require(model_->forward(source, std::span(&no_timestamps, 1), state));
-
-        const auto vocabulary = config_["model"]["vocab_size"].as<std::size_t>();
-        const auto end = generation_["eos_token_id"].as<std::int32_t>();
+        const auto features = require(extractor_.extract(waveform, sample_rate));
+        const auto feature_ns = elapsed(feature_start);
         std::string emitted;
-        for (std::size_t step = 0; step < options.maximum_tokens; ++step) {
-            scores = require(logits.data<float>());
-            const auto suppress = [&](std::int32_t token) {
-                if (token >= 0 && static_cast<std::size_t>(token) < scores.size())
-                    scores[token] = -std::numeric_limits<float>::infinity();
-            };
-            for (const auto token : suppress_) suppress(token);
-            if (!step)
-                for (const auto token : begin_suppress_) suppress(token);
-            suppress(no_timestamps);
-            for (std::size_t token = static_cast<std::size_t>(no_timestamps + 1); token < vocabulary; ++token)
-                scores[token] = -std::numeric_limits<float>::infinity();
-            const auto selected = static_cast<std::int32_t>(std::ranges::max_element(scores) - scores.begin());
-            if (selected == end) break;
-            result.token_ids.push_back(selected);
-            if (options.on_partial) {
-                const auto delta = require(tokenizer_.decode_delta(result.token_ids, emitted));
-                if (!delta.empty()) options.on_partial(emitted, result.language);
+        // One encode and greedy decode over the first `frames` feature frames (all when zero).
+        const auto attempt = [&](std::size_t frames) {
+            Transcription result;
+            emitted.clear();
+            const auto preparation = model_->preparation_ns();
+            const auto encode_start = Clock::now();
+            auto source = require(model_->encode(features, frames));
+            result.stats.encode_ns = elapsed(encode_start);
+            auto state = require(model_->create_state(options.maximum_tokens + 4));
+            const auto decode_start = Clock::now();
+            const auto start_token = generation_["decoder_start_token_id"].as<std::int32_t>();
+            auto logits = require(model_->forward(source, std::span(&start_token, 1), state));
+            auto scores = require(logits.data<float>());
+            std::int32_t language_token = -1;
+            if (options.language == "auto") {
+                auto best = -std::numeric_limits<float>::infinity();
+                for (const auto& [language, token] : languages_)
+                    if (scores[token] > best) {
+                        best = scores[token];
+                        result.language = language;
+                        language_token = token;
+                    }
+            } else {
+                const auto found = languages_.find(options.language);
+                if (found == languages_.end())
+                    throw ops::Failure(
+                        {ErrorCode::INVALID_ARGUMENT, "unsupported Whisper language: " + options.language});
+                result.language = found->first;
+                language_token = found->second;
             }
-            if (step + 1 < options.maximum_tokens)
-                logits = require(model_->forward(source, std::span(&selected, 1), state));
+            const std::array prefix{language_token, task.as<std::int32_t>()};
+            require(model_->prefill(source, prefix, state));
+            const auto no_timestamps = generation_["no_timestamps_token_id"].as<std::int32_t>();
+            logits = require(model_->forward(source, std::span(&no_timestamps, 1), state));
+
+            const auto vocabulary = config_["model"]["vocab_size"].as<std::size_t>();
+            const auto end = generation_["eos_token_id"].as<std::int32_t>();
+            for (std::size_t step = 0; step < options.maximum_tokens; ++step) {
+                scores = require(logits.data<float>());
+                const auto suppress = [&](std::int32_t token) {
+                    if (token >= 0 && static_cast<std::size_t>(token) < scores.size())
+                        scores[token] = -std::numeric_limits<float>::infinity();
+                };
+                for (const auto token : suppress_) suppress(token);
+                if (!step)
+                    for (const auto token : begin_suppress_) suppress(token);
+                suppress(no_timestamps);
+                for (std::size_t token = static_cast<std::size_t>(no_timestamps + 1); token < vocabulary; ++token)
+                    scores[token] = -std::numeric_limits<float>::infinity();
+                const auto selected = static_cast<std::int32_t>(std::ranges::max_element(scores) - scores.begin());
+                if (selected == end) break;
+                result.token_ids.push_back(selected);
+                if (options.on_partial) {
+                    const auto delta = require(tokenizer_.decode_delta(result.token_ids, emitted));
+                    if (!delta.empty()) options.on_partial(emitted, result.language);
+                }
+                if (step + 1 < options.maximum_tokens)
+                    logits = require(model_->forward(source, std::span(&selected, 1), state));
+            }
+            result.stats.decode_ns = elapsed(decode_start);
+            result.stats.preparation_ns = model_->preparation_ns() - preparation;
+            result.text = require(tokenizer_.decode(result.token_ids));
+            return result;
+        };
+        std::size_t frames = 0;
+        if (options.fit_audio) {
+            // 100 feature frames per second; 256 frames are one 128-position encoder slice.
+            const auto audio = (waveform.size() * 100 + sample_rate - 1) / sample_rate;
+            frames = std::min(features.frames, (audio + 100 + 255) / 256 * 256);
         }
-        result.stats.decode_ns = elapsed(decode_start);
-        result.stats.preparation_ns = model_->preparation_ns() - preparation;
-        result.text = require(tokenizer_.decode(result.token_ids));
+        auto result = attempt(frames);
+        // Whisper can loop on a shortened window; such output is decoded again over the full window.
+        if (frames && frames < features.frames && repetitive(result.token_ids)) {
+            const auto first = result.stats;
+            result = attempt(0);
+            result.stats.encode_ns += first.encode_ns;
+            result.stats.decode_ns += first.decode_ns;
+            result.stats.preparation_ns += first.preparation_ns;
+        }
+        result.stats.feature_ns = feature_ns;
         if (options.on_partial && result.text != emitted) options.on_partial(result.text, result.language);
         return result;
     } catch (const ops::Failure& error) {

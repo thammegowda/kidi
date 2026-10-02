@@ -22,14 +22,11 @@ if(EMSCRIPTEN)
     set(KIDI_WASM_ADDRESS_FLAG -sMEMORY64=2)
     add_compile_options(${KIDI_WASM_ADDRESS_FLAG} -msimd128)
     add_link_options(${KIDI_WASM_ADDRESS_FLAG} -msimd128 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=2MB)
-    if(KIDI_WASM_WEBGPU)
-        # Native Wasm exceptions let the JSPI-based WebGPU test binary suspend through C++ frames.
-        add_compile_options(-fwasm-exceptions)
-        add_link_options(-fwasm-exceptions)
-    else()
-        add_compile_options(-fexceptions)
-        add_link_options(-fexceptions)
-    endif()
+    # Native Wasm exceptions: the JavaScript fallback routes every call that may throw through `invoke_*` trampolines,
+    # which made CPU builds parse the Gemma tokenizer 3.5x slower. They also let the JSPI-based WebGPU test binary
+    # suspend through C++ frames.
+    add_compile_options(-fwasm-exceptions)
+    add_link_options(-fwasm-exceptions)
     if(KIDI_WASM_THREADS)
         add_compile_options(-pthread)
         add_link_options(-pthread -sPTHREAD_POOL_SIZE=7)

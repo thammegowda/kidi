@@ -169,8 +169,8 @@ required files for you. Advanced local-checkpoint import is documented in
 
 The browser settings accept Hugging Face model IDs rather than file URLs. Loading resolves the repository's current
 `main` revision to an immutable commit before downloading. The speech model field offers `openai/whisper-tiny`,
-`openai/whisper-base`, and `openai/whisper-small`; larger models trade substantially more download, memory, and latency
-for accuracy. During recording, the composer shows replaceable draft text and runs a final refinement after stop.
+`openai/whisper-base`, and `openai/whisper-small` (default); weights download as whisper.cpp Q8_0 files (264 MB for
+Small) and run as INT8. Larger models trade more download, memory, and latency for accuracy. During recording, the composer shows replaceable draft text and runs a final refinement after stop.
 
 ### RTG Model Package
 

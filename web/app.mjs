@@ -588,7 +588,7 @@ async function startRecording() {
         const sink = context.createGain();
         sink.gain.value = 0;
         const modelId = element('speech-model').value.trim();
-        if (!MODEL_ID.test(modelId)) throw new Error('Enter a Hugging Face speech model ID such as openai/whisper-tiny');
+        if (!MODEL_ID.test(modelId)) throw new Error('Enter a Hugging Face speech model ID such as openai/whisper-small');
         session = {stream, context, source, node, sink, chunks: [], started: performance.now(), modelId,
             ready: false, transcribing: false, lastDraftRequest: 0, draftText: '', finalAudio: null};
         node.port.onmessage = ({data}) => {
@@ -680,10 +680,12 @@ function preloadSpeech() {
             const percent = data.totalBytes ? (data.loadedBytes / data.totalBytes * 100).toFixed(0) : '0';
             status.textContent = `Loading speech model ${percent}%`;
             if (session) session.status = status.textContent;
+        } else if (data.type === 'cached') {
+            // The worker finished replacing downloaded speech weights with its converted copy.
+            refreshCachedModels();
         } else if (data.type === 'ready') {
             speechReady = true;
             status.textContent = 'Speech ready';
-            refreshCachedModels();
             if (session) {
                 session.ready = true;
                 session.status = recording === session ? 'Listening' : 'Preparing final transcript';

@@ -183,6 +183,8 @@ EMSCRIPTEN_KEEPALIVE auto kidi_load_asr(const char* directory) -> const char* {
         if (!configured_threads) throw std::runtime_error("Configure the runtime before loading the speech model");
         transcriber.emplace(
             kidi::ops::require(kidi::inference::Transcriber::load(directory, kidi::tensor::Device::cpu())));
+        // Pay weight packing and operator preparation while the speech model preloads, not on the first recording.
+        kidi::ops::require(transcriber->warm_up());
         return {{"ready", true}, {"threads", configured_threads}, {"backend", "wasm-cpu"}};
     });
 }
@@ -197,7 +199,10 @@ EMSCRIPTEN_KEEPALIVE auto kidi_transcribe(const float* samples_address, std::uin
         const auto samples = std::span(samples_address, static_cast<std::size_t>(sample_count));
         auto result = kidi::ops::require(loaded_transcriber().transcribe(
             samples, 16000,
-            {.language = language, .task = "transcribe", .maximum_tokens = static_cast<std::size_t>(maximum_tokens)}));
+            {.language = language,
+             .task = "transcribe",
+             .maximum_tokens = static_cast<std::size_t>(maximum_tokens),
+             .fit_audio = true}));
         return {{"text", result.text},
                 {"language", result.language},
                 {"token_ids", result.token_ids},

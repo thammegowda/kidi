@@ -167,7 +167,11 @@ learned decoder positions, fixed checkpoint encoder positions, and a tied output
 the checkpoint's embedded 80-bin mel bank. Conv1D is expressed as im2col plus the existing optimized linear operation;
 attention, normalization, cache mutation, and projection remain ordinary eager operations. `inference::Transcriber` owns
 language detection, task/no-timestamp prefixes, token suppression, and greedy ASR policy. Whisper processes one
-padded/truncated 30-second segment per call. Encoder and decoder share one CPU context; Android uses the same YNNPACK
+padded/truncated 30-second segment per call; with `TranscriptionOptions::fit_audio` (browser) the encoder sees only the
+audio plus at least one second of silence, and output that repeats itself is decoded again over the full window.
+Encoder-length inputs run in 128-row slices, so weighted operators are prepared once for the slice shape and retain
+slice-sized buffers whatever the audio length; decoder steps run whole. Only the current source length's captured
+decoder step is kept, because a captured step retains its encoder keys and values. Encoder and decoder share one CPU context; Android uses the same YNNPACK
 operators as native CPU inference. No Qualcomm SDK, calibration pass, or DSP graph cache is required.
 
 Whisper INT8 binds per-output-channel signed weights and FP32 scales to the existing quantized linear operation, including
@@ -186,7 +190,8 @@ directory (or `ggml-model.bin` when a directory has no Safetensors). Dimensions
 are checked against the GGML header. `Transcriber::load` prepares and reuses a
 separate `<filename>.kidi-int8-v1` cache through the same native quantization
 path. Unsupported legacy quantization versions fail explicitly. Source files
-are retained, and cache metadata binds source size/mtime and importer version.
+are retained, and cache metadata binds source size/mtime and importer version. The browser runs the same preparation in
+its in-memory file system, then keeps the converted `model.safetensors` in Cache Storage and loads it directly.
 No GGML graph/backend or model equations are vendored; generic GGUF-to-Whisper
 architecture mapping is not implemented.
 

@@ -55,9 +55,9 @@ JavaScript that runs in the browser. No Node server or model-export step is used
 The default chat model ID is `google/gemma-4-E2B-it-qat-mobile-transformers`. No local model, export, HF token, or
 republished weights are required. Load resolves the Hub repository's current `main` revision to an immutable commit,
 then the browser downloads the original Safetensors
-file in 8 MiB HTTP ranges, caches those original bytes, and normalizes the packed
-integer representation once while placing it. This is lossless, not
-re-quantization. The cache keeps the complete upstream file; see
+file in 8 MiB HTTP ranges and normalizes the packed integer representation (a sign-bit flip) once, before caching
+each range, so reloads copy weights without rewriting them. This is lossless, not re-quantization. Ranges cached by
+earlier versions as upstream bytes are rewritten once on the next load; see
 [Memory Layout](#memory-layout) for what enters the Wasm heap. Supported vision checkpoints accept images through the
 shared C++ core; audio input remains the separate Whisper dictation workflow.
 
@@ -66,10 +66,13 @@ byte ranges from different revisions cannot mix. Automatic chat startup remains 
 only when every required file is cached. Previously exported manifests and pinned config URLs remain readable for
 compatibility, but are not shown in settings.
 
-Microphone dictation accepts `openai/whisper-tiny`, `openai/whisper-base`, or `openai/whisper-small`. The browser caches
-the selected model's five upstream files without conversion or a generated manifest. The selected speech model
-(default `openai/whisper-tiny`) loads at startup, downloading missing files as needed. Whisper runs in one reusable CPU
-Wasm worker with its own linear heap, including when Gemma uses WebGPU. Model settings shows speech loading, ready,
+Microphone dictation accepts `openai/whisper-tiny`, `openai/whisper-base`, or `openai/whisper-small` (default). Like
+the Android app, the browser downloads config and tokenizer files from that repository and the weights from
+whisper.cpp's Q8_0 GGML file of the same size (`ggerganov/whisper.cpp`, pinned revision): 264 MB for Small instead of
+the 967 MB FP32 Safetensors. The GGML bytes are cached beside the model's own files, so the cache manager lists and
+deletes them together; a previously cached FP32 checkpoint is removed. The selected speech model loads at startup,
+downloading missing files as needed. Whisper runs in one reusable CPU Wasm worker with its own linear heap, including
+when Gemma uses WebGPU. Model settings shows speech loading, ready,
 or error status. Preloading does not request microphone permission; permission is requested only when recording starts.
 Changing the speech model or CPU thread count replaces that worker; chat-backend changes and completed recordings retain it.
 
@@ -174,12 +177,49 @@ The microphone button records at most 30 seconds, resamples captured mono PCM to
 isolated Whisper worker. Automatic language detection is enabled. While recording, replaceable draft hypotheses appear
 in the composer; stopping runs a final pass that may refine them. The transcript is not sent to Gemma until submitted.
 
+The first load converts the GGML weights to Kidi's per-channel INT8 checkpoint through the same preparation as native
+builds, in the in-memory file system. The worker then stores that checkpoint in Cache Storage in place of the GGML
+download (about the same size, 251 MB for Small), so later loads map it straight into the heap. Every load transcribes
+a second of silence (`Transcriber::warm_up`) so the first recording does not pay weight packing. Whisper always encodes a 30-second window;
+the browser instead encodes the recording plus at least one second of silence (`TranscriptionOptions::fit_audio`), in
+2.56-second steps. If that output repeats itself, a known failure of shortened windows, it is decoded again over the
+full window. On 43 LibriSpeech clean utterances (7.6 s on average) this matched the full window (Small 2.46% vs 2.58%
+WER, Tiny 8.09% vs 8.68%) while encoding about 3.5 times faster. The encoder runs in 128-row slices, so its retained
+buffers are small and shared by every recording length.
+
+| Whisper Small, Node, Apple M5, 4 threads | Before (FP32, full window) | Now |
+|---|---:|---:|
+| Download | 967 MB | 267 MB |
+| First load (convert + warm-up) | 0.56 s | 2.3 s |
+| Reload (warm-up only) | 0.56 s | 0.75 s |
+| Transcribe 6.6 s of speech | 3.1 s first, then 2.5 s | 0.63 s |
+| Wasm heap after transcribing | 3.29 GiB | 0.66-0.76 GiB |
+
+In Edge the app reports speech ready 1.5-2 s after opening with a cached model, and transcribes 3.9, 6.6 and 22.6
+seconds of speech in 0.34, 0.63 and 2.2 s.
+
+`benchmarks/web/asr_probe.mjs` runs the same loader and runtime in Node against a local Hugging Face cache.
+
 Loading ends with a one-token warm-up (`Generator::warm_up`) so the first message
 does not pay one-time work: on CPU, YNNPACK packs every projection weight on first
 use; on WebGPU, kernels are prepared and host-resident weights such as `lm_head`
 are uploaded. On an Apple M5 this moves about 1 s (one CPU thread) into loading;
 the first token of a short prompt arrives in 0.53 s with four CPU threads (was
 1.56 s) and WebGPU prefill takes 0.19 s.
+
+Reloading a cached Gemma model, measured in Edge on an Apple M5 from worker start to ready:
+
+| Backend | Before | Now |
+|---|---:|---:|
+| WebGPU | 4.0-4.3 s | 2.2-2.6 s |
+| CPU, 4 threads | 6.1 s | 2.7-2.8 s |
+| CPU, 1 thread | 6.3 s | 2.9 s |
+
+Three changes produced this: cached ranges are no longer hashed again (0.93 s), packed weights are cached already
+sign-flipped (0.86 s), and all variants use native Wasm exceptions. With Emscripten's JavaScript exception fallback, every
+call that might throw went through a JavaScript trampoline, and the CPU builds parsed the 32 MB Gemma tokenizer in 1.9 s
+instead of 0.5 s. What remains is reading 2.5 GB from Cache Storage (0.8-1.1 s), the tokenizer, and the warm-up, whose
+YNNPACK weight packing exists only in memory and cannot be cached.
 
 On startup, a fully cached chat model loads automatically. The last successfully
 loaded source is remembered. Empty, partial, or unavailable caches leave the
@@ -362,11 +402,10 @@ Cross-Origin-Embedder-Policy: require-corp
 Cross-Origin-Resource-Policy: same-origin
 ```
 
-Hub ranges are cached by pinned URL and byte interval. A SHA-256 digest computed
-at download time detects corruption on cache reuse; it is not an independent
-upstream checksum. Initial download integrity relies on HTTPS and the pinned
-revision. Previously exported manifests supply expected SHA-256 hashes for
-their chunks. Reloads fetch only missing or corrupt parts. The app requests
+Hub ranges are cached by pinned URL and byte interval. Download integrity relies on HTTPS and the pinned revision.
+Reuse checks each cached range's size, which catches truncated entries but not altered bytes: hashing every range again
+cost about 1 s of each Gemma reload. Previously exported manifests supply expected SHA-256 hashes, checked when their
+chunks are downloaded. Reloads fetch only missing or truncated parts. The app requests
 persistent storage and shows cached versus downloaded bytes; browser quota and
 eviction policy still apply. Cache Storage belongs to the app origin, so changing
 hostname or port starts a separate cache. Model settings lists each cached Hub

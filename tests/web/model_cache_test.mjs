@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {deleteCachedModel, interleavePacked, isModelCached, listCachedModels, loadModel, resolveModelSource, weightLayout}
-    from '../../web/model-cache.mjs';
+import {deleteCachedModel, interleavePacked, isModelCached, listCachedModels, loadModel, resolveModelSource,
+    storeConvertedSpeech, weightLayout} from '../../web/model-cache.mjs';
 import {unsignedHeapIndices} from '../../web/wasm-glue.mjs';
 
 test('built wasm32 runtime addresses memory above 2 GiB within its 4 GiB limit', {skip: !process.env.KIDI_TEST_WASM}, async () => {
@@ -202,7 +202,7 @@ test('cache inventory exposes partial model files and selectively deletes one mo
     }
 });
 
-test('Hub ranges normalize once in owned memory and preserve the upstream cache and checkpoint tensors', async () => {
+test('Hub ranges are cached sign-flipped once and reload into owned memory without rewriting', async () => {
     const source = `https://huggingface.co/google/test/resolve/${'a'.repeat(40)}/config.json`;
     const width = 8 * 1024 * 1024;
     const headerBytes = 2048;
@@ -227,10 +227,14 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
     }};
     const cache = new Map();
     const requests = [];
+    let failPuts = false;
     const originalFetch = globalThis.fetch, originalCaches = globalThis.caches;
     globalThis.caches = {open: async () => ({match: async key => cache.get(String(key))?.clone(),
         keys: async () => [...cache.keys()].map(url => ({url})),
-        put: async (key, response) => cache.set(String(key), response.clone()),
+        put: async (key, response) => {
+            if (failPuts) throw new Error('QuotaExceededError');
+            cache.set(String(key), response.clone());
+        },
         delete: async key => cache.delete(String(key))})};
     globalThis.fetch = async (url, options) => {
         requests.push(String(url));
@@ -292,7 +296,10 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
         assert.equal(descriptor.model.packed_weights_signed, true);
         assert.deepEqual(descriptor.decode, {maximum_new_tokens: 1024, context_size: 9216});
         const rangeKey = [...cache.keys()].find(key => key.endsWith('kidi_range=0-8388607'));
-        assert.deepEqual(new Uint8Array(await cache.get(rangeKey).clone().arrayBuffer()), upstream.subarray(0, width));
+        const cachedFirst = new Uint8Array(await cache.get(rangeKey).clone().arrayBuffer());
+        assert.equal(cache.get(rangeKey).headers.get('X-Kidi-Layout'), 'gemma-signed-v1');
+        assert.deepEqual(cachedFirst.subarray(0, 8 + headerBytes), upstream.subarray(0, 8 + headerBytes));
+        assert.ok(cachedFirst.subarray(8 + headerBytes).every(byte => byte === (0x12 ^ 0x88)));
         const count = requests.length;
         assert.equal(await isModelCached(source), true);
         const lastRange = [...cache.keys()].find(key => key.includes(`kidi_range=${width}-`));
@@ -314,9 +321,27 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
         assert.equal(reloaded.downloadedBytes, 0);
         assert.deepEqual(second.files.get('/model/model.safetensors').contents, mapped.contents);
         assert.deepEqual(second.files.get('/model/config.json'), first.files.get('/model/config.json'));
-        const corrupted = new Uint8Array(await cache.get(rangeKey).clone().arrayBuffer());
-        corrupted[4096] ^= 1;
-        cache.set(rangeKey, new Response(corrupted, {headers: cache.get(rangeKey).headers}));
+        // An entry cached by an earlier version holds upstream bytes: it is sign-flipped once and rewritten.
+        const layoutHeaders = cache.get(rangeKey).headers;
+        cache.set(rangeKey, new Response(upstream.slice(0, width), {headers: {'X-Kidi-Size': layoutHeaders.get('X-Kidi-Size')}}));
+        const migrated = runtime();
+        await loadModel(migrated, source, () => {}, {cacheOnly: true});
+        assert.deepEqual(migrated.files.get('/model/model.safetensors').contents, mapped.contents);
+        assert.equal(cache.get(rangeKey).headers.get('X-Kidi-Layout'), 'gemma-signed-v1');
+        assert.equal(requests.length, count);
+        // A rewrite that fails (for example over quota) leaves the old entry and still loads from the cache.
+        const signedEntry = cache.get(rangeKey);
+        cache.set(rangeKey, new Response(upstream.slice(0, width), {headers: {'X-Kidi-Size': layoutHeaders.get('X-Kidi-Size')}}));
+        failPuts = true;
+        const unconverted = runtime();
+        await loadModel(unconverted, source, () => {}, {cacheOnly: true});
+        failPuts = false;
+        assert.deepEqual(unconverted.files.get('/model/model.safetensors').contents, mapped.contents);
+        assert.equal(cache.get(rangeKey).headers.get('X-Kidi-Layout'), null);
+        cache.set(rangeKey, signedEntry);
+        // Contents are trusted; a truncated entry is still rejected.
+        const truncated = new Uint8Array(await cache.get(rangeKey).clone().arrayBuffer()).slice(0, -1);
+        cache.set(rangeKey, new Response(truncated, {headers: cache.get(rangeKey).headers}));
         await assert.rejects(loadModel(runtime(), source, () => {}, {cacheOnly: true}), /cache incomplete or damaged/);
         assert.equal(requests.length, count);
         assert.equal(await isModelCached(source), false);
@@ -333,6 +358,84 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
         await assert.rejects(loadModel(runtime(), source, () => {}), /Invalid byte-range response/);
         globalThis.caches = {open: async () => { throw new Error('Storage unavailable'); }};
         assert.equal(await isModelCached(source), false);
+    } finally {
+        globalThis.fetch = originalFetch;
+        if (originalCaches === undefined) delete globalThis.caches;
+        else globalThis.caches = originalCaches;
+    }
+});
+test('Whisper converts whisper.cpp Q8 weights once and reloads the cached INT8 checkpoint', async () => {
+    const source = `https://huggingface.co/openai/whisper-small/resolve/${'d'.repeat(40)}/config.json`;
+    const config = {model_type: 'whisper', architectures: ['WhisperForConditionalGeneration'], d_model: 768,
+        vocab_size: 51865};
+    const weights = Uint8Array.from({length: 8 * 1024 * 1024 + 5}, (_, index) => index % 251);
+    const converted = Uint8Array.from({length: 8 * 1024 * 1024 + 3}, (_, index) => index % 13);
+    const stale = `${new URL('model.safetensors', source).href}?kidi_range=0-8388607`;
+    const cache = new Map([[stale, new Response('old')]]);
+    const requests = [];
+    const originalFetch = globalThis.fetch, originalCaches = globalThis.caches;
+    globalThis.caches = {open: async () => ({match: async key => cache.get(String(key))?.clone(),
+        keys: async () => [...cache.keys()].map(url => ({url})),
+        put: async (key, response) => cache.set(String(key), response.clone()),
+        delete: async key => cache.delete(typeof key === 'string' ? key : key.url)})};
+    globalThis.fetch = async (url, options) => {
+        requests.push(String(url));
+        if (String(url).endsWith('/ggml-small-q8_0.bin')) {
+            assert.match(String(url), /^https:\/\/huggingface\.co\/ggerganov\/whisper\.cpp\/resolve\/[a-f0-9]{40}\//);
+            const [start, requestedEnd] = options.headers.Range.slice(6).split('-').map(Number);
+            const end = Math.min(requestedEnd, weights.length - 1);
+            return new Response(weights.slice(start, end + 1), {status: 206,
+                headers: {'Content-Range': `bytes ${start}-${end}/${weights.length}`}});
+        }
+        assert.ok(!String(url).includes('safetensors'));
+        return new Response(JSON.stringify(String(url).endsWith('/config.json') ? config : {}));
+    };
+    // A virtual file system with Emscripten's calls the loader uses.
+    const runtime = () => {
+        const files = new Map(), directories = new Set(['/']);
+        const HEAPU8 = new Uint8Array(32 * 1024 * 1024);
+        return {files, HEAPU8, _malloc: () => 4096, _free: () => {}, FS: {
+            mkdir: path => directories.add(path), rmdir: path => directories.delete(path),
+            writeFile: (name, data) => files.set(name, data), unlink: name => files.delete(name),
+            analyzePath: path => ({exists: files.has(path) || directories.has(path)}),
+            readdir: path => [...files.keys()].filter(name => name.startsWith(`${path}/`)).map(name => name.slice(path.length + 1)),
+            createDataFile: (directory, name) => files.set(`${directory}/${name}`, {stream_ops: {}}),
+            lookupPath: name => ({node: files.get(name)}),
+        }};
+    };
+    try {
+        const first = runtime();
+        const metrics = await loadModel(first, source, () => {});
+        assert.deepEqual(first.files.get('/model/ggml-model.bin'), weights);
+        assert.deepEqual([...first.files.keys()].sort(), ['/model/config.json', '/model/generation_config.json',
+            '/model/ggml-model.bin', '/model/preprocessor_config.json', '/model/tokenizer.json']);
+        assert.equal(metrics.precision, 'INT8 from GGML Q8_0');
+        assert.ok(!cache.has(stale));
+        assert.ok(cache.has(`${new URL('ggml-model.bin', source).href}?kidi_range=8388608-8388612`));
+        assert.equal(await isModelCached(source), true);
+        // kidi_load_asr converts the GGML weights and writes the INT8 checkpoint beside them.
+        const directory = '/model/ggml-model.bin.kidi-int8-v1';
+        first.FS.mkdir(directory);
+        first.files.set(`${directory}/model.safetensors`, {contents: converted, usedBytes: converted.length});
+        first.files.set(`${directory}/quantization.json`, {});
+        await storeConvertedSpeech(first, metrics);
+        assert.ok(![...first.files.keys()].some(name => name.includes('ggml-model.bin')));
+        assert.ok(![...cache.keys()].some(key => key.includes('ggml-model.bin')));
+        assert.ok([...cache.keys()].some(key => key.startsWith(metrics.convertedUrl)));
+        assert.equal(await isModelCached(source), true);
+        const count = requests.length;
+        const second = runtime();
+        const reloaded = await loadModel(second, source, () => {}, {cacheOnly: true});
+        assert.equal(reloaded.downloadedBytes, 0);
+        assert.equal(reloaded.convertedUrl, undefined);
+        assert.equal(requests.length, count);
+        assert.ok(!second.files.has('/model/ggml-model.bin'));
+        const mapped = second.files.get('/model/model.safetensors');
+        assert.deepEqual(mapped.contents, converted);
+        assert.equal(mapped.usedBytes, converted.length);
+        config.d_model = 640;
+        cache.clear();
+        await assert.rejects(loadModel(runtime(), source, () => {}), /Tiny, Base, or Small/);
     } finally {
         globalThis.fetch = originalFetch;
         if (originalCaches === undefined) delete globalThis.caches;
