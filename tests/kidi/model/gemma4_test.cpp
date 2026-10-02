@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <utility>
 #include <string>
 
 namespace {
@@ -300,6 +302,17 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
 
 // Failing checks report where they failed: several compare exactly, so results can differ between machines.
 std::string current_fixture = "setup", current_device = "none";
+// Largest absolute difference and where it occurs; non-finite values count as infinite.
+auto difference(std::span<const float> left, std::span<const float> right) -> std::pair<float, std::size_t> {
+    std::pair<float, std::size_t> worst{0.F, 0};
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        const auto gap = std::isfinite(left[index]) && std::isfinite(right[index])
+                             ? std::abs(left[index] - right[index])
+                             : std::numeric_limits<float>::infinity();
+        if (gap > worst.first) worst = {gap, index};
+    }
+    return worst;
+}
 auto failed(int line) -> int {
     std::cerr << "gemma4_test check at line " << line << " failed for " << current_fixture << " on " << current_device
               << '\n';
@@ -581,10 +594,11 @@ auto main() -> int {
                     const auto all_logits = ops::require(extended->forward(sequence, oracle_state, true));
                     const auto last_values = ops::require(prefix.data<float>());
                     const auto oracle_values = ops::require(all_logits.data<float>()).last(last_values.size());
-                    for (std::size_t index = 0; index < last_values.size(); ++index)
-                        if (!std::isfinite(last_values[index]) ||
-                            std::abs(last_values[index] - oracle_values[index]) > 2e-4F)
-                            return failed(__LINE__);
+                    if (const auto [gap, at] = difference(last_values, oracle_values); gap > 2e-4F) {
+                        std::cerr << "length " << length << ": incremental vs all-logits differs by " << gap << " at "
+                                  << at << '\n';
+                        return failed(__LINE__);
+                    }
                     auto history_state = ops::require(extended->create_state(capacity));
                     history_state.crop_local_attention = false;
                     ops::require(extended->prefill(std::span(sequence).first(length - 1), history_state));
@@ -596,21 +610,25 @@ auto main() -> int {
                     const auto bucket = ops::require(extended->forward(std::span(sequence).last(1), bucket_state));
                     const auto prefix_values = ops::require(prefix.data<float>()),
                                bucket_values = ops::require(bucket.data<float>());
-                    for (std::size_t index = 0; index < bucket_values.size(); ++index)
-                        if (!std::isfinite(bucket_values[index]) ||
-                            std::abs(bucket_values[index] - prefix_values[index]) > 2e-4F ||
-                            std::abs(bucket_values[index] - history_values[index]) > 2e-4F)
-                            return failed(__LINE__);
+                    const auto [prefix_gap, prefix_at] = difference(bucket_values, prefix_values);
+                    const auto [history_gap, history_at] = difference(bucket_values, history_values);
+                    if (prefix_gap > 2e-4F || history_gap > 2e-4F) {
+                        std::cerr << "length " << length << ": chunked prefill vs full prefix differs by " << prefix_gap
+                                  << " at " << prefix_at << ", vs uncropped history by " << history_gap << " at "
+                                  << history_at << '\n';
+                        return failed(__LINE__);
+                    }
                     auto larger_state = ops::require(extended->create_state(capacity));
                     const std::size_t chunk = length == 259 ? 256 : 512;
                     for (std::size_t offset = 0; offset < length - 3; offset += chunk)
                         ops::require(extended->prefill(std::span(sequence).subspan(offset, chunk), larger_state));
                     const auto larger = ops::require(extended->forward(std::span(sequence).last(3), larger_state));
                     const auto larger_values = ops::require(larger.data<float>());
-                    for (std::size_t index = 0; index < larger_values.size(); ++index)
-                        if (!std::isfinite(larger_values[index]) ||
-                            std::abs(larger_values[index] - prefix_values[index]) > 2e-4F)
-                            return failed(__LINE__);
+                    if (const auto [gap, at] = difference(larger_values, prefix_values); gap > 2e-4F) {
+                        std::cerr << "length " << length << ": " << chunk << "-token chunks vs full prefix differs by "
+                                  << gap << " at " << at << '\n';
+                        return failed(__LINE__);
+                    }
                 }
             }
         }
