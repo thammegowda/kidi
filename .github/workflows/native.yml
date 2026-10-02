@@ -49,7 +49,9 @@ jobs:
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_COMPILERCHECK: content
       CCACHE_MAXSIZE: 500M
+      # macOS arm64 runners have 3 cores: build and test with all of them.
       CMAKE_BUILD_PARALLEL_LEVEL: '3'
+      CTEST_PARALLEL_LEVEL: '3'
       CMAKE_ARGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache
     steps:
       - name: Check out source and dependencies
