@@ -71,30 +71,39 @@ jobs:
         run: brew install ninja ccache
 
       - name: Restore compiled objects
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-macos26-${{ github.sha }}
+          key: native-ccache-v2-${{ runner.os }}-${{ runner.arch }}-macos26-${{ github.sha }}
           restore-keys: |
-            native-ccache-v1-${{ runner.os }}-${{ runner.arch }}-macos26-
+            native-ccache-v2-${{ runner.os }}-${{ runner.arch }}-macos26-
 
-      - name: Build native unit tests
+      # One Release build serves the wheel and the tests: the wheel build configures build-ci with tests enabled and
+      # compiles the library, and the test programs then link against the same objects.
+      - name: Build Python wheel
         run: |
           ccache --zero-stats
-          cmake --preset debug \
-            -DKIDI_BUILD_PYTHON=OFF -DKIDI_BUILD_BENCHMARKS=OFF \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache
-          cmake --build --preset debug
+          python -m pip install "scikit-build-core>=0.12" "nanobind>=2.4"
+          python -m pip wheel --no-deps --no-build-isolation . --wheel-dir dist \
+            -C build-dir=build-ci -C cmake.define.KIDI_BUILD_TESTS=ON -C cmake.define.BUILD_TESTING=ON
+
+      - name: Build native unit tests
+        run: cmake --build build-ci
+
+      # Saved before the tests run, so later runs reuse compiled objects even when a test fails.
+      - name: Save compiled objects
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: native-ccache-v2-${{ runner.os }}-${{ runner.arch }}-macos26-${{ github.sha }}
 
       - name: Run native unit tests
-        run: ctest --preset debug
+        run: ctest --test-dir build-ci --output-on-failure
 
-      - name: Build and install Python wheel
+      - name: Install Python wheel
         shell: bash
         run: |
-          python -m pip wheel --no-deps . --wheel-dir dist
           wheels=(dist/kidi-*.whl)
           python -m pip install "${wheels[0]}[hf]"
 

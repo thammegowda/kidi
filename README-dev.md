@@ -315,7 +315,9 @@ The [Pages workflow](.github/workflows/pages.yml) builds/tests Wasm variants for
 relevant changes, reusing SDK/compiler caches; merges to `main` deploy the
 browser app. The separate [native workflow](.github/workflows/native.yml) runs
 native unit tests and installed Python-wheel smoke tests on macOS 26 without
-downloading models. It does not block Pages deployment.
+downloading models. One Release build serves both: the wheel build configures
+`build-ci` with tests enabled, and the test programs reuse its objects. Compiled
+objects (ccache) are saved even when tests fail. It does not block Pages deployment.
 
 See [GitHub Pages setup](web/README.md#github-pages) for one-time configuration.
 The generated browser directory is self-contained for static hosting; model
