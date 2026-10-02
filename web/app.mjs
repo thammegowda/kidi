@@ -1,4 +1,4 @@
-import {clearModelCache, deleteCachedModel, isModelCached, listCachedModels, MAX_WASM_MEMORY} from './model-cache.mjs';
+import {clearModelCache, deleteCachedModel, isModelCached, listCachedModels, MAX_WASM_MEMORY, webGpuSupport} from './model-cache.mjs';
 import {renderMarkdown} from './markdown.mjs';
 import {resampleAudio} from './speech.mjs';
 import {storeImage, readImage, removeUnusedImages, MAX_IMAGES, MAX_IMAGE_BYTES} from './images.mjs';
@@ -345,13 +345,50 @@ function setRuntimeState(state, label, detail, badge) {
     element('runtime-detail').textContent = detail;
     element('runtime-badge').textContent = badge;
 }
-function updateMemory(bytes) {
+let heapLimit = MAX_WASM_MEMORY;
+function updateMemory(bytes, limit = heapLimit) {
     const known = Number.isSafeInteger(bytes) && bytes >= 0;
     const gibibytes = value => `${(value / 2 ** 30).toFixed(2)} GiB`;
     element('heap-used').textContent = known ? gibibytes(bytes) : '--';
-    element('heap-headroom').textContent = known ? gibibytes(Math.max(0, MAX_WASM_MEMORY - bytes)) : '--';
+    element('heap-headroom').textContent = known ? gibibytes(Math.max(0, limit - bytes)) : '--';
     element('memory').textContent = known ? gibibytes(bytes) : '--';
-    element('memory-stats').classList.toggle('tight', known && MAX_WASM_MEMORY - bytes < 256 * 1024 ** 2);
+    element('memory-stats').classList.toggle('tight', known && limit - bytes < 256 * 1024 ** 2);
+}
+let memoryDiagnostics = null;
+const binaryBytes = value => !Number.isFinite(value) || value < 0 ? '--'
+    : value >= 2 ** 30 ? `${(value / 2 ** 30).toFixed(2)} GiB` : `${(value / 2 ** 20).toFixed(1)} MiB`;
+function renderMemoryDiagnostics(memory) {
+    memoryDiagnostics = memory || null;
+    element('copy-memory').disabled = !memory;
+    const summary = element('memory-summary'), categories = element('memory-categories');
+    summary.replaceChildren();
+    categories.replaceChildren();
+    const row = (label, value) => {
+        const term = document.createElement('dt'), detail = document.createElement('dd');
+        term.textContent = label;
+        detail.textContent = value;
+        summary.append(term, detail);
+    };
+    if (!memory) { row('Status', 'Load a model to collect statistics'); return; }
+    row('Wasm heap', `${binaryBytes(memory.heap_bytes)} of ${binaryBytes(memory.heap_limit_bytes)}`);
+    row('Allocated', binaryBytes(memory.malloc_in_use_bytes));
+    row('Allocator free', binaryBytes(memory.malloc_free_bytes));
+    row('Allocator peak', binaryBytes(memory.malloc_peak_footprint_bytes));
+    row('Weights in heap', binaryBytes(memory.weights_heap_bytes));
+    row('Weights outside heap', binaryBytes(memory.weights_external_bytes));
+    if (memory.weights_gpu_bytes) row('Weights in GPU buffers', binaryBytes(memory.weights_gpu_bytes));
+    row('KV cache', binaryBytes(memory.kv_cache_bytes));
+    row('Image features', binaryBytes(memory.image_feature_bytes));
+    if (memory.gpu_buffer_bytes !== undefined)
+        row('GPU buffers', `${binaryBytes(memory.gpu_buffer_bytes)} (${binaryBytes(memory.gpu_pooled_bytes)} pooled)`);
+    for (const entry of memory.categories || []) {
+        const item = document.createElement('li'), name = document.createElement('span'), value = document.createElement('span');
+        name.textContent = entry.category;
+        name.title = `${entry.category}: ${entry.count} allocation${entry.count === 1 ? '' : 's'}`;
+        value.textContent = `${entry.bytes < 0 ? '-' : ''}${binaryBytes(Math.abs(entry.bytes))} / ${entry.count}`;
+        item.append(name, value);
+        categories.append(item);
+    }
 }
 function controls() {
     const isRecording = Boolean(recording);
@@ -418,6 +455,7 @@ function restart() {
     stopping = false;
     stopLiveStats();
     updateMemory();
+    renderMemoryDiagnostics(null);
     element('gpu-memory').textContent = '--';
     element('status').textContent = 'Not loaded';
     setRuntimeState('', 'Model offline', 'Gemma 4 E2B IT', 'Offline');
@@ -773,7 +811,11 @@ async function loadRuntime(cacheOnly = false) {
     worker.onerror = failed;
     worker.onmessage = ({data}) => {
         document.dispatchEvent(new CustomEvent('kidi:runtime', {detail: data}));
-        if (data.heapBytes !== undefined) updateMemory(data.heapBytes);
+        if (data.memory) {
+            heapLimit = data.memory.heap_limit_bytes || heapLimit;
+            renderMemoryDiagnostics(data.memory);
+            updateMemory(data.memory.heap_bytes);
+        } else if (data.heapBytes !== undefined) updateMemory(data.heapBytes);
         if (data.gpuStats) element('gpu-memory').textContent = megabytes(data.gpuStats.allocatedBytes);
         if (busy && data.stats) { currentStats = data.stats; updateLiveStats(); }
         if (data.type === 'progress') {
@@ -851,6 +893,14 @@ async function loadRuntime(cacheOnly = false) {
     worker.postMessage({type: 'load', manifest, threads, backend, cacheOnly});
 }
 element('load').addEventListener('click', () => loadRuntime());
+element('copy-memory').addEventListener('click', async () => {
+    if (!memoryDiagnostics) return;
+    try {
+        await navigator.clipboard.writeText(JSON.stringify(memoryDiagnostics, null, 2));
+        element('copy-memory').textContent = 'Copied';
+    } catch { element('copy-memory').textContent = 'Copy failed'; }
+    setTimeout(() => { element('copy-memory').textContent = 'Copy diagnostics'; }, 1500);
+});
 
 async function restoreCachedModel() {
     const version = runtimeVersion;
@@ -862,8 +912,16 @@ async function restoreCachedModel() {
     } catch {}
 }
 
+const gpuUnavailable = webGpuSupport();
+if (gpuUnavailable) {
+    const option = element('backend').querySelector('option[value="webgpu"]');
+    option.disabled = true;
+    option.textContent = 'WebGPU (unavailable)';
+    option.title = `WebGPU is unavailable: ${gpuUnavailable}`;
+    if (element('backend').value === 'webgpu') element('backend').value = 'cpu';
+}
 async function selectDefaultBackend() {
-    if (preferences.backend || !navigator.gpu || !WebAssembly.Suspending || !WebAssembly.promising) return;
+    if (preferences.backend || gpuUnavailable) return;
     try {
         const adapter = await navigator.gpu.requestAdapter({powerPreference: 'high-performance'});
         if (adapter && !adapter.info.isFallbackAdapter && !preferences.backend) element('backend').value = 'webgpu';

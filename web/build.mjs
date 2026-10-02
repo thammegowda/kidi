@@ -1,7 +1,8 @@
 import {spawnSync} from 'node:child_process';
-import {mkdir, copyFile, readdir, rm, writeFile} from 'node:fs/promises';
+import {mkdir, copyFile, readdir, readFile, rm, writeFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {resolve, join} from 'node:path';
+import {unsignedHeapIndices} from './wasm-glue.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const libraries = join(root, 'src/web/libs');
@@ -20,8 +21,14 @@ for (const [name, threads, gpu] of [['single', 'OFF', 'OFF'], ['threads', 'ON', 
         if (result.error || result.status !== 0) throw new Error(result.error?.message || `${command} failed`);
     }
     await mkdir(join(destination, name), {recursive: true});
-    for (const file of await readdir(build))
-        if (/^kidi.*\.(wasm|mjs|js)$/.test(file)) await copyFile(join(build, file), join(destination, name, file));
+    for (const file of await readdir(build)) {
+        if (!/^kidi.*\.(wasm|mjs|js)$/.test(file)) continue;
+        const target = join(destination, name, file);
+        // Lowered builds index heap views with signed shifts, which break above 2 GiB.
+        if (!file.endsWith('.wasm'))
+            await writeFile(target, unsignedHeapIndices(await readFile(join(build, file), 'utf8')));
+        else await copyFile(join(build, file), target);
+    }
 }
 for (const file of ['index.html', 'app.mjs', 'style.css', 'inference-worker.mjs', 'asr-worker.mjs',
     'audio-capture-worklet.mjs', 'speech.mjs', 'images.mjs', 'model-cache.mjs', 'markdown.mjs', 'mermaid.mjs',

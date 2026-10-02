@@ -14,13 +14,16 @@ option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
 if(EMSCRIPTEN)
     option(KIDI_WASM_THREADS "Enable WebAssembly pthreads" ON)
-    option(KIDI_WASM_WEBGPU "Build the WebGPU execution backend with JSPI" OFF)
+    option(KIDI_WASM_WEBGPU "Build the WebGPU execution backend" OFF)
     if(KIDI_WASM_WEBGPU AND KIDI_WASM_THREADS)
-        message(WARNING "WebGPU with pthreads is experimental; JSPI and pthreads are otherwise never combined")
+        message(WARNING "WebGPU with pthreads is untested; the app pairs WebGPU with the single-thread build")
     endif()
-    add_compile_options(-m64 -msimd128)
-    add_link_options(-m64 -msimd128 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=8GB -sSTACK_SIZE=2MB)
+    # 64-bit C++ pointers lowered to a 4 GiB wasm32 memory, which every engine supports (Safari has no Memory64).
+    set(KIDI_WASM_ADDRESS_FLAG -sMEMORY64=2)
+    add_compile_options(${KIDI_WASM_ADDRESS_FLAG} -msimd128)
+    add_link_options(${KIDI_WASM_ADDRESS_FLAG} -msimd128 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=2MB)
     if(KIDI_WASM_WEBGPU)
+        # Native Wasm exceptions let the JSPI-based WebGPU test binary suspend through C++ frames.
         add_compile_options(-fwasm-exceptions)
         add_link_options(-fwasm-exceptions)
     else()
@@ -46,6 +49,7 @@ add_library(kidi
     src/kidi/checkpoint/package.cpp
     src/kidi/checkpoint/prepare.cpp
     src/kidi/checkpoint/weights.cpp
+    src/kidi/core/memory.cpp
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
     src/kidi/graph/graph.cpp
@@ -69,6 +73,7 @@ add_library(kidi
     src/kidi/runtime/ynn/graph.cpp
     src/kidi/tensor/backend.cpp
     src/kidi/tensor/cpu_backend.cpp
+    src/kidi/tensor/external.cpp
     src/kidi/tensor/tensor.cpp
     src/kidi/text/tokenizer.cpp
 )
@@ -79,7 +84,6 @@ if(EMSCRIPTEN)
         target_sources(kidi PRIVATE src/kidi/tensor/web_gpu_backend.cpp src/kidi/runtime/webgpu/operators.cpp)
         target_link_libraries(kidi PRIVATE nlohmann_json::nlohmann_json)
         target_compile_definitions(kidi PUBLIC KIDI_HAS_WEBGPU=1)
-        add_link_options(-sJSPI=1)
     endif()
     add_executable(kidi_wasm src/kidi/web/bindings.cpp)
     target_link_libraries(kidi_wasm PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
@@ -90,16 +94,14 @@ if(EMSCRIPTEN)
         "-sEXPORTED_RUNTIME_METHODS=['FS','ccall','HEAPU8']"
         "-sEXPORTED_FUNCTIONS=['_malloc','_free']"
     )
-    if(KIDI_WASM_WEBGPU)
-        target_link_options(kidi_wasm PRIVATE "-sJSPI_EXPORTS=['kidi_configure','kidi_load','kidi_enqueue','kidi_step','kidi_cancel']")
-        if(KIDI_BUILD_TESTS)
-            add_executable(kidi_webgpu_test tests/web/backend_test.cpp)
-            target_link_libraries(kidi_webgpu_test PRIVATE kidi::kidi)
-            set_target_properties(kidi_webgpu_test PROPERTIES SUFFIX .mjs)
-            target_link_options(kidi_webgpu_test PRIVATE --no-entry -sMODULARIZE=1
-                "-sEXPORTED_RUNTIME_METHODS=['HEAPU8','FS']" "-sEXPORTED_FUNCTIONS=['_malloc']"
-                "-sJSPI_EXPORTS=['kidi_gpu_test','kidi_gpu_diagnose']")
-        endif()
+    # The app never waits on the GPU inside Wasm. Only the backend test reads results inline, through JSPI.
+    if(KIDI_WASM_WEBGPU AND KIDI_BUILD_TESTS)
+        add_executable(kidi_webgpu_test tests/web/backend_test.cpp)
+        target_link_libraries(kidi_webgpu_test PRIVATE kidi::kidi)
+        set_target_properties(kidi_webgpu_test PROPERTIES SUFFIX .mjs)
+        target_link_options(kidi_webgpu_test PRIVATE --no-entry -sMODULARIZE=1 -sJSPI=1
+            "-sEXPORTED_RUNTIME_METHODS=['HEAPU8','FS']" "-sEXPORTED_FUNCTIONS=['_malloc']"
+            "-sJSPI_EXPORTS=['kidi_gpu_test','kidi_gpu_diagnose']")
     endif()
 endif()
 

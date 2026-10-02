@@ -4,6 +4,202 @@ Short progress notes for the current implementation. Measurements are explorator
 unless explicitly labelled as paired acceptance results. Historical comparisons
 remain in [QAT.md](QAT.md).
 
+## 2026-10-02: Simplification Before Commit
+
+- Removed paths that neither the Wasm CPU nor the WebGPU app uses: per-operator memory tracing (`kidi_trace_memory`,
+  context memory labels), `kidi_release_workspaces`, the native wasm64 build option (`KIDI_WASM_MEMORY64`), a build
+  variant filter, and the profiler's per-pass mode and kernel override hooks.
+- WebGPU calibrated projections pick one kernel: the float-based decode kernel for one to three rows (now with a
+  smaller unroll for narrow widths), 8x32 packed-dot tiles for other short inputs and the decode kernel's unsupported
+  shapes, and register-blocked tiles from 32 rows. The older GEMV now serves only uncalibrated projections.
+- Decode attention has one scan for any head width up to 1024 (the per-thread-key scan is gone); widths with a quad
+  count divisible by four keep the fixed-trip loop, which measured faster.
+- The backend test now exercises the decode kernel with every unroll and the fallback tiles, against the CPU.
+  Same 96 greedy tokens; decode 86 / 82 tok/s at 310 / 2,225 tokens, 2k prefill 2.45 s, butterfly 1.15 s, under
+  heavier machine load than the previous entry.
+
+## 2026-10-01: WebGPU Decode Kernels
+
+Apple M5 (metal-3), headless Edge, warm. Starting point at a 310-token prompt: 60 tok/s, 861 dispatches per step
+(205 activation quantizations, 242 norms); GPU time per step 15.3 ms, of which FFN 6.5 ms and other packed
+projections 3.8 ms.
+
+- Decode projections (one to three rows) no longer use `dot4I8Packed`, which Metal emulates. A stand-in dot cut
+  FFN time from 6.5 to 4.5 ms; with the weight decode removed, 2-bit gate/up dropped from 2.60 to 1.45 ms.
+  Each workgroup now stages the activation row as f32 pre-scaled by powers of two, quantizing it on the way, so the
+  separate quantization dispatch is gone. Weights are decoded with one mask per value after flipping each field's
+  sign bit, and a per-word activation sum removes the bias. Products and chunk sums are integers below 2^24, so
+  outputs equal the INT8 dot product exactly (96 greedy tokens identical). Measured decodes for 2-bit gate/up: shift
+  pair and convert 2.60 ms, `extractBits` 2.14, shift pair without convert 1.87, mask 1.61. FFN per step: 2-bit
+  gate/up 2.82 -> 1.73 ms, down 1.52 -> 0.98; 4-bit 1.37 -> 1.20 and 0.74 -> 0.67.
+- Norms keep each thread's values in registers and read operands with compile-time dtypes; the runtime dtype
+  switch serialized their loads. About 9 -> 5 us per decode norm; alone 60 -> 64.7 tok/s. A one-barrier
+  broadcast reduction was slower than the existing tree.
+- Work is submitted every 128 dispatches (previously only when 8,192 uniform slots filled), so the GPU starts while
+  the browser still records and translates the rest of the step: 77 -> 85 tok/s.
+- Decode attention scored each key on one thread (512 serial channels with per-channel dequantization); global
+  layers read the cache at about 9 GB/s at 2,225 tokens. Four lanes now score each key from a query pre-multiplied
+  by the key scale, values accumulate per four-channel quad with coalesced reads, and scales apply once. Attention
+  per step at 2,225 tokens 3.6 -> 1.7 ms. Against a float64 reference on model shapes (8 query heads on 1 KV head,
+  widths 256/512, sliding-window crop) the error matches the previous kernel (about 1e-5); greedy text can differ
+  from it at near-ties. CPU and WebGPU replies agree on three of four test prompts; the fourth diverges at token
+  10 ("revolutionized" vs "stands as").
+- Results: decode 60 -> 89 tok/s at 310 tokens and 54 -> 81.5 tok/s at 2,225 tokens; 2k prefill 2.43 s; butterfly
+  image request 2.07 -> 1.07 s (vision norms run over 2,340 rows), described as "orange and black wings ... bright
+  orange flower" (CPU: "black and orange wings ... yellow and orange flower").
+- Remaining per step at 2,225 tokens (12.2 ms): other projections 3.7 ms (`lm_head` 1.3 ms, about 75 GB/s), FFN
+  4.6 ms (110-120 GB/s), attention 1.7 ms, norms 1.3 ms, FP32 per-layer projection 0.5 ms.
+- Validation: backend test page passes (projection, FFN, attention including INT8 split decode, vision and
+  full-logit parity); web unit tests pass.
+
+## 2026-10-01: Register Block Sweep
+
+- The three hand-written 64x64 tile kernels (quantized projections, FP32 `linear`, prefill attention) now come
+  from one generator, `tiledProduct` in `web/webgpu-kernels.mjs`, with the per-thread block set by `TILE`
+  (default 4x4) and fully unrolled accumulators. At 4x4 its kernel times match the hand-written ones (2k prompt:
+  Q4 gate_up 705 vs 720-735 ms, down 389 vs 400 ms; butterfly: 8-bit vision projection 231 vs 238 ms,
+  attention scores 130 vs 131 ms).
+- Apple M5 (metal-3), headless Edge, warm. Per-thread block vs 2,225-token prefill wall time and summed Q4 gate_up
+  time: 2x4 3.30 s / 804 ms, 4x2 3.13 s / 747 ms, 4x4 3.00 s / 705 ms, 4x8 3.03 s / 690 ms, 8x4 3.14-3.20 s /
+  707 ms, 8x8 3.54 s. Butterfly image enqueue: 4x4 2.07-2.10 s, 8x4 2.08 s, 8x8 2.28 s. Tokens were identical
+  for every shape. Larger blocks do not help on this GPU and 8x8 is slower, so 4x4 stays the default. Wall times
+  are about 0.4 s above the earlier 2.6 s because the machine was under memory pressure (1.5 GB swap in use).
+- Kernel time barely changes with block size because the quantized GEMMs are ALU-bound on `dot4I8Packed`, which
+  Metal emulates: replacing it with a one-operation stand-in cut Q4 gate_up from 705 to 228 ms and prefill from
+  3.0 to 1.7 s. GPUs with native packed int8 dot products (DP4A-class Vulkan devices) may behave differently;
+  untested here.
+- Validation: `tests/web/backend_test.html` all checks pass (projection, attention and vision CPU/WebGPU parity,
+  full logits); web unit tests pass.
+
+## 2026-10-01: First-Request Latency
+
+- The ~2 s first-message delay was not shader compilation: the first 76-117 pipeline creations cost about 2 ms of
+  CPU (Chromium compiles asynchronously). A CPU profile of the worker showed two causes instead.
+- The memory ledger called `mallinfo` before and after every newly prepared operator; it walks the whole heap
+  (~22 ms per call with the model loaded), so each new prompt length re-prepared ~330 operators for seconds.
+  Per-operator accounting is removed (the ledger records only load phases), and the app refreshes allocator
+  statistics only at phase ends. This also affected the CPU builds.
+- `lm_head` (96 MB, 2-bit, heap-resident) was interleaved into kernel layout with a 16-iteration bit loop per word on
+  first use; it now uses four byte-table lookups per word, like the JavaScript loader.
+- Fresh headless Edge, M5: first request ("What is the capital of France?") prefill 2.3 s -> 0.27-0.49 s (CPU
+  95-213 ms); a new prompt length (13 tokens) 0.14 s; first image request (cat photo) 1.0 s, butterfly 1.4 s
+  including 0.19 s decode and resize. CPU (4 threads, Node): first token 1.56 s, then 0.47 s, from YNNPACK
+  packing on first use.
+- CPU first request: profiling (single thread) showed ~0.65 s of YNNPACK packing (interleave, transpose, int2/int4
+  convert) on first use. `Generator::warm_up` now runs one throwaway decode token at load, packing every projection
+  (Wasm decode and prefill share packed weights) and, on WebGPU, preparing kernels and uploading `lm_head`. First
+  token: 1 thread 2.11 -> 1.10 s, 4 threads 1.56 -> 0.53 s (a second prompt takes 0.44 s); WebGPU prefill 0.19 s.
+  Load grows by about 1 s on one thread. The 2/4-bit dot kernels are scalar in Wasm (no SIMD variant), which
+  dominates remaining CPU prefill time.
+- Tooling note: a DevTools-protocol `Page.reload` left this headless Edge running JavaScript and Wasm about 7x
+  slower (40 s model loads); restart the browser between Wasm builds instead.
+
+## 2026-10-01: WebGPU Profiling and Speedups
+
+Measured in headless Edge on an Apple M5 GPU (metal-3) with a persistent session that loads the model once and
+hot-reloads kernels; the VS Code integrated browser's renderer crashed intermittently under this load.
+
+- Profile at 2,211 tokens: prefill 10.9 s (8.3 s GPU: quantized projections 4.3 s, FP32 per-layer projection
+  0.95 s, attention 2.6 s); decode 46 tok/s, GPU busy 16.9 of 19 ms per step.
+- Sliding-window layers scanned all cached keys on WebGPU; enabled the existing local-attention crop there.
+  Same tokens; 2k decode 46 -> 50 tok/s.
+- Register-blocked 64x64 tiles (4x4 outputs per thread) for multi-row quantized projections (>= 32 rows) and
+  FP32 `linear` (>= 4 rows), replacing one-output-per-thread and one-workgroup-per-output kernels. Prefill
+  attention now runs as Q K^T and P V through the same tiles with the row softmax between them, with per-entry
+  address math hoisted out of the inner loop. Same tokens; 2k warm prefill 10.9 -> 2.6 s (860 tok/s).
+- Decode attention splits keys into 64-key pieces (was 256), so short contexts use more than eight workgroups:
+  2k decode 50 -> 55 tok/s.
+- WebGPU prefill chunks are 256 tokens (CPU keeps 32). Round trips were not the limit (10.9 -> 10.4 s alone), but
+  wider chunks feed the tiled kernels.
+- Vision ran 2,520 patches in 32-row CPU-sized slices, about 15k dispatches whose launch overhead hid 0.6 s of
+  kernel work in 2.3 s. WebGPU now runs projections and the MLP over all rows and attention in 512-query
+  blocks. Butterfly photo (4288x2848): decode + resize 0.19 s, image request 3.2 -> 1.5 s, same description.
+- Current, warm shaders: 300-token prompt decode 60 tok/s; 2,225 tokens 54 tok/s. First use of each shape still
+  pays synchronous shader compilation (about 2 s on the first request).
+- Remaining headroom: tiled GEMMs reach about 0.75 TMAC/s for both int8 and FP32; decode FFN projections read
+  weights at about 74 GB/s. (A later sweep showed the int8 tiles are limited by emulated `dot4I8Packed`, not tile
+  shape; see "Register Block Sweep".)
+
+## 2026-10-01: WebGPU Without JSPI and Weights Streamed to the GPU
+
+Goal: one WebGPU protocol for every browser (no JSPI, no Asyncify), following
+WebLLM: Wasm never waits for the GPU; JavaScript awaits between Wasm calls.
+
+- C++ GPU calls are synchronous: `createComputePipeline` replaces the async
+  variant (compile errors surface through error scopes on the next check), and
+  `synchronize()` submits without waiting. Timestamp labels now accumulate
+  across submissions and resolve once per JavaScript `synchronize()`.
+- `ServingOptions::deferred_tokens`: `step()` accepts the previous call's
+  selected tokens before submitting new work. A first version lost a decode
+  token when a final prefill chunk replayed the same captured decode step in the
+  same call (shared output buffer); a deferred step now submits one selection.
+  A native test compares deferred and immediate serving with one and two active
+  requests.
+- Removed mid-step reads: vision pooling runs on the device as nine strided
+  slices plus adds, and the position table is a CPU parameter. The table first
+  stayed on the GPU because a parameter's device comes from its module, not the
+  ambient `ModuleScope`; it is now registered with an explicit storage device.
+  Transformers vision references: max error 2.38e-7 (FP32) and 1.79e-7 (QAT).
+  One 2,469-token image probe flipped a near-tie at output token 5; a short
+  image prompt still describes the photo correctly.
+- The production GPU build drops JSPI. The developer backend test keeps it and
+  installs a test-only wait hook; all its checks pass, also with the WGSL
+  `packed_4x8_integer_dot_product` extension masked so kernels use the emulated
+  dot product.
+- GPU-mode loader uploads `model.language_model.layers.*` packed weights
+  (0.625 GiB) straight to GPU buffers, interleaved in JavaScript, with gate+up
+  fused; C++ adopts them via `external_tensors`. Heap weights 1.06 -> 0.43 GiB.
+- Chromium (Apple metal-3), 296-token prompt: heap 1.44 -> 0.82 GiB, GPU
+  buffers 1.53 -> 0.95 GiB, prefill 58 -> 84 tok/s, decode 11.2 -> 14.8 tok/s,
+  tokens equal to CPU. At 2,211 tokens: heap 0.82 GiB, GPU 1.04 GiB, prefill
+  67 tok/s, decode 4.9 tok/s (long-context GPU attention, not the protocol).
+- Safari 26.6 (no JSPI), WebGPU: 74 / 16 tok/s at 296 tokens, heap 0.82 GiB;
+  with a photo, a correct one-sentence description (heap 0.97, GPU 1.26 GiB).
+
+## 2026-10-01: wasm32 4 GiB Default and Memory-Efficient Loading
+
+Goal: run Gemma 4 E2B chat with up to ~2k-token contexts in a 4 GiB Wasm heap,
+so Safari (no Memory64; JSPI only from Safari 27) and every other engine can load it.
+The previous wasm64 build failed in Safari 26.6 at compile time ("Memory64 is
+not enabled"); with its hidden flag, JavaScriptCore still caps memories at 4 GiB.
+
+- Added a `mallinfo`-based memory ledger: `kidi_memory_stats` reports heap,
+  allocator use/free/peak, KV cache, image features, and net allocation by
+  category (tokenizer, weight binding, each operator type and row count when
+  first prepared). The app shows it under Model settings > Memory diagnostics.
+  `benchmarks/web/heap_probe.mjs` runs the real loader and module in Node.
+- Baseline, wasm64 CPU, 2,211 prompt + 32 output tokens: peak heap 4.38 GiB;
+  allocator 4.20 GiB = checkpoint 2.29 (per-layer table 1.13, audio tower
+  0.14), decode packing 0.73, fused-FFN prefill tiles 0.38, gate/up concat
+  0.31, tail-chunk packing 0.20, prefill attention packing 0.08, KV 0.08,
+  tokenizer 0.06. KV is not the constraint: only 15 layers own caches.
+- Loader: compacted 64-byte-aligned heap image without audio tensors, gate
+  directly before up (zero-copy fused view), per-layer embedding table in
+  JavaScript shards served through `external_tensors`. Peak 2.84 GiB; same 32
+  token IDs; decode 5.14 vs 5.08 tok/s.
+- Wasm-only policies: no CPU fused FFN (its transposed tiles were a second
+  FFN copy) and single-row calibrated projections on the shared INT8 dot so
+  YNNPACK packs each weight once. Peak 2.23 GiB, same tokens. One thread:
+  prefill 20.75 -> 21.13 tok/s, decode 5.14 -> 5.18. Four threads: prefill
+  53.3 -> 53.8-56.2, decode 12.59 -> 12.14-12.49 across three runs; treated as
+  noise. Native builds keep both previous policies.
+- Browser builds now default to `MEMORY64=2` (64-bit C++ pointers lowered to a
+  4 GiB wasm32 memory) with the restored glue heap-index fix; wasm64 is an
+  opt-in CMake setting and is no longer packaged. Lowered single-thread Node
+  runs were faster than wasm64 (prefill 24.3, decode 5.42 tok/s) with the same
+  tokens. A 2,469-token request with a 1600x1598 JPEG peaked at 2.32 GiB with
+  the original wasm64 run's exact tokens.
+- Safari 26.6 (harness on loopback, real Cache Storage path for the app):
+  one thread 18.8 prefill / 4.4 decode tok/s, four threads 52.7 / 11.8, peaks
+  2.23 / 2.24 GiB, token IDs identical to Node. The real app auto-loaded from
+  cache on `threads` and answered text and image chats. Chromium WebGPU
+  (Apple metal-3) on the lowered build: heap 1.44 GiB, GPU buffers 1.53 GiB,
+  same tokens as CPU, 58 prefill / 11.2 decode tok/s. The previous wasm64
+  WebGPU build crashed the integrated browser's renderer during `kidi_load`
+  before any GPU allocation; not investigated further since it is no longer built.
+- WebGPU was then unavailable in Safari 26 (no JSPI); the JSPI-free protocol
+  in the entry above removes that restriction.
+
 ## 2026-10-01: Native wasm64 and Vision Memory
 
 - All three browser variants now use native `-m64` unconditionally, with an

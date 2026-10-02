@@ -9,6 +9,22 @@
 #include <cmath>
 #include <fstream>
 
+namespace {
+// The app never waits inside Wasm; these checks read results inline, so this JSPI-linked binary installs a waiter.
+// clang-format off
+EM_ASYNC_JS(int, wait_now, (), {
+    try {
+        await Module.kidiGpu.synchronize();
+        return 0;
+    } catch (error) {
+        Module.kidiGpu.failure = Module.kidiGpu.failure || String(error);
+        return -1;
+    }
+});
+// clang-format on
+[[maybe_unused]] const bool WAITER = (kidi::tensor::set_web_gpu_wait(wait_now), true);
+} // namespace
+
 extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_test() -> int {
     try {
         using namespace kidi;
@@ -53,7 +69,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_test() -> int {
                 }
                 auto dense =
                     ops::require(tensor::Tensor::from_host({columns, width}, std::span<const float>(dense_values)));
-                for (const int rows : {1, 4}) {
+                for (const int rows : {1, 3, 4}) {
                     std::vector<float> values(rows * width);
                     for (std::size_t index = 0; index < values.size(); ++index)
                         values[index] = (static_cast<int>(index % 41) - 20) * 0.13F;
@@ -90,7 +106,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_test() -> int {
                             throw std::runtime_error("packed embedding mismatch at width " + std::to_string(width) +
                                                      " bits " + std::to_string(bits));
             }
-        std::cout << "Q2/Q4/Q8 calibrated one/four-row projection parity passed\n";
+        std::cout << "Q2/Q4/Q8 calibrated one/three/four-row projection parity passed\n";
         auto compare = [&](const tensor::Tensor& expected, const tensor::Tensor& actual, float tolerance) {
             auto host = ops::require(actual.to(tensor::Device::cpu()));
             auto left = ops::require(expected.data<float>());

@@ -3,6 +3,7 @@
 #include "kidi/inference/generator.h"
 #include "kidi/runtime/operator.h"
 #include "kidi/tensor/backend.h"
+#include "kidi/tensor/external.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -76,6 +77,87 @@ auto fixture_directory(std::string_view fixture) -> std::filesystem::path {
     return base.filename() == std::filesystem::path(fixture) ? base : base / fixture;
 }
 
+auto write_tokenizer(const std::filesystem::path& path) -> void {
+    std::ofstream(path) << R"({
+      "version":"1.0", "pre_tokenizer":{"type":"WhitespaceSplit"},
+      "decoder":{"type":"WordPiece","prefix":"##","cleanup":false},
+      "model":{"type":"WordLevel","unk_token":"<unk>","vocab":{
+        "<pad>":0,"<eos>":1,"<bos>":2,"<turn|>":3,"<|turn>":4,"<unk>":5,
+        "alpha":6,"beta":7,"gamma":8,"delta":9,"theta":10,"zeta":11,"eta":12,"iota":13,"kappa":14,"lambda":15}}
+    })";
+}
+
+/// Rows of a host table, counting gathers, standing in for a browser-held per-layer embedding table.
+class CountingRows final : public kidi::tensor::RowSource {
+public:
+    explicit CountingRows(kidi::tensor::Tensor table) : table_(std::move(table)) {}
+    auto gather(std::span<const std::int32_t> rows, std::span<std::byte> destination) const
+        -> kidi::Result<void> override {
+        gathered += rows.size();
+        return kidi::tensor::gather_rows(table_, rows, destination);
+    }
+    mutable std::size_t gathered = 0;
+
+private:
+    kidi::tensor::Tensor table_;
+};
+
+/// A per-layer embedding table supplied outside the checkpoint generates the same tokens through eager prefill and
+/// captured decode steps, and a declared external table without a source fails to load.
+auto check_external_rows(const std::filesystem::path& fixture, const YAML::Node& config,
+                         kidi::tensor::Device device) -> void {
+    using kidi::ops::require;
+    const std::string table_name = "model.language_model.embed_tokens_per_layer.weight";
+    const auto state = require(require(kidi::checkpoint::Weights::load(fixture / "model.safetensors")).state_dict());
+    if (!state.contains(table_name)) return;
+    const auto directory = std::filesystem::temp_directory_path() / "kidi-external-rows-test";
+    std::filesystem::remove_all(directory);
+    for (const auto* name : {"internal", "external"}) std::filesystem::create_directories(directory / name);
+    auto reduced = state;
+    reduced.erase(table_name);
+    require(kidi::checkpoint::Weights::save(directory / "internal" / "model.safetensors", state));
+    require(kidi::checkpoint::Weights::save(directory / "external" / "model.safetensors", reduced));
+    YAML::Node manifest;
+    manifest["format_version"] = 1;
+    manifest["weights_file"] = "model.safetensors";
+    manifest["tokenizer_file"] = "tokenizer.json";
+    manifest["model"] = YAML::Clone(config);
+    manifest["decode"]["maximum_new_tokens"] = 4;
+    manifest["decode"]["context_size"] = 16;
+    std::ofstream(directory / "internal" / "model.yaml") << manifest;
+    const auto& table = state.at(table_name);
+    YAML::Node declared;
+    declared["name"] = table_name;
+    declared["dtype"] = std::string(kidi::tensor::to_string(table.dtype()));
+    declared["shape"] = std::vector<std::int64_t>(table.shape().begin(), table.shape().end());
+    manifest["external_tensors"].push_back(declared);
+    std::ofstream(directory / "external" / "model.yaml") << manifest;
+    for (const auto* name : {"internal", "external"}) write_tokenizer(directory / name / "tokenizer.json");
+    if (kidi::inference::Generator::load(directory / "external", device))
+        throw std::runtime_error("declared external tensors loaded without a source");
+    auto rows = std::make_shared<CountingRows>(table);
+    auto external = require(kidi::inference::Generator::load(
+        directory / "external", device, 0, 128, false,
+        [&](std::string_view name, kidi::tensor::DType dtype, std::span<const std::int64_t> shape) {
+            if (name != table_name) throw std::runtime_error("unexpected external tensor");
+            return kidi::tensor::external_tensor({shape.begin(), shape.end()}, dtype, rows);
+        }));
+    auto internal = require(kidi::inference::Generator::load(directory / "internal", device));
+    kidi::inference::GenerationOptions options;
+    options.maximum_new_tokens = 4;
+    options.context_size = 16;
+    options.prefill_chunk_size = 2;
+    options.raw_prompt = true;
+    options.ignore_eos = true;
+    const auto expected = require(internal.generate("alpha beta gamma delta eta", options));
+    // A load-time warm-up only prepares operators; it must not leak state into the first request.
+    require(external.warm_up());
+    const auto actual = require(external.generate("alpha beta gamma delta eta", options));
+    if (actual.generation.token_ids != expected.generation.token_ids || rows->gathered < 5 + 3)
+        throw std::runtime_error("external per-layer embeddings changed tokens or skipped row gathers");
+    std::filesystem::remove_all(directory);
+}
+
 auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node& config,
                          kidi::tensor::Device device) -> void {
     using kidi::ops::require;
@@ -91,13 +173,7 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     manifest["decode"]["maximum_new_tokens"] = 3;
     manifest["decode"]["context_size"] = 16;
     std::ofstream(directory / "model.yaml") << manifest;
-    std::ofstream(directory / "tokenizer.json") << R"({
-      "version":"1.0", "pre_tokenizer":{"type":"WhitespaceSplit"},
-      "decoder":{"type":"WordPiece","prefix":"##","cleanup":false},
-      "model":{"type":"WordLevel","unk_token":"<unk>","vocab":{
-        "<pad>":0,"<eos>":1,"<bos>":2,"<turn|>":3,"<|turn>":4,"<unk>":5,
-        "alpha":6,"beta":7,"gamma":8,"delta":9,"theta":10,"zeta":11,"eta":12,"iota":13,"kappa":14,"lambda":15}}
-    })";
+    write_tokenizer(directory / "tokenizer.json");
     auto cached = require(kidi::inference::Generator::load(directory, device));
     auto plain = require(kidi::inference::Generator::load(directory, device));
     require(cached.configure_serving({1, 4, 16, 2}));
@@ -175,6 +251,24 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
         if (!results[index] || results[index]->generation.token_ids != expected.generation.token_ids ||
             results[index]->stats.reused_prompt_tokens != (index == 0 ? 3 : 0))
             throw std::runtime_error("queued requests shared or lost streaming KV state");
+    }
+    // Deferred tokens report each selection one step later, alone and batched, without changing the generation.
+    auto deferred = require(kidi::inference::Generator::load(directory, device));
+    for (const std::size_t active : {1, 2}) {
+        require(deferred.configure_serving(
+            {.maximum_active = active, .maximum_requests = 4, .cache_token_budget = 32, .prefill_tokens_per_step = 2,
+             .deferred_tokens = true}));
+        const std::array deferred_ids{require(deferred.enqueue(prompts[0], uncached)),
+                                      require(deferred.enqueue(prompts[1], uncached))};
+        std::array<std::optional<kidi::inference::TextGeneration>, 2> deferred_results;
+        while (deferred.pending_requests())
+            for (auto& event : require(deferred.step()).events)
+                if (event.completed)
+                    deferred_results[event.request_id == deferred_ids[0] ? 0 : 1] = std::move(event.completed);
+        for (std::size_t index = 0; index < deferred_results.size(); ++index)
+            if (!deferred_results[index] || deferred_results[index]->generation.token_ids !=
+                                                run(plain, prompts[index], uncached).generation.token_ids)
+                throw std::runtime_error("deferred token serving changed generated tokens");
     }
     manifest["model"]["max_position_embeddings"] = 1024;
     std::ofstream(directory / "model.yaml") << manifest;
@@ -258,6 +352,7 @@ auto main() -> int {
                 devices.push_back(tensor::Device::vulkan());
             for (auto device : devices) {
                 check_serving_cache(directory, config, device);
+                check_external_rows(directory, config, device);
                 const ModuleScope construction(tensor::DType::F32, false, device);
                 auto model = ops::require(model::Gemma4Impl::create(config));
                 ops::require(model->set_checkpoint(checkpoint));

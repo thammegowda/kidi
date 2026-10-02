@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <cstdint>
 #include <iostream>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include "kidi/tensor/backend.h"
+#include "kidi/tensor/external.h"
 #include "kidi/tensor/tensor.h"
 
 namespace {
@@ -16,6 +18,21 @@ auto require(bool condition, std::string_view message) -> bool {
     if (!condition) std::cerr << message << '\n';
     return condition;
 }
+
+/// Serves rows of a three-row table whose row `r` holds bytes `10 * r + column`.
+class GeneratedRows final : public kidi::tensor::RowSource {
+public:
+    auto gather(std::span<const std::int32_t> rows, std::span<std::byte> destination) const
+        -> kidi::Result<void> override {
+        const auto width = destination.size() / rows.size();
+        for (std::size_t index = 0; index < rows.size(); ++index)
+            for (std::size_t column = 0; column < width; ++column)
+                destination[index * width + column] = static_cast<std::byte>(10 * rows[index] + column);
+        ++calls;
+        return {};
+    }
+    mutable int calls = 0;
+};
 
 } // namespace
 
@@ -136,6 +153,38 @@ auto main() -> int {
     auto blob_values = read_only_blob.data<float>();
     if (!require(blob_values.has_value() && (*blob_values)[0] == 7 && (*blob_values)[1] == 8,
                  "read-only host blob lost its external owner")) {
+        return 1;
+    }
+
+    auto rows = std::make_shared<GeneratedRows>();
+    const auto table = kidi::tensor::external_tensor({3, 4}, DType::U8, rows);
+    std::array<std::byte, 8> gathered{};
+    const std::array<std::int32_t, 2> selected{2, 0};
+    if (!require(table.has_value() && kidi::tensor::is_external(*table) && table->nbytes() == 12 &&
+                     table->device() == Device::cpu() && !table->host_bytes().has_value() &&
+                     !table->to(Device::vulkan()).has_value(),
+                 "external tables must be shaped CPU tensors without host addresses")) {
+        return 1;
+    }
+    if (!require(kidi::tensor::gather_rows(*table, selected, gathered).has_value() && rows->calls == 1 &&
+                     gathered[0] == std::byte{20} && gathered[3] == std::byte{23} && gathered[4] == std::byte{0},
+                 "external row gather returned the wrong rows")) {
+        return 1;
+    }
+    const std::array<std::int32_t, 1> outside{3};
+    if (!require(!kidi::tensor::gather_rows(*table, outside, std::span(gathered).first(4)).has_value() &&
+                     !kidi::tensor::gather_rows(*table, selected, std::span(gathered).first(4)).has_value() &&
+                     rows->calls == 1,
+                 "row gathers must reject rows outside the table and mismatched destinations")) {
+        return 1;
+    }
+    const auto host_table = Tensor::from_host({2, 3}, std::span<const float>(VALUES));
+    std::array<std::byte, sizeof(float) * 3> host_row{};
+    const std::array<std::int32_t, 1> second{1};
+    if (!require(host_table.has_value() && !kidi::tensor::is_external(*host_table) &&
+                     kidi::tensor::gather_rows(*host_table, second, host_row).has_value() &&
+                     std::bit_cast<std::array<float, 3>>(host_row)[0] == 4,
+                 "host row gather returned the wrong row")) {
         return 1;
     }
     return 0;

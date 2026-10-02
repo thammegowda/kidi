@@ -1,24 +1,30 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {deleteCachedModel, isModelCached, listCachedModels, loadModel, resolveModelSource} from '../../web/model-cache.mjs';
+import {deleteCachedModel, interleavePacked, isModelCached, listCachedModels, loadModel, resolveModelSource, weightLayout}
+    from '../../web/model-cache.mjs';
+import {unsignedHeapIndices} from '../../web/wasm-glue.mjs';
 
-test('built wasm64 runtime addresses memory above 4 GiB', {skip: !process.env.KIDI_TEST_WASM}, async () => {
+test('built wasm32 runtime addresses memory above 2 GiB within its 4 GiB limit', {skip: !process.env.KIDI_TEST_WASM}, async () => {
     const {pathToFileURL} = await import('node:url');
     const {resolve} = await import('node:path');
     const {default: create} = await import(pathToFileURL(resolve(process.env.KIDI_TEST_WASM)).href);
     const module = await create();
-    const base = module._malloc(2 ** 32 + 64);
+    const base = Number(module._malloc(2 ** 31 + 64));
     assert.ok(base > 0);
     try {
-        const high = base + 2 ** 32;
+        const high = base + 2 ** 31;
         module.HEAPU8[high] = 137;
         module.HEAPU8[high + 31] = 251;
         assert.equal(module.HEAPU8[high], 137);
         assert.equal(module.HEAPU8[high + 31], 251);
-        assert.ok(module.HEAPU8.byteLength > 2 ** 32);
+        assert.ok(module.HEAPU8.byteLength > 2 ** 31);
         const result = JSON.parse(module.ccall('kidi_transcribe', 'string',
             ['pointer', 'number', 'string', 'number'], [high, 0, 'en', 1]));
         assert.match(result.error, /Speech must contain/);
+        const memory = JSON.parse(module.ccall('kidi_memory_stats', 'string', [], []));
+        // Emscripten keeps wasm32 memory one 64 KiB page below 4 GiB.
+        assert.equal(memory.heap_limit_bytes, 4 * 1024 ** 3 - 65536);
+        assert.ok(memory.malloc_in_use_bytes >= 2 ** 31);
     } finally { module._free(base); }
 });
 
@@ -59,6 +65,77 @@ test('image attachments persist outside chat text and stage bounded temporary re
         await assert.rejects(readImage({id: '../../model/model.yaml'}), /Invalid image/);
     } finally { globalThis.caches = previous; }
 });
+test('lowered wasm32 glue fixes direct and pthread heap indices without changing arithmetic shifts', () => {
+    const source = 'HEAP32[ptr >> 2] = 1; (growMemViews(), HEAPU64)[addr >> 3] = 2n; const signed = value >> 3;';
+    const fixed = unsignedHeapIndices(source);
+    assert.equal(fixed, 'HEAP32[ptr >>> 2] = 1; (growMemViews(), HEAPU64)[addr >>> 3] = 2n; const signed = value >> 3;');
+    assert.equal(unsignedHeapIndices(fixed), fixed);
+});
+
+test('Gemma heap layout drops audio, keeps per-layer embeddings outside, and joins gate/up projections', () => {
+    const tensor = (dtype, shape, start, end) => ({dtype, shape, data_offsets: [start, end]});
+    const header = {
+        'model.audio_tower.weight': tensor('F32', [4], 0, 16),
+        'model.language_model.embed_tokens_per_layer.embedding_quantized': tensor('U8', [4, 8], 16, 48),
+        'model.language_model.layers.0.mlp.up_proj.weight': tensor('U8', [2, 3], 48, 54),
+        'model.language_model.norm.weight': tensor('F32', [3], 54, 66),
+        'model.language_model.layers.0.mlp.gate_proj.weight': tensor('U8', [2, 3], 66, 72),
+    };
+    const ranges = Object.entries(header).map(([name, info]) =>
+        ({name, start: info.data_offsets[0], end: info.data_offsets[1], mask: 0}));
+    const layout = weightLayout(header, ranges, true);
+    assert.equal(layout.header['model.audio_tower.weight'], undefined);
+    assert.equal(layout.header['model.language_model.embed_tokens_per_layer.embedding_quantized'], undefined);
+    assert.deepEqual(layout.external.map(table => [table.name, table.rowBytes, table.shards[0].length]),
+        [['model.language_model.embed_tokens_per_layer.embedding_quantized', 8, 32]]);
+    const gate = layout.header['model.language_model.layers.0.mlp.gate_proj.weight'].data_offsets;
+    const up = layout.header['model.language_model.layers.0.mlp.up_proj.weight'].data_offsets;
+    assert.equal(gate[0] % 64, 0);
+    assert.equal(up[0], gate[1]);
+    assert.equal(layout.header['model.language_model.norm.weight'].data_offsets[0] % 64, 0);
+    assert.equal((8 + layout.headerBytes) % 64, 0);
+    assert.equal(layout.totalBytes, 8 + layout.headerBytes + layout.dataBytes);
+});
+
+test('packed weights interleave like the C++ WebGPU path', () => {
+    // Reference rule from runtime/webgpu/operators.cpp: value `slot` moves to byte slot % 4 at bit bits * (slot / 4).
+    const reference = (word, bits) => {
+        let output = 0;
+        for (let slot = 0; slot < 32 / bits; slot++)
+            output |= ((word >>> (slot * bits)) & ((1 << bits) - 1)) << (8 * (slot % 4) + bits * Math.floor(slot / 4));
+        return output >>> 0;
+    };
+    const words = new Uint32Array([0, 0xffffffff, 0x12345678, 0x89abcdef, 0x0f1e2d3c, 0xdeadbeef]);
+    for (const bits of [2, 4]) {
+        const bytes = new Uint8Array(words.slice().buffer);
+        interleavePacked(bytes, bits);
+        assert.deepEqual([...new Uint32Array(bytes.buffer)], [...words].map(word => reference(word, bits)));
+    }
+    const eight = new Uint8Array(words.slice().buffer);
+    interleavePacked(eight, 8);
+    assert.deepEqual([...new Uint32Array(eight.buffer)], [...words]);
+});
+
+test('WebGPU layout sends decoder projections to fused GPU buffers and keeps the rest in the heap', () => {
+    const tensor = (dtype, shape, start, end) => ({dtype, shape, data_offsets: [start, end]});
+    const header = {
+        'model.language_model.layers.0.mlp.gate_proj.weight': tensor('U8', [4, 2], 0, 8),
+        'model.language_model.layers.0.mlp.up_proj.weight': tensor('U8', [4, 2], 8, 16),
+        'model.language_model.layers.0.self_attn.q_proj.weight': tensor('U8', [4, 2], 16, 24),
+        'model.language_model.layers.0.mlp.gate_proj.weight_scale': tensor('F32', [4, 1], 24, 40),
+        'model.language_model.embed_tokens.embedding_quantized': tensor('U8', [4, 2], 40, 48),
+    };
+    const ranges = Object.entries(header).map(([name, info]) => ({name, start: info.data_offsets[0],
+        end: info.data_offsets[1], mask: 0, bits: name.endsWith('weight_scale') ? 0 : 4}));
+    const layout = weightLayout(header, ranges, true, true);
+    assert.deepEqual(layout.device.map(entry => [entry.name, entry.shape, entry.bytes, entry.bits]), [
+        ['model.language_model.layers.0.mlp.gate_up_proj.weight', [8, 2], 16, 4],
+        ['model.language_model.layers.0.self_attn.q_proj.weight', [4, 2], 8, 4]]);
+    assert.deepEqual(Object.keys(layout.header).sort(), ['model.language_model.embed_tokens.embedding_quantized',
+        'model.language_model.layers.0.mlp.gate_proj.weight_scale']);
+    assert.equal(weightLayout(header, ranges.map(range => ({...range})), true).device.length, 0);
+});
+
 test('model IDs resolve latest Hub revisions and retain an offline pinned mapping', async () => {
     const cache = new Map();
     const originalFetch = globalThis.fetch, originalCaches = globalThis.caches;
@@ -133,9 +210,12 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
         'model.language_model.test.weight': {dtype: 'U8', shape: [1, width], data_offsets: [0, width]},
         'lm_head.weight': {dtype: 'U8', shape: [1, 8], data_offsets: [width, width + 8]},
         'model.language_model.test_eight_bit.weight': {dtype: 'I8', shape: [1, 8], data_offsets: [width + 8, width + 16]},
-        'model.language_model.test_float.weight': {dtype: 'BF16', shape: [1, 4], data_offsets: [width + 16, width + 24]}
+        'model.language_model.test_float.weight': {dtype: 'BF16', shape: [1, 4], data_offsets: [width + 16, width + 24]},
+        'model.language_model.embed_tokens_per_layer.embedding_quantized':
+            {dtype: 'U8', shape: [2, 4], data_offsets: [width + 24, width + 32]},
+        'model.audio_tower.test.weight': {dtype: 'F32', shape: [4], data_offsets: [width + 32, width + 48]}
     };
-    const upstream = new Uint8Array(8 + headerBytes + width + 24);
+    const upstream = new Uint8Array(8 + headerBytes + width + 48);
     new DataView(upstream.buffer).setBigUint64(0, BigInt(headerBytes), true);
     upstream.fill(32, 8, 8 + headerBytes);
     upstream.set(new TextEncoder().encode(JSON.stringify(header)), 8);
@@ -179,19 +259,35 @@ test('Hub ranges normalize once in owned memory and preserve the upstream cache 
         assert.equal(metrics.cachedBytes, 0);
         const mapped = first.files.get('/model/model.safetensors');
         assert.equal(mapped.contents.buffer, first.HEAPU8.buffer);
-        assert.equal(mapped.usedBytes, upstream.length);
-        assert.equal(mapped.stream_ops.mmap(null, upstream.length, 0, 1).allocated, false);
-        const data = mapped.contents.subarray(8 + headerBytes);
-        assert.equal(data[0], 0x12 ^ 0x88);
-        assert.equal(data[width - 1], 0x12 ^ 0x88);
-        assert.equal(data[width], 0x12 ^ 0xaa);
-        assert.equal(data[width + 8], 0x12);
-        assert.deepEqual(data.subarray(width + 16), upstream.subarray(upstream.length - 8));
-        const normalized = JSON.parse(new TextDecoder().decode(mapped.contents.subarray(8, 8 + headerBytes)));
+        assert.equal(mapped.usedBytes, metrics.heapWeightBytes);
+        assert.equal(mapped.stream_ops.mmap(null, mapped.usedBytes, 0, 1).allocated, false);
+        const contents = mapped.contents;
+        const compactHeader = Number(new DataView(contents.buffer, contents.byteOffset, 8).getBigUint64(0, true));
+        assert.equal((contents.byteOffset + 8 + compactHeader) % 64, 0);
+        const normalized = JSON.parse(new TextDecoder().decode(contents.subarray(8, 8 + compactHeader)));
+        const tensor = name => contents.subarray(8 + compactHeader + normalized[name].data_offsets[0],
+            8 + compactHeader + normalized[name].data_offsets[1]);
+        assert.equal(tensor('model.language_model.test.weight')[0], 0x12 ^ 0x88);
+        assert.equal(tensor('model.language_model.test.weight').at(-1), 0x12 ^ 0x88);
+        assert.equal(tensor('lm_head.weight')[0], 0x12 ^ 0xaa);
+        assert.equal(tensor('model.language_model.test_eight_bit.weight')[0], 0x12);
+        assert.deepEqual(tensor('model.language_model.test_float.weight'),
+            upstream.subarray(8 + headerBytes + width + 16, 8 + headerBytes + width + 24));
         assert.equal(normalized['model.language_model.test_eight_bit.weight'].dtype, 'U8');
         assert.equal(normalized['model.language_model.test_float.weight'].dtype, 'BF16');
-        assert.deepEqual(Object.keys(normalized), Object.keys(header));
+        assert.deepEqual(Object.keys(normalized).sort(), ['lm_head.weight', 'model.language_model.test.weight',
+            'model.language_model.test_eight_bit.weight', 'model.language_model.test_float.weight']);
+        assert.equal(metrics.externalWeightBytes, 8);
+        const rows = 16, destination = 32;
+        new Int32Array(first.HEAPU8.buffer, rows, 3).set([1, 0, 2]);
+        first.kidiExternal.gather('model.language_model.embed_tokens_per_layer.embedding_quantized', rows, 2,
+            destination, 4);
+        assert.deepEqual([...first.HEAPU8.subarray(destination, destination + 8)], Array(8).fill(0x12 ^ 0x88));
+        assert.throws(() => first.kidiExternal.gather('model.language_model.embed_tokens_per_layer.embedding_quantized',
+            rows, 3, destination, 4), /outside/);
         const descriptor = JSON.parse(first.files.get('/model/model.yaml'));
+        assert.deepEqual(descriptor.external_tensors, [{name: 'model.language_model.embed_tokens_per_layer.embedding_quantized',
+            dtype: 'u8', shape: [2, 4]}]);
         assert.deepEqual(JSON.parse(new TextDecoder().decode(first.files.get('/model/config.json'))), config);
         assert.equal(descriptor.model.packed_weights_signed, true);
         assert.deepEqual(descriptor.decode, {maximum_new_tokens: 1024, context_size: 9216});

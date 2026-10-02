@@ -1,5 +1,6 @@
 const CACHE_NAME = 'kidi-model-v1';
-export const MAX_WASM_MEMORY = 8 * 1024 ** 3;
+export const MAX_WASM_MEMORY = 4 * 1024 ** 3;
+export const webGpuSupport = () => globalThis.navigator?.gpu ? '' : 'this browser has no WebGPU';
 const CHUNK_BYTES = 8 * 1024 * 1024;
 const MODEL_ID = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const hex = bytes => Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
@@ -209,20 +210,20 @@ function normalizationPlan(config, header, dataBytes) {
         if (![start, end, elements, elements * widths[tensor.dtype]].every(Number.isSafeInteger) ||
             start < 0 || end < start || end > dataBytes || end - start !== elements * widths[tensor.dtype] ||
             start % widths[tensor.dtype]) throw new Error(`Invalid tensor range: ${name}`);
-        let mask = 0;
+        let mask = 0, bits = 0;
         if (gemma && /\.(weight|embedding_quantized)$/.test(name) && ['U8', 'I8'].includes(tensor.dtype)) {
             const module = name.replace(/\.(weight|embedding_quantized)$/, '');
             if (quantization.modules_to_not_convert.some(excluded => module.includes(excluded)))
                 throw new Error(`Unexpected quantized excluded tensor: ${name}`);
             const override = Object.entries(quantization.module_quant_configs)
                 .find(([pattern]) => new RegExp(pattern).test(module));
-            const bits = override ? override[1].num_bits : quantization.num_bits;
+            bits = override ? override[1].num_bits : quantization.num_bits;
             if (![2, 4, 8].includes(bits) || tensor.dtype !== (bits === 8 ? 'I8' : 'U8'))
                 throw new Error(`Unsupported packed tensor: ${name}`);
             mask = bits === 2 ? 0xaa : bits === 4 ? 0x88 : 0;
             tensor.dtype = 'U8';
         }
-        ranges.push({start, end, mask});
+        ranges.push({name, start, end, mask, bits});
     }
     ranges.sort((left, right) => left.start - right.start);
     let end = 0;
@@ -231,10 +232,145 @@ function normalizationPlan(config, header, dataBytes) {
         end = range.end;
     }
     if (end !== dataBytes) throw new Error('Checkpoint tensor sizes do not cover the payload');
-    return ranges.filter(range => range.mask);
+    return ranges;
 }
 
-async function loadHubModel(module, source, progress, cache, warning, cacheOnly) {
+const ALIGNMENT = 64;
+const SHARD_BYTES = 256 * 1024 * 1024;
+const alignUp = (value, alignment) => Math.ceil(value / alignment) * alignment;
+// Chat never runs the audio tower, and per-layer embeddings are read a few rows per token, so neither needs heap space.
+const EXTERNAL_TENSORS = new Set(['model.language_model.embed_tokens_per_layer.embedding_quantized']);
+// With WebGPU, decoder projections are only read by GPU kernels, so they go straight to GPU buffers.
+const DEVICE_TENSOR = /^model\.language_model\.layers\.\d+\..+\.weight$/;
+const placement = (range, gemma, gpu) => !gemma ? 'heap'
+    : /^model\.(audio_tower|embed_audio)\./.test(range.name) ? 'skip'
+    : EXTERNAL_TENSORS.has(range.name) ? 'external'
+    : gpu && range.bits && DEVICE_TENSOR.test(range.name) ? 'gpu' : 'heap';
+
+// GPU kernels read 2- and 4-bit weights interleaved, so one shift and mask yields the four bytes of a dot product:
+// within each 32-bit word, value `slot` moves to byte `slot % 4` at bit `bits * floor(slot / 4)`.
+const interleaveTables = new Map();
+function interleaveTable(bits) {
+    if (!interleaveTables.has(bits)) {
+        const table = new Uint32Array(4 * 256), slots = 32 / bits, mask = (1 << bits) - 1;
+        for (let position = 0; position < 4; position++)
+            for (let value = 0; value < 256; value++) {
+                const input = (value << (8 * position)) >>> 0;
+                let output = 0;
+                for (let slot = 0; slot < slots; slot++)
+                    output |= ((input >>> (slot * bits)) & mask) << (8 * (slot % 4) + bits * Math.floor(slot / 4));
+                table[position * 256 + value] = output >>> 0;
+            }
+        interleaveTables.set(bits, table);
+    }
+    return interleaveTables.get(bits);
+}
+export function interleavePacked(bytes, bits) {
+    if (bits !== 2 && bits !== 4) return;
+    if (bytes.byteOffset % 4 || bytes.length % 4) throw new Error('Packed weights must occupy whole 32-bit words');
+    const table = interleaveTable(bits), words = new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4);
+    for (let index = 0; index < words.length; index++) {
+        const word = words[index];
+        words[index] = (table[word & 255] | table[256 + ((word >>> 8) & 255)] |
+            table[512 + ((word >>> 16) & 255)] | table[768 + (word >>> 24)]) >>> 0;
+    }
+}
+
+function applyMask(bytes, mask) {
+    if (!mask) return;
+    let index = 0;
+    if (bytes.byteOffset % 4 === 0) {
+        const words = new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.length >>> 2);
+        const wide = (mask * 0x01010101) >>> 0;
+        for (let word = 0; word < words.length; word++) words[word] ^= wide;
+        index = words.length * 4;
+    }
+    for (; index < bytes.length; index++) bytes[index] ^= mask;
+}
+
+/// Compacted heap layout: excluded tensors removed, 64-byte aligned starts, and each gate projection followed directly by
+/// its up projection so the runtime can view the pair as one fused matrix without copying. With `gpu`, decoder
+/// projections are staged for GPU buffers instead, gate and up fused into one `gate_up_proj` buffer.
+export function weightLayout(header, ranges, gemma, gpu = false) {
+    const byName = new Map(ranges.map(range => [range.name, range]));
+    const metadata = header.__metadata__;
+    const layout = {header: metadata ? {__metadata__: metadata} : {}, tensors: [], external: [], device: [],
+        dataBytes: 0};
+    let cursor = 0;
+    const place = (range, adjacent) => {
+        range.target = placement(range, gemma, gpu);
+        if (range.target === 'skip') return;
+        const info = header[range.name];
+        if (range.target === 'gpu') {
+            const bytes = range.end - range.start;
+            if (adjacent) {
+                const entry = layout.device.at(-1);
+                entry.name = entry.name.replace('.mlp.gate_proj.', '.mlp.gate_up_proj.');
+                entry.shape = [entry.shape[0] * 2, ...entry.shape.slice(1)];
+                range.device = entry;
+                range.offset = entry.bytes;
+                entry.bytes += bytes;
+                return;
+            }
+            range.device = {name: range.name, dtype: info.dtype, shape: [...info.shape], bits: range.bits, bytes};
+            range.offset = 0;
+            layout.device.push(range.device);
+            return;
+        }
+        if (range.target === 'external') {
+            const rowBytes = (range.end - range.start) / info.shape[0];
+            const rowsPerShard = Math.max(1, Math.floor(SHARD_BYTES / rowBytes));
+            const shardBytes = rowsPerShard * rowBytes;
+            const shards = [];
+            for (let start = 0; start < range.end - range.start; start += shardBytes)
+                shards.push(new Uint8Array(Math.min(shardBytes, range.end - range.start - start)));
+            range.table = {name: range.name, dtype: info.dtype, shape: info.shape, rowBytes, rowsPerShard, shardBytes, shards};
+            layout.external.push(range.table);
+            return;
+        }
+        range.offset = adjacent ? cursor : alignUp(cursor, ALIGNMENT);
+        cursor = range.offset + range.end - range.start;
+        layout.header[range.name] = {dtype: info.dtype, shape: info.shape, data_offsets: [range.offset, cursor]};
+        layout.tensors.push(range);
+    };
+    for (const range of ranges) {
+        if (range.name.includes('.mlp.up_proj.') && byName.has(range.name.replace('.mlp.up_proj.', '.mlp.gate_proj.')))
+            continue;
+        place(range, false);
+        const partner = byName.get(range.name.replace('.mlp.gate_proj.', '.mlp.up_proj.'));
+        if (partner && partner !== range) place(partner, range.target === 'heap' || range.target === 'gpu');
+    }
+    layout.dataBytes = cursor;
+    const json = new TextEncoder().encode(JSON.stringify(layout.header));
+    layout.headerBytes = alignUp(8 + json.byteLength, ALIGNMENT) - 8;
+    layout.headerJson = json;
+    layout.totalBytes = 8 + layout.headerBytes + layout.dataBytes;
+    return layout;
+}
+
+function externalTables(module, tables, device = []) {
+    const byName = new Map(tables.map(table => [table.name, table]));
+    return {
+        bytes: tables.reduce((sum, table) => sum + table.shards.reduce((total, shard) => total + shard.byteLength, 0), 0),
+        deviceBytes: device.reduce((sum, entry) => sum + entry.bytes, 0),
+        // GPU buffers the runtime adopts by name; ownership passes to Wasm when taken.
+        gpu: new Map(device.map(entry => [entry.name, {handle: entry.handle, layout: entry.layout}])),
+        gather(name, rowsAddress, count, destination, rowBytes) {
+            const table = byName.get(name);
+            if (!table || table.rowBytes !== rowBytes) throw new Error(`Unknown external table ${name}`);
+            const heap = module.HEAPU8;
+            const rows = new Int32Array(heap.buffer, rowsAddress, count);
+            for (let index = 0; index < count; index++) {
+                const row = rows[index];
+                if (!Number.isInteger(row) || row < 0 || row >= table.shape[0]) throw new Error(`Row ${row} outside ${name}`);
+                const shard = Math.floor(row / table.rowsPerShard), offset = (row - shard * table.rowsPerShard) * rowBytes;
+                heap.set(table.shards[shard].subarray(offset, offset + rowBytes), destination + index * rowBytes);
+            }
+        },
+    };
+}
+
+async function loadHubModel(module, source, progress, cache, warning, cacheOnly, gpu) {
     const configUrl = new URL(source);
     if (configUrl.origin !== 'https://huggingface.co' || configUrl.search || configUrl.hash ||
         !/^\/[^/]+\/[^/]+\/resolve\/[a-f0-9]{40}\/config\.json$/.test(configUrl.pathname))
@@ -301,18 +437,53 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly)
         throw new Error('Safetensors header must fit in the first download chunk');
     const header = JSON.parse(new TextDecoder().decode(new Uint8Array(first.bytes, 8, headerBytes)));
     const ranges = normalizationPlan(config, header, size - 8 - headerBytes);
-    const normalizedHeader = new TextEncoder().encode(JSON.stringify(header));
-    if (normalizedHeader.byteLength > headerBytes) throw new Error('Normalized header exceeds reserved space');
+    const layout = weightLayout(header, ranges, !whisper, Boolean(gpu));
     metrics.totalBytes = size + configData.bytes.byteLength;
     metrics.loadedBytes = configData.bytes.byteLength;
-    const pointer = allocateWeights(module, size);
-    const store = (data, start) => {
-        const bytes = new Uint8Array(module.HEAPU8.buffer, pointer + start, data.byteLength);
-        bytes.set(new Uint8Array(data));
-        for (const range of ranges) {
-            const begin = Math.max(0, 8 + headerBytes + range.start - start);
-            const end = Math.min(bytes.length, 8 + headerBytes + range.end - start);
-            for (let index = begin; index < end; index++) bytes[index] ^= range.mask;
+    const pointer = allocateWeights(module, layout.totalBytes + ALIGNMENT);
+    const base = alignUp(pointer, ALIGNMENT), data = base + 8 + layout.headerBytes, payload = 8 + headerBytes;
+    let next = 0;
+    const store = (chunk, fileStart) => {
+        const bytes = new Uint8Array(chunk), fileEnd = fileStart + bytes.length;
+        while (next < ranges.length && payload + ranges[next].end <= fileStart) next++;
+        for (let index = next; index < ranges.length && payload + ranges[index].start < fileEnd; index++) {
+            const range = ranges[index];
+            const begin = Math.max(payload + range.start, fileStart), end = Math.min(payload + range.end, fileEnd);
+            if (begin >= end || range.target === 'skip') continue;
+            const piece = bytes.subarray(begin - fileStart, end - fileStart);
+            let within = begin - payload - range.start;
+            if (range.target === 'heap') {
+                const destination = new Uint8Array(module.HEAPU8.buffer, data + range.offset + within, piece.length);
+                destination.set(piece);
+                applyMask(destination, range.mask);
+                continue;
+            }
+            if (range.target === 'gpu') {
+                const entry = range.device;
+                entry.staging ??= new Uint8Array(entry.bytes);
+                const destination = entry.staging.subarray(range.offset + within, range.offset + within + piece.length);
+                destination.set(piece);
+                applyMask(destination, range.mask);
+                entry.received = (entry.received ?? 0) + piece.length;
+                if (entry.received === entry.bytes) {
+                    interleavePacked(entry.staging, entry.bits);
+                    entry.handle = gpu.allocate(entry.bytes);
+                    gpu.upload(entry.handle, 0, entry.staging);
+                    entry.layout = entry.bits === 2 || entry.bits === 4 ? entry.bits : 0;
+                    entry.staging = null;
+                }
+                continue;
+            }
+            for (let consumed = 0; consumed < piece.length;) {
+                const {shardBytes, shards} = range.table;
+                const shard = Math.floor(within / shardBytes), inner = within - shard * shardBytes;
+                const count = Math.min(piece.length - consumed, shardBytes - inner);
+                const destination = shards[shard].subarray(inner, inner + count);
+                destination.set(piece.subarray(consumed, consumed + count));
+                applyMask(destination, range.mask);
+                consumed += count;
+                within += count;
+            }
         }
         metrics.loadedBytes += bytes.length;
         report('model.safetensors');
@@ -323,10 +494,13 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly)
         if (part.total !== size) throw new Error('Checkpoint size changed during download');
         store(part.bytes, start);
     }
-    module.HEAPU8.fill(32, pointer + 8, pointer + 8 + headerBytes);
-    module.HEAPU8.set(normalizedHeader, pointer + 8);
+    new DataView(module.HEAPU8.buffer, base, 8).setBigUint64(0, BigInt(layout.headerBytes), true);
+    module.HEAPU8.fill(32, base + 8, data);
+    module.HEAPU8.set(layout.headerJson, base + 8);
     module.FS.mkdir('/model');
-    mountWeights(module, pointer, size);
+    mountWeights(module, base, layout.totalBytes);
+    if (layout.device.some(entry => !entry.handle)) throw new Error('Incomplete GPU weight upload');
+    module.kidiExternal = externalTables(module, layout.external, layout.device);
     module.FS.writeFile('/model/config.json', new Uint8Array(configData.bytes));
     const metadata = whisper ? ['tokenizer.json', 'preprocessor_config.json', 'generation_config.json']
         : ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
@@ -341,20 +515,25 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly)
         weights_file: 'model.safetensors', tokenizer_file: 'tokenizer.json',
         model: {...config.text_config, type: 'gemma4_text', packed_weights_signed: true,
             quantization_config: config.quantization_config},
+        external_tensors: [...layout.external, ...layout.device].map(table => ({name: table.name,
+            dtype: table.dtype.toLowerCase(), shape: table.shape})),
         decode: {maximum_new_tokens: 1024, context_size: 9216}}));
     const modelName = whisper ? (config._name_or_path?.split('/').at(-1) || 'Whisper') : 'Gemma 4 E2B IT';
     return {...metrics, warning, model: modelName,
-        precision: whisper ? 'FP32' : 'QAT mixed 2/4/8-bit', id: configUrl.href};
+        precision: whisper ? 'FP32' : 'QAT mixed 2/4/8-bit', id: configUrl.href,
+        heapWeightBytes: layout.totalBytes, externalWeightBytes: module.kidiExternal.bytes,
+        gpuWeightBytes: module.kidiExternal.deviceBytes};
 }
 
-export async function loadModel(module, manifestUrl, progress, {cacheOnly = false} = {}) {
+/// Loads a model into `module`. With a WebGPU runtime `gpu`, decoder projection weights go straight to GPU buffers.
+export async function loadModel(module, manifestUrl, progress, {cacheOnly = false, gpu = null} = {}) {
     let cache;
     let warning = '';
     try { cache = await caches.open(CACHE_NAME); }
     catch (error) { warning = `Persistent cache unavailable: ${error.message}`; }
     manifestUrl = await resolveReference(manifestUrl, cache, cacheOnly);
     if (new URL(manifestUrl).pathname.endsWith('/config.json'))
-        return loadHubModel(module, manifestUrl, progress, cache, warning, cacheOnly);
+        return loadHubModel(module, manifestUrl, progress, cache, warning, cacheOnly, gpu);
     let response;
     if (cacheOnly) {
         response = cache && await cache.match(manifestUrl);
@@ -423,7 +602,9 @@ export async function loadModel(module, manifestUrl, progress, {cacheOnly = fals
         if (weights) mountWeights(module, pointer, file.size);
         else module.FS.writeFile(`/model/${file.name}`, smallFile);
     }
-    return {...metrics, warning, model: manifest.name, precision: manifest.precision, id: manifest.id};
+    const heapWeightBytes = manifest.files.find(file => file.name === 'model.safetensors').size;
+    return {...metrics, warning, model: manifest.name, precision: manifest.precision, id: manifest.id,
+        heapWeightBytes, externalWeightBytes: 0};
 }
 
 export async function clearModelCache() { return caches.delete(CACHE_NAME); }

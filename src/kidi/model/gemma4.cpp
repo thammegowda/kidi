@@ -72,6 +72,13 @@ auto concatenate_projection_rows(const Tensor& first, const Tensor& second) -> T
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "gate/up projection shape or dtype mismatch"});
     auto shape = std::vector<std::int64_t>(first.shape().begin(), first.shape().end());
     shape[0] *= 2;
+    if (first.device() == tensor::Device::cpu() && second.device() == tensor::Device::cpu()) {
+        const auto first_view = first.host_bytes(), second_view = second.host_bytes();
+        // Checkpoints laid out with each up projection directly after its gate projection need no copy.
+        if (first_view && second_view && first_view->data() + first_view->size() == second_view->data())
+            return require(Tensor::from_blob(shape, first.dtype(), {first_view->data(), first_view->size() * 2},
+                                             std::make_shared<std::array<Tensor, 2>>(std::array{first, second})));
+    }
     auto output = require(Tensor::empty(shape, first.dtype()));
     auto destination = require(output.host_bytes());
     const auto first_host = require(first.to(tensor::Device::cpu()));
@@ -334,6 +341,8 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
                  {std::string_view("weight"), std::string_view("weight_scale"),
                   std::string_view("input_activation_scale"), std::string_view("output_activation_scale")}) {
                 if (!impl_->qat && suffix != "weight") continue;
+                // Loaders that place weights on a device may supply the pair already fused.
+                if (state.contains(prefix + "gate_up_proj." + std::string(suffix))) continue;
                 const auto gate_name = prefix + "gate_proj." + std::string(suffix);
                 const auto up_name = prefix + "up_proj." + std::string(suffix);
                 const auto gate = state.find(gate_name), up = state.find(up_name);
@@ -451,6 +460,13 @@ auto Gemma4Impl::fork_state(const Gemma4State& source, std::size_t prefix_length
 }
 auto Gemma4Impl::forward_token(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<std::int32_t> {
     return selected_token(project(tokens, state, false, true));
+}
+auto Gemma4Impl::select_token(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<Tensor> {
+    return project(tokens, state, false, true);
+}
+auto Gemma4Impl::select_batch_tokens(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states)
+    -> Result<Tensor> {
+    return run_batch(tokens, states, true);
 }
 auto Gemma4Impl::forward_token(const Tensor& token, Gemma4State& state) -> Result<Tensor> {
     try {
@@ -571,7 +587,8 @@ auto Gemma4Impl::attention_inputs(Gemma4State& state, std::span<Gemma4State*> ba
     for (std::size_t row = 0; row < requests; ++row) {
         const auto& request = batch_states.empty() ? state : *batch_states[row];
         const auto extent = std::min(request.capacity, ((request.position + step_count + 127) / 128) * 128);
-        const auto crop_device = device() == tensor::Device::cpu() || device() == tensor::Device::vulkan();
+        const auto crop_device = device() == tensor::Device::cpu() || device() == tensor::Device::vulkan() ||
+                                 device() == tensor::Device::web_gpu();
         result.key_starts[row] = {request.crop_local_attention && crop_device &&
                                           request.position + 1 > static_cast<std::size_t>(impl_->window)
                                       ? ((request.position + 1 - impl_->window) / 128) * 128
@@ -639,11 +656,12 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
     auto index =
         require(step_input(inputs.index, {static_cast<std::int64_t>(length)}, DType::I32, device).data<std::int32_t>());
     for (std::size_t query = 0; query < length; ++query) index[query] = static_cast<std::int32_t>(position + query);
-    // Key extents follow the context's step policy: 128-position buckets and local-attention crops on CPU,
-    // coarser fixed shapes when an accelerator compiles the step.
+    // Key extents follow the context's step policy: 128-position buckets and local-attention crops on CPU, Vulkan and
+    // WebGPU, coarser fixed shapes when an accelerator compiles the step.
     const auto extent = context.step_extent(position + length, state.capacity);
     const bool crop = state.crop_local_attention &&
-                      (device == tensor::Device::cpu() || device == tensor::Device::vulkan()) &&
+                      (device == tensor::Device::cpu() || device == tensor::Device::vulkan() ||
+                       device == tensor::Device::web_gpu()) &&
                       context.crop_local_attention();
     const std::array<std::size_t, 2> key_starts{crop && position + 1 > static_cast<std::size_t>(impl_->window)
                                                     ? ((position + 1 - impl_->window) / 128) * 128
@@ -674,6 +692,13 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
     for (auto& input : step)
         if (input.device() != device) input = require(input.to(device));
     for (const auto& cache : state.layers) step.insert(step.end(), {cache.key, cache.value});
+    // An external per-layer table is read on the host, which a replay would skip, so its rows enter as a step input.
+    const bool external_rows = impl_->per_layer_tokens->external();
+    if (external_rows) {
+        const auto ids = require(tokens.copy_to_host());
+        step.push_back(impl_->per_layer_tokens->forward(
+            context, std::span(reinterpret_cast<const std::int32_t*>(ids.data()), tokens.numel())));
+    }
     const auto key = std::string(prefill ? "gemma4_prefill:" : "gemma4_decode:") + std::to_string(length) + ':' +
                      std::to_string(state.capacity) + ':' + std::to_string(extent) + ':' +
                      std::to_string(key_starts[0]) +
@@ -688,7 +713,8 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
         const auto layers = impl_->layer_count, width = impl_->per_layer_width;
         const auto rows = static_cast<std::int64_t>(length);
         auto hidden = impl_->tokens->forward(context, operands[0]);
-        const auto token_inputs = impl_->per_layer_tokens->forward(context, operands[0]);
+        const auto token_inputs = external_rows ? operands[8 + 2 * state.layers.size()]
+                                                : impl_->per_layer_tokens->forward(context, operands[0]);
         auto projection =
             context.multiply(impl_->per_layer_projection->forward(context, hidden), impl_->projection_scale);
         projection = context.reshape(projection, {1, rows, layers, width});

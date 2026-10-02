@@ -1,8 +1,14 @@
+#include "kidi/core/memory.h"
 #include "kidi/inference/generator.h"
 #include "kidi/inference/transcriber.h"
 #include "kidi/runtime/ynn/graph.h"
+#include "kidi/tensor/external.h"
+#ifdef KIDI_HAS_WEBGPU
+#include "kidi/tensor/web_gpu.h"
+#endif
 
 #include <emscripten.h>
+#include <emscripten/heap.h>
 #include <nlohmann/json.hpp>
 
 namespace {
@@ -16,13 +22,67 @@ int configured_threads;
 EM_JS(void, image_progress, (const char* stage), {
     self.postMessage({type: 'encoding-images', stage: UTF8ToString(Number(stage)), heapBytes: HEAPU8.byteLength});
 });
+EM_JS(int, gather_external_rows,
+      (const char* name, const std::int32_t* rows, std::size_t count, void* destination, std::size_t row_bytes), {
+    try {
+        Module.kidiExternal.gather(UTF8ToString(Number(name)), Number(rows), Number(count), Number(destination),
+                                   Number(row_bytes));
+        return 0;
+    } catch (error) {
+        err(`External tensor rows failed: ${error}`);
+        return -1;
+    }
+});
+#ifdef KIDI_HAS_WEBGPU
+EM_JS(int, external_gpu_layout, (const char* name), {
+    return Module.kidiExternal?.gpu?.get(UTF8ToString(Number(name)))?.layout ?? 0;
+});
+EM_JS(int, take_external_gpu_buffer, (const char* name), {
+    const key = UTF8ToString(Number(name));
+    const entry = Module.kidiExternal?.gpu?.get(key);
+    Module.kidiExternal?.gpu?.delete(key);
+    return entry?.handle ?? 0;
+});
+#endif
 // clang-format on
+
+/// Rows of a checkpoint table the browser loader keeps in JavaScript buffers instead of the Wasm heap.
+class JavaScriptRows final : public kidi::tensor::RowSource {
+public:
+    explicit JavaScriptRows(std::string name) : name_(std::move(name)) {}
+    auto gather(std::span<const std::int32_t> rows, std::span<std::byte> destination) const
+        -> kidi::Result<void> override {
+        if (rows.empty()) return {};
+        if (gather_external_rows(name_.c_str(), rows.data(), rows.size(), destination.data(),
+                                 destination.size() / rows.size()))
+            return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "cannot read external rows of " + name_});
+        return {};
+    }
+
+private:
+    std::string name_;
+};
+/// Tensors the loader kept out of the heap: GPU buffers it already filled, or JavaScript row tables.
+auto external_tensor(std::string_view name, kidi::tensor::DType dtype, std::span<const std::int64_t> shape)
+    -> kidi::Result<kidi::tensor::Tensor> {
+    const std::string key(name);
+#ifdef KIDI_HAS_WEBGPU
+    const auto layout = external_gpu_layout(key.c_str());
+    if (const auto handle = take_external_gpu_buffer(key.c_str()))
+        return kidi::tensor::adopt_web_gpu_buffer(static_cast<std::uint32_t>(handle), {shape.begin(), shape.end()},
+                                                  dtype, layout);
+#endif
+    return kidi::tensor::external_tensor({shape.begin(), shape.end()}, dtype, std::make_shared<JavaScriptRows>(key));
+}
 #ifdef KIDI_HAS_WEBGPU
 constexpr auto DEVICE = kidi::tensor::Device::web_gpu();
 constexpr auto BACKEND = "webgpu";
+// Each prefill chunk costs a JavaScript round trip, while the GPU has ample parallelism for wider chunks.
+constexpr std::size_t PREFILL_TOKENS = 256;
 #else
 constexpr auto DEVICE = kidi::tensor::Device::cpu();
 constexpr auto BACKEND = "wasm-cpu";
+constexpr std::size_t PREFILL_TOKENS = 32;
 #endif
 
 template <typename Function>
@@ -63,7 +123,7 @@ auto options(int maximum_tokens) -> kidi::inference::GenerationOptions {
     kidi::inference::GenerationOptions result;
     result.maximum_new_tokens = maximum_tokens;
     result.context_size = CONTEXT_TOKENS;
-    result.prefill_chunk_size = 32;
+    result.prefill_chunk_size = PREFILL_TOKENS;
     result.stream_text = true;
     result.on_image_progress = [](std::string_view stage) { image_progress(std::string(stage).c_str()); };
     return result;
@@ -88,8 +148,17 @@ EMSCRIPTEN_KEEPALIVE auto kidi_configure(int threads) -> const char* {
 EMSCRIPTEN_KEEPALIVE auto kidi_load(const char* directory) -> const char* {
     return answer([&]() -> nlohmann::json {
         if (!configured_threads) throw std::runtime_error("Configure the runtime before loading the model");
-        generator.emplace(kidi::ops::require(kidi::inference::Generator::load(directory, DEVICE, 0, 128, true)));
-        kidi::ops::require(generator->configure_serving({1, 1, CONTEXT_TOKENS, 32, true}));
+        generator.emplace(
+            kidi::ops::require(kidi::inference::Generator::load(directory, DEVICE, 0, 128, true, external_tensor)));
+        // Selected tokens arrive one call later, so WebGPU work completes while JavaScript awaits between steps.
+        kidi::ops::require(generator->configure_serving({.maximum_active = 1,
+                                                         .maximum_requests = 1,
+                                                         .cache_token_budget = CONTEXT_TOKENS,
+                                                         .prefill_tokens_per_step = PREFILL_TOKENS,
+                                                         .compact_cache = true,
+                                                         .deferred_tokens = true}));
+        // Pay first-use weight packing and kernel preparation during load rather than on the first message.
+        kidi::ops::require(generator->warm_up());
         return {{"ready", true},
                 {"native_qat", generator->native_qat()},
                 {"vision_supported", generator->vision_supported()},
@@ -164,6 +233,27 @@ EMSCRIPTEN_KEEPALIVE auto kidi_cancel(int request_id) -> const char* {
     return answer([&]() -> nlohmann::json {
         kidi::ops::require(loaded().cancel(request_id));
         return {{"cancelled", true}};
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_memory_stats() -> const char* {
+    return answer([]() -> nlohmann::json {
+        const auto usage = kidi::core::heap_usage();
+        nlohmann::json result{{"heap_bytes", emscripten_get_heap_size()},
+                              {"heap_limit_bytes", emscripten_get_heap_max()},
+                              {"malloc_in_use_bytes", usage.in_use},
+                              {"malloc_free_bytes", usage.free},
+                              {"malloc_peak_footprint_bytes", usage.footprint}};
+        if (generator) {
+            const auto memory = generator->memory();
+            result["kv_cache_bytes"] = memory.cache_bytes;
+            result["image_feature_bytes"] = memory.image_bytes;
+        }
+        auto categories = nlohmann::json::array();
+        for (const auto& entry : kidi::core::memory_entries())
+            categories.push_back({{"category", entry.category}, {"bytes", entry.bytes}, {"count", entry.count}});
+        result["categories"] = std::move(categories);
+        return result;
     });
 }
 }

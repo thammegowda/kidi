@@ -43,7 +43,7 @@ The JavaScript files have distinct roles:
 | Files | Run in | Purpose |
 |---|---|---|
 | `app.mjs`, `inference-worker.mjs`, `asr-worker.mjs`, `model-cache.mjs`, `images.mjs` | Browser | Chat UI, local image attachments, isolated Gemma/Whisper execution, Hub downloads and cache |
-| `build.mjs` | Node.js during build | Compile/package native wasm64 variants |
+| `build.mjs`, `wasm-glue.mjs` | Node.js during build | Compile/package the wasm32 variants and fix their generated heap indexing above 2 GiB |
 | `src/web/libs/` | Build inputs | Pinned isolation helper, selected icons, and JavaScript parser dependencies |
 
 Only browser assets and their licenses are copied to the deployment directory.
@@ -56,10 +56,10 @@ The default chat model ID is `google/gemma-4-E2B-it-qat-mobile-transformers`. No
 republished weights are required. Load resolves the Hub repository's current `main` revision to an immutable commit,
 then the browser downloads the original Safetensors
 file in 8 MiB HTTP ranges, caches those original bytes, and normalizes the packed
-integer representation once in the final Wasm buffer. This is lossless, not
-re-quantization. All checkpoint tensors, including vision/audio weights, are
-preserved. Supported vision checkpoints accept images through the shared C++ core; audio
-input remains the separate Whisper dictation workflow.
+integer representation once while placing it. This is lossless, not
+re-quantization. The cache keeps the complete upstream file; see
+[Memory Layout](#memory-layout) for what enters the Wasm heap. Supported vision checkpoints accept images through the
+shared C++ core; audio input remains the separate Whisper dictation workflow.
 
 Settings accept a public `OWNER/REPO` Hub model ID. The resolved commit is cached separately from the mutable ID so
 byte ranges from different revisions cannot mix. Automatic chat startup remains offline: it reuses the last resolved commit
@@ -75,19 +75,39 @@ Changing the speech model or CPU thread count replaces that worker; chat-backend
 
 ## Execution Modes
 
-On first use, the app selects WebGPU when a hardware adapter and WebAssembly JSPI are available; otherwise it uses CPU.
+On first use, the app selects WebGPU when a hardware adapter is available; otherwise it uses CPU.
 An explicitly selected backend is saved and takes precedence on later visits.
 
 - **WebAssembly CPU, one thread:** uses the single-thread SIMD module.
 - **WebAssembly CPU, 2-8 threads:** uses pthreads and the YNNPACK/Slinky
   scheduler. The selected count includes the calling thread.
-- **WebGPU:** uses the hardware GPU through the single-thread WASM/JSPI bridge.
-  It requires WebGPU and WebAssembly JSPI support. Captured decode steps reuse
-  prepared operators and GPU output buffers; per-call inputs upload explicitly.
+- **WebGPU:** uses the hardware GPU from the single-thread module. It needs
+  only WebGPU; without it the option is disabled with the reason in its
+  tooltip. Captured decode steps reuse prepared operators and GPU output
+  buffers; per-call inputs upload explicitly.
 
-Calibrated packed WebGPU FFNs with aligned decode shapes use three dispatches:
-input quantization, fused gate/up projection plus GELU-product/requantization,
-and down projection. The fused middle stage writes INT8 activations directly.
+Wasm never waits for the GPU, so every browser uses the same protocol and no
+JSPI or Asyncify is involved. C++ records and submits GPU work synchronously
+(pipelines use `createComputePipeline`), and `synchronize()` only submits.
+Values the host needs, such as the selected token, are copied back
+asynchronously. The worker calls `kidi_step`, awaits the runtime's
+`synchronize()`, and calls again; serving runs with
+`ServingOptions::deferred_tokens`, so each step first accepts the token
+selected by the previous one and then submits new work. The CPU variants use
+the same loop. Image encoding has no mid-step reads: patch pooling runs on the
+device and the position table stays on the host. Kernels that use
+`dot4I8Packed` fall back to an equivalent WGSL function when a browser lacks the
+`packed_4x8_integer_dot_product` extension. Recorded work is submitted every
+128 dispatches, so the GPU starts on a step while the rest is still recorded.
+
+Calibrated projections of one to three rows (decode) do not use `dot4I8Packed`,
+which Apple GPUs emulate. Each workgroup quantizes the activation row while
+staging it as floats, and the weights are decoded with one mask per value. The
+sums are exact integers, so the outputs match the INT8 dot product exactly, and
+no separate quantization dispatch is needed. Calibrated packed WebGPU FFNs with
+aligned decode shapes use two dispatches: the fused gate/up projection plus
+GELU-product/requantization, and the down projection. The first stage writes
+INT8 activations directly.
 Prefill keeps the existing projection path because the measured fused prefill
 kernel was slower. Unsupported fusion shapes and uncalibrated models retain
 their existing operators. The backend test page's **Benchmark FFN** control
@@ -130,8 +150,8 @@ The common default is 280 soft image tokens. Kidi configures Tahoma's existing
 decode options with `max_pixels = 24'000'000` and a 96,000,000-byte decoded
 limit, allowing four-channel input. JPEG and PNG enforce those limits before pixel allocation. The existing
 16,384-pixel axis guard runs after decoding and before resize scratch allocation.
-These are shared C++ resource limits, not UI resizing rules. WASM has an 8 GiB growth ceiling and may
-run out of memory with a full model and image input.
+These are shared C++ resource limits, not UI resizing rules. The Wasm heap has a 4 GiB ceiling; a 2,469-token
+request with a 280-token image peaked at 2.32 GiB.
 
 **Image resize limit (pixels)** in Model settings defaults to 3,000,000 and can
 be reduced to 161,280. It is saved locally and sent with each request; C++
@@ -153,6 +173,13 @@ and memory limits still apply.
 The microphone button records at most 30 seconds, resamples captured mono PCM to 16 kHz, and transfers snapshots to the
 isolated Whisper worker. Automatic language detection is enabled. While recording, replaceable draft hypotheses appear
 in the composer; stopping runs a final pass that may refine them. The transcript is not sent to Gemma until submitted.
+
+Loading ends with a one-token warm-up (`Generator::warm_up`) so the first message
+does not pay one-time work: on CPU, YNNPACK packs every projection weight on first
+use; on WebGPU, kernels are prepared and host-resident weights such as `lm_head`
+are uploaded. On an Apple M5 this moves about 1 s (one CPU thread) into loading;
+the first token of a short prompt arrives in 0.53 s with four CPU threads (was
+1.56 s) and WebGPU prefill takes 0.19 s.
 
 On startup, a fully cached chat model loads automatically. The last successfully
 loaded source is remembered. Empty, partial, or unavailable caches leave the
@@ -177,7 +204,7 @@ elapsed time. Speed excludes prompt preparation; final summaries use the native
 runtime counters. First-token latency is available in the footer tooltip.
 
 The header shows allocated Wasm linear memory and growth headroom below the
-8 GiB limit, refreshed during loading and generation. These are not process
+4 GiB limit, refreshed during loading and generation. These are not process
 RAM or free device memory, and headroom does not include reusable space already
 inside the heap or guarantee that the browser can allocate more memory.
 
@@ -195,20 +222,82 @@ several seconds to yield. A partial assistant response is retained only if text
 was emitted. Closing or navigating away from the page sends cancellation and
 terminates the inference worker immediately.
 
-All browser variants use native wasm64 (`-m64`), an 8 GiB maximum linear memory,
-a 64 MiB initial memory, and a 2 MiB stack. There is no wasm32 or small-memory
-build option. Use a current browser with native WebAssembly memory64 support;
-WebGPU additionally requires JSPI. Pthread control blocks are reserved before
-model loading. The memory ceiling is not an upfront allocation or a guarantee
-of available RAM. Long requests and simultaneous model workers can still
-exhaust memory or cause swapping.
+## Memory Layout
 
-Generated Emscripten glue is used unchanged; the old 32-bit heap-index rewrite
-has been removed. Allocation wrappers use JavaScript numbers, and `ccall`
-pointer arguments use its `pointer` type rather than 32-bit integer parameters.
-The direct loader accepts checkpoints above 4 GiB subject to the 8 GiB budget
-and room for runtime workspaces. Test the built single-thread ABI with a sparse
-allocation that crosses 4 GiB:
+All browser variants are wasm32 with a 4 GiB maximum linear memory, a 64 MiB
+initial memory, and a 2 MiB stack. C++ keeps 64-bit pointers and `size_t`;
+Emscripten lowers them to wasm32 (`MEMORY64=2`), so every current engine can
+run the modules, including Safari without Memory64. Emscripten 6.0.9's
+generated glue indexes heap views with signed shifts in this mode, which breaks
+above 2 GiB; [`wasm-glue.mjs`](wasm-glue.mjs) rewrites only those heap indices
+in the copied glue.
+
+Gemma fits in that budget because only data the runtime reads stays resident:
+
+- The loader writes a compacted Safetensors image into the heap: tensors start
+  on 64-byte boundaries, the unused audio tower is skipped, and each layer's
+  gate projection sits directly before its up projection, so the runtime views
+  the fused gate/up matrix without copying it.
+- The 1.09 GiB per-layer embedding table stays in JavaScript, in at most
+  256 MiB row-aligned shards. `model.yaml` declares it under
+  `external_tensors`; each step copies only the 4,480 bytes per token it reads.
+  WebGPU uploads those rows instead of holding a 1.12 GiB table buffer.
+- With WebGPU, the loader uploads the decoder's packed projection weights
+  (0.63 GiB) straight into GPU buffers, masked and interleaved into the
+  kernels' layout in JavaScript, gate and up fused into one buffer. C++ adopts
+  them through the same `external_tensors` declarations, so they never enter
+  the heap and the GPU holds one copy.
+- Wasm builds skip the CPU fused gate/up/down kernel, whose transposed weight
+  tiles were a second FFN copy, and run single-row calibrated projections
+  through the same INT8 dot as prefill. YNNPACK then packs each projection
+  once for both. Prefill and decode speed were unchanged in measurement.
+
+| 2,211 prompt + 32 output tokens, CPU | Peak heap |
+|---|---:|
+| Previous wasm64 build | 4.38 GiB |
+| Compacted heap and external per-layer table | 2.84 GiB |
+| Plus shared packing and no fused CPU FFN (current) | 2.23 GiB |
+
+| WebGPU, Chromium on an Apple GPU, 296-token prompt | Peak heap | GPU buffers | Prefill / decode tok/s |
+|---|---:|---:|---:|
+| JSPI build, weights uploaded from the heap | 1.44 GiB | 1.53 GiB | 58 / 11.2 |
+| Weights streamed to GPU, no JSPI (current) | 0.82 GiB | 0.95 GiB | 84 / 14.8 |
+
+At 2,211 prompt tokens the WebGPU heap stays at 0.82 GiB with 1.04 GiB of GPU
+buffers. Safari 26.6, which has no JSPI, ran the same WebGPU build at 74 / 16
+tokens/s and described an attached photo correctly. The CPU table is Node
+measurements of the same modules. Safari 26.6 ran
+the current wasm32 build on the same prompt with the same 32 token IDs: one
+thread at 18.8 prompt / 4.4 decode tokens/s and four threads at 52.7 / 11.8,
+both peaking at 2.24 GiB. Native wasm64 parity and an image request are in the
+[optimization journal](../benchmarks/gemma4/JOURNAL.md).
+
+### Memory diagnostics
+
+Model settings has a **Memory diagnostics** section, updated during loading and
+generation: heap size and limit, bytes allocated and free inside the allocator,
+its peak footprint, weights inside and outside the heap, KV cache, reusable
+image features, and WebGPU buffers. Allocator statistics walk the heap, so they
+refresh when a phase ends (load, reply, cancel or error); heap and GPU sizes stay
+live. Below them, allocations are grouped by the work that made them: tokenizer,
+weight binding and vision weights at load. These are net allocations for that
+work and do not shrink when workspaces are later released. **Copy diagnostics**
+copies the JSON for bug reports.
+
+To measure without a browser, run the same loader and module in Node against a
+local Hugging Face snapshot:
+
+```bash
+node benchmarks/web/heap_probe.mjs --glue build-web/single/kidi.mjs \
+  --snapshot ~/.cache/kidi/model-hub/models--google--gemma-4-E2B-it-qat-mobile-transformers/snapshots/<sha> \
+  [--threads 4] [--words 1600] [--image photo.jpg] [--json result.json]
+```
+
+The heap ceiling is not an upfront allocation or a guarantee of available RAM;
+the per-layer table also uses about 1.1 GiB of browser memory outside the heap.
+Long requests and simultaneous model workers can still exhaust memory.
+Allocation wrappers use JavaScript numbers, and `ccall` pointer arguments use
+its `pointer` type. Check the built ABI with an allocation that crosses 2 GiB:
 
 ```bash
 KIDI_TEST_WASM=build-web/single/kidi.mjs node --test tests/web/model_cache_test.mjs
@@ -305,7 +394,9 @@ python3 -m http.server 8081 --bind 127.0.0.1 --directory .
 ```
 
 Open `http://127.0.0.1:8081/tests/web/backend_test.html?run=1` in the integrated
-browser. Disable HTTP caching when iterating on shader modules. Checks cover
+browser. Unlike the app, this developer test links JSPI (so it needs a browser
+with JSPI, such as current Chromium): its checks read GPU results inline through
+a test-only `set_web_gpu_wait` hook. Disable HTTP caching when iterating on shader modules. Checks cover
 packed projections, attention, float/QAT Gemma references, replay rebinding,
 token readback, cache scatter aliasing and errors, and buffer lifetime/budgets.
 Full-model observations and performance limitations are recorded in the
