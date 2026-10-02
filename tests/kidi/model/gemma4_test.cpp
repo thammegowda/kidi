@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <string>
 
 namespace {
 /// A step compiler that declines every step, so accelerator-shaped steps (captured prefill chunks) replay on CPU.
@@ -297,10 +298,20 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
 }
 } // namespace
 
+// Failing checks report where they failed: several compare exactly, so results can differ between machines.
+std::string current_fixture = "setup", current_device = "none";
+auto failed(int line) -> int {
+    std::cerr << "gemma4_test check at line " << line << " failed for " << current_fixture << " on " << current_device
+              << '\n';
+    return 1;
+}
+
 auto main() -> int {
     using namespace kidi;
     try {
         for (const auto* fixture : {"gemma4", "gemma4-qat"}) {
+            current_fixture = fixture;
+            current_device = "cpu";
             const auto directory = fixture_directory(fixture);
             const auto config = YAML::LoadFile((directory / "model.yaml").string())["model"];
             auto checkpoint = ops::require(checkpoint::Weights::load(directory / "model.safetensors"));
@@ -341,7 +352,7 @@ auto main() -> int {
             invalid_config.remove("global_head_dim");
             if (model::Gemma4Impl::create(invalid_config)) {
                 std::cerr << "Gemma accepted a configuration without global_head_dim\n";
-                return 1;
+                return failed(__LINE__);
             }
             std::vector devices{tensor::Device::cpu()};
 #if defined(__APPLE__)
@@ -351,6 +362,7 @@ auto main() -> int {
             if (vulkan && (*vulkan)->is_available(tensor::Device::vulkan()) && (*vulkan)->supports_execution())
                 devices.push_back(tensor::Device::vulkan());
             for (auto device : devices) {
+                current_device = tensor::to_string(device);
                 check_serving_cache(directory, config, device);
                 check_external_rows(directory, config, device);
                 const ModuleScope construction(tensor::DType::F32, false, device);
@@ -360,13 +372,13 @@ auto main() -> int {
                 for (const auto& [name, parameter] : parameters)
                     if (name.find(".mlp.gate_proj.") != std::string::npos ||
                         name.find(".mlp.up_proj.") != std::string::npos)
-                        return 1;
+                        return failed(__LINE__);
                 for (int layer = 0; layer < config["num_hidden_layers"].as<int>(); ++layer) {
                     const auto prefix = "layers." + std::to_string(layer) + ".mlp.";
                     const auto gate =
                         ops::require(checkpoint.tensor("model.language_model." + prefix + "gate_proj.weight"));
                     const auto& combined = parameters.at(prefix + "gate_up_proj.weight");
-                    if (combined.size(0) != 2 * gate.size(0) || combined.size(1) != gate.size(1)) return 1;
+                    if (combined.size(0) != 2 * gate.size(0) || combined.size(1) != gate.size(1)) return failed(__LINE__);
                 }
                 auto full = ops::require(model->create_state(8));
                 const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
@@ -379,16 +391,16 @@ auto main() -> int {
                         ? tensor::DType::I8
                         : tensor::DType::F32;
                 for (const auto& cache : full.layers)
-                    if (cache.key.dtype() != cache_dtype || cache.value.dtype() != cache_dtype) return 1;
+                    if (cache.key.dtype() != cache_dtype || cache.value.dtype() != cache_dtype) return failed(__LINE__);
                 auto prefill = ops::require(model->forward(tokens, full, true));
                 const auto prefill_values = ops::require(prefill.data<float>());
-                if (prefill_values.size() != values.size()) return 1;
+                if (prefill_values.size() != values.size()) return failed(__LINE__);
                 for (std::size_t index = 0; index < values.size(); ++index)
                     if (!std::isfinite(prefill_values[index]) ||
                         std::abs(prefill_values[index] - values[index]) > 2e-4F) {
                         std::cerr << "Gemma reference mismatch at " << index << ": " << prefill_values[index]
                                   << " != " << values[index] << '\n';
-                        return 1;
+                        return failed(__LINE__);
                     }
                 auto incremental = ops::require(model->create_state(8));
                 auto selected_state = ops::require(model->create_state(8));
@@ -397,15 +409,15 @@ auto main() -> int {
                     const auto actual = ops::require(output.data<float>());
                     const auto selected =
                         ops::require(model->forward_token(std::span(tokens).subspan(position, 1), selected_state));
-                    if (selected != std::ranges::max_element(actual) - actual.begin()) return 1;
+                    if (selected != std::ranges::max_element(actual) - actual.begin()) return failed(__LINE__);
                     for (std::size_t token = 0; token < actual.size(); ++token)
                         if (!std::isfinite(actual[token]) ||
                             std::abs(actual[token] - values[position * actual.size() + token]) > 2e-4F) {
                             std::cerr << "Gemma cached logits differ at " << position << ':' << token << '\n';
-                            return 1;
+                            return failed(__LINE__);
                         }
                 }
-                if (incremental.position != tokens.size() || full.position != tokens.size()) return 1;
+                if (incremental.position != tokens.size() || full.position != tokens.size()) return failed(__LINE__);
                 {
                     // Replayed decode steps match eagerly executed steps bit for bit.
                     setenv("KIDI_REPLAY", "0", 1);
@@ -421,7 +433,7 @@ auto main() -> int {
                         if (!std::ranges::equal(ops::require(actual.data<float>()),
                                                 ops::require(expected.data<float>()))) {
                             std::cerr << "replayed Gemma decode differs from eager at " << position << '\n';
-                            return 1;
+                            return failed(__LINE__);
                         }
                     }
                     // Token tensors fed back from the previous step decode like host token IDs.
@@ -434,15 +446,15 @@ auto main() -> int {
                         next = ops::require(model->forward_token(std::span(&next, 1), integer));
                         if (ops::require(selected.data<std::int32_t>())[0] != next) {
                             std::cerr << "Gemma token tensor feedback differs at step " << step << '\n';
-                            return 1;
+                            return failed(__LINE__);
                         }
                         token = selected;
                     }
                     if (model->forward_token(ops::require(tensor::Tensor::from_host({2}, tokens.first(2), device)),
                                              fed))
-                        return 1;
+                        return failed(__LINE__);
                     if (device == tensor::Device::cpu() && !check_captured_prefill(config, checkpoint, tokens))
-                        return 1;
+                        return failed(__LINE__);
                 }
                 for (const std::size_t batch_size : {2, 4}) {
                     std::vector<model::Gemma4State> batch, serial;
@@ -456,7 +468,7 @@ auto main() -> int {
                     }
                     std::array duplicate{&batch[0], &batch[0]};
                     if (model->forward_batch(std::array{tokens[0], tokens[1]}, duplicate) || batch[0].position != 1)
-                        return 1;
+                        return failed(__LINE__);
                     for (std::size_t step = 0; step < 3; ++step) {
                         if (step == 1) std::ranges::reverse(order);
                         if (step == 2) order.pop_back();
@@ -473,29 +485,29 @@ auto main() -> int {
                         }
                         const auto output = ops::require(model->forward_batch(input_ids, states));
                         const auto actual = ops::require(output.data<float>());
-                        if (actual.size() != expected.size()) return 1;
+                        if (actual.size() != expected.size()) return failed(__LINE__);
                         for (std::size_t index = 0; index < actual.size(); ++index)
                             if (!std::isfinite(actual[index]) || std::abs(actual[index] - expected[index]) > 2e-4F) {
                                 std::cerr << "batched Gemma mismatch " << fixture << ' ' << tensor::to_string(device)
                                           << " batch " << batch_size << " step " << step << " index " << index << '\n';
-                                return 1;
+                                return failed(__LINE__);
                             }
                         for (auto row : order)
-                            if (batch[row].position != serial[row].position) return 1;
+                            if (batch[row].position != serial[row].position) return failed(__LINE__);
                     }
                 }
                 auto chunked = ops::require(model->create_state(8));
                 ops::require(model->prefill(tokens.first(3), chunked));
                 auto complete_prefix = ops::require(model->create_state(8));
                 ops::require(model->forward(tokens.first(3), complete_prefix, true));
-                if (chunked.position != complete_prefix.position) return 1;
+                if (chunked.position != complete_prefix.position) return failed(__LINE__);
                 for (std::size_t producer = 0; producer < chunked.layers.size(); ++producer)
                     if (ops::require(chunked.layers[producer].key.copy_to_host()) !=
                             ops::require(complete_prefix.layers[producer].key.copy_to_host()) ||
                         ops::require(chunked.layers[producer].value.copy_to_host()) !=
                             ops::require(complete_prefix.layers[producer].value.copy_to_host())) {
                         std::cerr << "cache-only prefill differs from full evaluation at producer " << producer << '\n';
-                        return 1;
+                        return failed(__LINE__);
                     }
                 auto snapshot = ops::require(model->fork_state(chunked, 3, 3));
                 const auto saved_key = ops::require(snapshot.layers[0].key.copy_to_host());
@@ -506,18 +518,18 @@ auto main() -> int {
                 if (!std::ranges::equal(ops::require(resumed_output.data<float>()), tail_values) ||
                     saved_key != ops::require(snapshot.layers[0].key.copy_to_host()) ||
                     model->fork_state(snapshot, 4, 8) || model->fork_state(snapshot, 3, 2))
-                    return 1;
+                    return failed(__LINE__);
                 const auto reference_tail = values.last(tail_values.size());
                 for (std::size_t index = 0; index < tail_values.size(); ++index)
                     if (!std::isfinite(tail_values[index]) ||
                         std::abs(tail_values[index] - reference_tail[index]) > 2e-4F)
-                        return 1;
+                        return failed(__LINE__);
                 const std::array<std::int32_t, 1> invalid{-1};
-                if (model->forward(invalid, incremental) || incremental.position != tokens.size()) return 1;
-                if (model->set_checkpoint(checkpoint, 4, 3)) return 1;
+                if (model->forward(invalid, incremental) || incremental.position != tokens.size()) return failed(__LINE__);
+                if (model->set_checkpoint(checkpoint, 4, 3)) return failed(__LINE__);
                 ops::require(model->set_checkpoint(checkpoint));
                 if (config["quantization_config"]) {
-                    if (model->set_checkpoint(checkpoint, 8, 4)) return 1;
+                    if (model->set_checkpoint(checkpoint, 8, 4)) return failed(__LINE__);
                     ops::require(model->set_checkpoint(checkpoint, 0, 128, true));
                     auto packed_state = ops::require(model->create_state(8));
                     const auto packed_output = ops::require(model->forward(tokens, packed_state, true));
@@ -525,7 +537,7 @@ auto main() -> int {
                     for (std::size_t index = 0; index < values.size(); ++index)
                         if (!std::isfinite(packed_values[index]) ||
                             std::abs(packed_values[index] - values[index]) > 2e-4F)
-                            return 1;
+                            return failed(__LINE__);
                 } else {
                     ops::require(model->set_checkpoint(checkpoint, 8, 4));
                     auto quantized_state = ops::require(model->create_state(8));
@@ -534,7 +546,7 @@ auto main() -> int {
                     for (std::size_t index = 0; index < quantized_values.size(); ++index)
                         if (!std::isfinite(quantized_values[index]) ||
                             std::abs(quantized_values[index] - values[index]) > 0.01F)
-                            return 1;
+                            return failed(__LINE__);
                     ops::require(model->set_checkpoint(checkpoint));
                     auto restored_state = ops::require(model->create_state(8));
                     const auto restored = ops::require(model->forward(tokens.first(1), restored_state));
@@ -542,7 +554,7 @@ auto main() -> int {
                     for (std::size_t index = 0; index < restored_values.size(); ++index)
                         if (!std::isfinite(restored_values[index]) ||
                             std::abs(restored_values[index] - values[index]) > 2e-4F)
-                            return 1;
+                            return failed(__LINE__);
                 }
                 for (const std::size_t length : {259, 1027}) {
                     const auto capacity = ((length + 127) / 128) * 128;
@@ -563,7 +575,7 @@ auto main() -> int {
                             : tensor::DType::F32;
                     for (const auto& cache : prefix_state.layers)
                         if (cache.key.dtype() != extended_cache_dtype || cache.value.dtype() != extended_cache_dtype)
-                            return 1;
+                            return failed(__LINE__);
                     const auto prefix = ops::require(extended->forward(sequence, prefix_state));
                     auto oracle_state = ops::require(extended->create_state(capacity));
                     const auto all_logits = ops::require(extended->forward(sequence, oracle_state, true));
@@ -572,7 +584,7 @@ auto main() -> int {
                     for (std::size_t index = 0; index < last_values.size(); ++index)
                         if (!std::isfinite(last_values[index]) ||
                             std::abs(last_values[index] - oracle_values[index]) > 2e-4F)
-                            return 1;
+                            return failed(__LINE__);
                     auto history_state = ops::require(extended->create_state(capacity));
                     history_state.crop_local_attention = false;
                     ops::require(extended->prefill(std::span(sequence).first(length - 1), history_state));
@@ -588,7 +600,7 @@ auto main() -> int {
                         if (!std::isfinite(bucket_values[index]) ||
                             std::abs(bucket_values[index] - prefix_values[index]) > 2e-4F ||
                             std::abs(bucket_values[index] - history_values[index]) > 2e-4F)
-                            return 1;
+                            return failed(__LINE__);
                     auto larger_state = ops::require(extended->create_state(capacity));
                     const std::size_t chunk = length == 259 ? 256 : 512;
                     for (std::size_t offset = 0; offset < length - 3; offset += chunk)
@@ -598,13 +610,13 @@ auto main() -> int {
                     for (std::size_t index = 0; index < larger_values.size(); ++index)
                         if (!std::isfinite(larger_values[index]) ||
                             std::abs(larger_values[index] - prefix_values[index]) > 2e-4F)
-                            return 1;
+                            return failed(__LINE__);
                 }
             }
         }
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
+        std::cerr << current_fixture << " on " << current_device << ": " << error.what() << '\n';
         return 1;
     }
 }
