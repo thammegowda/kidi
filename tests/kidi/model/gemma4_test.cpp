@@ -610,25 +610,46 @@ auto main() -> int {
                     const auto bucket = ops::require(extended->forward(std::span(sequence).last(1), bucket_state));
                     const auto prefix_values = ops::require(prefix.data<float>()),
                                bucket_values = ops::require(bucket.data<float>());
-                    const auto [prefix_gap, prefix_at] = difference(bucket_values, prefix_values);
-                    const auto [history_gap, history_at] = difference(bucket_values, history_values);
-                    if (prefix_gap > 2e-4F || history_gap > 2e-4F) {
-                        std::cerr << "length " << length << ": chunked prefill vs full prefix differs by " << prefix_gap
-                                  << " at " << prefix_at << ", vs uncropped history by " << history_gap << " at "
-                                  << history_at << '\n';
-                        return failed(__LINE__);
-                    }
                     auto larger_state = ops::require(extended->create_state(capacity));
                     const std::size_t chunk = length == 259 ? 256 : 512;
                     for (std::size_t offset = 0; offset < length - 3; offset += chunk)
                         ops::require(extended->prefill(std::span(sequence).subspan(offset, chunk), larger_state));
                     const auto larger = ops::require(extended->forward(std::span(sequence).last(3), larger_state));
                     const auto larger_values = ops::require(larger.data<float>());
-                    if (const auto [gap, at] = difference(larger_values, prefix_values); gap > 2e-4F) {
-                        std::cerr << "length " << length << ": " << chunk << "-token chunks vs full prefix differs by "
-                                  << gap << " at " << at << '\n';
-                        return failed(__LINE__);
+                    // CPU prefill is batch-invariant, so every chunking yields the same logits. Metal's QAT prefill
+                    // multiplies FP16-expanded weights, which can move a calibrated activation by one int8 step from
+                    // the exact decode kernel, so accelerators must produce the same tokens rather than logits.
+                    if (device == tensor::Device::cpu()) {
+                        for (const auto& [name, other] :
+                             {std::pair{"full prefix", prefix_values}, std::pair{"uncropped history", history_values},
+                              std::pair{"larger chunks", larger_values}})
+                            if (const auto [gap, at] = difference(bucket_values, other); gap > 2e-4F) {
+                                std::cerr << "length " << length << ": chunked prefill vs " << name << " differs by "
+                                          << gap << " at " << at << '\n';
+                                return failed(__LINE__);
+                            }
                     }
+                    // Greedy tokens after the prompt: the argmax of its last logits, then three decoded tokens. These
+                    // run last because decoding may reuse the buffers holding earlier logits.
+                    const auto continuation = [&](std::span<const float> logits, model::Gemma4State& state) {
+                        std::vector<std::int32_t> generated{
+                            static_cast<std::int32_t>(std::ranges::max_element(logits) - logits.begin())};
+                        for (int step = 0; step < 3; ++step) {
+                            const auto next = ops::require(extended->forward_token(std::span(generated).last(1), state));
+                            generated.push_back(next);
+                        }
+                        return generated;
+                    };
+                    const std::array generated{continuation(bucket_values, bucket_state),
+                                               continuation(prefix_values, prefix_state),
+                                               continuation(history_values, history_state),
+                                               continuation(larger_values, larger_state)};
+                    for (std::size_t index = 1; index < generated.size(); ++index)
+                        if (generated[index] != generated[0]) {
+                            std::cerr << "length " << length << ": chunking " << index
+                                      << " generates different tokens from 128-token chunks\n";
+                            return failed(__LINE__);
+                        }
                 }
             }
         }
