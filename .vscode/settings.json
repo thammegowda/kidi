@@ -11,8 +11,7 @@
         "**/third_party/tokenizerspp/**": true,
         "**/third_party/uni-algo/**": true,
         "**/third_party/yaml-cpp/**": true,
-        "**/third_party/ynnpack-dev/third_party/**": true,
-        "**/third_party/zlib/**": true
+        "**/third_party/ynnpack-dev/third_party/**": true
     },
     "search.exclude": {
         "**/.cache/**": true,
@@ -32,8 +31,7 @@
         "third_party/tokenizerspp/**",
         "third_party/uni-algo/**",
         "third_party/yaml-cpp/**",
-        "third_party/ynnpack-dev/third_party/**",
-        "third_party/zlib/**"
+        "third_party/ynnpack-dev/third_party/**"
     ],
     "js/ts.tsserver.automaticTypeAcquisition.enabled": false,
     "js/ts.tsserver.maxMemory": 768,

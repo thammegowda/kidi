@@ -196,7 +196,7 @@ target_link_libraries(kidi
     PRIVATE
         tokenizerpp
         TahomaVision::Vision
-        ZLIB::ZLIB
+        kidi::zlib
         ${CMAKE_DL_LIBS}
 )
 
