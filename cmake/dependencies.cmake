@@ -80,6 +80,27 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(nlohmann_json uni_algo abseil-cpp)
+if(EMSCRIPTEN)
+    function(kidi_suppress_abseil_warnings directory)
+        get_property(targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
+        foreach(target IN LISTS targets)
+            get_target_property(type "${target}" TYPE)
+            if(type MATCHES "^(STATIC|SHARED|MODULE|OBJECT)_LIBRARY$" OR type STREQUAL "EXECUTABLE")
+                target_compile_options("${target}" PRIVATE
+                    "SHELL:-Wno-deprecated-pragma"
+                    "SHELL:-Wno-sign-conversion"
+                    "SHELL:-Wno-c++98-compat-extra-semi"
+                )
+            endif()
+        endforeach()
+        get_property(subdirectories DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
+        foreach(subdirectory IN LISTS subdirectories)
+            kidi_suppress_abseil_warnings("${subdirectory}")
+        endforeach()
+    endfunction()
+    # Abseil enables these warnings on each target after inherited directory options.
+    kidi_suppress_abseil_warnings("${KIDI_THIRD_PARTY_DIR}/abseil-cpp")
+endif()
 # Only the Abseil libraries RE2 links are built; the default target skips the rest.
 set_property(DIRECTORY "${KIDI_THIRD_PARTY_DIR}/abseil-cpp" PROPERTY EXCLUDE_FROM_ALL TRUE)
 set(_KIDI_SKIP_INSTALL_RULES "${CMAKE_SKIP_INSTALL_RULES}")
