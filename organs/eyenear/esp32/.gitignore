@@ -1,0 +1,5 @@
+/.pio/
+/backups/
+/captures/
+__pycache__/
+*.pyc
