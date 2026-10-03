@@ -349,19 +349,22 @@ reports this rather than folding it into the decode rate. Long, steady 128-token
 NPU prefill graphs separately measure about 1,000 tok/s, but that advantage is
 not yet representative of a short interactive request.
 
-- **Auto** tries the Qualcomm NPU, then the CPU for chat, falling back only when loading fails. Speech stays on the
-  quality-checked CPU INT8 path.
+- **Auto** tries the Qualcomm NPU, Vulkan GPU, then CPU for chat, falling back only when loading fails. Speech stays on
+  the quality-checked CPU INT8 path.
 - **CPU, GPU, NPU** are explicit: if that accelerator is unavailable or fails to load, the error is shown and the
   model stays offline rather than silently running elsewhere.
 - **GPU (experimental)** runs Gemma 4 on Adreno through Kidi's Vulkan backend (built into the APK; no extra files).
-  It is currently slower than the CPU and its greedy output can drift from the CPU's, so Auto never picks it.
+  It is currently slower than the CPU and its greedy output can drift from the CPU's, so Auto uses it only when the NPU
+  is unavailable or cannot load.
 - **NPU** records Gemma 4 steps on the CPU, then runs complete 128-token prefill
-  and single-token decode graphs on Hexagon through QNN. Packed embeddings, all
-  transformer layers, attention/KV updates, vocabulary projection, and argmax
-  execute on HTP. The APK includes the matching runtime, prepare library, stub,
-  system library, and V79 skel. Prepare is 81 MiB installed but compresses to
-  about 35 MiB in the APK; it is what makes a fresh install able to compile its
-  first graph without manual provisioning.
+  and single-token decode graphs on Hexagon through QNN. The CPU gathers the two
+  token embedding rows so their 1.27 GiB packed tables do not consume the cDSP
+  virtual address space; all transformer layers, attention/KV updates,
+  vocabulary projection, and argmax execute on HTP. The APK includes the
+  matching runtime, prepare library, stub, system library, and V79 skel.
+  Prepare is 81 MiB installed but compresses to about 35 MiB in the APK; it is
+  what makes a fresh install able to compile its first graph without manual
+  provisioning.
 
   Compilation runs in the background while CPU replay remains available.
   Matching context binaries are persistent: measured reload is about 4 seconds

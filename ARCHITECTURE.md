@@ -851,23 +851,24 @@ compiler then lowers the entire captured prefill or decode step to chained QNN
 graphs. There is no operator-by-operator CPU/NPU alternation in accelerated
 steady state.
 
-The whole-step lowering covers packed 2/4/8-bit embeddings, calibrated
-projections and feed-forwards, RMS norms and residuals, rotary embeddings,
-grouped-query causal attention, KV writes, the 262K 2-bit vocabulary head, and
-greedy selection. Packed embedding tables reside in shared FastRPC memory and
-are gathered, unpacked, and scaled on HTP. KV caches use their trained INT8
+The whole-step lowering covers calibrated projections and feed-forwards, RMS
+norms and residuals, rotary embeddings, grouped-query causal attention, KV
+writes, the 262K 2-bit vocabulary head, and greedy selection. A host prologue
+gathers and dequantizes only the selected rows from the packed token and
+per-layer embedding tables. Mapping those complete tables into FastRPC consumed
+1.27 GiB of cDSP virtual address space and made later QNN graph mappings fail;
+the selected FP16 rows are small step inputs. KV caches use their trained INT8
 grids in registered shared memory; the host synchronizes an existing prefix
 once when a new 512/1024/2048/... attention bucket is selected, and copies only
-the newly produced KV rows back for model-state compatibility. Per-call host
-work is limited to binding inputs, cache-prefix synchronization, graph launches,
-and reading the selected token.
+the newly produced KV rows back for model-state compatibility. Other per-call
+host work is limited to binding inputs, graph launches, and reading the selected
+token.
 
 Low-bit FC weights use 8-bit containers with bit-width axis scales because this
 HTP release rejects packed SFIXED2/SFIXED4 constants. Graphs are split by an
 unpacked-weight budget (256 MiB by default) to keep `libQnnHtpPrepare` memory
-bounded. On the tested Gemma 4 E2B model this produces five prefill graphs and
-eleven decode graphs. Prefill and decode share a single FastRPC copy of the
-packed embedding tables.
+bounded. On the tested Gemma 4 E2B model this produces roughly five prefill
+graphs and ten decode graphs.
 
 Whole-step context binaries and JSON binding metadata are cached under
 `KIDI_QNN_CACHE_DIR`, keyed by step shape, sampled model content, lowering

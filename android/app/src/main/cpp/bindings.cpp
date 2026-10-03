@@ -90,8 +90,13 @@ auto messages(std::string_view source) -> std::vector<kidi::text::ChatMessage> {
 /// an explicit accelerator is tried alone so failures stay visible.
 auto candidates(std::string_view accelerator, bool speech) -> std::vector<kidi::tensor::Device> {
     if (accelerator != "auto") return {kidi::ops::require(kidi::inference::select_device(accelerator, speech))};
-    std::vector<kidi::tensor::Device> result{kidi::ops::require(kidi::inference::select_device("auto", speech))};
-    if (result.front() != kidi::tensor::Device::cpu()) result.push_back(kidi::tensor::Device::cpu());
+    if (speech) return {kidi::tensor::Device::cpu()};
+    std::vector<kidi::tensor::Device> result;
+    for (const auto choice : {"npu", "gpu"}) {
+        auto device = kidi::inference::select_device(choice);
+        if (device) result.push_back(*device);
+    }
+    result.push_back(kidi::tensor::Device::cpu());
     return result;
 }
 
