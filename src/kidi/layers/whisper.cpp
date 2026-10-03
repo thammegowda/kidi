@@ -1,10 +1,30 @@
 #include "kidi/layers/whisper.h"
 
+#include <algorithm>
 #include <cmath>
-#include <bit>
 
 namespace kidi::layers {
 using ops::require;
+
+namespace {
+// Encoder-length inputs run in fixed row slices: each weighted operator is prepared for one slice shape, so its retained
+// buffers stay small and are shared by every audio length. Inputs of one slice (decoder steps) run whole.
+constexpr std::int64_t ENCODER_ROWS = 128;
+template <typename Function>
+auto by_rows(ops::Context& context, const Tensor& input, Function&& function) -> Tensor {
+    const auto length = static_cast<std::int64_t>(input.size(1));
+    if (length <= ENCODER_ROWS) return function(input, 0);
+    Tensor output;
+    for (std::int64_t start = 0; start < length; start += ENCODER_ROWS) {
+        const auto part = function(context.slice(input, 1, start, std::min(ENCODER_ROWS, length - start)), start);
+        if (!output.defined())
+            output = require(Tensor::empty({1, length, static_cast<std::int64_t>(part.size(2))}, part.dtype(),
+                                            context.device()));
+        context.copy_slice_(output, part, 1, start);
+    }
+    return output;
+}
+} // namespace
 
 WhisperConv1dImpl::WhisperConv1dImpl(std::int32_t input_channels, std::int32_t output_channels, std::int32_t stride)
     : input_channels_(input_channels), output_channels_(output_channels), stride_(stride) {
@@ -21,35 +41,41 @@ auto WhisperConv1dImpl::forward(ops::Context& context, const Tensor& input) cons
     if (context.device() != tensor::Device::cpu() || input.device() != context.device() ||
         input.dtype() != tensor::DType::F32 || input.dimensions() != 3 || input.size(2) != input_channels_)
         throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper convolution requires FP32 CPU input"});
-    const auto batch = input.size(0), length = input.size(1);
-    const auto output_length = (length - 1) / static_cast<std::size_t>(stride_) + 1;
-    const std::vector<std::int64_t> shape{static_cast<std::int64_t>(batch), static_cast<std::int64_t>(output_length),
-                                          input_channels_ * 3};
-    const auto required = batch * output_length * input_channels_ * 3;
-    if (!columns_.defined() || columns_.numel() < required)
-        columns_ =
-            require(Tensor::empty({static_cast<std::int64_t>(std::bit_ceil(std::max<std::size_t>(64, required)))},
-                                  tensor::DType::F32, context.device()));
-    auto columns = require(columns_.data<float>());
+    if (input.size(0) != 1) throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper convolution takes one sequence"});
+    const auto length = static_cast<std::int64_t>(input.size(1));
+    const auto output_length = (length - 1) / stride_ + 1;
     const auto values = require(input.data<float>());
-    for (std::size_t row = 0; row < batch; ++row)
-        for (std::size_t output = 0; output < output_length; ++output)
+    const auto weight = context.reshape(weight_, {output_channels_, input_channels_ * 3});
+    // Output rows are unfolded and projected one slice at a time, like the encoder blocks.
+    const auto slice = std::min(ENCODER_ROWS, output_length);
+    const auto required = static_cast<std::size_t>(slice * input_channels_ * 3);
+    if (!columns_.defined() || columns_.numel() < required)
+        columns_ = require(Tensor::empty({static_cast<std::int64_t>(required)}, tensor::DType::F32, context.device()));
+    Tensor result;
+    for (std::int64_t first = 0; first < output_length; first += slice) {
+        const auto count = std::min(slice, output_length - first);
+        // The previous slice's projection must finish reading the shared buffer before it is refilled.
+        context.synchronize();
+        auto columns = require(columns_.data<float>());
+        for (std::int64_t output = 0; output < count; ++output)
             for (std::int32_t kernel = 0; kernel < 3; ++kernel) {
-                const auto source = static_cast<std::int64_t>(output * stride_ + kernel) - 1;
-                const auto destination = (row * output_length + output) * input_channels_ * 3;
-                if (source < 0 || static_cast<std::size_t>(source) >= length) {
-                    for (std::int32_t channel = 0; channel < input_channels_; ++channel)
-                        columns[destination + channel * 3 + kernel] = 0.F;
-                    continue;
-                }
-                const auto source_offset = (row * length + static_cast<std::size_t>(source)) * input_channels_;
+                const auto source = (first + output) * stride_ + kernel - 1;
+                const auto destination = static_cast<std::size_t>(output * input_channels_ * 3);
                 for (std::int32_t channel = 0; channel < input_channels_; ++channel)
-                    columns[destination + channel * 3 + kernel] = values[source_offset + channel];
+                    columns[destination + channel * 3 + kernel] =
+                        source < 0 || source >= length ? 0.F : values[source * input_channels_ + channel];
             }
-    auto weight = context.reshape(weight_, {output_channels_, input_channels_ * 3});
-    const auto unfolded = context.reshape(context.slice(columns_, 0, 0, required), shape);
-    if (weight_.dtype() == tensor::DType::I8) return context.quantized_linear(unfolded, weight, scale_, bias_, true);
-    return context.linear(unfolded, weight, bias_, true);
+        const auto unfolded = context.reshape(
+            context.slice(columns_, 0, 0, count * input_channels_ * 3), {1, count, input_channels_ * 3});
+        const auto part = weight_.dtype() == tensor::DType::I8
+                              ? context.quantized_linear(unfolded, weight, scale_, bias_, true)
+                              : context.linear(unfolded, weight, bias_, true);
+        if (count == output_length) return part;
+        if (!result.defined())
+            result = require(Tensor::empty({1, output_length, output_channels_}, tensor::DType::F32, context.device()));
+        context.copy_slice_(result, part, 1, first);
+    }
+    return result;
 }
 
 WhisperPositionEmbeddingImpl::WhisperPositionEmbeddingImpl(std::int32_t positions, std::int32_t width) {
@@ -86,7 +112,8 @@ WhisperAttentionImpl::WhisperAttentionImpl(std::int32_t hidden, std::int32_t hea
 }
 
 auto WhisperAttentionImpl::project_memory(ops::Context& context, const Tensor& input) const -> KeyValue {
-    return {key_->forward(context, input), value_->forward(context, input)};
+    return {by_rows(context, input, [&](const Tensor& rows, std::int64_t) { return key_->forward(context, rows); }),
+            by_rows(context, input, [&](const Tensor& rows, std::int64_t) { return value_->forward(context, rows); })};
 }
 
 auto WhisperAttentionImpl::forward(ops::Context& context, const Tensor& input, const KeyValue* memory,
@@ -117,10 +144,16 @@ WhisperEncoderBlockImpl::WhisperEncoderBlockImpl(std::int32_t hidden, std::int32
 }
 
 auto WhisperEncoderBlockImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    auto hidden = context.add(input, self_attention_->forward(context, self_norm_->forward(context, input)));
-    return context.add(
-        hidden,
-        second_->forward(context, context.gelu(first_->forward(context, final_norm_->forward(context, hidden)))));
+    const auto normalized =
+        by_rows(context, input, [&](const Tensor& rows, std::int64_t) { return self_norm_->forward(context, rows); });
+    const auto memory = self_attention_->project_memory(context, normalized);
+    return by_rows(context, input, [&](const Tensor& rows, std::int64_t start) {
+        const auto queries = context.slice(normalized, 1, start, static_cast<std::int64_t>(rows.size(1)));
+        auto hidden = context.add(rows, self_attention_->forward(context, queries, &memory));
+        return context.add(
+            hidden,
+            second_->forward(context, context.gelu(first_->forward(context, final_norm_->forward(context, hidden)))));
+    });
 }
 
 WhisperDecoderBlockImpl::WhisperDecoderBlockImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t heads,
@@ -184,7 +217,7 @@ auto WhisperEncoderImpl::encode(ops::Context& context, const Tensor& input) cons
     auto hidden = input;
     hidden = context.add(hidden, positions_->forward(context, 0, hidden.size(1)));
     for (const auto& layer : *layers_) hidden = layer->forward(context, hidden);
-    return norm_->forward(context, hidden);
+    return by_rows(context, hidden, [&](const Tensor& rows, std::int64_t) { return norm_->forward(context, rows); });
 }
 
 auto WhisperEncoderImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {

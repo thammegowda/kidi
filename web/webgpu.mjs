@@ -1,11 +1,12 @@
 import {makeProgram} from './webgpu-kernels.mjs';
 
-const UNIFORM_SLOTS = 8192;
+// Recorded work is submitted every UNIFORM_SLOTS dispatches, so the GPU starts on the first layers while the browser
+// still records and translates the rest of the step (decode: 77 -> 85 tok/s on an Apple M5).
+const UNIFORM_SLOTS = 128;
 const MAX_POOLED_BYTES = 128 * 1024 * 1024;
 
 export async function createWebGpu(module, options = {}) {
-    if (!navigator.gpu || !WebAssembly.Suspending || !WebAssembly.promising)
-        throw new Error('WebGPU requires a browser with WebGPU and WebAssembly JSPI support');
+    if (!navigator.gpu) throw new Error('This browser has no WebGPU');
     const adapter = await navigator.gpu.requestAdapter({powerPreference: 'high-performance'});
     if (!adapter || adapter.info.isFallbackAdapter) throw new Error('No hardware WebGPU adapter is available');
     const requiredFeatures = ['shader-f16', 'subgroups', 'timestamp-query'].filter(feature => adapter.features.has(feature));
@@ -57,6 +58,9 @@ class WebGpu {
         this.validationBuffer = null;
         this.validationPending = false;
         this.stats = {allocatedBytes: 0, pooledBytes: 0, submissions: 0, readBytes: 0, uploadBytes: 0, dispatches: 0};
+        // Kernels test optional device features and WGSL language extensions through one set.
+        this.features = new Set([...device.features,
+            ...(navigator.gpu.wgslLanguageFeatures?.has('packed_4x8_integer_dot_product') ? ['packed-dot'] : [])]);
         device.addEventListener('uncapturederror', event => { this.failure = event.error.message; });
         device.lost.then(info => { this.failure = `WebGPU device lost: ${info.message || info.reason}`; });
     }
@@ -66,7 +70,8 @@ class WebGpu {
     computePass() { return this.currentPass ??= this.commands().beginComputePass(); }
     endPass() { this.currentPass?.end(); this.currentPass = null; }
     transferCommands() { this.endPass(); return this.commands(); }
-    async pipeline(code, inputs, validation = false) {
+    // Wasm never waits on the GPU, so pipelines are created synchronously; compile errors surface on the next check.
+    pipeline(code, inputs, validation = false) {
         if (!this.pipelines.has(code)) {
             const shader = this.device.createShaderModule({code});
             const entries=Array.from({length:inputs+2},(_,binding)=>({binding,visibility:GPUShaderStage.COMPUTE,
@@ -76,23 +81,27 @@ class WebGpu {
             const group=this.device.createBindGroupLayout({entries});
             const layout=this.device.createPipelineLayout({bindGroupLayouts:[group]});
             const id=this.nextPipeline++;
-            this.pipelines.set(code, this.device.createComputePipelineAsync({layout, compute:{module:shader, entryPoint:'main'}})
-                .then(pipeline=>({pipeline,group,id,validation})).catch(async error => {
+            this.device.pushErrorScope('validation');
+            const pipeline=this.device.createComputePipeline({layout, compute:{module:shader, entryPoint:'main'}});
+            this.device.popErrorScope().then(async error => {
+                if (!error) return;
                 const messages=(await shader.getCompilationInfo()).messages.filter(message=>message.type==='error');
-                throw new Error(messages.map(message=>`${message.lineNum}:${message.linePos} ${message.message}`).join('\n') || error.message);
-            }));
+                this.failure ??= messages.map(message=>`${message.lineNum}:${message.linePos} ${message.message}`).join('\n') || error.message;
+            });
+            this.pipelines.set(code, {pipeline,group,id,validation});
         }
-        return await this.pipelines.get(code);
+        return this.pipelines.get(code);
     }
-    async prepare(spec) {
-        const plan = makeProgram(spec, this.device.features);
+    prepare(spec) {
+        this.check();
+        const plan = makeProgram(spec, this.features);
         plan.label=`${spec.operation}/${spec.attributes[0]??''}/${spec.inputs.map(input=>input.shape.join('x')).join(';')}`;
-        plan.pipeline = await this.pipeline(plan.code, plan.bindings ?? spec.inputs.length, plan.validatesIndices);
+        plan.pipeline = this.pipeline(plan.code, plan.bindings ?? spec.inputs.length, plan.validatesIndices);
         if (plan.scratch) {
-            plan.scratch.pipeline = await this.pipeline(plan.scratch.code,1);
+            plan.scratch.pipeline = this.pipeline(plan.scratch.code,1);
         }
         for (const stage of plan.stages ?? []) {
-            stage.pipeline = await this.pipeline(stage.code,stage.inputs.length);
+            stage.pipeline = this.pipeline(stage.code,stage.inputs.length);
         }
         const id = this.nextProgram++;
         this.programs.set(id, plan);
@@ -270,14 +279,20 @@ class WebGpu {
         this.readLater(handle, offset, destination, bytes);
         await this.synchronize();
     }
+    /// Called from Wasm at model synchronization points: submits recorded work without waiting. Results queued with
+    /// `readLater` reach the heap when JavaScript awaits `synchronize()` after the Wasm call returns.
+    flush() {
+        this.check();
+        if (this.validationPending) {
+            this.readLater(this.validationBuffer, 0, null, 4);
+            this.validationPending = false;
+        }
+        this.submitPending();
+    }
+    // Timestamp labels accumulate across submissions and resolve once in synchronize().
     submitPending() {
         this.endPass();
-        if (!this.encoder) { this.uniformIndex = 0; return null; }
-        const labels = this.queryLabels.splice(0);
-        if (labels.length) {
-            this.encoder.resolveQuerySet(this.queries,0,labels.length*2,this.queryBuffer,0);
-            this.encoder.copyBufferToBuffer(this.queryBuffer,0,this.queryRead,0,labels.length*16);
-        }
+        if (!this.encoder) { this.uniformIndex = 0; return; }
         if (this.uniformIndex)
             this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData, 0, this.uniformIndex * this.uniformWords);
         this.device.queue.submit([this.encoder.finish()]);
@@ -285,16 +300,22 @@ class WebGpu {
         this.uniformIndex = 0;
         ++this.epoch;
         ++this.stats.submissions;
-        return labels;
     }
     async synchronize() {
-        this.check();
-        if(this.validationPending){
-            this.readLater(this.validationBuffer,0,null,4);
-            this.validationPending=false;
+        this.flush();
+        const labels = this.queryLabels.splice(0);
+        if (labels.length) {
+            const encoder = this.device.createCommandEncoder();
+            encoder.resolveQuerySet(this.queries, 0, labels.length * 2, this.queryBuffer, 0);
+            encoder.copyBufferToBuffer(this.queryBuffer, 0, this.queryRead, 0, labels.length * 16);
+            this.device.queue.submit([encoder.finish()]);
         }
-        const labels = this.submitPending();
-        if (!labels) { this.trimBuffers(); return; }
+        if (!this.readbacks.length && !this.staging.length && !labels.length) {
+            await this.device.queue.onSubmittedWorkDone();
+            this.trimBuffers();
+            this.check();
+            return;
+        }
         const pending = this.readbacks.splice(0), staging = this.staging.splice(0);
         const reads=pending.map(async item => {
             await item.staging.mapAsync(GPUMapMode.READ, 0, item.size);

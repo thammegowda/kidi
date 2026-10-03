@@ -32,6 +32,13 @@ auto type(DType dtype) -> ynn_type {
     }
 }
 auto check(ynn_status status) -> void { require(ynn::check_status(status, "eager CPU operator")); }
+#if defined(__EMSCRIPTEN__)
+// Single-row calibrated projections use the same INT8 dot as multi-row ones, so YNNPACK's constant cache shares one
+// packed copy of each weight between prefill and decode. WebAssembly decode measured no slower this way.
+constexpr bool SHARED_DECODE_PACKING = true;
+#else
+constexpr bool SHARED_DECODE_PACKING = false;
+#endif
 auto transpose_packed_tile(const Tensor& input, std::int32_t bits, std::size_t row_start, std::size_t row_count,
                            std::size_t column_start, std::size_t column_count) -> std::vector<std::uint8_t> {
     const auto values_per_byte = static_cast<std::size_t>(8 / bits);
@@ -766,7 +773,7 @@ public:
                     check(ynn_define_static_transpose(native, 2, axes.data(), operands[1], &weight, 0));
                 }
                 if (packed && spec.epsilon > 0 && spec.attributes[1] == inputs[0].size(-1) &&
-                    inputs[0].numel() > inputs[0].size(-1)) {
+                    (SHARED_DECODE_PACKING || inputs[0].numel() > inputs[0].size(-1))) {
                     const std::size_t columns = padded_columns;
                     auto channel_scale = YNN_INVALID_VALUE_ID;
                     check(ynn_define_static_reshape(native, 1, &columns, operands[2], &channel_scale, 0));

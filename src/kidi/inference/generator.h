@@ -39,6 +39,9 @@ struct GenerationBatch {
 struct ServingOptions {
     std::size_t maximum_active = 4, maximum_requests = 64, cache_token_budget = 16384, prefill_tokens_per_step = 128;
     bool compact_cache = false;
+    /// `step()` submits work and reports the tokens it selects on the following call, so a device may finish
+    /// asynchronously in between without the caller blocking (the browser awaits WebGPU between calls).
+    bool deferred_tokens = false;
 };
 struct GenerationEvent {
     std::uint64_t request_id;
@@ -56,12 +59,24 @@ struct GenerationStep {
 /// `speech` selects the policy for Whisper, whose "auto" stays on the CPU INT8 path.
 auto select_device(std::string_view accelerator, bool speech = false) -> Result<tensor::Device>;
 
+/// Live bytes held by generation state, on whichever device owns it.
+struct GeneratorMemory {
+    std::size_t cache_bytes = 0;  // KV caches of running requests and retained prompt prefixes
+    std::size_t image_bytes = 0;  // reusable image embeddings
+};
+
+/// Creates a tensor that model.yaml lists under `external_tensors`: checkpoint data the embedder keeps outside
+/// linear memory, such as browser-held lookup tables.
+using ExternalTensorSource =
+    std::function<Result<tensor::Tensor>(std::string_view name, tensor::DType dtype, std::span<const std::int64_t> shape)>;
+
 class Generator {
 public:
     /// Loads Gemma 4 on `device`; the Qualcomm NPU device keeps the model on the CPU and compiles captured
     /// decoding steps for the NPU.
     static auto load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits = 0,
-                     std::int32_t group_size = 128, bool packed_prefill = false) -> Result<Generator>;
+                     std::int32_t group_size = 128, bool packed_prefill = false,
+                     const ExternalTensorSource& external = {}) -> Result<Generator>;
     /// Where text generation runs, e.g. "cpu", "vulkan", or "cpu+qnn-htp".
     auto execution() const -> std::string;
     auto generate(std::string_view prompt, GenerationOptions options = {}) -> Result<TextGeneration>;
@@ -76,6 +91,10 @@ public:
     auto pending_requests() const -> std::size_t { return waiting_.size() + running_.size(); }
     auto native_qat() const -> bool { return static_cast<bool>(config_["model"]["quantization_config"]); }
     auto vision_supported() const -> bool { return static_cast<bool>(config_["vision"]); }
+    auto memory() const -> GeneratorMemory;
+    /// Runs one throwaway decode step so operators are prepared and weights packed before the first request
+    /// (YNNPACK packs on first use; WebGPU prepares kernels and uploads host-resident weights).
+    auto warm_up() -> Result<void>;
 
 private:
     Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model, std::array<std::int32_t, 3> special);
@@ -114,6 +133,16 @@ private:
         std::string image_key;
     };
     auto retain_serving_prefix(QueuedGeneration& request) -> void;
+    /// Throws on devices whose selected tokens reach the host only on a later call (see `deferred_tokens`).
+    auto require_immediate_tokens() const -> void;
+    struct PendingToken {
+        std::uint64_t id;
+        tensor::Tensor selected;
+        std::size_t index;
+        std::chrono::steady_clock::time_point started;
+        bool prefill;
+    };
+    std::vector<PendingToken> pending_tokens_;
     std::optional<ServingOptions> serving_;
     std::deque<QueuedGeneration> waiting_;
     std::vector<QueuedGeneration> running_;

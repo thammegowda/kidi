@@ -62,6 +62,13 @@ private:
 
 struct MetalBufferView;
 struct WebGpuBufferView;
+class RowSource;
+class Tensor;
+auto external_tensor(std::vector<std::int64_t> shape, DType dtype, std::shared_ptr<const RowSource> source)
+    -> Result<Tensor>;
+auto is_external(const Tensor& tensor) noexcept -> bool;
+auto gather_rows(const Tensor& table, std::span<const std::int32_t> rows, std::span<std::byte> destination)
+    -> Result<void>;
 
 class Tensor {
 public:
@@ -132,6 +139,13 @@ private:
 
     friend auto metal_buffer(const Tensor& tensor) -> Result<MetalBufferView>;
     friend auto web_gpu_buffer(const Tensor& tensor) -> Result<WebGpuBufferView>;
+    friend auto adopt_web_gpu_buffer(std::uint32_t handle, std::vector<std::int64_t> shape, DType dtype,
+                                     std::int32_t packed_layout) -> Result<Tensor>;
+    friend auto external_tensor(std::vector<std::int64_t> shape, DType dtype, std::shared_ptr<const RowSource> source)
+        -> Result<Tensor>;
+    friend auto is_external(const Tensor& tensor) noexcept -> bool;
+    friend auto gather_rows(const Tensor& table, std::span<const std::int32_t> rows, std::span<std::byte> destination)
+        -> Result<void>;
     friend class Arena;
 
     std::shared_ptr<Backend> backend_;

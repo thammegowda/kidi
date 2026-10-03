@@ -27,6 +27,9 @@ public:
     auto forward(ops::Context& context, std::span<const std::int32_t> tokens) const -> Tensor;
     /// Embeds an I32 `[tokens]` tensor as `[1, tokens, width]`, on the device where supported.
     auto forward(ops::Context& context, const Tensor& tokens) const -> Tensor;
+    /// True when the table lives outside linear memory. Lookups then gather rows on the host, so captured steps must
+    /// pass the embedded rows in as step inputs instead of recording the lookup.
+    auto external() const -> bool;
 
 private:
     Tensor weight_;

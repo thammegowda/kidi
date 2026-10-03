@@ -18,7 +18,6 @@ kidi_require_submodule("uni-algo" "uni-algo/CMakeLists.txt")
 kidi_require_submodule("Abseil" "abseil-cpp/CMakeLists.txt")
 kidi_require_submodule("RE2" "re2/CMakeLists.txt")
 kidi_require_submodule("tokenizerspp" "tokenizerspp/CMakeLists.txt")
-kidi_require_submodule("zlib" "zlib/zlib.h")
 kidi_require_submodule("spdlog" "spdlog/CMakeLists.txt")
 kidi_require_submodule("ynnpack-dev" "ynnpack-dev/CMakeLists.txt")
 
@@ -81,6 +80,8 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(nlohmann_json uni_algo abseil-cpp)
+# Only the Abseil libraries RE2 links are built; the default target skips the rest.
+set_property(DIRECTORY "${KIDI_THIRD_PARTY_DIR}/abseil-cpp" PROPERTY EXCLUDE_FROM_ALL TRUE)
 set(_KIDI_SKIP_INSTALL_RULES "${CMAKE_SKIP_INSTALL_RULES}")
 set(CMAKE_SKIP_INSTALL_RULES ON)
 FetchContent_MakeAvailable(re2)
@@ -96,31 +97,6 @@ add_subdirectory(
     "${PROJECT_BINARY_DIR}/third_party/tokenizerspp"
     EXCLUDE_FROM_ALL
 )
-
-# zlib's upstream CMake mutates an out-of-tree source checkout by renaming its
-# checked-in zconf.h. Build the same static source set directly instead.
-add_library(kidi_zlib STATIC
-    "${KIDI_THIRD_PARTY_DIR}/zlib/adler32.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/compress.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/crc32.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/deflate.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/gzclose.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/gzlib.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/gzread.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/gzwrite.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/infback.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/inffast.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/inflate.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/inftrees.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/trees.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/uncompr.c"
-    "${KIDI_THIRD_PARTY_DIR}/zlib/zutil.c"
-)
-target_include_directories(kidi_zlib PUBLIC "${KIDI_THIRD_PARTY_DIR}/zlib")
-if(UNIX)
-    target_compile_definitions(kidi_zlib PRIVATE HAVE_UNISTD_H)
-endif()
-add_library(ZLIB::ZLIB ALIAS kidi_zlib)
 
 kidi_require_submodule("tahoma-vision" "tahoma-vision/CMakeLists.txt")
 set(TAHOMA_VISION_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -139,3 +115,7 @@ add_subdirectory(
     EXCLUDE_FROM_ALL
 )
 unset(CMAKE_PROJECT_TahomaVision_INCLUDE)
+
+# Tahoma's pigzpp builds zlib-ng with the zlib API (ZLIB_COMPAT) for PNG decoding. Kidi uses the same library for gzip
+# tokenizers: a second zlib would export the same symbols, and the linker would silently keep one for both.
+add_library(kidi::zlib ALIAS zlib-ng)

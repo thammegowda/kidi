@@ -128,6 +128,7 @@ struct Weights::Impl {
     std::unordered_map<std::string, OwnedTensor> transformed;
     std::unordered_map<std::string, std::string> aliases;
     std::unordered_set<std::string> hidden;
+    std::unordered_map<std::string, tensor::Tensor> provided;
 };
 
 namespace {
@@ -174,7 +175,8 @@ auto tensor_view(const Storage& impl, std::string_view name) -> RawTensorView {
 
 template <typename Storage>
 auto contains_tensor(const Storage& impl, std::string_view name) -> bool {
-    return impl.transformed.contains(std::string(name)) || impl.aliases.contains(std::string(name)) ||
+    return impl.provided.contains(std::string(name)) || impl.transformed.contains(std::string(name)) ||
+           impl.aliases.contains(std::string(name)) ||
            (!impl.hidden.contains(std::string(name)) &&
             (impl.imported ? impl.imported->tensors().contains(std::string(name))
                            : impl.checkpoint->contains(std::string(name))));
@@ -328,19 +330,29 @@ auto Weights::names() const -> std::vector<std::string> {
     });
     for (const auto& [name, unused] : impl_->aliases) result.push_back(name);
     for (const auto& [name, unused] : impl_->transformed) result.push_back(name);
+    for (const auto& [name, unused] : impl_->provided) result.push_back(name);
     std::ranges::sort(result);
     return result;
 }
 
 auto Weights::size() const noexcept -> std::size_t {
     return (impl_->imported ? impl_->imported->tensors().size() : impl_->checkpoint->tensors().size()) -
-           impl_->hidden.size() + impl_->transformed.size() + impl_->aliases.size();
+           impl_->hidden.size() + impl_->transformed.size() + impl_->aliases.size() + impl_->provided.size();
+}
+
+auto Weights::add(std::string name, tensor::Tensor value) -> Result<void> {
+    if (!value.defined() || contains(name))
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "duplicate or undefined weight tensor: " + name});
+    impl_->provided.emplace(std::move(name), std::move(value));
+    return {};
 }
 
 auto Weights::tensor(std::string_view name) const -> Result<tensor::Tensor> {
     if (!contains(name)) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "weight tensor not found: " + std::string(name)});
     }
+    if (const auto found = impl_->provided.find(std::string(name)); found != impl_->provided.end())
+        return found->second;
     if (impl_->imported && !impl_->transformed.contains(std::string(name))) {
         const auto alias = impl_->aliases.find(std::string(name));
         return impl_->imported->tensor(alias == impl_->aliases.end() ? name : std::string_view(alias->second));

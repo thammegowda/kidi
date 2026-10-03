@@ -198,6 +198,13 @@ dd { margin: 0; font-variant-numeric: tabular-nums; }
 #warning:empty { display: none; }
 .subtle { min-height: 28px; padding: 4px 0; border: 0; background: transparent; color: var(--muted); display: flex; align-items: center; gap: 6px; font-size: 11px; }
 .subtle img { width: 14px; height: 14px; }
+.memory-diagnostics { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); font-size: 11px; }
+.memory-diagnostics summary { cursor: pointer; font-weight: 650; }
+.memory-diagnostics dl { margin-top: 8px; }
+.memory-categories { display: grid; gap: 3px; max-height: 180px; margin: 4px 0; padding: 0; overflow: auto; color: var(--muted); font-size: 9px; list-style: none; }
+.memory-categories li { display: flex; justify-content: space-between; gap: 10px; }
+.memory-categories li span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.memory-categories li span:last-child { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
 .cache-manager { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
 .cache-heading, .cache-model-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .cache-heading h3 { margin: 0; font-size: 12px; }

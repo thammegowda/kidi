@@ -68,13 +68,13 @@ jobs:
 
       - name: Restore Emscripten SDK and system libraries
         id: emsdk
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/emsdk
           key: emsdk-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-${{ env.EMSCRIPTEN_VERSION }}
 
       - name: Restore compiled objects
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.CCACHE_DIR }}
           key: wasm-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.EMSCRIPTEN_VERSION }}-${{ github.sha }}
@@ -117,7 +117,7 @@ jobs:
 
       - name: Upload Pages artifact
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: build-pages
 
@@ -134,8 +134,8 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

@@ -1,4 +1,5 @@
 #include "kidi/inference/generator.h"
+#include "kidi/core/memory.h"
 #include "kidi/runtime/operator.h"
 #include "kidi/tensor/backend.h"
 #include "kidi/checkpoint/config.h"
@@ -7,8 +8,10 @@
 #include <optional>
 #include <cstdlib>
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <fstream>
+#include <utility>
 
 namespace kidi::inference {
 using ops::require;
@@ -28,11 +31,15 @@ Generator::Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4
                      std::array<std::int32_t, 3> special)
     : config_(std::move(config)), tokenizer_(std::move(tokenizer)), model_(std::move(model)), special_(special) {}
 auto Generator::load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits,
-                     std::int32_t group_size, bool packed_prefill) -> Result<Generator> {
+                     std::int32_t group_size, bool packed_prefill, const ExternalTensorSource& external)
+    -> Result<Generator> {
     try {
         auto config = require(checkpoint::load_config(directory / "model.yaml"));
         require(model::Gemma4Impl::validate_config(config["model"]));
-        auto tokenizer = require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
+        auto tokenizer = [&] {
+            const core::MemoryScope memory("load:tokenizer");
+            return require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
+        }();
         if (tokenizer.vocabulary_size() != config["model"]["vocab_size"].as<std::size_t>())
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Gemma 4 tokenizer vocabulary mismatch"});
         std::array<std::int32_t, 3> special;
@@ -46,6 +53,19 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
         if (!tokenizer.token_id("<bos>") || !tokenizer.token_id("<|turn>"))
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Gemma 4 tokenizer lacks chat delimiters"});
         auto weights = require(checkpoint::Weights::load(config["weights_file"].as<std::string>()));
+        for (const auto& declared : config["external_tensors"]) {
+            if (!external)
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "model declares external tensors but none were provided"});
+            const auto name = declared["name"].as<std::string>();
+            const auto dtype_name = declared["dtype"].as<std::string>();
+            std::optional<tensor::DType> dtype;
+            for (auto candidate = 0; candidate <= static_cast<int>(tensor::DType::E5M2); ++candidate)
+                if (tensor::to_string(static_cast<tensor::DType>(candidate)) == dtype_name)
+                    dtype = static_cast<tensor::DType>(candidate);
+            if (!dtype) throw ops::Failure({ErrorCode::INVALID_MANIFEST, "unknown external tensor dtype: " + dtype_name});
+            const auto shape = declared["shape"].as<std::vector<std::int64_t>>();
+            require(weights.add(name, require(external(name, *dtype, shape))));
+        }
         if (std::filesystem::is_regular_file(directory / "config.json") &&
             weights.contains("model.vision_tower.patch_embedder.input_proj.weight") &&
             weights.contains("model.embed_vision.embedding_projection.weight")) {
@@ -65,7 +85,10 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
         }
         const ModuleScope construction(parameter.dtype(), false, device);
         auto model = require(model::Gemma4Impl::create(config["model"]));
-        require(model->set_checkpoint(weights, weight_bits, group_size, packed_prefill));
+        {
+            const core::MemoryScope memory("load:bind_weights");
+            require(model->set_checkpoint(weights, weight_bits, group_size, packed_prefill));
+        }
         return Generator(std::move(config), std::move(tokenizer), std::move(model), special);
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
@@ -111,8 +134,40 @@ auto Generator::execution() const -> std::string {
     if (!accelerator.empty()) result += "+" + std::string(accelerator);
     return result;
 }
+auto Generator::warm_up() -> Result<void> {
+    try {
+        auto state = require(model_->create_state(
+            std::min<std::size_t>(128, config_["model"]["max_position_embeddings"].as<std::size_t>())));
+        const std::array token{*tokenizer_.token_id("<bos>")};
+        // The selected token is never read, so devices that finish asynchronously need no wait here.
+        require(model_->select_token(token, state));
+        return {};
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
+    }
+}
+auto Generator::memory() const -> GeneratorMemory {
+    GeneratorMemory result;
+    const auto add_state = [&](const model::Gemma4State& state) {
+        for (const auto& layer : state.layers) result.cache_bytes += layer.key.nbytes() + layer.value.nbytes();
+    };
+    for (const auto& request : running_)
+        if (request.state) add_state(*request.state);
+    if (prefix_) add_state(prefix_->state);
+    if (serving_prefix_) add_state(serving_prefix_->state);
+    for (const auto& image : images_) result.image_bytes += image.embeddings.nbytes();
+    return result;
+}
+auto Generator::require_immediate_tokens() const -> void {
+    if (tensor::DEVICE_CAPABILITIES[model_->device().kind].deferred_host_reads)
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "this device reports tokens on a later call; use serving with "
+                                                    "deferred_tokens"});
+}
 auto Generator::generate(std::string_view prompt, GenerationOptions options) -> Result<TextGeneration> {
     try {
+        require_immediate_tokens();
         options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
         if (pending_requests() || serving_failed_)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
@@ -232,6 +287,7 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
 auto Generator::generate_batch(std::span<const std::string> prompts,
                                GenerationOptions options) -> Result<GenerationBatch> {
     try {
+        require_immediate_tokens();
         options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
         if (pending_requests() || serving_failed_)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
@@ -330,6 +386,7 @@ auto Generator::generate_batch(std::span<const std::string> prompts,
 auto Generator::configure_serving(ServingOptions options) -> Result<void> {
     try {
         options.prefill_tokens_per_step = model_->prefill_chunk_size(options.prefill_tokens_per_step);
+        if (!options.deferred_tokens) require_immediate_tokens();
         if (pending_requests() || serving_failed_ || !options.maximum_active || options.maximum_active > 16 ||
             options.maximum_requests < options.maximum_active || !options.cache_token_budget ||
             !options.prefill_tokens_per_step)
@@ -388,6 +445,7 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
                         options.image_tokens, options.image_max_pixels));
                     if (!vision_) {
                         if (options.on_image_progress) options.on_image_progress("Preparing image model");
+                        const core::MemoryScope memory("load:vision");
                         const auto device = model_->device() == tensor::Device::web_gpu() ? tensor::Device::web_gpu()
                                                                                           : tensor::Device::cpu();
                         const ModuleScope construction(tensor::DType::F32, false, device);
@@ -605,18 +663,62 @@ auto Generator::step() -> Result<GenerationStep> {
             result.events.push_back(std::move(event));
         };
         admit();
+        // Deferred tokens selected by the previous call are complete once the caller has awaited the device.
+        for (auto& pending : std::exchange(pending_tokens_, {})) {
+            const auto request = std::ranges::find(running_, pending.id, &QueuedGeneration::id);
+            if (request == running_.end()) continue;
+            const auto token = require(std::as_const(pending.selected).data<std::int32_t>())[pending.index];
+            if (token < 0) throw ops::Failure({ErrorCode::RUNTIME, "Gemma 4 returned invalid token scores"});
+            (pending.prefill ? request->stats.prefill_ns : request->stats.decode_ns) += elapsed(pending.started);
+            accept(*request, token);
+        }
+        retire();
+        admit();
+        const auto next_prefill = [&] {
+            auto prefill = running_.end();
+            for (auto candidate = running_.begin(); candidate != running_.end(); ++candidate) {
+                if (candidate->search.result().decoder_steps) continue;
+                if (prefill == running_.end()) prefill = candidate;
+                if (candidate->id > prefill_after_) {
+                    prefill = candidate;
+                    break;
+                }
+            }
+            return prefill;
+        };
+        const auto chunk_length = [&](const QueuedGeneration& request) {
+            return std::min({request.prompt.size() - request.state->position, request.options.prefill_chunk_size,
+                             serving_->prefill_tokens_per_step});
+        };
+        // Captured steps reuse their output buffers, and deferred selections are read only on the next call, so a
+        // deferred step submits one selection: a final prefill chunk takes the step and decoding resumes next call.
+        const auto upcoming = next_prefill();
+        const bool prefill_selects = serving_->deferred_tokens && upcoming != running_.end() &&
+                                     upcoming->state->position + chunk_length(*upcoming) == upcoming->prompt.size();
         std::array<std::int32_t, 16> tokens{};
         std::array<model::Gemma4State*, 16> states{};
         std::array<std::size_t, 16> rows{};
         std::size_t count = 0;
-        for (std::size_t row = 0; row < running_.size(); ++row) {
+        for (std::size_t row = 0; row < running_.size() && !prefill_selects; ++row) {
             auto& request = running_[row];
             if (!request.search.result().decoder_steps) continue;
             tokens[count] = request.search.token();
             states[count] = &*request.state;
             rows[count++] = row;
         }
-        if (count) {
+        if (count && serving_->deferred_tokens) {
+            const auto started = Clock::now();
+            const auto prepared = model_->preparation_ns();
+            const auto selected =
+                count == 1 ? require(model_->select_token(std::span(tokens).first(1), *states[0]))
+                           : require(model_->select_batch_tokens(std::span(tokens).first(count),
+                                                                 std::span(states).first(count)));
+            for (std::size_t index = 0; index < count; ++index)
+                pending_tokens_.push_back({running_[rows[index]].id, selected, index, started, false});
+            result.decode_ns = elapsed(started);
+            if (serving_->maximum_active == 1)
+                running_[rows[0]].stats.preparation_ns += model_->preparation_ns() - prepared;
+        } else if (count) {
             const auto started = Clock::now();
             const auto prepared = model_->preparation_ns();
             std::vector<std::int32_t> selected;
@@ -634,32 +736,28 @@ auto Generator::step() -> Result<GenerationStep> {
         }
         retire();
         admit();
-        auto prefill = running_.end();
-        for (auto candidate = running_.begin(); candidate != running_.end(); ++candidate) {
-            if (candidate->search.result().decoder_steps) continue;
-            if (prefill == running_.end()) prefill = candidate;
-            if (candidate->id > prefill_after_) {
-                prefill = candidate;
-                break;
-            }
-        }
-        if (prefill != running_.end()) {
+        const auto prefill = next_prefill();
+        const bool second_selection = serving_->deferred_tokens && count && prefill != running_.end() &&
+                                      prefill->state->position + chunk_length(*prefill) == prefill->prompt.size();
+        if (prefill != running_.end() && !second_selection) {
             auto& request = *prefill;
             prefill_after_ = request.id;
-            const auto length = std::min({request.prompt.size() - request.state->position,
-                                          request.options.prefill_chunk_size, serving_->prefill_tokens_per_step});
+            const auto length = chunk_length(request);
             const auto input = std::span(request.prompt).subspan(request.state->position, length);
             const bool final_chunk = request.state->position + length == request.prompt.size();
             const auto started = Clock::now();
             const auto prepared = model_->preparation_ns();
             std::optional<std::int32_t> selected;
-            if (final_chunk) {
+            const bool deferred = final_chunk && serving_->deferred_tokens;
+            if (deferred)
+                pending_tokens_.push_back(
+                    {request.id, require(model_->select_token(input, *request.state)), 0, started, true});
+            else if (final_chunk)
                 selected = require(model_->forward_token(input, *request.state));
-            } else {
+            else
                 require(model_->prefill(input, *request.state));
-            }
             result.prefill_ns = elapsed(started);
-            request.stats.prefill_ns += result.prefill_ns;
+            if (!deferred) request.stats.prefill_ns += result.prefill_ns;
             request.stats.preparation_ns += model_->preparation_ns() - prepared;
             if (selected) accept(request, *selected);
         }
@@ -674,6 +772,7 @@ auto Generator::step() -> Result<GenerationStep> {
         serving_prefix_.reset();
         waiting_.clear();
         running_.clear();
+        pending_tokens_.clear();
         reserved_cache_tokens_ = 0;
         return std::unexpected(error.error());
     } catch (const std::exception& error) {
@@ -681,6 +780,7 @@ auto Generator::step() -> Result<GenerationStep> {
         serving_prefix_.reset();
         waiting_.clear();
         running_.clear();
+        pending_tokens_.clear();
         reserved_cache_tokens_ = 0;
         return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
     }

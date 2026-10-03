@@ -105,6 +105,13 @@ before assignment. There is no separate encoding enum or YAML precision setting.
 The execution policy follows stored weights; any future compute-precision override
 is a separate runtime option, not a duplicate declaration of checkpoint metadata.
 The old flat manifest layout is not supported or automatically migrated.
+`model.yaml` may list `external_tensors` (name, dtype, shape) that the embedder
+supplies through `Generator::load`'s `ExternalTensorSource`; `Weights::add`
+registers them beside the file's tensors. The browser uses this for the Gemma
+per-layer embedding table: `tensor::external_tensor` wraps a `RowSource` whose rows
+stay in JavaScript, and `gather_rows` copies only the requested rows. External
+tensors are CPU tensors without host addresses, so direct byte access and device
+transfers fail rather than materializing the table.
 
 CLI diagnostics use spdlog on stderr. Translation results and inspection output
 remain on stdout; machine-readable metric/profile records retain their unadorned
@@ -160,7 +167,11 @@ learned decoder positions, fixed checkpoint encoder positions, and a tied output
 the checkpoint's embedded 80-bin mel bank. Conv1D is expressed as im2col plus the existing optimized linear operation;
 attention, normalization, cache mutation, and projection remain ordinary eager operations. `inference::Transcriber` owns
 language detection, task/no-timestamp prefixes, token suppression, and greedy ASR policy. Whisper processes one
-padded/truncated 30-second segment per call. Encoder and decoder share one CPU context; Android uses the same YNNPACK
+padded/truncated 30-second segment per call; with `TranscriptionOptions::fit_audio` (browser) the encoder sees only the
+audio plus at least one second of silence, and output that repeats itself is decoded again over the full window.
+Encoder-length inputs run in 128-row slices, so weighted operators are prepared once for the slice shape and retain
+slice-sized buffers whatever the audio length; decoder steps run whole. Only the current source length's captured
+decoder step is kept, because a captured step retains its encoder keys and values. Encoder and decoder share one CPU context; Android uses the same YNNPACK
 operators as native CPU inference. No Qualcomm SDK, calibration pass, or DSP graph cache is required.
 
 Whisper INT8 binds per-output-channel signed weights and FP32 scales to the existing quantized linear operation, including
@@ -179,7 +190,8 @@ directory (or `ggml-model.bin` when a directory has no Safetensors). Dimensions
 are checked against the GGML header. `Transcriber::load` prepares and reuses a
 separate `<filename>.kidi-int8-v1` cache through the same native quantization
 path. Unsupported legacy quantization versions fail explicitly. Source files
-are retained, and cache metadata binds source size/mtime and importer version.
+are retained, and cache metadata binds source size/mtime and importer version. The browser runs the same preparation in
+its in-memory file system, then keeps the converted `model.safetensors` in Cache Storage and loads it directly.
 No GGML graph/backend or model equations are vendored; generic GGUF-to-Whisper
 architecture mapping is not implemented.
 
@@ -445,7 +457,21 @@ maximum output length in 128-token buckets rather than the full context limit.
 The reservation stays on the same side of the backend's INT8-cache threshold
 as the requested limit, preserving its precision policy. Native callers retain
 full reservations by default; the browser enables compact reservations to
-reduce pressure on its native wasm64 linear heap (8 GiB growth ceiling).
+reduce pressure on its 4 GiB wasm32 linear heap.
+
+`ServingOptions::deferred_tokens` lets a device finish asynchronously between
+`step()` calls. Each call first accepts the tokens selected by the previous call
+(`Gemma4::select_token` returns the selected-token tensor unread), then submits
+new work. Captured steps reuse their output buffers, so a deferred step submits
+at most one selection: a final prefill chunk takes the step and decoding resumes
+on the next call. The browser uses this for every backend. WebGPU from C++ never
+waits: `synchronize()` submits recorded work, and selected tokens reach their
+host tensors when JavaScript awaits the runtime between Wasm calls. Host copies of
+WebGPU tensors fail in that runtime; only the JSPI-linked backend test installs a
+waiting hook (`set_web_gpu_wait`). The browser loader can also hand WebGPU
+buffers it filled itself to `Generator::load` as external tensors; buffers tagged
+with a packed layout (`adopt_web_gpu_buffer`) are used in place by the packed
+projection kernels.
 
 The CPU backend replays prepared YNNPACK executables and custom kernels in order.
 Eager dispatch was about 0.75% of Whisper Small decode time on an Apple M5 (about
@@ -613,7 +639,10 @@ Gemma 4 configuration path. `Package` remains the RTG two-tokenizer package API.
 Gemma 4 key mapping and small BF16-to-FP32 normalization conversions happen at
 load time; there is no offline checkpoint conversion. Embeddings and the tied
 output projection retain CPU-mapped weights, with looked-up rows allocated on
-the execution device. Other projections execute on the selected backend.
+the execution device. An external per-layer embedding table is gathered on the
+host; captured steps receive those rows as a step input because a replay would
+skip host code. Gate/up projections stored back to back are viewed as the fused
+matrix without a copy. Other projections execute on the selected backend.
 
 Gemma 4 generation supports greedy text requests, including packed independent
 decode rows through `forward_batch` and `forward_batch_tokens`. Projection and

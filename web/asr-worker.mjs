@@ -1,4 +1,4 @@
-import {loadModel} from './model-cache.mjs';
+import {loadModel, storeConvertedSpeech} from './model-cache.mjs';
 
 let module;
 
@@ -20,6 +20,10 @@ self.onmessage = async ({data}) => {
                 metrics => self.postMessage({type: 'progress', ...metrics}), {cacheOnly: false});
             const result = await call('kidi_load_asr', ['string'], ['/model']);
             self.postMessage({type: 'ready', ...result, ...cache});
+            // Transcription can start meanwhile: storing only reads the converted file, now outside the Wasm heap.
+            await storeConvertedSpeech(module, cache).catch(error =>
+                self.postMessage({type: 'log', text: `Converted speech model not cached: ${error.message}`}));
+            self.postMessage({type: 'cached'});
         } else if (data.type === 'transcribe') {
             if (!module || !(data.audio instanceof ArrayBuffer)) throw new Error('Speech runtime is not ready');
             const audio = new Float32Array(data.audio);

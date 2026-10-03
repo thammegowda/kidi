@@ -247,7 +247,10 @@ architecture/tokenizer mappings. GGUF tensor names are retained, with the
 existing state-mapping API available to loaders. This importer does not execute
 GGML kernels or retain GGML block quantization for inference. Android Small
 downloads now combine GGML Q8 weights with matching HF sidecars, with both
-repository revisions tracked; the browser and Python Hub paths remain unchanged.
+repository revisions tracked. The browser does the same for Tiny, Base and Small,
+converting in its in-memory file system on first load and then keeping the
+converted checkpoint in Cache Storage instead of the GGML file; the Python Hub
+path remains unchanged.
 
 The small adapted [reference codec](src/kidi/checkpoint/ggml/dequantize.h)
 contains upstream credits, revision and MIT terms. No GGML runtime, backend,
@@ -312,7 +315,9 @@ The [Pages workflow](.github/workflows/pages.yml) builds/tests Wasm variants for
 relevant changes, reusing SDK/compiler caches; merges to `main` deploy the
 browser app. The separate [native workflow](.github/workflows/native.yml) runs
 native unit tests and installed Python-wheel smoke tests on macOS 26 without
-downloading models. It does not block Pages deployment.
+downloading models. One Release build serves both: the wheel build configures
+`build-ci` with tests enabled, and the test programs reuse its objects. Compiled
+objects (ccache) are saved even when tests fail. It does not block Pages deployment.
 
 See [GitHub Pages setup](web/README.md#github-pages) for one-time configuration.
 The generated browser directory is self-contained for static hosting; model

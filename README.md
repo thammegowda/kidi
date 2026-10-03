@@ -112,8 +112,9 @@ Microphone access requires permission and a secure browser context (HTTPS or
 localhost). Clearing site data removes downloaded models and saved browser data.
 To run your own instance, follow the [browser build instructions](README-dev.md#browser).
 
-Use a current Chromium browser with native WebAssembly memory64 support and ample memory. The Wasm heap can
-grow up to **8 GiB**, and long generations may exhaust available memory. The browser
+Use a current Chrome, Edge, Firefox, or Safari with ample memory. The Wasm heap is limited to **4 GiB**; a
+2,000-token chat peaks near 2.3 GiB on CPU or 0.8 GiB with WebGPU, plus about 1.1 GiB of browser memory for
+per-layer embeddings. WebGPU is used when the browser supports it. The browser
 defaults to 1,024 output tokens, allows up to 8,192, and shares a 9,216-token
 context between the conversation and reply. Its cache is separate from the CLI's.
 
@@ -168,8 +169,8 @@ required files for you. Advanced local-checkpoint import is documented in
 
 The browser settings accept Hugging Face model IDs rather than file URLs. Loading resolves the repository's current
 `main` revision to an immutable commit before downloading. The speech model field offers `openai/whisper-tiny`,
-`openai/whisper-base`, and `openai/whisper-small`; larger models trade substantially more download, memory, and latency
-for accuracy. During recording, the composer shows replaceable draft text and runs a final refinement after stop.
+`openai/whisper-base`, and `openai/whisper-small` (default); weights download as whisper.cpp Q8_0 files (264 MB for
+Small) and run as INT8. Larger models trade more download, memory, and latency for accuracy. During recording, the composer shows replaceable draft text and runs a final refinement after stop.
 
 ### RTG Model Package
 

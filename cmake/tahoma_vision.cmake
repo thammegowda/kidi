@@ -1,5 +1,5 @@
 if(EMSCRIPTEN)
-    string(APPEND CMAKE_C_FLAGS " -m64")
+    string(APPEND CMAKE_C_FLAGS " ${KIDI_WASM_ADDRESS_FLAG}")
     if(KIDI_WASM_THREADS)
         string(APPEND CMAKE_C_FLAGS " -pthread")
     endif()

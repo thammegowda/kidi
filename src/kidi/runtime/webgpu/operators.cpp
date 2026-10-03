@@ -5,6 +5,7 @@
 #include <emscripten.h>
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstring>
 #include <tuple>
 
@@ -12,11 +13,11 @@ namespace kidi::runtime {
 namespace {
 using ops::require;
 // clang-format off
-EM_ASYNC_JS(int, prepare_gpu, (const char* specification), {
+EM_JS(int, prepare_gpu, (const char* specification), {
     try {
-        return await Module.kidiGpu.prepare(JSON.parse(UTF8ToString(Number(specification))));
+        return Module.kidiGpu.prepare(JSON.parse(UTF8ToString(Number(specification))));
     } catch (error) {
-        Module.kidiGpu.failure = String(error);
+        Module.kidiGpu.failure = Module.kidiGpu.failure || String(error);
         return 0;
     }
 });
@@ -56,21 +57,39 @@ EM_JS(int, read_later, (int source, std::size_t offset, void* destination, std::
 });
 // clang-format on
 
-// Interleaving permits four signed-byte extractions with one shift and mask.
+// Interleaving permits four signed-byte extractions with one shift and mask: within each 32-bit word, value `slot`
+// moves to byte `slot % 4` at bit `bits * (slot / 4)`. The mapping is linear in the input bytes, so each word is the OR
+// of four byte lookups.
 auto interleave_packed(const tensor::Tensor& weight, std::int32_t bits) -> tensor::Tensor {
-    const auto source = require(weight.copy_to_host());
+    std::vector<std::byte> copied;
+    std::span<const std::byte> source;
+    if (weight.is_host_accessible()) {
+        source = require(weight.host_bytes());
+    } else {
+        copied = require(weight.copy_to_host());
+        source = copied;
+    }
     if (source.size() % 4 != 0)
         throw ops::Failure({ErrorCode::UNSUPPORTED, "packed weights must occupy whole 32-bit words"});
-    auto host = require(tensor::Tensor::empty({weight.shape().begin(), weight.shape().end()}, weight.dtype()));
-    auto destination = require(host.host_bytes());
+    std::array<std::uint32_t, 4 * 256> table{};
     const auto slots = static_cast<std::uint32_t>(32 / bits);
     const auto mask = (1u << bits) - 1u;
+    for (std::uint32_t position = 0; position < 4; ++position)
+        for (std::uint32_t value = 0; value < 256; ++value) {
+            const auto input = value << (8 * position);
+            std::uint32_t output = 0;
+            for (std::uint32_t slot = 0; slot < slots; ++slot)
+                output |= ((input >> (slot * static_cast<std::uint32_t>(bits))) & mask)
+                          << (8 * (slot % 4) + static_cast<std::uint32_t>(bits) * (slot / 4));
+            table[position * 256 + value] = output;
+        }
+    auto host = require(tensor::Tensor::empty({weight.shape().begin(), weight.shape().end()}, weight.dtype()));
+    auto destination = require(host.host_bytes());
     for (std::size_t word = 0; word < source.size() / 4; ++word) {
-        std::uint32_t input = 0, output = 0;
+        std::uint32_t input = 0;
         std::memcpy(&input, source.data() + word * 4, 4);
-        for (std::uint32_t slot = 0; slot < slots; ++slot)
-            output |= ((input >> (slot * static_cast<std::uint32_t>(bits))) & mask)
-                      << (8 * (slot % 4) + static_cast<std::uint32_t>(bits) * (slot / 4));
+        const auto output = table[input & 255] | table[256 + ((input >> 8) & 255)] |
+                            table[512 + ((input >> 16) & 255)] | table[768 + (input >> 24)];
         std::memcpy(destination.data() + word * 4, &output, 4);
     }
     return require(host.to(tensor::Device::web_gpu()));
@@ -207,9 +226,10 @@ public:
                     ? static_cast<std::int32_t>(spec.attributes[0])
                     : 0;
             const auto interleaved = packed_bits == 2 || packed_bits == 4 ? packed_bits : 0;
-            // Packed weights always need the interleaved copy, even when the checkpoint already placed them on the
-            // device.
-            if (interleaved || input.device() != tensor::Device::web_gpu()) {
+            // Weights the loader uploaded in kernel layout are used in place; others get an interleaved device copy.
+            const bool kernel_layout = interleaved && input.device() == tensor::Device::web_gpu() &&
+                                       require(tensor::web_gpu_buffer(input)).packed_layout == interleaved;
+            if (!kernel_layout && (interleaved || input.device() != tensor::Device::web_gpu())) {
                 const auto key = std::tuple{input.storage_identity(), input.storage_offset(), interleaved};
                 auto found = constants_.find(key);
                 if (found == constants_.end())

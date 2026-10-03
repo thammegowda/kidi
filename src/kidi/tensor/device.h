@@ -25,6 +25,9 @@ struct DeviceCapabilities {
     std::size_t blockwise_int8_attention_max_tokens = 0;
     /// Token embedding lookups run on the device from I32 token tensors.
     bool device_embedding = false;
+    /// Host-visible results arrive only after the embedder awaits the device between calls (browser WebGPU), so
+    /// selected tokens must be read on a later call (`ServingOptions::deferred_tokens`).
+    bool deferred_host_reads = false;
 };
 
 template <typename Key, typename Value, std::size_t Size>
@@ -62,7 +65,8 @@ inline constexpr EnumMap<DeviceKind, DeviceCapabilities, static_cast<std::size_t
                   DeviceCapabilities{.calibrated_int8_cast = true,
                                      .blockwise_int8_attention = true,
                                      .blockwise_int8_attention_max_tokens = std::numeric_limits<std::size_t>::max(),
-                                     .device_embedding = true}},
+                                     .device_embedding = true,
+                                     .deferred_host_reads = true}},
         std::pair{DeviceKind::VULKAN, DeviceCapabilities{.calibrated_int8_cast = true,
                                                          .blockwise_int8_attention = true,
                                                          .blockwise_int8_attention_max_tokens = 512,

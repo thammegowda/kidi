@@ -36,6 +36,8 @@ public:
         -> Result<Weights>;
     static auto save(const std::filesystem::path& path, const StateDict& state) -> Result<void>;
 
+    /// Adds a tensor supplied by the embedder rather than the file, such as a table kept outside linear memory.
+    auto add(std::string name, tensor::Tensor value) -> Result<void>;
     auto contains(std::string_view name) const -> bool;
     auto size() const noexcept -> std::size_t;
     auto names() const -> std::vector<std::string>;

@@ -40,7 +40,7 @@
                     <div id="memory-stats" class="memory-stats" tabindex="0" aria-label="WebAssembly memory" aria-describedby="memory-description">
                     <span>Wasm heap <strong id="heap-used">--</strong></span>
                     <span>Headroom <strong id="heap-headroom">--</strong></span>
-                    <span id="memory-description" role="tooltip">Allocated linear memory and growth remaining below the 8 GiB Wasm limit. Not total browser RAM or free device memory.</span>
+                    <span id="memory-description" role="tooltip">Allocated linear memory and growth remaining below the 4 GiB Wasm limit. Not total browser RAM or free device memory.</span>
                     </div>
                 </div>
                 <button id="header-settings" class="runtime-chip" type="button" title="Model settings" aria-label="Model settings"><span class="status-dot" aria-hidden="true"></span><span id="runtime-badge">Offline</span><img src="./icons/settings.svg" alt="" aria-hidden="true"></button>
@@ -80,7 +80,7 @@
                 <label class="numeric-setting" for="tokens">Output tokens<input id="tokens" type="number" min="1" max="8192" value="1024"></label>
                 <label class="full numeric-setting" for="image-pixels">Image resize limit (pixels)<input id="image-pixels" type="number" min="161280" max="3000000" step="1" value="3000000"></label>
                 <label class="full" for="manifest">Chat model ID<input id="manifest" type="text" spellcheck="false" autocomplete="off" autocapitalize="none" value="google/gemma-4-E2B-it-qat-mobile-transformers"></label>
-                <label class="full" for="speech-model">Speech model ID<input id="speech-model" type="text" list="speech-models" spellcheck="false" autocomplete="off" autocapitalize="none" value="openai/whisper-tiny"></label>
+                <label class="full" for="speech-model">Speech model ID<input id="speech-model" type="text" list="speech-models" spellcheck="false" autocomplete="off" autocapitalize="none" value="openai/whisper-small"></label>
                 <p id="speech-status" class="full speech-status" role="status">Loading speech model</p>
                 <datalist id="speech-models"><option value="openai/whisper-tiny"><option value="openai/whisper-base"><option value="openai/whisper-small"></datalist>
             </div>
@@ -92,6 +92,12 @@
                 <progress id="progress" value="0" max="1" hidden></progress>
                 <dl><dt>Download</dt><dd id="download">0 MB</dd><dt>From cache</dt><dd id="cached">0 MB</dd><dt>Load time</dt><dd id="load-time">--</dd><dt>Wasm heap</dt><dd id="memory">--</dd><dt>GPU buffers</dt><dd id="gpu-memory">--</dd></dl>
                 <p id="warning" role="alert"></p>
+                <details id="memory-diagnostics" class="memory-diagnostics">
+                    <summary>Memory diagnostics</summary>
+                    <dl id="memory-summary" aria-live="polite"><dt>Status</dt><dd>Load a model to collect statistics</dd></dl>
+                    <ul id="memory-categories" class="memory-categories" aria-label="Allocations by category"></ul>
+                    <button id="copy-memory" class="subtle" type="button" disabled>Copy diagnostics</button>
+                </details>
                 <section class="cache-manager" aria-labelledby="cache-title">
                     <div class="cache-heading"><h3 id="cache-title">Cached models</h3><span id="cache-total">--</span></div>
                     <div id="cache-models" class="cache-models" aria-live="polite"><p class="cache-empty">Reading cache</p></div>

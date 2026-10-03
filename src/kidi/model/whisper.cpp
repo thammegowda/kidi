@@ -17,6 +17,7 @@ struct WhisperImpl::State {
     layers::Linear output;
     DType precision = module_dtype;
     std::vector<Tensor> step_inputs;
+    std::string decode_key;
 
     explicit State(const YAML::Node& config)
         : context(module_device),
@@ -211,16 +212,16 @@ auto WhisperImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<v
     }
 }
 
-auto WhisperImpl::encode(const audio::WhisperFeatures& features) -> Result<WhisperEncoderState> {
+auto WhisperImpl::encode(const audio::WhisperFeatures& features, std::size_t frames) -> Result<WhisperEncoderState> {
     try {
+        if (!frames) frames = features.frames;
         if (device() != tensor::Device::cpu() || features.bins != 80 || features.frames != 3000 ||
-            features.values.size() != features.bins * features.frames)
+            features.values.size() != features.bins * features.frames || frames % 2 || frames > features.frames)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Whisper requires 80 x 3000 CPU features"});
-        auto input = require(
-            Tensor::empty({1, static_cast<std::int64_t>(features.frames), static_cast<std::int64_t>(features.bins)},
-                          DType::F32, device()));
+        auto input = require(Tensor::empty(
+            {1, static_cast<std::int64_t>(frames), static_cast<std::int64_t>(features.bins)}, DType::F32, device()));
         auto time_major = require(input.data<float>());
-        for (std::size_t frame = 0; frame < features.frames; ++frame)
+        for (std::size_t frame = 0; frame < frames; ++frame)
             for (std::size_t bin = 0; bin < features.bins; ++bin)
                 time_major[frame * features.bins + bin] = features.values[bin * features.frames + frame];
         auto convolution = impl_->encoder->convolve(impl_->context, input);
@@ -290,8 +291,15 @@ auto WhisperImpl::decode(const WhisperEncoderState& source, std::int32_t token, 
             for (const auto* layers : {&source.layers, &std::as_const(state.layers)})
                 for (const auto& layer : *layers) inputs.insert(inputs.end(), {layer.key, layer.value});
             const auto count = static_cast<std::size_t>(impl_->decoder_layers);
-            output = context.replay(
-                "whisper_decode_" + std::to_string(state.capacity), inputs, [&](std::span<const Tensor> step) {
+            const auto key = "whisper_decode_" + std::to_string(state.capacity) + '_' +
+                             std::to_string(source.layers.front().key.size(1));
+            // A captured step keeps its inputs, including the encoder keys and values, so only the current shape's
+            // step is retained.
+            if (key != impl_->decode_key) {
+                context.clear_replays("whisper_decode_");
+                impl_->decode_key = key;
+            }
+            output = context.replay(key, inputs, [&](std::span<const Tensor> step) {
                     std::vector<layers::KeyValue> memory, cache;
                     for (std::size_t layer = 0; layer < count; ++layer) {
                         memory.push_back({step[3 + 2 * layer], step[4 + 2 * layer]});

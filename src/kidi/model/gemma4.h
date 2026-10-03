@@ -48,6 +48,12 @@ public:
     auto forward_batch(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states) -> Result<tensor::Tensor>;
     auto forward_batch_tokens(std::span<const std::int32_t> tokens,
                               std::span<Gemma4State*> states) -> Result<std::vector<std::int32_t>>;
+    /// Like `forward_token`, but returns the selected token as an I32 `[1]` host tensor without reading it. Devices that
+    /// finish asynchronously fill it once submitted work completes; -1 marks invalid scores. The next call may reuse it.
+    auto select_token(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<tensor::Tensor>;
+    /// Batched `select_token`: an I32 `[states]` host tensor.
+    auto select_batch_tokens(std::span<const std::int32_t> tokens,
+                             std::span<Gemma4State*> states) -> Result<tensor::Tensor>;
     auto preparation_ns() const -> std::uint64_t;
     auto release_workspaces() -> void;
     /// Accelerator compiling this model's captured steps, or empty.

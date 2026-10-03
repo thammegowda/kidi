@@ -1,4 +1,5 @@
 #include "kidi/layers/gemma4.h"
+#include "kidi/tensor/external.h"
 
 #include <algorithm>
 #include <bit>
@@ -8,6 +9,13 @@ namespace kidi::layers {
 using ops::require;
 
 namespace {
+#if defined(__EMSCRIPTEN__)
+// The fused CPU kernel keeps its own transposed copy of every FFN weight. WebAssembly prefill measured no faster with
+// it, and the copy costs ~0.35 GiB of a 4 GiB heap, so browser builds use the separate projections.
+constexpr bool FUSED_CPU_FEED_FORWARD = false;
+#else
+constexpr bool FUSED_CPU_FEED_FORWARD = true;
+#endif
 auto gate_up_width(std::int32_t intermediate) -> std::int32_t {
     if (intermediate <= 0 || intermediate > std::numeric_limits<std::int32_t>::max() / 2)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid gated feed-forward width"});
@@ -53,10 +61,12 @@ TokenEmbeddingImpl::TokenEmbeddingImpl(std::int32_t vocabulary, std::int32_t wid
     if (module_dtype == tensor::DType::I8)
         register_parameter("scale", quantization_scale_, {vocabulary, 1}, tensor::DType::F32);
 }
+auto TokenEmbeddingImpl::external() const -> bool { return tensor::is_external(weight_); }
 auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int32_t> tokens) const -> Tensor {
     if (!weight_.defined() || tokens.empty())
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "uninitialized embedding or empty tokens"});
-    if (tensor::DEVICE_CAPABILITIES[context.device().kind].device_embedding)
+    const bool outside = external();
+    if (!outside && tensor::DEVICE_CAPABILITIES[context.device().kind].device_embedding)
         return forward(
             context, require(Tensor::from_host({static_cast<std::int64_t>(tokens.size())}, tokens, context.device())));
     for (auto token : tokens)
@@ -64,8 +74,20 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "embedding token outside vocabulary"});
     const auto width = static_cast<std::size_t>(width_);
     auto output = require(Tensor::empty({1, static_cast<std::int64_t>(tokens.size()), static_cast<std::int64_t>(width)},
-                                        tensor::DType::F32, context.device()));
-    const auto bytes = require(weight_.host_bytes());
+                                        tensor::DType::F32));
+    // External tables are gathered into a compact buffer, so row `index` holds token `tokens[index]`.
+    std::vector<std::byte> gathered;
+    std::span<const std::byte> bytes;
+    if (outside) {
+        gathered.resize(tokens.size() * (weight_.nbytes() / weight_.size(0)));
+        require(tensor::gather_rows(weight_, tokens, gathered));
+        bytes = gathered;
+    } else {
+        bytes = require(weight_.host_bytes());
+    }
+    const auto row = [&](std::size_t index) {
+        return outside ? index : static_cast<std::size_t>(tokens[index]);
+    };
     auto values = require(output.data<float>());
     if (packed_bits_ || weight_.dtype() == tensor::DType::I8) {
         const auto bits = packed_bits_ ? packed_bits_ : 8;
@@ -74,17 +96,17 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int
         const auto data = reinterpret_cast<const std::uint8_t*>(bytes.data());
         for (std::size_t index = 0; index < tokens.size(); ++index)
             for (std::size_t channel = 0; channel < width; ++channel) {
-                const auto offset = static_cast<std::size_t>(tokens[index]) * width + channel;
+                const auto offset = row(index) * width + channel;
                 const auto raw = (data[offset / (8 / bits)] >> ((offset % (8 / bits)) * bits)) & ((1 << bits) - 1);
                 const auto integer = (raw ^ (1 << (bits - 1))) - (1 << (bits - 1));
                 values[index * width + channel] =
                     integer * scales[tokens[index] * groups + channel / group_width] * scale_;
             }
-        return output;
+        return require(output.to(context.device()));
     }
     for (std::size_t index = 0; index < tokens.size(); ++index)
         for (std::size_t channel = 0; channel < width; ++channel) {
-            const auto offset = static_cast<std::size_t>(tokens[index]) * width + channel;
+            const auto offset = row(index) * width + channel;
             const auto value =
                 weight_.dtype() == tensor::DType::BF16
                     ? std::bit_cast<float>(
@@ -93,11 +115,16 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int
                     : reinterpret_cast<const float*>(bytes.data())[offset];
             values[index * width + channel] = value * scale_;
         }
-    return output;
+    return require(output.to(context.device()));
 }
 auto TokenEmbeddingImpl::forward(ops::Context& context, const Tensor& tokens) const -> Tensor {
     if (!weight_.defined() || tokens.dtype() != tensor::DType::I32 || tokens.dimensions() != 1 || !tokens.numel())
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "token embeddings require a nonempty I32 token vector"});
+    if (external()) {
+        context.synchronize();
+        const auto bytes = require(tokens.copy_to_host());
+        return forward(context, std::span(reinterpret_cast<const std::int32_t*>(bytes.data()), tokens.numel()));
+    }
     if (!tensor::DEVICE_CAPABILITIES[context.device().kind].device_embedding) {
         context.synchronize();
         return forward(context, require(tokens.data<std::int32_t>()));
@@ -117,9 +144,10 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
     const auto rows = input.numel() / input.size(-1);
     const bool web_fusion = context.device() == tensor::Device::web_gpu() && rows < 4 &&
                             gate_up_->input_size_ % 128 == 0 && down_->input_size_ % 32 == 0;
-    if ((((context.device() == tensor::Device::cpu() || context.device() == tensor::Device::vulkan()) && rows >= 32) ||
-         web_fusion) &&
-        gate_up_->packed_bits_ && gate_up_->packed_bits_ == down_->packed_bits_) {
+    const bool cpu_fusion = (context.device() == tensor::Device::cpu() && FUSED_CPU_FEED_FORWARD) ||
+                            context.device() == tensor::Device::vulkan();
+    if (((cpu_fusion && rows >= 32) || web_fusion) && gate_up_->packed_bits_ &&
+        gate_up_->packed_bits_ == down_->packed_bits_) {
         const Tensor& gate_input = gate_up_->input_scale_;
         const Tensor& gate_output = gate_up_->output_scale_;
         const Tensor& down_input = down_->input_scale_;
