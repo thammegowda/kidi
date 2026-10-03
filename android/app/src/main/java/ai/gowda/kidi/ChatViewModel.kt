@@ -11,9 +11,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -26,6 +28,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+
+/** A completed draft transcription of the first [samples] recorded samples. */
+private class SpeechDraft(val samples: Int, val result: JSONObject)
+
+/** A draft transcription of the first [samples] samples that may still be running; null when cancelled or failed. */
+private class PendingDraft(val samples: Int, val job: Deferred<JSONObject?>)
 
 private const val DEFAULT_MODEL_ID = "google/gemma-4-E2B-it-qat-mobile-transformers"
 private const val DEFAULT_SPEECH_MODEL_ID = "openai/whisper-small"
@@ -144,6 +153,11 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     private val imageStore = ImageStore(application)
     private val runtimeExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "kidi-runtime") }
     private val runtimeDispatcher: CoroutineDispatcher = runtimeExecutor.asCoroutineDispatcher()
+    // Speech has its own thread, like the web app's speech worker, so dictation never queues behind chat work.
+    private val speechExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "kidi-speech") }
+    private val speechDispatcher: CoroutineDispatcher = speechExecutor.asCoroutineDispatcher()
+    @Volatile
+    private var stopRequestedAtMs = 0L
     private val _state = MutableStateFlow(
         KidiUiState(
             modelId = preferences.getString(MODEL_ID_KEY, DEFAULT_MODEL_ID) ?: DEFAULT_MODEL_ID,
@@ -504,10 +518,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             _state.update { it.copy(error = "Load a Whisper speech model in settings first") }
             return
         }
-        if (current.generating || current.loadingModel || current.loadingSpeech || current.recording ||
-            current.transcribing)
+        if (current.generating || current.loadingSpeech || current.recording || current.transcribing)
             return
         speechRecorder.prepare()
+        stopRequestedAtMs = 0L
         _state.update {
             it.copy(recording = true, recordingSeconds = 0f, status = "Listening", error = null)
         }
@@ -516,11 +530,14 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             val draftBusy = AtomicBoolean()
             val draftEnabled = AtomicBoolean(true)
             var lastDraftSamples = 0
+            val latestDraft = AtomicReference<SpeechDraft?>(null)
+            val pendingDraft = AtomicReference<PendingDraft?>(null)
             val mergeTranscript = { transcript: String ->
                 listOf(composerPrefix, transcript.trim()).filter(String::isNotEmpty).joinToString(" ")
             }
             fun publishPartial(payload: String, draft: Boolean, complete: Boolean = false) {
                 val partial = checked(payload)
+                if (partial.optBoolean("cancelled")) return
                 val text = mergeTranscript(partial.optString("text"))
                 val start = if (composerPrefix.isEmpty()) 0 else composerPrefix.length + 1
                 _state.update { state ->
@@ -534,26 +551,48 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             }
             try {
                 var reportedTenths = -1
-                val samples = speechRecorder.capture(
-                    onSamples = { count ->
+                var preempted = false
+                val recording = speechRecorder.capture(
+                    onSamples = { count, speechEnd ->
                         val tenths = count / 1600
                         if (tenths != reportedTenths) {
                             reportedTenths = tenths
                             _state.update { it.copy(recordingSeconds = count / 16000f) }
                         }
-                        val due = count >= MINIMUM_DRAFT_SAMPLES &&
+                        val cadence = count >= MINIMUM_DRAFT_SAMPLES &&
                             (lastDraftSamples == 0 || count - lastDraftSamples >= DRAFT_INTERVAL_SAMPLES)
-                        val requested = due && draftEnabled.get() && draftBusy.compareAndSet(false, true)
-                        if (requested) lastDraftSamples = count
+                        // A pause after new speech gets a draft at once, so it is usually ready to become the final
+                        // transcript by the time the user stops recording.
+                        val paused = speechEnd > 0 && count - speechEnd >= PAUSE_SAMPLES &&
+                            lastDraftSamples < speechEnd + SPEECH_TAIL_SAMPLES
+                        // The draft in progress misses the latest speech, so give the thread to a covering one.
+                        if (paused && draftBusy.get() && !preempted) {
+                            preempted = true
+                            NativeRuntime.cancelTranscription()
+                        }
+                        val requested = (cadence || paused) && draftEnabled.get() &&
+                            draftBusy.compareAndSet(false, true)
+                        if (requested) {
+                            lastDraftSamples = count
+                            preempted = false
+                        }
                         requested
                     },
                     onSnapshot = { snapshot ->
-                        viewModelScope.launch(runtimeDispatcher) {
+                        val generation = NativeRuntime.transcriptionGeneration()
+                        val job = viewModelScope.async(speechDispatcher) {
                             try {
-                                val draft = NativeRuntime.transcribe(snapshot, "auto", 128) { payload ->
-                                    publishPartial(payload, true)
+                                val payload = NativeRuntime.transcribe(snapshot, "auto", 128, generation) { partial ->
+                                    publishPartial(partial, true)
                                 }
-                                publishPartial(draft, true, complete = true)
+                                val result = checked(payload)
+                                if (result.optBoolean("cancelled")) null else {
+                                    publishPartial(payload, true, complete = true)
+                                    latestDraft.accumulateAndGet(SpeechDraft(snapshot.size, result)) { old, new ->
+                                        if (old == null || new!!.samples >= old.samples) new else old
+                                    }
+                                    result
+                                }
                             } catch (error: CancellationException) {
                                 throw error
                             } catch (error: Throwable) {
@@ -561,18 +600,45 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                                 _state.update {
                                     it.copy(error = "Live transcript failed: ${error.userMessage()}")
                                 }
+                                null
                             } finally {
                                 draftBusy.set(false)
                             }
                         }
+                        pendingDraft.set(PendingDraft(snapshot.size, job))
                     },
                 )
                 _state.update { it.copy(recording = false, transcribing = true, status = "Refining transcript") }
-                val result = withContext(runtimeDispatcher) {
-                    checked(NativeRuntime.transcribe(samples, "auto", 128) { payload ->
-                        publishPartial(payload, false)
-                    })
+                val samples = recording.samples
+                val covers = { size: Int ->
+                    recording.speechEnd > 0 && size >= minOf(samples.size, recording.speechEnd + SPEECH_TAIL_SAMPLES)
                 }
+                var source = "draft"
+                var result = latestDraft.get()?.takeIf { covers(it.samples) }?.result
+                if (result == null) {
+                    val pending = pendingDraft.get()
+                    if (pending != null && covers(pending.samples)) {
+                        source = "pending-draft"
+                        result = pending.job.await()
+                    }
+                }
+                if (result == null) {
+                    source = "final"
+                    // Drafts still queued or running are stale; the final pass replaces them.
+                    val generation = NativeRuntime.cancelTranscription()
+                    result = withContext(speechDispatcher) {
+                        checked(NativeRuntime.transcribe(samples, "auto", 128, generation) { payload ->
+                            publishPartial(payload, false)
+                        })
+                    }
+                }
+                val stoppedAt = stopRequestedAtMs
+                // Abandon drafts still running so the speech thread is free for the next recording.
+                if (source != "final") NativeRuntime.cancelTranscription()
+                Log.i("KidiSpeech", "final source=$source audio_ms=${samples.size / 16} " +
+                    "speech_end_ms=${recording.speechEnd / 16} " +
+                    "stop_to_text_ms=${if (stoppedAt > 0) SystemClock.elapsedRealtime() - stoppedAt else -1} " +
+                    "encode_ms=${result.optDouble("encode_ms")} decode_ms=${result.optDouble("decode_ms")}")
                 val transcript = result.optString("text").trim()
                 _state.update {
                     it.copy(
@@ -607,6 +673,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun stopRecording() {
         if (!_state.value.recording) return
+        stopRequestedAtMs = SystemClock.elapsedRealtime()
         _state.update { it.copy(status = "Finishing recording") }
         speechRecorder.stop()
     }
@@ -718,7 +785,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             _state.value.recording || _state.value.transcribing)
             return
         viewModelScope.launch {
-            withContext(runtimeDispatcher) { NativeRuntime.unloadAsr() }
+            withContext(speechDispatcher) { NativeRuntime.unloadAsr() }
             repository.removeInstalledSpeech()
             _state.update {
                 it.copy(
@@ -775,15 +842,16 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                         loadingModel = false,
                         progress = 1f,
                         chatExecution = loaded.optString("backend"),
-                        status = "Ready on device",
+                        // Dictation can run while chat loads; keep its status visible.
+                        status = if (it.recording || it.transcribing) it.status else "Ready on device",
                     )
                 }
             }.onFailure { error ->
                 Log.e("KidiStartup", "gemma_failed elapsed_ms=${SystemClock.elapsedRealtime() - started}")
                 val message = "Chat model could not load: ${error.userMessage()}"
                 _state.update {
-                    it.copy(modelReady = false, loadingModel = false, status = "Model offline", error = message,
-                        modelError = message)
+                    it.copy(modelReady = false, loadingModel = false, error = message, modelError = message,
+                        status = if (it.recording || it.transcribing) it.status else "Model offline")
                 }
             }
         }
@@ -805,7 +873,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 error = null,
             )
         }
-        viewModelScope.launch(runtimeDispatcher) {
+        viewModelScope.launch(speechDispatcher) {
             val started = SystemClock.elapsedRealtime()
             Log.i("KidiStartup", "whisper_start queue_ms=${started - queued}")
             runCatching {
@@ -843,6 +911,10 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     private suspend fun finish(result: JSONObject) {
+        Log.i("KidiChat", "reply prompt_tokens=${result.optInt("prompt_tokens")} " +
+            "reused_tokens=${result.optInt("reused_prompt_tokens")} first_token_ms=${result.optDouble("first_token_ms")} " +
+            "prefill_ms=${result.optDouble("prefill_ms")} output_tokens=${result.optInt("output_tokens")} " +
+            "decode_ms=${result.optDouble("decode_ms")} decode_tokens=${result.optInt("decode_tokens")}")
         val stats = MessageStats(
             tokens = result.optInt("output_tokens"),
             elapsedMs = result.optDouble("generation_ms"),
@@ -913,6 +985,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     private fun readyStatus(state: KidiUiState) = when {
         state.modelReady -> "Ready on device"
+        state.loadingModel -> "Loading model"
         state.speechReady -> "Speech ready"
         else -> "Model offline"
     }
@@ -922,9 +995,11 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         speechRecorder.stop()
         recordingJob?.cancel()
         val id = requestId
+        NativeRuntime.cancelTranscription()
+        speechExecutor.execute { NativeRuntime.unloadAsr() }
+        speechExecutor.shutdown()
         runtimeExecutor.execute {
             if (id != null) runCatching { NativeRuntime.cancel(id) }
-            NativeRuntime.unloadAsr()
             NativeRuntime.unload()
             chats.close()
         }
@@ -946,6 +1021,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         const val MESSAGES_KEY = "messages"
         const val MINIMUM_DRAFT_SAMPLES = 12800
         const val DRAFT_INTERVAL_SAMPLES = 19200
+        const val PAUSE_SAMPLES = 4800
+        const val SPEECH_TAIL_SAMPLES = 3200
     }
 }
 

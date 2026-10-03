@@ -167,8 +167,10 @@ learned decoder positions, fixed checkpoint encoder positions, and a tied output
 the checkpoint's embedded 80-bin mel bank. Conv1D is expressed as im2col plus the existing optimized linear operation;
 attention, normalization, cache mutation, and projection remain ordinary eager operations. `inference::Transcriber` owns
 language detection, task/no-timestamp prefixes, token suppression, and greedy ASR policy. Whisper processes one
-padded/truncated 30-second segment per call; with `TranscriptionOptions::fit_audio` (browser) the encoder sees only the
-audio plus at least one second of silence, and output that repeats itself is decoded again over the full window.
+padded/truncated 30-second segment per call; with `TranscriptionOptions::fit_audio` (browser and Android) the encoder sees
+only the audio plus at least one second of silence, and output that repeats itself is decoded again over the full window.
+`TranscriptionOptions::cancelled` is polled between encoder blocks and decoder steps so a stale dictation draft can be
+abandoned.
 Encoder-length inputs run in 128-row slices, so weighted operators are prepared once for the slice shape and retain
 slice-sized buffers whatever the audio length; decoder steps run whole. Only the current source length's captured
 decoder step is kept, because a captured step retains its encoder keys and values. Encoder and decoder share one CPU context; Android uses the same YNNPACK
@@ -406,6 +408,12 @@ Other platforms retain default scheduling. See the
 [matched scheduling comparison](benchmarks/metal/scheduling-20260919/README.md),
 including preparation costs and quality differences from the old graph runtime.
 
+FP32 attention with at most eight query rows, such as a Whisper or RTG decoder
+step, bypasses the generic YNNPACK graph, which re-lays out every key and value
+into head-major order on each call. A dedicated kernel reads the row-major cache
+directly and parallelizes over batch, head, and query row. On the SM8750 phone it
+cut Whisper Small decoding from about 14.5 to 8.8 ms per token.
+
 No model graph, lazy fallback, compiler IR, or alternate generation policy is
 retained; captured steps are recorded from eager code as described below. The former graph comparison benchmark was removed; its raw
 measurements and report remain historical documentation. The superseded fusion
@@ -508,7 +516,8 @@ binaries remain cached on disk.
 `inference::select_device` maps "auto", "cpu", "gpu", and "npu" to a device.
 "auto" prefers the NPU, then Metal on Apple, then the CPU for Gemma, and the CPU
 for Whisper; Vulkan is an explicit, experimental choice until it measures faster
-than the CPU. Explicit choices fail when unavailable. `Generator::load` with
+than the CPU. Explicit choices fail when unavailable. The Android app's Auto setting instead tries the NPU, Vulkan,
+and then the CPU, treating a device that cannot load or complete a short warm-up request as failed. `Generator::load` with
 `Device::qualcomm_npu()` keeps Gemma on the CPU with the NPU step compiler, and
 `Generator::execution()` reports the result (e.g. `cpu+qnn-htp`).
 

@@ -270,6 +270,10 @@ private val KidiUiState.runtimeBusy: Boolean
 private val KidiUiState.chatBusy: Boolean
     get() = generating || recording || transcribing || loadingModel || loadingChat || importingImage
 
+/** Dictation runs on its own thread, so it stays available while the chat model loads. */
+private val KidiUiState.speechBusy: Boolean
+    get() = generating || recording || transcribing || loadingSpeech || loadingChat || importingImage
+
 private fun modelLabel(modelId: String) = when (modelId) {
     "google/gemma-4-E2B-it-qat-mobile-transformers" -> "Gemma 4 E2B"
     "openai/whisper-tiny" -> "Whisper Tiny"
@@ -656,7 +660,7 @@ private fun Composer(
                                 keyboard?.hide()
                                 if (state.speechReady) onRecord() else onSettings()
                             },
-                            enabled = !state.runtimeBusy,
+                            enabled = !state.speechBusy,
                             iconSize = 28.dp,
                         )
                         Spacer(Modifier.weight(1f))

@@ -82,6 +82,21 @@ The first turn includes cold operator preparation; do not compare it directly wi
 `cached` and `uncached` records, which use identical conversation input and generation limits in the same process.
 This checks the same shared serving core used by the app, not Compose/UI overhead or debug-build inference performance.
 
+## Dictation Check
+
+The dictation mode mirrors the app's speech path: it prepares the same INT8 cache from a Whisper checkpoint directory,
+warms up, then transcribes growing prefixes of the WAV at the app's draft cadence (0.8 s, then every 1.2 s) and the whole
+file, reporting feature, encode, and decode time for each pass. Set `KIDI_FIT_AUDIO=0` or `KIDI_WARM_UP=0` to compare
+against a padded 30-second window or a cold first request:
+
+```sh
+"$ADB" -s SERIAL shell "timeout 600 $REMOTE/runner dictation $REMOTE/models/whisper-small 4 2 $REMOTE/speech.wav" \
+  > benchmarks/android/.cache/dictation.jsonl
+```
+
+On the SM8750 phone the 9.1-second speech fixture's final pass took about 3.2 seconds with the padded window, 1.05
+seconds with fitted audio, and 0.84 seconds after the short-query decoder attention kernel (8.8 ms per token).
+
 ## Image Chat Check
 
 Place a JPEG/PNG test image in the ignored cache and stage it on the device. The image mode asks for a short description,

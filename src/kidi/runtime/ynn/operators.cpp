@@ -498,6 +498,102 @@ private:
     std::vector<std::byte> scratch_;
     OutputPool pool_;
 };
+/// Attention for a few FP32 query rows, as in an autoregressive decoding step. The generic graph copies every key and
+/// value into head-major order on each call, which dominates a one-token step over a long encoder memory.
+class FewQueryAttention final : public Operator {
+public:
+    static constexpr std::int64_t MAXIMUM_QUERIES = 8;
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) -> bool {
+        if (spec.attributes.size() != 1 || inputs[0].size(1) > MAXIMUM_QUERIES) return false;
+        for (std::size_t index = 0; index < inputs.size(); ++index)
+            if (inputs[index].dtype() != DType::F32) return false;
+        return true;
+    }
+    FewQueryAttention(const OperatorSpec& spec, tensor::Arena& arena)
+        : heads_(static_cast<std::size_t>(spec.attributes[0])), pool_(&arena) {}
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
+        attend(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "attention is not an in-place operation"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { attend(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    static auto dot(const float* left, const float* right, std::size_t count) -> float {
+        // Independent lanes let the compiler use vector multiply-adds.
+        std::array<float, 8> lanes{};
+        std::size_t index = 0;
+        for (; index + lanes.size() <= count; index += lanes.size())
+            for (std::size_t lane = 0; lane < lanes.size(); ++lane)
+                lanes[lane] += left[index + lane] * right[index + lane];
+        float sum = 0;
+        for (const auto lane : lanes) sum += lane;
+        for (; index < count; ++index) sum += left[index] * right[index];
+        return sum;
+    }
+    auto attend(TensorInputs inputs, Tensor& output) -> void {
+        const auto& query = inputs[0];
+        const auto batch = static_cast<std::size_t>(query.size(0)), rows = static_cast<std::size_t>(query.size(1));
+        const auto width = static_cast<std::size_t>(query.size(2)), head_width = width / heads_;
+        const auto keys = static_cast<std::size_t>(inputs[1].size(1));
+        const auto key_batch_stride = inputs[1].size(0) == 1 ? 0 : keys * width;
+        std::array<std::size_t, 4> mask_strides{};
+        const float* mask = nullptr;
+        if (inputs.size() == 4) {
+            mask = require(inputs[3].data<float>()).data();
+            std::size_t stride = 1;
+            for (std::size_t axis = inputs[3].dimensions(); axis-- > 0;) {
+                mask_strides[4 - inputs[3].dimensions() + axis] = inputs[3].size(axis) == 1 ? 0 : stride;
+                stride *= inputs[3].size(axis);
+            }
+        }
+        const auto* query_data = require(query.data<float>()).data();
+        const auto* key_data = require(inputs[1].data<float>()).data();
+        const auto* value_data = require(inputs[2].data<float>()).data();
+        auto* output_data = require(output.data<float>()).data();
+        const auto scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_width)));
+        const auto items = batch * heads_ * rows;
+        if (!items) return;
+        const auto tasks = std::min(ynn::thread_count(), items);
+        scratch_.resize(tasks * keys);
+        const auto per_task = (items + tasks - 1) / tasks;
+        require(ynn::parallel_for(tasks, [&](std::size_t task) {
+            auto* scores = scratch_.data() + task * keys;
+            for (auto item = task * per_task; item < std::min(items, (task + 1) * per_task); ++item) {
+                const auto row = item % rows, head = item / rows % heads_, sample = item / rows / heads_;
+                const auto* q = query_data + (sample * rows + row) * width + head * head_width;
+                const auto* k = key_data + sample * key_batch_stride + head * head_width;
+                const auto* v = value_data + sample * key_batch_stride + head * head_width;
+                const auto* bias = mask ? mask + sample * mask_strides[0] + head * mask_strides[1] +
+                                              row * mask_strides[2]
+                                        : nullptr;
+                auto largest = -std::numeric_limits<float>::infinity();
+                for (std::size_t key = 0; key < keys; ++key) {
+                    scores[key] = dot(q, k + key * width, head_width) * scale;
+                    if (bias) scores[key] += bias[key * mask_strides[3]];
+                    largest = std::max(largest, scores[key]);
+                }
+                float total = 0;
+                for (std::size_t key = 0; key < keys; ++key) total += scores[key] = std::exp(scores[key] - largest);
+                auto* out = output_data + (sample * rows + row) * width + head * head_width;
+                std::fill_n(out, head_width, 0.F);
+                for (std::size_t key = 0; key < keys; ++key) {
+                    const auto weight = scores[key] / total;
+                    const auto* source = v + key * width;
+                    for (std::size_t index = 0; index < head_width; ++index) out[index] += weight * source[index];
+                }
+            }
+        }));
+    }
+
+    std::size_t heads_;
+    std::vector<float> scratch_;
+    OutputPool pool_;
+};
 class CpuOperator final : public Operator {
 public:
     CpuOperator(ynn::Executable executable, std::size_t count, std::size_t dynamic_count, DType dtype,
@@ -577,6 +673,7 @@ public:
         if (spec.operation == Operation::CAST && spec.dtype == DType::I8 && spec.epsilon > 0)
             return std::make_unique<QuantizeInt8>(spec.epsilon, arena_);
         if (spec.operation == Operation::ATTENTION) {
+            if (FewQueryAttention::supports(spec, inputs)) return std::make_unique<FewQueryAttention>(spec, arena_);
             const bool byte_cache = inputs[1].dtype() == DType::I8 && !spec.quantization[0].scales.empty() &&
                                     !spec.quantization[1].scales.empty();
             if (byte_cache && inputs[0].dtype() == DType::F32 && inputs[2].dtype() == inputs[1].dtype())

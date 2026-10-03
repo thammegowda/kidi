@@ -120,14 +120,19 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
         const auto features = require(extractor_.extract(waveform, sample_rate));
         const auto feature_ns = elapsed(feature_start);
         std::string emitted;
+        const auto check_cancelled = [&] {
+            if (options.cancelled && options.cancelled())
+                throw ops::Failure({ErrorCode::RUNTIME, "transcription cancelled"});
+        };
         // One encode and greedy decode over the first `frames` feature frames (all when zero).
         const auto attempt = [&](std::size_t frames) {
             Transcription result;
             emitted.clear();
             const auto preparation = model_->preparation_ns();
             const auto encode_start = Clock::now();
-            auto source = require(model_->encode(features, frames));
+            auto source = require(model_->encode(features, frames, options.cancelled));
             result.stats.encode_ns = elapsed(encode_start);
+            check_cancelled();
             auto state = require(model_->create_state(options.maximum_tokens + 4));
             const auto decode_start = Clock::now();
             const auto start_token = generation_["decoder_start_token_id"].as<std::int32_t>();
@@ -158,6 +163,7 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
             const auto vocabulary = config_["model"]["vocab_size"].as<std::size_t>();
             const auto end = generation_["eos_token_id"].as<std::int32_t>();
             for (std::size_t step = 0; step < options.maximum_tokens; ++step) {
+                check_cancelled();
                 scores = require(logits.data<float>());
                 const auto suppress = [&](std::int32_t token) {
                     if (token >= 0 && static_cast<std::size_t>(token) < scores.size())

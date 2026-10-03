@@ -28,7 +28,17 @@ internal object NativeRuntime {
         int8: Boolean = false,
         accelerator: String = DEFAULT_ACCELERATOR,
     ): String
-    external fun transcribe(samples: FloatArray, language: String, maximumTokens: Int, listener: PartialListener? = null): String
+    external fun transcribe(
+        samples: FloatArray,
+        language: String,
+        maximumTokens: Int,
+        /** From [transcriptionGeneration] when the request was made; negative means the current generation. */
+        generation: Long = -1,
+        listener: PartialListener? = null,
+    ): String
+    /** Abandons every transcription requested so far and returns the new generation for later requests. */
+    external fun cancelTranscription(): Long
+    external fun transcriptionGeneration(): Long
     external fun unload()
     external fun unloadAsr()
 

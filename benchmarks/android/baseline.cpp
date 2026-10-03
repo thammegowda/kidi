@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include "kidi/inference/generator.h"
+#include "kidi/checkpoint/prepare.h"
 #include "kidi/inference/transcriber.h"
 #include "kidi/runtime/ynn/graph.h"
 
@@ -233,11 +234,56 @@ auto benchmark_whisper(const std::filesystem::path& directory, const std::filesy
         }
     }
 }
+/// The app's dictation path: INT8 preparation, then drafts while recording and a final pass after stopping.
+auto benchmark_dictation(const std::filesystem::path& directory, const std::filesystem::path& wav, int threads,
+                         int repeats) -> void {
+    const auto waveform = require(kidi::audio::load_wav(wav));
+    if (waveform.sample_rate != 16000 || waveform.samples.size() < 32000 || waveform.samples.size() > 480000)
+        throw std::runtime_error("benchmark WAV must be 2-30 seconds at 16 kHz");
+    const auto started = Clock::now();
+    const auto prepared = require(kidi::checkpoint::prepare(directory, kidi::model::WhisperImpl::checkpoint_config(),
+                                                            kidi::model::WhisperImpl::int8_preparation));
+    auto transcriber = require(kidi::inference::Transcriber::load(prepared));
+    emit({{"stage", "load"}, {"model", "whisper-int8"}, {"ms", rounded(elapsed_ms(started))}}, threads);
+    // Defaults match the app: fitted audio and a warm-up at load. Set either variable to 0 to compare.
+    const auto enabled = [](const char* name) {
+        const auto* value = std::getenv(name);
+        return !value || std::string_view(value) != "0";
+    };
+    const auto fit = enabled("KIDI_FIT_AUDIO");
+    if (enabled("KIDI_WARM_UP")) {
+        const auto warm = Clock::now();
+        require(transcriber.warm_up());
+        emit({{"stage", "warm_up"}, {"ms", rounded(elapsed_ms(warm))}}, threads);
+    }
+    std::vector<std::size_t> sizes;
+    for (std::size_t size = 12800; size < waveform.samples.size(); size += 19200) sizes.push_back(size);
+    sizes.push_back(waveform.samples.size());
+    for (int iteration = 0; iteration < repeats; ++iteration)
+        for (const auto size : sizes) {
+            const auto before = Clock::now();
+            const auto result = require(transcriber.transcribe(
+                std::span(waveform.samples).first(size), 16000,
+                {.language = "auto", .maximum_tokens = 128, .fit_audio = fit}));
+            emit({{"stage", "transcription"},
+                  {"iteration", iteration},
+                  {"fit_audio", fit},
+                  {"audio_seconds", rounded(size / 16000.0)},
+                  {"wall_ms", rounded(elapsed_ms(before))},
+                  {"feature_ms", rounded(result.stats.feature_ns / 1e6)},
+                  {"encode_ms", rounded(result.stats.encode_ns / 1e6)},
+                  {"decode_ms", rounded(result.stats.decode_ns / 1e6)},
+                  {"preparation_ms", rounded(result.stats.preparation_ns / 1e6)},
+                  {"tokens", result.token_ids.size()},
+                  {"text", result.text}},
+                 threads);
+        }
+}
 } // namespace
 
 auto main(int argc, char** argv) -> int {
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
-        std::cout << "usage: kidi_android_baseline gemma|chat|whisper|image MODEL THREADS REPEATS [MEDIA]\n";
+        std::cout << "usage: kidi_android_baseline gemma|chat|whisper|image|dictation MODEL THREADS REPEATS [MEDIA]\n";
         return 0;
     }
     try {
@@ -246,7 +292,7 @@ auto main(int argc, char** argv) -> int {
         const auto threads = std::stoi(argv[3]), repeats = std::stoi(argv[4]);
         if (threads < 1 || threads > 8 || repeats < 1 || repeats > 20 ||
             !(((mode == "gemma" || mode == "chat") && argc == 5) ||
-              ((mode == "whisper" || mode == "image") && argc == 6)))
+              ((mode == "whisper" || mode == "image" || mode == "dictation") && argc == 6)))
             throw std::runtime_error("invalid mode, thread count, repeat count, or WAV argument");
         kidi::runtime::ynn::set_thread_count(threads);
         require(kidi::runtime::ynn::reserve_thread_pool(threads));
@@ -261,6 +307,8 @@ auto main(int argc, char** argv) -> int {
             benchmark_chat_turns(argv[2], threads, repeats);
         else if (mode == "image")
             benchmark_image(argv[2], argv[5], threads);
+        else if (mode == "dictation")
+            benchmark_dictation(argv[2], argv[5], threads, repeats);
         else
             benchmark_whisper(argv[2], argv[5], threads, repeats);
         return 0;
