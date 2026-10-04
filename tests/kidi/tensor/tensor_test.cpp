@@ -68,6 +68,19 @@ auto main() -> int {
     auto values = tensor->data<float>();
     if (!require(values.has_value() && std::ranges::equal(*values, VALUES), "CPU tensor data mismatch")) return 1;
 
+    auto large_zero = Tensor::zeros({2 * 1024 * 1024}, DType::U8);
+    if (!require(large_zero.has_value(), large_zero ? "" : large_zero.error().message)) return 1;
+    auto zero_bytes = large_zero->data<std::uint8_t>();
+    if (!require(zero_bytes && (*zero_bytes)[0] == 0 && (*zero_bytes)[zero_bytes->size() / 2] == 0 &&
+                     (*zero_bytes)[zero_bytes->size() - 1] == 0,
+                 "large zero allocation is not initially zero"))
+        return 1;
+    (*zero_bytes)[0] = 7;
+    (*zero_bytes)[zero_bytes->size() - 1] = 9;
+    if (!require((*zero_bytes)[0] == 7 && (*zero_bytes)[zero_bytes->size() - 1] == 9,
+                 "large zero allocation is not writable"))
+        return 1;
+
     auto reshaped = tensor->reshape({3, 2});
     if (!require(reshaped.has_value() && std::ranges::equal(reshaped->shape(), std::array<std::int64_t, 2>{3, 2}) &&
                      std::ranges::equal(reshaped->strides(), std::array<std::int64_t, 2>{2, 1}),

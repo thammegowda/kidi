@@ -5,6 +5,10 @@
 #include <new>
 #include <utility>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#endif
+
 namespace kidi::tensor {
 namespace {
 
@@ -15,6 +19,31 @@ public:
     CpuStorage(Device device, std::size_t size_bytes, std::size_t alignment)
         : device_(device), size_bytes_(size_bytes), writable_(true) {
         auto* allocation = ::operator new(std::max<std::size_t>(size_bytes, 1), std::align_val_t(alignment));
+        owner_ = std::shared_ptr<const void>(allocation, [alignment](const void* pointer) {
+            ::operator delete(const_cast<void*>(pointer), std::align_val_t(alignment));
+        });
+        data_ = static_cast<const std::byte*>(allocation);
+    }
+
+    /// Zero-filled storage. Large buffers come straight from the kernel as zero pages that are committed on first
+    /// write, so a mostly unused KV cache costs neither time nor resident memory.
+    struct Zeroed {};
+    CpuStorage(Device device, std::size_t size_bytes, std::size_t alignment, Zeroed)
+        : device_(device), size_bytes_(size_bytes), writable_(true) {
+#if defined(__unix__) || defined(__APPLE__)
+        constexpr std::size_t MAPPED_THRESHOLD = std::size_t{1} << 20;
+        if (size_bytes >= MAPPED_THRESHOLD && alignment <= 4096) {
+            void* mapping = ::mmap(nullptr, size_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (mapping != MAP_FAILED) {
+                owner_ = std::shared_ptr<const void>(
+                    mapping, [size_bytes](const void* pointer) { ::munmap(const_cast<void*>(pointer), size_bytes); });
+                data_ = static_cast<const std::byte*>(mapping);
+                return;
+            }
+        }
+#endif
+        auto* allocation = ::operator new(std::max<std::size_t>(size_bytes, 1), std::align_val_t(alignment));
+        std::memset(allocation, 0, size_bytes);
         owner_ = std::shared_ptr<const void>(allocation, [alignment](const void* pointer) {
             ::operator delete(const_cast<void*>(pointer), std::align_val_t(alignment));
         });
@@ -86,6 +115,22 @@ public:
         }
         try {
             return std::shared_ptr<Storage>(new CpuStorage(device, size_bytes, alignment));
+        } catch (const std::bad_alloc&) {
+            return std::unexpected(Error{ErrorCode::RUNTIME, "failed to allocate CPU tensor storage"});
+        }
+    }
+
+    auto allocate_zeroed(Device device, std::size_t size_bytes, std::size_t alignment) const
+        -> Result<std::shared_ptr<Storage>> override {
+        if (!is_available(device)) {
+            return std::unexpected(Error{ErrorCode::UNSUPPORTED, unavailable_reason(device)});
+        }
+        alignment = std::max(alignment, YNNPACK_ALIGNMENT);
+        if ((alignment & (alignment - 1)) != 0) {
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "tensor alignment must be a power of two"});
+        }
+        try {
+            return std::shared_ptr<Storage>(new CpuStorage(device, size_bytes, alignment, CpuStorage::Zeroed{}));
         } catch (const std::bad_alloc&) {
             return std::unexpected(Error{ErrorCode::RUNTIME, "failed to allocate CPU tensor storage"});
         }

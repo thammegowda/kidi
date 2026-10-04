@@ -22,8 +22,8 @@ public:
         return std::unexpected(unavailable());
     }
 
-    auto wrap_host(Device, std::span<const std::byte>,
-                   std::shared_ptr<const void>) const -> Result<std::shared_ptr<Storage>> override {
+    auto wrap_host(Device, std::span<const std::byte>, std::shared_ptr<const void>) const
+        -> Result<std::shared_ptr<Storage>> override {
         return std::unexpected(unavailable());
     }
 
@@ -57,6 +57,14 @@ private:
 
 auto make_unavailable_backend(DeviceKind kind, std::string name, std::string reason) -> std::shared_ptr<Backend> {
     return std::make_shared<UnavailableBackend>(kind, std::move(name), std::move(reason));
+}
+
+auto Backend::allocate_zeroed(Device device, std::size_t size_bytes, std::size_t alignment) const
+    -> Result<std::shared_ptr<Storage>> {
+    auto storage = allocate(device, size_bytes, alignment);
+    if (!storage) return storage;
+    if (auto status = clear(**storage); !status) return std::unexpected(std::move(status.error()));
+    return storage;
 }
 
 auto Backend::clear(Storage& storage) const -> Result<void> {

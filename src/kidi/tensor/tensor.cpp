@@ -260,11 +260,19 @@ auto Tensor::empty(std::vector<std::int64_t> shape, DType dtype, Device device) 
 }
 
 auto Tensor::zeros(std::vector<std::int64_t> shape, DType dtype, Device device) -> Result<Tensor> {
-    auto tensor = empty(std::move(shape), dtype, device);
-    if (!tensor) return std::unexpected(std::move(tensor.error()));
-    auto status = tensor->backend_->clear(*tensor->storage_);
-    if (!status) return std::unexpected(std::move(status.error()));
-    return tensor;
+    auto bytes = checked_nbytes(shape, dtype);
+    if (!bytes) return std::unexpected(std::move(bytes.error()));
+    auto backend = BackendRegistry::instance().backend(device);
+    if (!backend) return std::unexpected(std::move(backend.error()));
+    if (!(*backend)->is_available(device)) {
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED, std::string((*backend)->name()) +
+                                                                 " backend is unavailable for " + to_string(device) +
+                                                                 ": " + (*backend)->unavailable_reason(device)});
+    }
+    auto storage = (*backend)->allocate_zeroed(device, *bytes, 64);
+    if (!storage) return std::unexpected(std::move(storage.error()));
+    auto strides = contiguous_strides(shape);
+    return Tensor(std::move(*backend), std::move(*storage), dtype, std::move(shape), std::move(strides), 0);
 }
 
 auto Tensor::from_bytes(std::vector<std::int64_t> shape, DType dtype, std::span<const std::byte> bytes, Device device)
