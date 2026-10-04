@@ -2674,7 +2674,7 @@ private:
             }
             case Source::Kind::INPUT: {
                 const auto slot = source.index;
-                if (slot >= 4 && slot < 8)
+                if ((slot >= 4 && slot < 8) || (slot >= 8 && !cache_of_slot_.contains(slot)))
                     base = input(Port::Kind::STEP_INPUT, slot, QNN_DATATYPE_FLOAT_16,
                                  dims_of(graph_.inputs()[slot].shape()));
                 else
@@ -3154,6 +3154,9 @@ public:
     explicit QnnStepCompiler(std::shared_ptr<QnnRuntime> runtime) : runtime_(std::move(runtime)) {}
 
     auto name() const -> std::string_view override { return "qnn-htp"; }
+    auto requires_second_capture(std::string_view key) const -> bool override {
+        return !key.starts_with("gemma4_prefill:");
+    }
 
     // Whole-step graphs use power-of-two cache prefixes. This keeps early decode from reading a 9K-token cache while
     // bounding the number of compiled shapes. A new bucket synchronizes the existing CPU cache prefix once.

@@ -34,8 +34,8 @@ auto project_rows(ops::Context& context, const layers::Linear& layer, const Tens
         const auto count = std::min(rows, length - start);
         const auto part = layer->forward(context, context.slice(input, 1, start, count));
         if (!output.defined())
-            output = require(
-                Tensor::empty({1, length, static_cast<std::int64_t>(part.size(2))}, part.dtype(), context.device()));
+            output = require(Tensor::empty({1, length, static_cast<std::int64_t>(part.size(2))}, part.dtype(),
+                                            context.device()));
         context.copy_slice_(output, part, 1, start);
     }
     return output;
@@ -75,16 +75,16 @@ public:
         };
         const auto query = rotary(project_rows(context, query_, input), query_norm_);
         const auto key = rotary(project_rows(context, key_, input), key_norm_);
-        const auto value = context.reshape(
-            value_norm_->forward(context,
-                                 context.reshape(project_rows(context, value_, input), {1, length, heads_, width_})),
-            {1, length, heads_ * width_});
+        const auto value =
+            context.reshape(value_norm_->forward(
+                                context, context.reshape(project_rows(context, value_, input), {1, length, heads_, width_})),
+                            {1, length, heads_ * width_});
         auto attended = require(Tensor::empty({1, length, heads_ * width_}, DType::F32, context.device()));
         const auto rows = slice_rows(context, true);
         for (std::int64_t start = 0; start < length; start += rows) {
             const auto count = std::min(rows, length - start);
-            const auto part = context.grouped_query_attention(context.slice(query, 1, start, count), key, value, heads_,
-                                                              heads_, mask, 1.F);
+            const auto part = context.grouped_query_attention(context.slice(query, 1, start, count), key, value,
+                                                              heads_, heads_, mask, 1.F);
             context.copy_slice_(attended, part, 1, start);
         }
         return project_rows(context, output_, attended);
@@ -110,14 +110,14 @@ public:
     }
     auto forward(ops::Context& context, const Tensor& input) -> Tensor {
         const auto length = static_cast<std::int64_t>(input.size(1));
-        auto output = require(
-            Tensor::empty({1, length, static_cast<std::int64_t>(input.size(2))}, input.dtype(), context.device()));
+        auto output = require(Tensor::empty({1, length, static_cast<std::int64_t>(input.size(2))}, input.dtype(),
+                                            context.device()));
         const auto chunk = slice_rows(context, false);
         for (std::int64_t start = 0; start < length; start += chunk) {
             const auto count = std::min(chunk, length - start);
             const auto rows = context.slice(input, 1, start, count);
-            const auto part = down_->forward(
-                context, context.gelu_multiply(gate_->forward(context, rows), up_->forward(context, rows)));
+            const auto part = down_->forward(context,
+                context.gelu_multiply(gate_->forward(context, rows), up_->forward(context, rows)));
             context.copy_slice_(output, part, 1, start);
         }
         return output;
@@ -224,9 +224,9 @@ struct Gemma4VisionImpl::State {
 
 Gemma4VisionImpl::Gemma4VisionImpl(const YAML::Node& config, std::int32_t text_width, bool quantized) {
     if ((module_device != tensor::Device::cpu() && module_device != tensor::Device::web_gpu()) ||
-        config["patch_size"].as<int>() != 16 || config["pooling_kernel_size"].as<int>() != 3 ||
-        config["standardize"].as<bool>(false) || config["use_clipped_linears"].as<bool>(false) ||
-        config["head_dim"].as<int>() % 4 ||
+        config["patch_size"].as<int>() != 16 ||
+        config["pooling_kernel_size"].as<int>() != 3 || config["standardize"].as<bool>(false) ||
+        config["use_clipped_linears"].as<bool>(false) || config["head_dim"].as<int>() % 4 ||
         config["num_key_value_heads"].as<int>() != config["num_attention_heads"].as<int>())
         throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported Gemma vision architecture"});
     impl_ = std::make_unique<State>(config, text_width, quantized);
@@ -293,10 +293,10 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image) -> Result<Tensor
                 position[patch * state.hidden + channel] =
                     table[(patch % image.patch_columns) * state.hidden + channel] +
                     table[(state.positions + patch / image.patch_columns) * state.hidden + channel];
-        auto hidden = context.add(
-            project_rows(context, state.tower->patch->projection,
-                         require(Tensor::from_host({1, length, 768}, std::span<const float>(pixels), device()))),
-            require(Tensor::from_host({1, length, state.hidden}, std::span<const float>(position), device())));
+        auto hidden =
+            context.add(project_rows(context, state.tower->patch->projection,
+                            require(Tensor::from_host({1, length, 768}, std::span<const float>(pixels), device()))),
+                        require(Tensor::from_host({1, length, state.hidden}, std::span<const float>(position), device())));
         std::vector<float> cosine(2 * length * (state.head_width / 4)), sine(cosine.size());
         for (std::int64_t patch = 0; patch < length; ++patch)
             for (int axis = 0; axis < 2; ++axis)
@@ -309,13 +309,13 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image) -> Result<Tensor
                 }
         const auto cos =
             require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(cosine), device()));
-        const auto sin =
-            require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(sine), device()));
+        const auto sin = require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(sine), device()));
         const auto mask = require(Tensor::zeros({1, 1, 1, length}, DType::F32, device()));
         for (const auto& layer : *state.tower->encoder->layers)
             hidden = layer->forward(context, hidden, cos, sin, mask);
         // Average each 3x3 patch neighbourhood on the device, viewing patches as [rows/3, 3, columns/3, 3, hidden].
-        const auto grid = context.reshape(hidden, {image.patch_rows / 3, 3, image.patch_columns / 3, 3, state.hidden});
+        const auto grid =
+            context.reshape(hidden, {image.patch_rows / 3, 3, image.patch_columns / 3, 3, state.hidden});
         Tensor pooled;
         for (std::int64_t row = 0; row < 3; ++row)
             for (std::int64_t column = 0; column < 3; ++column) {

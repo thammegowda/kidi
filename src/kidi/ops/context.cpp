@@ -544,12 +544,12 @@ auto Context::replay(std::string_view key, std::span<const Tensor> inputs,
     const auto outputs = step(inputs);
     impl.recorder = nullptr;
     auto graph = std::move(recorder).finish(outputs);
-    if (!entry.first) {
+    if (!entry.first && (!impl.compiler || impl.compiler->requires_second_capture(key))) {
         entry.first = std::move(graph);
         account("capture");
         return entry.first->outputs();
     }
-    graph::require_same_structure(*entry.first, graph, key);
+    if (entry.first) graph::require_same_structure(*entry.first, graph, key);
     entry.first.reset();
     entry.graph = std::move(graph);
     account("capture");

@@ -435,7 +435,7 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
                 if (cached != images_.end()) {
                     embeddings = cached->embeddings;
                 } else {
-                    if (model_->device() == tensor::Device::cpu()) {
+                    if (model_->device() == tensor::Device::cpu() && model_->accelerator().empty()) {
                         model_->release_workspaces();
                         if (vision_) vision_->release_workspaces();
                     }
@@ -627,7 +627,8 @@ auto Generator::step() -> Result<GenerationStep> {
                 if (!request.state) request.state = require(model_->create_state(request.capacity));
                 request.state->images = request.images;
                 request.state->crop_local_attention = !request.options.full_attention_cache;
-                request.state->capture_prefill = should_capture_prefill(model_->accelerator(), request.prompt.size());
+                request.state->capture_prefill =
+                    !request.images.empty() || should_capture_prefill(model_->accelerator(), request.prompt.size());
                 running_.push_back(std::move(request));
                 reserved_cache_tokens_ += running_.back().capacity;
                 waiting_.pop_front();

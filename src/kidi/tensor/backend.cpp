@@ -22,8 +22,8 @@ public:
         return std::unexpected(unavailable());
     }
 
-    auto wrap_host(Device, std::span<const std::byte>, std::shared_ptr<const void>) const
-        -> Result<std::shared_ptr<Storage>> override {
+    auto wrap_host(Device, std::span<const std::byte>,
+                   std::shared_ptr<const void>) const -> Result<std::shared_ptr<Storage>> override {
         return std::unexpected(unavailable());
     }
 
