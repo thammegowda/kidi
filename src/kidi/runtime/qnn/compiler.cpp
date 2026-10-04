@@ -2674,7 +2674,8 @@ private:
             }
             case Source::Kind::INPUT: {
                 const auto slot = source.index;
-                if ((slot >= 4 && slot < 8) || (slot >= 8 && !cache_of_slot_.contains(slot)))
+                if (((slot >= 4 && slot < 8) || (slot >= 8 && !cache_of_slot_.contains(slot))) &&
+                    graph_.inputs()[slot].dtype() == DType::F32)
                     base = input(Port::Kind::STEP_INPUT, slot, QNN_DATATYPE_FLOAT_16,
                                  dims_of(graph_.inputs()[slot].shape()));
                 else
