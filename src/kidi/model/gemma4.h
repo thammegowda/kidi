@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kidi/core/precision.h"
 #include "kidi/layers/gemma4.h"
 #include "kidi/checkpoint/weights.h"
 #include <yaml-cpp/yaml.h>
@@ -35,6 +36,8 @@ public:
     static auto create(const YAML::Node& config) -> Result<Gemma4>;
     auto set_checkpoint(const checkpoint::Weights& weights, std::int32_t weight_bits = 0, std::int32_t group_size = 128,
                         bool packed_prefill = false) -> Result<void>;
+    auto set_precision(core::InferencePrecision precision) noexcept -> void;
+    auto set_kv_cache_precision(core::KVCachePrecision precision) noexcept -> void;
     auto create_state(std::size_t capacity) -> Result<Gemma4State>;
     auto fork_state(const Gemma4State& source, std::size_t prefix_length, std::size_t capacity) -> Result<Gemma4State>;
     auto prefill(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void>;

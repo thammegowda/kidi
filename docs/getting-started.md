@@ -89,6 +89,22 @@ files remain unchanged. Models already packaged with `model.yaml` use that file.
 Unsupported architectures/formats fail explicitly; a Hugging Face ID alone does
 not make every model compatible with Kidi.
 
+Projection and KV-cache precision are separate load-time policies. The defaults
+preserve the checkpoint projection format and automatically use the calibrated
+INT8 KV cache when the QAT model and backend support it. CPU verification can
+select `--precision fp32` or `--precision qat-fp32`; the latter preserves the
+checkpoint's trained activation rounding and, on Apple CPU, enables the deliberately slow official-PyTorch parity
+math used by the vision benchmark. Explicit `q2a16`, `q4a16`, and
+`q8a16` policies requantize every packed projection to that weight width with
+BF16 activations; `q*ae4m3` and `q*ae5m2` select FP8 activations. Use
+`--kv-cache-precision fp32` to disable INT8 cache storage or
+`--kv-cache-precision int8` to require it.
+Unsupported model/backend combinations fail instead of falling back.
+
+Apple CPU users can select `--precision lowbit-parity` to retain packed QAT weights while matching the FP32
+accumulation oracle through bounded dequantization tiles. This is a correctness-oriented vision mode and is slower than
+the native checkpoint kernels.
+
 The model is publicly listed. For authentication or anonymous-download limits,
 run `hf auth login` in your terminal using a token with read access, then retry.
 Complete any access requirements shown on the model page. Never put tokens in

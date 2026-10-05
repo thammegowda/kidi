@@ -1,6 +1,8 @@
 package ai.gowda.kidi
 
 internal const val DEFAULT_ACCELERATOR = "auto"
+internal const val DEFAULT_PRECISION = "checkpoint"
+internal const val DEFAULT_KV_CACHE_PRECISION = "auto"
 internal val ACCELERATOR_LABELS =
     mapOf(DEFAULT_ACCELERATOR to "Auto", "cpu" to "CPU", "gpu" to "GPU (experimental)", "npu" to "NPU")
 
@@ -19,7 +21,12 @@ internal object NativeRuntime {
     /** Points native code at packaged/staged NPU libraries and the persistent compiled-graph cache. */
     external fun setDataDirectory(directory: String, dspDirectory: String = ""): String
     /** Loads the chat model; [accelerator] is auto, cpu, gpu, or npu. */
-    external fun load(directory: String, accelerator: String = DEFAULT_ACCELERATOR): String
+    external fun load(
+        directory: String,
+        accelerator: String = DEFAULT_ACCELERATOR,
+        precision: String = DEFAULT_PRECISION,
+        kvCachePrecision: String = DEFAULT_KV_CACHE_PRECISION,
+    ): String
     external fun enqueue(messagesJson: String, maximumTokens: Int): String
     external fun step(): String
     external fun cancel(requestId: Long): String

@@ -427,6 +427,8 @@ auto main() -> int {
                 auto byte_value = context.cast(test_value, tensor::DType::I8, VALUE_SCALE);
                 const ops::BlockwiseQuantization key_quantization{{KEY_SCALE}, {0}, WIDTH};
                 const ops::BlockwiseQuantization value_quantization{{VALUE_SCALE}, {0}, WIDTH};
+                if (device == tensor::Device::cpu())
+                    context.set_precision(core::InferencePrecision::QAT_FP32);
                 auto expected = context.grouped_query_attention(test_query, rounded_key, rounded_value, HEADS,
                                                                 KEY_HEADS, test_mask, 1.F, START);
                 auto actual =
@@ -437,6 +439,8 @@ auto main() -> int {
                 const auto actual_values = ops::require(actual.data<float>());
                 for (std::size_t index = 0; index < expected_values.size(); ++index)
                     if (std::abs(actual_values[index] - expected_values[index]) > 1e-4F) return 1;
+                if (device == tensor::Device::cpu())
+                    context.set_precision(core::InferencePrecision::CHECKPOINT);
             }
             auto saved = result;
             {

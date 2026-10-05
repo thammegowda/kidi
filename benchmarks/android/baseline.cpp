@@ -11,10 +11,15 @@
 #include <sys/resource.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <optional>
+#include <sstream>
+#include <utility>
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -206,53 +211,224 @@ auto benchmark_image(const std::filesystem::path& directory, const std::filesyst
     }
 }
 
-/// Vision-only path: preprocessing, checkpoint binding, the 16-block tower, pooling, and text-space projection.
-auto benchmark_vision(const std::filesystem::path& directory, const std::filesystem::path& image, int threads,
-                      int repeats) -> void {
-    const auto config = YAML::LoadFile((directory / "config.json").string());
-    const auto manifest = require(kidi::checkpoint::load_config(directory / "model.yaml"));
-    const auto weights = require(kidi::checkpoint::Weights::load(manifest["weights_file"].as<std::string>()));
-    std::ifstream stream(image, std::ios::binary);
-    if (!stream) throw std::runtime_error("unable to read benchmark image");
-    const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream), {}};
-    const auto prepare_started = Clock::now();
-    const auto pixels = require(kidi::image::prepare_gemma4(bytes, 280));
-    emit({{"stage", "vision_prepare"},
-          {"ms", rounded(elapsed_ms(prepare_started))},
-          {"patch_rows", pixels.patch_rows},
-          {"patch_columns", pixels.patch_columns},
-          {"patches", static_cast<std::size_t>(pixels.patch_rows) * pixels.patch_columns}},
-         threads);
+struct Comparison {
+    double relative_rmse, cosine, maximum;
+};
 
+auto compare(std::span<const float> actual, std::span<const float> expected) -> Comparison {
+    if (actual.size() != expected.size()) throw std::runtime_error("reference tensor shape changed");
+    double error = 0, energy = 0, dot = 0, norm = 0, maximum = 0;
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        if (!std::isfinite(actual[index]) || !std::isfinite(expected[index]))
+            throw std::runtime_error("vision tensor is not finite");
+        const auto delta = static_cast<double>(actual[index]) - expected[index];
+        error += delta * delta;
+        energy += static_cast<double>(expected[index]) * expected[index];
+        dot += static_cast<double>(actual[index]) * expected[index];
+        norm += static_cast<double>(actual[index]) * actual[index];
+        maximum = std::max(maximum, std::abs(delta));
+    }
+    return {std::sqrt(error / std::max(energy, 1e-30)),
+            dot / std::max(std::sqrt(energy * norm), 1e-30), maximum};
+}
+
+auto host_copy(const kidi::tensor::Tensor& tensor) -> kidi::tensor::Tensor {
+    const auto bytes = require(tensor.copy_to_host());
+    return require(kidi::tensor::Tensor::from_bytes(
+        {tensor.shape().begin(), tensor.shape().end()}, tensor.dtype(), bytes));
+}
+
+/// Vision-only path: preprocessing, checkpoint binding, the 16-block tower, pooling, and text-space projection.
+auto benchmark_vision(const std::filesystem::path& directory, std::span<const std::filesystem::path> images,
+                      int threads, int repeats) -> void {
+    const auto config = YAML::LoadFile((directory / "config.json").string());
+    const auto weights = require(kidi::checkpoint::Weights::load(directory / "model.safetensors"));
     const auto load_started = Clock::now();
     const kidi::ModuleScope scope(kidi::tensor::DType::F32, false, kidi::tensor::Device::cpu());
     auto vision = kidi::model::Gemma4Vision(config["vision_config"],
                                             config["text_config"]["hidden_size"].as<int>(),
-                                            static_cast<bool>(manifest["model"]["quantization_config"]));
+                                            static_cast<bool>(config["quantization_config"]));
+    const auto* precision_name = std::getenv("KIDI_VISION_PRECISION");
+    const auto precision =
+        kidi::core::parse_precision(precision_name ? std::string_view(precision_name) : std::string_view("checkpoint"));
+    if (!precision) throw std::runtime_error("invalid KIDI_VISION_PRECISION");
+    vision->set_precision(*precision);
     require(vision->set_checkpoint(weights));
-    emit({{"stage", "vision_load"}, {"ms", rounded(elapsed_ms(load_started))}}, threads);
+    emit({{"stage", "vision_load"},
+          {"ms", rounded(elapsed_ms(load_started))},
+          {"precision", kidi::core::to_string(*precision)}},
+         threads);
 
-    for (int iteration = 0; iteration < repeats; ++iteration) {
-        const auto started = Clock::now();
-        const auto output = require(vision->forward(pixels));
-        const auto values = require(output.data<float>());
-        double sum = 0, squared = 0, maximum = 0;
-        for (const auto value : values) {
-            if (!std::isfinite(value)) throw std::runtime_error("vision output is not finite");
-            sum += value;
-            squared += static_cast<double>(value) * value;
-            maximum = std::max(maximum, std::abs(static_cast<double>(value)));
+    const auto* reference_directory = std::getenv("KIDI_VISION_REFERENCE_DIR");
+    const auto* dump_directory = std::getenv("KIDI_VISION_DUMP_DIR");
+    std::size_t stage_layers = 3;
+    if (const auto* value = std::getenv("KIDI_VISION_STAGE_LAYERS")) {
+        const auto text = std::string_view(value);
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), stage_layers);
+        if (error != std::errc{} || end != text.data() + text.size() || stage_layers > 16)
+            throw std::runtime_error("KIDI_VISION_STAGE_LAYERS must be an integer from 0 to 16");
+    }
+    for (std::size_t image_index = 0; image_index < images.size(); ++image_index) {
+        const auto& image = images[image_index];
+        std::ifstream stream(image, std::ios::binary);
+        if (!stream) throw std::runtime_error("unable to read benchmark image");
+        const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream), {}};
+        const auto prepare_started = Clock::now();
+        const auto pixels = require(kidi::image::prepare_gemma4(bytes, 280));
+
+        std::optional<kidi::checkpoint::Weights> reference;
+        kidi::tensor::Tensor reference_output;
+        std::vector<kidi::tensor::Tensor> reference_blocks;
+        std::optional<kidi::image::Gemma4Image> reference_pixels;
+        nlohmann::json prepare_record{{"stage", "vision_prepare"},
+                                      {"image", image.filename().string()},
+                                      {"image_index", image_index},
+                                      {"ms", rounded(elapsed_ms(prepare_started))},
+                                      {"patch_rows", pixels.patch_rows},
+                                      {"patch_columns", pixels.patch_columns},
+                                      {"patches", static_cast<std::size_t>(pixels.patch_rows) * pixels.patch_columns}};
+        if (reference_directory) {
+            const auto path =
+                std::filesystem::path(reference_directory) / (image.stem().string() + ".safetensors");
+            reference.emplace(require(kidi::checkpoint::Weights::load(path)));
+            const auto expected_patches = require(reference->tensor("patches"));
+            const auto expected = require(expected_patches.data<float>());
+            const auto result = compare(pixels.patches, expected);
+            const auto expected_positions = require(reference->tensor("position_ids"));
+            const auto positions = require(expected_positions.data<std::int64_t>());
+            const auto patch_count = static_cast<std::size_t>(pixels.patch_rows) * pixels.patch_columns;
+            if (positions.size() != 2 * patch_count)
+                throw std::runtime_error("reference position tensor shape changed");
+            for (std::size_t patch = 0; patch < patch_count; ++patch)
+                if (positions[2 * patch] != static_cast<std::int64_t>(patch % pixels.patch_columns) ||
+                    positions[2 * patch + 1] != static_cast<std::int64_t>(patch / pixels.patch_columns))
+                    throw std::runtime_error("reference position IDs differ from Kidi patch order");
+            prepare_record["patch_relative_rmse"] = result.relative_rmse;
+            prepare_record["patch_cosine"] = result.cosine;
+            prepare_record["patch_max_abs"] = result.maximum;
+            prepare_record["position_ids_match"] = true;
+            if (const auto* canonical = std::getenv("KIDI_VISION_USE_REFERENCE_INPUT");
+                canonical && std::string_view(canonical) == "1") {
+                reference_pixels = pixels;
+                reference_pixels->patches.assign(expected.begin(), expected.end());
+            }
+            reference_output = require(reference->tensor("visual_embeddings"));
+            for (int block = 0; block < 16; ++block) {
+                std::ostringstream name;
+                name << "block_" << std::setfill('0') << std::setw(2) << block;
+                reference_blocks.push_back(require(reference->tensor(name.str())));
+            }
         }
-        emit({{"stage", "vision_encode"},
-              {"iteration", iteration},
-              {"warmup", iteration == 0},
-              {"ms", rounded(elapsed_ms(started))},
-              {"visual_tokens", output.size(1)},
-              {"width", output.size(2)},
-              {"sum", sum},
-              {"rms", std::sqrt(squared / values.size())},
-              {"max_abs", maximum}},
-             threads);
+        prepare_record["input"] = reference_pixels ? "official_reference" : "kidi_preprocess";
+        emit(std::move(prepare_record), threads);
+
+        for (int iteration = 0; iteration <= repeats; ++iteration) {
+            const auto started = Clock::now();
+            const auto output = require(vision->forward(reference_pixels ? *reference_pixels : pixels));
+            const auto values = require(output.data<float>());
+            double sum = 0, squared = 0, maximum = 0;
+            for (const auto value : values) {
+                if (!std::isfinite(value)) throw std::runtime_error("vision output is not finite");
+                sum += value;
+                squared += static_cast<double>(value) * value;
+                maximum = std::max(maximum, std::abs(static_cast<double>(value)));
+            }
+            nlohmann::json record{{"stage", "vision_encode"},
+                                  {"image", image.filename().string()},
+                                  {"image_index", image_index},
+                                  {"iteration", iteration},
+                                  {"warmup", iteration == 0},
+                                  {"ms", rounded(elapsed_ms(started))},
+                                  {"visual_tokens", output.size(1)},
+                                  {"width", output.size(2)},
+                                  {"sum", sum},
+                                  {"rms", std::sqrt(squared / values.size())},
+                                  {"max_abs", maximum}};
+            if (reference_output.defined()) {
+                const auto expected = require(std::as_const(reference_output).data<float>());
+                const auto result = compare(values, expected);
+                record["relative_rmse"] = result.relative_rmse;
+                record["cosine"] = result.cosine;
+                record["reference_max_abs"] = result.maximum;
+            }
+            emit(std::move(record), threads);
+        }
+        if (!reference_blocks.empty() || dump_directory) {
+            kidi::StateDict dump;
+            const auto& diagnostic_pixels = reference_pixels ? *reference_pixels : pixels;
+            if (dump_directory) {
+                const auto length =
+                    static_cast<std::int64_t>(diagnostic_pixels.patch_rows) * diagnostic_pixels.patch_columns;
+                dump.emplace(
+                    "patches",
+                    require(kidi::tensor::Tensor::from_host(
+                        {1, length, 768}, std::span<const float>(diagnostic_pixels.patches))));
+                std::vector<std::int64_t> positions(static_cast<std::size_t>(2 * length));
+                for (std::int64_t patch = 0; patch < length; ++patch) {
+                    positions[2 * patch] = patch % diagnostic_pixels.patch_columns;
+                    positions[2 * patch + 1] = patch / diagnostic_pixels.patch_columns;
+                }
+                dump.emplace(
+                    "position_ids",
+                    require(kidi::tensor::Tensor::from_host(
+                        {1, length, 2}, std::span<const std::int64_t>(positions))));
+            }
+            kidi::model::Gemma4VisionImpl::BlockObserver block_observer =
+                [&](std::size_t block, const kidi::tensor::Tensor& output) {
+                    std::ostringstream name;
+                    name << "block_" << std::setfill('0') << std::setw(2) << block;
+                    if (dump_directory) dump.emplace(name.str(), host_copy(output));
+                    if (!reference_blocks.empty()) {
+                        const auto actual = require(output.data<float>());
+                        const auto expected = require(std::as_const(reference_blocks.at(block)).data<float>());
+                        const auto result = compare(actual, expected);
+                        emit({{"stage", "vision_block"},
+                              {"image", image.filename().string()},
+                              {"image_index", image_index},
+                              {"block", block},
+                              {"relative_rmse", result.relative_rmse},
+                              {"cosine", result.cosine},
+                              {"max_abs", result.maximum}},
+                             threads);
+                    }
+                };
+            kidi::model::Gemma4VisionImpl::StageObserver stage_observer =
+                [&](std::size_t layer, std::string_view stage, const kidi::tensor::Tensor& output) {
+                    std::ostringstream name;
+                    name << "layer_" << std::setfill('0') << std::setw(2) << layer << '_' << stage;
+                    if (dump_directory) dump.emplace(name.str(), host_copy(output));
+                    if (reference && reference->contains(name.str())) {
+                        const auto expected_tensor = require(reference->tensor(name.str()));
+                        const auto actual = require(output.data<float>());
+                        const auto expected = require(expected_tensor.data<float>());
+                        const auto result = compare(actual, expected);
+                        emit({{"stage", "vision_stage"},
+                              {"image", image.filename().string()},
+                              {"image_index", image_index},
+                              {"layer", layer},
+                              {"name", stage},
+                              {"relative_rmse", result.relative_rmse},
+                              {"cosine", result.cosine},
+                              {"max_abs", result.maximum}},
+                             threads);
+                    }
+                };
+            const auto diagnostic_output = require(vision->forward(
+                reference_pixels ? *reference_pixels : pixels, block_observer, stage_observer, stage_layers));
+            if (dump_directory) {
+                dump.emplace("encoder_hidden", dump.at("block_15"));
+                dump.emplace("visual_embeddings", host_copy(diagnostic_output));
+                const auto destination =
+                    std::filesystem::path(dump_directory) / (image.stem().string() + ".safetensors");
+                std::filesystem::create_directories(destination.parent_path());
+                require(kidi::checkpoint::Weights::save(destination, dump));
+                emit({{"stage", "vision_dump"},
+                      {"image", image.filename().string()},
+                      {"path", destination.string()},
+                      {"tensors", dump.size()}},
+                     threads);
+            }
+        }
     }
 }
 
@@ -339,7 +515,7 @@ auto benchmark_dictation(const std::filesystem::path& directory, const std::file
 auto main(int argc, char** argv) -> int {
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
         std::cout << "usage: kidi_android_baseline gemma|chat|whisper|image|vision|dictation MODEL THREADS REPEATS "
-                     "[MEDIA]\n";
+                     "[MEDIA ...]\n";
         return 0;
     }
     try {
@@ -348,7 +524,8 @@ auto main(int argc, char** argv) -> int {
         const auto threads = std::stoi(argv[3]), repeats = std::stoi(argv[4]);
         if (threads < 1 || threads > 8 || repeats < 1 || repeats > 20 ||
             !(((mode == "gemma" || mode == "chat") && argc == 5) ||
-              ((mode == "whisper" || mode == "image" || mode == "vision" || mode == "dictation") && argc == 6)))
+              ((mode == "whisper" || mode == "image" || mode == "dictation") && argc == 6) ||
+              (mode == "vision" && argc >= 6)))
             throw std::runtime_error("invalid mode, thread count, repeat count, or WAV argument");
         kidi::runtime::ynn::set_thread_count(threads);
         require(kidi::runtime::ynn::reserve_thread_pool(threads));
@@ -363,8 +540,11 @@ auto main(int argc, char** argv) -> int {
             benchmark_chat_turns(argv[2], threads, repeats);
         else if (mode == "image")
             benchmark_image(argv[2], argv[5], threads);
-        else if (mode == "vision")
-            benchmark_vision(argv[2], argv[5], threads, repeats);
+        else if (mode == "vision") {
+            std::vector<std::filesystem::path> images;
+            for (int index = 5; index < argc; ++index) images.emplace_back(argv[index]);
+            benchmark_vision(argv[2], images, threads, repeats);
+        }
         else if (mode == "dictation")
             benchmark_dictation(argv[2], argv[5], threads, repeats);
         else

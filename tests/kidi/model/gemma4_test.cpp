@@ -472,6 +472,45 @@ auto main() -> int {
                         : tensor::DType::F32;
                 for (const auto& cache : full.layers)
                     if (cache.key.dtype() != cache_dtype || cache.value.dtype() != cache_dtype) return failed(__LINE__);
+                model->set_kv_cache_precision(core::KVCachePrecision::FP32);
+                const auto fp32_cache = ops::require(model->create_state(8));
+                for (const auto& cache : fp32_cache.layers)
+                    if (cache.key.dtype() != tensor::DType::F32 || cache.value.dtype() != tensor::DType::F32)
+                        return failed(__LINE__);
+                if (cache_dtype == tensor::DType::I8) {
+                    model->set_kv_cache_precision(core::KVCachePrecision::INT8);
+                    const auto int8_cache = ops::require(model->create_state(8));
+                    for (const auto& cache : int8_cache.layers)
+                        if (cache.key.dtype() != tensor::DType::I8 || cache.value.dtype() != tensor::DType::I8)
+                            return failed(__LINE__);
+                }
+                model->set_kv_cache_precision(core::KVCachePrecision::AUTO);
+                model->set_kv_cache_precision(core::KVCachePrecision::BF16);
+                const auto unsupported_cache = model->create_state(8);
+                if (unsupported_cache || unsupported_cache.error().code != ErrorCode::UNSUPPORTED)
+                    return failed(__LINE__);
+                model->set_kv_cache_precision(core::KVCachePrecision::AUTO);
+                if (fixture == std::string_view("gemma4-qat") && device == tensor::Device::cpu()) {
+                    std::vector precisions{
+                        core::InferencePrecision::FP32,      core::InferencePrecision::BF16,
+                        core::InferencePrecision::Q2A16,     core::InferencePrecision::Q4A16,
+                        core::InferencePrecision::Q8A16,     core::InferencePrecision::Q2AE4M3,
+                        core::InferencePrecision::Q4AE4M3,   core::InferencePrecision::Q8AE4M3,
+                        core::InferencePrecision::Q2AE5M2,   core::InferencePrecision::Q4AE5M2,
+                        core::InferencePrecision::Q8AE5M2,   core::InferencePrecision::QAT_FP32,
+                    };
+#if defined(__APPLE__)
+                    precisions.push_back(core::InferencePrecision::LOWBIT_PARITY);
+#endif
+                    for (const auto precision : precisions) {
+                        model->set_precision(precision);
+                        auto precision_state = ops::require(model->create_state(8));
+                        const auto precision_output = ops::require(model->forward(tokens, precision_state, true));
+                        for (const auto value : ops::require(precision_output.data<float>()))
+                            if (!std::isfinite(value)) return failed(__LINE__);
+                    }
+                    model->set_precision(core::InferencePrecision::CHECKPOINT);
+                }
                 auto prefill = ops::require(model->forward(tokens, full, true));
                 const auto prefill_values = ops::require(prefill.data<float>());
                 if (prefill_values.size() != values.size()) return failed(__LINE__);

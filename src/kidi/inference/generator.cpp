@@ -28,14 +28,51 @@ auto should_capture_prefill(std::string_view accelerator, std::size_t prompt_tok
 } // namespace
 
 Generator::Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model,
-                     std::array<std::int32_t, 3> special)
-    : config_(std::move(config)), tokenizer_(std::move(tokenizer)), model_(std::move(model)), special_(special) {}
+                     std::array<std::int32_t, 3> special, core::InferencePrecision precision,
+                     core::KVCachePrecision kv_cache_precision)
+    : config_(std::move(config)),
+      tokenizer_(std::move(tokenizer)),
+      model_(std::move(model)),
+      special_(special),
+      precision_(precision),
+      kv_cache_precision_(kv_cache_precision) {}
 auto Generator::load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits,
                      std::int32_t group_size, bool packed_prefill, const ExternalTensorSource& external)
     -> Result<Generator> {
+    return load(directory,
+                {.device = device,
+                 .precision = core::InferencePrecision::CHECKPOINT,
+                 .kv_cache_precision = core::KVCachePrecision::AUTO,
+                 .weight_bits = weight_bits,
+                 .group_size = group_size,
+                 .packed_prefill = packed_prefill},
+                external);
+}
+auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions options,
+                     const ExternalTensorSource& external) -> Result<Generator> {
     try {
         auto config = require(checkpoint::load_config(directory / "model.yaml"));
         require(model::Gemma4Impl::validate_config(config["model"]));
+        const bool qat = static_cast<bool>(config["model"]["quantization_config"]);
+        if (options.precision != core::InferencePrecision::CHECKPOINT && !qat)
+            throw ops::Failure(
+                {ErrorCode::UNSUPPORTED, "explicit projection precision currently requires a native QAT checkpoint"});
+        if (options.precision != core::InferencePrecision::CHECKPOINT && options.weight_bits)
+            throw ops::Failure(
+                {ErrorCode::INVALID_ARGUMENT, "precision and load-time weight packing cannot be combined"});
+        if (options.precision != core::InferencePrecision::CHECKPOINT && options.device != tensor::Device::cpu())
+            throw ops::Failure(
+                {ErrorCode::UNSUPPORTED, "selected precision is currently implemented only by the CPU backend"});
+#if !defined(__APPLE__)
+        if (options.precision == core::InferencePrecision::LOWBIT_PARITY)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "lowbit-parity currently requires Apple Accelerate"});
+#endif
+        if (options.kv_cache_precision == core::KVCachePrecision::BF16 ||
+            options.kv_cache_precision == core::KVCachePrecision::E4M3 ||
+            options.kv_cache_precision == core::KVCachePrecision::E5M2)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "selected KV-cache precision is not implemented"});
+        if (options.kv_cache_precision == core::KVCachePrecision::INT8 && !qat)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "INT8 KV cache requires a calibrated QAT checkpoint"});
         auto tokenizer = [&] {
             const core::MemoryScope memory("load:tokenizer");
             return require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
@@ -79,6 +116,7 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
                                                           ? "model.language_model.norm.weight"
                                                           : "model.language_model.embed_tokens.weight"));
         std::optional<ops::StepCompilerScope> accelerator;
+        auto device = options.device;
         if (device.kind == tensor::DeviceKind::Q_NPU) {
             accelerator.emplace(require(runtime::npu_step_compiler()));
             device = tensor::Device::cpu();
@@ -87,9 +125,12 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
         auto model = require(model::Gemma4Impl::create(config["model"]));
         {
             const core::MemoryScope memory("load:bind_weights");
-            require(model->set_checkpoint(weights, weight_bits, group_size, packed_prefill));
+            require(model->set_checkpoint(weights, options.weight_bits, options.group_size, options.packed_prefill));
         }
-        return Generator(std::move(config), std::move(tokenizer), std::move(model), special);
+        model->set_precision(options.precision);
+        model->set_kv_cache_precision(options.kv_cache_precision);
+        return Generator(std::move(config), std::move(tokenizer), std::move(model), special, options.precision,
+                         options.kv_cache_precision);
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     } catch (const std::exception& error) {
@@ -453,6 +494,7 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
                                                           native_qat());
                         auto weights = require(checkpoint::Weights::load(config_["weights_file"].as<std::string>()));
                         require(vision->set_checkpoint(weights));
+                        vision->set_precision(precision_);
                         vision_ = std::move(vision);
                     }
                     if (options.on_image_progress) options.on_image_progress("Encoding images");

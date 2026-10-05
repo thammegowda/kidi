@@ -102,6 +102,7 @@ add_library(kidi
     src/kidi/ops/context.cpp
     src/kidi/ops/quantization.cpp
     src/kidi/runtime/operator.cpp
+    src/kidi/runtime/parity_math.cpp
     src/kidi/runtime/ynn/operators.cpp
     src/kidi/runtime/ynn/graph.cpp
     src/kidi/tensor/backend.cpp
@@ -242,6 +243,7 @@ if(APPLE)
     find_library(KIDI_METAL_FRAMEWORK Metal REQUIRED)
     find_library(KIDI_MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
     find_library(KIDI_MPSGRAPH_FRAMEWORK MetalPerformanceShadersGraph REQUIRED)
+    find_library(KIDI_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
     target_sources(kidi
         PRIVATE
             src/kidi/runtime/mps/command_batch.mm
@@ -266,6 +268,7 @@ if(APPLE)
             ${KIDI_METAL_FRAMEWORK}
             ${KIDI_MPS_FRAMEWORK}
             ${KIDI_MPSGRAPH_FRAMEWORK}
+            ${KIDI_ACCELERATE_FRAMEWORK}
     )
 
     if(KIDI_BUILD_BENCHMARKS)
@@ -311,6 +314,10 @@ if(KIDI_BUILD_PYTHON)
     install(FILES "${KIDI_NANOBIND_LICENSE}" DESTINATION kidi/licenses/nanobind COMPONENT python)
     install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/checkpoint/ggml/LICENSE"
         DESTINATION kidi/licenses/ggml RENAME LICENSE COMPONENT python)
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/PYTORCH_LICENSE.txt"
+        DESTINATION kidi/licenses RENAME PYTORCH_LICENSE.txt COMPONENT python)
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SLEEF_LICENSE.txt"
+        DESTINATION kidi/licenses RENAME SLEEF_LICENSE.txt COMPONENT python)
 endif()
 
 include(CTest)

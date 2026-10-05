@@ -100,6 +100,7 @@ struct Gemma4Impl::State {
     float cap;
     YAML::Node construction_config;
     bool qat;
+    core::KVCachePrecision kv_cache_precision = core::KVCachePrecision::AUTO;
     bool packed_prefill = false;
     std::int32_t vocabulary, per_layer_vocabulary;
     std::vector<std::size_t> cache_layer;
@@ -394,20 +395,37 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
         return std::unexpected(error.error());
     }
 }
+auto Gemma4Impl::set_precision(core::InferencePrecision precision) noexcept -> void {
+    impl_->context.set_precision(precision);
+}
+auto Gemma4Impl::set_kv_cache_precision(core::KVCachePrecision precision) noexcept -> void {
+    impl_->kv_cache_precision = precision;
+}
 auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
     try {
         if (!capacity || capacity > static_cast<std::size_t>(impl_->maximum_position))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 cache capacity"});
         Gemma4State result;
         result.capacity = capacity;
+        if (impl_->kv_cache_precision == core::KVCachePrecision::BF16 ||
+            impl_->kv_cache_precision == core::KVCachePrecision::E4M3 ||
+            impl_->kv_cache_precision == core::KVCachePrecision::E5M2)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "selected KV-cache precision is not implemented"});
         // The QAT path already rounds cache rows onto an INT8 grid, so bytes cost no accuracy and a quarter the reads.
         const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
         const auto& capabilities = tensor::DEVICE_CAPABILITIES[device().kind];
-        auto byte_cache = (cache_override == nullptr || std::string_view(cache_override) != "0") && impl_->qat &&
-                          capabilities.calibrated_int8_cast && capabilities.blockwise_int8_attention &&
-                          capacity <= capabilities.blockwise_int8_attention_max_tokens && impl_->shared_begin > 0;
-        for (int index = 0; byte_cache && index < impl_->shared_begin; ++index)
-            byte_cache = impl_->layers->at(static_cast<std::size_t>(index))->has_cache_scales();
+        auto byte_cache_supported =
+            impl_->qat && capabilities.calibrated_int8_cast && capabilities.blockwise_int8_attention &&
+            capacity <= capabilities.blockwise_int8_attention_max_tokens && impl_->shared_begin > 0;
+        for (int index = 0; byte_cache_supported && index < impl_->shared_begin; ++index)
+            byte_cache_supported = impl_->layers->at(static_cast<std::size_t>(index))->has_cache_scales();
+        const auto request_byte_cache = impl_->kv_cache_precision == core::KVCachePrecision::INT8;
+        if (request_byte_cache && !byte_cache_supported)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "INT8 KV cache is unsupported by this model or backend"});
+        const auto byte_cache =
+            byte_cache_supported &&
+            (request_byte_cache || (impl_->kv_cache_precision == core::KVCachePrecision::AUTO &&
+                                    (cache_override == nullptr || std::string_view(cache_override) != "0")));
         const auto cache_dtype = byte_cache ? DType::I8 : DType::F32;
         for (int index = 0; index < impl_->shared_begin; ++index) {
             const std::vector<std::int64_t> shape{1, static_cast<std::int64_t>(capacity),

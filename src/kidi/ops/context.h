@@ -5,6 +5,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string_view>
+#include "kidi/core/precision.h"
 #include "kidi/tensor/tensor.h"
 
 namespace kidi::runtime {
@@ -79,6 +80,8 @@ public:
     auto device() const noexcept -> tensor::Device;
     auto synchronize() -> void;
     auto preparation_ns() const noexcept -> std::uint64_t;
+    auto set_precision(core::InferencePrecision precision) noexcept -> void;
+    auto precision() const noexcept -> core::InferencePrecision;
     auto profile_phase(std::string_view phase) -> void;
 
     /// Runs `step`, capturing its operators the first two times `key` is used and replaying them afterwards.

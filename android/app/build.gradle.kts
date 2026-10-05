@@ -134,6 +134,8 @@ val visionNotices by tasks.registering(Sync::class) {
         from(rootProject.file("../third_party/tahoma-vision/$source")) { rename { target } }
     }
     from(rootProject.file("../src/kidi/checkpoint/ggml/LICENSE")) { rename { "ggml_license.txt" } }
+    from(rootProject.file("../third_party/PYTORCH_LICENSE.txt")) { rename { "pytorch_license.txt" } }
+    from(rootProject.file("../third_party/SLEEF_LICENSE.txt")) { rename { "sleef_license.txt" } }
 }
 val legalDocuments by tasks.registering(Sync::class) {
     from(rootProject.file("PRIVACY.md"), rootProject.file("TERMS.md"))

@@ -188,10 +188,20 @@ struct ChatSession {
 auto load_chat_session(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory)
     -> kidi::Result<ChatSession> {
     const auto device = inference_device(arguments);
+    const auto precision = kidi::core::parse_precision(arguments.get<std::string>("precision"));
+    if (!precision) return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, "invalid precision"});
+    const auto kv_cache_precision =
+        kidi::core::parse_kv_cache_precision(arguments.get<std::string>("kv_cache_precision"));
+    if (!kv_cache_precision)
+        return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, "invalid KV-cache precision"});
     const auto started = std::chrono::steady_clock::now();
-    auto loaded = kidi::inference::Generator::load(directory, device, arguments.get<std::int32_t>("weight_bits"),
-                                                   arguments.get<std::int32_t>("group_size"),
-                                                   arguments.get<bool>("packed_prefill"));
+    auto loaded =
+        kidi::inference::Generator::load(directory, {.device = device,
+                                                     .precision = *precision,
+                                                     .kv_cache_precision = *kv_cache_precision,
+                                                     .weight_bits = arguments.get<std::int32_t>("weight_bits"),
+                                                     .group_size = arguments.get<std::int32_t>("group_size"),
+                                                     .packed_prefill = arguments.get<bool>("packed_prefill")});
     if (!loaded) return std::unexpected(std::move(loaded.error()));
     const auto load_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
@@ -637,6 +647,19 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             .dest("weight_bits")
             .default_value<std::int32_t>(0)
             .help("0: original weights; 4 or 8: load-time groupwise packing");
+        command_parser->add_argument("--precision")
+            .default_value(std::string("checkpoint"))
+            .choices({"checkpoint", "lowbit-parity", "checkpoint-parity", "fp32",    "bf16",    "q2a16",
+                      "i2a16",     "q4a16",          "i4a16",           "q8a16",   "i8a16",   "w8a16",
+                      "q2ae4m3",   "i2a8",           "q4ae4m3",         "i4a8",    "q8ae4m3", "i8a8",
+                      "w8a8",      "w8afp8",         "i8afp8",          "q2ae5m2", "q4ae5m2", "q8ae5m2",
+                      "w8ae5m2",   "qat-fp32"})
+            .help("projection compute policy; explicit policies currently require a native QAT checkpoint");
+        command_parser->add_argument("--kv-cache-precision")
+            .dest("kv_cache_precision")
+            .default_value(std::string("auto"))
+            .choices({"auto", "fp32", "bf16", "int8", "i8", "e4m3", "e5m2"})
+            .help("KV-cache storage policy; auto, fp32, and calibrated int8 are currently implemented");
         command_parser->add_argument("--group-size").dest("group_size").default_value<std::int32_t>(128);
         command_parser->add_argument("--packed-prefill")
             .dest("packed_prefill")

@@ -250,10 +250,21 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_setDataDirect
 }
 
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_load(JNIEnv* environment, jobject, jstring directory,
-                                                                        jstring accelerator) -> jstring {
+                                                                        jstring accelerator, jstring precision_name,
+                                                                        jstring kv_cache_precision_name) -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
         JavaString path(environment, directory);
         const auto preference = JavaString(environment, accelerator).get();
+        const auto precision_text = JavaString(environment, precision_name).get();
+        const auto precision = kidi::core::parse_precision(precision_text);
+        if (!precision)
+            throw kidi::ops::Failure(
+                {kidi::ErrorCode::INVALID_ARGUMENT, "unknown inference precision: " + precision_text});
+        const auto kv_cache_precision_text = JavaString(environment, kv_cache_precision_name).get();
+        const auto kv_cache_precision = kidi::core::parse_kv_cache_precision(kv_cache_precision_text);
+        if (!kv_cache_precision)
+            throw kidi::ops::Failure(
+                {kidi::ErrorCode::INVALID_ARGUMENT, "unknown KV-cache precision: " + kv_cache_precision_text});
         std::scoped_lock lock(runtime_mutex);
         const auto started = std::chrono::steady_clock::now();
         const auto milliseconds = [](auto from, auto to) {
@@ -264,7 +275,12 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_load(JNIEnv* 
         for (const auto device : candidates(preference, false)) {
             const auto attempt_started = std::chrono::steady_clock::now();
             auto ready = [&]() -> kidi::Result<kidi::inference::Generator> {
-                auto loaded = kidi::inference::Generator::load(path.get(), device, 0, 128, true);
+                auto loaded = kidi::inference::Generator::load(
+                    path.get(),
+                    {.device = device,
+                     .precision = *precision,
+                     .kv_cache_precision = *kv_cache_precision,
+                     .packed_prefill = true});
                 if (!loaded) return loaded;
                 const auto loaded_at = std::chrono::steady_clock::now();
                 if (auto configured = loaded->configure_serving({1, 1, CONTEXT_TOKENS, 32}); !configured)
@@ -300,6 +316,8 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_load(JNIEnv* 
                 {"vision", generator->vision_supported()},
                 {"backend", generator->execution()},
                 {"accelerator", preference},
+                {"precision", kidi::core::to_string(generator->precision())},
+                {"kv_cache_precision", kidi::core::to_string(generator->kv_cache_precision())},
                 {"fallbacks", attempts},
                 {"load_ms", milliseconds(started, std::chrono::steady_clock::now())},
                 {"stages_ms", stages}};
