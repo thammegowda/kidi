@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>ai.gowda.kidi.wifi-setup</string>
+    <key>CFBundleName</key>
+    <string>Kidi Wi-Fi Setup</string>
+    <key>CFBundleDisplayName</key>
+    <string>Kidi Wi-Fi Setup</string>
+    <key>CFBundleExecutable</key>
+    <string>kidi-wifi</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>NSLocationUsageDescription</key>
+    <string>Kidi reads the currently connected Wi-Fi name to configure your USB accessory. It does not collect or save your location.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Kidi reads the currently connected Wi-Fi name to configure your USB accessory. It does not collect or save your location.</string>
+</dict>
+</plist>

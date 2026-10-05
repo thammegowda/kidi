@@ -1,11 +1,14 @@
-# W11 USB Camera and Microphone Diagnostic
+# W11 USB and Wi-Fi Capture
 
 The board is running the diagnostic firmware, not the factory firmware. It
 supports photos, audio recordings, silent video, and simultaneous audio/video
 capture.
 
-No Wi-Fi, Bluetooth, or SD-card operations are performed. Network streaming is
-not implemented.
+The same firmware supports USB capture, authenticated HTTPS photos/audio
+recordings, and an experimental live camera/microphone viewer. Wi-Fi uses the
+module's station connection to the laptop's LAN. Live USB AV is hardware-verified;
+Wi-Fi live AV still stalls and may fail with explicit audio-overrun errors.
+Bluetooth pairing and Android integration are not implemented.
 
 ## Hardware
 
@@ -16,7 +19,7 @@ not implemented.
 | PSRAM | 8 MB octal PSRAM |
 | Camera | OV3660; JPEG photos at 2048 x 1536 by default; 640 x 480 optional |
 | Video | 1280 x 720 (720p) |
-| Microphone | PDM; 48 kHz, mono, signed 16-bit PCM |
+| Microphone | PDM; 16 kHz speech audio, mono, signed 16-bit PCM |
 
 ### Pin Mapping
 
@@ -39,14 +42,20 @@ Run commands from this directory:
 make help
 make build
 make flash
+make dev-connect
+make cache-wifi
+make speed-test
 make status
 make temperature
 make sensors
 make photo
+make photo TRANSPORT=wifi
+make photo TRANSPORT=usb
 make photo RESOLUTION=640x480
 make audio SECONDS=5
-make video SECONDS=10
-make av SECONDS=10 CAPTURE=captures/new-av-test
+make video TRANSPORT=usb
+make av TRANSPORT=usb
+make av TRANSPORT=wifi  # Experimental; current throughput is not reliable.
 make format-check test
 ```
 
@@ -61,24 +70,77 @@ make format-check test
 | `PIO_ENV` | PlatformIO build profile |
 | `CHIP` | ESP chip type passed to the flasher |
 | `PORT` | USB serial port |
+| `TRANSPORT` | Media route: `auto` (Wi-Fi first), `wifi`, or `usb` |
 | `BAUD` | Flashing baud rate |
-| `SECONDS` | Capture duration, from 1 to 10 seconds |
+| `SECONDS` | Saved audio recording duration, from 1 to 10 seconds |
+| `STREAM_SECONDS` | Live session safety limit, from 1 to 300 seconds |
+| `STREAM_RESOLUTION` | Live image size: `1280x720` (default) or `96x96` (lowest diagnostic profile) |
 | `RESOLUTION` | Photo resolution: `2048x1536` (default) or `640x480` |
 | `CAPTURE` | Capture path or filename prefix |
 | `OUTPUT` | Encoded MP4 filename |
 | `BACKUP` | Destination for a new flash backup |
 | `FACTORY_BACKUP` | Factory backup used for restoration or verification |
 
-Capture names default to timestamped paths under `captures/`. The `video` and
-`av` goals also encode MP4; `OUTPUT` overrides its filename.
+Saved photo/audio names default to timestamped paths under `captures/`.
+The `video` and `av` goals open a live viewer and do not use `CAPTURE` or save
+MP4. Direct USB saved-clip commands and `make encode` remain available below.
+
+## Live Preview
+
+```bash
+make video TRANSPORT=usb
+make av TRANSPORT=usb STREAM_SECONDS=60
+```
+
+These commands open a local browser viewer. Click Start to acquire media and
+Stop to close the session. Ctrl-C stops the laptop viewer. No recording is saved.
+Video is 1280x720 JPEG; live audio is 16 kHz mono PCM16 with browser high-pass
+filtering and adjustable playback gain. Browser audio buffering adds latency;
+sample-accurate audiovisual synchronization is not claimed.
+
+The device uses independent acquisition workers, a latest-frame queue, and a
+bounded audio queue. Slow transmission drops stale preview frames; missing
+audio or DMA overruns end the stream explicitly rather than hiding a gap.
+
+**Current limitation:** `TRANSPORT=wifi` is experimental. The tested networks
+had TLS transfer stalls, sometimes delivering fewer than one frame per second
+or overflowing the audio queue. USB delivered 8.8 fps in a five-second test with
+continuous audio. Do not infer frame rate from browser refresh or MP4 playback.
+
+Headless validation, without saving media:
+
+```bash
+uv run --no-project --with-requirements requirements-wifi.txt python live.py \
+  --mode av --transport usb --seconds 5 --check
+```
+
+Lowest-resolution Wi-Fi diagnostic:
+
+```bash
+make video TRANSPORT=wifi STREAM_RESOLUTION=96x96 STREAM_SECONDS=10
+make av TRANSPORT=wifi STREAM_RESOLUTION=96x96 STREAM_SECONDS=10
+```
+
+For a terminal-only test, use `live.py --resolution 96x96 --check` with the same
+mode, transport, and duration flags. Current audio is 16 kHz mono PCM16.
+
+The ten-second 96x96 Wi-Fi video-only test delivered 249 distinct images,
+24.9 fps. Combined Wi-Fi video/audio still failed with one dropped audio chunk
+and zero reported DMA overruns. The host verifies JPEG dimensions rather than
+trusting the stream's declared size. A separate low-resolution USB AV comparison
+hit a packet-framing error near the end and is not counted as a passing run.
+
+Use a trusted LAN that allows peer traffic. An isolated guest/IoT SSID prevents
+this test even when both devices are associated. The laptop can use the router's
+5 GHz band while the ESP32 uses its 2.4 GHz band; they do not need matching bands.
 
 ### Capture Requirements
 
-- The default serial port is `/dev/cu.usbmodem1101`. Override it with `PORT=...`
+- The default serial port is auto-detected. Override it with `PORT=...`
   for Make commands or `--port` for the capture script.
 - Capture durations must be between **1 and 10 seconds**.
 - Full-resolution still photos use `RESOLUTION=2048x1536`; video and simultaneous
-  AV use 1280x720. Audio uses 48 kHz mono PCM16. Install the updated firmware
+  AV use 1280x720. Audio uses 16 kHz mono PCM16. Install the updated firmware
   with `make flash` first.
 
 ## Temperature and Other Sensors
@@ -116,10 +178,96 @@ as proof of battery presence, a charging state, or a charge percentage.
 - [capture.py](capture.py) transfers binary data. Do not send `photo`, `audio`,
   `video`, or `av` commands from a plain-text terminal expecting readable output.
 
-## Direct Python Commands
+## Automated Wi-Fi Setup and Photo/Audio Capture
+
+```bash
+make dev-connect
+make photo
+make audio TRANSPORT=wifi SECONDS=5
+```
+
+Short Wi-Fi audio recordings are verified. A ten-second recording timed out
+in later testing; incomplete transfers fail without saving a success-shaped
+WAV or retrying a second capture over USB.
+
+Setup uses USB to identify the board, reuse the existing device network or a
+cached personal-network credential, provision the device identity
+and network, and verify the HTTPS endpoint. The laptop keeps its current
+internet connection. The network must have a reachable 2.4 GHz LAN for the
+ESP32-S3; guest isolation and managed authentication may prevent this.
+
+The selected network's authorized credential is cached in `.kidi.wifi.txt`.
+It is plaintext JSON, Git-ignored, and restricted to the current account
+(0600 on POSIX; owner-only Windows ACL). Matching SSIDs reuse it without another
+Keychain request. After reboot, setup first waits for the device's stored
+network to reconnect.
+
+Normal setup and capture are strictly cache-only for passwords: they never
+open Keychain or request password entry. New-network credential access requires
+the explicit `make cache-wifi` goal. The direct equivalent is
+`wifi.py cache-network --authorize-credentials`; that authorization flag is
+rejected for all other commands.
+
+```bash
+make cache-wifi         # Populate the current-network cache once.
+make forget-wifi-cache  # Remove laptop cached passwords, not device identity.
+```
+
+Use `WIFI_SSID=your-network` for an explicit network selection if automatic
+name discovery is unavailable. Cached credentials apply only to matching SSIDs.
+
+Do not publish or share this cache. Cancelled credential access stops the
+operation and does not populate it.
+
+On macOS, approve the named Wi-Fi helper's scoped request only if its network
+and Mac account match the intended setup. Wi-Fi Personal has no separate
+username; the displayed Mac account is the local authorization context.
+Location/local-network permissions may also be needed. No password is logged,
+written to source, or requested in chat.
+
+```bash
+make photo TRANSPORT=wifi  # Verified Wi-Fi only.
+make photo TRANSPORT=usb   # Physical USB development capture.
+```
+
+`auto` prefers a saved, verified Wi-Fi connection without opening USB. It can
+use an explicitly reported USB fallback for pre-request Wi-Fi unavailability.
+It never falls back after certificate/authentication failure or an interrupted
+capture whose outcome is unknown.
+
+Owner credentials and the generated helper are stored under Git-ignored
+`.private/` with restrictive permissions. Preserve that directory. The prototype
+does not silently replace another owner and does not yet implement production
+BLE ownership transfer.
+
+macOS “No route to host” for a valid LAN endpoint can indicate denied
+local-network permission. Allow the app/terminal running the client under
+System Settings > Privacy & Security > Local Network; do not disable TLS to
+work around a routing problem.
+
+## Authenticated Wi-Fi Speed Test
+
+```bash
+make speed-test TRANSFER_BYTES=1048576 BLOCK_BYTES=4096
+```
+
+Transfers a known pattern in both directions over certificate-verified HTTPS
+with owner authentication, checking every byte. Camera and microphone are
+excluded, and there is no USB fallback. Each direction reports bytes, transfer
+time, payload Mbit/s and KiB/s, RSSI, and TLS setup time separately.
+
+Limits: 4096-1048576 payload bytes; 256-16384 bytes per block; a 60-second
+device transfer deadline. A timeout is a failed measurement, not a zero-speed
+success. For one direction, run `speed.py --direction download` or `upload`
+with `uv run --no-project --with-requirements requirements-wifi.txt python`.
+
+The measured 1 MiB results were 2.41 Mbit/s download and 2.65 Mbit/s upload.
+These include HTTPS/application overhead; they are not raw radio capacity.
+
+## Direct USB Python Commands
 
 These commands are equivalent to the Make workflow. All Python tools use
-`uv run`.
+`uv run`. These examples deliberately use USB; `make photo` now prefers Wi-Fi.
 
 ### Status, Photos, and Audio
 
@@ -164,7 +312,7 @@ uv run --no-project --with imageio-ffmpeg python encode_video.py \
 
 The original WAV is preserved without gain or filtering.
 [capture.py](capture.py) also saves a DC-removed copy.
-New recordings use 48 kHz mono PCM16; this is not 24-bit audio.
+New recordings use 16 kHz mono PCM16; this is not 24-bit audio.
 
 The confirmed speech playback file, `captures/w11-mic-speech-playback.wav`, was
 high-pass filtered at 80 Hz and amplified 16x for listening. This processing was
@@ -196,15 +344,15 @@ video acquisition: **capture is simultaneous, but USB transmission is not**.
 - The host requires measured audio duration to be within 200 ms of nominal.
 - The original microphone recording is saved as `audio.wav`.
 - MP4 playback applies an 80 Hz high-pass and up to 16x audio gain, limited by
-  the measured peak to leave 1 dB headroom. Audio is encoded as 48 kHz mono AAC
-  at a target 128 kbit/s.
+  the measured peak to leave 1 dB headroom. Saved USB recordings can be encoded
+  as AAC at the original declared sample rate with a codec-safe bitrate.
 - The RGB LED is not driven while the camera is active.
 
 > **Synchronization limit:** The timing check is not a sample-accurate
 > audio/video synchronization guarantee. DMA buffering and camera frame
 > intervals introduce timing uncertainty.
 
-The verified 720p/48 kHz 10-second concurrent test produced:
+An earlier verified 720p/48 kHz 10-second concurrent test produced:
 
 | Measurement | Result |
 |---|---|

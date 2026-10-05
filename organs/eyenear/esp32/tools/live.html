@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kidi live camera and microphone</title>
+<style>
+body { margin: 2rem auto; padding: 0 1rem; max-width: 960px; font: 16px system-ui; background: #181818; color: #eee; }
+canvas { width: 100%; background: black; }
+button { padding: .6rem 1rem; margin: .5rem; }
+pre { white-space: pre-wrap; }
+</style>
+<h1>Kidi live preview</h1>
+<p>Local, authenticated accessory stream. No photos, audio, or video are saved.</p>
+<button id="start">Start</button><button id="stop" disabled>Stop</button>
+<label>Volume <input id="volume" type="range" min="0" max="16" value="8" step=".5"></label>
+<canvas id="camera" width="1280" height="720"></canvas>
+<pre id="status">Ready. Click Start to capture.</pre>
+<script>
+const token = VIEWER_TOKEN;
+const status = document.querySelector("#status");
+const canvas = document.querySelector("#camera");
+const drawing = canvas.getContext("2d");
+const startButton = document.querySelector("#start");
+const stopButton = document.querySelector("#stop");
+let controller, audio, gain, scheduled = 0, renderBusy = false;
+let active = false;
+let audioSampleRate = 16000;
+let generation = 0;
+function stop() {
+  generation++;
+  active = false;
+  controller?.abort();
+  audio?.close();
+  audio = null;
+  startButton.disabled = false;
+  stopButton.disabled = true;
+}
+stopButton.onclick = () => { stop(); status.textContent = "Stopped."; };
+document.querySelector("#volume").oninput = event => {
+  if (gain) gain.gain.value = Number(event.target.value);
+};
+window.addEventListener("pagehide", stop);
+startButton.onclick = async () => {
+  const current = ++generation;
+  controller = new AbortController();
+  active = true;
+  startButton.disabled = true;
+  stopButton.disabled = false;
+  let frames = 0, started = performance.now();
+  scheduled = 0;
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  audio = new AudioContext({sampleRate: 48000});
+  await audio.resume();
+  const highpass = audio.createBiquadFilter();
+  highpass.type = "highpass"; highpass.frequency.value = 80;
+  gain = audio.createGain(); gain.gain.value = Number(document.querySelector("#volume").value);
+  const limiter = audio.createDynamicsCompressor();
+  highpass.connect(gain); gain.connect(limiter); limiter.connect(audio.destination);
+  let queued = new Uint8Array(0);
+  try {
+    status.textContent = "Connecting and starting capture...";
+    const response = await fetch("/stream", {headers: {"X-Kidi-Viewer": token}, signal: controller.signal});
+    if (!response.ok) throw new Error(`Connection failed: HTTP ${response.status}. See terminal.`);
+    const reader = response.body.getReader();
+    let ended = false;
+    while (active) {
+      const {value, done} = await reader.read();
+      if (done) {
+        if (!ended) throw new Error("Stream disconnected. See terminal for the device/network error.");
+        break;
+      }
+      const combined = new Uint8Array(queued.length + value.length);
+      combined.set(queued); combined.set(value, queued.length); queued = combined;
+      while (queued.length >= 20 && active) {
+        const header = new DataView(queued.buffer, queued.byteOffset, 20);
+        const kind = header.getUint8(0), length = header.getUint32(16);
+        if (length === 0 || length > 1048576) throw new Error("Invalid stream packet.");
+        if (queued.length < 20 + length) break;
+        const payload = queued.slice(20, 20 + length);
+        queued = queued.slice(20 + length);
+        if (kind === 1) {
+          frames++;
+          if (!renderBusy) {
+            renderBusy = true;
+            createImageBitmap(new Blob([payload], {type: "image/jpeg"})).then(image => {
+              if (active && generation === current) drawing.drawImage(image, 0, 0, canvas.width, canvas.height);
+              image.close();
+            }).catch(error => {
+              if (generation === current) { status.textContent = `Image decode failed: ${error.message}`; stop(); }
+            }).finally(() => { renderBusy = false; });
+          }
+        } else if (kind === 2) {
+          if (!audio) continue;
+          const view = new DataView(payload.buffer);
+          const buffer = audio.createBuffer(1, payload.length / 2, audioSampleRate);
+          const samples = buffer.getChannelData(0);
+          for (let i = 0; i < samples.length; i++) samples[i] = view.getInt16(i * 2, true) / 32768;
+          const now = audio.currentTime;
+          if (scheduled > now + .5) throw new Error("Audio playback fell behind; stop and reconnect.");
+          scheduled = Math.max(scheduled, now + .04);
+          const source = audio.createBufferSource();
+          source.buffer = buffer; source.connect(highpass); source.start(scheduled);
+          scheduled += buffer.duration;
+        } else if (kind === 3) {
+          const info = JSON.parse(new TextDecoder().decode(payload));
+          if (info.protocol === 1) {
+            started = performance.now();
+            canvas.width = info.width;
+            canvas.height = info.height;
+            audioSampleRate = info.sample_rate;
+          }
+          const fps = frames * 1000 / Math.max(1, performance.now() - started);
+          status.textContent = `Received ${frames} frames (${fps.toFixed(1)} fps)\n${JSON.stringify(info, null, 2)}`;
+        } else if (kind === 4) {
+          ended = true;
+          status.textContent = "Session safety limit reached. Click Start to stream again.";
+          stop();
+        } else throw new Error("Unsupported stream packet.");
+      }
+      if (queued.length > 1048596) throw new Error("Stream buffer exceeded its bound.");
+    }
+  } catch (error) {
+    if (generation === current && error.name !== "AbortError") status.textContent = error.message;
+  } finally {
+    if (generation === current) stop();
+  }
+};
+</script>
+</html>

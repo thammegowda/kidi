@@ -82,7 +82,7 @@ class CaptureTest(unittest.TestCase):
     def test_rejects_audio_loss_and_timing_errors(self):
         cases = (
             {"samples": capture.SAMPLE_RATE - 1},
-            {"sample_rate": 16000},
+            {"sample_rate": 48000},
             {"overruns": 1},
             {"duration": 1300000},
             {"start": 1000},
@@ -120,7 +120,7 @@ class CaptureTest(unittest.TestCase):
         ).encode() + self.pcm + b"\nKIDI_END\n"
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(capture.capture(FakePort(data), "audio 1"), ("pcm16", self.pcm))
-        for invalid in (b"", b"KIDI_AUDIO_FORMAT sample_rate=16000 channels=1 bits=16\n"):
+        for invalid in (b"", b"KIDI_AUDIO_FORMAT sample_rate=48000 channels=1 bits=16\n"):
             with self.subTest(format=invalid):
                 payload = invalid + f"KIDI_BEGIN pcm16 {len(self.pcm)}\n".encode() + self.pcm + b"\nKIDI_END\n"
                 with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ValueError):
@@ -150,7 +150,7 @@ class CaptureTest(unittest.TestCase):
             with self.subTest(resolution=resolution):
                 output = Path(self.temporary.name) / f"photo-{resolution}.jpg"
                 port = FakePort(self.photo_data(resolution or "2048x1536"))
-                arguments = ["capture.py", "photo", "--output", str(output)]
+                arguments = ["capture.py", "photo", "--port", "test-port", "--output", str(output)]
                 if resolution is not None:
                     arguments.extend(["--resolution", resolution])
                 with (

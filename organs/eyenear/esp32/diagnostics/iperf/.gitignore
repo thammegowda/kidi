@@ -1,0 +1,8 @@
+/upstream/build/
+/upstream/managed_components/
+/upstream/sdkconfig
+/upstream/sdkconfig.old
+/upstream/dependencies.lock
+/.sdk/
+/.tools/
+/.build/

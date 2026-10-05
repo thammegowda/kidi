@@ -247,9 +247,362 @@ Local results:
 - `captures/av-720p-48khz-10s.mp4`.
 - `captures/av-720p-48khz-10s/capture.json` and original JPEG/audio data.
 
+## Laptop Wi-Fi Photo Slice
+
+The implementation now uses one firmware for USB and Wi-Fi. The initial archive
+plan was superseded by the user: USB capture remains active, and both photo
+transports share camera acquisition with a mutex. Wi-Fi support in this slice
+is limited to photographs; audio/video and sensor commands remain USB.
+
+The laptop setup command detects the board and provisions the selected saved
+Wi-Fi profile over trusted USB. A named macOS helper obtains the current SSID
+with Location Services authorization and scopes credential consent to the exact
+network and logged-in Mac account. The password is returned through a private
+process pipe, not printed or written to the project.
+
+Setup binds a unique ECDSA certificate/hostname and owner credential to the
+device. HTTPS photo/status endpoints require authorization. The laptop pins
+the device certificate; wrong certificate or owner authentication fails closed
+without a USB fallback. Device configuration persists in NVS, which is not
+encrypted on this prototype board.
+
+Integration issues found and corrected:
+
+- The SDK's constant-time comparison header lacked C++ linkage guards.
+- The native USB receive queue's 256-byte default truncated configuration
+  packets; the unified firmware uses an 8192-byte receive queue.
+- macOS redacted SSID data from ordinary CLI tools; the authorized native
+  helper obtained it without bypassing the OS permission boundary.
+- Initial local TCP access was denied by macOS Local Network privacy. Both the
+  accessory and gateway returned "No route to host" despite valid routing/ARP;
+  enabling the app/terminal's local-network access resolved it.
+- The client initially retained the five-second TCP-connect timeout for TLS
+  handshakes/response reads. It now applies the intended 25-second timeout.
+- USB AV exposed a too-small/short-wait TX path under concurrent Wi-Fi load.
+  The firmware now uses a 4096-byte TX queue and a one-second TX wait. The host
+  rejects unexpected binary control data without printing raw media.
+
+Hardware validation on macOS:
+
+- Automated selected-network provisioning completed without manual SSID or
+  password entry.
+- Authenticated full-resolution HTTPS photo saved as
+  `captures/wifi-photo-first.jpg`; decoded dimensions were 2048x1536.
+- Default automatic routing preferred Wi-Fi.
+- Wi-Fi-only capture completed without opening any serial connection:
+  `captures/wifi-no-serial-photo.jpg`, also 2048x1536.
+- Forced USB photo and one-second 48 kHz USB audio still worked.
+- USB video and a three-second USB AV regression passed with Wi-Fi enabled;
+  AV delivered 18 frames, all 144,000 audio samples, and zero reported overruns.
+- Automatic USB fallback was exercised against a deliberately unavailable TCP
+  endpoint while retaining the real hardware USB path. Saved credentials were
+  unchanged. This was a controlled outage test, not a router disconnection.
+- The firmware rejected a wrong owner before capture; the host rejected a
+  wrong device certificate before an HTTP request.
+- The laptop's original Wi-Fi internet route remained unchanged.
+- The saved station configuration, device identity, and owner authentication
+  survived reboot without another credential request.
+
+The final automated suite contains 34 passing USB/Wi-Fi tests, including local
+TLS integration, permission/cancellation behavior, private-file restrictions,
+transport selection, authentication rejection, and interrupted-transfer
+handling.
+
+Local owner credentials and generated helper files remain under Git-ignored
+`.private/`; capture results remain Git-ignored. Windows network/profile code
+and encrypted-key rejection have automated coverage, but Windows hardware
+validation is still pending.
+
+## Audio Recording and Live Preview Work
+
+Authenticated Wi-Fi audio recording was added, preserving 48 kHz mono PCM16
+and the original USB recording commands. The user confirmed understandable
+audio in an initial simultaneous Wi-Fi clip. Slow video delivery led the user
+to change scope from saved Wi-Fi video to live preview without recording.
+
+The firmware now shares microphone setup/readout in `audio.cpp`, and uses
+independent camera and microphone workers for live acquisition. Camera frame
+buffers and a one-slot preview queue discard stale frames. A bounded audio
+queue has priority in delivery; overruns or sequence gaps fail explicitly.
+USB and Wi-Fi carry the same typed packet protocol with sequence numbers,
+timestamps, declared formats, telemetry, and a successful end marker.
+
+`make video` and `make av` now launch a loopback-only browser viewer. Start/Stop
+controls acquisition; live media is not saved on the laptop or SD card.
+Sessions have a 1-300 second safety limit. TLS/device/owner verification is
+unchanged. Browser access to the loopback stream requires a per-viewer token.
+
+Verified:
+
+- Three-second Wi-Fi audio: all 144,000 samples, 48 kHz mono PCM16.
+- Wi-Fi full-resolution photo still decodes to 2048x1536.
+- An initial ten-second Wi-Fi AV recording returned all 480,000 audio samples
+  without DMA overruns, but only ten source images; its apparent MP4 frame rate
+  was not a real camera frame rate.
+- USB live AV delivered 44 frames in five seconds (8.8 fps), and 238,080 audio
+  samples in a later test, with zero reported audio drops or DMA overruns.
+  Live sessions stop at a wall-clock limit rather than promising the exact
+  sample count of a saved recording.
+- Automated tests cover typed packet framing, bounded payloads, sample
+  continuity, authentication, end markers, and route selection.
+- The browser viewer was exercised over USB: Start produced image/audio
+  packets and approximately 8.4 received frames/second in the UI; the session
+  safety limit returned it to the ready state, and Stop aborted the preview.
+- USB Stop now uses an explicit command and waits for the firmware's
+  post-cleanup acknowledgement before closing the port. CRLF line endings
+  are handled. An early Stop of a 60-second session was acknowledged, and
+  the camera was immediately reused successfully for a USB photo.
+- Fifty automated tests, the cross-build, and formatting checks passed.
+
+A ten-second saved Wi-Fi audio transfer also timed out before its complete
+payload arrived during the later network tests. The client refused to save
+that incomplete recording. Short three-second Wi-Fi audio and full-resolution
+Wi-Fi photographs were subsequently verified after the live refactor, but
+maximum-length wireless recording should not be presented as reliable.
+
+**Not resolved:** Wi-Fi live AV repeatedly suffered transmission stalls and
+audio queue overruns, even with strong signal. Camera acquisition continued
+producing frames while network delivery lagged. The laptop was switched to a
+new 2.4 GHz network and automated USB provisioning succeeded, but the streaming
+failure persisted. This was a new selected network; it does not prove a test
+against independent router infrastructure.
+
+Experiments with TCP batching, modem sleep, TLS cipher selection, chunk
+coalescing, PSRAM clip caching, and HTTP-task affinity did not establish a
+reliable improvement. Unsuccessful transport tuning was removed. The retained
+code uses the SDK response API and standard certificate-verified TLS defaults.
+No plaintext media workaround, silent audio loss, or quality reduction was used.
+
+The live viewer is a development prototype: USB streaming is verified, but
+Wi-Fi live AV must not be described as completed or production-ready. The
+remaining blocker needs focused transport profiling rather than another
+nominal-FPS claim.
+
+## Lowest-Resolution Wireless Live Test
+
+Added an explicit `STREAM_RESOLUTION=96x96` diagnostic profile, the smallest
+size listed by the tested camera driver. The normal live default remains
+1280x720, photo defaults are unchanged, and audio stays 48 kHz mono PCM16.
+The setting is wired through Make, laptop CLI, HTTPS requests, USB stream
+commands, firmware metadata, and the browser canvas. The host checks JPEG SOF
+dimensions against the requested resolution.
+
+Initial wireless testing could not reach the accessory's TCP endpoint.
+The laptop could reach the router, but not the module; both reported the same
+selected Wi-Fi profile. The user confirmed that network was an isolated
+guest/IoT network. This was a connectivity restriction, not a valid stream
+performance result.
+
+The user then selected a trusted dual-band network. Automated USB setup
+configured the accessory without changing its identity. The laptop did not
+need to be forced onto 2.4 GHz.
+
+Results on that reachable LAN:
+
+| Test | Result |
+|---|---|
+| Wi-Fi AV, requested 10 seconds, 96x96 + 48 kHz | Failed: one dropped audio chunk, zero reported DMA overruns |
+| Wi-Fi video only, 10 seconds, 96x96 | Passed: 249 frames, 24.9 fps |
+| Video acquisition timestamps | 0.030 to 9.921 seconds |
+| Video-only receive time | 10.241 seconds |
+| USB AV comparison, requested 10 seconds, 96x96 + 48 kHz | Framing error near the end; not a passing run |
+
+The failing Wi-Fi AV telemetry reported 32 acquired camera frames and one
+delivered frame before the audio error. The successful video-only run verifies
+that low-resolution wireless camera delivery works, but it does not resolve the
+combined stream's audio/transport issue.
+
+Firmware cross-build, formatting, and 54 automated tests passed. Tests cover
+resolution forwarding, actual JPEG size, mismatched declarations/payloads, and
+the lowest-resolution protocol over verified TLS. No SD-card writes or saved
+live recordings were used.
+
+A second five-second video-only run received 93 frames (18.6 fps). A received
+JPEG was fully decoded in memory to 96x96 RGB, confirming more than header
+metadata alone. No image or recording file was saved for this decode check.
+
+## Throughput Benchmark and Speech-Rate Audio
+
+Added `make speed-test`, using owner-authenticated, certificate-verified HTTPS
+in both directions with synthetic, deterministic bytes and full integrity
+checks. Capture resources are locked out during the test; there are no
+camera/microphone operations or media files. TLS setup is timed separately.
+This measures the existing application stack, not raw PHY or plaintext iperf.
+
+| Payload | Block size | Module to laptop | Laptop to module |
+|---|---:|---:|---:|
+| 128 KiB | 4096 bytes | 2.60 Mbit/s | 3.41 Mbit/s |
+| 1 MiB | 4096 bytes | 2.41 Mbit/s | 2.65 Mbit/s |
+| 128 KiB | 640 bytes | 1.87 Mbit/s | Not measured |
+| 128 KiB | 1920 bytes | 2.47 Mbit/s | Not measured |
+| 128 KiB | 16384 bytes | 2.06 Mbit/s | Not measured |
+
+The 1 MiB transfers took 3.475 seconds download and 3.164 seconds upload,
+excluding approximately one-second TLS setup. Device-reported upload receive
+time was 3.121 seconds. Every successful transfer passed integrity validation.
+
+[Espressif's target-specific guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32s3/api-guides/wifi.html#esp32-s3-wi-fi-throughput)
+publishes best over-air lab results up to 20 Mbit/s TCP and 30 Mbit/s UDP.
+Shielded-box figures are substantially higher and use the specified iperf
+configuration. They are not a promise for this camera application.
+The current prebuilt Arduino SDK uses 5760-byte TCP send/receive buffers,
+whereas the newer cited default-performance profile uses 32 KiB, and its iperf
+profile uses 64 KiB. This is a concrete difference to investigate, not a proven
+explanation or something safely changed by defining a compiler macro against
+prebuilt libraries.
+
+With the user's approval, microphone capture now defaults to 16 kHz mono
+PCM16, directly matching Whisper's input rate. Raw audio payload drops from
+768 to 256 kbit/s. Saved recordings, metadata validation, live framing, tests,
+and browser playback were updated consistently. Live decoding still accepts
+explicitly declared legacy 48 kHz input; playback uses the declared rate.
+
+The subsequent 96x96/16 kHz Wi-Fi AV test still failed: six audio-queue drops
+and zero reported DMA overruns. Its last telemetry reported 136 acquired
+camera frames and eight delivered frames. Lowering audio alone did not resolve
+the simultaneous streaming issue.
+
+## Private Selected-Network Credential Cache
+
+At the user's request, `.kidi.wifi.txt` stores authorized selected-network
+credentials as JSON text. It is Git-ignored (including its atomic temporary
+file), mode 0600 on macOS/POSIX, and given a current-user-only ACL on Windows.
+Writing the cache does not change the project directory's permissions.
+The cache is plaintext and must not be shared or committed.
+
+Matching SSIDs reuse the cache without another Keychain request. Unknown
+networks require their own selected-credential authorization; cancellation
+does not populate the cache. Invalid, symlinked, or permissive cache files
+fail explicitly rather than causing hidden credential retrieval.
+
+Setup now waits for a configured accessory to rejoin its saved network after
+reboot before requesting credentials. This addresses an unnecessary request
+when Wi-Fi was still connecting.
+
+macOS denied automatic SSID discovery after the native helper was updated.
+The user explicitly selected the already-provided network name instead.
+One scoped, approved credential read populated the real cache; a subsequent
+reuse was verified with Keychain access disabled in the test. The password
+was not logged. `make forget-wifi-cache` removes only the laptop's cached
+network passwords, not device identity or firmware.
+
+Firmware build/formatting and 63 automated tests passed, including cache
+scoping, owner-only permissions, directory-permission preservation, cancellation,
+and reboot reconnection without a credential request.
+
+## No Implicit Credential Prompts
+
+Following the user's objection to repeated Keychain prompts, normal setup and
+capture now use only existing device configuration or cached passwords.
+Missing credentials fail explicitly without OS lookup or password entry.
+Only `make cache-wifi` / `cache-network --authorize-credentials` may retrieve
+a new OS credential. That flag is rejected on other commands.
+
+An already-configured accessory is reused without automatic SSID discovery.
+A fresh accessory uses a single cached profile or requires explicit selection
+if the cache is ambiguous. No new Keychain authorization was requested during
+verification of this change.
+
+## Repeated Throughput Test Without Credential Access
+
+The user requested more testing with no Keychain/password interaction.
+Measurements used only the saved device identity and authenticated TLS
+endpoint. Keychain, OS Wi-Fi discovery, Windows credential retrieval, and
+interactive password APIs were disabled in the test process. No network
+configuration or firmware changes were made.
+
+The repeated 1 MiB batch did not complete:
+
+- Module-to-laptop download: 52.461 seconds, 0.160 Mbit/s; integrity passed.
+- The following upload timed out before its response; no successful upload
+  speed or three-run aggregate was claimed.
+
+The smaller 64 KiB, 4096-byte-block batch completed:
+
+| Run | Module to laptop | Laptop to module |
+|---|---:|---:|
+| 1 | 0.307 Mbit/s | 0.309 Mbit/s |
+| 2 | 0.116 Mbit/s | 0.160 Mbit/s |
+| 3 | 0.102 Mbit/s | 0.147 Mbit/s |
+| Median | 0.116 Mbit/s | 0.160 Mbit/s |
+
+All six smaller transfers passed byte integrity checks. Signal reports ranged
+from -64 to -65 dBm; TLS setup took approximately 1.3-2.6 seconds and was excluded
+from the payload rates.
+
+ICMP during the batch: 10/10 replies, 13.081-314.828 ms, average 140.808 ms.
+A separate idle sample, with no concurrent transfer/capture: 10/10 replies,
+59.646-432.564 ms, average 248.053 ms.
+
+These results are materially worse than the earlier 2.4-3.4 Mbit/s samples.
+The link/application transport is highly variable even without camera or
+microphone load. At the current medians, the 0.256 Mbit/s raw 16 kHz PCM16
+audio requirement alone exceeds the measured available throughput.
+This explains why streaming cannot be assumed reliable under these conditions,
+but does not identify whether power saving, radio conditions, routing/AP
+behavior, or TCP/TLS configuration is the root cause.
+
+No credential request was made, no media was captured, and no secrets were
+included in benchmark output.
+
+## Elevated-Module Reception Retest
+
+The user held the module up in midair for better reception. No firmware or
+network settings were changed, and all credential/discovery/password APIs
+remained disabled in the benchmark process.
+
+Three 128 KiB trials each way passed all integrity checks:
+
+| Direction | Median | Range |
+|---|---:|---:|
+| Module to laptop | 0.739 Mbit/s | 0.705-0.823 Mbit/s |
+| Laptop to module | 0.672 Mbit/s | 0.603-0.771 Mbit/s |
+
+For a matched comparison with the previous 64 KiB test, another three trials
+each way used exactly 64 KiB and 4096-byte blocks:
+
+| Direction | Previous median | Elevated median | Elevated range |
+|---|---:|---:|---:|
+| Module to laptop | 0.116 Mbit/s | 0.641 Mbit/s | 0.494-0.694 Mbit/s |
+| Laptop to module | 0.160 Mbit/s | 0.406 Mbit/s | 0.388-0.851 Mbit/s |
+
+All twelve elevated transfers passed integrity verification. Reported signal
+improved from approximately -64/-65 dBm to -57..-61 dBm across the retests.
+The matched median improvements were approximately 5.5x download and 2.5x
+upload. Placement correlates with a meaningful improvement, but this is not a
+controlled RF study and does not isolate it from changing interference.
+
+Idle ICMP while elevated: 10/10 replies, 15.739-453.230 ms, average 170.767 ms.
+Latency remains variable, and the improved throughput is still below the
+earlier highest application-stack samples and the published TCP lab figures.
+No camera/microphone capture or Keychain access was performed.
+
+## Official Espressif Benchmark Source
+
+Fetched an unmodified ESP-IDF v5.5.1 `examples/wifi/iperf` snapshot into
+`diagnostics/iperf/upstream`, pinned to commit
+`fcae32885b0296b32044cb99ecbdc50d98dddb83`.
+Each file was verified against its immutable upstream Git blob; provenance,
+original paths, and SHA-256 checksums are recorded in `source-manifest.json`.
+The source and license are available locally, but it has not been built/flashed.
+
+The official code explicitly disables modem sleep and uses 65535-byte TCP
+buffers, plus throughput-oriented aggregation and task settings. This
+contrasts with the current prebuilt SDK's 5760-byte TCP buffers and Kidi's
+HTTPS benchmark. It requires iperf 2.x, not iperf3.
+
+The example's watchdog/experimental PHY settings are benchmark-only. Before
+any replacement of the camera firmware, a full current-flash backup must be
+saved and verified so the provisioned identity and credentials can be restored.
+The official app can erase NVS on initialization errors; no such operation was
+performed while fetching the source.
+
 ## Remaining work
 
-- Wireless simultaneous image/audio streaming and Android/Kidi integration.
+- Resolve Wi-Fi live AV stalls and validate sustained throughput, stop/reconnect,
+  and browser audiovisual playback before claiming usable wireless streaming.
+- Production BLE pairing and Android/Kidi integration.
+- Windows hardware validation of the laptop setup and Wi-Fi photo workflow.
 - Long-running capture, recovery after disconnects, and sustained-load tests.
 - Frame-rate benchmarks and throughput improvements at the selected resolutions.
 - Tighter AV synchronization measurement if needed.
