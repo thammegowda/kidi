@@ -109,6 +109,18 @@ vision weights and does not download another model:
   > benchmarks/android/.cache/image-chat.jsonl
 ```
 
+`image` is an end-to-end check: it loads the full Gemma generator, encodes the image, prefills visual/text tokens,
+decodes an answer, and runs a cached follow-up. To optimize the vision frontend without LM load, prefill, decode, or
+prefix-cache noise, run the vision-only mode:
+
+```sh
+"$ADB" -s SERIAL shell "timeout 150 $REMOTE/runner vision $REMOTE/models/gemma4 4 3 $REMOTE/photo.jpg" \
+  > benchmarks/android/.cache/vision-only.jsonl
+```
+
+It reports image preparation, vision checkpoint binding, and each full frontend pass (patch projection, all 16 encoder
+blocks, 3x3 spatial pooling, and the projection to Gemma's text width). Iteration zero is marked as warm-up.
+
 With the existing PyTorch/Transformers reference environment, generate small numerical fixtures locally:
 
 ```sh

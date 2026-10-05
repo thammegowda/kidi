@@ -1,14 +1,19 @@
 #include <cstdlib>
+#include "kidi/checkpoint/config.h"
 #include "kidi/inference/generator.h"
 #include "kidi/checkpoint/prepare.h"
+#include "kidi/image/gemma4.h"
 #include "kidi/inference/transcriber.h"
+#include "kidi/model/gemma4_vision.h"
 #include "kidi/runtime/ynn/graph.h"
 
 #include <nlohmann/json.hpp>
 #include <sys/resource.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 
 namespace {
@@ -201,6 +206,56 @@ auto benchmark_image(const std::filesystem::path& directory, const std::filesyst
     }
 }
 
+/// Vision-only path: preprocessing, checkpoint binding, the 16-block tower, pooling, and text-space projection.
+auto benchmark_vision(const std::filesystem::path& directory, const std::filesystem::path& image, int threads,
+                      int repeats) -> void {
+    const auto config = YAML::LoadFile((directory / "config.json").string());
+    const auto manifest = require(kidi::checkpoint::load_config(directory / "model.yaml"));
+    const auto weights = require(kidi::checkpoint::Weights::load(manifest["weights_file"].as<std::string>()));
+    std::ifstream stream(image, std::ios::binary);
+    if (!stream) throw std::runtime_error("unable to read benchmark image");
+    const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream), {}};
+    const auto prepare_started = Clock::now();
+    const auto pixels = require(kidi::image::prepare_gemma4(bytes, 280));
+    emit({{"stage", "vision_prepare"},
+          {"ms", rounded(elapsed_ms(prepare_started))},
+          {"patch_rows", pixels.patch_rows},
+          {"patch_columns", pixels.patch_columns},
+          {"patches", static_cast<std::size_t>(pixels.patch_rows) * pixels.patch_columns}},
+         threads);
+
+    const auto load_started = Clock::now();
+    const kidi::ModuleScope scope(kidi::tensor::DType::F32, false, kidi::tensor::Device::cpu());
+    auto vision = kidi::model::Gemma4Vision(config["vision_config"],
+                                            config["text_config"]["hidden_size"].as<int>(),
+                                            static_cast<bool>(manifest["model"]["quantization_config"]));
+    require(vision->set_checkpoint(weights));
+    emit({{"stage", "vision_load"}, {"ms", rounded(elapsed_ms(load_started))}}, threads);
+
+    for (int iteration = 0; iteration < repeats; ++iteration) {
+        const auto started = Clock::now();
+        const auto output = require(vision->forward(pixels));
+        const auto values = require(output.data<float>());
+        double sum = 0, squared = 0, maximum = 0;
+        for (const auto value : values) {
+            if (!std::isfinite(value)) throw std::runtime_error("vision output is not finite");
+            sum += value;
+            squared += static_cast<double>(value) * value;
+            maximum = std::max(maximum, std::abs(static_cast<double>(value)));
+        }
+        emit({{"stage", "vision_encode"},
+              {"iteration", iteration},
+              {"warmup", iteration == 0},
+              {"ms", rounded(elapsed_ms(started))},
+              {"visual_tokens", output.size(1)},
+              {"width", output.size(2)},
+              {"sum", sum},
+              {"rms", std::sqrt(squared / values.size())},
+              {"max_abs", maximum}},
+             threads);
+    }
+}
+
 auto benchmark_whisper(const std::filesystem::path& directory, const std::filesystem::path& wav, int threads,
                        int repeats) -> void {
     const auto waveform = require(kidi::audio::load_wav(wav));
@@ -283,7 +338,8 @@ auto benchmark_dictation(const std::filesystem::path& directory, const std::file
 
 auto main(int argc, char** argv) -> int {
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
-        std::cout << "usage: kidi_android_baseline gemma|chat|whisper|image|dictation MODEL THREADS REPEATS [MEDIA]\n";
+        std::cout << "usage: kidi_android_baseline gemma|chat|whisper|image|vision|dictation MODEL THREADS REPEATS "
+                     "[MEDIA]\n";
         return 0;
     }
     try {
@@ -292,7 +348,7 @@ auto main(int argc, char** argv) -> int {
         const auto threads = std::stoi(argv[3]), repeats = std::stoi(argv[4]);
         if (threads < 1 || threads > 8 || repeats < 1 || repeats > 20 ||
             !(((mode == "gemma" || mode == "chat") && argc == 5) ||
-              ((mode == "whisper" || mode == "image" || mode == "dictation") && argc == 6)))
+              ((mode == "whisper" || mode == "image" || mode == "vision" || mode == "dictation") && argc == 6)))
             throw std::runtime_error("invalid mode, thread count, repeat count, or WAV argument");
         kidi::runtime::ynn::set_thread_count(threads);
         require(kidi::runtime::ynn::reserve_thread_pool(threads));
@@ -307,6 +363,8 @@ auto main(int argc, char** argv) -> int {
             benchmark_chat_turns(argv[2], threads, repeats);
         else if (mode == "image")
             benchmark_image(argv[2], argv[5], threads);
+        else if (mode == "vision")
+            benchmark_vision(argv[2], argv[5], threads, repeats);
         else if (mode == "dictation")
             benchmark_dictation(argv[2], argv[5], threads, repeats);
         else
