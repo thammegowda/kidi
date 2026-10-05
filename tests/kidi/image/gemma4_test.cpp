@@ -107,6 +107,21 @@ auto main(int argc, char** argv) -> int {
                 if (lowbit_maximum >= 2e-6F) return 1;
 #endif
             }
+#if defined(__APPLE__)
+            {
+                const kidi::ModuleScope gpu_scope(kidi::tensor::DType::F32, false,
+                                                  kidi::tensor::Device::apple_gpu());
+                auto gpu_model = kidi::model::Gemma4Vision(config, 20, argc == 3);
+                require(gpu_model->set_checkpoint(weights));
+                const auto gpu = require(gpu_model->forward({6, 9, {pixels.begin(), pixels.end()}}));
+                const auto gpu_values = require(gpu.data<float>());
+                float gpu_maximum = 0;
+                for (std::size_t index = 0; index < gpu_values.size(); ++index)
+                    gpu_maximum = std::max(gpu_maximum, std::abs(gpu_values[index] - actual_values[index]));
+                std::cout << "Metal vision max CPU difference: " << gpu_maximum << '\n';
+                if (gpu_maximum >= 2e-6F) return 1;
+            }
+#endif
             std::cout << "vision feature max error: " << maximum << '\n';
             return maximum < 2e-4F ? 0 : 1;
         } catch (const kidi::ops::Failure& error) {

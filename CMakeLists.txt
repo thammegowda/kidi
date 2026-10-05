@@ -244,15 +244,46 @@ if(APPLE)
     find_library(KIDI_MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
     find_library(KIDI_MPSGRAPH_FRAMEWORK MetalPerformanceShadersGraph REQUIRED)
     find_library(KIDI_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
+    set(KIDI_MPS_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated/mps")
+    file(MAKE_DIRECTORY "${KIDI_MPS_GENERATED}")
+    function(kidi_embed_text input output symbol)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input}")
+        file(READ "${input}" KIDI_EMBEDDED_TEXT)
+        set(KIDI_EMBEDDED_SYMBOL "${symbol}")
+        configure_file(cmake/embed_text.h.in "${output}" @ONLY)
+    endfunction()
+    set(KIDI_MPS_METAL_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/command_batch.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/eager_kernels.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/quantized_linear.metal"
+    )
+    kidi_embed_text(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/command_batch.metal"
+        "${KIDI_MPS_GENERATED}/command_batch_metal_source.h"
+        KIDI_COMMAND_BATCH_METAL_SOURCE
+    )
+    kidi_embed_text(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/eager_kernels.metal"
+        "${KIDI_MPS_GENERATED}/eager_kernels_metal_source.h"
+        KIDI_EAGER_KERNELS_METAL_SOURCE
+    )
+    kidi_embed_text(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/quantized_linear.metal"
+        "${KIDI_MPS_GENERATED}/quantized_linear_metal_source.h"
+        KIDI_QUANTIZED_LINEAR_METAL_SOURCE
+    )
     target_sources(kidi
         PRIVATE
             src/kidi/runtime/mps/command_batch.mm
             src/kidi/runtime/mps/graph.mm
             src/kidi/runtime/mps/operators.cpp
+            ${KIDI_MPS_METAL_SOURCES}
             src/kidi/runtime/mps/quantized_linear.mm
             src/kidi/runtime/mps/eager_kernels.mm
             src/kidi/tensor/metal_backend.mm
     )
+    set_source_files_properties(${KIDI_MPS_METAL_SOURCES} PROPERTIES HEADER_FILE_ONLY TRUE)
+    target_include_directories(kidi PRIVATE "${KIDI_MPS_GENERATED}")
     set_source_files_properties(
         src/kidi/runtime/mps/graph.mm
         src/kidi/runtime/mps/command_batch.mm

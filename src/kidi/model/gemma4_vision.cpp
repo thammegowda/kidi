@@ -283,8 +283,7 @@ struct Gemma4VisionImpl::State {
 };
 
 Gemma4VisionImpl::Gemma4VisionImpl(const YAML::Node& config, std::int32_t text_width, bool quantized) {
-    if ((module_device != tensor::Device::cpu() && module_device != tensor::Device::web_gpu()) ||
-        config["patch_size"].as<int>() != 16 ||
+    if (config["patch_size"].as<int>() != 16 ||
         config["pooling_kernel_size"].as<int>() != 3 || config["standardize"].as<bool>(false) ||
         config["use_clipped_linears"].as<bool>(false) || config["head_dim"].as<int>() % 4 ||
         config["num_key_value_heads"].as<int>() != config["num_attention_heads"].as<int>())
@@ -407,10 +406,14 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image, const BlockObser
             StageCallback stage_callback;
             if (stage_observer && layer_index < stage_layers)
                 stage_callback = [&](std::string_view stage, const Tensor& tensor) {
+                    context.synchronize();
                     stage_observer(layer_index, stage, tensor);
                 };
             hidden = layer->forward(context, hidden, cos, sin, mask, stage_callback);
-            if (block_observer) block_observer(layer_index, hidden);
+            if (block_observer) {
+                context.synchronize();
+                block_observer(layer_index, hidden);
+            }
             ++layer_index;
         }
         // Average each 3x3 patch neighbourhood on the device, viewing patches as [rows/3, 3, columns/3, 3, hidden].

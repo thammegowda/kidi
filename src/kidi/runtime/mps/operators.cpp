@@ -116,8 +116,11 @@ public:
         else if (quantized)
             require(quantized->encode(stream.commands(), inputs[0], output));
         else if (packed_bits) {
+            const auto rows = inputs[0].numel() / inputs[0].size(-1);
+            const bool integer_w8 = !prefill_executable && !vector_projection && rows >= 4 && packed_bits == 8 &&
+                                    packed_group == inputs[0].size(-1) && packed_input_scale > 0;
             Tensor calibrated_input;
-            if (packed_input_scale > 0) {
+            if (packed_input_scale > 0 && !integer_w8) {
                 calibrated_input = stream.acquire(inputs[0].shape(), prefill_executable ? DType::F16 : DType::F32);
                 require(mps::encode_eager(stream.commands(), Operation::STATIC_ROUND, packed_input_scale,
                                           inputs.first(1), calibrated_input));
@@ -141,7 +144,8 @@ public:
             } else {
                 require(mps::encode_packed_linear(
                     stream.commands(), calibrated_input.defined() ? calibrated_input : inputs[0], packed_weight,
-                    packed_scales, output, packed_bits, packed_group, 0.F, packed_output_scale, vector_projection));
+                    packed_scales, output, packed_bits, packed_group, integer_w8 ? packed_input_scale : 0.F,
+                    packed_output_scale, vector_projection));
             }
         } else {
             std::array outputs{output};

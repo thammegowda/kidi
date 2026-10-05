@@ -244,7 +244,8 @@ auto benchmark_vision(const std::filesystem::path& directory, std::span<const st
     const auto config = YAML::LoadFile((directory / "config.json").string());
     const auto weights = require(kidi::checkpoint::Weights::load(directory / "model.safetensors"));
     const auto load_started = Clock::now();
-    const kidi::ModuleScope scope(kidi::tensor::DType::F32, false, kidi::tensor::Device::cpu());
+    const auto device = gemma_device();
+    const kidi::ModuleScope scope(kidi::tensor::DType::F32, false, device);
     auto vision = kidi::model::Gemma4Vision(config["vision_config"],
                                             config["text_config"]["hidden_size"].as<int>(),
                                             static_cast<bool>(config["quantization_config"]));
@@ -256,6 +257,7 @@ auto benchmark_vision(const std::filesystem::path& directory, std::span<const st
     require(vision->set_checkpoint(weights));
     emit({{"stage", "vision_load"},
           {"ms", rounded(elapsed_ms(load_started))},
+          {"device", kidi::tensor::to_string(device)},
           {"precision", kidi::core::to_string(*precision)}},
          threads);
 

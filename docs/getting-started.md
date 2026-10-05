@@ -89,6 +89,9 @@ files remain unchanged. Models already packaged with `model.yaml` use that file.
 Unsupported architectures/formats fail explicitly; a Hugging Face ID alone does
 not make every model compatible with Kidi.
 
+For image prompts on macOS, `--backend mps` keeps both the language model and the low-bit vision tower on Apple GPU;
+the vision tower does not copy intermediate blocks back to CPU during normal inference.
+
 Projection and KV-cache precision are separate load-time policies. The defaults
 preserve the checkpoint projection format and automatically use the calibrated
 INT8 KV cache when the QAT model and backend support it. CPU verification can

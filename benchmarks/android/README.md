@@ -171,6 +171,20 @@ embeddings and one additional untimed diagnostic pass reports element-wise error
 `KIDI_VISION_DUMP_DIR` writes matching Kidi tensors to Safetensors for offline analysis; existing files are never
 overwritten.
 
+On macOS, set `KIDI_ACCELERATOR=gpu` to run the standalone tower on Apple GPU. The native W8 path keeps calibrated
+activations and weights as integer codes through the tiled projection, applying scales only after accumulation:
+
+```sh
+KIDI_ACCELERATOR=gpu KIDI_VISION_PRECISION=checkpoint \
+  build-release/kidi_android_baseline vision MODEL 4 3 image.png
+```
+
+On an Apple M5, the three 2,304-2,376-patch fixtures take about 0.67-0.70 s after warm-up. The fixed photo produces the
+same CPU and Metal answers (`A cat.` and `Orange/Ginger.`); the deterministic shape fixtures preserve the same objects
+and colors with minor wording differences. Intermediate features are not numerically identical—the residual difference
+can compound through the sensitive tower—so Metal quality is gated by short-answer equivalence rather than FP32 tensor
+parity.
+
 `KIDI_VISION_PRECISION` selects the projection compute policy. The default, `checkpoint`, uses the checkpoint's native
 precision. `fp32` disables activation quantization and dequantizes packed weights for FP32 computation; `bf16` uses
 BF16 activations and computation. `q2a16`, `q4a16`, and `q8a16` explicitly requantize weights to that width before BF16

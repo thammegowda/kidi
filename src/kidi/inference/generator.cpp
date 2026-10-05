@@ -487,9 +487,7 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
                     if (!vision_) {
                         if (options.on_image_progress) options.on_image_progress("Preparing image model");
                         const core::MemoryScope memory("load:vision");
-                        const auto device = model_->device() == tensor::Device::web_gpu() ? tensor::Device::web_gpu()
-                                                                                          : tensor::Device::cpu();
-                        const ModuleScope construction(tensor::DType::F32, false, device);
+                        const ModuleScope construction(tensor::DType::F32, false, model_->device());
                         auto vision = model::Gemma4Vision(config_["vision"], config_["model"]["hidden_size"].as<int>(),
                                                           native_qat());
                         auto weights = require(checkpoint::Weights::load(config_["weights_file"].as<std::string>()));
