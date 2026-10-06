@@ -1,21 +1,23 @@
 # Wireless Accessory Design
 
-Status: **design draft with the laptop Wi-Fi-photo development slice implemented**.
-Live-preview update: shared acquisition workers and a local viewer are now
-implemented. USB live AV is verified; Wi-Fi live AV remains experimental due
-to transfer stalls and audio queue overruns. Saved Wi-Fi audio is verified.
-The user superseded bounded Wi-Fi video recording with live preview, without
-saved video or SD-card caching. This does not establish production streaming
-readiness.
-Implementation update: the laptop development slice now uses one firmware for
-USB diagnostics and authenticated Wi-Fi photos. Automatic photo routing
-prefers a saved verified Wi-Fi endpoint and explicitly falls back to USB only
-for pre-request unavailability. Certificate/owner failures and ambiguous
-interrupted captures fail closed. Production BLE/Android and live Wi-Fi AV
-remain design work; the prototype does not imply those are implemented.
+Status: **reusable host/protocol components retained; new board firmware pending**.
+The old module has been returned and its board target/drivers removed.
+Historical measurements are under [history/w11/](history/w11/); they are not
+validation of the proposed hardware. Current SDK adapters have a pin-free
+ESP32-S3 compile check, not a production application.
 
-This design uses the W11 ESP32-S3 as the first accessory, but the protocol and
-`kidi::esp32` firmware structure must support other boards and peripherals.
+The next intended architecture is an ESP32-P4 media host with an ESP32-C6
+wireless co-processor. The precise board variant, C6 interconnect/firmware,
+camera cable and audio codec must be confirmed from vendor documentation.
+The camera listing identifies an OV5647 CSI module; its raw output needs
+P4 MIPI/ISP/JPEG or H.264 processing, not the old parallel-JPEG configuration.
+No P4/C6 backend or H.264 transport/viewer is currently implemented.
+
+The retained protocol and `kidi::esp32` components must support other boards
+and peripherals. Automatic photo routing still prefers a saved verified Wi-Fi
+endpoint, with fallback only before capture for unavailable transport.
+Certificate/owner failures and interrupted captures fail closed. These client
+and adapter behaviors do not establish new-hardware streaming readiness.
 The first product client is Android on explicitly qualified dual-Wi-Fi devices.
 iPhone support is deferred. The first implementation and validation will use
 macOS and Windows development clients; Android integration remains out of scope
@@ -25,15 +27,15 @@ for that prototype phase, but is the real-use client for version 1.
 
 | Client | Purpose | Required connection behavior | Current status |
 |---|---|---|---|
-| macOS laptop | Development, protocol validation, and recovery testing | Automated USB setup; accessory joins the laptop's existing LAN | USB setup and authenticated Wi-Fi photos hardware-tested |
+| macOS laptop | Development, protocol validation, and recovery testing | Automated USB setup; accessory joins the laptop's existing LAN | Retained tools tested on previous hardware; new board pending |
 | Windows laptop | The same development workflow | Automated USB setup; accessory joins the laptop's existing LAN | Native adapter implemented and parser-tested; Windows hardware validation pending |
 | Qualified Android phone | Real use in version 1 | BLE setup plus accessory Wi-Fi coexisting with internet/Android Auto | Designed; integration and device qualification remain pending |
 
-All three use the same accessory firmware, identity, ownership records,
-command schema, TLS authentication, and media framing. Development uses trusted
-USB setup and the module's station interface; Android uses BLE setup and the
-module's SoftAP. These are connection/setup adapters, not separate media
-implementations. Moving ownership between clients must not require reflashing.
+All three should use the same host application protocol, identity, ownership
+records and TLS authentication. The P4 application and C6 co-processor firmware
+are separate chip images, not separate firmware branches for each client.
+Development uses trusted USB plus station mode; Android uses BLE setup and
+SoftAP. Moving ownership between clients must not require reflashing.
 
 ## 1. Requirements
 
@@ -50,11 +52,13 @@ implementations. Moving ownership between clients must not require reflashing.
 - Authenticate the accessory and controller, not just their network addresses.
 - Preserve one application protocol across transports rather than implementing
   separate home/car/outdoors workflows.
-- Default media profiles remain 2048x1536 stills, 1280x720 video, and 16 kHz
-  mono PCM16 speech audio. The user explicitly approved this reduction from
-  the earlier 48 kHz diagnostic profile.
+- The retained reference profiles are JPEG stills, 1280x720 JPEG video and
+  16 kHz mono PCM16. New hardware must explicitly advertise supported sizes
+  and codecs; the old 2048x1536 still default is not a P4 ISP guarantee.
+- H.264 requires negotiated codec metadata, framing and client decoding.
+  Preserve JPEG/PCM interoperability; never relabel raw/H.264 bytes as JPEG.
 - Do not start capture merely because a paired client reconnects.
-- Do not integrate Android or change firmware during this design task.
+- Android integration and production BLE pairing remain separate tasks.
 
 ## 2. Android-First Connection Model
 
@@ -113,7 +117,7 @@ The supported accessory configuration requires:
 - An eligible foreground connection request. Background persistence and
   reconnection need separate platform validation; companion association is
   not an exemption from Wi-Fi or background-execution rules.
-- Coexistence on the actual channel/band combinations: the ESP32-S3 accessory
+- Coexistence on the actual channel/band combinations: the ESP32-C6 radio
   uses 2.4 GHz, while the router/car link may use another band.
 - Successful operation with the actual phone, OS build, and head unit.
 
@@ -179,9 +183,9 @@ network on the same reachable LAN. The laptop may use a different router band;
 both do not have to share a radio channel if the router bridges those networks.
 Ethernet and a second laptop Wi-Fi interface are not prerequisites.
 
-ESP32-S3 supports AP+STA mode. One TLS/media service can serve both module
-interfaces with the same identity, credentials, and command handlers. This is
-not an internet router or a bridge between the accessory subnet and the LAN.
+The C6 Wi-Fi/hosted stack must be configured and qualified for AP+STA mode.
+One host TLS/media service should serve both interfaces with the same identity
+and handlers. This is not an internet router or a subnet bridge.
 
 The module has one radio: its AP and STA share the station's channel when the
 station is connected. Do not connect, roam, or change this profile in the middle
@@ -201,12 +205,9 @@ limits instead of disconnecting the laptop or trying arbitrary other networks.
   do not imply enough radio interfaces for multiple concurrent SoftAP links.
 - Background or unattended capture without a separately approved UX/policy.
 
-The earlier Wi-Fi Aware research remains relevant to future platforms, not to
-this baseline. The current Espressif component lists ESP32-S31, not the W11's
-ESP32-S3, and secured iPhone compatibility requires a newer SDK. Its
-component-wide peer-platform configuration also needs single-firmware
-interoperability validation. Do not assume a reflash alone solves future
-iPhone connectivity.
+The earlier Wi-Fi Aware research is not a capability claim for the proposed
+C6 radio. Verify the exact SoC, hosted stack, SDK and peer-platform requirements
+before adding it. Do not assume a reflash alone solves iPhone connectivity.
 
 ## 4. Architecture Without Scenario-Specific Branches
 
@@ -321,9 +322,9 @@ requirement to fit the current framework.
   fail authentication afterward.
 - Rebooting must not undo revocation or reopen pairing.
 
-The W11's B button could provide physical authorization while firmware is
-already running. GPIO0 is a boot strap: holding it across reset enters the ROM
-bootloader, so pairing instructions must not use a BOOT/reset sequence.
+A board-specific physical action should authorize recovery while firmware is
+running. Determine boot-strap pins from the selected board's schematic; pairing
+instructions must not repurpose a BOOT/reset sequence.
 
 Development USB enrollment is an explicit privileged path, not a wireless
 authentication bypass. It must not silently replace an existing owner.
@@ -427,16 +428,15 @@ handler for the whole recording.
   credentials or accepting device data.
 - Do not require internet access, external analytics, or a relay service.
 
-The W11 RGB LED shares GPIO48 with camera data. It cannot be treated as a
-reliable independent recording indicator while camera DMA owns that pin.
-Use client indicators in the prototype; a dependable product-level hardware
-recording indicator needs a non-conflicting pin/hardware design.
+A dependable recording indicator needs a non-conflicting board pin/hardware
+design. Do not assume an onboard LED is independent of camera, SDIO, USB or
+audio signals. Use client indicators until the physical design is verified.
 
 ### At-Rest Limitation
 
-Secure Boot and flash encryption were disabled in the diagnosed board.
+Do not assume Secure Boot, flash or NVS encryption is enabled on a new board.
 Preferences/NVS persistence alone is not encrypted secret storage. Physical
-flash access is outside the first network prototype's protection boundary.
+flash access remains outside the reference network prototype's boundary.
 
 Production flash/NVS encryption, secure boot, manufacturing credentials, and
 recovery must be a separate reviewed hardening step. Do not burn irreversible
@@ -445,9 +445,9 @@ provisioned, flash backups must continue to be treated as private.
 
 ## 8. macOS/Windows Development and Android Version-1 Plan
 
-The laptop USB-setup/HTTPS-photo slice is implemented. The following milestones
-also describe broader work not yet implemented, including production BLE,
-live media delivery, and Android integration.
+Laptop setup/HTTPS/media components are retained from the previous prototype.
+The following milestones require revalidation on the P4/C6 hardware; production
+BLE, the new camera/audio backends and Android integration are not implemented.
 
 ### Shared Desktop Client
 
@@ -589,8 +589,9 @@ not directly invoke model inference or duplicate its preprocessing.
 - Pairing is unavailable outside the authorized window.
 - Owner transfer survives reboot; the previous owner cannot reconnect.
 - Device identity is stable while IP/BLE addresses may change.
-- Default photo decodes to 2048x1536; audio declares and delivers 16 kHz PCM16;
-  video frames decode to 1280x720.
+- Photos/video decode to the requested advertised size and codec; audio
+  declares and delivers the negotiated sample format. Unsupported modes fail
+  before capture rather than silently using a different resolution or codec.
 - Report actual distinct frames, timestamps, payload throughput, and audio
   sample continuity rather than nominal playback FPS.
 - Disconnects, permission denial, client process death, occupied radio interfaces,
@@ -608,6 +609,8 @@ not directly invoke model inference or duplicate its preprocessing.
 3. Which saved-network credential APIs/permissions can we support on the chosen
    macOS and Windows releases?
 4. How will the product provide a non-conflicting recording indicator?
+5. Which exact P4/C6 board revision, hosted link, camera cable/power setup and
+   audio codec will be used, and which SDK components support them?
 
 These are product and feasibility decisions, not branches to conceal inside
 the transport implementation.
@@ -627,4 +630,6 @@ the transport implementation.
 - [Espressif Wi-Fi Aware component README, verified revision](https://github.com/espressif/esp-wifi-apps/blob/ec06a61dd570c6805d817e70aec98011352765a0/components/wifi_aware/README.md).
 - [ESP-IDF 4.4 protocomm security capabilities](https://docs.espressif.com/projects/esp-idf/en/v4.4.8/esp32s3/api-reference/provisioning/protocomm.html).
 - [ESP32-S3 station/AP coexistence](https://docs.espressif.com/projects/esp-idf/en/v4.4.8/esp32s3/api-guides/wifi.html).
+- [ESP-Hosted co-processor integration](https://github.com/espressif/esp-hosted-mcu).
+- [Espressif camera/ISP sensor support](https://github.com/espressif/esp-video-components/tree/master/esp_cam_sensor).
 - [Windows Wi-Fi profile credential access and permissions](https://learn.microsoft.com/en-us/windows/win32/api/wlanapi/nf-wlanapi-wlangetprofile).

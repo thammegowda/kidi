@@ -173,6 +173,7 @@ def packets(source, resolution="1280x720"):
     audio_next = 0
     video_next = 0
     audio_bytes = None
+    with_audio = False
     while True:
         header = read_exact(source, HEADER.size)
         kind, sequence, timestamp, length = HEADER.unpack(header)
@@ -187,6 +188,9 @@ def packets(source, resolution="1280x720"):
             if (info["protocol"], info["width"], info["height"]) != (1, width, height) or info["sample_rate"] not in (16000, 48000):
                 raise wifi.SetupError("Unsupported live media format")
             audio_bytes = info["sample_rate"] // 50 * 2
+            if not isinstance(info["audio"], bool):
+                raise wifi.SetupError("Invalid audio-enabled metadata")
+            with_audio = info["audio"]
             started = True
         if kind == 1:
             if sequence != video_next or not payload.startswith(b"\xff\xd8") or not payload.endswith(b"\xff\xd9"):
@@ -195,11 +199,17 @@ def packets(source, resolution="1280x720"):
                 raise wifi.SetupError("Actual JPEG dimensions differ from the requested live resolution")
             video_next += 1
         elif kind == 2:
+            if not with_audio:
+                raise wifi.SetupError("Unexpected audio in a video-only stream")
             if sequence != audio_next or length % audio_bytes != 0 or timestamp != sequence * 20000:
                 raise wifi.SetupError("Live audio discontinuity")
             audio_next += length // audio_bytes
         elif kind == 3:
             info = json.loads(payload)
+            if "sdk_diagnostics" in info:
+                print("Accessory SDK diagnostic:", info["sdk_diagnostics"], file=sys.stderr)
+                if info.get("sdk_diagnostics_truncated"):
+                    print("Accessory SDK diagnostics exceeded their bounded buffer.", file=sys.stderr)
             if info.get("audio_dropped", 0) or info.get("audio_overruns", 0):
                 raise wifi.SetupError(
                     f"Live audio queue/DMA overrun: dropped={info.get('audio_dropped', 0)}, "
@@ -219,28 +229,56 @@ def check_stream(args):
     samples = 0
     first = None
     last = 0
+    video_bytes = 0
+    gaps = []
+    received_previous = None
+    summary = {}
     started = time.monotonic()
     try:
         for header, payload in packets(source, args.resolution):
             kind, _, timestamp, _ = HEADER.unpack(header)
             if kind == 1:
+                received = time.monotonic()
+                if received_previous is not None:
+                    gaps.append(received - received_previous)
+                received_previous = received
                 frames += 1
+                video_bytes += len(payload)
                 first = timestamp if first is None else first
                 last = timestamp
             elif kind == 2:
                 samples += len(payload) // 2
             elif kind == 3:
                 print("Live status:", payload.decode())
+            elif kind == 4:
+                summary = json.loads(payload)
     finally:
         source.close()
     elapsed = time.monotonic() - started
     if frames < 2 or (args.mode == "av" and samples == 0):
         raise wifi.SetupError("Live test did not receive usable media")
+    if args.mode == "video" and samples != 0:
+        raise wifi.SetupError("Video-only check received unexpected audio")
+    measured_seconds = max(args.seconds, elapsed)
+    delivered_fps = frames / measured_seconds
+    report = {
+        "transport": source.transport, "resolution": args.resolution, "mode": args.mode,
+        "frames": frames, "audio_samples": samples, "requested_seconds": args.seconds,
+        "received_seconds": elapsed, "delivered_fps": delivered_fps,
+        "video_bytes": video_bytes, "payload_mbps": video_bytes * 8 / measured_seconds / 1e6,
+        "max_frame_gap_seconds": max(gaps, default=0),
+        "camera_first_seconds": first / 1e6, "camera_last_seconds": last / 1e6,
+        "device": summary,
+    }
+    print("Live report:", json.dumps(report, sort_keys=True))
     print(
         f"Live {source.transport.upper()} {args.resolution}: {frames} frames, {samples} audio samples; "
-        f"{frames / args.seconds:.2f} fps over requested {args.seconds}s, "
+        f"{delivered_fps:.2f} delivered fps, "
         f"camera timestamps {first / 1e6:.3f}..{last / 1e6:.3f}s, received in {elapsed:.3f}s; no files saved"
     )
+    if args.min_fps is not None and delivered_fps < args.min_fps:
+        raise wifi.SetupError(f"Delivered {delivered_fps:.2f} fps, below required {args.min_fps:.2f}")
+    return report
 
 
 def serve_viewer(args):
@@ -257,7 +295,11 @@ def serve_viewer(args):
                 self.send_error(403)
                 return
             if self.path == "/":
-                html = (ROOT / "tools/live.html").read_text().replace("VIEWER_TOKEN", json.dumps(token))
+                html = (
+                    (ROOT / "tools/live.html").read_text()
+                    .replace("VIEWER_TOKEN", json.dumps(token))
+                    .replace("VIEWER_AUDIO", "true" if args.mode == "av" else "false")
+                )
                 data = html.encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -317,16 +359,19 @@ def serve_viewer(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("video", "av"), default="av")
+    parser.add_argument("--mode", choices=("video", "av"), default="video")
     parser.add_argument("--transport", choices=("auto", "wifi", "usb"), default="auto")
     parser.add_argument("--seconds", type=int, default=300, help="Safety limit, 1-300 seconds; Start can be pressed again")
     parser.add_argument("--port", default="auto")
     parser.add_argument("--device")
     parser.add_argument("--resolution", choices=tuple(RESOLUTIONS), default="1280x720")
     parser.add_argument("--check", action="store_true", help="Receive and validate media without opening a viewer")
+    parser.add_argument("--min-fps", type=float, help="Fail a headless check below this delivered FPS")
     args = parser.parse_args()
     if not 1 <= args.seconds <= 300:
         parser.error("--seconds must be 1 to 300")
+    if args.min_fps is not None and (not args.check or not 0 < args.min_fps <= 60):
+        parser.error("--min-fps requires --check and a value above 0 and at most 60")
     if args.check:
         check_stream(args)
     else:

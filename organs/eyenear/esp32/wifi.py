@@ -290,7 +290,7 @@ def usb_request(device, command, timeout=35):
                 raise SetupError(error)
             return response
         if line.startswith(b"KIDI_ERROR unknown command"):
-            raise WifiUnavailable("Installed firmware has no Wi-Fi setup interface; run make flash")
+            raise WifiUnavailable("Installed firmware has no Kidi Wi-Fi setup interface; install a compatible board-specific firmware")
     raise WifiUnavailable("USB Wi-Fi setup response timed out")
 
 
@@ -563,7 +563,7 @@ def setup_usb(device, requested_ssid=None, check_network=False):
     if reply["device_id"] != profile["device_id"] or reply["certificate"] != profile["certificate"]:
         raise SecurityError("Device identity changed during setup")
     if not reply["ready"]:
-        raise WifiUnavailable("Device joined without a ready secure photo server")
+        raise WifiUnavailable("Device joined without a ready secure accessory server")
     profile.update(address=reply["address"], port=reply["port"])
     save_profile(profile)
     return profile
@@ -785,7 +785,7 @@ def main():
         if args.command == "setup":
             profile = setup_usb(device, args.ssid, check_network=True)
             wifi_status(profile)
-            print(f"Secure Wi-Fi photo endpoint ready: {profile['address']}:{profile['port']}")
+            print(f"Secure Wi-Fi accessory endpoint ready: {profile['address']}:{profile['port']}")
             return
         if args.transport == "usb":
             usb_capture(device, args)

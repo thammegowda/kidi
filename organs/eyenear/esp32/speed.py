@@ -58,11 +58,19 @@ def transfer(profile, direction, size, block_size):
             for name, value in headers.items():
                 connection.putheader(name, value)
             connection.endheaders()
-            for offset in range(0, size, block_size):
-                if time.monotonic() - start > 65:
-                    raise TimeoutError("Upload speed test exceeded 65 seconds")
-                connection.send(pattern(offset, min(block_size, size - offset)))
-            response = connection.getresponse()
+            response = None
+            try:
+                for offset in range(0, size, block_size):
+                    if time.monotonic() - start > 65:
+                        raise TimeoutError("Upload speed test exceeded 65 seconds")
+                    connection.send(pattern(offset, min(block_size, size - offset)))
+            except (BrokenPipeError, ConnectionResetError) as send_error:
+                try:
+                    response = connection.getresponse()
+                except (OSError, http.client.HTTPException):
+                    raise send_error
+            if response is None:
+                response = connection.getresponse()
             check_status(response)
             data = response.read(4097)
             if len(data) > 4096:

@@ -97,6 +97,18 @@ class LiveTest(unittest.TestCase):
         usb.assert_called_once_with("test-port", "video", 5, "1280x720")
         wireless.assert_not_called()
 
+    def test_unconfigured_media_backend_never_falls_back_to_usb(self):
+        args = Namespace(transport="auto", device=None, port="auto", mode="video",
+                         seconds=5, resolution="1280x720")
+        with (
+            patch.object(wifi, "cached_profile", return_value={}),
+            patch.object(live, "open_wifi_source", side_effect=wifi.SetupError("HTTP 501: camera backend not configured")),
+            patch.object(live, "open_usb_source") as usb,
+            self.assertRaisesRegex(wifi.SetupError, "camera backend not configured"),
+        ):
+            live.open_source(args)
+        usb.assert_not_called()
+
     def test_usb_stop_waits_for_acknowledgement_before_closing(self):
         class Usb(io.BytesIO):
             def __init__(self, payload):
@@ -156,6 +168,85 @@ class LiveTest(unittest.TestCase):
             + packet(4, 0, 1000000, END)
         )
         self.assertEqual(len(list(live.packets(self.source(data)))), 4)
+
+    def test_video_only_accepts_split_packets_and_rejects_audio(self):
+        metadata = json.loads(FORMAT)
+        metadata.update(audio=False, sample_rate=16000, target_fps=10, frame_buffers=1)
+        data = (
+            packet(3, 0, 0, json.dumps(metadata).encode())
+            + packet(1, 0, 10000, JPEG)
+            + packet(4, 1, 1000000, END)
+        )
+
+        class Fragmented(io.BytesIO):
+            def read(self, size):
+                return super().read(min(size, 7))
+
+        source = live.LiveSource(Fragmented(data))
+        self.assertEqual(len(list(live.packets(source))), 3)
+        with self.assertRaisesRegex(wifi.SetupError, "Unexpected audio"):
+            list(live.packets(self.source(
+                packet(3, 0, 0, json.dumps(metadata).encode()) + packet(2, 0, 0, b"\0\0" * 320)
+            )))
+
+    def test_sdk_cleanup_diagnostic_is_framed_and_visible(self):
+        diagnostic = b'{"sdk_diagnostics":"gdma_disconnect: no peripheral","sdk_diagnostics_truncated":true}'
+        errors = io.StringIO()
+        with patch("sys.stderr", errors):
+            result = list(live.packets(self.source(
+                packet(3, 0, 0, FORMAT) + packet(3, 0, 1000000, diagnostic)
+                + packet(4, 0, 1000000, END)
+            )))
+        self.assertEqual(len(result), 3)
+        self.assertIn("gdma_disconnect: no peripheral", errors.getvalue())
+        self.assertIn("bounded buffer", errors.getvalue())
+
+    def check_packets(self):
+        return [
+            (live.HEADER.pack(1, 0, 10000, len(JPEG)), JPEG),
+            (live.HEADER.pack(1, 1, 110000, len(JPEG)), JPEG),
+            (live.HEADER.pack(4, 2, 1000000, len(END)), END),
+        ]
+
+    def test_check_reports_delivered_rate_and_video_bytes(self):
+        args = Namespace(mode="video", resolution="1280x720", seconds=1, min_fps=2)
+        with (
+            patch.object(live, "open_source", return_value=self.source(b"")),
+            patch.object(live, "packets", return_value=iter(self.check_packets())),
+            patch.object(live.time, "monotonic", side_effect=[0, .01, .11, 1]),
+            patch("builtins.print"),
+        ):
+            report = live.check_stream(args)
+        self.assertEqual(report["delivered_fps"], 2)
+        self.assertEqual(report["video_bytes"], len(JPEG) * 2)
+        self.assertEqual(report["audio_samples"], 0)
+        self.assertAlmostEqual(report["max_frame_gap_seconds"], .1)
+        self.assertEqual(report["device"]["reason"], "duration_limit")
+
+    def test_check_does_not_hide_network_stalls_in_requested_duration(self):
+        args = Namespace(mode="video", resolution="1280x720", seconds=1, min_fps=1)
+        with (
+            patch.object(live, "open_source", return_value=self.source(b"")),
+            patch.object(live, "packets", return_value=iter(self.check_packets())),
+            patch.object(live.time, "monotonic", side_effect=[0, .01, 5, 10]),
+            patch("builtins.print"),
+            self.assertRaisesRegex(wifi.SetupError, "below required"),
+        ):
+            live.check_stream(args)
+
+    def test_cli_defaults_to_video_and_validates_fps_requirement(self):
+        with patch("sys.argv", ["live.py", "--check"]), patch.object(live, "check_stream") as check:
+            live.main()
+        self.assertEqual(check.call_args.args[0].mode, "video")
+        for extra in (["--min-fps", "10"], ["--check", "--min-fps", "nan"], ["--check", "--min-fps", "0"]):
+            with (
+                self.subTest(arguments=extra),
+                patch("sys.argv", ["live.py", *extra]),
+                patch("sys.stderr", io.StringIO()),
+                self.assertRaises(SystemExit) as error,
+            ):
+                live.main()
+            self.assertEqual(error.exception.code, 2)
 
 
 if __name__ == "__main__":

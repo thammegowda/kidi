@@ -16,9 +16,9 @@ SAMPLE_RATE = 16000
 def choose_port(requested):
     if requested and requested != "auto":
         return requested
-    ports = [port.device for port in list_ports.comports() if port.vid == 0x303A and port.pid == 0x1001]
+    ports = [port.device for port in list_ports.comports() if port.vid == 0x303A]
     if len(ports) != 1:
-        raise ValueError("Connect one ESP32 accessory or select its serial port with PORT=...")
+        raise ValueError("Connect one Espressif USB serial device or select the accessory's port with --port/PORT=...")
     return ports[0]
 
 
@@ -71,17 +71,6 @@ def capture(port, command, resolution=None, send_command=True, require_end=False
             return None
         if command == "temperature" and line.startswith("KIDI_TEMPERATURE"):
             return None
-        if command == "sensors" and line.startswith("KIDI_SENSORS "):
-            snapshot = json.loads(line.removeprefix("KIDI_SENSORS "))
-            if snapshot["schema_version"] != 1 or snapshot["timestamp_us"] < 0:
-                raise ValueError("Unsupported sensor snapshot schema or timestamp")
-            for name in ("chip_temperature", "imu", "board_temperature", "battery_rail"):
-                reading = snapshot[name]
-                if not reading["available"]:
-                    print(f"{name}: {reading['error']}", file=sys.stderr)
-            if "i2c_error" in snapshot:
-                print(snapshot["i2c_error"], file=sys.stderr)
-            return None
         if line.startswith("KIDI_PHOTO "):
             fields = dict(field.split("=") for field in line.split()[1:])
             reported_resolution = f"{fields['width']}x{fields['height']}"
@@ -95,7 +84,7 @@ def capture(port, command, resolution=None, send_command=True, require_end=False
         if resolution is not None and reported_resolution != resolution:
             raise ValueError(f"Requested {resolution}, but camera reported {reported_resolution}")
         if command.startswith("audio ") and not audio_format_verified:
-            raise ValueError("Firmware did not confirm the microphone sample format; update it with make flash")
+            raise ValueError("Firmware did not confirm the microphone sample format; install compatible board-specific firmware")
         _, kind, size = line.split()
         length = int(size)
         payload = read_payload(port, length, deadline)
@@ -235,7 +224,7 @@ def save_audio(path, payload):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("kind", choices=("status", "temperature", "sensors", "photo", "audio", "video", "av"))
+    parser.add_argument("kind", choices=("status", "temperature", "photo", "audio", "video", "av"))
     parser.add_argument("--port", default="auto")
     parser.add_argument("--seconds", type=int, default=5)
     parser.add_argument(
@@ -244,7 +233,7 @@ def main():
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    if args.kind not in ("status", "temperature", "sensors") and args.output is None:
+    if args.kind not in ("status", "temperature") and args.output is None:
         parser.error("--output is required for captures")
     if not 1 <= args.seconds <= 10:
         parser.error("--seconds must be 1 to 10")
@@ -270,7 +259,7 @@ def main():
             result = capture(port, command, resolution=args.resolution)
     finally:
         port.close()
-    if args.kind in ("status", "temperature", "sensors", "video", "av"):
+    if args.kind in ("status", "temperature", "video", "av"):
         return
     kind, payload = result
     if args.kind == "photo":

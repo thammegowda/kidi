@@ -2,7 +2,7 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kidi live camera and microphone</title>
+<title>Kidi live preview</title>
 <style>
 body { margin: 2rem auto; padding: 0 1rem; max-width: 960px; font: 16px system-ui; background: #181818; color: #eee; }
 canvas { width: 100%; background: black; }
@@ -12,11 +12,12 @@ pre { white-space: pre-wrap; }
 <h1>Kidi live preview</h1>
 <p>Local, authenticated accessory stream. No photos, audio, or video are saved.</p>
 <button id="start">Start</button><button id="stop" disabled>Stop</button>
-<label>Volume <input id="volume" type="range" min="0" max="16" value="8" step=".5"></label>
+<label id="audio-controls" hidden>Volume <input id="volume" type="range" min="0" max="16" value="8" step=".5"></label>
 <canvas id="camera" width="1280" height="720"></canvas>
 <pre id="status">Ready. Click Start to capture.</pre>
 <script>
 const token = VIEWER_TOKEN;
+const wantsAudio = VIEWER_AUDIO;
 const status = document.querySelector("#status");
 const canvas = document.querySelector("#camera");
 const drawing = canvas.getContext("2d");
@@ -48,16 +49,21 @@ startButton.onclick = async () => {
   stopButton.disabled = false;
   let frames = 0, started = performance.now();
   scheduled = 0;
-  const AudioContext = window.AudioContext || window.webkitAudioContext;
-  audio = new AudioContext({sampleRate: 48000});
-  await audio.resume();
-  const highpass = audio.createBiquadFilter();
-  highpass.type = "highpass"; highpass.frequency.value = 80;
-  gain = audio.createGain(); gain.gain.value = Number(document.querySelector("#volume").value);
-  const limiter = audio.createDynamicsCompressor();
-  highpass.connect(gain); gain.connect(limiter); limiter.connect(audio.destination);
+  let highpass;
+  document.querySelector("#audio-controls").hidden = true;
   let queued = new Uint8Array(0);
   try {
+    if (wantsAudio) {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      audio = new AudioContext({sampleRate: 48000});
+      await audio.resume();
+      highpass = audio.createBiquadFilter();
+      highpass.type = "highpass"; highpass.frequency.value = 80;
+      gain = audio.createGain(); gain.gain.value = Number(document.querySelector("#volume").value);
+      const limiter = audio.createDynamicsCompressor();
+      highpass.connect(gain); gain.connect(limiter); limiter.connect(audio.destination);
+      document.querySelector("#audio-controls").hidden = false;
+    }
     status.textContent = "Connecting and starting capture...";
     const response = await fetch("/stream", {headers: {"X-Kidi-Viewer": token}, signal: controller.signal});
     if (!response.ok) throw new Error(`Connection failed: HTTP ${response.status}. See terminal.`);
@@ -108,6 +114,7 @@ startButton.onclick = async () => {
             canvas.width = info.width;
             canvas.height = info.height;
             audioSampleRate = info.sample_rate;
+            if (info.audio !== wantsAudio) throw new Error("Accessory audio mode differs from the requested preview.");
           }
           const fps = frames * 1000 / Math.max(1, performance.now() - started);
           status.textContent = `Received ${frames} frames (${fps.toFixed(1)} fps)\n${JSON.stringify(info, null, 2)}`;

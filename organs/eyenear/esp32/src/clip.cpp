@@ -2,10 +2,6 @@
 #include "camera.h"
 #include "clip.h"
 #include "audio.h"
-#include "stream.h"
-#include "sensors.h"
-#include "w11.h"
-#include "wireless.h"
 
 #include <atomic>
 #include <cstddef>
@@ -19,12 +15,7 @@ namespace kidi::esp32 {
 namespace {
 
 constexpr std::uint32_t SAMPLE_RATE = AUDIO_SAMPLE_RATE;
-constexpr I2sPort MICROPHONE_PORT = I2S_NUM_0;
-constexpr CameraFrameSize VIDEO_FRAME_SIZE = FRAMESIZE_HD;
-constexpr std::size_t USB_RX_BUFFER_SIZE = 8192;
-constexpr std::size_t USB_TX_BUFFER_SIZE = 4096;
-constexpr std::uint32_t USB_TX_TIMEOUT_MS = 1000;
-using BoardPins = W11Pins;
+constexpr CameraProfile VIDEO_PROFILE = CameraProfile::VIDEO_HD;
 
 class ClipOutput : public Print {
 public:
@@ -46,6 +37,7 @@ public:
 };
 
 SemaphoreHandle CLIP_MUTEX = nullptr;
+MediaExecutionConfig execution;
 ClipOutput clip_output;
 bool clip_failed = false;
 
@@ -59,33 +51,6 @@ auto report_clip_error(const char* operation, Error error) -> void {
     clip_output.printf("KIDI_ERROR %s: %s (0x%x)\n", operation, esp_err_to_name(error), static_cast<unsigned>(error));
 }
 
-auto write_usb_clip(const std::uint8_t* data, std::size_t length, void*) -> Error {
-    if (!Serial) return ESP_ERR_INVALID_STATE;
-    if (Serial.available()) {
-        auto command = Serial.readStringUntil('\n');
-        command.trim();
-        if (command == "stream-stop") return STREAM_CANCELLED;
-        Serial.println("KIDI_ERROR unexpected command during media transfer");
-        return ESP_ERR_INVALID_ARG;
-    }
-    return Serial.write(data, length) == length ? ESP_OK : ESP_FAIL;
-}
-
-auto write_usb_photo(const PhotoFrame& frame, void*) -> Error {
-    Serial.printf("KIDI_PHOTO width=%u height=%u\n", static_cast<unsigned>(frame.width),
-                  static_cast<unsigned>(frame.height));
-    Serial.printf("KIDI_BEGIN jpeg %u\n", static_cast<unsigned>(frame.size));
-    const auto written = Serial.write(frame.data, frame.size);
-    Serial.println();
-    Serial.println("KIDI_END");
-    return written == frame.size ? ESP_OK : ESP_FAIL;
-}
-
-auto capture_photo(CameraFrameSize frame_size = FRAMESIZE_QXGA) -> void {
-    const auto result = capture_photo_to(frame_size, write_usb_photo, nullptr);
-    if (result != ESP_OK) report_error("USB photo", result);
-}
-
 auto stream_video_frames(std::int64_t start, std::int64_t duration, unsigned& frame_count) -> bool {
     constexpr std::int64_t FRAME_INTERVAL_US = 100000;
     auto next_frame = start;
@@ -97,27 +62,28 @@ auto stream_video_frames(std::int64_t start, std::int64_t duration, unsigned& fr
             continue;
         }
         const auto acquisition_start = esp_timer_get_time();
-        CameraFrame* frame = esp_camera_fb_get();
+        CameraFrame frame;
+        const auto frame_result = acquire_camera_frame(frame);
         acquisition_us += esp_timer_get_time() - acquisition_start;
-        if (frame == nullptr) {
+        if (frame_result != ESP_OK) {
             report_clip_error("video frame capture failed");
             return false;
         }
         // The camera timestamp marks acquisition, not completion of USB transfer.
-        const auto timestamp = frame->timestamp.tv_sec * 1000000LL + frame->timestamp.tv_usec - start;
+        const auto timestamp = frame.timestamp_us - start;
         if (timestamp < 0 || timestamp >= duration) {
-            esp_camera_fb_return(frame);
+            return_camera_frame(frame);
             continue;
         }
-        const auto length = frame->len;
+        const auto length = frame.size;
         const auto transfer_start = esp_timer_get_time();
         clip_output.printf("KIDI_FRAME %llu %u\n", static_cast<unsigned long long>(timestamp),
                            static_cast<unsigned>(length));
-        const auto written = clip_output.write(frame->buf, length);
+        const auto written = clip_output.write(frame.data, length);
         clip_output.println();
         clip_output.println("KIDI_END");
         transfer_us += esp_timer_get_time() - transfer_start;
-        esp_camera_fb_return(frame);
+        return_camera_frame(frame);
         if (written != length) {
             report_clip_error("incomplete video frame transfer");
             return false;
@@ -137,7 +103,7 @@ auto capture_video(unsigned seconds) -> void {
         report_clip_error("video duration must be 1 to 10 seconds");
         return;
     }
-    const auto prepared = prepare_camera(VIDEO_FRAME_SIZE);
+    const auto prepared = prepare_camera({VIDEO_PROFILE, 1, 12});
     if (prepared != ESP_OK) {
         report_clip_error("video camera preparation", prepared);
         return;
@@ -165,8 +131,8 @@ auto read_microphone(std::uint8_t* destination, std::size_t length) -> bool {
     return result == ESP_OK;
 }
 
-auto start_microphone(QueueHandle* events = nullptr) -> bool {
-    const auto result = start_audio(events);
+auto start_microphone() -> bool {
+    const auto result = start_audio();
     if (result != ESP_OK) {
         report_clip_error("microphone initialization", result);
         return false;
@@ -191,14 +157,14 @@ auto capture_audio(unsigned seconds) -> void {
     }
     std::uint8_t warmup[4096];
     if (!read_microphone(warmup, sizeof(warmup))) {
-        const auto cleanup = i2s_driver_uninstall(MICROPHONE_PORT);
+        const auto cleanup = stop_audio();
         if (cleanup != ESP_OK) report_clip_error("microphone shutdown", cleanup);
         std::free(samples);
         return;
     }
     clip_output.printf("KIDI_RECORDING %u seconds\n", seconds);
     auto success = read_microphone(samples, length);
-    const auto result = i2s_driver_uninstall(MICROPHONE_PORT);
+    const auto result = stop_audio();
     if (result != ESP_OK) {
         report_clip_error("microphone shutdown", result);
         success = false;
@@ -218,7 +184,6 @@ struct ConcurrentAudio {
     std::uint8_t* samples = nullptr;
     std::size_t length = 0;
     std::size_t received = 0;
-    QueueHandle events = nullptr;
     SemaphoreHandle ready = nullptr;
     SemaphoreHandle done = nullptr;
     std::atomic<bool> cancel{false};
@@ -226,21 +191,24 @@ struct ConcurrentAudio {
     std::int64_t started = 0;
     std::int64_t finished = 0;
     std::int64_t max_read_time = 0;
+    unsigned baseline_overruns = 0;
     unsigned overruns = 0;
 };
 
-auto drain_microphone_events(ConcurrentAudio& audio) -> void {
-    I2sEvent event;
-    while (xQueueReceive(audio.events, &event, 0) == pdTRUE) {
-        if (event.type == I2S_EVENT_RX_Q_OVF || event.type == I2S_EVENT_DMA_ERROR) ++audio.overruns;
-    }
+auto update_microphone_stats(ConcurrentAudio& audio) -> void {
+    AudioStats stats;
+    const auto result = read_audio_stats(stats);
+    if (result != ESP_OK && audio.result.load() == ESP_OK) audio.result.store(result);
+    const auto total = stats.overruns + stats.dma_errors;
+    audio.overruns = total >= audio.baseline_overruns ? total - audio.baseline_overruns : total;
 }
 
 auto record_concurrent_audio(void* argument) -> void {
     auto& audio = *static_cast<ConcurrentAudio*>(argument);
     std::uint8_t warmup[4096];
     audio.result = read_microphone_bytes(warmup, sizeof(warmup));
-    drain_microphone_events(audio);
+    update_microphone_stats(audio);
+    audio.baseline_overruns = audio.overruns;
     audio.overruns = 0;
     audio.started = esp_timer_get_time();
     xSemaphoreGive(audio.ready);
@@ -251,7 +219,7 @@ auto record_concurrent_audio(void* argument) -> void {
         audio.result = read_microphone_bytes(audio.samples + audio.received, block);
         const auto elapsed = esp_timer_get_time() - before;
         if (elapsed > audio.max_read_time) audio.max_read_time = elapsed;
-        drain_microphone_events(audio);
+        update_microphone_stats(audio);
         if (audio.result.load() == ESP_OK) audio.received += block;
     }
     audio.finished = esp_timer_get_time();
@@ -276,15 +244,16 @@ auto capture_av(unsigned seconds) -> void {
         std::free(audio.samples);
         return;
     }
-    const auto camera_result = prepare_camera(VIDEO_FRAME_SIZE);
+    const auto camera_result = prepare_camera({VIDEO_PROFILE, 1, 12});
     const auto camera_ready = camera_result == ESP_OK;
     if (!camera_ready) report_clip_error("AV camera preparation", camera_result);
-    const auto microphone_ready = camera_ready && start_microphone(&audio.events);
+    const auto microphone_ready = camera_ready && start_microphone();
     auto video_success = false;
     unsigned frame_count = 0;
     if (microphone_ready) {
         const auto task_created =
-            xTaskCreatePinnedToCore(record_concurrent_audio, "kidi-mic", 8192, &audio, 2, nullptr, 0) == pdPASS;
+            xTaskCreatePinnedToCore(record_concurrent_audio, "kidi-mic", execution.audio_stack, &audio,
+                                    execution.audio_priority, nullptr, execution.audio_core) == pdPASS;
         if (!task_created) {
             report_clip_error("concurrent microphone task creation failed");
         } else {
@@ -326,7 +295,7 @@ auto capture_av(unsigned seconds) -> void {
         }
     }
     if (microphone_ready) {
-        const auto result = i2s_driver_uninstall(MICROPHONE_PORT);
+        const auto result = stop_audio();
         if (result != ESP_OK) report_clip_error("microphone shutdown", result);
     }
     if (camera_ready) {
@@ -338,15 +307,24 @@ auto capture_av(unsigned seconds) -> void {
     std::free(audio.samples);
 }
 
-auto print_status() -> void {
-    Serial.printf("KIDI_STATUS flash=%u psram=%u free_psram=%u sample_rate=%u video=1280x720\n", ESP.getFlashChipSize(),
-                  ESP.getPsramSize(), ESP.getFreePsram(), SAMPLE_RATE);
-    Serial.println(
-        "KIDI_READY commands: status, temperature, sensors, photo [640x480|2048x1536], audio <1-10>, video <1-10>, av "
-        "<1-10>");
+} // namespace
+
+auto initialize_media(const MediaExecutionConfig& configuration) -> Error {
+    if (CLIP_MUTEX != nullptr) return ESP_ERR_INVALID_STATE;
+    const auto valid_core = [](BaseType_t core) {
+        return core == tskNO_AFFINITY || (core >= 0 && core < portNUM_PROCESSORS);
+    };
+    if (!valid_core(configuration.camera_core) || !valid_core(configuration.audio_core) ||
+        configuration.camera_priority >= configMAX_PRIORITIES || configuration.audio_priority >= configMAX_PRIORITIES ||
+        configuration.camera_stack == 0 || configuration.audio_stack == 0)
+        return ESP_ERR_INVALID_ARG;
+    CLIP_MUTEX = xSemaphoreCreateMutex();
+    if (CLIP_MUTEX == nullptr) return ESP_ERR_NO_MEM;
+    execution = configuration;
+    return ESP_OK;
 }
 
-} // namespace
+auto media_execution_config() -> const MediaExecutionConfig& { return execution; }
 
 auto clip_busy() -> bool { return CLIP_MUTEX == nullptr || uxSemaphoreGetCount(CLIP_MUTEX) == 0; }
 
@@ -385,95 +363,4 @@ auto capture_clip(ClipKind kind, unsigned seconds, ClipWriter writer, void* cont
     return result;
 }
 
-auto initialize() -> void {
-    const auto rx_size = Serial.setRxBufferSize(USB_RX_BUFFER_SIZE);
-    const auto tx_size = Serial.setTxBufferSize(USB_TX_BUFFER_SIZE);
-    Serial.setTxTimeoutMs(USB_TX_TIMEOUT_MS);
-    Serial.begin(115200);
-    if (rx_size != USB_RX_BUFFER_SIZE) report_error("USB receive buffer allocation", ESP_ERR_NO_MEM);
-    if (tx_size != USB_TX_BUFFER_SIZE) report_error("USB transmit buffer allocation", ESP_ERR_NO_MEM);
-    Serial.setTimeout(1000);
-    const auto start = millis();
-    while (!Serial && millis() - start < 3000) delay(10);
-    const auto camera_result = initialize_camera();
-    if (camera_result != ESP_OK) report_error("camera mutex initialization", camera_result);
-    CLIP_MUTEX = xSemaphoreCreateMutex();
-    if (CLIP_MUTEX == nullptr) report_error("capture mutex initialization", ESP_ERR_NO_MEM);
-    Serial.println("KIDI_W11_USB_WIFI_DIAGNOSTIC v8");
-    print_status();
-    initialize_wireless();
-}
-
-auto poll() -> void {
-    poll_wireless();
-    if (!Serial.available()) {
-        delay(10);
-        return;
-    }
-    auto command = Serial.readStringUntil('\n');
-    command.trim();
-    if (handle_wireless_command(command)) return;
-    if (command == "status") {
-        print_status();
-    } else if (command == "temperature") {
-        print_temperature();
-    } else if (command == "sensors") {
-        print_sensors();
-    } else if (command == "stream-stop") {
-        Serial.println("KIDI_STREAM_STOPPED");
-    } else if (command == "photo") {
-        capture_photo();
-    } else if (command == "photo 640x480") {
-        capture_photo(FRAMESIZE_VGA);
-    } else if (command == "photo 2048x1536") {
-        capture_photo(FRAMESIZE_QXGA);
-    } else if (command.startsWith("stream ")) {
-        const auto separator = command.indexOf(' ', 7);
-        const auto kind = command.substring(7, separator);
-        const auto resolution_separator = command.indexOf(' ', separator + 1);
-        const auto duration = resolution_separator < 0 ? command.substring(separator + 1)
-                                                       : command.substring(separator + 1, resolution_separator);
-        const auto stream_resolution =
-            resolution_separator < 0 ? String("1280x720") : command.substring(resolution_separator + 1);
-        auto valid = separator > 7 && duration.length() > 0 && duration.length() <= 3;
-        for (unsigned index = 0; index < duration.length(); ++index)
-            valid = valid && duration[index] >= '0' && duration[index] <= '9';
-        if (!valid || (kind != "video" && kind != "av") ||
-            (stream_resolution != "1280x720" && stream_resolution != "96x96")) {
-            Serial.println("KIDI_ERROR invalid stream request");
-        } else {
-            const auto result = stream_media(kind == "av", static_cast<unsigned>(duration.toInt()), write_usb_clip,
-                                             nullptr, stream_resolution == "96x96" ? FRAMESIZE_96X96 : FRAMESIZE_HD);
-            if (result != ESP_OK) report_error("USB stream", result);
-            Serial.println("KIDI_STREAM_STOPPED");
-        }
-    } else if (command.startsWith("audio ") || command.startsWith("video ") || command.startsWith("av ")) {
-        const auto duration = command.substring(command.startsWith("av ") ? 3 : 6);
-        auto valid = duration.length() > 0;
-        for (unsigned index = 0; index < duration.length(); ++index) {
-            valid = valid && duration[index] >= '0' && duration[index] <= '9';
-        }
-        if (!valid || duration.length() > 2) {
-            Serial.println("KIDI_ERROR invalid capture duration");
-        } else if (command.startsWith("video ")) {
-            const auto result =
-                capture_clip(ClipKind::VIDEO, static_cast<unsigned>(duration.toInt()), write_usb_clip, nullptr);
-            if (result != ESP_OK) report_error("USB video", result);
-        } else if (command.startsWith("av ")) {
-            const auto result =
-                capture_clip(ClipKind::AV, static_cast<unsigned>(duration.toInt()), write_usb_clip, nullptr);
-            if (result != ESP_OK) report_error("USB AV", result);
-        } else {
-            const auto result =
-                capture_clip(ClipKind::AUDIO, static_cast<unsigned>(duration.toInt()), write_usb_clip, nullptr);
-            if (result != ESP_OK) report_error("USB audio", result);
-        }
-    } else {
-        Serial.println("KIDI_ERROR unknown command");
-    }
-}
-
 } // namespace kidi::esp32
-
-auto setup() -> void { kidi::esp32::initialize(); }
-auto loop() -> void { kidi::esp32::poll(); }

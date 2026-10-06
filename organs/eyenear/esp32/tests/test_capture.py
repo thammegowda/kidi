@@ -11,7 +11,7 @@ from unittest.mock import patch
 import wave
 
 
-spec = importlib.util.spec_from_file_location("w11_capture", Path(__file__).resolve().parents[1] / "capture.py")
+spec = importlib.util.spec_from_file_location("esp32_capture", Path(__file__).resolve().parents[1] / "capture.py")
 capture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(capture)
 
@@ -34,7 +34,7 @@ class FakePort(io.BytesIO):
 
 class CaptureTest(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="w11-capture-test-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="esp32-capture-test-")
         self.addCleanup(self.temporary.cleanup)
         self.output = Path(self.temporary.name) / "capture"
         self.pcm = struct.pack(
@@ -187,20 +187,39 @@ class CaptureTest(unittest.TestCase):
             self.assertIsNone(capture.capture(port, "temperature"))
         self.assertEqual(port.commands, [b"temperature\n"])
 
-    def test_sensor_snapshot_reports_unavailable_devices(self):
-        snapshot = {
-            "schema_version": 1, "timestamp_us": 123, "cpu_mhz": 240,
-            "chip_temperature": {"available": True, "celsius": 42.5},
-            "imu": {"available": True, "acceleration_g": [0, 0, 1], "gyroscope_dps": [0, 0, 0]},
-            "board_temperature": {"available": False, "error": "STS35 not detected"},
-            "battery_rail": {"available": True, "voltage_v": 4.1, "battery_presence": "unknown"},
-        }
-        port = FakePort(("KIDI_SENSORS " + json.dumps(snapshot) + "\n").encode())
-        errors = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
-            self.assertIsNone(capture.capture(port, "sensors"))
-        self.assertIn("STS35 not detected", errors.getvalue())
-        self.assertEqual(port.commands, [b"sensors\n"])
+    def test_removed_board_sensor_command_is_rejected_before_serial_access(self):
+        with (
+            patch("sys.argv", ["capture.py", "sensors"]),
+            contextlib.redirect_stderr(io.StringIO()),
+            patch.object(capture.serial, "Serial") as serial_port,
+            self.assertRaises(SystemExit) as error,
+        ):
+            capture.main()
+        self.assertEqual(error.exception.code, 2)
+        serial_port.assert_not_called()
+
+    def test_auto_port_accepts_espressif_usb_product_variants_only(self):
+        class Port:
+            def __init__(self, device, vid, pid):
+                self.device, self.vid, self.pid = device, vid, pid
+
+        unrelated = Port("unrelated-bridge", 0x10C4, 0xEA60)
+        for pid in (0x1001, 0x1002, 0x4001):
+            with (
+                self.subTest(pid=pid),
+                patch.object(capture.list_ports, "comports", return_value=[
+                    unrelated, Port("esp32-device", 0x303A, pid),
+                ]),
+            ):
+                self.assertEqual(capture.choose_port("auto"), "esp32-device")
+        for ports in ([], [unrelated], [
+            Port("p4-port", 0x303A, 0x1001), Port("c6-port", 0x303A, 0x1002),
+        ]):
+            with patch.object(capture.list_ports, "comports", return_value=ports), self.assertRaises(ValueError):
+                capture.choose_port("auto")
+        with patch.object(capture.list_ports, "comports") as discovery:
+            self.assertEqual(capture.choose_port("explicit-bridge"), "explicit-bridge")
+        discovery.assert_not_called()
 
     def test_rejects_payload_size_and_boundary(self):
         for length in (0, 1024 * 1024 + 1):

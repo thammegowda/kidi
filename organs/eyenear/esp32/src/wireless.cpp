@@ -20,6 +20,7 @@
 #include <mbedtls/sha256.h>
 #include <cstdlib>
 #include <esp_heap_caps.h>
+#include <lwip/sockets.h>
 
 extern "C" {
 #include <mbedtls/constant_time.h>
@@ -138,6 +139,18 @@ auto save_configuration() -> bool {
     return saved;
 }
 
+auto add_network_status(cJSON* object) -> void {
+    cJSON_AddNumberToObject(object, "rssi_dbm", WiFi.RSSI());
+    cJSON_AddStringToObject(object, "bssid", WiFi.BSSIDstr().c_str());
+    cJSON_AddNumberToObject(object, "channel", WiFi.channel());
+    WifiPowerSaveMode mode;
+    const auto result = esp_wifi_get_ps(&mode);
+    if (result == ESP_OK)
+        cJSON_AddNumberToObject(object, "power_save_mode", mode);
+    else
+        cJSON_AddStringToObject(object, "power_save_error", esp_err_to_name(result));
+}
+
 auto reply_info() -> void {
     auto response = make_json();
     if (!response) {
@@ -148,6 +161,8 @@ auto reply_info() -> void {
     cJSON_AddNumberToObject(response.get(), "protocol", 1);
     cJSON_AddStringToObject(response.get(), "hardware_id", WiFi.macAddress().c_str());
     cJSON_AddBoolToObject(response.get(), "configured", configuration.configured());
+    cJSON_AddBoolToObject(response.get(), "camera_configured", camera_configured());
+    cJSON_AddBoolToObject(response.get(), "microphone_configured", audio_configured());
     cJSON_AddStringToObject(response.get(), "device_id", configuration.device_id.c_str());
     cJSON_AddStringToObject(response.get(), "hostname", configuration.hostname().c_str());
     cJSON_AddStringToObject(response.get(), "certificate", configuration.certificate.c_str());
@@ -156,7 +171,7 @@ auto reply_info() -> void {
     cJSON_AddBoolToObject(response.get(), "ready", server != nullptr && WiFi.status() == WL_CONNECTED);
     cJSON_AddStringToObject(response.get(), "address", WiFi.localIP().toString().c_str());
     cJSON_AddNumberToObject(response.get(), "port", HTTPS_PORT);
-    cJSON_AddNumberToObject(response.get(), "rssi_dbm", WiFi.RSSI());
+    add_network_status(response.get());
     print_reply(response.get());
 }
 
@@ -188,11 +203,13 @@ auto handle_status(httpd_req_t* request) -> Error {
     cJSON_AddNumberToObject(object.get(), "protocol", 1);
     cJSON_AddStringToObject(object.get(), "device_id", configuration.device_id.c_str());
     cJSON_AddStringToObject(object.get(), "transport", "wifi");
-    cJSON_AddStringToObject(object.get(), "firmware", "kidi-usb-wifi-live-1");
+    cJSON_AddStringToObject(object.get(), "firmware", "kidi-esp32-media-reference-1");
+    cJSON_AddBoolToObject(object.get(), "camera_configured", camera_configured());
+    cJSON_AddBoolToObject(object.get(), "microphone_configured", audio_configured());
     cJSON_AddNumberToObject(object.get(), "max_clip_seconds", 10);
     cJSON_AddNumberToObject(object.get(), "max_stream_seconds", 300);
     cJSON_AddBoolToObject(object.get(), "stream_experimental", true);
-    cJSON_AddNumberToObject(object.get(), "rssi_dbm", WiFi.RSSI());
+    add_network_status(object.get());
     auto* text = cJSON_PrintUnformatted(object.get());
     if (text == nullptr) return ESP_ERR_NO_MEM;
     httpd_resp_set_type(request, "application/json");
@@ -236,16 +253,17 @@ auto handle_photo(httpd_req_t* request) -> Error {
     Json object(cJSON_ParseWithLength(body.data(), received), cJSON_Delete);
     if (!object) return send_error(request, "400 Bad Request", "invalid JSON");
     const auto resolution = json_string(object.get(), "resolution");
-    CameraFrameSize size;
+    CameraProfile profile;
     if (resolution == "2048x1536") {
-        size = FRAMESIZE_QXGA;
+        profile = CameraProfile::PHOTO_FULL;
     } else if (resolution == "640x480") {
-        size = FRAMESIZE_VGA;
+        profile = CameraProfile::PHOTO_VGA;
     } else {
         return send_error(request, "400 Bad Request", "unsupported photo resolution");
     }
+    if (!camera_configured()) return send_error(request, "501 Not Implemented", "camera backend is not configured");
     PhotoResponse response{request};
-    const auto result = capture_photo_to(size, write_wifi_photo, &response);
+    const auto result = capture_photo_to(profile, write_wifi_photo, &response);
     if (result == ESP_OK) return ESP_OK;
     report_error("Wi-Fi photo", result);
     if (response.started) return ESP_FAIL;
@@ -284,6 +302,7 @@ auto handle_clip(httpd_req_t* request) -> Error {
     if (!cJSON_IsNumber(duration) || !std::isfinite(duration->valuedouble) || duration->valuedouble < 1 ||
         duration->valuedouble > 10 || duration->valuedouble != duration->valueint)
         return send_error(request, "400 Bad Request", "clip duration must be an integer from 1 to 10");
+    if (!audio_configured()) return send_error(request, "501 Not Implemented", "microphone backend is not configured");
     httpd_resp_set_type(request, "application/vnd.kidi.capture");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
     httpd_resp_set_hdr(request, "X-Kidi-Transport", "wifi");
@@ -336,13 +355,34 @@ auto handle_stream(httpd_req_t* request) -> Error {
         return send_error(request, "400 Bad Request", "invalid mode or stream duration (1-300 seconds)");
     if (stream_resolution != "1280x720" && stream_resolution != "96x96")
         return send_error(request, "400 Bad Request", "stream resolution must be 1280x720 or 96x96");
+    if (!camera_configured()) return send_error(request, "501 Not Implemented", "camera backend is not configured");
+    if (mode == "av" && !audio_configured())
+        return send_error(request, "501 Not Implemented", "microphone backend is not configured");
+    const int no_delay = 1;
+    if (setsockopt(httpd_req_to_sockfd(request), IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay)) != 0) {
+        report_error("live socket TCP_NODELAY", ESP_FAIL);
+        return send_error(request, "500 Internal Server Error", "stream socket setup failed");
+    }
+    WifiPowerSaveMode previous_power_save;
+    auto power_result = esp_wifi_get_ps(&previous_power_save);
+    if (power_result == ESP_OK) power_result = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (power_result != ESP_OK) {
+        report_error("live Wi-Fi power setup", power_result);
+        return send_error(request, "500 Internal Server Error", "stream Wi-Fi setup failed");
+    }
     httpd_resp_set_type(request, "application/vnd.kidi.live");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
     httpd_resp_set_hdr(request, "X-Kidi-Transport", "wifi");
     httpd_resp_set_hdr(request, "X-Kidi-Stream-Protocol", "1");
     StreamResponse response{request};
-    const auto result = stream_media(mode == "av", static_cast<unsigned>(duration->valueint), write_wifi_stream,
-                                     &response, stream_resolution == "96x96" ? FRAMESIZE_96X96 : FRAMESIZE_HD);
+    auto result = stream_media(mode == "av", static_cast<unsigned>(duration->valueint), write_wifi_stream, &response,
+                               stream_resolution == "96x96" ? CameraProfile::VIDEO_LOW : CameraProfile::VIDEO_HD,
+                               MAX_PHOTO_BYTES);
+    power_result = esp_wifi_set_ps(previous_power_save);
+    if (power_result != ESP_OK) {
+        report_error("live Wi-Fi power restore", power_result);
+        if (result == ESP_OK) result = power_result;
+    }
     if (result == ESP_OK) return httpd_resp_send_chunk(request, nullptr, 0);
     report_error("Wi-Fi live stream", result);
     if (response.started) return ESP_FAIL;
@@ -593,6 +633,8 @@ auto configure(const cJSON* request) -> void {
 
 auto initialize_wireless() -> void {
     WiFi.mode(WIFI_STA);
+    WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+    WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
     Preferences preferences;
     if (!preferences.begin("kidi-wifi", true)) return;
     const auto saved = preferences.getString("configuration", "");

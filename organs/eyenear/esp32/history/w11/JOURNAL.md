@@ -1,5 +1,8 @@
 # W11 diagnosis and capture journal
 
+Archived hardware history. The W11 target and board drivers have been removed.
+These measurements and recovery notes are not instructions for the next board.
+
 Date: 2026-10-03. Host: Apple Silicon macOS. All tests were local; no camera,
 audio, or flash contents were sent to remote services. Kidi's application source
 and the SD card were not changed during the diagnosis.
@@ -596,6 +599,149 @@ any replacement of the camera firmware, a full current-flash backup must be
 saved and verified so the provisioned identity and credentials can be restored.
 The official app can erase NVS on initialization errors; no such operation was
 performed while fetching the source.
+
+## Official Espressif Hardware Benchmark (2026-10-05)
+
+The reconnected board was detected as the same ESP32-S3 with 16 MB flash and
+8 MB PSRAM. A fresh complete backup was saved. Resetting after verification
+changed only NVS; refreshing that partition produced another full image that
+passed a complete-flash digest check without booting the application.
+
+The unmodified ESP-IDF v5.5.1 example was temporarily flashed and joined the
+cached approved LAN, with all credential/discovery/password APIs disabled.
+No camera/audio or TLS workload was present.
+
+Three ten-second TCP receiver trials produced:
+
+| Direction | Trials (decimal Mbit/s) | Median |
+|---|---:|---:|
+| Module to laptop | 20.00, 19.20, 20.20 | 20.00 Mbit/s |
+| Laptop to module | 14.07, 16.74, 16.67 | 16.67 Mbit/s |
+
+The ESP receiver's binary rates were converted to decimal Mbit/s. Six UDP
+trials also completed; active-window receiver rates and measurement caveats
+are recorded in [the diagnostic results](../../diagnostics/iperf/README.md#hardware-results-2026-10-05).
+No validated UDP loss percentage is claimed.
+
+All ten initial pings returned. Average latency was 120.549 ms, dominated by
+a 1025.917 ms first reply; the other replies ranged from 10.720 to 36.707 ms.
+
+The session interruption happened before restoration was confirmed. A
+restore-only operation then wrote the complete 16 MB backup and verified its
+flash digest. A stale saved DHCP address initially caused TLS verification
+to fail; trusted USB verified the original device certificate and refreshed
+the address without changing credentials or bypassing certificate checks.
+Authenticated HTTPS status and a 2048x1536 JPEG (214277 bytes) passed afterward.
+Restored RSSI was -51 dBm. No additional benchmarks were run after the user
+asked to stop.
+
+Raw throughput is substantially better than previous application-stack
+measurements. This does not by itself identify the bottleneck or prove
+sustained encrypted audiovisual streaming. SDK/TCP configuration, modem
+sleep, TLS/application costs, and radio conditions still differ.
+
+## Video-Only Optimization (2026-10-05)
+
+The user selected video-only streaming as the primary use case, with a
+1280x720, nominal 10 fps target. Microphone support was retained as an explicit
+diagnostic option, not initialized during video preview. The browser likewise
+does not create an AudioContext for video-only sessions.
+
+Changes made:
+
+- Paced camera acquisition on core 1, two framebuffers and bounded frame
+  credits. Under backpressure, stale queued frames are recycled so the next
+  send starts with a recent image.
+- Sensor JPEG quality 16 for video-only, retaining quality 12 for photographs.
+- Removed the 1 MiB PSRAM packet staging buffer/full-frame memcpy. Only a
+  4 KiB header/prefix is staged in internal RAM; the remainder uses the
+  framebuffer directly. USB writes are bounded; HTTPS keeps bulk writes.
+- TCP_NODELAY and active-stream-only modem-sleep suppression with restoration.
+- All-channel association scan for the saved SSID, sorted by signal, and
+  BSSID/channel/power-policy diagnostics. No credential APIs were called.
+- Send duration, bytes, pre-send frame age and capture-wait counters; host
+  delivered-FPS, receive-gap and byte-rate reporting with an explicit threshold.
+
+Single-buffer capture serialized acquisition/transmission and had shutdown
+ownership problems; it was not retained. Sending whole USB frames without
+bounded writes produced framing/timeouts, so the final USB path uses 4 KiB
+writes. Applying those small chunks to HTTPS added excessive record overhead;
+HTTPS bulk writes were retained instead. Pinning the HTTPS handler to core 0
+and a test-only AES-128-GCM cipher choice did not establish an improvement;
+neither experiment was retained.
+
+The laptop was suspended during some early checks. Those checks were not
+treated as clean optimization evidence.
+
+An intermittent USB end-of-stream failure was traced to raw SDK text:
+`gdma_disconnect(299): no peripheral is connected to the channel`.
+The camera deinit API returned success, but its stdout text appeared before
+the binary END packet. Cleanup logs are now captured in a bounded buffer and
+forwarded as typed diagnostic status, with explicit truncation reporting.
+The message is still surfaced, not silently suppressed or mistaken for JPEG.
+
+Final sustained USB video validation:
+
+- 198 frames in 20 requested seconds; 20.098 seconds receiving time.
+- 9.85 delivered fps; 12,306,150 JPEG bytes, 4.90 Mbit/s payload.
+- Zero audio samples and zero dropped frames.
+- Maximum receive gap 103.7 ms; maximum JPEG send 69.4 ms.
+- Real browser JPEG decoding, no AudioContext, Stop/restart and duration expiry
+  passed. No media files were saved.
+
+Final Wi-Fi video validation:
+
+- Three JPEGs in ten requested seconds: 0.30 delivered fps.
+- Maximum JPEG send 6.42 seconds; maximum pre-send frame age 92.7 ms.
+- Zero audio samples; stale images were dropped rather than building a queue.
+- The 9.5 fps acceptance check failed. The 720p/10 fps wireless goal remains
+  unresolved; no wireless optimization success is claimed.
+
+An explicit Wi-Fi cancellation check verified power-save mode 1 before,
+0 while streaming, and 1 afterward. Cleanup completed in 1.64 seconds.
+A following authenticated 2048x1536 photo passed. Device identity and cached
+credentials were preserved; no Keychain/password prompts were used.
+
+The final firmware builds, formatting passes, and 70 host tests pass.
+Application-only flashing required making the esptool Make command explicitly
+use Python 3.12 and esptool 5.x; the unpinned command selected an older package
+without the expected executable/CLI options.
+
+Core separation is not complete: the prebuilt SDK pins Wi-Fi/TCP-IP and the
+camera driver to core 0 even though the application capture worker runs on
+core 1. A configurable SDK build is a candidate next step for camera-driver
+affinity and larger TCP buffers, not a proven cure. CPU usage/power were not
+measured, and differences in SDK, radio conditions, camera load and TLS prevent
+treating the official raw iperf result as an HTTPS-video guarantee.
+
+## Factory Restoration for Return (2026-10-05)
+
+The user decided to return the W11 and obtain different hardware. No further
+streaming optimization or SDK migration was performed.
+
+The original 16,777,216-byte factory backup was checked against its known
+SHA-256:
+`f6ea91cf9b8aca76944f649572efc3ca2a2192a6d346e867ef8999e34a8e7f74`.
+The complete flash was overwritten at offset zero using `keep` mode/frequency/
+size settings, preserving the original bootloader header. A separate full-flash
+verification passed its digest check before reset.
+
+This replaced Kidi firmware and the provisioned NVS identity, certificate/private
+key, owner-token hash and network configuration with the original factory
+contents. No efuses were modified, no credential APIs were accessed, and laptop
+backups/captures/credential caches were not deleted.
+
+Normal boot was confirmed with the `W11 Factory Test + Data Output` banner.
+IMU, digital microphone, camera, Wi-Fi AP initialization, BLE and ADC passed.
+SD-card mounting failed, as in the original diagnosis. The factory camera test
+still prints the hardcoded OV5640 label and a GDMA cleanup diagnostic, then
+reports PASS; the sensor was previously confirmed as OV3660.
+
+The live preview server was already stopped, and its browser page was cleared.
+The module is ready for power disconnection and packing. Personal SD storage
+must be removed or separately reviewed: restoring internal flash does not wipe
+an SD card. Software source and private local artifacts remain on the laptop;
+neither should be included in the seller's return package.
 
 ## Remaining work
 

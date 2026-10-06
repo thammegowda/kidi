@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include <Arduino.h>
+#include <driver/temp_sensor.h>
 
 namespace kidi::esp32 {
 
@@ -11,6 +12,7 @@ auto report_error(const char* operation, Error error) -> void {
 }
 
 auto read_chip_temperature(float& celsius) -> Error {
+    using TemperatureConfig = temp_sensor_config_t;
     TemperatureConfig config = TSENS_CONFIG_DEFAULT();
     config.dac_offset = TSENS_DAC_L1;
     auto result = temp_sensor_set_config(config);
