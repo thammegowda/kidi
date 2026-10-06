@@ -788,10 +788,23 @@ the checkpoint, or load unused modality encoders. QAT precision overrides are re
 
 Calibrated CPU projections quantize activations directly with the trained scale
 before integer dot products; uncalibrated projections retain dynamic activation
-quantization. Metal calibrates input once into prepared scratch and fuses output
-rounding into the packed projection. Static-range rounding uses ties-to-even,
-INT8 clipping, and zero-scale bypass. K/V cache values are rounded using their
-trained scales, while storage remains FP32.
+quantization. Metal calibrates input once into prepared scratch and reuses it for
+projections with the same source and trained scale. Its 64x64 W8 prefill kernel
+fuses output rounding. Q/K/V remain separate projections because one combined
+dispatch measured slower, but reuse the same quantized activation. Static-range
+rounding uses ties-to-even, INT8 clipping, and zero-scale bypass. K/V cache
+values are rounded using their trained scales, while storage remains FP32.
+
+Apple GPU vision also fuses axial RMSNorm with RoPE for Q/K. Equal-head attention
+uses MPSGraph's native scaled-dot-product-attention operation on supported OS
+versions, passing the checkpoint's explicit scale (Gemma vision uses 1.0 rather
+than `1/sqrt(head_dim)`). Vision checkpoint binding validates matching gate/up
+activation scales and concatenates their packed rows into the existing internal
+`gate_up_proj` representation. The gated FFN computes those two logical halves
+together, applies GELU/multiply before leaving the threadgroup, and writes the
+down projection's INT8 input codes without an FP32 hidden tensor. See the
+[illustrated FFN fusion walkthrough](ffn-fuse.md). Older systems retain the
+decomposed matmul/softmax graph.
 
 Default calibrated Metal prefill may cache expanded FP16 matrices for native
 matrix multiplication, sharing them across input shapes. Packed GEMV remains the

@@ -293,6 +293,26 @@ auto Graph::matmul(Value left, Value right, bool transpose_left, bool transpose_
     }
 }
 
+auto Graph::scaled_dot_product_attention(Value query, Value key, Value value, Value mask, float scale,
+                                         std::string_view name) -> Value {
+    if (impl_->error) return {};
+    if (@available(macOS 15.0, iOS 18.0, macCatalyst 18.0, tvOS 18.0, *)) {
+        @try {
+            return impl_->add([impl_->graph scaledDotProductAttentionWithQueryTensor:impl_->get(query)
+                                                                           keyTensor:impl_->get(key)
+                                                                         valueTensor:impl_->get(value)
+                                                                          maskTensor:impl_->get(mask)
+                                                                               scale:scale
+                                                                                name:ns_string(name)]);
+        } @catch (NSException* exception) {
+            impl_->fail(exception_error(exception, "create MPSGraph scaled dot-product attention"));
+            return {};
+        }
+    }
+    auto scores = multiply(matmul(query, key, false, true), scalar(scale, tensor::DType::F32));
+    return matmul(softmax(add(scores, mask), 3), value);
+}
+
 auto Graph::reshape(Value value, std::span<const std::int64_t> shape, std::string_view name) -> Value {
     if (impl_->error) return {};
     @try {

@@ -85,6 +85,19 @@ kernel void rms(device const float* input [[buffer(0)]], device const float* sca
             uint angle = ((row / geometry.heads) % geometry.other) * half_width + channel % half_width;
             value = value * residual[angle] + rotated * output_scale[angle];
         }
+        if (geometry.mode == 10) {
+            uint axis_width = geometry.width / 2;
+            uint half_axis = axis_width / 2;
+            uint axis = channel / axis_width;
+            uint axis_channel = channel % axis_width;
+            uint other_channel = axis * axis_width +
+                (axis_channel < half_axis ? axis_channel + half_axis : axis_channel - half_axis);
+            float rotated = input[row * geometry.width + other_channel] * partial[0] * scale[other_channel];
+            if (axis_channel < half_axis) rotated = -rotated;
+            uint position = (row / geometry.heads) % geometry.other;
+            uint angle = (axis * geometry.other + position) * half_axis + axis_channel % half_axis;
+            value = value * residual[angle] + rotated * output_scale[angle];
+        }
         output[row * geometry.width + channel] = value;
     }
 }

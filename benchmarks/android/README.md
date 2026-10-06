@@ -171,19 +171,38 @@ embeddings and one additional untimed diagnostic pass reports element-wise error
 `KIDI_VISION_DUMP_DIR` writes matching Kidi tensors to Safetensors for offline analysis; existing files are never
 overwritten.
 
-On macOS, set `KIDI_ACCELERATOR=gpu` to run the standalone tower on Apple GPU. The native W8 path keeps calibrated
-activations and weights as integer codes through the tiled projection, applying scales only after accumulation:
+On macOS, set `KIDI_ACCELERATOR=gpu` to run the standalone tower on Apple GPU. The native W8 path quantizes each
+shared activation once, keeps activation and weight codes integral through 64x64 tiled projections, and applies scales
+only after accumulation. Q/K/V reuse one quantized activation, Q/K use fused axial RMSNorm/RoPE, and large equal-head
+attention uses MPSGraph's fused SDPA operation with the checkpoint's scale of 1.0. A combined Q/K/V dispatch was
+removed after measuring slower than the three projections with shared quantization. At checkpoint binding, vision gate
+and up rows are validated and combined into the existing gated-FFN representation. The FFN computes both halves
+together, applies GELU/multiply on-chip, and writes the down projection's INT8 input directly; see the illustrated
+[FFN fusion walkthrough](../../ffn-fuse.md):
 
 ```sh
 KIDI_ACCELERATOR=gpu KIDI_VISION_PRECISION=checkpoint \
   build-release/kidi_android_baseline vision MODEL 4 3 image.png
 ```
 
-On an Apple M5, the three 2,304-2,376-patch fixtures take about 0.67-0.70 s after warm-up. The fixed photo produces the
+On an Apple M5, the three 2,304-2,376-patch fixtures take about 0.38-0.42 s after warm-up. The fixed photo produces the
 same CPU and Metal answers (`A cat.` and `Orange/Ginger.`); the deterministic shape fixtures preserve the same objects
 and colors with minor wording differences. Intermediate features are not numerically identical—the residual difference
 can compound through the sensitive tower—so Metal quality is gated by short-answer equivalence rather than FP32 tensor
 parity.
+
+The committed pre-optimization path measured about 0.67-0.70 s. Profiling attributed most of it to 112 packed
+projections per image: each output tile repeated FP32 activation rounding, and the 32x32 tile reread activations and
+weights more often. Captured-step replay can skip host-side operator lookup on later identical calls, but it does not
+fuse these Metal kernels and cannot reduce first-image latency; the backend fusions above address the measured GPU work
+directly.
+
+The packed-kernel benchmark has a vision-shape mode for the 768-wide attention projections and 3,072-wide MLP:
+
+```sh
+build-release/kidi_metal_packed_bench vision
+build-release/kidi_metal_packed_bench vision-ffn
+```
 
 `KIDI_VISION_PRECISION` selects the projection compute policy. The default, `checkpoint`, uses the checkpoint's native
 precision. `fp32` disables activation quantization and dequantizes packed weights for FP32 computation; `bf16` uses

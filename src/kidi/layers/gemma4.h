@@ -10,6 +10,8 @@ public:
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
     auto forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
                         const Tensor& sine) const -> Tensor;
+    auto forward_axial_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
+                              const Tensor& sine) const -> Tensor;
 
     auto forward_residual(ops::Context& context, const Tensor& input, const Tensor& residual,
                           const Tensor& output_scale = {}) const -> Tensor;
@@ -39,10 +41,14 @@ private:
 };
 
 KIDI_MODULE(GatedFeedForward);
+struct GatedFeedForwardStages {
+    Tensor gate, up, hidden, output;
+};
 class GatedFeedForwardImpl : public Module {
 public:
     GatedFeedForwardImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t packed_bits = 0);
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
+    auto forward_stages(ops::Context& context, const Tensor& input) const -> GatedFeedForwardStages;
 
 private:
     Linear gate_up_, down_;

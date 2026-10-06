@@ -23,6 +23,9 @@ struct DeviceCapabilities {
     bool calibrated_int8_cast = false;
     bool blockwise_int8_attention = false;
     std::size_t blockwise_int8_attention_max_tokens = 0;
+    bool fused_axial_rms_rotary = false;
+    bool fused_full_attention = false;
+    bool fused_packed_feed_forward = false;
     /// Token embedding lookups run on the device from I32 token tensors.
     bool device_embedding = false;
     /// Host-visible results arrive only after the embedder awaits the device between calls (browser WebGPU), so
@@ -60,7 +63,10 @@ inline constexpr EnumMap<DeviceKind, DeviceCapabilities, static_cast<std::size_t
                                                       .device_embedding = true}},
         std::pair{DeviceKind::Q_NPU, DeviceCapabilities{}},
         std::pair{DeviceKind::CUDA, DeviceCapabilities{}},
-        std::pair{DeviceKind::A_GPU, DeviceCapabilities{.calibrated_int8_cast = true}},
+        std::pair{DeviceKind::A_GPU, DeviceCapabilities{.calibrated_int8_cast = true,
+                                                        .fused_axial_rms_rotary = true,
+                                                        .fused_full_attention = true,
+                                                        .fused_packed_feed_forward = true}},
         std::pair{DeviceKind::WEB_GPU,
                   DeviceCapabilities{.calibrated_int8_cast = true,
                                      .blockwise_int8_attention = true,

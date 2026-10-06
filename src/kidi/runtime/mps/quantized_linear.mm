@@ -7,7 +7,7 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include <algorithm>
-#include <limits>
+#include <cmath>
 #include <mutex>
 #include <map>
 #include <tuple>
@@ -25,6 +25,8 @@ struct Pipelines {
     id<MTLComputePipelineState> quantize;
     id<MTLComputePipelineState> linear_packed;
     id<MTLComputePipelineState> linear_tiled;
+    id<MTLComputePipelineState> packed_i8w8;
+    id<MTLComputePipelineState> packed_gate_up;
     id<MTLLibrary> library;
 };
 
@@ -56,8 +58,15 @@ auto pipelines() -> Result<std::shared_ptr<Pipelines>> {
         result->linear_packed =
             [result->device newComputePipelineStateWithFunction:[library newFunctionWithName:@"linear_a8w8_packed"]
                                                           error:&error];
+        result->packed_i8w8 =
+            [result->device newComputePipelineStateWithFunction:[library newFunctionWithName:@"packed_gemm_i8w8"]
+                                                          error:&error];
+        result->packed_gate_up =
+            [result->device newComputePipelineStateWithFunction:[library newFunctionWithName:@"packed_gate_up_i8w8"]
+                                                          error:&error];
         result->library = library;
-        if (!result->quantize || !result->linear_tiled || !result->linear_packed)
+        if (!result->quantize || !result->linear_tiled || !result->linear_packed || !result->packed_i8w8 ||
+            !result->packed_gate_up)
             return std::unexpected(Error{ErrorCode::RUNTIME, "create INT8 Metal pipelines"});
         cached = result;
         return result;
@@ -66,20 +75,19 @@ auto pipelines() -> Result<std::shared_ptr<Pipelines>> {
 struct PackedPipelines {
     id<MTLComputePipelineState> gemv, gemm;
 };
-auto packed_pipelines(std::uint32_t bits, std::uint32_t group_size, bool input_scale, bool output_scale)
+auto packed_pipelines(std::uint32_t bits, std::uint32_t group_size, bool output_scale)
     -> Result<std::shared_ptr<PackedPipelines>> {
     static std::mutex mutex;
-    static std::map<std::tuple<std::uint32_t, std::uint32_t, bool, bool>, std::shared_ptr<PackedPipelines>> cache;
+    static std::map<std::tuple<std::uint32_t, std::uint32_t, bool>, std::shared_ptr<PackedPipelines>> cache;
     std::scoped_lock lock(mutex);
-    const auto key = std::tuple{bits, group_size, input_scale, output_scale};
+    const auto key = std::tuple{bits, group_size, output_scale};
     if (const auto found = cache.find(key); found != cache.end()) return found->second;
     auto shared = pipelines();
     if (!shared) return std::unexpected(std::move(shared.error()));
     MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
     [constants setConstantValue:&bits type:MTLDataTypeUInt atIndex:0];
     [constants setConstantValue:&group_size type:MTLDataTypeUInt atIndex:1];
-    [constants setConstantValue:&input_scale type:MTLDataTypeBool atIndex:2];
-    [constants setConstantValue:&output_scale type:MTLDataTypeBool atIndex:3];
+    [constants setConstantValue:&output_scale type:MTLDataTypeBool atIndex:2];
     NSError* error = nil;
     auto result = std::make_shared<PackedPipelines>();
     id<MTLFunction> gemv = [(*shared)->library newFunctionWithName:@"packed_gemv"
@@ -137,13 +145,11 @@ auto encode_expand_packed_weight(CommandBatch& batch, const Tensor& weight, cons
         }
     }
     const struct {
-        std::uint32_t rows, width, columns, bits, group_size;
+        std::uint32_t rows, width, columns;
         float input_scale, output_scale;
     } geometry{1,
                static_cast<std::uint32_t>(output.size(1)),
                static_cast<std::uint32_t>(output.size(0)),
-               static_cast<std::uint32_t>(bits),
-               static_cast<std::uint32_t>(group_size),
                0,
                0};
     MPSCommandBuffer* buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
@@ -163,26 +169,40 @@ auto encode_expand_packed_weight(CommandBatch& batch, const Tensor& weight, cons
 auto encode_packed_linear(CommandBatch& batch, const Tensor& input, const Tensor& weight, const Tensor& scales,
                           Tensor& output, std::int32_t bits, std::int32_t group_size, float input_scale,
                           float output_scale, bool vector_projection) -> Result<void> {
-    auto shared = packed_pipelines(bits, group_size, input_scale > 0, output_scale > 0);
-    if (!shared) return std::unexpected(std::move(shared.error()));
+    const bool quantized_input = input.dtype() == DType::I8;
+    if (!input.defined() || input.dimensions() < 2 || !input.size(-1) ||
+        (input.dtype() != DType::F32 && !quantized_input) || (!quantized_input && input_scale != 0) ||
+        (quantized_input && (bits != 8 || group_size != input.size(-1) || input_scale <= 0 || vector_projection ||
+                             input.numel() / input.size(-1) < 4)))
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid packed Metal linear input"});
     if (input.numel() > UINT32_MAX || output.numel() > UINT32_MAX || weight.numel() > UINT32_MAX)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "packed Metal linear exceeds indexing bounds"});
+    id<MTLComputePipelineState> gemv = nil, gemm = nil;
+    if (quantized_input) {
+        auto shared = pipelines();
+        if (!shared) return std::unexpected(std::move(shared.error()));
+        gemm = (*shared)->packed_i8w8;
+    } else {
+        auto shared = packed_pipelines(bits, group_size, output_scale > 0);
+        if (!shared) return std::unexpected(std::move(shared.error()));
+        gemv = (*shared)->gemv;
+        gemm = (*shared)->gemm;
+    }
     const struct {
-        std::uint32_t rows, width, columns, bits, group_size;
+        std::uint32_t rows, width, columns;
         float input_scale, output_scale;
     } geometry{static_cast<std::uint32_t>(input.numel() / input.size(-1)),
                static_cast<std::uint32_t>(input.size(-1)),
                static_cast<std::uint32_t>(weight.size(0)),
-               static_cast<std::uint32_t>(bits),
-               static_cast<std::uint32_t>(group_size),
                input_scale,
                output_scale};
     MPSCommandBuffer* buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
     id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
     if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create packed projection encoder"});
     const bool tiled = geometry.rows >= 4 && !vector_projection;
-    const auto columns_per_group = tiled ? 32u : 4u;
-    [encoder setComputePipelineState:tiled ? (*shared)->gemm : (*shared)->gemv];
+    const bool wide_tiled = tiled && quantized_input;
+    const auto columns_per_group = wide_tiled ? 64u : tiled ? 32u : 4u;
+    [encoder setComputePipelineState:tiled ? gemm : gemv];
     auto status = bind(encoder, input, 0);
     if (status) status = bind(encoder, weight, 1);
     if (status) status = bind(encoder, scales, 2);
@@ -190,8 +210,59 @@ auto encode_packed_linear(CommandBatch& batch, const Tensor& input, const Tensor
     [encoder setBytes:&geometry length:sizeof(geometry) atIndex:4];
     if (status)
         [encoder dispatchThreadgroups:MTLSizeMake((geometry.columns + columns_per_group - 1) / columns_per_group,
-                                                  tiled ? (geometry.rows + 31) / 32 : geometry.rows, 1)
-                threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                                                  wide_tiled ? (geometry.rows + 63) / 64
+                                                  : tiled    ? (geometry.rows + 31) / 32
+                                                             : geometry.rows,
+                                                  1)
+                threadsPerThreadgroup:MTLSizeMake(32, wide_tiled ? 16 : 4, 1)];
+    [encoder endEncoding];
+    return status;
+}
+
+auto encode_packed_gate_up(CommandBatch& batch, const Tensor& input, const Tensor& weight, const Tensor& scales,
+                           Tensor& output, float input_scale, float output_scale, float hidden_scale) -> Result<void> {
+    if (!input.defined() || input.device() != Device::apple_gpu() || input.dtype() != DType::I8 ||
+        input.dimensions() < 2 || !input.size(-1) || !input.numel() || input.numel() > UINT32_MAX ||
+        !std::isfinite(input_scale) || input_scale <= 0 || !output.defined() ||
+        output.device() != Device::apple_gpu() || output.dtype() != DType::I8 || output.numel() > UINT32_MAX ||
+        !std::isfinite(hidden_scale) || hidden_scale <= 0)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid packed Metal gate/up activation"});
+    if (!weight.defined() || weight.dtype() != DType::U8 || weight.dimensions() != 2 || !weight.size(0) ||
+        weight.size(0) % 2 || scales.dtype() != DType::F32 || scales.dimensions() != 2 ||
+        scales.size(0) != weight.size(0) || scales.size(1) != 1 || !std::isfinite(output_scale) || output_scale <= 0)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid packed Metal gate/up parameters"});
+    const auto rows = input.numel() / input.size(-1);
+    const auto width = input.size(-1);
+    const auto columns = weight.size(0) / 2;
+    auto expected_shape = std::vector<std::int64_t>(input.shape().begin(), input.shape().end());
+    expected_shape.back() = columns;
+    if (!std::ranges::equal(output.shape(), expected_shape))
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid packed Metal gate/up output"});
+    if (weight.size(1) != width)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid packed Metal gate/up parameters"});
+    auto shared = pipelines();
+    if (!shared) return std::unexpected(std::move(shared.error()));
+    const struct {
+        std::uint32_t rows, width, columns;
+        float input_scale, output_scale, hidden_scale;
+    } geometry{static_cast<std::uint32_t>(rows),
+               static_cast<std::uint32_t>(width),
+               static_cast<std::uint32_t>(columns),
+               input_scale,
+               output_scale,
+               hidden_scale};
+    MPSCommandBuffer* buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
+    id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
+    if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create packed gate/up encoder"});
+    [encoder setComputePipelineState:(*shared)->packed_gate_up];
+    auto status = bind(encoder, input, 0);
+    if (status) status = bind(encoder, weight, 1);
+    if (status) status = bind(encoder, scales, 2);
+    if (status) status = bind(encoder, output, 3);
+    [encoder setBytes:&geometry length:sizeof(geometry) atIndex:4];
+    if (status)
+        [encoder dispatchThreadgroups:MTLSizeMake((columns + 63) / 64, (rows + 63) / 64, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
     [encoder endEncoding];
     return status;
 }

@@ -108,6 +108,7 @@ auto encode_eager(CommandBatch& batch, Operation operation, float epsilon, Tenso
     const bool rms = operation == Operation::RMS_NORM || operation == Operation::RMS_NORM_RESIDUAL ||
                      operation == Operation::RMS_ROTARY;
     const bool rotary = operation == Operation::ROTARY || operation == Operation::RMS_ROTARY;
+    const bool axial = operation == Operation::RMS_ROTARY && inputs[2].size(0) == 2;
     const struct {
         std::uint32_t count, width, other, heads, mode;
         float epsilon;
@@ -117,7 +118,8 @@ auto encode_eager(CommandBatch& batch, Operation operation, float epsilon, Tenso
                                           : inputs.size() > 1 ? inputs[1].numel()
                                                               : 1),
                static_cast<std::uint32_t>(rotary ? inputs[0].size(2) : 1),
-               operation == Operation::GELU_MULTIPLY       ? 9u
+               axial                                       ? 10u
+               : operation == Operation::GELU_MULTIPLY     ? 9u
                : operation == Operation::RMS_ROTARY        ? 8u
                : operation == Operation::STATIC_ROUND      ? 7u
                : operation == Operation::RMS_NORM_RESIDUAL ? (inputs.size() == 4 ? 6u : 5u)

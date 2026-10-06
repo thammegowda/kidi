@@ -27,6 +27,11 @@ struct Stream {
     OutputPool outputs;
     AllocationStats output_allocations;
     std::unordered_set<void*> output_buffers;
+    std::vector<Tensor> packed_inputs;
+    std::vector<Tensor> packed_intermediates;
+    void* packed_input_source = nullptr;
+    std::size_t packed_input_source_offset = 0;
+    float packed_input_scale = 0;
     std::size_t prefill_cache_limit = std::numeric_limits<std::size_t>::max();
     bool profile_memory = std::getenv("KIDI_PROFILE_MEMORY") != nullptr;
     std::size_t observed_device_bytes = 0, recommended_working_set_bytes = 0;
@@ -55,13 +60,50 @@ struct Stream {
         auto output = outputs.acquire(shape, dtype, tensor::Device::apple_gpu());
         output_allocations.count += outputs.allocations().count - before.count;
         output_allocations.bytes += outputs.allocations().bytes - before.bytes;
-        output_buffers.insert(require(tensor::metal_buffer(output)).handle);
+        const auto handle = require(tensor::metal_buffer(output)).handle;
+        if (handle == packed_input_source) packed_input_source = nullptr;
+        output_buffers.insert(handle);
         return output;
     }
     auto retain(const Tensor& tensor) -> void {
         if (output_buffers.contains(require(tensor::metal_buffer(tensor)).handle)) return;
         pending.push_back(tensor);
         peak_pending = std::max(peak_pending, pending.size());
+    }
+    auto packed_input(const Tensor& input, float scale) -> std::pair<Tensor, bool> {
+        const auto shape = input.shape();
+        const auto found = std::ranges::find_if(
+            packed_inputs, [&](const Tensor& tensor) { return std::ranges::equal(tensor.shape(), shape); });
+        Tensor output;
+        if (found != packed_inputs.end()) {
+            output = *found;
+        } else {
+            packed_inputs.push_back(
+                require(Tensor::empty({shape.begin(), shape.end()}, DType::I8, tensor::Device::apple_gpu())));
+            output = packed_inputs.back();
+        }
+        const auto source_buffer = require(tensor::metal_buffer(input));
+        const bool reusable = packed_input_source == source_buffer.handle &&
+                              packed_input_source_offset == source_buffer.offset_bytes && packed_input_scale == scale;
+        packed_input_source = source_buffer.handle;
+        packed_input_source_offset = source_buffer.offset_bytes;
+        packed_input_scale = scale;
+        return {std::move(output), reusable};
+    }
+    auto packed_intermediate(std::span<const std::int64_t> shape) -> Tensor {
+        const auto found = std::ranges::find_if(
+            packed_intermediates, [&](const Tensor& tensor) { return std::ranges::equal(tensor.shape(), shape); });
+        if (found != packed_intermediates.end()) return *found;
+        packed_intermediates.push_back(
+            require(Tensor::empty({shape.begin(), shape.end()}, DType::I8, tensor::Device::apple_gpu())));
+        return packed_intermediates.back();
+    }
+    auto invalidate_packed_input(const Tensor& tensor) -> void {
+        if (!packed_input_source) return;
+        const auto buffer = require(tensor::metal_buffer(tensor));
+        if (buffer.handle == packed_input_source) {
+            packed_input_source = nullptr;
+        }
     }
     auto commands() -> mps::CommandBatch& {
         if (!batch)
@@ -78,6 +120,7 @@ struct Stream {
             recommended_working_set_bytes = memory.recommended_working_set_bytes;
         }
         pending.clear();
+        packed_input_source = nullptr;
     }
 };
 class MetalOperator final : public Operator {
@@ -86,6 +129,9 @@ public:
     std::optional<mps::Executable> executable;
     std::optional<mps::QuantizedLinear> quantized;
     Tensor packed_weight, packed_scales;
+    Tensor ffn_gate_up_weight, ffn_gate_up_scales, ffn_down_weight, ffn_down_scales;
+    float ffn_gate_up_output_scale = 0;
+    float ffn_down_input_scale = 0, ffn_down_output_scale = 0;
     Tensor prefill_weight;
     std::shared_ptr<const mps::Executable> prefill_executable;
     std::int32_t packed_bits = 0, packed_group = 0;
@@ -98,6 +144,7 @@ public:
     bool vector_projection = false;
     bool eager = false;
     bool quantize_int8 = false;
+    bool gated_feed_forward = false;
     Operation operation;
     float epsilon = 0;
     explicit MetalOperator(Stream& owner) : stream(owner) {}
@@ -115,12 +162,30 @@ public:
             require(mps::encode_eager(stream.commands(), operation, epsilon, inputs, output));
         else if (quantized)
             require(quantized->encode(stream.commands(), inputs[0], output));
-        else if (packed_bits) {
+        else if (gated_feed_forward) {
+            auto [packed, reusable] = stream.packed_input(inputs[0], packed_input_scale);
+            if (!reusable) require(mps::encode_quantize_int8(stream.commands(), packed_input_scale, inputs[0], packed));
+            auto hidden_shape = std::vector<std::int64_t>(inputs[0].shape().begin(), inputs[0].shape().end());
+            hidden_shape.back() = ffn_gate_up_weight.size(0) / 2;
+            auto hidden = stream.packed_intermediate(hidden_shape);
+            require(mps::encode_packed_gate_up(stream.commands(), packed, ffn_gate_up_weight, ffn_gate_up_scales,
+                                               hidden, packed_input_scale, ffn_gate_up_output_scale,
+                                               ffn_down_input_scale));
+            require(mps::encode_packed_linear(stream.commands(), hidden, ffn_down_weight, ffn_down_scales, output,
+                                              packed_bits, static_cast<std::int32_t>(hidden.size(-1)),
+                                              ffn_down_input_scale, ffn_down_output_scale, false));
+        } else if (packed_bits) {
             const auto rows = inputs[0].numel() / inputs[0].size(-1);
             const bool integer_w8 = !prefill_executable && !vector_projection && rows >= 4 && packed_bits == 8 &&
                                     packed_group == inputs[0].size(-1) && packed_input_scale > 0;
             Tensor calibrated_input;
-            if (packed_input_scale > 0 && !integer_w8) {
+            if (integer_w8) {
+                auto [packed, reusable] = stream.packed_input(inputs[0], packed_input_scale);
+                calibrated_input = std::move(packed);
+                if (!reusable)
+                    require(
+                        mps::encode_quantize_int8(stream.commands(), packed_input_scale, inputs[0], calibrated_input));
+            } else if (packed_input_scale > 0) {
                 calibrated_input = stream.acquire(inputs[0].shape(), prefill_executable ? DType::F16 : DType::F32);
                 require(mps::encode_eager(stream.commands(), Operation::STATIC_ROUND, packed_input_scale,
                                           inputs.first(1), calibrated_input));
@@ -158,6 +223,7 @@ public:
     auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
         if (destination.dtype() != dtype || !std::ranges::equal(destination.shape(), shape))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "in-place operation cannot change shape or dtype"});
+        stream.invalidate_packed_input(destination);
         if (scatter) {
             require(stream.commands().scatter_(destination, inputs[1], inputs[2]));
             for (std::size_t index = 0; index < inputs.size(); ++index) stream.retain(inputs[index]);
@@ -184,9 +250,13 @@ public:
     auto release_cached_buffers() -> void override {
         stream_.outputs = OutputPool{};
         stream_.output_buffers.clear();
+        stream_.packed_inputs.clear();
+        stream_.packed_intermediates.clear();
+        stream_.packed_input_source = nullptr;
     }
     auto copy_slice_(Tensor& destination, const Tensor& source, std::size_t outer, std::size_t source_bytes,
                      std::size_t destination_bytes, std::size_t offset_bytes) -> void override {
+        stream_.invalidate_packed_input(destination);
         require(
             stream_.commands().copy_slice_(source, destination, outer, source_bytes, destination_bytes, offset_bytes));
         stream_.retain(source);
@@ -238,6 +308,22 @@ public:
             require(result->quantized->prepare(inputs[0]));
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
             result->shape.back() = inputs[1].size(1);
+            return result;
+        }
+        if (spec.operation == Operation::GATED_FEED_FORWARD && inputs.size() == 5 && spec.attributes[0] == 8) {
+            result->gated_feed_forward = true;
+            result->packed_bits = spec.attributes[0];
+            result->packed_input_scale = spec.epsilon;
+            result->dynamic_count = 1;
+            result->ffn_gate_up_weight = require(inputs[1].to(tensor::Device::apple_gpu()));
+            result->ffn_gate_up_scales = require(inputs[2].to(tensor::Device::apple_gpu()));
+            result->ffn_down_weight = require(inputs[3].to(tensor::Device::apple_gpu()));
+            result->ffn_down_scales = require(inputs[4].to(tensor::Device::apple_gpu()));
+            result->ffn_gate_up_output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[3]));
+            result->ffn_down_input_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[4]));
+            result->ffn_down_output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[5]));
+            result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            result->shape.back() = inputs[3].size(0);
             return result;
         }
         if (spec.operation == Operation::PACKED_LINEAR) {
@@ -324,6 +410,8 @@ public:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "GELU multiplication requires direct kernel"});
             case Operation::RMS_ROTARY:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "RMS rotary requires direct kernel"});
+            case Operation::GATED_FEED_FORWARD:
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "gated feed-forward requires direct kernels"});
             case Operation::GREEDY_TOKEN:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "greedy selection must use the direct kernel"});
             case Operation::ADD:
@@ -337,6 +425,30 @@ public:
                 const auto head_width = static_cast<std::int64_t>(inputs[0].size(2)) / heads;
                 if (spec.attributes.size() >= 2) {
                     const auto key_heads = spec.attributes[1];
+                    if (heads == key_heads && spec.attributes.size() == 4 && spec.epsilon == 1.F &&
+                        inputs[0].size(1) >= 128 && inputs[3].dimensions() <= 4) {
+                        const std::array<std::int64_t, 4> axes{0, 2, 1, 3};
+                        const auto split = [&](std::size_t index) {
+                            auto operand = operands[index];
+                            auto length = static_cast<std::int64_t>(inputs[index].size(1));
+                            if (index != 0 && spec.attributes.size() == 4) {
+                                length = spec.attributes[3];
+                                if (spec.attributes[2] || length != static_cast<std::int64_t>(inputs[index].size(1)))
+                                    operand = graph.slice(operand, 1, spec.attributes[2], length);
+                            }
+                            return graph.transpose(
+                                graph.reshape(operand, {static_cast<std::int64_t>(inputs[index].size(0)), length, heads,
+                                                        head_width}),
+                                axes);
+                        };
+                        std::vector<std::int64_t> mask_shape(4 - inputs[3].dimensions(), 1);
+                        mask_shape.insert(mask_shape.end(), inputs[3].shape().begin(), inputs[3].shape().end());
+                        const auto mask = graph.reshape(operands[3], mask_shape);
+                        auto hidden =
+                            graph.scaled_dot_product_attention(split(0), split(1), split(2), mask, spec.epsilon);
+                        output = graph.reshape(graph.transpose(hidden, axes), inputs[0].shape());
+                        break;
+                    }
                     const std::array<std::int64_t, 5> axes{0, 2, 3, 1, 4};
                     const auto split = [&](std::size_t index) {
                         auto operand = operands[index];

@@ -898,6 +898,26 @@ auto Context::rms_rotary(const Tensor& input, const Tensor& scale, const Tensor&
         return rotary(rms_norm(input, scale, epsilon), cosine, sine);
     return impl_->run({Operation::RMS_ROTARY, {}, tensor::DType::F32, epsilon}, {&input, &scale, &cosine, &sine});
 }
+auto Context::rms_axial_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
+                               float epsilon) -> Tensor {
+    if (input.dimensions() != 4 || !input.numel() || input.dtype() != tensor::DType::F32 || input.size(3) % 4 ||
+        scale.dimensions() != 1 || scale.size(0) != input.size(3) || scale.dtype() != tensor::DType::F32 ||
+        !std::isfinite(epsilon) || epsilon <= 0)
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid axial RMS rotary operands"});
+    for (const auto* angle : {&cosine, &sine})
+        if (angle->dimensions() != 4 || angle->size(0) != 2 || angle->size(1) != input.size(1) || angle->size(2) != 1 ||
+            angle->size(3) != input.size(3) / 4 || angle->dtype() != tensor::DType::F32)
+            throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid axial RMS rotary angles"});
+    if (!tensor::DEVICE_CAPABILITIES[device().kind].fused_axial_rms_rotary) {
+        const auto normalized = rms_norm(input, scale, epsilon);
+        std::array<Tensor, 2> axes;
+        for (int axis = 0; axis < 2; ++axis)
+            axes[axis] = rotary(slice(normalized, 3, axis * input.size(3) / 2, input.size(3) / 2),
+                                slice(cosine, 0, axis, 1), slice(sine, 0, axis, 1));
+        return concat(axes, 3);
+    }
+    return impl_->run({Operation::RMS_ROTARY, {}, tensor::DType::F32, epsilon}, {&input, &scale, &cosine, &sine});
+}
 auto Context::rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,
                                 const Tensor& output_scale) -> Tensor {
     if (!input.defined() || !input.dimensions() || input.dtype() != tensor::DType::F32 || !scale.defined() ||

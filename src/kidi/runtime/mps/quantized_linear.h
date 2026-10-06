@@ -1,7 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
-#include <string>
+#include <span>
 #include "kidi/tensor/tensor.h"
 #include "kidi/runtime/mps/command_batch.h"
 
@@ -12,6 +13,9 @@ auto encode_packed_linear(CommandBatch& batch, const tensor::Tensor& input, cons
                           const tensor::Tensor& scales, tensor::Tensor& output, std::int32_t bits,
                           std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F,
                           bool vector_projection = false) -> Result<void>;
+auto encode_packed_gate_up(CommandBatch& batch, const tensor::Tensor& input, const tensor::Tensor& weight,
+                           const tensor::Tensor& scales, tensor::Tensor& output, float input_scale, float output_scale,
+                           float hidden_scale) -> Result<void>;
 
 class QuantizedLinear {
 public:

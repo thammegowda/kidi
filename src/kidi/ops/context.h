@@ -140,6 +140,8 @@ public:
     auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
     auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
                     float epsilon) -> Tensor;
+    auto rms_axial_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
+                          float epsilon) -> Tensor;
     auto rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,
                            const Tensor& output_scale = {}) -> Tensor;
     auto layer_norm(const Tensor& input, const Tensor& scale, const Tensor& bias, float epsilon) -> Tensor;
