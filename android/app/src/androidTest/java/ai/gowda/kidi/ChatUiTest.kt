@@ -300,6 +300,35 @@ class ChatUiTest {
     }
 
     @Test
+    fun pairedAccessoryCanBeUnpairedFromSettings() {
+        var unpaired = false
+        compose.setContent {
+            KidiTheme {
+                SettingsSheet(
+                    state = KidiUiState(pairedAccessoryName = "Kidi Lab"),
+                    onDismiss = {},
+                    onModelId = {},
+                    onSpeechModelId = {},
+                    onThreads = {},
+                    onTokens = {},
+                    onInstall = {},
+                    onCancelChat = {},
+                    onInstallSpeech = {},
+                    onCancelSpeech = {},
+                    onDelete = {},
+                    onDeleteSpeech = {},
+                    onUnpairAccessory = { unpaired = true },
+                )
+            }
+        }
+
+        compose.onNodeWithText("Accessory").performClick()
+        compose.onNodeWithText("Kidi Lab").assertIsDisplayed()
+        compose.onNodeWithTag("unpair-accessory").performClick()
+        compose.runOnIdle { assertEquals(true, unpaired) }
+    }
+
+    @Test
     fun photoControlsRespectVisionCapabilityAndAllowImageOnlySend() {
         val image = MessageAttachment(kind = AttachmentKind.IMAGE, localUri = "file:///unavailable-test-photo.jpg",
             name = "Photo", mimeType = "image/jpeg", sizeBytes = 123)

@@ -2,6 +2,7 @@ package ai.gowda.kidi
 
 import android.Manifest
 import android.app.Application
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
@@ -83,6 +84,12 @@ internal data class KidiUiState(
     val provisionalTextStart: Int? = null,
     val pendingImages: List<MessageAttachment> = emptyList(),
     val importingImage: Boolean = false,
+    val photoSource: CaptureSource = CaptureSource.PHONE,
+    val speechSource: CaptureSource = CaptureSource.PHONE,
+    val pairedAccessoryName: String? = null,
+    val pairingInvitation: PairingInvitation? = null,
+    val pairing: Boolean = false,
+    val accessoryBusy: Boolean = false,
     val visionReady: Boolean = false,
     val modelReady: Boolean = false,
     val loadingModel: Boolean = false,
@@ -151,6 +158,9 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     private val chats = ChatRepository(application)
     private val speechRecorder = SpeechRecorder()
     private val imageStore = ImageStore(application)
+    private val accessoryProfiles = AccessoryProfileStore(application)
+    private val accessoryNetwork = AccessoryNetwork(application)
+    private val accessoryPairer = AccessoryBlePairer(application, accessoryProfiles)
     private val runtimeExecutor = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "kidi-runtime") }
     private val runtimeDispatcher: CoroutineDispatcher = runtimeExecutor.asCoroutineDispatcher()
     // Speech has its own thread, like the web app's speech worker, so dictation never queues behind chat work.
@@ -170,6 +180,9 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 ?.takeIf { it in ACCELERATOR_LABELS } ?: DEFAULT_ACCELERATOR,
             speechAccelerator = preferences.getString(SPEECH_ACCELERATOR_KEY, null)
                 ?.takeIf { it in ACCELERATOR_LABELS } ?: DEFAULT_ACCELERATOR,
+            photoSource = preferences.captureSource(PHOTO_SOURCE_KEY),
+            speechSource = preferences.captureSource(SPEECH_SOURCE_KEY),
+            pairedAccessoryName = runCatching { accessoryProfiles.profiles().firstOrNull()?.name }.getOrNull(),
         ),
     )
     val state: StateFlow<KidiUiState> = _state.asStateFlow()
@@ -245,6 +258,150 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         if (captured) attachImage(uri) else imageStore.removeCapture(uri)
     }
 
+    fun setPhotoSource(source: CaptureSource) {
+        if (source == CaptureSource.ACCESSORY && _state.value.pairedAccessoryName == null) {
+            _state.update { it.copy(error = "Pair an accessory before selecting its camera") }
+            return
+        }
+        preferences.edit { putString(PHOTO_SOURCE_KEY, source.name) }
+        _state.update { it.copy(photoSource = source) }
+    }
+
+    fun setSpeechSource(source: CaptureSource) {
+        if (source == CaptureSource.ACCESSORY && _state.value.pairedAccessoryName == null) {
+            _state.update { it.copy(error = "Pair an accessory before selecting its microphone") }
+            return
+        }
+        preferences.edit { putString(SPEECH_SOURCE_KEY, source.name) }
+        _state.update { it.copy(speechSource = source) }
+    }
+
+    fun acceptPairingUri(value: String) {
+        if (_state.value.pairing || _state.value.accessoryBusy) return
+        runCatching {
+            AccessoryProtocol.parsePairingUri(value, System.currentTimeMillis() / 1000)
+        }.onSuccess { invitation ->
+            _state.update { it.copy(pairingInvitation = invitation, error = null) }
+        }.onFailure { error ->
+            _state.update { it.copy(error = "Invalid accessory invitation: ${error.userMessage()}") }
+        }
+    }
+
+    fun cancelPairing() {
+        if (!_state.value.pairing) _state.update { it.copy(pairingInvitation = null) }
+    }
+
+    @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT])
+    fun pairPendingAccessory(controllerName: String) {
+        val invitation = _state.value.pairingInvitation ?: return
+        if (_state.value.pairing || _state.value.chatBusyState) return
+        _state.update { it.copy(pairing = true, status = "Pairing ${invitation.deviceName}", error = null) }
+        viewModelScope.launch {
+            try {
+                val profile = accessoryPairer.pair(invitation, controllerName)
+                _state.update {
+                    it.copy(
+                        pairing = false,
+                        pairingInvitation = null,
+                        pairedAccessoryName = profile.name,
+                        status = readyStatus(it),
+                    )
+                }
+            } catch (error: Exception) {
+                _state.update {
+                    it.copy(
+                        pairing = false,
+                        status = readyStatus(it),
+                        error = "Accessory pairing failed: ${error.userMessage()}",
+                    )
+                }
+            }
+        }
+    }
+
+    @RequiresPermission(allOf = [Manifest.permission.CHANGE_WIFI_STATE, Manifest.permission.ACCESS_WIFI_STATE])
+    fun unpairAccessory() {
+        val current = _state.value
+        if (current.chatBusyState || current.accessoryBusy || current.pairing) return
+        val profile = runCatching { accessoryProfiles.profiles().firstOrNull() }.getOrNull()
+        if (profile == null) {
+            _state.update { it.copy(error = "No accessory is paired") }
+            return
+        }
+        _state.update { it.copy(accessoryBusy = true, status = "Unpairing ${profile.name}", error = null) }
+        viewModelScope.launch {
+            try {
+                accessoryNetwork.connect(profile).use { lease ->
+                    AccessoryClient(profile, lease.network.socketFactory).unpair()
+                }
+                accessoryProfiles.remove(profile.deviceId)
+                preferences.edit {
+                    putString(PHOTO_SOURCE_KEY, CaptureSource.PHONE.name)
+                    putString(SPEECH_SOURCE_KEY, CaptureSource.PHONE.name)
+                }
+                _state.update {
+                    it.copy(
+                        pairedAccessoryName = null,
+                        photoSource = CaptureSource.PHONE,
+                        speechSource = CaptureSource.PHONE,
+                        accessoryBusy = false,
+                        status = readyStatus(it),
+                    )
+                }
+            } catch (error: Exception) {
+                _state.update {
+                    it.copy(
+                        accessoryBusy = false,
+                        status = readyStatus(it),
+                        error = "Accessory unpair failed: ${error.userMessage()}",
+                    )
+                }
+            }
+        }
+    }
+
+    @RequiresPermission(allOf = [Manifest.permission.CHANGE_WIFI_STATE, Manifest.permission.ACCESS_WIFI_STATE])
+    fun captureAccessoryPhoto() {
+        val current = _state.value
+        if (!current.visionReady) {
+            _state.update { it.copy(error = "Load a vision model before attaching a photo") }
+            return
+        }
+        if (current.chatBusyState || current.accessoryBusy) return
+        val profile = runCatching { accessoryProfiles.profiles().firstOrNull() }.getOrNull()
+        if (profile == null) {
+            _state.update { it.copy(error = "Pair an accessory before requesting a photo") }
+            return
+        }
+        _state.update { it.copy(importingImage = true, accessoryBusy = true, status = "Waking accessory camera") }
+        viewModelScope.launch {
+            try {
+                val image = accessoryNetwork.connect(profile).use { lease ->
+                    val jpeg = AccessoryClient(profile, lease.network.socketFactory).capturePhoto("chat")
+                    withContext(Dispatchers.IO) { imageStore.importJpeg(jpeg, "${profile.name} photo") }
+                }
+                withContext(Dispatchers.IO) { current.pendingImages.forEach(imageStore::removeDraft) }
+                _state.update {
+                    it.copy(
+                        pendingImages = listOf(image),
+                        importingImage = false,
+                        accessoryBusy = false,
+                        status = readyStatus(it),
+                    )
+                }
+            } catch (error: Exception) {
+                _state.update {
+                    it.copy(
+                        importingImage = false,
+                        accessoryBusy = false,
+                        status = readyStatus(it),
+                        error = "Accessory photo failed: ${error.userMessage()}",
+                    )
+                }
+            }
+        }
+    }
+
     fun attachImage(uri: Uri) {
         val current = _state.value
         if (current.generating || current.recording || current.transcribing || current.importingImage) return
@@ -287,7 +444,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     private fun busy() = _state.value.let {
-        it.loadingModel || it.loadingSpeech || it.generating || it.recording || it.transcribing
+        it.loadingModel || it.loadingSpeech || it.generating || it.recording || it.transcribing ||
+            it.pairing || it.accessoryBusy
     }
 
     fun setChatAccelerator(value: String) {
@@ -512,18 +670,38 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    fun startRecording() {
+    fun startPhoneRecording() = startRecording(CaptureSource.PHONE)
+
+    @RequiresPermission(allOf = [Manifest.permission.CHANGE_WIFI_STATE, Manifest.permission.ACCESS_WIFI_STATE])
+    fun startAccessoryRecording() = startRecording(CaptureSource.ACCESSORY)
+
+    private fun startRecording(source: CaptureSource) {
         val current = _state.value
         if (!current.speechReady) {
             _state.update { it.copy(error = "Load a Whisper speech model in settings first") }
             return
         }
-        if (current.generating || current.loadingSpeech || current.recording || current.transcribing)
+        if (current.generating || current.loadingSpeech || current.recording || current.transcribing ||
+            current.pairing || current.accessoryBusy)
             return
+        val accessoryProfile = if (source == CaptureSource.ACCESSORY) {
+            runCatching { accessoryProfiles.profiles().firstOrNull() }.getOrNull() ?: run {
+                _state.update { it.copy(error = "Pair an accessory before using its microphone") }
+                return
+            }
+        } else {
+            null
+        }
         speechRecorder.prepare()
         stopRequestedAtMs = 0L
         _state.update {
-            it.copy(recording = true, recordingSeconds = 0f, status = "Listening", error = null)
+            it.copy(
+                recording = true,
+                accessoryBusy = source == CaptureSource.ACCESSORY,
+                recordingSeconds = 0f,
+                status = if (source == CaptureSource.ACCESSORY) "Waking accessory microphone" else "Listening",
+                error = null,
+            )
         }
         recordingJob = viewModelScope.launch {
             val composerPrefix = current.composerText.trim()
@@ -552,63 +730,79 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             try {
                 var reportedTenths = -1
                 var preempted = false
-                val recording = speechRecorder.capture(
-                    onSamples = { count, speechEnd ->
-                        val tenths = count / 1600
-                        if (tenths != reportedTenths) {
-                            reportedTenths = tenths
-                            _state.update { it.copy(recordingSeconds = count / 16000f) }
+                val onSamples: (Int, Int) -> Boolean = { count, speechEnd ->
+                    val tenths = count / 1600
+                    if (tenths != reportedTenths) {
+                        reportedTenths = tenths
+                        _state.update {
+                            it.copy(
+                                recordingSeconds = count / 16000f,
+                                status = if (source == CaptureSource.ACCESSORY) "Listening on accessory" else it.status,
+                            )
                         }
-                        val cadence = count >= MINIMUM_DRAFT_SAMPLES &&
-                            (lastDraftSamples == 0 || count - lastDraftSamples >= DRAFT_INTERVAL_SAMPLES)
-                        // A pause after new speech gets a draft at once, so it is usually ready to become the final
-                        // transcript by the time the user stops recording.
-                        val paused = speechEnd > 0 && count - speechEnd >= PAUSE_SAMPLES &&
-                            lastDraftSamples < speechEnd + SPEECH_TAIL_SAMPLES
-                        // The draft in progress misses the latest speech, so give the thread to a covering one.
-                        if (paused && draftBusy.get() && !preempted) {
-                            preempted = true
-                            NativeRuntime.cancelTranscription()
-                        }
-                        val requested = (cadence || paused) && draftEnabled.get() &&
-                            draftBusy.compareAndSet(false, true)
-                        if (requested) {
-                            lastDraftSamples = count
-                            preempted = false
-                        }
-                        requested
-                    },
-                    onSnapshot = { snapshot ->
-                        val generation = NativeRuntime.transcriptionGeneration()
-                        val job = viewModelScope.async(speechDispatcher) {
-                            try {
-                                val payload = NativeRuntime.transcribe(snapshot, "auto", 128, generation) { partial ->
-                                    publishPartial(partial, true)
-                                }
-                                val result = checked(payload)
-                                if (result.optBoolean("cancelled")) null else {
-                                    publishPartial(payload, true, complete = true)
-                                    latestDraft.accumulateAndGet(SpeechDraft(snapshot.size, result)) { old, new ->
-                                        if (old == null || new!!.samples >= old.samples) new else old
-                                    }
-                                    result
-                                }
-                            } catch (error: CancellationException) {
-                                throw error
-                            } catch (error: Throwable) {
-                                draftEnabled.set(false)
-                                _state.update {
-                                    it.copy(error = "Live transcript failed: ${error.userMessage()}")
-                                }
-                                null
-                            } finally {
-                                draftBusy.set(false)
+                    }
+                    val cadence = count >= MINIMUM_DRAFT_SAMPLES &&
+                        (lastDraftSamples == 0 || count - lastDraftSamples >= DRAFT_INTERVAL_SAMPLES)
+                    // A pause after new speech gets a draft at once, so it is usually ready to become the final
+                    // transcript by the time the user stops recording.
+                    val paused = speechEnd > 0 && count - speechEnd >= PAUSE_SAMPLES &&
+                        lastDraftSamples < speechEnd + SPEECH_TAIL_SAMPLES
+                    // The draft in progress misses the latest speech, so give the thread to a covering one.
+                    if (paused && draftBusy.get() && !preempted) {
+                        preempted = true
+                        NativeRuntime.cancelTranscription()
+                    }
+                    val requested = (cadence || paused) && draftEnabled.get() &&
+                        draftBusy.compareAndSet(false, true)
+                    if (requested) {
+                        lastDraftSamples = count
+                        preempted = false
+                    }
+                    requested
+                }
+                val onSnapshot: (FloatArray) -> Unit = { snapshot ->
+                    val generation = NativeRuntime.transcriptionGeneration()
+                    val job = viewModelScope.async(speechDispatcher) {
+                        try {
+                            val payload = NativeRuntime.transcribe(snapshot, "auto", 128, generation) { partial ->
+                                publishPartial(partial, true)
                             }
+                            val result = checked(payload)
+                            if (result.optBoolean("cancelled")) null else {
+                                publishPartial(payload, true, complete = true)
+                                latestDraft.accumulateAndGet(SpeechDraft(snapshot.size, result)) { old, new ->
+                                    if (old == null || new!!.samples >= old.samples) new else old
+                                }
+                                result
+                            }
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Throwable) {
+                            draftEnabled.set(false)
+                            _state.update {
+                                it.copy(error = "Live transcript failed: ${error.userMessage()}")
+                            }
+                            null
+                        } finally {
+                            draftBusy.set(false)
                         }
-                        pendingDraft.set(PendingDraft(snapshot.size, job))
-                    },
-                )
-                _state.update { it.copy(recording = false, transcribing = true, status = "Refining transcript") }
+                    }
+                    pendingDraft.set(PendingDraft(snapshot.size, job))
+                }
+                val recording = if (source == CaptureSource.PHONE) {
+                    speechRecorder.capture(onSamples, onSnapshot)
+                } else {
+                    accessoryNetwork.connect(requireNotNull(accessoryProfile)).use { lease ->
+                        speechRecorder.captureAccessory(
+                            AccessoryClient(accessoryProfile, lease.network.socketFactory),
+                            onSamples,
+                            onSnapshot,
+                        )
+                    }
+                }
+                _state.update {
+                    it.copy(recording = false, transcribing = true, accessoryBusy = false, status = "Refining transcript")
+                }
                 val samples = recording.samples
                 val covers = { size: Int ->
                     recording.speechEnd > 0 && size >= minOf(samples.size, recording.speechEnd + SPEECH_TAIL_SAMPLES)
@@ -666,6 +860,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     )
                 }
             } finally {
+                _state.update { if (it.accessoryBusy) it.copy(accessoryBusy = false) else it }
                 recordingJob = null
             }
         }
@@ -1018,6 +1213,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         const val TOKENS_KEY = "tokens"
         const val CHAT_ACCELERATOR_KEY = "chat-accelerator"
         const val SPEECH_ACCELERATOR_KEY = "speech-accelerator"
+        const val PHOTO_SOURCE_KEY = "photo-source"
+        const val SPEECH_SOURCE_KEY = "speech-source"
         const val MESSAGES_KEY = "messages"
         const val MINIMUM_DRAFT_SAMPLES = 12800
         const val DRAFT_INTERVAL_SAMPLES = 19200
@@ -1025,5 +1222,13 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         const val SPEECH_TAIL_SAMPLES = 3200
     }
 }
+
+private val KidiUiState.chatBusyState: Boolean
+    get() = generating || recording || transcribing || loadingModel || loadingChat || importingImage ||
+        pairing || accessoryBusy
+
+private fun SharedPreferences.captureSource(key: String): CaptureSource =
+    runCatching { CaptureSource.valueOf(getString(key, null) ?: CaptureSource.PHONE.name) }
+        .getOrDefault(CaptureSource.PHONE)
 
 private fun defaultThreadCount() = Runtime.getRuntime().availableProcessors().coerceIn(1, 4)

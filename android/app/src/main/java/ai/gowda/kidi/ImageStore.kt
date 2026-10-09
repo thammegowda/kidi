@@ -10,6 +10,7 @@ import android.net.Uri
 import androidx.core.content.FileProvider
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
 import java.util.UUID
 
 internal class ImageStore(private val context: Context) {
@@ -30,6 +31,21 @@ internal class ImageStore(private val context: Context) {
 
     fun import(uri: Uri): MessageAttachment {
         val source = ImageDecoder.createSource(context.contentResolver, uri)
+        return import(source, "Photo")
+    }
+
+    fun importJpeg(jpeg: ByteArray, name: String): MessageAttachment {
+        require(
+            jpeg.size in 4..4 * 1024 * 1024 &&
+                jpeg[0] == 0xff.toByte() &&
+                jpeg[1] == 0xd8.toByte() &&
+                jpeg[jpeg.lastIndex - 1] == 0xff.toByte() &&
+                jpeg[jpeg.lastIndex] == 0xd9.toByte(),
+        ) { "Accessory photo is not a bounded complete JPEG" }
+        return import(ImageDecoder.createSource(ByteBuffer.wrap(jpeg)), name)
+    }
+
+    private fun import(source: ImageDecoder.Source, name: String): MessageAttachment {
         val bitmap = ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
             require(info.size.width.toLong() * info.size.height in 1..64L * 1024 * 1024) { "Image is too large" }
             val factor = minOf(1.0, 2048.0 / maxOf(info.size.width, info.size.height))
@@ -49,7 +65,7 @@ internal class ImageStore(private val context: Context) {
                 it.fd.sync()
             }
             return MessageAttachment(id = id, kind = AttachmentKind.IMAGE, localUri = Uri.fromFile(file).toString(),
-                name = "Photo", mimeType = "image/jpeg", sizeBytes = file.length(), width = opaque.width, height = opaque.height)
+                name = name, mimeType = "image/jpeg", sizeBytes = file.length(), width = opaque.width, height = opaque.height)
         } catch (error: Exception) {
             file.delete()
             throw error

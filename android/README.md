@@ -22,6 +22,27 @@ sdkmanager --sdk_root="$HOME/Library/Android/sdk" \
 	'platforms;android-36' 'build-tools;36.0.0' 'cmake;3.31.6' 'ndk;28.0.13004108'
 ```
 
+## Camera and microphone accessory prototype
+
+Kidi has an opt-in client for the ESP32-P4/ESP32-C6 accessory protocol. A
+`kidi://pair/v1#...` invitation launches a confirmation dialog, pairs over BLE,
+and stores the resulting controller profile encrypted with Android Keystore.
+The existing photo and dictation controls then offer remembered **Phone** and
+**Accessory** sources.
+
+Accessory traffic uses an Android local-only Wi-Fi request and the returned
+network's socket factory; Kidi never rebinds the process-wide network. Control
+and media TLS certificates are pinned independently. Photos are bounded,
+digest-checked JPEGs imported through the normal image path. Audio is bounded
+16 kHz mono PCM16 and feeds the same voice-activity and Whisper pipeline as the
+phone microphone. A failed accessory capture is reported and never silently
+retried on a phone sensor.
+
+Concurrent use with an existing Wi-Fi internet connection requires Android 12
+or newer and a phone that supports STA concurrency for local-only connections.
+The matching C6/P4 product firmware is required; the diagnostic camera firmware
+does not implement this protocol.
+
 ## Build and Run
 
 For distribution through Google Play, follow the

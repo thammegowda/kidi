@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.net.Uri
 import android.os.SystemClock
+import android.os.Build
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -137,8 +138,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 
 @Composable
-internal fun KidiApp(viewModel: ChatViewModel = viewModel()) {
+internal fun KidiApp(
+    pairingUri: String? = null,
+    onPairingUriConsumed: () -> Unit = {},
+    viewModel: ChatViewModel = viewModel(),
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    LaunchedEffect(pairingUri) {
+        pairingUri?.let {
+            viewModel.acceptPairingUri(it)
+            onPairingUriConsumed()
+        }
+    }
     KidiTheme {
         KidiScreen(state, viewModel)
     }
@@ -154,6 +165,7 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
     val snackbar = remember { SnackbarHostState() }
     val context = LocalContext.current
     var captureUri by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingAccessoryAction by remember { mutableStateOf<(() -> Unit)?>(null) }
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { captured ->
         captureUri?.let { viewModel.finishCapture(Uri.parse(it), captured) }
         captureUri = null
@@ -162,14 +174,50 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
         uri?.let(viewModel::attachImage)
     }
     val microphonePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) viewModel.startRecording()
+        if (granted) viewModel.startPhoneRecording()
         else viewModel.reportError("Microphone permission is required for speech dictation")
     }
+    val pairingPermissions = if (Build.VERSION.SDK_INT >= 31) {
+        arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+    } else {
+        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    }
+    val networkPermissions = if (Build.VERSION.SDK_INT >= 33) {
+        arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
+    } else {
+        arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    }
+    fun granted(permissions: Array<String>) = permissions.all {
+        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+    }
+    val pairingPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        if (pairingPermissions.all { result[it] == true }) viewModel.pairPendingAccessory(Build.MODEL)
+        else viewModel.reportError("Nearby-device permission is required to pair the accessory")
+    }
+    val networkPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        val action = pendingAccessoryAction
+        pendingAccessoryAction = null
+        if (networkPermissions.all { result[it] == true }) action?.invoke()
+        else viewModel.reportError("Nearby Wi-Fi permission is required to use the accessory")
+    }
+    val runAccessoryAction: (() -> Unit) -> Unit = { action ->
+        if (granted(networkPermissions)) action()
+        else {
+            pendingAccessoryAction = action
+            networkPermission.launch(networkPermissions)
+        }
+    }
     val startRecording = {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
-            viewModel.startRecording()
-        else
+        if (state.speechSource == CaptureSource.ACCESSORY) {
+            runAccessoryAction(viewModel::startAccessoryRecording)
+        } else if (
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            viewModel.startPhoneRecording()
+        } else {
             microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
     LaunchedEffect(state.error, settingsOpen) {
         if (!settingsOpen) {
@@ -200,7 +248,9 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
                 .onFailure { viewModel.reportError("Photo picker is unavailable") }
         },
         onTakePhoto = {
-            if (captureUri == null) {
+            if (state.photoSource == CaptureSource.ACCESSORY) {
+                runAccessoryAction(viewModel::captureAccessoryPhoto)
+            } else if (captureUri == null) {
                 runCatching {
                     val uri = viewModel.captureImageUri()
                     captureUri = uri.toString()
@@ -213,7 +263,35 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
             }
         },
         onRemoveImage = viewModel::removePendingImage,
+        onPhotoSourceChange = viewModel::setPhotoSource,
+        onSpeechSourceChange = viewModel::setSpeechSource,
     )
+    state.pairingInvitation?.let { invitation ->
+        AlertDialog(
+            onDismissRequest = viewModel::cancelPairing,
+            title = { Text("Pair ${invitation.deviceName}?") },
+            text = {
+                Text(
+                    "Pair this accessory with ${Build.MODEL}. The invitation is single-use and expires shortly.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !state.pairing,
+                    onClick = {
+                        if (granted(pairingPermissions)) viewModel.pairPendingAccessory(Build.MODEL)
+                        else pairingPermission.launch(pairingPermissions)
+                    },
+                ) {
+                    if (state.pairing) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    else Text("Pair")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = viewModel::cancelPairing, enabled = !state.pairing) { Text("Cancel") }
+            },
+        )
+    }
 
     if (settingsOpen) {
         SettingsSheet(
@@ -231,6 +309,9 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
             onCancelSpeech = viewModel::cancelSpeechInstall,
             onDelete = { confirmDelete = true },
             onDeleteSpeech = { confirmSpeechDelete = true },
+            onUnpairAccessory = {
+                runAccessoryAction(viewModel::unpairAccessory)
+            },
         )
     }
     if (confirmDelete) {
@@ -265,14 +346,17 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
 }
 
 private val KidiUiState.runtimeBusy: Boolean
-    get() = generating || recording || transcribing || loadingModel || loadingSpeech || loadingChat || importingImage
+    get() = generating || recording || transcribing || loadingModel || loadingSpeech || loadingChat ||
+        importingImage || pairing || accessoryBusy
 
 private val KidiUiState.chatBusy: Boolean
-    get() = generating || recording || transcribing || loadingModel || loadingChat || importingImage
+    get() = generating || recording || transcribing || loadingModel || loadingChat || importingImage ||
+        pairing || accessoryBusy
 
 /** Dictation runs on its own thread, so it stays available while the chat model loads. */
 private val KidiUiState.speechBusy: Boolean
-    get() = generating || recording || transcribing || loadingSpeech || loadingChat || importingImage
+    get() = generating || recording || transcribing || loadingSpeech || loadingChat || importingImage ||
+        pairing || accessoryBusy
 
 private fun modelLabel(modelId: String) = when (modelId) {
     "google/gemma-4-E2B-it-qat-mobile-transformers" -> "Gemma 4 E2B"
@@ -309,6 +393,8 @@ internal fun ChatWorkspace(
     onPickImage: () -> Unit = {},
     onTakePhoto: () -> Unit = {},
     onRemoveImage: () -> Unit = {},
+    onPhotoSourceChange: (CaptureSource) -> Unit = {},
+    onSpeechSourceChange: (CaptureSource) -> Unit = {},
 ) {
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -333,7 +419,7 @@ internal fun ChatWorkspace(
                 scope.launch { drawer.open() }
             } },
             bottomBar = { Composer(state, onTextChange, onSend, onStop, onRecord, onStopRecording, onSettings,
-                onPickImage, onTakePhoto, onRemoveImage) },
+                onPickImage, onTakePhoto, onRemoveImage, onPhotoSourceChange, onSpeechSourceChange) },
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding), contentAlignment = Alignment.TopCenter) {
                 Conversation(state, onSettings, onTextChange, Modifier.widthIn(max = 760.dp).fillMaxSize(), onOlderMessages)
@@ -359,6 +445,53 @@ internal fun ToolButton(
     ) {
         IconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(48.dp)) {
             Icon(icon, label, Modifier.size(iconSize), tint = if (enabled) tint else tint.copy(alpha = 0.38f))
+        }
+    }
+}
+
+@Composable
+private fun SourceToolButton(
+    icon: ImageVector,
+    label: String,
+    source: CaptureSource,
+    accessoryName: String?,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    onSourceChange: (CaptureSource) -> Unit,
+    iconSize: Dp = 22.dp,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(Modifier.size(width = 58.dp, height = 48.dp)) {
+        ToolButton(
+            icon,
+            "$label · ${if (source == CaptureSource.PHONE) "Phone" else accessoryName ?: "Accessory"}",
+            onClick,
+            enabled,
+            iconSize = iconSize,
+        )
+        IconButton(
+            onClick = { expanded = true },
+            enabled = enabled,
+            modifier = Modifier.align(Alignment.BottomEnd).size(24.dp),
+        ) {
+            Icon(Icons.Default.ExpandMore, "Select $label source", Modifier.size(15.dp))
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(
+                text = { Text("Phone") },
+                onClick = {
+                    expanded = false
+                    onSourceChange(CaptureSource.PHONE)
+                },
+            )
+            DropdownMenuItem(
+                text = { Text(accessoryName ?: "Accessory not paired") },
+                enabled = accessoryName != null,
+                onClick = {
+                    expanded = false
+                    onSourceChange(CaptureSource.ACCESSORY)
+                },
+            )
         }
     }
 }
@@ -590,6 +723,8 @@ private fun Composer(
     onPickImage: () -> Unit,
     onTakePhoto: () -> Unit,
     onRemoveImage: () -> Unit,
+    onPhotoSourceChange: (CaptureSource) -> Unit,
+    onSpeechSourceChange: (CaptureSource) -> Unit,
 ) {
     val keyboard = LocalSoftwareKeyboardController.current
     val canSend = state.modelReady && !state.chatBusy &&
@@ -651,16 +786,27 @@ private fun Composer(
                         Modifier.fillMaxWidth().padding(start = 4.dp, end = 8.dp, bottom = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        ToolButton(Icons.Default.PhotoCamera, "Take photo", onTakePhoto, state.visionReady && !state.chatBusy)
+                        SourceToolButton(
+                            Icons.Default.PhotoCamera,
+                            "Take photo",
+                            state.photoSource,
+                            state.pairedAccessoryName,
+                            state.visionReady && !state.chatBusy,
+                            onTakePhoto,
+                            onPhotoSourceChange,
+                        )
                         ToolButton(Icons.Default.PhotoLibrary, "Choose photo", onPickImage, state.visionReady && !state.chatBusy)
-                        ToolButton(
+                        SourceToolButton(
                             Icons.Default.Mic,
                             if (state.speechReady) "Dictate message" else "Set up dictation",
+                            state.speechSource,
+                            state.pairedAccessoryName,
+                            !state.speechBusy,
                             {
                                 keyboard?.hide()
                                 if (state.speechReady) onRecord() else onSettings()
                             },
-                            enabled = !state.speechBusy,
+                            onSpeechSourceChange,
                             iconSize = 28.dp,
                         )
                         Spacer(Modifier.weight(1f))
@@ -788,6 +934,7 @@ internal fun SettingsSheet(
     onCancelSpeech: () -> Unit,
     onDelete: () -> Unit,
     onDeleteSpeech: () -> Unit,
+    onUnpairAccessory: () -> Unit = {},
     onChatAccelerator: (String) -> Unit = {},
     onSpeechAccelerator: (String) -> Unit = {},
 ) {
@@ -807,7 +954,7 @@ internal fun SettingsSheet(
                 ToolButton(Icons.Default.Close, "Close settings", onDismiss)
             }
             TabRow(selectedTabIndex = selectedTab, containerColor = MaterialTheme.colorScheme.surface) {
-                listOf("Models", "Inference").forEachIndexed { index, label ->
+                listOf("Models", "Inference", "Accessory").forEachIndexed { index, label ->
                     Tab(selected = selectedTab == index, onClick = { selectedTab = index }, text = { Text(label) })
                 }
             }
@@ -839,10 +986,44 @@ internal fun SettingsSheet(
                         onModelId = onSpeechModelId, onInstall = onInstallSpeech, onCancel = onCancelSpeech,
                         onDelete = onDeleteSpeech, deleteLabel = "Remove speech model",
                     )
-                } else {
+                } else if (selectedTab == 1) {
                     InferenceSettings(state, onThreads, onChatAccelerator, onSpeechAccelerator, onTokens)
+                } else {
+                    AccessorySettings(state, onUnpairAccessory)
                 }
                 LegalFooter(Modifier.padding(horizontal = 24.dp, vertical = 16.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun AccessorySettings(state: KidiUiState, onUnpairAccessory: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("Camera and microphone", style = MaterialTheme.typography.titleMedium)
+        Text(
+            state.pairedAccessoryName ?: "No accessory paired",
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        Text(
+            if (state.pairedAccessoryName == null) {
+                "Open a one-time Kidi pairing link to add an accessory."
+            } else {
+                "Unpairing revokes this controller on the accessory before removing its local profile."
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (state.pairedAccessoryName != null) {
+            TextButton(
+                onClick = onUnpairAccessory,
+                enabled = !state.accessoryBusy && !state.runtimeBusy,
+                modifier = Modifier.testTag("unpair-accessory"),
+            ) {
+                Text(if (state.accessoryBusy) "Unpairing…" else "Unpair accessory")
             }
         }
     }
