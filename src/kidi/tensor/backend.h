@@ -36,6 +36,9 @@ public:
 
     virtual auto allocate(Device device, std::size_t size_bytes,
                           std::size_t alignment) const -> Result<std::shared_ptr<Storage>> = 0;
+    /// Storage whose bytes are all zero. Backends may return lazily committed zero pages instead of writing them.
+    virtual auto allocate_zeroed(Device device, std::size_t size_bytes, std::size_t alignment) const
+        -> Result<std::shared_ptr<Storage>>;
     virtual auto wrap_host(Device device, std::span<const std::byte> bytes,
                            std::shared_ptr<const void> owner) const -> Result<std::shared_ptr<Storage>> = 0;
     virtual auto clear(Storage& storage) const -> Result<void>;

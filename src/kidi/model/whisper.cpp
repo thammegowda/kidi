@@ -212,7 +212,8 @@ auto WhisperImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<v
     }
 }
 
-auto WhisperImpl::encode(const audio::WhisperFeatures& features, std::size_t frames) -> Result<WhisperEncoderState> {
+auto WhisperImpl::encode(const audio::WhisperFeatures& features, std::size_t frames,
+                         const std::function<bool()>& cancelled) -> Result<WhisperEncoderState> {
     try {
         if (!frames) frames = features.frames;
         if (device() != tensor::Device::cpu() || features.bins != 80 || features.frames != 3000 ||
@@ -225,7 +226,7 @@ auto WhisperImpl::encode(const audio::WhisperFeatures& features, std::size_t fra
             for (std::size_t bin = 0; bin < features.bins; ++bin)
                 time_major[frame * features.bins + bin] = features.values[bin * features.frames + frame];
         auto convolution = impl_->encoder->convolve(impl_->context, input);
-        auto hidden = impl_->encoder->encode(impl_->context, convolution);
+        auto hidden = impl_->encoder->encode(impl_->context, convolution, cancelled);
         WhisperEncoderState result{convolution, hidden, impl_->decoder->project_source(impl_->context, hidden)};
         impl_->context.synchronize();
         return result;

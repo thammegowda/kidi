@@ -40,6 +40,10 @@ auto RmsNormImpl::forward_rotary(ops::Context& context, const Tensor& input, con
                                  const Tensor& sine) const -> Tensor {
     return context.rms_rotary(input, weight_, cosine, sine, epsilon_);
 }
+auto RmsNormImpl::forward_axial_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
+                                       const Tensor& sine) const -> Tensor {
+    return context.rms_axial_rotary(input, weight_, cosine, sine, epsilon_);
+}
 auto RmsNormImpl::forward_residual(ops::Context& context, const Tensor& input, const Tensor& residual,
                                    const Tensor& output_scale) const -> Tensor {
     return context.rms_norm_residual(input, weight_, residual, epsilon_, output_scale);
@@ -146,7 +150,9 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
                             gate_up_->input_size_ % 128 == 0 && down_->input_size_ % 32 == 0;
     const bool cpu_fusion = (context.device() == tensor::Device::cpu() && FUSED_CPU_FEED_FORWARD) ||
                             context.device() == tensor::Device::vulkan();
-    if (((cpu_fusion && rows >= 32) || web_fusion) && gate_up_->packed_bits_ &&
+    const bool metal_fusion = tensor::DEVICE_CAPABILITIES[context.device().kind].fused_packed_feed_forward &&
+                              rows >= 4 && gate_up_->packed_bits_ == 8;
+    if (((cpu_fusion && rows >= 32) || web_fusion || metal_fusion) && gate_up_->packed_bits_ &&
         gate_up_->packed_bits_ == down_->packed_bits_) {
         const Tensor& gate_input = gate_up_->input_scale_;
         const Tensor& gate_output = gate_up_->output_scale_;
@@ -166,11 +172,15 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
         if (!web_fusion)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "fused feed-forward requires positive trained scales"});
     }
+    return forward_stages(context, input).output;
+}
+auto GatedFeedForwardImpl::forward_stages(ops::Context& context, const Tensor& input) const -> GatedFeedForwardStages {
     const auto projected = gate_up_->forward(context, input);
     const auto intermediate = static_cast<std::int64_t>(projected.size(-1) / 2);
     const auto gate = context.slice(projected, -1, 0, intermediate);
     const auto up = context.slice(projected, -1, intermediate, intermediate);
-    return down_->forward(context, context.gelu_multiply(gate, up));
+    const auto hidden = context.gelu_multiply(gate, up);
+    return {gate, up, hidden, down_->forward(context, hidden)};
 }
 Gemma4AttentionImpl::Gemma4AttentionImpl(std::int32_t hidden, std::int32_t heads, std::int32_t key_heads,
                                          std::int32_t head_width, float epsilon, bool shared, std::int32_t packed_bits)

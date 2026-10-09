@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include "kidi/layers/gemma4.h"
 #include "kidi/layers/transformer.h"
 
@@ -74,7 +76,9 @@ public:
     WhisperEncoderImpl(std::int32_t mel_bins, std::int32_t hidden, std::int32_t intermediate, std::int32_t heads,
                        std::int32_t layer_count, std::int32_t positions, float epsilon);
     auto convolve(ops::Context& context, const Tensor& input) const -> Tensor;
-    auto encode(ops::Context& context, const Tensor& input) const -> Tensor;
+    /// Runs the encoder blocks; `cancelled` is polled between blocks and abandons encoding by throwing.
+    auto encode(ops::Context& context, const Tensor& input, const std::function<bool()>& cancelled = {}) const
+        -> Tensor;
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
 
 private:

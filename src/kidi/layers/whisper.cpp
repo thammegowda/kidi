@@ -213,10 +213,17 @@ auto WhisperEncoderImpl::convolve(ops::Context& context, const Tensor& input) co
     return context.gelu(second_conv_->forward(context, hidden));
 }
 
-auto WhisperEncoderImpl::encode(ops::Context& context, const Tensor& input) const -> Tensor {
+auto WhisperEncoderImpl::encode(ops::Context& context, const Tensor& input,
+                                const std::function<bool()>& cancelled) const -> Tensor {
     auto hidden = input;
     hidden = context.add(hidden, positions_->forward(context, 0, hidden.size(1)));
-    for (const auto& layer : *layers_) hidden = layer->forward(context, hidden);
+    for (const auto& layer : *layers_) {
+        if (cancelled && cancelled()) {
+            context.synchronize();
+            throw ops::Failure({ErrorCode::RUNTIME, "transcription cancelled"});
+        }
+        hidden = layer->forward(context, hidden);
+    }
     return by_rows(context, hidden, [&](const Tensor& rows, std::int64_t) { return norm_->forward(context, rows); });
 }
 

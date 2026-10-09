@@ -84,6 +84,8 @@ public:
 
     auto matmul(Value left, Value right, bool transpose_left = false, bool transpose_right = false,
                 std::string_view name = {}) -> Value;
+    auto scaled_dot_product_attention(Value query, Value key, Value value, Value mask, float scale,
+                                      std::string_view name = {}) -> Value;
     auto reshape(Value value, std::span<const std::int64_t> shape, std::string_view name = {}) -> Value;
     auto reshape(Value value, std::initializer_list<std::int64_t> shape, std::string_view name = {}) -> Value {
         return reshape(value, std::span<const std::int64_t>(shape.begin(), shape.size()), name);

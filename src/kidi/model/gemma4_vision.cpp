@@ -1,6 +1,8 @@
 #include "kidi/model/gemma4_vision.h"
 #include "kidi/layers/gemma4.h"
+#include "kidi/runtime/parity_math.h"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -13,12 +15,24 @@ using tensor::DType;
 using tensor::Tensor;
 
 namespace {
-// CPU slices bound workspace memory. On a GPU each slice costs fixed dispatch overhead, so slices are large: whole
-// projections, and attention query blocks whose score buffers stay small.
+using StageCallback = std::function<void(std::string_view, const Tensor&)>;
+
+// CPU slices bound workspace memory. GPU projections and fused attention run whole to avoid fixed dispatch overhead.
+#if defined(__ANDROID__)
+constexpr std::int64_t VISION_ROWS = 256;
+#else
 constexpr std::int64_t VISION_ROWS = 32;
+#endif
 auto slice_rows(const ops::Context& context, bool attention) -> std::int64_t {
+    if (context.device() == tensor::Device::cpu()) {
+        const auto precision = context.precision();
+        if (precision == core::InferencePrecision::LOWBIT_PARITY ||
+            (attention && precision == core::InferencePrecision::QAT_FP32))
+            return std::numeric_limits<std::int64_t>::max();
+    }
     if (context.device() == tensor::Device::cpu()) return VISION_ROWS;
-    return attention ? 512 : std::numeric_limits<std::int64_t>::max();
+    if (attention && !tensor::DEVICE_CAPABILITIES[context.device().kind].fused_full_attention) return 512;
+    return std::numeric_limits<std::int64_t>::max();
 }
 
 auto project_rows(ops::Context& context, const layers::Linear& layer, const Tensor& input) -> Tensor {
@@ -35,6 +49,29 @@ auto project_rows(ops::Context& context, const layers::Linear& layer, const Tens
         context.copy_slice_(output, part, 1, start);
     }
     return output;
+}
+
+auto concatenate_rows(const Tensor& first, const Tensor& second, std::string_view name) -> Tensor {
+    if (first.dtype() != second.dtype() || first.dimensions() != 2 || second.dimensions() != 2 ||
+        first.size(1) != second.size(1))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "cannot combine gate/up parameter: " + std::string(name)});
+    const auto first_bytes = require(std::as_const(first).host_bytes());
+    const auto second_bytes = require(std::as_const(second).host_bytes());
+    std::vector<std::byte> bytes(first_bytes.size() + second_bytes.size());
+    std::ranges::copy(first_bytes, bytes.begin());
+    std::ranges::copy(second_bytes, bytes.begin() + static_cast<std::ptrdiff_t>(first_bytes.size()));
+    return require(Tensor::from_bytes(
+        {static_cast<std::int64_t>(first.size(0) + second.size(0)), static_cast<std::int64_t>(first.size(1))},
+        first.dtype(), bytes));
+}
+
+auto require_same_scalar(const Tensor& first, const Tensor& second, std::string_view name) -> Tensor {
+    const auto first_bytes = require(std::as_const(first).host_bytes());
+    const auto second_bytes = require(std::as_const(second).host_bytes());
+    if (first.dtype() != second.dtype() || first.numel() != 1 || second.numel() != 1 ||
+        !std::ranges::equal(first_bytes, second_bytes))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "gate/up calibration differs: " + std::string(name)});
+    return first;
 }
 
 KIDI_MODULE(VisionAttention);
@@ -59,31 +96,53 @@ public:
     }
 
     auto forward(ops::Context& context, const Tensor& input, const Tensor& cosine, const Tensor& sine,
-                 const Tensor& mask) -> Tensor {
+                 const Tensor& mask, const StageCallback& observer) -> Tensor {
         const auto length = static_cast<std::int64_t>(input.size(1));
-        const auto rotary = [&](const Tensor& projected, layers::RmsNorm& norm) {
-            auto normalized = norm->forward(context, context.reshape(projected, {1, length, heads_, width_}));
+        const auto rotary = [&](const Tensor& projected, layers::RmsNorm& norm, std::string_view norm_stage,
+                                std::string_view rope_stage) {
+            const auto shaped = context.reshape(projected, {1, length, heads_, width_});
+            if (!observer)
+                return context.reshape(norm->forward_axial_rotary(context, shaped, cosine, sine),
+                                       {1, length, heads_ * width_});
+            auto normalized = norm->forward(context, shaped);
+            if (observer) observer(norm_stage, normalized);
             std::array<Tensor, 2> axes;
             for (int axis = 0; axis < 2; ++axis)
                 axes[axis] = context.rotary(context.slice(normalized, 3, axis * width_ / 2, width_ / 2),
                                             context.slice(cosine, 0, axis, 1), context.slice(sine, 0, axis, 1));
-            return context.reshape(context.concat(axes, 3), {1, length, heads_ * width_});
+            auto rotated = context.concat(axes, 3);
+            if (observer) observer(rope_stage, rotated);
+            return context.reshape(rotated, {1, length, heads_ * width_});
         };
-        const auto query = rotary(project_rows(context, query_, input), query_norm_);
-        const auto key = rotary(project_rows(context, key_, input), key_norm_);
-        const auto value =
-            context.reshape(value_norm_->forward(
-                                context, context.reshape(project_rows(context, value_, input), {1, length, heads_, width_})),
-                            {1, length, heads_ * width_});
-        auto attended = require(Tensor::empty({1, length, heads_ * width_}, DType::F32, context.device()));
+        const auto query_projected = project_rows(context, query_, input);
+        if (observer) observer("q_proj", query_projected);
+        const auto query = rotary(query_projected, query_norm_, "q_norm", "q_rope");
+        const auto key_projected = project_rows(context, key_, input);
+        if (observer) observer("k_proj", key_projected);
+        const auto key = rotary(key_projected, key_norm_, "k_norm", "k_rope");
+        const auto value_projected = project_rows(context, value_, input);
+        if (observer) observer("v_proj", value_projected);
+        const auto value_normalized =
+            value_norm_->forward(context, context.reshape(value_projected, {1, length, heads_, width_}));
+        if (observer) observer("v_norm", value_normalized);
+        const auto value = context.reshape(value_normalized, {1, length, heads_ * width_});
         const auto rows = slice_rows(context, true);
-        for (std::int64_t start = 0; start < length; start += rows) {
-            const auto count = std::min(rows, length - start);
-            const auto part = context.grouped_query_attention(context.slice(query, 1, start, count), key, value,
-                                                              heads_, heads_, mask, 1.F);
-            context.copy_slice_(attended, part, 1, start);
+        Tensor attended;
+        if (length <= rows) {
+            attended = context.grouped_query_attention(query, key, value, heads_, heads_, mask, 1.F);
+        } else {
+            attended = require(Tensor::empty({1, length, heads_ * width_}, DType::F32, context.device()));
+            for (std::int64_t start = 0; start < length; start += rows) {
+                const auto count = std::min(rows, length - start);
+                const auto part = context.grouped_query_attention(context.slice(query, 1, start, count), key, value,
+                                                                  heads_, heads_, mask, 1.F);
+                context.copy_slice_(attended, part, 1, start);
+            }
         }
-        return project_rows(context, output_, attended);
+        if (observer) observer("attended", attended);
+        auto output = project_rows(context, output_, attended);
+        if (observer) observer("o_proj", output);
+        return output;
     }
 
 private:
@@ -92,43 +151,56 @@ private:
     layers::RmsNorm query_norm_, key_norm_, value_norm_;
 };
 
-KIDI_MODULE(VisionMlp);
-class VisionMlpImpl : public Module {
-public:
-    VisionMlpImpl(const YAML::Node& config, bool quantized)
-        : gate_(config["hidden_size"].as<int>(), config["intermediate_size"].as<int>(), true, false, quantized ? 8 : 0),
-          up_(config["hidden_size"].as<int>(), config["intermediate_size"].as<int>(), true, false, quantized ? 8 : 0),
-          down_(config["intermediate_size"].as<int>(), config["hidden_size"].as<int>(), true, false,
-                quantized ? 8 : 0) {
-        register_module("gate_proj", gate_);
-        register_module("up_proj", up_);
-        register_module("down_proj", down_);
+auto forward_vision_mlp(ops::Context& context, const layers::GatedFeedForward& layer, const Tensor& input,
+                        const StageCallback& observer) -> Tensor {
+    const auto length = static_cast<std::int64_t>(input.size(1));
+    const auto chunk = slice_rows(context, false);
+    const auto observe = [&](const layers::GatedFeedForwardStages& stages) {
+        observer("gate_proj", stages.gate);
+        observer("up_proj", stages.up);
+        observer("mlp_hidden", stages.hidden);
+        observer("down_proj", stages.output);
+    };
+    if (length <= chunk) {
+        if (!observer) return layer->forward(context, input);
+        auto stages = layer->forward_stages(context, input);
+        observe(stages);
+        return stages.output;
     }
-    auto forward(ops::Context& context, const Tensor& input) -> Tensor {
-        const auto length = static_cast<std::int64_t>(input.size(1));
-        auto output = require(Tensor::empty({1, length, static_cast<std::int64_t>(input.size(2))}, input.dtype(),
-                                            context.device()));
-        const auto chunk = slice_rows(context, false);
-        for (std::int64_t start = 0; start < length; start += chunk) {
-            const auto count = std::min(chunk, length - start);
-            const auto rows = context.slice(input, 1, start, count);
-            const auto part = down_->forward(context,
-                context.gelu_multiply(gate_->forward(context, rows), up_->forward(context, rows)));
-            context.copy_slice_(output, part, 1, start);
+    auto output =
+        require(Tensor::empty({1, length, static_cast<std::int64_t>(input.size(2))}, input.dtype(), context.device()));
+    Tensor gate_output, up_output, hidden_output;
+    for (std::int64_t start = 0; start < length; start += chunk) {
+        const auto count = std::min(chunk, length - start);
+        const auto rows = context.slice(input, 1, start, count);
+        Tensor part;
+        if (observer) {
+            auto stages = layer->forward_stages(context, rows);
+            if (!gate_output.defined()) {
+                const auto intermediate = static_cast<std::int64_t>(stages.gate.size(2));
+                gate_output = require(Tensor::empty({1, length, intermediate}, DType::F32, context.device()));
+                up_output = require(Tensor::empty({1, length, intermediate}, DType::F32, context.device()));
+                hidden_output = require(Tensor::empty({1, length, intermediate}, DType::F32, context.device()));
+            }
+            context.copy_slice_(gate_output, stages.gate, 1, start);
+            context.copy_slice_(up_output, stages.up, 1, start);
+            context.copy_slice_(hidden_output, stages.hidden, 1, start);
+            part = std::move(stages.output);
+        } else {
+            part = layer->forward(context, rows);
         }
-        return output;
+        context.copy_slice_(output, part, 1, start);
     }
-
-private:
-    layers::Linear gate_, up_, down_;
-};
+    if (observer) observe({gate_output, up_output, hidden_output, output});
+    return output;
+}
 
 KIDI_MODULE(VisionBlock);
 class VisionBlockImpl : public Module {
 public:
     VisionBlockImpl(const YAML::Node& config, bool quantized)
         : attention_(config, quantized),
-          mlp_(config, quantized),
+          mlp_(config["hidden_size"].as<int>(), config["intermediate_size"].as<int>(), quantized ? 8 : 0),
           input_norm_(config["hidden_size"].as<int>(), config["rms_norm_eps"].as<float>()),
           attention_norm_(config["hidden_size"].as<int>(), config["rms_norm_eps"].as<float>()),
           feed_forward_norm_(config["hidden_size"].as<int>(), config["rms_norm_eps"].as<float>()),
@@ -141,16 +213,33 @@ public:
         register_module("post_feedforward_layernorm", output_norm_);
     }
     auto forward(ops::Context& context, const Tensor& input, const Tensor& cosine, const Tensor& sine,
-                 const Tensor& mask) -> Tensor {
-        const auto hidden = attention_norm_->forward_residual(
-            context, attention_->forward(context, input_norm_->forward(context, input), cosine, sine, mask), input);
-        return output_norm_->forward_residual(
-            context, mlp_->forward(context, feed_forward_norm_->forward(context, hidden)), hidden);
+                 const Tensor& mask, const StageCallback& observer) -> Tensor {
+        if (observer) observer("input", input);
+        const auto attention_input = input_norm_->forward(context, input);
+        if (observer) observer("input_norm", attention_input);
+        const auto attention_output = attention_->forward(context, attention_input, cosine, sine, mask, observer);
+        Tensor hidden;
+        if (observer) {
+            const auto normalized = attention_norm_->forward(context, attention_output);
+            observer("post_attention_norm", normalized);
+            hidden = context.add(input, normalized);
+        } else {
+            hidden = attention_norm_->forward_residual(context, attention_output, input);
+        }
+        if (observer) observer("attention_residual", hidden);
+        const auto feed_forward_input = feed_forward_norm_->forward(context, hidden);
+        if (observer) observer("pre_ffn_norm", feed_forward_input);
+        const auto mlp_output = forward_vision_mlp(context, mlp_, feed_forward_input, observer);
+        if (observer) observer("mlp", mlp_output);
+        if (!observer) return output_norm_->forward_residual(context, mlp_output, hidden);
+        const auto normalized = output_norm_->forward(context, mlp_output);
+        observer("post_ffn_norm", normalized);
+        return context.add(hidden, normalized);
     }
 
 private:
     VisionAttention attention_;
-    VisionMlp mlp_;
+    layers::GatedFeedForward mlp_;
     layers::RmsNorm input_norm_, attention_norm_, feed_forward_norm_, output_norm_;
 };
 
@@ -206,6 +295,7 @@ struct Gemma4VisionImpl::State {
     ops::Context context{module_device, true};
     int hidden, heads, head_width, positions;
     float theta;
+    core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
     VisionTower tower;
     VisionProjection projection;
     State(const YAML::Node& config, int text_width, bool quantized)
@@ -219,8 +309,7 @@ struct Gemma4VisionImpl::State {
 };
 
 Gemma4VisionImpl::Gemma4VisionImpl(const YAML::Node& config, std::int32_t text_width, bool quantized) {
-    if ((module_device != tensor::Device::cpu() && module_device != tensor::Device::web_gpu()) ||
-        config["patch_size"].as<int>() != 16 ||
+    if (config["patch_size"].as<int>() != 16 ||
         config["pooling_kernel_size"].as<int>() != 3 || config["standardize"].as<bool>(false) ||
         config["use_clipped_linears"].as<bool>(false) || config["head_dim"].as<int>() % 4 ||
         config["num_key_value_heads"].as<int>() != config["num_attention_heads"].as<int>())
@@ -230,13 +319,16 @@ Gemma4VisionImpl::Gemma4VisionImpl(const YAML::Node& config, std::int32_t text_w
     register_module("embed_vision", impl_->projection);
 }
 Gemma4VisionImpl::~Gemma4VisionImpl() = default;
+auto Gemma4VisionImpl::set_precision(core::InferencePrecision precision) noexcept -> void {
+    impl_->precision = precision;
+    impl_->context.set_precision(precision);
+}
 auto Gemma4VisionImpl::release_workspaces() -> void { impl_->context.release_workspaces(); }
 
 auto Gemma4VisionImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
     try {
-        StateDict state;
-        for (const auto& [name, declaration] : state_dict()) {
-            auto key = "model." + name;
+        const auto checkpoint_key = [&](std::string_view name) {
+            auto key = "model." + std::string(name);
             if (!weights.contains(key)) {
                 for (const auto suffix :
                      {".weight", ".weight_scale", ".input_activation_scale", ".output_activation_scale"}) {
@@ -246,24 +338,64 @@ auto Gemma4VisionImpl::set_checkpoint(const checkpoint::Weights& weights) -> Res
                     }
                 }
             }
-            auto value = require(weights.tensor(key));
+            return key;
+        };
+        const auto normalize_host = [&](Tensor value) {
             if (value.dtype() == DType::I8) {
                 const auto bytes = require(std::as_const(value).host_bytes());
-                value = require(Tensor::from_host(
-                    std::vector<std::int64_t>(value.shape().begin(), value.shape().end()),
-                    std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()), device()));
-            } else if (value.dtype() == DType::BF16 && name.ends_with("position_embedding_table")) {
+                return require(Tensor::from_bytes({value.shape().begin(), value.shape().end()}, DType::U8, bytes));
+            }
+            if (value.dtype() == DType::BF16) {
                 const auto bytes = require(std::as_const(value).host_bytes());
                 const auto source = reinterpret_cast<const std::uint16_t*>(bytes.data());
                 std::vector<float> values(value.numel());
                 for (std::size_t index = 0; index < values.size(); ++index)
                     values[index] = std::bit_cast<float>(static_cast<std::uint32_t>(source[index]) << 16);
-                value = require(Tensor::from_host(std::vector<std::int64_t>(value.shape().begin(), value.shape().end()),
-                                                  std::span<const float>(values)));
-            } else if (value.dtype() != DType::F32 && value.dtype() != DType::U8) {
-                value = impl_->context.cast(require(value.to(device())), DType::F32);
+                return require(
+                    Tensor::from_host({value.shape().begin(), value.shape().end()}, std::span<const float>(values)));
             }
-            state.emplace(name, std::move(value));
+            if (value.dtype() != DType::F32 && value.dtype() != DType::U8)
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported vision checkpoint parameter dtype"});
+            return value;
+        };
+        const auto normalize = [&](std::string_view name, Tensor value) {
+            if (value.dtype() == DType::I8) return require(normalize_host(std::move(value)).to(device()));
+            if (value.dtype() == DType::BF16 && name.ends_with("position_embedding_table"))
+                return normalize_host(std::move(value));
+            if (value.dtype() != DType::F32 && value.dtype() != DType::U8)
+                return impl_->context.cast(require(value.to(device())), DType::F32);
+            return value;
+        };
+        const auto load = [&](std::string_view name) {
+            return normalize(name, require(weights.tensor(checkpoint_key(name))));
+        };
+        const auto load_host = [&](std::string_view name) {
+            return normalize_host(require(weights.tensor(checkpoint_key(name))));
+        };
+        StateDict state;
+        for (const auto& parameter : state_dict()) {
+            const auto& name = parameter.first;
+            constexpr std::string_view GATE_UP = ".mlp.gate_up_proj.";
+            if (const auto position = name.find(GATE_UP); position != std::string::npos) {
+                const auto combined_key = checkpoint_key(name);
+                if (weights.contains(combined_key)) {
+                    state.emplace(name, normalize(name, require(weights.tensor(combined_key))));
+                    continue;
+                }
+                auto gate_name = name;
+                gate_name.replace(position, GATE_UP.size(), ".mlp.gate_proj.");
+                auto up_name = name;
+                up_name.replace(position, GATE_UP.size(), ".mlp.up_proj.");
+                auto gate = load_host(gate_name);
+                auto up = load_host(up_name);
+                const bool scalar =
+                    name.ends_with("input_activation_scale") || name.ends_with("output_activation_scale");
+                auto combined = scalar ? require_same_scalar(gate, up, name) : concatenate_rows(gate, up, name);
+                if (!scalar) combined = require(combined.to(device()));
+                state.emplace(name, std::move(combined));
+                continue;
+            }
+            state.emplace(name, load(name));
         }
         return set_state(state);
     } catch (const ops::Failure& error) {
@@ -272,6 +404,15 @@ auto Gemma4VisionImpl::set_checkpoint(const checkpoint::Weights& weights) -> Res
 }
 
 auto Gemma4VisionImpl::forward(const image::Gemma4Image& image) -> Result<Tensor> {
+    return forward(image, {});
+}
+
+auto Gemma4VisionImpl::forward(const image::Gemma4Image& image, const BlockObserver& observer) -> Result<Tensor> {
+    return forward(image, observer, {}, 0);
+}
+
+auto Gemma4VisionImpl::forward(const image::Gemma4Image& image, const BlockObserver& block_observer,
+                               const StageObserver& stage_observer, std::size_t stage_layers) -> Result<Tensor> {
     try {
         auto& state = *impl_;
         auto& context = state.context;
@@ -298,17 +439,48 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image) -> Result<Tensor
             for (int axis = 0; axis < 2; ++axis)
                 for (int channel = 0; channel < state.head_width / 4; ++channel) {
                     const auto coordinate = axis ? patch / image.patch_columns : patch % image.patch_columns;
-                    const auto frequency = std::pow(state.theta, -static_cast<float>(channel) * 4 / state.head_width);
+                    const auto exponent = static_cast<float>(channel) * 4 / state.head_width;
+                    const auto parity_math = state.precision == core::InferencePrecision::QAT_FP32 ||
+                                             state.precision == core::InferencePrecision::LOWBIT_PARITY;
+                    const auto frequency = parity_math
+                                               ? 1.F / std::pow(state.theta, exponent)
+                                               : std::pow(state.theta, -exponent);
                     const auto offset = (axis * length + patch) * (state.head_width / 4) + channel;
-                    cosine[offset] = std::cos(coordinate * frequency);
-                    sine[offset] = std::sin(coordinate * frequency);
+                    const auto angle = static_cast<float>(coordinate) * frequency;
+                    if (parity_math) {
+                        if (std::abs(angle) >= 125.F)
+                            throw ops::Failure(
+                                {ErrorCode::UNSUPPORTED, "qat-fp32 vision parity supports RoPE angles below 125"});
+                        cosine[offset] = runtime::parity::cosine(angle);
+                        sine[offset] = runtime::parity::sine(angle);
+                    } else {
+                        cosine[offset] = std::cos(angle);
+                        sine[offset] = std::sin(angle);
+                    }
                 }
         const auto cos =
             require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(cosine), device()));
         const auto sin = require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(sine), device()));
         const auto mask = require(Tensor::zeros({1, 1, 1, length}, DType::F32, device()));
-        for (const auto& layer : *state.tower->encoder->layers)
-            hidden = layer->forward(context, hidden, cos, sin, mask);
+        if (stage_observer && stage_layers) {
+            stage_observer(0, "rope_cos", cos);
+            stage_observer(0, "rope_sin", sin);
+        }
+        std::size_t layer_index = 0;
+        for (const auto& layer : *state.tower->encoder->layers) {
+            StageCallback stage_callback;
+            if (stage_observer && layer_index < stage_layers)
+                stage_callback = [&](std::string_view stage, const Tensor& tensor) {
+                    context.synchronize();
+                    stage_observer(layer_index, stage, tensor);
+                };
+            hidden = layer->forward(context, hidden, cos, sin, mask, stage_callback);
+            if (block_observer) {
+                context.synchronize();
+                block_observer(layer_index, hidden);
+            }
+            ++layer_index;
+        }
         // Average each 3x3 patch neighbourhood on the device, viewing patches as [rows/3, 3, columns/3, 3, hidden].
         const auto grid =
             context.reshape(hidden, {image.patch_rows / 3, 3, image.patch_columns / 3, 3, state.hidden});

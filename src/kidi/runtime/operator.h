@@ -149,6 +149,8 @@ public:
     virtual auto name() const -> std::string_view = 0;
     /// Returns nullptr to decline `graph`; throws ops::Failure when a supported step fails to compile.
     virtual auto compile(const graph::Graph& graph, std::string_view key) -> std::unique_ptr<StepExecutable> = 0;
+    /// Fully calibrated prefill can compile after one capture; decoding may need a second for output calibration.
+    virtual auto requires_second_capture(std::string_view) const -> bool { return true; }
     /// Key extent for a captured attention step: accelerators prefer few, coarse fixed shapes.
     virtual auto key_extent(std::size_t required, std::size_t capacity) const -> std::size_t {
         return std::min(capacity, (required + 127) / 128 * 128);

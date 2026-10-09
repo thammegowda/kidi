@@ -82,6 +82,21 @@ The first turn includes cold operator preparation; do not compare it directly wi
 `cached` and `uncached` records, which use identical conversation input and generation limits in the same process.
 This checks the same shared serving core used by the app, not Compose/UI overhead or debug-build inference performance.
 
+## Dictation Check
+
+The dictation mode mirrors the app's speech path: it prepares the same INT8 cache from a Whisper checkpoint directory,
+warms up, then transcribes growing prefixes of the WAV at the app's draft cadence (0.8 s, then every 1.2 s) and the whole
+file, reporting feature, encode, and decode time for each pass. Set `KIDI_FIT_AUDIO=0` or `KIDI_WARM_UP=0` to compare
+against a padded 30-second window or a cold first request:
+
+```sh
+"$ADB" -s SERIAL shell "timeout 600 $REMOTE/runner dictation $REMOTE/models/whisper-small 4 2 $REMOTE/speech.wav" \
+  > benchmarks/android/.cache/dictation.jsonl
+```
+
+On the SM8750 phone the 9.1-second speech fixture's final pass took about 3.2 seconds with the padded window, 1.05
+seconds with fitted audio, and 0.84 seconds after the short-query decoder attention kernel (8.8 ms per token).
+
 ## Image Chat Check
 
 Place a JPEG/PNG test image in the ignored cache and stage it on the device. The image mode asks for a short description,
@@ -93,6 +108,140 @@ vision weights and does not download another model:
 "$ADB" -s SERIAL shell "timeout 150 $REMOTE/runner image $REMOTE/models/gemma4 4 1 $REMOTE/photo.jpg" \
   > benchmarks/android/.cache/image-chat.jsonl
 ```
+
+`image` is an end-to-end check: it loads the full Gemma generator, encodes the image, prefills visual/text tokens,
+decodes an answer, and runs a cached follow-up. To optimize the vision frontend without LM load, prefill, decode, or
+prefix-cache noise, run the vision-only mode:
+
+```sh
+"$ADB" -s SERIAL shell "timeout 150 $REMOTE/runner vision $REMOTE/models/gemma4 4 3 $REMOTE/photo.jpg" \
+  > benchmarks/android/.cache/vision-only.jsonl
+```
+
+It reports image preparation, vision checkpoint binding, and each full frontend pass (patch projection, all 16 encoder
+blocks, 3x3 spatial pooling, and the projection to Gemma's text width). Iteration zero is marked as warm-up. One model
+load can benchmark several images:
+
+```sh
+"$ADB" -s SERIAL shell "timeout 300 $REMOTE/runner vision $REMOTE/models/gemma4 4 3 \
+  $REMOTE/vision-suite/square-grid.png \
+  $REMOTE/vision-suite/landscape-shapes.png \
+  $REMOTE/vision-suite/portrait-shapes.png"
+```
+
+Generate those deterministic images and element-wise reference tensors with the official Google checkpoint and
+Transformers implementation. The script pins its Python dependencies and the exact checkpoint revision:
+
+```sh
+uv run --script benchmarks/android/gemma4_vision_reference.py \
+  --output benchmarks/android/.cache/vision-suite
+```
+
+Each Safetensors reference contains the unpadded input patches and position IDs, all 16 unpooled block outputs, the
+first configured layers' internal stages, compact axial RoPE angles, the final unpooled encoder output, pooled 768-wide
+tokens, and projected 1536-wide visual embeddings. `--stage-layers N` controls the diagnostic depth.
+`--verify-determinism` reruns every captured tensor with the thread counts from `--determinism-threads` and fails on
+any elementwise change. Push the images and references to the phone, then set `KIDI_VISION_REFERENCE_DIR` for
+element-wise preprocessing and final-output metrics:
+
+The module hooks are registered through [`torch_intercept.py`](./torch_intercept.py), a reusable context manager
+adapted from the earlier forward-interception script. Model-specific code only declares which module inputs and
+outputs receive stable tensor names.
+
+```sh
+"$ADB" -s SERIAL shell "mkdir -p $REMOTE/vision-suite/images $REMOTE/vision-suite/references"
+for file in benchmarks/android/.cache/vision-suite/images/*.png; do
+  "$ADB" -s SERIAL push "$file" "$REMOTE/vision-suite/images/"
+done
+for file in benchmarks/android/.cache/vision-suite/references/*.safetensors; do
+  "$ADB" -s SERIAL push "$file" "$REMOTE/vision-suite/references/"
+done
+"$ADB" -s SERIAL shell "KIDI_VISION_REFERENCE_DIR=$REMOTE/vision-suite/references timeout 300 \
+  $REMOTE/runner vision $REMOTE/models/gemma4 4 3 \
+  $REMOTE/vision-suite/images/square-grid.png \
+  $REMOTE/vision-suite/images/landscape-shapes.png \
+  $REMOTE/vision-suite/images/portrait-shapes.png"
+```
+
+Set `KIDI_VISION_USE_REFERENCE_INPUT=1` as well to feed the saved official patch tensor into Kidi. This isolates model
+inference correctness from decoder/resizer differences; without it, the benchmark measures the real Kidi preprocessing
+path and reports its patch error separately. When references are enabled, the timed passes compare final projected
+embeddings and one additional untimed diagnostic pass reports element-wise error after every encoder block.
+`KIDI_VISION_STAGE_LAYERS` changes the number of layers reported by that diagnostic pass (0-16).
+`KIDI_VISION_DUMP_DIR` writes matching Kidi tensors to Safetensors for offline analysis; existing files are never
+overwritten.
+
+On macOS, set `KIDI_ACCELERATOR=gpu` to run the standalone tower on Apple GPU. The native W8 path quantizes each
+shared activation once, keeps activation and weight codes integral through 64x64 tiled projections, and applies scales
+only after accumulation. Q/K/V reuse one quantized activation, Q/K use fused axial RMSNorm/RoPE, and large equal-head
+attention uses MPSGraph's fused SDPA operation with the checkpoint's scale of 1.0. A combined Q/K/V dispatch was
+removed after measuring slower than the three projections with shared quantization. At checkpoint binding, vision gate
+and up rows are validated and combined into the existing gated-FFN representation. The FFN computes both halves
+together, applies GELU/multiply on-chip, and writes the down projection's INT8 input directly; see the illustrated
+[FFN fusion walkthrough](../../ffn-fuse.md):
+
+```sh
+KIDI_ACCELERATOR=gpu KIDI_VISION_PRECISION=checkpoint \
+  build-release/kidi_android_baseline vision MODEL 4 3 image.png
+```
+
+On an Apple M5, the three 2,304-2,376-patch fixtures take about 0.38-0.42 s after warm-up. The fixed photo produces the
+same CPU and Metal answers (`A cat.` and `Orange/Ginger.`); the deterministic shape fixtures preserve the same objects
+and colors with minor wording differences. Intermediate features are not numerically identical—the residual difference
+can compound through the sensitive tower—so Metal quality is gated by short-answer equivalence rather than FP32 tensor
+parity.
+
+The committed pre-optimization path measured about 0.67-0.70 s. Profiling attributed most of it to 112 packed
+projections per image: each output tile repeated FP32 activation rounding, and the 32x32 tile reread activations and
+weights more often. Captured-step replay can skip host-side operator lookup on later identical calls, but it does not
+fuse these Metal kernels and cannot reduce first-image latency; the backend fusions above address the measured GPU work
+directly.
+
+The packed-kernel benchmark has a vision-shape mode for the 768-wide attention projections and 3,072-wide MLP:
+
+```sh
+build-release/kidi_metal_packed_bench vision
+build-release/kidi_metal_packed_bench vision-ffn
+```
+
+`KIDI_VISION_PRECISION` selects the projection compute policy. The default, `checkpoint`, uses the checkpoint's native
+precision. `fp32` disables activation quantization and dequantizes packed weights for FP32 computation; `bf16` uses
+BF16 activations and computation. `q2a16`, `q4a16`, and `q8a16` explicitly requantize weights to that width before BF16
+compute. Their `q*ae4m3` and `q*ae5m2` variants round activations through the selected FP8 format and use FP32
+accumulation; `i8a8` is an alias for `q8ae4m3`. `qat-fp32` is the deliberately slow numerical verification policy: it
+preserves trained activation SRQ while dequantizing each layer's checkpoint weights for FP32 accumulation. On Apple
+CPU it also mirrors the pinned PyTorch build's RMS reduction, SLEEF RoPE math, and softmax reduction; it is an oracle,
+not a performance mode. `lowbit-parity` retains packed weights, dequantizes only 192 output channels at a time into
+scratch, and uses the same parity math; it currently requires Apple Accelerate. Unsupported backend combinations never
+fall back silently. For example:
+
+```sh
+KIDI_VISION_PRECISION=qat-fp32 "$REMOTE/runner" vision "$REMOTE/models/gemma4" 4 3 image.png
+```
+
+Compare matching official and Kidi dumps, then attribute projection differences to local computation versus propagated
+inputs:
+
+```sh
+uv run --script benchmarks/android/gemma4_vision_diagnose.py \
+  --official benchmarks/android/.cache/vision-suite/references/square-grid.safetensors \
+  --kidi /path/to/kidi-dump/square-grid.safetensors \
+  --checkpoint benchmarks/android/.cache/gemma4-official \
+  --projection 0:q_proj --projection 0:gate_proj
+```
+
+For the pinned Apple/PyTorch oracle, `qat-fp32` produces elementwise-identical outputs after all 16 encoder blocks on
+the square, landscape, and portrait fixtures. Final projected embeddings remain within roughly `2.4e-7` relative RMSE
+because pooling/projector reductions are not part of the parity path. The native `checkpoint` mode intentionally
+retains its much faster integer projection kernels and is not expected to be bit-identical to dequantized PyTorch.
+The original drift was seeded by different RMS mean reduction and RoPE/softmax arithmetic; sparse one-quantum SRQ
+changes were then amplified by large learned norm scales and the gated MLP. The parity modes support PyTorch-compatible
+small-range RoPE angles (absolute angle below 125), which covers this three-image suite.
+
+On an Apple M5 CPU with four threads, `lowbit-parity` keeps all 16 block outputs elementwise identical on all three
+fixtures and final embedding relative RMSE below `2.4e-7`. Steady-state encoding is about 1.72-1.76 s for 2,304-2,376
+patches, versus about 1.25 s for native `checkpoint` and 3.96 s for full `qat-fp32`. Square-image peak RSS is about
+0.89 GiB rather than about 2.03 GiB for cached FP32 weights.
 
 With the existing PyTorch/Transformers reference environment, generate small numerical fixtures locally:
 

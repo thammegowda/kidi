@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <charconv>
 #include <chrono>
@@ -70,7 +71,7 @@ using GetProviders = Qnn_ErrorHandle_t (*)(const QnnInterface_t***, std::uint32_
 
 constexpr std::uint64_t FNV_OFFSET = 14695981039346656037ULL;
 constexpr std::uint64_t FNV_PRIME = 1099511628211ULL;
-constexpr std::string_view CACHE_VERSION = "kidi-qnn-v3";
+constexpr std::string_view CACHE_VERSION = "kidi-qnn-v4";
 
 auto diagnostic_log(const std::string& message) -> void {
     std::cerr << message << '\n';
@@ -159,10 +160,19 @@ auto prepend_adsp_paths(const std::string& directory) -> void {
     setenv("ADSP_LIBRARY_PATH", combined.c_str(), 1);
 }
 
+std::atomic<std::uint64_t> graph_memory_failures = 0;
+
 auto log_callback(const char* format, QnnLog_Level_t level, std::uint64_t, va_list arguments) -> void {
-    std::fprintf(stderr, "[kidi-qnn:%d] ", static_cast<int>(level));
-    std::vfprintf(stderr, format, arguments);
-    std::fputc('\n', stderr);
+    std::array<char, 2048> message{};
+    va_list copy;
+    va_copy(copy, arguments);
+    std::vsnprintf(message.data(), message.size(), format, copy);
+    va_end(copy);
+    const std::string_view text(message.data());
+    if (text.contains("Failed to map weights buffer") || text.contains("Could not allocate persistent weights buffer") ||
+        text.contains("Failed to initialize graph memory"))
+        graph_memory_failures.fetch_add(1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[kidi-qnn:%d] %s\n", static_cast<int>(level), message.data());
 }
 
 auto qnn_error(Qnn_ErrorHandle_t status) -> std::uint32_t { return QNN_GET_ERROR_CODE(status); }
@@ -239,8 +249,12 @@ public:
                            std::string(status == QNN_PROPERTY_SUPPORTED ? "supported" : "unsupported") +
                            "|status=" + std::to_string(qnn_error(status)));
         }
-        if (const char* level = std::getenv("KIDI_QNN_LOG"))
-            check(api_.logCreate(log_callback, static_cast<QnnLog_Level_t>(std::atoi(level)), &log_), "create QNN log");
+        const auto log_level = [] {
+            if (const char* level = std::getenv("KIDI_QNN_LOG"))
+                return static_cast<QnnLog_Level_t>(std::atoi(level));
+            return QNN_LOG_LEVEL_ERROR;
+        }();
+        check(api_.logCreate(log_callback, log_level, &log_), "create QNN log");
         check(api_.backendCreate(log_, nullptr, &backend_), "create QNN HTP backend");
         // The host (prepare) and DSP (execute) builds of the package have different file names so both fit in an APK.
         if (const auto package = getenv_string("KIDI_QNN_OP_PACKAGE"); !package.empty()) {
@@ -2313,7 +2327,10 @@ public:
             document.value("prefill", !prefill_) != prefill_)
             throw unsupported("cached whole-step metadata does not match");
         context_ = std::make_unique<QnnContext>(runtime_);
+        const auto failures = graph_memory_failures.load(std::memory_order_relaxed);
         context_->load(binary);
+        if (graph_memory_failures.load(std::memory_order_relaxed) != failures)
+            throw ops::Failure({ErrorCode::RUNTIME, "loading cached QNN context exhausted DSP mapped memory"});
         memory_ = std::make_unique<SharedMemory>();
         prologue_ = document.at("prologue").get<std::vector<std::size_t>>();
         for (const auto& item : document.at("caches")) {
@@ -2448,6 +2465,10 @@ private:
         partition_.assign(nodes.size(), 0);
         for (std::size_t index = 0; index < nodes.size(); ++index) {
             const auto& node = nodes[index];
+            if (node.operation == Operation::EMBEDDING) {
+                is_prologue_[index] = true;
+                prologue_.push_back(index);
+            }
             if (node.operation == Operation::SCATTER) {
                 const bool has_row_node = node.sources[1].kind == Source::Kind::NODE;
                 const auto row_node = has_row_node ? node.sources[1].index : 0;
@@ -2498,9 +2519,10 @@ private:
         // Finalizing hundreds of megabytes of unpacked low-bit containers in one graph can spend minutes in
         // libQnnHtpPrepare or exhaust its memory. Smaller graphs still keep all arithmetic on the HTP and make
         // compilation observable and recoverable.
-        const auto budget = environment_size("KIDI_QNN_PARTITION_MB", 64) * 1024 * 1024;
+        const auto budget = environment_size("KIDI_QNN_PARTITION_MB", 256) * 1024 * 1024;
         std::size_t part = 0, bytes = 0;
         for (std::size_t index = 0; index < nodes.size(); ++index) {
+            if (is_prologue_[index]) continue;
             const auto& node = nodes[index];
             std::size_t weight = 0;
             if (node.operation == Operation::PACKED_LINEAR)
@@ -2571,8 +2593,12 @@ private:
         if (const char* dump = std::getenv("KIDI_QNN_DUMP"); dump && *dump)
             std::cerr << "kidi_qnn_finalize|graph=" << graphs_.back().name << "|nodes=" << graphs_.back().first_node
                       << '-' << graphs_.back().last_node << "|state=begin\n";
+        const auto failures = graph_memory_failures.load(std::memory_order_relaxed);
         check(runtime_->api().graphFinalize(graphs_.back().handle, nullptr, nullptr),
               "finalize QNN graph " + graphs_.back().name);
+        if (graph_memory_failures.load(std::memory_order_relaxed) != failures)
+            throw ops::Failure(
+                {ErrorCode::RUNTIME, "finalize QNN graph " + graphs_.back().name + " exhausted DSP mapped memory"});
         if (const char* dump = std::getenv("KIDI_QNN_DUMP"); dump && *dump)
             std::cerr << "kidi_qnn_finalize|graph=" << graphs_.back().name << "|nodes=" << graphs_.back().first_node
                       << '-' << graphs_.back().last_node << "|state=end|ms="
@@ -2648,7 +2674,8 @@ private:
             }
             case Source::Kind::INPUT: {
                 const auto slot = source.index;
-                if (slot >= 4 && slot < 8)
+                if (((slot >= 4 && slot < 8) || (slot >= 8 && !cache_of_slot_.contains(slot))) &&
+                    graph_.inputs()[slot].dtype() == DType::F32)
                     base = input(Port::Kind::STEP_INPUT, slot, QNN_DATATYPE_FLOAT_16,
                                  dims_of(graph_.inputs()[slot].shape()));
                 else
@@ -3128,6 +3155,9 @@ public:
     explicit QnnStepCompiler(std::shared_ptr<QnnRuntime> runtime) : runtime_(std::move(runtime)) {}
 
     auto name() const -> std::string_view override { return "qnn-htp"; }
+    auto requires_second_capture(std::string_view key) const -> bool override {
+        return !key.starts_with("gemma4_prefill:");
+    }
 
     // Whole-step graphs use power-of-two cache prefixes. This keeps early decode from reading a 9K-token cache while
     // bounding the number of compiled shapes. A new bucket synchronizes the existing CPU cache prefix once.

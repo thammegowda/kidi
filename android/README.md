@@ -22,6 +22,27 @@ sdkmanager --sdk_root="$HOME/Library/Android/sdk" \
 	'platforms;android-36' 'build-tools;36.0.0' 'cmake;3.31.6' 'ndk;28.0.13004108'
 ```
 
+## Camera and microphone accessory prototype
+
+Kidi has an opt-in client for the ESP32-P4/ESP32-C6 accessory protocol. A
+`kidi://pair/v1#...` invitation launches a confirmation dialog, pairs over BLE,
+and stores the resulting controller profile encrypted with Android Keystore.
+The existing photo and dictation controls then offer remembered **Phone** and
+**Accessory** sources.
+
+Accessory traffic uses an Android local-only Wi-Fi request and the returned
+network's socket factory; Kidi never rebinds the process-wide network. Control
+and media TLS certificates are pinned independently. Photos are bounded,
+digest-checked JPEGs imported through the normal image path. Audio is bounded
+16 kHz mono PCM16 and feeds the same voice-activity and Whisper pipeline as the
+phone microphone. A failed accessory capture is reported and never silently
+retried on a phone sensor.
+
+Concurrent use with an existing Wi-Fi internet connection requires Android 12
+or newer and a phone that supports STA concurrency for local-only connections.
+The matching C6/P4 product firmware is required; the diagnostic camera firmware
+does not implement this protocol.
+
 ## Build and Run
 
 For distribution through Google Play, follow the
@@ -203,28 +224,38 @@ separate progress, cancellation, restore and removal controls.
 
 The earlier FP32-to-INT8 Small path matched Small FP32 quality on a 40-clip/776-word English clean-speech confirmation sample (2.32% versus
 2.45% word error rate; Tiny 9.79%). This small sample does not establish multilingual, noisy-speech, or accent coverage.
-Those measurements do not certify GGML Q8 re-quantization. Small is slower than Tiny: earlier four-thread phone runs averaged roughly 2.75 seconds per complete segment versus 0.82 seconds
-for Tiny. Live dictation still replaces drafts with one inference in flight; draft latency is model-dependent.
+Those measurements do not certify GGML Q8 re-quantization.
 
 Speech runs on the CPU INT8 path in Auto mode; see [Accelerators](#accelerators) for chat.
 Release builds enable R8/resource shrinking and discard unused native dependency sections while preserving JNI
 entry points and partial-transcript callbacks.
 
-Model loading memory-maps the cached INT8 checkpoint without a throwaway startup transcription. CPU operators prepare
-on the first real ASR request. A new model or missing INT8 cache still incurs the one-time conversion cost. Typing stays
-editable during model loading, and sending is enabled once chat is ready even when speech is preparing. Native operations
-remain serialized.
+Speech has its own native lock and runtime thread, like the web app's speech worker, so it loads alongside Gemma and
+dictation never queues behind chat loading. Loading memory-maps the cached INT8 checkpoint and then transcribes a second
+of silence, so weight packing and operator preparation (about 1.4 seconds on the SM8750 phone) happen before the first
+recording. Speech is ready about 1.8 seconds after launch, and the microphone stays available while the chat model loads.
+A new model or missing INT8 cache still incurs the one-time conversion cost. Typing stays editable during model loading,
+and sending is enabled once chat is ready even when speech is preparing.
 
 The microphone button requests `RECORD_AUDIO` permission when first used. Recording captures mono PCM at 16 kHz for at
 most 30 seconds. During recording, the bottom-right send button becomes a red stop control; tap it to finish earlier.
 It returns to Send after transcript refinement, while generation uses the same button to stop the response.
-Kidi automatically detects the language and runs one native
-Whisper prefix transcription at a time on the shared runtime thread. Partial text is published during token decoding and
-replaces the dictation suffix in the composer while recording. The final pass after Stop also publishes partial text,
-then replaces it with the completed transcript. A draft failure is shown as an error rather than silently hiding updates;
-recording continues and the final pass is still attempted. The first text still waits for audio encoding to complete.
-The transcript is never sent to Gemma automatically. Audio
-remains in memory only for the current transcription and is not uploaded or saved.
+Kidi automatically detects the language. Like the web app, each pass encodes only the recorded audio plus at least a
+second of silence, rounded up to 128-position encoder slices, instead of a padded 30-second window; output that repeats
+itself is decoded again over the full window. Drafts run every 1.2 seconds while recording, and as soon as a pause of
+300 ms follows new speech; a stale draft still running then is cancelled so the covering one starts at once. Partial
+text is published during token decoding and replaces the dictation suffix in the composer while recording. A draft
+failure is shown as an error rather than silently hiding updates; recording continues and the final pass is still
+attempted. The transcript is never sent to Gemma automatically. Audio remains in memory only for the current
+transcription and is not uploaded or saved.
+
+Stopping reuses a completed (or nearly complete) draft when it already covers all detected speech plus 200 ms, so the
+final transcript usually appears immediately. Speech is tracked from 20 ms frame energy against a slowly rising noise
+floor and a fraction of the loudest speech; the thresholds err toward counting speech, which only costs a final pass.
+Otherwise drafts in progress are cancelled and one final pass runs over the whole recording. On the SM8750 phone,
+LibriSpeech clips played through a speaker and stopped after a natural pause took 37-86 ms from Stop to final text for
+5.5-17.7 seconds of audio; stopping mid-sentence ran the final pass in 0.44 seconds for 5.8 seconds of audio. The
+earlier full-window final pass took about 3.2 seconds plus any draft already in progress.
 
 Provisional speech is light gray in the composer, including while the final pass is decoding. Text typed before dictation
 keeps its normal color. Successful finalization restores the normal text color; a failed final pass leaves its draft
@@ -233,11 +264,12 @@ Repeated hypotheses do not replace the editor value. A new decoding pass retains
 completed corrections may replace it. The composer uses a fixed three-line, internally scrollable viewport and a remembered
 text transformation, so timer updates and shorter hypotheses do not resize or reset the input field.
 
-ASR skips FFT/mel work for the mathematically zero padded tail while retaining the same 80-by-3000 feature tensor.
-Convolution writes into a reusable im2col buffer with power-of-two capacity growth; feature transposition writes directly
-into its tensor. Forced decoder-prefix tokens populate KV without unnecessary vocabulary projections. Decoder self-KV
-and projected encoder K/V are already reused within one transcription. They are not reused across changing audio, since
-Whisper's encoder is bidirectional. The full fixed-length encoder remains the main latency cost.
+ASR skips FFT/mel work for the zero padded tail. Convolution writes into a reusable im2col buffer with power-of-two
+capacity growth; feature transposition writes directly into its tensor. Forced decoder-prefix tokens populate KV without
+unnecessary vocabulary projections. Decoder attention over the cached encoder keys and values uses a dedicated
+short-query CPU kernel instead of re-laying out every key and value per token, which cut decoding from about 14.5 to
+8.8 ms per token. Decoder self-KV and projected encoder K/V are reused within one transcription. They are not reused
+across changing audio, since Whisper's encoder is bidirectional; encoding remains the main cost of a final pass.
 
 ## Interface
 
@@ -349,24 +381,34 @@ reports this rather than folding it into the decode rate. Long, steady 128-token
 NPU prefill graphs separately measure about 1,000 tok/s, but that advantage is
 not yet representative of a short interactive request.
 
-- **Auto** tries the Qualcomm NPU, then the CPU for chat, falling back only when loading fails. Speech stays on the
-  quality-checked CPU INT8 path.
+- **Auto** tries the Qualcomm NPU, Vulkan GPU, then CPU for chat, falling back only when loading fails. Speech stays on
+  the quality-checked CPU INT8 path.
 - **CPU, GPU, NPU** are explicit: if that accelerator is unavailable or fails to load, the error is shown and the
   model stays offline rather than silently running elsewhere.
 - **GPU (experimental)** runs Gemma 4 on Adreno through Kidi's Vulkan backend (built into the APK; no extra files).
-  It is currently slower than the CPU and its greedy output can drift from the CPU's, so Auto never picks it.
+  It is currently slower than the CPU and its greedy output can drift from the CPU's, so Auto uses it only when the NPU
+  is unavailable or cannot load.
 - **NPU** records Gemma 4 steps on the CPU, then runs complete 128-token prefill
-  and single-token decode graphs on Hexagon through QNN. Packed embeddings, all
-  transformer layers, attention/KV updates, vocabulary projection, and argmax
-  execute on HTP. The APK includes the matching runtime, prepare library, stub,
-  system library, and V79 skel. Prepare is 81 MiB installed but compresses to
-  about 35 MiB in the APK; it is what makes a fresh install able to compile its
-  first graph without manual provisioning.
+  and single-token decode graphs on Hexagon through QNN. The CPU gathers the two
+  token embedding rows so their 1.27 GiB packed tables do not consume the cDSP
+  virtual address space; all transformer layers, attention/KV updates,
+  vocabulary projection, and argmax execute on HTP. The APK includes the
+  matching runtime, prepare library, stub, system library, and V79 skel.
+  Prepare is 81 MiB installed but compresses to about 35 MiB in the APK; it is
+  what makes a fresh install able to compile its first graph without manual
+  provisioning.
 
   Compilation runs in the background while CPU replay remains available.
   Matching context binaries are persistent: measured reload is about 4 seconds
   for prefill and 8 seconds for decode. The 512-key prefill/decode caches consume
   about 319/804 MiB.
+
+Chat loading finishes with a three-token warm-up request using the serving shapes, so CPU weight packing and, on the
+NPU, the decode context load (or the start of its first compilation) happen before the model reports ready rather than
+during the first reply. A device that cannot complete the warm-up counts as a failed load, so Auto moves on to the next
+accelerator. On the SM8750 phone with the NPU, chat becomes ready about 11 seconds after launch (about 8.5 seconds of
+it warm-up); the first reply's first token then arrived in 0.40 seconds and a follow-up's in 0.07 seconds, decoding at
+about 43 tokens/s.
 
 ## Validation
 

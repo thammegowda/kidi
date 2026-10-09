@@ -1,0 +1,4 @@
+#pragma once
+
+inline constexpr char @KIDI_EMBEDDED_SYMBOL@[] = R"kidi_text(
+@KIDI_EMBEDDED_TEXT@)kidi_text";

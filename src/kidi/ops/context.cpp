@@ -1,11 +1,13 @@
 #include "kidi/ops/context.h"
 #include "kidi/graph/graph.h"
 #include "kidi/runtime/operator.h"
+#include "kidi/runtime/parity_math.h"
 #include "kidi/ops/quantization.h"
 #include <array>
 #include <optional>
 #include <bit>
 #include <chrono>
+#include <compare>
 #include <map>
 #include <list>
 #include <algorithm>
@@ -26,6 +28,7 @@ using runtime::TensorInputs;
 namespace {
 thread_local bool decode_projections = false;
 thread_local std::shared_ptr<runtime::StepCompiler> default_compiler;
+
 class InplaceScope {
 public:
     explicit InplaceScope(bool enabled) noexcept : previous_(std::exchange(is_inplace, enabled)) {}
@@ -71,7 +74,21 @@ struct Context::Impl {
         PackedWeight packed;
         bool packed_prefill;
     };
+    struct DequantizedBinding {
+        Tensor weight, scales, value;
+    };
+    struct DequantizedKey {
+        const std::byte* weight;
+        const std::byte* scales;
+        tensor::DType dtype;
+        core::InferencePrecision precision;
+        std::int32_t bits, group_size;
+        std::size_t rows, packed_columns, scale_count;
+        auto operator<=>(const DequantizedKey&) const = default;
+    };
     std::map<const std::byte*, PackedBinding> packed_weights;
+    std::map<DequantizedKey, DequantizedBinding> dequantized_weights;
+    core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
     std::uint64_t preparation = 0;
     bool profiling = false;
     bool profile_requested = false;
@@ -450,6 +467,16 @@ auto Context::profile_phase(std::string_view phase) -> void {
     impl_->phase = phase;
 }
 auto Context::preparation_ns() const noexcept -> std::uint64_t { return impl_->preparation; }
+auto Context::set_precision(core::InferencePrecision precision) noexcept -> void {
+    if (impl_->precision == precision) return;
+    impl_->steps.clear();
+    impl_->recent.clear();
+    impl_->operators.clear();
+    impl_->eager_outputs.clear();
+    impl_->dequantized_weights.clear();
+    impl_->precision = precision;
+}
+auto Context::precision() const noexcept -> core::InferencePrecision { return impl_->precision; }
 auto Context::replay_enabled() const noexcept -> bool { return impl_->replay_enabled; }
 auto Context::clear_replays() -> void { impl_->steps.clear(); }
 auto Context::release_workspaces() -> void {
@@ -544,12 +571,12 @@ auto Context::replay(std::string_view key, std::span<const Tensor> inputs,
     const auto outputs = step(inputs);
     impl.recorder = nullptr;
     auto graph = std::move(recorder).finish(outputs);
-    if (!entry.first) {
+    if (!entry.first && (!impl.compiler || impl.compiler->requires_second_capture(key))) {
         entry.first = std::move(graph);
         account("capture");
         return entry.first->outputs();
     }
-    graph::require_same_structure(*entry.first, graph, key);
+    if (entry.first) graph::require_same_structure(*entry.first, graph, key);
     entry.first.reset();
     entry.graph = std::move(graph);
     account("capture");
@@ -659,6 +686,111 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
                             std::int32_t group_size, float input_scale, float output_scale) -> Tensor {
     if (!std::isfinite(input_scale) || input_scale < 0 || !std::isfinite(output_scale) || output_scale < 0)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid calibrated projection scales"});
+    if (impl_->precision != core::InferencePrecision::CHECKPOINT &&
+        impl_->precision != core::InferencePrecision::LOWBIT_PARITY) {
+        const auto valid_bits = bits == 2 || bits == 4 || bits == 8;
+        const auto values_per_byte = valid_bits ? 8 / bits : 0;
+        const auto width = weight.dimensions() == 2 ? weight.size(1) * values_per_byte : 0;
+        const auto groups = group_size > 0 ? width / group_size : 0;
+        if (device() != tensor::Device::cpu() || !valid_bits || input.dimensions() == 0 || group_size <= 0 ||
+            width != input.size(-1) || width % group_size || weight.dimensions() != 2 ||
+            (weight.dtype() != tensor::DType::U8 && weight.dtype() != tensor::DType::I8) ||
+            scales.dtype() != tensor::DType::F32 || scales.numel() != weight.size(0) * groups)
+            throw Failure({ErrorCode::UNSUPPORTED,
+                           "selected precision requires CPU packed weights with compatible group scales"});
+        const auto fp8 = core::uses_e4m3_activations(impl_->precision) ||
+                         core::uses_e5m2_activations(impl_->precision);
+        const auto weight_dtype = impl_->precision == core::InferencePrecision::FP32 ||
+                                          impl_->precision == core::InferencePrecision::QAT_FP32 || fp8
+                                      ? tensor::DType::F32
+                                      : tensor::DType::BF16;
+        const auto bytes = require(weight.host_bytes());
+        const auto scale_bytes = require(scales.host_bytes());
+        const auto key = Impl::DequantizedKey{
+            .weight = bytes.data(),
+            .scales = scale_bytes.data(),
+            .dtype = weight_dtype,
+            .precision = impl_->precision,
+            .bits = bits,
+            .group_size = group_size,
+            .rows = weight.size(0),
+            .packed_columns = weight.size(1),
+            .scale_count = scales.numel(),
+        };
+        auto found = impl_->dequantized_weights.find(key);
+        if (found == impl_->dequantized_weights.end()) {
+            const auto scale_values = require(scales.data<float>());
+            if (!std::ranges::all_of(scale_values, [](float scale) { return std::isfinite(scale) && scale > 0.F; }))
+                throw Failure({ErrorCode::INVALID_ARGUMENT, "packed weight scales must be finite and positive"});
+            const auto* values = reinterpret_cast<const std::uint8_t*>(bytes.data());
+            std::vector<float> dequantized(weight.size(0) * width);
+            const auto mask = (1 << bits) - 1;
+            const auto sign = 1 << (bits - 1);
+            for (std::size_t row = 0; row < weight.size(0); ++row)
+                for (std::size_t column = 0; column < width; ++column) {
+                    const auto packed_column = column / values_per_byte;
+                    auto value = (values[row * weight.size(1) + packed_column] >>
+                                  ((column % values_per_byte) * bits)) &
+                                 mask;
+                    if (value & sign) value -= 1 << bits;
+                    dequantized[row * width + column] =
+                        static_cast<float>(value) * scale_values[row * groups + column / group_size];
+                }
+            if (const auto target_bits = core::requested_weight_bits(impl_->precision)) {
+                const auto limit = (1 << (*target_bits - 1)) - 1;
+                for (std::size_t row = 0; row < weight.size(0); ++row)
+                    for (std::size_t group = 0; group < groups; ++group) {
+                        const auto begin = row * width + group * group_size;
+                        float maximum = 0.F;
+                        for (std::int32_t column = 0; column < group_size; ++column)
+                            maximum = std::max(maximum, std::abs(dequantized[begin + column]));
+                        const auto scale = maximum == 0.F ? 1.F : maximum / limit;
+                        for (std::int32_t column = 0; column < group_size; ++column) {
+                            const auto quotient = dequantized[begin + column] / scale;
+                            auto rounded = std::trunc(quotient);
+                            if (std::abs(quotient - rounded) >= 0.5F)
+                                rounded += std::copysign(1.F, quotient);
+                            dequantized[begin + column] =
+                                std::clamp(rounded, -static_cast<float>(limit), static_cast<float>(limit)) * scale;
+                        }
+                    }
+            }
+            auto unpacked =
+                require(Tensor::from_host({static_cast<std::int64_t>(weight.size(0)),
+                                           static_cast<std::int64_t>(width)},
+                                          std::span<const float>(dequantized)));
+            if (weight_dtype == tensor::DType::BF16) unpacked = cast(unpacked, tensor::DType::BF16);
+            found =
+                impl_->dequantized_weights.emplace(key, Impl::DequantizedBinding{weight, scales, std::move(unpacked)})
+                    .first;
+        }
+        const bool preserve_srq = impl_->precision == core::InferencePrecision::QAT_FP32;
+        auto activation = preserve_srq ? static_round(input, input_scale) : input;
+        if (fp8) {
+            const auto dtype =
+                core::uses_e4m3_activations(impl_->precision) ? tensor::DType::E4M3 : tensor::DType::E5M2;
+            activation = cast(cast(activation, dtype), tensor::DType::F32);
+        }
+        auto output = linear(activation, found->second.value, {}, true);
+        if (output.dtype() != tensor::DType::F32) output = cast(output, tensor::DType::F32);
+        return preserve_srq ? static_round(output, output_scale) : output;
+    }
+    if (impl_->precision == core::InferencePrecision::LOWBIT_PARITY) {
+        const auto valid_bits = bits == 2 || bits == 4 || bits == 8;
+        const auto values_per_byte = valid_bits ? 8 / bits : 0;
+        const auto width = weight.dimensions() == 2 ? weight.size(1) * values_per_byte : 0;
+        const auto groups = group_size > 0 ? width / group_size : 0;
+        if (device() != tensor::Device::cpu() || !valid_bits || input.dtype() != tensor::DType::F32 ||
+            input.dimensions() == 0 || input_scale <= 0 || output_scale <= 0 || group_size <= 0 ||
+            width != input.size(-1) || width % group_size || weight.dimensions() != 2 ||
+            weight.dtype() != tensor::DType::U8 || scales.dtype() != tensor::DType::F32 ||
+            scales.numel() != weight.size(0) * groups || input.numel() / width > INT_MAX ||
+            width > INT_MAX || weight.size(0) > INT_MAX)
+            throw Failure({ErrorCode::UNSUPPORTED,
+                           "lowbit-parity requires calibrated CPU packed weights with compatible group scales"});
+        return require(runtime::parity::packed_linear(input, weight, scales, bits, group_size, input_scale,
+                                                      output_scale));
+    }
     const std::array<std::int64_t, 3> attributes{bits, group_size, std::bit_cast<std::int32_t>(output_scale)};
     return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
                       {&input, &weight, &scales});
@@ -678,6 +810,15 @@ auto Context::gated_feed_forward(const Tensor& input, const Tensor& gate_up_weig
                                  std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
                                  float gate_up_output_scale, float down_input_scale,
                                  float down_output_scale) -> Tensor {
+    if (impl_->precision != core::InferencePrecision::CHECKPOINT) {
+        const auto gate_up = packed_linear(input, gate_up_weight, gate_up_scales, bits, input_size, gate_up_input_scale,
+                                           gate_up_output_scale);
+        const auto gate = slice(gate_up, -1, 0, intermediate_size);
+        const auto up = slice(gate_up, -1, intermediate_size, intermediate_size);
+        const auto hidden = gelu_multiply(gate, up);
+        return packed_linear(hidden, down_weight, down_scales, bits, intermediate_size, down_input_scale,
+                             down_output_scale);
+    }
     const std::array<std::int64_t, 6> attributes{bits,
                                                  input_size,
                                                  intermediate_size,
@@ -723,14 +864,23 @@ auto Context::grouped_query_attention(const Tensor& query, const Tensor& key, co
         (!quantized && (!key_quantization.scales.empty() || !value_quantization.scales.empty())))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid attention cache quantization metadata"});
     const auto key_length = !key_start && mask.size(-1) == 1 ? key.size(1) : mask.size(-1);
-    const std::array<std::int64_t, 4> attributes{heads, key_value_heads, key_start,
-                                                 static_cast<std::int64_t>(key_length)};
-    OperatorSpec spec{Operation::ATTENTION, attributes, tensor::DType::F32, scale};
+    const auto parity_math = impl_->precision == core::InferencePrecision::QAT_FP32 ||
+                             impl_->precision == core::InferencePrecision::LOWBIT_PARITY;
+    const std::array<std::int64_t, 5> attributes{
+        heads, key_value_heads, key_start, static_cast<std::int64_t>(key_length),
+        parity_math};
+    const auto attribute_count = parity_math ? attributes.size() : attributes.size() - 1;
+    OperatorSpec spec{Operation::ATTENTION, std::span(attributes).first(attribute_count), tensor::DType::F32, scale};
     spec.quantization = {{{key_quantization.scales, key_quantization.zero_points, key_quantization.block_size},
                           {value_quantization.scales, value_quantization.zero_points, value_quantization.block_size}}};
     return impl_->run(spec, {&query, &key, &value, &mask});
 }
 auto Context::rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor {
+    if (impl_->precision == core::InferencePrecision::QAT_FP32 ||
+        impl_->precision == core::InferencePrecision::LOWBIT_PARITY) {
+        const std::array<std::int64_t, 1> attributes{1};
+        return impl_->run({Operation::RMS_NORM, attributes, tensor::DType::F32, epsilon}, {&input, &scale});
+    }
     return impl_->run({Operation::RMS_NORM, {}, tensor::DType::F32, epsilon}, {&input, &scale});
 }
 auto Context::rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
@@ -748,6 +898,26 @@ auto Context::rms_rotary(const Tensor& input, const Tensor& scale, const Tensor&
         return rotary(rms_norm(input, scale, epsilon), cosine, sine);
     return impl_->run({Operation::RMS_ROTARY, {}, tensor::DType::F32, epsilon}, {&input, &scale, &cosine, &sine});
 }
+auto Context::rms_axial_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
+                               float epsilon) -> Tensor {
+    if (input.dimensions() != 4 || !input.numel() || input.dtype() != tensor::DType::F32 || input.size(3) % 4 ||
+        scale.dimensions() != 1 || scale.size(0) != input.size(3) || scale.dtype() != tensor::DType::F32 ||
+        !std::isfinite(epsilon) || epsilon <= 0)
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid axial RMS rotary operands"});
+    for (const auto* angle : {&cosine, &sine})
+        if (angle->dimensions() != 4 || angle->size(0) != 2 || angle->size(1) != input.size(1) || angle->size(2) != 1 ||
+            angle->size(3) != input.size(3) / 4 || angle->dtype() != tensor::DType::F32)
+            throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid axial RMS rotary angles"});
+    if (!tensor::DEVICE_CAPABILITIES[device().kind].fused_axial_rms_rotary) {
+        const auto normalized = rms_norm(input, scale, epsilon);
+        std::array<Tensor, 2> axes;
+        for (int axis = 0; axis < 2; ++axis)
+            axes[axis] = rotary(slice(normalized, 3, axis * input.size(3) / 2, input.size(3) / 2),
+                                slice(cosine, 0, axis, 1), slice(sine, 0, axis, 1));
+        return concat(axes, 3);
+    }
+    return impl_->run({Operation::RMS_ROTARY, {}, tensor::DType::F32, epsilon}, {&input, &scale, &cosine, &sine});
+}
 auto Context::rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,
                                 const Tensor& output_scale) -> Tensor {
     if (!input.defined() || !input.dimensions() || input.dtype() != tensor::DType::F32 || !scale.defined() ||
@@ -756,6 +926,13 @@ auto Context::rms_norm_residual(const Tensor& input, const Tensor& scale, const 
         !std::ranges::equal(input.shape(), residual.shape()) || !std::isfinite(epsilon) || epsilon <= 0 ||
         (output_scale.defined() && (output_scale.dtype() != tensor::DType::F32 || output_scale.numel() != 1)))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid RMS residual normalization operands"});
+    if (impl_->precision == core::InferencePrecision::QAT_FP32 ||
+        impl_->precision == core::InferencePrecision::LOWBIT_PARITY) {
+        const std::array<std::int64_t, 1> attributes{1};
+        const OperatorSpec spec{Operation::RMS_NORM_RESIDUAL, attributes, tensor::DType::F32, epsilon};
+        if (output_scale.defined()) return impl_->run(spec, {&input, &scale, &residual, &output_scale});
+        return impl_->run(spec, {&input, &scale, &residual});
+    }
     const OperatorSpec spec{Operation::RMS_NORM_RESIDUAL, {}, tensor::DType::F32, epsilon};
     if (output_scale.defined()) return impl_->run(spec, {&input, &scale, &residual, &output_scale});
     return impl_->run(spec, {&input, &scale, &residual});

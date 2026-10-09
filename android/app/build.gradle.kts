@@ -106,10 +106,14 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.noties.markwon:core:4.6.2")
     implementation("io.noties.markwon:ext-latex:4.6.2")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("com.squareup.okhttp3:okhttp-tls:4.12.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation(platform("androidx.compose:compose-bom:2025.04.01"))
@@ -134,6 +138,8 @@ val visionNotices by tasks.registering(Sync::class) {
         from(rootProject.file("../third_party/tahoma-vision/$source")) { rename { target } }
     }
     from(rootProject.file("../src/kidi/checkpoint/ggml/LICENSE")) { rename { "ggml_license.txt" } }
+    from(rootProject.file("../third_party/PYTORCH_LICENSE.txt")) { rename { "pytorch_license.txt" } }
+    from(rootProject.file("../third_party/SLEEF_LICENSE.txt")) { rename { "sleef_license.txt" } }
 }
 val legalDocuments by tasks.registering(Sync::class) {
     from(rootProject.file("PRIVACY.md"), rootProject.file("TERMS.md"))

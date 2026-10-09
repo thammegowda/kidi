@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kidi/core/precision.h"
 #include "kidi/inference/decoder.h"
 #include "kidi/model/gemma4.h"
 #include "kidi/model/gemma4_vision.h"
@@ -70,8 +71,19 @@ struct GeneratorMemory {
 using ExternalTensorSource =
     std::function<Result<tensor::Tensor>(std::string_view name, tensor::DType dtype, std::span<const std::int64_t> shape)>;
 
+struct ModelLoadOptions {
+    tensor::Device device = tensor::Device::cpu();
+    core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
+    core::KVCachePrecision kv_cache_precision = core::KVCachePrecision::AUTO;
+    std::int32_t weight_bits = 0;
+    std::int32_t group_size = 128;
+    bool packed_prefill = false;
+};
+
 class Generator {
 public:
+    static auto load(const std::filesystem::path& directory, ModelLoadOptions options,
+                     const ExternalTensorSource& external = {}) -> Result<Generator>;
     /// Loads Gemma 4 on `device`; the Qualcomm NPU device keeps the model on the CPU and compiles captured
     /// decoding steps for the NPU.
     static auto load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits = 0,
@@ -89,6 +101,8 @@ public:
     auto step() -> Result<GenerationStep>;
     auto cancel(std::uint64_t request_id) -> Result<void>;
     auto pending_requests() const -> std::size_t { return waiting_.size() + running_.size(); }
+    auto precision() const noexcept -> core::InferencePrecision { return precision_; }
+    auto kv_cache_precision() const noexcept -> core::KVCachePrecision { return kv_cache_precision_; }
     auto native_qat() const -> bool { return static_cast<bool>(config_["model"]["quantization_config"]); }
     auto vision_supported() const -> bool { return static_cast<bool>(config_["vision"]); }
     auto memory() const -> GeneratorMemory;
@@ -97,7 +111,8 @@ public:
     auto warm_up() -> Result<void>;
 
 private:
-    Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model, std::array<std::int32_t, 3> special);
+    Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model, std::array<std::int32_t, 3> special,
+              core::InferencePrecision precision, core::KVCachePrecision kv_cache_precision);
     YAML::Node config_;
     text::Tokenizer tokenizer_;
     model::Gemma4 model_;
@@ -110,6 +125,8 @@ private:
     };
     std::vector<CachedImage> images_;
     std::array<std::int32_t, 3> special_;
+    core::InferencePrecision precision_;
+    core::KVCachePrecision kv_cache_precision_;
     struct PrefixEntry {
         std::vector<std::int32_t> tokens;
         model::Gemma4State state;

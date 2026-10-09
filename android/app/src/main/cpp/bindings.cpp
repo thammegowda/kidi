@@ -12,6 +12,7 @@
 #include <sys/system_properties.h>
 #include <uni_algo/conv.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -24,9 +25,13 @@ constexpr int MAXIMUM_OUTPUT_TOKENS = 8192;
 constexpr std::size_t CONTEXT_TOKENS = 9216;
 constexpr std::size_t PREFIX_CACHE_BYTES = 512 * 1024 * 1024;
 
-std::mutex runtime_mutex;
+// Chat and speech have separate locks so dictation never waits behind a model load or reply, as the web app gives
+// speech its own worker. The CPU thread pool accepts concurrent callers.
+std::mutex runtime_mutex, speech_mutex;
 std::optional<kidi::inference::Generator> generator;
 std::optional<kidi::inference::Transcriber> transcriber;
+// Incremented to abandon the transcription in progress, for example a draft made stale by the final request.
+std::atomic<std::uint64_t> speech_generation = 0;
 
 class JavaString {
 public:
@@ -90,8 +95,13 @@ auto messages(std::string_view source) -> std::vector<kidi::text::ChatMessage> {
 /// an explicit accelerator is tried alone so failures stay visible.
 auto candidates(std::string_view accelerator, bool speech) -> std::vector<kidi::tensor::Device> {
     if (accelerator != "auto") return {kidi::ops::require(kidi::inference::select_device(accelerator, speech))};
-    std::vector<kidi::tensor::Device> result{kidi::ops::require(kidi::inference::select_device("auto", speech))};
-    if (result.front() != kidi::tensor::Device::cpu()) result.push_back(kidi::tensor::Device::cpu());
+    if (speech) return {kidi::tensor::Device::cpu()};
+    std::vector<kidi::tensor::Device> result;
+    for (const auto choice : {"npu", "gpu"}) {
+        auto device = kidi::inference::select_device(choice);
+        if (device) result.push_back(*device);
+    }
+    result.push_back(kidi::tensor::Device::cpu());
     return result;
 }
 
@@ -195,8 +205,14 @@ auto hardware_info() -> nlohmann::json {
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_configure(JNIEnv* environment, jobject,
                                                                              jint threads) -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
-        std::scoped_lock lock(runtime_mutex);
         if (threads < 1 || threads > 8) throw std::runtime_error("Threads must be between 1 and 8");
+        // Chat and speech both configure before loading on their own threads. Serializing configuration lets the
+        // second caller see the count already applied and skip the model locks, rather than wait behind a load.
+        static std::mutex configure_mutex;
+        std::scoped_lock configure_lock(configure_mutex);
+        if (kidi::runtime::ynn::thread_count() == static_cast<std::size_t>(threads))
+            return {{"configured", true}, {"threads", threads}, {"backend", "android-cpu"}};
+        std::scoped_lock lock(runtime_mutex, speech_mutex);
         kidi::runtime::ynn::set_thread_count(threads);
         kidi::ops::require(kidi::runtime::ynn::reserve_thread_pool(threads));
         return {{"configured", true}, {"threads", threads}, {"backend", "android-cpu"}};
@@ -234,38 +250,77 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_setDataDirect
 }
 
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_load(JNIEnv* environment, jobject, jstring directory,
-                                                                        jstring accelerator) -> jstring {
+                                                                        jstring accelerator, jstring precision_name,
+                                                                        jstring kv_cache_precision_name) -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
         JavaString path(environment, directory);
         const auto preference = JavaString(environment, accelerator).get();
+        const auto precision_text = JavaString(environment, precision_name).get();
+        const auto precision = kidi::core::parse_precision(precision_text);
+        if (!precision)
+            throw kidi::ops::Failure(
+                {kidi::ErrorCode::INVALID_ARGUMENT, "unknown inference precision: " + precision_text});
+        const auto kv_cache_precision_text = JavaString(environment, kv_cache_precision_name).get();
+        const auto kv_cache_precision = kidi::core::parse_kv_cache_precision(kv_cache_precision_text);
+        if (!kv_cache_precision)
+            throw kidi::ops::Failure(
+                {kidi::ErrorCode::INVALID_ARGUMENT, "unknown KV-cache precision: " + kv_cache_precision_text});
         std::scoped_lock lock(runtime_mutex);
         const auto started = std::chrono::steady_clock::now();
+        const auto milliseconds = [](auto from, auto to) {
+            return std::chrono::duration<double, std::milli>(to - from).count();
+        };
         generator.reset();
-        nlohmann::json attempts = nlohmann::json::array();
+        nlohmann::json attempts = nlohmann::json::array(), stages;
         for (const auto device : candidates(preference, false)) {
-            auto loaded = kidi::inference::Generator::load(path.get(), device, 0, 128, true);
-            if (loaded) {
-                generator.emplace(std::move(*loaded));
+            const auto attempt_started = std::chrono::steady_clock::now();
+            auto ready = [&]() -> kidi::Result<kidi::inference::Generator> {
+                auto loaded = kidi::inference::Generator::load(
+                    path.get(),
+                    {.device = device,
+                     .precision = *precision,
+                     .kv_cache_precision = *kv_cache_precision,
+                     .packed_prefill = true});
+                if (!loaded) return loaded;
+                const auto loaded_at = std::chrono::steady_clock::now();
+                if (auto configured = loaded->configure_serving({1, 1, CONTEXT_TOKENS, 32}); !configured)
+                    return std::unexpected(configured.error());
+                const auto configured_at = std::chrono::steady_clock::now();
+                // A short request with the serving shapes packs CPU weights, and on the NPU captures the decode step
+                // so its context loads (or starts compiling) now rather than during the first reply. Nothing is
+                // retained, and a device that cannot finish it is treated as a failed load.
+                auto warm = options(3);
+                warm.prefix_cache_bytes = 0;
+                warm.stream_text = false;
+                if (auto request = loaded->enqueue_chat(std::vector{kidi::text::ChatMessage{"user", "Hi"}}, warm);
+                    !request)
+                    return std::unexpected(request.error());
+                while (loaded->pending_requests())
+                    if (auto step = loaded->step(); !step) return std::unexpected(step.error());
+                const auto ready_at = std::chrono::steady_clock::now();
+                stages = {{"checkpoint_tokenizer_model", milliseconds(attempt_started, loaded_at)},
+                          {"serving_setup", milliseconds(loaded_at, configured_at)},
+                          {"warm_up", milliseconds(configured_at, ready_at)}};
+                return loaded;
+            }();
+            if (ready) {
+                generator.emplace(std::move(*ready));
                 break;
             }
-            attempts.push_back({{"device", kidi::tensor::to_string(device)}, {"error", loaded.error().message}});
-            if (preference != "auto") throw kidi::ops::Failure(loaded.error());
+            attempts.push_back({{"device", kidi::tensor::to_string(device)}, {"error", ready.error().message}});
+            if (preference != "auto") throw kidi::ops::Failure(ready.error());
         }
         if (!generator) throw std::runtime_error(attempts.back()["error"].get<std::string>());
-        const auto loaded_at = std::chrono::steady_clock::now();
-        kidi::ops::require(generator->configure_serving({1, 1, CONTEXT_TOKENS, 32}));
-        const auto ready_at = std::chrono::steady_clock::now();
-        return {
-            {"ready", true},
-            {"native_qat", generator->native_qat()},
-            {"vision", generator->vision_supported()},
-            {"backend", generator->execution()},
-            {"accelerator", preference},
-            {"fallbacks", attempts},
-            {"load_ms", std::chrono::duration<double, std::milli>(ready_at - started).count()},
-            {"stages_ms",
-             {{"checkpoint_tokenizer_model", std::chrono::duration<double, std::milli>(loaded_at - started).count()},
-              {"serving_setup", std::chrono::duration<double, std::milli>(ready_at - loaded_at).count()}}}};
+        return {{"ready", true},
+                {"native_qat", generator->native_qat()},
+                {"vision", generator->vision_supported()},
+                {"backend", generator->execution()},
+                {"accelerator", preference},
+                {"precision", kidi::core::to_string(generator->precision())},
+                {"kv_cache_precision", kidi::core::to_string(generator->kv_cache_precision())},
+                {"fallbacks", attempts},
+                {"load_ms", milliseconds(started, std::chrono::steady_clock::now())},
+                {"stages_ms", stages}};
     });
 }
 
@@ -325,7 +380,7 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_loadAsr(JNIEn
         JavaString path(environment, directory);
         const auto preference = JavaString(environment, accelerator).get();
         const auto devices = candidates(preference, true);
-        std::scoped_lock lock(runtime_mutex);
+        std::scoped_lock lock(speech_mutex);
         transcriber.reset();
         const auto load_start = std::chrono::steady_clock::now();
         auto stage_start = load_start;
@@ -352,9 +407,12 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_loadAsr(JNIEn
         }
         if (!transcriber) throw std::runtime_error(failure);
         mark("checkpoint_tokenizer_model");
+        // Weight packing and operator preparation happen here instead of during the first dictation.
+        kidi::ops::require(transcriber->warm_up());
+        mark("warm_up");
         return {{"ready", true},
                 {"stages_ms", stages},
-                {"startup_warmup", false},
+                {"startup_warmup", true},
                 {"load_ms",
                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - load_start).count()},
                 {"backend", transcriber->execution()},
@@ -367,6 +425,7 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_loadAsr(JNIEn
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_transcribe(JNIEnv* environment, jobject,
                                                                               jfloatArray samples_array,
                                                                               jstring language, jint maximum_tokens,
+                                                                              jlong requested_generation,
                                                                               jobject listener) -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
         const auto sample_count = environment->GetArrayLength(samples_array);
@@ -378,9 +437,16 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_transcribe(JN
         environment->GetFloatArrayRegion(samples_array, 0, sample_count, samples.data());
         if (environment->ExceptionCheck()) throw std::runtime_error("Unable to read speech samples");
         JavaString language_name(environment, language);
-        kidi::inference::TranscriptionOptions options{.language = language_name.get(),
-                                                      .task = "transcribe",
-                                                      .maximum_tokens = static_cast<std::size_t>(maximum_tokens)};
+        // A request belongs to the generation current when it was made, so cancelling also covers queued requests.
+        const auto generation =
+            requested_generation < 0 ? speech_generation.load() : static_cast<std::uint64_t>(requested_generation);
+        kidi::inference::TranscriptionOptions options{
+            .language = language_name.get(),
+            .task = "transcribe",
+            .maximum_tokens = static_cast<std::size_t>(maximum_tokens),
+            // Like the web app: encode the speech plus a second of silence instead of a padded 30-second window.
+            .fit_audio = true,
+            .cancelled = [generation] { return speech_generation.load() != generation; }};
         if (listener) {
             const auto listener_class = environment->GetObjectClass(listener);
             if (!listener_class) {
@@ -410,8 +476,11 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_transcribe(JN
                 }
             };
         }
-        std::scoped_lock lock(runtime_mutex);
-        auto result = kidi::ops::require(loaded_transcriber().transcribe(samples, 16000, options));
+        std::scoped_lock lock(speech_mutex);
+        if (options.cancelled()) return {{"cancelled", true}};
+        auto transcribed = loaded_transcriber().transcribe(samples, 16000, options);
+        if (!transcribed && options.cancelled()) return {{"cancelled", true}};
+        auto result = kidi::ops::require(std::move(transcribed));
         return {{"text", result.text},
                 {"preparation_ms", result.stats.preparation_ns / 1e6},
                 {"language", result.language},
@@ -422,12 +491,20 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_transcribe(JN
     });
 }
 
+extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_cancelTranscription(JNIEnv*, jobject) -> jlong {
+    return static_cast<jlong>(++speech_generation);
+}
+
+extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_transcriptionGeneration(JNIEnv*, jobject) -> jlong {
+    return static_cast<jlong>(speech_generation.load());
+}
+
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_unload(JNIEnv*, jobject) -> void {
     std::scoped_lock lock(runtime_mutex);
     generator.reset();
 }
 
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_unloadAsr(JNIEnv*, jobject) -> void {
-    std::scoped_lock lock(runtime_mutex);
+    std::scoped_lock lock(speech_mutex);
     transcriber.reset();
 }

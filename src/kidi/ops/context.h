@@ -5,6 +5,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string_view>
+#include "kidi/core/precision.h"
 #include "kidi/tensor/tensor.h"
 
 namespace kidi::runtime {
@@ -79,6 +80,8 @@ public:
     auto device() const noexcept -> tensor::Device;
     auto synchronize() -> void;
     auto preparation_ns() const noexcept -> std::uint64_t;
+    auto set_precision(core::InferencePrecision precision) noexcept -> void;
+    auto precision() const noexcept -> core::InferencePrecision;
     auto profile_phase(std::string_view phase) -> void;
 
     /// Runs `step`, capturing its operators the first two times `key` is used and replaying them afterwards.
@@ -137,6 +140,8 @@ public:
     auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
     auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
                     float epsilon) -> Tensor;
+    auto rms_axial_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
+                          float epsilon) -> Tensor;
     auto rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,
                            const Tensor& output_scale = {}) -> Tensor;
     auto layer_norm(const Tensor& input, const Tensor& scale, const Tensor& bias, float epsilon) -> Tensor;

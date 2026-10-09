@@ -167,8 +167,10 @@ learned decoder positions, fixed checkpoint encoder positions, and a tied output
 the checkpoint's embedded 80-bin mel bank. Conv1D is expressed as im2col plus the existing optimized linear operation;
 attention, normalization, cache mutation, and projection remain ordinary eager operations. `inference::Transcriber` owns
 language detection, task/no-timestamp prefixes, token suppression, and greedy ASR policy. Whisper processes one
-padded/truncated 30-second segment per call; with `TranscriptionOptions::fit_audio` (browser) the encoder sees only the
-audio plus at least one second of silence, and output that repeats itself is decoded again over the full window.
+padded/truncated 30-second segment per call; with `TranscriptionOptions::fit_audio` (browser and Android) the encoder sees
+only the audio plus at least one second of silence, and output that repeats itself is decoded again over the full window.
+`TranscriptionOptions::cancelled` is polled between encoder blocks and decoder steps so a stale dictation draft can be
+abandoned.
 Encoder-length inputs run in 128-row slices, so weighted operators are prepared once for the slice shape and retain
 slice-sized buffers whatever the audio length; decoder steps run whole. Only the current source length's captured
 decoder step is kept, because a captured step retains its encoder keys and values. Encoder and decoder share one CPU context; Android uses the same YNNPACK
@@ -406,6 +408,12 @@ Other platforms retain default scheduling. See the
 [matched scheduling comparison](benchmarks/metal/scheduling-20260919/README.md),
 including preparation costs and quality differences from the old graph runtime.
 
+FP32 attention with at most eight query rows, such as a Whisper or RTG decoder
+step, bypasses the generic YNNPACK graph, which re-lays out every key and value
+into head-major order on each call. A dedicated kernel reads the row-major cache
+directly and parallelizes over batch, head, and query row. On the SM8750 phone it
+cut Whisper Small decoding from about 14.5 to 8.8 ms per token.
+
 No model graph, lazy fallback, compiler IR, or alternate generation policy is
 retained; captured steps are recorded from eager code as described below. The former graph comparison benchmark was removed; its raw
 measurements and report remain historical documentation. The superseded fusion
@@ -508,7 +516,8 @@ binaries remain cached on disk.
 `inference::select_device` maps "auto", "cpu", "gpu", and "npu" to a device.
 "auto" prefers the NPU, then Metal on Apple, then the CPU for Gemma, and the CPU
 for Whisper; Vulkan is an explicit, experimental choice until it measures faster
-than the CPU. Explicit choices fail when unavailable. `Generator::load` with
+than the CPU. Explicit choices fail when unavailable. The Android app's Auto setting instead tries the NPU, Vulkan,
+and then the CPU, treating a device that cannot load or complete a short warm-up request as failed. `Generator::load` with
 `Device::qualcomm_npu()` keeps Gemma on the CPU with the NPU step compiler, and
 `Generator::execution()` reports the result (e.g. `cpu+qnn-htp`).
 
@@ -779,10 +788,23 @@ the checkpoint, or load unused modality encoders. QAT precision overrides are re
 
 Calibrated CPU projections quantize activations directly with the trained scale
 before integer dot products; uncalibrated projections retain dynamic activation
-quantization. Metal calibrates input once into prepared scratch and fuses output
-rounding into the packed projection. Static-range rounding uses ties-to-even,
-INT8 clipping, and zero-scale bypass. K/V cache values are rounded using their
-trained scales, while storage remains FP32.
+quantization. Metal calibrates input once into prepared scratch and reuses it for
+projections with the same source and trained scale. Its 64x64 W8 prefill kernel
+fuses output rounding. Q/K/V remain separate projections because one combined
+dispatch measured slower, but reuse the same quantized activation. Static-range
+rounding uses ties-to-even, INT8 clipping, and zero-scale bypass. K/V cache
+values are rounded using their trained scales, while storage remains FP32.
+
+Apple GPU vision also fuses axial RMSNorm with RoPE for Q/K. Equal-head attention
+uses MPSGraph's native scaled-dot-product-attention operation on supported OS
+versions, passing the checkpoint's explicit scale (Gemma vision uses 1.0 rather
+than `1/sqrt(head_dim)`). Vision checkpoint binding validates matching gate/up
+activation scales and concatenates their packed rows into the existing internal
+`gate_up_proj` representation. The gated FFN computes those two logical halves
+together, applies GELU/multiply before leaving the threadgroup, and writes the
+down projection's INT8 input codes without an FP32 hidden tensor. See the
+[illustrated FFN fusion walkthrough](ffn-fuse.md). Older systems retain the
+decomposed matmul/softmax graph.
 
 Default calibrated Metal prefill may cache expanded FP16 matrices for native
 matrix multiplication, sharing them across input shapes. Packed GEMV remains the
@@ -851,23 +873,24 @@ compiler then lowers the entire captured prefill or decode step to chained QNN
 graphs. There is no operator-by-operator CPU/NPU alternation in accelerated
 steady state.
 
-The whole-step lowering covers packed 2/4/8-bit embeddings, calibrated
-projections and feed-forwards, RMS norms and residuals, rotary embeddings,
-grouped-query causal attention, KV writes, the 262K 2-bit vocabulary head, and
-greedy selection. Packed embedding tables reside in shared FastRPC memory and
-are gathered, unpacked, and scaled on HTP. KV caches use their trained INT8
+The whole-step lowering covers calibrated projections and feed-forwards, RMS
+norms and residuals, rotary embeddings, grouped-query causal attention, KV
+writes, the 262K 2-bit vocabulary head, and greedy selection. A host prologue
+gathers and dequantizes only the selected rows from the packed token and
+per-layer embedding tables. Mapping those complete tables into FastRPC consumed
+1.27 GiB of cDSP virtual address space and made later QNN graph mappings fail;
+the selected FP16 rows are small step inputs. KV caches use their trained INT8
 grids in registered shared memory; the host synchronizes an existing prefix
 once when a new 512/1024/2048/... attention bucket is selected, and copies only
-the newly produced KV rows back for model-state compatibility. Per-call host
-work is limited to binding inputs, cache-prefix synchronization, graph launches,
-and reading the selected token.
+the newly produced KV rows back for model-state compatibility. Other per-call
+host work is limited to binding inputs, graph launches, and reading the selected
+token.
 
 Low-bit FC weights use 8-bit containers with bit-width axis scales because this
 HTP release rejects packed SFIXED2/SFIXED4 constants. Graphs are split by an
 unpacked-weight budget (256 MiB by default) to keep `libQnnHtpPrepare` memory
-bounded. On the tested Gemma 4 E2B model this produces five prefill graphs and
-eleven decode graphs. Prefill and decode share a single FastRPC copy of the
-packed embedding tables.
+bounded. On the tested Gemma 4 E2B model this produces roughly five prefill
+graphs and ten decode graphs.
 
 Whole-step context binaries and JSON binding metadata are cached under
 `KIDI_QNN_CACHE_DIR`, keyed by step shape, sampled model content, lowering

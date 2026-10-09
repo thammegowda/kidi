@@ -19,6 +19,10 @@ namespace {
 class DecliningCompiler final : public kidi::runtime::StepCompiler {
 public:
     auto name() const -> std::string_view override { return "declining"; }
+    auto requires_second_capture(std::string_view) const -> bool override { return false; }
+    auto prefill_chunk_size(std::size_t requested) const -> std::size_t override {
+        return std::max(requested, std::size_t{16});
+    }
     auto compile(const kidi::graph::Graph&,
                  std::string_view key) -> std::unique_ptr<kidi::runtime::StepExecutable> override {
         keys.emplace_back(key);
@@ -54,7 +58,13 @@ auto check_captured_prefill(const YAML::Node& config, const kidi::checkpoint::We
         require((*captured)->prefill(std::span(sequence).subspan(offset, 16), captured_state));
         require(eager->prefill(std::span(sequence).subspan(offset, 16), eager_state));
     }
-    for (std::size_t position = 64; position < sequence.size(); ++position) {
+    require((*captured)->prefill(std::span(sequence).subspan(64, 7), captured_state));
+    require(eager->prefill(std::span(sequence).subspan(64, 7), eager_state));
+    if (captured_state.position != 71 || eager_state.position != 71) {
+        std::cerr << "padded prefill advanced by its padded length\n";
+        return false;
+    }
+    for (std::size_t position = 71; position < sequence.size(); ++position) {
         const auto token = std::span(sequence).subspan(position, 1);
         const auto actual = require((*captured)->forward(token, captured_state));
         const auto expected = require(eager->forward(token, eager_state));
@@ -71,6 +81,63 @@ auto check_captured_prefill(const YAML::Node& config, const kidi::checkpoint::We
     for (const auto& key : compiler->keys) std::cerr << ' ' << key;
     std::cerr << '\n';
     return false;
+}
+
+/// Image embeddings are step inputs, not graph constants: a captured image-prefill shape must rebind a later image.
+auto check_image_prefill_rebinding(const YAML::Node& config, const kidi::checkpoint::Weights& checkpoint,
+                                   std::span<const std::int32_t> tokens) -> bool {
+    using kidi::ops::require;
+    using kidi::tensor::Tensor;
+    auto extended = YAML::Clone(config);
+    extended["max_position_embeddings"] = 128;
+    auto compiler = std::make_shared<DecliningCompiler>();
+    std::optional<kidi::model::Gemma4> captured;
+    {
+        const kidi::ops::StepCompilerScope scope(compiler);
+        captured = require(kidi::model::Gemma4Impl::create(extended));
+    }
+    auto eager = require(kidi::model::Gemma4Impl::create(extended));
+    require((*captured)->set_checkpoint(checkpoint));
+    require(eager->set_checkpoint(checkpoint));
+    const auto hidden = extended["hidden_size"].as<std::int64_t>();
+    const auto embeddings = [&](float offset) {
+        std::vector<float> values(static_cast<std::size_t>(4 * hidden));
+        for (std::size_t index = 0; index < values.size(); ++index)
+            values[index] = offset + static_cast<float>(index % static_cast<std::size_t>(hidden)) / hidden;
+        return require(Tensor::from_host({1, 4, hidden}, std::span<const float>(values)));
+    };
+    std::array<std::int32_t, 16> sequence{};
+    for (std::size_t index = 0; index < sequence.size(); ++index) sequence[index] = tokens[index % tokens.size()];
+    const auto run = [&](kidi::model::Gemma4& model, float offset) {
+        auto state = require(model->create_state(128));
+        state.images.push_back({3, embeddings(offset)});
+        require(model->prefill(sequence, state));
+        return state;
+    };
+    const auto first = run(*captured, 0.25F);
+    const auto rebound = run(*captured, 3.5F);
+    const auto expected = run(eager, 3.5F);
+    bool distinct = false;
+    for (std::size_t layer = 0; layer < rebound.layers.size(); ++layer) {
+        for (const auto pair : {std::pair{&first.layers[layer].key, &rebound.layers[layer].key},
+                                std::pair{&first.layers[layer].value, &rebound.layers[layer].value}}) {
+            distinct = distinct ||
+                       !std::ranges::equal(require(pair.first->host_bytes()), require(pair.second->host_bytes()));
+        }
+        for (const auto pair : {std::pair{&rebound.layers[layer].key, &expected.layers[layer].key},
+                                std::pair{&rebound.layers[layer].value, &expected.layers[layer].value}})
+            if (!std::ranges::equal(require(pair.first->host_bytes()), require(pair.second->host_bytes()))) {
+                std::cerr << "captured image prefill did not rebind layer " << layer << '\n';
+                return false;
+            }
+    }
+    if (!distinct) {
+        std::cerr << "distinct image embeddings produced identical caches\n";
+        return false;
+    }
+    return std::ranges::any_of(compiler->keys,
+                               [](const std::string& key) { return key.starts_with("gemma4_prefill:16:") &&
+                                                                  key.ends_with(":images"); });
 }
 
 auto fixture_directory(std::string_view fixture) -> std::filesystem::path {
@@ -405,6 +472,45 @@ auto main() -> int {
                         : tensor::DType::F32;
                 for (const auto& cache : full.layers)
                     if (cache.key.dtype() != cache_dtype || cache.value.dtype() != cache_dtype) return failed(__LINE__);
+                model->set_kv_cache_precision(core::KVCachePrecision::FP32);
+                const auto fp32_cache = ops::require(model->create_state(8));
+                for (const auto& cache : fp32_cache.layers)
+                    if (cache.key.dtype() != tensor::DType::F32 || cache.value.dtype() != tensor::DType::F32)
+                        return failed(__LINE__);
+                if (cache_dtype == tensor::DType::I8) {
+                    model->set_kv_cache_precision(core::KVCachePrecision::INT8);
+                    const auto int8_cache = ops::require(model->create_state(8));
+                    for (const auto& cache : int8_cache.layers)
+                        if (cache.key.dtype() != tensor::DType::I8 || cache.value.dtype() != tensor::DType::I8)
+                            return failed(__LINE__);
+                }
+                model->set_kv_cache_precision(core::KVCachePrecision::AUTO);
+                model->set_kv_cache_precision(core::KVCachePrecision::BF16);
+                const auto unsupported_cache = model->create_state(8);
+                if (unsupported_cache || unsupported_cache.error().code != ErrorCode::UNSUPPORTED)
+                    return failed(__LINE__);
+                model->set_kv_cache_precision(core::KVCachePrecision::AUTO);
+                if (fixture == std::string_view("gemma4-qat") && device == tensor::Device::cpu()) {
+                    std::vector precisions{
+                        core::InferencePrecision::FP32,      core::InferencePrecision::BF16,
+                        core::InferencePrecision::Q2A16,     core::InferencePrecision::Q4A16,
+                        core::InferencePrecision::Q8A16,     core::InferencePrecision::Q2AE4M3,
+                        core::InferencePrecision::Q4AE4M3,   core::InferencePrecision::Q8AE4M3,
+                        core::InferencePrecision::Q2AE5M2,   core::InferencePrecision::Q4AE5M2,
+                        core::InferencePrecision::Q8AE5M2,   core::InferencePrecision::QAT_FP32,
+                    };
+#if defined(__APPLE__)
+                    precisions.push_back(core::InferencePrecision::LOWBIT_PARITY);
+#endif
+                    for (const auto precision : precisions) {
+                        model->set_precision(precision);
+                        auto precision_state = ops::require(model->create_state(8));
+                        const auto precision_output = ops::require(model->forward(tokens, precision_state, true));
+                        for (const auto value : ops::require(precision_output.data<float>()))
+                            if (!std::isfinite(value)) return failed(__LINE__);
+                    }
+                    model->set_precision(core::InferencePrecision::CHECKPOINT);
+                }
                 auto prefill = ops::require(model->forward(tokens, full, true));
                 const auto prefill_values = ops::require(prefill.data<float>());
                 if (prefill_values.size() != values.size()) return failed(__LINE__);
@@ -466,8 +572,11 @@ auto main() -> int {
                     if (model->forward_token(ops::require(tensor::Tensor::from_host({2}, tokens.first(2), device)),
                                              fed))
                         return failed(__LINE__);
-                    if (device == tensor::Device::cpu() && !check_captured_prefill(config, checkpoint, tokens))
-                        return failed(__LINE__);
+                    if (device == tensor::Device::cpu()) {
+                        if (!check_captured_prefill(config, checkpoint, tokens) ||
+                            !check_image_prefill_rebinding(config, checkpoint, tokens))
+                            return failed(__LINE__);
+                    }
                 }
                 for (const std::size_t batch_size : {2, 4}) {
                     std::vector<model::Gemma4State> batch, serial;

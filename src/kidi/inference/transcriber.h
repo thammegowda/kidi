@@ -22,6 +22,8 @@ struct TranscriptionOptions {
     /// 30-second window. Short dictation encodes several times faster; the margin keeps Whisper from repeating text.
     bool fit_audio = false;
     std::function<void(std::string_view, std::string_view)> on_partial;
+    /// Polled between stages and decoder steps; returning true abandons the request with an error.
+    std::function<bool()> cancelled;
 };
 
 struct TranscriptionStats {

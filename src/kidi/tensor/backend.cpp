@@ -59,6 +59,14 @@ auto make_unavailable_backend(DeviceKind kind, std::string name, std::string rea
     return std::make_shared<UnavailableBackend>(kind, std::move(name), std::move(reason));
 }
 
+auto Backend::allocate_zeroed(Device device, std::size_t size_bytes, std::size_t alignment) const
+    -> Result<std::shared_ptr<Storage>> {
+    auto storage = allocate(device, size_bytes, alignment);
+    if (!storage) return storage;
+    if (auto status = clear(**storage); !status) return std::unexpected(std::move(status.error()));
+    return storage;
+}
+
 auto Backend::clear(Storage& storage) const -> Result<void> {
     const std::vector<std::byte> zeros(storage.size_bytes());
     return copy_from_host(storage, 0, zeros);

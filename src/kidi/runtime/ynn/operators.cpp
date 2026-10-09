@@ -1,4 +1,5 @@
 #include "kidi/runtime/operator.h"
+#include "kidi/runtime/parity_math.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/ops/context.h"
 #include "ynnpack/composites/composites.h"
@@ -11,6 +12,11 @@
 #include <algorithm>
 #include <limits>
 #include <cstdlib>
+
+#if defined(__APPLE__)
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
+#endif
 
 namespace kidi::runtime {
 namespace {
@@ -27,6 +33,10 @@ auto type(DType dtype) -> ynn_type {
             return ynn_type_int8;
         case DType::I32:
             return ynn_type_int32;
+        case DType::E4M3:
+            return ynn_type_fp8_e4m3;
+        case DType::E5M2:
+            return ynn_type_fp8_e5m2;
         default:
             throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported eager CPU dtype"});
     }
@@ -254,12 +264,90 @@ private:
     OutputPool pool_;
 };
 
+#if defined(__APPLE__)
+// PyTorch-compatible attention reduction order; see third_party/PYTORCH_LICENSE.txt.
+class PytorchParityAttention final : public Operator {
+public:
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) -> bool {
+        if (spec.operation != Operation::ATTENTION || spec.attributes.size() != 5 || !spec.attributes[4] ||
+            inputs.size() != 4 || spec.attributes[0] != spec.attributes[1] || spec.attributes[2] != 0 ||
+            inputs[0].dimensions() != 3 || inputs[1].dimensions() != 3 || inputs[2].dimensions() != 3 ||
+            inputs[3].dtype() != DType::F32 || inputs[3].numel() != inputs[3].size(-1) ||
+            static_cast<std::size_t>(spec.attributes[3]) != inputs[3].size(-1))
+            return false;
+        for (std::size_t index = 0; index < 3; ++index)
+            if (inputs[index].dtype() != DType::F32 || !inputs[index].is_contiguous()) return false;
+        return inputs[0].size(0) == inputs[1].size(0) && inputs[1].size(0) == inputs[2].size(0) &&
+               inputs[1].size(1) == inputs[2].size(1) && inputs[0].size(2) == inputs[1].size(2) &&
+               inputs[1].size(2) == inputs[2].size(2);
+    }
+    PytorchParityAttention(const OperatorSpec& spec, tensor::Arena& arena)
+        : heads_(static_cast<std::size_t>(spec.attributes[0])),
+          key_length_(static_cast<std::size_t>(spec.attributes[3])),
+          scale_(spec.epsilon),
+          pool_(&arena) {}
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
+        apply(inputs, destination);
+        return destination;
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(TensorInputs inputs, Tensor& output) const -> void {
+        const auto batch_size = inputs[0].size(0), query_length = inputs[0].size(1);
+        const auto hidden = inputs[0].size(2), head_width = hidden / heads_;
+        const auto* query = require(inputs[0].data<float>()).data();
+        const auto* key = require(inputs[1].data<float>()).data();
+        const auto* value = require(inputs[2].data<float>()).data();
+        const auto* mask = require(inputs[3].data<float>()).data();
+        auto* target = require(output.data<float>()).data();
+        std::vector<float> scores(query_length * key_length_);
+        for (std::size_t batch = 0; batch < batch_size; ++batch) {
+            const auto query_batch = query + batch * query_length * hidden;
+            const auto key_batch = key + batch * inputs[1].size(1) * hidden;
+            const auto value_batch = value + batch * inputs[2].size(1) * hidden;
+            auto output_batch = target + batch * query_length * hidden;
+            for (std::size_t head = 0; head < heads_; ++head) {
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, static_cast<int>(query_length),
+                            static_cast<int>(key_length_), static_cast<int>(head_width), scale_,
+                            query_batch + head * head_width, static_cast<int>(hidden),
+                            key_batch + head * head_width, static_cast<int>(hidden), 0.F, scores.data(),
+                            static_cast<int>(key_length_));
+                for_rows(query_length, key_length_, [&](std::size_t begin, std::size_t end) {
+                    for (std::size_t row = begin; row < end; ++row)
+                        parity::softmax(std::span(scores).subspan(row * key_length_, key_length_),
+                                        std::span(mask, key_length_));
+                });
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(query_length),
+                            static_cast<int>(head_width), static_cast<int>(key_length_), 1.F, scores.data(),
+                            static_cast<int>(key_length_), value_batch + head * head_width,
+                            static_cast<int>(hidden), 0.F, output_batch + head * head_width,
+                            static_cast<int>(hidden));
+            }
+        }
+    }
+
+    std::size_t heads_, key_length_;
+    float scale_;
+    OutputPool pool_;
+};
+#endif
+
 /// RMS normalization over the last axis with a per-channel weight; the residual form adds `inputs[2]` and optionally
 /// scales by the scalar `inputs[3]`.
 class RmsNorm final : public Operator {
 public:
     RmsNorm(const OperatorSpec& spec, tensor::Arena& arena)
-        : epsilon_(spec.epsilon), residual_(spec.operation == Operation::RMS_NORM_RESIDUAL), pool_(&arena) {}
+        : epsilon_(spec.epsilon),
+          residual_(spec.operation == Operation::RMS_NORM_RESIDUAL),
+          pytorch_parity_(!spec.attributes.empty() && spec.attributes[0]),
+          pool_(&arena) {}
     static auto supports(const OperatorSpec& spec, TensorInputs inputs) -> bool {
         const bool residual = spec.operation == Operation::RMS_NORM_RESIDUAL;
         if (inputs.size() < 2 || inputs.size() > (residual ? 4U : 2U) || (residual && inputs.size() < 3)) return false;
@@ -300,14 +388,20 @@ private:
             for (auto row = begin; row < end; ++row) {
                 const auto* x = source + row * width;
                 auto* y = target + row * width;
-                std::array<float, 8> partial{};
                 std::size_t index = 0;
-                for (; index + 8 <= width; index += 8)
-                    for (std::size_t lane = 0; lane < 8; ++lane) partial[lane] += x[index + lane] * x[index + lane];
                 auto sum = 0.F;
-                for (; index < width; ++index) sum += x[index] * x[index];
-                for (const auto value : partial) sum += value;
-                const auto inverse = 1.F / std::sqrt(sum * reciprocal + epsilon_);
+                if (pytorch_parity_) {
+                    sum = parity::sum_squares(std::span(x, width));
+                } else {
+                    std::array<float, 8> partial{};
+                    for (; index + 8 <= width; index += 8)
+                        for (std::size_t lane = 0; lane < 8; ++lane)
+                            partial[lane] += x[index + lane] * x[index + lane];
+                    for (; index < width; ++index) sum += x[index] * x[index];
+                    for (const auto value : partial) sum += value;
+                }
+                const auto mean = pytorch_parity_ ? sum / static_cast<float>(width) : sum * reciprocal;
+                const auto inverse = 1.F / std::sqrt(mean + epsilon_);
                 if (!residual_) {
                     for (index = 0; index < width; ++index) y[index] = x[index] * inverse * weight[index];
                     continue;
@@ -322,6 +416,7 @@ private:
     }
     float epsilon_;
     bool residual_;
+    bool pytorch_parity_;
     OutputPool pool_;
 };
 
@@ -498,6 +593,102 @@ private:
     std::vector<std::byte> scratch_;
     OutputPool pool_;
 };
+/// Attention for a few FP32 query rows, as in an autoregressive decoding step. The generic graph copies every key and
+/// value into head-major order on each call, which dominates a one-token step over a long encoder memory.
+class FewQueryAttention final : public Operator {
+public:
+    static constexpr std::int64_t MAXIMUM_QUERIES = 8;
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) -> bool {
+        if (spec.attributes.size() != 1 || inputs[0].size(1) > MAXIMUM_QUERIES) return false;
+        for (std::size_t index = 0; index < inputs.size(); ++index)
+            if (inputs[index].dtype() != DType::F32) return false;
+        return true;
+    }
+    FewQueryAttention(const OperatorSpec& spec, tensor::Arena& arena)
+        : heads_(static_cast<std::size_t>(spec.attributes[0])), pool_(&arena) {}
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
+        attend(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "attention is not an in-place operation"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { attend(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    static auto dot(const float* left, const float* right, std::size_t count) -> float {
+        // Independent lanes let the compiler use vector multiply-adds.
+        std::array<float, 8> lanes{};
+        std::size_t index = 0;
+        for (; index + lanes.size() <= count; index += lanes.size())
+            for (std::size_t lane = 0; lane < lanes.size(); ++lane)
+                lanes[lane] += left[index + lane] * right[index + lane];
+        float sum = 0;
+        for (const auto lane : lanes) sum += lane;
+        for (; index < count; ++index) sum += left[index] * right[index];
+        return sum;
+    }
+    auto attend(TensorInputs inputs, Tensor& output) -> void {
+        const auto& query = inputs[0];
+        const auto batch = static_cast<std::size_t>(query.size(0)), rows = static_cast<std::size_t>(query.size(1));
+        const auto width = static_cast<std::size_t>(query.size(2)), head_width = width / heads_;
+        const auto keys = static_cast<std::size_t>(inputs[1].size(1));
+        const auto key_batch_stride = inputs[1].size(0) == 1 ? 0 : keys * width;
+        std::array<std::size_t, 4> mask_strides{};
+        const float* mask = nullptr;
+        if (inputs.size() == 4) {
+            mask = require(inputs[3].data<float>()).data();
+            std::size_t stride = 1;
+            for (std::size_t axis = inputs[3].dimensions(); axis-- > 0;) {
+                mask_strides[4 - inputs[3].dimensions() + axis] = inputs[3].size(axis) == 1 ? 0 : stride;
+                stride *= inputs[3].size(axis);
+            }
+        }
+        const auto* query_data = require(query.data<float>()).data();
+        const auto* key_data = require(inputs[1].data<float>()).data();
+        const auto* value_data = require(inputs[2].data<float>()).data();
+        auto* output_data = require(output.data<float>()).data();
+        const auto scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_width)));
+        const auto items = batch * heads_ * rows;
+        if (!items) return;
+        const auto tasks = std::min(ynn::thread_count(), items);
+        scratch_.resize(tasks * keys);
+        const auto per_task = (items + tasks - 1) / tasks;
+        require(ynn::parallel_for(tasks, [&](std::size_t task) {
+            auto* scores = scratch_.data() + task * keys;
+            for (auto item = task * per_task; item < std::min(items, (task + 1) * per_task); ++item) {
+                const auto row = item % rows, head = item / rows % heads_, sample = item / rows / heads_;
+                const auto* q = query_data + (sample * rows + row) * width + head * head_width;
+                const auto* k = key_data + sample * key_batch_stride + head * head_width;
+                const auto* v = value_data + sample * key_batch_stride + head * head_width;
+                const auto* bias = mask ? mask + sample * mask_strides[0] + head * mask_strides[1] +
+                                              row * mask_strides[2]
+                                        : nullptr;
+                auto largest = -std::numeric_limits<float>::infinity();
+                for (std::size_t key = 0; key < keys; ++key) {
+                    scores[key] = dot(q, k + key * width, head_width) * scale;
+                    if (bias) scores[key] += bias[key * mask_strides[3]];
+                    largest = std::max(largest, scores[key]);
+                }
+                float total = 0;
+                for (std::size_t key = 0; key < keys; ++key) total += scores[key] = std::exp(scores[key] - largest);
+                auto* out = output_data + (sample * rows + row) * width + head * head_width;
+                std::fill_n(out, head_width, 0.F);
+                for (std::size_t key = 0; key < keys; ++key) {
+                    const auto weight = scores[key] / total;
+                    const auto* source = v + key * width;
+                    for (std::size_t index = 0; index < head_width; ++index) out[index] += weight * source[index];
+                }
+            }
+        }));
+    }
+
+    std::size_t heads_;
+    std::vector<float> scratch_;
+    OutputPool pool_;
+};
 class CpuOperator final : public Operator {
 public:
     CpuOperator(ynn::Executable executable, std::size_t count, std::size_t dynamic_count, DType dtype,
@@ -577,6 +768,11 @@ public:
         if (spec.operation == Operation::CAST && spec.dtype == DType::I8 && spec.epsilon > 0)
             return std::make_unique<QuantizeInt8>(spec.epsilon, arena_);
         if (spec.operation == Operation::ATTENTION) {
+#if defined(__APPLE__)
+            if (PytorchParityAttention::supports(spec, inputs))
+                return std::make_unique<PytorchParityAttention>(spec, arena_);
+#endif
+            if (FewQueryAttention::supports(spec, inputs)) return std::make_unique<FewQueryAttention>(spec, arena_);
             const bool byte_cache = inputs[1].dtype() == DType::I8 && !spec.quantization[0].scales.empty() &&
                                     !spec.quantization[1].scales.empty();
             if (byte_cache && inputs[0].dtype() == DType::F32 && inputs[2].dtype() == inputs[1].dtype())
@@ -675,7 +871,7 @@ public:
                     const auto split = [&](std::size_t index, bool key) {
                         auto operand = operands[index];
                         auto length = inputs[index].size(1);
-                        if (index != 0 && spec.attributes.size() == 4) {
+                        if (index != 0 && spec.attributes.size() >= 4) {
                             length = spec.attributes[3];
                             if (spec.attributes[2] || length != inputs[index].size(1)) {
                                 const std::int32_t axis = 1;

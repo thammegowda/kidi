@@ -100,6 +100,7 @@ struct Gemma4Impl::State {
     float cap;
     YAML::Node construction_config;
     bool qat;
+    core::KVCachePrecision kv_cache_precision = core::KVCachePrecision::AUTO;
     bool packed_prefill = false;
     std::int32_t vocabulary, per_layer_vocabulary;
     std::vector<std::size_t> cache_layer;
@@ -110,6 +111,7 @@ struct Gemma4Impl::State {
     layers::RmsNorm per_layer_norm, norm;
     Tensor projection_scale, combination_scale, logit_scale, inverse_logit_scale;
     std::vector<Tensor> step_inputs;
+    std::string npu_prefill_key, npu_decode_key;
 
     explicit State(const YAML::Node& config)
         : context(module_device),
@@ -393,20 +395,37 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
         return std::unexpected(error.error());
     }
 }
+auto Gemma4Impl::set_precision(core::InferencePrecision precision) noexcept -> void {
+    impl_->context.set_precision(precision);
+}
+auto Gemma4Impl::set_kv_cache_precision(core::KVCachePrecision precision) noexcept -> void {
+    impl_->kv_cache_precision = precision;
+}
 auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
     try {
         if (!capacity || capacity > static_cast<std::size_t>(impl_->maximum_position))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 cache capacity"});
         Gemma4State result;
         result.capacity = capacity;
+        if (impl_->kv_cache_precision == core::KVCachePrecision::BF16 ||
+            impl_->kv_cache_precision == core::KVCachePrecision::E4M3 ||
+            impl_->kv_cache_precision == core::KVCachePrecision::E5M2)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "selected KV-cache precision is not implemented"});
         // The QAT path already rounds cache rows onto an INT8 grid, so bytes cost no accuracy and a quarter the reads.
         const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
         const auto& capabilities = tensor::DEVICE_CAPABILITIES[device().kind];
-        auto byte_cache = (cache_override == nullptr || std::string_view(cache_override) != "0") && impl_->qat &&
-                          capabilities.calibrated_int8_cast && capabilities.blockwise_int8_attention &&
-                          capacity <= capabilities.blockwise_int8_attention_max_tokens && impl_->shared_begin > 0;
-        for (int index = 0; byte_cache && index < impl_->shared_begin; ++index)
-            byte_cache = impl_->layers->at(static_cast<std::size_t>(index))->has_cache_scales();
+        auto byte_cache_supported =
+            impl_->qat && capabilities.calibrated_int8_cast && capabilities.blockwise_int8_attention &&
+            capacity <= capabilities.blockwise_int8_attention_max_tokens && impl_->shared_begin > 0;
+        for (int index = 0; byte_cache_supported && index < impl_->shared_begin; ++index)
+            byte_cache_supported = impl_->layers->at(static_cast<std::size_t>(index))->has_cache_scales();
+        const auto request_byte_cache = impl_->kv_cache_precision == core::KVCachePrecision::INT8;
+        if (request_byte_cache && !byte_cache_supported)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "INT8 KV cache is unsupported by this model or backend"});
+        const auto byte_cache =
+            byte_cache_supported &&
+            (request_byte_cache || (impl_->kv_cache_precision == core::KVCachePrecision::AUTO &&
+                                    (cache_override == nullptr || std::string_view(cache_override) != "0")));
         const auto cache_dtype = byte_cache ? DType::I8 : DType::F32;
         for (int index = 0; index < impl_->shared_begin; ++index) {
             const std::vector<std::int64_t> shape{1, static_cast<std::int64_t>(capacity),
@@ -644,7 +663,8 @@ auto Gemma4Impl::can_decode_step(const Gemma4State& state) const -> bool {
 }
 
 auto Gemma4Impl::decode_step(const Tensor& token, Gemma4State& state, bool select) -> Tensor {
-    if (state.prefilling && !impl_->context.accelerator().empty()) impl_->context.clear_replays("gemma4_prefill:");
+    if (state.prefilling && state.images.empty() && !impl_->context.accelerator().empty())
+        impl_->context.clear_replays("gemma4_prefill:");
     return captured_step(token, state, state.step, false, select);
 }
 
@@ -692,8 +712,16 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
     for (auto& input : step)
         if (input.device() != device) input = require(input.to(device));
     for (const auto& cache : state.layers) step.insert(step.end(), {cache.key, cache.value});
+    // Image embeddings are request data, not graph constants. Prepare the multimodal embedding on the host and bind
+    // it as step inputs so the same compiled transformer body works for every image of this shape.
+    const bool image_rows = prefill && !state.images.empty();
+    if (image_rows) {
+        const auto ids = require(tokens.data<std::int32_t>());
+        const auto embedded = embed(ids, state.images, position);
+        step.insert(step.end(), embedded.begin(), embedded.end());
+    }
     // An external per-layer table is read on the host, which a replay would skip, so its rows enter as a step input.
-    const bool external_rows = impl_->per_layer_tokens->external();
+    const bool external_rows = !image_rows && impl_->per_layer_tokens->external();
     if (external_rows) {
         const auto ids = require(tokens.copy_to_host());
         step.push_back(impl_->per_layer_tokens->forward(
@@ -702,9 +730,19 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
     const auto key = std::string(prefill ? "gemma4_prefill:" : "gemma4_decode:") + std::to_string(length) + ':' +
                      std::to_string(state.capacity) + ':' + std::to_string(extent) + ':' +
                      std::to_string(key_starts[0]) +
+                     (image_rows ? ":images" : "") +
                      (prefill  ? ""
                       : select ? ":token"
                                : ":logits");
+    if (context.accelerator() == "qnn-htp") {
+        // Bound NPU prefill and decode shape caches to one executable each so attention buckets do not accumulate
+        // duplicate HTP weights.
+        auto& previous = prefill ? impl_->npu_prefill_key : impl_->npu_decode_key;
+        if (previous != key) {
+            context.clear_replays(prefill ? "gemma4_prefill:" : "gemma4_decode:");
+            previous = key;
+        }
+    }
     const auto outputs = context.replay(key, step, [&](std::span<const Tensor> operands) {
         std::vector<layers::KeyValue> caches;
         for (std::size_t producer = 0; producer < state.layers.size(); ++producer)
@@ -712,15 +750,19 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
                               state.layers[producer].key_quantization, state.layers[producer].value_quantization});
         const auto layers = impl_->layer_count, width = impl_->per_layer_width;
         const auto rows = static_cast<std::int64_t>(length);
-        auto hidden = impl_->tokens->forward(context, operands[0]);
-        const auto token_inputs = external_rows ? operands[8 + 2 * state.layers.size()]
-                                                : impl_->per_layer_tokens->forward(context, operands[0]);
-        auto projection =
-            context.multiply(impl_->per_layer_projection->forward(context, hidden), impl_->projection_scale);
-        projection = context.reshape(projection, {1, rows, layers, width});
-        const auto per_layer = context.multiply(context.add(impl_->per_layer_norm->forward(context, projection),
-                                                            context.reshape(token_inputs, {1, rows, layers, width})),
-                                                impl_->combination_scale);
+        auto hidden = image_rows ? operands[8 + 2 * state.layers.size()]
+                                 : impl_->tokens->forward(context, operands[0]);
+        const auto per_layer = [&] {
+            if (image_rows) return operands[9 + 2 * state.layers.size()];
+            const auto token_inputs = external_rows ? operands[8 + 2 * state.layers.size()]
+                                                    : impl_->per_layer_tokens->forward(context, operands[0]);
+            auto projection =
+                context.multiply(impl_->per_layer_projection->forward(context, hidden), impl_->projection_scale);
+            projection = context.reshape(projection, {1, rows, layers, width});
+            return context.multiply(context.add(impl_->per_layer_norm->forward(context, projection),
+                                                 context.reshape(token_inputs, {1, rows, layers, width})),
+                                    impl_->combination_scale);
+        }();
         std::array<layers::Gemma4AttentionSegment, 1> segments;
         // Prefill only has to write the producer layers' K/V; the last producer's output is never read.
         const auto count = prefill ? impl_->shared_begin : impl_->layer_count;
@@ -758,20 +800,25 @@ auto Gemma4Impl::prefill_impl(std::span<const std::int32_t> tokens, Gemma4State&
         }
         // With an accelerator, power-of-two chunks run as captured steps; other lengths (prompt tails) stay eager
         // so each accelerator compiles only a few shapes.
-        if (state.capture_prefill && !context.accelerator().empty() && context.step_compiler()->captures_prefill() &&
-            std::has_single_bit(tokens.size()) && tokens.size() >= 16 && can_decode_step(state) &&
-            std::ranges::none_of(state.images, [&](const Gemma4ImageTokens& image) {
-                return image.position < state.position + tokens.size() &&
-                       state.position < image.position + image.embeddings.size(1);
-            })) {
-            context.profile_phase("prefill_body");
-            auto& ids =
-                step_input(state.prefill_step.token, {static_cast<std::int64_t>(tokens.size())}, DType::I32, device());
-            std::ranges::copy(tokens, require(ids.data<std::int32_t>()).begin());
-            captured_step(ids, state, state.prefill_step, true, false);
-            context.synchronize();
-            state.position += tokens.size();
-            return {};
+        if (state.capture_prefill && !context.accelerator().empty() && context.step_compiler()->captures_prefill()) {
+            // A short prompt tail reuses the compiled chunk. Padded rows follow every real row, so causal attention
+            // never reads them, and later steps overwrite those cache positions.
+            const auto chunk = context.prefill_chunk_size(1);
+            const bool exact = std::has_single_bit(tokens.size()) && tokens.size() >= 16;
+            const bool padded = !exact && tokens.size() < chunk && state.position + chunk <= state.capacity;
+            if (exact || padded) {
+                context.profile_phase("prefill_body");
+                const auto length = padded ? chunk : tokens.size();
+                auto& ids = step_input(state.prefill_step.token, {static_cast<std::int64_t>(length)}, DType::I32,
+                                       device());
+                const auto destination = require(ids.data<std::int32_t>());
+                std::ranges::copy(tokens, destination.begin());
+                std::fill(destination.begin() + static_cast<std::ptrdiff_t>(tokens.size()), destination.end(), 0);
+                captured_step(ids, state, state.prefill_step, true, false);
+                context.synchronize();
+                state.position += tokens.size();
+                return {};
+            }
         }
         context.profile_phase(state.prefilling ? "prefill_embedding" : "decode_embedding");
         const auto length = static_cast<std::int64_t>(tokens.size());

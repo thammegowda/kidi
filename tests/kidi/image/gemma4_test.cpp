@@ -57,13 +57,71 @@ auto main(int argc, char** argv) -> int {
             require(model->set_checkpoint(weights));
             const auto patches = require(reference.tensor("patches"));
             const auto pixels = require(patches.data<float>());
-            const auto actual = require(model->forward({6, 9, {pixels.begin(), pixels.end()}}));
+            std::size_t observed_blocks = 0;
+            std::size_t observed_stages = 0;
+            const auto actual = require(model->forward(
+                {6, 9, {pixels.begin(), pixels.end()}},
+                [&](std::size_t index, const kidi::tensor::Tensor& block) {
+                    if (index != observed_blocks || block.dimensions() != 3 || block.size(0) != 1 ||
+                        block.size(1) != 54 || block.size(2) != config["hidden_size"].as<std::size_t>())
+                        throw std::runtime_error("invalid vision block observation");
+                    ++observed_blocks;
+                },
+                [&](std::size_t layer, std::string_view stage, const kidi::tensor::Tensor& output) {
+                    if (layer != observed_blocks || stage.empty() || !output.defined())
+                        throw std::runtime_error("invalid vision stage observation");
+                    ++observed_stages;
+                },
+                config["num_hidden_layers"].as<std::size_t>()));
+            if (observed_blocks != config["num_hidden_layers"].as<std::size_t>())
+                throw std::runtime_error("vision block observer missed layers");
+            if (!observed_stages) throw std::runtime_error("vision stage observer missed operations");
             const auto expected = require(reference.tensor("features"));
             const auto actual_values = require(actual.data<float>()), expected_values = require(expected.data<float>());
             if (actual_values.size() != expected_values.size()) return 1;
             float maximum = 0;
             for (std::size_t index = 0; index < actual_values.size(); ++index)
                 maximum = std::max(maximum, std::abs(actual_values[index] - expected_values[index]));
+            if (argc == 3) {
+                model->set_precision(kidi::core::InferencePrecision::QAT_FP32);
+                const auto reference_actual = require(model->forward({6, 9, {pixels.begin(), pixels.end()}}));
+                const auto reference_values = require(reference_actual.data<float>());
+                float reference_maximum = 0;
+                for (std::size_t index = 0; index < reference_values.size(); ++index)
+                    reference_maximum =
+                        std::max(reference_maximum, std::abs(reference_values[index] - expected_values[index]));
+                std::cout << "QAT-FP32 parity max error: " << reference_maximum << '\n';
+                if (reference_maximum >= 2e-6F) {
+                    std::cerr << "FP32 packed-linear reference max error: " << reference_maximum << '\n';
+                    return 1;
+                }
+#if defined(__APPLE__)
+                model->set_precision(kidi::core::InferencePrecision::LOWBIT_PARITY);
+                const auto lowbit_actual = require(model->forward({6, 9, {pixels.begin(), pixels.end()}}));
+                const auto lowbit_values = require(lowbit_actual.data<float>());
+                float lowbit_maximum = 0;
+                for (std::size_t index = 0; index < lowbit_values.size(); ++index)
+                    lowbit_maximum =
+                        std::max(lowbit_maximum, std::abs(lowbit_values[index] - expected_values[index]));
+                std::cout << "low-bit parity max error: " << lowbit_maximum << '\n';
+                if (lowbit_maximum >= 2e-6F) return 1;
+#endif
+            }
+#if defined(__APPLE__)
+            {
+                const kidi::ModuleScope gpu_scope(kidi::tensor::DType::F32, false,
+                                                  kidi::tensor::Device::apple_gpu());
+                auto gpu_model = kidi::model::Gemma4Vision(config, 20, argc == 3);
+                require(gpu_model->set_checkpoint(weights));
+                const auto gpu = require(gpu_model->forward({6, 9, {pixels.begin(), pixels.end()}}));
+                const auto gpu_values = require(gpu.data<float>());
+                float gpu_maximum = 0;
+                for (std::size_t index = 0; index < gpu_values.size(); ++index)
+                    gpu_maximum = std::max(gpu_maximum, std::abs(gpu_values[index] - actual_values[index]));
+                std::cout << "Metal vision max CPU difference: " << gpu_maximum << '\n';
+                if (gpu_maximum >= 2e-6F) return 1;
+            }
+#endif
             std::cout << "vision feature max error: " << maximum << '\n';
             return maximum < 2e-4F ? 0 : 1;
         } catch (const kidi::ops::Failure& error) {

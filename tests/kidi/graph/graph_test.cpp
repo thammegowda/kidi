@@ -243,6 +243,41 @@ private:
     std::shared_future<void> released_ = release_.get_future().share();
 };
 
+class SingleCaptureCompiler final : public kidi::runtime::StepCompiler {
+public:
+    auto name() const -> std::string_view override { return "single-capture-test"; }
+    auto requires_second_capture(std::string_view) const -> bool override { return false; }
+    auto compile(const kidi::graph::Graph& graph,
+                 std::string_view) -> std::unique_ptr<kidi::runtime::StepExecutable> override {
+        ++compiles;
+        if (graph.nodes().empty())
+            throw kidi::ops::Failure({kidi::core::ErrorCode::UNSUPPORTED, "empty single-capture test graph"});
+        return std::make_unique<Doubler>(runs);
+    }
+    int compiles = 0;
+    std::atomic<int> runs{0};
+};
+
+auto single_capture_compiles_and_rebinds_inputs() -> bool {
+    auto compiler = std::make_shared<SingleCaptureCompiler>();
+    const kidi::ops::StepCompilerScope scope(compiler);
+    Context context;
+    int captures = 0;
+    const auto step = [&](std::span<const Tensor> inputs) {
+        ++captures;
+        return std::vector{context.add(inputs[0], inputs[0])};
+    };
+    auto first = tensor({2}, {1, 2});
+    const auto initial = values(context.replay("single", std::array{first}, step)[0]);
+    auto second = tensor({2}, {3, 5});
+    const auto rebound = values(context.replay("single", std::array{second}, step)[0]);
+    return expect(initial == std::vector<float>{2, 4}, "single capture returns the eager capture output") &&
+           expect(rebound == std::vector<float>{6, 10}, "single-capture executable reads a rebound input") &&
+           expect(captures == 1, "a single-capture compiler runs the step body once") &&
+           expect(compiler->compiles == 1 && compiler->runs == 1,
+                  "a single-capture compiler compiles once and executes on the next call");
+}
+
 auto background_compilation_hands_over_from_cpu_replay(bool fail) -> bool {
     auto compiler = std::make_shared<BackgroundCompiler>(fail);
     const kidi::ops::StepCompilerScope scope(compiler);
@@ -307,6 +342,7 @@ auto main() -> int {
         return replay_matches_eager() && replay_rebinds_inputs_and_views() && replay_updates_state_in_place() &&
                        replay_supports_paired_and_selection_outputs() && capture_rejects_per_call_host_values() &&
                        least_recently_used_steps_are_recaptured() && disabled_replay_runs_eagerly() &&
+                       single_capture_compiles_and_rebinds_inputs() &&
                        background_compilation_hands_over_from_cpu_replay(false) &&
                        background_compilation_hands_over_from_cpu_replay(true) &&
                        pending_background_compilation_does_not_block_eviction()

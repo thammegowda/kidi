@@ -1,4 +1,5 @@
 #include "kidi/layers/transformer.h"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -7,7 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
-
+#include <vector>
 #include "kidi/checkpoint/weights.h"
 
 namespace {
@@ -134,6 +135,54 @@ auto main() -> int {
                        rebound_values = ops::require(rebound.data<float>());
             for (std::size_t index = 0; index < unmasked_values.size(); ++index)
                 if (std::abs(unmasked_values[index] - rebound_values[index]) > 3e-5F) return 1;
+
+            // Decoder-sized heads exercise the vectorized lanes of short-query attention.
+            constexpr std::int64_t HEADS = 3, HEAD_WIDTH = 64, KEYS = 37;
+            std::vector<float> key_values(KEYS * HEADS * HEAD_WIDTH), value_values(key_values.size());
+            for (std::size_t index = 0; index < key_values.size(); ++index) {
+                key_values[index] = std::sin(0.37F * static_cast<float>(index));
+                value_values[index] = std::cos(0.11F * static_cast<float>(index));
+            }
+            const auto key = ops::require(tensor::Tensor::from_host(
+                {1, KEYS, HEADS * HEAD_WIDTH}, std::span<const float>(key_values), device));
+            const auto value = ops::require(tensor::Tensor::from_host(
+                {1, KEYS, HEADS * HEAD_WIDTH}, std::span<const float>(value_values), device));
+            for (const std::int64_t rows : {1, 5}) {
+                std::vector<float> query_values(rows * HEADS * HEAD_WIDTH), bias(rows * KEYS);
+                for (std::size_t index = 0; index < query_values.size(); ++index)
+                    query_values[index] = std::sin(0.23F * static_cast<float>(index) + 1.F);
+                for (std::size_t index = 0; index < bias.size(); ++index)
+                    bias[index] = index % KEYS > 30 ? -1e9F : 0.F;
+                const auto wide_query = ops::require(tensor::Tensor::from_host(
+                    {1, rows, HEADS * HEAD_WIDTH}, std::span<const float>(query_values), device));
+                const auto wide_mask =
+                    ops::require(tensor::Tensor::from_host({1, 1, rows, KEYS}, std::span<const float>(bias), device));
+                auto wide = context.scaled_dot_product_attention(wide_query, key, value, HEADS, wide_mask);
+                context.synchronize();
+                const auto actual = ops::require(wide.data<float>());
+                for (std::int64_t row = 0; row < rows; ++row)
+                    for (std::int64_t head = 0; head < HEADS; ++head) {
+                        std::vector<double> weights(KEYS);
+                        double largest = -1e300, total = 0;
+                        for (std::int64_t position = 0; position < KEYS; ++position) {
+                            double score = 0;
+                            for (std::int64_t index = 0; index < HEAD_WIDTH; ++index)
+                                score += static_cast<double>(query_values[(row * HEADS + head) * HEAD_WIDTH + index]) *
+                                         key_values[(position * HEADS + head) * HEAD_WIDTH + index];
+                            weights[position] = score / 8.0 + bias[row * KEYS + position];
+                            largest = std::max(largest, weights[position]);
+                        }
+                        for (auto& weight : weights) total += weight = std::exp(weight - largest);
+                        for (std::int64_t index = 0; index < HEAD_WIDTH; ++index) {
+                            double expected_value = 0;
+                            for (std::int64_t position = 0; position < KEYS; ++position)
+                                expected_value += weights[position] / total *
+                                                  value_values[(position * HEADS + head) * HEAD_WIDTH + index];
+                            if (std::abs(actual[(row * HEADS + head) * HEAD_WIDTH + index] - expected_value) > 1e-4)
+                                return 1;
+                        }
+                    }
+            }
         }
         std::filesystem::remove(path);
         return 0;
