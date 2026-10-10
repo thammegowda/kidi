@@ -47,8 +47,9 @@ Qwen3Impl::Qwen3Impl(const YAML::Node& config)
       norm_(hidden_, config["rms_norm_eps"].as<float>(), true, true) {
     const auto valid = validate_config(config);
     if (!valid) throw ops::Failure(valid.error());
-    if (module_dtype != tensor::DType::I8 || module_device != tensor::Device::cpu())
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "Qwen3 prototype requires INT8 parameters on the CPU"});
+    if (module_dtype != tensor::DType::I8 ||
+        (module_device != tensor::Device::cpu() && module_device != tensor::Device::vulkan()))
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "Qwen3 requires INT8 parameters on the CPU or Vulkan"});
     const layers::Qwen3Shape shape{
         .hidden = hidden_,
         .intermediate = config["intermediate_size"].as<std::int32_t>(),
@@ -79,10 +80,16 @@ auto Qwen3Impl::embed(ops::Context& context, std::span<const std::int32_t> token
     return tokens_->forward(context, tokens);
 }
 
-auto Qwen3Impl::prepare_attention(std::size_t length) const -> void {
-    if (length == attention_length_) return;
+auto Qwen3Impl::prepare_attention(std::size_t length) const -> const AttentionState& {
     if (!length || length > static_cast<std::size_t>(maximum_position_))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Qwen3 sequence exceeds positional capacity"});
+    if (const auto found = attention_.find(length); found != attention_.end()) {
+        found->second.used = ++attention_clock_;
+        return found->second;
+    }
+    constexpr std::size_t CAPACITY = 4;
+    if (attention_.size() >= CAPACITY)
+        attention_.erase(std::ranges::min_element(attention_, {}, [](const auto& item) { return item.second.used; }));
     const auto half = static_cast<std::size_t>(head_width_ / 2);
     std::vector<float> cosine(length * half), sine(length * half);
     for (std::size_t position = 0; position < length; ++position)
@@ -93,23 +100,48 @@ auto Qwen3Impl::prepare_attention(std::size_t length) const -> void {
             cosine[position * half + index] = std::cos(angle);
             sine[position * half + index] = std::sin(angle);
         }
-    cosine_ = require(tensor::Tensor::from_host(
-        {1, static_cast<std::int64_t>(length), 1, static_cast<std::int64_t>(half)}, std::span<const float>(cosine)));
-    sine_ = require(tensor::Tensor::from_host(
-        {1, static_cast<std::int64_t>(length), 1, static_cast<std::int64_t>(half)}, std::span<const float>(sine)));
-    mask_ = require(tensor::Tensor::zeros({1, 1, static_cast<std::int64_t>(length), static_cast<std::int64_t>(length)},
-                                          tensor::DType::F32));
-    attention_length_ = length;
+    AttentionState state{
+        .cosine = require(
+            tensor::Tensor::from_host({1, static_cast<std::int64_t>(length), 1, static_cast<std::int64_t>(half)},
+                                      std::span<const float>(cosine), device())),
+        .sine = require(
+            tensor::Tensor::from_host({1, static_cast<std::int64_t>(length), 1, static_cast<std::int64_t>(half)},
+                                      std::span<const float>(sine), device())),
+        .mask =
+            require(tensor::Tensor::zeros({1, 1, static_cast<std::int64_t>(length), static_cast<std::int64_t>(length)},
+                                          tensor::DType::F32, device())),
+        .used = ++attention_clock_,
+    };
+    return attention_.emplace(length, std::move(state)).first->second;
 }
 
 auto Qwen3Impl::forward(ops::Context& context, const tensor::Tensor& embeddings) const -> tensor::Tensor {
-    if (embeddings.dtype() != tensor::DType::F32 || embeddings.device() != tensor::Device::cpu() ||
-        embeddings.dimensions() != 3 || embeddings.size(0) != 1 || embeddings.size(2) != hidden_)
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Qwen3 requires FP32 [1, sequence, hidden] embeddings"});
-    prepare_attention(embeddings.size(1));
-    auto hidden = embeddings;
-    for (const auto& block : *blocks_) hidden = block->forward(context, hidden, mask_, cosine_, sine_);
-    return norm_->forward(context, hidden);
+    if (embeddings.dtype() != tensor::DType::F32 || embeddings.device() != context.device() ||
+        embeddings.dimensions() != 3 || !embeddings.size(0) || embeddings.size(2) != hidden_)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Qwen3 requires FP32 [batch, sequence, hidden] embeddings"});
+    const auto& attention = prepare_attention(embeddings.size(1));
+    return forward(context, embeddings, attention.mask);
+}
+
+auto Qwen3Impl::forward(ops::Context& context, const tensor::Tensor& embeddings, const tensor::Tensor& mask) const
+    -> tensor::Tensor {
+    if (embeddings.dtype() != tensor::DType::F32 || embeddings.device() != context.device() ||
+        embeddings.dimensions() != 3 || !embeddings.size(0) || embeddings.size(2) != hidden_)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Qwen3 requires FP32 [batch, sequence, hidden] embeddings"});
+    const auto& attention = prepare_attention(embeddings.size(1));
+    if (mask.dtype() != tensor::DType::F32 || mask.device() != context.device() || mask.dimensions() != 4 ||
+        mask.size(0) != 1 || mask.size(1) != 1 || mask.size(2) != embeddings.size(1) ||
+        mask.size(3) != embeddings.size(1))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Qwen3 requires an FP32 [1, 1, sequence, sequence] mask"});
+    const auto key = "qwen3:" + std::to_string(embeddings.size(0)) + ':' + std::to_string(embeddings.size(1));
+    const std::array inputs{embeddings, mask};
+    const auto outputs = context.replay(key, inputs, [&](std::span<const tensor::Tensor> operands) {
+        auto hidden = operands[0];
+        for (const auto& block : *blocks_)
+            hidden = block->forward(context, hidden, operands[1], attention.cosine, attention.sine);
+        return std::vector{norm_->forward(context, hidden)};
+    });
+    return outputs.front();
 }
 
 } // namespace kidi::model

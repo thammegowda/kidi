@@ -608,8 +608,8 @@ auto load_word(const std::byte* source) -> std::uint32_t {
     return result;
 }
 
-auto gemv_weights(const Tensor& weight, int bits, std::size_t columns,
-                  std::size_t width) -> std::vector<std::uint32_t> {
+auto gemv_weights(const Tensor& weight, int bits, std::size_t columns, std::size_t width)
+    -> std::vector<std::uint32_t> {
     const auto bytes = require(weight.host_bytes());
     const auto bytes_per_row = width / (8 / bits);
     const auto words_per_column = width * static_cast<std::size_t>(bits) / 32;
@@ -621,8 +621,8 @@ auto gemv_weights(const Tensor& weight, int bits, std::size_t columns,
     return result;
 }
 
-auto gemm_weights(const Tensor& weight, int bits, std::size_t columns,
-                  std::size_t width) -> std::vector<std::uint32_t> {
+auto gemm_weights(const Tensor& weight, int bits, std::size_t columns, std::size_t width)
+    -> std::vector<std::uint32_t> {
     const auto bytes = require(weight.host_bytes());
     const auto bytes_per_row = width / (8 / bits);
     const auto parts = static_cast<std::size_t>(bits / 2);
@@ -646,8 +646,8 @@ auto factors(const Tensor& scales, float input_scale, float output_scale = 0.F) 
     return result;
 }
 
-auto quantize_words(const Tensor& input, std::uint32_t rows, std::uint32_t width,
-                    float scale) -> std::vector<std::uint32_t> {
+auto quantize_words(const Tensor& input, std::uint32_t rows, std::uint32_t width, float scale)
+    -> std::vector<std::uint32_t> {
     const auto values = require(input.data<float>());
     std::vector<std::uint32_t> result(static_cast<std::size_t>(rows) * width / 4);
     for (std::size_t row = 0; row < rows; ++row)
@@ -664,6 +664,96 @@ auto quantize_words(const Tensor& input, std::uint32_t rows, std::uint32_t width
         }
     return result;
 }
+
+auto dynamic_scale(const Tensor& input) -> float {
+    const auto values = require(input.data<float>());
+    float maximum = 0.F;
+    for (const auto value : values) {
+        if (!std::isfinite(value))
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Vulkan projection input must be finite"});
+        maximum = std::max(maximum, std::abs(value));
+    }
+    return maximum > 0.F ? maximum / 127.F : 1.F;
+}
+
+class QuantizedLinearOperator final : public Operator {
+public:
+    QuantizedLinearOperator(TensorInputs inputs, Device device)
+        : device_(device),
+          rows_(static_cast<std::uint32_t>(inputs[0].numel() / inputs[0].size(-1))),
+          width_(static_cast<std::uint32_t>(inputs[0].size(-1))),
+          columns_(static_cast<std::uint32_t>(inputs[1].size(0))),
+          kernel_(rows_ < 4 ? Kernel::GEMV : Kernel::GEMM) {
+        shape_.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+        shape_.back() = columns_;
+        const auto scales = require(inputs[2].data<float>());
+        weight_scales_.assign(scales.begin(), scales.end());
+        auto& context = GpuContext::instance();
+        const auto weight_words = kernel_ == Kernel::GEMV ? gemv_weights(inputs[1], 8, columns_, width_)
+                                                          : gemm_weights(inputs[1], 8, columns_, width_);
+        weights_ = context.upload(std::as_bytes(std::span<const std::uint32_t>(weight_words)));
+        factors_ = context.buffer(static_cast<VkDeviceSize>(columns_) * sizeof(float));
+        activations_ = context.buffer(static_cast<VkDeviceSize>(rows_) * width_);
+        output_ = context.buffer(static_cast<VkDeviceSize>(rows_) * columns_ * sizeof(float));
+    }
+
+    static auto supported(const OperatorSpec& spec, TensorInputs inputs) -> bool {
+        const auto* disabled = std::getenv("KIDI_VULKAN_QUANTIZED");
+        if (disabled && std::string_view(disabled) == "0") return false;
+        if (spec.operation != Operation::QUANTIZED_LINEAR || spec.attributes.size() != 1 || !spec.attributes[0] ||
+            inputs.size() != 4 || inputs[0].dtype() != DType::F32 || inputs[1].dtype() != DType::I8 ||
+            inputs[1].dimensions() != 2 || inputs[2].dtype() != DType::F32 || inputs[2].dimensions() != 2 ||
+            inputs[2].size(0) != inputs[1].size(0) || inputs[2].size(1) != 1 || inputs[3].dtype() != DType::F32 ||
+            inputs[3].dimensions() != 1 || inputs[3].size(0) != inputs[1].size(0))
+            return false;
+        const auto rows = inputs[0].numel() / inputs[0].size(-1);
+        const auto width = inputs[0].size(-1);
+        const auto columns = inputs[1].size(0);
+        if (width != inputs[1].size(1) || width % 16) return false;
+        if (rows < 4 ? columns % 8 : columns % 256) return false;
+        const auto scales = inputs[2].data<float>();
+        const auto bias = inputs[3].data<float>();
+        return scales &&
+               std::ranges::all_of(*scales, [](float value) { return std::isfinite(value) && value > 0.F; }) && bias &&
+               std::ranges::all_of(*bias, [](float value) { return value == 0.F; });
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, DType::F32, device_);
+        compute(inputs[0], output);
+        return output;
+    }
+
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "quantized linear is not an in-place operation"});
+    }
+
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { compute(inputs[0], outputs[0]); }
+
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto compute(const Tensor& input, Tensor& output) -> void {
+        const auto scale = dynamic_scale(input);
+        const auto quantized = quantize_words(input, rows_, width_, scale);
+        std::memcpy(activations_.mapped, quantized.data(), quantized.size() * sizeof(std::uint32_t));
+        auto* factors = static_cast<float*>(factors_.mapped);
+        for (std::size_t index = 0; index < weight_scales_.size(); ++index)
+            factors[index] = weight_scales_[index] * scale;
+        GpuContext::instance().dispatch(kernel_, 8, activations_, weights_, factors_, output_, rows_, width_, columns_,
+                                        0.F);
+        const auto target = require(output.host_bytes());
+        std::memcpy(target.data(), output_.mapped, target.size());
+    }
+
+    Device device_;
+    std::uint32_t rows_, width_, columns_;
+    Kernel kernel_;
+    std::vector<std::int64_t> shape_;
+    std::vector<float> weight_scales_;
+    GpuBuffer weights_, factors_, activations_, output_;
+    OutputPool pool_;
+};
 
 class PackedLinearOperator final : public Operator {
 public:
@@ -845,8 +935,8 @@ auto broadcast_shape(const Tensor& left, const Tensor& right) -> std::vector<std
     return result;
 }
 
-auto inferred_outputs(const OperatorSpec& spec,
-                      TensorInputs inputs) -> std::pair<std::vector<std::vector<std::int64_t>>, std::vector<DType>> {
+auto inferred_outputs(const OperatorSpec& spec, TensorInputs inputs)
+    -> std::pair<std::vector<std::vector<std::int64_t>>, std::vector<DType>> {
     auto shape = tensor_shape(inputs[0]);
     auto dtype = spec.dtype;
     switch (spec.operation) {
@@ -932,6 +1022,7 @@ auto inferred_outputs(const OperatorSpec& spec,
         case Operation::ROTARY:
         case Operation::STATIC_ROUND:
         case Operation::GELU_MULTIPLY:
+        case Operation::SILU_MULTIPLY:
         case Operation::RMS_ROTARY:
             dtype = DType::F32;
             break;
@@ -951,6 +1042,8 @@ public:
                 std::vector<std::int64_t>(inputs[0].shape().begin(), inputs[0].shape().end()), Device::vulkan());
         if (GatedFeedForwardOperator::supported(spec, inputs))
             return std::make_unique<GatedFeedForwardOperator>(spec, inputs, Device::vulkan());
+        if (QuantizedLinearOperator::supported(spec, inputs))
+            return std::make_unique<QuantizedLinearOperator>(inputs, Device::vulkan());
         if (PackedLinearOperator::supported(spec, inputs))
             return std::make_unique<PackedLinearOperator>(spec, inputs, Device::vulkan());
         auto [shapes, dtypes] = inferred_outputs(spec, inputs);

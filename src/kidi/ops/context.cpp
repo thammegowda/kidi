@@ -130,8 +130,8 @@ struct Context::Impl {
         } catch (...) {
         }
     }
-    auto run(OperatorSpec spec, TensorInputs inputs, Tensor* residual = nullptr,
-             Tensor* destination = nullptr) -> Tensor {
+    auto run(OperatorSpec spec, TensorInputs inputs, Tensor* residual = nullptr, Tensor* destination = nullptr)
+        -> Tensor {
         const InplaceScope mode(destination != nullptr);
         spec.packed_prefill = packed_prefill;
         spec.vector_projection = decode_projections && spec.operation == Operation::PACKED_LINEAR &&
@@ -480,7 +480,8 @@ auto Context::precision() const noexcept -> core::InferencePrecision { return im
 auto Context::replay_enabled() const noexcept -> bool { return impl_->replay_enabled; }
 auto Context::clear_replays() -> void { impl_->steps.clear(); }
 auto Context::release_workspaces() -> void {
-    if (impl_->recorder) throw Failure({ErrorCode::INVALID_ARGUMENT, "cannot release workspaces inside a captured step"});
+    if (impl_->recorder)
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "cannot release workspaces inside a captured step"});
     synchronize();
     impl_->steps.clear();
     impl_->eager_outputs.clear();
@@ -505,8 +506,8 @@ auto Context::crop_local_attention() const noexcept -> bool {
 auto Context::prefill_chunk_size(std::size_t requested) const -> std::size_t {
     return impl_->compiler ? impl_->compiler->prefill_chunk_size(requested) : requested;
 }
-auto Context::replay(std::string_view key, std::span<const Tensor> inputs,
-                     const Step& step) -> std::span<const Tensor> {
+auto Context::replay(std::string_view key, std::span<const Tensor> inputs, const Step& step)
+    -> std::span<const Tensor> {
     auto& impl = *impl_;
     if (impl.recorder) throw Failure({ErrorCode::INVALID_ARGUMENT, "captured steps cannot be nested"});
     if (!impl.replay_enabled) {
@@ -698,8 +699,7 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
             scales.dtype() != tensor::DType::F32 || scales.numel() != weight.size(0) * groups)
             throw Failure({ErrorCode::UNSUPPORTED,
                            "selected precision requires CPU packed weights with compatible group scales"});
-        const auto fp8 = core::uses_e4m3_activations(impl_->precision) ||
-                         core::uses_e5m2_activations(impl_->precision);
+        const auto fp8 = core::uses_e4m3_activations(impl_->precision) || core::uses_e5m2_activations(impl_->precision);
         const auto weight_dtype = impl_->precision == core::InferencePrecision::FP32 ||
                                           impl_->precision == core::InferencePrecision::QAT_FP32 || fp8
                                       ? tensor::DType::F32
@@ -729,9 +729,8 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
             for (std::size_t row = 0; row < weight.size(0); ++row)
                 for (std::size_t column = 0; column < width; ++column) {
                     const auto packed_column = column / values_per_byte;
-                    auto value = (values[row * weight.size(1) + packed_column] >>
-                                  ((column % values_per_byte) * bits)) &
-                                 mask;
+                    auto value =
+                        (values[row * weight.size(1) + packed_column] >> ((column % values_per_byte) * bits)) & mask;
                     if (value & sign) value -= 1 << bits;
                     dequantized[row * width + column] =
                         static_cast<float>(value) * scale_values[row * groups + column / group_size];
@@ -748,16 +747,14 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
                         for (std::int32_t column = 0; column < group_size; ++column) {
                             const auto quotient = dequantized[begin + column] / scale;
                             auto rounded = std::trunc(quotient);
-                            if (std::abs(quotient - rounded) >= 0.5F)
-                                rounded += std::copysign(1.F, quotient);
+                            if (std::abs(quotient - rounded) >= 0.5F) rounded += std::copysign(1.F, quotient);
                             dequantized[begin + column] =
                                 std::clamp(rounded, -static_cast<float>(limit), static_cast<float>(limit)) * scale;
                         }
                     }
             }
             auto unpacked =
-                require(Tensor::from_host({static_cast<std::int64_t>(weight.size(0)),
-                                           static_cast<std::int64_t>(width)},
+                require(Tensor::from_host({static_cast<std::int64_t>(weight.size(0)), static_cast<std::int64_t>(width)},
                                           std::span<const float>(dequantized)));
             if (weight_dtype == tensor::DType::BF16) unpacked = cast(unpacked, tensor::DType::BF16);
             found =
@@ -784,12 +781,12 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
             input.dimensions() == 0 || input_scale <= 0 || output_scale <= 0 || group_size <= 0 ||
             width != input.size(-1) || width % group_size || weight.dimensions() != 2 ||
             weight.dtype() != tensor::DType::U8 || scales.dtype() != tensor::DType::F32 ||
-            scales.numel() != weight.size(0) * groups || input.numel() / width > INT_MAX ||
-            width > INT_MAX || weight.size(0) > INT_MAX)
+            scales.numel() != weight.size(0) * groups || input.numel() / width > INT_MAX || width > INT_MAX ||
+            weight.size(0) > INT_MAX)
             throw Failure({ErrorCode::UNSUPPORTED,
                            "lowbit-parity requires calibrated CPU packed weights with compatible group scales"});
-        return require(runtime::parity::packed_linear(input, weight, scales, bits, group_size, input_scale,
-                                                      output_scale));
+        return require(
+            runtime::parity::packed_linear(input, weight, scales, bits, group_size, input_scale, output_scale));
     }
     const std::array<std::int64_t, 3> attributes{bits, group_size, std::bit_cast<std::int32_t>(output_scale)};
     return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
@@ -805,11 +802,17 @@ auto Context::gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor {
         throw Failure({ErrorCode::INVALID_ARGUMENT, "GELU multiplication requires matching FP32 tensors"});
     return impl_->run({Operation::GELU_MULTIPLY}, {&gate, &value});
 }
+auto Context::silu_multiply(const Tensor& gate, const Tensor& value) -> Tensor {
+    if (!gate.defined() || !value.defined() || gate.dtype() != tensor::DType::F32 ||
+        value.dtype() != tensor::DType::F32 || !std::ranges::equal(gate.shape(), value.shape()))
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "SiLU multiplication requires matching FP32 tensors"});
+    return impl_->run({Operation::SILU_MULTIPLY}, {&gate, &value});
+}
 auto Context::gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
                                  const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
                                  std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
-                                 float gate_up_output_scale, float down_input_scale,
-                                 float down_output_scale) -> Tensor {
+                                 float gate_up_output_scale, float down_input_scale, float down_output_scale)
+    -> Tensor {
     if (impl_->precision != core::InferencePrecision::CHECKPOINT) {
         const auto gate_up = packed_linear(input, gate_up_weight, gate_up_scales, bits, input_size, gate_up_input_scale,
                                            gate_up_output_scale);
@@ -866,9 +869,8 @@ auto Context::grouped_query_attention(const Tensor& query, const Tensor& key, co
     const auto key_length = !key_start && mask.size(-1) == 1 ? key.size(1) : mask.size(-1);
     const auto parity_math = impl_->precision == core::InferencePrecision::QAT_FP32 ||
                              impl_->precision == core::InferencePrecision::LOWBIT_PARITY;
-    const std::array<std::int64_t, 5> attributes{
-        heads, key_value_heads, key_start, static_cast<std::int64_t>(key_length),
-        parity_math};
+    const std::array<std::int64_t, 5> attributes{heads, key_value_heads, key_start,
+                                                 static_cast<std::int64_t>(key_length), parity_math};
     const auto attribute_count = parity_math ? attributes.size() : attributes.size() - 1;
     OperatorSpec spec{Operation::ATTENTION, std::span(attributes).first(attribute_count), tensor::DType::F32, scale};
     spec.quantization = {{{key_quantization.scales, key_quantization.zero_points, key_quantization.block_size},

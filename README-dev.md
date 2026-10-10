@@ -141,6 +141,59 @@ See [android/README.md](android/README.md) for SDK setup, JNI behavior, device
 tests and model storage. Moving only the Android directory is not supported:
 the project builds the shared repository C++ core.
 
+### Embedding TTS in Another Android App
+
+Kidi's TTS API is independent of the repository's Android application. An app
+can include this repository with `add_subdirectory`, link `kidi::kidi`, and
+provide its own JNI or native UI boundary:
+
+```cmake
+set(KIDI_BUILD_TESTS OFF CACHE BOOL "")
+set(KIDI_BUILD_BENCHMARKS OFF CACHE BOOL "")
+set(KIDI_ENABLE_VULKAN ON CACHE BOOL "")
+add_subdirectory(path/to/kidi)
+target_link_libraries(reader-native PRIVATE kidi::kidi)
+```
+
+Keep one synthesizer alive and reuse it for successive paragraphs so prepared
+operators, Qwen attention tables, and captured fixed-shape steps remain cached:
+
+```cpp
+#include "kidi/inference/synthesizer.h"
+#include "kidi/runtime/ynn/graph.h"
+
+kidi::runtime::ynn::set_thread_count(4);
+auto synthesizer = kidi::inference::Synthesizer::load(
+    model_directory, kidi::tensor::Device::vulkan());
+if (!synthesizer && synthesizer.error().code == kidi::ErrorCode::UNSUPPORTED)
+    synthesizer = kidi::inference::Synthesizer::load(
+        model_directory, kidi::tensor::Device::cpu());
+if (!synthesizer)
+    throw std::runtime_error(synthesizer.error().message);
+
+kidi::inference::SynthesisOptions options;
+options.language = "English";
+auto speech = synthesizer->synthesize(paragraph, options);
+if (!speech)
+    throw std::runtime_error(speech.error().message);
+// speech->samples contains mono FP32 PCM at speech->sample_rate.
+```
+
+Serialize calls through one worker per synthesizer; its execution context and
+replay caches are mutable. Split books into sentence or paragraph requests
+rather than passing an entire chapter as one dense-attention sequence. Android
+enables the Vulkan backend by default. OmniVoice runs compatible per-channel
+INT8 projections on Vulkan and uses CPU fallbacks for the remaining generator
+operators; its convolutional Higgs/DAC waveform decoder is CPU-only. Model
+weights remain host-backed and are uploaded into reusable Vulkan projection
+layouts, avoiding a second full checkpoint allocation. The same package and API
+work with `Device::cpu()` on systems without suitable Vulkan 1.3 INT8 dot-product
+support.
+
+This integration does not change the upstream model licenses. In particular,
+review OmniVoice's CC-BY-NC and bundled decoder licenses before integrating it
+into a distributed reader application.
+
 ### Google Play Releases
 
 The APK targets above do **not** produce the Play upload bundle. For a Play beta:
@@ -343,6 +396,18 @@ not promises for other devices or proof of quality equivalence across quantizers
 - [RTG](benchmarks/rtg/README.md): FP32/BF16/INT8 translation benchmarks.
 - [Apple Metal](benchmarks/metal/README.md): backend measurements and execution studies.
 - [Android](benchmarks/android/README.md): reproducible device benchmark setup.
+
+For reusable TTS latency, run repeated synthesis through one loaded model:
+
+```bash
+build-release/kidi_tts_bench .cache/omnivoice-int8 cpu 3 4
+# On a Vulkan-enabled Android build:
+build-release/kidi_tts_bench /data/local/tmp/omnivoice-int8 vulkan 3 4
+```
+
+The first record is cold. Later records retain prepared operators, attention
+tables, and graph replays, matching an embedding application that keeps one
+synthesizer alive.
 
 Keep generated model files, local reports and large binary artifacts out of Git.
 

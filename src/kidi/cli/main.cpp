@@ -36,6 +36,7 @@ namespace {
 
 auto inference_device(const kidi::cli::Namespace& arguments) -> kidi::tensor::Device {
     const auto& backend = arguments.get<std::string>("backend");
+    if (backend == "vulkan") return kidi::tensor::Device::vulkan();
     return backend == "mps" || (backend == "auto" && kidi::module_device == kidi::tensor::Device::apple_gpu())
                ? kidi::tensor::Device::apple_gpu()
                : kidi::tensor::Device::cpu();
@@ -43,7 +44,9 @@ auto inference_device(const kidi::cli::Namespace& arguments) -> kidi::tensor::De
 
 /// Stable label for machine-readable stderr records.
 auto backend_label(kidi::tensor::Device device) -> std::string_view {
-    return device == kidi::tensor::Device::apple_gpu() ? "mps_gpu" : "ynnpack_cpu";
+    if (device == kidi::tensor::Device::apple_gpu()) return "mps_gpu";
+    if (device == kidi::tensor::Device::vulkan()) return "vulkan_gpu";
+    return "ynnpack_cpu";
 }
 
 auto inspect(const std::filesystem::path& directory) -> int {
@@ -582,7 +585,8 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
         spdlog::error("thread count must be positive");
         return 2;
     }
-    if (arguments.get<std::string>("backend") == "mps") {
+    const auto& backend = arguments.get<std::string>("backend");
+    if (backend != "auto" && backend != "ynnpack") {
         spdlog::error("Whisper currently requires the YNNPACK backend");
         return 2;
     }
@@ -637,9 +641,11 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
 auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
     if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TTS)) return status;
     if (arguments.get<std::string>("backend") == "mps") {
-        spdlog::error("TTS prototype currently requires the YNNPACK backend");
+        spdlog::error("TTS supports YNNPACK CPU and Vulkan backends");
         return 2;
     }
+    const auto device = arguments.get<std::string>("backend") == "vulkan" ? kidi::tensor::Device::vulkan()
+                                                                          : kidi::tensor::Device::cpu();
     std::optional<float> duration_seconds;
     const auto duration = arguments.get<std::string>("duration");
     if (duration != "auto") {
@@ -656,7 +662,7 @@ auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesy
         return 2;
     }
     const auto started = std::chrono::steady_clock::now();
-    auto synthesizer = kidi::inference::Synthesizer::load(directory, kidi::tensor::Device::cpu());
+    auto synthesizer = kidi::inference::Synthesizer::load(directory, device);
     if (!synthesizer) {
         spdlog::error("{}", synthesizer.error().message);
         return 1;
@@ -699,9 +705,10 @@ auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesy
         }
     }
     if (arguments.get<bool>("profile"))
-        std::cerr << "kidi_profile|backend=ynnpack|threads=" << kidi::runtime::ynn::thread_count()
-                  << "|model_load_ns=" << load_ns << "|generation_ns=" << result->stats.generation_ns
-                  << "|decode_ns=" << result->stats.decode_ns << "|preparation_ns=" << result->stats.preparation_ns
+        std::cerr << "kidi_profile|backend=" << synthesizer->execution()
+                  << "|threads=" << kidi::runtime::ynn::thread_count() << "|model_load_ns=" << load_ns
+                  << "|generation_ns=" << result->stats.generation_ns << "|decode_ns=" << result->stats.decode_ns
+                  << "|preparation_ns=" << result->stats.preparation_ns
                   << "|audio_tokens=" << result->stats.audio_tokens << "|samples=" << result->samples.size()
                   << "|sample_rate=" << result->sample_rate << '\n';
     return 0;
@@ -750,7 +757,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             .help("Hugging Face model cache directory");
         command_parser->add_argument("--backend")
             .default_value(std::string("auto"))
-            .choices({"auto", "ynnpack", "mps"});
+            .choices({"auto", "ynnpack", "mps", "vulkan"});
         command_parser->add_argument("-j", "--threads").default_value<std::int32_t>(4);
         command_parser->add_argument("--profile").action(kidi::cli::Action::STORE_TRUE);
     }

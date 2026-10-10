@@ -161,6 +161,8 @@ if(KIDI_ENABLE_QNN)
 endif()
 
 if(KIDI_BUILD_BENCHMARKS)
+    add_executable(kidi_tts_bench benchmarks/tts/synthesis.cpp)
+    target_link_libraries(kidi_tts_bench PRIVATE kidi::kidi)
     add_executable(kidi_gemma4_quality benchmarks/gemma4/quality.cpp)
     target_link_libraries(kidi_gemma4_quality PRIVATE kidi::kidi)
     add_executable(kidi_whisper_quality benchmarks/whisper/quality.cpp)

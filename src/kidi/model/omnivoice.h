@@ -26,7 +26,7 @@ public:
     auto set_checkpoint(const checkpoint::Weights& weights) -> Result<void>;
     auto synthesize(std::string_view text, const inference::SynthesisOptions& options)
         -> Result<inference::Synthesis> override;
-    auto execution() const -> std::string override { return "cpu"; }
+    auto execution() const -> std::string override;
 
     /// `input_ids` is codebook-major `[codebooks, sequence]`; `audio_mask` marks waveform-token positions.
     /// Returns target logits as `[1, target_length, codebooks * audio_vocabulary]`.

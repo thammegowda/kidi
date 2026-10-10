@@ -408,6 +408,8 @@ public:
         switch (spec.operation) {
             case Operation::GELU_MULTIPLY:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "GELU multiplication requires direct kernel"});
+            case Operation::SILU_MULTIPLY:
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "SiLU multiplication is not implemented on Metal"});
             case Operation::RMS_ROTARY:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "RMS rotary requires direct kernel"});
             case Operation::GATED_FEED_FORWARD:

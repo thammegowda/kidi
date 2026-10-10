@@ -146,18 +146,28 @@ The OmniVoice prototype uses reusable Qwen3 full-attention blocks for iterative
 masked audio-token generation. Conversion concatenates Q/K/V and gate/up
 projections along their output dimension before row quantization. The runtime
 therefore uses the canonical fused `Linear` and `GatedFeedForward` layers rather
-than Qwen-specific parallel projections. Its Higgs Audio V2 subset contains only
-the eight RVQ decode tables, their output projections, and the DAC waveform
-decoder; HuBERT, semantic/acoustic encoders, and training state are not packaged.
-Every retained learned tensor is signed INT8. Matrices and embedding tables use
-per-output-row scales; vectors use one scale per tensor. Scale tensors are FP32
-quantization metadata. Small vectors are dequantized on first use, while matrix
-and convolution weights stay INT8 through the CPU projection path.
+than Qwen-specific parallel projections. Classifier-free guidance packs its
+conditional and unconditional sequences behind a block-diagonal attention mask,
+so each diffusion step traverses Qwen once. Audio-codebook embeddings are shared
+between both segments, attention tables are bounded and cached by length, and
+fixed-shape Qwen steps use the generic graph replay path. SiLU multiplication is
+a canonical operator rather than a host-side synchronization point.
 
-TTS currently executes only on the CPU. General Conv1d and ConvTranspose1d are
-implemented as INT8 projections plus explicit sequence lowering/overlap for
-correctness. This is intentionally not a performance commitment, and no Android
-or browser surface consumes the TTS API yet.
+The Higgs Audio V2 subset contains only the eight RVQ decode tables, their output
+projections, and the DAC waveform decoder; HuBERT, semantic/acoustic encoders,
+and training state are not packaged. Every retained learned tensor is signed
+INT8. Matrices and embedding tables use per-output-row scales; vectors use one
+scale per tensor. Scale tensors are FP32 quantization metadata. Small vectors
+are dequantized on first use, while matrix and convolution weights stay INT8
+through the projection path.
+
+OmniVoice generation accepts CPU or Vulkan execution. Vulkan keeps checkpoint
+parameters in host-backed storage, uploads reusable packed layouts for supported
+per-channel INT8 projections, and bridges unsupported operators to CPU. The
+Higgs/DAC waveform decoder remains on CPU. General Conv1d and ConvTranspose1d
+use INT8 projections plus explicit sequence lowering/overlap for correctness.
+No Android or browser UI surface consumes the TTS API; another application can
+link the C++ library directly and select `Device::cpu()` or `Device::vulkan()`.
 
 OmniVoice prompt syntax is package data rather than C++ policy:
 `synthesis_template.jinja` is rendered by tokenizer++ with `language`,

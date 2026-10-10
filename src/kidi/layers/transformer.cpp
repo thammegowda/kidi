@@ -11,6 +11,9 @@ auto check_precision(tensor::DType precision) -> void {
     if (precision != tensor::DType::F32 && precision != tensor::DType::BF16 && precision != tensor::DType::I8)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "unsupported parameter precision"});
 }
+auto parameter_device() -> tensor::Device {
+    return module_device == tensor::Device::vulkan() ? tensor::Device::cpu() : module_device;
+}
 auto split_qkv(ops::Context& context, const Tensor& projected) -> std::array<Tensor, 3> {
     auto width = static_cast<std::int64_t>(projected.size(-1) / 3);
     return {context.slice(projected, 2, 0, width), context.slice(projected, 2, width, width),
@@ -36,12 +39,15 @@ auto QuantizedState::decode_vector(const Tensor& values, std::string_view name) 
 LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose, bool bias,
                        std::int32_t packed_bits, bool quantized_bias)
     : packed_bits_(packed_bits), input_size_(input_size), transpose_(transpose), has_bias_(bias) {
+    const auto storage = parameter_device();
     if (packed_bits) {
         if ((packed_bits != 2 && packed_bits != 4 && packed_bits != 8) || !transpose || bias ||
             input_size % (8 / packed_bits))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed linear construction"});
-        register_parameter("weight", weight_, {output_size, input_size / (8 / packed_bits)}, tensor::DType::U8);
-        register_parameter("weight_scale", packed_scale_, {output_size, 1}, tensor::DType::F32);
+        register_parameter("weight", weight_, {output_size, input_size / (8 / packed_bits)}, tensor::DType::U8,
+                           allocate_parameters, storage);
+        register_parameter("weight_scale", packed_scale_, {output_size, 1}, tensor::DType::F32, allocate_parameters,
+                           storage);
         register_parameter("input_activation_scale", input_scale_, {}, tensor::DType::F32, allocate_parameters,
                            tensor::Device::cpu());
         register_parameter("output_activation_scale", output_scale_, {}, tensor::DType::F32, allocate_parameters,
@@ -51,20 +57,21 @@ LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool t
     check_precision(module_dtype);
     register_parameter("weight", weight_,
                        transpose ? std::vector<std::int64_t>{output_size, input_size}
-                                 : std::vector<std::int64_t>{input_size, output_size});
+                                 : std::vector<std::int64_t>{input_size, output_size},
+                       module_dtype, allocate_parameters, storage);
     if (quantized_bias && (!bias || module_dtype != tensor::DType::I8))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "quantized linear bias requires INT8 weights and a bias"});
     if (bias && quantized_bias) {
         bias_qstate_.emplace();
-        register_parameter("bias", bias_, {output_size}, tensor::DType::I8);
-        register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32);
+        register_parameter("bias", bias_, {output_size}, tensor::DType::I8, allocate_parameters, storage);
+        register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32, allocate_parameters, storage);
     } else if (bias) {
-        register_parameter("bias", bias_, {output_size}, tensor::DType::F32);
+        register_parameter("bias", bias_, {output_size}, tensor::DType::F32, allocate_parameters, storage);
     } else if (module_dtype == tensor::DType::I8)
-        bias_ = require(Tensor::zeros({output_size}, tensor::DType::F32, device()));
+        bias_ = require(Tensor::zeros({output_size}, tensor::DType::F32, storage));
     if (module_dtype == tensor::DType::I8) {
         qstate_.emplace();
-        register_parameter("scale", qstate_->scale, {output_size, 1}, tensor::DType::F32);
+        register_parameter("scale", qstate_->scale, {output_size, 1}, tensor::DType::F32, allocate_parameters, storage);
         if (allocate_parameters) std::ranges::fill(require(qstate_->scale.data<float>()), 1.F);
     }
 }

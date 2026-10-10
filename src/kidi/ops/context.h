@@ -127,6 +127,7 @@ public:
                        std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F) -> Tensor;
     auto gelu(const Tensor& input, bool approximate = false) -> Tensor;
     auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
+    auto silu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
     auto gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
                             const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
                             std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
@@ -138,8 +139,8 @@ public:
     auto embedding(const Tensor& indices, const Tensor& weight, const Tensor& scales, std::int32_t width,
                    std::int32_t bits, float multiplier) -> Tensor;
     auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
-    auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
-                    float epsilon) -> Tensor;
+    auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine, float epsilon)
+        -> Tensor;
     auto rms_axial_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
                           float epsilon) -> Tensor;
     auto rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,

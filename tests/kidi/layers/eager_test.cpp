@@ -106,6 +106,15 @@ auto main() -> int {
                     rejected = true;
                 }
                 if (!rejected) return 1;
+                if (device == tensor::Device::cpu()) {
+                    const auto silu = context.silu_multiply(gate, factor);
+                    context.synchronize();
+                    const auto actual = ops::require(silu.data<float>());
+                    for (std::size_t index = 0; index < actual.size(); ++index) {
+                        const auto expected = values[index] / (1.F + std::exp(-values[index])) * factors[index];
+                        if (std::abs(actual[index] - expected) > 1e-6F) return 1;
+                    }
+                }
             }
             for (const std::int64_t width : {40, 256, 512}) {
                 auto input = ops::require(tensor::Tensor::empty({2, 3, 4, width}, tensor::DType::F32, device));
@@ -427,8 +436,7 @@ auto main() -> int {
                 auto byte_value = context.cast(test_value, tensor::DType::I8, VALUE_SCALE);
                 const ops::BlockwiseQuantization key_quantization{{KEY_SCALE}, {0}, WIDTH};
                 const ops::BlockwiseQuantization value_quantization{{VALUE_SCALE}, {0}, WIDTH};
-                if (device == tensor::Device::cpu())
-                    context.set_precision(core::InferencePrecision::QAT_FP32);
+                if (device == tensor::Device::cpu()) context.set_precision(core::InferencePrecision::QAT_FP32);
                 auto expected = context.grouped_query_attention(test_query, rounded_key, rounded_value, HEADS,
                                                                 KEY_HEADS, test_mask, 1.F, START);
                 auto actual =
@@ -439,8 +447,7 @@ auto main() -> int {
                 const auto actual_values = ops::require(actual.data<float>());
                 for (std::size_t index = 0; index < expected_values.size(); ++index)
                     if (std::abs(actual_values[index] - expected_values[index]) > 1e-4F) return 1;
-                if (device == tensor::Device::cpu())
-                    context.set_precision(core::InferencePrecision::CHECKPOINT);
+                if (device == tensor::Device::cpu()) context.set_precision(core::InferencePrecision::CHECKPOINT);
             }
             auto saved = result;
             {

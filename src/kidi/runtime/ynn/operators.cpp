@@ -197,8 +197,8 @@ private:
 };
 /// Token rows gathered from FP32/BF16 tables, or signed 2/4/8-bit tables with per-row group scales, times a multiplier.
 /// Splits `rows` across the thread pool in contiguous blocks; small problems run on the calling thread.
-auto for_rows(std::size_t rows, std::size_t row_work,
-              const std::function<void(std::size_t, std::size_t)>& body) -> void {
+auto for_rows(std::size_t rows, std::size_t row_work, const std::function<void(std::size_t, std::size_t)>& body)
+    -> void {
     const auto tasks = rows * row_work < 32768 ? std::size_t{1} : std::min(ynn::thread_count(), rows);
     if (tasks <= 1) return body(0, rows);
     const auto block = (rows + tasks - 1) / tasks;
@@ -316,9 +316,8 @@ private:
             for (std::size_t head = 0; head < heads_; ++head) {
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, static_cast<int>(query_length),
                             static_cast<int>(key_length_), static_cast<int>(head_width), scale_,
-                            query_batch + head * head_width, static_cast<int>(hidden),
-                            key_batch + head * head_width, static_cast<int>(hidden), 0.F, scores.data(),
-                            static_cast<int>(key_length_));
+                            query_batch + head * head_width, static_cast<int>(hidden), key_batch + head * head_width,
+                            static_cast<int>(hidden), 0.F, scores.data(), static_cast<int>(key_length_));
                 for_rows(query_length, key_length_, [&](std::size_t begin, std::size_t end) {
                     for (std::size_t row = begin; row < end; ++row)
                         parity::softmax(std::span(scores).subspan(row * key_length_, key_length_),
@@ -326,9 +325,8 @@ private:
                 });
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, static_cast<int>(query_length),
                             static_cast<int>(head_width), static_cast<int>(key_length_), 1.F, scores.data(),
-                            static_cast<int>(key_length_), value_batch + head * head_width,
-                            static_cast<int>(hidden), 0.F, output_batch + head * head_width,
-                            static_cast<int>(hidden));
+                            static_cast<int>(key_length_), value_batch + head * head_width, static_cast<int>(hidden),
+                            0.F, output_batch + head * head_width, static_cast<int>(hidden));
             }
         }
     }
@@ -395,8 +393,7 @@ private:
                 } else {
                     std::array<float, 8> partial{};
                     for (; index + 8 <= width; index += 8)
-                        for (std::size_t lane = 0; lane < 8; ++lane)
-                            partial[lane] += x[index + lane] * x[index + lane];
+                        for (std::size_t lane = 0; lane < 8; ++lane) partial[lane] += x[index + lane] * x[index + lane];
                     for (; index < width; ++index) sum += x[index] * x[index];
                     for (const auto value : partial) sum += value;
                 }
@@ -663,9 +660,8 @@ private:
                 const auto* q = query_data + (sample * rows + row) * width + head * head_width;
                 const auto* k = key_data + sample * key_batch_stride + head * head_width;
                 const auto* v = value_data + sample * key_batch_stride + head * head_width;
-                const auto* bias = mask ? mask + sample * mask_strides[0] + head * mask_strides[1] +
-                                              row * mask_strides[2]
-                                        : nullptr;
+                const auto* bias =
+                    mask ? mask + sample * mask_strides[0] + head * mask_strides[1] + row * mask_strides[2] : nullptr;
                 auto largest = -std::numeric_limits<float>::infinity();
                 for (std::size_t key = 0; key < keys; ++key) {
                     scores[key] = dot(q, k + key * width, head_width) * scale;
@@ -1063,6 +1059,11 @@ public:
                 result = binary(ynn_binary_multiply, operands[0], probability);
                 break;
             }
+            case Operation::SILU_MULTIPLY:
+                result = binary(ynn_binary_multiply,
+                                binary(ynn_binary_multiply, operands[0], unary(ynn_unary_sigmoid, operands[0])),
+                                operands[1]);
+                break;
             case Operation::ROTARY: {
                 const std::int32_t axis = 3;
                 const std::int64_t begin = 0, middle = inputs[0].size(3) / 2, end = inputs[0].size(3), stride = 1;

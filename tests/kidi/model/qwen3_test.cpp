@@ -60,5 +60,32 @@ int main() {
     const auto values = output.data<float>();
     if (!values || !std::ranges::all_of(*values, [](float value) { return std::isfinite(value); }))
         return fail("Qwen3 output contains a non-finite value");
+    const std::vector expected(values->begin(), values->end());
+    const auto mask = kidi::ops::require(kidi::tensor::Tensor::zeros({1, 1, 2, 2}, kidi::tensor::DType::F32));
+    const auto explicit_mask = model->forward(context, embeddings, mask);
+    const auto replayed = model->forward(context, embeddings);
+    context.synchronize();
+    const auto explicit_values = kidi::ops::require(explicit_mask.data<float>());
+    const auto replayed_values = kidi::ops::require(replayed.data<float>());
+    if (!std::ranges::equal(expected, explicit_values) || !std::ranges::equal(expected, replayed_values))
+        return fail("Qwen3 masked replay changed the output");
+
+    const std::array<std::int32_t, 1> one_token{2};
+    const auto single_embedding = model->embed(context, one_token);
+    const auto single_output = model->forward(context, single_embedding);
+    const std::array packed_inputs{embeddings, single_embedding};
+    const auto packed_embedding = context.concat(packed_inputs, 1);
+    constexpr std::array<float, 9> MASK{0.F, 0.F, -1.0e9F, 0.F, 0.F, -1.0e9F, -1.0e9F, -1.0e9F, 0.F};
+    const auto packed_mask =
+        kidi::ops::require(kidi::tensor::Tensor::from_host({1, 1, 3, 3}, std::span<const float>(MASK)));
+    const auto packed_output = model->forward(context, packed_embedding, packed_mask);
+    context.synchronize();
+    const auto single_values = kidi::ops::require(single_output.data<float>());
+    const auto packed_values = kidi::ops::require(packed_output.data<float>());
+    for (std::size_t index = 0; index < expected.size(); ++index)
+        if (std::abs(expected[index] - packed_values[index]) > 1e-5F) return fail("Qwen3 packed first segment differs");
+    for (std::size_t index = 0; index < single_values.size(); ++index)
+        if (std::abs(single_values[index] - packed_values[expected.size() + index]) > 1e-5F)
+            return fail("Qwen3 packed second segment differs");
     return 0;
 }

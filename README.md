@@ -175,11 +175,12 @@ required files for you. Advanced local-checkpoint import is documented in
 
 ### OmniVoice Text-to-Speech
 
-OmniVoice support is an experimental native CPU prototype. Convert the original
-checkpoint once; the export retains the Qwen3 generator and waveform decoder,
-omits voice-cloning encoders, and stores every retained learned parameter as
-signed INT8 with separate FP32 quantization scales. Conversion fuses Q/K/V and
-gate/up weights into the shared Kidi transformer layer layout.
+OmniVoice support is an experimental native CPU/Vulkan implementation. Convert
+the original checkpoint once; the export retains the Qwen3 generator and
+waveform decoder, omits voice-cloning encoders, and stores every retained
+learned parameter as signed INT8 with separate FP32 quantization scales.
+Conversion fuses Q/K/V and gate/up weights into the shared Kidi transformer
+layer layout.
 
 ```bash
 python -m pip install '.[convert,hf]'
@@ -197,6 +198,11 @@ build-release/kidi synthesize \
   --duration 1.0 \
   --out hello.wav
 ```
+
+CPU is the portable default. Android builds also accept `--backend vulkan`;
+Vulkan accelerates compatible INT8 generator projections while unsupported
+operators and the waveform decoder use the CPU. Applications embedding the C++
+library can select the same behavior with `tensor::Device::vulkan()`.
 
 The current converted package is about **618 MB**, including a **607 MB** INT8
 Safetensors file and tokenizer. `--duration auto` is the default and uses

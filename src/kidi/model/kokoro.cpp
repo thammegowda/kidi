@@ -954,6 +954,7 @@ auto KokoroImpl::synthesize(std::string_view text, const inference::SynthesisOpt
     try {
         if (!impl_->phonemizer)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Kokoro was not loaded as a synthesis model"});
+        const auto preparation = preparation_ns();
         if (options.duration_seconds)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "Kokoro predicts duration; use --duration auto"});
         auto language = options.language;
@@ -995,7 +996,7 @@ auto KokoroImpl::synthesize(std::string_view text, const inference::SynthesisOpt
                 {
                     .generation_ns = generation_ns,
                     .decode_ns = 0,
-                    .preparation_ns = preparation_ns(),
+                    .preparation_ns = preparation_ns() - preparation,
                     .audio_tokens = frames,
                 },
         };

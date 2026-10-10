@@ -22,17 +22,21 @@ auto gate_up_width(std::int32_t intermediate) -> std::int32_t {
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid gated feed-forward width"});
     return 2 * intermediate;
 }
+auto parameter_device() -> tensor::Device {
+    return module_device == tensor::Device::vulkan() ? tensor::Device::cpu() : module_device;
+}
 } // namespace
 
 RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned, bool quantized) : epsilon_(epsilon) {
+    const auto storage = parameter_device();
     if (quantized && (!learned || module_dtype != tensor::DType::I8))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "quantized RMS normalization requires learned INT8 state"});
     if (learned && quantized) {
         qstate_.emplace();
-        register_parameter("weight", weight_, {width}, tensor::DType::I8);
-        register_parameter("scale", qstate_->scale, {1}, tensor::DType::F32);
+        register_parameter("weight", weight_, {width}, tensor::DType::I8, allocate_parameters, storage);
+        register_parameter("scale", qstate_->scale, {1}, tensor::DType::F32, allocate_parameters, storage);
     } else if (learned)
-        register_parameter("weight", weight_, {width}, tensor::DType::F32);
+        register_parameter("weight", weight_, {width}, tensor::DType::F32, allocate_parameters, storage);
     else
         weight_ = require(Tensor::empty({width}, tensor::DType::F32, device()));
     if (weight_.defined() && !quantized) {
@@ -61,19 +65,23 @@ auto RmsNormImpl::forward_residual(ops::Context& context, const Tensor& input, c
 TokenEmbeddingImpl::TokenEmbeddingImpl(std::int32_t vocabulary, std::int32_t width, float scale,
                                        std::int32_t packed_bits, std::int32_t scale_groups)
     : width_(width), packed_bits_(packed_bits), scale_(scale) {
+    const auto storage = parameter_device();
     if (packed_bits) {
         if ((packed_bits != 2 && packed_bits != 4 && packed_bits != 8) || width % (8 / packed_bits) ||
             scale_groups <= 0 || width % scale_groups)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed embedding dimensions"});
-        register_parameter("embedding_quantized", weight_, {vocabulary, width / (8 / packed_bits)}, tensor::DType::U8);
-        register_parameter("embedding_scale", quantization_scale_, {vocabulary, scale_groups}, tensor::DType::F32);
+        register_parameter("embedding_quantized", weight_, {vocabulary, width / (8 / packed_bits)}, tensor::DType::U8,
+                           allocate_parameters, storage);
+        register_parameter("embedding_scale", quantization_scale_, {vocabulary, scale_groups}, tensor::DType::F32,
+                           allocate_parameters, storage);
         return;
     }
     if (module_dtype != tensor::DType::F32 && module_dtype != tensor::DType::BF16 && module_dtype != tensor::DType::I8)
         throw ops::Failure({ErrorCode::UNSUPPORTED, "token embeddings require FP32, BF16, or INT8 weights"});
-    register_parameter("weight", weight_, {vocabulary, width});
+    register_parameter("weight", weight_, {vocabulary, width}, module_dtype, allocate_parameters, storage);
     if (module_dtype == tensor::DType::I8)
-        register_parameter("scale", quantization_scale_, {vocabulary, 1}, tensor::DType::F32);
+        register_parameter("scale", quantization_scale_, {vocabulary, 1}, tensor::DType::F32, allocate_parameters,
+                           storage);
 }
 auto TokenEmbeddingImpl::external() const -> bool { return tensor::is_external(weight_); }
 auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int32_t> tokens) const -> Tensor {
@@ -193,13 +201,7 @@ auto GatedFeedForwardImpl::forward_stages(ops::Context& context, const Tensor& i
     if (activation_ == GatedActivation::GELU) {
         hidden = context.gelu_multiply(gate, up);
     } else {
-        context.synchronize();
-        hidden = require(Tensor::empty({gate.shape().begin(), gate.shape().end()}, tensor::DType::F32));
-        const auto gate_values = require(gate.data<float>());
-        const auto up_values = require(up.data<float>());
-        auto output = require(hidden.data<float>());
-        for (std::size_t index = 0; index < output.size(); ++index)
-            output[index] = gate_values[index] / (1.F + std::exp(-gate_values[index])) * up_values[index];
+        hidden = context.silu_multiply(gate, up);
     }
     return {gate, up, hidden, down_->forward(context, hidden)};
 }

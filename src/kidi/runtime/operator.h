@@ -68,6 +68,7 @@ enum class Operation {
     GREEDY_TOKEN,
     RMS_ROTARY,
     GELU_MULTIPLY,
+    SILU_MULTIPLY,
     EMBEDDING,
     GATED_FEED_FORWARD
 };
@@ -114,8 +115,8 @@ public:
     /// True when every prepared operator implements `run_into`, so captured steps can replay.
     virtual auto supports_replay() const noexcept -> bool { return false; }
     virtual auto copy_slice_(tensor::Tensor& destination, const tensor::Tensor& source, std::size_t outer,
-                             std::size_t source_bytes, std::size_t destination_bytes,
-                             std::size_t offset_bytes) -> void = 0;
+                             std::size_t source_bytes, std::size_t destination_bytes, std::size_t offset_bytes)
+        -> void = 0;
 };
 class OutputPool {
 public:
