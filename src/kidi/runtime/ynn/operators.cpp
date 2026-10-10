@@ -208,6 +208,68 @@ auto for_rows(std::size_t rows, std::size_t row_work, const std::function<void(s
     }));
 }
 
+#if defined(__APPLE__)
+class SiluGate final : public Operator {
+public:
+    SiluGate(const Tensor& input, tensor::Arena& arena)
+        : rows_(input.numel() / input.size(-1)),
+          width_(input.size(-1) / 2),
+          tasks_(rows_ * input.size(-1) < 32768 ? 1 : std::min(ynn::thread_count(), rows_)),
+          scratch_(tasks_ * width_),
+          pool_(&arena) {
+        shape_.assign(input.shape().begin(), input.shape().end());
+        shape_.back() = static_cast<std::int64_t>(width_);
+    }
+
+    static auto supports(TensorInputs inputs) -> bool {
+        return inputs.size() == 1 && inputs[0].dtype() == DType::F32 && inputs[0].dimensions() > 0 &&
+               inputs[0].is_contiguous() && inputs[0].size(-1) > 0 && inputs[0].size(-1) % 2 == 0;
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, DType::F32, tensor::Device::cpu());
+        apply(inputs[0], output);
+        return output;
+    }
+
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "SiLU gate is not an in-place operation"});
+    }
+
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs[0]); }
+
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(const Tensor& input, Tensor& output) -> void {
+        const auto* source = require(input.data<float>()).data();
+        auto* target = require(output.data<float>()).data();
+        const auto rows_per_task = (rows_ + tasks_ - 1) / tasks_;
+        require(ynn::parallel_for(tasks_, [&](std::size_t task) {
+            auto* temporary = scratch_.data() + task * width_;
+            const auto begin = task * rows_per_task, end = std::min(rows_, begin + rows_per_task);
+            const auto count = static_cast<int>(width_);
+            const float one = 1.F;
+            for (auto row = begin; row < end; ++row) {
+                const auto* gate = source + row * 2 * width_;
+                const auto* up = gate + width_;
+                auto* hidden = target + row * width_;
+                vDSP_vneg(gate, 1, temporary, 1, width_);
+                vvexpf(hidden, temporary, &count);
+                vDSP_vsadd(hidden, 1, &one, hidden, 1, width_);
+                vDSP_vdiv(hidden, 1, gate, 1, temporary, 1, width_);
+                vDSP_vmul(temporary, 1, up, 1, hidden, 1, width_);
+            }
+        }));
+    }
+
+    std::size_t rows_, width_, tasks_;
+    std::vector<float> scratch_;
+    std::vector<std::int64_t> shape_;
+    OutputPool pool_;
+};
+#endif
+
 /// Rotary embedding of `[batch, rows, heads, width]` by `[batch or 1, rows, 1, width / 2]` angles in one pass.
 class Rotary final : public Operator {
 public:
@@ -414,6 +476,80 @@ private:
     float epsilon_;
     bool residual_;
     bool pytorch_parity_;
+    OutputPool pool_;
+};
+
+class RmsRotary final : public Operator {
+public:
+    RmsRotary(const OperatorSpec& spec, tensor::Arena& arena) : epsilon_(spec.epsilon), pool_(&arena) {}
+
+    static auto supports(TensorInputs inputs) -> bool {
+        if (inputs.size() != 4) return false;
+        const auto &input = inputs[0], &weight = inputs[1], &cosine = inputs[2], &sine = inputs[3];
+        return input.dtype() == DType::F32 && weight.dtype() == DType::F32 && cosine.dtype() == DType::F32 &&
+               sine.dtype() == DType::F32 && input.dimensions() == 4 && input.is_contiguous() &&
+               weight.is_contiguous() && cosine.is_contiguous() && sine.is_contiguous() && input.size(3) % 2 == 0 &&
+               weight.numel() == input.size(3) && cosine.size(3) == input.size(3) / 2 && cosine.size(2) == 1 &&
+               cosine.size(1) == input.size(1) && std::ranges::equal(cosine.shape(), sine.shape()) &&
+               (cosine.size(0) == input.size(0) || cosine.size(0) == 1);
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+
+    auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
+        apply(inputs, destination);
+        return destination;
+    }
+
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(TensorInputs inputs, Tensor& output) const -> void {
+        const auto &input = inputs[0], &cosine = inputs[2];
+        const auto rows = input.size(1), heads = input.size(2), width = input.size(3), half = width / 2;
+        const auto vectors = input.size(0) * rows * heads;
+        const auto* source = require(input.data<float>()).data();
+        const auto* weight = require(inputs[1].data<float>()).data();
+        const auto* cosines = require(cosine.data<float>()).data();
+        const auto* sines = require(inputs[3].data<float>()).data();
+        auto* target = require(output.data<float>()).data();
+        const auto shared_angles = cosine.size(0) == 1;
+        const auto reciprocal = 1.F / static_cast<float>(width);
+        for_rows(vectors, width, [&](std::size_t begin, std::size_t end) {
+#pragma clang fp contract(off)
+            for (auto vector = begin; vector < end; ++vector) {
+                const auto* x = source + vector * width;
+                auto* y = target + vector * width;
+                std::array<float, 8> partial{};
+                std::size_t index = 0;
+                for (; index + 8 <= width; index += 8)
+                    for (std::size_t lane = 0; lane < 8; ++lane) partial[lane] += x[index + lane] * x[index + lane];
+                auto sum = 0.F;
+                for (; index < width; ++index) sum += x[index] * x[index];
+                for (const auto value : partial) sum += value;
+                const auto inverse = 1.F / std::sqrt(sum * reciprocal + epsilon_);
+                const auto sample = vector / (rows * heads);
+                const auto position = vector / heads % rows;
+                const auto angle = (shared_angles ? position : sample * rows + position) * half;
+                const auto* c = cosines + angle;
+                const auto* s = sines + angle;
+                for (index = 0; index < half; ++index) {
+                    const auto first = x[index] * inverse * weight[index];
+                    const auto second = x[index + half] * inverse * weight[index + half];
+                    y[index] = first * c[index] - second * s[index];
+                    y[index + half] = second * c[index] + first * s[index];
+                }
+            }
+        });
+    }
+
+    float epsilon_;
     OutputPool pool_;
 };
 
@@ -757,10 +893,16 @@ public:
         if (spec.operation == Operation::SCATTER) return std::make_unique<Scatter>(arena_);
         if (spec.operation == Operation::GREEDY_TOKEN) return std::make_unique<GreedyToken>(arena_);
         if (spec.operation == Operation::EMBEDDING) return std::make_unique<Embedding>(spec, inputs, arena_);
+#if defined(__APPLE__)
+        if (spec.operation == Operation::SILU_GATE && SiluGate::supports(inputs))
+            return std::make_unique<SiluGate>(inputs[0], arena_);
+#endif
         if (spec.operation == Operation::ROTARY && Rotary::supports(inputs)) return std::make_unique<Rotary>(arena_);
         if ((spec.operation == Operation::RMS_NORM || spec.operation == Operation::RMS_NORM_RESIDUAL) &&
             RmsNorm::supports(spec, inputs))
             return std::make_unique<RmsNorm>(spec, arena_);
+        if (spec.operation == Operation::RMS_ROTARY && RmsRotary::supports(inputs))
+            return std::make_unique<RmsRotary>(spec, arena_);
         if (spec.operation == Operation::CAST && spec.dtype == DType::I8 && spec.epsilon > 0)
             return std::make_unique<QuantizeInt8>(spec.epsilon, arena_);
         if (spec.operation == Operation::ATTENTION) {
@@ -1064,6 +1206,16 @@ public:
                                 binary(ynn_binary_multiply, operands[0], unary(ynn_unary_sigmoid, operands[0])),
                                 operands[1]);
                 break;
+            case Operation::SILU_GATE: {
+                const std::int32_t axis = static_cast<std::int32_t>(inputs[0].dimensions() - 1);
+                const std::int64_t begin = 0, middle = inputs[0].size(-1) / 2, end = inputs[0].size(-1), stride = 1;
+                auto gate = YNN_INVALID_VALUE_ID, up = YNN_INVALID_VALUE_ID;
+                check(ynn_define_static_slice(native, 1, &axis, &begin, &middle, &stride, operands[0], &gate, 0));
+                check(ynn_define_static_slice(native, 1, &axis, &middle, &end, &stride, operands[0], &up, 0));
+                result =
+                    binary(ynn_binary_multiply, binary(ynn_binary_multiply, gate, unary(ynn_unary_sigmoid, gate)), up);
+                break;
+            }
             case Operation::ROTARY: {
                 const std::int32_t axis = 3;
                 const std::int64_t begin = 0, middle = inputs[0].size(3) / 2, end = inputs[0].size(3), stride = 1;

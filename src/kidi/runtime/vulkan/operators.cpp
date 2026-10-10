@@ -1023,8 +1023,10 @@ auto inferred_outputs(const OperatorSpec& spec, TensorInputs inputs)
         case Operation::STATIC_ROUND:
         case Operation::GELU_MULTIPLY:
         case Operation::SILU_MULTIPLY:
+        case Operation::SILU_GATE:
         case Operation::RMS_ROTARY:
             dtype = DType::F32;
+            if (spec.operation == Operation::SILU_GATE) shape.back() /= 2;
             break;
     }
     return {{{shape}}, {dtype}};

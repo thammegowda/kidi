@@ -173,22 +173,35 @@ if (!synthesizer)
 
 kidi::inference::SynthesisOptions options;
 options.language = "English";
+std::shared_ptr<const kidi::inference::VoicePrompt> narrator;
+options.voice_prompt = narrator;
 auto speech = synthesizer->synthesize(paragraph, options);
 if (!speech)
     throw std::runtime_error(speech.error().message);
+narrator = speech->voice_prompt;
 // speech->samples contains mono FP32 PCM at speech->sample_rate.
 ```
 
 Serialize calls through one worker per synthesizer; its execution context and
-replay caches are mutable. Split books into sentence or paragraph requests
-rather than passing an entire chapter as one dense-attention sequence. Android
-enables the Vulkan backend by default. OmniVoice runs compatible per-channel
-INT8 projections on Vulkan and uses CPU fallbacks for the remaining generator
-operators; its convolutional Higgs/DAC waveform decoder is CPU-only. Model
-weights remain host-backed and are uploaded into reusable Vulkan projection
-layouts, avoiding a second full checkpoint allocation. The same package and API
-work with `Device::cpu()` on systems without suitable Vulkan 1.3 INT8 dot-product
-support.
+replay caches are mutable. `Synthesizer::segment` exposes the same linguistic
+sentence boundaries used by `synthesize`; long-form synthesis processes those
+sentences serially and releases per-sentence workspaces automatically. Wrapped
+lines are unwrapped within paragraphs, while blank lines remain hard paragraph
+boundaries. Each TTS package supplies `sentence-prefixes.tsv` with
+language-specific `always` and `numeric` non-breaking prefix classes. This
+design follows the paragraph and prefix-table lessons from Moses' sentence
+splitter without invoking Perl or embedding model data in C++. Preserve
+`speech->voice_prompt` and pass it in the next request's
+`options.voice_prompt` to keep the same generated OmniVoice narrator across
+paragraphs or chapters. A multi-sentence request does this automatically.
+
+Android enables the Vulkan backend by default. OmniVoice runs compatible
+per-channel INT8 projections on Vulkan and uses CPU fallbacks for the remaining
+generator operators; its convolutional Higgs/DAC waveform decoder is CPU-only.
+Model weights remain host-backed and are uploaded into reusable Vulkan
+projection layouts, avoiding a second full checkpoint allocation. The same
+package and API work with `Device::cpu()` on systems without suitable Vulkan
+1.3 INT8 dot-product support.
 
 This integration does not change the upstream model licenses. In particular,
 review OmniVoice's CC-BY-NC and bundled decoder licenses before integrating it
@@ -408,6 +421,33 @@ build-release/kidi_tts_bench /data/local/tmp/omnivoice-int8 vulkan 3 4
 The first record is cold. Later records retain prepared operators, attention
 tables, and graph replays, matching an embedding application that keeps one
 synthesizer alive.
+
+For the measured Apple CPU lower-latency profile, use eight threads and 25
+OmniVoice steps. The default 32-step path is intentionally quality-first:
+
+```bash
+build-release/kidi synthesize -m .cache/omnivoice-int8 \
+  --text 'Long-form sentence.' --language English --steps 25 -j 8 \
+  -o speech.wav
+```
+
+For Apple Metal, retain the quality-first 32 steps:
+
+```bash
+build-release/kidi synthesize -m .cache/omnivoice-int8 \
+  --backend mps --text 'Long-form sentence.' --language English \
+  --steps 32 -o speech.wav
+```
+
+Metal expands the INT8 Qwen projections to a shared FP16 cache because native
+half GEMM substantially outperforms per-tile INT8-to-half conversion on Apple
+GPU. Set `KIDI_MPS_Q_LINEAR_FP16=0` only for numerical/performance diagnostics.
+
+For multi-sentence input, the synthesizer first generates the shortest sentence
+estimated at least three seconds and uses its text plus generated codec tokens as the
+fixed OmniVoice reference for all remaining sentences. This retains a single
+narrator across sentence-sized workspaces. It does not require the external-WAV
+voice-cloning encoder, which is intentionally absent from the converted package.
 
 Keep generated model files, local reports and large binary artifacts out of Git.
 

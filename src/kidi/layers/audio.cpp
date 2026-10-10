@@ -55,18 +55,21 @@ auto Conv1dImpl::forward(ops::Context& context, const Tensor& input) const -> Te
     const auto numerator = input_length + 2 * padding_ - receptive;
     if (numerator < 0) throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Conv1d kernel exceeds padded input"});
     const auto output_length = numerator / stride_ + 1;
-    auto columns = require(Tensor::zeros({1, output_length, input_channels_ * kernel_size_}, tensor::DType::F32));
-    context.synchronize();
-    const auto source = require(input.data<float>());
-    auto unfolded = require(columns.data<float>());
-    for (std::int64_t output = 0; output < output_length; ++output)
-        for (std::int32_t channel = 0; channel < input_channels_; ++channel)
-            for (std::int32_t kernel = 0; kernel < kernel_size_; ++kernel) {
-                const auto position = output * stride_ - padding_ + kernel * dilation_;
-                if (position >= 0 && position < input_length)
-                    unfolded[(output * input_channels_ + channel) * kernel_size_ + kernel] =
-                        source[position * input_channels_ + channel];
-            }
+    Tensor columns = input;
+    if (kernel_size_ != 1 || stride_ != 1 || padding_ != 0 || dilation_ != 1) {
+        columns = require(Tensor::zeros({1, output_length, input_channels_ * kernel_size_}, tensor::DType::F32));
+        context.synchronize();
+        const auto source = require(input.data<float>());
+        auto unfolded = require(columns.data<float>());
+        for (std::int64_t output = 0; output < output_length; ++output)
+            for (std::int32_t channel = 0; channel < input_channels_; ++channel)
+                for (std::int32_t kernel = 0; kernel < kernel_size_; ++kernel) {
+                    const auto position = output * stride_ - padding_ + kernel * dilation_;
+                    if (position >= 0 && position < input_length)
+                        unfolded[(output * input_channels_ + channel) * kernel_size_ + kernel] =
+                            source[position * input_channels_ + channel];
+                }
+    }
     if (qstate_) return context.quantized_linear(columns, weight_, qstate_->scale, bias(), true);
     return context.linear(columns, weight_, bias(), true);
 }

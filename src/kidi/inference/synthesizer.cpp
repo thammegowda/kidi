@@ -10,6 +10,7 @@
 #include "kidi/model/omnivoice.h"
 #include "kidi/model/registry.h"
 #include "kidi/ops/context.h"
+#include "kidi/text/sentence.h"
 
 namespace kidi::inference {
 using ops::require;
@@ -77,7 +78,10 @@ auto synthesis_elapsed_ns(std::chrono::steady_clock::time_point start) -> std::u
 }
 
 struct Synthesizer::Impl {
+    explicit Impl(text::SentenceSegmenter value) : sentences(std::move(value)) {}
+
     std::shared_ptr<SynthesizerModel> model;
+    text::SentenceSegmenter sentences;
 };
 
 Synthesizer::Synthesizer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -91,7 +95,8 @@ auto Synthesizer::load(const std::filesystem::path& directory, tensor::Device de
         const auto type = config["model"]["type"].as<std::string>();
         if (!model::supports_task(type, model::Task::TTS))
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, type + " does not support the TTS task"});
-        auto impl = std::make_unique<Impl>();
+        auto sentences = require(text::SentenceSegmenter::load(config["sentence_prefixes_file"].as<std::string>()));
+        auto impl = std::make_unique<Impl>(std::move(sentences));
         if (type == "omnivoice")
             impl->model = require(model::OmniVoiceImpl::load(std::move(config), device)).ptr();
         else if (type == "kokoro")
@@ -107,7 +112,99 @@ auto Synthesizer::load(const std::filesystem::path& directory, tensor::Device de
 }
 
 auto Synthesizer::synthesize(std::string_view text, const SynthesisOptions& options) const -> Result<Synthesis> {
-    return impl_->model->synthesize(text, options);
+    if (options.voice_prompt && !impl_->model->supports_voice_prompt())
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "TTS model does not support generated voice prompts"});
+    const auto synthesize_one = [&](std::string_view chunk) -> Result<Synthesis> {
+        Result<Synthesis> synthesis = [&]() {
+            if (!options.voice_prompt) return impl_->model->synthesize(chunk, options);
+            const SynthesisReference reference{options.voice_prompt->text, options.voice_prompt->tokens};
+            return impl_->model->synthesize_with_reference(chunk, options, reference);
+        }();
+        if (synthesis) {
+            if (options.voice_prompt)
+                synthesis->voice_prompt = options.voice_prompt;
+            else if (impl_->model->supports_voice_prompt() && !synthesis->tokens.empty())
+                synthesis->voice_prompt =
+                    std::make_shared<VoicePrompt>(VoicePrompt{std::string(chunk), synthesis->tokens});
+        }
+        return synthesis;
+    };
+    if (options.duration_seconds) return synthesize_one(text);
+    auto sentences = segment(text, options.language);
+    if (!sentences) return std::unexpected(std::move(sentences.error()));
+    if (sentences->size() == 1) return synthesize_one(sentences->front());
+    try {
+        const auto selected_reference = options.voice_prompt
+                                            ? std::optional<std::size_t>{}
+                                            : require(impl_->model->voice_reference_chunk(*sentences, options));
+        if (selected_reference && *selected_reference >= sentences->size())
+            throw ops::Failure({ErrorCode::RUNTIME, "TTS model selected an invalid voice reference chunk"});
+
+        Synthesis result{.sample_rate = 0};
+        result.stats.chunks = sentences->size();
+        std::size_t completed = 0;
+        const auto generate = [&](std::size_t index, const SynthesisReference* reference) -> Result<Synthesis> {
+            auto chunk_options = options;
+            if (options.on_progress)
+                chunk_options.on_progress = [callback = options.on_progress, completed, chunks = sentences->size()](
+                                                std::size_t step, std::size_t steps) {
+                    callback(completed * steps + step, chunks * steps);
+                };
+            chunk_options.on_chunk = {};
+            auto chunk = reference
+                             ? impl_->model->synthesize_with_reference((*sentences)[index], chunk_options, *reference)
+                             : impl_->model->synthesize((*sentences)[index], chunk_options);
+            if (!chunk) {
+                impl_->model->release_workspaces();
+                return std::unexpected(std::move(chunk.error()));
+            }
+            ++completed;
+            if (options.on_chunk) options.on_chunk(completed, sentences->size());
+            impl_->model->release_workspaces();
+            return chunk;
+        };
+
+        std::optional<Synthesis> reference_chunk;
+        auto voice_prompt = options.voice_prompt;
+        if (selected_reference) {
+            auto chunk = generate(*selected_reference, nullptr);
+            if (!chunk) return std::unexpected(std::move(chunk.error()));
+            voice_prompt = std::make_shared<VoicePrompt>(VoicePrompt{(*sentences)[*selected_reference], chunk->tokens});
+            reference_chunk = std::move(*chunk);
+        }
+
+        for (std::size_t index = 0; index < sentences->size(); ++index) {
+            Result<Synthesis> generated = [&]() -> Result<Synthesis> {
+                if (selected_reference && index == *selected_reference) return std::move(*reference_chunk);
+                if (!voice_prompt) return generate(index, nullptr);
+                const SynthesisReference reference{voice_prompt->text, voice_prompt->tokens};
+                return generate(index, &reference);
+            }();
+            if (!generated) return std::unexpected(std::move(generated.error()));
+            auto chunk = std::move(*generated);
+            if (result.sample_rate && result.sample_rate != chunk.sample_rate)
+                throw ops::Failure({ErrorCode::RUNTIME, "TTS chunks produced different sample rates"});
+            result.sample_rate = chunk.sample_rate;
+            result.samples.insert(result.samples.end(), chunk.samples.begin(), chunk.samples.end());
+            result.tokens.insert(result.tokens.end(), chunk.tokens.begin(), chunk.tokens.end());
+            result.stats.generation_ns += chunk.stats.generation_ns;
+            result.stats.decode_ns += chunk.stats.decode_ns;
+            result.stats.preparation_ns += chunk.stats.preparation_ns;
+            result.stats.audio_tokens += chunk.stats.audio_tokens;
+        }
+        result.voice_prompt = std::move(voice_prompt);
+        return result;
+    } catch (const ops::Failure& error) {
+        impl_->model->release_workspaces();
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        impl_->model->release_workspaces();
+        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
+    }
+}
+
+auto Synthesizer::segment(std::string_view text, std::string_view language) const -> Result<std::vector<std::string>> {
+    return impl_->sentences.split(text, language);
 }
 
 auto Synthesizer::execution() const -> std::string { return impl_->model->execution(); }

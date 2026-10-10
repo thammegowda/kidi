@@ -31,6 +31,7 @@ public:
     auto synthesize(std::string_view text, const inference::SynthesisOptions& options)
         -> Result<inference::Synthesis> override;
     auto execution() const -> std::string override { return "cpu"; }
+    auto release_workspaces() -> void override;
     auto sample_rate() const noexcept -> std::uint32_t;
     auto preparation_ns() const noexcept -> std::uint64_t;
 

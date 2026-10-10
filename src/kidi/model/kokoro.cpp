@@ -1009,5 +1009,6 @@ auto KokoroImpl::synthesize(std::string_view text, const inference::SynthesisOpt
 
 auto KokoroImpl::sample_rate() const noexcept -> std::uint32_t { return impl_->sample_rate; }
 auto KokoroImpl::preparation_ns() const noexcept -> std::uint64_t { return impl_->context.preparation_ns(); }
+auto KokoroImpl::release_workspaces() -> void { impl_->context.release_workspaces(); }
 
 } // namespace kidi::model

@@ -22,13 +22,18 @@ auto gate_up_width(std::int32_t intermediate) -> std::int32_t {
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid gated feed-forward width"});
     return 2 * intermediate;
 }
-auto parameter_device() -> tensor::Device {
+auto table_device() -> tensor::Device {
+    return module_device == tensor::Device::vulkan() || module_device == tensor::Device::apple_gpu()
+               ? tensor::Device::cpu()
+               : module_device;
+}
+auto vector_device() -> tensor::Device {
     return module_device == tensor::Device::vulkan() ? tensor::Device::cpu() : module_device;
 }
 } // namespace
 
 RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned, bool quantized) : epsilon_(epsilon) {
-    const auto storage = parameter_device();
+    const auto storage = vector_device();
     if (quantized && (!learned || module_dtype != tensor::DType::I8))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "quantized RMS normalization requires learned INT8 state"});
     if (learned && quantized) {
@@ -45,7 +50,7 @@ RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned, bool q
     }
 }
 auto RmsNormImpl::weight() const -> const Tensor& {
-    return qstate_ ? qstate_->decode_vector(weight_, "RMS normalization") : weight_;
+    return qstate_ ? qstate_->decode_vector(weight_, "RMS normalization", device()) : weight_;
 }
 auto RmsNormImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
     return context.rms_norm(input, weight(), epsilon_);
@@ -65,7 +70,7 @@ auto RmsNormImpl::forward_residual(ops::Context& context, const Tensor& input, c
 TokenEmbeddingImpl::TokenEmbeddingImpl(std::int32_t vocabulary, std::int32_t width, float scale,
                                        std::int32_t packed_bits, std::int32_t scale_groups)
     : width_(width), packed_bits_(packed_bits), scale_(scale) {
-    const auto storage = parameter_device();
+    const auto storage = table_device();
     if (packed_bits) {
         if ((packed_bits != 2 && packed_bits != 4 && packed_bits != 8) || width % (8 / packed_bits) ||
             scale_groups <= 0 || width % scale_groups)
@@ -190,6 +195,13 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
         if (!web_fusion)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "fused feed-forward requires positive trained scales"});
     }
+#if defined(__APPLE__)
+    if (activation_ == GatedActivation::SILU &&
+        (context.device() == tensor::Device::cpu() || context.device() == tensor::Device::apple_gpu())) {
+        const auto projected = gate_up_->forward(context, input);
+        return down_->forward(context, context.silu_gate(projected));
+    }
+#endif
     return forward_stages(context, input).output;
 }
 auto GatedFeedForwardImpl::forward_stages(ops::Context& context, const Tensor& input) const -> GatedFeedForwardStages {

@@ -119,6 +119,8 @@ auto encode_eager(CommandBatch& batch, Operation operation, float epsilon, Tenso
                                                               : 1),
                static_cast<std::uint32_t>(rotary ? inputs[0].size(2) : 1),
                axial                                       ? 10u
+               : operation == Operation::SILU_GATE         ? 12u
+               : operation == Operation::SILU_MULTIPLY     ? 11u
                : operation == Operation::GELU_MULTIPLY     ? 9u
                : operation == Operation::RMS_ROTARY        ? 8u
                : operation == Operation::STATIC_ROUND      ? 7u

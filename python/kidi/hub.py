@@ -21,11 +21,15 @@ def _package_files(document: object) -> list[str]:
     elif model.get("type") == "omnivoice":
         if document.get("task") != "tts" or not isinstance(document.get("synthesis"), dict):
             raise ValueError("OmniVoice model.yaml requires task: tts and a synthesis mapping")
-        names.extend([document.get("tokenizer_file"), document.get("template_file")])
+        names.extend([
+            document.get("tokenizer_file"),
+            document.get("template_file"),
+            document.get("sentence_prefixes_file"),
+        ])
     elif model.get("type") == "kokoro":
         if document.get("task") != "tts" or not isinstance(document.get("synthesis"), dict):
             raise ValueError("Kokoro model.yaml requires task: tts and a synthesis mapping")
-        names.append(document.get("lexicon_file"))
+        names.extend([document.get("lexicon_file"), document.get("sentence_prefixes_file")])
     elif model.get("type") == "rtg_transformer_nmt":
         if not isinstance(document.get("decode"), dict):
             raise ValueError("RTG model.yaml requires a decode mapping")

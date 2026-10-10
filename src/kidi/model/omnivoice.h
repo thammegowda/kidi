@@ -26,7 +26,14 @@ public:
     auto set_checkpoint(const checkpoint::Weights& weights) -> Result<void>;
     auto synthesize(std::string_view text, const inference::SynthesisOptions& options)
         -> Result<inference::Synthesis> override;
+    auto synthesize_with_reference(std::string_view text, const inference::SynthesisOptions& options,
+                                   const inference::SynthesisReference& reference)
+        -> Result<inference::Synthesis> override;
+    auto voice_reference_chunk(std::span<const std::string> chunks, const inference::SynthesisOptions& options) const
+        -> Result<std::optional<std::size_t>> override;
+    auto supports_voice_prompt() const noexcept -> bool override { return true; }
     auto execution() const -> std::string override;
+    auto release_workspaces() -> void override;
 
     /// `input_ids` is codebook-major `[codebooks, sequence]`; `audio_mask` marks waveform-token positions.
     /// Returns target logits as `[1, target_length, codebooks * audio_vocabulary]`.
@@ -44,7 +51,10 @@ public:
     auto preparation_ns() const noexcept -> std::uint64_t;
 
 private:
-    auto target_length(std::string_view text, const inference::SynthesisOptions& options) const -> std::size_t;
+    auto target_length(std::string_view text, const inference::SynthesisOptions& options,
+                       const inference::SynthesisReference* reference = nullptr) const -> std::size_t;
+    auto synthesize_(std::string_view text, const inference::SynthesisOptions& options,
+                     const inference::SynthesisReference* reference) -> Result<inference::Synthesis>;
     struct State;
     std::unique_ptr<State> impl_;
 };

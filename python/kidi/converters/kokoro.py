@@ -152,6 +152,7 @@ def _model_document(config: dict, voices: list[str], license_files: list[str] | 
         "license_files": license_files or [],
         "weights_file": "model.safetensors",
         "lexicon_file": "lexicon-us.tsv",
+        "sentence_prefixes_file": "sentence-prefixes.tsv",
         "model": {
             "type": "kokoro",
             "config": config,
@@ -247,6 +248,7 @@ Sources:
         yaml.safe_dump(document, sort_keys=False, allow_unicode=True), encoding="utf-8"
     )
     lexicon_entries = _write_lexicon(destination / "lexicon-us.tsv", british=False)
+    shutil.copy2(Path(__file__).with_name("sentence-prefixes.tsv"), destination / "sentence-prefixes.tsv")
     for name in ("README.md", "VOICES.md"):
         if (source / name).is_file():
             shutil.copy2(source / name, destination / name)

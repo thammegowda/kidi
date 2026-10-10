@@ -34,10 +34,8 @@ auto Qwen3AttentionImpl::forward(ops::Context& context, const Tensor& input, con
     auto query = context.slice(projected, -1, 0, query_width_);
     auto key = context.slice(projected, -1, query_width_, key_value_width_);
     auto value = context.slice(projected, -1, query_width_ + key_value_width_, key_value_width_);
-    query = query_norm_->forward(context, reshape_heads(context, query, heads_, head_width_));
-    key = key_norm_->forward(context, reshape_heads(context, key, key_value_heads_, head_width_));
-    query = context.rotary(query, cosine, sine);
-    key = context.rotary(key, cosine, sine);
+    query = query_norm_->forward_rotary(context, reshape_heads(context, query, heads_, head_width_), cosine, sine);
+    key = key_norm_->forward_rotary(context, reshape_heads(context, key, key_value_heads_, head_width_), cosine, sine);
     query = context.reshape(query, {static_cast<std::int64_t>(input.size(0)), static_cast<std::int64_t>(input.size(1)),
                                     heads_ * head_width_});
     key = context.reshape(key, {static_cast<std::int64_t>(input.size(0)), static_cast<std::int64_t>(input.size(1)),
@@ -58,11 +56,17 @@ Qwen3BlockImpl::Qwen3BlockImpl(Qwen3Shape shape)
     register_module("post_attention_layernorm", post_attention_norm_);
 }
 
-auto Qwen3BlockImpl::forward(ops::Context& context, const Tensor& input, const Tensor& mask, const Tensor& cosine,
-                             const Tensor& sine) const -> Tensor {
-    auto hidden =
-        context.add(input, attention_->forward(context, input_norm_->forward(context, input), mask, cosine, sine));
-    return context.add(hidden, feed_forward_->forward(context, post_attention_norm_->forward(context, hidden)));
+auto Qwen3BlockImpl::forward(ops::Context& context, Tensor input, const Tensor& mask, const Tensor& cosine,
+                             const Tensor& sine, bool consume_input) const -> Tensor {
+    const auto attended = attention_->forward(context, input_norm_->forward(context, input), mask, cosine, sine);
+    Tensor hidden;
+    if (consume_input) {
+        context.add_(input, attended);
+        hidden = std::move(input);
+    } else {
+        hidden = context.add(input, attended);
+    }
+    return context.add_(hidden, feed_forward_->forward(context, post_attention_norm_->forward(context, hidden)));
 }
 
 } // namespace kidi::layers

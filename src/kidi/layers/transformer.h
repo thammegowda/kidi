@@ -29,7 +29,8 @@ struct QuantizedState {
     Tensor scale;
     mutable Tensor decoded;
 
-    auto decode_vector(const Tensor& values, std::string_view name) const -> const Tensor&;
+    auto decode_vector(const Tensor& values, std::string_view name, tensor::Device target = tensor::Device::cpu()) const
+        -> const Tensor&;
 };
 
 KIDI_MODULE(Linear);

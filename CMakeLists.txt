@@ -120,6 +120,7 @@ add_library(kidi
     src/kidi/tensor/external.cpp
     src/kidi/tensor/tensor.cpp
     src/kidi/text/phonemizer.cpp
+    src/kidi/text/sentence.cpp
     src/kidi/text/tokenizer.cpp
 )
 add_library(kidi::kidi ALIAS kidi)

@@ -11,8 +11,11 @@ auto check_precision(tensor::DType precision) -> void {
     if (precision != tensor::DType::F32 && precision != tensor::DType::BF16 && precision != tensor::DType::I8)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "unsupported parameter precision"});
 }
-auto parameter_device() -> tensor::Device {
-    return module_device == tensor::Device::vulkan() ? tensor::Device::cpu() : module_device;
+auto parameter_device(bool packed) -> tensor::Device {
+    return module_device == tensor::Device::vulkan() ||
+                   (module_device == tensor::Device::apple_gpu() && (module_dtype == tensor::DType::I8 || packed))
+               ? tensor::Device::cpu()
+               : module_device;
 }
 auto split_qkv(ops::Context& context, const Tensor& projected) -> std::array<Tensor, 3> {
     auto width = static_cast<std::int64_t>(projected.size(-1) / 3);
@@ -21,25 +24,29 @@ auto split_qkv(ops::Context& context, const Tensor& projected) -> std::array<Ten
 }
 } // namespace
 
-auto QuantizedState::decode_vector(const Tensor& values, std::string_view name) const -> const Tensor& {
+auto QuantizedState::decode_vector(const Tensor& values, std::string_view name, tensor::Device target) const
+    -> const Tensor& {
     if (decoded.defined()) return decoded;
     if (values.dtype() != tensor::DType::I8 || values.dimensions() != 1 || scale.dtype() != tensor::DType::F32 ||
         scale.numel() != 1)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid quantized vector: " + std::string(name)});
-    const auto multiplier = require(scale.data<float>())[0];
+    const auto scale_bytes = require(scale.copy_to_host());
+    const auto multiplier = *reinterpret_cast<const float*>(scale_bytes.data());
     if (!std::isfinite(multiplier) || multiplier <= 0)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid quantized scale: " + std::string(name)});
-    const auto source = require(values.data<std::int8_t>());
-    std::vector<float> output(source.size());
-    for (std::size_t index = 0; index < source.size(); ++index) output[index] = source[index] * multiplier;
-    decoded = require(Tensor::from_host({static_cast<std::int64_t>(output.size())}, std::span<const float>(output)));
+    const auto source = require(values.copy_to_host());
+    const auto integers = std::span(reinterpret_cast<const std::int8_t*>(source.data()), values.numel());
+    std::vector<float> output(integers.size());
+    for (std::size_t index = 0; index < integers.size(); ++index) output[index] = integers[index] * multiplier;
+    decoded =
+        require(Tensor::from_host({static_cast<std::int64_t>(output.size())}, std::span<const float>(output), target));
     return decoded;
 }
 
 LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose, bool bias,
                        std::int32_t packed_bits, bool quantized_bias)
     : packed_bits_(packed_bits), input_size_(input_size), transpose_(transpose), has_bias_(bias) {
-    const auto storage = parameter_device();
+    const auto storage = parameter_device(packed_bits != 0);
     if (packed_bits) {
         if ((packed_bits != 2 && packed_bits != 4 && packed_bits != 8) || !transpose || bias ||
             input_size % (8 / packed_bits))

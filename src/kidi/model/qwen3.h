@@ -23,6 +23,7 @@ public:
     auto hidden_size() const noexcept -> std::int32_t { return hidden_; }
     auto vocabulary_size() const noexcept -> std::int32_t { return vocabulary_; }
     auto maximum_position() const noexcept -> std::int32_t { return maximum_position_; }
+    auto clear_attention() -> void { attention_.clear(); }
 
 private:
     struct AttentionState {

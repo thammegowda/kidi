@@ -124,7 +124,8 @@ model can be registered without changing the public task. Its PImpl stores the
 generic `SynthesizerModel` interface. `OmniVoiceImpl` and `KokoroImpl` implement
 that interface directly, so each model's package loading, frontend, voice
 schema, prompt policy and neural equations stay together in its model file.
-`synthesizer.cpp` contains only generic option parsing and model-type dispatch.
+`synthesizer.cpp` owns generic option parsing, model-type dispatch, sentence
+orchestration, and the model-neutral lifetime of generated voice prompts.
 
 `SynthesisOptions::voice` is a model-independent string map populated by the
 repeatable `--voice KEY=VALUE` CLI option. Parsing validates only generic
@@ -132,6 +133,12 @@ assignment syntax and duplicate keys. The active model adapter owns its schema:
 OmniVoice converts gender, age, pitch, style, accent, and dialect attributes to
 the checkpoint's instruction-token format. Future TTS models may accept
 different keys without extending the CLI.
+
+`Synthesis::voice_prompt` owns a model-native text/audio-token reference.
+Passing it through `SynthesisOptions::voice_prompt` keeps one narrator across
+separate synthesis calls without retaining sentence workspaces. Models that do
+not implement generated prompts reject the option rather than silently ignoring
+it.
 
 Kokoro demonstrates the second schema: `name` selects an embedded voice table
 and `speed` scales its predicted durations. Its backend uses a replaceable
@@ -151,7 +158,20 @@ conditional and unconditional sequences behind a block-diagonal attention mask,
 so each diffusion step traverses Qwen once. Audio-codebook embeddings are shared
 between both segments, attention tables are bounded and cached by length, and
 fixed-shape Qwen steps use the generic graph replay path. SiLU multiplication is
-a canonical operator rather than a host-side synchronization point.
+a canonical operator rather than a host-side synchronization point. On Apple
+CPU, split SiLU reads the fused gate/up projection directly through
+Accelerate/vForce, RMS normalization and rotary are one operator, and Qwen/DAC
+residual streams plus codebook sums reuse their input buffers. Unit-stride 1x1
+audio convolutions bypass im2col lowering.
+
+Qwen projection weights remain signed INT8 in output-major checkpoint layout.
+YNNPACK dynamically quantizes each FP32 activation directly to INT8 for its
+blockwise dot product; the path has no intermediate FP16/BF16 casts and does not
+dequantize full weight matrices. Output-major storage is intentional:
+conversion-time input-major storage was measured and reverted because it made
+YNNPACK preparation substantially slower. A trusted Qwen replay captures each
+fixed shape once, so constant weight transposition and packing are not repeated
+for every diffusion step.
 
 The Higgs Audio V2 subset contains only the eight RVQ decode tables, their output
 projections, and the DAC waveform decoder; HuBERT, semantic/acoustic encoders,
@@ -161,19 +181,58 @@ scale per tensor. Scale tensors are FP32 quantization metadata. Small vectors
 are dequantized on first use, while matrix and convolution weights stay INT8
 through the projection path.
 
-OmniVoice generation accepts CPU or Vulkan execution. Vulkan keeps checkpoint
+OmniVoice generation accepts CPU, Metal, or Vulkan execution. Vulkan keeps checkpoint
 parameters in host-backed storage, uploads reusable packed layouts for supported
 per-channel INT8 projections, and bridges unsupported operators to CPU. The
 Higgs/DAC waveform decoder remains on CPU. General Conv1d and ConvTranspose1d
 use INT8 projections plus explicit sequence lowering/overlap for correctness.
 No Android or browser UI surface consumes the TTS API; another application can
-link the C++ library directly and select `Device::cpu()` or `Device::vulkan()`.
+link the C++ library directly and select `Device::cpu()`,
+`Device::apple_gpu()`, or `Device::vulkan()`.
+
+On Apple GPU, OmniVoice retains INT8 package storage but expands each constant
+projection once to FP16 and feeds it to MPSGraph half GEMM. Shape-specific
+operators share that 898 MB expansion cache; temporary INT8 uploads are released
+after expansion, and sentence boundaries clear graph/output workspaces without
+discarding expanded weights. RMS/rotary, residuals, attention, and fused
+SiLU-gate stay on Metal, logits are copied to the host once per diffusion step
+for deterministic token selection, and Higgs/DAC decoding remains on CPU.
 
 OmniVoice prompt syntax is package data rather than C++ policy:
 `synthesis_template.jinja` is rendered by tokenizer++ with `language`,
 `instruction`, and `text` arguments before tokenization. The manifest requires
 the template so Hub resolution cannot produce a package with missing prompt
 semantics.
+
+Long-form TTS uses `text::SentenceSegmenter` before model dispatch. It unwraps
+non-empty lines within a paragraph, preserves blank paragraph boundaries, and
+recognizes Unicode terminators, closing punctuation, decimals, initials,
+acronyms, and plausible Unicode sentence starters. Non-breaking prefixes are
+loaded from the package's `sentence-prefixes.tsv`; rows classify a prefix by
+language as `always` or `numeric`. The organization is informed by Moses'
+sentence splitter and language-prefix tables, while the implementation is
+native C++ and Unicode-algo based.
+
+OmniVoice long-form synthesis chooses the shortest sentence estimated at least
+three seconds as the narrator anchor and generates it first. Its transcript
+and codebook-major audio tokens become a fixed conditional prefix for every
+other sentence, matching upstream generated-prompt chunking without requiring
+the omitted waveform encoder. Results are assembled in source order. Each
+sentence still releases replay/operator workspaces before the next, so chapter
+memory is bounded by the largest reference-conditioned sentence rather than the
+whole chapter.
+
+OmniVoice selects classifier-free-guidance layout by target length. Short
+sentences concatenate conditional and unconditional sequences behind a
+block-diagonal mask, minimizing projection rows. At 128 or more audio frames,
+the runtime instead forms a two-row padded batch: this adds only the prompt
+padding rows while avoiding the packed layout's cross-segment attention-score
+rectangle. On the profiled 449-frame sentence this reduced 32-step generation
+from 22.38 to 19.16 seconds. Generated voice prompting adds the fixed reference
+prefix to long-form conditional attention: the current reference-conditioned
+25-step profile has RTF 1.195 on the reference 8-core Apple CPU. The
+unreferenced single-sentence path retains its previous latency, and 32 steps
+remain available as the quality-first setting.
 
 CLI diagnostics use spdlog on stderr. Translation results and inspection output
 remain on stdout; machine-readable metric/profile records retain their unadorned

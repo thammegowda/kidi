@@ -174,7 +174,8 @@ struct Context::Impl {
             if (!input.defined() || !input.is_contiguous())
                 throw Failure({ErrorCode::INVALID_ARGUMENT, "eager operations require defined contiguous tensors"});
             if ((!constant_parameters || index < parameter_start) && input.device() != device)
-                throw Failure({ErrorCode::INVALID_ARGUMENT, "eager operand device mismatch"});
+                throw Failure({ErrorCode::INVALID_ARGUMENT, "eager operand device mismatch for " +
+                                                                std::string(runtime::operation_name(spec.operation))});
             key.push_back(static_cast<int>(input.dtype()));
             key.push_back(input.dimensions());
             key.insert(key.end(), input.shape().begin(), input.shape().end());
@@ -506,7 +507,7 @@ auto Context::crop_local_attention() const noexcept -> bool {
 auto Context::prefill_chunk_size(std::size_t requested) const -> std::size_t {
     return impl_->compiler ? impl_->compiler->prefill_chunk_size(requested) : requested;
 }
-auto Context::replay(std::string_view key, std::span<const Tensor> inputs, const Step& step)
+auto Context::replay(std::string_view key, std::span<const Tensor> inputs, const Step& step, bool validate_structure)
     -> std::span<const Tensor> {
     auto& impl = *impl_;
     if (impl.recorder) throw Failure({ErrorCode::INVALID_ARGUMENT, "captured steps cannot be nested"});
@@ -572,7 +573,9 @@ auto Context::replay(std::string_view key, std::span<const Tensor> inputs, const
     const auto outputs = step(inputs);
     impl.recorder = nullptr;
     auto graph = std::move(recorder).finish(outputs);
-    if (!entry.first && (!impl.compiler || impl.compiler->requires_second_capture(key))) {
+    const auto requires_second_capture =
+        impl.compiler ? impl.compiler->requires_second_capture(key) : validate_structure;
+    if (!entry.first && requires_second_capture) {
         entry.first = std::move(graph);
         account("capture");
         return entry.first->outputs();
@@ -808,6 +811,11 @@ auto Context::silu_multiply(const Tensor& gate, const Tensor& value) -> Tensor {
         throw Failure({ErrorCode::INVALID_ARGUMENT, "SiLU multiplication requires matching FP32 tensors"});
     return impl_->run({Operation::SILU_MULTIPLY}, {&gate, &value});
 }
+auto Context::silu_gate(const Tensor& gate_up) -> Tensor {
+    if (!gate_up.defined() || gate_up.dtype() != tensor::DType::F32 || !gate_up.dimensions() || gate_up.size(-1) % 2)
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "SiLU gate requires FP32 [..., 2 * intermediate] input"});
+    return impl_->run({Operation::SILU_GATE}, {&gate_up});
+}
 auto Context::gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
                                  const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
                                  std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
@@ -895,9 +903,6 @@ auto Context::rms_rotary(const Tensor& input, const Tensor& scale, const Tensor&
         if (angle->dimensions() != 4 || angle->size(0) != 1 || angle->size(1) != input.size(1) || angle->size(2) != 1 ||
             angle->size(3) != input.size(3) / 2 || angle->dtype() != tensor::DType::F32)
             throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid RMS rotary angles"});
-    if (device() != tensor::Device::apple_gpu() && device() != tensor::Device::web_gpu() &&
-        device() != tensor::Device::vulkan())
-        return rotary(rms_norm(input, scale, epsilon), cosine, sine);
     return impl_->run({Operation::RMS_ROTARY, {}, tensor::DType::F32, epsilon}, {&input, &scale, &cosine, &sine});
 }
 auto Context::rms_axial_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,

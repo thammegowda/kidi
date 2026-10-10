@@ -48,8 +48,9 @@ Qwen3Impl::Qwen3Impl(const YAML::Node& config)
     const auto valid = validate_config(config);
     if (!valid) throw ops::Failure(valid.error());
     if (module_dtype != tensor::DType::I8 ||
-        (module_device != tensor::Device::cpu() && module_device != tensor::Device::vulkan()))
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "Qwen3 requires INT8 parameters on the CPU or Vulkan"});
+        (module_device != tensor::Device::cpu() && module_device != tensor::Device::vulkan() &&
+         module_device != tensor::Device::apple_gpu()))
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "Qwen3 requires INT8 parameters on CPU, Metal, or Vulkan"});
     const layers::Qwen3Shape shape{
         .hidden = hidden_,
         .intermediate = config["intermediate_size"].as<std::int32_t>(),
@@ -130,17 +131,24 @@ auto Qwen3Impl::forward(ops::Context& context, const tensor::Tensor& embeddings,
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Qwen3 requires FP32 [batch, sequence, hidden] embeddings"});
     const auto& attention = prepare_attention(embeddings.size(1));
     if (mask.dtype() != tensor::DType::F32 || mask.device() != context.device() || mask.dimensions() != 4 ||
-        mask.size(0) != 1 || mask.size(1) != 1 || mask.size(2) != embeddings.size(1) ||
-        mask.size(3) != embeddings.size(1))
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Qwen3 requires an FP32 [1, 1, sequence, sequence] mask"});
+        (mask.size(0) != 1 && mask.size(0) != embeddings.size(0)) || mask.size(1) != 1 ||
+        mask.size(2) != embeddings.size(1) || mask.size(3) != embeddings.size(1))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Qwen3 requires a broadcastable FP32 attention mask"});
     const auto key = "qwen3:" + std::to_string(embeddings.size(0)) + ':' + std::to_string(embeddings.size(1));
     const std::array inputs{embeddings, mask};
-    const auto outputs = context.replay(key, inputs, [&](std::span<const tensor::Tensor> operands) {
-        auto hidden = operands[0];
-        for (const auto& block : *blocks_)
-            hidden = block->forward(context, hidden, operands[1], attention.cosine, attention.sine);
-        return std::vector{norm_->forward(context, hidden)};
-    });
+    const auto outputs = context.replay(
+        key, inputs,
+        [&](std::span<const tensor::Tensor> operands) {
+            auto hidden = operands[0];
+            bool consume = false;
+            for (const auto& block : *blocks_) {
+                hidden =
+                    block->forward(context, std::move(hidden), operands[1], attention.cosine, attention.sine, consume);
+                consume = true;
+            }
+            return std::vector{norm_->forward(context, hidden)};
+        },
+        false);
     return outputs.front();
 }
 

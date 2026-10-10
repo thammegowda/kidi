@@ -21,6 +21,17 @@ namespace {
 using ops::require;
 using tensor::DType;
 using tensor::Tensor;
+auto input_major_weight(const Tensor& weight) -> Tensor {
+    const auto output = weight.size(0), input = weight.size(1);
+    const auto bytes = require(weight.copy_to_host());
+    const auto source = std::span(reinterpret_cast<const std::int8_t*>(bytes.data()), weight.numel());
+    std::vector<std::int8_t> values(input * output);
+    for (std::size_t row = 0; row < output; ++row)
+        for (std::size_t column = 0; column < input; ++column)
+            values[column * output + row] = source[row * input + column];
+    return require(Tensor::from_host({static_cast<std::int64_t>(input), static_cast<std::int64_t>(output)},
+                                     std::span<const std::int8_t>(values)));
+}
 struct Stream {
     std::optional<mps::CommandBatch> batch;
     std::vector<Tensor> pending;
@@ -253,6 +264,7 @@ public:
         stream_.packed_inputs.clear();
         stream_.packed_intermediates.clear();
         stream_.packed_input_source = nullptr;
+        prefill_programs_.clear();
     }
     auto copy_slice_(Tensor& destination, const Tensor& source, std::size_t outer, std::size_t source_bytes,
                      std::size_t destination_bytes, std::size_t offset_bytes) -> void override {
@@ -288,7 +300,8 @@ public:
              (inputs[0].dimensions() > 0 && inputs[1].dimensions() == 1 && inputs[1].size(0) == inputs[0].size(-1)));
         if (device_fp32 && (spec.operation == Operation::RMS_NORM || spec.operation == Operation::RMS_NORM_RESIDUAL ||
                             spec.operation == Operation::RMS_ROTARY || spec.operation == Operation::ROTARY ||
-                            spec.operation == Operation::GELU_MULTIPLY || spec.operation == Operation::TANH ||
+                            spec.operation == Operation::GELU_MULTIPLY || spec.operation == Operation::SILU_MULTIPLY ||
+                            spec.operation == Operation::SILU_GATE || spec.operation == Operation::TANH ||
                             spec.operation == Operation::STATIC_ROUND ||
                             (spec.operation == Operation::GELU && spec.attributes[0]) || simple_binary)) {
             result->eager = true;
@@ -296,6 +309,7 @@ public:
             result->epsilon = spec.epsilon;
             result->dynamic_count = inputs.size();
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            if (spec.operation == Operation::SILU_GATE) result->shape.back() /= 2;
             return result;
         }
         if (result->scatter && ops::is_inplace) {
@@ -303,11 +317,65 @@ public:
             return result;
         }
         if (spec.operation == Operation::QUANTIZED_LINEAR) {
+            const auto rows = inputs[0].numel() / inputs[0].size(-1);
+            const auto* fp16 = std::getenv("KIDI_MPS_Q_LINEAR_FP16");
+            const auto bias = inputs[3].data<float>();
+            const auto use_fp16 = (!fp16 || std::string_view(fp16) != "0") && rows >= 4 && spec.attributes[0] && bias &&
+                                  std::ranges::all_of(*bias, [](float value) { return value == 0.F; });
+            if (use_fp16) {
+                result->dynamic_count = 1;
+                result->packed_bits = 8;
+                result->packed_group = inputs[0].size(-1);
+                result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+                result->shape.back() = inputs[1].size(0);
+                const std::array<std::int64_t, 2> matrix_shape{static_cast<std::int64_t>(inputs[1].size(0)),
+                                                               static_cast<std::int64_t>(inputs[0].size(-1))};
+                const auto key =
+                    std::tuple{require(inputs[1].host_bytes()).data(), require(inputs[2].host_bytes()).data(),
+                               std::int32_t{8}, static_cast<std::int32_t>(inputs[0].size(-1))};
+                auto found = prefill_weights_.find(key);
+                const auto matrix_bytes =
+                    static_cast<std::size_t>(matrix_shape[0]) * matrix_shape[1] * sizeof(_Float16);
+                if (found == prefill_weights_.end()) {
+                    if (matrix_bytes > stream_.prefill_cache_limit - stream_.expanded_bytes)
+                        throw ops::Failure({ErrorCode::UNSUPPORTED, "Metal FP16 projection cache limit exceeded"});
+                    auto expanded = require(Tensor::empty({matrix_shape.begin(), matrix_shape.end()}, DType::F16,
+                                                          tensor::Device::apple_gpu()));
+                    auto device_weight = require(inputs[1].to(tensor::Device::apple_gpu()));
+                    auto device_scales = require(inputs[2].to(tensor::Device::apple_gpu()));
+                    stream_.retain(device_weight);
+                    stream_.retain(device_scales);
+                    stream_.retain(expanded);
+                    require(mps::encode_expand_packed_weight(stream_.commands(), device_weight, device_scales, expanded,
+                                                             8, result->packed_group));
+                    found =
+                        prefill_weights_.emplace(key, PrefillWeight{inputs[1], inputs[2], std::move(expanded)}).first;
+                    stream_.expanded_bytes += found->second.value.nbytes();
+                }
+                result->prefill_weight = found->second.value;
+                std::vector<std::int64_t> program_key(inputs[0].shape().begin(), inputs[0].shape().end());
+                program_key.push_back(matrix_shape[0]);
+                program_key.push_back(-8);
+                auto program = prefill_programs_.find(program_key);
+                if (program == prefill_programs_.end()) {
+                    auto graph = require(mps::Graph::create());
+                    const std::array feeds{graph.placeholder(inputs[0].shape(), DType::F32),
+                                           graph.placeholder(matrix_shape, DType::F16)};
+                    const auto hidden = graph.matmul(graph.cast(feeds[0], DType::F16), feeds[1], false, true);
+                    const std::array outputs{graph.cast(hidden, DType::F32)};
+                    auto executable = std::make_shared<mps::Executable>(require(graph.compile(feeds, outputs)));
+                    if (prefill_programs_.size() >= 128) prefill_programs_.clear();
+                    program = prefill_programs_.emplace(std::move(program_key), std::move(executable)).first;
+                }
+                result->prefill_executable = program->second;
+                return result;
+            }
             result->dynamic_count = 1;
-            result->quantized = require(mps::QuantizedLinear::create(inputs[1], inputs[2], inputs[3]));
+            const auto weight = spec.attributes[0] ? input_major_weight(inputs[1]) : inputs[1];
+            result->quantized = require(mps::QuantizedLinear::create(weight, inputs[2], inputs[3]));
             require(result->quantized->prepare(inputs[0]));
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
-            result->shape.back() = inputs[1].size(1);
+            result->shape.back() = inputs[1].size(spec.attributes[0] ? 0 : 1);
             return result;
         }
         if (spec.operation == Operation::GATED_FEED_FORWARD && inputs.size() == 5 && spec.attributes[0] == 8) {
@@ -410,6 +478,8 @@ public:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "GELU multiplication requires direct kernel"});
             case Operation::SILU_MULTIPLY:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "SiLU multiplication is not implemented on Metal"});
+            case Operation::SILU_GATE:
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "split SiLU is not implemented on Metal"});
             case Operation::RMS_ROTARY:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "RMS rotary requires direct kernel"});
             case Operation::GATED_FEED_FORWARD:

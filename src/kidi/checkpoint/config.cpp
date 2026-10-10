@@ -50,6 +50,9 @@ auto load_config(const std::filesystem::path& path) -> Result<YAML::Node> {
                 if (!license) return std::unexpected(std::move(license.error()));
                 config["license_files"][index] = license->string();
             }
+            auto sentence_prefixes = resolve_file(directory, config["sentence_prefixes_file"]);
+            if (!sentence_prefixes) return std::unexpected(std::move(sentence_prefixes.error()));
+            config["sentence_prefixes_file"] = sentence_prefixes->string();
             if (type == "omnivoice") {
                 auto tokenizer = resolve_file(directory, config["tokenizer_file"]);
                 if (!tokenizer) return std::unexpected(std::move(tokenizer.error()));

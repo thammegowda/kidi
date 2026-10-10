@@ -197,6 +197,7 @@ public:
                                                             {Operation::RMS_ROTARY, "rms_rotary"},
                                                             {Operation::GELU_MULTIPLY, "gelu_multiply"},
                                                             {Operation::SILU_MULTIPLY, "silu_multiply"},
+                                                            {Operation::SILU_GATE, "silu_gate"},
                                                             {Operation::EMBEDDING, "embedding"},
                                                             {Operation::GATED_FEED_FORWARD, "gated_feed_forward"}};
         const bool direct_inplace = spec.operation == Operation::SCATTER && ops::is_inplace;

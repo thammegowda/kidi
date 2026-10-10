@@ -84,13 +84,14 @@ public:
     auto precision() const noexcept -> core::InferencePrecision;
     auto profile_phase(std::string_view phase) -> void;
 
-    /// Runs `step`, capturing its operators the first two times `key` is used and replaying them afterwards.
+    /// Runs `step`, normally capturing its operators twice to validate structure before replay.
     /// A step reads only `inputs`, parameters, and tensors whose storage stays fixed; values that change per call
     /// are written into `inputs` before calling. The two captures must match, which rejects host-computed
     /// temporaries and per-call operator arguments. Replay may rebind inputs of the same shape and dtype. Outputs
     /// belong to the captured step and are overwritten by the next call with the same key. Backends without replay,
-    /// or `KIDI_REPLAY=0`, run `step` eagerly on every call.
-    auto replay(std::string_view key, std::span<const Tensor> inputs, const Step& step) -> std::span<const Tensor>;
+    /// or `KIDI_REPLAY=0`, run `step` eagerly on every call. Trusted operator-only steps may disable validation.
+    auto replay(std::string_view key, std::span<const Tensor> inputs, const Step& step, bool validate_structure = true)
+        -> std::span<const Tensor>;
     auto replay_enabled() const noexcept -> bool;
     auto clear_replays() -> void;
     auto release_workspaces() -> void;
@@ -128,6 +129,7 @@ public:
     auto gelu(const Tensor& input, bool approximate = false) -> Tensor;
     auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
     auto silu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
+    auto silu_gate(const Tensor& gate_up) -> Tensor;
     auto gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
                             const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
                             std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,

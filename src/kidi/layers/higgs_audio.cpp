@@ -26,12 +26,12 @@ DacResidualUnitImpl::DacResidualUnitImpl(std::int32_t channels, std::int32_t dil
     register_module("conv2", second_conv_);
 }
 
-auto DacResidualUnitImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
+auto DacResidualUnitImpl::forward(ops::Context& context, Tensor input) const -> Tensor {
     auto output = first_conv_->forward(context, first_snake_->forward(context, input));
     output = second_conv_->forward(context, second_snake_->forward(context, output));
     if (!std::ranges::equal(input.shape(), output.shape()))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "DAC residual unit changed the sequence shape"});
-    return context.add(input, output);
+    return context.add_(input, output);
 }
 
 DacDecoderBlockImpl::DacDecoderBlockImpl(std::int32_t input_channels, std::int32_t output_channels, std::int32_t stride)
@@ -101,7 +101,10 @@ auto HiggsDecoderImpl::forward(ops::Context& context, std::span<const std::int32
     for (std::int32_t codebook = 0; codebook < shape_.codebooks; ++codebook) {
         auto decoded = (*quantizers_)[codebook]->forward(
             context, tokens.subspan(static_cast<std::size_t>(codebook) * length, length));
-        quantized = quantized.defined() ? context.add(quantized, decoded) : std::move(decoded);
+        if (quantized.defined())
+            context.add_(quantized, decoded);
+        else
+            quantized = std::move(decoded);
     }
     return decoder_->forward(context, acoustic_projection_->forward(context, quantized));
 }

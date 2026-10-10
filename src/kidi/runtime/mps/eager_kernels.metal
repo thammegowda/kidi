@@ -116,6 +116,15 @@ kernel void pointwise(device const float* input [[buffer(0)]], device const floa
         output[index] = geometry.mode == 9 ? activated * other[index] : activated;
     }
     else if (geometry.mode == 3) output[index] = tanh(clamp(value, -10.0f, 10.0f));
+    else if (geometry.mode == 11) output[index] = precise::divide(value, 1.0f + precise::exp(-value)) * other[index];
+    else if (geometry.mode == 12) {
+        uint half_width = geometry.width / 2;
+        uint row = index / half_width;
+        uint channel = index % half_width;
+        float gate = input[row * geometry.width + channel];
+        float up = input[row * geometry.width + half_width + channel];
+        output[index] = precise::divide(gate, 1.0f + precise::exp(-gate)) * up;
+    }
     else if (geometry.mode == 7) output[index] = clamp(rint(value / geometry.epsilon), -128.0f, 127.0f) * geometry.epsilon;
     else {
         uint half_width = geometry.width / 2;

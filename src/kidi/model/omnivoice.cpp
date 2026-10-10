@@ -22,6 +22,8 @@ using ops::require;
 
 namespace {
 
+constexpr std::size_t BATCH_GUIDANCE_MIN_TOKENS = 128;
+
 auto decoder_shape(const YAML::Node& config) -> layers::HiggsDecoderShape {
     const auto codec = config["codec_config"];
     return {
@@ -198,7 +200,10 @@ struct OmniVoiceImpl::State {
                 shifted[position] = token + codebook * audio_vocabulary;
             }
             auto embedded = audio_embeddings->forward(context, shifted);
-            audio = audio.defined() ? context.add(audio, embedded) : std::move(embedded);
+            if (audio.defined())
+                context.add_(audio, embedded);
+            else
+                audio = std::move(embedded);
         }
         return audio;
     }
@@ -208,6 +213,14 @@ struct OmniVoiceImpl::State {
         auto hidden = llm->forward(context, embeddings);
         hidden = context.slice(hidden, 1, target_start, target_length);
         return audio_heads->forward(context, hidden);
+    }
+
+    auto host_floats(const tensor::Tensor& value, std::vector<float>& storage) -> std::span<const float> {
+        if (value.is_host_accessible()) return require(value.data<float>());
+        const auto bytes = require(value.copy_to_host());
+        const auto values = std::span(reinterpret_cast<const float*>(bytes.data()), value.numel());
+        storage.assign(values.begin(), values.end());
+        return storage;
     }
 };
 
@@ -240,8 +253,9 @@ OmniVoiceImpl::OmniVoiceImpl(const YAML::Node& config) {
     auto valid = validate_config(config);
     if (!valid) throw ops::Failure(valid.error());
     if (module_dtype != tensor::DType::I8 ||
-        (module_device != tensor::Device::cpu() && module_device != tensor::Device::vulkan()))
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "OmniVoice requires INT8 parameters on the CPU or Vulkan"});
+        (module_device != tensor::Device::cpu() && module_device != tensor::Device::vulkan() &&
+         module_device != tensor::Device::apple_gpu()))
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "OmniVoice requires INT8 parameters on CPU, Metal, or Vulkan"});
     impl_ = std::make_unique<State>(config, device());
     register_module("llm", impl_->llm);
     register_module("audio_embeddings", impl_->audio_embeddings);
@@ -265,8 +279,9 @@ auto OmniVoiceImpl::create(const YAML::Node& config) -> Result<OmniVoice> {
 
 auto OmniVoiceImpl::load(YAML::Node package, tensor::Device device) -> Result<OmniVoice> {
     try {
-        if (device != tensor::Device::cpu() && device != tensor::Device::vulkan())
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "OmniVoice supports CPU and Vulkan generation"});
+        if (device != tensor::Device::cpu() && device != tensor::Device::vulkan() &&
+            device != tensor::Device::apple_gpu())
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "OmniVoice supports CPU, Metal, and Vulkan generation"});
         auto tokenizer = require(text::Tokenizer::load(package["tokenizer_file"].as<std::string>(),
                                                        {{"synthesis", package["template_file"].as<std::string>()}}));
         auto weights = require(checkpoint::Weights::load(package["weights_file"].as<std::string>()));
@@ -420,16 +435,18 @@ auto OmniVoiceImpl::forward(std::span<const std::int32_t> input_ids, std::span<c
         }
 
         impl_->context.synchronize();
-        const auto text_values = require(text.data<float>());
-        const auto audio_values = require(audio.data<float>());
-        auto combined = require(tensor::Tensor::empty({1, static_cast<std::int64_t>(length), impl_->llm->hidden_size()},
-                                                      tensor::DType::F32, impl_->context.device()));
-        auto values = require(combined.data<float>());
+        std::vector<float> text_storage, audio_storage;
+        const auto text_values = impl_->host_floats(text, text_storage);
+        const auto audio_values = impl_->host_floats(audio, audio_storage);
         const auto width = static_cast<std::size_t>(impl_->llm->hidden_size());
+        std::vector<float> values(length * width);
         for (std::size_t position = 0; position < length; ++position) {
             const auto source = audio_mask[position] ? audio_values : text_values;
             std::ranges::copy(source.subspan(position * width, width), values.begin() + position * width);
         }
+        auto combined =
+            require(tensor::Tensor::from_host({1, static_cast<std::int64_t>(length), impl_->llm->hidden_size()},
+                                              std::span<const float>(values), impl_->context.device()));
         return impl_->project(combined, target_start, target_length);
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
@@ -447,23 +464,68 @@ auto OmniVoiceImpl::decode(std::span<const std::int32_t> tokens, std::size_t len
     }
 }
 
-auto OmniVoiceImpl::target_length(std::string_view text, const inference::SynthesisOptions& options) const
-    -> std::size_t {
+auto OmniVoiceImpl::target_length(std::string_view text, const inference::SynthesisOptions& options,
+                                  const inference::SynthesisReference* reference) const -> std::size_t {
     if (options.duration_seconds) {
         if (!std::isfinite(*options.duration_seconds) || *options.duration_seconds <= 0)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "TTS duration must be positive and finite"});
         return std::max<std::size_t>(1, static_cast<std::size_t>(*options.duration_seconds * frame_rate()));
     }
     const auto settings = impl_->package["synthesis"]["auto_duration"];
-    const auto estimate = require(audio::RuleDurationEstimator().estimate(
-        text, settings["reference_text"].as<std::string>("Nice to meet you."),
-        settings["reference_tokens"].as<float>(25.F), settings["low_threshold"].as<float>(50.F),
-        settings["boost_strength"].as<float>(3.F)));
+    const auto reference_text =
+        reference ? std::string(reference->text) : settings["reference_text"].as<std::string>("Nice to meet you.");
+    const auto reference_tokens =
+        reference ? static_cast<float>(reference->tokens.size() / static_cast<std::size_t>(impl_->codebooks))
+                  : settings["reference_tokens"].as<float>(25.F);
+    const auto estimate = require(audio::RuleDurationEstimator().estimate(text, reference_text, reference_tokens,
+                                                                          settings["low_threshold"].as<float>(50.F),
+                                                                          settings["boost_strength"].as<float>(3.F)));
     return std::max<std::size_t>(1, static_cast<std::size_t>(estimate));
 }
 
 auto OmniVoiceImpl::synthesize(std::string_view text, const inference::SynthesisOptions& options)
     -> Result<inference::Synthesis> {
+    return synthesize_(text, options, nullptr);
+}
+
+auto OmniVoiceImpl::synthesize_with_reference(std::string_view text, const inference::SynthesisOptions& options,
+                                              const inference::SynthesisReference& reference)
+    -> Result<inference::Synthesis> {
+    return synthesize_(text, options, &reference);
+}
+
+auto OmniVoiceImpl::voice_reference_chunk(std::span<const std::string> chunks,
+                                          const inference::SynthesisOptions& options) const
+    -> Result<std::optional<std::size_t>> {
+    try {
+        if (chunks.empty()) return std::optional<std::size_t>{};
+        const auto minimum = static_cast<std::size_t>(3 * frame_rate());
+        std::optional<std::size_t> selected, fallback;
+        auto shortest_qualified = std::numeric_limits<std::size_t>::max();
+        std::size_t longest = 0;
+        for (std::size_t index = 0; index < chunks.size(); ++index) {
+            const auto cleaned = clean_text(chunks[index]);
+            if (cleaned.empty()) continue;
+            const auto length = target_length(cleaned, options);
+            if (!fallback || length > longest) {
+                fallback = index;
+                longest = length;
+            }
+            if (length >= minimum && length < shortest_qualified) {
+                selected = index;
+                shortest_qualified = length;
+            }
+        }
+        return selected ? selected : fallback;
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
+    }
+}
+
+auto OmniVoiceImpl::synthesize_(std::string_view text, const inference::SynthesisOptions& options,
+                                const inference::SynthesisReference* reference) -> Result<inference::Synthesis> {
     try {
         if (!impl_->tokenizer)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "OmniVoice was not loaded as a synthesis model"});
@@ -475,24 +537,74 @@ auto OmniVoiceImpl::synthesize(std::string_view text, const inference::Synthesis
             !std::isfinite(options.position_temperature) || options.position_temperature < 0)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid OmniVoice generation options"});
 
-        const auto target = target_length(cleaned, options);
+        std::string reference_text;
+        std::size_t reference_length = 0;
+        if (reference) {
+            reference_text = clean_text(reference->text);
+            if (reference_text.empty() || reference->tokens.empty() ||
+                reference->tokens.size() % static_cast<std::size_t>(impl_->codebooks))
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid OmniVoice voice reference"});
+            reference_length = reference->tokens.size() / static_cast<std::size_t>(impl_->codebooks);
+        }
+
+        const auto target = target_length(cleaned, options, reference);
         const auto language = options.language.empty() ? "None" : options.language;
         auto instruction = require(voice_instruction(options.voice, cleaned, language));
         if (instruction.empty()) instruction = "None";
+        auto prompt_text = reference ? reference_text + " " + cleaned : cleaned;
         auto prompt = require(impl_->tokenizer->encode_template(
-            "synthesis", {{"language", language}, {"instruction", instruction}, {"text", cleaned}}));
+            "synthesis", {{"language", language}, {"instruction", instruction}, {"text", prompt_text}}));
+        if (reference) {
+            const auto denoise = impl_->tokenizer->token_id("<|denoise|>");
+            if (!denoise)
+                throw ops::Failure({ErrorCode::INVALID_MANIFEST, "OmniVoice tokenizer is missing <|denoise|>"});
+            prompt.insert(prompt.begin(), *denoise);
+        }
         if (prompt.empty())
             throw ops::Failure({ErrorCode::RUNTIME, "OmniVoice prompt tokenization returned no tokens"});
 
         std::vector<std::int32_t> tokens(static_cast<std::size_t>(impl_->codebooks) * target, impl_->mask_id);
+        const auto audio_length = reference_length + target;
+        std::vector<std::int32_t> conditional_tokens;
+        if (reference) {
+            conditional_tokens.resize(static_cast<std::size_t>(impl_->codebooks) * audio_length, impl_->mask_id);
+            for (std::int32_t codebook = 0; codebook < impl_->codebooks; ++codebook) {
+                const auto source =
+                    reference->tokens.subspan(static_cast<std::size_t>(codebook) * reference_length, reference_length);
+                std::ranges::copy(source,
+                                  conditional_tokens.begin() + static_cast<std::size_t>(codebook) * audio_length);
+            }
+        }
         const auto prompt_embedding = impl_->llm->embed(impl_->context, prompt);
-        const auto conditional_length = prompt.size() + target;
+        const auto conditional_target_start = prompt.size() + reference_length;
+        const auto conditional_length = conditional_target_start + target;
         const auto packed_length = conditional_length + target;
         const auto* disable_packing = std::getenv("KIDI_OMNIVOICE_PACKED_GUIDANCE");
-        const auto packed_guidance = packed_length <= static_cast<std::size_t>(impl_->llm->maximum_position()) &&
+        const auto* guidance_layout = std::getenv("KIDI_OMNIVOICE_GUIDANCE_LAYOUT");
+        const auto force_batch = guidance_layout && std::string_view(guidance_layout) == "batch";
+        const auto force_packed = guidance_layout && std::string_view(guidance_layout) == "packed";
+        const auto batch_guidance = conditional_length <= static_cast<std::size_t>(impl_->llm->maximum_position()) &&
+                                    (force_batch || (!force_packed && target >= BATCH_GUIDANCE_MIN_TOKENS));
+        const auto packed_guidance = !batch_guidance &&
+                                     packed_length <= static_cast<std::size_t>(impl_->llm->maximum_position()) &&
                                      !(disable_packing && std::string_view(disable_packing) == "0");
         tensor::Tensor guidance_mask;
-        if (packed_guidance) {
+        tensor::Tensor unconditional_padding;
+        if (batch_guidance) {
+            std::vector<float> values(2 * conditional_length * conditional_length, 0.F);
+            auto* unconditional = values.data() + conditional_length * conditional_length;
+            std::fill(unconditional, unconditional + conditional_length * conditional_length, -1.0e9F);
+            for (std::size_t row = 0; row < target; ++row)
+                std::fill_n(unconditional + row * conditional_length, target, 0.F);
+            for (std::size_t row = target; row < conditional_length; ++row)
+                unconditional[row * conditional_length + row] = 0.F;
+            guidance_mask = require(tensor::Tensor::from_host(
+                {2, 1, static_cast<std::int64_t>(conditional_length), static_cast<std::int64_t>(conditional_length)},
+                std::span<const float>(values), impl_->context.device()));
+            unconditional_padding = require(tensor::Tensor::zeros(
+                {1, static_cast<std::int64_t>(conditional_length - target), impl_->llm->hidden_size()},
+                tensor::DType::F32, impl_->context.device()));
+        } else if (packed_guidance) {
             std::vector<float> values(packed_length * packed_length, -1.0e9F);
             for (std::size_t row = 0; row < conditional_length; ++row)
                 std::fill_n(values.begin() + row * packed_length, conditional_length, 0.F);
@@ -524,36 +636,57 @@ auto OmniVoiceImpl::synthesize(std::string_view text, const inference::Synthesis
         std::mt19937_64 random(options.seed);
         std::uniform_real_distribution<float> uniform(std::nextafter(0.F, 1.F), 1.F);
         std::vector<float> conditional_copy;
+        std::vector<float> logits_host;
         std::vector<float> guided(static_cast<std::size_t>(impl_->audio_vocabulary));
         std::vector<Candidate> candidates;
         candidates.reserve(tokens.size());
         const auto generation_start = std::chrono::steady_clock::now();
         for (std::size_t step = 0; step < options.steps; ++step) {
-            const auto audio_embedding = impl_->embed_audio(tokens, target);
-            const std::array conditional_parts{prompt_embedding, audio_embedding};
+            const auto target_audio_embedding = impl_->embed_audio(tokens, target);
+            const auto conditional_audio_embedding =
+                reference ? impl_->embed_audio(conditional_tokens, audio_length) : target_audio_embedding;
+            const std::array conditional_parts{prompt_embedding, conditional_audio_embedding};
             const auto conditional_embedding = impl_->context.concat(conditional_parts, 1);
             tensor::Tensor logits;
             std::span<const float> conditional_values, unconditional_values;
-            if (packed_guidance) {
-                const std::array guidance_parts{conditional_embedding, audio_embedding};
-                const auto guidance_embedding = impl_->context.concat(guidance_parts, 1);
+            if (batch_guidance) {
+                const std::array unconditional_parts{target_audio_embedding, unconditional_padding};
+                const auto unconditional_embedding = impl_->context.concat(unconditional_parts, 1);
+                const std::array guidance_parts{conditional_embedding, unconditional_embedding};
+                const auto guidance_embedding = impl_->context.concat(guidance_parts, 0);
                 auto hidden = impl_->llm->forward(impl_->context, guidance_embedding, guidance_mask);
-                hidden = impl_->context.slice(hidden, 1, prompt.size(), 2 * target);
+                auto conditional_hidden = impl_->context.slice(hidden, 0, 0, 1);
+                conditional_hidden = impl_->context.slice(conditional_hidden, 1, conditional_target_start, target);
+                auto unconditional_hidden = impl_->context.slice(hidden, 0, 1, 1);
+                unconditional_hidden = impl_->context.slice(unconditional_hidden, 1, 0, target);
+                const std::array hidden_parts{conditional_hidden, unconditional_hidden};
+                hidden = impl_->context.concat(hidden_parts, 1);
                 logits = impl_->audio_heads->forward(impl_->context, hidden);
                 impl_->context.synchronize();
-                const auto values = require(logits.data<float>());
+                const auto values = impl_->host_floats(logits, logits_host);
+                const auto distribution_size = values.size() / 2;
+                conditional_values = values.first(distribution_size);
+                unconditional_values = values.last(distribution_size);
+            } else if (packed_guidance) {
+                const std::array guidance_parts{conditional_embedding, target_audio_embedding};
+                const auto guidance_embedding = impl_->context.concat(guidance_parts, 1);
+                auto hidden = impl_->llm->forward(impl_->context, guidance_embedding, guidance_mask);
+                hidden = impl_->context.slice(hidden, 1, conditional_target_start, 2 * target);
+                logits = impl_->audio_heads->forward(impl_->context, hidden);
+                impl_->context.synchronize();
+                const auto values = impl_->host_floats(logits, logits_host);
                 const auto distribution_size = values.size() / 2;
                 conditional_values = values.first(distribution_size);
                 unconditional_values = values.last(distribution_size);
             } else {
-                auto conditional_logits = impl_->project(conditional_embedding, prompt.size(), target);
+                auto conditional_logits = impl_->project(conditional_embedding, conditional_target_start, target);
                 impl_->context.synchronize();
-                const auto values = require(conditional_logits.data<float>());
+                const auto values = impl_->host_floats(conditional_logits, logits_host);
                 conditional_copy.assign(values.begin(), values.end());
-                logits = impl_->project(audio_embedding, 0, target);
+                logits = impl_->project(target_audio_embedding, 0, target);
                 impl_->context.synchronize();
                 conditional_values = conditional_copy;
-                unconditional_values = require(logits.data<float>());
+                unconditional_values = impl_->host_floats(logits, logits_host);
             }
             if (conditional_values.size() != unconditional_values.size())
                 throw ops::Failure({ErrorCode::RUNTIME, "conditional and unconditional logits disagree"});
@@ -592,7 +725,14 @@ auto OmniVoiceImpl::synthesize(std::string_view text, const inference::Synthesis
                 }
             const auto count = std::min(schedule[step], candidates.size());
             std::ranges::partial_sort(candidates, candidates.begin() + count, std::greater{}, &Candidate::score);
-            for (const auto& candidate : std::span(candidates).first(count)) tokens[candidate.index] = candidate.token;
+            for (const auto& candidate : std::span(candidates).first(count)) {
+                tokens[candidate.index] = candidate.token;
+                if (reference) {
+                    const auto codebook = candidate.index / target;
+                    const auto position = candidate.index % target;
+                    conditional_tokens[codebook * audio_length + reference_length + position] = candidate.token;
+                }
+            }
             if (options.on_progress) options.on_progress(step + 1, options.steps);
         }
         const auto generation_ns = inference::synthesis_elapsed_ns(generation_start);
@@ -631,7 +771,13 @@ auto OmniVoiceImpl::preparation_ns() const noexcept -> std::uint64_t {
     return impl_->context.preparation_ns() + impl_->decoder_context.preparation_ns();
 }
 auto OmniVoiceImpl::execution() const -> std::string {
+    if (impl_->context.device() == tensor::Device::apple_gpu()) return "mps+ynnpack";
     return impl_->context.device() == tensor::Device::vulkan() ? "vulkan+ynnpack" : "ynnpack";
+}
+auto OmniVoiceImpl::release_workspaces() -> void {
+    impl_->context.release_workspaces();
+    impl_->decoder_context.release_workspaces();
+    impl_->llm->clear_attention();
 }
 
 } // namespace kidi::model

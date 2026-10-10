@@ -106,13 +106,25 @@ auto main() -> int {
                     rejected = true;
                 }
                 if (!rejected) return 1;
-                if (device == tensor::Device::cpu()) {
-                    const auto silu = context.silu_multiply(gate, factor);
-                    context.synchronize();
-                    const auto actual = ops::require(silu.data<float>());
-                    for (std::size_t index = 0; index < actual.size(); ++index) {
-                        const auto expected = values[index] / (1.F + std::exp(-values[index])) * factors[index];
-                        if (std::abs(actual[index] - expected) > 1e-6F) return 1;
+                const auto silu = context.silu_multiply(gate, factor);
+                tensor::Tensor split_silu;
+                if (device == tensor::Device::cpu() || device == tensor::Device::apple_gpu()) {
+                    const std::array parts{gate, factor};
+                    const auto combined = context.concat(parts, 1);
+                    split_silu = context.silu_gate(combined);
+                }
+                context.synchronize();
+                const auto actual = ops::require(silu.data<float>());
+                const auto split_values =
+                    split_silu.defined() ? ops::require(split_silu.data<float>()) : std::span<const float>{};
+                for (std::size_t index = 0; index < actual.size(); ++index) {
+                    const auto expected = values[index] / (1.F + std::exp(-values[index])) * factors[index];
+                    if (std::abs(actual[index] - expected) > 1e-5F ||
+                        (!split_values.empty() && std::abs(split_values[index] - expected) > 1e-5F)) {
+                        std::cerr << "SiLU mismatch at " << index << ": " << actual[index];
+                        if (!split_values.empty()) std::cerr << ", " << split_values[index];
+                        std::cerr << ", expected " << expected << '\n';
+                        return 1;
                     }
                 }
             }

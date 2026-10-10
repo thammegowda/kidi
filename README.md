@@ -175,7 +175,7 @@ required files for you. Advanced local-checkpoint import is documented in
 
 ### OmniVoice Text-to-Speech
 
-OmniVoice support is an experimental native CPU/Vulkan implementation. Convert
+OmniVoice support is an experimental native CPU/Metal/Vulkan implementation. Convert
 the original checkpoint once; the export retains the Qwen3 generator and
 waveform decoder, omits voice-cloning encoders, and stores every retained
 learned parameter as signed INT8 with separate FP32 quantization scales.
@@ -203,18 +203,48 @@ CPU is the portable default. Android builds also accept `--backend vulkan`;
 Vulkan accelerates compatible INT8 generator projections while unsupported
 operators and the waveform decoder use the CPU. Applications embedding the C++
 library can select the same behavior with `tensor::Device::vulkan()`.
+Apple builds use Metal with `--backend mps` (and select it for `--backend auto`);
+the INT8 checkpoint is expanded once into a reusable FP16 projection cache for
+native Metal GEMM while the DAC waveform decoder remains on CPU.
 
 The current converted package is about **618 MB**, including a **607 MB** INT8
 Safetensors file and tokenizer. `--duration auto` is the default and uses
 OmniVoice's Unicode script-weighted rule estimator; pass a positive number such
 as `--duration 1.5` to request exact seconds. Use `--steps 32` for the upstream
-decoding schedule; smaller values are useful only for diagnostics.
+quality-first decoding schedule; smaller values trade iterative refinement for
+lower latency.
 Voice design uses the repeatable, model-independent `--voice KEY=VALUE` option.
 For example, repeat the same option as `--voice gender=female --voice
 age=young-adult --voice style=whisper`. OmniVoice currently recognizes
 `gender`, `age`, `pitch`, `style`, `accent`, and `dialect`; another TTS model
-can interpret a different set through the same task-level map. Reference-audio
-voice cloning remains excluded from this decoder-only package.
+can interpret a different set through the same task-level map. Encoding an
+external reference WAV remains excluded from this decoder-only package.
+
+Long text is split at linguistic sentence boundaries before synthesis. Wrapped
+source lines remain in one paragraph, blank lines force paragraph boundaries,
+and Unicode punctuation, closing quotes, initials, decimals, acronyms, and
+language-specific non-breaking prefixes are handled before each sentence is
+synthesized. Prefix rules are package data in `sentence-prefixes.tsv`, not
+hard-coded model logic. OmniVoice first generates the shortest sentence whose
+estimated duration is at least three seconds, then reuses that sentence's text and audio
+tokens as a fixed speaker prompt for every other sentence. The output remains
+in source order, but all chunks inherit one narrator instead of independently
+choosing voices.
+
+For CPU long-form reading, `--steps 25` is the lower-latency profile on an
+8-core Apple M5; retain `--steps 32` when maximum iterative-decoding quality is
+more important than latency. On the 195-word `tmp2.txt` fixture, consistent-voice
+25-step synthesis produced 64.04 seconds of audio in 76.54 seconds (RTF 1.195).
+Kidi automatically
+uses two-row batched classifier-free guidance for longer sentences to reduce
+masked attention work; short sentences retain the lower-overhead packed layout.
+
+Metal is the preferred Apple backend: on the same 195-word fixture, quality-first
+consistent-voice 32-step synthesis produced 64.04 seconds of audio in 36.91
+seconds (RTF 0.576, 1.74x real time). The measured expanded-weight cache is
+about 898 MB, peak device allocation is 5.82 GB, and peak process footprint is
+10.72 GB. Reference conditioning intentionally trades memory and latency for a
+stable narrator.
 
 | OmniVoice key | Accepted values |
 |---|---|

@@ -162,6 +162,7 @@ def _model_document(source: Path, license_files: list[str] | None = None) -> dic
         "weights_file": "model.safetensors",
         "tokenizer_file": "tokenizer.json",
         "template_file": "synthesis_template.jinja",
+        "sentence_prefixes_file": "sentence-prefixes.tsv",
         "model": {
             "type": "omnivoice",
             "audio_vocab_size": config["audio_vocab_size"],
@@ -229,7 +230,7 @@ def _model_document(source: Path, license_files: list[str] | None = None) -> dic
             "matrix_scheme": "symmetric-per-output-channel",
             "vector_scheme": "symmetric-per-tensor",
             "scope": "all retained learned parameters",
-            "omitted": "voice-cloning encoder and unused training state",
+            "omitted": "external-waveform voice-cloning encoder and unused training state",
         },
     }
 
@@ -308,6 +309,7 @@ Sources:
         "<|text_start|>{{- text -}}<|text_end|>",
         encoding="utf-8",
     )
+    shutil.copy2(Path(__file__).with_name("sentence-prefixes.tsv"), destination / "sentence-prefixes.tsv")
     for name in ("tokenizer.json", "tokenizer_config.json", "README.md"):
         path = source / name
         if path.is_file():

@@ -30,8 +30,8 @@ KIDI_MODULE(Qwen3Block);
 class Qwen3BlockImpl : public Module {
 public:
     explicit Qwen3BlockImpl(Qwen3Shape shape);
-    auto forward(ops::Context& context, const Tensor& input, const Tensor& mask, const Tensor& cosine,
-                 const Tensor& sine) const -> Tensor;
+    auto forward(ops::Context& context, Tensor input, const Tensor& mask, const Tensor& cosine, const Tensor& sine,
+                 bool consume_input = false) const -> Tensor;
 
 private:
     Qwen3Attention attention_;

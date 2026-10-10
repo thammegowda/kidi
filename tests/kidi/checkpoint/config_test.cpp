@@ -97,6 +97,7 @@ decode: {beam_size: 4}
     omnivoice["synthesis"]["steps"] = 32;
     omnivoice["license_files"].push_back("src.json");
     omnivoice["template_file"] = "src.json";
+    omnivoice["sentence_prefixes_file"] = "src.json";
     write(directory / "omnivoice.yaml", YAML::Dump(omnivoice));
     auto omnivoice_config = kidi::checkpoint::load_config(directory / "omnivoice.yaml");
     if (!omnivoice_config ||
@@ -116,6 +117,7 @@ decode: {beam_size: 4}
     kokoro["task"] = "tts";
     kokoro["synthesis"]["default_voice"] = "af_heart";
     kokoro["lexicon_file"] = "src.json";
+    kokoro["sentence_prefixes_file"] = "src.json";
     kokoro["license_files"].push_back("src.json");
     write(directory / "kokoro.yaml", YAML::Dump(kokoro));
     auto kokoro_config = kidi::checkpoint::load_config(directory / "kokoro.yaml");

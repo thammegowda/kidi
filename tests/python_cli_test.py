@@ -164,10 +164,17 @@ class HubCliTest(unittest.TestCase):
                 "weights_file": "model.safetensors",
                 "tokenizer_file": "tokenizer.json",
                 "template_file": "synthesis_template.jinja",
+                "sentence_prefixes_file": "sentence-prefixes.tsv",
             }
             config = snapshot / "model.yaml"
             config.write_text(yaml.safe_dump(document))
-            for name in ("model.safetensors", "tokenizer.json", "synthesis_template.jinja", "NOTICE"):
+            for name in (
+                "model.safetensors",
+                "tokenizer.json",
+                "synthesis_template.jinja",
+                "sentence-prefixes.tsv",
+                "NOTICE",
+            ):
                 (snapshot / name).write_bytes(b"fixture")
             with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
                 self.assertEqual(resolve("owner/omnivoice", root), snapshot)
@@ -195,10 +202,11 @@ class HubCliTest(unittest.TestCase):
                 "license_files": ["NOTICE"],
                 "weights_file": "model.safetensors",
                 "lexicon_file": "lexicon-us.tsv",
+                "sentence_prefixes_file": "sentence-prefixes.tsv",
             }
             config = snapshot / "model.yaml"
             config.write_text(yaml.safe_dump(document))
-            for name in ("model.safetensors", "lexicon-us.tsv", "NOTICE"):
+            for name in ("model.safetensors", "lexicon-us.tsv", "sentence-prefixes.tsv", "NOTICE"):
                 (snapshot / name).write_bytes(b"fixture")
             with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
                 self.assertEqual(resolve("owner/kokoro", root), snapshot)

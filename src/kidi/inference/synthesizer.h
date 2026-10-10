@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -17,10 +18,17 @@ namespace kidi::inference {
 
 using VoiceAttributes = std::map<std::string, std::string, std::less<>>;
 
+struct VoicePrompt {
+    std::string text;
+    /// Model-native, codebook-major audio tokens paired with `text`.
+    std::vector<std::int32_t> tokens;
+};
+
 struct SynthesisOptions {
     std::optional<float> duration_seconds;
     std::string language;
     VoiceAttributes voice;
+    std::shared_ptr<const VoicePrompt> voice_prompt;
     std::size_t steps = 32;
     float guidance_scale = 2.F;
     float time_shift = 0.1F;
@@ -28,6 +36,7 @@ struct SynthesisOptions {
     float position_temperature = 5.F;
     std::uint64_t seed = 0;
     std::function<void(std::size_t, std::size_t)> on_progress;
+    std::function<void(std::size_t, std::size_t)> on_chunk;
 };
 
 struct SynthesisStats {
@@ -35,6 +44,7 @@ struct SynthesisStats {
     std::uint64_t decode_ns = 0;
     std::uint64_t preparation_ns = 0;
     std::size_t audio_tokens = 0;
+    std::size_t chunks = 1;
 };
 
 struct Synthesis {
@@ -42,6 +52,12 @@ struct Synthesis {
     std::uint32_t sample_rate;
     std::vector<std::int32_t> tokens;
     SynthesisStats stats;
+    std::shared_ptr<const VoicePrompt> voice_prompt;
+};
+
+struct SynthesisReference {
+    std::string_view text;
+    std::span<const std::int32_t> tokens;
 };
 
 auto parse_synthesis_number(std::string_view value) -> Result<float>;
@@ -52,7 +68,17 @@ class SynthesizerModel {
 public:
     virtual ~SynthesizerModel() = default;
     virtual auto synthesize(std::string_view text, const SynthesisOptions& options) -> Result<Synthesis> = 0;
+    virtual auto synthesize_with_reference(std::string_view text, const SynthesisOptions& options,
+                                           const SynthesisReference& reference) -> Result<Synthesis> {
+        return synthesize(text, options);
+    }
+    virtual auto voice_reference_chunk(std::span<const std::string> chunks, const SynthesisOptions& options) const
+        -> Result<std::optional<std::size_t>> {
+        return std::optional<std::size_t>{};
+    }
+    virtual auto supports_voice_prompt() const noexcept -> bool { return false; }
     virtual auto execution() const -> std::string = 0;
+    virtual auto release_workspaces() -> void {}
 };
 
 class Synthesizer {
@@ -66,6 +92,7 @@ public:
 
     static auto load(const std::filesystem::path& directory, tensor::Device device = tensor::Device::cpu())
         -> Result<Synthesizer>;
+    auto segment(std::string_view text, std::string_view language = {}) const -> Result<std::vector<std::string>>;
     auto synthesize(std::string_view text, const SynthesisOptions& options = {}) const -> Result<Synthesis>;
     auto execution() const -> std::string;
 

@@ -87,5 +87,39 @@ int main() {
     for (std::size_t index = 0; index < single_values.size(); ++index)
         if (std::abs(single_values[index] - packed_values[expected.size() + index]) > 1e-5F)
             return fail("Qwen3 packed second segment differs");
+
+    const std::array batch_inputs{embeddings, embeddings};
+    const auto batch_embedding = context.concat(batch_inputs, 0);
+    const auto batch_mask = kidi::ops::require(kidi::tensor::Tensor::zeros({2, 1, 2, 2}, kidi::tensor::DType::F32));
+    const auto batch_output = model->forward(context, batch_embedding, batch_mask);
+    context.synchronize();
+    const auto batch_values = kidi::ops::require(batch_output.data<float>());
+    for (std::size_t index = 0; index < batch_values.size(); ++index)
+        if (std::abs(expected[index % expected.size()] - batch_values[index]) > 1e-5F)
+            return fail("Qwen3 batched guidance differs");
+
+#if defined(__APPLE__)
+    const std::array<std::int32_t, 4> metal_tokens{1, 2, 1, 2};
+    const auto cpu_metal_reference = model->forward(context, model->embed(context, metal_tokens));
+    context.synchronize();
+    const auto reference_bytes = kidi::ops::require(cpu_metal_reference.copy_to_host());
+    {
+        const kidi::ModuleScope metal_scope(kidi::tensor::DType::I8, false, kidi::tensor::Device::apple_gpu());
+        kidi::model::Qwen3 metal(config);
+        kidi::ops::require(metal->set_state(state));
+        kidi::ops::Context metal_context(kidi::tensor::Device::apple_gpu());
+        const auto metal_output = metal->forward(metal_context, metal->embed(metal_context, metal_tokens));
+        metal_context.synchronize();
+        const auto metal_bytes = kidi::ops::require(metal_output.copy_to_host());
+        const auto reference =
+            std::span(reinterpret_cast<const float*>(reference_bytes.data()), reference_bytes.size() / sizeof(float));
+        const auto actual =
+            std::span(reinterpret_cast<const float*>(metal_bytes.data()), metal_bytes.size() / sizeof(float));
+        if (reference.size() != actual.size()) return fail("Qwen3 Metal output shape differs");
+        for (std::size_t index = 0; index < actual.size(); ++index)
+            if (!std::isfinite(actual[index]) || std::abs(reference[index] - actual[index]) > 0.02F)
+                return fail("Qwen3 Metal numerical mismatch");
+    }
+#endif
     return 0;
 }

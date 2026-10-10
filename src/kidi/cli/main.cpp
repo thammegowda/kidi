@@ -640,12 +640,7 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
 
 auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
     if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TTS)) return status;
-    if (arguments.get<std::string>("backend") == "mps") {
-        spdlog::error("TTS supports YNNPACK CPU and Vulkan backends");
-        return 2;
-    }
-    const auto device = arguments.get<std::string>("backend") == "vulkan" ? kidi::tensor::Device::vulkan()
-                                                                          : kidi::tensor::Device::cpu();
+    const auto device = inference_device(arguments);
     std::optional<float> duration_seconds;
     const auto duration = arguments.get<std::string>("duration");
     if (duration != "auto") {
@@ -709,8 +704,8 @@ auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesy
                   << "|threads=" << kidi::runtime::ynn::thread_count() << "|model_load_ns=" << load_ns
                   << "|generation_ns=" << result->stats.generation_ns << "|decode_ns=" << result->stats.decode_ns
                   << "|preparation_ns=" << result->stats.preparation_ns
-                  << "|audio_tokens=" << result->stats.audio_tokens << "|samples=" << result->samples.size()
-                  << "|sample_rate=" << result->sample_rate << '\n';
+                  << "|audio_tokens=" << result->stats.audio_tokens << "|chunks=" << result->stats.chunks
+                  << "|samples=" << result->samples.size() << "|sample_rate=" << result->sample_rate << '\n';
     return 0;
 }
 

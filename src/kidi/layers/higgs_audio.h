@@ -33,7 +33,7 @@ KIDI_MODULE(DacResidualUnit);
 class DacResidualUnitImpl : public Module {
 public:
     DacResidualUnitImpl(std::int32_t channels, std::int32_t dilation);
-    auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
+    auto forward(ops::Context& context, Tensor input) const -> Tensor;
 
 private:
     Snake1d first_snake_, second_snake_;

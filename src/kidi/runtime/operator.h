@@ -69,6 +69,7 @@ enum class Operation {
     RMS_ROTARY,
     GELU_MULTIPLY,
     SILU_MULTIPLY,
+    SILU_GATE,
     EMBEDDING,
     GATED_FEED_FORWARD
 };
