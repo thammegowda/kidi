@@ -101,6 +101,10 @@ auto Argument::action(Action value) -> Argument& {
         converter_ = [](std::string_view) { return std::any(false); };
         default_value_ = std::any(true);
         default_display_ = "true";
+    } else if (action_ == Action::APPEND) {
+        converter_ = [](std::string_view argument) { return std::any(std::string(argument)); };
+        default_value_ = std::vector<std::string>{};
+        default_display_.clear();
     } else {
         converter_ = [](std::string_view argument) { return std::any(std::string(argument)); };
         default_value_.reset();
@@ -116,7 +120,9 @@ auto Argument::choices(std::initializer_list<std::string_view> values) -> Argume
     return *this;
 }
 
-auto Argument::is_flag() const noexcept -> bool { return action_ != Action::STORE; }
+auto Argument::is_flag() const noexcept -> bool {
+    return action_ == Action::STORE_TRUE || action_ == Action::STORE_FALSE;
+}
 
 auto Argument::display_name() const -> std::string { return optional_ ? join(names_, ", ") : value_name(); }
 
@@ -358,7 +364,18 @@ auto ArgumentParser::add_argument(std::vector<std::string> names) -> Argument& {
 
 auto ArgumentParser::set_value(Namespace& result, const Argument& argument, std::string_view value) const -> void {
     try {
-        result.set(argument.destination_, argument.parse(value));
+        auto parsed = argument.parse(value);
+        if (argument.action_ == Action::APPEND) {
+            auto found = result.values_.find(argument.destination_);
+            if (found == result.values_.end())
+                found = result.values_.emplace(argument.destination_, std::vector<std::string>{}).first;
+            auto* values = std::any_cast<std::vector<std::string>>(&found->second);
+            const auto* item = std::any_cast<std::string>(&parsed);
+            if (!values || !item) throw std::logic_error("append arguments require string values");
+            values->push_back(*item);
+        } else {
+            result.set(argument.destination_, std::move(parsed));
+        }
     } catch (const std::invalid_argument& error) {
         fail("argument " + argument.display_name() + ": " + error.what() + ": '" + std::string(value) + "'");
     }

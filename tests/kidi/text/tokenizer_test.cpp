@@ -90,6 +90,8 @@ auto main(int argc, char** argv) -> int {
            "{% if add_generation_prompt %}assistant:{% endif %}{% if enable_thinking %}thinking{% endif %}";
     if (kidi::text::Tokenizer::load(plain_path)) return 1;
     std::ofstream(directory / "tokenizer_config.json") << R"({"bos_token":"<bos>"})";
+    const auto synthesis_template = directory / "synthesis_template.jinja";
+    std::ofstream(synthesis_template) << "<lang>{{- language -}}</lang><style>{{- instruction -}}</style>{{- text -}}";
     auto chat = kidi::text::Tokenizer::load(plain_path);
     if (!chat) return 1;
     auto formatted = chat->format_chat(conversation);
@@ -98,6 +100,12 @@ auto main(int argc, char** argv) -> int {
     if (chat->format_chat({}) || chat->format_chat(std::span(conversation).first(3))) return 1;
     const std::array invalid{kidi::text::ChatMessage{"tool", "ignored"}, kidi::text::ChatMessage{"user", "Hi"}};
     if (chat->format_chat(invalid)) return 1;
+    auto templated = kidi::text::Tokenizer::load(plain_path, {{"synthesis", synthesis_template}});
+    if (!templated) return 1;
+    auto synthesis = templated->format_template(
+        "synthesis", {{"language", "English"}, {"instruction", "female"}, {"text", "Hello"}});
+    if (!synthesis || *synthesis != "<lang>English</lang><style>female</style>Hello") return 1;
+    if (templated->format_template("missing", {})) return 1;
 
     std::ofstream(directory / "bytes.json") << R"({
       "version":"1.0", "decoder":{"type":"ByteFallback"},

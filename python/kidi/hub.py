@@ -11,18 +11,35 @@ def _package_files(document: object) -> list[str]:
     if not isinstance(document, dict) or document.get("format_version") != 1:
         raise ValueError("Unsupported model.yaml; expected a Kidi format_version 1 package")
     model = document.get("model", {})
-    if not isinstance(model, dict) or not isinstance(document.get("decode"), dict):
-        raise ValueError("model.yaml requires model and decode mappings")
+    if not isinstance(model, dict):
+        raise ValueError("model.yaml requires a model mapping")
     names = [document.get("weights_file")]
     if model.get("type") == "gemma4_text":
+        if not isinstance(document.get("decode"), dict):
+            raise ValueError("Gemma model.yaml requires a decode mapping")
         names.append(document.get("tokenizer_file"))
+    elif model.get("type") == "omnivoice":
+        if document.get("task") != "tts" or not isinstance(document.get("synthesis"), dict):
+            raise ValueError("OmniVoice model.yaml requires task: tts and a synthesis mapping")
+        names.extend([document.get("tokenizer_file"), document.get("template_file")])
+    elif model.get("type") == "kokoro":
+        if document.get("task") != "tts" or not isinstance(document.get("synthesis"), dict):
+            raise ValueError("Kokoro model.yaml requires task: tts and a synthesis mapping")
+        names.append(document.get("lexicon_file"))
     elif model.get("type") == "rtg_transformer_nmt":
+        if not isinstance(document.get("decode"), dict):
+            raise ValueError("RTG model.yaml requires a decode mapping")
         tokenizers = document.get("tokenizers", {})
         if not isinstance(tokenizers, dict):
             raise ValueError("model.yaml requires a tokenizers mapping")
         names.extend([tokenizers.get("source"), tokenizers.get("target")])
     else:
         raise ValueError(f"Unsupported Kidi model type: {model.get('type')!r}")
+    if model.get("type") in {"omnivoice", "kokoro"}:
+        license_files = document.get("license_files")
+        if not isinstance(license_files, list) or not license_files:
+            raise ValueError(f"{model.get('type')} model.yaml requires redistributed license files")
+        names.extend(license_files)
     for name in names:
         if (not isinstance(name, str) or not name or PurePosixPath(name).is_absolute()
                 or ".." in PurePosixPath(name).parts or any(char in name for char in "\\:*?[]\0")):

@@ -6,14 +6,9 @@
 #include <utility>
 #include <vector>
 
-#include "kidi/core/error.h"
+#include "kidi/audio/wav.h"
 
 namespace kidi::audio {
-
-struct Waveform {
-    std::vector<float> samples;
-    std::uint32_t sample_rate;
-};
 
 struct WhisperFeatures {
     std::vector<float> values;
@@ -31,7 +26,5 @@ private:
 
     std::vector<float> filters_;
 };
-
-auto load_wav(const std::filesystem::path& path) -> Result<Waveform>;
 
 } // namespace kidi::audio

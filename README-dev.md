@@ -57,9 +57,46 @@ and `python -m kidi` share the same native implementation.
 
 The [getting-started guide](docs/getting-started.md) covers authentication,
 revision selection, offline use, and manual model setup. Gemma setup writes
-configuration only; original weights and tokenizers are not rewritten. Legacy
-RTG conversion needs the `convert` extra and a **trusted** training export:
+configuration only; original weights and tokenizers are not rewritten. Legacy RTG and OmniVoice conversion need the `convert` extra. RTG requires a
+**trusted** training export:
 PyTorch checkpoints can contain executable pickle data.
+
+OmniVoice conversion reads public Safetensors only and writes a decoder-only,
+all-parameter INT8 package:
+
+```bash
+python -m pip install '.[convert,hf]'
+SOURCE="$(hf download k2-fsa/OmniVoice)"
+python -m kidi.converters.omnivoice "$SOURCE" .cache/omnivoice-int8
+build-release/kidi inspect --model .cache/omnivoice-int8
+```
+
+The generated directory is ignored by Git and can be uploaded separately after
+reviewing the upstream model's CC-BY-NC terms. Do not commit the generated
+Safetensors file to this repository. The generated synthesis settings include
+the upstream rule-estimator calibration used by the default `--duration auto`;
+numeric seconds remain an explicit override. Voice controls enter the task API
+as a generic `key=value` map; model adapters own supported keys, normalization,
+and validation rather than adding model-specific CLI flags.
+
+Every generated TTS package declares `license_files` in `model.yaml`. Package
+loading and Hub resolution treat those paths as required payload rather than
+optional documentation. OmniVoice conversion includes CC BY-NC, Boson Higgs
+Audio 2, Meta Llama 3, its Acceptable Use Policy, and the mandated notice.
+It also emits `synthesis_template.jinja`; tokenizer++ renders this model-owned
+prompt with language, instruction, and text arguments.
+
+Kokoro conversion uses `torch.load(..., weights_only=True)`, fuses the
+checkpoint's weight-normalization tensors, packs the Misaki US-English
+pronunciation dictionaries, and embeds requested voice tables:
+
+```bash
+python -m kidi.converters.kokoro /path/to/Kokoro-82M .cache/kokoro-int8 \
+  --voices af_heart
+```
+
+Kokoro conversion includes separate Kokoro and Misaki Apache-2.0 texts and a
+source attribution notice.
 
 ## Android
 
@@ -187,7 +224,7 @@ and Android model storage.
 ## Architecture and Models
 
 ```text
-Inference -> Models -> Neural Layers -> Eager Tensor Operations -> Runtime Backend
+Task API -> Inference -> Models -> Neural Layers -> Eager Tensor Operations -> Runtime Backend
 Checkpoint I/O -> Model-owned configuration and preparation hooks
 ```
 
@@ -203,7 +240,7 @@ I/O and atomic cache preparation. Format readers have their own `ggml/` and
 sidecars, compatibility checks, conversion/export rules and cache identity.
 
 Adding an architecture requires its model implementation, weight mappings and
-applicable checkpoint hooks. Gemma, Whisper and RTG are examples, not automatic
+applicable checkpoint hooks. Gemma, Whisper, OmniVoice and RTG are examples, not automatic
 support for arbitrary Hugging Face architectures.
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): ownership, execution, state and backend contracts.

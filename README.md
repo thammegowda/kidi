@@ -1,13 +1,14 @@
 # Kidi <a href="docs/kidi-logo.png"><img src="docs/kidi-logo-small.png" alt="Kidi logo" width="48" height="48"></a>
 
-**Local AI chat, image questions, speech transcription, and translation.**
+**Local AI chat, image questions, speech transcription and synthesis, and translation.**
 
 Kidi ("spark" in Kannada) runs models on your device. Use the Android app for
 chat, photos, and dictation, the browser app for local chat and dictation, or
 the command line for chat, audio files, and translation.
 
 [Quick Start](#quick-start) | [Android](#android) | [Browser](#webassembly) | [Chat](#interactive-chat) |
-[Transcription](#whisper-transcription) | [Translation](#rtg-model-package) | [Developer Guide](README-dev.md) |
+[Transcription](#whisper-transcription) | [Synthesis](#omnivoice-text-to-speech) |
+[Translation](#rtg-model-package) | [Developer Guide](README-dev.md) |
 [Getting Started Guide](docs/getting-started.md)
 
 ## Why Kidi?
@@ -27,10 +28,12 @@ the command line for chat, audio files, and translation.
 |---|---|
 | Gemma 4 E2B-it | Text chat and generation; Android photo questions with the default mobile model |
 | Whisper Tiny/Base/Small | Multilingual speech transcription and speech-to-English translation |
+| OmniVoice | Experimental multilingual text-to-speech in the native CLI |
+| Kokoro-82M | Experimental US-English text-to-speech with selectable voice and speed |
 | RTG Transformer | Text translation, including the public 500-language-to-English model |
 
 The tested command-line setup is **Apple Silicon, macOS 26+, and Python 3.12+**.
-Gemma E2B has been tested on a 16 GiB Apple M5. Browser inference has been tested
+Gemma E2B, OmniVoice, and Kokoro have been tested on a 16 GiB Apple M5. Browser inference has been tested
 in current 64-bit Chromium. Native Linux/Windows and Gemma E4B have not been
 validated end to end here.
 
@@ -39,7 +42,10 @@ architecture compatible. Terminal chat and JSONL generation are currently
 text-only and greedy. Photo input is available in the Android app, not every
 interface. Tool execution, video/document input, CUDA, and Apple Neural Engine
 execution are not supported. Whisper runs on CPU and accepts at most 30 seconds
-of 16 kHz audio per request.
+of 16 kHz audio per request. TTS currently runs on CPU from the native CLI;
+Android and browser TTS surfaces are not implemented. OmniVoice voice cloning
+and long-form chunking are not yet supported. The first Kokoro package supports
+US English and one or more explicitly embedded voice packs.
 
 ## Quick Start
 
@@ -166,6 +172,98 @@ supported speech into English; the default task transcribes in the detected or s
 CPU-only, so use `--backend ynnpack` rather than Metal. Hub downloads handle the
 required files for you. Advanced local-checkpoint import is documented in
 [README-dev.md](README-dev.md#ggml-and-gguf-import).
+
+### OmniVoice Text-to-Speech
+
+OmniVoice support is an experimental native CPU prototype. Convert the original
+checkpoint once; the export retains the Qwen3 generator and waveform decoder,
+omits voice-cloning encoders, and stores every retained learned parameter as
+signed INT8 with separate FP32 quantization scales. Conversion fuses Q/K/V and
+gate/up weights into the shared Kidi transformer layer layout.
+
+```bash
+python -m pip install '.[convert,hf]'
+SOURCE="$(hf download k2-fsa/OmniVoice)"
+python -m kidi.converters.omnivoice "$SOURCE" .cache/omnivoice-int8
+
+build-release/kidi synthesize \
+  --model .cache/omnivoice-int8 \
+  --text 'Hello from Kidi.' \
+  --language English \
+  --voice gender=female \
+  --voice 'age=young adult' \
+  --voice pitch=high \
+  --voice accent=british \
+  --duration 1.0 \
+  --out hello.wav
+```
+
+The current converted package is about **618 MB**, including a **607 MB** INT8
+Safetensors file and tokenizer. `--duration auto` is the default and uses
+OmniVoice's Unicode script-weighted rule estimator; pass a positive number such
+as `--duration 1.5` to request exact seconds. Use `--steps 32` for the upstream
+decoding schedule; smaller values are useful only for diagnostics.
+Voice design uses the repeatable, model-independent `--voice KEY=VALUE` option.
+For example, repeat the same option as `--voice gender=female --voice
+age=young-adult --voice style=whisper`. OmniVoice currently recognizes
+`gender`, `age`, `pitch`, `style`, `accent`, and `dialect`; another TTS model
+can interpret a different set through the same task-level map. Reference-audio
+voice cloning remains excluded from this decoder-only package.
+
+| OmniVoice key | Accepted values |
+|---|---|
+| `gender` | `male`, `female` |
+| `age` | `child`, `teenager`, `young adult`, `middle-aged`, `elderly` |
+| `pitch` | `very low`, `low`, `moderate`, `high`, `very high` |
+| `style` | `whisper` |
+| `accent` | `american`, `british`, `australian`, `chinese`, `canadian`, `indian`, `korean`, `portuguese`, `russian`, `japanese` |
+| `dialect` | The twelve Chinese dialect labels supported by the upstream checkpoint |
+
+Use `auto` as a value to omit an attribute. English accent and Chinese dialect
+cannot be combined.
+
+The upstream code is Apache-2.0, but the pretrained OmniVoice weights are
+**CC-BY-NC**. Review that non-commercial license before redistributing a
+converted checkpoint or using it in a product. The bundled Higgs Audio 2
+decoder is additionally governed by the Boson Higgs Audio 2 Community License,
+the Meta Llama 3 Community License, and its Acceptable Use Policy. Converted
+packages include all of these texts and the required attribution in `NOTICE`;
+review their commercial-user and redistribution terms independently.
+
+### Kokoro-82M Text-to-Speech
+
+Kokoro uses the same `synthesize` task and generic `--voice KEY=VALUE` map, but
+its model adapter recognizes different keys:
+
+```bash
+SOURCE="$(hf download hexgrad/Kokoro-82M \
+  config.json kokoro-v1_0.pth voices/af_heart.pt README.md VOICES.md)"
+python -m kidi.converters.kokoro \
+  "$SOURCE" \
+  .cache/kokoro-int8 \
+  --voices af_heart
+
+build-release/kidi synthesize \
+  --model .cache/kokoro-int8 \
+  --text 'Hello world.' \
+  --language English \
+  --voice name=af_heart \
+  --voice speed=1.0 \
+  --out kokoro.wav
+```
+
+The package stores every learned model and voice value as signed INT8. Matrices
+use eight-value quantization groups and vectors use per-element scales to avoid
+Kokoro's known AdaIN/Snake instability. Parameters are lazily dequantized for
+FP32 CPU compute because correctness is the current priority. The package also
+contains an offline Misaki-derived US-English pronunciation lexicon.
+
+Kokoro supports `name=<embedded voice>` and `speed=<positive factor>`. It
+predicts its own duration, so `--duration auto` is required. This first package
+supports US English and reports an explicit error for out-of-lexicon words.
+The model and reference implementation are Apache-2.0 licensed.
+Converted packages include separate Kokoro and Misaki Apache-2.0 license copies
+plus an attribution `NOTICE`.
 
 The browser settings accept Hugging Face model IDs rather than file URLs. Loading resolves the repository's current
 `main` revision to an immutable commit before downloading. The speech model field offers `openai/whisper-tiny`,

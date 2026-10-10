@@ -32,12 +32,41 @@ auto load_config(const std::filesystem::path& path) -> Result<YAML::Node> {
         auto config = YAML::LoadFile(path.string());
         if (!config.IsMap() || config["format_version"].as<int>() != 1)
             return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "unsupported config; expected format_version 1"});
-        if (!config["model"].IsMap() || !config["decode"].IsMap())
-            return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "model and decode must be YAML mappings"});
+        if (!config["model"].IsMap())
+            return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "model must be a YAML mapping"});
         auto weights = resolve_file(directory, config["weights_file"]);
         if (!weights) return std::unexpected(std::move(weights.error()));
         config["weights_file"] = weights->string();
-        if (config["model"]["type"].as<std::string>() == "gemma4_text") {
+        const auto type = config["model"]["type"].as<std::string>();
+        if (type == "omnivoice" || type == "kokoro") {
+            if (config["task"].as<std::string>("") != "tts" || !config["synthesis"].IsMap())
+                return std::unexpected(
+                    Error{ErrorCode::INVALID_MANIFEST, type + " requires task: tts and synthesis settings"});
+            if (!config["license_files"].IsSequence() || !config["license_files"].size())
+                return std::unexpected(
+                    Error{ErrorCode::INVALID_MANIFEST, type + " requires redistributed license files"});
+            for (std::size_t index = 0; index < config["license_files"].size(); ++index) {
+                auto license = resolve_file(directory, config["license_files"][index]);
+                if (!license) return std::unexpected(std::move(license.error()));
+                config["license_files"][index] = license->string();
+            }
+            if (type == "omnivoice") {
+                auto tokenizer = resolve_file(directory, config["tokenizer_file"]);
+                if (!tokenizer) return std::unexpected(std::move(tokenizer.error()));
+                config["tokenizer_file"] = tokenizer->string();
+                auto synthesis_template = resolve_file(directory, config["template_file"]);
+                if (!synthesis_template) return std::unexpected(std::move(synthesis_template.error()));
+                config["template_file"] = synthesis_template->string();
+            } else {
+                auto lexicon = resolve_file(directory, config["lexicon_file"]);
+                if (!lexicon) return std::unexpected(std::move(lexicon.error()));
+                config["lexicon_file"] = lexicon->string();
+            }
+            return config;
+        }
+        if (!config["decode"].IsMap())
+            return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "decode must be a YAML mapping"});
+        if (type == "gemma4_text") {
             auto tokenizer = resolve_file(directory, config["tokenizer_file"]);
             if (!tokenizer) return std::unexpected(std::move(tokenizer.error()));
             config["tokenizer_file"] = tokenizer->string();

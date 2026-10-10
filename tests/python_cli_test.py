@@ -147,6 +147,68 @@ class HubCliTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "Invalid package file path"):
                         resolve("owner/rtg", root)
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
+    def test_preconfigured_omnivoice_package(self):
+        import yaml
+        from kidi.hub import resolve
+
+        with tempfile.TemporaryDirectory() as root:
+            snapshot = Path(root).resolve() / ("d" * 40)
+            snapshot.mkdir()
+            document = {
+                "format_version": 1,
+                "task": "tts",
+                "model": {"type": "omnivoice"},
+                "synthesis": {},
+                "license_files": ["NOTICE"],
+                "weights_file": "model.safetensors",
+                "tokenizer_file": "tokenizer.json",
+                "template_file": "synthesis_template.jinja",
+            }
+            config = snapshot / "model.yaml"
+            config.write_text(yaml.safe_dump(document))
+            for name in ("model.safetensors", "tokenizer.json", "synthesis_template.jinja", "NOTICE"):
+                (snapshot / name).write_bytes(b"fixture")
+            with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
+                self.assertEqual(resolve("owner/omnivoice", root), snapshot)
+                patterns = download.call_args.kwargs["allow_patterns"]
+                self.assertIn("model.safetensors", patterns)
+                self.assertIn("tokenizer.json", patterns)
+                document.pop("task")
+                config.write_text(yaml.safe_dump(document))
+                with self.assertRaisesRegex(ValueError, "task: tts"):
+                    resolve("owner/omnivoice", root)
+
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
+    def test_preconfigured_kokoro_package(self):
+        import yaml
+        from kidi.hub import resolve
+
+        with tempfile.TemporaryDirectory() as root:
+            snapshot = Path(root).resolve() / ("e" * 40)
+            snapshot.mkdir()
+            document = {
+                "format_version": 1,
+                "task": "tts",
+                "model": {"type": "kokoro"},
+                "synthesis": {"default_voice": "af_heart"},
+                "license_files": ["NOTICE"],
+                "weights_file": "model.safetensors",
+                "lexicon_file": "lexicon-us.tsv",
+            }
+            config = snapshot / "model.yaml"
+            config.write_text(yaml.safe_dump(document))
+            for name in ("model.safetensors", "lexicon-us.tsv", "NOTICE"):
+                (snapshot / name).write_bytes(b"fixture")
+            with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
+                self.assertEqual(resolve("owner/kokoro", root), snapshot)
+                patterns = download.call_args.kwargs["allow_patterns"]
+                self.assertIn("model.safetensors", patterns)
+                self.assertIn("lexicon-us.tsv", patterns)
+                (snapshot / "NOTICE").unlink()
+                with self.assertRaisesRegex(ValueError, "Missing NOTICE"):
+                    resolve("owner/kokoro", root)
+
 
 class PythonCliTest(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("KIDI_CHAT_MODEL"), "set KIDI_CHAT_MODEL for real chat CLI checks")

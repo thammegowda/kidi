@@ -76,6 +76,8 @@ target_include_directories(kidi_argparse PUBLIC $<BUILD_INTERFACE:${CMAKE_CURREN
 target_compile_features(kidi_argparse PUBLIC cxx_std_23)
 
 add_library(kidi
+    src/kidi/audio/duration.cpp
+    src/kidi/audio/wav.cpp
     src/kidi/audio/whisper.cpp
     src/kidi/checkpoint/config.cpp
     src/kidi/checkpoint/ggml/reader.cpp
@@ -89,14 +91,22 @@ add_library(kidi
     src/kidi/image/gemma4.cpp
     src/kidi/inference/decoder.cpp
     src/kidi/inference/generator.cpp
+    src/kidi/inference/synthesizer.cpp
     src/kidi/inference/transcriber.cpp
     src/kidi/inference/translator.cpp
     src/kidi/layers/position_encoding.cpp
+    src/kidi/layers/audio.cpp
     src/kidi/layers/gemma4.cpp
+    src/kidi/layers/higgs_audio.cpp
+    src/kidi/layers/qwen3.cpp
     src/kidi/layers/transformer.cpp
     src/kidi/layers/whisper.cpp
     src/kidi/model/gemma4.cpp
     src/kidi/model/gemma4_vision.cpp
+    src/kidi/model/kokoro.cpp
+    src/kidi/model/omnivoice.cpp
+    src/kidi/model/qwen3.cpp
+    src/kidi/model/registry.cpp
     src/kidi/model/transformer.cpp
     src/kidi/model/whisper.cpp
     src/kidi/ops/context.cpp
@@ -109,6 +119,7 @@ add_library(kidi
     src/kidi/tensor/cpu_backend.cpp
     src/kidi/tensor/external.cpp
     src/kidi/tensor/tensor.cpp
+    src/kidi/text/phonemizer.cpp
     src/kidi/text/tokenizer.cpp
 )
 add_library(kidi::kidi ALIAS kidi)
@@ -231,6 +242,7 @@ target_link_libraries(kidi
         ynnpack_composites
         yaml-cpp::yaml-cpp
     PRIVATE
+        uni-algo::uni-algo
         tokenizerpp
         TahomaVision::Vision
         kidi::zlib
