@@ -48,6 +48,7 @@ startButton.onclick = async () => {
   startButton.disabled = true;
   stopButton.disabled = false;
   let frames = 0, started = performance.now();
+  let formatReceived = false;
   scheduled = 0;
   let highpass;
   document.querySelector("#audio-controls").hidden = true;
@@ -84,6 +85,7 @@ startButton.onclick = async () => {
         if (queued.length < 20 + length) break;
         const payload = queued.slice(20, 20 + length);
         queued = queued.slice(20 + length);
+        if (!formatReceived && kind !== 3) throw new Error("Stream is missing format metadata.");
         if (kind === 1) {
           frames++;
           if (!renderBusy) {
@@ -109,12 +111,16 @@ startButton.onclick = async () => {
           scheduled += buffer.duration;
         } else if (kind === 3) {
           const info = JSON.parse(new TextDecoder().decode(payload));
-          if (info.protocol === 1) {
+          if (!formatReceived) {
+            if (info.protocol !== 1) throw new Error(`Unsupported accessory protocol version: ${info.protocol}.`);
+            formatReceived = true;
             started = performance.now();
             canvas.width = info.width;
             canvas.height = info.height;
             audioSampleRate = info.sample_rate;
             if (info.audio !== wantsAudio) throw new Error("Accessory audio mode differs from the requested preview.");
+          } else if ("protocol" in info && info.protocol !== 1) {
+            throw new Error(`Unsupported accessory protocol version: ${info.protocol}.`);
           }
           const fps = frames * 1000 / Math.max(1, performance.now() - started);
           status.textContent = `Received ${frames} frames (${fps.toFixed(1)} fps)\n${JSON.stringify(info, null, 2)}`;

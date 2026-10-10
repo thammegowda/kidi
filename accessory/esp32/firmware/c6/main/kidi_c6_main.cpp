@@ -132,10 +132,10 @@ static void complete_ble_exchange(void) {
 }
 
 static esp_err_t init_nvs(void) {
-    esp_err_t error = nvs_flash_init();
+    const esp_err_t error = nvs_flash_init();
     if (error == ESP_ERR_NVS_NO_FREE_PAGES || error == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "failed to erase incompatible NVS");
-        error = nvs_flash_init();
+        ESP_LOGE(TAG,
+                 "NVS requires explicit recovery or migration; refusing to erase pairing, controller, and TLS state");
     }
     return error;
 }

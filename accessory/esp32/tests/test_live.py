@@ -1,6 +1,7 @@
 from argparse import Namespace
 import io
 import json
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +31,13 @@ END = b'{"reason":"duration_limit"}'
 class LiveTest(unittest.TestCase):
     def source(self, payload):
         return live.LiveSource(io.BytesIO(payload))
+
+    def test_browser_rejects_unknown_protocol_before_media(self):
+        viewer = (Path(__file__).resolve().parents[1] / "tools/live.html").read_text()
+        rejection = 'if (info.protocol !== 1) throw new Error(`Unsupported accessory protocol version: ${info.protocol}.`);'
+        self.assertIn(rejection, viewer)
+        self.assertIn('if (!formatReceived && kind !== 3)', viewer)
+        self.assertLess(viewer.index(rejection), viewer.index("canvas.width = info.width"))
 
     def test_camera_and_audio_packets(self):
         data = (

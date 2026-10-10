@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <stdbool.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -29,7 +30,7 @@
 
 static const char* TAG = "kidi_p4";
 static kidi_tls_identity_t media_tls_identity;
-static volatile bool security_synchronized;
+static std::atomic_bool security_synchronized{false};
 
 static void media_session_complete(std::span<const uint8_t, KIDI_ACCESSORY_TICKET_NONCE_BYTES> nonce) {
     std::array<uint8_t, KIDI_PEER_MEDIA_COMPLETE_BYTES> message{};
@@ -42,10 +43,9 @@ static void media_session_complete(std::span<const uint8_t, KIDI_ACCESSORY_TICKE
 }
 
 static esp_err_t init_nvs(void) {
-    esp_err_t error = nvs_flash_init();
+    const esp_err_t error = nvs_flash_init();
     if (error == ESP_ERR_NVS_NO_FREE_PAGES || error == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        error = nvs_flash_init();
+        ESP_LOGE(TAG, "NVS requires explicit recovery or migration; refusing to erase the persistent media identity");
     }
     return error;
 }
@@ -59,8 +59,18 @@ static esp_err_t init_network_split(void) {
     if (error != ESP_OK && error != ESP_ERR_INVALID_STATE) {
         return error;
     }
-    esp_hosted_init();
-    esp_hosted_connect_to_slave();
+    const int hosted_init = esp_hosted_init();
+    if (hosted_init != 0) {
+        return static_cast<esp_err_t>(hosted_init);
+    }
+    const int hosted_connect = esp_hosted_connect_to_slave();
+    if (hosted_connect != 0) {
+        const int hosted_deinit = esp_hosted_deinit();
+        if (hosted_deinit != 0) {
+            ESP_LOGE(TAG, "failed to deinitialize Hosted after connection failure: %d", hosted_deinit);
+        }
+        return static_cast<esp_err_t>(hosted_connect);
+    }
     return ESP_OK;
 }
 
@@ -82,7 +92,7 @@ static void sync_response(uint32_t message_id, const uint8_t* data, size_t data_
         ESP_LOGE(TAG, "failed to install C6 media security: %s", esp_err_to_name(error));
         return;
     }
-    security_synchronized = true;
+    security_synchronized.store(true, std::memory_order_release);
     ESP_LOGI(TAG, "C6 media ticket key and clock synchronized");
 }
 
@@ -158,7 +168,7 @@ static esp_err_t start_console(void) {
 
 static void security_sync_task(void* context) {
     (void)context;
-    while (!security_synchronized) {
+    while (!security_synchronized.load(std::memory_order_acquire)) {
         uint8_t request[KIDI_PEER_SYNC_REQUEST_BYTES]{};
         request[0] = KIDI_ACCESSORY_PROTOCOL_VERSION;
         memcpy(request + 1, media_tls_identity.certificate_sha256, sizeof(media_tls_identity.certificate_sha256));

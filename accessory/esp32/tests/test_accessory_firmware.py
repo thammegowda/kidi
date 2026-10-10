@@ -67,6 +67,33 @@ class AccessoryFirmwareTest(unittest.TestCase):
         self.assertNotIn("\nflash:", makefile)
         self.assertNotIn("\nrestore:", makefile)
 
+    def test_persistent_identity_is_never_erased_during_boot(self):
+        for chip in ("c6", "p4"):
+            main = (ROOT / f"firmware/{chip}/main/kidi_{chip}_main.cpp").read_text()
+            self.assertNotIn("nvs_flash_erase", main)
+            self.assertIn("refusing to erase", main)
+
+    def test_p4_sync_and_hosted_transport_are_synchronized_and_checked(self):
+        main = (ROOT / "firmware/p4/main/kidi_p4_main.cpp").read_text()
+        self.assertIn("std::atomic_bool security_synchronized", main)
+        self.assertIn("security_synchronized.store(true, std::memory_order_release)", main)
+        self.assertIn("security_synchronized.load(std::memory_order_acquire)", main)
+        self.assertIn("const int hosted_init = esp_hosted_init()", main)
+        self.assertIn("const int hosted_connect = esp_hosted_connect_to_slave()", main)
+        self.assertIn("return static_cast<esp_err_t>(hosted_init)", main)
+        self.assertIn("return static_cast<esp_err_t>(hosted_connect)", main)
+
+    def test_camera_encoder_uses_only_dequeued_payload(self):
+        camera = (ROOT / "firmware/p4/main/kidi_camera.cpp").read_text()
+        self.assertIn(
+            "session->encoder, session->buffers[buffer.index], buffer.bytesused",
+            camera,
+        )
+        self.assertIn(
+            "buffer.bytesused > session->buffer_sizes[buffer.index]",
+            camera,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

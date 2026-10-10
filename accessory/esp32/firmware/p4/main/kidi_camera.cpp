@@ -155,10 +155,11 @@ static esp_err_t copy_jpeg(camera_session_t* session, kidi_camera_photo_t* photo
     const uint8_t* jpeg = session->buffers[buffer.index];
     uint32_t jpeg_size = buffer.bytesused;
     esp_err_t error = ESP_OK;
-    if (session->pixel_format != V4L2_PIX_FMT_JPEG) {
-        error = example_encoder_process(session->encoder, session->buffers[buffer.index],
-                                        session->buffer_sizes[buffer.index], session->encoded,
-                                        session->encoded_capacity, &jpeg_size);
+    if (buffer.bytesused == 0 || buffer.bytesused > session->buffer_sizes[buffer.index]) {
+        error = ESP_ERR_INVALID_RESPONSE;
+    } else if (session->pixel_format != V4L2_PIX_FMT_JPEG) {
+        error = example_encoder_process(session->encoder, session->buffers[buffer.index], buffer.bytesused,
+                                        session->encoded, session->encoded_capacity, &jpeg_size);
         jpeg = session->encoded;
     }
     if (error == ESP_OK && (jpeg_size < 4 || jpeg_size > KIDI_ACCESSORY_MAX_PHOTO_BYTES || jpeg[0] != 0xff ||
