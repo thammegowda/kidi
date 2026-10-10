@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <optional>
+#include <string_view>
 
 #include "kidi/core/module.h"
 #include "kidi/ops/context.h"
@@ -23,6 +25,13 @@ struct KeyValue {
     ops::BlockwiseQuantization key_quantization, value_quantization;
 };
 
+struct QuantizedState {
+    Tensor scale;
+    mutable Tensor decoded;
+
+    auto decode_vector(const Tensor& values, std::string_view name) const -> const Tensor&;
+};
+
 KIDI_MODULE(Linear);
 
 /// Affine projection over the final dimension with bound weights and optional bias.
@@ -30,12 +39,16 @@ KIDI_MODULE(Linear);
 class LinearImpl : public Module {
 public:
     LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose = false, bool bias = true,
-               std::int32_t packed_bits = 0);
+               std::int32_t packed_bits = 0, bool quantized_bias = false);
     auto forward(ops::Context&, const Tensor&) const -> Tensor;
 
 private:
     friend class GatedFeedForwardImpl;
-    Tensor weight_, bias_, scale_;
+    auto bias() const -> const Tensor&;
+
+    Tensor weight_, bias_;
+    std::optional<QuantizedState> qstate_, bias_qstate_;
+    Tensor packed_scale_;
     Tensor input_scale_, output_scale_;
     std::int32_t packed_bits_ = 0, input_size_ = 0;
     bool transpose_, has_bias_;

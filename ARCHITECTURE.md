@@ -6,7 +6,7 @@ recorded control flow. A fixed-shape step may be captured from that same eager
 code and replayed (see [Captured Steps](#captured-steps)).
 
 ```text
-inference::{Decoder, Transcriber} -> model::{Transformer, Gemma4, Whisper} -> layers -> ops::Context -> backend
+inference::{Decoder, Transcriber, Synthesizer} -> model::{Transformer, Gemma4, Whisper, OmniVoice} -> layers -> ops::Context -> backend
 ```
 
 ## Ownership
@@ -20,7 +20,7 @@ inference::{Decoder, Transcriber} -> model::{Transformer, Gemma4, Whisper} -> la
 | `layers` | Bound parameters and reusable neural equations |
 | `checkpoint` | Configuration/package I/O, format readers, serialization and generic cache preparation |
 | `model` | Neural network topology, parameter binding, checkpoint policies, source and decoder state |
-| `inference` | Generic generation/search, translation application, profiling |
+| `inference` | Generic generation/search, translation and synthesis applications, profiling |
 | `runtime/ynn` | Private prepared CPU operators and YNNPACK ownership |
 | `runtime/mps` | Private prepared Metal operators, command batches, INT8 kernels |
 | `text`, `cli` | Tokenization and command/input/output policy |
@@ -29,8 +29,8 @@ RTG is an import/package format, not the owner of general modeling code. Do not
 add independent CPU and GPU model implementations. Backend fusion belongs in
 operators, not duplicated Transformer equations.
 
-`kidi::model` contains Gemma 4, its vision tower, Transformer and Whisper model
-implementations. Model-specific validation, parameter binding and checkpoint
+`kidi::model` contains Gemma 4, its vision tower, Transformer, Whisper, Qwen3
+and OmniVoice model implementations. Model-specific validation, parameter binding and checkpoint
 customizations stay with the model. Models define metadata layout, required
 sidecars, source compatibility, conversion/export rules and cache identity.
 `kidi::checkpoint` invokes those hooks while owning filesystem access, source
@@ -105,6 +105,9 @@ before assignment. There is no separate encoding enum or YAML precision setting.
 The execution policy follows stored weights; any future compute-precision override
 is a separate runtime option, not a duplicate declaration of checkpoint metadata.
 The old flat manifest layout is not supported or automatically migrated.
+TTS manifests declare every redistributed legal artifact in `license_files`;
+configuration loading and Hub resolution require and path-check the complete
+list alongside weights and tokenizer/frontend data.
 `model.yaml` may list `external_tensors` (name, dtype, shape) that the embedder
 supplies through `Generator::load`'s `ExternalTensorSource`; `Weights::add`
 registers them beside the file's tensors. The browser uses this for the Gemma
@@ -112,6 +115,55 @@ per-layer embedding table: `tensor::external_tensor` wraps a `RowSource` whose r
 stay in JavaScript, and `gather_rows` copies only the requested rows. External
 tensors are CPU tensors without host addresses, so direct byte access and device
 transfers fail rather than materializing the table.
+
+`model::registered_models()` is the central model-to-task descriptor list.
+Commands validate a task (`TRANSLATION`, `TEXT_GENERATION`,
+`SPEECH_RECOGNITION`, or `TTS`) rather than equating a command with one model
+type. `inference::Synthesizer` currently dispatches TTS to OmniVoice; another TTS
+model can be registered without changing the public task. Its PImpl stores the
+generic `SynthesizerModel` interface. `OmniVoiceImpl` and `KokoroImpl` implement
+that interface directly, so each model's package loading, frontend, voice
+schema, prompt policy and neural equations stay together in its model file.
+`synthesizer.cpp` contains only generic option parsing and model-type dispatch.
+
+`SynthesisOptions::voice` is a model-independent string map populated by the
+repeatable `--voice KEY=VALUE` CLI option. Parsing validates only generic
+assignment syntax and duplicate keys. The active model adapter owns its schema:
+OmniVoice converts gender, age, pitch, style, accent, and dialect attributes to
+the checkpoint's instruction-token format. Future TTS models may accept
+different keys without extending the CLI.
+
+Kokoro demonstrates the second schema: `name` selects an embedded voice table
+and `speed` scales its predicted durations. Its backend uses a replaceable
+`text::LexiconPhonemizer`: input words are resolved through a pronunciation
+lexicon, then the resulting IPA is tokenized by Unicode codepoint. The acoustic
+backend uses shared-weight ALBERT, quantized BiLSTMs, StyleTTS2 duration/F0/noise
+prediction, AdaIN/Snake decoder blocks, a deterministic harmonic source, and a
+CPU iSTFT. The package is entirely INT8 at rest; matrices are lazily dequantized
+for FP32 compute because acoustic errors compound through the vocoder.
+
+The OmniVoice prototype uses reusable Qwen3 full-attention blocks for iterative
+masked audio-token generation. Conversion concatenates Q/K/V and gate/up
+projections along their output dimension before row quantization. The runtime
+therefore uses the canonical fused `Linear` and `GatedFeedForward` layers rather
+than Qwen-specific parallel projections. Its Higgs Audio V2 subset contains only
+the eight RVQ decode tables, their output projections, and the DAC waveform
+decoder; HuBERT, semantic/acoustic encoders, and training state are not packaged.
+Every retained learned tensor is signed INT8. Matrices and embedding tables use
+per-output-row scales; vectors use one scale per tensor. Scale tensors are FP32
+quantization metadata. Small vectors are dequantized on first use, while matrix
+and convolution weights stay INT8 through the CPU projection path.
+
+TTS currently executes only on the CPU. General Conv1d and ConvTranspose1d are
+implemented as INT8 projections plus explicit sequence lowering/overlap for
+correctness. This is intentionally not a performance commitment, and no Android
+or browser surface consumes the TTS API yet.
+
+OmniVoice prompt syntax is package data rather than C++ policy:
+`synthesis_template.jinja` is rendered by tokenizer++ with `language`,
+`instruction`, and `text` arguments before tokenization. The manifest requires
+the template so Hub resolution cannot produce a package with missing prompt
+semantics.
 
 CLI diagnostics use spdlog on stderr. Translation results and inspection output
 remain on stdout; machine-readable metric/profile records retain their unadorned

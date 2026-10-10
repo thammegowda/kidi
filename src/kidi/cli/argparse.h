@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <any>
 #include <charconv>
+#include <cmath>
 #include <concepts>
 #include <cstddef>
 #include <functional>
 #include <initializer_list>
+#include <locale>
 #include <memory>
 #include <optional>
 #include <span>
@@ -43,9 +45,11 @@ auto parse_argument(std::string_view value) -> T {
         }
         return result;
     } else if constexpr (std::floating_point<T>) {
+        std::istringstream input{std::string(value)};
+        input.imbue(std::locale::classic());
         T result{};
-        const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), result);
-        if (error != std::errc{} || end != value.data() + value.size()) {
+        input >> std::noskipws >> result;
+        if (!input || !input.eof() || !std::isfinite(result)) {
             throw std::invalid_argument("expected a number");
         }
         return result;
@@ -77,6 +81,7 @@ enum class Action {
     STORE,
     STORE_TRUE,
     STORE_FALSE,
+    APPEND,
 };
 
 enum class ParseStatus {

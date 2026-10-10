@@ -89,6 +89,41 @@ decode: {beam_size: 4}
     gemma["tokenizer_file"] = "../outside";
     write(directory / "invalid-gemma.yaml", YAML::Dump(gemma));
     if (kidi::checkpoint::load_config(directory / "invalid-gemma.yaml")) return 1;
+    auto omnivoice = YAML::Clone(gemma);
+    omnivoice["model"]["type"] = "omnivoice";
+    omnivoice["tokenizer_file"] = "src.json";
+    omnivoice.remove("decode");
+    omnivoice["task"] = "tts";
+    omnivoice["synthesis"]["steps"] = 32;
+    omnivoice["license_files"].push_back("src.json");
+    omnivoice["template_file"] = "src.json";
+    write(directory / "omnivoice.yaml", YAML::Dump(omnivoice));
+    auto omnivoice_config = kidi::checkpoint::load_config(directory / "omnivoice.yaml");
+    if (!omnivoice_config ||
+        (*omnivoice_config)["tokenizer_file"].as<std::string>() != (directory / "src.json").string())
+        return 1;
+    auto unlicensed_omnivoice = YAML::Clone(omnivoice);
+    unlicensed_omnivoice.remove("license_files");
+    write(directory / "unlicensed-omnivoice.yaml", YAML::Dump(unlicensed_omnivoice));
+    if (kidi::checkpoint::load_config(directory / "unlicensed-omnivoice.yaml")) return 1;
+    omnivoice.remove("synthesis");
+    write(directory / "invalid-omnivoice.yaml", YAML::Dump(omnivoice));
+    if (kidi::checkpoint::load_config(directory / "invalid-omnivoice.yaml")) return 1;
+    auto kokoro = YAML::Clone(gemma);
+    kokoro["model"]["type"] = "kokoro";
+    kokoro.remove("decode");
+    kokoro.remove("tokenizer_file");
+    kokoro["task"] = "tts";
+    kokoro["synthesis"]["default_voice"] = "af_heart";
+    kokoro["lexicon_file"] = "src.json";
+    kokoro["license_files"].push_back("src.json");
+    write(directory / "kokoro.yaml", YAML::Dump(kokoro));
+    auto kokoro_config = kidi::checkpoint::load_config(directory / "kokoro.yaml");
+    if (!kokoro_config || (*kokoro_config)["lexicon_file"].as<std::string>() != (directory / "src.json").string())
+        return 1;
+    kokoro["lexicon_file"] = "../outside";
+    write(directory / "invalid-kokoro.yaml", YAML::Dump(kokoro));
+    if (kidi::checkpoint::load_config(directory / "invalid-kokoro.yaml")) return 1;
     write(directory / "config.json", R"({"model_type":"whisper","d_model":384})");
     write(directory / "tokenizer.json");
     write(directory / "preprocessor_config.json");

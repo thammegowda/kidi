@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <limits>
 
 namespace kidi::layers {
@@ -23,30 +24,39 @@ auto gate_up_width(std::int32_t intermediate) -> std::int32_t {
 }
 } // namespace
 
-RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned) : epsilon_(epsilon) {
-    if (learned)
+RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned, bool quantized) : epsilon_(epsilon) {
+    if (quantized && (!learned || module_dtype != tensor::DType::I8))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "quantized RMS normalization requires learned INT8 state"});
+    if (learned && quantized) {
+        qstate_.emplace();
+        register_parameter("weight", weight_, {width}, tensor::DType::I8);
+        register_parameter("scale", qstate_->scale, {1}, tensor::DType::F32);
+    } else if (learned)
         register_parameter("weight", weight_, {width}, tensor::DType::F32);
     else
         weight_ = require(Tensor::empty({width}, tensor::DType::F32, device()));
-    if (weight_.defined()) {
+    if (weight_.defined() && !quantized) {
         const std::vector<float> ones(width, 1.F);
         weight_ = require(Tensor::from_host({width}, std::span<const float>(ones), device()));
     }
 }
+auto RmsNormImpl::weight() const -> const Tensor& {
+    return qstate_ ? qstate_->decode_vector(weight_, "RMS normalization") : weight_;
+}
 auto RmsNormImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    return context.rms_norm(input, weight_, epsilon_);
+    return context.rms_norm(input, weight(), epsilon_);
 }
 auto RmsNormImpl::forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
                                  const Tensor& sine) const -> Tensor {
-    return context.rms_rotary(input, weight_, cosine, sine, epsilon_);
+    return context.rms_rotary(input, weight(), cosine, sine, epsilon_);
 }
 auto RmsNormImpl::forward_axial_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
                                        const Tensor& sine) const -> Tensor {
-    return context.rms_axial_rotary(input, weight_, cosine, sine, epsilon_);
+    return context.rms_axial_rotary(input, weight(), cosine, sine, epsilon_);
 }
 auto RmsNormImpl::forward_residual(ops::Context& context, const Tensor& input, const Tensor& residual,
                                    const Tensor& output_scale) const -> Tensor {
-    return context.rms_norm_residual(input, weight_, residual, epsilon_, output_scale);
+    return context.rms_norm_residual(input, weight(), residual, epsilon_, output_scale);
 }
 TokenEmbeddingImpl::TokenEmbeddingImpl(std::int32_t vocabulary, std::int32_t width, float scale,
                                        std::int32_t packed_bits, std::int32_t scale_groups)
@@ -89,9 +99,7 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int
     } else {
         bytes = require(weight_.host_bytes());
     }
-    const auto row = [&](std::size_t index) {
-        return outside ? index : static_cast<std::size_t>(tokens[index]);
-    };
+    const auto row = [&](std::size_t index) { return outside ? index : static_cast<std::size_t>(tokens[index]); };
     auto values = require(output.data<float>());
     if (packed_bits_ || weight_.dtype() == tensor::DType::I8) {
         const auto bits = packed_bits_ ? packed_bits_ : 8;
@@ -138,9 +146,11 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, const Tensor& tokens) co
     const auto bits = packed_bits_ ? packed_bits_ : weight_.dtype() == tensor::DType::I8 ? 8 : 0;
     return context.embedding(tokens, weight_, quantization_scale_, width_, bits, scale_);
 }
-GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t packed_bits)
+GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t packed_bits,
+                                           GatedActivation activation)
     : gate_up_(hidden, gate_up_width(intermediate), true, false, packed_bits),
-      down_(intermediate, hidden, true, false, packed_bits) {
+      down_(intermediate, hidden, true, false, packed_bits),
+      activation_(activation) {
     register_module("gate_up_proj", gate_up_);
     register_module("down_proj", down_);
 }
@@ -152,8 +162,8 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
                             context.device() == tensor::Device::vulkan();
     const bool metal_fusion = tensor::DEVICE_CAPABILITIES[context.device().kind].fused_packed_feed_forward &&
                               rows >= 4 && gate_up_->packed_bits_ == 8;
-    if (((cpu_fusion && rows >= 32) || web_fusion || metal_fusion) && gate_up_->packed_bits_ &&
-        gate_up_->packed_bits_ == down_->packed_bits_) {
+    if (activation_ == GatedActivation::GELU && ((cpu_fusion && rows >= 32) || web_fusion || metal_fusion) &&
+        gate_up_->packed_bits_ && gate_up_->packed_bits_ == down_->packed_bits_) {
         const Tensor& gate_input = gate_up_->input_scale_;
         const Tensor& gate_output = gate_up_->output_scale_;
         const Tensor& down_input = down_->input_scale_;
@@ -163,10 +173,10 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
         const auto down_input_scale = require(down_input.data<float>())[0];
         const auto down_output_scale = require(down_output.data<float>())[0];
         if (gate_input_scale > 0 && gate_output_scale > 0 && down_input_scale > 0 && down_output_scale > 0) {
-            const auto output =
-                context.gated_feed_forward(input, gate_up_->weight_, gate_up_->scale_, down_->weight_, down_->scale_,
-                                           gate_up_->packed_bits_, gate_up_->input_size_, down_->input_size_,
-                                           gate_input_scale, gate_output_scale, down_input_scale, down_output_scale);
+            const auto output = context.gated_feed_forward(input, gate_up_->weight_, gate_up_->packed_scale_,
+                                                           down_->weight_, down_->packed_scale_, gate_up_->packed_bits_,
+                                                           gate_up_->input_size_, down_->input_size_, gate_input_scale,
+                                                           gate_output_scale, down_input_scale, down_output_scale);
             return output;
         }
         if (!web_fusion)
@@ -179,7 +189,18 @@ auto GatedFeedForwardImpl::forward_stages(ops::Context& context, const Tensor& i
     const auto intermediate = static_cast<std::int64_t>(projected.size(-1) / 2);
     const auto gate = context.slice(projected, -1, 0, intermediate);
     const auto up = context.slice(projected, -1, intermediate, intermediate);
-    const auto hidden = context.gelu_multiply(gate, up);
+    Tensor hidden;
+    if (activation_ == GatedActivation::GELU) {
+        hidden = context.gelu_multiply(gate, up);
+    } else {
+        context.synchronize();
+        hidden = require(Tensor::empty({gate.shape().begin(), gate.shape().end()}, tensor::DType::F32));
+        const auto gate_values = require(gate.data<float>());
+        const auto up_values = require(up.data<float>());
+        auto output = require(hidden.data<float>());
+        for (std::size_t index = 0; index < output.size(); ++index)
+            output[index] = gate_values[index] / (1.F + std::exp(-gate_values[index])) * up_values[index];
+    }
     return {gate, up, hidden, down_->forward(context, hidden)};
 }
 Gemma4AttentionImpl::Gemma4AttentionImpl(std::int32_t hidden, std::int32_t heads, std::int32_t key_heads,

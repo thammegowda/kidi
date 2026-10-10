@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <deque>
@@ -16,13 +17,18 @@
 
 #include "kidi/cli/argparse.h"
 #include "kidi/cli/main.h"
+#include "kidi/audio/wav.h"
 #include "kidi/cli/interactive.h"
 #include "kidi/core/version.h"
 #include "kidi/checkpoint/package.h"
 #include "kidi/checkpoint/config.h"
 #include "kidi/inference/translator.h"
 #include "kidi/inference/generator.h"
+#include "kidi/inference/synthesizer.h"
 #include "kidi/inference/transcriber.h"
+#include "kidi/model/omnivoice.h"
+#include "kidi/model/kokoro.h"
+#include "kidi/model/registry.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/tensor/backend.h"
 
@@ -105,6 +111,64 @@ auto inspect(const std::filesystem::path& directory) -> int {
                   << "text layers: " << (*document)["model"]["num_hidden_layers"].as<int>() << '\n'
                   << "vocabulary: " << (*document)["model"]["vocab_size"].as<int>() << '\n'
                   << "default device: " << kidi::tensor::to_string(kidi::module_device) << '\n';
+        return 0;
+    }
+    if ((*document)["model"]["type"].as<std::string>() == "omnivoice") {
+        auto validation = kidi::model::OmniVoiceImpl::validate_config((*document)["model"]);
+        if (!validation) {
+            spdlog::error("{}", validation.error().message);
+            return 1;
+        }
+        auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
+        if (!weights) {
+            spdlog::error("{}", weights.error().message);
+            return 1;
+        }
+        const auto embedding = weights->tensor("llm.embed_tokens.weight");
+        if (!embedding) {
+            spdlog::error("{}", embedding.error().message);
+            return 1;
+        }
+        const auto& model = (*document)["model"];
+        std::cout << "format: " << (*document)["format_version"].as<int>() << '\n'
+                  << "task: tts\n"
+                  << "model: omnivoice\n"
+                  << "weights: " << (*document)["weights_file"].as<std::string>() << '\n'
+                  << "weight tensors: " << weights->size() << '\n'
+                  << "weight dtype: " << kidi::tensor::to_string(embedding->dtype()) << '\n'
+                  << "text layers: " << model["llm_config"]["num_hidden_layers"].as<int>() << '\n'
+                  << "text vocabulary: " << model["llm_config"]["vocab_size"].as<int>() << '\n'
+                  << "audio codebooks: " << model["num_audio_codebook"].as<int>() << '\n'
+                  << "sample rate: " << model["codec_config"]["sample_rate"].as<int>() << '\n'
+                  << "execution device: cpu\n";
+        return 0;
+    }
+    if ((*document)["model"]["type"].as<std::string>() == "kokoro") {
+        auto validation = kidi::model::KokoroImpl::validate_config((*document)["model"]);
+        if (!validation) {
+            spdlog::error("{}", validation.error().message);
+            return 1;
+        }
+        auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
+        if (!weights) {
+            spdlog::error("{}", weights.error().message);
+            return 1;
+        }
+        const auto embedding = weights->tensor("bert.module.embeddings.word_embeddings.weight");
+        if (!embedding) {
+            spdlog::error("{}", embedding.error().message);
+            return 1;
+        }
+        const auto& model = (*document)["model"];
+        std::cout << "format: " << (*document)["format_version"].as<int>() << '\n'
+                  << "task: tts\n"
+                  << "model: kokoro\n"
+                  << "weights: " << (*document)["weights_file"].as<std::string>() << '\n'
+                  << "weight tensors: " << weights->size() << '\n'
+                  << "weight dtype: " << kidi::tensor::to_string(embedding->dtype()) << '\n'
+                  << "voices: " << model["voices"].size() << '\n'
+                  << "sample rate: " << model["sample_rate"].as<int>() << '\n'
+                  << "execution device: cpu\n";
         return 0;
     }
     auto package = kidi::checkpoint::Package::load(directory);
@@ -434,7 +498,7 @@ auto generate_translation(const kidi::cli::Namespace& arguments, const std::file
 
 /// Validates the thread count and that the package holds the model family this command serves.
 auto prepare_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory,
-                     std::string_view expected_type) -> int {
+                     kidi::model::Task task) -> int {
     const auto threads = arguments.get<std::int32_t>("threads");
     if (threads <= 0) {
         spdlog::error("thread count must be positive");
@@ -447,9 +511,9 @@ auto prepare_command(const kidi::cli::Namespace& arguments, const std::filesyste
         return 1;
     }
     const auto type = (*config)["model"]["type"].as<std::string>();
-    if (type != expected_type) {
-        spdlog::error("{} expects a {} model, but this package is {}", arguments.get<std::string>("command"),
-                      expected_type, type);
+    if (!kidi::model::supports_task(type, task)) {
+        spdlog::error("{} expects a model supporting {}, but this package is {}", arguments.get<std::string>("command"),
+                      kidi::model::task_name(task), type);
         return 2;
     }
     return 0;
@@ -489,21 +553,21 @@ auto run_with_streams(const kidi::cli::Namespace& arguments,
 }
 
 auto translate_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
-    if (const auto status = prepare_command(arguments, directory, "rtg_transformer_nmt")) return status;
+    if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TRANSLATION)) return status;
     return run_with_streams(arguments, [&](std::istream& input, std::ostream& output) {
         return generate_translation(arguments, directory, input, output);
     });
 }
 
 auto generate_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
-    if (const auto status = prepare_command(arguments, directory, "gemma4_text")) return status;
+    if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TEXT_GENERATION)) return status;
     return run_with_streams(arguments, [&](std::istream& input, std::ostream& output) {
         return generate_chat(arguments, directory, input, output);
     });
 }
 
 auto chat_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
-    if (const auto status = prepare_command(arguments, directory, "gemma4_text")) return status;
+    if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TEXT_GENERATION)) return status;
     auto session = load_chat_session(arguments, directory);
     if (!session) {
         spdlog::error("{}", session.error().message);
@@ -570,6 +634,79 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
     return 0;
 }
 
+auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
+    if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TTS)) return status;
+    if (arguments.get<std::string>("backend") == "mps") {
+        spdlog::error("TTS prototype currently requires the YNNPACK backend");
+        return 2;
+    }
+    std::optional<float> duration_seconds;
+    const auto duration = arguments.get<std::string>("duration");
+    if (duration != "auto") {
+        auto seconds = kidi::inference::parse_synthesis_number(duration);
+        if (!seconds || *seconds <= 0) {
+            spdlog::error("duration must be 'auto' or a positive number of seconds");
+            return 2;
+        }
+        duration_seconds = *seconds;
+    }
+    auto voice = kidi::inference::parse_voice_attributes(arguments.get<std::vector<std::string>>("voice"));
+    if (!voice) {
+        spdlog::error("{}", voice.error().message);
+        return 2;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    auto synthesizer = kidi::inference::Synthesizer::load(directory, kidi::tensor::Device::cpu());
+    if (!synthesizer) {
+        spdlog::error("{}", synthesizer.error().message);
+        return 1;
+    }
+    const auto load_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
+    kidi::inference::SynthesisOptions options{
+        .duration_seconds = duration_seconds,
+        .language = arguments.get<std::string>("language"),
+        .voice = std::move(*voice),
+        .steps = arguments.get<std::size_t>("steps"),
+        .guidance_scale = arguments.get<float>("guidance_scale"),
+        .time_shift = arguments.get<float>("time_shift"),
+        .layer_penalty = arguments.get<float>("layer_penalty"),
+        .position_temperature = arguments.get<float>("position_temperature"),
+        .seed = arguments.get<std::uint64_t>("seed"),
+    };
+    auto result = synthesizer->synthesize(arguments.get<std::string>("text"), options);
+    if (!result) {
+        spdlog::error("{}", result.error().message);
+        return result.error().code == kidi::ErrorCode::INVALID_ARGUMENT ? 2 : 1;
+    }
+    const auto output = arguments.get<std::filesystem::path>("output");
+    auto saved = kidi::audio::save_wav(output, result->samples, result->sample_rate);
+    if (!saved) {
+        spdlog::error("{}", saved.error().message);
+        return 1;
+    }
+    if (arguments.contains("tokens_output")) {
+        const auto path = arguments.get<std::filesystem::path>("tokens_output");
+        std::ofstream tokens(path);
+        if (!tokens) {
+            spdlog::error("cannot create audio-token output: {}", path.string());
+            return 1;
+        }
+        tokens << nlohmann::json(result->tokens).dump() << '\n';
+        if (!tokens) {
+            spdlog::error("cannot write audio-token output: {}", path.string());
+            return 1;
+        }
+    }
+    if (arguments.get<bool>("profile"))
+        std::cerr << "kidi_profile|backend=ynnpack|threads=" << kidi::runtime::ynn::thread_count()
+                  << "|model_load_ns=" << load_ns << "|generation_ns=" << result->stats.generation_ns
+                  << "|decode_ns=" << result->stats.decode_ns << "|preparation_ns=" << result->stats.preparation_ns
+                  << "|audio_tokens=" << result->stats.audio_tokens << "|samples=" << result->samples.size()
+                  << "|sample_rate=" << result->sample_rate << '\n';
+    return 0;
+}
+
 } // namespace
 
 auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& resolve_model) -> int {
@@ -578,7 +715,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     spdlog::set_default_logger(std::move(logger));
     spdlog::set_pattern("[%n] [%l] %v");
     spdlog::cfg::load_env_levels();
-    kidi::cli::ArgumentParser parser("kidi", "Run translation, transcription and text generation models.");
+    kidi::cli::ArgumentParser parser("kidi", "Run translation, transcription, text generation and TTS models.");
     parser.version("kidi " + std::string(kidi::version()));
     auto& commands = parser.add_subparsers().required();
     auto& translate_parser = commands.add_parser("translate", "translate one Moses-tokenized line per input line");
@@ -591,6 +728,8 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     transcribe_parser.description(
         "Transcribe or translate speech with Whisper Tiny, Base, or Small: Hugging Face directory or GGML file with HF "
         "sidecars.");
+    auto& synthesize_parser = commands.add_parser("synthesize", "synthesize speech from text");
+    synthesize_parser.description("Synthesize a mono WAV file with a TTS model.");
     chat_parser.add_argument("--system").default_value(std::string{}).help("system instruction");
     chat_parser.add_argument("--color")
         .default_value(std::string("auto"))
@@ -598,7 +737,8 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         .help("terminal colors; auto respects NO_COLOR");
     generate_parser.add_argument("--max-active").dest("max_active").default_value<std::size_t>(4);
     generate_parser.add_argument("--queue-size").dest("queue_size").default_value<std::size_t>(64);
-    for (auto* command_parser : {&translate_parser, &generate_parser, &chat_parser, &transcribe_parser}) {
+    for (auto* command_parser :
+         {&translate_parser, &generate_parser, &chat_parser, &transcribe_parser, &synthesize_parser}) {
         command_parser->add_argument("-m", "--model")
             .type<std::filesystem::path>()
             .required()
@@ -630,6 +770,33 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         .default_value(std::string("transcribe"))
         .choices({"transcribe", "translate"});
     transcribe_parser.add_argument("--max-new-tokens").dest("max_new_tokens").default_value<std::size_t>(128);
+    synthesize_parser.add_argument("--text").required().help("text to synthesize");
+    synthesize_parser.add_argument("-o", "--out")
+        .dest("output")
+        .type<std::filesystem::path>()
+        .required()
+        .metavar("WAV")
+        .help("24 kHz mono WAV output");
+    synthesize_parser.add_argument("--language").default_value(std::string{}).metavar("NAME");
+    synthesize_parser.add_argument("--duration")
+        .default_value(std::string("auto"))
+        .metavar("auto|SECONDS")
+        .help("automatic speech-length estimate or an exact duration in seconds");
+    synthesize_parser.add_argument("--voice")
+        .action(kidi::cli::Action::APPEND)
+        .metavar("KEY=VALUE")
+        .help("repeatable model-specific voice attribute");
+    synthesize_parser.add_argument("--steps").default_value<std::size_t>(32);
+    synthesize_parser.add_argument("--guidance-scale").dest("guidance_scale").default_value(2.F);
+    synthesize_parser.add_argument("--time-shift").dest("time_shift").default_value(0.1F);
+    synthesize_parser.add_argument("--layer-penalty").dest("layer_penalty").default_value(5.F);
+    synthesize_parser.add_argument("--position-temperature").dest("position_temperature").default_value(5.F);
+    synthesize_parser.add_argument("--seed").default_value<std::uint64_t>(0);
+    synthesize_parser.add_argument("--tokens-out")
+        .dest("tokens_output")
+        .type<std::filesystem::path>()
+        .metavar("JSON")
+        .help("optional generated audio-token dump");
     for (auto* command_parser : {&generate_parser, &chat_parser}) {
         command_parser->add_argument("--cache-tokens")
             .dest("cache_tokens")
@@ -649,11 +816,15 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             .help("0: original weights; 4 or 8: load-time groupwise packing");
         command_parser->add_argument("--precision")
             .default_value(std::string("checkpoint"))
-            .choices({"checkpoint", "lowbit-parity", "checkpoint-parity", "fp32",    "bf16",    "q2a16",
-                      "i2a16",     "q4a16",          "i4a16",           "q8a16",   "i8a16",   "w8a16",
-                      "q2ae4m3",   "i2a8",           "q4ae4m3",         "i4a8",    "q8ae4m3", "i8a8",
-                      "w8a8",      "w8afp8",         "i8afp8",          "q2ae5m2", "q4ae5m2", "q8ae5m2",
-                      "w8ae5m2",   "qat-fp32"})
+            .choices({"checkpoint", "lowbit-parity", "checkpoint-parity",
+                      "fp32",       "bf16",          "q2a16",
+                      "i2a16",      "q4a16",         "i4a16",
+                      "q8a16",      "i8a16",         "w8a16",
+                      "q2ae4m3",    "i2a8",          "q4ae4m3",
+                      "i4a8",       "q8ae4m3",       "i8a8",
+                      "w8a8",       "w8afp8",        "i8afp8",
+                      "q2ae5m2",    "q4ae5m2",       "q8ae5m2",
+                      "w8ae5m2",    "qat-fp32"})
             .help("projection compute policy; explicit policies currently require a native QAT checkpoint");
         command_parser->add_argument("--kv-cache-precision")
             .dest("kv_cache_precision")
@@ -668,7 +839,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     }
 
     auto& inspect_parser = commands.add_parser("inspect", "inspect a model package");
-    inspect_parser.description("Inspect an RTG, Gemma 4, or direct Whisper model package.");
+    inspect_parser.description("Inspect an RTG, Gemma 4, OmniVoice, Kokoro, or direct Whisper model package.");
     inspect_parser.add_argument("-m", "--model")
         .type<std::filesystem::path>()
         .required()
@@ -742,6 +913,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         if (command == "generate") return generate_command(arguments, directory);
         if (command == "chat") return chat_command(arguments, directory);
         if (command == "transcribe") return transcribe_command(arguments, directory);
+        if (command == "synthesize") return synthesize_command(arguments, directory);
         throw std::logic_error("unhandled command: " + command);
     } catch (const kidi::cli::ParseError& error) {
         std::cerr << error.usage();
