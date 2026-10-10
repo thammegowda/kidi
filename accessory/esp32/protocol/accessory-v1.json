@@ -1,0 +1,162 @@
+{
+  "version": 1,
+  "pairing_uri": {
+    "scheme": "kidi",
+    "host": "pair",
+    "path": "/v1",
+    "fragment_encoding": "unpadded base64url JSON",
+    "maximum_lifetime_seconds": 900,
+    "fields": {
+      "v": "integer 1",
+      "device_id": "32 lowercase hexadecimal characters",
+      "device_public_key": "unpadded base64url SEC1 uncompressed P-256 public key",
+      "invitation": "unpadded base64url 32-byte one-time secret",
+      "expires_at": "Unix epoch seconds",
+      "ble_service": "service UUID",
+      "name": "non-empty UTF-8, maximum 64 characters"
+    }
+  },
+  "ble": {
+    "uuid_derivation": {
+      "algorithm": "UUIDv5",
+      "namespace": "DNS",
+      "namespace_uuid": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    },
+    "service": {
+      "tag": "ai.gowda.kidi.accessory.v1.service",
+      "uuid": "9a1f0dbc-a6fe-536d-94d8-5ca19ed84493"
+    },
+    "pair_request": {
+      "tag": "ai.gowda.kidi.accessory.v1.pair-request",
+      "uuid": "8e68995e-6448-552c-9376-168454089158"
+    },
+    "pair_response": {
+      "tag": "ai.gowda.kidi.accessory.v1.pair-response",
+      "uuid": "e9c06854-b576-5a5a-876d-79fa31eb1e52"
+    },
+    "status": {
+      "tag": "ai.gowda.kidi.accessory.v1.status",
+      "uuid": "d7105927-5e98-5292-8fe4-1fb2cab546b9"
+    },
+    "maximum_message_bytes": 2048,
+    "framing": "2-byte big-endian payload length followed by payload fragments",
+    "advertisement_service_data": "version byte followed by raw 16-byte device ID"
+  },
+  "pairing": {
+    "request_encoding": "UTF-8 JSON, no insignificant whitespace, fields in request_fields order",
+    "request_fields": [
+      "v",
+      "device_id",
+      "controller_id",
+      "name",
+      "nonce",
+      "proof"
+    ],
+    "controller_id": "32 lowercase hexadecimal characters",
+    "nonce": "unpadded base64url 32 bytes",
+    "request_proof": {
+      "algorithm": "HMAC-SHA256",
+      "key": "invitation secret",
+      "message": "UTF-8 kidi-pair-request-v1, NUL, UTF-8 device ID, raw controller ID, raw nonce, UTF-8 controller name"
+    },
+    "response_fields": [
+      "v",
+      "iv",
+      "ciphertext",
+      "signature"
+    ],
+    "response_encryption": {
+      "algorithm": "AES-256-GCM",
+      "key_derivation": "HKDF-SHA256(invitation secret, salt=client nonce, info=UTF-8 kidi-pair-response-v1)",
+      "iv": "12 random bytes",
+      "aad": "UTF-8 device ID followed by raw controller ID"
+    },
+    "response_signature": {
+      "algorithm": "ECDSA P-256 with SHA-256",
+      "message": "SHA-256(exact request payload) followed by IV and ciphertext"
+    },
+    "profile_fields": [
+      "v",
+      "device_id",
+      "name",
+      "host",
+      "control_port",
+      "media_port",
+      "control_certificate_sha256",
+      "media_certificate_sha256",
+      "controller_token",
+      "softap_ssid",
+      "softap_password"
+    ]
+  },
+  "controllers": {
+    "maximum": 4,
+    "maximum_active_media_sessions": 1,
+    "controller_token_bytes": 32,
+    "authorization": "Bearer <unpadded-base64url-controller-token>"
+  },
+  "network": {
+    "control_port": 61443,
+    "media_port": 54443,
+    "control_owner": "esp32-c6",
+    "media_owner": "esp32-p4"
+  },
+  "media": {
+    "photo_path": "/v1/photo",
+    "audio_path": "/v1/audio",
+    "ticket_path": "/v1/media-ticket",
+    "status_path": "/v1/status",
+    "controllers_self_path": "/v1/controllers/self",
+    "ticket_authorization": "Ticket <opaque-ticket>",
+    "ticket_maximum_bytes": 512,
+    "ticket_lifetime_seconds": 10,
+    "ticket_encoding": {
+      "outer": "unpadded base64url",
+      "byte_order": "big endian",
+      "body_bytes": 82,
+      "authenticated_bytes": 114,
+      "fields": [
+        "version: uint8",
+        "media_kind: uint8 (photo=1, audio=2)",
+        "issued_at: uint64 Unix seconds",
+        "expires_at: uint64 Unix seconds",
+        "nonce: 16 bytes",
+        "controller_id: 16 bytes",
+        "SHA-256 of exact request parameters JSON: 32 bytes",
+        "HMAC-SHA256 over all preceding ticket bytes: 32 bytes"
+      ]
+    },
+    "ticket_properties": [
+      "single use",
+      "controller bound",
+      "media-kind bound",
+      "request-parameter bound",
+      "expiry bound",
+      "HMAC-SHA256 authenticated"
+    ],
+    "photo_content_type": "image/jpeg",
+    "photo_maximum_bytes": 4194304,
+    "photo_required_headers": [
+      "Content-Length",
+      "X-Kidi-SHA256",
+      "X-Kidi-Width",
+      "X-Kidi-Height"
+    ],
+    "audio_content_type": "application/vnd.kidi.pcm16",
+    "audio_sample_rate": 16000,
+    "audio_channels": 1,
+    "audio_bits_per_sample": 16,
+    "maximum_audio_seconds": 30,
+    "audio_required_headers": [
+      "X-Kidi-Sample-Rate",
+      "X-Kidi-Channels",
+      "X-Kidi-Bits-Per-Sample"
+    ],
+    "disconnect_semantics": "closing the audio response socket stops capture"
+  },
+  "power": {
+    "c6_wakeup_gpio": 2,
+    "p4_wakeup_gpio": 6,
+    "p4_c6_reset_gpio": 54
+  }
+}

@@ -1,0 +1,8 @@
+/.pio/
+/.private/
+/.kidi.wifi.txt
+/.kidi.wifi.txt.tmp
+/backups/
+/captures/
+__pycache__/
+*.pyc

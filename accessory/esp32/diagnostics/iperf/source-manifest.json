@@ -1,0 +1,61 @@
+{
+  "repository": "https://github.com/espressif/esp-idf",
+  "release": "v5.5.1",
+  "commit": "fcae32885b0296b32044cb99ecbdc50d98dddb83",
+  "files": [
+    {
+      "file": "CMakeLists.txt",
+      "upstream_path": "examples/wifi/iperf/CMakeLists.txt",
+      "git_blob_sha1": "ee2035eb688669f99102011eaca9bdf89c23c112",
+      "sha256": "494c50731656894c7f2595fb1dc54672d20951fcc5040582a02f40fba61b7aa1"
+    },
+    {
+      "file": "README.md",
+      "upstream_path": "examples/wifi/iperf/README.md",
+      "git_blob_sha1": "baa19da3173d44feea587b3f9a49a5ac59b63739",
+      "sha256": "d0c0b0cde37997464746af6b16a5d73a1fe731810042632ac736daa66b4bd074"
+    },
+    {
+      "file": "sdkconfig.defaults",
+      "upstream_path": "examples/wifi/iperf/sdkconfig.defaults",
+      "git_blob_sha1": "3f9430a1022a99e63f0329ae6f611a166d4b35db",
+      "sha256": "2b14b89e322cf422e2efaf4d04355d76fdf7ade7a1276dbefb7c17eae22b2653"
+    },
+    {
+      "file": "sdkconfig.defaults.esp32s3",
+      "upstream_path": "examples/wifi/iperf/sdkconfig.defaults.esp32s3",
+      "git_blob_sha1": "dea1000c9bc0929eaef5f4eb26852ab49c79ddb0",
+      "sha256": "7d6d3f3047c636e2dee4119a57e10bc06ccf06b5a144335dc0c099dc36950d57"
+    },
+    {
+      "file": "main/CMakeLists.txt",
+      "upstream_path": "examples/wifi/iperf/main/CMakeLists.txt",
+      "git_blob_sha1": "156c3bfc7b6f647fa3904be1fdf20cab3850ecc5",
+      "sha256": "9a7aa96a758b4bde0377d39fd8e8482b08e09552975787cd933f428bb782ccf2"
+    },
+    {
+      "file": "main/idf_component.yml",
+      "upstream_path": "examples/wifi/iperf/main/idf_component.yml",
+      "git_blob_sha1": "4a8cf16c45f0ca8353501221b16fa8a29b216e9b",
+      "sha256": "084ca5bc268d27b93cfa92acff7e7fd73670038c74385f21860f38387bbce1c7"
+    },
+    {
+      "file": "main/iperf_example_main.c",
+      "upstream_path": "examples/wifi/iperf/main/iperf_example_main.c",
+      "git_blob_sha1": "a7fb3c36086a47198578b3e614bedf40018051cd",
+      "sha256": "23ba838811607c36e5d073aafcbe47d81b1aed072629b70fd989dfeea4c30f4b"
+    },
+    {
+      "file": "pytest_iperf.py",
+      "upstream_path": "examples/wifi/iperf/pytest_iperf.py",
+      "git_blob_sha1": "5858a4af22149d7319322b4d09af65d4b8e32719",
+      "sha256": "d4a54b6970fbde5428bdb64fb5f1878bca575f9707b950e299c6545adc729c90"
+    },
+    {
+      "file": "LICENSE",
+      "upstream_path": "LICENSE",
+      "git_blob_sha1": "d645695673349e3947e8e5ae42332d0ac3164cd7",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    }
+  ]
+}
