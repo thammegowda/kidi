@@ -112,7 +112,7 @@ void main() {
 #endif
 
 #ifdef KERNEL_GEMM
-#define ROWS 16u
+#define ROWS 8u
 layout(local_size_x = 64) in;
 
 int signExtend(uint bytes) {
@@ -141,7 +141,7 @@ int dot16(ivec4 a, ivec4 b) {
     return packedDot(a.x, b.x, 0) + packedDot(a.y, b.y, 0) + packedDot(a.z, b.z, 0) + packedDot(a.w, b.w, 0);
 }
 
-#define FOR_ROWS(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15)
+#define FOR_ROWS(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7)
 #define DECLARE(r) ivec4 acc##r = ivec4(0);
 #define UPDATE(r)                                                                \
     {                                                                            \

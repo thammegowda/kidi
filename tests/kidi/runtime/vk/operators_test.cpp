@@ -32,18 +32,18 @@ auto tensor(std::vector<std::int64_t> shape, std::span<const float> values, Devi
     return require(Tensor::from_host(std::move(shape), values, device));
 }
 
-auto integers(std::vector<std::int64_t> shape, std::span<const std::int32_t> values,
-              Device device = Device::cpu()) -> Tensor {
+auto integers(std::vector<std::int64_t> shape, std::span<const std::int32_t> values, Device device = Device::cpu())
+    -> Tensor {
     return require(Tensor::from_host(std::move(shape), values, device));
 }
 
-auto bytes(std::vector<std::int64_t> shape, std::span<const std::uint8_t> values,
-           Device device = Device::cpu()) -> Tensor {
+auto bytes(std::vector<std::int64_t> shape, std::span<const std::uint8_t> values, Device device = Device::cpu())
+    -> Tensor {
     return require(Tensor::from_host(std::move(shape), values, device));
 }
 
-auto signed_bytes(std::vector<std::int64_t> shape, std::span<const std::int8_t> values,
-                  Device device = Device::cpu()) -> Tensor {
+auto signed_bytes(std::vector<std::int64_t> shape, std::span<const std::int8_t> values, Device device = Device::cpu())
+    -> Tensor {
     return require(Tensor::from_host(std::move(shape), values, device));
 }
 
@@ -67,8 +67,8 @@ auto byte_values(const Tensor& input) -> std::vector<std::int8_t> {
     return {span.begin(), span.end()};
 }
 
-auto assert_close(std::string_view name, const Tensor& expected, const Tensor& actual,
-                  float tolerance = 2e-4F) -> void {
+auto assert_close(std::string_view name, const Tensor& expected, const Tensor& actual, float tolerance = 2e-4F)
+    -> void {
     const auto left = values(expected), right = values(actual);
     if (left.size() != right.size()) throw std::runtime_error(std::string(name) + " size mismatch");
     for (std::size_t index = 0; index < left.size(); ++index)
@@ -88,8 +88,8 @@ auto make_sequence(std::size_t count, float scale = 0.03125F) -> std::vector<flo
     return result;
 }
 
-auto packed(std::span<const std::int8_t> unpacked, std::size_t rows, std::size_t columns,
-            int bits) -> std::vector<std::uint8_t> {
+auto packed(std::span<const std::int8_t> unpacked, std::size_t rows, std::size_t columns, int bits)
+    -> std::vector<std::uint8_t> {
     const auto per_byte = static_cast<std::size_t>(8 / bits);
     const auto mask = static_cast<std::uint8_t>((1 << bits) - 1);
     std::vector<std::uint8_t> result(rows * columns / per_byte);
@@ -169,7 +169,7 @@ auto check_packed_projection(std::size_t rows, std::size_t width, std::size_t co
         unsetenv("KIDI_VULKAN_PACKED");
 }
 
-auto check_gated_feed_forward(std::size_t rows) -> void {
+auto check_gated_feed_forward(std::size_t rows, bool silu = false) -> void {
     kidi::ops::Context cpu(Device::cpu()), vk(Device::vulkan());
     constexpr std::size_t WIDTH = 256;
     constexpr std::size_t INTERMEDIATE = 256;
@@ -191,13 +191,22 @@ auto check_gated_feed_forward(std::size_t rows) -> void {
     const auto down = bytes({WIDTH, INTERMEDIATE / (8 / BITS)}, packed(down_values, WIDTH, INTERMEDIATE, BITS));
     const auto gate_scale = tensor({2 * INTERMEDIATE, 1}, gate_up_scales);
     const auto down_scale = tensor({WIDTH, 1}, down_scales);
-    assert_close(
-        "gated feed-forward",
-        cpu.gated_feed_forward(input, gate_up, gate_scale, down, down_scale, BITS, WIDTH, INTERMEDIATE, 0.125F, 0.0625F,
-                               0.03125F, 0.125F),
-        vk.gated_feed_forward(to_vulkan(input), to_vulkan(gate_up), to_vulkan(gate_scale), to_vulkan(down),
-                              to_vulkan(down_scale), BITS, WIDTH, INTERMEDIATE, 0.125F, 0.0625F, 0.03125F, 0.125F),
-        2e-4F);
+    Tensor expected;
+    if (silu) {
+        const auto projected = cpu.packed_linear(input, gate_up, gate_scale, BITS, WIDTH, 0.125F, 0.0625F);
+        const auto gate = cpu.slice(projected, -1, 0, INTERMEDIATE);
+        const auto up = cpu.slice(projected, -1, INTERMEDIATE, INTERMEDIATE);
+        expected =
+            cpu.packed_linear(cpu.silu_multiply(gate, up), down, down_scale, BITS, INTERMEDIATE, 0.03125F, 0.125F);
+    } else {
+        expected = cpu.gated_feed_forward(input, gate_up, gate_scale, down, down_scale, BITS, WIDTH, INTERMEDIATE,
+                                          0.125F, 0.0625F, 0.03125F, 0.125F);
+    }
+    assert_close("gated feed-forward", expected,
+                 vk.gated_feed_forward(to_vulkan(input), to_vulkan(gate_up), to_vulkan(gate_scale), to_vulkan(down),
+                                       to_vulkan(down_scale), BITS, WIDTH, INTERMEDIATE, 0.125F, 0.0625F, 0.03125F,
+                                       0.125F, silu),
+                 2e-4F);
 }
 
 auto check_embedding() -> void {
@@ -279,6 +288,40 @@ auto check_attention(std::size_t rows) -> void {
                  1e-4F);
 }
 
+auto check_native_attention(std::size_t rows, std::size_t batch) -> void {
+    const auto* previous = std::getenv("KIDI_VULKAN_ATTENTION");
+    const std::string saved = previous ? previous : "";
+    setenv("KIDI_VULKAN_ATTENTION", "1", 1);
+    kidi::ops::Context cpu(Device::cpu()), vk(Device::vulkan());
+    constexpr std::size_t HEADS = 2;
+    constexpr std::size_t KEY_HEADS = 1;
+    constexpr std::size_t WIDTH = 64;
+    const auto query_values = make_sequence(batch * rows * HEADS * WIDTH, 0.015625F);
+    const auto key_values = make_sequence(batch * rows * KEY_HEADS * WIDTH, 0.0125F);
+    const auto value_values = make_sequence(batch * rows * KEY_HEADS * WIDTH, 0.02F);
+    const auto query =
+        tensor({static_cast<std::int64_t>(batch), static_cast<std::int64_t>(rows), HEADS * WIDTH}, query_values);
+    const auto key =
+        tensor({static_cast<std::int64_t>(batch), static_cast<std::int64_t>(rows), KEY_HEADS * WIDTH}, key_values);
+    const auto value =
+        tensor({static_cast<std::int64_t>(batch), static_cast<std::int64_t>(rows), KEY_HEADS * WIDTH}, value_values);
+    std::vector<float> mask(batch * rows * rows, 0.F);
+    if (rows > 1)
+        for (std::size_t item = 0; item < batch; ++item)
+            for (std::size_t row = 0; row + 1 < rows; ++row) mask[(item * rows + row) * rows + rows - 1] = -1.0e9F;
+    const auto mask_tensor = tensor(
+        {static_cast<std::int64_t>(batch), 1, static_cast<std::int64_t>(rows), static_cast<std::int64_t>(rows)}, mask);
+    assert_close("native attention",
+                 cpu.grouped_query_attention(query, key, value, HEADS, KEY_HEADS, mask_tensor, 0.125F),
+                 vk.grouped_query_attention(to_vulkan(query), to_vulkan(key), to_vulkan(value), HEADS, KEY_HEADS,
+                                            to_vulkan(mask_tensor), 0.125F),
+                 2e-3F);
+    if (previous)
+        setenv("KIDI_VULKAN_ATTENTION", saved.c_str(), 1);
+    else
+        unsetenv("KIDI_VULKAN_ATTENTION");
+}
+
 auto check_indexing() -> void {
     kidi::ops::Context cpu(Device::cpu()), vk(Device::vulkan());
     const auto input_values = make_sequence(6);
@@ -335,8 +378,8 @@ auto last_row_margin(std::span<const float> logits, std::size_t vocabulary, std:
     return last_row_value(logits, vocabulary, token) - second;
 }
 
-auto compare_last_row(std::span<const float> expected, std::span<const float> actual,
-                      std::size_t vocabulary) -> std::pair<double, double> {
+auto compare_last_row(std::span<const float> expected, std::span<const float> actual, std::size_t vocabulary)
+    -> std::pair<double, double> {
     if (expected.size() < vocabulary || actual.size() < vocabulary) throw std::runtime_error("invalid logits");
     expected = expected.last(vocabulary);
     actual = actual.last(vocabulary);
@@ -448,13 +491,18 @@ auto main(int argc, char** argv) -> int {
         }
         check_packed_projection(1, 1536, 512, 4);
         check_packed_projection(1, 6144, 512, 2);
+        check_packed_projection(7, 64, 256, 8);
+        check_packed_projection(32, 64, 256, 4);
         check_gated_feed_forward(1);
         check_gated_feed_forward(32);
+        check_gated_feed_forward(32, true);
         check_embedding();
         for (const auto rows : {std::size_t{1}, std::size_t{32}}) {
             check_norm_rotary(rows);
             check_attention(rows);
         }
+        check_native_attention(7, 1);
+        check_native_attention(5, 2);
         check_indexing();
         check_selection();
         return 0;

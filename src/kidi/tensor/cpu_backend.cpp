@@ -52,6 +52,8 @@ public:
 
     CpuStorage(Device device, std::span<const std::byte> bytes, std::shared_ptr<const void> owner)
         : device_(device), size_bytes_(bytes.size()), owner_(std::move(owner)), data_(bytes.data()), writable_(false) {}
+    CpuStorage(Device device, std::span<std::byte> bytes, std::shared_ptr<void> owner)
+        : device_(device), size_bytes_(bytes.size()), owner_(std::move(owner)), data_(bytes.data()), writable_(true) {}
 
     CpuStorage(const CpuStorage&) = delete;
     auto operator=(const CpuStorage&) -> CpuStorage& = delete;
@@ -137,6 +139,17 @@ public:
     }
 
     auto wrap_host(Device device, std::span<const std::byte> bytes, std::shared_ptr<const void> owner) const
+        -> Result<std::shared_ptr<Storage>> override {
+        if (!is_available(device)) {
+            return std::unexpected(Error{ErrorCode::UNSUPPORTED, unavailable_reason(device)});
+        }
+        if (!owner && !bytes.empty()) {
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "external tensor storage requires an owner"});
+        }
+        return std::shared_ptr<Storage>(new CpuStorage(device, bytes, std::move(owner)));
+    }
+
+    auto wrap_host_mutable(Device device, std::span<std::byte> bytes, std::shared_ptr<void> owner) const
         -> Result<std::shared_ptr<Storage>> override {
         if (!is_available(device)) {
             return std::unexpected(Error{ErrorCode::UNSUPPORTED, unavailable_reason(device)});

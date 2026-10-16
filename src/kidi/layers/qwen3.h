@@ -10,7 +10,16 @@ struct Qwen3Shape {
     std::int32_t heads;
     std::int32_t key_value_heads;
     std::int32_t head_width;
+    std::int32_t packed_bits = 0;
     float epsilon;
+};
+
+struct Qwen3AttentionSegment {
+    std::size_t offset;
+    std::size_t length;
+    const Tensor* mask;
+    const Tensor* cosine;
+    const Tensor* sine;
 };
 
 KIDI_MODULE(Qwen3Attention);
@@ -19,6 +28,8 @@ public:
     explicit Qwen3AttentionImpl(Qwen3Shape shape);
     auto forward(ops::Context& context, const Tensor& input, const Tensor& mask, const Tensor& cosine,
                  const Tensor& sine) const -> Tensor;
+    auto forward(ops::Context& context, const Tensor& input, std::span<const Qwen3AttentionSegment> segments) const
+        -> Tensor;
 
 private:
     Linear qkv_, output_;
@@ -31,6 +42,8 @@ class Qwen3BlockImpl : public Module {
 public:
     explicit Qwen3BlockImpl(Qwen3Shape shape);
     auto forward(ops::Context& context, Tensor input, const Tensor& mask, const Tensor& cosine, const Tensor& sine,
+                 bool consume_input = false) const -> Tensor;
+    auto forward(ops::Context& context, Tensor input, std::span<const Qwen3AttentionSegment> segments,
                  bool consume_input = false) const -> Tensor;
 
 private:

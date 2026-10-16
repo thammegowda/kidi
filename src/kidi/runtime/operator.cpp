@@ -47,7 +47,8 @@ auto operation_name(Operation operation) -> std::string_view {
                                "silu_multiply",
                                "silu_gate",
                                "embedding",
-                               "gated_feed_forward"};
+                               "gated_feed_forward",
+                               "quantized_gated_feed_forward"};
     return names.at(static_cast<std::size_t>(operation));
 }
 

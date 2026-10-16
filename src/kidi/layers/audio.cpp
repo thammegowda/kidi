@@ -4,6 +4,8 @@
 #include <cmath>
 #include <string_view>
 
+#include "kidi/runtime/ynn/graph.h"
+
 namespace kidi::layers {
 using ops::require;
 namespace {
@@ -13,6 +15,21 @@ auto require_cpu(const Tensor& input, std::int32_t channels, std::string_view op
         input.size(0) != 1 || input.size(2) != channels)
         throw ops::Failure(
             {ErrorCode::UNSUPPORTED, std::string(operation) + " requires FP32 [1, time, channels] CPU input"});
+}
+
+template <typename Function>
+auto for_independent_ranges(std::size_t size, std::size_t work_per_item, Function&& function) -> void {
+#if defined(__ANDROID__)
+    const auto tasks = size * work_per_item < 32768 ? std::size_t{1} : std::min(runtime::ynn::thread_count(), size);
+#else
+    const auto tasks = std::size_t{1};
+#endif
+    if (tasks <= 1) return function(0, size);
+    const auto block = (size + tasks - 1) / tasks;
+    require(runtime::ynn::parallel_for(tasks, [&](std::size_t task) {
+        const auto begin = task * block;
+        if (begin < size) function(begin, std::min(begin + block, size));
+    }));
 }
 
 } // namespace
@@ -61,14 +78,17 @@ auto Conv1dImpl::forward(ops::Context& context, const Tensor& input) const -> Te
         context.synchronize();
         const auto source = require(input.data<float>());
         auto unfolded = require(columns.data<float>());
-        for (std::int64_t output = 0; output < output_length; ++output)
-            for (std::int32_t channel = 0; channel < input_channels_; ++channel)
-                for (std::int32_t kernel = 0; kernel < kernel_size_; ++kernel) {
-                    const auto position = output * stride_ - padding_ + kernel * dilation_;
-                    if (position >= 0 && position < input_length)
-                        unfolded[(output * input_channels_ + channel) * kernel_size_ + kernel] =
-                            source[position * input_channels_ + channel];
-                }
+        for_independent_ranges(output_length, input_channels_ * kernel_size_, [&](std::size_t begin, std::size_t end) {
+            for (auto output = begin; output < end; ++output)
+                for (std::int32_t channel = 0; channel < input_channels_; ++channel)
+                    for (std::int32_t kernel = 0; kernel < kernel_size_; ++kernel) {
+                        const auto position =
+                            static_cast<std::int64_t>(output) * stride_ - padding_ + kernel * dilation_;
+                        if (position >= 0 && position < input_length)
+                            unfolded[(output * input_channels_ + channel) * kernel_size_ + kernel] =
+                                source[position * input_channels_ + channel];
+                    }
+        });
     }
     if (qstate_) return context.quantized_linear(columns, weight_, qstate_->scale, bias(), true);
     return context.linear(columns, weight_, bias(), true);
@@ -124,16 +144,20 @@ auto ConvTranspose1dImpl::forward(ops::Context& context, const Tensor& input) co
     const auto offsets = require(bias().data<float>());
     auto output = require(Tensor::empty({1, output_length, output_channels_}, tensor::DType::F32));
     auto result = require(output.data<float>());
-    for (std::int64_t position = 0; position < output_length; ++position)
-        std::ranges::copy(offsets, result.begin() + position * output_channels_);
-    for (std::int64_t input_position = 0; input_position < input_length; ++input_position)
-        for (std::int32_t channel = 0; channel < output_channels_; ++channel)
-            for (std::int32_t kernel = 0; kernel < kernel_size_; ++kernel) {
-                const auto output_position = input_position * stride_ - padding_ + kernel * dilation_;
-                if (output_position >= 0 && output_position < output_length)
-                    result[output_position * output_channels_ + channel] +=
-                        projected_values[(input_position * output_channels_ + channel) * kernel_size_ + kernel];
+    for_independent_ranges(
+        output_channels_, output_length + input_length * kernel_size_, [&](std::size_t begin, std::size_t end) {
+            for (auto channel = begin; channel < end; ++channel) {
+                for (std::int64_t position = 0; position < output_length; ++position)
+                    result[position * output_channels_ + channel] = offsets[channel];
+                for (std::int64_t input_position = 0; input_position < input_length; ++input_position)
+                    for (std::int32_t kernel = 0; kernel < kernel_size_; ++kernel) {
+                        const auto output_position = input_position * stride_ - padding_ + kernel * dilation_;
+                        if (output_position >= 0 && output_position < output_length)
+                            result[output_position * output_channels_ + channel] +=
+                                projected_values[(input_position * output_channels_ + channel) * kernel_size_ + kernel];
+                    }
             }
+        });
     return output;
 }
 
@@ -161,15 +185,17 @@ auto Snake1dImpl::forward(ops::Context& context, const Tensor& input) const -> T
     const auto parameters = require(alpha().data<float>());
     auto output = require(Tensor::empty({input.shape().begin(), input.shape().end()}, tensor::DType::F32));
     auto result = require(output.data<float>());
-    for (std::size_t index = 0; index < source.size(); ++index) {
-        const auto coefficient = parameters[index % channels_];
-        if (std::abs(coefficient) < 1e-9F) {
-            result[index] = source[index];
-            continue;
+    for_independent_ranges(source.size(), 16, [&](std::size_t begin, std::size_t end) {
+        for (auto index = begin; index < end; ++index) {
+            const auto coefficient = parameters[index % channels_];
+            if (std::abs(coefficient) < 1e-9F) {
+                result[index] = source[index];
+                continue;
+            }
+            const auto sine = std::sin(coefficient * source[index]);
+            result[index] = source[index] + sine * sine / (coefficient + 1e-9F);
         }
-        const auto sine = std::sin(coefficient * source[index]);
-        result[index] = source[index] + sine * sine / (coefficient + 1e-9F);
-    }
+    });
     return output;
 }
 

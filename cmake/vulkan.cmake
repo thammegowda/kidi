@@ -4,6 +4,7 @@ set(KIDI_VULKAN_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated/vulkan")
 file(MAKE_DIRECTORY "${KIDI_VULKAN_GENERATED}")
 set(KIDI_VULKAN_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/vulkan/packed_linear.comp")
 set(KIDI_VULKAN_GELU_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/vulkan/gelu_multiply.comp")
+set(KIDI_VULKAN_ATTENTION_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/vulkan/attention.comp")
 set(KIDI_VULKAN_SPIRV_INCS)
 foreach(kind IN ITEMS gemv gemm)
     foreach(bits IN ITEMS 2 4 8)
@@ -37,6 +38,15 @@ add_custom_command(
     VERBATIM
 )
 list(APPEND KIDI_VULKAN_SPIRV_INCS "${gelu_output}")
+set(attention_output "${KIDI_VULKAN_GENERATED}/attention.inc")
+add_custom_command(
+    OUTPUT "${attention_output}"
+    COMMAND "${KIDI_VULKAN_GLSLC}" --target-env=vulkan1.3 -O -mfmt=num "${KIDI_VULKAN_ATTENTION_SHADER}"
+            -o "${attention_output}"
+    DEPENDS "${KIDI_VULKAN_ATTENTION_SHADER}"
+    VERBATIM
+)
+list(APPEND KIDI_VULKAN_SPIRV_INCS "${attention_output}")
 
 target_sources(kidi PRIVATE
     src/kidi/tensor/vulkan_backend.cpp

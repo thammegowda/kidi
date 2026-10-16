@@ -225,8 +225,8 @@ public:
     explicit BackgroundCompiler(bool fail) : fail_(fail) {}
     auto name() const -> std::string_view override { return "background-test"; }
     auto compiles_in_background() const -> bool override { return true; }
-    auto compile(const kidi::graph::Graph& graph,
-                 std::string_view) -> std::unique_ptr<kidi::runtime::StepExecutable> override {
+    auto compile(const kidi::graph::Graph& graph, std::string_view)
+        -> std::unique_ptr<kidi::runtime::StepExecutable> override {
         ++compiles;
         released_.wait();
         ++completed;
@@ -247,8 +247,9 @@ class SingleCaptureCompiler final : public kidi::runtime::StepCompiler {
 public:
     auto name() const -> std::string_view override { return "single-capture-test"; }
     auto requires_second_capture(std::string_view) const -> bool override { return false; }
-    auto compile(const kidi::graph::Graph& graph,
-                 std::string_view) -> std::unique_ptr<kidi::runtime::StepExecutable> override {
+    auto captures_prefill() const -> bool override { return true; }
+    auto compile(const kidi::graph::Graph& graph, std::string_view)
+        -> std::unique_ptr<kidi::runtime::StepExecutable> override {
         ++compiles;
         if (graph.nodes().empty())
             throw kidi::ops::Failure({kidi::core::ErrorCode::UNSUPPORTED, "empty single-capture test graph"});
@@ -276,6 +277,19 @@ auto single_capture_compiles_and_rebinds_inputs() -> bool {
            expect(captures == 1, "a single-capture compiler runs the step body once") &&
            expect(compiler->compiles == 1 && compiler->runs == 1,
                   "a single-capture compiler compiles once and executes on the next call");
+}
+
+auto attached_accelerator_enables_replay() -> bool {
+    auto compiler = std::make_shared<SingleCaptureCompiler>();
+    const kidi::ops::StepCompilerScope scope(compiler);
+    Context context(kidi::tensor::Device::cpu(), false, false);
+    auto input = tensor({2}, {1, 2});
+    const auto step = [&](std::span<const Tensor> inputs) { return std::vector{context.add(inputs[0], inputs[0])}; };
+    (void)context.replay("accelerated", std::array{input}, step);
+    (void)context.replay("accelerated", std::array{input}, step);
+    return expect(context.replay_enabled(), "an attached whole-step accelerator enables capture") &&
+           expect(compiler->compiles == 1 && compiler->runs == 1,
+                  "the attached whole-step accelerator compiles and replays");
 }
 
 auto background_compilation_hands_over_from_cpu_replay(bool fail) -> bool {
@@ -323,6 +337,8 @@ auto pending_background_compilation_does_not_block_eviction() -> bool {
 }
 
 auto disabled_replay_runs_eagerly() -> bool {
+    auto compiler = std::make_shared<SingleCaptureCompiler>();
+    const kidi::ops::StepCompilerScope scope(compiler);
     setenv("KIDI_REPLAY", "0", 1);
     Context context;
     unsetenv("KIDI_REPLAY");
@@ -333,7 +349,29 @@ auto disabled_replay_runs_eagerly() -> bool {
             ++calls;
             return std::vector{context.add(inputs[0], inputs[0])};
         });
-    return expect(!context.replay_enabled() && calls == 3, "KIDI_REPLAY=0 runs the step eagerly every call");
+    return expect(!context.replay_enabled() && calls == 3 && compiler->compiles == 0,
+                  "KIDI_REPLAY=0 runs the step eagerly even with an attached accelerator");
+}
+
+auto bounded_replay_cache_evicts_old_shapes() -> bool {
+    setenv("KIDI_REPLAY_CAPACITY", "1", 1);
+    Context context;
+    unsetenv("KIDI_REPLAY_CAPACITY");
+    auto input = tensor({2}, {1, 2});
+    int first_calls = 0, second_calls = 0;
+    const auto replay = [&](std::string_view key, int& calls) {
+        return context.replay(key, std::array{input}, [&](std::span<const Tensor> inputs) {
+            ++calls;
+            return std::vector{context.add(inputs[0], inputs[0])};
+        });
+    };
+    (void)replay("first", first_calls);
+    (void)replay("first", first_calls);
+    (void)replay("second", second_calls);
+    (void)replay("second", second_calls);
+    (void)replay("first", first_calls);
+    return expect(first_calls == 3 && second_calls == 2,
+                  "a bounded replay cache recaptures the least-recently-used shape");
 }
 } // namespace
 
@@ -341,8 +379,9 @@ auto main() -> int {
     try {
         return replay_matches_eager() && replay_rebinds_inputs_and_views() && replay_updates_state_in_place() &&
                        replay_supports_paired_and_selection_outputs() && capture_rejects_per_call_host_values() &&
-                       least_recently_used_steps_are_recaptured() && disabled_replay_runs_eagerly() &&
-                       single_capture_compiles_and_rebinds_inputs() &&
+                       least_recently_used_steps_are_recaptured() && bounded_replay_cache_evicts_old_shapes() &&
+                       disabled_replay_runs_eagerly() && single_capture_compiles_and_rebinds_inputs() &&
+                       attached_accelerator_enables_replay() &&
                        background_compilation_hands_over_from_cpu_replay(false) &&
                        background_compilation_hands_over_from_cpu_replay(true) &&
                        pending_background_compilation_does_not_block_eviction()

@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
+#include <string_view>
 
 namespace kidi::layers {
 using ops::require;
@@ -58,6 +60,13 @@ auto RmsNormImpl::forward(ops::Context& context, const Tensor& input) const -> T
 auto RmsNormImpl::forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
                                  const Tensor& sine) const -> Tensor {
     return context.rms_rotary(input, weight(), cosine, sine, epsilon_);
+}
+auto RmsNormImpl::forward_rotary_slice(ops::Context& context, const Tensor& input, const Tensor& cosine,
+                                       const Tensor& sine, std::int64_t heads, std::int64_t width,
+                                       std::int64_t channel_offset, std::int64_t sequence_offset,
+                                       std::int64_t sequence_length) const -> Tensor {
+    return context.rms_rotary_slice(input, weight(), cosine, sine, epsilon_, heads, width, channel_offset,
+                                    sequence_offset, sequence_length);
 }
 auto RmsNormImpl::forward_axial_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
                                        const Tensor& sine) const -> Tensor {
@@ -168,6 +177,14 @@ GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t int
     register_module("down_proj", down_);
 }
 auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
+#if defined(__ANDROID__)
+    const auto* fused = std::getenv("KIDI_YNN_FUSED_QFFN");
+    if (activation_ == GatedActivation::SILU && context.device() == tensor::Device::cpu() && gate_up_->qstate_ &&
+        down_->qstate_ && fused && std::string_view(fused) == "1")
+        return context.quantized_gated_feed_forward(input, gate_up_->weight_, gate_up_->qstate_->scale,
+                                                    gate_up_->bias(), down_->weight_, down_->qstate_->scale,
+                                                    down_->bias());
+#endif
     const auto rows = input.numel() / input.size(-1);
     const bool web_fusion = context.device() == tensor::Device::web_gpu() && rows < 4 &&
                             gate_up_->input_size_ % 128 == 0 && down_->input_size_ % 32 == 0;
@@ -175,8 +192,11 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
                             context.device() == tensor::Device::vulkan();
     const bool metal_fusion = tensor::DEVICE_CAPABILITIES[context.device().kind].fused_packed_feed_forward &&
                               rows >= 4 && gate_up_->packed_bits_ == 8;
-    if (activation_ == GatedActivation::GELU && ((cpu_fusion && rows >= 32) || web_fusion || metal_fusion) &&
-        gate_up_->packed_bits_ && gate_up_->packed_bits_ == down_->packed_bits_) {
+    const bool fused_gelu =
+        activation_ == GatedActivation::GELU && ((cpu_fusion && rows >= 32) || web_fusion || metal_fusion);
+    const bool fused_silu =
+        activation_ == GatedActivation::SILU && context.device() == tensor::Device::vulkan() && rows >= 4;
+    if ((fused_gelu || fused_silu) && gate_up_->packed_bits_ && gate_up_->packed_bits_ == down_->packed_bits_) {
         const Tensor& gate_input = gate_up_->input_scale_;
         const Tensor& gate_output = gate_up_->output_scale_;
         const Tensor& down_input = down_->input_scale_;
@@ -186,22 +206,20 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
         const auto down_input_scale = require(down_input.data<float>())[0];
         const auto down_output_scale = require(down_output.data<float>())[0];
         if (gate_input_scale > 0 && gate_output_scale > 0 && down_input_scale > 0 && down_output_scale > 0) {
-            const auto output = context.gated_feed_forward(input, gate_up_->weight_, gate_up_->packed_scale_,
-                                                           down_->weight_, down_->packed_scale_, gate_up_->packed_bits_,
-                                                           gate_up_->input_size_, down_->input_size_, gate_input_scale,
-                                                           gate_output_scale, down_input_scale, down_output_scale);
+            const auto output = context.gated_feed_forward(
+                input, gate_up_->weight_, gate_up_->packed_scale_, down_->weight_, down_->packed_scale_,
+                gate_up_->packed_bits_, gate_up_->input_size_, down_->input_size_, gate_input_scale, gate_output_scale,
+                down_input_scale, down_output_scale, fused_silu);
             return output;
         }
         if (!web_fusion)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "fused feed-forward requires positive trained scales"});
     }
-#if defined(__APPLE__)
     if (activation_ == GatedActivation::SILU &&
         (context.device() == tensor::Device::cpu() || context.device() == tensor::Device::apple_gpu())) {
         const auto projected = gate_up_->forward(context, input);
         return down_->forward(context, context.silu_gate(projected));
     }
-#endif
     return forward_stages(context, input).output;
 }
 auto GatedFeedForwardImpl::forward_stages(ops::Context& context, const Tensor& input) const -> GatedFeedForwardStages {

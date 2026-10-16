@@ -2,9 +2,11 @@
 #include <charconv>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -36,6 +38,15 @@ auto elapsed(std::chrono::steady_clock::time_point start) -> std::uint64_t {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
 }
 
+auto token_hash(std::span<const std::int32_t> tokens) -> std::uint64_t {
+    std::uint64_t result = 1469598103934665603ULL;
+    for (const auto token : tokens) {
+        result ^= static_cast<std::uint32_t>(token);
+        result *= 1099511628211ULL;
+    }
+    return result;
+}
+
 auto text_chunks(std::string_view argument) -> std::vector<std::string> {
     if (!argument.starts_with('@')) return {std::string(argument)};
     std::ifstream input(std::filesystem::path(argument.substr(1)), std::ios::binary);
@@ -48,8 +59,8 @@ auto text_chunks(std::string_view argument) -> std::vector<std::string> {
 } // namespace
 
 auto main(int argc, char** argv) -> int {
-    if (argc < 2 || argc > 6) {
-        std::cerr << "usage: kidi_tts_bench MODEL [cpu|mps|vulkan] [REPETITIONS] [THREADS] [TEXT|@FILE]\n";
+    if (argc < 2 || argc > 7) {
+        std::cerr << "usage: kidi_tts_bench MODEL [cpu|mps|vulkan|npu] [REPETITIONS] [THREADS] [TEXT|@FILE] [STEPS]\n";
         return 2;
     }
     try {
@@ -58,11 +69,14 @@ auto main(int argc, char** argv) -> int {
         const auto device = backend == "cpu"      ? kidi::tensor::Device::cpu()
                             : backend == "mps"    ? kidi::tensor::Device::apple_gpu()
                             : backend == "vulkan" ? kidi::tensor::Device::vulkan()
-                                                  : throw std::invalid_argument("backend must be cpu, mps, or vulkan");
+                            : backend == "npu"
+                                ? kidi::tensor::Device::qualcomm_npu()
+                                : throw std::invalid_argument("backend must be cpu, mps, vulkan, or npu");
         const auto repetitions = argc >= 4 ? nonnegative_integer(argv[3], "repetitions") : 3;
         const auto available = std::max(1U, std::thread::hardware_concurrency());
         const auto threads = argc >= 5 ? positive_integer(argv[4], "threads") : std::min<std::size_t>(4, available);
         const auto chunks = text_chunks(argc >= 6 ? argv[5] : "Hello from Kidi.");
+        const auto steps = argc >= 7 ? positive_integer(argv[6], "steps") : 32;
         kidi::runtime::ynn::set_thread_count(threads);
 
         const auto load_start = std::chrono::steady_clock::now();
@@ -93,6 +107,7 @@ auto main(int argc, char** argv) -> int {
         for (std::size_t repetition = 0; repetition < repetitions; ++repetition) {
             kidi::inference::SynthesisOptions options;
             options.language = "English";
+            options.steps = steps;
             const auto start = std::chrono::steady_clock::now();
             std::vector<std::int32_t> tokens;
             std::uint64_t generation_ns = 0, decode_ns = 0, preparation_ns = 0;
@@ -120,11 +135,22 @@ auto main(int argc, char** argv) -> int {
                 reference = tokens;
             else if (tokens != reference)
                 throw std::runtime_error("repeated deterministic synthesis changed audio tokens");
+            if (repetition == 0) {
+                if (const auto* output = std::getenv("KIDI_TTS_TOKENS_OUT"); output && *output) {
+                    std::ofstream stream(output);
+                    if (!stream) throw std::runtime_error("cannot create token output: " + std::string(output));
+                    for (std::size_t index = 0; index < tokens.size(); ++index)
+                        stream << (index ? "," : "") << tokens[index];
+                    stream << '\n';
+                    if (!stream) throw std::runtime_error("cannot write token output: " + std::string(output));
+                }
+            }
             std::cout << "kidi_tts_bench|backend=" << synthesizer->execution() << "|threads=" << threads
-                      << "|repetition=" << repetition << "|chunks=" << synthesized_chunks << "|load_ns=" << load_ns
-                      << "|total_ns=" << total_ns << "|generation_ns=" << generation_ns << "|decode_ns=" << decode_ns
-                      << "|preparation_ns=" << preparation_ns << "|audio_tokens=" << audio_tokens
-                      << "|samples=" << samples << "|sample_rate=" << sample_rate << '\n';
+                      << "|steps=" << steps << "|repetition=" << repetition << "|chunks=" << synthesized_chunks
+                      << "|load_ns=" << load_ns << "|total_ns=" << total_ns << "|generation_ns=" << generation_ns
+                      << "|decode_ns=" << decode_ns << "|preparation_ns=" << preparation_ns
+                      << "|audio_tokens=" << audio_tokens << "|samples=" << samples << "|sample_rate=" << sample_rate
+                      << "|token_hash=" << token_hash(tokens) << '\n';
         }
         return 0;
     } catch (const std::exception& error) {

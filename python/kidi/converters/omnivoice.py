@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -49,6 +50,21 @@ def _store_weight(output: dict[str, torch.Tensor], name: str, value: torch.Tenso
     output[_weight_scale_name(name)] = scale
 
 
+def _store_calibrated_weight(
+    output: dict[str, torch.Tensor],
+    name: str,
+    value: torch.Tensor,
+    input_scale: float,
+    output_scale: float,
+) -> None:
+    quantized, scale = _row_quantize(value)
+    prefix = name.removesuffix(".weight")
+    output[name] = quantized.view(torch.uint8).contiguous()
+    output[prefix + ".weight_scale"] = scale
+    output[prefix + ".input_activation_scale"] = torch.tensor(input_scale, dtype=torch.float32)
+    output[prefix + ".output_activation_scale"] = torch.tensor(output_scale, dtype=torch.float32)
+
+
 def _store_vector(
     output: dict[str, torch.Tensor],
     name: str,
@@ -60,26 +76,57 @@ def _store_vector(
     output[scale_name] = scale
 
 
-def _convert_generator(source: Path, output: dict[str, torch.Tensor]) -> None:
+def _projection_scales(
+    activation_quantization: dict,
+    layer: int,
+    input_edge: str,
+    output_edge: str,
+) -> tuple[float, float]:
+    edges = activation_quantization["edge_order"]
+    scales = activation_quantization["scales"][layer]
+    input_index, output_index = edges.index(input_edge), edges.index(output_edge)
+    return max(bucket[input_index] for bucket in scales), max(bucket[output_index] for bucket in scales)
+
+
+def _convert_generator(
+    source: Path,
+    output: dict[str, torch.Tensor],
+    activation_quantization: dict | None = None,
+) -> None:
+    def store(name: str, value: torch.Tensor, input_edge: str | None = None, output_edge: str | None = None) -> None:
+        match = re.search(r"\.layers\.(\d+)\.", name)
+        if activation_quantization is None or match is None or input_edge is None or output_edge is None:
+            _store_weight(output, name, value)
+            return
+        input_scale, output_scale = _projection_scales(
+            activation_quantization,
+            int(match[1]),
+            input_edge,
+            output_edge,
+        )
+        _store_calibrated_weight(output, name, value, input_scale, output_scale)
+
     with safe_open(source / "model.safetensors", framework="pt", device="cpu") as checkpoint:
         consumed: set[str] = {"codebook_layer_offsets"}
         for name in checkpoint.keys():
             if name.endswith(".self_attn.q_proj.weight"):
                 prefix = name.removesuffix("q_proj.weight")
                 sources = [prefix + projection for projection in ("q_proj.weight", "k_proj.weight", "v_proj.weight")]
-                _store_weight(
-                    output,
+                store(
                     prefix + "qkv_proj.weight",
                     torch.cat([checkpoint.get_tensor(source) for source in sources], dim=0),
+                    "attention_norm",
+                    "qkv",
                 )
                 consumed.update(sources)
             elif name.endswith(".mlp.gate_proj.weight"):
                 prefix = name.removesuffix("gate_proj.weight")
                 sources = [prefix + projection for projection in ("gate_proj.weight", "up_proj.weight")]
-                _store_weight(
-                    output,
+                store(
                     prefix + "gate_up_proj.weight",
                     torch.cat([checkpoint.get_tensor(source) for source in sources], dim=0),
+                    "ffn_norm",
+                    "gate_up",
                 )
                 consumed.update(sources)
         for name in checkpoint.keys():
@@ -88,7 +135,12 @@ def _convert_generator(source: Path, output: dict[str, torch.Tensor]) -> None:
             value = checkpoint.get_tensor(name)
             if not name.endswith(".weight"):
                 raise ValueError(f"Unexpected OmniVoice generator tensor: {name}")
-            _store_weight(output, name, value)
+            if name.endswith(".self_attn.o_proj.weight"):
+                store(name, value, "attention_output", "attention_residual")
+            elif name.endswith(".mlp.down_proj.weight"):
+                store(name, value, "ffn_hidden", "ffn_residual")
+            else:
+                _store_weight(output, name, value)
 
 
 def _convert_audio_decoder(source: Path, output: dict[str, torch.Tensor], codebooks: int) -> None:
@@ -145,6 +197,64 @@ def _convert_audio_decoder(source: Path, output: dict[str, torch.Tensor], codebo
                 _store_weight(output, destination, value)
             else:
                 raise ValueError(f"Unexpected acoustic decoder tensor: {name}")
+
+
+def _activation_quantization(path: Path, layers: int, percentile: str) -> dict:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("format_version") != 1:
+        raise ValueError("Unsupported activation calibration format")
+    statistic = {
+        "max": "symmetric_int8_scale",
+        "p99": "symmetric_int8_scale_p99",
+        "p99.9": "symmetric_int8_scale_p99_9",
+        "p99.99": "symmetric_int8_scale_p99_99",
+    }[percentile]
+    buckets = ["early", "middle", "late"]
+    edges = [
+        "attention_norm",
+        "qkv",
+        "attention_output",
+        "attention_residual",
+        "ffn_norm",
+        "gate_up",
+        "ffn_hidden",
+        "ffn_residual",
+    ]
+    calibrated = document.get("layers", {})
+    if len(calibrated) != layers:
+        raise ValueError(f"Activation calibration has {len(calibrated)} layers, expected {layers}")
+    scales = []
+    for layer in range(layers):
+        found = calibrated.get(str(layer))
+        if not isinstance(found, dict):
+            raise ValueError(f"Activation calibration is missing layer {layer}")
+        layer_scales = []
+        for bucket in buckets:
+            bucket_scales = []
+            for edge in edges:
+                try:
+                    value = float(found[edge][bucket][statistic])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError(f"Activation calibration is missing {edge}/{bucket} in layer {layer}") from error
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"Activation calibration has invalid {edge}/{bucket} scale in layer {layer}")
+                bucket_scales.append(value)
+            layer_scales.append(bucket_scales)
+        scales.append(layer_scales)
+    return {
+        "format": "signed-int8",
+        "scheme": "symmetric-per-tensor",
+        "percentile": percentile,
+        "bucket_order": buckets,
+        "edge_order": edges,
+        "scales": scales,
+        "calibration": {
+            key: document.get(key)
+            for key in ("model", "dtype", "steps", "guidance_scale", "language", "instruction", "samples")
+        },
+        "packed_bits": 8,
+        "runtime_scale_policy": "maximum-across-diffusion-buckets",
+    }
 
 
 def _model_document(source: Path, license_files: list[str] | None = None) -> dict:
@@ -235,7 +345,14 @@ def _model_document(source: Path, license_files: list[str] | None = None) -> dic
     }
 
 
-def convert(source: Path, destination: Path, *, force: bool = False) -> Path:
+def convert(
+    source: Path,
+    destination: Path,
+    *,
+    force: bool = False,
+    activation_calibration: Path | None = None,
+    activation_percentile: str = "p99.99",
+) -> Path:
     source = source.expanduser().resolve()
     destination = destination.expanduser().resolve()
     required = (
@@ -277,14 +394,26 @@ Sources:
         {"HIGGS-AUDIO-2-LICENSE.txt": source / "audio_tokenizer" / "LICENSE"},
     )
     document = _model_document(source, license_files)
+    activation_quantization = None
+    if activation_calibration is not None:
+        activation_calibration = activation_calibration.expanduser().resolve()
+        if not activation_calibration.is_file():
+            raise ValueError(f"Activation calibration does not exist: {activation_calibration}")
+        layers = document["model"]["llm_config"]["num_hidden_layers"]
+        activation_quantization = _activation_quantization(
+            activation_calibration,
+            layers,
+            activation_percentile,
+        )
+        document["model"]["llm_config"]["activation_quantization"] = activation_quantization
     tensors: dict[str, torch.Tensor] = {}
-    _convert_generator(source, tensors)
+    _convert_generator(source, tensors, activation_quantization)
     _convert_audio_decoder(source, tensors, document["model"]["num_audio_codebook"])
     for name, value in tensors.items():
         if name.endswith(".scale") or name.endswith("_scale"):
             if value.dtype != torch.float32:
                 raise ValueError(f"Quantization scale is not FP32: {name}")
-        elif value.dtype != torch.int8:
+        elif value.dtype not in (torch.int8, torch.uint8):
             raise ValueError(f"Retained parameter is not INT8: {name}")
 
     temporary = None
@@ -325,6 +454,8 @@ Sources:
             for name, value in tensors.items()
             if not (name.endswith(".scale") or name.endswith("_scale"))
         ),
+        "activation_calibration": str(activation_calibration) if activation_calibration is not None else None,
+        "activation_percentile": activation_percentile if activation_calibration is not None else None,
     }
     (destination / "conversion.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return destination
@@ -335,8 +466,23 @@ def main() -> None:
     parser.add_argument("source", type=Path, help="downloaded k2-fsa/OmniVoice snapshot")
     parser.add_argument("destination", type=Path, help="output Kidi package directory")
     parser.add_argument("--force", action="store_true", help="replace generated files in a nonempty destination")
+    parser.add_argument("--activation-calibration", type=Path, help="JSON produced by calibrate_omnivoice.py")
+    parser.add_argument(
+        "--activation-percentile",
+        choices=("max", "p99", "p99.9", "p99.99"),
+        default="p99.99",
+        help="calibration clipping percentile",
+    )
     args = parser.parse_args()
-    print(convert(args.source, args.destination, force=args.force))
+    print(
+        convert(
+            args.source,
+            args.destination,
+            force=args.force,
+            activation_calibration=args.activation_calibration,
+            activation_percentile=args.activation_percentile,
+        )
+    )
 
 
 if __name__ == "__main__":

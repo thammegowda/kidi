@@ -126,6 +126,8 @@ public:
                            Device device = Device::cpu()) -> Result<Tensor>;
     static auto from_blob(std::vector<std::int64_t> shape, DType dtype, std::span<const std::byte> bytes,
                           std::shared_ptr<const void> owner) -> Result<Tensor>;
+    static auto from_mutable_blob(std::vector<std::int64_t> shape, DType dtype, std::span<std::byte> bytes,
+                                  std::shared_ptr<void> owner) -> Result<Tensor>;
 
     template <typename Value>
     static auto from_host(std::vector<std::int64_t> shape, std::span<const Value> values, Device device = Device::cpu())

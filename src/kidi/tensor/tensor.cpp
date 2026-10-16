@@ -306,4 +306,20 @@ auto Tensor::from_blob(std::vector<std::int64_t> shape, DType dtype, std::span<c
     return Tensor(std::move(*backend), std::move(*storage), dtype, std::move(shape), std::move(strides), 0);
 }
 
+auto Tensor::from_mutable_blob(std::vector<std::int64_t> shape, DType dtype, std::span<std::byte> bytes,
+                               std::shared_ptr<void> owner) -> Result<Tensor> {
+    auto expected = checked_nbytes(shape, dtype);
+    if (!expected) return std::unexpected(std::move(expected.error()));
+    if (bytes.size() != *expected) {
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT, "mutable host blob byte count does not match tensor shape and dtype"});
+    }
+    auto backend = BackendRegistry::instance().backend(Device::cpu());
+    if (!backend) return std::unexpected(std::move(backend.error()));
+    auto storage = (*backend)->wrap_host_mutable(Device::cpu(), bytes, std::move(owner));
+    if (!storage) return std::unexpected(std::move(storage.error()));
+    auto strides = contiguous_strides(shape);
+    return Tensor(std::move(*backend), std::move(*storage), dtype, std::move(shape), std::move(strides), 0);
+}
+
 } // namespace kidi::tensor

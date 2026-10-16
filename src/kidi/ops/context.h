@@ -71,7 +71,8 @@ public:
     /// One fixed-shape step body: ordinary eager operations over `inputs`, returning the step outputs.
     using Step = std::function<std::vector<Tensor>(std::span<const Tensor> inputs)>;
 
-    explicit Context(tensor::Device device = tensor::Device::cpu(), bool packed_prefill = false);
+    explicit Context(tensor::Device device = tensor::Device::cpu(), bool packed_prefill = false,
+                     std::optional<bool> replay_enabled = std::nullopt);
     ~Context();
     Context(Context&&) noexcept;
     auto operator=(Context&&) noexcept -> Context&;
@@ -133,7 +134,11 @@ public:
     auto gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
                             const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
                             std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
-                            float gate_up_output_scale, float down_input_scale, float down_output_scale) -> Tensor;
+                            float gate_up_output_scale, float down_input_scale, float down_output_scale,
+                            bool silu = false) -> Tensor;
+    auto quantized_gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
+                                      const Tensor& gate_up_bias, const Tensor& down_weight, const Tensor& down_scales,
+                                      const Tensor& down_bias) -> Tensor;
     auto gelu_(Tensor& input, bool approximate = false) -> Tensor&;
     auto tanh(const Tensor& input) -> Tensor;
     auto static_round(const Tensor& input, float scale) -> Tensor;
@@ -143,6 +148,9 @@ public:
     auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
     auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine, float epsilon)
         -> Tensor;
+    auto rms_rotary_slice(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
+                          float epsilon, std::int64_t heads, std::int64_t width, std::int64_t channel_offset,
+                          std::int64_t sequence_offset, std::int64_t sequence_length) -> Tensor;
     auto rms_axial_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
                           float epsilon) -> Tensor;
     auto rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,

@@ -16,6 +16,45 @@ import kidi
 
 
 class HubCliTest(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires kidi[convert]")
+    def test_omnivoice_activation_calibration(self):
+        from kidi.converters.omnivoice import _activation_quantization
+
+        edges = (
+            "attention_norm",
+            "qkv",
+            "attention_output",
+            "attention_residual",
+            "ffn_norm",
+            "gate_up",
+            "ffn_hidden",
+            "ffn_residual",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "calibration.json"
+            layers = {}
+            for layer in range(2):
+                layers[str(layer)] = {
+                    edge: {
+                        bucket: {
+                            "symmetric_int8_scale": 1.0,
+                            "symmetric_int8_scale_p99": 0.9,
+                            "symmetric_int8_scale_p99_9": 0.8,
+                            "symmetric_int8_scale_p99_99": 0.7 + layer / 10,
+                        }
+                        for bucket in ("early", "middle", "late")
+                    }
+                    for edge in edges
+                }
+            path.write_text(json.dumps({"format_version": 1, "layers": layers}))
+            result = _activation_quantization(path, 2, "p99.99")
+            self.assertEqual(result["bucket_order"], ["early", "middle", "late"])
+            self.assertEqual(result["edge_order"], list(edges))
+            self.assertEqual(result["scales"][0][0][0], 0.7)
+            self.assertAlmostEqual(result["scales"][1][2][-1], 0.8)
+            with self.assertRaisesRegex(ValueError, "expected 3"):
+                _activation_quantization(path, 3, "p99.99")
+
     def test_resolution_only_after_valid_arguments(self):
         with patch("kidi.hub.resolve") as resolve:
             self.assertEqual(kidi.main(["chat", "--help", "-m", "@google/example"]), 0)

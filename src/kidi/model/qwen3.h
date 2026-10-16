@@ -20,6 +20,8 @@ public:
     auto forward(ops::Context& context, const tensor::Tensor& embeddings) const -> tensor::Tensor;
     auto forward(ops::Context& context, const tensor::Tensor& embeddings, const tensor::Tensor& mask) const
         -> tensor::Tensor;
+    auto forward_segmented(ops::Context& context, const tensor::Tensor& embeddings,
+                           std::span<const std::size_t> segment_lengths) const -> tensor::Tensor;
     auto hidden_size() const noexcept -> std::int32_t { return hidden_; }
     auto vocabulary_size() const noexcept -> std::int32_t { return vocabulary_; }
     auto maximum_position() const noexcept -> std::int32_t { return maximum_position_; }

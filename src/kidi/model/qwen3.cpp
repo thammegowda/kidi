@@ -1,6 +1,7 @@
 #include "kidi/model/qwen3.h"
 
 #include <cmath>
+#include <numeric>
 
 namespace kidi::model {
 using ops::require;
@@ -20,9 +21,11 @@ auto Qwen3Impl::validate_config(const YAML::Node& config) -> Result<void> {
         const auto maximum = config["max_position_embeddings"].as<std::int32_t>();
         const auto epsilon = config["rms_norm_eps"].as<float>();
         const auto theta = config["rope_parameters"]["rope_theta"].as<float>();
+        const auto packed_bits =
+            config["activation_quantization"] ? config["activation_quantization"]["packed_bits"].as<std::int32_t>() : 0;
         if (vocabulary <= 0 || hidden <= 0 || intermediate <= 0 || layers <= 0 || heads <= 0 || key_heads <= 0 ||
             heads % key_heads || head_width <= 0 || head_width % 2 || maximum <= 0 || !std::isfinite(epsilon) ||
-            epsilon <= 0 || !std::isfinite(theta) || theta <= 0)
+            epsilon <= 0 || !std::isfinite(theta) || theta <= 0 || (packed_bits != 0 && packed_bits != 8))
             return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "invalid Qwen3 dimensions"});
         for (const auto& layer : config["layer_types"])
             if (layer.as<std::string>() != "full_attention")
@@ -57,6 +60,8 @@ Qwen3Impl::Qwen3Impl(const YAML::Node& config)
         .heads = heads_,
         .key_value_heads = key_value_heads_,
         .head_width = head_width_,
+        .packed_bits =
+            config["activation_quantization"] ? config["activation_quantization"]["packed_bits"].as<std::int32_t>() : 0,
         .epsilon = config["rms_norm_eps"].as<float>(),
     };
     for (std::int32_t index = 0; index < layers_; ++index) blocks_->push_back(layers::Qwen3Block(shape));
@@ -144,6 +149,43 @@ auto Qwen3Impl::forward(ops::Context& context, const tensor::Tensor& embeddings,
             for (const auto& block : *blocks_) {
                 hidden =
                     block->forward(context, std::move(hidden), operands[1], attention.cosine, attention.sine, consume);
+                consume = true;
+            }
+            return std::vector{norm_->forward(context, hidden)};
+        },
+        false);
+    return outputs.front();
+}
+
+auto Qwen3Impl::forward_segmented(ops::Context& context, const tensor::Tensor& embeddings,
+                                  std::span<const std::size_t> segment_lengths) const -> tensor::Tensor {
+    if (embeddings.dtype() != tensor::DType::F32 || embeddings.device() != context.device() ||
+        embeddings.dimensions() != 3 || embeddings.size(0) != 1 || embeddings.size(2) != hidden_ ||
+        segment_lengths.empty() ||
+        std::ranges::any_of(
+            segment_lengths,
+            [&](auto length) { return !length || length > static_cast<std::size_t>(maximum_position_); }) ||
+        std::accumulate(segment_lengths.begin(), segment_lengths.end(), std::size_t{0}) != embeddings.size(1))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Qwen3 segmented input dimensions are invalid"});
+
+    std::vector<layers::Qwen3AttentionSegment> segments;
+    segments.reserve(segment_lengths.size());
+    std::size_t offset = 0;
+    std::string key = "qwen3-segmented:1";
+    for (const auto length : segment_lengths) {
+        const auto& attention = prepare_attention(length);
+        segments.push_back({offset, length, &attention.mask, &attention.cosine, &attention.sine});
+        offset += length;
+        key += ':' + std::to_string(length);
+    }
+    const std::array inputs{embeddings};
+    const auto outputs = context.replay(
+        key, inputs,
+        [&](std::span<const tensor::Tensor> operands) {
+            auto hidden = operands[0];
+            bool consume = false;
+            for (const auto& block : *blocks_) {
+                hidden = block->forward(context, std::move(hidden), segments, consume);
                 consume = true;
             }
             return std::vector{norm_->forward(context, hidden)};

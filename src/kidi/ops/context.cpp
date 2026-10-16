@@ -11,10 +11,12 @@
 #include <map>
 #include <list>
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -109,7 +111,7 @@ struct Context::Impl {
     };
     bool background_compile = true;
     // Captured steps retain their buffers, so only the most recently used shapes are kept.
-    static constexpr std::size_t STEP_CAPACITY = 8;
+    std::size_t step_capacity = 8;
     std::map<std::string, Captured, std::less<>> steps;
     std::uint64_t step_clock = 0;
     std::vector<Tensor> eager_outputs;
@@ -158,7 +160,8 @@ struct Context::Impl {
             spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
             spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RESIDUAL_NORM ||
             spec.operation == Operation::RMS_NORM || spec.operation == Operation::PACKED_LINEAR ||
-            spec.operation == Operation::EMBEDDING || spec.operation == Operation::GATED_FEED_FORWARD;
+            spec.operation == Operation::EMBEDDING || spec.operation == Operation::GATED_FEED_FORWARD ||
+            spec.operation == Operation::QUANTIZED_GATED_FEED_FORWARD;
         const std::size_t parameter_start = spec.operation == Operation::RESIDUAL_NORM ? 2 : 1;
         // Packed projections bake an interleaved copy of their weights, so each weight needs its own program.
         spec.dynamic_parameters =
@@ -203,7 +206,9 @@ struct Context::Impl {
                     "packed linear shape or dtype mismatch");
         }
         if (spec.operation == Operation::GATED_FEED_FORWARD) {
-            invalid(spec.attributes.size() != 6, "invalid gated feed-forward attributes");
+            invalid((spec.attributes.size() != 6 && spec.attributes.size() != 7) ||
+                        (spec.attributes.size() == 7 && spec.attributes[6] != 1),
+                    "invalid gated feed-forward attributes");
             const auto bits = spec.attributes[0], input_size = spec.attributes[1], intermediate = spec.attributes[2];
             invalid((bits != 2 && bits != 4 && bits != 8) || input_size <= 0 || intermediate <= 0 ||
                         input.dtype() != tensor::DType::F32 || input.dimensions() != 3 || input.size(-1) != input_size,
@@ -223,6 +228,21 @@ struct Context::Impl {
             for (std::size_t index = 3; index < spec.attributes.size(); ++index) {
                 const auto scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[index]));
                 invalid(!std::isfinite(scale) || scale <= 0, "invalid gated feed-forward calibration");
+            }
+            if (spec.operation == Operation::QUANTIZED_GATED_FEED_FORWARD) {
+                invalid(inputs.size() != 7 || input.dtype() != tensor::DType::F32 || input.dimensions() < 2 ||
+                            inputs[1].dtype() != tensor::DType::I8 || inputs[1].dimensions() != 2 ||
+                            inputs[1].size(1) != input.size(-1) || inputs[1].size(0) % 2 ||
+                            inputs[2].dtype() != tensor::DType::F32 || inputs[2].dimensions() != 2 ||
+                            inputs[2].size(0) != inputs[1].size(0) || inputs[2].size(1) != 1 ||
+                            inputs[3].dtype() != tensor::DType::F32 || inputs[3].dimensions() != 1 ||
+                            inputs[3].size(0) != inputs[1].size(0) || inputs[4].dtype() != tensor::DType::I8 ||
+                            inputs[4].dimensions() != 2 || inputs[4].size(1) * 2 != inputs[1].size(0) ||
+                            inputs[4].size(0) != input.size(-1) || inputs[5].dtype() != tensor::DType::F32 ||
+                            inputs[5].dimensions() != 2 || inputs[5].size(0) != inputs[4].size(0) ||
+                            inputs[5].size(1) != 1 || inputs[6].dtype() != tensor::DType::F32 ||
+                            inputs[6].dimensions() != 1 || inputs[6].size(0) != inputs[4].size(0),
+                        "invalid quantized gated feed-forward operands");
             }
         }
         if (spec.operation == Operation::ROTARY) {
@@ -418,7 +438,8 @@ struct Context::Impl {
         return captured(std::move(output));
     }
 };
-Context::Context(tensor::Device device, bool packed_prefill) : impl_(std::make_unique<Impl>()) {
+Context::Context(tensor::Device device, bool packed_prefill, std::optional<bool> replay_enabled)
+    : impl_(std::make_unique<Impl>()) {
     impl_->device = device;
     impl_->packed_prefill = packed_prefill;
     impl_->dispatch_key.reserve(128);
@@ -444,10 +465,21 @@ Context::Context(tensor::Device device, bool packed_prefill) : impl_(std::make_u
 #endif
     else
         throw Failure({ErrorCode::UNSUPPORTED, "no eager backend for requested device"});
-    impl_->replay_enabled = impl_->backend->supports_replay() && !(replay && std::string_view(replay) == "0");
-    if (device == tensor::Device::cpu() && impl_->replay_enabled) impl_->compiler = default_compiler;
+    if (device == tensor::Device::cpu()) impl_->compiler = default_compiler;
+    const auto configured_replay = replay_enabled.value_or(!(replay && std::string_view(replay) == "0"));
+    const auto accelerator_replay =
+        impl_->compiler && impl_->compiler->captures_prefill() && !(replay && std::string_view(replay) == "0");
+    impl_->replay_enabled = impl_->backend->supports_replay() && (configured_replay || accelerator_replay);
     const auto background = std::getenv("KIDI_BACKGROUND_COMPILE");
     impl_->background_compile = !(background && std::string_view(background) == "0");
+    if (const auto* capacity = std::getenv("KIDI_REPLAY_CAPACITY")) {
+        char* end = nullptr;
+        errno = 0;
+        const auto parsed = std::strtoull(capacity, &end, 10);
+        if (errno || end == capacity || *end || !parsed || parsed > std::numeric_limits<std::size_t>::max())
+            throw Failure({ErrorCode::INVALID_ARGUMENT, "KIDI_REPLAY_CAPACITY must be a positive integer"});
+        impl_->step_capacity = parsed;
+    }
 }
 Context::~Context() = default;
 Context::Context(Context&&) noexcept = default;
@@ -517,7 +549,7 @@ auto Context::replay(std::string_view key, std::span<const Tensor> inputs, const
     }
     auto found = impl.steps.find(key);
     if (found == impl.steps.end()) {
-        if (impl.steps.size() >= Impl::STEP_CAPACITY)
+        if (impl.steps.size() >= impl.step_capacity)
             impl.steps.erase(
                 std::ranges::min_element(impl.steps, {}, [](const auto& item) { return item.second.used; }));
         found = impl.steps.try_emplace(std::string(key)).first;
@@ -819,25 +851,37 @@ auto Context::silu_gate(const Tensor& gate_up) -> Tensor {
 auto Context::gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
                                  const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
                                  std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
-                                 float gate_up_output_scale, float down_input_scale, float down_output_scale)
+                                 float gate_up_output_scale, float down_input_scale, float down_output_scale, bool silu)
     -> Tensor {
     if (impl_->precision != core::InferencePrecision::CHECKPOINT) {
         const auto gate_up = packed_linear(input, gate_up_weight, gate_up_scales, bits, input_size, gate_up_input_scale,
                                            gate_up_output_scale);
         const auto gate = slice(gate_up, -1, 0, intermediate_size);
         const auto up = slice(gate_up, -1, intermediate_size, intermediate_size);
-        const auto hidden = gelu_multiply(gate, up);
+        const auto hidden = silu ? silu_multiply(gate, up) : gelu_multiply(gate, up);
         return packed_linear(hidden, down_weight, down_scales, bits, intermediate_size, down_input_scale,
                              down_output_scale);
     }
-    const std::array<std::int64_t, 6> attributes{bits,
+
+    const std::array<std::int64_t, 7> attributes{bits,
                                                  input_size,
                                                  intermediate_size,
                                                  std::bit_cast<std::int32_t>(gate_up_output_scale),
                                                  std::bit_cast<std::int32_t>(down_input_scale),
-                                                 std::bit_cast<std::int32_t>(down_output_scale)};
-    return impl_->run({Operation::GATED_FEED_FORWARD, attributes, tensor::DType::F32, gate_up_input_scale},
-                      {&input, &gate_up_weight, &gate_up_scales, &down_weight, &down_scales});
+                                                 std::bit_cast<std::int32_t>(down_output_scale),
+                                                 silu};
+    const auto count = silu ? attributes.size() : attributes.size() - 1;
+    return impl_->run(
+        {Operation::GATED_FEED_FORWARD, std::span(attributes).first(count), tensor::DType::F32, gate_up_input_scale},
+        {&input, &gate_up_weight, &gate_up_scales, &down_weight, &down_scales});
+}
+auto Context::quantized_gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight,
+                                           const Tensor& gate_up_scales, const Tensor& gate_up_bias,
+                                           const Tensor& down_weight, const Tensor& down_scales,
+                                           const Tensor& down_bias) -> Tensor {
+    return impl_->run(
+        {Operation::QUANTIZED_GATED_FEED_FORWARD},
+        {&input, &gate_up_weight, &gate_up_scales, &gate_up_bias, &down_weight, &down_scales, &down_bias});
 }
 auto Context::gelu_(Tensor& input, bool approximate) -> Tensor& {
     const std::array<std::int64_t, 1> attributes{approximate};
@@ -904,6 +948,23 @@ auto Context::rms_rotary(const Tensor& input, const Tensor& scale, const Tensor&
             angle->size(3) != input.size(3) / 2 || angle->dtype() != tensor::DType::F32)
             throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid RMS rotary angles"});
     return impl_->run({Operation::RMS_ROTARY, {}, tensor::DType::F32, epsilon}, {&input, &scale, &cosine, &sine});
+}
+auto Context::rms_rotary_slice(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
+                               float epsilon, std::int64_t heads, std::int64_t width, std::int64_t channel_offset,
+                               std::int64_t sequence_offset, std::int64_t sequence_length) -> Tensor {
+    if (input.dimensions() != 3 || input.dtype() != tensor::DType::F32 || heads <= 0 || width <= 0 || width % 2 ||
+        channel_offset < 0 || sequence_offset < 0 || sequence_length <= 0 ||
+        channel_offset + heads * width > input.size(2) || sequence_offset + sequence_length > input.size(1) ||
+        scale.dimensions() != 1 || scale.size(0) != width || scale.dtype() != tensor::DType::F32 ||
+        !std::isfinite(epsilon) || epsilon <= 0)
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid sliced RMS rotary operands"});
+    for (const auto* angle : {&cosine, &sine})
+        if (angle->dimensions() != 4 || angle->size(0) != 1 || angle->size(1) != sequence_length ||
+            angle->size(2) != 1 || angle->size(3) != width / 2 || angle->dtype() != tensor::DType::F32)
+            throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid sliced RMS rotary angles"});
+    const std::array attributes{heads, width, channel_offset, sequence_offset, sequence_length};
+    return impl_->run({Operation::RMS_ROTARY, attributes, tensor::DType::F32, epsilon},
+                      {&input, &scale, &cosine, &sine});
 }
 auto Context::rms_axial_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
                                float epsilon) -> Tensor {

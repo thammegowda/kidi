@@ -10,6 +10,9 @@ public:
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
     auto forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine, const Tensor& sine) const
         -> Tensor;
+    auto forward_rotary_slice(ops::Context& context, const Tensor& input, const Tensor& cosine, const Tensor& sine,
+                              std::int64_t heads, std::int64_t width, std::int64_t channel_offset,
+                              std::int64_t sequence_offset, std::int64_t sequence_length) const -> Tensor;
     auto forward_axial_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
                               const Tensor& sine) const -> Tensor;
 

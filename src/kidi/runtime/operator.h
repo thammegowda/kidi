@@ -71,7 +71,8 @@ enum class Operation {
     SILU_MULTIPLY,
     SILU_GATE,
     EMBEDDING,
-    GATED_FEED_FORWARD
+    GATED_FEED_FORWARD,
+    QUANTIZED_GATED_FEED_FORWARD
 };
 struct BlockwiseQuantizationSpec {
     std::span<const float> scales;
@@ -124,6 +125,7 @@ public:
     explicit OutputPool(tensor::Arena* arena = nullptr) : arena_(arena) { buffers_.reserve(32); }
     auto acquire(std::span<const std::int64_t> shape, tensor::DType dtype, tensor::Device device) -> tensor::Tensor;
     auto allocations() const -> AllocationStats { return allocations_; }
+    auto clear() -> void { buffers_.clear(); }
 
 private:
     tensor::Arena* arena_;

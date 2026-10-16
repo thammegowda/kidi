@@ -3,6 +3,7 @@
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/ops/context.h"
 #include "ynnpack/composites/composites.h"
+#include "ynnpack/kernels/unary/unary.h"
 #include <array>
 #include <functional>
 #include <bit>
@@ -12,6 +13,10 @@
 #include <algorithm>
 #include <limits>
 #include <cstdlib>
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 #if defined(__APPLE__)
 #define ACCELERATE_NEW_LAPACK
@@ -208,7 +213,6 @@ auto for_rows(std::size_t rows, std::size_t row_work, const std::function<void(s
     }));
 }
 
-#if defined(__APPLE__)
 class SiluGate final : public Operator {
 public:
     SiluGate(const Tensor& input, tensor::Arena& arena)
@@ -246,19 +250,40 @@ private:
         auto* target = require(output.data<float>()).data();
         const auto rows_per_task = (rows_ + tasks_ - 1) / tasks_;
         require(ynn::parallel_for(tasks_, [&](std::size_t task) {
-            auto* temporary = scratch_.data() + task * width_;
             const auto begin = task * rows_per_task, end = std::min(rows_, begin + rows_per_task);
+#if defined(__APPLE__)
+            auto* temporary = scratch_.data() + task * width_;
             const auto count = static_cast<int>(width_);
             const float one = 1.F;
+#else
+            static const auto sigmoid =
+                ::ynn::get_unary_kernel(ynn_unary_sigmoid, ynn_type_fp32, ynn_type_fp32);
+            static const auto sigmoid_params = ::ynn::get_unary_params(ynn_unary_sigmoid);
+            if (!sigmoid) throw ops::Failure({ErrorCode::UNSUPPORTED, "FP32 sigmoid kernel is unavailable"});
+#endif
             for (auto row = begin; row < end; ++row) {
                 const auto* gate = source + row * 2 * width_;
                 const auto* up = gate + width_;
                 auto* hidden = target + row * width_;
+#if defined(__APPLE__)
                 vDSP_vneg(gate, 1, temporary, 1, width_);
                 vvexpf(hidden, temporary, &count);
                 vDSP_vsadd(hidden, 1, &one, hidden, 1, width_);
                 vDSP_vdiv(hidden, 1, gate, 1, temporary, 1, width_);
                 vDSP_vmul(temporary, 1, up, 1, hidden, 1, width_);
+#else
+                sigmoid(1, width_, width_ * sizeof(float), gate, width_ * sizeof(float), hidden, &sigmoid_params);
+                std::size_t channel = 0;
+#if defined(__ARM_NEON)
+                for (; channel + 8 <= width_; channel += 8) {
+                    const auto first = vmulq_f32(vld1q_f32(hidden + channel), vld1q_f32(gate + channel));
+                    const auto second = vmulq_f32(vld1q_f32(hidden + channel + 4), vld1q_f32(gate + channel + 4));
+                    vst1q_f32(hidden + channel, vmulq_f32(first, vld1q_f32(up + channel)));
+                    vst1q_f32(hidden + channel + 4, vmulq_f32(second, vld1q_f32(up + channel + 4)));
+                }
+#endif
+                for (; channel < width_; ++channel) hidden[channel] *= gate[channel] * up[channel];
+#endif
             }
         }));
     }
@@ -268,7 +293,6 @@ private:
     std::vector<std::int64_t> shape_;
     OutputPool pool_;
 };
-#endif
 
 /// Rotary embedding of `[batch, rows, heads, width]` by `[batch or 1, rows, 1, width / 2]` angles in one pass.
 class Rotary final : public Operator {
@@ -481,11 +505,24 @@ private:
 
 class RmsRotary final : public Operator {
 public:
-    RmsRotary(const OperatorSpec& spec, tensor::Arena& arena) : epsilon_(spec.epsilon), pool_(&arena) {}
+    RmsRotary(const OperatorSpec& spec, tensor::Arena& arena)
+        : epsilon_(spec.epsilon),
+          sliced_(!spec.attributes.empty()),
+          heads_(sliced_ ? static_cast<std::size_t>(spec.attributes[0]) : 0),
+          width_(sliced_ ? static_cast<std::size_t>(spec.attributes[1]) : 0),
+          channel_offset_(sliced_ ? static_cast<std::size_t>(spec.attributes[2]) : 0),
+          sequence_offset_(sliced_ ? static_cast<std::size_t>(spec.attributes[3]) : 0),
+          sequence_length_(sliced_ ? static_cast<std::size_t>(spec.attributes[4]) : 0),
+          pool_(&arena) {}
 
-    static auto supports(TensorInputs inputs) -> bool {
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) -> bool {
         if (inputs.size() != 4) return false;
         const auto &input = inputs[0], &weight = inputs[1], &cosine = inputs[2], &sine = inputs[3];
+        if (!spec.attributes.empty())
+            return spec.attributes.size() == 5 && input.dtype() == DType::F32 && input.dimensions() == 3 &&
+                   input.is_contiguous() && weight.dtype() == DType::F32 && weight.is_contiguous() &&
+                   cosine.dtype() == DType::F32 && cosine.is_contiguous() && sine.dtype() == DType::F32 &&
+                   sine.is_contiguous() && std::ranges::equal(cosine.shape(), sine.shape());
         return input.dtype() == DType::F32 && weight.dtype() == DType::F32 && cosine.dtype() == DType::F32 &&
                sine.dtype() == DType::F32 && input.dimensions() == 4 && input.is_contiguous() &&
                weight.is_contiguous() && cosine.is_contiguous() && sine.is_contiguous() && input.size(3) % 2 == 0 &&
@@ -495,7 +532,12 @@ public:
     }
 
     auto run(TensorInputs inputs) -> Tensor override {
-        auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
+        const auto shape =
+            sliced_ ? std::vector<std::int64_t>{static_cast<std::int64_t>(inputs[0].size(0)),
+                                                static_cast<std::int64_t>(sequence_length_),
+                                                static_cast<std::int64_t>(heads_), static_cast<std::int64_t>(width_)}
+                    : std::vector<std::int64_t>{inputs[0].shape().begin(), inputs[0].shape().end()};
+        auto output = pool_.acquire(shape, DType::F32, tensor::Device::cpu());
         apply(inputs, output);
         return output;
     }
@@ -512,7 +554,10 @@ public:
 private:
     auto apply(TensorInputs inputs, Tensor& output) const -> void {
         const auto &input = inputs[0], &cosine = inputs[2];
-        const auto rows = input.size(1), heads = input.size(2), width = input.size(3), half = width / 2;
+        const auto rows = sliced_ ? sequence_length_ : input.size(1);
+        const auto heads = sliced_ ? heads_ : input.size(2);
+        const auto width = sliced_ ? width_ : input.size(3);
+        const auto half = width / 2;
         const auto vectors = input.size(0) * rows * heads;
         const auto* source = require(input.data<float>()).data();
         const auto* weight = require(inputs[1].data<float>()).data();
@@ -524,7 +569,13 @@ private:
         for_rows(vectors, width, [&](std::size_t begin, std::size_t end) {
 #pragma clang fp contract(off)
             for (auto vector = begin; vector < end; ++vector) {
-                const auto* x = source + vector * width;
+                const auto sample = vector / (rows * heads);
+                const auto position = vector / heads % rows;
+                const auto head = vector % heads;
+                const auto* x = sliced_
+                                    ? source + (sample * input.size(1) + sequence_offset_ + position) * input.size(2) +
+                                          channel_offset_ + head * width
+                                    : source + vector * width;
                 auto* y = target + vector * width;
                 std::array<float, 8> partial{};
                 std::size_t index = 0;
@@ -534,8 +585,6 @@ private:
                 for (; index < width; ++index) sum += x[index] * x[index];
                 for (const auto value : partial) sum += value;
                 const auto inverse = 1.F / std::sqrt(sum * reciprocal + epsilon_);
-                const auto sample = vector / (rows * heads);
-                const auto position = vector / heads % rows;
                 const auto angle = (shared_angles ? position : sample * rows + position) * half;
                 const auto* c = cosines + angle;
                 const auto* s = sines + angle;
@@ -550,6 +599,8 @@ private:
     }
 
     float epsilon_;
+    bool sliced_;
+    std::size_t heads_, width_, channel_offset_, sequence_offset_, sequence_length_;
     OutputPool pool_;
 };
 
@@ -628,6 +679,7 @@ private:
     float multiplier_;
     OutputPool pool_;
 };
+
 class QuantizedAttention final : public Operator {
 public:
     QuantizedAttention(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
@@ -893,15 +945,13 @@ public:
         if (spec.operation == Operation::SCATTER) return std::make_unique<Scatter>(arena_);
         if (spec.operation == Operation::GREEDY_TOKEN) return std::make_unique<GreedyToken>(arena_);
         if (spec.operation == Operation::EMBEDDING) return std::make_unique<Embedding>(spec, inputs, arena_);
-#if defined(__APPLE__)
         if (spec.operation == Operation::SILU_GATE && SiluGate::supports(inputs))
             return std::make_unique<SiluGate>(inputs[0], arena_);
-#endif
         if (spec.operation == Operation::ROTARY && Rotary::supports(inputs)) return std::make_unique<Rotary>(arena_);
         if ((spec.operation == Operation::RMS_NORM || spec.operation == Operation::RMS_NORM_RESIDUAL) &&
             RmsNorm::supports(spec, inputs))
             return std::make_unique<RmsNorm>(spec, arena_);
-        if (spec.operation == Operation::RMS_ROTARY && RmsRotary::supports(inputs))
+        if (spec.operation == Operation::RMS_ROTARY && RmsRotary::supports(spec, inputs))
             return std::make_unique<RmsRotary>(spec, arena_);
         if (spec.operation == Operation::CAST && spec.dtype == DType::I8 && spec.epsilon > 0)
             return std::make_unique<QuantizeInt8>(spec.epsilon, arena_);
@@ -924,7 +974,8 @@ public:
             !spec.dynamic_parameters &&
             (spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
              spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RMS_NORM ||
-             spec.operation == Operation::PACKED_LINEAR || spec.operation == Operation::GATED_FEED_FORWARD || paired);
+             spec.operation == Operation::PACKED_LINEAR || spec.operation == Operation::GATED_FEED_FORWARD ||
+             spec.operation == Operation::QUANTIZED_GATED_FEED_FORWARD || paired);
         const std::size_t dynamic_count = constant ? (paired ? 2 : 1) : inputs.size();
         const std::size_t column_alignment = spec.operation == Operation::PACKED_LINEAR ? 8 / spec.attributes[0] : 1;
         const auto padded_columns =
@@ -1175,6 +1226,34 @@ public:
                     up_weight_ids.data(), up_scale_ids.data(), scalar(gate_output_scale), down_weight_ids.data(),
                     operands[4], scalar(down_input_scale), scalar(down_output_scale), input_size, intermediate,
                     TILE_SIZE, true, result));
+                break;
+            }
+            case Operation::QUANTIZED_GATED_FEED_FORWARD: {
+                const auto projection = [&](std::uint32_t activation, std::uint32_t weight, std::uint32_t scales,
+                                            std::uint32_t bias, std::size_t input_width) {
+                    auto zero = YNN_INVALID_VALUE_ID, scale = YNN_INVALID_VALUE_ID, quantized = YNN_INVALID_VALUE_ID;
+                    const auto range = reduce(ynn_reduce_min_max, activation);
+                    check(ynn_define_dynamic_quantization(native, range, ynn_type_int8, &zero, &scale, 0));
+                    check(ynn_define_quantize(native, activation, ynn_type_int8, zero, scale, &quantized, 0));
+                    const std::array<std::int32_t, 2> axes{1, 0};
+                    auto transposed = YNN_INVALID_VALUE_ID;
+                    check(ynn_define_static_transpose(native, axes.size(), axes.data(), weight, &transposed, 0));
+                    auto output = YNN_INVALID_VALUE_ID;
+                    check(::ynn::define_blockwise_dot(native, quantized, zero, scale, transposed, YNN_INVALID_VALUE_ID,
+                                                      scales, input_width, bias, ynn_type_fp32, output, 0));
+                    return output;
+                };
+                const auto projected =
+                    projection(operands[0], operands[1], operands[2], operands[3], inputs[0].size(-1));
+                const auto intermediate = inputs[4].size(1);
+                const auto axis = static_cast<std::int32_t>(inputs[0].dimensions() - 1);
+                const std::int64_t begin = 0, middle = intermediate, end = 2 * intermediate, stride = 1;
+                auto gate = YNN_INVALID_VALUE_ID, up = YNN_INVALID_VALUE_ID;
+                check(ynn_define_static_slice(native, 1, &axis, &begin, &middle, &stride, projected, &gate, 0));
+                check(ynn_define_static_slice(native, 1, &axis, &middle, &end, &stride, projected, &up, 0));
+                const auto hidden =
+                    binary(ynn_binary_multiply, binary(ynn_binary_multiply, gate, unary(ynn_unary_sigmoid, gate)), up);
+                result = projection(hidden, operands[4], operands[5], operands[6], intermediate);
                 break;
             }
             case Operation::GELU_MULTIPLY:

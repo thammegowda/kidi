@@ -10,6 +10,8 @@
 #include "kidi/model/omnivoice.h"
 #include "kidi/model/registry.h"
 #include "kidi/ops/context.h"
+#include "kidi/runtime/operator.h"
+#include "kidi/runtime/ynn/graph.h"
 #include "kidi/text/sentence.h"
 
 namespace kidi::inference {
@@ -95,6 +97,14 @@ auto Synthesizer::load(const std::filesystem::path& directory, tensor::Device de
         const auto type = config["model"]["type"].as<std::string>();
         if (!model::supports_task(type, model::Task::TTS))
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, type + " does not support the TTS task"});
+        std::optional<ops::StepCompilerScope> accelerator;
+        if (device.kind == tensor::DeviceKind::Q_NPU) {
+            if (type != "omnivoice")
+                throw ops::Failure({ErrorCode::UNSUPPORTED, type + " does not support Qualcomm NPU synthesis"});
+            accelerator.emplace(require(runtime::npu_step_compiler()));
+            device = tensor::Device::cpu();
+        }
+        require(runtime::ynn::reserve_thread_pool(runtime::ynn::thread_count()));
         auto sentences = require(text::SentenceSegmenter::load(config["sentence_prefixes_file"].as<std::string>()));
         auto impl = std::make_unique<Impl>(std::move(sentences));
         if (type == "omnivoice")

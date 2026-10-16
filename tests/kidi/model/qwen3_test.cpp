@@ -79,14 +79,23 @@ int main() {
     const auto packed_mask =
         kidi::ops::require(kidi::tensor::Tensor::from_host({1, 1, 3, 3}, std::span<const float>(MASK)));
     const auto packed_output = model->forward(context, packed_embedding, packed_mask);
+    const std::array<std::size_t, 2> segment_lengths{2, 1};
+    const auto segmented_output = model->forward_segmented(context, packed_embedding, segment_lengths);
     context.synchronize();
     const auto single_values = kidi::ops::require(single_output.data<float>());
     const auto packed_values = kidi::ops::require(packed_output.data<float>());
+    const auto segmented_values = kidi::ops::require(segmented_output.data<float>());
     for (std::size_t index = 0; index < expected.size(); ++index)
         if (std::abs(expected[index] - packed_values[index]) > 1e-5F) return fail("Qwen3 packed first segment differs");
     for (std::size_t index = 0; index < single_values.size(); ++index)
         if (std::abs(single_values[index] - packed_values[expected.size() + index]) > 1e-5F)
             return fail("Qwen3 packed second segment differs");
+    for (std::size_t index = 0; index < expected.size(); ++index)
+        if (std::abs(expected[index] - segmented_values[index]) > 1e-5F)
+            return fail("Qwen3 segmented first segment differs");
+    for (std::size_t index = 0; index < single_values.size(); ++index)
+        if (std::abs(single_values[index] - segmented_values[expected.size() + index]) > 1e-5F)
+            return fail("Qwen3 segmented second segment differs");
 
     const std::array batch_inputs{embeddings, embeddings};
     const auto batch_embedding = context.concat(batch_inputs, 0);

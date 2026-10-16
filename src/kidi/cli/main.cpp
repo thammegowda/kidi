@@ -37,6 +37,7 @@ namespace {
 auto inference_device(const kidi::cli::Namespace& arguments) -> kidi::tensor::Device {
     const auto& backend = arguments.get<std::string>("backend");
     if (backend == "vulkan") return kidi::tensor::Device::vulkan();
+    if (backend == "npu") return kidi::tensor::Device::qualcomm_npu();
     return backend == "mps" || (backend == "auto" && kidi::module_device == kidi::tensor::Device::apple_gpu())
                ? kidi::tensor::Device::apple_gpu()
                : kidi::tensor::Device::cpu();
@@ -752,7 +753,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             .help("Hugging Face model cache directory");
         command_parser->add_argument("--backend")
             .default_value(std::string("auto"))
-            .choices({"auto", "ynnpack", "mps", "vulkan"});
+            .choices({"auto", "ynnpack", "mps", "vulkan", "npu"});
         command_parser->add_argument("-j", "--threads").default_value<std::int32_t>(4);
         command_parser->add_argument("--profile").action(kidi::cli::Action::STORE_TRUE);
     }
