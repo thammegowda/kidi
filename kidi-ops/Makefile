@@ -1,5 +1,5 @@
-QNN_SDK_ROOT ?= $(abspath ../../../../../../benchmarks/android/.cache/qairt/2.50.0.260828)
-HEXAGON_SDK_ROOT ?= $(abspath ../../../../../../benchmarks/android/.cache/hexagon-sdk/v6.3.0)
+QNN_SDK_ROOT ?= $(abspath ../benchmarks/android/.cache/qairt/2.50.0.260828)
+HEXAGON_SDK_ROOT ?= $(abspath ../benchmarks/android/.cache/hexagon-sdk/v6.3.0)
 HEXAGON_TOOLS_VERSION ?= 19.0.04
 ANDROID_NDK_ROOT ?= $(HOME)/Library/Android/sdk/ndk/28.0.13004108
 
@@ -15,8 +15,8 @@ SIM_HMX_PACK_TEST := build/hexagon-v79/hmx_packing_test.elf
 SIM_CROUTON_TEST := build/hexagon-v79/crouton_reader_test.elf
 SIM_PHASE_BENCH := build/hexagon-v79/prefill_phase_bench.elf
 AARCH64_OUTPUT := build/aarch64-android/libQnnKidiOps.so
-SOURCES := src/KidiOpsPackageInterface.cpp src/ops/StructuredAttention.cpp src/ops/FusedOps.cpp
-OBJECTS := $(patsubst src/%.cpp,build/hexagon-v79/%.o,$(SOURCES))
+SOURCES := kidi_ops/package_interface.cpp kidi_ops/ops/structured_attention.cpp kidi_ops/ops/fused_ops.cpp
+OBJECTS := $(patsubst kidi_ops/%.cpp,build/hexagon-v79/%.o,$(SOURCES))
 HOST_CXX ?= c++
 HOST_TEST := build/host/attention_math_test
 
@@ -50,46 +50,46 @@ sim-crouton-test: $(SIM_CROUTON_TEST)
 sim-phase-bench: $(SIM_PHASE_BENCH)
 	$(HEXAGON_SIM) --timing --simulated_returnval $(SIM_PHASE_BENCH)
 
-$(HOST_TEST): tests/AttentionMathTest.cpp src/ops/AttentionMath.h
+$(HOST_TEST): tests/attention_math_test.cpp kidi_ops/ops/attention_math.h
 	@mkdir -p $(@D)
-	$(HOST_CXX) -std=c++17 -O2 -Wall -Wextra -Werror -Isrc/ops $< -o $@
+	$(HOST_CXX) -std=c++17 -O2 -Wall -Wextra -Werror -Ikidi_ops/ops $< -o $@
 
-$(SIM_TEST): tests/HvxKernelTest.cpp src/ops/AttentionHvx.h
+$(SIM_TEST): tests/hvx_kernel_test.cpp kidi_ops/ops/attention_hvx.h
 	@mkdir -p $(@D)
 	$(HEXAGON_CXX) -std=c++17 -O3 -fno-vectorize -fno-slp-vectorize -stdlib=libc++ \
 		-mhvx -mhvx-length=128B -mv79 -DUSE_OS_QURT \
 		-I$(QNN_INCLUDE) -I$(QNN_INCLUDE)/HTP/core -I$(QURT_INCLUDE)/qurt -I$(QURT_INCLUDE)/posix \
-		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Isrc/ops $< -o $@
+		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Ikidi_ops/ops $< -o $@
 
-$(SIM_BENCH): tests/HvxKernelBench.cpp src/ops/AttentionHvx.h
+$(SIM_BENCH): tests/hvx_kernel_bench.cpp kidi_ops/ops/attention_hvx.h
 	@mkdir -p $(@D)
 	$(HEXAGON_CXX) -std=c++17 -O3 -ffast-math -stdlib=libc++ -mhvx -mhvx-length=128B -mv79 -DUSE_OS_QURT \
 		-I$(QNN_INCLUDE) -I$(QNN_INCLUDE)/HTP/core -I$(QURT_INCLUDE)/qurt -I$(QURT_INCLUDE)/posix \
-		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Isrc/ops $< -lhexagon -o $@
+		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Ikidi_ops/ops $< -lhexagon -o $@
 
-$(SIM_HMX_TEST): tests/HmxTileTest.cpp
+$(SIM_HMX_TEST): tests/hmx_tile_test.cpp
 	@mkdir -p $(@D)
 	$(HEXAGON_CXX) -std=c++17 -O3 -stdlib=libc++ -mhvx -mhvx-length=128B -mhmx -mv79 -DUSE_OS_QURT \
 		-I$(QURT_INCLUDE)/qurt -I$(QURT_INCLUDE)/posix -I$(HEXAGON_SDK_ROOT)/incs \
 		-I$(HEXAGON_SDK_ROOT)/incs/stddef $< -o $@
 
-$(SIM_HMX_PACK_TEST): tests/HmxPackingTest.cpp src/ops/AttentionHmx.h
+$(SIM_HMX_PACK_TEST): tests/hmx_packing_test.cpp kidi_ops/ops/attention_hmx.h
 	@mkdir -p $(@D)
 	$(HEXAGON_CXX) -std=c++17 -O3 -stdlib=libc++ -mhvx -mhvx-length=128B -mhmx -mv79 -DUSE_OS_QURT \
 		-I$(QNN_INCLUDE) -I$(QNN_INCLUDE)/HTP/core -I$(QURT_INCLUDE)/qurt -I$(QURT_INCLUDE)/posix \
-		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Isrc/ops $< -o $@
+		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Ikidi_ops/ops $< -o $@
 
-$(SIM_CROUTON_TEST): tests/CroutonReaderTest.cpp src/ops/AttentionCrouton.h
+$(SIM_CROUTON_TEST): tests/crouton_reader_test.cpp kidi_ops/ops/attention_crouton.h
 	@mkdir -p $(@D)
 	$(HEXAGON_CXX) -std=c++17 -O3 -stdlib=libc++ -mhvx -mhvx-length=128B -mv79 -DUSE_OS_QURT \
 		-I$(QNN_INCLUDE) -I$(QNN_INCLUDE)/HTP/core -I$(QURT_INCLUDE)/qurt -I$(QURT_INCLUDE)/posix \
-		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Isrc/ops $< -o $@
+		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Ikidi_ops/ops $< -o $@
 
 $(OUTPUT): $(OBJECTS)
 	@mkdir -p $(@D)
 	$(HEXAGON_CXX) -mv79 -fPIC -stdlib=libc++ -shared -o $@ $^
 
-build/hexagon-v79/%.o: src/%.cpp
+build/hexagon-v79/%.o: kidi_ops/%.cpp
 	@mkdir -p $(@D)
 	$(HEXAGON_CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
@@ -105,11 +105,11 @@ AARCH64_FLAGS += -DTHIS_PKG_NAME=KidiOps
 AARCH64_FLAGS += -I$(QNN_INCLUDE) -I$(QNN_INCLUDE)/HTP/core
 AARCH64_FLAGS += -I$(HEXAGON_SDK_ROOT)/tools/HEXAGON_Tools/$(HEXAGON_TOOLS_VERSION)/Tools/libnative/include
 
-$(AARCH64_OUTPUT): $(patsubst src/%.cpp,build/aarch64-android/%.o,$(SOURCES))
+$(AARCH64_OUTPUT): $(patsubst kidi_ops/%.cpp,build/aarch64-android/%.o,$(SOURCES))
 	@mkdir -p $(@D)
 	$(AARCH64_CXX) $(AARCH64_FLAGS) -shared -static-libstdc++ -o $@ $^ -L$(QNN_SDK_ROOT)/lib/aarch64-android -lQnnHtp -lQnnHtpPrepare
 
-build/aarch64-android/%.o: src/%.cpp
+build/aarch64-android/%.o: kidi_ops/%.cpp
 	@mkdir -p $(@D)
 	$(AARCH64_CXX) $(AARCH64_FLAGS) -MMD -MP -c $< -o $@
 
@@ -118,19 +118,19 @@ build/aarch64-android/%.o: src/%.cpp
 clean:
 	rm -rf build
 
-$(SIM_PHASE_BENCH): tests/PrefillPhaseBench.cpp src/ops/AttentionHvx.h src/ops/AttentionMath.h
+$(SIM_PHASE_BENCH): tests/prefill_phase_bench.cpp kidi_ops/ops/attention_hvx.h kidi_ops/ops/attention_math.h
 	@mkdir -p $(@D)
 	$(HEXAGON_CXX) -std=c++17 -O3 -ffast-math -stdlib=libc++ -mhvx -mhvx-length=128B -mv79 -DUSE_OS_QURT \
 		-I$(QNN_INCLUDE) -I$(QNN_INCLUDE)/HTP/core -I$(QURT_INCLUDE)/qurt -I$(QURT_INCLUDE)/posix \
-		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Isrc/ops $< -lhexagon -o $@
+		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Ikidi_ops/ops $< -lhexagon -o $@
 
 SIM_FUSED_TEST := build/hexagon-v79/fused_ops_test.elf
 .PHONY: sim-fused-test
 sim-fused-test: $(SIM_FUSED_TEST)
 	$(HEXAGON_SIM) --simulated_returnval $(SIM_FUSED_TEST)
 
-$(SIM_FUSED_TEST): tests/FusedOpsTest.cpp src/ops/FusedOps.h
+$(SIM_FUSED_TEST): tests/fused_ops_test.cpp kidi_ops/ops/fused_ops.h
 	@mkdir -p $(@D)
 	$(HEXAGON_CXX) -std=c++17 -O3 -stdlib=libc++ -mhvx -mhvx-length=128B -mv79 -DUSE_OS_QURT \
 		-I$(QNN_INCLUDE) -I$(QNN_INCLUDE)/HTP/core -I$(QURT_INCLUDE)/qurt -I$(QURT_INCLUDE)/posix \
-		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Isrc/ops $< -o $@
+		-I$(HEXAGON_SDK_ROOT)/incs -I$(HEXAGON_SDK_ROOT)/incs/stddef -Ikidi_ops/ops $< -o $@

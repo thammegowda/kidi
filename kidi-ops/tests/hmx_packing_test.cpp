@@ -1,4 +1,4 @@
-#include "AttentionHmx.h"
+#include "attention_hmx.h"
 
 #include <array>
 #include <cstddef>

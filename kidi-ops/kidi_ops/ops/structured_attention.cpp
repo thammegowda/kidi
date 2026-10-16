@@ -1,7 +1,7 @@
-#include "AttentionHvx.h"
-#include "AttentionMath.h"
+#include "attention_hvx.h"
+#include "attention_math.h"
 #ifdef __hexagon__
-#include "AttentionCrouton.h"
+#include "attention_crouton.h"
 #endif
 
 #include "HTP/core/float16.h"

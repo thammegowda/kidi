@@ -1038,7 +1038,7 @@ of a 128-token INT8-KV prefill step found element-wise work dominating (GELU-tan
 chain 30%, other multiply/add 26%, quantize/dequantize 20%, RMS norms 10%), while
 HMX matmuls were 3.6% and attention 1%.
 
-`src/kidi/runtime/qnn/htp/KidiOpsPackage` is a QNN HTP op package (QHPI,
+`kidi-ops` is a standalone QNN HTP op package (QHPI,
 multithreaded HVX) that restores those fusions on the NPU. `GeluMultiply` maps
 the UINT8 gate/up projection output directly to the UINT8 input of the down
 projection in one pass, and `RmsNorm` covers plain and residual norms with an

@@ -1,4 +1,4 @@
-#include "FusedOps.h"
+#include "fused_ops.h"
 
 #include <array>
 #include <cmath>

@@ -2,7 +2,7 @@
 
 #ifdef __hexagon__
 
-#include "AttentionMath.h"
+#include "attention_math.h"
 
 #include "HTP/core/intrinsics.h"
 

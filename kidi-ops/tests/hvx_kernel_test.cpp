@@ -1,4 +1,4 @@
-#include "AttentionHvx.h"
+#include "attention_hvx.h"
 
 #include <algorithm>
 #include <array>

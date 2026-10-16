@@ -2,7 +2,7 @@
 
 #ifdef __hexagon__
 
-#include "AttentionHvx.h"
+#include "attention_hvx.h"
 
 #include <hmx_hexagon_protos.h>
 

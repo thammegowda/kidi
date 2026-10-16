@@ -6,7 +6,7 @@
 #include "HTP/core/memory_layout.h"
 #include "HTP/core/qhpi.h"
 
-#include "AttentionHvx.h"
+#include "attention_hvx.h"
 
 #include <algorithm>
 #include <array>

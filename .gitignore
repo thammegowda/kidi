@@ -65,6 +65,5 @@ __pycache__/
 
 # Local model directory.
 /models/
-/kidi-ops/build/
 
 tmp*

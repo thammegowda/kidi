@@ -1,5 +1,5 @@
 // Breaks the HVX prefill attention inner loop into phases, in cycles per (query, key) pair.
-#include "AttentionHvx.h"
+#include "attention_hvx.h"
 
 #include <array>
 #include <cstdint>

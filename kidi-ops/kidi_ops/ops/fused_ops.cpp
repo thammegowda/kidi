@@ -1,4 +1,4 @@
-#include "FusedOps.h"
+#include "fused_ops.h"
 
 #include "HTP/core/float16.h"
 #include "HTP/core/qhpi.h"
