@@ -12,6 +12,11 @@ option(KIDI_BUILD_TESTS "Build kidi tests" ON)
 option(KIDI_BUILD_INTEGRATION_TESTS "Register Python, browser, and model regression tests" OFF)
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
+set(KIDI_DESKTOP_APP_DEFAULT ON)
+if(ANDROID OR EMSCRIPTEN)
+    set(KIDI_DESKTOP_APP_DEFAULT OFF)
+endif()
+option(KIDI_BUILD_DESKTOP_APP "Build the native LiteApp web UI" ${KIDI_DESKTOP_APP_DEFAULT})
 if(EMSCRIPTEN)
     option(KIDI_WASM_THREADS "Enable WebAssembly pthreads" ON)
     option(KIDI_WASM_WEBGPU "Build the WebGPU execution backend" OFF)
@@ -342,6 +347,71 @@ target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi spdlog::spd
 add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)
 set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
 target_link_libraries(kidi_cli PRIVATE kidi_cli_main)
+
+if(KIDI_BUILD_DESKTOP_APP)
+    set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "Build LiteApp's GoogleTest suite" FORCE)
+    add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
+    set(KIDI_DESKTOP_WEB_STAGE "${CMAKE_CURRENT_BINARY_DIR}/generated/desktop-web")
+    file(MAKE_DIRECTORY
+        "${KIDI_DESKTOP_WEB_STAGE}"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/marked"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/dompurify"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/highlightjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/icons"
+    )
+    set(KIDI_DESKTOP_WEB_FILES
+        app.js
+        capture-worklet.js
+        icons/audio-waveform.svg
+        icons/copy.svg
+        icons/volume.svg
+        index.html
+        markdown.js
+        playback-worklet.js
+        style.css
+    )
+    file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}/icons")
+    foreach(file IN LISTS KIDI_DESKTOP_WEB_FILES)
+        configure_file("desktop/web/${file}" "${KIDI_DESKTOP_WEB_STAGE}/${file}" COPYONLY)
+    endforeach()
+    configure_file("src/web/libs/marked/marked.esm.js"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/marked/marked.esm.js" COPYONLY)
+    configure_file("src/web/libs/dompurify/purify.es.mjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/dompurify/purify.es.js" COPYONLY)
+    configure_file("src/web/libs/highlightjs/highlight.min.js"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/highlightjs/highlight.min.js" COPYONLY)
+    configure_file("src/web/libs/lucide-static/icons/mic.svg"
+        "${KIDI_DESKTOP_WEB_STAGE}/icons/mic.svg" COPYONLY)
+    configure_file("src/web/libs/lucide-static/icons/square.svg"
+        "${KIDI_DESKTOP_WEB_STAGE}/icons/square.svg" COPYONLY)
+    configure_file("src/web/libs/lucide-static/icons/settings.svg"
+        "${KIDI_DESKTOP_WEB_STAGE}/icons/settings.svg" COPYONLY)
+    liteapp_embed_archive(
+        TARGET kidi_desktop_assets
+        NAMESPACE kidi::desktop_assets
+        HEADER kidi/desktop_assets.h
+        ROOT "${KIDI_DESKTOP_WEB_STAGE}"
+        FILES
+            ${KIDI_DESKTOP_WEB_FILES}
+            libs/marked/marked.esm.js
+            libs/dompurify/purify.es.js
+            libs/highlightjs/highlight.min.js
+            icons/mic.svg
+            icons/square.svg
+            icons/settings.svg
+    )
+    add_executable(kidi_app desktop/app.cpp)
+    set_target_properties(kidi_app PROPERTIES OUTPUT_NAME kidi-app)
+    target_link_libraries(kidi_app PRIVATE
+        kidi::kidi
+        kidi_desktop_assets
+        liteapp::http
+        liteapp::platform
+        liteapp::vfs
+        nlohmann_json::nlohmann_json
+    )
+    liteapp_harden(kidi_app)
+endif()
 
 if(KIDI_BUILD_PYTHON)
     find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module Development.SABIModule)

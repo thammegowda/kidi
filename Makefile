@@ -11,7 +11,7 @@ TEST_DIST := .cache/test-dist
 
 export KIDI_HUB PYTHON
 
-.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test regression-test test wasm serve apk apk-release
+.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test regression-test test app wasm serve apk apk-release
 
 setup-test:
 	bash tests/setup.sh
@@ -47,6 +47,10 @@ prepare-test: build-test build-python-test
 
 test: prepare-test
 	ctest --preset debug
+
+app:
+	cmake --preset release -DKIDI_BUILD_DESKTOP_APP=ON
+	cmake --build --preset release --target kidi_app
 
 wasm:
 	node web/build.mjs "$(WEB_DIR)"

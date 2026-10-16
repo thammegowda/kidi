@@ -108,6 +108,45 @@ Conversation history and the requested reply must fit within the context.
 Use `/clear` or lower the output budget when it fills up; history is not silently
 truncated. See the [chat guide](docs/getting-started.md#2-start-chat) for more.
 
+### Desktop App
+
+The native desktop app combines Kidi's C++ inference runtime with an embedded
+HTML/CSS/JavaScript interface through the vendored LiteApp framework. Unlike the
+WebAssembly build, model weights remain in the native process and the UI talks
+only to a capability-protected loopback server.
+
+```bash
+make app
+build-release/kidi-app examples/kidi-app.yaml
+```
+
+The app opens in the system browser on macOS and Linux and uses an embedded
+WebView on supported Windows builds. The command-line
+[`examples/kidi-app.yaml`](examples/kidi-app.yaml) is the single source for chat,
+ASR, and TTS model directories,
+accelerators, generation limits, cache sizes, languages, and voice settings;
+relative model paths resolve from the YAML file. The example uses the models
+under `models/`, enables Gemma 4 and Whisper, and leaves OmniVoice disabled until
+a converted package is added. The process validates and loads this configuration
+before opening the UI; model paths and runtime settings cannot be changed from
+the browser and remain fixed until the application restarts. A read-only
+configuration panel shows the active models, limits, and system prompt. TTS
+language, diffusion steps, and voice attributes are user preferences and may be
+overridden there for future Read aloud requests. Conversations and TTS
+preferences stay in browser-local storage; prompts are sent only to the local
+native process.
+The executable embeds its frontend assets and does not need a separate web
+server or installed Node.js runtime. Chat tokens, live microphone PCM and
+partial transcripts, and TTS PCM chunks share one authenticated WebSocket; see
+the [desktop streaming protocol](desktop/README.md). The waveform control runs
+continuous voice turns—VAD-finalized ASR, streamed chat, TTS playback, then
+automatic listening—using the same visible conversation history. Assistant replies render
+sanitized GitHub-flavored Markdown with safe links, tables, block quotes, and
+syntax-highlighted code blocks. During generation, completed lines render as
+Markdown immediately while only the unfinished final line remains plain text.
+Open fenced-code blocks stream as unhighlighted code until their closing fence
+arrives.
+
 ### WebAssembly
 
 The self-hosted browser app runs Gemma E2B locally, with streaming replies, saved
@@ -240,6 +279,17 @@ more important than latency. On the 195-word `tmp2.txt` fixture, consistent-voic
 Kidi automatically
 uses two-row batched classifier-free guidance for longer sentences to reduce
 masked attention work; short sentences retain the lower-overhead packed layout.
+
+Embedded applications may retain the generated `VoicePrompt` from one fixed
+reference utterance and supply it to later requests. The desktop app does this
+per voice-attribute profile so separate messages and sentence chunks keep one
+narrator. Setting the language to `auto`, `none`, or an empty value omits
+explicit language conditioning and lets OmniVoice infer it from the text; its
+script-aware duration and voice-instruction paths continue to distinguish Han
+text automatically. Embedded clients may also set `duration_scale`: values
+above `1` allocate more acoustic frames for a slower, calmer delivery without
+resampling the waveform or lowering its pitch. The desktop presets are Brisk
+(`0.9`), Natural (`1.0`), Relaxed (`1.15`), and Mellow (`1.2`).
 
 Metal is the preferred Apple backend: on the same 195-word fixture, quality-first
 consistent-voice 32-step synthesis produced 64.04 seconds of audio in 36.91

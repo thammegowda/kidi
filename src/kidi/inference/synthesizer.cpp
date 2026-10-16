@@ -136,13 +136,23 @@ auto Synthesizer::synthesize(std::string_view text, const SynthesisOptions& opti
             else if (impl_->model->supports_voice_prompt() && !synthesis->tokens.empty())
                 synthesis->voice_prompt =
                     std::make_shared<VoicePrompt>(VoicePrompt{std::string(chunk), synthesis->tokens});
+            if (options.on_audio_chunk) options.on_audio_chunk(synthesis->samples, synthesis->sample_rate);
+            if (!options.retain_audio) synthesis->samples.clear();
         }
         return synthesis;
     };
-    if (options.duration_seconds) return synthesize_one(text);
+    if (options.duration_seconds) {
+        auto result = synthesize_one(text);
+        impl_->model->release_workspaces();
+        return result;
+    }
     auto sentences = segment(text, options.language);
     if (!sentences) return std::unexpected(std::move(sentences.error()));
-    if (sentences->size() == 1) return synthesize_one(sentences->front());
+    if (sentences->size() == 1) {
+        auto result = synthesize_one(sentences->front());
+        impl_->model->release_workspaces();
+        return result;
+    }
     try {
         const auto selected_reference = options.voice_prompt
                                             ? std::optional<std::size_t>{}
@@ -195,7 +205,8 @@ auto Synthesizer::synthesize(std::string_view text, const SynthesisOptions& opti
             if (result.sample_rate && result.sample_rate != chunk.sample_rate)
                 throw ops::Failure({ErrorCode::RUNTIME, "TTS chunks produced different sample rates"});
             result.sample_rate = chunk.sample_rate;
-            result.samples.insert(result.samples.end(), chunk.samples.begin(), chunk.samples.end());
+            if (options.on_audio_chunk) options.on_audio_chunk(chunk.samples, chunk.sample_rate);
+            if (options.retain_audio) result.samples.insert(result.samples.end(), chunk.samples.begin(), chunk.samples.end());
             result.tokens.insert(result.tokens.end(), chunk.tokens.begin(), chunk.tokens.end());
             result.stats.generation_ns += chunk.stats.generation_ns;
             result.stats.decode_ns += chunk.stats.decode_ns;
@@ -218,5 +229,6 @@ auto Synthesizer::segment(std::string_view text, std::string_view language) cons
 }
 
 auto Synthesizer::execution() const -> std::string { return impl_->model->execution(); }
+auto Synthesizer::supports_voice_prompt() const noexcept -> bool { return impl_->model->supports_voice_prompt(); }
 
 } // namespace kidi::inference

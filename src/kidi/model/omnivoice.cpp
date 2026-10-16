@@ -490,7 +490,9 @@ auto OmniVoiceImpl::target_length(std::string_view text, const inference::Synthe
     const auto estimate = require(audio::RuleDurationEstimator().estimate(text, reference_text, reference_tokens,
                                                                           settings["low_threshold"].as<float>(50.F),
                                                                           settings["boost_strength"].as<float>(3.F)));
-    return std::max<std::size_t>(1, static_cast<std::size_t>(estimate));
+    if (!std::isfinite(options.duration_scale) || options.duration_scale < 0.5F || options.duration_scale > 2.F)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "OmniVoice duration scale must be between 0.5 and 2"});
+    return std::max<std::size_t>(1, static_cast<std::size_t>(estimate * options.duration_scale));
 }
 
 auto OmniVoiceImpl::synthesize(std::string_view text, const inference::SynthesisOptions& options)
@@ -558,7 +560,8 @@ auto OmniVoiceImpl::synthesize_(std::string_view text, const inference::Synthesi
         }
 
         const auto target = target_length(cleaned, options, reference);
-        const auto language = options.language.empty() ? "None" : options.language;
+        const auto requested_language = explicit_language(options.language);
+        const auto language = requested_language.empty() ? "None" : options.language;
         auto instruction = require(voice_instruction(options.voice, cleaned, language));
         if (instruction.empty()) instruction = "None";
         auto prompt_text = reference ? reference_text + " " + cleaned : cleaned;

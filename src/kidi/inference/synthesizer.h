@@ -34,9 +34,15 @@ struct SynthesisOptions {
     float time_shift = 0.1F;
     float layer_penalty = 5.F;
     float position_temperature = 5.F;
+    /// Multiplies model-estimated automatic duration; greater than one speaks more slowly without resampling audio.
+    float duration_scale = 1.F;
     std::uint64_t seed = 0;
     std::function<void(std::size_t, std::size_t)> on_progress;
     std::function<void(std::size_t, std::size_t)> on_chunk;
+    /// Receives completed waveform chunks in playback order. The span is valid only for the duration of the callback.
+    std::function<void(std::span<const float>, std::uint32_t)> on_audio_chunk;
+    /// Disable when audio is consumed through `on_audio_chunk` to avoid retaining the complete waveform.
+    bool retain_audio = true;
 };
 
 struct SynthesisStats {
@@ -69,10 +75,10 @@ public:
     virtual ~SynthesizerModel() = default;
     virtual auto synthesize(std::string_view text, const SynthesisOptions& options) -> Result<Synthesis> = 0;
     virtual auto synthesize_with_reference(std::string_view text, const SynthesisOptions& options,
-                                           const SynthesisReference& reference) -> Result<Synthesis> {
+                                           const SynthesisReference&) -> Result<Synthesis> {
         return synthesize(text, options);
     }
-    virtual auto voice_reference_chunk(std::span<const std::string> chunks, const SynthesisOptions& options) const
+    virtual auto voice_reference_chunk(std::span<const std::string>, const SynthesisOptions&) const
         -> Result<std::optional<std::size_t>> {
         return std::optional<std::size_t>{};
     }
@@ -95,6 +101,7 @@ public:
     auto segment(std::string_view text, std::string_view language = {}) const -> Result<std::vector<std::string>>;
     auto synthesize(std::string_view text, const SynthesisOptions& options = {}) const -> Result<Synthesis>;
     auto execution() const -> std::string;
+    auto supports_voice_prompt() const noexcept -> bool;
 
 private:
     struct Impl;

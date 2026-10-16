@@ -1,0 +1,74 @@
+# Kidi desktop application configuration.
+# Relative model paths are resolved from this file's directory.
+version: 1
+
+runtime:
+  threads: 8
+  concurrency: single
+  idle_model_timeout_seconds: 300
+  preload_speech: true
+
+transport:
+  max_text_frame_bytes: 1048576
+  max_audio_queue_ms: 3000
+  heartbeat_seconds: 15
+
+models:
+  chat:
+    enabled: true
+    directory: ../models/gemma-4-E2B-it-qat-mobile-transformers
+    accelerator: auto
+    precision: checkpoint
+    kv_cache_precision: auto
+    metal_prefill_cache_mb: 512
+    system_prompt: >-
+      You are a helpful local AI assistant. Respond directly without
+      introductions, self-references, signatures, or name prefixes. If the user
+      explicitly asks your name, answer "Kidi." Do not mention the underlying
+      model unless the user asks. Be brief, concise, practical, respectful, and
+      polite. Do not suggest harmful or unsafe actions.
+    generation:
+      max_tokens: 512
+      context_tokens: 8192
+      prefill_chunk_tokens: 128
+      prefix_cache_mb: 512
+
+  asr:
+    enabled: true
+    directory: ../models/whisper-tiny
+    accelerator: cpu
+    language: auto
+    max_tokens: 128
+    partial_interval_ms: 600
+    sample_rate: 16000
+    frame_ms: 20
+    vad:
+      threshold: 0.012
+      minimum_speech_ms: 250
+      silence_ms: 650
+
+  tts:
+    enabled: true
+    directory: ../models/omnivoice
+    accelerator: auto
+    metal_prefill_cache_mb: 1024
+    language: auto
+    pace: 1.15
+    reference_language: English
+    reference_text: >-
+      Hello, I am Kidi, your helpful local assistant. I am here to answer your
+      questions clearly and concisely.
+    steps: 10
+    wire_format: pcm_s16le
+    playback_buffer_ms: 150
+    streaming:
+      first_segment_chars: 48
+      first_segment_steps: 8
+      segment_chars: 120
+      clause_min_chars: 32
+    voice:
+      gender: female
+      age: young adult
+      pitch: moderate
+      style: ""
+      accent: ""
