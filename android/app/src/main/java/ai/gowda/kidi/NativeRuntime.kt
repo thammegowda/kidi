@@ -11,6 +11,10 @@ internal object NativeRuntime {
         fun onPartial(payload: String)
     }
 
+    fun interface TtsProgressListener {
+        fun onProgress(completed: Int, total: Int)
+    }
+
     init {
         System.loadLibrary("kidi_android")
     }
@@ -46,7 +50,18 @@ internal object NativeRuntime {
     /** Abandons every transcription requested so far and returns the new generation for later requests. */
     external fun cancelTranscription(): Long
     external fun transcriptionGeneration(): Long
+    external fun loadTts(directory: String, accelerator: String = "npu"): String
+    external fun synthesize(
+        text: String,
+        language: String = "English",
+        steps: Int = 10,
+        voiceJson: String = "{}",
+        listener: TtsProgressListener? = null,
+    ): ShortArray
+    external fun ttsSampleRate(): Int
+    external fun cancelTts()
     external fun unload()
     external fun unloadAsr()
+    external fun unloadTts()
 
 }

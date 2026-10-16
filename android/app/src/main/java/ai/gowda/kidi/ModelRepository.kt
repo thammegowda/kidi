@@ -44,6 +44,12 @@ internal class ModelRepository(context: Context) {
 
     fun installedSpeech(): InstalledModel? = installed(SPEECH_CURRENT_FILE, SPEECH_FILES)
 
+    fun installedTts(): File? = ttsDirectory().takeIf { directory ->
+        directory.isDirectory && TTS_FILES.all { File(directory, it).isFile }
+    }
+
+    fun ttsDirectory(): File = File(root, TTS_DIRECTORY)
+
     private fun installed(currentName: String, requiredFiles: List<String>): InstalledModel? {
         val current = File(root, currentName)
         if (!current.isFile) return null
@@ -307,6 +313,14 @@ internal class ModelRepository(context: Context) {
             "generation_config.json",
         )
         val SPEECH_FILES = SPEECH_METADATA_FILES + "model.safetensors"
+        val TTS_FILES = listOf(
+            "model.yaml",
+            "model.safetensors",
+            "tokenizer.json",
+            "sentence-prefixes.tsv",
+            "synthesis_template.jinja",
+            "NOTICE",
+        )
         val SUPPORTED_WHISPER_SIGNATURES = setOf(
             listOf(384, 4, 4, 6, 6, 1536, 1536),
             listOf(512, 6, 6, 8, 8, 2048, 2048),
@@ -316,6 +330,7 @@ internal class ModelRepository(context: Context) {
         const val READY_FILE = "ready.json"
         const val CURRENT_FILE = "current.json"
         const val SPEECH_CURRENT_FILE = "speech-current.json"
+        const val TTS_DIRECTORY = "tts"
         const val DOWNLOAD_HEADROOM_BYTES = 256L * 1024 * 1024
         const val CONNECT_TIMEOUT_MS = 30_000
         const val READ_TIMEOUT_MS = 30_000

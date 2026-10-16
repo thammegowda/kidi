@@ -27,6 +27,8 @@ also require connections to third-party hosting services, as explained below.
 - **Microphone audio:** Optional dictation processes audio in memory on your
   device. Kidi does not upload audio or save an audio recording. Transcribed
   text becomes part of a saved conversation if you send it as a message.
+- **Read-aloud audio:** Optional text-to-speech and playback run on-device from
+  in-memory audio buffers. Kidi does not save or upload the generated audio.
 - **Settings and models:** Preferences, downloaded model files, and locally
   generated model caches are stored on your device.
 
