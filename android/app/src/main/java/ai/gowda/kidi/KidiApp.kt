@@ -606,7 +606,10 @@ private fun Conversation(
                 MessageRow(
                     message,
                     speaking = state.speakingMessageId == message.id,
-                    canSpeak = !state.chatBusy || state.speakingMessageId == message.id,
+                    synthesizing = state.loadingTts && state.speakingMessageId == message.id,
+                    synthesisProgress = if (state.ttsTotalChunks > 0)
+                        state.ttsCompletedChunks.toFloat() / state.ttsTotalChunks else null,
+                    canSpeak = !state.runtimeBusy || state.speakingMessageId == message.id,
                     onSpeak = onSpeak,
                 )
             }
@@ -679,6 +682,8 @@ private fun MessageRow(
     message: ChatMessage,
     active: Boolean = false,
     speaking: Boolean = false,
+    synthesizing: Boolean = false,
+    synthesisProgress: Float? = null,
     canSpeak: Boolean = false,
     onSpeak: (ChatMessage) -> Unit = {},
 ) {
@@ -727,7 +732,25 @@ private fun MessageRow(
                 }
             }
             if (!user && !active && message.status == MessageStatus.COMPLETE && message.content.isNotBlank()) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (synthesizing) {
+                        val progressModifier = Modifier
+                            .width(96.dp)
+                            .height(3.dp)
+                            .testTag("tts-progress-${message.id}")
+                        if (synthesisProgress == null)
+                            LinearProgressIndicator(modifier = progressModifier)
+                        else
+                            LinearProgressIndicator(
+                                progress = { synthesisProgress.coerceIn(0f, 1f) },
+                                modifier = progressModifier,
+                            )
+                        Spacer(Modifier.width(8.dp))
+                    }
                     IconButton(
                         onClick = { onSpeak(message) },
                         enabled = canSpeak,
@@ -735,7 +758,9 @@ private fun MessageRow(
                     ) {
                         Icon(
                             if (speaking) Icons.Default.Stop else Icons.AutoMirrored.Filled.VolumeUp,
-                            if (speaking) "Stop reading response" else "Read response aloud",
+                            if (synthesizing) "Stop synthesizing response"
+                            else if (speaking) "Stop reading response"
+                            else "Read response aloud",
                             Modifier.size(20.dp),
                         )
                     }

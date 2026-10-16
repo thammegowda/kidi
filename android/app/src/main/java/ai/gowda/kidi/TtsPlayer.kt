@@ -9,8 +9,9 @@ import android.media.AudioTrack
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import java.util.concurrent.Executors
 
-internal class TtsPlayer(context: Context) {
+internal class TtsPlayer(context: Context) : AutoCloseable {
     private val audio = context.getSystemService(AudioManager::class.java)
     private val attributes = AudioAttributes.Builder()
         .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -27,11 +28,18 @@ internal class TtsPlayer(context: Context) {
     private var track: AudioTrack? = null
     private var completion: (() -> Unit)? = null
     private var focusHeld = false
+    private val main = Handler(Looper.getMainLooper())
+    private val writer = Executors.newSingleThreadExecutor { task -> Thread(task, "kidi-tts-playback") }
+    @Volatile private var generation = 0L
 
-    fun play(samples: ShortArray, sampleRate: Int, onComplete: () -> Unit) {
+    fun play(
+        samples: ShortArray,
+        sampleRate: Int,
+        onError: (Throwable) -> Unit = { error -> Log.e("KidiTts", "playback_failed", error) },
+        onComplete: () -> Unit,
+    ) {
         require(samples.isNotEmpty() && sampleRate > 0) { "Synthesized audio is empty" }
         stop()
-        val audioBytes = Math.multiplyExact(samples.size, Short.SIZE_BYTES)
         val minimumBytes = AudioTrack.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
@@ -48,7 +56,7 @@ internal class TtsPlayer(context: Context) {
                     .build(),
             )
             .setTransferMode(AudioTrack.MODE_STREAM)
-            .setBufferSizeInBytes(maxOf(audioBytes, minimumBytes))
+            .setBufferSizeInBytes(maxOf(sampleRate / 4 * Short.SIZE_BYTES, minimumBytes))
             .build()
         try {
             require(next.state == AudioTrack.STATE_INITIALIZED) { "Unable to initialize audio playback" }
@@ -63,9 +71,6 @@ internal class TtsPlayer(context: Context) {
                 },
                 Handler(Looper.getMainLooper()),
             )
-            require(next.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING) == samples.size) {
-                "Unable to buffer synthesized audio"
-            }
             next.notificationMarkerPosition = samples.size
             next.setVolume(AudioTrack.getMaxVolume())
             focusHeld = audio.requestAudioFocus(focus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
@@ -74,8 +79,30 @@ internal class TtsPlayer(context: Context) {
             }
             track = next
             completion = onComplete
+            val request = generation
             next.play()
             Log.i("KidiTts", "playback_started frames=${samples.size} sample_rate=$sampleRate")
+            writer.execute {
+                try {
+                    var offset = 0
+                    while (offset < samples.size && generation == request) {
+                        val count =
+                            next.write(samples, offset, minOf(4096, samples.size - offset), AudioTrack.WRITE_BLOCKING)
+                        if (generation != request) return@execute
+                        check(count > 0) { "Unable to stream synthesized audio: AudioTrack error $count" }
+                        offset += count
+                    }
+                } catch (error: Exception) {
+                    main.post {
+                        if (generation == request && track === next) {
+                            Log.e("KidiTts", "playback_failed", error)
+                            completion = null
+                            release(next)
+                            onError(error)
+                        }
+                    }
+                }
+            }
         } catch (error: Exception) {
             release(next)
             throw error
@@ -83,6 +110,7 @@ internal class TtsPlayer(context: Context) {
     }
 
     fun stop() {
+        ++generation
         completion = null
         val current = track
         if (current != null) release(current) else abandonFocus()
@@ -97,9 +125,16 @@ internal class TtsPlayer(context: Context) {
     }
 
     private fun release(value: AudioTrack) {
-        if (track === value) track = null
-        runCatching { value.stop() }
-        value.flush()
+        if (track === value) {
+            ++generation
+            track = null
+        }
+        try {
+            value.stop()
+            value.flush()
+        } catch (error: IllegalStateException) {
+            Log.w("KidiTts", "playback_release_state_changed", error)
+        }
         value.release()
         abandonFocus()
     }
@@ -107,5 +142,10 @@ internal class TtsPlayer(context: Context) {
     private fun abandonFocus() {
         if (focusHeld) audio.abandonAudioFocusRequest(focus)
         focusHeld = false
+    }
+
+    override fun close() {
+        stop()
+        writer.shutdownNow()
     }
 }

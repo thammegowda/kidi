@@ -129,6 +129,8 @@ internal data class KidiUiState(
     val speechModelError: String? = null,
     val ttsReady: Boolean = false,
     val loadingTts: Boolean = false,
+    val ttsCompletedChunks: Int = 0,
+    val ttsTotalChunks: Int = 0,
     val speakingMessageId: String? = null,
     val ttsExecution: String = "",
     val ttsLanguage: String = "English",
@@ -793,6 +795,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 visionReady = false,
                 speechReady = false,
                 loadingTts = true,
+                ttsCompletedChunks = 0,
+                ttsTotalChunks = 0,
                 speakingMessageId = message.id,
                 ttsReady = true,
                 status = "Preparing speech",
@@ -817,8 +821,16 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     ttsSteps,
                     ttsVoice,
                     NativeRuntime.TtsProgressListener { completed, total ->
-                        if (ttsRequest == request)
-                            _state.update { it.copy(status = "Synthesizing speech ($completed/$total)") }
+                        if (ttsRequest == request && !ttsStopRequested.get()) {
+                            require(total > 0 && completed in 1..total) { "Invalid synthesis progress" }
+                            _state.update {
+                                it.copy(
+                                    ttsCompletedChunks = completed,
+                                    ttsTotalChunks = total,
+                                    status = "Synthesizing speech ($completed/$total)",
+                                )
+                            }
+                        }
                     },
                 )
                 val sampleRate = NativeRuntime.ttsSampleRate()
@@ -833,17 +845,41 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                     _state.update {
                         it.copy(
                             loadingTts = false,
+                            ttsCompletedChunks = 0,
+                            ttsTotalChunks = 0,
                             ttsExecution = loaded.optString("backend"),
                             status = "Playing response",
                         )
                     }
-                    ttsPlayer.play(samples, sampleRate) {
-                        _state.update { it.copy(speakingMessageId = null, status = readyStatus(it)) }
-                    }
+                    ttsPlayer.play(
+                        samples,
+                        sampleRate,
+                        onError = { error ->
+                            if (ttsRequest == request) {
+                                _state.update {
+                                    it.copy(
+                                        speakingMessageId = null,
+                                        status = readyStatus(it),
+                                        error = "Unable to play speech: ${error.userMessage()}",
+                                    )
+                                }
+                            }
+                        },
+                        onComplete = {
+                            if (ttsRequest == request)
+                                _state.update { it.copy(speakingMessageId = null, status = readyStatus(it)) }
+                        },
+                    )
                 }
             } catch (error: CancellationException) {
                 _state.update {
-                    it.copy(loadingTts = false, speakingMessageId = null, status = readyStatus(it))
+                    it.copy(
+                        loadingTts = false,
+                        ttsCompletedChunks = 0,
+                        ttsTotalChunks = 0,
+                        speakingMessageId = null,
+                        status = readyStatus(it),
+                    )
                 }
                 throw error
             } catch (error: Throwable) {
@@ -853,6 +889,8 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
                 _state.update {
                     it.copy(
                         loadingTts = false,
+                        ttsCompletedChunks = 0,
+                        ttsTotalChunks = 0,
                         speakingMessageId = null,
                         status = readyStatus(it),
                     )
@@ -1397,7 +1435,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         NativeRuntime.cancelTts()
         ttsJob?.cancel()
         ++ttsRequest
-        ttsPlayer.stop()
+        ttsPlayer.close()
         val id = requestId
         NativeRuntime.cancelTranscription()
         speechExecutor.execute { NativeRuntime.unloadAsr() }

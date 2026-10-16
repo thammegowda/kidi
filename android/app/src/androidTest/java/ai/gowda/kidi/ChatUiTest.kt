@@ -1,10 +1,14 @@
 package ai.gowda.kidi
 
 import androidx.compose.foundation.layout.padding
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -78,6 +82,30 @@ class ChatUiTest {
         compose.runOnIdle { assertSame(message, selected) }
         compose.runOnIdle { state.value = state.value.copy(speakingMessageId = message.id) }
         compose.onNodeWithContentDescription("Stop reading response").assertIsDisplayed().assertIsEnabled()
+        compose.runOnIdle {
+            state.value = state.value.copy(loadingTts = true, loadingModel = true, loadingSpeech = true)
+        }
+        compose.onNodeWithTag("tts-progress-${message.id}").assertIsDisplayed().assert(
+            SemanticsMatcher.expectValue(
+                SemanticsProperties.ProgressBarRangeInfo,
+                ProgressBarRangeInfo.Indeterminate,
+            ),
+        )
+        compose.onNodeWithContentDescription("Stop synthesizing response").assertIsEnabled().performClick()
+        compose.runOnIdle { assertSame(message, selected) }
+        compose.runOnIdle {
+            state.value = state.value.copy(ttsCompletedChunks = 1, ttsTotalChunks = 4)
+        }
+        compose.onNodeWithTag("tts-progress-${message.id}").assert(
+            SemanticsMatcher.expectValue(
+                SemanticsProperties.ProgressBarRangeInfo,
+                ProgressBarRangeInfo(0.25f, 0f..1f, 0),
+            ),
+        )
+        compose.runOnIdle {
+            state.value = state.value.copy(loadingTts = false, loadingModel = false, loadingSpeech = false)
+        }
+        assertEquals(0, compose.onAllNodesWithTag("tts-progress-${message.id}").fetchSemanticsNodes().size)
         compose.runOnIdle {
             state.value = state.value.copy(
                 speakingMessageId = null,
