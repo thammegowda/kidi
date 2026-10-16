@@ -28,7 +28,7 @@ the command line for chat, audio files, and translation.
 |---|---|
 | Gemma 4 E2B-it | Text chat and generation; Android photo questions with the default mobile model |
 | Whisper Tiny/Base/Small | Multilingual speech transcription and speech-to-English translation |
-| OmniVoice | Experimental multilingual text-to-speech in the native CLI |
+| OmniVoice | Experimental multilingual text-to-speech in the native CLI and Android read-aloud |
 | Kokoro-82M | Experimental US-English text-to-speech with selectable voice and speed |
 | RTG Transformer | Text translation, including the public 500-language-to-English model |
 
@@ -42,10 +42,12 @@ architecture compatible. Terminal chat and JSONL generation are currently
 text-only and greedy. Photo input is available in the Android app, not every
 interface. Tool execution, video/document input, CUDA, and Apple Neural Engine
 execution are not supported. Whisper runs on CPU and accepts at most 30 seconds
-of 16 kHz audio per request. TTS currently runs on CPU from the native CLI;
-Android and browser TTS surfaces are not implemented. OmniVoice voice cloning
-and long-form chunking are not yet supported. The first Kokoro package supports
-US English and one or more explicitly embedded voice packs.
+of 16 kHz audio per request. TTS runs from the native CLI and Android read-aloud;
+the Android app automatically tries Vulkan and then CPU. Browser TTS and
+external-audio OmniVoice voice cloning are not implemented. Long-form native
+synthesis uses sentence-sized chunks with a consistent generated reference.
+The first Kokoro package supports US English and one or more explicitly embedded
+voice packs.
 
 ## Quick Start
 

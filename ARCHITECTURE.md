@@ -186,9 +186,11 @@ parameters in host-backed storage, uploads reusable packed layouts for supported
 per-channel INT8 projections, and bridges unsupported operators to CPU. The
 Higgs/DAC waveform decoder remains on CPU. General Conv1d and ConvTranspose1d
 use INT8 projections plus explicit sequence lowering/overlap for correctness.
-No Android or browser UI surface consumes the TTS API; another application can
-link the C++ library directly and select `Device::cpu()`,
-`Device::apple_gpu()`, or `Device::vulkan()`.
+The Android read-aloud surface reaches this API through JNI, selects Vulkan with
+CPU fallback, converts the completed waveform to PCM16, and streams it through
+`AudioTrack`. It does not require QNN or a custom HTP package. Browser TTS is not
+implemented. Another application can link the C++ library directly and select
+`Device::cpu()`, `Device::apple_gpu()`, or `Device::vulkan()`.
 
 On Apple GPU, OmniVoice retains INT8 package storage but expands each constant
 projection once to FP16 and feeds it to MPSGraph half GEMM. Shape-specific
