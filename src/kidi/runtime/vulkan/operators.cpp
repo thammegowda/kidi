@@ -1122,10 +1122,6 @@ auto inferred_outputs(const OperatorSpec& spec, TensorInputs inputs)
             shape.back() = spec.attributes[1];
             dtype = DType::F32;
             break;
-        case Operation::QUANTIZED_GATED_FEED_FORWARD:
-            shape.back() = inputs[4].size(0);
-            dtype = DType::F32;
-            break;
         case Operation::GREEDY_TOKEN:
             shape = {static_cast<std::int64_t>(inputs[0].numel() / inputs[0].size(-1))};
             dtype = DType::I32;

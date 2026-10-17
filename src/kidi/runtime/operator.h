@@ -72,7 +72,12 @@ enum class Operation {
     SILU_GATE,
     EMBEDDING,
     GATED_FEED_FORWARD,
-    QUANTIZED_GATED_FEED_FORWARD
+    DIFFUSION_CANDIDATES,
+    DIFFUSION_UPDATE,
+    EMBEDDING_SUM,
+    CONV1D,
+    CONV_TRANSPOSE_FOLD,
+    SNAKE
 };
 struct BlockwiseQuantizationSpec {
     std::span<const float> scales;
@@ -107,7 +112,9 @@ public:
     /// Used to replay captured steps without allocating.
     virtual auto run_into(TensorInputs inputs, std::span<tensor::Tensor> outputs) -> void;
     virtual auto allocations() const -> AllocationStats { return {}; }
+    virtual auto release_workspaces() -> void {}
 };
+class StepExecutable;
 class OperatorBackend {
 public:
     virtual ~OperatorBackend() = default;
@@ -116,6 +123,7 @@ public:
     virtual auto release_cached_buffers() -> void {}
     /// True when every prepared operator implements `run_into`, so captured steps can replay.
     virtual auto supports_replay() const noexcept -> bool { return false; }
+    virtual auto prepare_graph(const graph::Graph&, std::string_view) -> std::unique_ptr<StepExecutable>;
     virtual auto copy_slice_(tensor::Tensor& destination, const tensor::Tensor& source, std::size_t outer,
                              std::size_t source_bytes, std::size_t destination_bytes, std::size_t offset_bytes)
         -> void = 0;

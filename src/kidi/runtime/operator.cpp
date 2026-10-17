@@ -10,6 +10,9 @@ namespace kidi::runtime {
 auto Operator::run_into(TensorInputs, std::span<tensor::Tensor>) -> void {
     throw ops::Failure({ErrorCode::UNSUPPORTED, "this backend cannot replay captured steps"});
 }
+auto OperatorBackend::prepare_graph(const graph::Graph&, std::string_view) -> std::unique_ptr<StepExecutable> {
+    return nullptr;
+}
 
 #if !defined(KIDI_HAS_QNN)
 auto npu_step_compiler() -> Result<std::shared_ptr<StepCompiler>> {
@@ -48,7 +51,12 @@ auto operation_name(Operation operation) -> std::string_view {
                                "silu_gate",
                                "embedding",
                                "gated_feed_forward",
-                               "quantized_gated_feed_forward"};
+                               "diffusion_candidates",
+                               "diffusion_update",
+                               "embedding_sum",
+                               "conv1d",
+                               "conv_transpose_fold",
+                               "snake"};
     return names.at(static_cast<std::size_t>(operation));
 }
 

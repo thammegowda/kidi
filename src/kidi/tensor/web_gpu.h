@@ -10,6 +10,9 @@ struct WebGpuBufferView {
     std::int32_t packed_layout = 0;
 };
 auto web_gpu_buffer(const Tensor& tensor) -> Result<WebGpuBufferView>;
+/// Queues a device-to-host copy into stable Wasm memory. JavaScript must await the WebGPU runtime after the current
+/// Wasm call returns before the destination is read.
+auto web_gpu_read_later(const Tensor& source, std::span<std::byte> destination) -> Result<void>;
 /// Wraps a buffer the JavaScript runtime already filled, taking ownership of its handle. `packed_layout` records
 /// that 2- or 4-bit packed weights were uploaded in the kernels' interleaved layout.
 auto adopt_web_gpu_buffer(std::uint32_t handle, std::vector<std::int64_t> shape, DType dtype,

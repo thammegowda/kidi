@@ -34,8 +34,10 @@ auto vector_device() -> tensor::Device {
 }
 } // namespace
 
-RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned, bool quantized) : epsilon_(epsilon) {
-    const auto storage = vector_device();
+RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned, bool quantized)
+    : target_device_(module_device), epsilon_(epsilon) {
+    const auto storage =
+        quantized && module_device == tensor::Device::web_gpu() ? tensor::Device::cpu() : vector_device();
     if (quantized && (!learned || module_dtype != tensor::DType::I8))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "quantized RMS normalization requires learned INT8 state"});
     if (learned && quantized) {
@@ -52,7 +54,7 @@ RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned, bool q
     }
 }
 auto RmsNormImpl::weight() const -> const Tensor& {
-    return qstate_ ? qstate_->decode_vector(weight_, "RMS normalization", device()) : weight_;
+    return qstate_ ? qstate_->decode_vector(weight_, "RMS normalization", target_device_) : weight_;
 }
 auto RmsNormImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
     return context.rms_norm(input, weight(), epsilon_);
@@ -163,10 +165,12 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, const Tensor& tokens) co
         context.synchronize();
         return forward(context, require(tokens.data<std::int32_t>()));
     }
-    if (weight_.dtype() == tensor::DType::I8 && context.device() == tensor::Device::web_gpu())
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "unpacked INT8 embedding is not supported on WebGPU"});
     const auto bits = packed_bits_ ? packed_bits_ : weight_.dtype() == tensor::DType::I8 ? 8 : 0;
     return context.embedding(tokens, weight_, quantization_scale_, width_, bits, scale_);
+}
+auto TokenEmbeddingImpl::forward_sum(ops::Context& context, const Tensor& tokens) const -> Tensor {
+    const auto bits = packed_bits_ ? packed_bits_ : weight_.dtype() == tensor::DType::I8 ? 8 : 0;
+    return context.embedding_sum(tokens, weight_, quantization_scale_, width_, bits, scale_);
 }
 GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t packed_bits,
                                            GatedActivation activation)
@@ -177,14 +181,6 @@ GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t int
     register_module("down_proj", down_);
 }
 auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-#if defined(__ANDROID__)
-    const auto* fused = std::getenv("KIDI_YNN_FUSED_QFFN");
-    if (activation_ == GatedActivation::SILU && context.device() == tensor::Device::cpu() && gate_up_->qstate_ &&
-        down_->qstate_ && fused && std::string_view(fused) == "1")
-        return context.quantized_gated_feed_forward(input, gate_up_->weight_, gate_up_->qstate_->scale,
-                                                    gate_up_->bias(), down_->weight_, down_->qstate_->scale,
-                                                    down_->bias());
-#endif
     const auto rows = input.numel() / input.size(-1);
     const bool web_fusion = context.device() == tensor::Device::web_gpu() && rows < 4 &&
                             gate_up_->input_size_ % 128 == 0 && down_->input_size_ % 32 == 0;

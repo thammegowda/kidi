@@ -1,6 +1,5 @@
 #pragma once
 
-#include <span>
 #include <vector>
 
 #include "kidi/layers/audio.h"
@@ -22,7 +21,7 @@ KIDI_MODULE(HiggsQuantizer);
 class HiggsQuantizerImpl : public Module {
 public:
     explicit HiggsQuantizerImpl(HiggsDecoderShape shape);
-    auto forward(ops::Context& context, std::span<const std::int32_t> tokens) const -> Tensor;
+    auto forward(ops::Context& context, const Tensor& tokens) const -> Tensor;
 
 private:
     TokenEmbedding codebook_;
@@ -68,7 +67,7 @@ KIDI_MODULE(HiggsDecoder);
 class HiggsDecoderImpl : public Module {
 public:
     explicit HiggsDecoderImpl(HiggsDecoderShape shape);
-    auto forward(ops::Context& context, std::span<const std::int32_t> tokens, std::size_t length) const -> Tensor;
+    auto forward(ops::Context& context, const Tensor& tokens) const -> Tensor;
 
 private:
     HiggsDecoderShape shape_;

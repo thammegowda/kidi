@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -50,8 +51,14 @@ struct Node {
 /// Step inputs may be rebound to other contiguous tensors with the same shape, dtype, and device.
 class Graph {
 public:
+    struct BufferPlanStats {
+        std::size_t original_bytes = 0, planned_bytes = 0, slots = 0;
+    };
     /// Rebinds changed inputs, runs every node, and returns graph-owned outputs overwritten by the next replay.
     auto replay(std::span<const Tensor> inputs) -> std::span<const Tensor>;
+    auto rebind(std::span<const Tensor> inputs) -> void;
+    using ScratchAllocator = std::function<Tensor(std::size_t, std::size_t, tensor::DType, tensor::Device)>;
+    auto plan_intermediates(const ScratchAllocator& allocate = {}) -> BufferPlanStats;
     auto nodes() const noexcept -> std::span<const Node> { return nodes_; }
     auto inputs() const noexcept -> std::span<const Tensor> { return inputs_; }
     auto outputs() const noexcept -> std::span<const Tensor> { return outputs_; }

@@ -70,8 +70,9 @@ LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool t
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "quantized linear bias requires INT8 weights and a bias"});
     if (bias && quantized_bias) {
         bias_qstate_.emplace();
-        register_parameter("bias", bias_, {output_size}, tensor::DType::I8, allocate_parameters, storage);
-        register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32, allocate_parameters, storage);
+        const auto vector_storage = module_device == tensor::Device::web_gpu() ? tensor::Device::cpu() : storage;
+        register_parameter("bias", bias_, {output_size}, tensor::DType::I8, allocate_parameters, vector_storage);
+        register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32, allocate_parameters, vector_storage);
     } else if (bias) {
         register_parameter("bias", bias_, {output_size}, tensor::DType::F32, allocate_parameters, storage);
     } else if (module_dtype == tensor::DType::I8)

@@ -484,8 +484,6 @@ public:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "RMS rotary requires direct kernel"});
             case Operation::GATED_FEED_FORWARD:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "gated feed-forward requires direct kernels"});
-            case Operation::QUANTIZED_GATED_FEED_FORWARD:
-                throw ops::Failure({ErrorCode::UNSUPPORTED, "quantized gated feed-forward is CPU-only"});
             case Operation::GREEDY_TOKEN:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "greedy selection must use the direct kernel"});
             case Operation::ADD:

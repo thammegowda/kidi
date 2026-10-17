@@ -1,10 +1,39 @@
 #include "kidi/model/qwen3.h"
 
 #include <cmath>
+#include <iterator>
 #include <numeric>
 
 namespace kidi::model {
 using ops::require;
+
+namespace {
+template <typename Layers, typename Step>
+auto replay_regions(ops::Context& context, std::string_view key, std::span<const tensor::Tensor> inputs,
+                    const Layers& layers, const Step& step) -> tensor::Tensor {
+    constexpr std::size_t region_layers = 4;
+    const auto count = static_cast<std::size_t>(std::distance(layers.begin(), layers.end()));
+    if (context.device() != tensor::Device::web_gpu() || count <= region_layers)
+        return context.replay(key, inputs, [&](std::span<const tensor::Tensor> operands) {
+            return std::vector{step(operands, layers.begin(), layers.end(), true)};
+        }, false).front();
+    context.set_replay_capacity((count + region_layers - 1) / region_layers);
+    auto hidden = inputs.front();
+    std::size_t region = 0;
+    for (auto first = layers.begin(); first != layers.end(); ++region) {
+        auto last = first;
+        for (std::size_t index = 0; index < region_layers && last != layers.end(); ++index) ++last;
+        std::vector<tensor::Tensor> operands(inputs.begin(), inputs.end());
+        operands.front() = hidden;
+        hidden = context.replay(std::string(key) + ':' + std::to_string(region), operands,
+            [&](std::span<const tensor::Tensor> values) {
+                return std::vector{step(values, first, last, last == layers.end())};
+            }, false).front();
+        first = last;
+    }
+    return hidden;
+}
+} // namespace
 
 auto Qwen3Impl::validate_config(const YAML::Node& config) -> Result<void> {
     try {
@@ -52,8 +81,8 @@ Qwen3Impl::Qwen3Impl(const YAML::Node& config)
     if (!valid) throw ops::Failure(valid.error());
     if (module_dtype != tensor::DType::I8 ||
         (module_device != tensor::Device::cpu() && module_device != tensor::Device::vulkan() &&
-         module_device != tensor::Device::apple_gpu()))
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "Qwen3 requires INT8 parameters on CPU, Metal, or Vulkan"});
+         module_device != tensor::Device::apple_gpu() && module_device != tensor::Device::web_gpu()))
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "Qwen3 requires INT8 parameters on CPU, Metal, Vulkan, or WebGPU"});
     const layers::Qwen3Shape shape{
         .hidden = hidden_,
         .intermediate = config["intermediate_size"].as<std::int32_t>(),
@@ -141,20 +170,17 @@ auto Qwen3Impl::forward(ops::Context& context, const tensor::Tensor& embeddings,
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Qwen3 requires a broadcastable FP32 attention mask"});
     const auto key = "qwen3:" + std::to_string(embeddings.size(0)) + ':' + std::to_string(embeddings.size(1));
     const std::array inputs{embeddings, mask};
-    const auto outputs = context.replay(
-        key, inputs,
-        [&](std::span<const tensor::Tensor> operands) {
+    return replay_regions(context, key, inputs, *blocks_,
+        [&](std::span<const tensor::Tensor> operands, auto first, auto last, bool final) {
             auto hidden = operands[0];
             bool consume = false;
-            for (const auto& block : *blocks_) {
+            for (auto block = first; block != last; ++block) {
                 hidden =
-                    block->forward(context, std::move(hidden), operands[1], attention.cosine, attention.sine, consume);
+                    (*block)->forward(context, std::move(hidden), operands[1], attention.cosine, attention.sine, consume);
                 consume = true;
             }
-            return std::vector{norm_->forward(context, hidden)};
-        },
-        false);
-    return outputs.front();
+            return final ? norm_->forward(context, hidden) : hidden;
+        });
 }
 
 auto Qwen3Impl::forward_segmented(ops::Context& context, const tensor::Tensor& embeddings,
@@ -179,19 +205,16 @@ auto Qwen3Impl::forward_segmented(ops::Context& context, const tensor::Tensor& e
         key += ':' + std::to_string(length);
     }
     const std::array inputs{embeddings};
-    const auto outputs = context.replay(
-        key, inputs,
-        [&](std::span<const tensor::Tensor> operands) {
+    return replay_regions(context, key, inputs, *blocks_,
+        [&](std::span<const tensor::Tensor> operands, auto first, auto last, bool final) {
             auto hidden = operands[0];
             bool consume = false;
-            for (const auto& block : *blocks_) {
-                hidden = block->forward(context, std::move(hidden), segments, consume);
+            for (auto block = first; block != last; ++block) {
+                hidden = (*block)->forward(context, std::move(hidden), segments, consume);
                 consume = true;
             }
-            return std::vector{norm_->forward(context, hidden)};
-        },
-        false);
-    return outputs.front();
+            return final ? norm_->forward(context, hidden) : hidden;
+        });
 }
 
 } // namespace kidi::model

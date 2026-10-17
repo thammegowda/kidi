@@ -29,6 +29,10 @@
 .model-loading progress { display: block; width: 100%; height: 8px; margin: 10px 0; accent-color: var(--accent); }
 #model-loading-bytes, #model-loading-file { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 [hidden] { display: none !important; }
+::highlight(kidi-speech-ready) { background-color: color-mix(in srgb, var(--accent) 22%, transparent); }
+::highlight(kidi-speech-playing) { background-color: var(--accent); color: var(--accent-ink); text-decoration: underline; }
+.speech-segment-ready { background: color-mix(in srgb, var(--accent) 22%, transparent); color: inherit; }
+.speech-segment-playing { background: var(--accent); color: var(--accent-ink); text-decoration: underline; }
 html, body { height: 100%; }
 body { margin: 0; overflow: hidden; background: var(--bg); color: var(--text); }
 button, input, select, textarea { font: inherit; }

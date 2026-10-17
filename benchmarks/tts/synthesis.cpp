@@ -13,6 +13,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 #include "kidi/inference/synthesizer.h"
 #include "kidi/runtime/ynn/graph.h"
@@ -59,8 +60,8 @@ auto text_chunks(std::string_view argument) -> std::vector<std::string> {
 } // namespace
 
 auto main(int argc, char** argv) -> int {
-    if (argc < 2 || argc > 7) {
-        std::cerr << "usage: kidi_tts_bench MODEL [cpu|mps|vulkan|npu] [REPETITIONS] [THREADS] [TEXT|@FILE] [STEPS]\n";
+    if (argc < 2 || argc > 8) {
+        std::cerr << "usage: kidi_tts_bench MODEL [cpu|mps|vulkan|npu] [REPETITIONS] [THREADS] [TEXT|@FILE] [STEPS] [OPTIONS_JSON]\n";
         return 2;
     }
     try {
@@ -77,6 +78,8 @@ auto main(int argc, char** argv) -> int {
         const auto threads = argc >= 5 ? positive_integer(argv[4], "threads") : std::min<std::size_t>(4, available);
         const auto chunks = text_chunks(argc >= 6 ? argv[5] : "Hello from Kidi.");
         const auto steps = argc >= 7 ? positive_integer(argv[6], "steps") : 32;
+        const auto settings = nlohmann::json::parse(argc >= 8 ? argv[7] : "{}");
+        if (!settings.is_object()) throw std::invalid_argument("OPTIONS_JSON must be an object");
         kidi::runtime::ynn::set_thread_count(threads);
 
         const auto load_start = std::chrono::steady_clock::now();
@@ -106,8 +109,15 @@ auto main(int argc, char** argv) -> int {
         std::vector<std::int32_t> reference;
         for (std::size_t repetition = 0; repetition < repetitions; ++repetition) {
             kidi::inference::SynthesisOptions options;
-            options.language = "English";
+            options.language = settings.value("language", "English");
             options.steps = steps;
+            options.seed = settings.value("seed", std::uint64_t{0});
+            options.duration_scale = settings.value("pace", 1.F);
+            options.guidance_scale = settings.value("guidance_scale", 2.F);
+            options.time_shift = settings.value("time_shift", 0.1F);
+            options.position_temperature = settings.value("position_temperature", 5.F);
+            if (settings.contains("voice"))
+                options.voice = settings["voice"].get<kidi::inference::VoiceAttributes>();
             const auto start = std::chrono::steady_clock::now();
             std::vector<std::int32_t> tokens;
             std::uint64_t generation_ns = 0, decode_ns = 0, preparation_ns = 0;
@@ -131,6 +141,7 @@ auto main(int argc, char** argv) -> int {
                 options.voice_prompt = speech->voice_prompt;
             }
             const auto total_ns = elapsed(start);
+            const auto audio_seconds = static_cast<double>(samples) / sample_rate;
             if (repetition == 0)
                 reference = tokens;
             else if (tokens != reference)
@@ -150,6 +161,7 @@ auto main(int argc, char** argv) -> int {
                       << "|load_ns=" << load_ns << "|total_ns=" << total_ns << "|generation_ns=" << generation_ns
                       << "|decode_ns=" << decode_ns << "|preparation_ns=" << preparation_ns
                       << "|audio_tokens=" << audio_tokens << "|samples=" << samples << "|sample_rate=" << sample_rate
+                      << "|rtf=" << (total_ns / 1e9 / audio_seconds)
                       << "|token_hash=" << token_hash(tokens) << '\n';
         }
         return 0;

@@ -9,7 +9,11 @@ const root = fileURLToPath(new URL('../../', import.meta.url));
 const libraries = join(root, 'web/libs');
 const destination = resolve(process.argv[2] || join(root, 'build-web'));
 await rm(destination, {recursive: true, force: true});
-for (const [name, threads, gpu] of [['single', 'OFF', 'OFF'], ['threads', 'ON', 'OFF'], ['gpu', 'OFF', 'ON']]) {
+for (const [name, threads, gpu] of [
+    ['single', 'OFF', 'OFF'],
+    ['threads', 'ON', 'OFF'],
+    ['gpu', 'OFF', 'ON'],
+]) {
     const build = join(root, name === 'single' ? 'build-wasm' : name === 'gpu' ? 'build-webgpu' : 'build-wasm-threads');
     for (const [command, args] of [
         ['emcmake', ['cmake', '-S', root, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
@@ -33,13 +37,30 @@ for (const [name, threads, gpu] of [['single', 'OFF', 'OFF'], ['threads', 'ON', 
 }
 for (const file of ['backend.js', 'inference-worker.mjs', 'asr-worker.mjs',
     'tts-worker.mjs', 'speech.mjs', 'model-cache.mjs',
-    'webgpu.mjs', 'webgpu-kernels.mjs'])
+    'webgpu.mjs', 'webgpu-kernels.mjs', 'scoped-model.mjs', 'runtime-scheduler.mjs', 'model-residency.mjs',
+    'speech-segments.mjs', 'recent-audio.mjs'])
     await copyFile(join(root, 'web/hosts/wasm', file), join(destination, file));
-for (const file of ['app.js', 'style.css', 'markdown.js', 'mermaid.js', 'images.js'])
+for (const file of ['runtime-client.mjs', 'gpu-runtime-worker.mjs']) {
+    const source = await readFile(join(root, 'web/hosts/wasm', file), 'utf8');
+    await writeFile(join(destination, file),
+        source.replaceAll('../../../third_party/liteapp/web/', './liteapp/'));
+}
+await mkdir(join(destination, 'liteapp', 'transport'), {recursive: true});
+await copyFile(join(root, 'third_party/liteapp/web/liteapp.mjs'), join(destination, 'liteapp/liteapp.mjs'));
+for (const file of ['protocol.mjs', 'channel.mjs', 'service-router.mjs', 'message-transport.mjs'])
+    await copyFile(join(root, 'third_party/liteapp/web/transport', file), join(destination, 'liteapp/transport', file));
+for (const file of ['app.js', 'style.css', 'markdown.js', 'mermaid.js', 'images.js', 'speech-highlights.js'])
     await copyFile(join(root, 'web/ui', file), join(destination, file));
 for (const file of ['capture-worklet.js', 'playback-worklet.js'])
     await copyFile(join(root, 'web/hosts/desktop', file), join(destination, file));
 const sharedIndex = await readFile(join(root, 'web/ui/index.html'), 'utf8');
+await copyFile(join(root, 'benchmarks/browser/runtime_bench.mjs'), join(destination, 'runtime-bench.mjs'));
+const numericalChecks = await readFile(join(root, 'tests/browser/webgpu_numerical.mjs'), 'utf8');
+await writeFile(join(destination, 'webgpu-checks.mjs'),
+    numericalChecks.replace('../../web/hosts/wasm/', './'));
+const integrationChecks = await readFile(join(root, 'tests/browser/gpu_runtime_integration.mjs'), 'utf8');
+await writeFile(join(destination, 'gpu-runtime-checks.mjs'),
+    integrationChecks.replace('../../web/hosts/wasm/', './'));
 await writeFile(join(destination, 'index.html'),
     sharedIndex.replace('<script type="module" src="./app.js"></script>',
         '<script src="./coi-serviceworker.js"></script>\n  <script type="module" src="./app.js"></script>'));

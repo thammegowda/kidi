@@ -2,6 +2,8 @@
 #include "kidi/inference/generator.h"
 #include "kidi/inference/synthesizer.h"
 #include "kidi/inference/transcriber.h"
+#include "kidi/model/omnivoice.h"
+#include "kidi/checkpoint/config.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/tensor/external.h"
 #ifdef KIDI_HAS_WEBGPU
@@ -14,14 +16,27 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 
 namespace {
 constexpr int MAXIMUM_OUTPUT_TOKENS = 8192;
 constexpr std::size_t CONTEXT_TOKENS = 9216;
-std::optional<kidi::inference::Generator> generator;
-std::optional<kidi::inference::Synthesizer> synthesizer;
-std::optional<kidi::inference::Transcriber> transcriber;
-std::shared_ptr<const kidi::inference::VoicePrompt> voice_prompt;
+struct ModelSession {
+    std::optional<kidi::inference::Generator> generator;
+    std::optional<kidi::inference::Synthesizer> synthesizer;
+    std::optional<kidi::inference::Transcriber> transcriber;
+    std::unique_ptr<kidi::inference::TranscriptionSession> transcription;
+    std::string transcription_text, transcription_language;
+    std::shared_ptr<const kidi::inference::VoicePrompt> voice_prompt;
+    bool cache_voice_prompt = false;
+    bool diagnostics = false;
+    std::string directory;
+    std::size_t synthesis_step = 0, synthesis_steps = 0;
+    std::unique_ptr<kidi::inference::SynthesisSession> synthesis;
+};
+std::map<int, ModelSession> model_sessions;
+int selected_session = 0, next_session = 1;
+auto session() -> ModelSession& { return model_sessions.try_emplace(selected_session).first->second; }
 std::string response;
 int configured_threads;
 // clang-format off
@@ -106,16 +121,16 @@ auto answer(Function&& function) -> const char* {
 }
 
 auto loaded() -> kidi::inference::Generator& {
-    if (!generator) throw std::runtime_error("Load a model first");
-    return *generator;
+    if (!session().generator) throw std::runtime_error("Load a model first");
+    return *session().generator;
 }
 auto loaded_transcriber() -> kidi::inference::Transcriber& {
-    if (!transcriber) throw std::runtime_error("Load a speech model first");
-    return *transcriber;
+    if (!session().transcriber) throw std::runtime_error("Load a speech model first");
+    return *session().transcriber;
 }
 auto loaded_synthesizer() -> kidi::inference::Synthesizer& {
-    if (!synthesizer) throw std::runtime_error("Load a TTS model first");
-    return *synthesizer;
+    if (!session().synthesizer) throw std::runtime_error("Load a TTS model first");
+    return *session().synthesizer;
 }
 auto messages(const char* messages_json) -> std::vector<kidi::text::ChatMessage> {
     std::vector<kidi::text::ChatMessage> result;
@@ -138,9 +153,124 @@ auto options(int maximum_tokens) -> kidi::inference::GenerationOptions {
     result.on_image_progress = [](std::string_view stage) { image_progress(std::string(stage).c_str()); };
     return result;
 }
+auto synthesis_options(const nlohmann::json& values) -> kidi::inference::SynthesisOptions {
+    kidi::inference::SynthesisOptions options;
+    options.language = values.value("language", "auto");
+    options.steps = values.value("steps", std::size_t{10});
+    options.duration_scale = values.value("pace", 1.F);
+    options.seed = values.value("seed", std::uint64_t{0});
+    if (values.contains("voice")) {
+        if (!values["voice"].is_object()) throw std::runtime_error("TTS voice must be an object");
+        for (const auto& [name, value] : values["voice"].items()) {
+            const auto selected = value.get<std::string>();
+            if (!selected.empty()) options.voice[name] = selected;
+        }
+    }
+    auto& state = session();
+    state.diagnostics = values.value("diagnostics", false) || values.value("return_tokens", false);
+    if (values.value("use_voice_prompt", true)) options.voice_prompt = state.voice_prompt;
+    options.on_progress = [&state](std::size_t step, std::size_t steps) {
+        state.synthesis_step = step;
+        state.synthesis_steps = steps;
+    };
+    return options;
+}
+auto synthesis_result(kidi::inference::Synthesis result) -> nlohmann::json {
+    auto& state = session();
+    if (!state.voice_prompt && result.voice_prompt && state.cache_voice_prompt) state.voice_prompt = result.voice_prompt;
+    const auto bytes = result.samples.size() * sizeof(float);
+    auto* audio = static_cast<float*>(std::malloc(bytes));
+    if (!audio && bytes) throw std::runtime_error("Unable to allocate synthesized audio output");
+    std::ranges::copy(result.samples, audio);
+    nlohmann::json payload{{"pending", false},
+            {"audio_address", reinterpret_cast<std::uintptr_t>(audio)},
+            {"samples", result.samples.size()},
+            {"sample_rate", result.sample_rate},
+            {"chunks", result.stats.chunks},
+            {"audio_tokens", result.stats.audio_tokens},
+            {"generation_ms", result.stats.generation_ns / 1e6},
+            {"decode_ms", result.stats.decode_ns / 1e6},
+            {"preparation_ms", result.stats.preparation_ns / 1e6},
+            {"voice_prompt_cached", static_cast<bool>(state.voice_prompt)}};
+    if (state.diagnostics) payload["token_ids"] = result.tokens;
+    return payload;
+}
+auto advance_synthesis() -> nlohmann::json {
+    auto& state = session();
+    if (!state.synthesis) throw std::runtime_error("Start a TTS session first");
+    auto advanced = state.synthesis->step();
+    if (!advanced) {
+        state.synthesis.reset();
+        throw kidi::ops::Failure(std::move(advanced.error()));
+    }
+    if (!*advanced) return {{"pending", true}, {"step", state.synthesis_step}, {"steps", state.synthesis_steps}};
+    auto result = synthesis_result(std::move(**advanced));
+    state.synthesis.reset();
+    return result;
+}
+auto transcription_result(kidi::inference::Transcription result) -> nlohmann::json {
+    return {{"pending", false}, {"text", result.text}, {"language", result.language}, {"token_ids", result.token_ids},
+            {"feature_ms", result.stats.feature_ns / 1e6}, {"encode_ms", result.stats.encode_ns / 1e6},
+            {"decode_ms", result.stats.decode_ns / 1e6}, {"preparation_ms", result.stats.preparation_ns / 1e6},
+            {"attempts", result.stats.attempts}};
+}
+auto advance_transcription() -> nlohmann::json {
+    auto& state = session();
+    if (!state.transcription) throw std::runtime_error("Start a transcription session first");
+    auto advanced = state.transcription->step();
+    if (!advanced) {
+        state.transcription.reset();
+        throw kidi::ops::Failure(std::move(advanced.error()));
+    }
+    if (!*advanced) return {{"pending", true}, {"text", state.transcription_text},
+                            {"language", state.transcription_language}};
+    auto result = transcription_result(std::move(**advanced));
+    state.transcription.reset();
+    return result;
+}
 } // namespace
 
 extern "C" {
+EMSCRIPTEN_KEEPALIVE auto kidi_session_create() -> const char* {
+    return answer([]() -> nlohmann::json {
+        if (next_session == INT32_MAX) throw std::runtime_error("Model session identifiers exhausted");
+        const auto id = next_session++;
+        model_sessions.try_emplace(id);
+        selected_session = id;
+        return {{"session_id", id}};
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_session_select(int id) -> const char* {
+    return answer([&]() -> nlohmann::json {
+        if (!model_sessions.contains(id)) throw std::runtime_error("Unknown model session");
+        selected_session = id;
+        return {{"session_id", id}};
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_session_close(int id) -> const char* {
+    return answer([&]() -> nlohmann::json {
+        if (!model_sessions.erase(id)) throw std::runtime_error("Unknown model session");
+        if (selected_session == id) selected_session = 0;
+        return {{"closed", true}};
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_tts_cancel() -> const char* {
+    return answer([]() -> nlohmann::json {
+        session().synthesis.reset();
+        return {{"cancelled", true}};
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_asr_cancel() -> const char* {
+    return answer([]() -> nlohmann::json {
+        session().transcription.reset();
+        return {{"cancelled", true}};
+    });
+}
+
 EMSCRIPTEN_KEEPALIVE auto kidi_configure(int threads) -> const char* {
     return answer([&]() -> nlohmann::json {
 #ifdef __EMSCRIPTEN_PTHREADS__
@@ -158,6 +288,7 @@ EMSCRIPTEN_KEEPALIVE auto kidi_configure(int threads) -> const char* {
 EMSCRIPTEN_KEEPALIVE auto kidi_load(const char* directory) -> const char* {
     return answer([&]() -> nlohmann::json {
         if (!configured_threads) throw std::runtime_error("Configure the runtime before loading the model");
+        auto& generator = session().generator;
         generator.emplace(
             kidi::ops::require(kidi::inference::Generator::load(directory, DEVICE, 0, 128, true, external_tensor)));
         // Selected tokens arrive one call later, so WebGPU work completes while JavaScript awaits between steps.
@@ -191,82 +322,86 @@ EMSCRIPTEN_KEEPALIVE auto kidi_enqueue(const char* messages_json, int maximum_to
 EMSCRIPTEN_KEEPALIVE auto kidi_load_asr(const char* directory) -> const char* {
     return answer([&]() -> nlohmann::json {
         if (!configured_threads) throw std::runtime_error("Configure the runtime before loading the speech model");
-        transcriber.emplace(
-            kidi::ops::require(kidi::inference::Transcriber::load(directory, kidi::tensor::Device::cpu())));
+        auto& transcriber = session().transcriber;
+        transcriber.emplace(kidi::ops::require(kidi::inference::Transcriber::load(directory, DEVICE)));
         // Pay weight packing and operator preparation while the speech model preloads, not on the first recording.
-        kidi::ops::require(transcriber->warm_up());
-        return {{"ready", true}, {"threads", configured_threads}, {"backend", "wasm-cpu"}};
+        if (DEVICE == kidi::tensor::Device::cpu()) kidi::ops::require(transcriber->warm_up());
+        return {{"ready", true}, {"threads", configured_threads}, {"backend", BACKEND}};
     });
 }
 
-EMSCRIPTEN_KEEPALIVE auto kidi_transcribe(const float* samples_address, std::uint32_t sample_count,
-                                          const char* language, int maximum_tokens) -> const char* {
+EMSCRIPTEN_KEEPALIVE auto kidi_asr_start(const float* samples, std::uint32_t count, const char* language,
+                                        int maximum_tokens) -> const char* {
     return answer([&]() -> nlohmann::json {
-        if (!samples_address || !sample_count || sample_count > 480000)
-            throw std::runtime_error("Speech must contain 1 to 480000 samples");
-        if (maximum_tokens < 1 || maximum_tokens > 444)
-            throw std::runtime_error("Speech output tokens must be between 1 and 444");
-        const auto samples = std::span(samples_address, static_cast<std::size_t>(sample_count));
-        auto result = kidi::ops::require(loaded_transcriber().transcribe(
-            samples, 16000,
-            {.language = language,
-             .task = "transcribe",
-             .maximum_tokens = static_cast<std::size_t>(maximum_tokens),
-             .fit_audio = true}));
-        return {{"text", result.text},
-                {"language", result.language},
-                {"token_ids", result.token_ids},
-                {"feature_ms", result.stats.feature_ns / 1e6},
-                {"encode_ms", result.stats.encode_ns / 1e6},
-                {"decode_ms", result.stats.decode_ns / 1e6}};
+        auto& state = session();
+        if (state.transcription) throw std::runtime_error("A transcription session is already active");
+        if (!samples || !count || count > 480000 || maximum_tokens < 1 || maximum_tokens > 444)
+            throw std::runtime_error("Invalid speech input or output token limit");
+        state.transcription_text.clear();
+        state.transcription_language.clear();
+        kidi::inference::TranscriptionOptions options{
+            .language = language ? language : "auto", .task = "transcribe",
+            .maximum_tokens = static_cast<std::size_t>(maximum_tokens), .fit_audio = true};
+        options.on_partial = [&state](std::string_view text, std::string_view language) {
+            state.transcription_text = text;
+            state.transcription_language = language;
+        };
+        state.transcription = kidi::ops::require(loaded_transcriber().start({samples, count}, 16000, options));
+        return advance_transcription();
     });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_asr_step() -> const char* {
+    return answer([]() -> nlohmann::json { return advance_transcription(); });
 }
 
 EMSCRIPTEN_KEEPALIVE auto kidi_load_tts(const char* directory) -> const char* {
     return answer([&]() -> nlohmann::json {
         if (!configured_threads) throw std::runtime_error("Configure the runtime before loading the TTS model");
+        auto& synthesizer = session().synthesizer;
+        session().directory = directory;
         synthesizer.emplace(kidi::ops::require(
-            kidi::inference::Synthesizer::load(directory, kidi::tensor::Device::cpu())));
-        voice_prompt.reset();
+            kidi::inference::Synthesizer::load(directory, DEVICE)));
+        session().voice_prompt.reset();
         return {{"ready", true},
                 {"backend", synthesizer->execution()},
                 {"voice_prompt", synthesizer->supports_voice_prompt()}};
     });
 }
 
-EMSCRIPTEN_KEEPALIVE auto kidi_synthesize(const char* text, const char* options_json) -> const char* {
+EMSCRIPTEN_KEEPALIVE auto kidi_tts_start(const char* text, const char* options_json) -> const char* {
     return answer([&]() -> nlohmann::json {
+        auto& state = session();
+        if (state.synthesis) throw std::runtime_error("A TTS session is already active");
         if (!text || !*text) throw std::runtime_error("TTS text must not be empty");
         const auto values = nlohmann::json::parse(options_json ? options_json : "{}");
-        kidi::inference::SynthesisOptions options;
-        options.language = values.value("language", "auto");
-        options.steps = values.value("steps", std::size_t{10});
-        options.duration_scale = values.value("pace", 1.F);
-        options.seed = values.value("seed", std::uint64_t{0});
-        if (values.contains("voice")) {
-            if (!values["voice"].is_object()) throw std::runtime_error("TTS voice must be an object");
-            for (const auto& [name, value] : values["voice"].items()) {
-                const auto selected = value.get<std::string>();
-                if (!selected.empty()) options.voice[name] = selected;
-            }
-        }
-        if (values.value("use_voice_prompt", true)) options.voice_prompt = voice_prompt;
-        auto result = kidi::ops::require(loaded_synthesizer().synthesize(text, options));
-        if (!voice_prompt && result.voice_prompt && values.value("cache_voice_prompt", true))
-            voice_prompt = result.voice_prompt;
-        const auto bytes = result.samples.size() * sizeof(float);
-        auto* audio = static_cast<float*>(std::malloc(bytes));
-        if (!audio && bytes) throw std::runtime_error("Unable to allocate synthesized audio output");
-        std::ranges::copy(result.samples, audio);
+        auto options = synthesis_options(values);
+        state.cache_voice_prompt = values.value("cache_voice_prompt", true);
+        state.synthesis_step = state.synthesis_steps = 0;
+        state.synthesis = kidi::ops::require(loaded_synthesizer().start(text, options));
+        return advance_synthesis();
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_tts_step() -> const char* {
+    return answer([]() -> nlohmann::json { return advance_synthesis(); });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_tts_decode_reference(const std::int32_t* tokens, std::uint32_t count) -> const char* {
+    return answer([&]() -> nlohmann::json {
+        if (!tokens || !count || count > 80000 || session().directory.empty())
+            throw std::runtime_error("Invalid reference codec input");
+        auto package = kidi::ops::require(
+            kidi::checkpoint::load_config(std::filesystem::path(session().directory) / "model.yaml"));
+        auto model =
+            kidi::ops::require(kidi::model::OmniVoiceImpl::load(std::move(package), kidi::tensor::Device::cpu()));
+        auto waveform = kidi::ops::require(model->decode_reference({tokens, count}));
+        auto* audio = static_cast<float*>(std::malloc(waveform.samples.size() * sizeof(float)));
+        if (!audio) throw std::runtime_error("Cannot allocate reference waveform");
+        std::ranges::copy(waveform.samples, audio);
         return {{"audio_address", reinterpret_cast<std::uintptr_t>(audio)},
-                {"samples", result.samples.size()},
-                {"sample_rate", result.sample_rate},
-                {"chunks", result.stats.chunks},
-                {"audio_tokens", result.stats.audio_tokens},
-                {"generation_ms", result.stats.generation_ns / 1e6},
-                {"decode_ms", result.stats.decode_ns / 1e6},
-                {"preparation_ms", result.stats.preparation_ns / 1e6},
-                {"voice_prompt_cached", static_cast<bool>(voice_prompt)}};
+                {"samples", waveform.samples.size()},
+                {"sample_rate", waveform.sample_rate}};
     });
 }
 
@@ -307,7 +442,7 @@ EMSCRIPTEN_KEEPALIVE auto kidi_memory_stats() -> const char* {
                               {"malloc_in_use_bytes", usage.in_use},
                               {"malloc_free_bytes", usage.free},
                               {"malloc_peak_footprint_bytes", usage.footprint}};
-        if (generator) {
+        if (const auto& generator = session().generator) {
             const auto memory = generator->memory();
             result["kv_cache_bytes"] = memory.cache_bytes;
             result["image_feature_bytes"] = memory.image_bytes;

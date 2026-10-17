@@ -18,9 +18,9 @@ test('built wasm32 runtime addresses memory above 2 GiB within its 4 GiB limit',
         assert.equal(module.HEAPU8[high], 137);
         assert.equal(module.HEAPU8[high + 31], 251);
         assert.ok(module.HEAPU8.byteLength > 2 ** 31);
-        const result = JSON.parse(module.ccall('kidi_transcribe', 'string',
+        const result = JSON.parse(module.ccall('kidi_asr_start', 'string',
             ['pointer', 'number', 'string', 'number'], [high, 0, 'en', 1]));
-        assert.match(result.error, /Speech must contain/);
+        assert.match(result.error, /Invalid speech input/);
         const memory = JSON.parse(module.ccall('kidi_memory_stats', 'string', [], []));
         // Emscripten keeps wasm32 memory one 64 KiB page below 4 GiB.
         assert.equal(memory.heap_limit_bytes, 4 * 1024 ** 3 - 65536);
@@ -32,7 +32,7 @@ test('image attachments persist outside chat text and stage bounded temporary re
     const {storeImage, readImage, stageImages, removeUnusedImages} =
         await import('../../web/ui/images.js');
     const previous = globalThis.caches;
-    const saved = new Map(), files = new Map();
+    const saved = new Map(), files = new Map(), removedDirectories = [];
     globalThis.caches = {open: async () => ({
         put: async (key, response) => saved.set(key, response),
         match: async key => saved.get(key)?.clone(),
@@ -40,7 +40,7 @@ test('image attachments persist outside chat text and stage bounded temporary re
         delete: async key => saved.delete(typeof key === 'string' ? key : key.url)
     })};
     const module = {FS: {mkdirTree: () => {}, writeFile: (path, bytes) => files.set(path, bytes),
-        unlink: path => files.delete(path)}};
+        unlink: path => files.delete(path), rmdir: path => removedDirectories.push(path)}};
     try {
         const image = await storeImage(new Blob(['image bytes'], {type: 'image/jpeg'}), 'photo.jpg');
         assert.equal(await (await readImage(image)).text(), 'image bytes');
@@ -56,6 +56,17 @@ test('image attachments persist outside chat text and stage bounded temporary re
         assert.deepEqual(files.get('/images/0.png'), original);
         pngRequest.dispose();
         assert.equal(files.size, 0);
+        const one = await stageImages(module, [{role: 'user', content: '', images: [png]}],
+            {directory: '/images/request-1'});
+        const two = await stageImages(module, [{role: 'user', content: '', images: [image]}],
+            {directory: '/images/request-2'});
+        one.dispose();
+        one.dispose();
+        assert.equal(files.has('/images/request-2/0.jpg'), true);
+        two.dispose();
+        assert.deepEqual(removedDirectories, ['/images/request-1', '/images/request-2']);
+        assert.equal(files.size, 0);
+        await assert.rejects(stageImages(module, [], {directory: '/model'}), /staging directory/);
         await assert.rejects(stageImages(module, [{role: 'assistant', content: '', images: [image]}]), /user messages/);
         await assert.rejects(stageImages(module, [{role: 'user', content: '', images: Array(9).fill(image)}]), /at most eight/);
         assert.equal(files.size, 0);

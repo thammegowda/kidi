@@ -23,6 +23,7 @@ constexpr std::int64_t VISION_ROWS = 256;
 #else
 constexpr std::int64_t VISION_ROWS = 32;
 #endif
+constexpr std::size_t VISION_REGION_LAYERS = 4;
 auto slice_rows(const ops::Context& context, bool attention) -> std::int64_t {
     if (context.device() == tensor::Device::cpu()) {
         const auto precision = context.precision();
@@ -31,7 +32,9 @@ auto slice_rows(const ops::Context& context, bool attention) -> std::int64_t {
             return std::numeric_limits<std::int64_t>::max();
     }
     if (context.device() == tensor::Device::cpu()) return VISION_ROWS;
-    if (attention && !tensor::DEVICE_CAPABILITIES[context.device().kind].fused_full_attention) return 512;
+    if (attention && context.device() != tensor::Device::web_gpu() &&
+        !tensor::DEVICE_CAPABILITIES[context.device().kind].fused_full_attention)
+        return 512;
     return std::numeric_limits<std::int64_t>::max();
 }
 
@@ -305,7 +308,11 @@ struct Gemma4VisionImpl::State {
           positions(config["position_embedding_size"].as<int>()),
           theta(config["rope_parameters"]["rope_theta"].as<float>()),
           tower(config, quantized),
-          projection(hidden, text_width, config["rms_norm_eps"].as<float>()) {}
+          projection(hidden, text_width, config["rms_norm_eps"].as<float>()) {
+        if (module_device == tensor::Device::web_gpu())
+            context.set_replay_capacity(std::max<std::size_t>(
+                1, (config["num_hidden_layers"].as<std::size_t>() + VISION_REGION_LAYERS - 1) / VISION_REGION_LAYERS));
+    }
 };
 
 Gemma4VisionImpl::Gemma4VisionImpl(const YAML::Node& config, std::int32_t text_width, bool quantized) {
@@ -323,7 +330,10 @@ auto Gemma4VisionImpl::set_precision(core::InferencePrecision precision) noexcep
     impl_->precision = precision;
     impl_->context.set_precision(precision);
 }
-auto Gemma4VisionImpl::release_workspaces() -> void { impl_->context.release_workspaces(); }
+auto Gemma4VisionImpl::release_workspaces() -> void {
+    if (device() == tensor::Device::web_gpu()) impl_->context.trim_workspaces();
+    else impl_->context.release_workspaces();
+}
 
 auto Gemma4VisionImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
     try {
@@ -430,10 +440,10 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image, const BlockObser
                 position[patch * state.hidden + channel] =
                     table[(patch % image.patch_columns) * state.hidden + channel] +
                     table[(state.positions + patch / image.patch_columns) * state.hidden + channel];
-        auto hidden =
-            context.add(project_rows(context, state.tower->patch->projection,
-                            require(Tensor::from_host({1, length, 768}, std::span<const float>(pixels), device()))),
-                        require(Tensor::from_host({1, length, state.hidden}, std::span<const float>(position), device())));
+        const auto patches =
+            require(Tensor::from_host({1, length, 768}, std::span<const float>(pixels), device()));
+        const auto positions =
+            require(Tensor::from_host({1, length, state.hidden}, std::span<const float>(position), device()));
         std::vector<float> cosine(2 * length * (state.head_width / 4)), sine(cosine.size());
         for (std::int64_t patch = 0; patch < length; ++patch)
             for (int axis = 0; axis < 2; ++axis)
@@ -462,26 +472,45 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image, const BlockObser
             require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(cosine), device()));
         const auto sin = require(Tensor::from_host({2, length, 1, state.head_width / 4}, std::span<const float>(sine), device()));
         const auto mask = require(Tensor::zeros({1, 1, 1, length}, DType::F32, device()));
-        if (stage_observer && stage_layers) {
-            stage_observer(0, "rope_cos", cos);
-            stage_observer(0, "rope_sin", sin);
-        }
-        std::size_t layer_index = 0;
-        for (const auto& layer : *state.tower->encoder->layers) {
-            StageCallback stage_callback;
-            if (stage_observer && layer_index < stage_layers)
-                stage_callback = [&](std::string_view stage, const Tensor& tensor) {
-                    context.synchronize();
-                    stage_observer(layer_index, stage, tensor);
-                };
-            hidden = layer->forward(context, hidden, cos, sin, mask, stage_callback);
-            if (block_observer) {
-                context.synchronize();
-                block_observer(layer_index, hidden);
+        auto hidden = context.add(project_rows(context, state.tower->patch->projection, patches), positions);
+        const auto& layers = *state.tower->encoder->layers;
+        if (device() == tensor::Device::web_gpu() && !block_observer && !stage_observer) {
+            std::size_t region = 0;
+            for (auto first = layers.begin(); first != layers.end(); ++region) {
+                auto last = first;
+                for (std::size_t count = 0; count < VISION_REGION_LAYERS && last != layers.end(); ++count) ++last;
+                const std::array inputs{hidden, cos, sin, mask};
+                hidden = context.replay(
+                    "vision:" + std::to_string(length) + ':' + std::to_string(region), inputs,
+                    [&](std::span<const Tensor> operands) {
+                        auto value = operands[0];
+                        for (auto layer = first; layer != last; ++layer)
+                            value = (*layer)->forward(context, value, operands[1], operands[2], operands[3], {});
+                        return std::vector<Tensor>{value};
+                    }, false).front();
+                first = last;
             }
-            ++layer_index;
+        } else {
+            if (stage_observer && stage_layers) {
+                stage_observer(0, "rope_cos", cos);
+                stage_observer(0, "rope_sin", sin);
+            }
+            std::size_t layer_index = 0;
+            for (const auto& layer : layers) {
+                StageCallback stage_callback;
+                if (stage_observer && layer_index < stage_layers)
+                    stage_callback = [&](std::string_view stage, const Tensor& tensor) {
+                        context.synchronize();
+                        stage_observer(layer_index, stage, tensor);
+                    };
+                hidden = layer->forward(context, hidden, cos, sin, mask, stage_callback);
+                if (block_observer) {
+                    context.synchronize();
+                    block_observer(layer_index, hidden);
+                }
+                ++layer_index;
+            }
         }
-        // Average each 3x3 patch neighbourhood on the device, viewing patches as [rows/3, 3, columns/3, 3, hidden].
         const auto grid =
             context.reshape(hidden, {image.patch_rows / 3, 3, image.patch_columns / 3, 3, state.hidden});
         Tensor pooled;
@@ -492,7 +521,7 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image, const BlockObser
             }
         const auto scale = std::sqrt(static_cast<float>(state.hidden)) / 9.F;
         pooled = context.multiply(context.reshape(pooled, {1, length / 9, state.hidden}),
-                                  require(Tensor::from_host({}, std::span<const float>(&scale, 1), device())));
+            require(Tensor::from_host({}, std::span<const float>(&scale, 1), device())));
         auto output = state.projection->projection->forward(context, state.projection->norm->forward(context, pooled));
         context.synchronize();
         return output;

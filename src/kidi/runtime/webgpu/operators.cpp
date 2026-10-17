@@ -1,11 +1,13 @@
 #include "kidi/runtime/operator.h"
 #include "kidi/ops/context.h"
 #include "kidi/tensor/web_gpu.h"
+#include "kidi/graph/graph.h"
 
 #include <emscripten.h>
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <bit>
 #include <cstring>
 #include <tuple>
 
@@ -35,6 +37,25 @@ EM_JS(int, run_gpu, (int program, const std::uint32_t* bindings, int count), {
     }
 });
 EM_JS(void, release_program, (int program), { Module.kidiGpu.releaseProgram(program); });
+EM_JS(int, prepare_region, (const char* specification), {
+    try {
+        return Module.kidiGpu.prepareRegion(JSON.parse(UTF8ToString(Number(specification))));
+    } catch (error) {
+        Module.kidiGpu.failure = String(error);
+        return 0;
+    }
+});
+EM_JS(int, run_region, (int region, const std::uint32_t* bindings, int count), {
+    try {
+        Module.kidiGpu.runRegion(region, HEAPU32.subarray(Number(bindings) / 4, Number(bindings) / 4 + count));
+        return 0;
+    } catch (error) {
+        Module.kidiGpu.failure = String(error);
+        return -1;
+    }
+});
+EM_JS(void, release_region, (int region), { Module.kidiGpu.releaseRegion(region); });
+EM_JS(int, lower_regions, (), { return Module.kidiGpu.lowerGraphs ? 1 : 0; });
 EM_JS(int, copy_gpu,
       (int source, std::size_t source_offset, int destination, std::size_t destination_offset, std::size_t bytes), {
           try {
@@ -131,7 +152,8 @@ public:
     }
     auto run_(TensorInputs inputs, tensor::Tensor& destination) -> tensor::Tensor override {
         if (direct_inplace_) {
-            std::array rebound{inputs[0], inputs[1], inputs[2]};
+            std::vector<tensor::Tensor> rebound;
+            for (std::size_t index = 0; index < inputs.size(); ++index) rebound.push_back(inputs[index]);
             for (std::size_t index = 1; index < rebound.size(); ++index) {
                 if (rebound[index].storage_identity() != destination.storage_identity()) continue;
                 const auto source = require(tensor::web_gpu_buffer(rebound[index]));
@@ -157,6 +179,49 @@ public:
         return destination;
     }
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+    auto release_workspaces() -> void override {
+        pool_.clear();
+        host_pool_.clear();
+    }
+
+    auto record(const graph::Node& node, std::vector<tensor::Tensor>& retained)
+        -> std::optional<nlohmann::json> {
+        using Source = graph::Source;
+        const auto binding = [&](const tensor::Tensor& value, const Source* source = nullptr) -> nlohmann::json {
+            if (source && source->kind == Source::Kind::INPUT)
+                return {{"input", source->index}, {"offset", source->offset}};
+            const auto view = require(tensor::web_gpu_buffer(value));
+            return {{"handle", view.handle}, {"offset", view.offset_bytes}};
+        };
+        nlohmann::json command{{"program", program_}, {"bindings", nlohmann::json::array()}};
+        for (std::size_t index = 0; index < node.input_count; ++index) {
+            if (constants_[index].defined())
+                command["bindings"].push_back(binding(constants_[index]));
+            else
+                command["bindings"].push_back(binding(node.operands[index], &node.sources[index]));
+        }
+        const auto& destination = node.outputs().front();
+        if (direct_inplace_ && node.mode == graph::Mode::IN_PLACE) {
+            for (std::size_t index = 1; index < node.input_count; ++index)
+                if (node.operands[index].storage_identity() == destination.storage_identity()) return std::nullopt;
+        }
+        if (selected_ || (node.mode == graph::Mode::IN_PLACE && !direct_inplace_)) {
+            auto temporary = pool_.acquire(shape_, dtype_, tensor::Device::web_gpu());
+            command["bindings"].push_back(binding(temporary));
+            retained.push_back(std::move(temporary));
+            if (selected_) {
+                const auto bytes = require(destination.host_bytes());
+                command["read"] = {{"destination", reinterpret_cast<std::uintptr_t>(bytes.data())},
+                                    {"bytes", bytes.size()}};
+            } else {
+                command["copy"] = {{"destination", binding(destination, &node.sources.back())},
+                                    {"bytes", destination.nbytes()}};
+            }
+        } else {
+            command["bindings"].push_back(binding(destination, &node.sources.back()));
+        }
+        return command;
+    }
 
 private:
     int program_;
@@ -166,9 +231,66 @@ private:
     bool selected_, direct_inplace_;
     OutputPool pool_, host_pool_;
 };
+
+class GpuRegion final : public StepExecutable {
+public:
+    GpuRegion(int program, graph::Graph graph, std::vector<tensor::Tensor> retained)
+        : program_(program), graph_(std::move(graph)), retained_(std::move(retained)) {}
+    ~GpuRegion() override { release_region(program_); }
+    auto run(std::span<const tensor::Tensor> inputs, std::span<tensor::Tensor> outputs) -> void override {
+        graph_.rebind(inputs);
+        std::vector<std::uint32_t> bindings;
+        bindings.reserve(inputs.size() * 2);
+        for (const auto& input : inputs) {
+            const auto view = require(tensor::web_gpu_buffer(input));
+            bindings.push_back(view.handle);
+            bindings.push_back(view.offset_bytes);
+        }
+        if (run_region(program_, bindings.data(), bindings.size())) throw ops::Failure(tensor::web_gpu_error());
+        std::ranges::copy(graph_.outputs(), outputs.begin());
+    }
+
+private:
+    int program_;
+    graph::Graph graph_;
+    std::vector<tensor::Tensor> retained_;
+};
+
 class GpuBackend final : public OperatorBackend {
 public:
     auto supports_replay() const noexcept -> bool override { return true; }
+    auto prepare_graph(const graph::Graph& graph, std::string_view key) -> std::unique_ptr<StepExecutable> override {
+        if (!lower_regions()) return nullptr;
+        for (const auto& input : graph.inputs())
+            if (input.device() != tensor::Device::web_gpu()) return nullptr;
+        auto planned = graph;
+        const auto memory = planned.plan_intermediates(
+            [&](std::size_t slot, std::size_t elements, tensor::DType dtype, tensor::Device device) {
+                auto& storage = scratch_[{static_cast<int>(dtype), slot}];
+                if (!storage.defined() || storage.numel() < elements) {
+                    const auto capacity = std::bit_ceil(std::max<std::size_t>(elements, 1));
+                    storage = require(tensor::Tensor::empty({static_cast<std::int64_t>(capacity)}, dtype, device));
+                }
+                return storage;
+            });
+        nlohmann::json description{{"key", key}, {"commands", nlohmann::json::array()},
+                                   {"originalBytes", memory.original_bytes},
+                                   {"plannedBytes", memory.planned_bytes}};
+        std::vector<tensor::Tensor> retained;
+        for (const auto& node : planned.nodes()) {
+            if (node.outputs().size() != 1) return nullptr;
+            auto* operation = dynamic_cast<GpuOperator*>(node.prepared.get());
+            if (!operation) return nullptr;
+            auto command = operation->record(node, retained);
+            if (!command) return nullptr;
+            description["commands"].push_back(std::move(*command));
+        }
+        const auto region = prepare_region(description.dump().c_str());
+        if (!region) return nullptr;
+        for (const auto& node : planned.nodes())
+            static_cast<GpuOperator*>(node.prepared.get())->release_workspaces();
+        return std::make_unique<GpuRegion>(region, std::move(planned), std::move(retained));
+    }
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
         static const std::map<Operation, std::string> names{{Operation::ADD, "add"},
                                                             {Operation::MULTIPLY, "multiply"},
@@ -199,8 +321,16 @@ public:
                                                             {Operation::SILU_MULTIPLY, "silu_multiply"},
                                                             {Operation::SILU_GATE, "silu_gate"},
                                                             {Operation::EMBEDDING, "embedding"},
-                                                            {Operation::GATED_FEED_FORWARD, "gated_feed_forward"}};
-        const bool direct_inplace = spec.operation == Operation::SCATTER && ops::is_inplace;
+                                                            {Operation::GATED_FEED_FORWARD, "gated_feed_forward"},
+                                                            {Operation::DIFFUSION_CANDIDATES, "diffusion_candidates"},
+                                                            {Operation::DIFFUSION_UPDATE, "diffusion_update"},
+                                                            {Operation::EMBEDDING_SUM, "embedding_sum"},
+                                                            {Operation::CONV1D, "conv1d"},
+                                                            {Operation::CONV_TRANSPOSE_FOLD, "conv_transpose_fold"},
+                                                            {Operation::SNAKE, "snake"}};
+        const bool direct_inplace = ops::is_inplace &&
+                                    (spec.operation == Operation::SCATTER || spec.operation == Operation::ADD ||
+                                     spec.operation == Operation::MULTIPLY);
         nlohmann::json description{
             {"operation", names.at(spec.operation)},
             {"inplace", direct_inplace},
@@ -269,6 +399,7 @@ public:
     }
 
 private:
+    std::map<std::pair<int, std::size_t>, tensor::Tensor> scratch_;
     std::map<std::tuple<const void*, std::int64_t, std::int32_t>, std::pair<tensor::Tensor, tensor::Tensor>> constants_;
 };
 } // namespace

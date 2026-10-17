@@ -82,7 +82,8 @@ for (const wav of wavs) {
     const pointer = Number(module._malloc(audio.byteLength));
     new Float32Array(module.HEAPU8.buffer, pointer, audio.length).set(audio);
     const started = performance.now();
-    const result = call('kidi_transcribe', ['pointer', 'number', 'string', 'number'], [pointer, audio.length, 'auto', 128]);
+    let result = call('kidi_asr_start', ['pointer', 'number', 'string', 'number'], [pointer, audio.length, 'auto', 128]);
+    while (result.pending) result = call('kidi_asr_step');
     module._free(pointer);
     console.log(`${(audio.length / 16000).toFixed(1)} s audio in ${(performance.now() - started).toFixed(0)} ms ` +
         `(encode ${result.encode_ms.toFixed(0)}, decode ${result.decode_ms.toFixed(0)}) ${result.language}:${result.text}`);

@@ -949,62 +949,60 @@ auto KokoroImpl::synthesize(std::span<const std::int32_t> phoneme_ids, std::stri
     }
 }
 
-auto KokoroImpl::synthesize(std::string_view text, const inference::SynthesisOptions& options)
-    -> Result<inference::Synthesis> {
-    try {
-        if (!impl_->phonemizer)
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Kokoro was not loaded as a synthesis model"});
-        const auto preparation = preparation_ns();
-        if (options.duration_seconds)
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "Kokoro predicts duration; use --duration auto"});
-        auto language = options.language;
-        std::ranges::transform(language, language.begin(),
-                               [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
-        if (!language.empty() && language != "auto" && language != "english" && language != "en" && language != "en-us")
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "this Kokoro package supports US English only"});
+auto KokoroImpl::start_synthesis(std::string_view text, const inference::SynthesisOptions& options)
+    -> Result<std::unique_ptr<inference::SynthesisSession>> {
+    return std::make_unique<Session>(synthesis_session_(std::string(text), options));
+}
 
-        auto voice = impl_->default_voice;
-        float speed = 1.F;
-        for (const auto& [key, value] : options.voice) {
-            if (key == "name") {
-                voice = value;
-            } else if (key == "speed") {
-                auto parsed = inference::parse_synthesis_number(value);
-                if (!parsed || *parsed <= 0)
-                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Kokoro speed must be positive and finite"});
-                speed = *parsed;
-            } else {
-                throw ops::Failure({ErrorCode::UNSUPPORTED, "Kokoro does not support voice attribute: " + key});
-            }
-        }
+auto KokoroImpl::synthesis_session_(std::string text, inference::SynthesisOptions options) -> Session {
+    if (!impl_->phonemizer)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Kokoro was not loaded as a synthesis model"});
+    const auto preparation = preparation_ns();
+    if (options.duration_seconds)
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "Kokoro predicts duration; use --duration auto"});
+    auto language = options.language;
+    std::ranges::transform(language, language.begin(),
+                           [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+    if (!language.empty() && language != "auto" && language != "english" && language != "en" && language != "en-us")
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "this Kokoro package supports US English only"});
 
-        auto phonemes = require(impl_->phonemizer->phonemize(text));
-        const auto started = std::chrono::steady_clock::now();
-        auto output = require(synthesize(phonemes.ids, voice, speed, options.seed));
-        const auto generation_ns = inference::synthesis_elapsed_ns(started);
-        const auto peak = std::ranges::max(output.samples, {}, [](float value) { return std::abs(value); });
-        if (std::abs(peak) > 0.3F) {
-            const auto scale = 0.3F / std::abs(peak);
-            for (auto& sample : output.samples) sample *= scale;
+    auto voice = impl_->default_voice;
+    float speed = 1.F;
+    for (const auto& [key, value] : options.voice) {
+        if (key == "name") {
+            voice = value;
+        } else if (key == "speed") {
+            auto parsed = inference::parse_synthesis_number(value);
+            if (!parsed || *parsed <= 0)
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Kokoro speed must be positive and finite"});
+            speed = *parsed;
+        } else {
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "Kokoro does not support voice attribute: " + key});
         }
-        const auto frames = std::accumulate(output.durations.begin(), output.durations.end(), std::size_t{0});
-        return inference::Synthesis{
-            .samples = std::move(output.samples),
-            .sample_rate = sample_rate(),
-            .tokens = std::move(phonemes.ids),
-            .stats =
-                {
-                    .generation_ns = generation_ns,
-                    .decode_ns = 0,
-                    .preparation_ns = preparation_ns() - preparation,
-                    .audio_tokens = frames,
-                },
-        };
-    } catch (const ops::Failure& error) {
-        return std::unexpected(error.error());
-    } catch (const std::exception& error) {
-        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
     }
+
+    auto phonemes = require(impl_->phonemizer->phonemize(text));
+    const auto started = std::chrono::steady_clock::now();
+    auto output = require(synthesize(phonemes.ids, voice, speed, options.seed));
+    const auto generation_ns = inference::synthesis_elapsed_ns(started);
+    const auto peak = std::ranges::max(output.samples, {}, [](float value) { return std::abs(value); });
+    if (std::abs(peak) > 0.3F) {
+        const auto scale = 0.3F / std::abs(peak);
+        for (auto& sample : output.samples) sample *= scale;
+    }
+    const auto frames = std::accumulate(output.durations.begin(), output.durations.end(), std::size_t{0});
+    co_return Result<inference::Synthesis>{inference::Synthesis{
+        .samples = std::move(output.samples),
+        .sample_rate = sample_rate(),
+        .tokens = std::move(phonemes.ids),
+        .stats =
+            {
+                .generation_ns = generation_ns,
+                .decode_ns = 0,
+                .preparation_ns = preparation_ns() - preparation,
+                .audio_tokens = frames,
+            },
+    }};
 }
 
 auto KokoroImpl::sample_rate() const noexcept -> std::uint32_t { return impl_->sample_rate; }

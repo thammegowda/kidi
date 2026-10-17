@@ -147,6 +147,15 @@ auto web_gpu_buffer(const Tensor& tensor) -> Result<WebGpuBufferView> {
                             static_cast<std::size_t>(tensor.storage_offset()) * element_size(tensor.dtype()),
                             storage.packed_layout()};
 }
+auto web_gpu_read_later(const Tensor& source, std::span<std::byte> destination) -> Result<void> {
+    auto view = web_gpu_buffer(source);
+    if (!view) return std::unexpected(std::move(view.error()));
+    if (destination.size() > source.nbytes())
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "WebGPU deferred read exceeds tensor storage"});
+    if (queue_read(static_cast<int>(view->handle), view->offset_bytes, destination.data(), destination.size()))
+        return std::unexpected(web_gpu_error());
+    return {};
+}
 auto adopt_web_gpu_buffer(std::uint32_t handle, std::vector<std::int64_t> shape, DType dtype,
                           std::int32_t packed_layout) -> Result<Tensor> {
     if (!handle || shape.empty()) return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid WebGPU buffer"});

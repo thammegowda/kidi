@@ -974,8 +974,7 @@ public:
             !spec.dynamic_parameters &&
             (spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
              spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RMS_NORM ||
-             spec.operation == Operation::PACKED_LINEAR || spec.operation == Operation::GATED_FEED_FORWARD ||
-             spec.operation == Operation::QUANTIZED_GATED_FEED_FORWARD || paired);
+             spec.operation == Operation::PACKED_LINEAR || spec.operation == Operation::GATED_FEED_FORWARD || paired);
         const std::size_t dynamic_count = constant ? (paired ? 2 : 1) : inputs.size();
         const std::size_t column_alignment = spec.operation == Operation::PACKED_LINEAR ? 8 / spec.attributes[0] : 1;
         const auto padded_columns =
@@ -1226,34 +1225,6 @@ public:
                     up_weight_ids.data(), up_scale_ids.data(), scalar(gate_output_scale), down_weight_ids.data(),
                     operands[4], scalar(down_input_scale), scalar(down_output_scale), input_size, intermediate,
                     TILE_SIZE, true, result));
-                break;
-            }
-            case Operation::QUANTIZED_GATED_FEED_FORWARD: {
-                const auto projection = [&](std::uint32_t activation, std::uint32_t weight, std::uint32_t scales,
-                                            std::uint32_t bias, std::size_t input_width) {
-                    auto zero = YNN_INVALID_VALUE_ID, scale = YNN_INVALID_VALUE_ID, quantized = YNN_INVALID_VALUE_ID;
-                    const auto range = reduce(ynn_reduce_min_max, activation);
-                    check(ynn_define_dynamic_quantization(native, range, ynn_type_int8, &zero, &scale, 0));
-                    check(ynn_define_quantize(native, activation, ynn_type_int8, zero, scale, &quantized, 0));
-                    const std::array<std::int32_t, 2> axes{1, 0};
-                    auto transposed = YNN_INVALID_VALUE_ID;
-                    check(ynn_define_static_transpose(native, axes.size(), axes.data(), weight, &transposed, 0));
-                    auto output = YNN_INVALID_VALUE_ID;
-                    check(::ynn::define_blockwise_dot(native, quantized, zero, scale, transposed, YNN_INVALID_VALUE_ID,
-                                                      scales, input_width, bias, ynn_type_fp32, output, 0));
-                    return output;
-                };
-                const auto projected =
-                    projection(operands[0], operands[1], operands[2], operands[3], inputs[0].size(-1));
-                const auto intermediate = inputs[4].size(1);
-                const auto axis = static_cast<std::int32_t>(inputs[0].dimensions() - 1);
-                const std::int64_t begin = 0, middle = intermediate, end = 2 * intermediate, stride = 1;
-                auto gate = YNN_INVALID_VALUE_ID, up = YNN_INVALID_VALUE_ID;
-                check(ynn_define_static_slice(native, 1, &axis, &begin, &middle, &stride, projected, &gate, 0));
-                check(ynn_define_static_slice(native, 1, &axis, &middle, &end, &stride, projected, &up, 0));
-                const auto hidden =
-                    binary(ynn_binary_multiply, binary(ynn_binary_multiply, gate, unary(ynn_unary_sigmoid, gate)), up);
-                result = projection(hidden, operands[4], operands[5], operands[6], intermediate);
                 break;
             }
             case Operation::GELU_MULTIPLY:

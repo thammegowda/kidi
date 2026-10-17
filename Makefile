@@ -36,7 +36,7 @@ python-test: build-python-test
 	$(TEST_PYTHON) -m unittest discover -s tests -p python_cli_test.py
 
 web-test:
-	node --test tests/browser/*.mjs third_party/liteapp/tests/browser/*.mjs
+	node --test tests/browser/*_test.mjs third_party/liteapp/tests/browser/*_test.mjs
 
 regression-test: setup-test build-test
 	$(TEST_PYTHON) tests/rtg_regression.py run --binary "$(KIDI_BIN)" --backend "$(BACKEND)" --threads "$(THREADS)" --min-chrf "$(MIN_CHRF)"

@@ -373,13 +373,70 @@ auto bounded_replay_cache_evicts_old_shapes() -> bool {
     return expect(first_calls == 3 && second_calls == 2,
                   "a bounded replay cache recaptures the least-recently-used shape");
 }
+
+auto replay_capacity_can_be_changed() -> bool {
+    Context context;
+    context.set_replay_capacity(2);
+    const auto input = tensor({2}, {1, 2});
+    int first_calls = 0, second_calls = 0, third_calls = 0;
+    const auto replay = [&](std::string_view key, int& calls) {
+        return context.replay(key, std::array{input}, [&](std::span<const Tensor> inputs) {
+            ++calls;
+            return std::vector{context.add(inputs[0], inputs[0])};
+        }, false);
+    };
+    (void)replay("first", first_calls);
+    (void)replay("second", second_calls);
+    (void)replay("first", first_calls);
+    (void)replay("third", third_calls);
+    (void)replay("first", first_calls);
+    (void)replay("second", second_calls);
+    if (!expect(first_calls == 1 && second_calls == 2 && third_calls == 1,
+                "configured capacity retains hot regions and evicts the least recent region"))
+        return false;
+    context.set_replay_capacity(1);
+    (void)replay("second", second_calls);
+    const auto output = values(replay("first", first_calls)[0]);
+    return expect(first_calls == 2 && second_calls == 2 && output == std::vector<float>{2, 4},
+                  "shrinking replay capacity immediately evicts cold regions") &&
+           fails_with([&] { context.set_replay_capacity(0); }, "positive");
+}
+} // namespace
+
+namespace {
+auto planned_intermediates_preserve_rebinding() -> bool {
+    auto input = tensor({4}, {1, 2, 3, 4});
+    const auto increment = tensor({4}, {1, 1, 1, 1});
+    const std::array inputs{input};
+    kidi::graph::Recorder recorder(inputs);
+    auto backend = kidi::runtime::cpu_operators();
+    auto previous = input;
+    for (int index = 0; index < 8; ++index) {
+        const kidi::runtime::OperatorSpec spec{kidi::runtime::Operation::ADD, {}, DType::F32};
+        const std::array operands{previous, increment};
+        std::shared_ptr<kidi::runtime::Operator> operation = backend->prepare(spec, operands);
+        auto output = operation->run(operands);
+        output = tensor({4}, values(output));
+        recorder.record(spec, operation, kidi::graph::Mode::RESULT, operands, {&output, 1});
+        previous = std::move(output);
+    }
+    auto graph = std::move(recorder).finish(std::array{previous});
+    const auto memory = graph.plan_intermediates();
+    const auto rebound = tensor({4}, {10, 20, 30, 40});
+    const auto outputs = graph.replay(std::array{rebound});
+    return expect(memory.planned_bytes < memory.original_bytes, "liveness planning reuses intermediate buffers") &&
+           expect(values(outputs[0]) == std::vector<float>{18, 28, 38, 48},
+                  "planned buffers preserve numerical output and input rebinding");
+}
 } // namespace
 
 auto main() -> int {
     try {
-        return replay_matches_eager() && replay_rebinds_inputs_and_views() && replay_updates_state_in_place() &&
+        return planned_intermediates_preserve_rebinding() &&
+                       replay_matches_eager() && replay_rebinds_inputs_and_views() && replay_updates_state_in_place() &&
                        replay_supports_paired_and_selection_outputs() && capture_rejects_per_call_host_values() &&
                        least_recently_used_steps_are_recaptured() && bounded_replay_cache_evicts_old_shapes() &&
+                       replay_capacity_can_be_changed() &&
                        disabled_replay_runs_eagerly() && single_capture_compiles_and_rebinds_inputs() &&
                        attached_accelerator_enables_replay() &&
                        background_compilation_hands_over_from_cpu_replay(false) &&

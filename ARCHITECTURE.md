@@ -126,6 +126,15 @@ that interface directly, so each model's package loading, frontend, voice
 schema, prompt policy and neural equations stay together in its model file.
 `synthesizer.cpp` owns generic option parsing, model-type dispatch, sentence
 orchestration, and the model-neutral lifetime of generated voice prompts.
+Both synchronous and stepped synthesis use the same chunk orchestrator. A
+reference sentence may be generated first, but completed audio is emitted in
+playback order as soon as earlier sentences are available. Disabling
+`retain_audio` releases delivered waveforms instead of buffering every sentence.
+Models expose one session-oriented synthesis contract. The native synchronous
+frontend advances that session once; CPU/Metal/Vulkan models complete in that
+call, while a pending WebGPU session is rejected because JavaScript must await
+submitted work between steps. `SynthesisOptions::voice_prompt` is the sole owned
+reference carrier; there is no parallel borrowed-reference API.
 
 `SynthesisOptions::voice` is a model-independent string map populated by the
 repeatable `--voice KEY=VALUE` CLI option. Parsing validates only generic
@@ -163,6 +172,26 @@ CPU, split SiLU reads the fused gate/up projection directly through
 Accelerate/vForce, RMS normalization and rotary are one operator, and Qwen/DAC
 residual streams plus codebook sums reuse their input buffers. Unit-stride 1x1
 audio convolutions bypass im2col lowering.
+
+Neural audio APIs use shaped tensors, not flat token spans plus a separate
+length: codebook IDs are I32 `[codebooks, length]`, while OmniVoice `forward()`
+takes FP32 `[1, sequence, hidden]` embeddings. Higgs quantization/decoding has
+one tensor implementation for all supported devices. Host vectors remain at
+tokenization, CPU sampling, and serialized result boundaries. Reference
+embeddings are prepared once and concatenated with the current target
+embedding, rather than re-embedding the reference and target every step.
+
+WebGPU diffusion always uses device-side candidate selection, state updates,
+and codebook embedding sums. Experimental full-logit readback/host-sampling
+modes and forced guidance-layout environment switches have been removed.
+Guidance layout is selected automatically; separate conditional/unconditional
+passes remain the capacity fallback. Native CPU/Metal/Vulkan sampling is not
+an obsolete WebGPU fallback and remains supported.
+
+The Wasm speech ABI likewise uses only `start`/`step` for TTS and ASR. CPU
+workers complete on the start call; WebGPU workers continue while `pending`.
+Separate synchronous Wasm exports were removed, while native synchronous C++
+frontends remain.
 
 Qwen projection weights remain signed INT8 in output-major checkpoint layout.
 YNNPACK dynamically quantizes each FP32 activation directly to INT8 for its

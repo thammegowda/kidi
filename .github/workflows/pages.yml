@@ -92,7 +92,7 @@ jobs:
           "$RUNNER_TEMP/emsdk/emsdk" activate "$EMSCRIPTEN_VERSION"
 
       - name: Test browser model loader
-        run: node --test tests/browser/*.mjs
+        run: node --test tests/browser/*_test.mjs
 
       - name: Build single-thread and pthread WebAssembly
         shell: bash
@@ -109,7 +109,7 @@ jobs:
         shell: bash
         run: |
           test -f build-pages/.nojekyll
-          for file in index.html coi-serviceworker.js single/kidi.mjs single/kidi.wasm threads/kidi.mjs threads/kidi.wasm; do
+          for file in index.html coi-serviceworker.js single/kidi.mjs single/kidi.wasm threads/kidi.mjs threads/kidi.wasm gpu/kidi.mjs gpu/kidi.wasm; do
             test -s "build-pages/$file"
           done
           test -z "$(find build-pages -type l -print -quit)"

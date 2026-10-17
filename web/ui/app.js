@@ -1,6 +1,7 @@
 import {renderMarkdown, renderStreamingMarkdown} from './markdown.js';
 import {backend} from './backend.js';
 import {MAX_IMAGE_BYTES, MAX_IMAGES, readImage, removeUnusedImages, storeImage} from './images.js';
+import {renderSpeechHighlights} from './speech-highlights.js';
 
 const $ = id => document.getElementById(id);
 const STORAGE = 'kidi-app-v2';
@@ -334,7 +335,8 @@ function connectBackend() {
   backend.connect({
     onOpen: () => { state.socketReady = true; renderRuntime(); },
     onEvent: handleEvent,
-    onAudio: buffer => handleAudio(buffer).catch(error => showNotice(error.message)),
+    onAudio: buffer => handleAudio(buffer).catch(error => audioFailure(playbackStreamId, error)),
+    onPcm: frame => handlePcm(frame),
     onClose: () => {
     if (activeRequest?.kind === 'chat') {
       const chat = activeChat();
@@ -465,19 +467,24 @@ function renderMessages() {
     container.scrollTop = followOutput ? container.scrollHeight : previousTop;
     requestAnimationFrame(() => { rebuildingMessages = false; });
   });
+  renderSpeechHighlights(ttsStreams.values());
 }
 
 function renderRuntime() {
   const asrActive = activeRequest?.kind === 'asr';
   const playingVoiceReply = voiceMode && playbackStreamId !== null;
   const label = asrActive ? (recording ? 'Listening…' :
-    asrFinalizing ? 'Finalizing dictation…' : 'Preparing speech recognition…') :
-    activeRequest?.kind === 'chat' && voiceMode ? 'Kidi is thinking…' :
-    activeRequest?.kind === 'tts' && voiceMode ? 'Kidi is speaking…' :
+    activeRequest.asrStatus || (asrFinalizing ? 'Finalizing dictation…' : 'Preparing speech recognition…')) :
+    activeRequest?.kind === 'chat' && voiceMode ?
+      (ttsStreams.get(playbackStreamId)?.bufferedFrames > 0 ? 'Speaking while writing…' : 'Kidi is thinking…') :
+    activeRequest?.kind === 'tts' ? activeRequest.ttsStatus || 'Preparing speech…' :
+    activeRequest?.kind === 'voice-tts' ? activeRequest.ttsStatus || 'Kidi is speaking…' :
     playingVoiceReply ? 'Kidi is speaking…' :
     voiceMode ? 'Voice mode ready' :
+    state.runtime.reloading ? 'Loading cached model…' :
     state.busy ? 'Generating locally…' : state.runtime.loading ?
-      $('model-loading-stage').textContent : state.ready ? executionLabel(state.backend) : 'No model loaded';
+      $('model-loading-stage').textContent : state.ready ?
+        state.runtime.resident === false ? 'Model cached · loads on use' : executionLabel(state.backend) : 'No model loaded';
   $('runtime-label').textContent = label;
   $('runtime-dot').className = `runtime-dot${state.busy ? ' busy' : state.ready ? ' ready' : ''}`;
   $('send').disabled = (asrActive ? (!recording || sendAfterTranscription) :
@@ -575,6 +582,7 @@ function renderConfig() {
   $('tts-config-summary').replaceChildren(
     configSection('Speech synthesis', [
       configRow('TTS', tts.enabled ? `${tts.accelerator} · ${tts.directory}` : 'Disabled', 'wide'),
+      configRow('CPU threads', tts.threads ?? '—'),
       configRow('TTS Metal cache', `${tts.metal_prefill_cache_mb ?? '—'} MiB`),
       configRow('Language mode', tts.settings?.language || 'auto'),
       configRow('Reference language', tts.settings?.reference_language || 'English'),
@@ -592,12 +600,14 @@ function renderConfig() {
   $('tts-pitch').value = voice.pitch || 'moderate';
   $('tts-style').value = voice.style || '';
   $('tts-accent').value = voice.accent || '';
+  $('tts-gpu-precision').value = settings.gpu_precision || 'f32';
   $('tts-availability').textContent = tts.enabled ? 'Available' : 'Model disabled';
   $('system-prompt').value = chat.system_prompt || '';
   const configured = chat.configured_system_prompt || '';
   $('system-prompt-status').textContent =
     (chat.system_prompt || '') === configured ? 'From configuration' : 'Modified for this session';
   const wasm = state.runtime.host === 'wasm';
+  $('tts-gpu-precision-row').hidden = !wasm || state.runtime.requested_backend !== 'webgpu';
   document.querySelector('[data-settings-page="cache"]').hidden = !wasm;
   $('wasm-preferences').hidden = !wasm;
   selectSettingsPage(!wasm && settingsPage === 'cache' ? 'llm' : settingsPage);
@@ -618,6 +628,7 @@ function initializeTtsSettings() {
     language: saved.language || defaults.language || 'English',
     steps: Number.isInteger(saved.steps) ? saved.steps : defaults.steps || 10,
     pace: Number.isFinite(saved.pace) ? saved.pace : defaults.pace || 1,
+    gpu_precision: ['f32', 'mixed-f16', 'w8a8'].includes(saved.gpu_precision) ? saved.gpu_precision : 'f32',
     voice: {...(defaults.voice || {}), ...(saved.voice || {})},
   };
   ttsSettingsInitialized = true;
@@ -629,6 +640,7 @@ function updateTtsSettings() {
     language: $('tts-language').value.trim() || 'English',
     steps: Number.isInteger(steps) && steps >= 1 && steps <= 128 ? steps : 10,
     pace: Number($('tts-pace').value),
+    gpu_precision: $('tts-gpu-precision').value,
     voice: {
       gender: $('tts-gender').value,
       age: $('tts-age').value,
@@ -638,6 +650,12 @@ function updateTtsSettings() {
     },
   };
   persist();
+}
+
+function ttsRequestOptions() {
+  const options = {...state.ttsSettings};
+  if (state.runtime.host !== 'wasm') delete options.gpu_precision;
+  return options;
 }
 
 function applySystemPrompt(prompt) {
@@ -678,6 +696,7 @@ function streamText(delta) {
   if (content) {
     content.className = 'message-content streaming';
     renderStreamingMarkdown(content, message.content);
+    renderSpeechHighlights(ttsStreams.values());
   }
   if (followOutput) {
     requestAnimationFrame(() => {
@@ -697,7 +716,7 @@ function setReadAloudState(button, active) {
   button.title = active ? 'Stop reading response' : 'Read response aloud';
 }
 
-function appendReadAloud(body, content) {
+function appendReadAloud(body, text) {
   const read = document.createElement('button');
   read.type = 'button'; read.className = 'message-action read-aloud';
   read.innerHTML = '<span class="read-aloud-icon" aria-hidden="true"></span>';
@@ -705,7 +724,7 @@ function appendReadAloud(body, content) {
   read.addEventListener('click', () => {
     const stream = [...ttsStreams.entries()].find(([, value]) => value.button === read);
     if (stream) stopTts(stream[0]);
-    else startTts(content.textContent, read);
+    else startTts(text, read);
   });
   body.append(read);
 }
@@ -713,7 +732,7 @@ function appendReadAloud(body, content) {
 function appendMessageActions(row, content, source) {
   const actions = document.createElement('div');
   actions.className = 'message-actions';
-  if (state.components.tts?.enabled) appendReadAloud(actions, content);
+  if (state.components.tts?.enabled) appendReadAloud(actions, source);
   const copy = document.createElement('button');
   copy.type = 'button'; copy.className = 'message-action copy-message';
   copy.innerHTML = '<span class="copy-message-icon" aria-hidden="true"></span>';
@@ -744,6 +763,7 @@ function finalizeAssistant(message) {
   const content = article.querySelector('.message-content, .thinking');
   content.className = 'message-content';
   renderMarkdown(content, message.content);
+  renderSpeechHighlights(ttsStreams.values());
   const body = content.closest('.message-body');
   const bubbleRow = content.closest('.message-bubble-row');
   if (bubbleRow && !bubbleRow.querySelector('.message-actions'))
@@ -783,6 +803,22 @@ function handleEvent(event) {
     state.ready = false;
     state.runtime = {...state.runtime, ...payload.runtime, loading: true};
     renderModelProgress(); renderRuntime();
+    return;
+  }
+  if (event.type === 'runtime.availability') {
+    state.runtime = {...state.runtime, resident: payload.resident, reloading: Boolean(payload.reloading)};
+    if (payload.available === false) {
+      state.ready = false;
+      state.runtime.loading = false;
+      showNotice(payload.message || 'Browser runtime is unavailable. Reload the model to recover.');
+    }
+    renderModelProgress(); renderRuntime();
+    return;
+  }
+  if (event.type === 'asr.progress' && activeRequest?.id === event.id) {
+    activeRequest.asrStatus = payload.state === 'ready' ? null :
+      payload.message || payload.stage || 'Loading cached speech model…';
+    renderRuntime();
     return;
   }
   if (event.type === 'runtime.progress' && event.id === runtimeLoadId) {
@@ -865,6 +901,10 @@ function handleEvent(event) {
     });
     return;
   }
+  if (event.type === 'asr.progress' && activeRequest?.id === event.id) {
+    if (payload.phase === 'fallback') showNotice(payload.message);
+    return;
+  }
   if (event.type === 'asr.partial' && activeRequest?.id === event.id) {
     $('prompt').value = `${payload.stable || ''}${payload.provisional || ''}`; resizePrompt();
     return;
@@ -886,13 +926,33 @@ function handleEvent(event) {
     }
     return;
   }
-  if (event.type === 'tts.completed') {
+  if (event.type === 'tts.segment') {
     const stream = ttsStreams.get(payload.stream_id);
     if (stream) {
-      playback?.node.port.postMessage({type: 'end'});
-      stream.completed = true;
+      stream.segments ||= new Map();
+      stream.segments.set(payload.segment_id, {id: payload.segment_id, text: payload.text,
+        start: payload.start, end: payload.end, status: 'ready'});
+      renderSpeechHighlights(ttsStreams.values());
     }
-    if (activeRequest?.id === event.id) finishRequest();
+    return;
+  }
+  if (event.type === 'tts.completed') {
+    if (ttsStreams.has(payload.stream_id)) completeAudioStream(payload.stream_id);
+    else if (activeRequest?.id === event.id) finishRequest();
+    return;
+  }
+  if (event.type === 'tts.progress' && activeRequest?.id === event.id) {
+    if (payload.phase === 'loading' && payload.totalBytes > 0) {
+      const percent = Math.min(100, Math.floor((payload.loadedBytes || 0) / payload.totalBytes * 100));
+      activeRequest.ttsStatus = `Loading speech model · ${percent}%`;
+    } else if (payload.phase === 'fallback') {
+      activeRequest.ttsStatus = payload.message || 'Using threaded CPU speech…';
+    } else if (payload.phase === 'synthesizing') {
+      activeRequest.ttsStatus = payload.steps > 0 && payload.step > 0
+        ? `Synthesizing speech · ${payload.step}/${payload.steps}`
+        : 'Synthesizing speech…';
+    }
+    renderRuntime();
     return;
   }
   if (event.type === 'voice.audio.started' && activeRequest?.id === event.id) {
@@ -900,26 +960,24 @@ function handleEvent(event) {
     playbackStreamId = streamId;
     ttsStreams.set(streamId, {
       button: null, completed: false, voiceTurn: true,
-      voiceEpoch: activeRequest.voiceEpoch, requestId: event.id,
+      voiceEpoch: activeRequest.voiceEpoch, requestId: event.id, messageId: activeRequest.messageId,
     });
+    activeRequest.streamId = streamId;
     ensurePlayback().catch(error => showNotice(error.message));
     return;
   }
   if (event.type === 'voice.audio.completed' && activeRequest?.id === event.id) {
-    const stream = ttsStreams.get(payload.stream_id);
-    if (stream) {
-      stream.completed = true;
-      playback?.node.port.postMessage({type: 'end'});
-    }
+    completeAudioStream(payload.stream_id);
     return;
   }
   if (event.type === 'voice.audio.error' && activeRequest?.id === event.id) {
+    const generating = activeRequest.kind === 'chat';
     const stream = [...ttsStreams.entries()].find(([, value]) => value.requestId === event.id);
     playback?.node.port.postMessage({type: 'reset'});
     if (stream) finishTts(stream[1].button, stream[0]);
     showNotice(payload.message || 'Voice playback failed');
     stopVoiceMode(false);
-    finishRequest();
+    if (!generating) finishRequest();
     return;
   }
   if (event.type === 'voice.prepare.error' && activeRequest?.id === event.id) {
@@ -965,22 +1023,65 @@ function resample(samples, sourceRate, targetRate) {
 
 let playbackPromise;
 async function ensurePlayback(sampleRate) {
-  if (playback) return playback;
+  if (playback?.context.state === 'closed') {
+    playback = null;
+    playbackPromise = null;
+  }
+  if (playback) {
+    if (playback.context.state === 'suspended') await playback.context.resume();
+    return playback;
+  }
   if (!playbackPromise) playbackPromise = (async () => {
     const context = sampleRate ? new AudioContext({sampleRate}) : new AudioContext();
-    const resumed = context.resume();
-    await context.audioWorklet.addModule(new URL('./playback-worklet.js', import.meta.url));
-    const node = new AudioWorkletNode(context, 'kidi-playback', {outputChannelCount: [1]});
-    node.connect(context.destination);
-    node.port.onmessage = event => {
-      if (event.data.type !== 'drained' || playbackStreamId === null) return;
-      const stream = ttsStreams.get(playbackStreamId);
-      if (stream) finishTts(stream.button, playbackStreamId);
-    };
-    await resumed;
-    playback = {context, node};
-    return playback;
-  })();
+    try {
+      await Promise.all([context.resume(),
+        context.audioWorklet.addModule(new URL('./playback-worklet.js', import.meta.url))]);
+      const node = new AudioWorkletNode(context, 'kidi-playback', {outputChannelCount: [1]});
+      node.connect(context.destination);
+      node.port.onmessage = event => {
+        const data = event.data;
+        if (playback?.node !== node || data.streamId !== playbackStreamId) return;
+        const stream = ttsStreams.get(data.streamId);
+        if (!stream) return;
+        if (data.type === 'buffered') {
+          const wasPlaying = stream.bufferedFrames > 0;
+          stream.playedFrames = data.playedFrames;
+          stream.bufferedFrames = (stream.sentFrames || 0) - data.playedFrames;
+          if (stream.bufferedFrames <= playerBufferLimit(context.sampleRate))
+            for (const resolve of stream.capacityWaiters?.splice(0) || []) resolve();
+          if (wasPlaying !== (stream.bufferedFrames > 0)) renderRuntime();
+        } else if (data.type === 'segment-started' || data.type === 'segment-ended') {
+          const segment = stream.segments?.get(data.segmentId);
+          if (segment) segment.status = data.type === 'segment-started' ? 'playing' : 'played';
+          renderSpeechHighlights(ttsStreams.values());
+          renderRuntime();
+        } else if (data.type === 'drained' && stream.completed) finishTts(stream.button, data.streamId);
+      };
+      playback = {context, node};
+      const failed = error => {
+        if (playback?.node !== node) return;
+        const id = playbackStreamId;
+        playback = null;
+        playbackPromise = null;
+        if (id !== null) audioFailure(id, error);
+        if (context.state !== 'closed')
+          context.close().catch(closeError => console.error('Unable to close failed playback context:', closeError));
+      };
+      node.onprocessorerror = () => failed(new Error('Speech audio processor failed'));
+      context.onstatechange = () => {
+        if (context.state === 'closed' || context.state === 'interrupted')
+          failed(new Error('Speech audio playback was interrupted'));
+      };
+      return playback;
+    } catch (error) {
+      try { await context.close(); }
+      catch (closeError) { console.error('Unable to close failed playback context:', closeError); }
+      throw error;
+    }
+  })().catch(error => {
+    playbackPromise = null;
+    throw error;
+  });
   return playbackPromise;
 }
 
@@ -993,14 +1094,68 @@ async function handleAudio(buffer) {
   const id = view.getUint32(8, true);
   const sampleRate = view.getUint32(16, true);
   const length = view.getUint32(20, true);
-  if (!ttsStreams.has(id) || length !== buffer.byteLength - 24 || length % 2) return;
-  playbackStreamId = id;
+  if (!ttsStreams.has(id)) return;
+  if (length !== buffer.byteLength - 24 || length % 2) throw new Error('Invalid speech audio frame');
   const pcm = new Int16Array(buffer, 24, length / 2);
   const samples = new Float32Array(pcm.length);
   for (let index = 0; index < pcm.length; index++) samples[index] = pcm[index] / 32768;
-  const player = await ensurePlayback(sampleRate);
-  const output = resample(samples, sampleRate, player.context.sampleRate);
-  player.node.port.postMessage({type: 'chunk', samples: output.buffer}, [output.buffer]);
+  return handlePcm({streamId: id, sequence: view.getUint32(12, true), sampleRate, samples});
+}
+
+const playerBufferLimit = rate => rate * 6;
+
+function handlePcm({streamId: id, sequence, sampleRate, samples, segmentId}) {
+  const stream = ttsStreams.get(id);
+  if (!stream) return;
+  if (!(samples instanceof Float32Array) || !samples.length || samples.some(value => !Number.isFinite(value)) ||
+      !Number.isInteger(sampleRate) || sampleRate <= 0 || !Number.isInteger(sequence) ||
+      sequence !== (stream.audioSequence || 0) || stream.completed)
+    throw new Error('Invalid or out-of-order speech PCM');
+  stream.audioSequence = (sequence + 1) >>> 0;
+  stream.delivery = (stream.delivery || Promise.resolve()).then(async () => {
+    if (ttsStreams.get(id) !== stream) return;
+    const player = await ensurePlayback(sampleRate);
+    if (ttsStreams.get(id) !== stream) return;
+    if (!stream.audioStarted) {
+      player.node.port.postMessage({type: 'start', streamId: id});
+      stream.audioStarted = true;
+    }
+    playbackStreamId = id;
+    if (activeRequest?.streamId === id) {
+      activeRequest.ttsStatus = activeRequest.voiceTurn ? 'Kidi is speaking…' : 'Playing speech…';
+      renderRuntime();
+    }
+    let output = resample(samples, sampleRate, player.context.sampleRate);
+    if (output.byteOffset || output.byteLength !== output.buffer.byteLength) output = output.slice();
+    stream.sentFrames = (stream.sentFrames || 0) + output.length;
+    stream.bufferedFrames = stream.sentFrames - (stream.playedFrames || 0);
+    player.node.port.postMessage({type: 'chunk', streamId: id, segmentId, samples: output.buffer}, [output.buffer]);
+    if (stream.bufferedFrames > playerBufferLimit(player.context.sampleRate))
+      await new Promise(resolve => { (stream.capacityWaiters ||= []).push(resolve); });
+  });
+  return stream.delivery;
+}
+
+function completeAudioStream(id) {
+  const stream = ttsStreams.get(id);
+  if (!stream) return;
+  stream.completed = true;
+  Promise.resolve(stream.delivery).then(() => {
+    if (ttsStreams.get(id) !== stream) return;
+    if (!stream.audioStarted || !playback) throw new Error('Speech completed without audio');
+    playback.node.port.postMessage({type: 'end', streamId: id});
+  }).catch(error => audioFailure(id, error));
+}
+
+function audioFailure(id, error) {
+  const stream = ttsStreams.get(id);
+  if (stream?.requestId) send('cancel', stream.requestId, {scope: 'speech', message: error.message});
+  if (stream?.voiceTurn) stopVoiceMode(false);
+  else if (stream) {
+    playback?.node.port.postMessage({type: 'reset'});
+    finishTts(stream.button, id);
+  }
+  showNotice(error.message || 'Speech playback failed');
 }
 
 async function beginCapture(id) {
@@ -1075,7 +1230,7 @@ function startDictation(epoch = voiceEpoch) {
     send('asr.start', id, {
       stream_id: audioId,
       voice_mode: voiceMode,
-      tts_options: voiceMode ? state.ttsSettings : undefined,
+      tts_options: voiceMode ? ttsRequestOptions() : undefined,
     });
   }
   catch (error) { showNotice(error.message); finishRequest(); }
@@ -1127,12 +1282,13 @@ function startTts(text, button, voiceTurn = false, epoch = voiceEpoch) {
   const id = crypto.randomUUID();
   const audioId = streamId++;
   activeRequest = {id, kind: 'tts', streamId: audioId, voiceTurn, voiceEpoch: voiceTurn ? epoch : null};
-  ttsStreams.set(audioId, {button, completed: false, voiceTurn, voiceEpoch: voiceTurn ? epoch : null});
+  ttsStreams.set(audioId, {button, completed: false, voiceTurn, requestId: id, voiceEpoch: voiceTurn ? epoch : null,
+    messageId: button?.closest('[data-message-id]')?.dataset.messageId});
   playbackStreamId = audioId;
   setReadAloudState(button, true);
   state.busy = true; showNotice(); renderRuntime();
   ensurePlayback().catch(error => showNotice(error.message));
-  try { send('tts.start', id, {stream_id: audioId, text, options: state.ttsSettings}); }
+  try { send('tts.start', id, {stream_id: audioId, text, options: ttsRequestOptions()}); }
   catch (error) {
     finishTts(button, audioId);
     showNotice(error.message); finishRequest();
@@ -1144,9 +1300,12 @@ function finishTts(button, stream) {
   const voiceTurn = entry?.voiceTurn;
   const epoch = entry?.voiceEpoch;
   setReadAloudState(button, false);
+  for (const resolve of entry?.capacityWaiters?.splice(0) || []) resolve();
   ttsStreams.delete(stream);
+  renderSpeechHighlights(ttsStreams.values());
   if (playbackStreamId === stream) playbackStreamId = null;
-  if (voiceTurn && activeRequest?.id === entry?.requestId) finishRequest();
+  if (activeRequest?.kind !== 'chat' &&
+      (activeRequest?.streamId === stream || activeRequest?.id === entry?.requestId)) finishRequest();
   renderRuntime();
   if (voiceTurn && voiceMode && epoch === voiceEpoch) scheduleVoiceListening(epoch);
 }
@@ -1204,7 +1363,7 @@ async function sendMessage(event) {
     send('chat.start', requestId, {
       messages: preparedMessages,
       speak: voiceMode,
-      tts_options: voiceMode ? state.ttsSettings : undefined,
+      tts_options: voiceMode ? ttsRequestOptions() : undefined,
     });
   } catch (error) {
     chat.messages = chat.messages.filter(message => message.id !== responseId);
@@ -1279,7 +1438,8 @@ $('clear-model-cache').addEventListener('click', () => {
 $('config-dialog').addEventListener('click', event => {
   if (event.target === $('config-dialog')) $('config-dialog').close();
 });
-for (const id of ['tts-language', 'tts-steps', 'tts-pace', 'tts-gender', 'tts-age', 'tts-pitch', 'tts-style', 'tts-accent'])
+for (const id of ['tts-language', 'tts-steps', 'tts-pace', 'tts-gender', 'tts-age', 'tts-pitch', 'tts-style', 'tts-accent',
+  'tts-gpu-precision'])
   $(id).addEventListener('change', updateTtsSettings);
 $('messages').addEventListener('scroll', () => {
   if (rebuildingMessages) return;

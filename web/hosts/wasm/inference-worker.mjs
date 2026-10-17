@@ -95,7 +95,9 @@ self.onmessage = async ({data}) => {
             module = await createKidi({printErr: text => self.postMessage({type: 'log', text})});
             if (useGpu) {
                 const {createWebGpu} = await import('./webgpu.mjs');
-                gpu = await createWebGpu(module, {profile: data.profile === true});
+                gpu = await createWebGpu(module, {profile: data.profile === true, measure: data.measure === true,
+                    lowerGraphs: data.lowerGraphs !== false, onlineAttention: data.onlineAttention ?? 'auto',
+                    matrixPrecision: data.matrixPrecision, packedDot: data.packedDot, w8a8Kernel: data.w8a8Kernel});
                 gpu.device.lost.then(info => fail(new Error(`WebGPU device lost: ${info.message || info.reason}`), true));
             }
             await call('kidi_configure', ['number'], [useGpu ? 1 : data.threads]);

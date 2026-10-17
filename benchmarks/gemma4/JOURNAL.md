@@ -4,6 +4,258 @@ Short progress notes for the current implementation. Measurements are explorator
 unless explicitly labelled as paired acceptance results. Historical comparisons
 remain in [QAT.md](QAT.md).
 
+## 2026-10-17: Deletion-led C++ and Wasm simplification
+
+This pass followed the streaming/WebGPU implementation with a strict rule:
+keep a refactor only when it deletes a production path, public surface, state,
+or configuration mode. It did not change the model, steps, voice, wire format,
+or supported CPU/Metal/Vulkan/WebGPU execution.
+
+### Removed complexity
+
+- `omnivoice.cpp` and `synthesizer.cpp` fell from 1,348 observed lines before
+  cleanup to 1,113, a reduction of 235 lines in the two central TTS files.
+- Higgs decode now has one I32 `[codebooks, length]` tensor implementation;
+  the parallel span-plus-length neural path was removed.
+- OmniVoice uses one shaped token tensor and one audio-embedding path. Reference
+  embeddings are prepared once, not rebuilt from combined host token arrays on
+  every diffusion step.
+- Eleven OmniVoice public members were deleted or made private. The browser
+  reference codec is one host `decode_reference(span) -> audio::Waveform`
+  boundary; shape, codebook count, and sample rate no longer leak as separate
+  getters.
+- `SynthesisReference`, `synthesize_with_reference`, and the nullable reference
+  argument to `start_synthesis` were removed. `SynthesisOptions::voice_prompt`
+  is the single owned reference carrier.
+- Models now expose one session-oriented synthesis contract. The generic
+  frontend handles synchronous completion; the duplicate model-level
+  synchronous virtual and orchestrator branch were removed.
+- Standalone Wasm CPU and WebGPU speech use the same start/step ABI. The
+  duplicate `kidi_synthesize` and `kidi_transcribe` exports and worker branches
+  were removed.
+- The Android-only, opt-in, undocumented `KIDI_YNN_FUSED_QFFN` branch was the
+  only caller of `QUANTIZED_GATED_FEED_FORWARD`. The switch, Context API,
+  operation enum, validation, and YNN/Metal/Vulkan backend cases were deleted.
+- The W8A8 micro-tuner was removed. Its 128-row probe selected packed dots for
+  one family even though full-model runs were 15-18% faster with the floating
+  kernel and had identical output hashes. Production now selects `float`
+  explicitly. Packed dots remain an explicit diagnostic mode.
+- Node discovers only `*_test.mjs`; exported real-GPU harnesses are not counted
+  as passing tests merely because importing them succeeds. Redundant shader
+  source assertions, duplicate deployment string checks, repeated invalid-input
+  variants, and a test-only public constructor/mock were removed.
+
+### Acceptance
+
+- Native CPU short tokens, native Metal short/two-sentence tokens, and the
+  complete two-sentence Metal WAV match the pre-refactor bytes.
+- Isolated two-sentence Metal warm RTF: **0.375-0.378**, versus **0.379** in the
+  recorded pre-refactor pair.
+- FP32 WebGPU token/PCM hashes match for short and two-sentence inputs. Dispatch,
+  operator, bridge, and region counts are unchanged.
+- Floating W8A8 hashes match. Short warm RTF is **0.816-0.826** and two-sentence
+  RTF **0.982**, versus **0.813-0.819** and **0.971** before cleanup.
+- Browser CPU TTS completed through the unified start/step ABI; CPU Whisper also
+  completed through that ABI (one second of silence in about 46 ms).
+- **31/31 native tests**, **71 browser tests** (one optional ABI skip), and the
+  explicit built-Wasm ABI selection (**10/10**) pass.
+- Single-thread CPU, pthread CPU, and unified WebGPU Wasm artifacts build.
+  Release CLI, benchmark, and desktop app build.
+- Validation ended with zero validation models/GPU bytes. The four saved chats,
+  active chat, settings, image attachment, and
+  `http://127.0.0.1:10010/` origin were preserved.
+
+## 2026-10-17: Bounded streaming speech, highlights, and replay
+
+The browser adapter now feeds incremental chat text into a bounded phrase queue.
+It synthesizes one phrase per existing stepped native synthesis request, keeps
+the logical speech session through the utterance, and delivers Float32 PCM
+immediately. Read-aloud uses the same queue. Sentence/clause/word boundaries are
+preferred; long unpunctuated text is bounded as well (96 weighted units, first
+phrase 64; CJK graphemes cost three units).
+
+The first real image-chat/long-reply test exposed a second memory problem:
+despite bounded input, cached decoder graphs retained waveform buffers for eight
+lengths, and Qwen retained two activation-shape sets. The third phrase exceeded
+the unchanged 3 GiB quota. The decoder now keeps one length, Qwen one four-layer
+region set, and admission retains the conservative 768 MiB new-shape workspace
+reservation. Decode releases chat's prefill-only reservation. This is bounded
+working-set retention, not a larger quota or a lower-precision default.
+
+Apple M5 / Chromium 150, same OmniVoice checkpoint, English, female/young-adult/
+moderate, seed 0, ten steps, pace 1.15, no voice-reference reuse. A 725-character
+story contains a long first sentence and produces ten phrases / 53.16 seconds
+of padded audio. These are streaming controls, **not** the earlier 16-step short
+phrase's paired Metal comparison.
+
+| Test | Result |
+| --- | --- |
+| FP32 after a real image-conditioned chat | First PCM 6.72 s including speech initialization; total 45.62 s, end-to-end RTF 0.858 |
+| FP32 per-phrase synthesis RTF, excluding initial load | 0.75-0.94 |
+| FP32 residency sampled after each phrase, with vision/chat retained | 2.21-2.35 GB; ten phrases completed without a budget/device failure |
+| Full replay of that story | All ten phrases cached; 100 ms including diagnostic status round trips |
+| Real FP32 chat plus speech | First PCM at 8.40 s, text complete at 83.35 s; 36 phrases / 164.72 s of audio, speech complete at 146.74 s |
+| W8A8 same 725-character story | First PCM 7.89 s including new-profile initialization/tuning; total 32.04 s, end-to-end RTF 0.603 |
+| W8A8 per-phrase synthesis RTF, excluding initial load | 0.46-0.57 |
+
+The real-model consumer above collects PCM immediately and samples runtime
+residency after delivery; it does not model speaker-clock pacing. Separately,
+the actual shared UI and AudioWorklet played five synthetic four-second phrases
+with a maximum measured queue of 9.995 seconds: below six seconds plus one
+four-second phrase. Playback began before production completed. Cumulative
+consumed-frame credits prevent stale enqueue reports from admitting more audio.
+
+The UI showed one currently-playing highlight and subtle ready/played highlights
+across inline Markdown. Actual DOM checks covered decomposed accents, astral
+letters, and the removable-mark fallback. Drain/cancellation cleared highlights
+and capacity waiters. A controlled speech failure during generation preserved
+the later text and re-enabled the composer.
+
+Replay uses a transfer-safe 16 MiB / 48-phrase / ten-minute in-memory LRU keyed by
+text, model source, backend preference, and effective options. Changed settings
+miss the cache; replay hits do not initialize a worker. Saved conversations,
+preferences, image attachments, and the origin `http://127.0.0.1:10010/` were
+preserved during checks.
+
+Whisper Tiny backtranscription of the first two joined phrases matched all words
+for FP32. W8A8 changed `rustle` to `ruffle` and `warmed` to `warm` in that proxy.
+This is not a listening score or comprehensive long-form quality validation;
+precision remains an explicit choice. Slower-than-realtime settings can still
+have playback gaps even with correct segmentation.
+
+## 2026-10-17: Shared WebGPU runtime, TTS/ASR/vision regions, and W8A8
+
+Scope: one GPU worker/device/Wasm heap for logical chat, speech, and vision
+sessions, using the existing graph IR. CPU fallbacks keep separate workers.
+No production JSPI, Asyncify, GPU pthread requirement, or separate TTS GPU
+artifact. The default model/checkpoint, diffusion steps, and voice settings
+were not silently replaced.
+
+### Execution and ownership
+
+- Native model-session handles, scoped loader files/external weights, tracked
+  host allocations, and request-scoped image files replace singleton ownership.
+- Captured regions patch dynamic input bindings and execute without a C++/JS
+  crossing per operator. Alias-aware liveness planning reuses scratch; direct
+  mutations remove compute-then-copy buffers.
+- Four-layer Qwen and vision captures avoid retaining a whole cold eager tower.
+  Qwen originally kept two bounded shape sets for multi-sentence/reference
+  reuse; streaming now retains one working set as described above.
+- Speech-priority scheduling yields at native/GPU step boundaries. Residency
+  is limited to three native models, five-minute idle eviction, 3 GiB tracked
+  GPU buffers, 3 GiB accounted host model memory, and a 1 GiB prepared cache.
+  Attached logical clients reload after eviction. Empty residency releases
+  the device and Wasm module.
+- Read failures await sibling reads before releasing destinations. Cancellation
+  fences native request state. Device loss/validation errors invalidate all
+  logical leases; unavailable and evicted are distinct UI states.
+- Browser output now delivers Float32 PCM directly. Native signed-16 framing
+  remains supported; playback waits for delivery and uses stream-tagged
+  start/chunk/end/drain messages to reject cancelled audio.
+
+An admission bug found by longer mixed-model tests freed the requested model's
+FP16 cache and then immediately rebuilt it, exceeding the quota. The requested
+owner is now protected. Reservations include evicted representations that must
+be restored and new-shape scratch; repeated one-chunk inputs use a smaller
+reservation only when their reference policy is stable. The 3 GiB limit was
+not increased to hide this failure.
+
+### TTS: unchanged 16-step controls, then opt-in precision
+
+Apple M5, 16 GiB, Chromium 150. Text `The logo is for "kidi".`, English,
+female/middle-aged/moderate, seed 0, pace 1, no cached voice reference.
+Every run returned 46,080 samples at 24 kHz: 1.92 seconds including padding.
+Warm wall times include generation and the required codec, not load/playback.
+
+| Path | Warm synthesis | RTF | GPU storage buffers |
+| --- | ---: | ---: | ---: |
+| GPU FP32 activation baseline | 2.45-2.64 s | 1.28-1.37 | 0.83 GB |
+| GPU mixed FP16 | 1.52-1.65 s | 0.79-0.86 | 1.76 GB |
+| W8A8 packed intrinsic | 2.057-2.062 s | 1.071-1.074 | 0.84 GB |
+| W8A8 software integer dot | 2.063-2.066 s | 1.075-1.076 | 0.84 GB |
+| W8A8 floating tile / INT32 per-quad accumulation | 1.687-1.712 s | 0.879-0.892 | 0.84 GB |
+| W8A8 floating tile / FP32 accumulation | 1.52-1.54 s | 0.79-0.80 | 0.84 GB |
+| Native Metal in-process reference | 0.681-0.687 s | 0.355-0.358 | not compared |
+
+The slower per-quad float-to-integer conversion variant was replaced, not
+promoted as another user setting. Packed and floating families remain because
+native integer-dot hardware can differ. A small alternating-order benchmark
+validates outputs and chooses a family for wide-output and wide-depth
+projections, cached by device feature set. There is no Apple-vendor switch.
+
+W8A8 is affine dynamic INT8 activation quantization per row plus the original
+INT8 projection weights, with cached column sums for zero-point correction.
+It retains only about 1.5 MB of prepared sums versus 919 MB of FP16-expanded
+weights. Both profiles had zero warm preparation misses; W8A8 reduced storage
+buffer residency by about 52% relative to mixed FP16.
+
+The browser exposes `packed_4x8_integer_dot_product`, and an actual
+`dot4I8Packed([1,-2,3,-4],[-5,6,-7,8])` probe returned -70. This is API
+functionality, not proof of native INT8 throughput. Current
+[Dawn Metal lowering](https://github.com/google/dawn/blob/main/src/tint/lang/msl/writer/raise/raise.cc)
+sets the packed-dot polyfill, whose
+[core transform](https://github.com/google/dawn/blob/main/src/tint/lang/core/ir/transform/builtin_polyfill.cc)
+unpacks integers before dot arithmetic. Forced software and intrinsic timings
+were effectively identical here.
+
+The floating tile implementation does not add dot-accumulation error for the
+inspected checkpoint: 169 INT8 rank-two tensors, 547,981 rows, 634,044,640
+weight bytes, maximum row L1 sum 102,822. Thus every partial signed-INT8 dot is
+bounded by `128 * 102822 = 13,161,216 < 2^24`; conversion of INT8 values to
+FP16 tiles is exact too. Other checkpoints require their own bound/quality checks.
+
+Device guidance/update/embedding selection reduces the reference logit readback
+from 45,132,800 bytes to 1,376 final-code bytes. Waveform readback is separate.
+Copy bytes fell from 409,010,176 to zero. Warm W8A8 uses 226 bridge calls rather
+than about 12,417 original per-operator calls. GPU codec decode is about 50 ms
+warm, instead of the original browser CPU codec's roughly 1.6 s.
+
+GPU codec FP32 activation math is not the CPU YNN dynamic-INT8 activation path.
+Decoding identical codes on both gave RMSE 0.001845 and SNR 32.16 dB for the
+short reference; both backtranscribed correctly. Waveform equality is not
+claimed after changing codec arithmetic or activation precision.
+
+### ASR, vision, and quality gates
+
+- GPU Whisper Tiny transcribed the 11-second JFK fixture in about 0.40 s warm,
+  versus 2.36-2.44 s CPU in the controlled baseline. English and auto language
+  returned the expected 24-token final transcript. This includes the existing
+  two-attempt shortened-window repetition retry.
+- Online multi-query attention covers batch/GQA/key starts/masks/tails and
+  F32/INT8 KV. Materialized scores/probabilities remain for small shapes, where
+  forcing fusion was slower. Register-tiled QK and parallel softmax improve
+  the large bounded-memory path.
+- Whole-tower vision capture was rejected at 5.75 GB cold. Four-layer regions
+  reduced that to 2.40 GB; five fresh images reached a storage-memory plateau.
+  Green K, blue R, and red M prompts remained semantically correct. Cached
+  embeddings were not counted as fresh encoder timings.
+- FP32, FP16, and W8A8 were checked on short/medium/two-sentence English and
+  Spanish/French/German. English/German backtranscription matched across
+  profiles. W8A8 French matched; Spanish had one homophone spelling error.
+  FP32/FP16 Spanish proxy recognition failed, so this is not a general
+  multilingual quality claim. All outputs were finite/non-silent.
+
+FP32 stays the default. Mixed FP16 and W8A8 are explicit browser TTS choices;
+step/model alternatives are not silently applied. These tests use Whisper Tiny
+as a proxy, not listening/MOS. No broad corpus, non-Apple GPU, or new Safari
+release validation is claimed.
+
+Final checks on this machine: 31 native tests passed; release app/CLI/TTS
+benchmark targets built; all three Wasm artifact families built. Production
+integration checked simultaneous chat/ASR/TTS, cancel/reuse, attached-client
+eviction/reload, device loss/recreation, and zero final GPU residency. A real
+WebGPU synthesis also succeeded in a non-isolated frame. Browser settings were
+smoke-tested at `/kidi/`: FP32 default, opt-in persistence without step changes,
+idle/unavailable status, and native-only hiding of GPU controls. Cross-vendor
+measurements and listening remain external validation limits.
+
+Reproduction uses [`runtime_bench.mjs`](../browser/runtime_bench.mjs),
+the production-style GPU numerical/integration modules under
+[`tests/browser`](../../tests/browser), and the commands in
+[`web/README.md`](../../web/README.md). Keep browser model tests at
+`http://127.0.0.1:10010/`, disable timestamp instrumentation for headline timing,
+and run one controlled model benchmark at a time.
+
 ## 2026-10-02: Faster Reloads
 
 Measured with the app's own workers in headless Edge (Apple M5), Hugging Face requests served from local hub caches,

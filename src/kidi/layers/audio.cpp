@@ -50,8 +50,9 @@ Conv1dImpl::Conv1dImpl(std::int32_t input_channels, std::int32_t output_channels
         qstate_.emplace();
         register_parameter("scale", qstate_->scale, {output_channels, 1}, tensor::DType::F32);
         bias_qstate_.emplace();
-        register_parameter("bias", bias_, {output_channels}, tensor::DType::I8);
-        register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32);
+        const auto vectors = module_device == tensor::Device::web_gpu() ? tensor::Device::cpu() : module_device;
+        register_parameter("bias", bias_, {output_channels}, tensor::DType::I8, allocate_parameters, vectors);
+        register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32, allocate_parameters, vectors);
         if (allocate_parameters) {
             std::ranges::fill(require(qstate_->scale.data<float>()), 1.F);
             std::ranges::fill(require(bias_qstate_->scale.data<float>()), 1.F);
@@ -66,6 +67,9 @@ auto Conv1dImpl::bias() const -> const Tensor& {
 }
 
 auto Conv1dImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
+    if (context.device() == tensor::Device::web_gpu())
+        return context.conv1d(input, weight_, qstate_ ? qstate_->scale : Tensor{}, bias(),
+                               kernel_size_, stride_, padding_, dilation_);
     require_cpu(input, input_channels_, "Conv1d");
     const auto input_length = static_cast<std::int64_t>(input.size(1));
     const auto receptive = dilation_ * (kernel_size_ - 1) + 1;
@@ -113,8 +117,9 @@ ConvTranspose1dImpl::ConvTranspose1dImpl(std::int32_t input_channels, std::int32
         qstate_.emplace();
         register_parameter("scale", qstate_->scale, {output_channels * kernel_size, 1}, tensor::DType::F32);
         bias_qstate_.emplace();
-        register_parameter("bias", bias_, {output_channels}, tensor::DType::I8);
-        register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32);
+        const auto vectors = module_device == tensor::Device::web_gpu() ? tensor::Device::cpu() : module_device;
+        register_parameter("bias", bias_, {output_channels}, tensor::DType::I8, allocate_parameters, vectors);
+        register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32, allocate_parameters, vectors);
         if (allocate_parameters) {
             std::ranges::fill(require(qstate_->scale.data<float>()), 1.F);
             std::ranges::fill(require(bias_qstate_->scale.data<float>()), 1.F);
@@ -131,6 +136,12 @@ auto ConvTranspose1dImpl::bias() const -> const Tensor& {
 }
 
 auto ConvTranspose1dImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
+    if (context.device() == tensor::Device::web_gpu()) {
+        const auto projected = qstate_
+            ? context.quantized_linear(input, weight_, qstate_->scale, projection_bias_, true)
+            : context.linear(input, weight_, projection_bias_, true);
+        return context.conv_transpose_fold(projected, bias(), kernel_size_, stride_, padding_, output_padding_, dilation_);
+    }
     require_cpu(input, input_channels_, "ConvTranspose1d");
     const auto input_length = static_cast<std::int64_t>(input.size(1));
     const auto output_length =
@@ -164,10 +175,11 @@ auto ConvTranspose1dImpl::forward(ops::Context& context, const Tensor& input) co
 Snake1dImpl::Snake1dImpl(std::int32_t channels) : channels_(channels) {
     if (channels <= 0 || (module_dtype != tensor::DType::F32 && module_dtype != tensor::DType::I8))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Snake1d construction"});
-    register_parameter("alpha", alpha_, {channels});
+    const auto vectors = module_device == tensor::Device::web_gpu() ? tensor::Device::cpu() : module_device;
+    register_parameter("alpha", alpha_, {channels}, module_dtype, allocate_parameters, vectors);
     if (module_dtype == tensor::DType::I8) {
         qstate_.emplace();
-        register_parameter("alpha_scale", qstate_->scale, {1}, tensor::DType::F32);
+        register_parameter("alpha_scale", qstate_->scale, {1}, tensor::DType::F32, allocate_parameters, vectors);
         if (allocate_parameters) std::ranges::fill(require(qstate_->scale.data<float>()), 1.F);
     } else if (allocate_parameters) {
         std::ranges::fill(require(alpha_.data<float>()), 1.F);
@@ -179,6 +191,7 @@ auto Snake1dImpl::alpha() const -> const Tensor& {
 }
 
 auto Snake1dImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
+    if (context.device() == tensor::Device::web_gpu()) return context.snake(input, alpha());
     require_cpu(input, channels_, "Snake1d");
     context.synchronize();
     const auto source = require(input.data<float>());

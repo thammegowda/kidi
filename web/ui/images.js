@@ -38,9 +38,15 @@ export async function removeUnusedImages(retained) {
     }
 }
 
-export async function stageImages(module, messages) {
+export async function stageImages(module, messages, {directory = '/images'} = {}) {
+    if (!/^\/images(?:\/[a-z0-9-]+)?$/.test(directory)) throw new Error('Invalid image staging directory');
     const files = [];
-    const dispose = () => { for (const path of files) module.FS.unlink(path); };
+    let created = false;
+    const dispose = () => {
+        for (const path of files.splice(0)) module.FS.unlink(path);
+        if (created && directory !== '/images') module.FS.rmdir(directory);
+        created = false;
+    };
     let total = 0;
     try {
         const staged = [];
@@ -52,8 +58,9 @@ export async function stageImages(module, messages) {
                 const blob = await readImage(image);
                 total += blob.size;
                 if (total > MAX_IMAGE_BYTES) throw new Error('Images exceed the 32 MiB conversation limit');
-                module.FS.mkdirTree('/images');
-                const path = `/images/${files.length}.${blob.type === 'image/png' ? 'png' : 'jpg'}`;
+                module.FS.mkdirTree(directory);
+                created = true;
+                const path = `${directory}/${files.length}.${blob.type === 'image/png' ? 'png' : 'jpg'}`;
                 module.FS.writeFile(path, new Uint8Array(await blob.arrayBuffer()));
                 files.push(path);
                 images.push(path);

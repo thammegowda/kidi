@@ -1,4 +1,5 @@
 #include "kidi/layers/audio.h"
+#include "kidi/layers/higgs_audio.h"
 
 #include <array>
 #include <cassert>
@@ -22,6 +23,48 @@ auto set_quantized(kidi::Module& module, std::int8_t weight, float scale, std::i
 }
 
 auto close(float left, float right) -> bool { return std::abs(left - right) < 1e-2F; }
+
+auto higgs_tokens(kidi::ops::Context& context) -> void {
+    using namespace kidi;
+    layers::HiggsDecoder decoder(layers::HiggsDecoderShape{2, 4, 2, 2, 2, 4, {2}});
+    set_quantized(*decoder, 1, 0.5F);
+    for (auto& [name, tensor] : decoder->state_dict())
+        if (name.ends_with("codebook.weight")) {
+            auto values = ops::require(tensor.data<std::int8_t>());
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = static_cast<std::int8_t>(index + 1);
+        }
+    constexpr std::array<std::int32_t, 4> CODES{0, 1, 2, 3};
+    const auto tokens = ops::require(tensor::Tensor::from_host({2, 2}, std::span<const std::int32_t>(CODES)));
+    const auto output = decoder->forward(context, tokens);
+    context.synchronize();
+    const auto values = ops::require(output.data<float>());
+    const std::vector expected(values.begin(), values.end());
+    assert(expected.size() == 4);
+    assert(std::ranges::all_of(expected, [](float value) { return std::isfinite(value); }));
+
+    constexpr std::array<std::int32_t, 6> PADDED{9, 9, 0, 1, 2, 3};
+    const auto padded = ops::require(tensor::Tensor::from_host({3, 2}, std::span<const std::int32_t>(PADDED)));
+    const auto view = ops::require(padded.narrow(0, 1, 2));
+    const auto replayed = decoder->forward(context, view);
+    context.synchronize();
+    const auto actual = ops::require(replayed.data<float>());
+    assert(actual.size() == expected.size());
+    for (std::size_t index = 0; index < actual.size(); ++index)
+        assert(std::abs(actual[index] - expected[index]) <= 1e-5F * std::max(1.F, std::abs(expected[index])));
+
+    const auto rejects = [&](const tensor::Tensor& input) {
+        try {
+            (void)decoder->forward(context, input);
+            return false;
+        } catch (const ops::Failure& error) {
+            return error.error().code == ErrorCode::INVALID_ARGUMENT;
+        }
+    };
+    assert(rejects(ops::require(tokens.reshape({4}))));
+    constexpr std::array<std::int32_t, 4> INVALID{0, 4, 1, 2};
+    assert(rejects(ops::require(tensor::Tensor::from_host({2, 2}, std::span<const std::int32_t>(INVALID)))));
+}
 
 } // namespace
 
@@ -63,4 +106,5 @@ int main() {
     for (std::size_t index = 0; index < input_values.size(); ++index)
         assert(close((*activated_values)[index],
                      input_values[index] + std::sin(input_values[index]) * std::sin(input_values[index])));
+    higgs_tokens(context);
 }

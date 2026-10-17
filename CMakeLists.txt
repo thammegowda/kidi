@@ -20,9 +20,6 @@ option(KIDI_BUILD_DESKTOP_APP "Build the native LiteApp web UI" ${KIDI_DESKTOP_A
 if(EMSCRIPTEN)
     option(KIDI_WASM_THREADS "Enable WebAssembly pthreads" ON)
     option(KIDI_WASM_WEBGPU "Build the WebGPU execution backend" OFF)
-    if(KIDI_WASM_WEBGPU AND KIDI_WASM_THREADS)
-        message(WARNING "WebGPU with pthreads is untested; the app pairs WebGPU with the single-thread build")
-    endif()
     # 64-bit C++ pointers lowered to a 4 GiB wasm32 memory, which every engine supports (Safari has no Memory64).
     set(KIDI_WASM_ADDRESS_FLAG -sMEMORY64=2)
     add_compile_options(${KIDI_WASM_ADDRESS_FLAG} -msimd128)
@@ -169,7 +166,7 @@ endif()
 
 if(KIDI_BUILD_BENCHMARKS)
     add_executable(kidi_tts_bench benchmarks/tts/synthesis.cpp)
-    target_link_libraries(kidi_tts_bench PRIVATE kidi::kidi)
+    target_link_libraries(kidi_tts_bench PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
     add_executable(kidi_gemma4_quality benchmarks/gemma4/quality.cpp)
     target_link_libraries(kidi_gemma4_quality PRIVATE kidi::kidi)
     add_executable(kidi_whisper_quality benchmarks/whisper/quality.cpp)
@@ -369,6 +366,7 @@ if(KIDI_BUILD_DESKTOP_APP)
         images.js
         markdown.js
         mermaid.js
+        speech-highlights.js
         style.css
     )
     set(KIDI_DESKTOP_WEB_FILES

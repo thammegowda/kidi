@@ -94,8 +94,11 @@ public:
     auto replay(std::string_view key, std::span<const Tensor> inputs, const Step& step, bool validate_structure = true)
         -> std::span<const Tensor>;
     auto replay_enabled() const noexcept -> bool;
+    auto set_replay_capacity(std::size_t capacity) -> void;
     auto clear_replays() -> void;
     auto release_workspaces() -> void;
+    /// Drops unreferenced output caches while retaining bounded prepared operators and captured graphs.
+    auto trim_workspaces() -> void;
     /// Evicts captured steps whose key begins with `prefix`, for example completed prefill shapes before decode.
     auto clear_replays(std::string_view prefix) -> void;
     /// Name of the accelerator compiling captured steps, or empty when steps replay on this context's device.
@@ -136,15 +139,23 @@ public:
                             std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
                             float gate_up_output_scale, float down_input_scale, float down_output_scale,
                             bool silu = false) -> Tensor;
-    auto quantized_gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
-                                      const Tensor& gate_up_bias, const Tensor& down_weight, const Tensor& down_scales,
-                                      const Tensor& down_bias) -> Tensor;
     auto gelu_(Tensor& input, bool approximate = false) -> Tensor&;
     auto tanh(const Tensor& input) -> Tensor;
     auto static_round(const Tensor& input, float scale) -> Tensor;
     auto greedy_token(const Tensor& logits) -> Tensor;
     auto embedding(const Tensor& indices, const Tensor& weight, const Tensor& scales, std::int32_t width,
                    std::int32_t bits, float multiplier) -> Tensor;
+    auto embedding_sum(const Tensor& tokens, const Tensor& weight, const Tensor& scales, std::int32_t width,
+                       std::int32_t bits, float multiplier) -> Tensor;
+    auto diffusion_candidates(const Tensor& logits, std::size_t target, std::int32_t codebooks, std::int32_t vocabulary,
+                              std::int32_t mask, float guidance) -> Tensor;
+    auto diffusion_update(const Tensor& tokens, const Tensor& candidates, const Tensor& noise, std::size_t count,
+                          std::int32_t mask, float penalty, float temperature) -> Tensor;
+    auto conv1d(const Tensor& input, const Tensor& weight, const Tensor& scales, const Tensor& bias,
+                std::int32_t kernel, std::int32_t stride, std::int32_t padding, std::int32_t dilation) -> Tensor;
+    auto conv_transpose_fold(const Tensor& projected, const Tensor& bias, std::int32_t kernel, std::int32_t stride,
+                             std::int32_t padding, std::int32_t output_padding, std::int32_t dilation) -> Tensor;
+    auto snake(const Tensor& input, const Tensor& alpha) -> Tensor;
     auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
     auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine, float epsilon)
         -> Tensor;

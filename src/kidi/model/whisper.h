@@ -44,6 +44,8 @@ public:
     auto prefill(const WhisperEncoderState& source, std::span<const std::int32_t> tokens,
                  WhisperDecoderState& state) -> Result<void>;
     auto preparation_ns() const -> std::uint64_t;
+    auto select_token(const tensor::Tensor& logits, const tensor::Tensor& mask) -> tensor::Tensor;
+    auto select_language(const tensor::Tensor& logits, const tensor::Tensor& language_ids) -> tensor::Tensor;
 
 private:
     auto decode(const WhisperEncoderState& source, std::int32_t token, WhisperDecoderState& state,

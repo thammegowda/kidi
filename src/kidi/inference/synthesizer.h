@@ -13,6 +13,7 @@
 
 #include "kidi/core/error.h"
 #include "kidi/tensor/tensor.h"
+#include "kidi/text/sentence.h"
 
 namespace kidi::inference {
 
@@ -61,28 +62,28 @@ struct Synthesis {
     std::shared_ptr<const VoicePrompt> voice_prompt;
 };
 
-struct SynthesisReference {
-    std::string_view text;
-    std::span<const std::int32_t> tokens;
-};
-
 auto parse_synthesis_number(std::string_view value) -> Result<float>;
 auto parse_voice_attributes(std::span<const std::string> specifications) -> Result<VoiceAttributes>;
 auto synthesis_elapsed_ns(std::chrono::steady_clock::time_point start) -> std::uint64_t;
 
+class SynthesisSession {
+public:
+    virtual ~SynthesisSession() = default;
+    /// Advances until GPU work must complete or synthesis finishes. An empty optional means JavaScript should await
+    /// submitted WebGPU work before calling again.
+    virtual auto step() -> Result<std::optional<Synthesis>> = 0;
+};
+
 class SynthesizerModel {
 public:
     virtual ~SynthesizerModel() = default;
-    virtual auto synthesize(std::string_view text, const SynthesisOptions& options) -> Result<Synthesis> = 0;
-    virtual auto synthesize_with_reference(std::string_view text, const SynthesisOptions& options,
-                                           const SynthesisReference&) -> Result<Synthesis> {
-        return synthesize(text, options);
-    }
     virtual auto voice_reference_chunk(std::span<const std::string>, const SynthesisOptions&) const
         -> Result<std::optional<std::size_t>> {
         return std::optional<std::size_t>{};
     }
     virtual auto supports_voice_prompt() const noexcept -> bool { return false; }
+    virtual auto start_synthesis(std::string_view, const SynthesisOptions&)
+        -> Result<std::unique_ptr<SynthesisSession>> = 0;
     virtual auto execution() const -> std::string = 0;
     virtual auto release_workspaces() -> void {}
 };
@@ -100,12 +101,16 @@ public:
         -> Result<Synthesizer>;
     auto segment(std::string_view text, std::string_view language = {}) const -> Result<std::vector<std::string>>;
     auto synthesize(std::string_view text, const SynthesisOptions& options = {}) const -> Result<Synthesis>;
+    auto start(std::string_view text, const SynthesisOptions& options = {}) const
+        -> Result<std::unique_ptr<SynthesisSession>>;
     auto execution() const -> std::string;
     auto supports_voice_prompt() const noexcept -> bool;
 
 private:
     struct Impl;
-    explicit Synthesizer(std::unique_ptr<Impl> impl);
+    Synthesizer(std::shared_ptr<SynthesizerModel> model, text::SentenceSegmenter sentences);
+    auto create_session(std::string_view text, const SynthesisOptions& options, bool stepped) const
+        -> Result<std::unique_ptr<SynthesisSession>>;
 
     std::unique_ptr<Impl> impl_;
 };

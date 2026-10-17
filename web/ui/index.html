@@ -202,11 +202,20 @@
       </section>
       <section class="tts-preferences" data-settings-panel="speech" hidden>
         <div class="settings-section-heading">
-          <div><h3>TTS</h3><p>Applied to future Read aloud requests.</p></div>
+          <div><h3>TTS</h3><p>Applied to future speech requests.</p></div>
           <span id="tts-availability"></span>
         </div>
         <div id="tts-config-summary" class="component-config-summary"></div>
         <div class="tts-grid">
+          <label id="tts-gpu-precision-row" class="wide-setting" hidden>
+            <span>Browser GPU precision</span>
+            <select id="tts-gpu-precision">
+              <option value="f32">FP32 activations (baseline)</option>
+              <option value="mixed-f16">Mixed FP16 (more GPU memory)</option>
+              <option value="w8a8">INT8 / W8A8 (lower GPU memory)</option>
+            </select>
+            <small>FP16 and INT8 are opt-in. INT8 favors memory efficiency; speed and pronunciation can vary.</small>
+          </label>
           <label><span>Language</span><input id="tts-language" type="text" maxlength="64"></label>
           <label><span>Diffusion steps</span><input id="tts-steps" type="number" min="1" max="128"></label>
           <label><span>Delivery</span><select id="tts-pace">

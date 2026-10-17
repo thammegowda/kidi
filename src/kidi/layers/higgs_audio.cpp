@@ -11,7 +11,7 @@ HiggsQuantizerImpl::HiggsQuantizerImpl(HiggsDecoderShape shape)
     register_module("project_out", project_out_);
 }
 
-auto HiggsQuantizerImpl::forward(ops::Context& context, std::span<const std::int32_t> tokens) const -> Tensor {
+auto HiggsQuantizerImpl::forward(ops::Context& context, const Tensor& tokens) const -> Tensor {
     return project_out_->forward(context, codebook_->forward(context, tokens));
 }
 
@@ -93,14 +93,16 @@ HiggsDecoderImpl::HiggsDecoderImpl(HiggsDecoderShape shape)
     register_module("acoustic_decoder", decoder_);
 }
 
-auto HiggsDecoderImpl::forward(ops::Context& context, std::span<const std::int32_t> tokens, std::size_t length) const
-    -> Tensor {
-    if (!length || tokens.size() != static_cast<std::size_t>(shape_.codebooks) * length)
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Higgs audio codes have invalid dimensions"});
+auto HiggsDecoderImpl::forward(ops::Context& context, const Tensor& tokens) const -> Tensor {
+    if (tokens.device() != context.device() || tokens.dtype() != tensor::DType::I32 || tokens.dimensions() != 2 ||
+        tokens.size(0) != static_cast<std::size_t>(shape_.codebooks) || !tokens.size(1))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
+                            "Higgs audio codes require an I32 [codebooks, length] tensor on the execution device"});
     Tensor quantized;
     for (std::int32_t codebook = 0; codebook < shape_.codebooks; ++codebook) {
-        auto decoded = (*quantizers_)[codebook]->forward(
-            context, tokens.subspan(static_cast<std::size_t>(codebook) * length, length));
+        const auto row =
+            context.reshape(context.slice(tokens, 0, codebook, 1), {static_cast<std::int64_t>(tokens.size(1))});
+        auto decoded = (*quantizers_)[codebook]->forward(context, row);
         if (quantized.defined())
             context.add_(quantized, decoded);
         else
