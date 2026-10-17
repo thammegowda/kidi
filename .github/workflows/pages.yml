@@ -12,7 +12,7 @@ on:
       - 'src/**'
       - 'third_party/**'
       - 'web/**'
-      - 'tests/web/**'
+      - 'tests/browser/**'
       - 'docs/kidi-logo-small.png'
   pull_request:
     branches: [main]
@@ -25,7 +25,7 @@ on:
       - 'src/**'
       - 'third_party/**'
       - 'web/**'
-      - 'tests/web/**'
+      - 'tests/browser/**'
       - 'docs/kidi-logo-small.png'
   workflow_dispatch:
 
@@ -92,7 +92,7 @@ jobs:
           "$RUNNER_TEMP/emsdk/emsdk" activate "$EMSCRIPTEN_VERSION"
 
       - name: Test browser model loader
-        run: node --test tests/web/model_cache_test.mjs
+        run: node --test tests/browser/*.mjs
 
       - name: Build single-thread and pthread WebAssembly
         shell: bash

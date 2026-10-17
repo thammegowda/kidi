@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -51,7 +52,8 @@ auto milliseconds(Clock::time_point started) -> double {
     return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
 }
 
-auto messages_from(const Json& source) -> kidi::Result<std::vector<ChatMessage>> {
+auto messages_from(const Json& source, const std::map<std::uint32_t, std::filesystem::path>& images)
+    -> kidi::Result<std::vector<ChatMessage>> {
     const auto invalid = [](std::string message) {
         return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, std::move(message)});
     };
@@ -60,15 +62,27 @@ auto messages_from(const Json& source) -> kidi::Result<std::vector<ChatMessage>>
     std::vector<ChatMessage> result;
     result.reserve(source.size());
     for (const auto& message : source) {
-        if (!message.is_object() || message.size() != 2 || !message.contains("role") ||
+        if (!message.is_object() || message.size() < 2 || message.size() > 3 || !message.contains("role") ||
             !message["role"].is_string() || !message.contains("content") || !message["content"].is_string())
-            return invalid("each message must contain string role and content fields only");
+            return invalid("each message must contain role, content, and optional images fields only");
         const auto role = message["role"].get<std::string>();
         if (role != "user" && role != "assistant")
             return invalid("message role must be user or assistant");
         auto content = message["content"].get<std::string>();
-        if (content.empty()) return invalid("message content must not be empty");
-        result.push_back({.role = role, .content = std::move(content), .images = {}});
+        std::vector<std::filesystem::path> paths;
+        if (message.contains("images")) {
+            if (!message["images"].is_array() || message["images"].size() > 8 ||
+                (role != "user" && !message["images"].empty()))
+                return invalid("images require a user message with at most eight entries");
+            for (const auto& value : message["images"]) {
+                if (!value.is_number_unsigned()) return invalid("image IDs must be unsigned integers");
+                const auto found = images.find(value.get<std::uint32_t>());
+                if (found == images.end()) return invalid("message references an unavailable image");
+                paths.push_back(found->second);
+            }
+        }
+        if (content.empty() && paths.empty()) return invalid("message content or images must not be empty");
+        result.push_back({.role = role, .content = std::move(content), .images = std::move(paths)});
     }
     return result;
 }
@@ -785,6 +799,7 @@ constexpr std::size_t AUDIO_HEADER_BYTES = 24;
 constexpr std::uint8_t AUDIO_VERSION = 1;
 constexpr std::uint8_t AUDIO_ASR = 1;
 constexpr std::uint8_t AUDIO_TTS = 2;
+constexpr std::uint8_t IMAGE_INPUT = 3;
 
 void write_u32(std::span<std::byte> output, std::size_t offset, std::uint32_t value) {
     for (std::size_t byte = 0; byte < 4; ++byte)
@@ -812,6 +827,7 @@ public:
         }
         audio_ready_.notify_all();
         if (task_.joinable()) task_.join();
+        clear_uploaded_images();
     }
 
     void run() {
@@ -986,12 +1002,67 @@ private:
             }
             return;
         }
+        if (type == "image.start") {
+            if (active_.load() || !payload.contains("stream_id") || !payload["stream_id"].is_number_unsigned() ||
+                !payload.contains("size") || !payload["size"].is_number_unsigned() ||
+                !payload.contains("content_type") || !payload["content_type"].is_string()) {
+                send_error(id, "invalid_image", "Image upload requires stream_id, size, and content_type");
+                return;
+            }
+            const auto stream_id = payload["stream_id"].get<std::uint32_t>();
+            const auto size = payload["size"].get<std::size_t>();
+            const auto content_type = payload["content_type"].get<std::string>();
+            if (!size || size > 32U * 1024U * 1024U ||
+                (content_type != "image/jpeg" && content_type != "image/png") ||
+                image_uploads_.contains(stream_id) || uploaded_images_.contains(stream_id)) {
+                send_error(id, "invalid_image", "Image must be a unique JPEG or PNG no larger than 32 MiB");
+                return;
+            }
+            image_uploads_.emplace(stream_id, ImageUpload{
+                .request_id = id,
+                .content_type = content_type,
+                .expected_size = size,
+            });
+            return;
+        }
+        if (type == "image.finish") {
+            if (!payload.contains("stream_id") || !payload["stream_id"].is_number_unsigned()) {
+                send_error(id, "invalid_image", "Image stream_id is required");
+                return;
+            }
+            const auto stream_id = payload["stream_id"].get<std::uint32_t>();
+            const auto found = image_uploads_.find(stream_id);
+            if (found == image_uploads_.end() || found->second.request_id != id ||
+                found->second.bytes.size() != found->second.expected_size) {
+                send_error(id, "invalid_image", "Image upload is incomplete");
+                return;
+            }
+            const auto token = liteapp::secure_random_token(18);
+            if (!token) {
+                send_error(id, "image_storage", token.error().message);
+                return;
+            }
+            const auto extension = found->second.content_type == "image/png" ? ".png" : ".jpg";
+            const auto path = std::filesystem::temp_directory_path() / ("kidi-image-" + *token + extension);
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            output.write(reinterpret_cast<const char*>(found->second.bytes.data()),
+                         static_cast<std::streamsize>(found->second.bytes.size()));
+            output.close();
+            if (!output) {
+                send_error(id, "image_storage", "Unable to store the uploaded image");
+                return;
+            }
+            uploaded_images_[stream_id] = path;
+            image_uploads_.erase(found);
+            send_event(id, "image.completed", {{"stream_id", stream_id}});
+            return;
+        }
         if (type == "chat.start") {
             if (!payload.contains("messages")) {
                 send_error(id, "invalid_messages", "messages is required");
                 return;
             }
-            auto messages = messages_from(payload["messages"]);
+            auto messages = messages_from(payload["messages"], uploaded_images_);
             if (!messages) {
                 send_error(id, "invalid_messages", messages.error().message);
                 return;
@@ -1080,15 +1151,32 @@ private:
 
     void handle_binary(std::string_view frame) {
         if (frame.size() < AUDIO_HEADER_BYTES || frame.substr(0, 4) != "KDA1" ||
-            static_cast<std::uint8_t>(frame[4]) != AUDIO_VERSION ||
-            static_cast<std::uint8_t>(frame[5]) != AUDIO_ASR) {
-            send_error("", "invalid_audio", "Invalid ASR audio frame header");
+            static_cast<std::uint8_t>(frame[4]) != AUDIO_VERSION) {
+            send_error("", "invalid_binary", "Invalid binary frame header");
             return;
         }
+        const auto kind = static_cast<std::uint8_t>(frame[5]);
         const auto stream_id = read_u32(frame, 8);
         const auto sequence = read_u32(frame, 12);
         const auto sample_rate = read_u32(frame, 16);
         const auto bytes = read_u32(frame, 20);
+        if (kind == IMAGE_INPUT) {
+            const auto found = image_uploads_.find(stream_id);
+            if (found == image_uploads_.end() || sequence != found->second.sequence++ || sample_rate ||
+                bytes != frame.size() - AUDIO_HEADER_BYTES ||
+                found->second.bytes.size() + bytes > found->second.expected_size) {
+                send_error(found == image_uploads_.end() ? "" : found->second.request_id,
+                           "invalid_image", "Image upload frame is invalid or out of order");
+                if (found != image_uploads_.end()) image_uploads_.erase(found);
+                return;
+            }
+            found->second.bytes.insert(found->second.bytes.end(), frame.begin() + AUDIO_HEADER_BYTES, frame.end());
+            return;
+        }
+        if (kind != AUDIO_ASR) {
+            send_error("", "invalid_audio", "Invalid ASR audio frame header");
+            return;
+        }
         if (sample_rate != 16000 || bytes != frame.size() - AUDIO_HEADER_BYTES || bytes % sizeof(std::int16_t)) {
             send_error("", "invalid_audio", "ASR frames must contain 16 kHz mono PCM16");
             return;
@@ -1132,6 +1220,15 @@ private:
             }
         }
         audio_ready_.notify_all();
+    }
+
+    void clear_uploaded_images() {
+        for (const auto& [stream, path] : uploaded_images_) {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+        }
+        uploaded_images_.clear();
+        image_uploads_.clear();
     }
 
     void run_chat(const std::string& id, std::span<const ChatMessage> messages, bool speak, const Json& settings) {
@@ -1240,6 +1337,7 @@ private:
                     }
                 }
             });
+        clear_uploaded_images();
 
         if (result) send_event(id, "chat.completed", {{"text", result->text}, {"stats", result->stats}});
         if (speak) {
@@ -1402,6 +1500,14 @@ private:
                    {"voice_prompt_reused", result->voice_prompt_reused}});
     }
 
+    struct ImageUpload {
+        std::string request_id;
+        std::string content_type;
+        std::size_t expected_size = 0;
+        std::uint32_t sequence = 0;
+        std::vector<std::uint8_t> bytes;
+    };
+
     std::shared_ptr<AppBackend> backend_;
     liteapp::WebSocket& socket_;
     std::mutex send_mutex_;
@@ -1420,21 +1526,23 @@ private:
     std::uint32_t audio_stream_id_ = 0;
     std::uint32_t audio_expected_sequence_ = 0;
     std::size_t audio_processed_ = 0;
+    std::map<std::uint32_t, ImageUpload> image_uploads_;
+    std::map<std::uint32_t, std::filesystem::path> uploaded_images_;
     std::atomic_uint32_t next_server_stream_{0x80000000U};
 };
 
 struct Arguments {
     std::filesystem::path config;
     int port = 0;
-    bool open = true;
+    bool dev = false;
 };
 
 auto parse_arguments(int count, char** values) -> std::optional<Arguments> {
     Arguments result;
     for (int index = 1; index < count; ++index) {
         const std::string_view argument{values[index]};
-        if (argument == "--no-open") {
-            result.open = false;
+        if (argument == "--dev") {
+            result.dev = true;
         } else if (argument == "--port" && index + 1 < count) {
             const std::string_view value{values[++index]};
             const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result.port);
@@ -1442,7 +1550,7 @@ auto parse_arguments(int count, char** values) -> std::optional<Arguments> {
                 result.port > std::numeric_limits<std::uint16_t>::max())
                 return std::nullopt;
         } else if (argument == "--help") {
-            std::cout << "usage: kidi-app CONFIG [--port PORT] [--no-open]\n";
+            std::cout << "usage: kidi-app CONFIG [--port PORT] [--dev]\n";
             std::exit(0);
         } else if (!argument.starts_with('-') && result.config.empty()) {
             result.config = argument;
@@ -1453,12 +1561,41 @@ auto parse_arguments(int count, char** values) -> std::optional<Arguments> {
     if (result.config.empty()) return std::nullopt;
     return result;
 }
+
+auto development_files(const std::filesystem::path& root) -> std::vector<liteapp::StaticFile> {
+    std::vector<liteapp::StaticFile> files;
+    const auto add = [&](std::string route, std::filesystem::path path, std::string content_type) {
+        files.push_back({
+            .route = std::move(route),
+            .path = root / std::move(path),
+            .content_type = std::move(content_type),
+        });
+    };
+    const auto text = "text/javascript; charset=utf-8";
+    add("/", "web/ui/index.html", "text/html; charset=utf-8");
+    add("/index.html", "web/ui/index.html", "text/html; charset=utf-8");
+    add("/style.css", "web/ui/style.css", "text/css; charset=utf-8");
+    for (const auto* file : {"app.js", "images.js", "markdown.js", "mermaid.js"})
+        add('/' + std::string(file), std::filesystem::path{"web/ui"} / file, text);
+    for (const auto* file : {"backend.js", "capture-worklet.js", "playback-worklet.js"})
+        add('/' + std::string(file), std::filesystem::path{"web/hosts/desktop"} / file, text);
+    for (const auto* file : {"audio-waveform.svg", "book-open.svg", "copy.svg", "volume.svg"})
+        add("/icons/" + std::string(file), std::filesystem::path{"web/ui/icons"} / file, "image/svg+xml");
+    for (const auto* file : {"mic.svg", "message-square.svg", "settings.svg", "square.svg"})
+        add("/icons/" + std::string(file), std::filesystem::path{"web/libs/lucide-static/icons"} / file,
+            "image/svg+xml");
+    add("/libs/marked/marked.esm.js", "web/libs/marked/marked.esm.js", text);
+    add("/libs/dompurify/purify.es.mjs", "web/libs/dompurify/purify.es.mjs", text);
+    add("/libs/highlightjs/highlight.min.js", "web/libs/highlightjs/highlight.min.js", text);
+    add("/libs/mermaid/mermaid.min.js", "web/libs/mermaid/mermaid.min.js", text);
+    return files;
+}
 }  // namespace
 
 auto main(int argc, char** argv) -> int {
     const auto arguments = parse_arguments(argc, argv);
     if (!arguments) {
-        std::cerr << "usage: kidi-app CONFIG [--port PORT] [--no-open]\n";
+        std::cerr << "usage: kidi-app CONFIG [--port PORT] [--dev]\n";
         return 2;
     }
     auto backend = std::make_shared<AppBackend>();
@@ -1467,16 +1604,25 @@ auto main(int argc, char** argv) -> int {
         std::cerr << "Unable to load " << arguments->config << ": " << loaded.error().message << '\n';
         return 1;
     }
-    const auto token = liteapp::secure_random_token();
-    if (!token) {
-        std::cerr << "Unable to create local access token: " << token.error().message << '\n';
-        return 1;
+    std::optional<liteapp::LocalAccess> local_access;
+    if (arguments->dev) {
+        std::cerr << "WARNING: --dev disables local access authentication and serves source files directly.\n";
+    } else {
+        const auto token = liteapp::secure_random_token();
+        if (!token) {
+            std::cerr << "Unable to create local access token: " << token.error().message << '\n';
+            return 1;
+        }
+        local_access = liteapp::LocalAccess{.token = *token, .cookie_name = "kidi_app_access"};
     }
     auto created = liteapp::HttpServer::create({
         .host = "127.0.0.1",
         .port = arguments->port,
         .max_body_bytes = 2U * 1024U * 1024U,
-        .local_access = liteapp::LocalAccess{.token = *token, .cookie_name = "kidi_app_access"},
+        .local_access = std::move(local_access),
+        .content_security_policy =
+            "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+            "img-src 'self' data: blob:; script-src 'self'; style-src 'self'",
     });
     if (!created) {
         std::cerr << "Unable to create server: " << created.error().message << '\n';
@@ -1489,14 +1635,22 @@ auto main(int argc, char** argv) -> int {
         session.run();
     }, {.max_text_bytes = backend->config().max_text_frame_bytes, .max_binary_bytes = 128U * 1024U});
 
-    auto assets = liteapp::vfs::FileSystem::from_zip(kidi::desktop_assets::archive());
-    if (!assets) {
-        std::cerr << "Unable to read embedded UI: " << assets.error().message << '\n';
-        return 1;
-    }
-    if (auto served = server.serve_static(*assets); !served) {
-        std::cerr << "Unable to serve embedded UI: " << served.error().message << '\n';
-        return 1;
+    if (arguments->dev) {
+        const auto files = development_files(std::filesystem::current_path());
+        if (auto served = server.serve_files(files); !served) {
+            std::cerr << "Unable to serve development UI: " << served.error().message << '\n';
+            return 1;
+        }
+    } else {
+        auto assets = liteapp::vfs::FileSystem::from_zip(kidi::desktop_assets::archive());
+        if (!assets) {
+            std::cerr << "Unable to read embedded UI: " << assets.error().message << '\n';
+            return 1;
+        }
+        if (auto served = server.serve_static(*assets); !served) {
+            std::cerr << "Unable to serve embedded UI: " << served.error().message << '\n';
+            return 1;
+        }
     }
     const auto port = server.bind();
     if (!port) {
@@ -1511,22 +1665,22 @@ auto main(int argc, char** argv) -> int {
     backend->start_background_warmup();
     const auto launch_url = server.local_launch_url(*port);
     std::cout << launch_url << '\n' << std::flush;
-    if (arguments->open) {
-        if (liteapp::platform::webview_window_supported()) {
-            const auto opened = liteapp::platform::run_webview_window({
-                .app_id = "ai.gowda.kidi",
-                .title = "Kidi",
-                .launch_url = launch_url,
-                .allowed_origin = "http://127.0.0.1:" + std::to_string(*port),
-                .profile_directory = std::filesystem::temp_directory_path() / "kidi-webview",
-            });
-            server.stop();
-            if (!opened) {
-                std::cerr << "Unable to open app window: " << opened.error().message << '\n';
-                return 1;
-            }
-        } else if (auto opened = liteapp::platform::open_url(launch_url); !opened) {
-            std::cerr << "Open this URL in a browser: " << launch_url << '\n';
+    if (!arguments->dev && liteapp::platform::webview_window_supported()) {
+        const auto opened = liteapp::platform::run_webview_window({
+            .app_id = "ai.gowda.kidi",
+            .title = "Kidi",
+            .launch_url = launch_url,
+            .allowed_origin = "http://127.0.0.1:" + std::to_string(*port),
+            .profile_directory = std::filesystem::temp_directory_path() / "kidi-webview",
+        });
+        server.stop();
+        if (!opened) {
+            std::cerr << "Unable to open app window: " << opened.error().message << '\n';
+            return 1;
+        }
+    } else if (!arguments->dev) {
+        if (auto opened = liteapp::platform::open_url(launch_url); !opened) {
+            std::cerr << "Unable to open the app automatically: " << opened.error().message << '\n';
         }
     }
     if (auto waited = running->wait(); !waited) {

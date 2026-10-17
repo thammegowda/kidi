@@ -5,6 +5,18 @@ capability-protected loopback server, and serves the embedded interface. HTTP is
 used only for bootstrap assets and `/api/status`; interactive work uses one
 authenticated WebSocket at `/ws`.
 
+For development, `kidi-app CONFIG --port 10010 --dev` keeps the loopback bind
+and security headers but disables the one-time capability and cookie exchange.
+It serves the shared UI, desktop host adapter, worklets, icons, and browser
+libraries directly from the repository, so HTML, JavaScript, and CSS edits only
+need a browser reload. Development assets are resolved from the current working
+directory. Development mode prints a warning and serves a stable
+clickable `http://127.0.0.1:10010/` URL without opening a browser or application
+window. Never use `--dev` with an exposed or forwarded port.
+
+`make app-dev` builds and runs this mode on port `10010`. Override the defaults
+with `APP_CONFIG=path/to/config.yaml` or `APP_PORT=another-loopback-port`.
+
 ## Text messages
 
 Every command and event is a JSON object:
@@ -13,11 +25,19 @@ Every command and event is a JSON object:
 {"v":1,"id":"request UUID","type":"chat.start","seq":0,"payload":{}}
 ```
 
-Client commands are `chat.start`, `asr.start`, `asr.stop`, `tts.start`,
-`settings.system_prompt.set`, and `cancel`. Server events are `session.ready`,
+Client commands are `chat.start`, `image.start`, `image.finish`, `asr.start`,
+`asr.stop`, `tts.start`, `settings.system_prompt.set`, and `cancel`. Server events are `session.ready`,
 `settings.system_prompt.updated`, modality-specific `started`, `partial`/`delta`,
 and `completed` events, `request.cancelled`, and `error`. Sequence numbers are
 monotonic within each request.
+
+Images use bounded binary frames with kind `3`. The browser announces a unique
+stream, MIME type, and total size, sends ordered 64 KiB chunks, and finishes the
+stream before starting chat. The server accepts JPEG and PNG data only, limits
+each upload to 32 MiB, writes an unguessable request-scoped temporary file for
+the existing multimodal generator API, and removes it after completion,
+cancellation, or disconnect. Browser-provided filesystem paths are never
+accepted.
 
 Chat publishes each tokenizer-safe `GenerationEvent.text` delta immediately.
 ASR accepts rolling microphone audio and emits bounded partial snapshots before
@@ -37,7 +57,7 @@ process memory, so restarting the app restores the YAML value. `tts.start` may
 include validated per-request language, diffusion-step, gender, age, pitch,
 style, and accent overrides without changing the immutable model configuration.
 
-## Binary audio frames
+## Binary frames
 
 Audio uses PCM16 little-endian mono data. Each binary WebSocket message starts
 with this 24-byte little-endian header:
@@ -46,7 +66,7 @@ with this 24-byte little-endian header:
 |---:|---:|---|
 | 0 | 4 | ASCII `KDA1` |
 | 4 | 1 | Protocol version (`1`) |
-| 5 | 1 | Kind: `1` ASR input, `2` TTS output |
+| 5 | 1 | Kind: `1` ASR input, `2` TTS output, `3` image input |
 | 6 | 2 | Reserved |
 | 8 | 4 | Stream ID |
 | 12 | 4 | Sequence number |

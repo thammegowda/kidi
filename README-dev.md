@@ -384,7 +384,7 @@ and numerical contracts.
 Browser loader/generated-glue tests can also run directly:
 
 ```bash
-node --test tests/web/*.mjs
+node --test tests/browser/*.mjs
 ```
 
 Android model-download contracts run locally without installing over a phone app:

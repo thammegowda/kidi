@@ -107,7 +107,7 @@ projections 3.8 ms.
 ## 2026-10-01: Register Block Sweep
 
 - The three hand-written 64x64 tile kernels (quantized projections, FP32 `linear`, prefill attention) now come
-  from one generator, `tiledProduct` in `web/webgpu-kernels.mjs`, with the per-thread block set by `TILE`
+  from one generator, `tiledProduct` in `web/hosts/wasm/webgpu-kernels.mjs`, with the per-thread block set by `TILE`
   (default 4x4) and fully unrolled accumulators. At 4x4 its kernel times match the hand-written ones (2k prompt:
   Q4 gate_up 705 vs 720-735 ms, down 389 vs 400 ms; butterfly: 8-bit vision projection 231 vs 238 ms,
   attention scores 130 vs 131 ms).
@@ -120,7 +120,7 @@ projections 3.8 ms.
   Metal emulates: replacing it with a one-operation stand-in cut Q4 gate_up from 705 to 228 ms and prefill from
   3.0 to 1.7 s. GPUs with native packed int8 dot products (DP4A-class Vulkan devices) may behave differently;
   untested here.
-- Validation: `tests/web/backend_test.html` all checks pass (projection, attention and vision CPU/WebGPU parity,
+- Validation: `tests/browser/backend_test.html` all checks pass (projection, attention and vision CPU/WebGPU parity,
   full logits); web unit tests pass.
 
 ## 2026-10-01: First-Request Latency
@@ -219,7 +219,7 @@ not enabled"); with its hidden flag, JavaScriptCore still caps memories at 4 GiB
   allocator use/free/peak, KV cache, image features, and net allocation by
   category (tokenizer, weight binding, each operator type and row count when
   first prepared). The app shows it under Model settings > Memory diagnostics.
-  `benchmarks/web/heap_probe.mjs` runs the real loader and module in Node.
+  `benchmarks/browser/heap_probe.mjs` runs the real loader and module in Node.
 - Baseline, wasm64 CPU, 2,211 prompt + 32 output tokens: peak heap 4.38 GiB;
   allocator 4.20 GiB = checkpoint 2.29 (per-layer table 1.13, audio tower
   0.14), decode packing 0.73, fused-FFN prefill tiles 0.38, gate/up concat
@@ -264,7 +264,7 @@ not enabled"); with its hidden flag, JavaScriptCore still caps memories at 4 GiB
   address 4,297,849,912. Sparse probe peak RSS was about 64 MiB, not 4 GiB.
   The first probe incorrectly assumed a following small allocation could not
   reuse a low free block; corrected it to test inside the large allocation.
-  Repeatable test: `KIDI_TEST_WASM=build-web/single/kidi.mjs node --test tests/web/model_cache_test.mjs`.
+  Repeatable test: `KIDI_TEST_WASM=build-web/single/kidi.mjs node --test tests/browser/model_cache_test.mjs`.
 - Common vision code now uses 32-row projection/FFN/query workspaces and a
   broadcast attention mask, retaining every key/value and the image resolution.
   RMSNorm residual additions use the existing fused operation. This bounds
@@ -445,7 +445,7 @@ No inference optimization is included in this baseline pass.
 ### Structural Baseline
 
 The controlling WebGPU implementation is
-[`makeProgram`](../../web/webgpu-kernels.mjs). Initial source inspection gives:
+[`makeProgram`](../../web/hosts/wasm/webgpu-kernels.mjs). Initial source inspection gives:
 
 | Attention core | Dispatches | Global intermediate storage, excluding output |
 | --- | ---: | --- |
@@ -477,7 +477,7 @@ First falsifiable check: instantiate `makeProgram` at 255/256/511/512/2200 keys
 and for multi-query prefill, count scratch/stage/final dispatches, and inspect
 intermediate bytes. This checks program construction without a GPU; it does not
 validate WGSL compilation, numerical parity, or runtime timing. Existing browser
-numerical checks live in [backend_test.html](../../tests/web/backend_test.html).
+numerical checks live in [backend_test.html](../../tests/browser/backend_test.html).
 The check passed for all six cases: decode temporary bytes were 0 / 0 / 0 /
 16512 / 66048 at eight query heads and width 256; prefill at `B=1, H=8, Q=128,
 K=4096` requested 33554432 bytes (32 MiB). The first probe used the wrong spec
@@ -692,7 +692,7 @@ check passing.
    one mask. The word size is unchanged, so there is no memory cost. The Q2
    1536 -> 12288 projection went from roughly 38 to 49 GB/s of weight traffic.
 
-Two findings were worth more than the speed. First, `web/build.mjs` reconfigures
+Two findings were worth more than the speed. First, `web/tools/build.mjs` reconfigures
 `build-webgpu` with tests off, which deletes the `kidi_webgpu_test` target and
 leaves a stale binary that still loads and reports success. The browser checks had
 therefore been validating older C++ for several rounds. Second, that stale binary

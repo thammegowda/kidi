@@ -1,6 +1,8 @@
-# Kidi WebAssembly Demo
+# Kidi WebAssembly Application
 
-This directory builds a self-contained browser chat app for Gemma 4 E2B IT with image input and Whisper microphone dictation.
+This directory builds the WASM host for Kidi's shared multi-view interface with
+Gemma chat and vision, Whisper microphone dictation, and OmniVoice read-aloud
+and continuous voice mode.
 It uses the released `google/gemma-4-E2B-it-qat-mobile-transformers` checkpoint,
 keeps its trained mixed 2/4/8-bit values, and runs Kidi's existing C++ Gemma
 model through WebAssembly.
@@ -15,7 +17,7 @@ Requirements:
 
 ```bash
 brew install emscripten node
-node web/build.mjs build-web
+node web/tools/build.mjs build-web
 ```
 
 ## Serve
@@ -34,17 +36,23 @@ Without Make, run `python -m http.server 8080 --bind 127.0.0.1 --directory build
 Open `http://localhost:8080`. The first visit may reload automatically to enable
 multithreading. Open Model settings and load the model. Node.js and Emscripten
 are build-time dependencies; deployment needs only a static HTTP server.
+While loading, the workspace header shows progress even with settings closed.
+Browser runtime settings show the progress bar, loaded/total bytes, separate
+download and cache byte counts, and the current file. Model initialization
+uses an indeterminate indicator rather than a misleading completed download bar.
+Cached automatic restores report the same progress as manual loads.
 The required libraries and icons are vendored in
-[`src/web/libs/`](../src/web/libs/README.md), with versions and licenses recorded
+[`web/libs/`](./libs/README.md), with versions and licenses recorded
 there. No npm installation or dependency download is needed for the web build.
 
 The JavaScript files have distinct roles:
 
 | Files | Run in | Purpose |
 |---|---|---|
-| `app.mjs`, `inference-worker.mjs`, `asr-worker.mjs`, `model-cache.mjs`, `images.mjs` | Browser | Chat UI, local image attachments, isolated Gemma/Whisper execution, Hub downloads and cache |
+| `web/ui/` | Browser | Shared multi-view Kidi shell, Chat UI, Markdown, images, voice controls, settings, and persistence |
+| `backend.js`, `inference-worker.mjs`, `asr-worker.mjs`, `tts-worker.mjs`, `model-cache.mjs` | Browser | WASM host adapter, isolated Gemma/Whisper/OmniVoice execution, Hub downloads, and cache |
 | `build.mjs`, `wasm-glue.mjs` | Node.js during build | Compile/package the wasm32 variants and fix their generated heap indexing above 2 GiB |
-| `src/web/libs/` | Build inputs | Pinned isolation helper, selected icons, and JavaScript parser dependencies |
+| `web/libs/` | Build inputs | Pinned isolation helper, selected icons, and JavaScript parser dependencies |
 
 Only browser assets and their licenses are copied to the deployment directory.
 Do not deploy build scripts or the build-only parsers. Serving via Python does not replace the
@@ -125,7 +133,13 @@ does not silently fall back to CPU.
 
 ## Browser Workflow
 
-The main screen reserves the viewport for messages and the bottom composer.
+The application shell, Chat view, Reader placeholder, message rendering,
+Markdown, attachments, settings, and voice-mode controller come from
+[`web/ui/`](./ui/), which is also embedded in the native desktop
+application. This directory contains only the WASM host adapter, model workers,
+cache implementation, and build packaging.
+
+The Chat view reserves the viewport for messages and the bottom composer.
 Model source, thread count, cache and token controls live in the runtime settings dialog.
 Valid thread-count and output-token changes are remembered in local storage.
 If isolation is unavailable, the current session uses one thread without replacing
@@ -134,6 +148,48 @@ inside the browser.
 New chat creates a blank conversation; completed chats are stored in local
 browser storage and can be reopened or deleted from the history rail. Chat
 content is not sent to a server.
+
+### Text to speech
+
+Browser runtime settings include a Model cache view listing files and their
+combined cached sizes. Ranges and speech-model chunks are grouped by original
+file; old chunks without a manifest appear as Unreferenced package data.
+The file explorer opens directories with a click and provides breadcrumbs and
+an Up button. Folders show aggregate sizes and support confirmed recursive
+deletion of all cached files/chunks beneath them, at any directory level.
+Refresh updates the inventory; Delete removes all cached parts of a file, and Clear model cache
+removes only model storage, not conversations or attached images. Both deletion
+actions require confirmation. Running models stay loaded, but later loads need
+to fetch deleted data again. Keep the same origin (scheme, host, and port) to
+manage the same cache.
+
+Settings use a two-panel layout: section navigation on the left and independently
+scrolling details on the right. Sections are LLM (including the system prompt
+and browser model-loading controls), ASR, TTS, and finally Model Cache.
+Model Cache and browser model-loading controls are browser-only.
+
+Chat and Reader are top-level destinations in the application header. Chat owns
+its conversation sidebar; Reader uses the full workspace for its library.
+The library layout includes search, sorting, and an empty state. Book import
+and the dedicated open-book reading workspace are not implemented yet.
+
+When the local OmniVoice package is available during `make wasm`, the build
+creates a chunked browser manifest under `models/omnivoice`, with chunks of up
+to 256 MiB (three weight chunks for the current OmniVoice model). Smaller
+support files remain separate. This reduces request overhead while bounding
+the temporary buffers used for download, checksum verification, and caching;
+it does not accelerate CPU synthesis. Existing 8 MiB packages remain supported.
+Rebuilding changes chunk identities, so the new package needs a one-time cache
+fill even if the old package was cached. The browser caches
+those chunks at the application origin. OmniVoice runs in a dedicated
+single-thread WASM worker and sends transferable Float32 PCM to the shared
+playback worklet.
+
+The worker is terminated after each synthesis. This deliberately trades a
+short cached-model reload for bounded memory: retaining the first synthesis
+heap caused later OmniVoice requests to exceed practical WASM tensor storage.
+The application never substitutes the browser's platform-dependent
+`speechSynthesis` voices.
 
 ### Images
 
@@ -198,7 +254,7 @@ buffers are small and shared by every recording length.
 In Edge the app reports speech ready 1.5-2 s after opening with a cached model, and transcribes 3.9, 6.6 and 22.6
 seconds of speech in 0.34, 0.63 and 2.2 s.
 
-`benchmarks/web/asr_probe.mjs` runs the same loader and runtime in Node against a local Hugging Face cache.
+`benchmarks/browser/asr_probe.mjs` runs the same loader and runtime in Node against a local Hugging Face cache.
 
 Loading ends with a one-token warm-up (`Generator::warm_up`) so the first message
 does not pay one-time work: on CPU, YNNPACK packs every projection weight on first
@@ -328,7 +384,7 @@ To measure without a browser, run the same loader and module in Node against a
 local Hugging Face snapshot:
 
 ```bash
-node benchmarks/web/heap_probe.mjs --glue build-web/single/kidi.mjs \
+node benchmarks/browser/heap_probe.mjs --glue build-web/single/kidi.mjs \
   --snapshot ~/.cache/kidi/model-hub/models--google--gemma-4-E2B-it-qat-mobile-transformers/snapshots/<sha> \
   [--threads 4] [--words 1600] [--image photo.jpg] [--json result.json]
 ```
@@ -340,7 +396,7 @@ Allocation wrappers use JavaScript numbers, and `ccall` pointer arguments use
 its `pointer` type. Check the built ABI with an allocation that crosses 2 GiB:
 
 ```bash
-KIDI_TEST_WASM=build-web/single/kidi.mjs node --test tests/web/model_cache_test.mjs
+KIDI_TEST_WASM=build-web/single/kidi.mjs node --test tests/browser/model_cache_test.mjs
 ```
 
 ## Hosting and Cache
@@ -432,7 +488,7 @@ cmake --build build-webgpu --target kidi_webgpu_test -j8
 python3 -m http.server 8081 --bind 127.0.0.1 --directory .
 ```
 
-Open `http://127.0.0.1:8081/tests/web/backend_test.html?run=1` in the integrated
+Open `http://127.0.0.1:8081/tests/browser/backend_test.html?run=1` in the integrated
 browser. Unlike the app, this developer test links JSPI (so it needs a browser
 with JSPI, such as current Chromium): its checks read GPU results inline through
 a test-only `set_web_gpu_wait` hook. Disable HTTP caching when iterating on shader modules. Checks cover
@@ -463,7 +519,7 @@ bytes in 4.9-5.6 seconds. `Count from one to five in words.` produced the expect
 been published in this session. Loader and generated-glue regression checks:
 
 ```bash
-node --test tests/web/model_cache_test.mjs
+node --test tests/browser/model_cache_test.mjs
 ```
 
 ### Scheduling follow-up

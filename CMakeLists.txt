@@ -136,7 +136,7 @@ if(EMSCRIPTEN)
         target_link_libraries(kidi PRIVATE nlohmann_json::nlohmann_json)
         target_compile_definitions(kidi PUBLIC KIDI_HAS_WEBGPU=1)
     endif()
-    add_executable(kidi_wasm src/kidi/web/bindings.cpp)
+    add_executable(kidi_wasm src/kidi/platform/wasm/bindings.cpp)
     target_link_libraries(kidi_wasm PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
     set_target_properties(kidi_wasm PROPERTIES OUTPUT_NAME kidi SUFFIX .mjs)
     target_link_options(kidi_wasm PRIVATE
@@ -147,7 +147,7 @@ if(EMSCRIPTEN)
     )
     # The app never waits on the GPU inside Wasm. Only the backend test reads results inline, through JSPI.
     if(KIDI_WASM_WEBGPU AND KIDI_BUILD_TESTS)
-        add_executable(kidi_webgpu_test tests/web/backend_test.cpp)
+        add_executable(kidi_webgpu_test tests/browser/backend_test.cpp)
         target_link_libraries(kidi_webgpu_test PRIVATE kidi::kidi)
         set_target_properties(kidi_webgpu_test PROPERTIES SUFFIX .mjs)
         target_link_options(kidi_webgpu_test PRIVATE --no-entry -sMODULARIZE=1 -sJSPI=1
@@ -359,32 +359,46 @@ if(KIDI_BUILD_DESKTOP_APP)
         "${KIDI_DESKTOP_WEB_STAGE}/libs/highlightjs"
         "${KIDI_DESKTOP_WEB_STAGE}/icons"
     )
-    set(KIDI_DESKTOP_WEB_FILES
+    set(KIDI_SHARED_WEB_FILES
         app.js
-        capture-worklet.js
         icons/audio-waveform.svg
+        icons/book-open.svg
         icons/copy.svg
         icons/volume.svg
         index.html
+        images.js
         markdown.js
-        playback-worklet.js
+        mermaid.js
         style.css
     )
+    set(KIDI_DESKTOP_WEB_FILES
+        backend.js
+        capture-worklet.js
+        playback-worklet.js
+    )
     file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}/icons")
-    foreach(file IN LISTS KIDI_DESKTOP_WEB_FILES)
-        configure_file("desktop/web/${file}" "${KIDI_DESKTOP_WEB_STAGE}/${file}" COPYONLY)
+    foreach(file IN LISTS KIDI_SHARED_WEB_FILES)
+        configure_file("web/ui/${file}" "${KIDI_DESKTOP_WEB_STAGE}/${file}" COPYONLY)
     endforeach()
-    configure_file("src/web/libs/marked/marked.esm.js"
+    foreach(file IN LISTS KIDI_DESKTOP_WEB_FILES)
+        configure_file("web/hosts/desktop/${file}" "${KIDI_DESKTOP_WEB_STAGE}/${file}" COPYONLY)
+    endforeach()
+    configure_file("web/libs/marked/marked.esm.js"
         "${KIDI_DESKTOP_WEB_STAGE}/libs/marked/marked.esm.js" COPYONLY)
-    configure_file("src/web/libs/dompurify/purify.es.mjs"
-        "${KIDI_DESKTOP_WEB_STAGE}/libs/dompurify/purify.es.js" COPYONLY)
-    configure_file("src/web/libs/highlightjs/highlight.min.js"
+    configure_file("web/libs/dompurify/purify.es.mjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/dompurify/purify.es.mjs" COPYONLY)
+    configure_file("web/libs/highlightjs/highlight.min.js"
         "${KIDI_DESKTOP_WEB_STAGE}/libs/highlightjs/highlight.min.js" COPYONLY)
-    configure_file("src/web/libs/lucide-static/icons/mic.svg"
+    file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}/libs/mermaid")
+    configure_file("web/libs/mermaid/mermaid.min.js"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/mermaid/mermaid.min.js" COPYONLY)
+    configure_file("web/libs/lucide-static/icons/mic.svg"
         "${KIDI_DESKTOP_WEB_STAGE}/icons/mic.svg" COPYONLY)
-    configure_file("src/web/libs/lucide-static/icons/square.svg"
+    configure_file("web/libs/lucide-static/icons/message-square.svg"
+        "${KIDI_DESKTOP_WEB_STAGE}/icons/message-square.svg" COPYONLY)
+    configure_file("web/libs/lucide-static/icons/square.svg"
         "${KIDI_DESKTOP_WEB_STAGE}/icons/square.svg" COPYONLY)
-    configure_file("src/web/libs/lucide-static/icons/settings.svg"
+    configure_file("web/libs/lucide-static/icons/settings.svg"
         "${KIDI_DESKTOP_WEB_STAGE}/icons/settings.svg" COPYONLY)
     liteapp_embed_archive(
         TARGET kidi_desktop_assets
@@ -392,11 +406,14 @@ if(KIDI_BUILD_DESKTOP_APP)
         HEADER kidi/desktop_assets.h
         ROOT "${KIDI_DESKTOP_WEB_STAGE}"
         FILES
+            ${KIDI_SHARED_WEB_FILES}
             ${KIDI_DESKTOP_WEB_FILES}
             libs/marked/marked.esm.js
-            libs/dompurify/purify.es.js
+            libs/dompurify/purify.es.mjs
             libs/highlightjs/highlight.min.js
+            libs/mermaid/mermaid.min.js
             icons/mic.svg
+            icons/message-square.svg
             icons/square.svg
             icons/settings.svg
     )
