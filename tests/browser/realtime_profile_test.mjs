@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {selectRealtimeProfile} from '../../web/ui/realtime-profile.js';
 
-test('native GPU uses the measured six-step low-latency profile', () => {
+test('native GPU preserves the intelligible TTS step floor', () => {
   assert.deepEqual(selectRealtimeProfile({
     runtime: {host: 'native', threads: 4, speech_backend: 'a_gpu'},
     backend: 'a_gpu',
@@ -13,7 +13,7 @@ test('native GPU uses the measured six-step low-latency profile', () => {
     execution: 'gpu',
     cores: 12,
     endpointMs: 800,
-    ttsSteps: 6,
+    ttsSteps: 10,
     segmentation: {
       firstMaximumUnits: 128,
       firstTargetUnits: 48,
@@ -31,22 +31,22 @@ test('Wasm WebGPU dispatches independently of CPU thread count', () => {
   });
   assert.equal(profile.id, 'wasm-webgpu');
   assert.equal(profile.execution, 'gpu');
-  assert.equal(profile.ttsSteps, 4);
+  assert.equal(profile.ttsSteps, 10);
   assert.equal(profile.segmentation.firstMaximumUnits, 96);
 });
 
-test('higher-capacity WebGPU retains a five-step realtime profile', () => {
+test('higher-capacity WebGPU preserves the intelligible TTS step floor', () => {
   const profile = selectRealtimeProfile({
     runtime: {host: 'wasm', requested_backend: 'webgpu', speech_backend: 'webgpu'},
     hardwareConcurrency: 8,
     deviceMemory: 8,
   });
   assert.equal(profile.id, 'wasm-webgpu');
-  assert.equal(profile.ttsSteps, 5);
+  assert.equal(profile.ttsSteps, 10);
   assert.equal(profile.segmentation.firstMaximumUnits, 112);
 });
 
-test('constrained CPU gets smaller chunks and fewer diffusion steps', () => {
+test('constrained CPU keeps smaller chunks without lowering TTS quality', () => {
   const profile = selectRealtimeProfile({
     runtime: {host: 'wasm', requested_backend: 'cpu', speech_backend: 'cpu', threads: 4},
     components: {tts: {accelerator: 'wasm-threads'}},
@@ -54,7 +54,7 @@ test('constrained CPU gets smaller chunks and fewer diffusion steps', () => {
     deviceMemory: 4,
   });
   assert.equal(profile.id, 'wasm-cpu-constrained');
-  assert.equal(profile.ttsSteps, 4);
+  assert.equal(profile.ttsSteps, 10);
   assert.equal(profile.endpointMs, 700);
   assert.equal(profile.segmentation.firstMaximumUnits, 96);
   assert.equal(profile.segmentation.maximumUnits, 160);
@@ -70,7 +70,7 @@ test('explicit native CPU overrides a GPU chat backend', () => {
   });
   assert.equal(profile.id, 'native-cpu-balanced');
   assert.equal(profile.execution, 'cpu');
-  assert.equal(profile.ttsSteps, 5);
+  assert.equal(profile.ttsSteps, 10);
 });
 
 test('loaded Wasm CPU fallback overrides stale requested WebGPU', () => {

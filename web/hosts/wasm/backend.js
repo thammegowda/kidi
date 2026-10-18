@@ -1,20 +1,21 @@
-import {isModelCached, webGpuSupport, listCachedFiles, deleteCachedFile, deleteCachedFiles, clearModelCache} from './model-cache.mjs';
+import {configureModelHub, isModelCached, webGpuSupport, listCachedFiles, deleteCachedFile, deleteCachedFiles,
+  clearModelCache} from './model-cache.mjs';
 import {createGpuWorker} from './runtime-client.mjs';
 import {clearVoicePromptCache, describeVoicePrompt, loadVoicePrompt, storeVoicePrompt}
   from './voice-prompt-cache.mjs';
+import {loadAppConfig} from './app-config.mjs';
 
 const SETTINGS_KEY = 'kidi-wasm-host-v1';
-const VOICE_REFERENCES = [
-  'Hello, I am Kidi, your local assistant.',
-  'A quiet breeze moves through the bright garden.',
-  'Clear morning light falls across the open window.',
-];
+const APP_CONFIG = await loadAppConfig();
+configureModelHub(APP_CONFIG.model_hub.remote);
+const CHAT = APP_CONFIG.models.chat, ASR = APP_CONFIG.models.asr, TTS = APP_CONFIG.models.tts;
+const VOICE_REFERENCES = TTS.reference_sentences || [TTS.reference_text];
 const DEFAULTS = {
-  model: 'google/gemma-4-E2B-it-qat-mobile-transformers',
-  backend: 'webgpu',
-  threads: 4,
-  maximumTokens: 512,
-  systemPrompt: 'You are a helpful local AI assistant. Respond directly, briefly, and in the language or language mix used by the user.',
+  model: CHAT.model_id,
+  backend: CHAT.accelerator === 'cpu' ? 'cpu' : 'webgpu',
+  threads: APP_CONFIG.runtime.threads,
+  maximumTokens: CHAT.generation.max_tokens,
+  systemPrompt: CHAT.system_prompt,
 };
 
 class WasmBackend {
@@ -22,43 +23,45 @@ class WasmBackend {
   #asr;
   #components = {
     chat: {
-      enabled: true,
-      directory: 'Browser model cache',
+      enabled: CHAT.enabled !== false,
+      directory: CHAT.model_id,
       accelerator: 'wasm',
-      precision: 'checkpoint',
-      kv_cache_precision: 'auto',
+      precision: CHAT.precision,
+      kv_cache_precision: CHAT.kv_cache_precision,
       system_prompt: DEFAULTS.systemPrompt,
       configured_system_prompt: DEFAULTS.systemPrompt,
       maximum_tokens: DEFAULTS.maximumTokens,
-      context_tokens: 9216,
-      prefix_cache_mb: 0,
+      context_tokens: CHAT.generation.context_tokens,
+      prefix_cache_mb: CHAT.generation.prefix_cache_mb,
     },
     asr: {
-      enabled: true,
+      enabled: ASR.enabled !== false,
+      loaded: false,
       accelerator: 'wasm-cpu',
-      directory: 'openai/whisper-small',
+      directory: ASR.model_id,
       settings: {
-        language: 'auto',
-        max_tokens: 128,
-        vad: {threshold: 0.012, minimum_speech_ms: 250, silence_ms: 800},
+        language: ASR.language,
+        max_tokens: ASR.max_tokens,
+        vad: {...ASR.vad},
       },
     },
     tts: {
-      enabled: true,
+      enabled: TTS.enabled !== false,
+      loaded: false,
       accelerator: 'auto',
-      directory: './models/omnivoice/manifest.json',
+      directory: TTS.model_id,
       settings: {
-        language: 'auto',
-        steps: 10,
-        realtime_steps: 6,
-        reference_steps: 6,
-        pace: 1.15,
-        gpu_precision: 'w8a8',
-        reference_language: 'English',
-        reference_text: VOICE_REFERENCES[0],
+        language: TTS.language,
+        steps: TTS.steps,
+        realtime_steps: TTS.realtime_steps,
+        reference_steps: TTS.reference_steps || TTS.realtime_steps,
+        pace: TTS.pace,
+        gpu_precision: TTS.gpu_precision || 'w8a8',
+        reference_language: TTS.reference_language,
+        reference_text: TTS.reference_text,
         reference_sentences: VOICE_REFERENCES,
         voice_seed: 0,
-        voice: {gender: 'female', age: 'young adult', pitch: 'moderate', style: '', accent: ''},
+        voice: {...TTS.voice},
       },
     },
   };
@@ -67,6 +70,7 @@ class WasmBackend {
   #settings = {...DEFAULTS};
   #speechReady;
   #speechWorker;
+  #speechLoadingId;
   #speechMode;
   #ttsRequest;
   #ttsReady;
@@ -82,6 +86,8 @@ class WasmBackend {
   #worker;
   #resident = false;
   #reloading = false;
+  #componentMemory = {};
+  #gpuMemory = 0;
 
   constructor() {
     try {
@@ -276,9 +282,11 @@ class WasmBackend {
         };
         worker.onmessage = ({data}) => {
           if (worker !== this.#ttsWorker) return;
+          this.#captureTelemetry('tts', data);
           if (this.#handleTtsControl(data, id)) return;
           if (data.type === 'ready') {
             loaded = true;
+            this.#components.tts.loaded = true;
             this.#ttsModelInfo = data;
             this.#components.tts.threads = data.threads;
             this.#components.tts.accelerator = data.backend ||
@@ -301,6 +309,7 @@ class WasmBackend {
           } else if (data.type === 'audio') {
             this.#ttsAudio(data);
           } else if (data.type === 'residency' && data.state === 'evicted') {
+            this.#components.tts.loaded = false;
             this.#ttsReady = null;
             this.#ttsVoiceKey = null;
           } else if (data.type === 'error') {
@@ -350,6 +359,7 @@ class WasmBackend {
     this.#ttsRequest = request;
     this.#ensureTts(id, effectiveOptions).then(() => {
       if (this.#ttsRequest !== request) return;
+      this.#event(id, 'tts.ready', {component: this.#components.tts, runtime: this.#runtime()});
       this.#event(id, 'tts.progress', {phase: 'synthesizing'});
       this.#ttsWorker.postMessage({
         type: 'synthesize', requestId: id, streamSegment: true, text,
@@ -368,6 +378,8 @@ class WasmBackend {
     this.#ttsControls.clear();
     this.#ttsWorker?.terminate();
     this.#ttsWorker = null;
+    this.#components.tts.loaded = false;
+    delete this.#componentMemory.tts;
     this.#ttsReady = null;
     this.#ttsLoadingId = null;
     this.#ttsModelInfo = null;
@@ -505,6 +517,29 @@ class WasmBackend {
       });
       return;
     }
+    if (type === 'asr.preload') {
+      if (!this.#components.asr.enabled)
+        return this.#error(id, 'asr_disabled', 'Speech recognition is disabled');
+      this.#event(id, 'asr.progress', {phase: 'loading', stage: 'Preparing speech recognition model'});
+      this.#ensureSpeech(id).then(() => {
+        this.#event(id, 'asr.ready', {component: this.#components.asr, runtime: this.#runtime()});
+      }).catch(error => this.#error(id, 'asr_load_failed', error.message));
+      return;
+    }
+    if (type === 'tts.preload') {
+      if (!this.#components.tts.enabled)
+        return this.#error(id, 'tts_disabled', 'Speech synthesis is disabled');
+      const options = {
+        ...this.#components.tts.settings,
+        ...(payload.options || {}),
+        voice: {...this.#components.tts.settings.voice, ...(payload.options?.voice || {})},
+      };
+      this.#event(id, 'tts.progress', {phase: 'loading', stage: 'Preparing TTS (text-to-speech) model'});
+      this.#ensureTts(id, options).then(() => {
+        this.#event(id, 'tts.ready', {component: this.#components.tts, runtime: this.#runtime()});
+      }).catch(error => this.#error(id, 'tts_load_failed', error.message));
+      return;
+    }
     if (type === 'tts.start') {
       if (!Number.isInteger(payload.stream_id) || payload.stream_id < 0 || payload.stream_id > 0xffffffff ||
           typeof payload.text !== 'string' || !payload.text)
@@ -570,9 +605,11 @@ class WasmBackend {
         partialSequence: 0,
         lastPartialSamples: 0,
       };
-      this.#ensureSpeech().then(() => {
-        if (this.#asr?.id === id)
+      this.#ensureSpeech(id).then(() => {
+        if (this.#asr?.id === id) {
+          this.#event(id, 'asr.ready', {component: this.#components.asr, runtime: this.#runtime()});
           this.#event(id, 'asr.started', {stream_id: payload.stream_id, sample_rate: 16000});
+        }
       }).catch(error => {
         if (this.#asr?.id === id) this.#asr = null;
         this.#error(id, 'asr_load_failed', error.message);
@@ -679,7 +716,7 @@ class WasmBackend {
     });
   }
 
-  #ensureSpeech() {
+  #ensureSpeech(id = '') {
     const preferredGpu = this.#settings.backend === 'webgpu' && !webGpuSupport();
     const mode = JSON.stringify({gpu: preferredGpu, threads: this.#settings.threads});
     if (this.#speechMode !== mode) {
@@ -689,6 +726,7 @@ class WasmBackend {
       this.#speechMode = mode;
     }
     if (this.#speechReady) return this.#speechReady;
+    this.#speechLoadingId = id;
     this.#speechReady = new Promise((resolve, reject) => {
       const start = useGpu => {
         const worker = useGpu ? createGpuWorker('asr') :
@@ -699,7 +737,7 @@ class WasmBackend {
           if (worker !== this.#speechWorker) return;
           worker.terminate();
           if (!loaded && useGpu) {
-            this.#event(this.#asr?.id || '', 'asr.progress', {
+            this.#event(this.#speechLoadingId || '', 'asr.progress', {
               phase: 'fallback', message: `WebGPU speech recognition unavailable; using CPU (${message})`,
             });
             start(false);
@@ -707,6 +745,8 @@ class WasmBackend {
           }
           this.#speechWorker = null;
           this.#speechReady = null;
+          this.#speechLoadingId = null;
+          this.#components.asr.loaded = false;
           if (!loaded) reject(new Error(message));
           else if (this.#asr) {
             const id = this.#asr.id;
@@ -716,10 +756,13 @@ class WasmBackend {
         };
         worker.onmessage = ({data}) => {
           if (worker !== this.#speechWorker) return;
+          this.#captureTelemetry('asr', data);
           if (data.type === 'ready') {
             loaded = true;
+            this.#components.asr.loaded = true;
             this.#components.asr.accelerator = data.backend || 'wasm-cpu';
             this.#components.asr.threads = data.threads;
+            this.#speechLoadingId = null;
             resolve();
           } else if (data.type === 'result') {
             this.#speechResult(data);
@@ -729,8 +772,14 @@ class WasmBackend {
               stable: '', provisional: data.text || '', language: data.language || 'auto',
             });
           } else if (data.type === 'error') fail(data.error || 'Speech recognition failed');
-          else if ((data.type === 'progress' || data.type === 'residency') && this.#asr) {
-            this.#event(this.#asr.id, 'asr.progress', {phase: 'loading', ...data});
+          else if (data.type === 'residency' && data.state === 'evicted') {
+            this.#components.asr.loaded = false;
+            this.#speechReady = null;
+            delete this.#componentMemory.asr;
+          } else if (data.type === 'progress' ||
+                     (data.type === 'residency' && data.state === 'loading')) {
+            this.#event(this.#speechLoadingId || this.#asr?.id || id, 'asr.progress',
+              {phase: 'loading', ...data});
           }
         };
         worker.onerror = event => fail(event.message || 'Speech worker failed');
@@ -798,6 +847,7 @@ class WasmBackend {
 
   #workerEvent(loadId, worker, data) {
     if (worker !== this.#worker) return;
+    this.#captureTelemetry('chat', data);
     if (data.type === 'residency') {
       this.#resident = data.state === 'ready';
       this.#reloading = data.state === 'loading';
@@ -885,11 +935,47 @@ class WasmBackend {
     }
   }
 
+  #captureTelemetry(kind, data = {}) {
+    const finite = value => Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : null;
+    const current = this.#componentMemory[kind] || {};
+    if (data.memory) {
+      const allocated = finite(data.memory.malloc_in_use_bytes);
+      const external = finite(data.memory.weights_external_bytes) || 0;
+      if (allocated !== null) current.host = allocated + external;
+      const limit = finite(data.memory.heap_limit_bytes);
+      if (limit !== null) current.limit = limit;
+      const gpu = finite(data.memory.gpu_buffer_bytes);
+      if (gpu !== null) this.#gpuMemory = gpu;
+    } else {
+      const heapWeights = finite(data.heapWeightBytes);
+      const externalWeights = finite(data.externalWeightBytes);
+      if (heapWeights !== null || externalWeights !== null)
+        current.host = (heapWeights || 0) + (externalWeights || 0);
+    }
+    const gpuTotal = finite(data.gpuStats?.totalBufferBytes);
+    const gpuWeights = finite(data.gpuWeightBytes);
+    if (gpuTotal !== null) this.#gpuMemory = gpuTotal;
+    else if (gpuWeights !== null) current.gpu = gpuWeights;
+    if (Object.keys(current).length) this.#componentMemory[kind] = current;
+  }
+
+  #memory() {
+    const components = Object.values(this.#componentMemory);
+    const componentGpu = components.reduce((sum, item) => sum + (item.gpu || 0), 0);
+    return {
+      host_bytes: components.reduce((sum, item) => sum + (item.host || 0), 0),
+      gpu_bytes: Math.max(this.#gpuMemory, componentGpu),
+      host_limit_bytes: Math.max(0, ...components.map(item => item.limit || 0)),
+    };
+  }
+
   #runtime() {
     return {
       host: 'wasm',
       threads: this.#settings.threads,
       concurrency: this.#settings.backend === 'webgpu' ? 'shared-gpu' : 'single',
+      model_hub_remote: APP_CONFIG.model_hub.remote,
+      model_hub_local: 'Cache Storage',
       resident: this.#resident,
       reloading: this.#reloading,
       preload_speech: false,
@@ -899,6 +985,7 @@ class WasmBackend {
       maximum_tokens: this.#settings.maximumTokens,
       speech_backend: this.#ttsWorker ? (this.#ttsUseGpu ? 'webgpu' : 'cpu') :
         (this.#settings.backend === 'webgpu' ? 'webgpu' : 'cpu'),
+      memory: this.#memory(),
       loading: Boolean(this.#worker && !this.#ready),
     };
   }

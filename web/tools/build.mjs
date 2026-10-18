@@ -1,9 +1,8 @@
 import {spawnSync} from 'node:child_process';
-import {access, mkdir, copyFile, readdir, readFile, rm, writeFile} from 'node:fs/promises';
+import {mkdir, copyFile, readdir, readFile, rm, writeFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {resolve, join, dirname} from 'node:path';
 import {unsignedHeapIndices} from './wasm-glue.mjs';
-import {packageModel} from './package-model.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const libraries = join(root, 'web/libs');
@@ -38,6 +37,10 @@ for (const file of ['backend.js', 'inference-worker.mjs', 'asr-worker.mjs',
     'tts-worker.mjs', 'speech.mjs', 'model-cache.mjs', 'voice-prompt-cache.mjs',
     'webgpu.mjs', 'webgpu-kernels.mjs', 'scoped-model.mjs', 'runtime-scheduler.mjs'])
     await copyFile(join(root, 'web/hosts/wasm', file), join(destination, file));
+await writeFile(join(destination, 'app-config.mjs'),
+    (await readFile(join(root, 'web/hosts/wasm/app-config.mjs'), 'utf8'))
+        .replace('../../libs/js-yaml/', './libs/js-yaml/'));
+await copyFile(join(root, 'examples/kidi-app.yaml'), join(destination, 'app-config.yaml'));
 await writeFile(join(destination, 'model-residency.mjs'),
     (await readFile(join(root, 'web/hosts/wasm/model-residency.mjs'), 'utf8'))
         .replace('../../ui/speech-controller.js', './speech-controller.js'));
@@ -69,7 +72,7 @@ await writeFile(join(destination, 'gpu-runtime-checks.mjs'),
 await writeFile(join(destination, 'index.html'),
     sharedIndex.replace('<script type="module" src="./app.js"></script>',
         '<script src="./coi-serviceworker.js"></script>\n  <script type="module" src="./app.js"></script>'));
-for (const name of ['marked', 'dompurify', 'highlightjs', 'mermaid']) {
+for (const name of ['marked', 'dompurify', 'highlightjs', 'mermaid', 'js-yaml']) {
     await mkdir(join(destination, 'libs', name), {recursive: true});
     for (const file of await readdir(join(libraries, name)))
         await copyFile(join(libraries, name, file), join(destination, 'libs', name, file));
@@ -86,21 +89,4 @@ for (const icon of ['send-horizontal', 'square', 'download', 'trash-2', 'plus', 
     'message-square', 'mic'])
     await copyFile(join(libraries, 'lucide-static/icons', `${icon}.svg`), join(destination, 'icons', `${icon}.svg`));
 await copyFile(join(root, 'docs/kidi-logo-small.png'), join(destination, 'icons/kidi-logo.png'));
-const ttsSource = resolve(process.env.KIDI_WEB_TTS_MODEL || join(root, 'models/omnivoice'));
-if (await access(join(ttsSource, 'model.yaml')).then(() => true, () => false)) {
-    const ttsDestination = join(destination, 'models', 'omnivoice');
-    await packageModel(ttsSource, ttsDestination, [
-        'model.yaml',
-        'model.safetensors',
-        'tokenizer.json',
-        'tokenizer_config.json',
-        'sentence-prefixes.tsv',
-        'synthesis_template.jinja',
-        'NOTICE',
-        'licenses/OMNIVOICE-CC-BY-NC-4.0.txt',
-        'licenses/META-LLAMA-3-LICENSE.txt',
-        'licenses/META-LLAMA-3-USE-POLICY.md',
-        'licenses/HIGGS-AUDIO-2-LICENSE.txt',
-    ], {name: 'OmniVoice', precision: 'BF16'});
-}
 console.log(`Browser app: ${destination}`);

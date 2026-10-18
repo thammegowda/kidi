@@ -3,6 +3,21 @@ import assert from 'node:assert/strict';
 import {setImmediate} from 'node:timers/promises';
 
 let nextModule = 0;
+const TEST_APP_CONFIG = {
+    version: 1,
+    model_hub: {remote: 'https://huggingface.co', local: '~/.cache/kidi/model-hub'},
+    runtime: {threads: 4},
+    models: {
+        chat: {enabled: true, model_id: 'google/test', accelerator: 'auto', precision: 'checkpoint',
+            kv_cache_precision: 'auto', system_prompt: 'Test prompt',
+            generation: {max_tokens: 128, context_tokens: 1024, prefix_cache_mb: 0}},
+        asr: {enabled: true, model_id: 'openai/whisper-small', language: 'auto', max_tokens: 128,
+            vad: {threshold: .012, minimum_speech_ms: 250, silence_ms: 800}},
+        tts: {enabled: true, model_id: 'test/omnivoice', language: 'auto', steps: 10, realtime_steps: 6,
+            pace: 1.15, reference_language: 'English', reference_text: 'Hello.',
+            voice: {gender: 'female', age: 'young adult', pitch: 'moderate', style: '', accent: ''}},
+    },
+};
 function deferred() {
     let resolve;
     const promise = new Promise(yes => { resolve = yes; });
@@ -83,6 +98,7 @@ async function withBackend(action, {ready = true} = {}) {
             },
         },
         fetch: async () => { throw new Error('Tests must not download models'); },
+        KIDI_APP_CONFIG: TEST_APP_CONFIG,
     };
     const previous = new Map(Object.keys(globals).map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
     try {
@@ -261,6 +277,32 @@ test('ASR rejects malformed recognition language preferences', async () => {
         assert.equal(workers.some(worker => worker.url.includes('asr-worker')), false);
         const error = events.find(event => event.id === 'invalid-language' && event.type === 'error');
         assert.equal(error.payload.code, 'invalid_asr');
+    });
+});
+
+test('speech models can be preloaded without recording or synthesis', async () => {
+    await withBackend(async ({backend, workers, events, connect}) => {
+        connect({});
+        backend.send('asr.preload', 'load-asr');
+        await waitFor(() => events.some(event => event.id === 'load-asr' && event.type === 'asr.ready'));
+        const asr = workers.find(worker => worker.url.includes('asr-worker'));
+        assert.ok(asr);
+        assert.equal(asr.calls[0].type, 'load');
+        assert.equal(asr.calls.some(call => call.type === 'transcribe'), false);
+        const asrProgress = events.filter(event => event.type === 'asr.progress').length;
+        asr.emit({type: 'residency', state: 'ready'});
+        assert.equal(events.filter(event => event.type === 'asr.progress').length, asrProgress);
+
+        backend.send('tts.preload', 'load-tts', {options: {gpu_precision: 'w8a8'}});
+        await waitFor(() => events.some(event => event.id === 'load-tts' && event.type === 'tts.ready'));
+        const tts = workers.find(worker => worker.url.includes('tts-worker'));
+        assert.ok(tts);
+        assert.equal(tts.calls[0].type, 'load');
+        assert.equal(visibleSynthesis(tts).length, 0);
+
+        const status = await backend.status();
+        assert.equal(status.components.asr.loaded, true);
+        assert.equal(status.components.tts.loaded, true);
     });
 });
 

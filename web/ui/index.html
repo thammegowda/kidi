@@ -22,6 +22,10 @@
           <span class="reader-view-icon" aria-hidden="true"></span><span>Reader</span>
         </button>
       </nav>
+      <div class="backend-telemetry" aria-label="Backend activity">
+        <span id="backend-activity">Idle</span>
+        <span id="backend-memory">Memory —</span>
+      </div>
       <div class="language-switchers" aria-label="Conversation languages">
         <label class="language-picker">
           <span class="mic-icon" aria-hidden="true"></span>
@@ -76,9 +80,68 @@
             <span id="runtime-label">No model loaded</span>
           </div>
         </div>
+        <progress id="runtime-progress" aria-label="Backend operation progress" hidden></progress>
       </header>
 
       <section class="messages" id="messages" aria-live="polite">
+        <section class="model-onboarding" id="model-onboarding" aria-labelledby="model-onboarding-title">
+          <button id="dismiss-model-onboarding" class="model-onboarding-close" type="button"
+            aria-label="Close model setup">×</button>
+          <div class="model-onboarding-kicker">One-time setup</div>
+          <h2 id="model-onboarding-title">Set up your local models</h2>
+          <p>The chat model is required. Speech recognition is recommended for dictation and voice mode. Text-to-speech is optional, but loading it now avoids a delay before the first spoken response.</p>
+          <div class="model-onboarding-options">
+            <section>
+              <div>
+                <span class="model-requirement">Required</span>
+                <strong>Chat / LLM</strong>
+                <small><span id="model-onboarding-name">Configured chat model</span> · <span id="model-onboarding-execution">Automatic</span></small>
+              </div>
+              <button id="onboarding-load-model" class="model-action" type="button">Load LLM model</button>
+            </section>
+            <section id="onboarding-asr-option">
+              <div>
+                <span class="model-requirement recommended">Recommended</span>
+                <strong>Speech recognition / ASR</strong>
+                <small id="model-onboarding-asr-name">Configured speech model</small>
+              </div>
+              <button id="onboarding-load-asr" class="model-action" type="button">Load ASR model</button>
+            </section>
+            <section id="onboarding-tts-option">
+              <div>
+                <span class="model-requirement optional">Optional</span>
+                <strong>Speech synthesis / TTS</strong>
+                <small id="model-onboarding-tts-name">Configured text-to-speech model</small>
+              </div>
+              <button id="onboarding-load-tts" class="model-action" type="button">Load TTS model</button>
+            </section>
+          </div>
+          <div id="onboarding-model-loading" class="model-loading" hidden>
+            <div id="onboarding-model-loading-stage" role="status">Preparing model</div>
+            <progress id="onboarding-model-loading-progress" aria-label="Initial model loading progress"></progress>
+            <div id="onboarding-model-loading-bytes"></div>
+            <div id="onboarding-model-loading-file"></div>
+          </div>
+          <div id="onboarding-asr-loading" class="model-loading" hidden>
+            <div id="onboarding-asr-loading-stage" role="status">Preparing speech recognition model</div>
+            <progress id="onboarding-asr-loading-progress" aria-label="Initial speech recognition loading progress"></progress>
+            <div id="onboarding-asr-loading-bytes"></div>
+            <div id="onboarding-asr-loading-file"></div>
+          </div>
+          <div id="onboarding-tts-loading" class="model-loading" hidden>
+            <div id="onboarding-tts-loading-stage" role="status">Preparing text-to-speech model</div>
+            <progress id="onboarding-tts-loading-progress" aria-label="Initial text-to-speech loading progress"></progress>
+            <div id="onboarding-tts-loading-bytes"></div>
+            <div id="onboarding-tts-loading-file"></div>
+          </div>
+          <p id="model-onboarding-error" class="model-onboarding-error" role="alert" hidden></p>
+          <p id="onboarding-asr-error" class="model-onboarding-error" role="alert" hidden></p>
+          <p id="onboarding-tts-error" class="model-onboarding-error" role="alert" hidden></p>
+          <footer>
+            <small>Downloaded files remain in this browser's local cache.</small>
+            <button id="skip-onboarding-asr" type="button">Continue without speech models</button>
+          </footer>
+        </section>
         <div class="welcome" id="welcome">
           <div class="welcome-mark" aria-hidden="true">K</div>
           <h2>What would you like to explore?</h2>
@@ -207,9 +270,23 @@
       </section>
       </section>
       <section data-settings-panel="asr" hidden>
-        <h3>ASR</h3>
-        <p>Automatic speech recognition and microphone activity detection.</p>
+        <div class="settings-section-heading">
+          <div><h3>ASR</h3><p>Automatic speech recognition and microphone activity detection.</p></div>
+          <span id="asr-availability">Not loaded</span>
+        </div>
         <div id="asr-config-summary" class="component-config-summary"></div>
+        <div id="asr-model-controls">
+          <div id="asr-model-loading" class="model-loading" hidden>
+            <div id="asr-model-loading-stage" role="status">Preparing speech recognition model</div>
+            <progress id="asr-model-loading-progress" aria-label="Speech recognition model loading progress"></progress>
+            <div id="asr-model-loading-bytes"></div>
+            <div id="asr-model-loading-file"></div>
+          </div>
+          <p id="asr-model-error" class="speech-model-error" role="alert" hidden></p>
+          <div class="settings-actions">
+            <button id="load-asr-model" class="primary" type="button">Load ASR model</button>
+          </div>
+        </div>
       </section>
       <section id="cache-management" data-settings-panel="cache" hidden>
           <h3>Model cache</h3>
@@ -227,17 +304,29 @@
           <span id="tts-availability"></span>
         </div>
         <div id="tts-config-summary" class="component-config-summary"></div>
+        <div id="tts-model-controls">
+          <div id="tts-model-loading" class="model-loading" hidden>
+            <div id="tts-model-loading-stage" role="status">Preparing TTS (text-to-speech) model</div>
+            <progress id="tts-model-loading-progress" aria-label="Speech synthesis model loading progress"></progress>
+            <div id="tts-model-loading-bytes"></div>
+            <div id="tts-model-loading-file"></div>
+          </div>
+          <p id="tts-model-error" class="speech-model-error" role="alert" hidden></p>
+          <div class="settings-actions">
+            <button id="load-tts-model" class="primary" type="button">Load TTS model</button>
+          </div>
+        </div>
         <div class="tts-grid">
           <label id="tts-gpu-precision-row" class="wide-setting" hidden>
             <span>Browser GPU precision</span>
             <select id="tts-gpu-precision">
-              <option value="f32">FP32 activations (baseline)</option>
+              <option value="f32">FP32 activations (quality baseline)</option>
               <option value="mixed-f16">Mixed FP16 (more GPU memory)</option>
               <option value="w8a8">INT8 / W8A8 (recommended)</option>
             </select>
-            <small>W8A8 is the browser default for speed and memory. FP32 is the quality baseline; pronunciation can vary by profile.</small>
+            <small>W8A8 is the fast browser default. Kidi keeps at least 10 diffusion steps because lower settings can make speech unintelligible.</small>
           </label>
-          <label><span>Diffusion steps</span><input id="tts-steps" type="number" min="1" max="128"></label>
+          <label><span>Diffusion steps</span><input id="tts-steps" type="number" min="10" max="128"></label>
           <label><span>Delivery</span><select id="tts-pace">
             <option value="1.2">Mellow</option><option value="1.15">Relaxed</option>
             <option value="1">Natural</option><option value="0.9">Brisk</option>

@@ -1,5 +1,7 @@
 const finitePositive = (value, fallback) =>
   Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : fallback;
+// Round-trip tests become semantically unstable below this floor; eight steps can already repeat words.
+export const MINIMUM_TTS_STEPS = 10;
 
 function cpuTier(cores, memory) {
   if (cores <= 4 || memory <= 4) return 'constrained';
@@ -34,7 +36,7 @@ export function selectRealtimeProfile({
       execution: 'gpu',
       cores,
       endpointMs: web ? (constrainedWeb ? 650 : 700) : 800,
-      ttsSteps: web ? (constrainedWeb ? 4 : 5) : 6,
+      ttsSteps: MINIMUM_TTS_STEPS,
       segmentation: web ? {
         firstMaximumUnits: constrainedWeb ? 96 : 112,
         firstTargetUnits: constrainedWeb ? 36 : 40,
@@ -57,7 +59,7 @@ export function selectRealtimeProfile({
       execution: 'cpu',
       cores,
       endpointMs: 700,
-      ttsSteps: 4,
+      ttsSteps: MINIMUM_TTS_STEPS,
       segmentation: {
         firstMaximumUnits: 96,
         firstTargetUnits: 36,
@@ -73,7 +75,7 @@ export function selectRealtimeProfile({
       execution: 'cpu',
       cores,
       endpointMs: 750,
-      ttsSteps: 5,
+      ttsSteps: MINIMUM_TTS_STEPS,
       segmentation: {
         firstMaximumUnits: 112,
         firstTargetUnits: 40,
@@ -88,7 +90,7 @@ export function selectRealtimeProfile({
     execution: 'cpu',
     cores,
     endpointMs: 800,
-    ttsSteps: 6,
+    ttsSteps: MINIMUM_TTS_STEPS,
     segmentation: {
       firstMaximumUnits: 128,
       firstTargetUnits: 48,

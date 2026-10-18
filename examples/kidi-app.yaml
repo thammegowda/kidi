@@ -2,6 +2,10 @@
 # Relative model paths are resolved from this file's directory.
 version: 1
 
+model_hub:
+  remote: https://huggingface.co
+  local: ~/.cache/kidi/model-hub
+
 runtime:
   threads: 4
   concurrency: single
@@ -16,7 +20,8 @@ transport:
 models:
   chat:
     enabled: true
-    directory: ../models/gemma-4-E2B-it-qat-mobile-transformers
+    model_id: google/gemma-4-E2B-it-qat-mobile-transformers
+    revision: main
     accelerator: auto
     precision: checkpoint
     kv_cache_precision: auto
@@ -35,7 +40,8 @@ models:
 
   asr:
     enabled: true
-    directory: ../models/whisper-small
+    model_id: openai/whisper-small
+    revision: main
     accelerator: cpu
     language: auto
     max_tokens: 128
@@ -49,17 +55,17 @@ models:
 
   tts:
     enabled: true
-    directory: ../models/omnivoice
+    model_id: thammegowda/OmniVoice-q8
+    revision: main
     accelerator: auto
     metal_prefill_cache_mb: 1024
     language: auto
     pace: 1.15
     reference_language: English
-    reference_text: >-
-      Hello, I am Kidi, your helpful local assistant. I am here to answer your
-      questions clearly and concisely.
+    reference_text: Nice to meet you.
     steps: 10
-    realtime_steps: 6
+    realtime_steps: 10
+    gpu_precision: w8a8
     wire_format: pcm_s16le
     playback_buffer_ms: 150
     voice:

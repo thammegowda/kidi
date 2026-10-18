@@ -82,6 +82,7 @@ add_library(kidi
     src/kidi/audio/wav.cpp
     src/kidi/audio/whisper.cpp
     src/kidi/checkpoint/config.cpp
+    src/kidi/checkpoint/hub.cpp
     src/kidi/checkpoint/ggml/reader.cpp
     src/kidi/checkpoint/package.cpp
     src/kidi/checkpoint/prepare.cpp

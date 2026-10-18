@@ -1,6 +1,7 @@
 const CACHE_NAME = 'kidi-model-v1';
 export const MAX_WASM_MEMORY = 4 * 1024 ** 3;
 export const webGpuSupport = () => globalThis.navigator?.gpu ? '' : 'this browser has no WebGPU';
+let MODEL_HUB_REMOTE = 'https://huggingface.co';
 const CHUNK_BYTES = 8 * 1024 * 1024;
 // Whisper weights come from whisper.cpp's Q8_0 GGML files (a quarter of the FP32 Safetensors download), which the runtime
 // converts to per-channel INT8 at load. The model's own repository supplies config and tokenizer files.
@@ -8,6 +9,8 @@ const WHISPER_GGML_REVISION = '5359861c739e955e79d9a303bcbc70fb988958b1';
 const WHISPER_SIZES = {384: 'tiny', 512: 'base', 768: 'small'};
 const isWhisper = config => config.model_type === 'whisper' &&
     config.architectures?.includes('WhisperForConditionalGeneration');
+const isKidiOmniVoice = config => config.model_type === 'kidi_omnivoice' &&
+    config.architectures?.includes('KidiOmniVoiceForTextToSpeech') && config.kidi_format_version === 1;
 // After the first load the cache keeps the INT8 checkpoint the runtime converted from the GGML weights, so reloads skip
 // the conversion. The name changes with the GGML source and the conversion format.
 const convertedSpeech = configUrl => new URL(`kidi-int8-v1-${WHISPER_GGML_REVISION.slice(0, 12)}.safetensors`, configUrl);
@@ -16,8 +19,16 @@ const SIGNED_WEIGHTS = 'gemma-signed-v1';
 const MODEL_ID = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const hex = bytes => Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
 
-const referenceKey = modelId => `https://kidi.invalid/__model_refs__/${encodeURIComponent(modelId)}`;
-const configUrl = (modelId, revision) => `https://huggingface.co/${modelId}/resolve/${revision}/config.json`;
+export function configureModelHub(remote) {
+    const url = new URL(remote);
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash ||
+        (url.pathname !== '/' && url.pathname !== ''))
+        throw new Error('Model Hub remote must be a public HTTPS origin');
+    MODEL_HUB_REMOTE = url.origin;
+}
+const referenceKey = modelId =>
+    `https://kidi.invalid/__model_refs__/${encodeURIComponent(`${MODEL_HUB_REMOTE}/${modelId}`)}`;
+const configUrl = (modelId, revision) => `${MODEL_HUB_REMOTE}/${modelId}/resolve/${revision}/config.json`;
 
 async function resolveReference(source, cache, cacheOnly) {
     const value = String(source).trim();
@@ -38,7 +49,7 @@ async function resolveReference(source, cache, cacheOnly) {
     }
     try {
         const path = value.split('/').map(encodeURIComponent).join('/');
-        const response = await fetch(`https://huggingface.co/api/models/${path}/revision/main`,
+        const response = await fetch(`${MODEL_HUB_REMOTE}/api/models/${path}/revision/main`,
             {mode: 'cors', credentials: 'omit', cache: 'no-cache', signal: AbortSignal.timeout(30000)});
         if (!response.ok) throw new Error(`Hugging Face model lookup HTTP ${response.status}`);
         const metadata = await response.json();
@@ -60,7 +71,7 @@ export async function resolveModelSource(source, {cacheOnly = false} = {}) {
 }
 
 function hubFile(url) {
-    const match = /^\/([^/]+)\/([^/]+)\/resolve\/([a-f0-9]{40})\/([^/]+)$/.exec(url.pathname);
+    const match = /^\/([^/]+)\/([^/]+)\/resolve\/([a-f0-9]{40})\/(.+)$/.exec(url.pathname);
     return match && {modelId: `${match[1]}/${match[2]}`, revision: match[3], name: match[4]};
 }
 
@@ -95,7 +106,7 @@ async function cacheInventory() {
             } catch {}
             continue;
         }
-        const file = url.origin === 'https://huggingface.co' && hubFile(url);
+        const file = url.origin === new URL(MODEL_HUB_REMOTE).origin && hubFile(url);
         if (file) {
             const source = configUrl(file.modelId, file.revision);
             let model = hubs.get(source);
@@ -121,7 +132,8 @@ async function cacheInventory() {
         const reference = references.get(model.source);
         if (reference) model.cacheKeys.add(reference.key);
         const files = [...model.files.values()].sort((left, right) => right.bytes - left.bytes);
-        const kind = model.config?.model_type === 'whisper' ? 'Speech' :
+        const kind = model.config?.model_type === 'kidi_omnivoice' ? 'TTS' :
+            model.config?.model_type === 'whisper' ? 'Speech' :
             model.config?.model_type === 'gemma4' ? 'Chat' : 'Model';
         models.push({...model, name: reference?.modelId || model.modelId, kind, files,
             bytes: files.reduce((sum, file) => sum + file.bytes, 0), complete: await isModelCached(model.source)});
@@ -227,11 +239,14 @@ export async function isModelCached(source) {
         const keys = new Set((await cache.keys()).map(request => request.url));
         if (!keys.has(url.href)) return false;
         if (url.pathname.endsWith('/config.json')) {
-            if (url.origin !== 'https://huggingface.co' || url.search || url.hash ||
+            if (url.origin !== new URL(MODEL_HUB_REMOTE).origin || url.search || url.hash ||
                 !/^\/[^/]+\/[^/]+\/resolve\/[a-f0-9]{40}\/config\.json$/.test(url.pathname)) return false;
             const response = await cache.match(url.href);
             const config = await response.json();
-            const required = isWhisper(config)
+            const required = isKidiOmniVoice(config)
+                ? ['model.yaml', 'tokenizer.json.gz', 'sentence-prefixes.tsv',
+                    'synthesis_template.jinja', 'NOTICE']
+                : isWhisper(config)
                 ? ['tokenizer.json', 'preprocessor_config.json', 'generation_config.json']
                 : ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
             for (const name of required)
@@ -462,7 +477,7 @@ function externalTables(module, tables, device = []) {
 
 async function loadHubModel(module, source, progress, cache, warning, cacheOnly, gpu) {
     const configUrl = new URL(source);
-    if (configUrl.origin !== 'https://huggingface.co' || configUrl.search || configUrl.hash ||
+    if (configUrl.origin !== new URL(MODEL_HUB_REMOTE).origin || configUrl.search || configUrl.hash ||
         !/^\/[^/]+\/[^/]+\/resolve\/[a-f0-9]{40}\/config\.json$/.test(configUrl.pathname))
         throw new Error('Use a public Hugging Face config.json URL pinned to a full commit SHA');
     const metrics = {totalBytes: 0, loadedBytes: 0, cachedBytes: 0, downloadedBytes: 0};
@@ -545,12 +560,41 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
         module.FS.writeFile('/model/config.json', new Uint8Array(configData.bytes));
         for (const name of names) {
             const file = await get(new URL(name, configUrl));
-            module.FS.writeFile(`/model/${name}`, new Uint8Array(file.bytes));
+            const path = `/model/${name}`;
+            const directory = path.slice(0, path.lastIndexOf('/'));
+            if (directory !== '/model') module.FS.mkdirTree(directory);
+            module.FS.writeFile(path, new Uint8Array(file.bytes));
             metrics.totalBytes += file.bytes.byteLength;
             metrics.loadedBytes += file.bytes.byteLength;
             report(name);
         }
     };
+    if (isKidiOmniVoice(config)) {
+        module.FS.mkdir('/model');
+        metrics.totalBytes += configData.bytes.byteLength;
+        metrics.loadedBytes += configData.bytes.byteLength;
+        await writeMetadata(['model.yaml', 'tokenizer.json.gz', 'sentence-prefixes.tsv',
+            'synthesis_template.jinja', 'NOTICE',
+            'licenses/OMNIVOICE-CC-BY-NC-4.0.txt', 'licenses/META-LLAMA-3-LICENSE.txt',
+            'licenses/META-LLAMA-3-USE-POLICY.md', 'licenses/HIGGS-AUDIO-2-LICENSE.txt']);
+        const weightsUrl = new URL('model.safetensors', configUrl);
+        let pointer = 0;
+        let total = 0;
+        await readRanges(weightsUrl, (bytes, start, size) => {
+            if (!pointer) {
+                total = size;
+                pointer = allocateWeights(module, size);
+                metrics.totalBytes += size;
+            }
+            module.HEAPU8.set(bytes, pointer + start);
+            metrics.loadedBytes += bytes.length;
+            report('model.safetensors');
+        });
+        mountWeights(module, pointer, total);
+        return {...metrics, warning, model: config.name || 'OmniVoice-q8',
+            precision: config.quantization_config?.format || 'signed INT8', id: configUrl.href,
+            heapWeightBytes: total, externalWeightBytes: 0};
+    }
     if (isWhisper(config)) {
         const size = WHISPER_SIZES[config.d_model];
         if (!size || config.vocab_size !== 51865) throw new Error('Expected multilingual Whisper Tiny, Base, or Small');
@@ -585,7 +629,7 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
         }
         // The runtime converts these weights while loading (`kidi_load_asr`); `storeConvertedSpeech` then caches the
         // result in their place.
-        const source = `https://huggingface.co/ggerganov/whisper.cpp/resolve/${WHISPER_GGML_REVISION}/ggml-${size}-q8_0.bin`;
+        const source = `${MODEL_HUB_REMOTE}/ggerganov/whisper.cpp/resolve/${WHISPER_GGML_REVISION}/ggml-${size}-q8_0.bin`;
         let weights;
         await readRanges(source, (bytes, start, size) => {
             if (!weights) {

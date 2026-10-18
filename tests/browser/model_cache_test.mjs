@@ -180,6 +180,58 @@ test('model IDs resolve latest Hub revisions and retain an offline pinned mappin
     }
 });
 
+test('Kidi OmniVoice Hub package streams one safetensors file by ranges', async () => {
+    const revision = 'd'.repeat(40);
+    const source = `https://huggingface.co/kidi/OmniVoice-q8/resolve/${revision}/config.json`;
+    const config = {name: 'OmniVoice-q8', model_type: 'kidi_omnivoice',
+        architectures: ['KidiOmniVoiceForTextToSpeech'], kidi_format_version: 1,
+        quantization_config: {format: 'signed-int8'}};
+    const metadata = ['model.yaml', 'tokenizer.json.gz', 'sentence-prefixes.tsv',
+        'synthesis_template.jinja', 'NOTICE', 'licenses/OMNIVOICE-CC-BY-NC-4.0.txt',
+        'licenses/META-LLAMA-3-LICENSE.txt', 'licenses/META-LLAMA-3-USE-POLICY.md',
+        'licenses/HIGGS-AUDIO-2-LICENSE.txt'];
+    const weights = Uint8Array.from({length: 32}, (_, index) => index);
+    const cache = new Map(), files = new Map(), nodes = new Map();
+    const originalFetch = globalThis.fetch, originalCaches = globalThis.caches;
+    globalThis.caches = {open: async () => ({
+        match: async key => cache.get(String(key))?.clone(),
+        put: async (key, response) => cache.set(String(key), response.clone()),
+        keys: async () => [...cache.keys()].map(url => ({url})),
+        delete: async key => cache.delete(String(key)),
+    })};
+    globalThis.fetch = async (url, options = {}) => {
+        const value = String(url);
+        const path = new URL(value).pathname;
+        if (value === source) return new Response(JSON.stringify(config));
+        if (path.endsWith('/model.safetensors')) return new Response(weights, {
+            status: 206, headers: {'Content-Range': `bytes 0-${weights.length - 1}/${weights.length}`},
+        });
+        if (metadata.some(name => path.endsWith(`/${name}`))) return new Response(`data:${path.split('/').at(-1)}`);
+        throw new Error(`Unexpected request: ${value} ${JSON.stringify(options)}`);
+    };
+    const module = {HEAPU8: new Uint8Array(4096), _malloc: () => 64, FS: {
+        mkdir() {},
+        mkdirTree() {},
+        writeFile: (name, data) => files.set(name, data),
+        createDataFile: (directory, name) => nodes.set(`${directory}/${name}`, {stream_ops: {}}),
+        lookupPath: name => ({node: nodes.get(name)}),
+    }};
+    try {
+        const loaded = await loadModel(module, source, () => {});
+        assert.equal(loaded.model, 'OmniVoice-q8');
+        assert.equal(loaded.precision, 'signed-int8');
+        assert.equal(loaded.heapWeightBytes, weights.length);
+        assert.deepEqual([...nodes.get('/model/model.safetensors').contents], [...weights]);
+        assert.ok(files.has('/model/model.yaml'));
+        assert.ok(files.has('/model/licenses/HIGGS-AUDIO-2-LICENSE.txt'));
+        assert.equal(await isModelCached(source), true);
+    } finally {
+        globalThis.fetch = originalFetch;
+        if (originalCaches === undefined) delete globalThis.caches;
+        else globalThis.caches = originalCaches;
+    }
+});
+
 test('cache inventory exposes partial model files and selectively deletes one model', async () => {
     const cache = new Map();
     const originalCaches = globalThis.caches;

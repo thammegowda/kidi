@@ -14,6 +14,7 @@ on:
       - 'web/**'
       - 'tests/browser/**'
       - 'docs/kidi-logo-small.png'
+      - 'examples/kidi-app.yaml'
   pull_request:
     branches: [main]
     paths:
@@ -27,6 +28,7 @@ on:
       - 'web/**'
       - 'tests/browser/**'
       - 'docs/kidi-logo-small.png'
+      - 'examples/kidi-app.yaml'
   workflow_dispatch:
 
 permissions:
@@ -109,7 +111,8 @@ jobs:
         shell: bash
         run: |
           test -f build-pages/.nojekyll
-          for file in index.html coi-serviceworker.js threads/kidi.mjs threads/kidi.wasm gpu/kidi.mjs gpu/kidi.wasm; do
+          for file in index.html app-config.yaml app-config.mjs libs/js-yaml/js-yaml.mjs \
+              threads/kidi.mjs threads/kidi.wasm gpu/kidi.mjs gpu/kidi.wasm; do
             test -s "build-pages/$file"
           done
           test ! -e build-pages/single

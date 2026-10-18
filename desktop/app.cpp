@@ -1,4 +1,5 @@
 #include "kidi/core/precision.h"
+#include "kidi/checkpoint/hub.h"
 #include "kidi/inference/generator.h"
 #include "kidi/inference/synthesizer.h"
 #include "kidi/inference/transcriber.h"
@@ -19,6 +20,7 @@
 #include <bit>
 #include <charconv>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -154,6 +156,8 @@ private:
 
 struct ModelConfig {
     bool enabled = false;
+    std::string model_id;
+    std::string revision{"main"};
     std::filesystem::path directory;
     std::string accelerator{"auto"};
     std::size_t metal_prefill_cache_bytes = 0;
@@ -161,6 +165,8 @@ struct ModelConfig {
 
 struct AppConfig {
     std::filesystem::path source;
+    std::string model_hub_remote{"https://huggingface.co"};
+    std::filesystem::path model_hub_local;
     std::size_t threads = 4;
     bool preload_speech = true;
     std::size_t idle_model_timeout_seconds = 300;
@@ -185,6 +191,8 @@ struct AppConfig {
             {"chat",
              {
                  {"enabled", chat.enabled},
+                 {"model_id", chat.model_id},
+                 {"revision", chat.revision},
                  {"directory", chat.directory.string()},
                  {"accelerator", chat.accelerator},
                  {"metal_prefill_cache_mb", chat.metal_prefill_cache_bytes / (1024U * 1024U)},
@@ -199,6 +207,8 @@ struct AppConfig {
             {"asr",
              {
                  {"enabled", asr.enabled},
+                 {"model_id", asr.model_id},
+                 {"revision", asr.revision},
                  {"directory", asr.directory.string()},
                  {"accelerator", asr.accelerator},
                  {"settings", asr_settings},
@@ -206,6 +216,8 @@ struct AppConfig {
             {"tts",
              {
                  {"enabled", tts.enabled},
+                 {"model_id", tts.model_id},
+                 {"revision", tts.revision},
                  {"directory", tts.directory.string()},
                  {"accelerator", tts.accelerator},
                  {"metal_prefill_cache_mb", tts.metal_prefill_cache_bytes / (1024U * 1024U)},
@@ -239,6 +251,8 @@ auto model_config(const std::filesystem::path& source, const YAML::Node& node, b
     if (!node || !node.IsMap()) return {.enabled = default_enabled};
     return {
         .enabled = node["enabled"] ? node["enabled"].as<bool>() : default_enabled,
+        .model_id = yaml_string(node, "model_id"),
+        .revision = yaml_string(node, "revision", "main"),
         .directory = resolve_model_path(source, node),
         .accelerator = yaml_string(node, "accelerator", "auto"),
         .metal_prefill_cache_bytes = positive_size(node, "metal_prefill_cache_mb", 512, 4096) * 1024U * 1024U,
@@ -276,6 +290,11 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
         if (!models.IsMap() || !models["chat"].IsMap()) return invalid_config("models.chat configuration is required");
         AppConfig result;
         result.source = source;
+        const auto hub = root["model_hub"];
+        const kidi::checkpoint::Hub model_hub{yaml_string(hub, "remote", "https://huggingface.co"),
+                                               yaml_string(hub, "local", "~/.cache/kidi/model-hub")};
+        result.model_hub_remote = model_hub.remote();
+        result.model_hub_local = model_hub.local();
         result.threads = positive_size(root["runtime"], "threads", 4, 64);
         result.preload_speech =
             root["runtime"] && root["runtime"]["preload_speech"] ? root["runtime"]["preload_speech"].as<bool>() : true;
@@ -283,11 +302,18 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
         result.chat = model_config(source, models["chat"], true);
         result.asr = model_config(source, models["asr"], false);
         result.tts = model_config(source, models["tts"], false);
+        for (auto* model : {&result.chat, &result.asr, &result.tts}) {
+            if (!model->enabled || !model->directory.empty()) continue;
+            auto resolved = model_hub.resolve(model->model_id, model->revision);
+            if (!resolved) return invalid_config(resolved.error().message);
+            model->directory = std::move(*resolved);
+        }
         if (!result.chat.enabled) return invalid_config("models.chat must be enabled");
-        if (result.chat.directory.empty()) return invalid_config("models.chat.directory is required");
+        if (result.chat.directory.empty())
+            return invalid_config("Chat model is not present in model_hub.local");
         for (const auto* model : {&result.chat, &result.asr, &result.tts}) {
             if (model->enabled && model->directory.empty())
-                return invalid_config("Every enabled model requires a directory");
+                return invalid_config("Enabled model is not present in model_hub.local: " + model->model_id);
             if (model->accelerator != "auto" && model->accelerator != "cpu" && model->accelerator != "gpu" &&
                 model->accelerator != "npu")
                 return invalid_config("Model accelerator must be auto, cpu, gpu, or npu");
@@ -295,11 +321,14 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
                 return invalid_config("Enabled model directory does not exist: " + model->directory.string());
         }
         if (result.tts.enabled) {
-            for (const auto* file : {"model.yaml", "model.safetensors", "tokenizer.json", "sentence-prefixes.tsv",
-                                     "synthesis_template.jinja", "NOTICE"}) {
+            for (const auto* file :
+                 {"model.yaml", "model.safetensors", "sentence-prefixes.tsv", "synthesis_template.jinja", "NOTICE"}) {
                 if (!std::filesystem::is_regular_file(result.tts.directory / file, error))
                     return invalid_config("TTS package is missing required file: " + std::string(file));
             }
+            if (!std::filesystem::is_regular_file(result.tts.directory / "tokenizer.json", error) &&
+                !std::filesystem::is_regular_file(result.tts.directory / "tokenizer.json.gz", error))
+                return invalid_config("TTS package is missing tokenizer.json or tokenizer.json.gz");
         }
         const auto precision_name = yaml_string(models["chat"], "precision", "checkpoint");
         const auto precision = kidi::core::parse_precision(precision_name);
@@ -343,10 +372,9 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
             {"pace", pace},
             {"reference_language", yaml_string(tts, "reference_language", "English")},
             {"reference_text",
-             yaml_string(tts, "reference_text",
-                         "Hello, I am Kidi, your helpful local assistant. I am here to help clearly and concisely.")},
+             yaml_string(tts, "reference_text", "Nice to meet you.")},
             {"steps", positive_size(tts, "steps", 10, 128)},
-            {"realtime_steps", positive_size(tts, "realtime_steps", 6, 128)},
+            {"realtime_steps", std::max<std::size_t>(10, positive_size(tts, "realtime_steps", 10, 128))},
             {"voice",
              {
                  {"gender", yaml_string(voice, "gender", "female")},
@@ -480,6 +508,8 @@ public:
             {"threads", config_->threads},
             {"hardware_concurrency", std::max(1U, std::thread::hardware_concurrency())},
             {"concurrency", "single"},
+            {"model_hub_remote", config_->model_hub_remote},
+            {"model_hub_local", config_->model_hub_local.string()},
             {"speech_backend", speech_execution_},
             {"preload_speech", config_->preload_speech},
             {"idle_model_timeout_seconds", config_->idle_model_timeout_seconds},
@@ -691,8 +721,7 @@ private:
         reference_options.on_audio_chunk = {};
         reference_options.retain_audio = false;
         const auto reference_text = config_->tts_settings.value(
-            "reference_text",
-            "Hello, I am Kidi, your helpful local assistant. I am here to help clearly and concisely.");
+            "reference_text", "Nice to meet you.");
         auto reference = synthesizer_->synthesize(reference_text, reference_options);
         if (!reference) return std::unexpected(reference.error());
         if (!reference->voice_prompt)

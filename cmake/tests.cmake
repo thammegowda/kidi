@@ -13,6 +13,7 @@ add_test(NAME kidi_argparse_test COMMAND kidi_argparse_test)
 set_tests_properties(kidi_argparse_test PROPERTIES LABELS native)
 
 kidi_add_test(kidi_manifest_test tests/kidi/checkpoint/config_test.cpp)
+kidi_add_test(kidi_hub_test tests/kidi/checkpoint/hub_test.cpp)
 kidi_add_test(kidi_whisper_audio_test tests/kidi/audio/whisper_test.cpp)
 kidi_add_test(kidi_duration_test tests/kidi/audio/duration_test.cpp)
 kidi_add_test(kidi_wav_test tests/kidi/audio/wav_test.cpp)

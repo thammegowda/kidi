@@ -17,6 +17,29 @@ window. Never use `--dev` with an exposed or forwarded port.
 `make app-dev` builds and runs this mode on port `10010`. Override the defaults
 with `APP_CONFIG=path/to/config.yaml` or `APP_PORT=another-loopback-port`.
 
+## Shared application configuration
+
+Desktop and Wasm consume the same canonical YAML. The Web build copies it as
+`app-config.yaml`; the browser parses it locally and resolves model IDs into
+Cache Storage. Native constructs `checkpoint::Hub(remote, local)` and resolves
+the same IDs from the configured filesystem cache:
+
+```yaml
+model_hub:
+  remote: https://huggingface.co
+  local: ~/.cache/kidi/model-hub
+
+models:
+  chat:
+    model_id: google/gemma-4-E2B-it-qat-mobile-transformers
+    revision: main
+```
+
+Native cache entries use Hugging Face's `models--OWNER--REPO/refs` and
+`snapshots` layout. `Hub::resolve()` returns a snapshot directory and
+`Hub::get_file()` resolves validated files inside it. Legacy `directory` values
+remain readable for migration but are absent from the shared example.
+
 ## Text messages
 
 Every command and event is a JSON object:

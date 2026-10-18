@@ -4,6 +4,16 @@ import {readFile} from 'node:fs/promises';
 
 async function backendSource() {
   let source = await readFile(new URL('../../web/hosts/wasm/backend.js', import.meta.url), 'utf8');
+  source = source.replace("import {loadAppConfig} from './app-config.mjs';",
+    `const loadAppConfig = async () => ({version:1,model_hub:{remote:'https://huggingface.co',local:'cache'},
+      runtime:{threads:4},models:{
+        chat:{enabled:true,model_id:'google/test',accelerator:'auto',precision:'checkpoint',
+          kv_cache_precision:'auto',system_prompt:'Test',generation:{max_tokens:128,context_tokens:1024,prefix_cache_mb:0}},
+        asr:{enabled:true,model_id:'openai/whisper-small',language:'auto',max_tokens:128,
+          vad:{threshold:.012,minimum_speech_ms:250,silence_ms:800}},
+        tts:{enabled:true,model_id:'test/tts',language:'auto',steps:10,realtime_steps:6,pace:1.15,
+          reference_language:'English',reference_text:'Hello.',voice:{}}
+      }});`);
   source = source.replace(
     "import {clearVoicePromptCache, describeVoicePrompt, loadVoicePrompt, storeVoicePrompt}\n  from './voice-prompt-cache.mjs';",
     `const clearVoicePromptCache = async () => {};
@@ -34,8 +44,8 @@ test('automatic cache restore announces its request before progress and readines
     const isolated = source
       .replace("import {createGpuWorker} from './runtime-client.mjs';",
         'const createGpuWorker = kind => new Worker(kind + "-gpu");')
-      .replace("import {isModelCached, webGpuSupport, listCachedFiles, deleteCachedFile, deleteCachedFiles, clearModelCache} from './model-cache.mjs';",
-        'const isModelCached = async () => true; const webGpuSupport = () => null;')
+      .replace("import {configureModelHub, isModelCached, webGpuSupport, listCachedFiles, deleteCachedFile, deleteCachedFiles,\n  clearModelCache} from './model-cache.mjs';",
+        'const configureModelHub = () => {}; const isModelCached = async () => true; const webGpuSupport = () => null;')
       .replace("new URL('./inference-worker.mjs', import.meta.url)", "'inference-worker.mjs'");
     const {backend} = await import(`data:text/javascript,${encodeURIComponent(isolated)}`);
     const events = [];
@@ -79,8 +89,8 @@ test('isolated browsers use available CPU threads for TTS', async () => {
     const isolated = source
       .replace("import {createGpuWorker} from './runtime-client.mjs';",
         'const createGpuWorker = kind => new Worker(kind + "-gpu");')
-      .replace("import {isModelCached, webGpuSupport, listCachedFiles, deleteCachedFile, deleteCachedFiles, clearModelCache} from './model-cache.mjs';",
-        'const isModelCached = async () => false; const webGpuSupport = () => null;')
+      .replace("import {configureModelHub, isModelCached, webGpuSupport, listCachedFiles, deleteCachedFile, deleteCachedFiles,\n  clearModelCache} from './model-cache.mjs';",
+        'const configureModelHub = () => {}; const isModelCached = async () => false; const webGpuSupport = () => null;')
       .replace("new URL('./tts-worker.mjs', import.meta.url)", "'tts-worker.mjs'");
     const {backend} = await import(`data:text/javascript,${encodeURIComponent(isolated)}#tts`);
     const events = [];
@@ -129,8 +139,8 @@ test('WebGPU TTS initialization failure reports and uses threaded CPU fallback',
     const isolated = source
       .replace("import {createGpuWorker} from './runtime-client.mjs';",
         'const createGpuWorker = kind => new Worker(kind + "-gpu");')
-      .replace("import {isModelCached, webGpuSupport, listCachedFiles, deleteCachedFile, deleteCachedFiles, clearModelCache} from './model-cache.mjs';",
-        'const isModelCached = async () => false; const webGpuSupport = () => null;')
+      .replace("import {configureModelHub, isModelCached, webGpuSupport, listCachedFiles, deleteCachedFile, deleteCachedFiles,\n  clearModelCache} from './model-cache.mjs';",
+        'const configureModelHub = () => {}; const isModelCached = async () => false; const webGpuSupport = () => null;')
       .replace("new URL('./tts-worker.mjs', import.meta.url)", "'tts-worker.mjs'");
     const {backend} = await import(`data:text/javascript,${encodeURIComponent(isolated)}#tts-fallback`);
     const events = [];
