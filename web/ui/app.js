@@ -15,7 +15,7 @@ if (!languageResponse.ok) throw new Error(`Unable to load language table (${lang
 const languageTable = parseLanguages(await languageResponse.text());
 const languageNames = new Map(languageTable.languages.map(language => [language.code, language.name]));
 const STORAGE = 'kidi-app-v2';
-const TTS_DEFAULTS_VERSION = 6;
+const TTS_DEFAULTS_VERSION = 9;
 const state = {
   ready: false,
   socketReady: false,
@@ -1235,7 +1235,8 @@ function configSection(title, rows) {
 
 function ttsPacePreset(value) {
   const pace = Number(value || 1);
-  return pace >= 1.175 ? '1.2' : pace >= 1.075 ? '1.15' : pace >= .95 ? '1' : '0.9';
+  return pace >= 1.04 ? '1.1' : pace >= .92 ? '0.98' : pace >= .8 ? '0.86' :
+    pace >= .68 ? '0.74' : pace >= .56 ? '0.62' : '0.5';
 }
 
 function renderBookTtsControls() {
@@ -1366,9 +1367,15 @@ function initializeTtsSettings() {
   const savedSteps = Number.isInteger(saved.steps) ? saved.steps : null;
   const savedPace = Number.isFinite(saved.pace) ? saved.pace : null;
   const migrateSteps = migrateDefaults && [10, 24].includes(savedSteps);
+  const paceMigration = saved.defaults_version === 8
+    ? new Map([[1.1, 1.1], [1, 0.98], [0.9, 0.86], [0.75, 0.74], [0.6, 0.62], [0.45, 0.5]])
+    : saved.defaults_version === 7
+      ? new Map([[1.1, 1.1], [1, 0.98], [0.9, 0.86], [0.8, 0.74], [0.7, 0.62]])
+      : new Map([[1.2, 1.1], [1.15, 0.98], [1, 0.86], [0.9, 0.74], [0.8, 0.74]]);
+  const migratedPace = migrateDefaults ? paceMigration.get(savedPace) ?? savedPace : savedPace;
   state.ttsSettings = {
     steps: migrateSteps ? defaults.steps || 16 : savedSteps ?? defaults.steps ?? 16,
-    pace: migrateDefaults && savedPace === 1.15 ? defaults.pace || 0.9 : savedPace ?? defaults.pace ?? 0.9,
+    pace: migratedPace ?? defaults.pace ?? 0.74,
     gpu_precision: migratePrecision ? 'w8a8' : savedPrecision,
     gpu_precision_version: 3,
     defaults_version: TTS_DEFAULTS_VERSION,
@@ -1388,9 +1395,7 @@ function selectedInputLanguages() {
 }
 
 function selectedOutputLanguages() {
-  const configured = conversationLanguages(state.languages);
-  return state.outputLanguage && configured.includes(state.outputLanguage)
-    ? [state.outputLanguage] : selectedInputLanguages();
+  return state.outputLanguage ? [state.outputLanguage] : selectedInputLanguages();
 }
 
 function renderLanguageSwitchers() {

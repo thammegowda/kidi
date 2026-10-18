@@ -549,8 +549,10 @@ public:
         auto prompt = system_prompt();
         if (!languages.empty())
             prompt += languages.find(',') == std::string_view::npos
-                          ? "\nThe user speaks " + std::string(language_names) + ". Respond in " +
-                                std::string(language_names) + " only."
+                          ? "\nThe selected output language is " + std::string(language_names) +
+                                ". You must respond entirely in " + std::string(language_names) +
+                                ", regardless of the language of the user's message. This requirement overrides any "
+                                "earlier instruction to match the user's language."
                           : "\nThe user may code-switch among " + std::string(language_names) +
                                 ". Respond in the same language or language mix as the latest user message.";
         std::vector<ChatMessage> conversation;

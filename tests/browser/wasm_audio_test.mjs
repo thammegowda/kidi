@@ -233,7 +233,8 @@ test('chat system prompt follows pinned and code-switched language settings', as
         backend.send('chat.start', 'pinned', {
             messages: [{role: 'user', content: 'Hello'}], languages: 'kn', language_names: 'Kannada',
         });
-        assert.match(worker.calls.at(-1).messages[0].content, /speaks Kannada.*Kannada only/u);
+        assert.match(worker.calls.at(-1).messages[0].content,
+            /selected output language is Kannada.*respond entirely in Kannada.*regardless/u);
         worker.emit({type: 'step', events: [{completed: {text: 'ok', stats: {}}}]});
         backend.send('chat.start', 'mixed', {
             messages: [{role: 'user', content: 'Hello'}], languages: 'en,kn',

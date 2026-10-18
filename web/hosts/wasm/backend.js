@@ -590,7 +590,9 @@ class WasmBackend {
       if (this.#settings.systemPrompt) {
         const instruction = !languages ? '' : languages.includes(',')
           ? `\nThe user may code-switch among ${languageNames}. Respond in the same language or language mix as the latest user message.`
-          : `\nThe user speaks ${languageNames}. Respond in ${languageNames} only.`;
+          : `\nThe selected output language is ${languageNames}. You must respond entirely in ${languageNames}, ` +
+            `regardless of the language of the user's message. This requirement overrides any earlier instruction ` +
+            `to match the user's language.`;
         messages.unshift({role: 'system', content: this.#settings.systemPrompt + instruction});
       }
       this.#current = {

@@ -289,8 +289,10 @@ explicit language conditioning and lets OmniVoice infer it from the text; its
 script-aware duration and voice-instruction paths continue to distinguish Han
 text automatically. Embedded clients may also set `duration_scale`: values
 above `1` allocate more acoustic frames for a slower, calmer delivery without
-resampling the waveform or lowering its pitch. The desktop presets are Brisk
-(`0.9`), Natural (`1.0`), Relaxed (`1.15`), and Mellow (`1.2`).
+resampling the waveform or lowering its pitch. Because OmniVoice's baseline is
+deliberate, Kidi linearly spaces its reading-oriented presets across the
+model-supported range: Briskyest (`0.50`), Briskier (`0.62`), Brisk (`0.74`),
+Natural (`0.86`), Relaxed (`0.98`), and Mellow (`1.10`).
 
 Metal is the preferred Apple backend: on the same 195-word fixture, quality-first
 consistent-voice 32-step synthesis produced 64.04 seconds of audio in 36.91

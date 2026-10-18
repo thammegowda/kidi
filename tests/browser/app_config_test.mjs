@@ -16,7 +16,7 @@ test('browser consumes the canonical desktop YAML configuration', async () => {
   assert.equal(config.models.asr.vad.silence_ms, 800);
   assert.equal(config.models.tts.realtime_steps, 10);
   assert.equal(config.models.tts.steps, 16);
-  assert.equal(config.models.tts.pace, 0.9);
+  assert.equal(config.models.tts.pace, 0.74);
   assert.equal(config.models.tts.gpu_precision, 'w8a8');
   assert.equal(config.models.tts.reference_text, 'Nice to meet you.');
 });
@@ -46,6 +46,7 @@ test('first-run browser UI requests model loading and exposes progress', async (
   assert.match(app, /\$\('onboarding-load-tts'\)\.addEventListener\('click'/);
   assert.match(app, /\$\('dismiss-model-onboarding'\)\.addEventListener\('click', dismissModelSetup\)/);
   assert.match(app, /delete options\.gpu_precision_version;\s+delete options\.defaults_version;/);
+  assert.match(app, /return state\.outputLanguage \? \[state\.outputLanguage\] : selectedInputLanguages\(\)/);
 });
 
 test('browser branding uses the square Kidi icon', async () => {
