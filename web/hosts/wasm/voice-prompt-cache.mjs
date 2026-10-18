@@ -18,18 +18,18 @@ function requireDescriptor(descriptor) {
 }
 
 function tokensFrom(value, config) {
-    const tokens = value instanceof Int32Array ? value : Array.isArray(value) ? Int32Array.from(value) : null;
+    const source = value instanceof Int32Array || Array.isArray(value) ? value : null;
     const codebooks = Number(config.codebooks), frameRate = Number(config.frameRate);
     const vocabulary = Number(config.vocabulary), maximumSeconds = Number(config.maximumSeconds);
-    if (!tokens || !Number.isSafeInteger(codebooks) || codebooks <= 0 ||
+    if (!source || !Number.isSafeInteger(codebooks) || codebooks <= 0 ||
         !Number.isSafeInteger(frameRate) || frameRate <= 0 ||
         !Number.isSafeInteger(vocabulary) || vocabulary <= 0 ||
         !Number.isFinite(maximumSeconds) || maximumSeconds <= 0 ||
-        !tokens.length || tokens.length % codebooks ||
-        tokens.length / codebooks > frameRate * maximumSeconds ||
-        tokens.some(token => !Number.isInteger(token) || token < 0 || token >= vocabulary))
+        !source.length || source.length % codebooks ||
+        source.length / codebooks > frameRate * maximumSeconds ||
+        source.some(token => !Number.isSafeInteger(token) || token < 0 || token >= vocabulary))
         throw new Error('Invalid cached voice prompt tokens');
-    return tokens;
+    return value instanceof Int32Array ? value : Int32Array.from(value);
 }
 
 async function payloadDigest(text, tokens) {

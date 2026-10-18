@@ -1,6 +1,7 @@
 export function speechMatchText(text) {
   return text.replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
-    .replace(/^```[^\n]*$/gm, '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    .replace(/^```[^\n]*$/gm, '').normalize('NFKC').toLowerCase()
+    .replace(/\u03c2/g, '\u03c3').replace(/[^\p{L}\p{N}]/gu, '');
 }
 
 export function speechRanges(root, segments) {

@@ -201,9 +201,10 @@ bindings are disabled in the embedded dependency build.
 
 Completed assistant responses can be synthesized with a converted OmniVoice
 package. Copy `model.yaml`, `model.safetensors`, `tokenizer.json`,
-`sentence-prefixes.tsv`, `synthesis_template.jinja`, and `NOTICE` into the
-app-private `models/tts` directory shown in Settings. The model is detected on
-the next app start.
+`sentence-prefixes.tsv`, `synthesis_template.jinja`, `NOTICE`, and the complete
+`licenses/` directory into the app-private `models/tts` directory shown in
+Settings. Preserve the package directory structure because `model.yaml` lists
+the required license files. The model is detected on the next app start.
 
 Read-aloud automatically tries the built-in Vulkan backend and falls back to
 CPU. It does not require QAIRT, QNN libraries, or a KidiOps package. Requests

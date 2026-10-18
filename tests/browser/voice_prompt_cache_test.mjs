@@ -69,9 +69,11 @@ test('voice prompt cache rejects corrupt and out-of-range data', async () => {
         const entries = storage.stores.get('kidi-voice-prompts-v1');
         const key = [...entries.keys()][0];
         const payload = await entries.get(key).json();
-        payload.tokens[0] = 1024;
-        entries.set(key, new Response(JSON.stringify(payload)));
-        await assert.rejects(loadVoicePrompt(descriptor), /tokens/);
+        for (const invalid of [1024, 1.5, 4294967297]) {
+            payload.tokens[0] = invalid;
+            entries.set(key, new Response(JSON.stringify(payload)));
+            await assert.rejects(loadVoicePrompt(descriptor), /tokens/);
+        }
     } finally {
         globalThis.caches = previous;
     }
