@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
   <meta name="color-scheme" content="dark light">
   <title>Kidi</title>
   <link rel="icon" type="image/png" sizes="512x512" href="./icons/kidi-logo.png">
@@ -12,15 +12,19 @@
 </head>
 <body>
   <header class="app-header">
+      <button class="icon-button menu-button" id="menu" type="button" aria-label="Open navigation"
+        aria-controls="sidebar" aria-expanded="false">
+        <span class="panel-icon" aria-hidden="true"></span>
+      </button>
       <div class="brand">
         <img class="brand-mark" src="./icons/kidi-logo.png" alt="">
-        <div><strong>Kidi</strong><span>Local AI workspace</span></div>
+        <strong>Kidi</strong>
       </div>
       <nav class="app-views" aria-label="Kidi views">
-        <button id="open-chat-view" class="active" type="button" aria-current="page">
+        <button id="open-chat-view" class="active" type="button" aria-current="page" aria-label="Chat" title="Chat">
           <span class="chat-view-icon" aria-hidden="true"></span><span>Chat</span>
         </button>
-        <button id="open-reader-view" type="button">
+        <button id="open-reader-view" type="button" aria-label="Reader" title="Reader">
           <span class="reader-view-icon" aria-hidden="true"></span><span>Reader</span>
         </button>
       </nav>
@@ -28,19 +32,23 @@
         <span id="backend-activity">Idle</span>
         <span id="backend-memory">Memory —</span>
       </div>
-      <div class="language-switchers" aria-label="Conversation languages">
-        <label class="language-picker">
-          <span class="mic-icon" aria-hidden="true"></span>
-          <input id="input-language" class="language-switcher" aria-label="Input language" autocomplete="off">
-          <span id="input-language-menu" class="language-menu" hidden></span>
-        </label>
-        <span aria-hidden="true">→</span>
-        <label class="language-picker">
-          <span class="speaker-icon" aria-hidden="true"></span>
-          <input id="output-language" class="language-switcher" aria-label="Output language" autocomplete="off">
-          <span id="output-language-menu" class="language-menu" hidden></span>
-        </label>
-      </div>
+      <details class="language-controls" id="language-controls">
+        <summary aria-label="Conversation languages">
+          <span id="language-summary">English</span>
+        </summary>
+        <div class="language-switchers">
+          <label class="language-picker">
+            <span>Input language</span>
+            <input id="input-language" class="language-switcher" aria-label="Input language" autocomplete="off">
+            <span id="input-language-menu" class="language-menu" hidden></span>
+          </label>
+          <label class="language-picker">
+            <span>Output language</span>
+            <input id="output-language" class="language-switcher" aria-label="Output language" autocomplete="off">
+            <span id="output-language-menu" class="language-menu" hidden></span>
+          </label>
+        </div>
+      </details>
       <button class="icon-button config-button" id="open-config" type="button" aria-label="Settings">
         <span class="config-icon" aria-hidden="true"></span>
       </button>
@@ -74,7 +82,6 @@
 
     <main class="workspace" id="chat-view">
       <header class="topbar">
-        <button class="icon-button menu-button" id="menu" type="button" aria-label="Toggle navigation">☰</button>
         <div>
           <h1 id="conversation-title">New conversation</h1>
           <div class="runtime-line">
@@ -99,7 +106,7 @@
                 <strong>Chat / LLM</strong>
                 <small><span id="model-onboarding-name">Configured chat model</span> · <span id="model-onboarding-execution">Automatic</span></small>
               </div>
-              <button id="onboarding-load-model" class="model-action" type="button">Load LLM model</button>
+              <button id="onboarding-load-model" class="model-action" type="button" aria-label="Load LLM model">Load</button>
             </section>
             <section id="onboarding-asr-option">
               <div>
@@ -107,7 +114,7 @@
                 <strong>Speech recognition / ASR</strong>
                 <small id="model-onboarding-asr-name">Configured speech model</small>
               </div>
-              <button id="onboarding-load-asr" class="model-action" type="button">Load ASR model</button>
+              <button id="onboarding-load-asr" class="model-action" type="button" aria-label="Load ASR model">Load</button>
             </section>
             <section id="onboarding-tts-option">
               <div>
@@ -115,7 +122,7 @@
                 <strong>Speech synthesis / TTS</strong>
                 <small id="model-onboarding-tts-name">Configured text-to-speech model</small>
               </div>
-              <button id="onboarding-load-tts" class="model-action" type="button">Load TTS model</button>
+              <button id="onboarding-load-tts" class="model-action" type="button" aria-label="Load TTS model">Load</button>
             </section>
           </div>
           <div id="onboarding-model-loading" class="model-loading" hidden>
@@ -165,6 +172,7 @@
       <div class="composer-wrap">
         <div class="notice" id="notice" hidden></div>
         <div class="attachments" id="attachments" hidden></div>
+        <p class="disclaimer">Kidi can make mistakes. Verify important information.</p>
         <form class="composer" id="composer">
           <input id="image-files" type="file" accept="image/jpeg,image/png" multiple hidden>
           <button class="attach" id="attach" type="button" aria-label="Attach images" title="Attach images">＋</button>
@@ -179,7 +187,6 @@
           <button class="send" id="send" type="submit" aria-label="Send message">↑</button>
           <button class="stop" id="stop" type="button" hidden>Stop</button>
         </form>
-        <p class="disclaimer">Kidi can make mistakes. Verify important information.</p>
       </div>
     </main>
 
@@ -267,7 +274,7 @@
           <label><span>Output tokens</span><input id="wasm-tokens" type="number" min="1" max="8192" value="512"></label>
         </div>
         <div class="settings-actions">
-          <button id="load-wasm-model" class="primary" type="button">Load model</button>
+          <button id="load-wasm-model" class="primary" type="button" aria-label="Load LLM model">Load</button>
         </div>
       </section>
       </section>
@@ -286,7 +293,7 @@
           </div>
           <p id="asr-model-error" class="speech-model-error" role="alert" hidden></p>
           <div class="settings-actions">
-            <button id="load-asr-model" class="primary" type="button">Load ASR model</button>
+            <button id="load-asr-model" class="primary" type="button" aria-label="Load ASR model">Load</button>
           </div>
         </div>
       </section>
@@ -315,7 +322,7 @@
           </div>
           <p id="tts-model-error" class="speech-model-error" role="alert" hidden></p>
           <div class="settings-actions">
-            <button id="load-tts-model" class="primary" type="button">Load TTS model</button>
+            <button id="load-tts-model" class="primary" type="button" aria-label="Load TTS model">Load</button>
           </div>
         </div>
         <div class="tts-grid">

@@ -7,6 +7,7 @@ import {SpeechController, VoiceLatencyBenchmark} from './speech-controller.js';
 import {renderSpeechHighlights} from './speech-highlights.js';
 
 const $ = id => document.getElementById(id);
+const narrowLayout = matchMedia('(max-width: 760px)');
 const languageResponse = await fetch(new URL('./languages.tsv', import.meta.url));
 if (!languageResponse.ok) throw new Error(`Unable to load language table (${languageResponse.status})`);
 const languageTable = parseLanguages(await languageResponse.text());
@@ -316,6 +317,12 @@ function speechProgressDetails(kind, payload = {}) {
   };
 }
 
+function renderLoadButton(button, label, loading, loaded = false) {
+  button.textContent = loading ? 'Loading…' : loaded ? 'Loaded' : 'Load';
+  button.setAttribute('aria-label', `${loading ? 'Loading' : loaded ? 'Loaded' : 'Load'} ${label} model`);
+  button.classList.toggle('loaded', Boolean(loaded));
+}
+
 function renderSpeechModelLoad(kind) {
   const load = speechModelLoads[kind];
   const component = state.components[kind] || {};
@@ -341,8 +348,7 @@ function renderSpeechModelLoad(kind) {
   error.hidden = !load.error;
   const button = $(`load-${kind}-model`);
   button.disabled = !wasm || !state.socketReady || loading || !component.enabled || component.loaded;
-  button.textContent = loading ? `Loading ${label} model…` :
-    component.loaded ? `${label} model loaded` : `Load ${label} model`;
+  renderLoadButton(button, label, loading, component.loaded);
   if (kind === 'asr' || kind === 'tts') {
     $(`onboarding-${kind}-option`).hidden = !wasm;
     const onboarding = $(`onboarding-${kind}-loading`);
@@ -360,9 +366,7 @@ function renderSpeechModelLoad(kind) {
     onboardingError.hidden = !load.error;
     const onboardingButton = $(`onboarding-load-${kind}`);
     onboardingButton.disabled = !state.socketReady || loading || !component.enabled || component.loaded;
-    onboardingButton.textContent = loading ? `Loading ${label}…` :
-      component.loaded ? `${label} loaded` : `Load ${label} model`;
-    onboardingButton.classList.toggle('loaded', Boolean(component.loaded));
+    renderLoadButton(onboardingButton, label, loading, component.loaded);
   }
 }
 
@@ -605,7 +609,7 @@ function renderHistory() {
     const open = document.createElement('button');
     open.type = 'button'; open.textContent = chat.title; open.title = chat.title;
     open.addEventListener('click', () => {
-      state.active = chat.id; followOutput = true; persist(); render(); $('sidebar').classList.remove('open');
+      state.active = chat.id; followOutput = true; persist(); render(); closeSidebar();
     });
     const remove = document.createElement('button');
     remove.type = 'button'; remove.className = 'delete-chat'; remove.textContent = '×';
@@ -749,10 +753,9 @@ function renderRuntime() {
   $('backend-memory').textContent = memoryParts.join(' · ') || 'Memory —';
   const modelLoading = Boolean(state.runtime.loading);
   $('load-wasm-model').disabled = modelLoading || !state.socketReady;
+  renderLoadButton($('load-wasm-model'), 'LLM', modelLoading);
   $('onboarding-load-model').disabled = modelLoading || !state.socketReady || state.ready;
-  $('onboarding-load-model').textContent = modelLoading ? 'Loading LLM…' :
-    state.ready ? 'LLM loaded' : 'Load LLM model';
-  $('onboarding-load-model').classList.toggle('loaded', state.ready);
+  renderLoadButton($('onboarding-load-model'), 'LLM', modelLoading, state.ready);
   $('model-onboarding-name').textContent = state.components.chat?.model_id ||
     state.components.chat?.directory || state.model || 'Configured chat model';
   $('model-onboarding-asr-name').textContent = state.components.asr?.model_id ||
@@ -939,6 +942,11 @@ function renderLanguageSwitchers() {
   if (state.outputLanguage && !languageNames.has(state.outputLanguage)) state.outputLanguage = '';
   input.value = state.inputLanguage ? languageNames.get(state.inputLanguage) : 'Auto';
   output.value = state.outputLanguage ? languageNames.get(state.outputLanguage) : 'Match input';
+  const outputName = state.outputLanguage ? output.value : input.value;
+  $('language-summary').textContent = input.value === outputName ? input.value : `${input.value} → ${outputName}`;
+  const summary = $('language-controls').querySelector('summary');
+  summary.title = `Input: ${input.value}. Output: ${output.value}.`;
+  summary.setAttribute('aria-description', summary.title);
 }
 
 function setupLanguagePicker(inputId, menuId, special, select) {
@@ -1033,7 +1041,23 @@ function newChat() {
   state.active = null; followOutput = true; selectView('chat'); persist(); showNotice(); render(); $('prompt').focus();
 }
 
-function closeSidebar() { $('sidebar').classList.remove('open'); }
+function renderSidebarToggle() {
+  const expanded = state.view === 'chat' && (narrowLayout.matches
+    ? $('sidebar').classList.contains('open')
+    : !$('app-shell').classList.contains('sidebar-collapsed'));
+  $('menu').disabled = state.view !== 'chat';
+  $('sidebar').inert = !expanded;
+  $('menu').setAttribute('aria-expanded', String(expanded));
+  $('menu').setAttribute('aria-label', expanded ? 'Close navigation' : 'Open navigation');
+  $('menu').title = expanded ? 'Close navigation' : 'Open navigation';
+}
+
+function closeSidebar() {
+  const restoreFocus = $('sidebar').contains(document.activeElement) || document.activeElement === $('sidebar-backdrop');
+  $('sidebar').classList.remove('open');
+  renderSidebarToggle();
+  if (restoreFocus) $('menu').focus();
+}
 
 function activeMessage() {
   if (!activeRequest?.messageId) return null;
@@ -1947,7 +1971,12 @@ $('composer').addEventListener('drop', event => {
 $('prompt').addEventListener('keydown', event => {
   if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendMessage(); }
 });
-$('menu').addEventListener('click', () => $('sidebar').classList.toggle('open'));
+$('menu').addEventListener('click', () => {
+  if (narrowLayout.matches) $('sidebar').classList.toggle('open');
+  else $('app-shell').classList.toggle('sidebar-collapsed');
+  renderSidebarToggle();
+});
+narrowLayout.addEventListener('change', closeSidebar);
 $('close-menu').addEventListener('click', closeSidebar);
 $('sidebar-backdrop').addEventListener('click', closeSidebar);
 $('open-chat-view').addEventListener('click', () => selectView('chat'));
@@ -2020,6 +2049,23 @@ setupLanguagePicker('input-language', 'input-language-menu', 'Auto', code => {
 });
 setupLanguagePicker('output-language', 'output-language-menu', 'Match input', code => {
   state.outputLanguage = code; renderLanguageSwitchers(); persist();
+});
+const languageControls = $('language-controls');
+document.addEventListener('click', event => {
+  if (!languageControls.contains(event.target)) languageControls.open = false;
+});
+languageControls.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  event.preventDefault();
+  event.stopPropagation();
+  languageControls.open = false;
+  languageControls.querySelector('summary').focus();
+});
+languageControls.addEventListener('toggle', () => {
+  if (languageControls.open) return;
+  $('input-language-menu').hidden = true;
+  $('output-language-menu').hidden = true;
+  renderLanguageSwitchers();
 });
 $('messages').addEventListener('scroll', () => {
   if (rebuildingMessages) return;

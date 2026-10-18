@@ -5,6 +5,7 @@ import {createServer} from 'node:http';
 import {resolve, extname, sep} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {chromium} from 'playwright';
+import {testResponsiveUi} from './test-responsive-ui.mjs';
 
 const directory = resolve(process.argv[2] || fileURLToPath(new URL('../../build-web', import.meta.url)));
 const prefix = '/kidi/';
@@ -128,6 +129,7 @@ test('Pages artifact starts under a repository subpath without server isolation 
             assert.ok(result.memory.heap_bytes > 0, `${variant} native heap`);
             assert.equal(result.memory.error, undefined, `${variant} memory statistics`);
         }
+        await testResponsiveUi(browser, `${origin}${prefix}`);
         assert.deepEqual([...failures], [], 'The deployed site must not have JavaScript, network, or asset errors');
     } catch (error) {
         if (failures.size)

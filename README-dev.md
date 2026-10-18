@@ -285,7 +285,7 @@ Open **http://localhost:8080/**. Override server settings with
 build-time dependencies; the generated app needs only static hosting. No npm
 install is required. Deploy generated assets, not build scripts.
 
-The [browser guide](web/README.md) covers execution modes, caches, browser
+The [browser developer guide](web/README-dev.md) covers execution modes, caches, browser
 requirements, and deployment. Model weights are downloaded by the browser and
 are not embedded in the site artifact. Browser caches are separate from native
 and Android model storage.
@@ -393,7 +393,7 @@ make web-test
 For production-like browser startup validation of a built artifact, run
 `make web-smoke-test WEB_DIR=build-pages` after installing the browser test tools
 and building the site as described in the
-[browser guide](web/README.md#deployment-regression-tests).
+[browser guide](web/README-dev.md#deployment-regression-tests).
 The Pages workflow requires this check before uploading the artifact.
 
 Android model-download contracts run locally without installing over a phone app:
@@ -470,6 +470,6 @@ downloading models. One Release build serves both: the wheel build configures
 `build-ci` with tests enabled, and the test programs reuse its objects. Compiled
 objects (ccache) are saved even when tests fail. It does not block Pages deployment.
 
-See [GitHub Pages setup](web/README.md#github-pages) for one-time configuration.
+See [GitHub Pages setup](web/README-dev.md#github-pages) for one-time configuration.
 The generated browser directory is self-contained for static hosting; model
 weights are downloaded at runtime, not committed or shipped in site artifacts.
