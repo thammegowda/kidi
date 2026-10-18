@@ -1,10 +1,12 @@
 import {renderMarkdown, renderStreamingMarkdown} from './markdown.js';
 import {backend} from './backend.js';
+import {readEbook, removeEbook, storeEbook} from './ebooks.js';
 import {MAX_IMAGE_BYTES, MAX_IMAGES, readImage, removeUnusedImages, storeImage} from './images.js';
 import {parseLanguages, resolveLanguages} from './languages.js';
+import {normalizeReaderText, readerProgressLabel, readerSpeechSlice} from './reader-position.js';
 import {MINIMUM_TTS_STEPS, selectRealtimeProfile} from './realtime-profile.js';
 import {SpeechController, VoiceLatencyBenchmark} from './speech-controller.js';
-import {renderSpeechHighlights} from './speech-highlights.js';
+import {createSpeechIndex, renderSpeechHighlights, speechRanges, speechSearchOffset} from './speech-highlights.js';
 
 const $ = id => document.getElementById(id);
 const narrowLayout = matchMedia('(max-width: 760px)');
@@ -13,6 +15,7 @@ if (!languageResponse.ok) throw new Error(`Unable to load language table (${lang
 const languageTable = parseLanguages(await languageResponse.text());
 const languageNames = new Map(languageTable.languages.map(language => [language.code, language.name]));
 const STORAGE = 'kidi-app-v2';
+const TTS_DEFAULTS_VERSION = 6;
 const state = {
   ready: false,
   socketReady: false,
@@ -29,6 +32,7 @@ const state = {
   ttsSetupSkipped: false,
   modelSetupDismissed: false,
   ttsSettings: null,
+  books: [],
   chats: [],
   active: null,
   view: 'chat',
@@ -56,6 +60,18 @@ const speechModelLoads = {
 };
 let cacheBusy = false;
 let cachePath = [];
+let libraryQuery = '';
+let readerBookId = null;
+let readerChapterIndex = 0;
+let readerBusy = false;
+let readerRenderToken = 0;
+let readerSeekToken = 0;
+let readerSpeechOffset = 0;
+let readerScrubbing = false;
+let readerHighlightIndex;
+let readerControlsTimer;
+let readerScrollTimer;
+const ebookSessions = new Map();
 const voiceLatency = new VoiceLatencyBenchmark();
 globalThis.kidiVoiceLatency = voiceLatency;
 const realtimeProfile = () => selectRealtimeProfile({
@@ -84,6 +100,7 @@ const speech = new SpeechController({
       });
     }
   },
+
   onWirePcm: current => {
     if (current.voice) voiceLatency.mark('first_pcm');
   },
@@ -103,6 +120,376 @@ const speech = new SpeechController({
   },
   onError: (current, error) => audioFailure(current.streamId, error),
 });
+function setLibraryStatus(message = '', error = false) {
+  const status = $('library-status');
+  status.textContent = message;
+  status.hidden = !message;
+  status.classList.toggle('error', error);
+}
+
+function setBookReaderStatus(message = '', error = false) {
+  const status = $('book-reader-status');
+  status.textContent = message;
+  status.classList.toggle('error', error);
+}
+
+function renderLibrary() {
+  const available = typeof backend.importEbook === 'function' && typeof backend.loadEbookChapter === 'function';
+  $('add-book').disabled = readerBusy || !available;
+  $('library-search').disabled = !available;
+  if (!available) setLibraryStatus('EPUB import is currently available in the desktop app.', false);
+  const query = libraryQuery.trim().toLocaleLowerCase();
+  const books = state.books.filter(book => !query ||
+    `${book.title} ${book.author}`.toLocaleLowerCase().includes(query));
+  const sort = $('library-sort').value;
+  books.sort((left, right) => {
+    if (sort === 'title') return left.title.localeCompare(right.title);
+    const field = sort === 'added' ? 'addedAt' : sort === 'opened' ? 'lastOpenedAt' : null;
+    const leftValue = field ? left[field] : Math.max(left.lastOpenedAt, left.addedAt);
+    const rightValue = field ? right[field] : Math.max(right.lastOpenedAt, right.addedAt);
+    return rightValue - leftValue || left.title.localeCompare(right.title);
+  });
+  const grid = $('library-grid');
+  grid.replaceChildren();
+  for (const book of books) {
+    const card = document.createElement('article');
+    card.className = 'book-card';
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'book-card-open';
+    open.disabled = readerBusy;
+    open.setAttribute('aria-label', `Open ${book.title}`);
+    const cover = document.createElement('span');
+    cover.className = 'book-cover';
+    const coverTitle = document.createElement('span');
+    coverTitle.textContent = book.title;
+    cover.append(coverTitle);
+    const copy = document.createElement('span');
+    copy.className = 'book-card-copy';
+    const title = document.createElement('strong');
+    title.textContent = book.title;
+    const author = document.createElement('span');
+    author.textContent = book.author;
+    const progress = document.createElement('small');
+    const chapter = Math.min(book.progress.chapter, book.chapters.length - 1);
+    progress.textContent = book.lastOpenedAt ? `${book.chapters[chapter].title} · Continue reading` :
+      `${book.chapters.length} ${book.chapters.length === 1 ? 'chapter' : 'chapters'}`;
+    copy.append(title, author, progress);
+    open.append(cover, copy);
+    open.addEventListener('click', () => openBook(book.id));
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'book-remove';
+    remove.textContent = '×';
+    remove.setAttribute('aria-label', `Remove ${book.title}`);
+    remove.addEventListener('click', async () => {
+      if (!confirm(`Remove "${book.title}" from this computer?`)) return;
+      try {
+        await removeEbook(book);
+        state.books = state.books.filter(candidate => candidate.id !== book.id);
+        ebookSessions.delete(book.id);
+        persist();
+        renderLibrary();
+      } catch (error) {
+        setLibraryStatus(error.message || 'Unable to remove the book', true);
+      }
+    });
+    card.append(open, remove);
+    grid.append(card);
+  }
+  $('reader-empty').hidden = Boolean(books.length) || Boolean(query);
+  grid.hidden = !books.length;
+  if (available && !readerBusy && $('library-status').textContent.startsWith('EPUB import is'))
+    setLibraryStatus();
+}
+
+function validatedEbookMetadata(metadata) {
+  if (!metadata || typeof metadata.book_id !== 'string' || typeof metadata.title !== 'string' ||
+      typeof metadata.author !== 'string' || typeof metadata.language !== 'string' ||
+      !Array.isArray(metadata.chapters) || !metadata.chapters.length ||
+      metadata.chapters.some(chapter =>
+        !chapter || typeof chapter.id !== 'string' || typeof chapter.title !== 'string'))
+    throw new Error('The desktop app returned invalid EPUB metadata');
+  return metadata;
+}
+
+async function importEbooks(files) {
+  if (readerBusy || typeof backend.importEbook !== 'function') return;
+  readerBusy = true;
+  renderLibrary();
+  try {
+    for (const file of files) {
+      setLibraryStatus(`Importing ${file.name}…`);
+      const metadata = validatedEbookMetadata(await backend.importEbook(file, file.name));
+      const stored = await storeEbook(file, file.name);
+      const existing = state.books.find(book => book.id === stored.id);
+      const record = {
+        ...stored,
+        title: metadata.title,
+        author: metadata.author,
+        language: metadata.language,
+        chapters: metadata.chapters,
+        addedAt: existing?.addedAt || Date.now(),
+        lastOpenedAt: existing?.lastOpenedAt || 0,
+        progress: existing?.progress || {chapter: 0, scroll: {}},
+      };
+      state.books = [record, ...state.books.filter(book => book.id !== record.id)].slice(0, 50);
+      ebookSessions.set(record.id, metadata.book_id);
+      persist();
+    }
+    setLibraryStatus();
+  } catch (error) {
+    setLibraryStatus(error.message || 'Unable to import the EPUB', true);
+  } finally {
+    readerBusy = false;
+    renderLibrary();
+  }
+}
+
+async function ensureEbookSession(book) {
+  if (ebookSessions.has(book.id)) return ebookSessions.get(book.id);
+  const blob = await readEbook(book);
+  const metadata = validatedEbookMetadata(await backend.importEbook(blob, book.name));
+  ebookSessions.set(book.id, metadata.book_id);
+  return metadata.book_id;
+}
+
+function sanitizeBookChapter(html) {
+  const parsed = new DOMParser().parseFromString(String(html || ''), 'text/html');
+  const source = parsed.body;
+  for (const blocked of source.querySelectorAll(
+    'script, style, link, meta, base, iframe, object, embed, form, input, button, textarea, select, canvas, svg'
+  )) blocked.remove();
+  const allowed = new Set(['lang', 'dir', 'colspan', 'rowspan']);
+  for (const element of source.querySelectorAll('*'))
+    for (const attribute of [...element.attributes])
+      if (!allowed.has(attribute.name.toLowerCase())) element.removeAttribute(attribute.name);
+  const fragment = document.createDocumentFragment();
+  for (const child of [...source.childNodes]) fragment.append(document.importNode(child, true));
+  return fragment;
+}
+
+function currentReaderBook() {
+  return state.books.find(book => book.id === readerBookId);
+}
+
+function readerContent() {
+  return $('book-chapter-content').querySelector('.book-chapter-content');
+}
+
+function readerText() {
+  return normalizeReaderText(readerContent().innerText);
+}
+
+function updateReaderSpeechPosition(offset, length = readerText().length) {
+  readerSpeechOffset = Math.max(0, Math.min(Number(offset) || 0, length));
+  const position = $('book-speech-position');
+  position.max = String(Math.max(1, length));
+  position.value = String(Math.round(readerSpeechOffset));
+  const label = readerProgressLabel(readerSpeechOffset, length);
+  position.setAttribute('aria-valuetext', label);
+  $('book-speech-progress').textContent = label;
+}
+
+function scheduleReaderControlsHide(delay = 2400) {
+  clearTimeout(readerControlsTimer);
+  if (!readerBookId) return;
+  readerControlsTimer = setTimeout(() => {
+    if (!$('book-reader').matches(':focus-within') && !$('book-tts-controls').open) hideReaderControls();
+  }, delay);
+}
+
+function hideReaderControls() {
+  $('book-reader').classList.add('controls-hidden');
+  $('toggle-reader-controls').setAttribute('aria-label', 'Show reader controls');
+  $('toggle-reader-controls').title = 'Show reader controls';
+  $('toggle-reader-controls').textContent = '⌄';
+}
+
+function showReaderControls(schedule = true) {
+  $('book-reader').classList.remove('controls-hidden');
+  $('toggle-reader-controls').setAttribute('aria-label', 'Hide reader controls');
+  $('toggle-reader-controls').title = 'Hide reader controls';
+  $('toggle-reader-controls').textContent = '⌃';
+  if (schedule) scheduleReaderControlsHide();
+}
+
+function toggleReaderControls() {
+  const hidden = $('book-reader').classList.toggle('controls-hidden');
+  clearTimeout(readerControlsTimer);
+  $('toggle-reader-controls').setAttribute('aria-label', hidden ? 'Show reader controls' : 'Hide reader controls');
+  $('toggle-reader-controls').title = hidden ? 'Show reader controls' : 'Hide reader controls';
+  $('toggle-reader-controls').textContent = hidden ? '⌄' : '⌃';
+  if (!hidden) scheduleReaderControlsHide();
+}
+
+async function stopReaderSpeech() {
+  const stream = [...ttsStreams.entries()].find(([, value]) => value.button === $('read-book-chapter'));
+  if (stream) await stopTts(stream[0]);
+}
+
+function readerCaretOffset(event) {
+  const root = readerContent();
+  const position = document.caretPositionFromPoint?.(event.clientX, event.clientY);
+  const fallback = position ? null : document.caretRangeFromPoint?.(event.clientX, event.clientY);
+  const node = position?.offsetNode || fallback?.startContainer;
+  const offset = position?.offset ?? fallback?.startOffset;
+  if (!node || offset === undefined || !root.contains(node)) return null;
+  const range = document.createRange();
+  range.selectNodeContents(root);
+  try {
+    range.setEnd(node, offset);
+  } catch {
+    return null;
+  }
+  return normalizeReaderText(range.toString()).length;
+}
+
+function scrollReaderSegmentIntoView(stream, segment) {
+  const root = document.querySelector(stream.highlightRoot);
+  if (!root) return;
+  const cursor = stream.highlightOffset + speechSearchOffset(stream.readerSpokenText, segment.start);
+  const match = speechRanges(root, [segment], cursor, stream.highlightIndex)[0]?.range;
+  const element = match?.startContainer?.parentElement;
+  if (!element) return;
+  const documentRect = $('book-document').getBoundingClientRect();
+  const elementRect = element.getBoundingClientRect();
+  if (elementRect.top < documentRect.top + 32 || elementRect.bottom > documentRect.bottom - 32)
+    element.scrollIntoView({behavior: 'smooth', block: 'center'});
+}
+
+async function startBookSpeech(requestedOffset = readerSpeechOffset) {
+  if (readerBusy || !state.components.tts?.enabled) return;
+  const sliced = readerSpeechSlice(readerContent().innerText, requestedOffset);
+  const offset = sliced.speech ? sliced.offset : 0;
+  const speechText = sliced.speech || sliced.text;
+  if (!speechText) return;
+  updateReaderSpeechPosition(offset, sliced.text.length);
+  const language = currentReaderBook()?.language?.split(/[-_]/u)[0]?.toLowerCase();
+  const spokenLanguage = languageNames.get(language) || language || 'auto';
+  startTts(speechText, $('read-book-chapter'), false, voiceEpoch, {language: spokenLanguage}, {
+    highlightRoot: '#book-chapter-content .book-chapter-content',
+    highlightOffset: speechSearchOffset(sliced.text, offset),
+    reader: true,
+    readerSourceOffset: offset,
+    readerSpokenText: speechText,
+    readerTextLength: sliced.text.length,
+    highlightIndex: readerHighlightIndex,
+  });
+  scheduleReaderControlsHide(1000);
+}
+
+async function seekBookSpeech(requestedOffset) {
+  const token = ++readerSeekToken;
+  readerScrubbing = true;
+  updateReaderSpeechPosition(requestedOffset);
+  try {
+    await stopReaderSpeech();
+    if (token !== readerSeekToken || !readerBookId) return;
+    await startBookSpeech(readerSpeechOffset);
+  } finally {
+    if (token === readerSeekToken) readerScrubbing = false;
+  }
+}
+
+async function loadBookChapter(chapterIndex, requestedScroll) {
+  const book = currentReaderBook();
+  if (!book || readerBusy) return;
+  const index = Math.max(0, Math.min(Number(chapterIndex) || 0, book.chapters.length - 1));
+  const token = ++readerRenderToken;
+  readerBusy = true;
+  setBookReaderStatus(`Opening ${book.chapters[index].title}…`);
+  $('book-chapter').disabled = true;
+  $('previous-book-chapter').disabled = true;
+  $('next-book-chapter').disabled = true;
+  $('read-book-chapter').disabled = true;
+  try {
+    await stopReaderSpeech();
+    const session = await ensureEbookSession(book);
+    const chapter = await backend.loadEbookChapter(session, index);
+    if (token !== readerRenderToken || readerBookId !== book.id) return;
+    if (!chapter || typeof chapter.html !== 'string')
+      throw new Error('The desktop app returned an invalid EPUB chapter');
+    const content = $('book-chapter-content').querySelector('.book-chapter-content');
+    content.replaceChildren(sanitizeBookChapter(chapter.html));
+    if (!content.textContent.trim()) throw new Error('This EPUB chapter has no readable text');
+    readerHighlightIndex = createSpeechIndex(content);
+    readerChapterIndex = index;
+    book.progress.chapter = index;
+    book.lastOpenedAt = Date.now();
+    $('book-chapter').value = String(index);
+    $('book-progress').textContent = `Chapter ${index + 1} of ${book.chapters.length}`;
+    updateReaderSpeechPosition(0);
+    const savedScroll = requestedScroll ?? Number(book.progress.scroll[index] || 0);
+    requestAnimationFrame(() => { $('book-document').scrollTop = Math.max(0, savedScroll); });
+    persist();
+    setBookReaderStatus();
+  } catch (error) {
+    if (token === readerRenderToken) {
+      $('book-chapter-content').querySelector('.book-chapter-content').replaceChildren();
+      setBookReaderStatus(error.message || 'Unable to open this chapter', true);
+    }
+  } finally {
+    if (token === readerRenderToken) {
+      readerBusy = false;
+      $('book-chapter').disabled = false;
+      $('previous-book-chapter').disabled = index === 0;
+      $('next-book-chapter').disabled = index === book.chapters.length - 1;
+      $('read-book-chapter').disabled = !state.components.tts?.enabled ||
+        !$('book-chapter-content').querySelector('.book-chapter-content').textContent.trim();
+    }
+  }
+}
+
+async function openBook(bookId) {
+  const book = state.books.find(candidate => candidate.id === bookId);
+  if (!book || readerBusy) return;
+  readerBookId = book.id;
+  document.body.classList.add('reading-mode');
+  $('library-view').hidden = true;
+  $('book-reader').hidden = false;
+  showReaderControls();
+  $('book-title').textContent = book.title;
+  $('book-author').textContent = book.author;
+  const chapters = $('book-chapter');
+  chapters.replaceChildren(...book.chapters.map((chapter, index) => {
+    const option = document.createElement('option');
+    option.value = String(index);
+    option.textContent = chapter.title;
+    return option;
+  }));
+  await loadBookChapter(book.progress.chapter);
+}
+
+async function closeBook() {
+  readerRenderToken++;
+  readerSeekToken++;
+  clearTimeout(readerControlsTimer);
+  clearTimeout(readerScrollTimer);
+  await stopReaderSpeech();
+  readerBookId = null;
+  readerHighlightIndex = null;
+  document.body.classList.remove('reading-mode');
+  $('book-reader').classList.remove('controls-hidden');
+  $('book-reader').hidden = true;
+  $('library-view').hidden = false;
+  setBookReaderStatus();
+  renderLibrary();
+}
+
+async function toggleBookSpeech() {
+  if (readerBusy || !state.components.tts?.enabled) return;
+  const button = $('read-book-chapter');
+  const stream = [...ttsStreams.entries()].find(([, value]) => value.button === button);
+  if (stream) {
+    if (stream[1].paused) resumeTts(stream[0]);
+    else pauseTts(stream[0]);
+    return;
+  }
+  for (const [id] of [...ttsStreams]) await stopTts(id);
+  await startBookSpeech(readerSpeechOffset);
+}
+
 function formatCacheSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
@@ -444,6 +831,23 @@ function loadLocal() {
             })),
         })).slice(0, 40);
     }
+    if (Array.isArray(saved.books)) {
+      state.books = saved.books.filter(book =>
+        book && /^[a-f0-9]{64}$/.test(book.id) && typeof book.name === 'string' &&
+        typeof book.title === 'string' && typeof book.author === 'string' &&
+        typeof book.language === 'string' && Array.isArray(book.chapters) && book.chapters.length)
+        .map(book => ({
+          ...book,
+          chapters: book.chapters.filter(chapter =>
+            chapter && typeof chapter.id === 'string' && typeof chapter.title === 'string'),
+          addedAt: Number(book.addedAt) || Date.now(),
+          lastOpenedAt: Number(book.lastOpenedAt) || 0,
+          progress: {
+            chapter: Math.max(0, Number(book.progress?.chapter) || 0),
+            scroll: book.progress?.scroll && typeof book.progress.scroll === 'object' ? book.progress.scroll : {},
+          },
+        })).filter(book => book.chapters.length).slice(0, 50);
+    }
     state.active = typeof saved.active === 'string' ? saved.active : null;
     state.view = saved.view === 'reader' ? 'reader' : 'chat';
     if (typeof (saved.languages || saved.asrLanguage) === 'string')
@@ -466,6 +870,7 @@ function persist() {
       inputLanguage: state.inputLanguage, outputLanguage: state.outputLanguage,
       asrSetupSkipped: state.asrSetupSkipped, ttsSetupSkipped: state.ttsSetupSkipped,
       modelSetupDismissed: state.modelSetupDismissed, tts: state.ttsSettings,
+      books: state.books,
     }));
   }
   catch {}
@@ -555,6 +960,7 @@ function connectBackend() {
     onPcm: frame => speech.handlePcm(frame) || handlePcm(frame),
     onClose: () => {
     speech.reset('The local speech transport disconnected');
+    ebookSessions.clear();
     if (activeRequest?.kind === 'chat') {
       const chat = activeChat();
       if (chat?.messages.at(-1)?.pending) {
@@ -785,10 +1191,12 @@ function render() {
   const chat = activeChat();
   $('conversation-title').textContent = chat?.title || 'New conversation';
   renderHistory(); renderMessages(); renderRuntime(); renderLanguageSwitchers();
+  renderLibrary();
 }
 
 function selectView(view, updateRoute = true) {
   state.view = view === 'reader' ? 'reader' : 'chat';
+  document.body.classList.toggle('reading-mode', state.view === 'reader' && Boolean(readerBookId));
   $('chat-view').hidden = state.view !== 'chat';
   $('reader-view').hidden = state.view !== 'reader';
   $('chat-navigation').hidden = state.view !== 'chat';
@@ -823,6 +1231,49 @@ function configSection(title, rows) {
   const list = document.createElement('dl'); list.append(...rows);
   section.append(heading, list);
   return section;
+}
+
+function ttsPacePreset(value) {
+  const pace = Number(value || 1);
+  return pace >= 1.175 ? '1.2' : pace >= 1.075 ? '1.15' : pace >= .95 ? '1' : '0.9';
+}
+
+function renderBookTtsControls() {
+  const settings = state.ttsSettings || {};
+  const voice = settings.voice || {};
+  const pace = ttsPacePreset(settings.pace);
+  const mirrorSelect = (readerId, settingsId, value) => {
+    const reader = $(readerId);
+    if (!reader.options.length)
+      reader.replaceChildren(...[...$(settingsId).options].map(option => option.cloneNode(true)));
+    reader.value = value;
+    return reader;
+  };
+  const delivery = mirrorSelect('book-tts-pace', 'tts-pace', pace);
+  mirrorSelect('book-tts-gender', 'tts-gender', voice.gender || 'female');
+  mirrorSelect('book-tts-age', 'tts-age', voice.age || 'young adult');
+  mirrorSelect('book-tts-pitch', 'tts-pitch', voice.pitch || 'moderate');
+  mirrorSelect('book-tts-style', 'tts-style', voice.style || '');
+  mirrorSelect('book-tts-accent', 'tts-accent', voice.accent || '');
+  mirrorSelect('book-tts-gpu-precision', 'tts-gpu-precision', settings.gpu_precision || 'w8a8');
+  $('book-tts-gpu-precision-row').hidden =
+    state.runtime.host !== 'wasm' || state.runtime.requested_backend !== 'webgpu';
+  $('book-tts-steps').value = String(settings.steps || 16);
+  delivery.value = pace;
+  $('book-tts-summary').textContent =
+    `${settings.steps || 16} · ${delivery.selectedOptions[0]?.textContent || 'Natural'}`;
+  const description = [
+    `${settings.steps || 16} diffusion steps`,
+    delivery.selectedOptions[0]?.textContent || 'Natural',
+    $('book-tts-gender').selectedOptions[0]?.textContent,
+    $('book-tts-age').selectedOptions[0]?.textContent,
+    `${$('book-tts-pitch').selectedOptions[0]?.textContent} pitch`,
+    $('book-tts-style').value ? $('book-tts-style').selectedOptions[0]?.textContent : '',
+    $('book-tts-accent').value ? `${$('book-tts-accent').selectedOptions[0]?.textContent} accent` : '',
+  ].filter(Boolean).join(', ');
+  const summary = $('book-tts-controls').querySelector('summary');
+  summary.title = `Narration settings: ${description}`;
+  summary.setAttribute('aria-description', description);
 }
 
 function renderConfig() {
@@ -876,8 +1327,7 @@ function renderConfig() {
   const voice = settings.voice || {};
   $('conversation-languages').value = state.languages || 'auto';
   $('tts-steps').value = String(settings.steps || 10);
-  const pace = Number(settings.pace || 1);
-  $('tts-pace').value = pace >= 1.175 ? '1.2' : pace >= 1.075 ? '1.15' : pace >= .95 ? '1' : '0.9';
+  $('tts-pace').value = ttsPacePreset(settings.pace);
   $('tts-gender').value = voice.gender || 'female';
   $('tts-age').value = voice.age || 'young adult';
   $('tts-pitch').value = voice.pitch || 'moderate';
@@ -901,6 +1351,7 @@ function renderConfig() {
     renderModelProgress();
   }
   renderSpeechModelLoads();
+  renderBookTtsControls();
 }
 
 function initializeTtsSettings() {
@@ -911,15 +1362,21 @@ function initializeTtsSettings() {
   const savedPrecision = ['f32', 'mixed-f16', 'w8a8'].includes(saved.gpu_precision)
     ? saved.gpu_precision : defaults.gpu_precision || 'w8a8';
   const migratePrecision = browserGpu && saved.gpu_precision_version === 2 && savedPrecision === 'f32';
+  const migrateDefaults = saved.defaults_version !== TTS_DEFAULTS_VERSION;
+  const savedSteps = Number.isInteger(saved.steps) ? saved.steps : null;
+  const savedPace = Number.isFinite(saved.pace) ? saved.pace : null;
+  const migrateSteps = migrateDefaults && [10, 24].includes(savedSteps);
   state.ttsSettings = {
-    steps: Number.isInteger(saved.steps) ? saved.steps : defaults.steps || 10,
-    pace: Number.isFinite(saved.pace) ? saved.pace : defaults.pace || 1,
+    steps: migrateSteps ? defaults.steps || 16 : savedSteps ?? defaults.steps ?? 16,
+    pace: migrateDefaults && savedPace === 1.15 ? defaults.pace || 0.9 : savedPace ?? defaults.pace ?? 0.9,
     gpu_precision: migratePrecision ? 'w8a8' : savedPrecision,
     gpu_precision_version: 3,
+    defaults_version: TTS_DEFAULTS_VERSION,
     voice: {...(defaults.voice || {}), ...(saved.voice || {})},
   };
   ttsSettingsInitialized = true;
-  if (migratePrecision) queueMicrotask(persist);
+  renderBookTtsControls();
+  if (migratePrecision || migrateDefaults) queueMicrotask(persist);
 }
 
 function conversationLanguages(value) {
@@ -991,6 +1448,7 @@ function updateTtsSettings() {
     pace: Number($('tts-pace').value),
     gpu_precision: $('tts-gpu-precision').value,
     gpu_precision_version: 3,
+    defaults_version: TTS_DEFAULTS_VERSION,
     voice: {
       gender: $('tts-gender').value,
       age: $('tts-age').value,
@@ -1000,6 +1458,34 @@ function updateTtsSettings() {
     },
   };
   persist();
+  renderBookTtsControls();
+}
+
+async function updateBookTtsSettings() {
+  const steps = Number($('book-tts-steps').value);
+  const pace = Number($('book-tts-pace').value);
+  if (!Number.isInteger(steps) || steps < 10 || steps > 128 || !Number.isFinite(pace))
+    return renderBookTtsControls();
+  const current = state.ttsSettings || {};
+  state.ttsSettings = {
+    ...current,
+    steps,
+    pace,
+    gpu_precision: $('book-tts-gpu-precision').value || current.gpu_precision,
+    voice: {
+      ...(current.voice || {}),
+      gender: $('book-tts-gender').value,
+      age: $('book-tts-age').value,
+      pitch: $('book-tts-pitch').value,
+      style: $('book-tts-style').value,
+      accent: $('book-tts-accent').value,
+    },
+  };
+  persist();
+  renderBookTtsControls();
+  if ($('config-dialog').open) renderConfig();
+  const stream = [...ttsStreams.values()].find(value => value.button === $('read-book-chapter'));
+  if (stream) await seekBookSpeech(readerSpeechOffset);
 }
 
 function ttsRequestOptions(realtime = false) {
@@ -1007,6 +1493,7 @@ function ttsRequestOptions(realtime = false) {
   const languages = selectedOutputLanguages();
   options.language = languages.length === 1 ? languageNames.get(languages[0]) || languages[0] : 'auto';
   delete options.gpu_precision_version;
+  delete options.defaults_version;
   if (state.runtime.host !== 'wasm') delete options.gpu_precision;
   if (realtime) {
     const realtimeSteps = Math.max(MINIMUM_TTS_STEPS, Math.min(
@@ -1093,10 +1580,13 @@ function setReadAloudState(button, state) {
   const mode = state === 'playing' || state === 'paused' ? state : 'idle';
   button.classList.toggle('active', mode !== 'idle');
   button.classList.toggle('paused', mode === 'paused');
-  const label = mode === 'playing' ? 'Pause reading response' :
-    mode === 'paused' ? 'Resume reading response' : 'Read response aloud';
+  const subject = button.dataset.readAloudSubject || 'response';
+  const label = mode === 'playing' ? `Pause reading ${subject}` :
+    mode === 'paused' ? `Resume reading ${subject}` : `Read ${subject} aloud`;
   button.setAttribute('aria-label', label);
   button.title = label;
+  const visible = button.querySelector('.read-aloud-label');
+  if (visible) visible.textContent = mode === 'playing' ? 'Pause' : mode === 'paused' ? 'Resume' : `Read ${subject}`;
 }
 
 function appendReadAloud(body, text) {
@@ -1499,8 +1989,14 @@ async function ensurePlayback(sampleRate) {
           const segment = stream.segments?.get(data.segmentId);
           if (segment) segment.status = data.type === 'segment-started' ? 'playing' : 'played';
           renderSpeechHighlights(ttsStreams.values());
+          if (segment && stream.reader && !readerScrubbing) {
+            const offset = stream.readerSourceOffset +
+              (data.type === 'segment-started' ? segment.start : segment.end);
+            updateReaderSpeechPosition(offset, stream.readerTextLength);
+            if (data.type === 'segment-started') scrollReaderSegmentIntoView(stream, segment);
+          }
           renderRuntime();
-        } else if (data.type === 'drained' && stream.completed) finishTts(stream.button, data.streamId);
+        } else if (data.type === 'drained' && stream.completed) finishTts(stream.button, data.streamId, true);
       };
       playback = {context, node};
       const failed = error => {
@@ -1780,19 +2276,19 @@ function toggleVoiceMode() {
   startDictation(epoch);
 }
 
-function startTts(text, button, voiceTurn = false, epoch = voiceEpoch) {
+function startTts(text, button, voiceTurn = false, epoch = voiceEpoch, optionOverrides = {}, streamMetadata = {}) {
   if (state.busy) return;
   const id = crypto.randomUUID();
   const audioId = streamId++;
   activeRequest = {id, kind: 'tts', streamId: audioId, voiceTurn, voiceEpoch: voiceTurn ? epoch : null};
   ttsStreams.set(audioId, {button, completed: false, voiceTurn, requestId: id, voiceEpoch: voiceTurn ? epoch : null,
-    messageId: button?.closest('[data-message-id]')?.dataset.messageId, paused: false});
+    messageId: button?.closest('[data-message-id]')?.dataset.messageId, paused: false, ...streamMetadata});
   playbackStreamId = audioId;
   setReadAloudState(button, 'playing');
   state.busy = true; showNotice(); renderRuntime();
   ensurePlayback().catch(error => showNotice(error.message));
   try {
-    const options = ttsRequestOptions(voiceTurn);
+    const options = {...ttsRequestOptions(voiceTurn), ...optionOverrides};
     const profile = voiceTurn ? realtimeProfile() : null;
     speech.start({
       id, streamId: audioId, text, options, voice: voiceTurn, finished: true,
@@ -1806,7 +2302,7 @@ function startTts(text, button, voiceTurn = false, epoch = voiceEpoch) {
   }
 }
 
-function finishTts(button, stream) {
+function finishTts(button, stream, drained = false) {
   const entry = ttsStreams.get(stream);
   const voiceTurn = entry?.voiceTurn;
   const epoch = entry?.voiceEpoch;
@@ -1814,6 +2310,7 @@ function finishTts(button, stream) {
   for (const resolve of entry?.capacityWaiters?.splice(0) || []) resolve();
   ttsStreams.delete(stream);
   renderSpeechHighlights(ttsStreams.values());
+  if (entry?.reader && drained) updateReaderSpeechPosition(entry.readerTextLength, entry.readerTextLength);
   if (playbackStreamId === stream) playbackStreamId = null;
   if (activeRequest?.kind !== 'chat' &&
       (activeRequest?.streamId === stream || activeRequest?.id === entry?.requestId)) finishRequest();
@@ -1981,6 +2478,70 @@ $('close-menu').addEventListener('click', closeSidebar);
 $('sidebar-backdrop').addEventListener('click', closeSidebar);
 $('open-chat-view').addEventListener('click', () => selectView('chat'));
 $('open-reader-view').addEventListener('click', () => selectView('reader'));
+$('add-book').addEventListener('click', () => $('ebook-files').click());
+$('ebook-files').addEventListener('change', event => {
+  importEbooks([...event.target.files]);
+  event.target.value = '';
+});
+$('library-search').addEventListener('input', event => {
+  libraryQuery = event.target.value;
+  renderLibrary();
+});
+$('library-sort').addEventListener('change', renderLibrary);
+$('close-book').addEventListener('click', closeBook);
+$('book-chapter').addEventListener('change', event => loadBookChapter(Number(event.target.value), 0));
+$('previous-book-chapter').addEventListener('click', () => loadBookChapter(readerChapterIndex - 1, 0));
+$('next-book-chapter').addEventListener('click', () => loadBookChapter(readerChapterIndex + 1, 0));
+$('read-book-chapter').addEventListener('click', toggleBookSpeech);
+for (const id of ['book-tts-steps', 'book-tts-pace', 'book-tts-gender', 'book-tts-age',
+  'book-tts-pitch', 'book-tts-style', 'book-tts-accent', 'book-tts-gpu-precision'])
+  $(id).addEventListener('change', () =>
+    updateBookTtsSettings().catch(error => showNotice(error.message)));
+$('book-tts-controls').addEventListener('toggle', () => {
+  if ($('book-tts-controls').open) showReaderControls(false);
+  else scheduleReaderControlsHide();
+});
+$('book-tts-more').addEventListener('click', () => {
+  $('book-tts-controls').open = false;
+  settingsPage = 'speech';
+  renderConfig();
+  $('config-dialog').showModal();
+});
+$('toggle-reader-controls').addEventListener('click', event => {
+  event.stopPropagation();
+  toggleReaderControls();
+});
+$('book-reader').addEventListener('pointermove', () => showReaderControls());
+$('book-reader').addEventListener('pointerleave', () => scheduleReaderControlsHide(800));
+$('book-speech-position').addEventListener('pointerdown', () => { readerScrubbing = true; });
+$('book-speech-position').addEventListener('input', event => {
+  readerScrubbing = true;
+  updateReaderSpeechPosition(Number(event.target.value));
+});
+$('book-speech-position').addEventListener('change', event => {
+  readerScrubbing = false;
+  seekBookSpeech(Number(event.target.value));
+});
+$('book-speech-position').addEventListener('blur', () => { readerScrubbing = false; });
+$('book-chapter-content').addEventListener('click', event => {
+  if (!readerBookId || readerBusy || !state.components.tts?.enabled ||
+      !document.getSelection()?.isCollapsed) return;
+  const offset = readerCaretOffset(event);
+  if (offset === null) return;
+  seekBookSpeech(offset);
+});
+$('book-document').addEventListener('scroll', () => {
+  const book = currentReaderBook();
+  if (!book || readerBusy) return;
+  scheduleReaderControlsHide(700);
+  clearTimeout(readerScrollTimer);
+  readerScrollTimer = setTimeout(() => {
+    if (readerBookId !== book.id || readerChapterIndex !== book.progress.chapter) return;
+    book.progress.scroll[readerChapterIndex] = Math.round($('book-document').scrollTop);
+    book.lastOpenedAt = Date.now();
+    persist();
+  }, 200);
+});
 $('open-config').addEventListener('click', () => { renderConfig(); $('config-dialog').showModal(); });
 $('close-config').addEventListener('click', () => $('config-dialog').close());
 $('apply-system-prompt').addEventListener('click', () => applySystemPrompt($('system-prompt').value));
@@ -2053,6 +2614,7 @@ setupLanguagePicker('output-language', 'output-language-menu', 'Match input', co
 const languageControls = $('language-controls');
 document.addEventListener('click', event => {
   if (!languageControls.contains(event.target)) languageControls.open = false;
+  if (!$('book-tts-controls').contains(event.target)) $('book-tts-controls').open = false;
 });
 languageControls.addEventListener('keydown', event => {
   if (event.key !== 'Escape') return;

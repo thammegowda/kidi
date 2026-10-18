@@ -4,7 +4,12 @@ export function speechMatchText(text) {
     .replace(/\u03c2/g, '\u03c3').replace(/[^\p{L}\p{N}]/gu, '');
 }
 
-export function speechRanges(root, segments) {
+export function speechSearchOffset(text, sourceOffset) {
+  const safe = Math.max(0, Math.min(Number(sourceOffset) || 0, text.length));
+  return speechMatchText(text.slice(0, safe)).length;
+}
+
+export function createSpeechIndex(root) {
   const document = root.ownerDocument, positions = [];
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode: node => node.parentElement?.closest('button, script, style, [aria-hidden="true"]')
@@ -21,8 +26,14 @@ export function speechRanges(root, segments) {
       }
     }
   }
+  return {root, document, text, positions};
+}
+
+export function speechRanges(root, segments, initialCursor = 0, index = null) {
+  const prepared = index?.root === root ? index : createSpeechIndex(root);
+  const {document, text, positions} = prepared;
   const ranges = [];
-  let cursor = 0;
+  let cursor = Math.max(0, Math.min(Number(initialCursor) || 0, text.length));
   for (const segment of segments) {
     const needle = speechMatchText(segment.text);
     if (!needle) continue;
@@ -51,17 +62,21 @@ export function renderSpeechHighlights(streams) {
   clearMarks();
   const ready = [], playing = [];
   for (const stream of streams) {
-    if (!stream.messageId || !stream.segments) continue;
-    const root = document.querySelector(`[data-message-id="${CSS.escape(stream.messageId)}"] .message-content`);
+    if (!stream.segments) continue;
+    const root = stream.highlightRoot ? document.querySelector(stream.highlightRoot) :
+      stream.messageId ? document.querySelector(
+        `[data-message-id="${CSS.escape(stream.messageId)}"] .message-content`) : null;
     if (!root) continue;
-    const segments = [...stream.segments.values()].sort((a, b) => a.id - b.id);
-    for (const value of speechRanges(root, segments))
+    const segments = [...stream.segments.values()].filter(segment => segment.status !== 'played')
+      .sort((a, b) => a.id - b.id);
+    const index = globalThis.Highlight && CSS.highlights ? stream.highlightIndex : null;
+    for (const value of speechRanges(root, segments, stream.highlightOffset, index))
       (value.status === 'playing' ? playing : ready).push(value.range);
   }
   if (globalThis.Highlight && CSS.highlights) {
     CSS.highlights.set('kidi-speech-ready', new Highlight(...ready));
     CSS.highlights.set('kidi-speech-playing', new Highlight(...playing));
-    return;
+    return {ready, playing};
   }
   for (const [ranges, status] of [[ready, 'ready'], [playing, 'playing']]) {
     for (const range of ranges.reverse()) {
@@ -80,6 +95,7 @@ export function renderSpeechHighlights(streams) {
         mark.className = `speech-segment-${status}`;
         part.surroundContents(mark);
       }
+      return {ready, playing};
     }
   }
 }

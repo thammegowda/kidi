@@ -15,6 +15,8 @@ test('browser consumes the canonical desktop YAML configuration', async () => {
   assert.equal(config.models.chat.system_prompt.includes('preserve natural code switching'), true);
   assert.equal(config.models.asr.vad.silence_ms, 800);
   assert.equal(config.models.tts.realtime_steps, 10);
+  assert.equal(config.models.tts.steps, 16);
+  assert.equal(config.models.tts.pace, 0.9);
   assert.equal(config.models.tts.gpu_precision, 'w8a8');
   assert.equal(config.models.tts.reference_text, 'Nice to meet you.');
 });
@@ -32,6 +34,8 @@ test('first-run browser UI requests model loading and exposes progress', async (
     'onboarding-model-loading-progress', 'onboarding-model-loading-bytes', 'onboarding-load-asr',
     'onboarding-load-tts', 'dismiss-model-onboarding', 'load-asr-model', 'load-tts-model',
     'backend-activity', 'backend-memory', 'runtime-progress',
+    'book-tts-controls', 'book-tts-steps', 'book-tts-pace', 'book-tts-gender', 'book-tts-age',
+    'book-tts-pitch', 'book-tts-style', 'book-tts-accent', 'book-tts-gpu-precision', 'book-tts-more',
   ])
     assert.match(html, new RegExp(`id="${id}"`));
   assert.match(app, /function requestModelLoad\(\)/);
@@ -41,6 +45,7 @@ test('first-run browser UI requests model loading and exposes progress', async (
   assert.match(app, /\$\('onboarding-load-asr'\)\.addEventListener\('click'/);
   assert.match(app, /\$\('onboarding-load-tts'\)\.addEventListener\('click'/);
   assert.match(app, /\$\('dismiss-model-onboarding'\)\.addEventListener\('click', dismissModelSetup\)/);
+  assert.match(app, /delete options\.gpu_precision_version;\s+delete options\.defaults_version;/);
 });
 
 test('browser branding uses the square Kidi icon', async () => {

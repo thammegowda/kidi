@@ -24,7 +24,7 @@ export async function packageSite(destination, runtimes = {
     }
     for (const file of ['backend.js', 'inference-worker.mjs', 'asr-worker.mjs',
         'tts-worker.mjs', 'speech.mjs', 'model-cache.mjs', 'voice-prompt-cache.mjs',
-        'webgpu.mjs', 'webgpu-kernels.mjs', 'scoped-model.mjs', 'runtime-scheduler.mjs'])
+        'webgpu.mjs', 'webgpu-kernels.mjs', 'scoped-model.mjs', 'runtime-scheduler.mjs', 'browser-epub.js'])
         await copyFile(join(root, 'web/hosts/wasm', file), join(destination, file));
     await writeFile(join(destination, 'app-config.mjs'),
         (await readFile(join(root, 'web/hosts/wasm/app-config.mjs'), 'utf8'))

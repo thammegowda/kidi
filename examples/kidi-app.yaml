@@ -60,10 +60,10 @@ models:
     accelerator: auto
     metal_prefill_cache_mb: 1024
     language: auto
-    pace: 1.15
+    pace: 0.9
     reference_language: English
     reference_text: Nice to meet you.
-    steps: 10
+    steps: 16
     realtime_steps: 10
     gpu_precision: w8a8
     wire_format: pcm_s16le

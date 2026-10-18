@@ -115,6 +115,35 @@ test('desktop adapter uses LiteApp requests, binary uploads, and isolated speech
             {role: 'user', content: 'describe', images: [started.payload.stream_id]},
         ]);
 
+        const importing = backend.importEbook(new Blob([new Uint8Array([4, 5, 6])]), 'sample.epub');
+        await setImmediate();
+        const ebookStarted = message(main);
+        assert.equal(ebookStarted.method, 'ebook.start');
+        main.receive(event(ebookStarted.id, 0, 'completed', {stream_id: ebookStarted.payload.stream_id}));
+        await setImmediate();
+        const ebookFrame = main.sent.at(-2);
+        assert.ok(ebookFrame instanceof Uint8Array);
+        assert.equal(ebookFrame[5], 4);
+        const ebookFinished = message(main);
+        assert.equal(ebookFinished.method, 'ebook.finish');
+        main.receive(event(ebookFinished.id, 0, 'completed', {
+            book_id: 'native-book',
+            title: 'Sample',
+            author: 'Writer',
+            language: 'en',
+            chapters: [{id: 'one', title: 'One'}],
+        }));
+        assert.equal((await importing).book_id, 'native-book');
+
+        const chapter = backend.loadEbookChapter('native-book', 0);
+        await setImmediate();
+        const chapterRequest = message(main);
+        assert.equal(chapterRequest.method, 'ebook.chapter');
+        main.receive(event(chapterRequest.id, 0, 'completed', {
+            book_id: 'native-book', chapter: 0, title: 'One', html: '<p>Hello</p>',
+        }));
+        assert.equal((await chapter).html, '<p>Hello</p>');
+
         speech.close();
         await setImmediate();
         assert.equal(main.readyState, Socket.CLOSED);

@@ -1,5 +1,6 @@
 #include "kidi/core/precision.h"
 #include "kidi/checkpoint/hub.h"
+#include "ebook.h"
 #include "kidi/inference/generator.h"
 #include "kidi/inference/synthesizer.h"
 #include "kidi/inference/transcriber.h"
@@ -754,6 +755,7 @@ constexpr std::uint8_t AUDIO_VERSION = 1;
 constexpr std::uint8_t AUDIO_ASR = 1;
 constexpr std::uint8_t AUDIO_TTS = 2;
 constexpr std::uint8_t IMAGE_INPUT = 3;
+constexpr std::uint8_t EBOOK_INPUT = 4;
 
 void write_u32(std::span<std::byte> output, std::size_t offset, std::uint32_t value) {
     for (std::size_t byte = 0; byte < 4; ++byte)
@@ -777,6 +779,12 @@ public:
                                 [this](liteapp::ServiceContext& context) { return start_image(context); });
         router_.register_method("image.finish",
                                 [this](liteapp::ServiceContext& context) { return finish_image(context); });
+        router_.register_method("ebook.start",
+                                [this](liteapp::ServiceContext& context) { return start_ebook(context); });
+        router_.register_method("ebook.finish",
+                                [this](liteapp::ServiceContext& context) { return finish_ebook(context); });
+        router_.register_method("ebook.chapter",
+                                [this](liteapp::ServiceContext& context) { return read_ebook_chapter(context); });
         router_.register_method("chat.start", [this](liteapp::ServiceContext& context) {
             return run_inference([&] { return run_chat(context); });
         });
@@ -929,6 +937,97 @@ private:
         uploaded_images_[stream_id] = path;
         image_uploads_.erase(found);
         return Json{{"stream_id", stream_id}};
+    }
+
+    auto start_ebook(liteapp::ServiceContext& context) -> liteapp::Result<Json> {
+        const auto& payload = context.payload();
+        if (!payload.is_object() || !payload.contains("stream_id") || !payload["stream_id"].is_number_unsigned() ||
+            !payload.contains("size") || !payload["size"].is_number_unsigned())
+            return failure("invalid_ebook", "EPUB upload requires stream_id and size");
+        const auto stream_id = payload["stream_id"].get<std::uint32_t>();
+        const auto size = payload["size"].get<std::size_t>();
+        std::scoped_lock lock{ebook_mutex_};
+        if (!size || size > 64U * 1024U * 1024U || ebook_uploads_.contains(stream_id))
+            return failure("invalid_ebook", "EPUB must use a unique stream and be no larger than 64 MiB");
+        ebook_uploads_.emplace(stream_id, EbookUpload{.expected_size = size});
+        return Json{{"stream_id", stream_id}};
+    }
+
+    auto finish_ebook(liteapp::ServiceContext& context) -> liteapp::Result<Json> {
+        const auto& payload = context.payload();
+        if (!payload.is_object() || !payload.contains("stream_id") || !payload["stream_id"].is_number_unsigned())
+            return failure("invalid_ebook", "EPUB stream_id is required");
+        const auto stream_id = payload["stream_id"].get<std::uint32_t>();
+        std::vector<std::byte> archive;
+        {
+            std::unique_lock lock{ebook_mutex_};
+            const auto found = ebook_uploads_.find(stream_id);
+            if (found == ebook_uploads_.end()) return failure("invalid_ebook", "EPUB upload is incomplete");
+            if (found->second.finishing)
+                return failure("invalid_ebook", "EPUB upload is already being finalized");
+            found->second.finishing = true;
+            ebook_ready_.wait_for(lock, std::chrono::seconds{5}, [&] {
+                return found->second.error || found->second.bytes.size() == found->second.expected_size;
+            });
+            if (found->second.error) {
+                const auto error = *found->second.error;
+                ebook_uploads_.erase(found);
+                return std::unexpected(error);
+            }
+            if (found->second.bytes.size() != found->second.expected_size) {
+                const auto message = "EPUB upload is incomplete: received " +
+                                     std::to_string(found->second.bytes.size()) + " of " +
+                                     std::to_string(found->second.expected_size) + " bytes";
+                ebook_uploads_.erase(found);
+                return failure("invalid_ebook", message);
+            }
+            archive = std::move(found->second.bytes);
+            ebook_uploads_.erase(found);
+        }
+        auto parsed = kidi::desktop::parse_epub(archive);
+        if (!parsed) return std::unexpected(parsed.error());
+        auto book = std::make_shared<kidi::desktop::Ebook>(std::move(*parsed));
+        Json chapters = Json::array();
+        for (const auto& chapter : book->chapters)
+            chapters.push_back({{"id", chapter.id}, {"title", chapter.title}});
+        const auto result = Json{
+            {"book_id", book->id},
+            {"title", book->title},
+            {"author", book->author},
+            {"language", book->language},
+            {"chapters", std::move(chapters)},
+        };
+        {
+            std::scoped_lock lock{ebook_mutex_};
+            if (!ebooks_.contains(book->id) && ebooks_.size() >= 8)
+                return failure("ebook_limit", "Close and reopen Kidi before loading more books");
+            ebooks_.insert_or_assign(book->id, std::move(book));
+        }
+        return result;
+    }
+
+    auto read_ebook_chapter(liteapp::ServiceContext& context) -> liteapp::Result<Json> {
+        const auto& payload = context.payload();
+        if (!payload.is_object() || !payload.contains("book_id") || !payload["book_id"].is_string() ||
+            !payload.contains("chapter") || !payload["chapter"].is_number_unsigned())
+            return failure("invalid_ebook", "EPUB chapter request requires book_id and chapter");
+        const auto book_id = payload["book_id"].get<std::string>();
+        const auto chapter = payload["chapter"].get<std::size_t>();
+        std::shared_ptr<const kidi::desktop::Ebook> book;
+        {
+            std::scoped_lock lock{ebook_mutex_};
+            const auto found = ebooks_.find(book_id);
+            if (found == ebooks_.end()) return failure("ebook_unavailable", "EPUB is not loaded in this session");
+            book = found->second;
+        }
+        auto html = kidi::desktop::read_epub_chapter(*book, chapter);
+        if (!html) return std::unexpected(html.error());
+        return Json{
+            {"book_id", book_id},
+            {"chapter", chapter},
+            {"title", book->chapters[chapter].title},
+            {"html", std::move(*html)},
+        };
     }
 
     auto run_chat(liteapp::ServiceContext& context) -> liteapp::Result<Json> {
@@ -1196,6 +1295,23 @@ private:
             found->second.bytes.insert(found->second.bytes.end(), frame.begin() + AUDIO_HEADER_BYTES, frame.end());
             return;
         }
+        if (kind == EBOOK_INPUT) {
+            std::scoped_lock ebook_lock{ebook_mutex_};
+            const auto upload = ebook_uploads_.find(stream_id);
+            if (upload == ebook_uploads_.end()) return;
+            if (sequence != upload->second.sequence++ || sample_rate ||
+                payload_bytes != frame.size() - AUDIO_HEADER_BYTES ||
+                upload->second.bytes.size() + payload_bytes > upload->second.expected_size) {
+                upload->second.error =
+                    liteapp::Error{"invalid_ebook", "EPUB upload frame is invalid or out of order"};
+                ebook_ready_.notify_all();
+                return;
+            }
+            upload->second.bytes.insert(
+                upload->second.bytes.end(), bytes.begin() + AUDIO_HEADER_BYTES, bytes.end());
+            if (upload->second.bytes.size() == upload->second.expected_size) ebook_ready_.notify_all();
+            return;
+        }
         if (kind != AUDIO_ASR) {
             fail_audio("invalid_audio", "Invalid ASR audio frame header");
             return;
@@ -1266,6 +1382,14 @@ private:
         std::optional<liteapp::Error> error;
     };
 
+    struct EbookUpload {
+        std::size_t expected_size = 0;
+        std::uint32_t sequence = 0;
+        bool finishing = false;
+        std::vector<std::byte> bytes;
+        std::optional<liteapp::Error> error;
+    };
+
     struct AudioInput {
         std::string request_id;
         std::uint32_t stream_id = 0;
@@ -1282,6 +1406,10 @@ private:
     std::mutex image_mutex_;
     std::map<std::uint32_t, ImageUpload> image_uploads_;
     std::map<std::uint32_t, std::filesystem::path> uploaded_images_;
+    std::mutex ebook_mutex_;
+    std::condition_variable ebook_ready_;
+    std::map<std::uint32_t, EbookUpload> ebook_uploads_;
+    std::map<std::string, std::shared_ptr<kidi::desktop::Ebook>, std::less<>> ebooks_;
     std::mutex audio_mutex_;
     std::condition_variable audio_ready_;
     std::optional<AudioInput> audio_;

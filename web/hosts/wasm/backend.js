@@ -21,6 +21,7 @@ const DEFAULTS = {
 class WasmBackend {
   #callbacks;
   #asr;
+  #ebooks = new Map();
   #components = {
     chat: {
       enabled: CHAT.enabled !== false,
@@ -65,6 +66,7 @@ class WasmBackend {
       },
     },
   };
+  #epubProvider;
   #current;
   #ready = false;
   #settings = {...DEFAULTS};
@@ -465,6 +467,23 @@ class WasmBackend {
 
   async status() {
     return this.#snapshot();
+  }
+
+  async importEbook(blob) {
+    this.#epubProvider ||= import('./browser-epub.js');
+    const book = await (await this.#epubProvider).openBrowserEpub(blob);
+    this.#ebooks.delete(book.metadata.book_id);
+    this.#ebooks.set(book.metadata.book_id, book);
+    while (this.#ebooks.size > 2) this.#ebooks.delete(this.#ebooks.keys().next().value);
+    return book.metadata;
+  }
+
+  async loadEbookChapter(bookId, chapter) {
+    const book = this.#ebooks.get(bookId);
+    if (!book) throw new Error('EPUB is not loaded in this browser session');
+    this.#ebooks.delete(bookId);
+    this.#ebooks.set(bookId, book);
+    return book.chapter(chapter);
   }
 
   listCachedFiles() { return listCachedFiles(); }

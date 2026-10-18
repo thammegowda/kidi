@@ -191,27 +191,90 @@
     </main>
 
     <main class="workspace reader-workspace" id="reader-view" hidden>
-      <header class="library-header">
-        <div>
-          <h1>Your library</h1>
-          <p>A home for your books and reading.</p>
+      <section id="library-view" class="library-view">
+        <header class="library-header">
+          <div>
+            <h1>Your library</h1>
+            <p>Private EPUB reading and narration on this computer.</p>
+          </div>
+          <input id="ebook-files" type="file" accept=".epub,application/epub+zip" multiple hidden>
+          <button id="add-book" class="library-add" type="button">Add EPUB</button>
+        </header>
+        <div class="library-toolbar">
+          <label>Search library<input id="library-search" type="search" placeholder="Title or author"></label>
+          <label>Sort by<select id="library-sort">
+            <option value="activity">Recent activity</option>
+            <option value="added">Recently added</option>
+            <option value="opened">Last opened</option>
+            <option value="title">Title</option>
+          </select></label>
         </div>
-        <button class="library-add" type="button" disabled title="Book import is coming later">Add book</button>
-      </header>
-      <div class="library-toolbar">
-        <label>Search library<input type="search" placeholder="Search books" disabled></label>
-        <label>Sort by<select id="library-sort">
-          <option value="activity">Recent activity</option>
-          <option value="added">Recently added</option>
-          <option value="opened">Last opened</option>
-          <option value="title">Title</option>
-        </select></label>
-      </div>
-      <section class="reader-empty">
-        <span class="reader-mark" aria-hidden="true"></span>
-        <h2>Your next chapter starts here</h2>
-        <p>Your books will appear here. Open a book to read in a dedicated, full-width workspace with Kidi.</p>
-        <p class="library-planned">Book import and reading are coming next.</p>
+        <p id="library-status" class="library-status" role="status" hidden></p>
+        <section id="library-grid" class="library-grid" aria-label="Books"></section>
+        <section id="reader-empty" class="reader-empty">
+          <span class="reader-mark" aria-hidden="true"></span>
+          <h2>Your next chapter starts here</h2>
+          <p>Add an EPUB to read it in a focused workspace. Books and progress stay on this computer.</p>
+        </section>
+      </section>
+      <section id="book-reader" class="book-reader" hidden>
+        <button id="toggle-reader-controls" class="reader-controls-toggle" type="button"
+          aria-label="Hide reader controls" title="Hide reader controls">⌃</button>
+        <header class="book-reader-header">
+          <button id="close-book" class="book-reader-back" type="button" aria-label="Back to library"
+            title="Back to library">←</button>
+          <div class="book-reader-identity">
+            <h1 id="book-title">Book</h1>
+            <p id="book-author">Author</p>
+          </div>
+          <label class="book-chapter-picker"><span>Chapter</span>
+            <select id="book-chapter"></select>
+          </label>
+          <details id="book-tts-controls" class="book-tts-controls">
+            <summary aria-label="Narration settings" title="Narration settings">
+              <span class="read-aloud-icon" aria-hidden="true"></span>
+              <span id="book-tts-summary">16 · Brisk</span>
+            </summary>
+            <div class="book-tts-panel">
+              <label><span>Diffusion steps</span>
+                <input id="book-tts-steps" type="number" min="10" max="128" step="1">
+              </label>
+              <label><span>Delivery</span><select id="book-tts-pace"></select></label>
+              <label><span>Gender</span><select id="book-tts-gender"></select></label>
+              <label><span>Age</span><select id="book-tts-age"></select></label>
+              <label><span>Pitch</span><select id="book-tts-pitch"></select></label>
+              <label><span>Style</span><select id="book-tts-style"></select></label>
+              <label><span>Accent</span><select id="book-tts-accent"></select></label>
+              <label id="book-tts-gpu-precision-row" class="wide-setting" hidden>
+                <span>Browser GPU precision</span><select id="book-tts-gpu-precision"></select>
+              </label>
+              <button id="book-tts-more" type="button">TTS model settings…</button>
+            </div>
+          </details>
+          <button id="read-book-chapter" class="book-reader-speech" type="button"
+            data-read-aloud-subject="chapter">
+            <span class="read-aloud-icon" aria-hidden="true"></span>
+            <span id="read-book-label" class="read-aloud-label">Read chapter</span>
+          </button>
+        </header>
+        <div id="book-reader-status" class="book-reader-status" role="status"></div>
+        <div id="book-document" class="book-document">
+          <article id="book-chapter-content" data-message-id="reader-chapter">
+            <div class="message-content book-chapter-content"></div>
+          </article>
+        </div>
+        <footer class="book-reader-footer">
+          <button id="previous-book-chapter" type="button" aria-label="Previous chapter" title="Previous chapter">←</button>
+          <div class="book-position">
+            <input id="book-speech-position" type="range" min="0" max="1" value="0"
+              aria-label="Narration position">
+            <div>
+              <span id="book-progress">Chapter 1</span>
+              <span id="book-speech-progress">Start</span>
+            </div>
+          </div>
+          <button id="next-book-chapter" type="button" aria-label="Next chapter" title="Next chapter">→</button>
+        </footer>
       </section>
     </main>
   </div>

@@ -243,7 +243,7 @@ does not silently fall back to CPU.
 
 ## Browser Workflow
 
-The application shell, Chat view, Reader placeholder, message rendering,
+The application shell, Chat view, EPUB Reader, message rendering,
 Markdown, attachments, settings, and voice-mode controller come from
 [`web/ui/`](./ui/), which is also embedded in the native desktop
 application. This directory contains only the WASM host adapter, model workers,
@@ -280,8 +280,18 @@ Model Cache and browser model-loading controls are browser-only.
 
 Chat and Reader are top-level destinations in the application header. Chat owns
 its conversation sidebar; Reader uses the full workspace for its library.
-The library layout includes search, sorting, and an empty state. Book import
-and the dedicated open-book reading workspace are not implemented yet.
+The library supports local EPUB import, search, sorting, removal, chapter
+navigation, reading progress, and TTS narration. Browser EPUB parsing handles
+stored or deflated ZIP entries locally with archive, entry, expanded-size,
+path, and CRC checks. Original EPUB blobs use a dedicated Cache Storage cache
+at the application origin; bounded metadata and progress remain in local
+storage. Reloading reparses a cached package and requested chapter without a
+server or model load. The in-memory provider retains at most two parsed
+archives and lazily decompresses chapter content.
+The open-book toolbar includes diffusion steps, delivery, gender, age, pitch,
+style, accent, and browser GPU precision where available. Changes persist
+through the shared TTS settings and restart active narration at the current text
+position. Model loading and diagnostics remain in the full TTS settings panel.
 
 When the local OmniVoice package is available during `make wasm`, the build
 creates a chunked browser manifest under `models/omnivoice`, with chunks of up
@@ -411,6 +421,15 @@ reference, and 46,080 samples at 24 kHz (1.92 s including padding):
 | W8A8 packed intrinsic | 1.07-1.08 | about 0.84 GB |
 | W8A8 selected floating kernel | 0.79-0.80 | about 0.84 GB |
 | Native Metal reference | 0.35-0.36 | not compared |
+
+An October 18 reproduction using the identical checkpoint and fixture did not
+reproduce the original W8A8 number: the historical `28467d9` binary measured
+1.13-1.15 RTF and the current binary measured 1.09-1.35 in a fresh Chromium
+156 profile. VS Code's Electron/Chromium 150 browser measured about 1.5 RTF.
+Installing the current 39-frame cached voice prompt increased one controlled
+run from 1.92 to 2.17 RTF. These comparisons rule out a current W8A8 fallback
+or a diffusion-kernel regression, but show that the earlier 0.79-0.80 result is
+not a stable cross-browser performance expectation.
 
 RTF includes generation and required codec work, not model load, playback, or
 diagnostic CPU reference decoding. Warm preparation misses were zero. These are

@@ -15,6 +15,7 @@ class DesktopBackend {
   #connection = 0;
   #disconnecting = false;
   #client;
+  #nextEbookStream = 0x40000000;
   #nextImageStream = 1;
   #transport;
   #channel;
@@ -140,6 +141,40 @@ class DesktopBackend {
     if (!this.#transport?.open)
       throw new Error('The local session is reconnecting');
     this.#transport.postBinary(frame);
+  }
+
+  async importEbook(blob, name = 'Book.epub') {
+    if (!(blob instanceof Blob) || !blob.size || blob.size > 64 * 1024 * 1024)
+      throw new Error('Choose an EPUB no larger than 64 MiB');
+    if (!this.#channel || !this.#transport?.open)
+      throw new Error('The local session is reconnecting');
+    const streamId = this.#nextEbookStream++;
+    await this.#channel.request('ebook.start', {
+      stream_id: streamId,
+      size: blob.size,
+      name: String(name).slice(0, 256),
+    });
+    let sequence = 0;
+    for (let offset = 0; offset < blob.size; offset += 64 * 1024) {
+      const payload = new Uint8Array(await blob.slice(offset, offset + 64 * 1024).arrayBuffer());
+      const frame = new Uint8Array(24 + payload.length);
+      frame.set([0x4b, 0x44, 0x41, 0x31, 1, 4], 0);
+      const header = new DataView(frame.buffer);
+      header.setUint32(8, streamId, true);
+      header.setUint32(12, sequence++, true);
+      header.setUint32(16, 0, true);
+      header.setUint32(20, payload.length, true);
+      frame.set(payload, 24);
+      this.#transport.postBinary(frame);
+      await this.#transport.waitForDrain();
+    }
+    return this.#channel.request('ebook.finish', {stream_id: streamId});
+  }
+
+  async loadEbookChapter(bookId, chapter) {
+    if (!this.#channel || !this.#transport?.open)
+      throw new Error('The local session is reconnecting');
+    return this.#channel.request('ebook.chapter', {book_id: bookId, chapter});
   }
 
   async prepareMessages(messages) {

@@ -17,6 +17,16 @@ window. Never use `--dev` with an exposed or forwarded port.
 `make app-dev` builds and runs this mode on port `10010`. Override the defaults
 with `APP_CONFIG=path/to/config.yaml` or `APP_PORT=another-loopback-port`.
 
+Release builds package the UI as one deterministic ZIP and link that binary
+resource directly into the executable through LiteApp's
+`liteapp_embed_archive()`. C++ compiles only the small `std::span` accessor and
+never parses generated JavaScript, CSS, HTML, or ZIP byte initializers. UI-only
+edits therefore restage assets, rebuild the resource object, and relink without
+recompiling the application.
+`web/ui/assets.txt` is the shared asset inventory; `desktop/assets.txt` adds
+desktop-only destination/source mappings. CMake derives every staging and
+archive dependency from those manifests and contains no asset path list.
+
 ## Shared application configuration
 
 Desktop and Wasm consume the same canonical YAML. The Web build copies it as
@@ -48,8 +58,9 @@ Every command and event is a JSON object:
 {"v":1,"id":"request UUID","type":"chat.start","seq":0,"payload":{}}
 ```
 
-Client commands are `chat.start`, `image.start`, `image.finish`, `asr.start`,
-`asr.stop`, `tts.start`, `settings.system_prompt.set`, and `cancel`. Server events are `session.ready`,
+Client commands are `chat.start`, `image.start`, `image.finish`, `ebook.start`,
+`ebook.finish`, `ebook.chapter`, `asr.start`, `asr.stop`, `tts.start`,
+`settings.system_prompt.set`, and `cancel`. Server events are `session.ready`,
 `settings.system_prompt.updated`, modality-specific `started`, `partial`/`delta`,
 and `completed` events, `request.cancelled`, and `error`. Sequence numbers are
 monotonic within each request.
@@ -61,6 +72,21 @@ each upload to 32 MiB, writes an unguessable request-scoped temporary file for
 the existing multimodal generator API, and removes it after completion,
 cancellation, or disconnect. Browser-provided filesystem paths are never
 accepted.
+
+The desktop reader uploads local EPUB files with binary kind `4`. Archives are
+limited to 64 MiB and opened with bounded entry, expanded-size, and path checks.
+The native session reads package metadata and spine chapters without exposing a
+host filesystem path. The UI stores the original EPUB in browser Cache Storage,
+keeps library metadata and chapter progress in local storage, and re-uploads the
+archive after a native reconnect. Chapter narration uses the same segmented TTS
+controller and playback worklet as chat read-aloud. The reading surface hides
+global chrome while a book is open and auto-hides its compact controls.
+Narration highlights the active text; clicking chapter text or releasing the
+draggable narration marker cancels the current stream and resumes from the
+selected word. The compact reader bar exposes diffusion steps, delivery,
+gender, age, pitch, style, accent, and browser GPU precision where available.
+Changing any setting restarts active narration at the current position. Its
+**TTS model settings…** action opens model loading and diagnostics.
 
 Chat publishes each tokenizer-safe `GenerationEvent.text` delta immediately.
 ASR accepts rolling microphone audio and emits bounded partial snapshots before
@@ -89,7 +115,7 @@ with this 24-byte little-endian header:
 |---:|---:|---|
 | 0 | 4 | ASCII `KDA1` |
 | 4 | 1 | Protocol version (`1`) |
-| 5 | 1 | Kind: `1` ASR input, `2` TTS output, `3` image input |
+| 5 | 1 | Kind: `1` ASR input, `2` TTS output, `3` image input, `4` EPUB input |
 | 6 | 2 | Reserved |
 | 8 | 4 | Stream ID |
 | 12 | 4 | Sequence number |
