@@ -378,6 +378,14 @@ if(KIDI_BUILD_DESKTOP_APP)
         "${KIDI_DESKTOP_WEB_STAGE}/libs/dompurify/purify.es.mjs" COPYONLY)
     configure_file("web/libs/highlightjs/highlight.min.js"
         "${KIDI_DESKTOP_WEB_STAGE}/libs/highlightjs/highlight.min.js" COPYONLY)
+    configure_file("third_party/liteapp/web/transport/websocket-transport.mjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/websocket-transport.mjs" COPYONLY)
+    configure_file("third_party/liteapp/web/transport/channel.mjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/channel.mjs" COPYONLY)
+    configure_file("third_party/liteapp/web/host/event-client.mjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/event-client.mjs" COPYONLY)
+    configure_file("third_party/liteapp/web/transport/protocol.mjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/protocol.mjs" COPYONLY)
     file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}/libs/mermaid")
     configure_file("web/libs/mermaid/mermaid.min.js"
         "${KIDI_DESKTOP_WEB_STAGE}/libs/mermaid/mermaid.min.js" COPYONLY)
@@ -401,6 +409,10 @@ if(KIDI_BUILD_DESKTOP_APP)
             libs/dompurify/purify.es.mjs
             libs/highlightjs/highlight.min.js
             libs/mermaid/mermaid.min.js
+            channel.mjs
+            event-client.mjs
+            protocol.mjs
+            websocket-transport.mjs
             icons/mic.svg
             icons/message-square.svg
             icons/square.svg
@@ -411,8 +423,8 @@ if(KIDI_BUILD_DESKTOP_APP)
     target_link_libraries(kidi_app PRIVATE
         kidi::kidi
         kidi_desktop_assets
-        liteapp::http
-        liteapp::platform
+        liteapp::app
+        liteapp::service
         liteapp::vfs
         nlohmann_json::nlohmann_json
     )

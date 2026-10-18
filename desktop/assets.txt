@@ -1,0 +1,15 @@
+/backend.js	web/hosts/desktop/backend.js
+/capture-worklet.js	web/hosts/desktop/capture-worklet.js
+/playback-worklet.js	web/hosts/desktop/playback-worklet.js
+/channel.mjs	third_party/liteapp/web/transport/channel.mjs
+/event-client.mjs	third_party/liteapp/web/host/event-client.mjs
+/protocol.mjs	third_party/liteapp/web/transport/protocol.mjs
+/websocket-transport.mjs	third_party/liteapp/web/transport/websocket-transport.mjs
+/icons/mic.svg	web/libs/lucide-static/icons/mic.svg
+/icons/message-square.svg	web/libs/lucide-static/icons/message-square.svg
+/icons/settings.svg	web/libs/lucide-static/icons/settings.svg
+/icons/square.svg	web/libs/lucide-static/icons/square.svg
+/libs/marked/marked.esm.js	web/libs/marked/marked.esm.js
+/libs/dompurify/purify.es.mjs	web/libs/dompurify/purify.es.mjs
+/libs/highlightjs/highlight.min.js	web/libs/highlightjs/highlight.min.js
+/libs/mermaid/mermaid.min.js	web/libs/mermaid/mermaid.min.js

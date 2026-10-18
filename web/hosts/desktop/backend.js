@@ -1,16 +1,29 @@
 import {readImage} from './images.js';
+import {RequestChannel} from './channel.mjs';
+import {EventClient} from './event-client.mjs';
+import {connectWebSocket} from './websocket-transport.mjs';
+
+const COMPLETION_EVENTS = new Map([
+  ['settings.system_prompt.set', 'settings.system_prompt.updated'],
+  ['chat.start', 'chat.completed'],
+  ['asr.start', 'asr.completed'],
+  ['tts.start', 'tts.completed'],
+]);
 
 class DesktopBackend {
   #callbacks;
+  #connection = 0;
+  #disconnecting = false;
+  #client;
   #nextImageStream = 1;
-  #uploads = new Map();
-  #socket;
-  #speechSocket;
-  #speechQueue = [];
-  #speechRequests = new Set();
+  #transport;
+  #channel;
+  #speechClient;
+  #speechTransport;
+  #speechChannel;
 
   get bufferedAmount() {
-    return Math.max(this.#socket?.bufferedAmount || 0, this.#speechSocket?.bufferedAmount || 0);
+    return Math.max(this.#transport?.bufferedAmount || 0, this.#speechTransport?.bufferedAmount || 0);
   }
 
   async status() {
@@ -22,86 +35,111 @@ class DesktopBackend {
 
   connect(callbacks) {
     this.#callbacks = callbacks;
+    const connection = ++this.#connection;
+    this.#disconnecting = false;
+    this.#client?.dispose('The local session was replaced');
+    this.#speechClient?.dispose('The native speech channel was replaced');
+    this.#client = null;
+    this.#speechClient = null;
+    this.#channel = null;
+    this.#speechChannel = null;
+    this.#transport = null;
+    this.#speechTransport = null;
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const address = `${protocol}//${location.host}/ws`;
-    const socket = new WebSocket(address);
-    const speech = new WebSocket(address);
-    this.#socket = socket;
-    this.#speechSocket = speech;
-    socket.binaryType = 'arraybuffer';
-    speech.binaryType = 'arraybuffer';
-    socket.addEventListener('open', () => callbacks.onOpen?.());
-    speech.addEventListener('open', () => {
-      if (this.#speechSocket !== speech) return;
-      for (const message of this.#speechQueue.splice(0)) speech.send(message);
-    });
-    const receive = (event, speechChannel) => {
-      if (typeof event.data === 'string') {
-        try {
-          const message = JSON.parse(event.data);
-          if (speechChannel && message.type === 'session.ready') return;
-          const upload = this.#uploads.get(message.id);
-          if (upload && (message.type === 'image.completed' || message.type === 'error')) {
-            this.#uploads.delete(message.id);
-            if (message.type === 'image.completed') upload.resolve();
-            else upload.reject(new Error(message.payload?.message || 'Image upload failed'));
-            return;
-          }
-          if (speechChannel && ['tts.completed', 'request.cancelled', 'error'].includes(message.type))
-            this.#speechRequests.delete(message.id);
-          callbacks.onEvent?.(message);
-        }
-        catch { callbacks.onError?.(new Error('Received an invalid local protocol message')); }
-      } else {
-        callbacks.onAudio?.(event.data);
+    Promise.all([connectWebSocket(address), connectWebSocket(address)]).then(([transport, speechTransport]) => {
+      if (connection !== this.#connection) {
+        transport.close();
+        speechTransport.close();
+        return;
       }
-    };
-    socket.addEventListener('message', event => receive(event, false));
-    speech.addEventListener('message', event => receive(event, true));
-    socket.addEventListener('close', () => {
-      if (this.#socket === socket) this.#socket = null;
-      if (this.#speechSocket === speech && speech.readyState < WebSocket.CLOSING) speech.close();
-      const error = new Error('The local session disconnected during image upload');
-      for (const upload of this.#uploads.values()) upload.reject(error);
-      this.#uploads.clear();
+      const channel = new RequestChannel(transport);
+      const speechChannel = new RequestChannel(speechTransport);
+      const emit = event => callbacks.onEvent?.({
+        v: 1, id: event.id, type: event.type, seq: event.sequence, payload: event.payload,
+      });
+      const mapError = speech => error => ({
+        code: this.#disconnecting && speech ? 'speech_disconnected'
+          : this.#disconnecting ? 'disconnected'
+            : error.code || 'service_error',
+        message: error.message || 'Local service request failed',
+        ...(error.details === undefined ? {} : {details: error.details}),
+      });
+      const client = new EventClient(channel, {
+        completionEvents: COMPLETION_EVENTS,
+        mapError: mapError(false),
+        onEvent: emit,
+      });
+      const speechClient = new EventClient(speechChannel, {
+        completionEvents: COMPLETION_EVENTS,
+        mapError: mapError(true),
+        onEvent: emit,
+      });
+      this.#transport = transport;
+      this.#channel = channel;
+      this.#client = client;
+      this.#speechTransport = speechTransport;
+      this.#speechChannel = speechChannel;
+      this.#speechClient = speechClient;
+      transport.subscribeBinary(data => callbacks.onAudio?.(data));
+      speechTransport.subscribeBinary(data => callbacks.onAudio?.(data));
+      let closed = false;
+      const disconnected = speech => {
+        if (closed || connection !== this.#connection) return;
+        closed = true;
+        this.#disconnecting = true;
+        this.#transport = null;
+        this.#speechTransport = null;
+        client.dispose(speech
+          ? 'The native speech channel disconnected'
+          : 'The local session disconnected');
+        speechClient.dispose(speech
+          ? 'The native speech channel disconnected'
+          : 'The local session disconnected');
+        this.#client = null;
+        this.#speechClient = null;
+        this.#channel = null;
+        this.#speechChannel = null;
+        callbacks.onClose?.();
+      };
+      transport.closed.then(() => disconnected(false));
+      speechTransport.closed.then(() => disconnected(true));
+      callbacks.onOpen?.();
+    }).catch(error => {
+      if (connection !== this.#connection) return;
+      callbacks.onError?.(error);
       callbacks.onClose?.();
     });
-    speech.addEventListener('close', () => {
-      if (this.#speechSocket !== speech) return;
-      this.#speechSocket = null;
-      this.#speechQueue.length = 0;
-      for (const id of this.#speechRequests)
-        callbacks.onEvent?.({v: 1, id, type: 'error', seq: 0,
-          payload: {code: 'speech_disconnected', message: 'The native speech channel disconnected'}});
-      this.#speechRequests.clear();
-      if (this.#socket?.readyState < WebSocket.CLOSING) this.#socket.close();
-    });
-    socket.addEventListener('error', () => socket.close());
-    speech.addEventListener('error', () => speech.close());
   }
 
   send(type, id, payload = {}) {
-    const message = JSON.stringify({v: 1, id, type, payload});
-    const speechRequest = type === 'tts.start' ||
-      (type === 'cancel' && payload.scope === 'speech' && this.#speechRequests.has(id));
-    if (speechRequest) {
-      if (!this.#speechSocket || this.#speechSocket.readyState === WebSocket.CLOSING ||
-          this.#speechSocket.readyState === WebSocket.CLOSED)
-        throw new Error('The native speech channel is reconnecting');
-      if (type === 'tts.start') this.#speechRequests.add(id);
-      if (this.#speechSocket.readyState === WebSocket.OPEN) this.#speechSocket.send(message);
-      else this.#speechQueue.push(message);
+    if (type === 'cancel') {
+      if (!this.#client?.cancel(id) && !this.#speechClient?.cancel(id))
+        this.#callbacks?.onEvent?.({v: 1, id, type: 'request.cancelled', seq: 0, payload});
       return;
     }
-    if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN)
-      throw new Error('The local session is reconnecting');
-    this.#socket.send(message);
+    if (type === 'asr.stop') {
+      if (!this.#channel) throw new Error('The local session is reconnecting');
+      this.#channel.request('asr.stop', {request_id: id}).catch(error => {
+        if (error.name !== 'AbortError')
+          this.#callbacks?.onEvent?.({v: 1, id, type: 'error', seq: 0,
+            payload: {code: error.code || 'service_error', message: error.message}});
+      });
+      return;
+    }
+    const speech = type === 'tts.start';
+    const client = speech ? this.#speechClient : this.#client;
+    if (!client || !(speech ? this.#speechTransport : this.#transport)?.open)
+      throw new Error(speech
+        ? 'The native speech channel is reconnecting'
+        : 'The local session is reconnecting');
+    client.request(type, id, payload);
   }
 
   sendBinary(frame) {
-    if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN)
+    if (!this.#transport?.open)
       throw new Error('The local session is reconnecting');
-    this.#socket.send(frame);
+    this.#transport.postBinary(frame);
   }
 
   async prepareMessages(messages) {
@@ -111,9 +149,9 @@ class DesktopBackend {
       for (const image of message.images || []) {
         const blob = await readImage(image);
         const streamId = this.#nextImageStream++;
-        const uploadId = crypto.randomUUID();
-        const completed = new Promise((resolve, reject) => this.#uploads.set(uploadId, {resolve, reject}));
-        this.send('image.start', uploadId, {
+        if (!this.#channel || !this.#transport?.open)
+          throw new Error('The local session is reconnecting');
+        await this.#channel.request('image.start', {
           stream_id: streamId,
           size: blob.size,
           content_type: blob.type,
@@ -131,11 +169,10 @@ class DesktopBackend {
           header.setUint32(16, 0, true);
           header.setUint32(20, payload.length, true);
           frame.set(payload, 24);
-          this.sendBinary(frame);
-          await this.#waitForDrain();
+          this.#transport.postBinary(frame);
+          await this.#transport.waitForDrain();
         }
-        this.send('image.finish', uploadId, {stream_id: streamId});
-        await completed;
+        await this.#channel.request('image.finish', {stream_id: streamId});
         images.push(streamId);
       }
       prepared.push(images.length
@@ -145,16 +182,6 @@ class DesktopBackend {
     return prepared;
   }
 
-  async #waitForDrain() {
-    const started = performance.now();
-    while (this.#socket?.readyState === WebSocket.OPEN && this.#socket.bufferedAmount > 512 * 1024) {
-      if (performance.now() - started > 30000)
-        throw new Error('Image upload could not keep up with the local server');
-      await new Promise(resolve => setTimeout(resolve, 5));
-    }
-    if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN)
-      throw new Error('The local session disconnected during image upload');
-  }
 }
 
 export const backend = new DesktopBackend();

@@ -48,7 +48,8 @@ kidi_add_test(kidi_rtg_int8_precision_test tests/kidi/layers/int8_precision_test
 kidi_add_test(kidi_qwen3_test tests/kidi/model/qwen3_test.cpp)
 if(TARGET liteapp_http)
     kidi_add_test(kidi_desktop_websocket_test tests/kidi/desktop/websocket_test.cpp)
-    target_link_libraries(kidi_desktop_websocket_test PRIVATE liteapp::http liteapp::httplib)
+    target_link_libraries(kidi_desktop_websocket_test PRIVATE
+        liteapp::http liteapp::service liteapp::httplib)
 endif()
 
 if(KIDI_BUILD_INTEGRATION_TESTS)

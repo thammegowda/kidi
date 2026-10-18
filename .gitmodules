@@ -26,3 +26,6 @@
 [submodule "third_party/tahoma-vision"]
 	path = third_party/tahoma-vision
 	url = https://github.com/thammegowda/tahoma-vision.git
+[submodule "third_party/liteapp"]
+	path = third_party/liteapp
+	url = https://github.com/thammegowda/liteapp.git
