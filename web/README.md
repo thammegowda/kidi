@@ -48,6 +48,36 @@ The required libraries and icons are vendored in
 [`web/libs/`](./libs/README.md), with versions and licenses recorded
 there. No npm installation or dependency download is needed for the web build.
 
+### Deployment regression tests
+
+`make web-test` runs the browser unit tests, including the real site packager
+with small runtime fixtures. The packaging test checks local module imports,
+re-exports, literal dynamic imports, and worker/asset URLs in the generated
+application, and links the packaged LiteApp entry point. LiteApp's complete
+browser module tree is shipped rather than a hand-maintained list of imports.
+
+To test a built site in a real browser:
+
+```bash
+npm ci --prefix web --ignore-scripts --no-audit --no-fund
+npm --prefix web exec -- playwright install chromium
+make wasm WEB_DIR=build-pages
+make web-smoke-test WEB_DIR=build-pages
+```
+
+The smoke test serves only the generated artifact under `/kidi/`, without
+COOP/COEP server headers, using a fresh Chromium context. It verifies the
+isolation service worker, backend initialization, settings and view navigation,
+the shared runtime worker's request/response transport, and native configuration
+and memory calls in both actual WebAssembly modules
+(including CPU pthread startup). JavaScript errors, failed assets, and external
+requests fail the test. It does not download model weights or require a GPU;
+model inference and hardware WebGPU execution remain separate tests.
+
+The Pages workflow runs both test layers on pull requests and before uploading
+the exact tested artifact for deployment. Source-only tests and checking that
+the HTML and Wasm files exist do not establish that the deployed app can start.
+
 The JavaScript files have distinct roles:
 
 | Files | Run in | Purpose |
@@ -56,7 +86,7 @@ The JavaScript files have distinct roles:
 | `backend.js`, `runtime-client.mjs` | Browser main thread | Shared UI adapter and logical GPU model leases |
 | `gpu-runtime-worker.mjs`, `runtime-scheduler.mjs`, `model-residency.mjs`, `scoped-model.mjs` | One GPU worker | One device/Wasm heap, isolated native model sessions, priority scheduling, scoped files/weights, and residency |
 | `inference-worker.mjs`, `asr-worker.mjs`, `tts-worker.mjs`, `model-cache.mjs` | Workers | CPU execution, standalone benchmark/reference execution, Hub downloads, and persistent model cache |
-| `build.mjs`, `wasm-glue.mjs` | Node.js during build | Compile/package the wasm32 variants and fix their generated heap indexing above 2 GiB |
+| `build.mjs`, `package-site.mjs`, `wasm-glue.mjs` | Node.js during build | Compile/package the wasm32 variants and fix their generated heap indexing above 2 GiB |
 | `web/libs/` | Build inputs | Pinned isolation helper, selected icons, and JavaScript parser dependencies |
 
 Only browser assets and their licenses are copied to the deployment directory.

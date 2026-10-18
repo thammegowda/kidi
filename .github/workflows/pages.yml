@@ -93,8 +93,8 @@ jobs:
         run: |
           "$RUNNER_TEMP/emsdk/emsdk" activate "$EMSCRIPTEN_VERSION"
 
-      - name: Test browser model loader
-        run: node --test tests/browser/*_test.mjs
+      - name: Test browser units and site packaging
+        run: make web-test
 
       - name: Build WebGPU and pthread WebAssembly
         shell: bash
@@ -118,6 +118,14 @@ jobs:
           test ! -e build-pages/single
           test -z "$(find build-pages -type l -print -quit)"
           test -z "$(find build-pages -name '*.safetensors' -print -quit)"
+
+      - name: Install browser smoke test tools
+        run: |
+          npm ci --prefix web --ignore-scripts --no-audit --no-fund
+          npm --prefix web exec -- playwright install --with-deps chromium
+
+      - name: Test packaged Pages app in Chromium
+        run: make web-smoke-test WEB_DIR=build-pages
 
       - name: Upload Pages artifact
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'

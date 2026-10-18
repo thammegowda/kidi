@@ -384,11 +384,17 @@ required. Individual targets are `native-test`, `python-test`, `web-test`, and
 `regression-test`. See [tests/data/README.md](tests/data/README.md) for fixtures
 and numerical contracts.
 
-Browser loader/generated-glue tests can also run directly:
+Browser unit, loader, generated-glue, and site-packaging tests:
 
 ```bash
-node --test tests/browser/*.mjs
+make web-test
 ```
+
+For production-like browser startup validation of a built artifact, run
+`make web-smoke-test WEB_DIR=build-pages` after installing the browser test tools
+and building the site as described in the
+[browser guide](web/README.md#deployment-regression-tests).
+The Pages workflow requires this check before uploading the artifact.
 
 Android model-download contracts run locally without installing over a phone app:
 

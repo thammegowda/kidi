@@ -8,6 +8,7 @@ test('shared entry assets and audio worklets resolve within repository subpaths'
     const app = await readFile(new URL('../../web/ui/app.js', import.meta.url), 'utf8');
     const worker = await readFile(new URL('../../web/hosts/wasm/tts-worker.mjs', import.meta.url), 'utf8');
     const build = await readFile(new URL('../../web/tools/build.mjs', import.meta.url), 'utf8');
+    const packager = await readFile(new URL('../../web/tools/package-site.mjs', import.meta.url), 'utf8');
     const desktop = await readFile(new URL('../../desktop/app.cpp', import.meta.url), 'utf8');
     const cmake = await readFile(new URL('../../CMakeLists.txt', import.meta.url), 'utf8');
     const manifest = await readFile(new URL('../../web/ui/assets.txt', import.meta.url), 'utf8');
@@ -31,5 +32,5 @@ test('shared entry assets and audio worklets resolve within repository subpaths'
     for (const asset of ['speech-highlights.js', 'pause.svg', 'play.svg']) {
         assert.match(manifest, new RegExp(asset.replace('.', '\\.')));
     }
-    for (const consumer of [desktop, cmake, build]) assert.match(consumer, /web\/ui\/assets\.txt/);
+    for (const consumer of [desktop, cmake, packager]) assert.match(consumer, /web\/ui\/assets\.txt/);
 });
