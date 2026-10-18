@@ -356,19 +356,9 @@ if(KIDI_BUILD_DESKTOP_APP)
         "${KIDI_DESKTOP_WEB_STAGE}/libs/highlightjs"
         "${KIDI_DESKTOP_WEB_STAGE}/icons"
     )
-    set(KIDI_SHARED_WEB_FILES
-        app.js
-        icons/audio-waveform.svg
-        icons/book-open.svg
-        icons/copy.svg
-        icons/volume.svg
-        index.html
-        images.js
-        markdown.js
-        mermaid.js
-        speech-highlights.js
-        style.css
-    )
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/web/ui/assets.txt")
+    file(STRINGS "web/ui/assets.txt" KIDI_SHARED_WEB_FILES)
     set(KIDI_DESKTOP_WEB_FILES
         backend.js
         capture-worklet.js

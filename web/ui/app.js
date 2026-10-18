@@ -1,6 +1,7 @@
 import {renderMarkdown, renderStreamingMarkdown} from './markdown.js';
 import {backend} from './backend.js';
 import {MAX_IMAGE_BYTES, MAX_IMAGES, readImage, removeUnusedImages, storeImage} from './images.js';
+import {SpeechController} from './speech-controller.js';
 import {renderSpeechHighlights} from './speech-highlights.js';
 
 const $ = id => document.getElementById(id);
@@ -36,6 +37,25 @@ let runtimeLoadId;
 let modelLoadProgress;
 let cacheBusy = false;
 let cachePath = [];
+const speech = new SpeechController({
+  send: (type, id, payload) => send(type, id, payload),
+  nextWireStream: () => streamId++,
+  onProgress: (current, payload) => updateTtsProgress(current.id, payload),
+  onSegment: (current, segment) => {
+    const stream = ttsStreams.get(current.streamId);
+    if (!stream) return;
+    stream.segments ||= new Map();
+    stream.segments.set(segment.id, {...segment, status: 'ready'});
+    renderSpeechHighlights(ttsStreams.values());
+  },
+  onPcm: (_current, frame) => handlePcm(frame),
+  onCompleted: current => completeAudioStream(current.streamId),
+  onCancelled: current => {
+    const stream = ttsStreams.get(current.streamId);
+    if (stream) finishTts(stream.button, current.streamId);
+  },
+  onError: (current, error) => audioFailure(current.streamId, error),
+});
 function formatCacheSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
@@ -336,8 +356,9 @@ function connectBackend() {
     onOpen: () => { state.socketReady = true; renderRuntime(); },
     onEvent: handleEvent,
     onAudio: buffer => handleAudio(buffer).catch(error => audioFailure(playbackStreamId, error)),
-    onPcm: frame => handlePcm(frame),
+    onPcm: frame => speech.handlePcm(frame) || handlePcm(frame),
     onClose: () => {
+    speech.reset('The local speech transport disconnected');
     if (activeRequest?.kind === 'chat') {
       const chat = activeChat();
       if (chat?.messages.at(-1)?.pending) {
@@ -473,13 +494,20 @@ function renderMessages() {
 function renderRuntime() {
   const asrActive = activeRequest?.kind === 'asr';
   const playingVoiceReply = voiceMode && playbackStreamId !== null;
-  const label = asrActive ? (recording ? 'Listening…' :
+  const activeSpeech = ttsStreams.get(playbackStreamId);
+  const pauseSeconds = recording ? (recording.silenceLimitMs / 1000).toFixed(1).replace(/\.0$/, '') : '';
+  const listening = recording?.heardSpeech && voiceMode ?
+    `Listening · pause ${pauseSeconds}s to send` : recording ? 'Listening for speech…' : '';
+  const label = asrActive ? (recording ? listening :
     activeRequest.asrStatus || (asrFinalizing ? 'Finalizing dictation…' : 'Preparing speech recognition…')) :
     activeRequest?.kind === 'chat' && voiceMode ?
-      (ttsStreams.get(playbackStreamId)?.bufferedFrames > 0 ? 'Speaking while writing…' : 'Kidi is thinking…') :
+      (activeSpeech?.paused ? 'Speech paused' :
+        activeSpeech?.bufferedFrames > 0 ? 'Speaking while writing…' : 'Kidi is thinking…') :
     activeRequest?.kind === 'tts' ? activeRequest.ttsStatus || 'Preparing speech…' :
     activeRequest?.kind === 'voice-tts' ? activeRequest.ttsStatus || 'Kidi is speaking…' :
     playingVoiceReply ? 'Kidi is speaking…' :
+    !state.busy && activeSpeech?.paused ? 'Speech paused' :
+    !state.busy && activeSpeech ? (activeSpeech.audioStarted ? 'Playing speech…' : 'Preparing speech…') :
     voiceMode ? 'Voice mode ready' :
     state.runtime.reloading ? 'Loading cached model…' :
     state.busy ? 'Generating locally…' : state.runtime.loading ?
@@ -494,7 +522,7 @@ function renderRuntime() {
   $('prompt').disabled = state.busy && !asrActive;
   $('prompt').readOnly = asrActive;
   $('mic').disabled = (state.busy && activeRequest?.kind !== 'asr') ||
-    (asrActive && !recording) || playbackStreamId !== null ||
+    (asrActive && !recording) || (playbackStreamId !== null && !activeSpeech?.paused) ||
     !state.socketReady || !state.components.asr?.enabled;
   $('voice-mode').disabled = (state.busy && !voiceMode) || (playbackStreamId !== null && !voiceMode) || !state.socketReady ||
     !state.components.asr?.enabled || !state.components.tts?.enabled;
@@ -600,7 +628,7 @@ function renderConfig() {
   $('tts-pitch').value = voice.pitch || 'moderate';
   $('tts-style').value = voice.style || '';
   $('tts-accent').value = voice.accent || '';
-  $('tts-gpu-precision').value = settings.gpu_precision || 'f32';
+  $('tts-gpu-precision').value = settings.gpu_precision || 'w8a8';
   $('tts-availability').textContent = tts.enabled ? 'Available' : 'Model disabled';
   $('system-prompt').value = chat.system_prompt || '';
   const configured = chat.configured_system_prompt || '';
@@ -624,14 +652,20 @@ function initializeTtsSettings() {
   if (ttsSettingsInitialized) return;
   const defaults = state.components.tts?.settings || {};
   const saved = state.ttsSettings || {};
+  const browserGpu = state.runtime.host === 'wasm' && state.runtime.requested_backend === 'webgpu';
+  const savedPrecision = ['f32', 'mixed-f16', 'w8a8'].includes(saved.gpu_precision)
+    ? saved.gpu_precision : defaults.gpu_precision || 'w8a8';
+  const migratePrecision = browserGpu && saved.gpu_precision_version !== 1 && savedPrecision === 'f32';
   state.ttsSettings = {
     language: saved.language || defaults.language || 'English',
     steps: Number.isInteger(saved.steps) ? saved.steps : defaults.steps || 10,
     pace: Number.isFinite(saved.pace) ? saved.pace : defaults.pace || 1,
-    gpu_precision: ['f32', 'mixed-f16', 'w8a8'].includes(saved.gpu_precision) ? saved.gpu_precision : 'f32',
+    gpu_precision: migratePrecision ? 'w8a8' : savedPrecision,
+    gpu_precision_version: 1,
     voice: {...(defaults.voice || {}), ...(saved.voice || {})},
   };
   ttsSettingsInitialized = true;
+  if (migratePrecision) queueMicrotask(persist);
 }
 
 function updateTtsSettings() {
@@ -641,6 +675,7 @@ function updateTtsSettings() {
     steps: Number.isInteger(steps) && steps >= 1 && steps <= 128 ? steps : 10,
     pace: Number($('tts-pace').value),
     gpu_precision: $('tts-gpu-precision').value,
+    gpu_precision_version: 1,
     voice: {
       gender: $('tts-gender').value,
       age: $('tts-age').value,
@@ -654,6 +689,7 @@ function updateTtsSettings() {
 
 function ttsRequestOptions() {
   const options = {...state.ttsSettings};
+  delete options.gpu_precision_version;
   if (state.runtime.host !== 'wasm') delete options.gpu_precision;
   return options;
 }
@@ -709,22 +745,31 @@ function finishRequest() {
   state.busy = false; activeRequest = null; renderRuntime(); $('prompt').focus();
 }
 
-function setReadAloudState(button, active) {
+function setReadAloudState(button, state) {
   if (!button) return;
-  button.classList.toggle('active', active);
-  button.setAttribute('aria-label', active ? 'Stop reading response' : 'Read response aloud');
-  button.title = active ? 'Stop reading response' : 'Read response aloud';
+  const mode = state === 'playing' || state === 'paused' ? state : 'idle';
+  button.classList.toggle('active', mode !== 'idle');
+  button.classList.toggle('paused', mode === 'paused');
+  const label = mode === 'playing' ? 'Pause reading response' :
+    mode === 'paused' ? 'Resume reading response' : 'Read response aloud';
+  button.setAttribute('aria-label', label);
+  button.title = label;
 }
 
 function appendReadAloud(body, text) {
   const read = document.createElement('button');
   read.type = 'button'; read.className = 'message-action read-aloud';
   read.innerHTML = '<span class="read-aloud-icon" aria-hidden="true"></span>';
-  setReadAloudState(read, false);
-  read.addEventListener('click', () => {
+  setReadAloudState(read, 'idle');
+  read.addEventListener('click', async () => {
     const stream = [...ttsStreams.entries()].find(([, value]) => value.button === read);
-    if (stream) stopTts(stream[0]);
-    else startTts(text, read);
+    if (stream) {
+      if (stream[1].paused) resumeTts(stream[0]);
+      else pauseTts(stream[0]);
+    } else {
+      for (const [id] of [...ttsStreams]) await stopTts(id);
+      startTts(text, read);
+    }
   });
   body.append(read);
 }
@@ -784,8 +829,26 @@ function finalizeAssistant(message) {
   if (followOutput) requestAnimationFrame(() => { $('messages').scrollTop = $('messages').scrollHeight; });
 }
 
+function updateTtsProgress(id, payload) {
+  if (activeRequest?.id !== id) return;
+  if (ttsStreams.get(activeRequest.streamId)?.paused) {
+    activeRequest.ttsStatus = 'Speech paused';
+  } else if (payload.phase === 'loading' && payload.totalBytes > 0) {
+    const percent = Math.min(100, Math.floor((payload.loadedBytes || 0) / payload.totalBytes * 100));
+    activeRequest.ttsStatus = `Loading speech model · ${percent}%`;
+  } else if (payload.phase === 'fallback') {
+    activeRequest.ttsStatus = payload.message || 'Using threaded CPU speech…';
+  } else if (payload.phase === 'synthesizing') {
+    activeRequest.ttsStatus = payload.steps > 0 && payload.step > 0
+      ? `Synthesizing speech · ${payload.step}/${payload.steps}`
+      : 'Synthesizing speech…';
+  }
+  renderRuntime();
+}
+
 function handleEvent(event) {
   if (!event || event.v !== 1 || typeof event.type !== 'string') return;
+  if (speech.handleEvent(event)) return;
   const payload = event.payload || {};
   if (event.type === 'session.ready') {
     state.components = payload.components || {};
@@ -864,14 +927,24 @@ function handleEvent(event) {
     return;
   }
   if (event.type === 'chat.delta' && activeRequest?.id === event.id) {
-    streamText(payload.text || '');
+    const delta = payload.text || '';
+    streamText(delta);
+    if (activeRequest.voiceTurn) speech.append(event.id, delta);
     return;
   }
   if (event.type === 'chat.completed' && activeRequest?.id === event.id) {
     const speak = voiceMode && activeRequest.voiceTurn && activeRequest.voiceEpoch === voiceEpoch;
     const message = activeMessage();
+    const streamed = message?.content || '';
+    const completedText = payload.text || streamed;
+    if (speak) {
+      if (completedText.startsWith(streamed)) speech.append(event.id, completedText.slice(streamed.length), true);
+      else if (completedText.trim() === streamed.trim()) speech.append(event.id, '', true);
+      else speech.cancel(event.id, 'The streamed response changed before speech completed')
+        .catch(error => showNotice(error.message));
+    }
     if (message) {
-      message.content = payload.text || message.content;
+      message.content = completedText;
       message.pending = false;
       message.stats = payload.stats;
       const chat = activeChat(); chat.updatedAt = Date.now(); persist();
@@ -884,7 +957,7 @@ function handleEvent(event) {
       const stream = [...ttsStreams.entries()].find(([, value]) => value.requestId === event.id);
       if (stream) {
         stream[1].button = button;
-        setReadAloudState(button, true);
+        setReadAloudState(button, stream[1].paused ? 'paused' : 'playing');
         activeRequest.kind = 'voice-tts';
         activeRequest.streamId = stream[0];
         renderRuntime();
@@ -906,6 +979,7 @@ function handleEvent(event) {
     return;
   }
   if (event.type === 'asr.partial' && activeRequest?.id === event.id) {
+    if (asrFinalizing || !recording?.heardSpeech) return;
     $('prompt').value = `${payload.stable || ''}${payload.provisional || ''}`; resizePrompt();
     return;
   }
@@ -920,7 +994,7 @@ function handleEvent(event) {
       if ($('prompt').value.trim())
         setTimeout(() => {
           if (!voiceTurn || (voiceMode && epoch === voiceEpoch)) sendMessage();
-        }, 25);
+        }, voiceTurn ? 600 : 25);
       else if (voiceTurn) scheduleVoiceListening(voiceEpoch);
       else showNotice('No speech was recognized');
     }
@@ -942,42 +1016,7 @@ function handleEvent(event) {
     return;
   }
   if (event.type === 'tts.progress' && activeRequest?.id === event.id) {
-    if (payload.phase === 'loading' && payload.totalBytes > 0) {
-      const percent = Math.min(100, Math.floor((payload.loadedBytes || 0) / payload.totalBytes * 100));
-      activeRequest.ttsStatus = `Loading speech model · ${percent}%`;
-    } else if (payload.phase === 'fallback') {
-      activeRequest.ttsStatus = payload.message || 'Using threaded CPU speech…';
-    } else if (payload.phase === 'synthesizing') {
-      activeRequest.ttsStatus = payload.steps > 0 && payload.step > 0
-        ? `Synthesizing speech · ${payload.step}/${payload.steps}`
-        : 'Synthesizing speech…';
-    }
-    renderRuntime();
-    return;
-  }
-  if (event.type === 'voice.audio.started' && activeRequest?.id === event.id) {
-    const streamId = payload.stream_id;
-    playbackStreamId = streamId;
-    ttsStreams.set(streamId, {
-      button: null, completed: false, voiceTurn: true,
-      voiceEpoch: activeRequest.voiceEpoch, requestId: event.id, messageId: activeRequest.messageId,
-    });
-    activeRequest.streamId = streamId;
-    ensurePlayback().catch(error => showNotice(error.message));
-    return;
-  }
-  if (event.type === 'voice.audio.completed' && activeRequest?.id === event.id) {
-    completeAudioStream(payload.stream_id);
-    return;
-  }
-  if (event.type === 'voice.audio.error' && activeRequest?.id === event.id) {
-    const generating = activeRequest.kind === 'chat';
-    const stream = [...ttsStreams.entries()].find(([, value]) => value.requestId === event.id);
-    playback?.node.port.postMessage({type: 'reset'});
-    if (stream) finishTts(stream[1].button, stream[0]);
-    showNotice(payload.message || 'Voice playback failed');
-    stopVoiceMode(false);
-    if (!generating) finishRequest();
+    updateTtsProgress(event.id, payload);
     return;
   }
   if (event.type === 'voice.prepare.error' && activeRequest?.id === event.id) {
@@ -1094,12 +1133,14 @@ async function handleAudio(buffer) {
   const id = view.getUint32(8, true);
   const sampleRate = view.getUint32(16, true);
   const length = view.getUint32(20, true);
-  if (!ttsStreams.has(id)) return;
   if (length !== buffer.byteLength - 24 || length % 2) throw new Error('Invalid speech audio frame');
   const pcm = new Int16Array(buffer, 24, length / 2);
   const samples = new Float32Array(pcm.length);
   for (let index = 0; index < pcm.length; index++) samples[index] = pcm[index] / 32768;
-  return handlePcm({streamId: id, sequence: view.getUint32(12, true), sampleRate, samples});
+  const frame = {streamId: id, sequence: view.getUint32(12, true), sampleRate, samples};
+  if (speech.handlePcm(frame)) return;
+  if (!ttsStreams.has(id)) return;
+  return handlePcm(frame);
 }
 
 const playerBufferLimit = rate => rate * 6;
@@ -1118,6 +1159,7 @@ function handlePcm({streamId: id, sequence, sampleRate, samples, segmentId}) {
     if (ttsStreams.get(id) !== stream) return;
     if (!stream.audioStarted) {
       player.node.port.postMessage({type: 'start', streamId: id});
+      if (stream.paused) player.node.port.postMessage({type: 'pause', streamId: id});
       stream.audioStarted = true;
     }
     playbackStreamId = id;
@@ -1149,7 +1191,7 @@ function completeAudioStream(id) {
 
 function audioFailure(id, error) {
   const stream = ttsStreams.get(id);
-  if (stream?.requestId) send('cancel', stream.requestId, {scope: 'speech', message: error.message});
+  if (stream?.requestId) speech.cancel(stream.requestId, error.message).catch(cancelError => showNotice(cancelError.message));
   if (stream?.voiceTurn) stopVoiceMode(false);
   else if (stream) {
     playback?.node.port.postMessage({type: 'reset'});
@@ -1169,34 +1211,61 @@ async function beginCapture(id) {
   const silence = context.createGain(); silence.gain.value = 0;
   source.connect(node); node.connect(silence); silence.connect(context.destination);
   const vad = state.components.asr?.settings?.vad || {};
+  const minimumSpeechMs = Number(vad.minimum_speech_ms || 250);
   recording = {
     id, sequence: 0, context, media, source, node,
     heardSpeech: false, speechMs: 0, silenceMs: 0,
+    preRoll: [], preRollSamples: 0,
     threshold: Number(vad.threshold || .012),
-    minimumSpeechMs: Number(vad.minimum_speech_ms || 250),
-    silenceLimitMs: Number(vad.silence_ms || 800),
+    minimumSpeechMs,
+    silenceLimitMs: Number(vad.silence_ms || 1500),
+    preRollLimitSamples: Math.max(8000, Math.ceil(minimumSpeechMs * 16)),
+  };
+  const sendFrame = (current, values) => {
+    if (backend.bufferedAmount > 1024 * 1024) {
+      showNotice('Microphone stream cannot keep up'); stopCapture();
+      return false;
+    }
+    const pcm = new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+    const header = audioHeader(1, id, current.sequence++, 16000, pcm.byteLength);
+    const frame = new Uint8Array(header.byteLength + pcm.byteLength);
+    frame.set(header); frame.set(pcm, header.byteLength); backend.sendBinary(frame);
+    return true;
   };
   node.port.onmessage = event => {
     const current = recording;
-    if (!current || backend.bufferedAmount > 1024 * 1024) {
-      if (recording) { showNotice('Microphone stream cannot keep up'); stopCapture(); }
-      return;
-    }
-    const pcm = new Uint8Array(event.data);
+    if (!current) return;
     const values = new Int16Array(event.data);
     let energy = 0;
     for (const value of values) energy += (value / 32768) ** 2;
     const rms = Math.sqrt(energy / Math.max(1, values.length));
     const frameMs = values.length / 16;
-    if (rms >= current.threshold) {
-      current.speechMs += frameMs; current.silenceMs = 0;
-      if (current.speechMs >= current.minimumSpeechMs) current.heardSpeech = true;
-    } else if (current.heardSpeech) {
-      current.silenceMs += frameMs;
+    const active = rms >= current.threshold;
+    if (!current.heardSpeech) {
+      current.preRoll.push(values);
+      current.preRollSamples += values.length;
+      while (current.preRollSamples > current.preRollLimitSamples) {
+        current.preRollSamples -= current.preRoll[0].length;
+        current.preRoll.shift();
+      }
+      current.speechMs = active ? current.speechMs + frameMs : 0;
+      if (current.speechMs < current.minimumSpeechMs) return;
+      current.heardSpeech = true;
+      renderRuntime();
+      const buffered = current.preRoll;
+      current.preRoll = [];
+      current.preRollSamples = 0;
+      for (const bufferedFrame of buffered)
+        if (!sendFrame(current, bufferedFrame)) return;
+    } else {
+      if (active) {
+        current.speechMs += frameMs;
+        current.silenceMs = 0;
+      } else {
+        current.silenceMs += frameMs;
+      }
+      if (!sendFrame(current, values)) return;
     }
-    const header = audioHeader(1, id, current.sequence++, 16000, pcm.byteLength);
-    const frame = new Uint8Array(header.byteLength + pcm.byteLength);
-    frame.set(header); frame.set(pcm, header.byteLength); backend.sendBinary(frame);
     if (voiceMode && current.heardSpeech && current.silenceMs >= current.silenceLimitMs) stopCapture();
   };
   await context.resume();
@@ -1212,8 +1281,13 @@ function stopCapture(notify = true) {
   current.context.close();
   $('mic').classList.remove('recording'); $('mic').setAttribute('aria-label', 'Start dictation');
   if (notify && activeRequest?.kind === 'asr') {
-    asrFinalizing = true;
-    send('asr.stop', activeRequest.id);
+    if (current.heardSpeech) {
+      asrFinalizing = true;
+      send('asr.stop', activeRequest.id);
+    } else {
+      showNotice('No speech was detected');
+      send('cancel', activeRequest.id);
+    }
   }
   renderRuntime();
 }
@@ -1251,6 +1325,7 @@ function scheduleVoiceListening(epoch = voiceEpoch) {
 
 function stopVoiceMode(cancel = true) {
   const requestId = activeRequest?.id;
+  const speechId = speech.active?.id;
   voiceMode = false;
   voiceEpoch++;
   clearTimeout(voiceRestartTimer);
@@ -1258,6 +1333,7 @@ function stopVoiceMode(cancel = true) {
   asrFinalizing = false;
   playback?.node.port.postMessage({type: 'reset'});
   for (const [stream, value] of ttsStreams) finishTts(value.button, stream);
+  if (speechId) speech.cancel(speechId, 'Voice mode stopped').catch(error => showNotice(error.message));
   if (cancel && requestId) send('cancel', requestId);
   renderRuntime();
 }
@@ -1283,12 +1359,18 @@ function startTts(text, button, voiceTurn = false, epoch = voiceEpoch) {
   const audioId = streamId++;
   activeRequest = {id, kind: 'tts', streamId: audioId, voiceTurn, voiceEpoch: voiceTurn ? epoch : null};
   ttsStreams.set(audioId, {button, completed: false, voiceTurn, requestId: id, voiceEpoch: voiceTurn ? epoch : null,
-    messageId: button?.closest('[data-message-id]')?.dataset.messageId});
+    messageId: button?.closest('[data-message-id]')?.dataset.messageId, paused: false});
   playbackStreamId = audioId;
-  setReadAloudState(button, true);
+  setReadAloudState(button, 'playing');
   state.busy = true; showNotice(); renderRuntime();
   ensurePlayback().catch(error => showNotice(error.message));
-  try { send('tts.start', id, {stream_id: audioId, text, options: ttsRequestOptions()}); }
+  try {
+    const options = ttsRequestOptions();
+    speech.start({
+      id, streamId: audioId, text, options, voice: voiceTurn, finished: true,
+      cacheIdentity: JSON.stringify([state.runtime.host, state.backend, state.components.tts?.directory]),
+    });
+  }
   catch (error) {
     finishTts(button, audioId);
     showNotice(error.message); finishRequest();
@@ -1299,7 +1381,7 @@ function finishTts(button, stream) {
   const entry = ttsStreams.get(stream);
   const voiceTurn = entry?.voiceTurn;
   const epoch = entry?.voiceEpoch;
-  setReadAloudState(button, false);
+  setReadAloudState(button, 'idle');
   for (const resolve of entry?.capacityWaiters?.splice(0) || []) resolve();
   ttsStreams.delete(stream);
   renderSpeechHighlights(ttsStreams.values());
@@ -1310,13 +1392,42 @@ function finishTts(button, stream) {
   if (voiceTurn && voiceMode && epoch === voiceEpoch) scheduleVoiceListening(epoch);
 }
 
-function stopTts(stream) {
+async function stopTts(stream) {
   const current = ttsStreams.get(stream);
   if (!current) return;
   playback?.node.port.postMessage({type: 'reset'});
+  await speech.cancel(current.requestId, 'Speech playback replaced');
+  if (ttsStreams.has(stream)) finishTts(current.button, stream);
+}
+
+function pauseTts(stream) {
+  const current = ttsStreams.get(stream);
+  if (!current || current.paused) return;
+  current.paused = true;
+  playback?.node.port.postMessage({type: 'pause', streamId: stream});
+  setReadAloudState(current.button, 'paused');
+  const foreground = activeRequest &&
+    (activeRequest.streamId === stream || current.requestId === activeRequest.id);
+  if (foreground)
+    activeRequest.ttsStatus = 'Speech paused';
+  if (foreground && !current.voiceTurn) {
+    current.detached = true;
+    finishRequest();
+    return;
+  }
+  renderRuntime();
+}
+
+function resumeTts(stream) {
+  const current = ttsStreams.get(stream);
+  if (!current || !current.paused) return;
+  current.paused = false;
+  playback?.context.resume().catch(error => audioFailure(stream, error));
+  playback?.node.port.postMessage({type: 'resume', streamId: stream});
+  setReadAloudState(current.button, 'playing');
   if (activeRequest && (activeRequest.streamId === stream || current.requestId === activeRequest.id))
-    send('cancel', activeRequest.id);
-  finishTts(current.button, stream);
+    activeRequest.ttsStatus = current.voiceTurn ? 'Kidi is speaking…' : 'Playing speech…';
+  renderRuntime();
 }
 
 async function sendMessage(event) {
@@ -1354,6 +1465,21 @@ async function sendMessage(event) {
       id: requestId, kind: 'chat', messageId: responseId,
       voiceTurn: voiceMode, voiceEpoch: voiceMode ? voiceEpoch : null,
     };
+    if (voiceMode) {
+      const audioId = streamId++;
+      activeRequest.streamId = audioId;
+      ttsStreams.set(audioId, {
+        button: null, completed: false, paused: false, voiceTurn: true,
+        requestId, voiceEpoch, messageId: responseId,
+      });
+      playbackStreamId = audioId;
+      const options = ttsRequestOptions();
+      speech.start({
+        id: requestId, streamId: audioId, text: '', options, voice: true, finished: false,
+        cacheIdentity: JSON.stringify([state.runtime.host, state.backend, state.components.tts?.directory]),
+      });
+      ensurePlayback().catch(error => audioFailure(audioId, error));
+    }
     const requestMessages = chat.messages.filter(message => !message.pending)
       .map(({role, content, images}) =>
         role === 'user' && images?.length ? {role, content, images} : {role, content});
@@ -1362,17 +1488,22 @@ async function sendMessage(event) {
       : requestMessages;
     send('chat.start', requestId, {
       messages: preparedMessages,
-      speak: voiceMode,
-      tts_options: voiceMode ? ttsRequestOptions() : undefined,
+      speak: false,
     });
   } catch (error) {
+    if (speech.active?.id === requestId) await speech.cancel(requestId, error.message);
     chat.messages = chat.messages.filter(message => message.id !== responseId);
     showNotice(error.message); finishRequest(); render();
   }
 }
 
 async function cancelGeneration() {
-  try { if (activeRequest) send('cancel', activeRequest.id); }
+  try {
+    if (!activeRequest) return;
+    if (speech.active?.id === activeRequest.id)
+      await speech.cancel(activeRequest.id, 'Speech generation cancelled');
+    send('cancel', activeRequest.id);
+  }
   catch (error) { showNotice(error.message); }
 }
 

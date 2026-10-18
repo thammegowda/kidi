@@ -45,7 +45,7 @@ models:
     vad:
       threshold: 0.012
       minimum_speech_ms: 250
-      silence_ms: 650
+      silence_ms: 2500
 
   tts:
     enabled: true
@@ -61,11 +61,6 @@ models:
     steps: 10
     wire_format: pcm_s16le
     playback_buffer_ms: 150
-    streaming:
-      first_segment_chars: 48
-      first_segment_steps: 8
-      segment_chars: 120
-      clause_min_chars: 32
     voice:
       gender: female
       age: young adult

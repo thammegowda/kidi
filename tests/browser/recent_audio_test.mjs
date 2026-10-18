@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {RecentAudio} from '../../web/hosts/wasm/recent-audio.mjs';
+import {RecentAudio} from '../../web/ui/speech-controller.js';
 
 test('cached audio owns its bytes and replay is safe to transfer', () => {
     const cache = new RecentAudio();

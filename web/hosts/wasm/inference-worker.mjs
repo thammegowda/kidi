@@ -86,12 +86,11 @@ self.onmessage = async ({data}) => {
             if (module) throw new Error('Restart the worker to change runtime settings');
             const started = performance.now();
             const useGpu = data.backend === 'webgpu';
-            if (!useGpu && data.threads > 1 && !self.crossOriginIsolated)
-                throw new Error('Multiple threads require COOP/COEP response headers');
-            const threaded = !useGpu && data.threads > 1;
+            if (!useGpu && !self.crossOriginIsolated)
+                throw new Error('The CPU backend requires cross-origin isolation');
             const unsupported = useGpu && webGpuSupport();
             if (unsupported) throw new Error(`WebGPU is unavailable: ${unsupported}. Use the WebAssembly CPU backend.`);
-            const {default: createKidi} = await import(useGpu ? './gpu/kidi.mjs' : threaded ? './threads/kidi.mjs' : './single/kidi.mjs');
+            const {default: createKidi} = await import(useGpu ? './gpu/kidi.mjs' : './threads/kidi.mjs');
             module = await createKidi({printErr: text => self.postMessage({type: 'log', text})});
             if (useGpu) {
                 const {createWebGpu} = await import('./webgpu.mjs');

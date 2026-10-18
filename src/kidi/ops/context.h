@@ -153,6 +153,11 @@ public:
                           std::int32_t mask, float penalty, float temperature) -> Tensor;
     auto conv1d(const Tensor& input, const Tensor& weight, const Tensor& scales, const Tensor& bias,
                 std::int32_t kernel, std::int32_t stride, std::int32_t padding, std::int32_t dilation) -> Tensor;
+    auto snake_conv1d(const Tensor& input, const Tensor& alpha, const Tensor& weight, const Tensor& scales,
+                      const Tensor& bias, std::int32_t kernel, std::int32_t stride, std::int32_t padding,
+                      std::int32_t dilation) -> Tensor;
+    auto snake_quantized_linear(const Tensor& input, const Tensor& alpha, const Tensor& weight, const Tensor& scale,
+                                const Tensor& bias, bool transpose_weight = false) -> Tensor;
     auto conv_transpose_fold(const Tensor& projected, const Tensor& bias, std::int32_t kernel, std::int32_t stride,
                              std::int32_t padding, std::int32_t output_padding, std::int32_t dilation) -> Tensor;
     auto snake(const Tensor& input, const Tensor& alpha) -> Tensor;

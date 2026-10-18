@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {MAX_SPEECH_SEGMENT_UNITS, SpeechSegments, speechUnits} from '../../web/hosts/wasm/speech-segments.mjs';
+import {MAX_SPEECH_SEGMENT_UNITS, SpeechSegments, speechUnits} from '../../web/ui/speech-controller.js';
 
 test('speech starts at complete sentences before the input stream finishes', () => {
     const stream = new SpeechSegments();
@@ -11,7 +11,8 @@ test('speech starts at complete sentences before the input stream finishes', () 
 });
 
 test('long sentences are bounded without dropping or duplicating source text', () => {
-    const text = 'The small wooden bridge crosses the river near the old mill and follows a winding path through the trees where a bright bird sings softly while the sun rises over the valley.';
+    const clause = 'The small wooden bridge crosses the river near the old mill and follows a winding path through the trees where a bright bird sings softly while the sun rises over the valley';
+    const text = `${clause} and ${clause.toLowerCase()} and ${clause.toLowerCase()}.`;
     const stream = new SpeechSegments(), output = [];
     for (let start = 0; start < text.length; start += 7) output.push(...stream.push(text.slice(start, start + 7)));
     output.push(...stream.push('', true));
@@ -40,5 +41,15 @@ test('abbreviations wait for their sentence and oversized graphemes fail explici
     const stream = new SpeechSegments();
     assert.deepEqual(stream.push('Meet Dr. '), []);
     assert.deepEqual(stream.push('Smith. More'), [{id: 0, text: 'Meet Dr. Smith.', start: 0, end: 15}]);
-    assert.throws(() => new SpeechSegments().push('e' + '\u0301'.repeat(100), true), /grapheme/);
+    assert.throws(() => new SpeechSegments().push('e' + '\u0301'.repeat(300), true), /grapheme/);
+});
+
+test('normal sentences remain whole instead of splitting a noun phrase', () => {
+    const text = 'I can understand, generate, and debug code in many programming languages, including Python, JavaScript, Java, C++, and more.';
+    for (const size of [1, 7, text.length]) {
+        const stream = new SpeechSegments(), output = [];
+        for (let index = 0; index < text.length; index += size) output.push(...stream.push(text.slice(index, index + size)));
+        output.push(...stream.push('', true));
+        assert.deepEqual(output.map(segment => segment.text), [text]);
+    }
 });

@@ -98,6 +98,11 @@ auto Conv1dImpl::forward(ops::Context& context, const Tensor& input) const -> Te
     return context.linear(columns, weight_, bias(), true);
 }
 
+auto Conv1dImpl::forward_snake(ops::Context& context, const Tensor& input, const Tensor& alpha) const -> Tensor {
+    return context.snake_conv1d(input, alpha, weight_, qstate_ ? qstate_->scale : Tensor{}, bias(), kernel_size_,
+                                stride_, padding_, dilation_);
+}
+
 ConvTranspose1dImpl::ConvTranspose1dImpl(std::int32_t input_channels, std::int32_t output_channels,
                                          std::int32_t kernel_size, std::int32_t stride, std::int32_t padding,
                                          std::int32_t output_padding, std::int32_t dilation)
@@ -172,6 +177,14 @@ auto ConvTranspose1dImpl::forward(ops::Context& context, const Tensor& input) co
     return output;
 }
 
+auto ConvTranspose1dImpl::forward_snake(ops::Context& context, const Tensor& input, const Tensor& alpha) const
+    -> Tensor {
+    if (!qstate_) return forward(context, context.snake(input, alpha));
+    const auto projected =
+        context.snake_quantized_linear(input, alpha, weight_, qstate_->scale, projection_bias_, true);
+    return context.conv_transpose_fold(projected, bias(), kernel_size_, stride_, padding_, output_padding_, dilation_);
+}
+
 Snake1dImpl::Snake1dImpl(std::int32_t channels) : channels_(channels) {
     if (channels <= 0 || (module_dtype != tensor::DType::F32 && module_dtype != tensor::DType::I8))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Snake1d construction"});
@@ -210,6 +223,17 @@ auto Snake1dImpl::forward(ops::Context& context, const Tensor& input) const -> T
         }
     });
     return output;
+}
+
+auto Snake1dImpl::forward(ops::Context& context, const Tensor& input, const Conv1d& convolution) const -> Tensor {
+    if (context.device() == tensor::Device::web_gpu()) return convolution->forward_snake(context, input, alpha());
+    return convolution->forward(context, forward(context, input));
+}
+
+auto Snake1dImpl::forward(ops::Context& context, const Tensor& input, const ConvTranspose1d& convolution) const
+    -> Tensor {
+    if (context.device() == tensor::Device::web_gpu()) return convolution->forward_snake(context, input, alpha());
+    return convolution->forward(context, forward(context, input));
 }
 
 } // namespace kidi::layers

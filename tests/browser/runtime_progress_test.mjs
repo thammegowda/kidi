@@ -4,9 +4,21 @@ import {readFile} from 'node:fs/promises';
 
 async function backendSource() {
   let source = await readFile(new URL('../../web/hosts/wasm/backend.js', import.meta.url), 'utf8');
-  for (const name of ['speech-segments.mjs', 'recent-audio.mjs'])
-    source = source.replace(`from './${name}'`, `from '${new URL(`../../web/hosts/wasm/${name}`, import.meta.url).href}'`);
+  source = source.replace(
+    "import {clearVoicePromptCache, describeVoicePrompt, loadVoicePrompt, storeVoicePrompt}\n  from './voice-prompt-cache.mjs';",
+    `const clearVoicePromptCache = async () => {};
+     const describeVoicePrompt = async config => ({id: 'a'.repeat(64), metadata: '{}', config});
+     const loadVoicePrompt = async () => ({text: 'Hello, I am Kidi.', tokens: new Int32Array(600)});
+     const storeVoicePrompt = async () => {};`);
   return source;
+}
+
+async function waitFor(predicate) {
+  for (let attempt = 0; attempt < 100; ++attempt) {
+    if (predicate()) return;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  throw new Error('Timed out waiting for backend state');
 }
 
 test('automatic cache restore announces its request before progress and readiness', async () => {
@@ -84,7 +96,9 @@ test('isolated browsers use available CPU threads for TTS', async () => {
     assert.equal(progress.type, 'tts.progress');
     assert.equal(progress.payload.phase, 'loading');
     workers[0].onmessage({data: {type: 'ready', threads: expectedThreads}});
-    await new Promise(resolve => setImmediate(resolve));
+    await waitFor(() => workers[0].message.type === 'voice-prompt');
+    workers[0].onmessage({data: {type: 'voice-prompt-ready', requestId: workers[0].message.requestId}});
+    await waitFor(() => workers[0].message.type === 'synthesize');
     assert.equal(events.at(-1).type, 'tts.progress');
     assert.equal(events.at(-1).payload.phase, 'synthesizing');
     assert.equal(workers[0].message.type, 'synthesize');
@@ -131,7 +145,9 @@ test('WebGPU TTS initialization failure reports and uses threaded CPU fallback',
     const fallback = events.find(event => event.type === 'tts.progress' && event.payload.phase === 'fallback');
     assert.match(fallback.payload.message, /JSPI unavailable/);
     workers[1].onmessage({data: {type: 'ready', threads: workers[1].message.threads, backend: 'wasm-threads'}});
-    await new Promise(resolve => setImmediate(resolve));
+    await waitFor(() => workers[1].message.type === 'voice-prompt');
+    workers[1].onmessage({data: {type: 'voice-prompt-ready', requestId: workers[1].message.requestId}});
+    await waitFor(() => workers[1].message.type === 'synthesize');
     assert.equal(workers[1].message.type, 'synthesize');
   } finally {
     if (previousIsolation === undefined) delete globalThis.crossOriginIsolated;

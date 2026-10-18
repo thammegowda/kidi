@@ -1,7 +1,7 @@
 import {spawnSync} from 'node:child_process';
 import {access, mkdir, copyFile, readdir, readFile, rm, writeFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
-import {resolve, join} from 'node:path';
+import {resolve, join, dirname} from 'node:path';
 import {unsignedHeapIndices} from './wasm-glue.mjs';
 import {packageModel} from './package-model.mjs';
 
@@ -10,11 +10,10 @@ const libraries = join(root, 'web/libs');
 const destination = resolve(process.argv[2] || join(root, 'build-web'));
 await rm(destination, {recursive: true, force: true});
 for (const [name, threads, gpu] of [
-    ['single', 'OFF', 'OFF'],
     ['threads', 'ON', 'OFF'],
     ['gpu', 'OFF', 'ON'],
 ]) {
-    const build = join(root, name === 'single' ? 'build-wasm' : name === 'gpu' ? 'build-webgpu' : 'build-wasm-threads');
+    const build = join(root, name === 'gpu' ? 'build-webgpu' : 'build-wasm-threads');
     for (const [command, args] of [
         ['emcmake', ['cmake', '-S', root, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
             '-DBUILD_TESTING=OFF', '-DKIDI_BUILD_TESTS=OFF',
@@ -36,10 +35,12 @@ for (const [name, threads, gpu] of [
     }
 }
 for (const file of ['backend.js', 'inference-worker.mjs', 'asr-worker.mjs',
-    'tts-worker.mjs', 'speech.mjs', 'model-cache.mjs',
-    'webgpu.mjs', 'webgpu-kernels.mjs', 'scoped-model.mjs', 'runtime-scheduler.mjs', 'model-residency.mjs',
-    'speech-segments.mjs', 'recent-audio.mjs'])
+    'tts-worker.mjs', 'speech.mjs', 'model-cache.mjs', 'voice-prompt-cache.mjs',
+    'webgpu.mjs', 'webgpu-kernels.mjs', 'scoped-model.mjs', 'runtime-scheduler.mjs'])
     await copyFile(join(root, 'web/hosts/wasm', file), join(destination, file));
+await writeFile(join(destination, 'model-residency.mjs'),
+    (await readFile(join(root, 'web/hosts/wasm/model-residency.mjs'), 'utf8'))
+        .replace('../../ui/speech-controller.js', './speech-controller.js'));
 for (const file of ['runtime-client.mjs', 'gpu-runtime-worker.mjs']) {
     const source = await readFile(join(root, 'web/hosts/wasm', file), 'utf8');
     await writeFile(join(destination, file),
@@ -49,8 +50,12 @@ await mkdir(join(destination, 'liteapp', 'transport'), {recursive: true});
 await copyFile(join(root, 'third_party/liteapp/web/liteapp.mjs'), join(destination, 'liteapp/liteapp.mjs'));
 for (const file of ['protocol.mjs', 'channel.mjs', 'service-router.mjs', 'message-transport.mjs'])
     await copyFile(join(root, 'third_party/liteapp/web/transport', file), join(destination, 'liteapp/transport', file));
-for (const file of ['app.js', 'style.css', 'markdown.js', 'mermaid.js', 'images.js', 'speech-highlights.js'])
-    await copyFile(join(root, 'web/ui', file), join(destination, file));
+const sharedAssets = (await readFile(join(root, 'web/ui/assets.txt'), 'utf8')).split(/\r?\n/).filter(Boolean);
+for (const file of sharedAssets) {
+    const target = join(destination, file);
+    await mkdir(dirname(target), {recursive: true});
+    await copyFile(join(root, 'web/ui', file), target);
+}
 for (const file of ['capture-worklet.js', 'playback-worklet.js'])
     await copyFile(join(root, 'web/hosts/desktop', file), join(destination, file));
 const sharedIndex = await readFile(join(root, 'web/ui/index.html'), 'utf8');
@@ -80,8 +85,6 @@ await copyFile(join(libraries, 'lucide-static/LICENSE'), join(destination, 'icon
 for (const icon of ['send-horizontal', 'square', 'download', 'trash-2', 'plus', 'settings', 'x', 'panel-left',
     'message-square', 'mic'])
     await copyFile(join(libraries, 'lucide-static/icons', `${icon}.svg`), join(destination, 'icons', `${icon}.svg`));
-for (const icon of ['audio-waveform', 'book-open', 'copy', 'volume'])
-    await copyFile(join(root, 'web/ui/icons', `${icon}.svg`), join(destination, 'icons', `${icon}.svg`));
 await copyFile(join(root, 'docs/kidi-logo-small.png'), join(destination, 'icons/kidi-logo.png'));
 const ttsSource = resolve(process.env.KIDI_WEB_TTS_MODEL || join(root, 'models/omnivoice'));
 if (await access(join(ttsSource, 'model.yaml')).then(() => true, () => false)) {

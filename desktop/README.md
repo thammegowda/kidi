@@ -80,11 +80,19 @@ before adding samples to the playback worklet.
 
 ## Scheduling
 
-The default scheduler permits one active chat, ASR, or TTS inference request.
-Network callbacks only validate and enqueue work. Model execution runs on a
-background task, and WebSocket writes are serialized. Cancellation and socket
+The shared JavaScript `SpeechController` owns sentence segmentation, logical
+streams, PCM replay, one-segment lookahead, highlighting metadata, pause/resume,
+replacement, and terminal sequencing for both desktop and Wasm. The native
+server exposes only one-segment TTS primitives.
+
+The desktop adapter uses one WebSocket for chat/ASR/images and a second for
+primitive TTS. The native request gate allows one chat and one TTS request to
+overlap, matching the former native voice pipeline. Distinct model kinds may
+overlap; duplicate requests of one kind are rejected. Cancellation and
 disconnects are checked between generation steps, Whisper stages, and TTS
 diffusion steps.
+Every cancel receives a terminal acknowledgement, including an already-finished
+native request.
 
 The browser uses an `AudioWorklet` for microphone downsampling and another
 worklet for TTS playback. Audio never enters JSON, and `WebSocket.bufferedAmount`
@@ -92,22 +100,20 @@ provides client-side backpressure before the server's bounded queue limit.
 
 ## Voice mode
 
-Read aloud and continuous voice mode share the same TTS request,
-PCM-framing, playback queue, cancellation, and voice-preference path. Read aloud
-starts `tts.start` from a selected assistant message. The waveform control
-starts a persistent turn orchestrator:
+Read aloud and continuous voice mode share the same frontend speech controller,
+PCM framing, playback queue, cancellation, and voice-preference path. The
+controller drives the turn sequence:
 
 ```text
-ASR final -> chat.start -> streamed chat completion -> tts.start -> PCM playback
+ASR final -> chat.start -> shared text segmentation -> primitive tts.start -> PCM playback
 ```
 
 The capture worklet computes frame RMS for browser-side endpointing. Once speech
 has exceeded the configured minimum and silence reaches the YAML VAD threshold,
 capture finalizes automatically. ASR text and the assistant response remain in
 normal conversation history, and listening resumes only after the TTS worklet
-reports that playback drained. The single-inference scheduler keeps stages
-sequential. Clicking the waveform again cancels the current stage and exits
-voice mode.
+reports that playback drained. Clicking the waveform again cancels the current
+stage and exits voice mode.
 
 Every voice-mode activation increments a client epoch carried through ASR,
 chat, TTS, playback drain, and delayed listen restarts. Exiting voice mode
@@ -131,14 +137,11 @@ Whisper and the default OmniVoice voice prompt warm in the background after the
 loopback server starts. The first voice-mode recording therefore overlaps model
 preparation instead of paying it after chat completion.
 
-For voice mode, the first speech segment is word-bounded near 48 characters and
-uses eight diffusion steps. Later segments use natural clause/sentence
-boundaries, a 120-character cap, and the configured quality schedule. Once the
-first segment enters the queue, Gemma briefly yields Metal submission until the
-server reports `voice.audio.first`; generation then resumes while speech plays.
-In the measured pipeline first PCM arrived about 0.74 seconds after the first
-displayed token. A more aggressive 36-character/six-step profile improved only
-about 22 ms and was rejected to preserve first-phrase quality.
+Desktop and Wasm now use the same sentence policy: complete sentences remain
+whole through 192 weighted units, and only oversized sentences use shared
+clause/word targets. Exactly one segment may synthesize ahead of playback. The
+same controller emits source offsets and segment IDs for highlighting on both
+backends.
 
 Metal FP16 projection expansion is bounded separately per constructed model:
 512 MiB for Gemma and 1 GiB for OmniVoice in the example. An unlimited cache

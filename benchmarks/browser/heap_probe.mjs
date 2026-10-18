@@ -2,7 +2,7 @@
 // The real browser loader runs against a local Hugging Face snapshot, so heap layout matches the web app.
 //
 //   node benchmarks/browser/heap_probe.mjs --snapshot ~/.cache/kidi/model-hub/models--google--gemma-4-E2B-it-qat-mobile-transformers/snapshots/<sha> \
-//       [--glue build-web/single/kidi.mjs] [--threads 1] [--words 1600 | --prompt text] [--tokens 32] [--image photo.jpg]
+//       [--glue build-web/threads/kidi.mjs] [--threads 4] [--words 1600 | --prompt text] [--tokens 32] [--image photo.jpg]
 //       [--json out.json]
 import {readFile, open, writeFile} from 'node:fs/promises';
 import {basename, dirname, join, resolve} from 'node:path';
@@ -10,7 +10,7 @@ import {parseArgs} from 'node:util';
 import {pathToFileURL} from 'node:url';
 
 const {values: options} = parseArgs({options: {
-    snapshot: {type: 'string'}, glue: {type: 'string', default: 'build-web/single/kidi.mjs'},
+    snapshot: {type: 'string'}, glue: {type: 'string', default: 'build-web/threads/kidi.mjs'},
     words: {type: 'string', default: '1600'}, tokens: {type: 'string', default: '32'},
     image: {type: 'string'}, json: {type: 'string'}, 'image-pixels': {type: 'string', default: '3000000'},
     threads: {type: 'string', default: '1'}, prompt: {type: 'string'},

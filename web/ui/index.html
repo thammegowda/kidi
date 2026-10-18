@@ -212,9 +212,9 @@
             <select id="tts-gpu-precision">
               <option value="f32">FP32 activations (baseline)</option>
               <option value="mixed-f16">Mixed FP16 (more GPU memory)</option>
-              <option value="w8a8">INT8 / W8A8 (lower GPU memory)</option>
+              <option value="w8a8">INT8 / W8A8 (recommended)</option>
             </select>
-            <small>FP16 and INT8 are opt-in. INT8 favors memory efficiency; speed and pronunciation can vary.</small>
+            <small>W8A8 is the browser default for speed and memory. FP32 is the quality baseline; pronunciation can vary by profile.</small>
           </label>
           <label><span>Language</span><input id="tts-language" type="text" maxlength="64"></label>
           <label><span>Diffusion steps</span><input id="tts-steps" type="number" min="1" max="128"></label>

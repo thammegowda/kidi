@@ -55,6 +55,8 @@ auto operation_name(Operation operation) -> std::string_view {
                                "diffusion_update",
                                "embedding_sum",
                                "conv1d",
+                               "snake_conv1d",
+                               "snake_quantized_linear",
                                "conv_transpose_fold",
                                "snake"};
     return names.at(static_cast<std::size_t>(operation));

@@ -1,0 +1,14 @@
+app.js
+icons/audio-waveform.svg
+icons/book-open.svg
+icons/copy.svg
+icons/pause.svg
+icons/play.svg
+icons/volume.svg
+index.html
+images.js
+markdown.js
+mermaid.js
+speech-controller.js
+speech-highlights.js
+style.css

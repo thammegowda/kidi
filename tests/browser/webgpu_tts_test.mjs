@@ -39,6 +39,48 @@ test('W8A8 kernel variants share bounded activation scratch and binding layout',
     }
 });
 
+test('Snake projection quantizes the fused activation directly for W8A8', () => {
+    const plan = makeProgram({
+        operation: 'snake_quantized_linear',
+        w8a8: true,
+        w8a8Kernel: 'float',
+        dtype: 11,
+        epsilon: 0,
+        attributes: [1],
+        inputs: [
+            f32([1, 65, 64]),
+            f32([64]),
+            {shape: [96, 64], dtype: 2},
+            f32([96, 1]),
+            f32([96]),
+        ],
+    }, new Set());
+    assert.deepEqual(plan.shape, [1, 65, 96]);
+    assert.deepEqual(plan.scratch.inputs, [0, 1]);
+    assert.equal(plan.scratch.bytes, 65 * (64 + 8));
+    assert.equal(plan.bindings, 5);
+    assert.deepEqual(plan.finalInputs, [0, 2, 3, 4, 5]);
+});
+
+test('Snake convolution removes the standalone activation output', () => {
+    const plan = makeProgram({
+        operation: 'snake_conv1d',
+        dtype: 11,
+        epsilon: 0,
+        attributes: [7, 1, 3, 1],
+        inputs: [
+            f32([1, 257, 64]),
+            f32([64]),
+            {shape: [32, 448], dtype: 2},
+            f32([32, 1]),
+            f32([32]),
+        ],
+    }, new Set());
+    assert.deepEqual(plan.shape, [1, 257, 32]);
+    assert.equal(plan.stages, undefined);
+    assert.equal(plan.scratch, undefined);
+});
+
 test('in-place arithmetic binds only the right operand and writes the destination directly', () => {
     for (const operation of ['add', 'multiply']) {
         const plan = makeProgram({

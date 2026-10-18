@@ -15,9 +15,9 @@ self.onmessage = async ({data}) => {
         if (data.type === 'load') {
             if (module) throw new Error('Speech runtime is already loaded');
             const useGpu = data.backend === 'webgpu';
-            const threaded = !useGpu && data.threads > 1;
-            const {default: createKidi} = await import(useGpu ? './gpu/kidi.mjs' :
-                threaded ? './threads/kidi.mjs' : './single/kidi.mjs');
+            if (!useGpu && !self.crossOriginIsolated)
+                throw new Error('The CPU backend requires cross-origin isolation');
+            const {default: createKidi} = await import(useGpu ? './gpu/kidi.mjs' : './threads/kidi.mjs');
             module = await createKidi({printErr: text => self.postMessage({type: 'log', text})});
             if (useGpu) {
                 const {createWebGpu} = await import('./webgpu.mjs');

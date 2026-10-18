@@ -90,6 +90,33 @@ export async function runNumericalChecks(options = {}) {
             await run(spec, [input, weight, scale, bias], expected);
             if (w8a8) await run(spec, [input, weight, scale, bias], expected, 1e-4, [4, 1, 4, 0]);
         }
+        {
+            const rows = 8, width = 64, columns = 5;
+            const input = Float32Array.from({length: rows * width}, (_, index) => (index % 17 - 8) / 8);
+            const alpha = Float32Array.from({length: width}, (_, index) => index % 5 ? 0.75 : 0);
+            const activated = Float32Array.from(input, (value, index) => {
+                const coefficient = alpha[index % width];
+                return Math.abs(coefficient) < 1e-9 ? value :
+                    value + Math.sin(coefficient * value) ** 2 / (coefficient + 1e-9);
+            });
+            const weight = Int8Array.from({length: columns * width}, (_, index) => index % 11 - 5);
+            const scale = new Float32Array(columns).fill(0.25), bias = new Float32Array(columns).fill(0.125);
+            const quantized = gpu.matrixPrecision === 'w8a8' ? affineActivations(activated, rows, width) : null;
+            const expected = Float32Array.from({length: rows * columns}, (_, index) => {
+                const row = Math.floor(index / columns), column = index % columns;
+                let sum = 0;
+                for (let channel = 0; channel < width; ++channel)
+                    sum += quantized ? (quantized.values[row * width + channel] - quantized.zeros[row]) *
+                        weight[column * width + channel]
+                        : activated[row * width + channel] * weight[column * width + channel] * scale[column];
+                return (quantized ? Math.fround(Math.fround(sum * quantized.scales[row]) * scale[column]) : sum) +
+                    bias[column];
+            });
+            await run({operation: 'snake_quantized_linear', dtype: 11, epsilon: 0, attributes: [1],
+                inputs: [tensor([1, rows, width], 11), tensor([width], 11), tensor([columns, width], 2),
+                    tensor([columns, 1], 11), tensor([columns], 11)]},
+            [input, alpha, weight, scale, bias], expected, gpu.matrixPrecision === 'mixed-f16' ? 1e-2 : 1e-4);
+        }
         if (gpu.matrixPrecision === 'w8a8') {
             const rows = 4, width = 3072, columns = 3;
             const input = new Float32Array(rows * width).fill(255);
@@ -229,6 +256,26 @@ export async function runNumericalChecks(options = {}) {
             await run({operation: 'conv1d', dtype: 11, epsilon: 0, attributes: [kernel, stride, padding, dilation],
                 inputs: [tensor([1, length, channels], 11), tensor([outputs, channels * kernel], 2),
                     tensor([outputs, 1], 11), tensor([outputs], 11)]}, [input, weight, scales, bias], expected);
+            const alpha = new Float32Array([0.75, 1.25]);
+            const activated = Float32Array.from(input, (value, index) =>
+                value + Math.sin(alpha[index % channels] * value) ** 2 / (alpha[index % channels] + 1e-9));
+            const fusedExpected = Float32Array.from({length: rows * outputs}, (_, index) => {
+                const row = Math.floor(index / outputs), column = index % outputs;
+                let sum = bias[column];
+                for (let channel = 0; channel < channels; ++channel)
+                    for (let k = 0; k < kernel; ++k) {
+                        const position = row * stride - padding + k * dilation;
+                        if (position >= 0 && position < length)
+                            sum += activated[position * channels + channel] *
+                                weight[(column * channels + channel) * kernel + k] * scales[column];
+                    }
+                return sum;
+            });
+            await run({operation: 'snake_conv1d', dtype: 11, epsilon: 0,
+                attributes: [kernel, stride, padding, dilation],
+                inputs: [tensor([1, length, channels], 11), tensor([channels], 11),
+                    tensor([outputs, channels * kernel], 2), tensor([outputs, 1], 11), tensor([outputs], 11)]},
+            [input, alpha, weight, scales, bias], fusedExpected);
         }
 
         const projected = Float32Array.from({length: 3 * 2 * 3}, (_, index) => index / 8);

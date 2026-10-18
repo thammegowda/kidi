@@ -29,6 +29,7 @@ struct ModelSession {
     std::string transcription_text, transcription_language;
     std::shared_ptr<const kidi::inference::VoicePrompt> voice_prompt;
     bool cache_voice_prompt = false;
+    bool used_voice_prompt = false;
     bool diagnostics = false;
     std::string directory;
     std::size_t synthesis_step = 0, synthesis_steps = 0;
@@ -191,7 +192,8 @@ auto synthesis_result(kidi::inference::Synthesis result) -> nlohmann::json {
             {"generation_ms", result.stats.generation_ns / 1e6},
             {"decode_ms", result.stats.decode_ns / 1e6},
             {"preparation_ms", result.stats.preparation_ns / 1e6},
-            {"voice_prompt_cached", static_cast<bool>(state.voice_prompt)}};
+            {"voice_prompt_cached", static_cast<bool>(state.voice_prompt)},
+            {"voice_prompt_used", state.used_voice_prompt}};
     if (state.diagnostics) payload["token_ids"] = result.tokens;
     return payload;
 }
@@ -369,6 +371,31 @@ EMSCRIPTEN_KEEPALIVE auto kidi_load_tts(const char* directory) -> const char* {
     });
 }
 
+EMSCRIPTEN_KEEPALIVE auto kidi_tts_set_voice_prompt(const char* text, const std::int32_t* tokens,
+                                                    std::uint32_t count) -> const char* {
+    return answer([&]() -> nlohmann::json {
+        auto& state = session();
+        if (!state.synthesizer || !state.synthesizer->supports_voice_prompt())
+            throw std::runtime_error("The loaded TTS model does not support voice prompts");
+        if (!text || !*text || !tokens || !count || count > 80000)
+            throw std::runtime_error("Invalid TTS voice prompt");
+        const auto package =
+            kidi::ops::require(kidi::checkpoint::load_config(std::filesystem::path(state.directory) / "model.yaml"));
+        const auto model = package["model"];
+        const auto codebooks = model["num_audio_codebook"].as<std::size_t>();
+        const auto vocabulary = model["audio_vocab_size"].as<std::int32_t>();
+        const auto frame_rate = model["codec_config"]["frame_rate"].as<std::size_t>();
+        if (!codebooks || !vocabulary || !frame_rate || count % codebooks || count / codebooks > frame_rate * 20 ||
+            std::ranges::any_of(std::span(tokens, count),
+                                [&](auto token) { return token < 0 || token >= vocabulary; }))
+            throw std::runtime_error("Invalid TTS voice prompt tokens");
+        state.voice_prompt = std::make_shared<kidi::inference::VoicePrompt>(
+            kidi::inference::VoicePrompt{text, std::vector<std::int32_t>(tokens, tokens + count)});
+        state.used_voice_prompt = false;
+        return {{"voice_prompt", true}, {"tokens", count}};
+    });
+}
+
 EMSCRIPTEN_KEEPALIVE auto kidi_tts_start(const char* text, const char* options_json) -> const char* {
     return answer([&]() -> nlohmann::json {
         auto& state = session();
@@ -377,6 +404,7 @@ EMSCRIPTEN_KEEPALIVE auto kidi_tts_start(const char* text, const char* options_j
         const auto values = nlohmann::json::parse(options_json ? options_json : "{}");
         auto options = synthesis_options(values);
         state.cache_voice_prompt = values.value("cache_voice_prompt", true);
+        state.used_voice_prompt = static_cast<bool>(options.voice_prompt);
         state.synthesis_step = state.synthesis_steps = 0;
         state.synthesis = kidi::ops::require(loaded_synthesizer().start(text, options));
         return advance_synthesis();

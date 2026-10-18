@@ -380,10 +380,13 @@ auto replay_capacity_can_be_changed() -> bool {
     const auto input = tensor({2}, {1, 2});
     int first_calls = 0, second_calls = 0, third_calls = 0;
     const auto replay = [&](std::string_view key, int& calls) {
-        return context.replay(key, std::array{input}, [&](std::span<const Tensor> inputs) {
-            ++calls;
-            return std::vector{context.add(inputs[0], inputs[0])};
-        }, false);
+        return context.replay(
+            key, std::array{input},
+            [&](std::span<const Tensor> inputs) {
+                ++calls;
+                return std::vector{context.add(inputs[0], inputs[0])};
+            },
+            false);
     };
     (void)replay("first", first_calls);
     (void)replay("second", second_calls);
@@ -432,13 +435,12 @@ auto planned_intermediates_preserve_rebinding() -> bool {
 
 auto main() -> int {
     try {
-        return planned_intermediates_preserve_rebinding() &&
-                       replay_matches_eager() && replay_rebinds_inputs_and_views() && replay_updates_state_in_place() &&
+        return planned_intermediates_preserve_rebinding() && replay_matches_eager() &&
+                       replay_rebinds_inputs_and_views() && replay_updates_state_in_place() &&
                        replay_supports_paired_and_selection_outputs() && capture_rejects_per_call_host_values() &&
                        least_recently_used_steps_are_recaptured() && bounded_replay_cache_evicts_old_shapes() &&
-                       replay_capacity_can_be_changed() &&
-                       disabled_replay_runs_eagerly() && single_capture_compiles_and_rebinds_inputs() &&
-                       attached_accelerator_enables_replay() &&
+                       replay_capacity_can_be_changed() && disabled_replay_runs_eagerly() &&
+                       single_capture_compiles_and_rebinds_inputs() && attached_accelerator_enables_replay() &&
                        background_compilation_hands_over_from_cpu_replay(false) &&
                        background_compilation_hands_over_from_cpu_replay(true) &&
                        pending_background_compilation_does_not_block_eviction()

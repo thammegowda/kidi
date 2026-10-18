@@ -344,6 +344,7 @@ async function modelFor(payload, emit, signal) {
 const router = new ServiceRouter(new MessageTransport(self));
 router.register('runtime.status', async () => ({
     type: 'runtime-status', memory: await memoryTotals(), gpuStats: runtime ? {...runtime.gpu.stats} : null,
+    gpuRegions: runtime?.gpu.regionStats() || [],
     logicalSessions: clients.size,
     models: [...models.values()].map(model => ({
         kind: model.kind, source: model.source, matrixPrecision: model.matrixPrecision,
@@ -464,6 +465,31 @@ router.register('synthesize', async ({payload, emit, signal}) => {
         try {
             if (!completed && !reportedFailure) await call(model, 'kidi_tts_cancel');
         } finally { finishRequest(model, client); }
+    }
+});
+
+router.register('voice-prompt', async ({payload, emit, signal}) => {
+    const {model, client} = await modelFor(payload, emit, signal);
+    let pointer = 0;
+    try {
+        if (model.kind !== 'tts') throw new Error('Voice prompts require a TTS model session');
+        const data = payload.data;
+        if (!(data.tokens instanceof ArrayBuffer) || !data.tokens.byteLength || data.tokens.byteLength % 4 ||
+            typeof data.text !== 'string' || !data.text.trim())
+            throw new Error('Invalid cached voice prompt');
+        await reserve(model, 64 * 1024 * 1024, 16 * 1024 * 1024, signal);
+        const tokens = new Int32Array(data.tokens);
+        pointer = Number(runtime.module._malloc(tokens.byteLength));
+        if (!pointer || pointer + tokens.byteLength > runtime.module.HEAPU8.byteLength)
+            throw new Error('Cannot allocate cached voice prompt');
+        new Int32Array(runtime.module.HEAPU8.buffer, pointer, tokens.length).set(tokens);
+        const result = await call(model, 'kidi_tts_set_voice_prompt', ['string', 'pointer', 'number'],
+            [data.text, pointer, tokens.length], signal);
+        cancelled(signal);
+        return {type: 'voice-prompt-ready', requestId: data.requestId, ...result};
+    } finally {
+        if (pointer) runtime.module._free(pointer);
+        finishRequest(model, client);
     }
 });
 

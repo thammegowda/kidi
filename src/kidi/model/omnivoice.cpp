@@ -187,7 +187,7 @@ struct OmniVoiceImpl::State {
           audio_embeddings(codebooks * audio_vocabulary, llm->hidden_size(), 1.F),
           audio_heads(llm->hidden_size(), codebooks * audio_vocabulary, true, false),
           audio_tokenizer(decoder_module(config, device)) {
-        if (device == tensor::Device::web_gpu()) decoder_context.set_replay_capacity(1);
+        if (device == tensor::Device::web_gpu()) decoder_context.set_replay_capacity(7);
     }
 
     auto embed_audio(const tensor::Tensor& tokens) -> tensor::Tensor {
@@ -770,15 +770,7 @@ auto OmniVoiceImpl::synthesis_session_(std::string text, inference::SynthesisOpt
         const auto& codes = webgpu ? device_tokens : host_tokens;
 #if defined(KIDI_HAS_WEBGPU)
         if (impl_->decoder_context.device() == tensor::Device::web_gpu()) {
-            const auto decoded =
-                impl_->decoder_context
-                    .replay(
-                        "higgs:" + std::to_string(target), std::array{codes},
-                        [&](std::span<const tensor::Tensor> inputs) {
-                            return std::vector{impl_->audio_tokenizer->forward(impl_->decoder_context, inputs[0])};
-                        },
-                        false)
-                    .front();
+            const auto decoded = impl_->audio_tokenizer->forward(impl_->decoder_context, codes);
             samples.resize(decoded.numel());
             require(tensor::web_gpu_read_later(decoded, std::as_writable_bytes(std::span(samples))));
             impl_->decoder_context.synchronize();

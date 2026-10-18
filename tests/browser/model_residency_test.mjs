@@ -58,5 +58,7 @@ test('speech reserves new-shape scratch and any evicted prepared weights', () =>
     assert.equal(synthesisGpuReserve(warm, {...data, text: 'A longer utterance'}, 900 * mib).bytes, 768 * mib);
     assert.equal(synthesisGpuReserve({...warm, lastChunks: 2}, data, 900 * mib).bytes, 768 * mib);
     assert.equal(synthesisGpuReserve(warm, {...data, text: 'A new short phrase', streamSegment: true}, 900 * mib).bytes, 768 * mib);
+    assert.equal(synthesisGpuReserve(warm, {...data, text: 'x'.repeat(120), streamSegment: true}, 900 * mib).bytes, 768 * mib);
+    assert.equal(synthesisGpuReserve(warm, {...data, text: 'x'.repeat(165), streamSegment: true}, 900 * mib).bytes, 1280 * mib);
     assert.throws(() => synthesisGpuReserve(warm, {...data, text: 'x'.repeat(300), streamSegment: true}, 0), /text budget/);
 });

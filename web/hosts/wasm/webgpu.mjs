@@ -180,25 +180,30 @@ class WebGpu {
                 (spec.attributes[3] ?? spec.inputs[1].shape[1]) : 0;
         const onlineAttention = spec.onlineAttention ?? (this.onlineAttention === true ||
             (this.onlineAttention === 'auto' && scoreBytes > 32 * 1024 * 1024));
-        const quantizedMatrix = spec.operation === 'quantized_linear' &&
-            spec.attributes[0] !== 0 && spec.inputs[1].dtype === 2 && spec.inputs[0].shape.at(-1) % 4 === 0 &&
+        const snakeProjection = spec.operation === 'snake_quantized_linear';
+        const weightIndex = snakeProjection ? 2 : 1;
+        const quantizedMatrix = (spec.operation === 'quantized_linear' || snakeProjection) &&
+            spec.attributes[0] !== 0 && spec.inputs[weightIndex].dtype === 2 &&
+            spec.inputs[0].shape.at(-1) % 4 === 0 &&
             spec.inputs[0].shape.slice(0, -1).reduce((count, size) => count * size, 1) >= 4;
         const mixedF16 = quantizedMatrix && this.matrixPrecision === 'mixed-f16' && this.features.has('shader-f16') &&
-            spec.inputs[1].shape[0] * spec.inputs[1].shape[1] * 2 <=
+            spec.inputs[weightIndex].shape[0] * spec.inputs[weightIndex].shape[1] * 2 <=
                 Math.min(this.preparedWeightBudget, this.device.limits.maxStorageBufferBindingSize);
         const w8a8 = quantizedMatrix && this.matrixPrecision === 'w8a8' && spec.inputs[0].shape.at(-1) <= 65536 &&
-            spec.inputs[1].shape[0] * 4 <= this.preparedWeightBudget;
+            spec.inputs[weightIndex].shape[0] * 4 <= this.preparedWeightBudget;
         const w8a8Kernel = this.w8a8Kernel;
         const plan = makeProgram({...spec, onlineAttention, mixedF16, w8a8, w8a8Kernel,
-            inputs: mixedF16 ? spec.inputs.map((input, index) => index === 1 ? {...input, dtype: 9} : input) : spec.inputs},
+            inputs: mixedF16 ? spec.inputs.map((input, index) => index === weightIndex ? {...input, dtype: 9} : input)
+                : spec.inputs},
         this.features);
         if (mixedF16 || w8a8) {
-            const indices = w8a8 ? [1] : [1, 2];
+            const indices = w8a8 ? [weightIndex] : [weightIndex, weightIndex + 1];
             const preparation = makeProgram({operation: w8a8 ? 'w8a8_weight_sums' : 'expand_quantized_f16',
                 dtype: w8a8 ? 6 : 9, attributes: [], inputs: indices.map(index => spec.inputs[index])}, this.features);
             preparation.pipeline = this.pipeline(preparation.code, indices.length, preparation.validatesIndices);
-            preparation.bytes = spec.inputs[1].shape[0] * (w8a8 ? 4 : spec.inputs[1].shape[1] * 2);
-            preparation.width = spec.inputs[1].shape[1];
+            preparation.bytes = spec.inputs[weightIndex].shape[0] *
+                (w8a8 ? 4 : spec.inputs[weightIndex].shape[1] * 2);
+            preparation.width = spec.inputs[weightIndex].shape[1];
             preparation.inputs = indices;
             preparation.kind = w8a8 ? 'w8a8' : 'mixed-f16';
             plan.weightPreparation = preparation;
@@ -207,7 +212,8 @@ class WebGpu {
         plan.label=`${spec.operation}/${spec.attributes[0]??''}/${spec.inputs.map(input=>input.shape.join('x')).join(';')}`;
         plan.pipeline = this.pipeline(plan.code, plan.bindings ?? spec.inputs.length, plan.validatesIndices);
         if (plan.scratch) {
-            plan.scratch.pipeline = this.pipeline(plan.scratch.code,1,plan.scratch.validatesIndices);
+            plan.scratch.pipeline = this.pipeline(
+                plan.scratch.code, plan.scratch.inputs?.length ?? 1, plan.scratch.validatesIndices);
         }
         for (const stage of plan.stages ?? []) {
             stage.pipeline = this.pipeline(stage.code,stage.inputs.length);
@@ -238,6 +244,14 @@ class WebGpu {
             this.stats.regionPlannedBytes -= region.plannedBytes || 0;
         }
         this.regions.delete(id);
+    }
+    regionStats() {
+        return [...this.regions.values()].map(region => ({
+            key: region.key,
+            commands: region.commands.length,
+            originalBytes: region.originalBytes || 0,
+            plannedBytes: region.plannedBytes || 0,
+        }));
     }
     runRegion(id, inputs) {
         const region = this.regions.get(id);
@@ -367,12 +381,13 @@ class WebGpu {
             if (plan.weightPreparation) {
                 const prepared = this.preparedWeight(plan, operands);
                 if (plan.w8a8) operands.push(prepared);
-                else operands[1] = prepared;
+                else operands[plan.weightPreparation.inputs[0]] = prepared;
             }
             if(plan.scratch){
                 const scratch={handle:this.allocate(plan.scratch.bytes),offset:0};
                 temporaries.push(scratch.handle);
-                this.dispatch(plan.scratch.pipeline,[operands[0]],scratch,plan.scratch.uniforms,plan.scratch.groups,`quantize/${plan.label}`);
+                this.dispatch(plan.scratch.pipeline,(plan.scratch.inputs??[0]).map(index=>operands[index]),scratch,
+                    plan.scratch.uniforms,plan.scratch.groups,`quantize/${plan.label}`);
                 operands[0]=scratch;
             }
             let previous;

@@ -20,6 +20,9 @@ brew install emscripten node
 node web/tools/build.mjs build-web
 ```
 
+The packaged site contains two runtimes: the primary non-pthread WebGPU module
+and a pthread CPU fallback. There is no single-thread CPU artifact.
+
 ## Serve
 
 Once built, only Python (or another static host) is needed:
@@ -87,14 +90,25 @@ CPU pthreads are used only on isolated pages. Microphone permission is requested
 Tiny has real GPU numerical, transcription, and timing coverage; Base/Small loading remains supported but their
 GPU quality/performance has not been measured in this redesign.
 
+Microphone capture keeps a bounded 500 ms pre-roll locally and does not send PCM
+to Whisper until the configured amount of consecutive speech crosses VAD.
+Sub-threshold frames reset that consecutive-speech timer, so intermittent noise
+cannot accumulate into a false start. Voice mode finalizes after end silence
+and shows provisional recognition in the composer after speech starts.
+The header explains that a 1.5-second pause sends the turn. The final transcript
+remains editable and visible for 600 ms before voice mode submits it. Manual
+dictation retains the same VAD-gated partial text without automatic submission.
+Stopping before VAD confirms speech cancels cleanly and reports that no speech
+was detected instead of decoding silence.
+
 ## Execution Modes
 
 On first use, the app selects WebGPU when a hardware adapter is available; otherwise it uses CPU.
 An explicitly selected backend is saved and takes precedence on later visits.
 
-- **WebAssembly CPU, one thread:** uses the single-thread SIMD module.
-- **WebAssembly CPU, 2-8 threads:** uses pthreads and the YNNPACK/Slinky
-  scheduler. The selected count includes the calling thread.
+- **WebAssembly CPU, 1-8 configured threads:** uses the pthread module and the
+  YNNPACK/Slinky scheduler. The selected count includes the calling thread and
+  requires cross-origin isolation even when configured to one.
 - **WebGPU:** uses the non-pthread `gpu` module. It requires a hardware WebGPU
   adapter and a secure context, but not cross-origin isolation, JSPI, or Asyncify.
   Chat, TTS, ASR, and vision share one device and Wasm heap. CPU threading remains
@@ -185,9 +199,9 @@ cache implementation, and build packaging.
 The Chat view reserves the viewport for messages and the bottom composer.
 Model source, thread count, cache and token controls live in the runtime settings dialog.
 Valid thread-count and output-token changes are remembered in local storage.
-If isolation is unavailable, the current session uses one thread without replacing
-the saved thread preference. The composer identifies inference as running locally
-inside the browser.
+If isolation is unavailable, WebGPU remains usable but the CPU backend reports
+that its pthread runtime is unavailable. The composer identifies inference as
+running locally inside the browser.
 New chat creates a blank conversation; completed chats are stored in local
 browser storage and can be reopened or deleted from the history rail. Chat
 content is not sent to a server.
@@ -235,8 +249,8 @@ The 16-step reference's full-logit readback falls from 45,132,800 bytes to 1,376
 bytes of final codes; PCM is read back separately. Each diffusion step yields to
 JavaScript before the next C++ call. No production JSPI or Asyncify is used.
 If WebGPU TTS initialization fails,
-the UI reports the fallback and retries with up to eight WASM CPU threads.
-Browsers without isolation use the single-thread CPU runtime.
+the UI reports the fallback and retries with up to eight WASM CPU threads when
+cross-origin isolation is available.
 The UI reports model loading, synthesis, and playback as separate phases.
 Browser playback accepts transferable Float32 PCM directly, avoiding the old
 Float32-to-Int16-to-Float32 round trip. Native binary PCM framing remains supported.
@@ -246,30 +260,66 @@ Read aloud sends only the assistant response to OmniVoice, excluding hidden UI
 labels such as the long-response disclosure.
 
 Browser speech is synthesized in bounded phrases, not as one complete reply.
+One shared `SpeechController` implements this behavior for Wasm and native
+desktop; backend adapters expose only chat/ASR/TTS primitives and transport.
 In voice mode, text deltas feed the phrase queue while chat generation continues;
 playback starts when the first phrase arrives. Sentence and clause boundaries
-are preferred, with a hard 96-unit limit (64 for the first phrase; CJK graphemes
-cost three units). A long sentence is therefore bounded too. Text offsets and
+are preferred. Complete sentences up to 192 weighted units remain whole; only
+longer sentences use soft targets of 128 units for the first phrase and 160
+thereafter. CJK graphemes cost three units. Text offsets and
 segment IDs connect synthesis to transient message highlights: ready/played
 phrases have a subtle background, and the phrase actually playing is emphasized.
 CSS Custom Highlights preserve the Markdown DOM; older browsers use removable
 inline marks. Cancellation and playback completion clear the highlights.
 
-Playback applies backpressure at six seconds of queued audio, plus at most one
-bounded phrase. Cumulative consumed-frame reports include chunks still in
-transit, so fast cache replays cannot accidentally bypass that limit. A speech
-or audio-device failure stops its speech stream without discarding an ongoing
-text reply. The GPU decoder retains one waveform shape and Qwen retains one
-working set of four-layer regions, rather than accumulating buffers for every
-phrase length. Chat releases its prefill-only reservation after the first token;
-the existing 3 GiB GPU quota is unchanged.
+The controller is transport-independent and depends only on the versioned
+command/event/PCM contract. This keeps a future Android host adapter possible
+without moving browser-specific WebSocket, Worker, Cache Storage, or DOM details
+into the state machine.
+
+OmniVoice voice-design attributes describe a class of speaker, not one fixed
+speaker identity. During TTS loading, the browser deterministically synthesizes
+one short calibration sentence from the selected voice attributes and a voice
+seed. It retains the matching transcript plus model-native 8-codebook tokens as
+an OmniVoice voice prompt. Every visible segment, including segment zero, uses
+that same immutable prompt; no sentence derives its identity from another
+sentence.
+
+The roughly 2.4 KiB prompt is persisted in a dedicated, versioned Cache Storage
+namespace. Its key covers the model package, execution precision, voice
+attributes, calibration text/language, voice seed, and diffusion parameters.
+Cached prompts are shape/range/checksum validated before a narrow Wasm import.
+A miss regenerates the deterministic prompt; corrupt or unavailable cache data
+never falls back to an unconditioned voice. Model-cache deletion also clears
+voice prompts. This uses OmniVoice's documented reusable prompt conditioning
+instead of relying on [voice-design attributes](https://github.com/k2-fsa/OmniVoice/blob/master/docs/voice-design.md)
+alone.
+
+Playback applies backpressure at six seconds of queued audio with exactly one
+segment of lookahead. The next segment starts synthesizing as soon as the
+current PCM is queued; if it finishes early, its one PCM buffer waits for
+playback capacity before a third synthesis can start. Cumulative consumed-frame
+reports include chunks still in transit, so fast cache replays cannot bypass
+that bound. The response speaker button is a three-state control: speaker starts
+playback, pause stops consumption at the exact sample while bounded synthesis
+may continue, and play resumes from that sample. Pausing a manual read detaches
+it from the foreground request, re-enabling the composer and dictation while
+the bounded speech stream remains resumable. Selecting another response's
+speaker control cancels and clears the old playing or paused stream before
+starting the newly selected response. A speech or audio-device failure stops
+its speech stream without discarding an ongoing text reply. The GPU decoder
+retains one waveform shape and Qwen retains one working set of four-layer
+regions, rather than accumulating buffers for every phrase length.
+Chat releases its prefill-only reservation after the first token; the existing
+3 GiB GPU quota is unchanged. TTS admission reserves 768 MiB up to 128 text
+units and 1.25 GiB for 129-192. These are pressure estimates, not allocations.
 
 Recent synthesized PCM is cached in memory for replay: at most 16 MiB, 48 phrases,
 and ten minutes from synthesis, with LRU eviction. Keys include source, selected
-backend, text, and effective synthesis settings. Cached storage owns its bytes
-independently of playback transfers; a hit needs no speech worker/model load.
-The cache is not written to disk and is cleared by a page reload. Model storage
-and saved conversations are unchanged.
+backend, text, effective synthesis settings, and the deterministic voice key.
+Cached storage owns its bytes independently of playback transfers; a hit needs
+no speech worker/model load. The cache is not written to disk and is cleared by
+a page reload. Model storage and saved conversations are unchanged.
 
 Segmentation reduces first-audio latency and bounds memory; it does not make
 a slower-than-realtime profile gapless. Keep the chosen voice, steps, pace, and
@@ -286,8 +336,8 @@ diffusion steps or voice settings:
   and zero point. INT8 weights remain packed; cached column sums provide exact
   zero-point correction. Production uses the portable floating-dot kernel;
   packed integer dots remain an explicit diagnostic option for adapters where
-  full-model measurement proves they help. This is opt-in because activation
-  quantization can change speech.
+  full-model measurement proves they help. This is the default browser WebGPU
+  profile; FP32 remains selectable as the quality/reference baseline.
 
 `packed_4x8_integer_dot_product` exposes `dot4I8Packed`, not a guarantee of native
 INT8 throughput. [Dawn's Metal lowering](https://github.com/google/dawn/blob/main/src/tint/lang/msl/writer/raise/raise.cc)
@@ -315,7 +365,9 @@ one-adapter observations, not a universal INT8/FP16 speed claim or native parity
 The prepared representation is about 919 MB for FP16 versus 1.5 MB of W8A8
 column sums. Small English, Spanish, French, and German backtranscription checks
 cover finite/non-silent speech and up to two sentences, but are not a listening
-score or a comprehensive quality evaluation. FP32 remains the default.
+score or a comprehensive quality evaluation. Existing browser WebGPU settings
+from the former FP32-default release migrate once to W8A8; subsequent explicit
+profile choices are preserved.
 
 The adapter releases a logical TTS lease after delivery; the shared worker retains
 bounded weights/plans for reuse rather than destroying the device every utterance.
@@ -532,7 +584,7 @@ To measure without a browser, run the same loader and module in Node against a
 local Hugging Face snapshot:
 
 ```bash
-node benchmarks/browser/heap_probe.mjs --glue build-web/single/kidi.mjs \
+node benchmarks/browser/heap_probe.mjs --glue build-web/threads/kidi.mjs \
   --snapshot ~/.cache/kidi/model-hub/models--google--gemma-4-E2B-it-qat-mobile-transformers/snapshots/<sha> \
   [--threads 4] [--words 1600] [--image photo.jpg] [--json result.json]
 ```
@@ -545,7 +597,7 @@ Allocation wrappers use JavaScript numbers, and `ccall` pointer arguments use
 its `pointer` type. Check the built ABI with an allocation that crosses 2 GiB:
 
 ```bash
-KIDI_TEST_WASM=build-web/single/kidi.mjs node --test tests/browser/model_cache_test.mjs
+KIDI_TEST_WASM=build-web/gpu/kidi.mjs node --test tests/browser/model_cache_test.mjs
 ```
 
 ## Hosting and Cache
@@ -556,12 +608,13 @@ isolation headers through a service worker on servers that cannot configure
 them, including Python's standard server and GitHub Pages. It must remain beside
 the index page on the same origin. First installation can trigger a page reload;
 subsequent visits reuse it. Browsers that cannot establish isolation fall back
-to one thread. HTTPS is required except on localhost/loopback.
+to WebGPU when available; the CPU backend requires isolation. HTTPS is required
+except on localhost/loopback.
 
 ### GitHub Pages
 
 The [WebAssembly Pages workflow](../.github/workflows/pages.yml) tests the browser
-loader and builds the single-thread, pthread, and unified WebGPU variants for
+loader and builds the pthread CPU fallback and unified WebGPU primary runtime for
 relevant pull requests and pushes to `main`.
 Only `main` deploys, using the `github-pages` environment and GitHub's Pages
 artifact service. It can also be run manually from the Actions tab on `main`.

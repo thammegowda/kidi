@@ -4,6 +4,7 @@ class KidiPlaybackProcessor extends AudioWorkletProcessor {
     this.queue = [];
     this.offset = 0;
     this.ending = false;
+    this.paused = false;
     this.streamId = null;
     this.frames = 0;
     this.playedFrames = 0;
@@ -11,7 +12,7 @@ class KidiPlaybackProcessor extends AudioWorkletProcessor {
     this.port.onmessage = event => {
       const data = event.data;
       if (data.type === 'start') {
-        this.queue = []; this.offset = 0; this.ending = false; this.streamId = data.streamId;
+        this.queue = []; this.offset = 0; this.ending = false; this.paused = false; this.streamId = data.streamId;
         this.frames = 0; this.reported = 0;
         this.playedFrames = 0;
       }
@@ -22,8 +23,10 @@ class KidiPlaybackProcessor extends AudioWorkletProcessor {
         this.port.postMessage({type: 'buffered', streamId: this.streamId, frames: this.frames, playedFrames: this.playedFrames});
       }
       if (data.type === 'end' && data.streamId === this.streamId) this.ending = true;
+      if (data.type === 'pause' && data.streamId === this.streamId) this.paused = true;
+      if (data.type === 'resume' && data.streamId === this.streamId) this.paused = false;
       if (data.type === 'reset') {
-        this.queue = []; this.offset = 0; this.ending = false; this.streamId = null;
+        this.queue = []; this.offset = 0; this.ending = false; this.paused = false; this.streamId = null;
         this.frames = 0; this.reported = 0;
         this.playedFrames = 0;
       }
@@ -33,6 +36,7 @@ class KidiPlaybackProcessor extends AudioWorkletProcessor {
   process(_inputs, outputs) {
     const output = outputs[0][0];
     output.fill(0);
+    if (this.paused) return true;
     let written = 0;
     while (written < output.length && this.queue.length) {
       const current = this.queue[0];

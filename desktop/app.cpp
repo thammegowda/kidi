@@ -4,6 +4,7 @@
 #include "kidi/inference/transcriber.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/text/tokenizer.h"
+#include "kidi/desktop/request_gate.h"
 #include "liteapp/core/random.h"
 #include "liteapp/http/server.h"
 #include "liteapp/platform/openers.h"
@@ -22,7 +23,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
-#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -66,8 +66,7 @@ auto messages_from(const Json& source, const std::map<std::uint32_t, std::filesy
             !message["role"].is_string() || !message.contains("content") || !message["content"].is_string())
             return invalid("each message must contain role, content, and optional images fields only");
         const auto role = message["role"].get<std::string>();
-        if (role != "user" && role != "assistant")
-            return invalid("message role must be user or assistant");
+        if (role != "user" && role != "assistant") return invalid("message role must be user or assistant");
         auto content = message["content"].get<std::string>();
         std::vector<std::filesystem::path> paths;
         if (message.contains("images")) {
@@ -86,105 +85,6 @@ auto messages_from(const Json& source, const std::map<std::uint32_t, std::filesy
     }
     return result;
 }
-
-auto plain_speech_text(std::string_view source) -> std::string {
-        std::string result;
-        result.reserve(source.size());
-        bool space = false, tag = false, url = false;
-        for (std::size_t index = 0; index < source.size(); ++index) {
-            const auto value = source[index];
-            if (url) {
-                if (value == ')') url = false;
-                continue;
-            }
-            if (tag) {
-                if (value == '>') tag = false;
-                continue;
-            }
-            if (value == '<') {
-                tag = true;
-                continue;
-            }
-            if (value == ']' && index + 1 < source.size() && source[index + 1] == '(') {
-                url = true;
-                ++index;
-                continue;
-            }
-            if (value == '*' || value == '_' || value == '`' || value == '#' || value == '>' || value == '[' ||
-                value == ']')
-                continue;
-            if (std::isspace(static_cast<unsigned char>(value))) {
-                space = !result.empty();
-                continue;
-            }
-            if (space) result.push_back(' ');
-            result.push_back(value);
-            space = false;
-        }
-        while (!result.empty() && result.back() == ' ') result.pop_back();
-        return result;
-}
-
-struct SpeechSegmenter {
-    std::size_t first_limit;
-    std::size_t segment_limit;
-    std::size_t clause_min;
-    bool first = true;
-    std::string buffer;
-
-    auto append(std::string_view delta, bool flush = false) -> std::vector<std::string> {
-        buffer += delta;
-        std::vector<std::string> result;
-        while (!buffer.empty()) {
-            std::vector<std::size_t> offsets{0};
-            offsets.reserve(buffer.size() + 1);
-            for (std::size_t index = 1; index < buffer.size(); ++index) {
-                const auto value = static_cast<unsigned char>(buffer[index]);
-                if ((value & 0xc0U) != 0x80U) offsets.push_back(index);
-            }
-            offsets.push_back(buffer.size());
-            const auto characters = offsets.size() - 1;
-            std::size_t boundary = std::string::npos;
-            const auto sentence_min = first ? std::size_t{12} : std::size_t{23};
-            const auto current_clause_min = first ? std::min(clause_min, std::size_t{24}) : clause_min;
-            for (std::size_t index = 0; index < characters; ++index) {
-                const auto byte = offsets[index];
-                const auto sentence =
-                    buffer[byte] == '.' || buffer[byte] == '?' || buffer[byte] == '!' || buffer[byte] == '\n';
-                const auto clause = buffer[byte] == ',' || buffer[byte] == ';' || buffer[byte] == ':';
-                const auto followed_by_space = index + 1 == characters ||
-                                               std::isspace(static_cast<unsigned char>(buffer[offsets[index + 1]]));
-                if (((index >= sentence_min && sentence) || (index >= current_clause_min && clause)) &&
-                    followed_by_space) {
-                    boundary = offsets[index + 1];
-                    break;
-                }
-            }
-            const auto limit = first ? first_limit : segment_limit;
-            if (boundary == std::string::npos && characters >= limit) {
-                for (auto index = limit; index > 16; --index) {
-                    if (buffer[offsets[index - 1]] == ' ') {
-                        boundary = offsets[index - 1];
-                        break;
-                    }
-                }
-                if (boundary == std::string::npos) boundary = offsets[limit];
-            }
-            if (boundary == std::string::npos) {
-                if (!flush) break;
-                boundary = buffer.size();
-            }
-            auto segment = plain_speech_text(std::string_view(buffer).substr(0, boundary));
-            buffer.erase(0, boundary);
-            while (!buffer.empty() && std::isspace(static_cast<unsigned char>(buffer.front()))) buffer.erase(0, 1);
-            if (!segment.empty()) {
-                result.push_back(std::move(segment));
-                first = false;
-            }
-        }
-        return result;
-    }
-};
 
 class StreamingAudioJoiner {
 public:
@@ -320,15 +220,13 @@ auto resolve_model_path(const std::filesystem::path& config, const YAML::Node& n
 auto positive_size(const YAML::Node& node, std::string_view key, std::size_t fallback, std::size_t maximum)
     -> std::size_t;
 
-auto model_config(const std::filesystem::path& source, const YAML::Node& node, bool default_enabled)
-    -> ModelConfig {
+auto model_config(const std::filesystem::path& source, const YAML::Node& node, bool default_enabled) -> ModelConfig {
     if (!node || !node.IsMap()) return {.enabled = default_enabled};
     return {
         .enabled = node["enabled"] ? node["enabled"].as<bool>() : default_enabled,
         .directory = resolve_model_path(source, node),
         .accelerator = yaml_string(node, "accelerator", "auto"),
-        .metal_prefill_cache_bytes =
-            positive_size(node, "metal_prefill_cache_mb", 512, 4096) * 1024U * 1024U,
+        .metal_prefill_cache_bytes = positive_size(node, "metal_prefill_cache_mb", 512, 4096) * 1024U * 1024U,
     };
 }
 
@@ -360,17 +258,13 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
         if (!root.IsMap() || !root["version"] || root["version"].as<int>() != 1)
             return invalid_config("Configuration version must be 1");
         const auto models = root["models"];
-        if (!models.IsMap() || !models["chat"].IsMap())
-            return invalid_config("models.chat configuration is required");
+        if (!models.IsMap() || !models["chat"].IsMap()) return invalid_config("models.chat configuration is required");
         AppConfig result;
         result.source = source;
         result.threads = positive_size(root["runtime"], "threads", 4, 64);
         result.preload_speech =
-            root["runtime"] && root["runtime"]["preload_speech"]
-                ? root["runtime"]["preload_speech"].as<bool>()
-                : true;
-        result.idle_model_timeout_seconds =
-            positive_size(root["runtime"], "idle_model_timeout_seconds", 300, 86400);
+            root["runtime"] && root["runtime"]["preload_speech"] ? root["runtime"]["preload_speech"].as<bool>() : true;
+        result.idle_model_timeout_seconds = positive_size(root["runtime"], "idle_model_timeout_seconds", 300, 86400);
         result.chat = model_config(source, models["chat"], true);
         result.asr = model_config(source, models["asr"], false);
         result.tts = model_config(source, models["tts"], false);
@@ -386,9 +280,8 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
                 return invalid_config("Enabled model directory does not exist: " + model->directory.string());
         }
         if (result.tts.enabled) {
-            for (const auto* file :
-                 {"model.yaml", "model.safetensors", "tokenizer.json", "sentence-prefixes.tsv",
-                  "synthesis_template.jinja", "NOTICE"}) {
+            for (const auto* file : {"model.yaml", "model.safetensors", "tokenizer.json", "sentence-prefixes.tsv",
+                                     "synthesis_template.jinja", "NOTICE"}) {
                 if (!std::filesystem::is_regular_file(result.tts.directory / file, error))
                     return invalid_config("TTS package is missing required file: " + std::string(file));
             }
@@ -420,7 +313,7 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
             {"vad",
              {{"threshold", vad_threshold},
               {"minimum_speech_ms", positive_size(vad, "minimum_speech_ms", 250, 10000)},
-              {"silence_ms", positive_size(vad, "silence_ms", 800, 10000)}}},
+              {"silence_ms", positive_size(vad, "silence_ms", 1500, 10000)}}},
         };
         result.max_audio_queue_ms = positive_size(root["transport"], "max_audio_queue_ms", 3000, 30000);
         result.max_text_frame_bytes =
@@ -438,11 +331,6 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
              yaml_string(tts, "reference_text",
                          "Hello, I am Kidi, your helpful local assistant. I am here to help clearly and concisely.")},
             {"steps", positive_size(tts, "steps", 10, 128)},
-            {"streaming",
-             {{"first_segment_chars", positive_size(tts["streaming"], "first_segment_chars", 48, 512)},
-              {"first_segment_steps", positive_size(tts["streaming"], "first_segment_steps", 8, 128)},
-              {"segment_chars", positive_size(tts["streaming"], "segment_chars", 120, 1024)},
-              {"clause_min_chars", positive_size(tts["streaming"], "clause_min_chars", 32, 256)}}},
             {"voice",
              {
                  {"gender", yaml_string(voice, "gender", "female")},
@@ -481,14 +369,12 @@ public:
         kidi::runtime::ynn::set_thread_count(parsed->threads);
         if (auto reserved = kidi::runtime::ynn::reserve_thread_pool(parsed->threads); !reserved)
             return std::unexpected(liteapp::Error{"load_failed", reserved.error().message});
-        auto loaded = Generator::load(
-            parsed->chat.directory,
-            {
-                .device = *selected,
-                .precision = parsed->precision,
-                .kv_cache_precision = parsed->kv_cache_precision,
-                .packed_prefill = true,
-            });
+        auto loaded = Generator::load(parsed->chat.directory, {
+                                                                  .device = *selected,
+                                                                  .precision = parsed->precision,
+                                                                  .kv_cache_precision = parsed->kv_cache_precision,
+                                                                  .packed_prefill = true,
+                                                              });
         if (!loaded) return std::unexpected(liteapp::Error{"load_failed", loaded.error().message});
         auto configured = loaded->configure_serving({
             .maximum_active = 1,
@@ -528,7 +414,7 @@ public:
             reaper_ = std::jthread([this](std::stop_token stop) {
                 while (!stop.stop_requested()) {
                     std::this_thread::sleep_for(std::chrono::seconds(5));
-                    if (stop.stop_requested() || request_active_.load()) continue;
+                    if (stop.stop_requested() || request_gate_.any()) continue;
                     const auto now = speech_clock();
                     const auto timeout = config_->idle_model_timeout_seconds * 1000;
                     if (last_asr_use_.load() && now - last_asr_use_.load() >= timeout) {
@@ -555,12 +441,11 @@ public:
         return json_response({
             {"ready", generator_.has_value()},
             {"config", config_ ? config_->source.string() : ""},
-            {"runtime",
-             config_ ? Json{{"threads", config_->threads},
-                            {"concurrency", "single"},
-                            {"preload_speech", config_->preload_speech},
-                            {"idle_model_timeout_seconds", config_->idle_model_timeout_seconds}}
-                     : Json::object()},
+            {"runtime", config_ ? Json{{"threads", config_->threads},
+                                       {"concurrency", "single"},
+                                       {"preload_speech", config_->preload_speech},
+                                       {"idle_model_timeout_seconds", config_->idle_model_timeout_seconds}}
+                                : Json::object()},
             {"components", components()},
             {"model", model_path_},
             {"backend", execution_},
@@ -602,8 +487,7 @@ public:
         const auto prompt = system_prompt();
         std::vector<ChatMessage> conversation;
         conversation.reserve(messages.size() + !prompt.empty());
-        if (!prompt.empty())
-            conversation.push_back({.role = "system", .content = prompt, .images = {}});
+        if (!prompt.empty()) conversation.push_back({.role = "system", .content = prompt, .images = {}});
         conversation.insert(conversation.end(), messages.begin(), messages.end());
         auto queued = generator_->enqueue_chat(conversation, options);
         if (!queued) return std::unexpected(queued.error());
@@ -701,8 +585,8 @@ public:
     }
 
     auto config() const -> const AppConfig& { return *config_; }
-    auto begin_request() -> bool { return !request_active_.exchange(true); }
-    void end_request() { request_active_.store(false); }
+    auto begin_request(std::string_view kind) -> bool { return request_gate_.acquire(kind); }
+    void end_request(std::string_view kind) { request_gate_.release(kind); }
 
 private:
     auto prepare_asr_locked() -> kidi::Result<void> {
@@ -778,7 +662,7 @@ private:
     std::mutex chat_mutex_;
     std::mutex asr_mutex_;
     std::mutex tts_mutex_;
-    std::atomic_bool request_active_{false};
+    kidi::desktop::RequestGate request_gate_;
     std::optional<Generator> generator_;
     std::optional<kidi::inference::Transcriber> transcriber_;
     std::optional<kidi::inference::Synthesizer> synthesizer_;
@@ -857,11 +741,7 @@ private:
         if (disconnected_.load() || !socket_.is_open()) return;
         auto& sequence = sequences_[std::string(id)];
         const auto message = Json{
-            {"v", 1},
-            {"id", id},
-            {"type", type},
-            {"seq", sequence++},
-            {"payload", std::move(payload)},
+            {"v", 1}, {"id", id}, {"type", type}, {"seq", sequence++}, {"payload", std::move(payload)},
         };
         if (!socket_.send_text(message.dump())) disconnected_.store(true);
     }
@@ -886,8 +766,7 @@ private:
                 }
                 settings["language"] = value;
             } else if (name == "steps") {
-                if (!value.is_number_unsigned() || value.get<std::size_t>() < 1 ||
-                    value.get<std::size_t>() > 128) {
+                if (!value.is_number_unsigned() || value.get<std::size_t>() < 1 || value.get<std::size_t>() > 128) {
                     send_error(id, "invalid_tts", "TTS steps must be between 1 and 128");
                     return std::nullopt;
                 }
@@ -905,8 +784,8 @@ private:
                     return std::nullopt;
                 }
                 for (const auto& [attribute, selected] : value.items()) {
-                    if (attribute != "gender" && attribute != "age" && attribute != "pitch" &&
-                        attribute != "style" && attribute != "accent") {
+                    if (attribute != "gender" && attribute != "age" && attribute != "pitch" && attribute != "style" &&
+                        attribute != "accent") {
                         send_error(id, "invalid_tts", "Unsupported TTS voice attribute: " + attribute);
                         return std::nullopt;
                     }
@@ -929,7 +808,7 @@ private:
             send_error(id, "busy", "Another inference request is active");
             return false;
         }
-        if (!backend_->begin_request()) {
+        if (!backend_->begin_request(kind)) {
             active_.store(false);
             send_error(id, "busy", "Another inference request is active");
             return false;
@@ -939,24 +818,22 @@ private:
         {
             std::scoped_lock lock(active_mutex_);
             active_id_ = std::move(id);
-            active_kind_ = std::move(kind);
+            active_kind_ = kind;
         }
-        task_ = std::jthread([this, work = std::move(work)] {
+        task_ = std::jthread([this, kind, work = std::move(work)] {
             work();
             {
                 std::scoped_lock lock(active_mutex_);
                 active_id_.clear();
                 active_kind_.clear();
             }
-            backend_->end_request();
+            backend_->end_request(kind);
             active_.store(false);
         });
         return true;
     }
 
-    auto cancelled() const -> bool {
-        return disconnected_.load() || cancel_requested_.load();
-    }
+    auto cancelled() const -> bool { return disconnected_.load() || cancel_requested_.load(); }
 
     void finish_error(std::string_view id, const kidi::Error& error) {
         if (cancelled() || error.message.find("cancel") != std::string::npos)
@@ -967,9 +844,9 @@ private:
 
     void handle_text(std::string_view text) {
         const auto message = Json::parse(text, nullptr, false);
-        if (message.is_discarded() || !message.is_object() || message.value("v", 0) != 1 ||
-            !message.contains("id") || !message["id"].is_string() || !message.contains("type") ||
-            !message["type"].is_string() || !message.contains("payload") || !message["payload"].is_object()) {
+        if (message.is_discarded() || !message.is_object() || message.value("v", 0) != 1 || !message.contains("id") ||
+            !message["id"].is_string() || !message.contains("type") || !message["type"].is_string() ||
+            !message.contains("payload") || !message["payload"].is_object()) {
             send_error("", "invalid_message", "Expected a versioned request object");
             return;
         }
@@ -995,11 +872,16 @@ private:
             return;
         }
         if (type == "cancel") {
-            std::scoped_lock lock(active_mutex_);
-            if (id == active_id_) {
-                cancel_requested_.store(true);
-                audio_ready_.notify_all();
+            bool active = false;
+            {
+                std::scoped_lock lock(active_mutex_);
+                active = id == active_id_;
+                if (active) {
+                    cancel_requested_.store(true);
+                    audio_ready_.notify_all();
+                }
             }
+            if (!active) send_event(id, "request.cancelled");
             return;
         }
         if (type == "image.start") {
@@ -1012,17 +894,16 @@ private:
             const auto stream_id = payload["stream_id"].get<std::uint32_t>();
             const auto size = payload["size"].get<std::size_t>();
             const auto content_type = payload["content_type"].get<std::string>();
-            if (!size || size > 32U * 1024U * 1024U ||
-                (content_type != "image/jpeg" && content_type != "image/png") ||
+            if (!size || size > 32U * 1024U * 1024U || (content_type != "image/jpeg" && content_type != "image/png") ||
                 image_uploads_.contains(stream_id) || uploaded_images_.contains(stream_id)) {
                 send_error(id, "invalid_image", "Image must be a unique JPEG or PNG no larger than 32 MiB");
                 return;
             }
             image_uploads_.emplace(stream_id, ImageUpload{
-                .request_id = id,
-                .content_type = content_type,
-                .expected_size = size,
-            });
+                                                  .request_id = id,
+                                                  .content_type = content_type,
+                                                  .expected_size = size,
+                                              });
             return;
         }
         if (type == "image.finish") {
@@ -1067,24 +948,8 @@ private:
                 send_error(id, "invalid_messages", messages.error().message);
                 return;
             }
-            if (payload.contains("speak") && !payload["speak"].is_boolean()) {
-                send_error(id, "invalid_message", "speak must be a boolean");
-                return;
-            }
-            const auto speak = payload.value("speak", false);
-            if (speak && !backend_->config().tts.enabled) {
-                send_error(id, "tts_disabled", "Voice mode requires an enabled TTS model");
-                return;
-            }
-            auto speech_settings =
-                speak ? tts_settings(id, payload.contains("tts_options") ? payload["tts_options"] : Json{})
-                      : std::optional<Json>{Json::object()};
-            if (!speech_settings) return;
             auto owned = std::move(*messages);
-            start_task(id, "chat",
-                       [this, id, messages = std::move(owned), speak, settings = std::move(*speech_settings)] {
-                           run_chat(id, messages, speak, settings);
-                       });
+            start_task(id, "chat", [this, id, messages = std::move(owned)] { run_chat(id, messages); });
             return;
         }
         if (type == "asr.start") {
@@ -1102,14 +967,13 @@ private:
                 return;
             }
             const auto voice_mode = payload.value("voice_mode", false);
-            auto settings =
-                voice_mode ? tts_settings(id, payload.contains("tts_options") ? payload["tts_options"] : Json{})
-                           : std::optional<Json>{Json::object()};
+            auto settings = voice_mode
+                                ? tts_settings(id, payload.contains("tts_options") ? payload["tts_options"] : Json{})
+                                : std::optional<Json>{Json::object()};
             if (!settings) return;
-            start_task(id, "asr",
-                       [this, id, stream_id, voice_mode, settings = std::move(*settings)] {
-                           run_asr(id, stream_id, voice_mode, settings);
-                       });
+            start_task(id, "asr", [this, id, stream_id, voice_mode, settings = std::move(*settings)] {
+                run_asr(id, stream_id, voice_mode, settings);
+            });
             return;
         }
         if (type == "asr.stop") {
@@ -1140,10 +1004,9 @@ private:
             }
             auto settings = tts_settings(id, payload.contains("options") ? payload["options"] : Json{});
             if (!settings) return;
-            start_task(id, "tts",
-                       [this, id, stream_id, source, settings = std::move(*settings)] {
-                           run_tts(id, stream_id, source, settings);
-                       });
+            start_task(id, "tts", [this, id, stream_id, source, settings = std::move(*settings)] {
+                run_tts(id, stream_id, source, settings);
+            });
             return;
         }
         send_error(id, "unknown_type", "Unknown request type: " + type);
@@ -1165,8 +1028,8 @@ private:
             if (found == image_uploads_.end() || sequence != found->second.sequence++ || sample_rate ||
                 bytes != frame.size() - AUDIO_HEADER_BYTES ||
                 found->second.bytes.size() + bytes > found->second.expected_size) {
-                send_error(found == image_uploads_.end() ? "" : found->second.request_id,
-                           "invalid_image", "Image upload frame is invalid or out of order");
+                send_error(found == image_uploads_.end() ? "" : found->second.request_id, "invalid_image",
+                           "Image upload frame is invalid or out of order");
                 if (found != image_uploads_.end()) image_uploads_.erase(found);
                 return;
             }
@@ -1231,143 +1094,16 @@ private:
         image_uploads_.clear();
     }
 
-    void run_chat(const std::string& id, std::span<const ChatMessage> messages, bool speak, const Json& settings) {
-        std::mutex speech_mutex;
-        std::condition_variable speech_ready;
-        std::deque<std::string> speech_queue;
-        bool speech_done = false;
-        std::optional<kidi::Error> speech_error;
-        const auto streaming = settings.value("streaming", Json::object());
-        SpeechSegmenter segmenter{
-            .first_limit = streaming.value("first_segment_chars", std::size_t{48}),
-            .segment_limit = streaming.value("segment_chars", std::size_t{120}),
-            .clause_min = streaming.value("clause_min_chars", std::size_t{32}),
-        };
-        const auto stream_id = speak ? next_server_stream_.fetch_add(1) : 0;
-        std::uint32_t audio_sequence = 0;
-        std::size_t audio_samples = 0, audio_chunks = 0;
-        std::size_t speech_segments = 0;
-        bool reused_voice_prompt = false;
-        bool first_audio_sent = false, first_segment_queued = false;
-        const auto chat_started = Clock::now();
-        StreamingAudioJoiner audio_joiner([&, this](std::span<const float> samples, std::uint32_t rate) {
-            audio_samples += samples.size();
-            send_audio(stream_id, audio_sequence, samples, rate);
-            {
-                std::scoped_lock lock(speech_mutex);
-                if (!first_audio_sent) {
-                    first_audio_sent = true;
-                    send_event(id, "voice.audio.first",
-                               {{"stream_id", stream_id}, {"elapsed_ms", milliseconds(chat_started)}});
-                }
-            }
-            speech_ready.notify_all();
-        });
-        const auto fail_speech = [&](kidi::Error error) {
-            {
-                std::scoped_lock lock(speech_mutex);
-                speech_error = std::move(error);
-            }
-            speech_ready.notify_all();
-        };
-        std::jthread speech_worker;
-        if (speak) {
-            send_event(id, "voice.audio.started", {{"stream_id", stream_id}, {"format", "pcm_s16le"}});
-            speech_worker = std::jthread([&] {
-                if (auto prepared = backend_->prepare_tts_profile(settings, [this] { return cancelled(); }); !prepared) {
-                    fail_speech(prepared.error());
-                    return;
-                }
-                while (!cancelled()) {
-                    std::string segment;
-                    {
-                        std::unique_lock lock(speech_mutex);
-                        while (!cancelled() && !speech_done && speech_queue.empty())
-                            speech_ready.wait_for(lock, std::chrono::milliseconds(25));
-                        if (cancelled()) return;
-                        if (speech_queue.empty()) {
-                            if (speech_done) break;
-                            continue;
-                        }
-                        segment = std::move(speech_queue.front());
-                        speech_queue.pop_front();
-                        speech_ready.notify_all();
-                    }
-                    auto segment_settings = settings;
-                    if (!speech_segments)
-                        segment_settings["steps"] =
-                            settings["streaming"].value("first_segment_steps", settings.value("steps", 10));
-                    auto speech = backend_->synthesize(
-                        segment, segment_settings, [this] { return cancelled(); },
-                        [&audio_joiner](std::span<const float> samples, std::uint32_t rate) {
-                            audio_joiner.push(samples, rate);
-                        });
-                    if (!speech) {
-                        fail_speech(speech.error());
-                        return;
-                    }
-                    audio_chunks += speech->synthesis.stats.chunks;
-                    ++speech_segments;
-                    reused_voice_prompt = reused_voice_prompt || speech->voice_prompt_reused;
-                }
-            });
-        }
-
+    void run_chat(const std::string& id, std::span<const ChatMessage> messages) {
         send_event(id, "chat.started");
         auto result = backend_->chat(
             messages, [this] { return cancelled(); },
-            [&, this](std::string_view delta) {
+            [this, &id](std::string_view delta) {
                 send_event(id, "chat.delta", {{"text", delta}});
-                if (!speak) return;
-                auto segments = segmenter.append(delta);
-                for (auto& segment : segments) {
-                    std::unique_lock lock(speech_mutex);
-                    while (!cancelled() && !speech_error && speech_queue.size() >= 4)
-                        speech_ready.wait_for(lock, std::chrono::milliseconds(25));
-                    if (cancelled() || speech_error) return;
-                    speech_queue.push_back(std::move(segment));
-                    const auto prioritize = !first_segment_queued;
-                    first_segment_queued = true;
-                    lock.unlock();
-                    speech_ready.notify_all();
-                    if (prioritize) {
-                        lock.lock();
-                        while (!cancelled() && !speech_error && !first_audio_sent)
-                            speech_ready.wait_for(lock, std::chrono::milliseconds(10));
-                    }
-                }
             });
         clear_uploaded_images();
-
         if (result) send_event(id, "chat.completed", {{"text", result->text}, {"stats", result->stats}});
-        if (speak) {
-            if (result && !cancelled()) {
-                auto trailing = segmenter.append({}, true);
-                {
-                    std::scoped_lock lock(speech_mutex);
-                    if (!speech_error)
-                        for (auto& segment : trailing) speech_queue.push_back(std::move(segment));
-                }
-            }
-            {
-                std::scoped_lock lock(speech_mutex);
-                speech_done = true;
-            }
-            speech_ready.notify_all();
-            if (speech_worker.joinable()) speech_worker.join();
-            if (!speech_error && !cancelled()) audio_joiner.finish();
-        }
         if (!result) return finish_error(id, result.error());
-        if (!speak) return;
-        if (cancelled()) return send_event(id, "request.cancelled");
-        if (speech_error)
-            return send_event(id, "voice.audio.error",
-                              {{"code", "synthesis_failed"}, {"message", speech_error->message}});
-        send_event(id, "voice.audio.completed",
-                   {{"stream_id", stream_id},
-                    {"samples", audio_samples},
-                    {"chunks", audio_chunks},
-                    {"voice_prompt_reused", reused_voice_prompt}});
     }
 
     void run_asr(const std::string& id, std::uint32_t stream_id, bool voice_mode, const Json& speech_settings) {
@@ -1375,8 +1111,7 @@ private:
         std::jthread tts_warm;
         if (voice_mode) {
             tts_warm = std::jthread([&, this] {
-                if (auto warmed =
-                        backend_->prepare_tts_profile(speech_settings, [this] { return cancelled(); });
+                if (auto warmed = backend_->prepare_tts_profile(speech_settings, [this] { return cancelled(); });
                     !warmed)
                     warm_error = warmed.error();
             });
@@ -1393,8 +1128,7 @@ private:
         send_event(id, "asr.started", {{"stream_id", stream_id}, {"sample_rate", 16000}});
         std::size_t processed = 0;
         std::string previous;
-        const auto interval =
-            std::max<std::size_t>(8000, backend_->config().asr_partial_interval_ms * 16000 / 1000);
+        const auto interval = std::max<std::size_t>(8000, backend_->config().asr_partial_interval_ms * 16000 / 1000);
         while (!cancelled()) {
             std::vector<float> snapshot;
             bool final = false;
@@ -1432,8 +1166,7 @@ private:
                 return;
             }
             std::size_t common = 0;
-            while (common < previous.size() && common < result->text.size() &&
-                   previous[common] == result->text[common])
+            while (common < previous.size() && common < result->text.size() && previous[common] == result->text[common])
                 ++common;
             const auto boundary = result->text.rfind(' ', common);
             previous = boundary == std::string::npos ? std::string{} : result->text.substr(0, boundary + 1);
@@ -1487,17 +1220,15 @@ private:
         });
         auto result = backend_->synthesize(
             text, settings, [this] { return cancelled(); },
-            [&audio_joiner](std::span<const float> samples, std::uint32_t rate) {
-                audio_joiner.push(samples, rate);
-            });
+            [&audio_joiner](std::span<const float> samples, std::uint32_t rate) { audio_joiner.push(samples, rate); });
         if (!result) return finish_error(id, result.error());
         audio_joiner.finish();
         send_event(id, "tts.completed",
                    {{"stream_id", stream_id},
-                   {"sample_rate", result->synthesis.sample_rate},
-                   {"samples", total_samples},
-                   {"chunks", result->synthesis.stats.chunks},
-                   {"voice_prompt_reused", result->voice_prompt_reused}});
+                    {"sample_rate", result->synthesis.sample_rate},
+                    {"samples", total_samples},
+                    {"chunks", result->synthesis.stats.chunks},
+                    {"voice_prompt_reused", result->voice_prompt_reused}});
     }
 
     struct ImageUpload {
@@ -1528,7 +1259,6 @@ private:
     std::size_t audio_processed_ = 0;
     std::map<std::uint32_t, ImageUpload> image_uploads_;
     std::map<std::uint32_t, std::filesystem::path> uploaded_images_;
-    std::atomic_uint32_t next_server_stream_{0x80000000U};
 };
 
 struct Arguments {
@@ -1572,15 +1302,18 @@ auto development_files(const std::filesystem::path& root) -> std::vector<liteapp
         });
     };
     const auto text = "text/javascript; charset=utf-8";
-    add("/", "web/ui/index.html", "text/html; charset=utf-8");
-    add("/index.html", "web/ui/index.html", "text/html; charset=utf-8");
-    add("/style.css", "web/ui/style.css", "text/css; charset=utf-8");
-    for (const auto* file : {"app.js", "images.js", "markdown.js", "mermaid.js"})
-        add('/' + std::string(file), std::filesystem::path{"web/ui"} / file, text);
+    std::ifstream manifest(root / "web/ui/assets.txt");
+    for (std::string file; std::getline(manifest, file);) {
+        if (file.empty()) continue;
+        const auto extension = std::filesystem::path(file).extension();
+        const auto content_type = extension == ".html" ? "text/html; charset=utf-8" :
+                                  extension == ".css"  ? "text/css; charset=utf-8" :
+                                  extension == ".svg"  ? "image/svg+xml"
+                                                       : text;
+        add(file == "index.html" ? "/" : '/' + file, std::filesystem::path{"web/ui"} / file, content_type);
+    }
     for (const auto* file : {"backend.js", "capture-worklet.js", "playback-worklet.js"})
         add('/' + std::string(file), std::filesystem::path{"web/hosts/desktop"} / file, text);
-    for (const auto* file : {"audio-waveform.svg", "book-open.svg", "copy.svg", "volume.svg"})
-        add("/icons/" + std::string(file), std::filesystem::path{"web/ui/icons"} / file, "image/svg+xml");
     for (const auto* file : {"mic.svg", "message-square.svg", "settings.svg", "square.svg"})
         add("/icons/" + std::string(file), std::filesystem::path{"web/libs/lucide-static/icons"} / file,
             "image/svg+xml");
@@ -1590,7 +1323,7 @@ auto development_files(const std::filesystem::path& root) -> std::vector<liteapp
     add("/libs/mermaid/mermaid.min.js", "web/libs/mermaid/mermaid.min.js", text);
     return files;
 }
-}  // namespace
+} // namespace
 
 auto main(int argc, char** argv) -> int {
     const auto arguments = parse_arguments(argc, argv);
@@ -1630,10 +1363,12 @@ auto main(int argc, char** argv) -> int {
     }
     auto server = std::move(*created);
     server.get("/api/status", [backend](const liteapp::Request&) { return backend->status(); });
-    server.websocket("/ws", [backend](const liteapp::Request&, liteapp::WebSocket& socket) {
-        AppSession session(backend, socket);
-        session.run();
-    }, {.max_text_bytes = backend->config().max_text_frame_bytes, .max_binary_bytes = 128U * 1024U});
+    server.websocket("/ws",
+                     [backend](const liteapp::Request&, liteapp::WebSocket& socket) {
+                         AppSession session(backend, socket);
+                         session.run();
+                     },
+                     {.max_text_bytes = backend->config().max_text_frame_bytes, .max_binary_bytes = 128U * 1024U});
 
     if (arguments->dev) {
         const auto files = development_files(std::filesystem::current_path());

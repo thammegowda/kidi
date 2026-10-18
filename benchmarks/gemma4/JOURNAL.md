@@ -4,6 +4,322 @@ Short progress notes for the current implementation. Measurements are explorator
 unless explicitly labelled as paired acceptance results. Historical comparisons
 remain in [QAT.md](QAT.md).
 
+## 2026-10-17: One shared speech controller for Wasm and native
+
+The shared HTML/CSS layout had concealed two independent speech applications:
+Wasm owned segmentation, replay, replacement, and `tts.segment` events in
+JavaScript, while desktop owned a different segmenter and voice pipeline in
+C++. Desktop cancellation was asynchronous behind one global request lock and
+its PCM carried no UI segment contract. Browser tests exercised the Wasm path;
+the desktop WebSocket test only covered authenticated echo transport.
+
+The frontend now has one transport-independent `SpeechController` that owns:
+
+- Unicode/sentence segmentation and source offsets;
+- logical versus wire stream IDs;
+- recent PCM replay;
+- exactly one segment of lookahead;
+- cancellation acknowledgement and replacement ordering;
+- segment-tagged PCM delivery and highlighting;
+- completion/error lifecycle.
+
+Wasm and desktop now expose one-segment TTS primitives. Desktop uses a dedicated
+speech WebSocket and a tested native request gate that allows distinct model
+kinds to overlap while keeping duplicate requests of one kind exclusive. The
+previous native-only `SpeechSegmenter` and integrated chat/TTS orchestration
+were deleted. A single `web/ui/assets.txt` manifest now
+drives Wasm packaging, native embedding, and native development serving.
+
+The identical live scenario passed on both backends: first response highlighted,
+pause, select the second response, old cancellation acknowledged, exactly one
+active button, second response highlighted, and no busy error. Independent
+native chat and TTS requests also completed concurrently (`chat.started/delta/
+completed`, `tts.started` plus 18 PCM frames and `tts.completed`).
+
+The browser suite passes 80 executable tests with one optional skip. Shared
+controller tests cover lookahead, replacement acknowledgement, caching, and
+logical segment IDs; desktop adapter tests cover channel routing; the native
+request-gate test covers concurrency invariants.
+
+## 2026-10-17: Sample-exact read-aloud pause and resume
+
+The response speaker control previously treated its second click as
+cancellation: it reset the AudioWorklet, cancelled synthesis, and discarded
+buffered PCM. It now has explicit idle, playing, and paused states. The worklet
+outputs silence while paused without advancing its sample offset, played-frame
+counter, segment boundaries, or drain state. Synthesis may continue only within
+the existing six-second buffer plus one-segment lookahead bound. Resume continues
+from the exact next sample.
+
+The button presents volume, pause, and play icons with matching accessible
+labels. A live WebGPU read-aloud check changed from `Pause reading response` to
+`Resume reading response` / `Speech paused`, remained paused, then returned to
+`Pause reading response` / `Playing speech…`. Worklet tests verify sample-exact
+continuation even when another PCM segment arrives during the pause. A paused
+manual read is detached from the foreground request so the composer and
+dictation are enabled; its buffered stream remains available for resume.
+Selecting another response atomically cancels that old request by its own speech
+request ID, resets its PCM/button state, and starts the newly selected response.
+A live nine-response conversation check left exactly one active speaker button
+and produced no backend busy error.
+
+## 2026-10-17: Cached load-time voice identity and gapless segment lookahead
+
+The browser passed the same voice-design attributes to every segment but also
+forced `use_voice_prompt=false` and `cache_voice_prompt=false`. OmniVoice voice
+design selects a matching voice on each independent generation; attributes such
+as `female`, `young adult`, and `moderate pitch` describe a class of speakers,
+not one speaker identity. This made adjacent sentences sound like different
+women.
+
+Using the complete first sentence as OmniVoice's reference fixed identity but
+was too expensive on this runtime. In the lighthouse example, the conditioned
+second segment took 9.79 s to produce 9.00 s of audio (RTF 1.09).
+Backpressure also waited 2.04 s before starting that synthesis, producing a
+measured 3.79 s projected gap.
+
+The retained design prepares identity while TTS loads:
+
+- voice seed zero selects the compact calibration sentence
+  `Hello, I am Kidi, your local assistant.`;
+- calibration produces an exact transcript plus 8-codebook `VoicePrompt`;
+- every visible segment, including segment zero, uses that immutable prompt;
+- the prompt is cached persistently by model/precision/voice/seed/settings and
+  imported through a validated Wasm boundary after worker, model, or page reload;
+- PCM replay uses the same voice key;
+- playback allows exactly one segment of synthesis lookahead while retaining
+  the six-second queue bound.
+
+Cold real-WebGPU calibration took 1.45 s. The two lighthouse segments then
+measured:
+
+- segment 0: 4.98 s synthesis / 7.92 s audio, RTF 0.629;
+- segment 1: 5.01 s synthesis / 7.76 s audio, RTF 0.645;
+- simulated playback gap: zero.
+
+A fresh worker restored the persistent prompt (`voice-ready cached=true`) with
+no diffusion calibration. A 192-character conditioned sentence took 8.55 s for
+13.36 s of audio (RTF 0.640), with a 1,749,459,808-byte TTS-only peak. Cache
+payloads are only about 2.4 KiB for a three-second prompt and validate format,
+model key, codebook shape, frame bound, token range, transcript, and SHA-256
+digest.
+
+All 82 executable browser tests pass; one optional wasm32 ABI probe remains
+skipped. Native voice/audio/graph/Qwen tests pass, and the GPU Wasm ABI exposes
+all 11 expected functions including prompt import.
+
+## 2026-10-17: Codec regions and quantized activation islands
+
+TTS parameter residency was not the multi-gigabyte problem: floating W8A8
+OmniVoice weights occupy about 638 MB. The WebGPU graph recorder was retaining
+every intermediate from the complete DAC decoder at once. Splitting the codec
+into one code projection region, five DAC block regions, and one output region
+reduced the measured co-resident chat/TTS peak from 2,986,058,984 to
+2,372,754,480 bytes (613 MB, 20.5%) without changing token or waveform hashes.
+
+Per-region diagnostics then showed that Qwen's seven regions each planned about
+40 MiB and reuse the same scratch slots, while DAC blocks 2-4 dominated the
+remaining codec workspace. The first activation island therefore targets DAC,
+not the smaller language-model FFN:
+
+- every Snake-to-Conv1d pair is one kernel, so the nonlinear FP32 activation is
+  never written as a separate tensor;
+- Snake-to-ConvTranspose quantizes the transformed row directly into the
+  existing dynamic affine INT8 scratch;
+- projection accumulation remains FP32, and only the convolution output needed
+  by residual/nonlinear consumers is materialized as FP32;
+- native backends retain the original separate operations.
+
+For the 165-unit diagnostic sentence after region splitting, the fused island
+reduced a cold TTS-only peak from 1,638,960,792 to 1,369,706,136 bytes
+(269 MB, 16.4%) and settled bytes from 1,139,311,688 to 1,080,591,432. Each DAC
+block fell from 18 recorded commands to 11. Summed DAC `originalBytes` fell from
+1,328,472,064 to 708,448,256; this diagnostic is useful for attribution but is
+not physical residency because regions share scratch.
+
+The 192-character production-bound sentence generated 284,160 samples
+(11.84 seconds) in 9.92 seconds cold, RTF 0.838, with a 1,666,684,132-byte
+TTS-only peak. With the 912,859,304-byte chat model already resident, the same
+sentence peaked at 2,579,543,436 bytes. Both models remained resident and chat
+then replied `OK` without reload. Admission is consequently simpler:
+
+- up to 128 units: 768 MiB;
+- 129-192 units: 1,280 MiB;
+- an exact repeated one-chunk request: 128 MiB.
+
+The known 344-token short phrase retained exact hashes:
+
+- tokens: `f2d27a196010740f66d694abfa773859ee11f0385bd61d1a2595d035ac2aef04`;
+- PCM: `8c5743fd933e3bca3f1f6cb889de47cd5d1e451d5b21cf4b66c157e8b77860e6`.
+
+Validation passed 37 W8A8, 33 mixed-F16, and 32 FP32 real-GPU numerical checks,
+the native audio/graph/Qwen tests, all 10 GPU Wasm ABI checks, and 76/76
+executable browser tests (one optional ABI test skipped). Final explicit
+eviction returned model count and GPU bytes to zero.
+
+## 2026-10-17: Length-aware GPU admission prevents TTS budget failure
+
+The live page failed after several voice turns with:
+
+`WebGPU buffer budget exceeded (3230786688 > 3221225472; requested 30228480, prepared 1491744, owner TTS/W8A8)`
+
+Inspection before reproducing the failure showed this was **not** unreleased
+pool or prepared-weight memory:
+
+- chat owner: 912,859,304 bytes;
+- TTS owner after load: 637,645,620 bytes;
+- total before synthesis: 1,550,537,704 bytes;
+- pooled bytes: zero;
+- prepared weights: zero.
+
+The cause was admission under-reservation. Every new streamed shape reserved a
+fixed 768 MiB. The failing 165-unit phrase needed roughly 1.68 GB of additional
+peak workspace, so admission left the idle chat model resident and the next
+30 MB TTS allocation crossed the 3 GiB budget.
+
+Streamed-shape admission is now length-aware:
+
+- up to 96 units: 768 MiB;
+- 97-128 units: 1,536 MiB;
+- 129-192 units: 1,792 MiB;
+- exact repeated one-chunk shapes retain the 128 MiB warm reservation.
+
+The reservation does not allocate that memory; it causes pressure eviction
+before execution. In the exact co-resident reproduction:
+
+1. Chat + loaded TTS: 1.55 GB total, no pool.
+2. 124-unit TTS: completed with chat resident; peak 2.986 GB.
+3. Chat generated `OK`.
+4. 165-unit TTS: admission evicted the idle 913 MB chat model; completed with
+   1.143 GB resident and 122 MB pooled.
+5. The attached chat session lazily reloaded and generated `OK`; total settled
+   at 1.998 GB.
+
+The peak remained 2.986 GB across both different TTS shapes instead of growing.
+Pooled buffers remained below the existing 128 MiB cap, and final explicit
+eviction returned model count/GPU bytes to zero.
+
+## 2026-10-17: Semantic streaming segments and faster browser default
+
+The first streaming phrase limit was incorrectly implemented as a hard 64-unit
+cap. With:
+
+`I can understand, generate, and debug code in many programming languages, including Python, JavaScript, Java, C++, and more.`
+
+the fallback therefore chose the last whitespace before 64 and split the noun
+phrase into `... programming` / `languages, ...`.
+
+The old “units” were effectively characters for Latin text (grapheme UTF-16
+length), while Han/Hiragana/Katakana/Hangul graphemes counted as three. The hard
+cap was raised from 96 to **192 weighted units**; latency targets rose to 128 for
+the first oversized sentence and 160 thereafter. Complete sentences under 192
+remain whole. Only sentences beyond the hard limit choose the first clause
+boundary after the target, then a word fallback. The example is now one segment.
+
+This is stable for character-at-a-time, chunked, and batch delivery; offsets,
+Unicode coverage, and abbreviation handling remain intact.
+
+The reported browser was also using the former default: FP32 activations,
+16 diffusion steps, pace 1. FP32 measured around RTF 1.3 on this adapter and
+cannot sustain continuous playback. Floating W8A8 measured around RTF 0.82 with
+roughly half the FP16 storage footprint. Browser WebGPU now defaults to W8A8,
+and legacy settings that still carry the old unversioned FP32 default migrate
+once. A version marker preserves every subsequent explicit profile choice.
+
+The limit comes from an isolated real-GPU sweep, not an arbitrary character
+count. Floating W8A8, 16 steps, pace 1:
+
+- 124-character reported sentence: 6.24 s synthesis, 7.64 s audio, RTF 0.817,
+  2.07 GB peak;
+- 198-character sentence: succeeded at RTF 0.855 and 3.03 GB peak;
+- 228-character sentence: succeeded but peaked at 3.19 GB, too close to the
+  3,221,225,472-byte tracked budget for a safe production bound;
+- 261-character sentence: failed the GPU budget.
+
+The 192-unit production limit retains roughly 194 MB of tracked margin at the
+tested long-sentence boundary while covering normal sentences like the report.
+A production read-aloud check highlighted the entire 124-character sentence as
+one playing range. The browser suite passes 74 tests with one optional ABI skip;
+the explicit GPU Wasm ABI selection passes 10/10.
+
+## 2026-10-17: Pages reduced to WebGPU plus pthread fallback
+
+The browser package previously built three approximately 6 MiB Wasm modules:
+single-thread CPU, pthread CPU, and non-pthread WebGPU. Runtime selection showed
+that Pages uses WebGPU as the primary path and pthread CPU only as fallback after
+`coi-serviceworker` establishes cross-origin isolation. The single-thread module
+was solely a non-isolated CPU fallback.
+
+Pages and local `make wasm` now build only:
+
+- `gpu/kidi.{mjs,wasm}`: primary shared WebGPU runtime for chat, vision, ASR,
+  and TTS;
+- `threads/kidi.{mjs,wasm}`: CPU fallback with 1-8 configured YNNPACK threads.
+
+CPU workers now require `crossOriginIsolated` and return a clear error otherwise;
+WebGPU remains available without isolation. A combined WebGPU+pthreads artifact
+was not used because the C++ binding selects `DEVICE` at compile time: a WebGPU
+build always creates WebGPU models, so enabling pthreads would add isolation,
+worker-pool, and memory requirements without making it a CPU fallback.
+
+Validation:
+
+- final `build-web/` contains `gpu/` and `threads/`; `single/` returns 404;
+- Pages-style Python serving was cross-origin isolated through the bundled
+  service worker;
+- both GPU and pthread assets returned HTTP 200;
+- the pthread module instantiated in Node and configured four threads;
+- the GPU module passed all 10 explicit Wasm ABI tests;
+- 73 browser tests passed with one optional ABI skip;
+- the obsolete local `build-wasm/` tree (107 MiB) was removed;
+- the temporary server was stopped and validation GPU residency returned to
+  zero.
+
+## 2026-10-17: Voice-mode ASR silence and provisional-text UX
+
+The apparent tokenizer/language corruption in voice mode was an input-gating
+bug. The UI computed RMS VAD, but it sent every microphone frame to Whisper from
+the beginning and used VAD only to decide when to stop. The browser started a
+new partial transcription every 800 ms regardless of detected speech, automatic
+language selection ran on silence/noise, and every provisional hypothesis was
+copied directly into the composer. Sub-threshold gaps also did not reset the
+pre-speech timer, so unrelated noise bursts could accumulate into a false start.
+Whisper is generative; a controlled one-second silence probe had produced
+`\" The\"`, so emojis or unrelated multilingual tokens on unconstrained silence
+are expected hallucinations rather than damaged tokenizer data.
+
+The shared UI now keeps at most 500 ms of PCM pre-roll and sends nothing until
+the configured amount of **consecutive** above-threshold speech is observed.
+Sub-threshold frames reset that timer. When speech begins, pre-roll is flushed
+in sequence so initial consonants are retained. A quiet manual stop cancels the
+request and reports `No speech was detected`.
+
+After user review, voice-mode partial recognition was restored **after** VAD
+confirms speech, so the composer shows what Whisper is currently hearing without
+reintroducing silence hallucinations. Manual dictation uses the same gating.
+The end-of-turn threshold increased from 650-800 ms to 1.5 seconds, and the
+header displays `Listening · pause 1.5s to send`. The final transcript remains
+visible/editable for 600 ms before voice mode submits it. The browser backend
+handles an empty final request without invoking Whisper.
+
+Synthetic shared-UI validation:
+
+- 2.0 seconds of silence: zero PCM frames sent, empty composer.
+- Injected emoji/Korean/Japanese provisional event before speech: hidden.
+- 260 ms consecutive speech: 25 ordered 20 ms frames flushed (500 ms bounded
+  pre-roll, sequence 0-24).
+- Voice mode after speech: provisional `Hello there` displayed.
+- 1.48 seconds of pause: no submission; 1.50 seconds: finalization begins.
+- Final `Hello there final` remained visible for 607 ms before the mock LLM
+  request.
+- Manual dictation: 13 speech frames sent and `Hello world` displayed.
+- Quiet manual stop: zero PCM sent and the no-speech notice shown.
+
+Browser backend tests verify that voice mode and dictation both expose partial
+recognition once VAD-gated audio arrives, and that empty stop completes without
+decoding silence. The full browser suite passes 73 tests with one optional ABI
+skip; release desktop builds and its WebSocket test passes.
+
 ## 2026-10-17: Deletion-led C++ and Wasm simplification
 
 This pass followed the streaming/WebGPU implementation with a strict rule:
@@ -71,8 +387,8 @@ The browser adapter now feeds incremental chat text into a bounded phrase queue.
 It synthesizes one phrase per existing stepped native synthesis request, keeps
 the logical speech session through the utterance, and delivers Float32 PCM
 immediately. Read-aloud uses the same queue. Sentence/clause/word boundaries are
-preferred; long unpunctuated text is bounded as well (96 weighted units, first
-phrase 64; CJK graphemes cost three units).
+preferred. The original implementation used 96 weighted units and a 64-unit
+first cap; the later semantic-segmentation entry above records the raised limit.
 
 The first real image-chat/long-reply test exposed a second memory problem:
 despite bounded input, cached decoder graphs retained waveform buffers for eight

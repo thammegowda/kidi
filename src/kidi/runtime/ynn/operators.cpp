@@ -1364,6 +1364,8 @@ public:
             case Operation::GREEDY_TOKEN:
             case Operation::RMS_ROTARY:
             case Operation::EMBEDDING:
+            case Operation::SNAKE_CONV1D:
+            case Operation::SNAKE_QUANTIZED_LINEAR:
                 break;
         }
         auto output_id = static_cast<std::uint32_t>(inputs.size());

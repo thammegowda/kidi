@@ -225,9 +225,11 @@ button:disabled { opacity: .45; cursor: default; transform: none; }
   background: transparent; color: #89929c;
 }
 .message-action:hover { background: #20252b; color: var(--text); }
-.read-aloud.active { background: #4a2229; color: #ff9a9a; }
+.read-aloud.active { background: #18342c; color: var(--accent); }
+.read-aloud.paused { background: #3b321d; color: #f3c969; }
 .read-aloud-icon { width: 16px; height: 16px; background: currentColor; mask: url("./icons/volume.svg") center / contain no-repeat; }
-.read-aloud.active .read-aloud-icon { width: 12px; height: 12px; mask-image: url("./icons/square.svg"); }
+.read-aloud.active .read-aloud-icon { mask-image: url("./icons/pause.svg"); }
+.read-aloud.paused .read-aloud-icon { mask-image: url("./icons/play.svg"); }
 .copy-message-icon { width: 15px; height: 15px; background: currentColor; mask: url("./icons/copy.svg") center / contain no-repeat; }
 .copy-message.copied { color: var(--accent); }
 .thinking { display: inline-flex; gap: 5px; padding: 11px 13px; border-radius: 17px 17px 17px 5px; background: var(--panel-2); }

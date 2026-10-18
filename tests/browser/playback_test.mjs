@@ -77,6 +77,23 @@ test('playback reports actual segment boundaries and buffered frames', () => {
     assert.equal(player.messages.filter(message => message.type === 'buffered').at(-1).playedFrames, 5);
 });
 
+test('pause preserves the exact buffered position until resume', () => {
+    const player = playback();
+    player.send({type: 'start', streamId: 8});
+    player.chunk(8, [0.1, 0.2, 0.3, 0.4], 0);
+    assert.deepEqual(player.render(2), [Math.fround(0.1), Math.fround(0.2)]);
+    player.send({type: 'pause', streamId: 8});
+    assert.deepEqual(player.render(4), [0, 0, 0, 0]);
+    assert.equal(player.messages.filter(message => message.type === 'segment-ended').length, 0);
+    player.chunk(8, [0.5, 0.6], 1);
+    assert.deepEqual(player.render(2), [0, 0]);
+    player.send({type: 'resume', streamId: 8});
+    assert.deepEqual(player.render(4), [Math.fround(0.3), Math.fround(0.4), Math.fround(0.5), Math.fround(0.6)]);
+    assert.deepEqual(player.messages.filter(message => message.type === 'segment-ended')
+        .map(message => message.segmentId), [0, 1]);
+    assert.equal(player.messages.filter(message => message.type === 'buffered').at(-1).playedFrames, 6);
+});
+
 test('buffer reports include consumed frames even when newer chunks are in transit', () => {
     const player = playback();
     player.send({type: 'start', streamId: 6});

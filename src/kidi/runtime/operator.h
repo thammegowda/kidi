@@ -76,6 +76,8 @@ enum class Operation {
     DIFFUSION_UPDATE,
     EMBEDDING_SUM,
     CONV1D,
+    SNAKE_CONV1D,
+    SNAKE_QUANTIZED_LINEAR,
     CONV_TRANSPOSE_FOLD,
     SNAKE
 };

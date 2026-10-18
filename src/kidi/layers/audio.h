@@ -4,6 +4,8 @@
 
 namespace kidi::layers {
 
+class Snake1dImpl;
+
 KIDI_MODULE(Conv1d);
 class Conv1dImpl : public Module {
 public:
@@ -12,6 +14,8 @@ public:
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
 
 private:
+    friend class Snake1dImpl;
+    auto forward_snake(ops::Context& context, const Tensor& input, const Tensor& alpha) const -> Tensor;
     auto bias() const -> const Tensor&;
 
     Tensor weight_, bias_;
@@ -28,6 +32,8 @@ public:
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
 
 private:
+    friend class Snake1dImpl;
+    auto forward_snake(ops::Context& context, const Tensor& input, const Tensor& alpha) const -> Tensor;
     auto bias() const -> const Tensor&;
 
     Tensor weight_, bias_, projection_bias_;
@@ -40,6 +46,8 @@ class Snake1dImpl : public Module {
 public:
     explicit Snake1dImpl(std::int32_t channels);
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
+    auto forward(ops::Context& context, const Tensor& input, const Conv1d& convolution) const -> Tensor;
+    auto forward(ops::Context& context, const Tensor& input, const ConvTranspose1d& convolution) const -> Tensor;
 
 private:
     auto alpha() const -> const Tensor&;

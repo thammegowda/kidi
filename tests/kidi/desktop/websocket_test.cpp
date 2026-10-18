@@ -1,4 +1,5 @@
 #include "liteapp/http/server.h"
+#include "kidi/desktop/request_gate.h"
 
 #include <httplib.h>
 
@@ -13,6 +14,18 @@ auto expect(bool condition, const char* message) -> bool {
 }  // namespace
 
 auto main() -> int {
+    kidi::desktop::RequestGate requests;
+    if (!expect(requests.acquire("chat"), "chat request acquires") ||
+        !expect(requests.acquire("tts"), "TTS overlaps chat") ||
+        !expect(!requests.acquire("chat"), "duplicate chat is rejected") ||
+        !expect(requests.acquire("asr"), "ASR overlaps distinct model work")) return 1;
+    requests.release("asr");
+    requests.release("tts");
+    requests.release("chat");
+    if (!expect(requests.acquire("asr"), "ASR acquires when idle") ||
+        !expect(!requests.acquire("asr"), "duplicate ASR is rejected")) return 1;
+    requests.release("asr");
+
     auto created = liteapp::HttpServer::create({
         .host = "127.0.0.1",
         .port = 0,

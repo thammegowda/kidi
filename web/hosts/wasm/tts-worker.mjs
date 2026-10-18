@@ -57,14 +57,29 @@ async function synthesize(text, options) {
     return {result, audio};
 }
 
+async function installVoicePrompt(data) {
+    if (!(data.tokens instanceof ArrayBuffer) || !data.tokens.byteLength || data.tokens.byteLength % 4 ||
+        typeof data.text !== 'string' || !data.text.trim())
+        throw new Error('Invalid cached voice prompt');
+    const tokens = new Int32Array(data.tokens);
+    const pointer = Number(module._malloc(tokens.byteLength));
+    if (!pointer || pointer + tokens.byteLength > module.HEAPU8.byteLength)
+        throw new Error('Cannot allocate cached voice prompt');
+    try {
+        new Int32Array(module.HEAPU8.buffer, pointer, tokens.length).set(tokens);
+        return await call('kidi_tts_set_voice_prompt', ['string', 'pointer', 'number'],
+            [data.text, pointer, tokens.length]);
+    } finally { module._free(pointer); }
+}
+
 self.onmessage = async ({data}) => {
     try {
         if (data.type === 'load') {
             if (module) throw new Error('TTS runtime is already loaded');
             const useGpu = data.backend === 'webgpu';
-            const threaded = !useGpu && data.threads > 1;
-            const {default: createKidi} = await import(
-                useGpu ? './gpu/kidi.mjs' : threaded ? './threads/kidi.mjs' : './single/kidi.mjs');
+            if (!useGpu && !self.crossOriginIsolated)
+                throw new Error('The CPU backend requires cross-origin isolation');
+            const {default: createKidi} = await import(useGpu ? './gpu/kidi.mjs' : './threads/kidi.mjs');
             module = await createKidi({printErr: text => self.postMessage({type: 'log', text})});
             if (useGpu) {
                 const {createWebGpu} = await import('./webgpu.mjs');
@@ -91,6 +106,10 @@ self.onmessage = async ({data}) => {
             if (result.reference_audio instanceof ArrayBuffer) transfer.push(result.reference_audio);
             self.postMessage({type: 'audio', requestId: data.requestId, ...result, audio: audio.buffer,
                 gpuStats: gpu?.stats}, transfer);
+        } else if (data.type === 'voice-prompt') {
+            if (!ready) throw new Error('TTS runtime is not ready');
+            self.postMessage({type: 'voice-prompt-ready', requestId: data.requestId,
+                ...await installVoicePrompt(data)});
         }
     } catch (error) {
         self.postMessage({

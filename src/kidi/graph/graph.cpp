@@ -110,8 +110,8 @@ auto Graph::plan_intermediates(const ScratchAllocator& allocate) -> BufferPlanSt
             if (found == lifetimes.end()) continue;
             auto& lifetime = found->second;
             lifetime.last = std::max(lifetime.last, index);
-            lifetime.elements = std::max(lifetime.elements,
-                                         static_cast<std::size_t>(value.storage_offset()) + value.numel());
+            lifetime.elements =
+                std::max(lifetime.elements, static_cast<std::size_t>(value.storage_offset()) + value.numel());
         }
     std::vector<Lifetime*> ordered;
     for (auto& [identity, lifetime] : lifetimes) ordered.push_back(&lifetime);

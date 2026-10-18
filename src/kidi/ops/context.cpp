@@ -161,8 +161,9 @@ struct Context::Impl {
             spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RESIDUAL_NORM ||
             spec.operation == Operation::RMS_NORM || spec.operation == Operation::PACKED_LINEAR ||
             spec.operation == Operation::EMBEDDING || spec.operation == Operation::GATED_FEED_FORWARD ||
-            spec.operation == Operation::CONV1D || spec.operation == Operation::CONV_TRANSPOSE_FOLD ||
-            spec.operation == Operation::SNAKE;
+            spec.operation == Operation::CONV1D || spec.operation == Operation::SNAKE_CONV1D ||
+            spec.operation == Operation::SNAKE_QUANTIZED_LINEAR ||
+            spec.operation == Operation::CONV_TRANSPOSE_FOLD || spec.operation == Operation::SNAKE;
         const std::size_t parameter_start = spec.operation == Operation::RESIDUAL_NORM ? 2 : 1;
         // Packed projections bake an interleaved copy of their weights, so each weight needs its own program.
         spec.dynamic_parameters =
@@ -708,6 +709,29 @@ auto Context::conv1d(const Tensor& input, const Tensor& weight, const Tensor& sc
     const std::array<std::int64_t, 4> attributes{kernel, stride, padding, dilation};
     if (scales.defined()) return impl_->run({Operation::CONV1D, attributes}, {&input, &weight, &scales, &bias});
     return impl_->run({Operation::CONV1D, attributes}, {&input, &weight, &bias});
+}
+auto Context::snake_conv1d(const Tensor& input, const Tensor& alpha, const Tensor& weight, const Tensor& scales,
+                           const Tensor& bias, std::int32_t kernel, std::int32_t stride, std::int32_t padding,
+                           std::int32_t dilation) -> Tensor {
+    if (device() != tensor::Device::web_gpu() || input.dtype() != tensor::DType::F32 || input.dimensions() != 3 ||
+        input.size(0) != 1 || alpha.dtype() != tensor::DType::F32 || alpha.dimensions() != 1 ||
+        alpha.numel() != input.size(2) || kernel <= 0 || stride <= 0 || padding < 0 || dilation <= 0 ||
+        weight.dimensions() != 2 || weight.size(1) != input.size(2) * kernel || bias.dtype() != tensor::DType::F32 ||
+        bias.numel() != weight.size(0))
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid device Snake convolution"});
+    const std::array<std::int64_t, 4> attributes{kernel, stride, padding, dilation};
+    if (scales.defined())
+        return impl_->run({Operation::SNAKE_CONV1D, attributes}, {&input, &alpha, &weight, &scales, &bias});
+    return impl_->run({Operation::SNAKE_CONV1D, attributes}, {&input, &alpha, &weight, &bias});
+}
+auto Context::snake_quantized_linear(const Tensor& input, const Tensor& alpha, const Tensor& weight,
+                                    const Tensor& scale, const Tensor& bias, bool transpose_weight) -> Tensor {
+    if (device() != tensor::Device::web_gpu() || input.dtype() != tensor::DType::F32 || input.dimensions() != 3 ||
+        input.size(0) != 1 || alpha.dtype() != tensor::DType::F32 || alpha.dimensions() != 1 ||
+        alpha.numel() != input.size(2))
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid device Snake projection"});
+    const std::array<std::int64_t, 1> attributes{transpose_weight};
+    return impl_->run({Operation::SNAKE_QUANTIZED_LINEAR, attributes}, {&input, &alpha, &weight, &scale, &bias});
 }
 auto Context::conv_transpose_fold(const Tensor& projected, const Tensor& bias, std::int32_t kernel, std::int32_t stride,
                                   std::int32_t padding, std::int32_t output_padding, std::int32_t dilation) -> Tensor {

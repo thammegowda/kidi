@@ -434,11 +434,14 @@ partial[thread]=sum;workgroupBarrier();for(var step=${laneCount/2}u;step>0u;step
 if(lane==0u&&column<columns){store(row*columns+column,calibrated(${staged&&singleScale?'sum*load2(column)':'sum'},scalar(21u)));} }`;
             groups=rows*uniforms[24];
         }
-    } else if (operation === 'conv1d') {
+    } else if (operation === 'conv1d' || operation === 'snake_conv1d') {
         const [kernel, stride, padding, dilation] = attributes;
+        const fusedSnake = operation === 'snake_conv1d', weightIndex = fusedSnake ? 2 : 1;
         const channels = inputShape[2], inputLength = inputShape[1];
         const rows = Math.floor((inputLength + 2 * padding - dilation * (kernel - 1) - 1) / stride) + 1;
-        const columns = operands[1].shape[0], width = channels * kernel, quantized = operands.length === 4;
+        const columns = operands[weightIndex].shape[0], width = channels * kernel;
+        const quantized = operands.length === (fusedSnake ? 5 : 4);
+        const scaleIndex = weightIndex + 1, biasIndex = weightIndex + (quantized ? 2 : 1);
         if (rows <= 0) throw new Error('Convolution kernel exceeds padded input');
         shape = [1, rows, columns]; dtype = 11;
         uniforms[16] = width; uniforms[17] = columns; uniforms[18] = rows;
@@ -450,11 +453,13 @@ if(lane==0u&&column<columns){store(row*columns+column,calibrated(${staged&&singl
 fn convolution_input(row:u32,d:u32)->f32{
 let position=i32(row*param(29u)+(d%param(28u))*param(31u))-i32(param(30u));
 if(position<0||position>=i32(param(27u))){return 0.0;}
-return load0(u32(position)*param(26u)+d/param(28u));}
+let channel=d/param(28u);var value=load0(u32(position)*param(26u)+channel);
+${fusedSnake ? `let alpha=load1(channel);if(abs(alpha)>=1e-9){let wave=sin(alpha*value);value+=wave*wave/(alpha+1e-9);}` : ''}
+return value;}
 ${vectorEntry('a_entry', 'param(16u)', 'convolution_input(index,d)')}
-${vectorEntry('b_entry', 'param(16u)', `load1(index*param(16u)+d)${quantized ? '*load2(index)' : ''}`)}
-fn put_out(row:u32,column:u32,value:f32){store(row*param(17u)+column,value+load${quantized ? 3 : 2}(column));}`});
-        groups = Math.ceil(rows / TILE_ROWS) * Math.ceil(columns / TILE_COLUMNS);
+${vectorEntry('b_entry', 'param(16u)', `load${weightIndex}(index*param(16u)+d)${quantized ? `*load${scaleIndex}(index)` : ''}`)}
+fn put_out(row:u32,column:u32,value:f32){store(row*param(17u)+column,value+load${biasIndex}(column));}`});
+    groups = Math.ceil(rows / TILE_ROWS) * Math.ceil(columns / TILE_COLUMNS);
     } else if (operation === 'conv_transpose_fold') {
         const [kernel, stride, padding, outputPadding, dilation] = attributes;
         const inputLength = inputShape[1], channels = inputShape[2] / kernel;
@@ -490,6 +495,38 @@ partial[thread]=sum;workgroupBarrier();
 for(var stride=64u;stride>0u;stride/=2u){if(thread<stride){partial[thread]+=partial[thread+stride];}workgroupBarrier();}
 if(thread==0u){output[param(8u)/4u+column]=bitcast<u32>(partial[0]);}}`;
         groups = columns;
+    } else if (operation === 'snake_quantized_linear') {
+        const linear = buildProgram({...spec, operation: 'quantized_linear',
+            inputs: [operands[0], operands[2], operands[3], operands[4]]}, features);
+        if (!spec.w8a8) {
+            const snake = buildProgram({operation: 'snake', dtype: 11, epsilon: 0, attributes: [],
+                inputs: operands.slice(0, 2)}, features);
+            return {...linear, operation, bindings: linear.bindings ?? 4,
+                stages: [{code: snake.code, groups: snake.groups, uniforms: snake.uniforms,
+                    bytes: product(inputShape) * 4, inputs: [0, 1]}],
+                finalInputs: ['previous', 2, 3, 4]};
+        }
+        if (!linear.scratch) throw new Error('Fused Snake projection requires W8A8 activation quantization');
+        linear.scratch = {...linear.scratch, inputs: [0, 1], code: header(2, '', [11, 11]) + `
+@group(0) @binding(4) var<storage,read_write> failure:atomic<u32>;
+var<workgroup> range:array<vec2<f32>,128>;
+fn activated(index:u32)->f32{let value=load0(index);let alpha=load1(index%param(16u));
+if(abs(alpha)<1e-9){return value;}let wave=sin(alpha*value);return value+wave*wave/(alpha+1e-9);}
+@compute @workgroup_size(128) fn main(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index) thread:u32){
+let row=group_index(group);if(row>=param(17u)){return;}var low=0.0;var high=0.0;
+for(var channel=thread;channel<param(16u);channel+=128u){let value=activated(row*param(16u)+channel);
+if(!(abs(value)<=3.402823466e38)){atomicOr(&failure,8u);}low=min(low,value);high=max(high,value);}
+range[thread]=vec2<f32>(low,high);workgroupBarrier();
+for(var stride=64u;stride>0u;stride/=2u){if(thread<stride){range[thread]=vec2<f32>(min(range[thread].x,range[thread+stride].x),max(range[thread].y,range[thread+stride].y));}workgroupBarrier();}
+let extent=range[0].y-range[0].x;var scale=1.0;var zero=0i;
+if(extent>0.0){scale=extent/255.0;if(!(scale>0.0&&scale<=3.402823466e38)){atomicOr(&failure,8u);scale=1.0;}
+zero=i32(clamp(round_even(-128.0-range[0].x/scale),-128.0,127.0));}
+if(thread==0u){output[param(8u)/4u+param(18u)+row]=bitcast<u32>(scale);output[param(8u)/4u+param(18u)+param(17u)+row]=bitcast<u32>(zero);}
+for(var word=thread;word<param(16u)/4u;word+=128u){var packed=0u;
+for(var component=0u;component<4u;component++){let value=activated(row*param(16u)+word*4u+component);
+let quantized=clamp(i32(round_even(value/scale))+zero,-128i,127i);packed|=(u32(quantized)&255u)<<(component*8u);}
+output[param(8u)/4u+row*(param(16u)/4u)+word]=packed;}}`};
+        return {...linear, operation, bindings: 5, finalInputs: [0, 2, 3, 4, 5]};
     } else if (operation === 'quantized_linear' && spec.w8a8) {
         const width = inputShape.at(-1), rows = product(inputShape) / width, columns = operands[1].shape[0];
         const words = width / 4, dataWords = rows * words;

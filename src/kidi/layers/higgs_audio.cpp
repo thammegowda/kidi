@@ -27,8 +27,8 @@ DacResidualUnitImpl::DacResidualUnitImpl(std::int32_t channels, std::int32_t dil
 }
 
 auto DacResidualUnitImpl::forward(ops::Context& context, Tensor input) const -> Tensor {
-    auto output = first_conv_->forward(context, first_snake_->forward(context, input));
-    output = second_conv_->forward(context, second_snake_->forward(context, output));
+    auto output = first_snake_->forward(context, input, first_conv_);
+    output = second_snake_->forward(context, output, second_conv_);
     if (!std::ranges::equal(input.shape(), output.shape()))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "DAC residual unit changed the sequence shape"});
     return context.add_(input, output);
@@ -48,7 +48,7 @@ DacDecoderBlockImpl::DacDecoderBlockImpl(std::int32_t input_channels, std::int32
 }
 
 auto DacDecoderBlockImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    auto hidden = upsample_->forward(context, snake_->forward(context, input));
+    auto hidden = snake_->forward(context, input, upsample_);
     hidden = first_->forward(context, hidden);
     hidden = second_->forward(context, hidden);
     return third_->forward(context, hidden);
@@ -75,9 +75,36 @@ DacDecoderImpl::DacDecoderImpl(HiggsDecoderShape shape)
 }
 
 auto DacDecoderImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
+    if (context.device() == tensor::Device::web_gpu()) {
+        auto hidden = input;
+        std::size_t index = 0;
+        for (const auto& block : *blocks_) {
+            const std::array operands{hidden};
+            hidden = context
+                         .replay(
+                             "dac:block:" + std::to_string(input.size(1)) + ':' + std::to_string(index), operands,
+                             [&](std::span<const Tensor> values) {
+                                 auto value = values[0];
+                                 if (!index) value = input_->forward(context, value);
+                                 return std::vector{block->forward(context, value)};
+                             },
+                             false)
+                         .front();
+            ++index;
+        }
+        const std::array operands{hidden};
+        return context
+            .replay(
+                "dac:output:" + std::to_string(input.size(1)), operands,
+                [&](std::span<const Tensor> values) {
+                    return std::vector{snake_->forward(context, values[0], output_)};
+                },
+                false)
+            .front();
+    }
     auto hidden = input_->forward(context, input);
     for (const auto& block : *blocks_) hidden = block->forward(context, hidden);
-    return output_->forward(context, snake_->forward(context, hidden));
+    return snake_->forward(context, hidden, output_);
 }
 
 HiggsDecoderImpl::HiggsDecoderImpl(HiggsDecoderShape shape)
@@ -98,17 +125,27 @@ auto HiggsDecoderImpl::forward(ops::Context& context, const Tensor& tokens) cons
         tokens.size(0) != static_cast<std::size_t>(shape_.codebooks) || !tokens.size(1))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
                             "Higgs audio codes require an I32 [codebooks, length] tensor on the execution device"});
-    Tensor quantized;
-    for (std::int32_t codebook = 0; codebook < shape_.codebooks; ++codebook) {
-        const auto row =
-            context.reshape(context.slice(tokens, 0, codebook, 1), {static_cast<std::int64_t>(tokens.size(1))});
-        auto decoded = (*quantizers_)[codebook]->forward(context, row);
-        if (quantized.defined())
-            context.add_(quantized, decoded);
-        else
-            quantized = std::move(decoded);
+    const auto project = [&](std::span<const Tensor> inputs) {
+        Tensor quantized;
+        for (std::int32_t codebook = 0; codebook < shape_.codebooks; ++codebook) {
+            const auto row = context.reshape(context.slice(inputs[0], 0, codebook, 1),
+                                             {static_cast<std::int64_t>(inputs[0].size(1))});
+            auto decoded = (*quantizers_)[codebook]->forward(context, row);
+            if (quantized.defined())
+                context.add_(quantized, decoded);
+            else
+                quantized = std::move(decoded);
+        }
+        return std::vector{acoustic_projection_->forward(context, quantized)};
+    };
+    Tensor acoustic;
+    if (context.device() == tensor::Device::web_gpu()) {
+        const std::array inputs{tokens};
+        acoustic = context.replay("higgs:codes:" + std::to_string(tokens.size(1)), inputs, project, false).front();
+    } else {
+        acoustic = project(std::array{tokens}).front();
     }
-    return decoder_->forward(context, acoustic_projection_->forward(context, quantized));
+    return decoder_->forward(context, acoustic);
 }
 
 } // namespace kidi::layers

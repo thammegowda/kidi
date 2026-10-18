@@ -1,4 +1,4 @@
-import {MAX_SPEECH_SEGMENT_UNITS, speechUnits} from './speech-segments.mjs';
+import {MAX_SPEECH_SEGMENT_UNITS, speechUnits} from '../../ui/speech-controller.js';
 
 export const MODEL_IDLE_MS = 300000;
 export const MAX_RESIDENT_MODELS = 3;
@@ -29,11 +29,15 @@ export function protectedRepresentationOwners(models, requested) {
 }
 
 export function synthesisGpuReserve(model, data, preparedBytes) {
-    if (data.streamSegment && speechUnits(data.text) > MAX_SPEECH_SEGMENT_UNITS)
+    const units = data.streamSegment ? speechUnits(data.text) : 0;
+    if (units > MAX_SPEECH_SEGMENT_UNITS)
         throw new Error('Streaming speech segment exceeds its text budget');
     const signature = JSON.stringify([data.text, data.options || {}]);
     const same = model.lastSynthesis === signature && model.lastChunks === 1 &&
         data.options?.use_voice_prompt === false && data.options?.cache_voice_prompt === false;
-    const workspace = !model.warmed && model.matrixPrecision === 'mixed-f16' ? 1536 : same ? 128 : 768;
+    const streamedWorkspace = units > 128 ? 1280 : 768;
+    const workspace = same ? 128 :
+        !model.warmed && model.matrixPrecision === 'mixed-f16' ? Math.max(1536, streamedWorkspace) :
+            streamedWorkspace;
     return {signature, bytes: workspace * 1024 * 1024 + Math.max(0, (model.requiredPreparedBytes || 0) - preparedBytes)};
 }

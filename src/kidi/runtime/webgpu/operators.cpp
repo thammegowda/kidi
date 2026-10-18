@@ -184,8 +184,7 @@ public:
         host_pool_.clear();
     }
 
-    auto record(const graph::Node& node, std::vector<tensor::Tensor>& retained)
-        -> std::optional<nlohmann::json> {
+    auto record(const graph::Node& node, std::vector<tensor::Tensor>& retained) -> std::optional<nlohmann::json> {
         using Source = graph::Source;
         const auto binding = [&](const tensor::Tensor& value, const Source* source = nullptr) -> nlohmann::json {
             if (source && source->kind == Source::Kind::INPUT)
@@ -212,10 +211,10 @@ public:
             if (selected_) {
                 const auto bytes = require(destination.host_bytes());
                 command["read"] = {{"destination", reinterpret_cast<std::uintptr_t>(bytes.data())},
-                                    {"bytes", bytes.size()}};
+                                   {"bytes", bytes.size()}};
             } else {
                 command["copy"] = {{"destination", binding(destination, &node.sources.back())},
-                                    {"bytes", destination.nbytes()}};
+                                   {"bytes", destination.nbytes()}};
             }
         } else {
             command["bindings"].push_back(binding(destination, &node.sources.back()));
@@ -273,7 +272,8 @@ public:
                 }
                 return storage;
             });
-        nlohmann::json description{{"key", key}, {"commands", nlohmann::json::array()},
+        nlohmann::json description{{"key", key},
+                                   {"commands", nlohmann::json::array()},
                                    {"originalBytes", memory.original_bytes},
                                    {"plannedBytes", memory.planned_bytes}};
         std::vector<tensor::Tensor> retained;
@@ -287,8 +287,7 @@ public:
         }
         const auto region = prepare_region(description.dump().c_str());
         if (!region) return nullptr;
-        for (const auto& node : planned.nodes())
-            static_cast<GpuOperator*>(node.prepared.get())->release_workspaces();
+        for (const auto& node : planned.nodes()) static_cast<GpuOperator*>(node.prepared.get())->release_workspaces();
         return std::make_unique<GpuRegion>(region, std::move(planned), std::move(retained));
     }
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
@@ -326,11 +325,14 @@ public:
                                                             {Operation::DIFFUSION_UPDATE, "diffusion_update"},
                                                             {Operation::EMBEDDING_SUM, "embedding_sum"},
                                                             {Operation::CONV1D, "conv1d"},
+                                                            {Operation::SNAKE_CONV1D, "snake_conv1d"},
+                                                            {Operation::SNAKE_QUANTIZED_LINEAR,
+                                                             "snake_quantized_linear"},
                                                             {Operation::CONV_TRANSPOSE_FOLD, "conv_transpose_fold"},
                                                             {Operation::SNAKE, "snake"}};
-        const bool direct_inplace = ops::is_inplace &&
-                                    (spec.operation == Operation::SCATTER || spec.operation == Operation::ADD ||
-                                     spec.operation == Operation::MULTIPLY);
+        const bool direct_inplace =
+            ops::is_inplace && (spec.operation == Operation::SCATTER || spec.operation == Operation::ADD ||
+                                spec.operation == Operation::MULTIPLY);
         nlohmann::json description{
             {"operation", names.at(spec.operation)},
             {"inplace", direct_inplace},

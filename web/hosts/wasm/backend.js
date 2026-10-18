@@ -1,9 +1,14 @@
 import {isModelCached, webGpuSupport, listCachedFiles, deleteCachedFile, deleteCachedFiles, clearModelCache} from './model-cache.mjs';
 import {createGpuWorker} from './runtime-client.mjs';
-import {SpeechSegments} from './speech-segments.mjs';
-import {RecentAudio} from './recent-audio.mjs';
+import {clearVoicePromptCache, describeVoicePrompt, loadVoicePrompt, storeVoicePrompt}
+  from './voice-prompt-cache.mjs';
 
 const SETTINGS_KEY = 'kidi-wasm-host-v1';
+const VOICE_REFERENCES = [
+  'Hello, I am Kidi, your local assistant.',
+  'A quiet breeze moves through the bright garden.',
+  'Clear morning light falls across the open window.',
+];
 const DEFAULTS = {
   model: 'google/gemma-4-E2B-it-qat-mobile-transformers',
   backend: 'webgpu',
@@ -35,7 +40,7 @@ class WasmBackend {
       settings: {
         language: 'auto',
         max_tokens: 128,
-        vad: {threshold: 0.012, minimum_speech_ms: 250, silence_ms: 650},
+        vad: {threshold: 0.012, minimum_speech_ms: 250, silence_ms: 1500},
       },
     },
     tts: {
@@ -46,9 +51,11 @@ class WasmBackend {
         language: 'auto',
         steps: 10,
         pace: 1.15,
-        gpu_precision: 'f32',
+        gpu_precision: 'w8a8',
         reference_language: 'English',
-        reference_text: 'Hello, I am Kidi, your helpful local assistant.',
+        reference_text: VOICE_REFERENCES[0],
+        reference_sentences: VOICE_REFERENCES,
+        voice_seed: 0,
         voice: {gender: 'female', age: 'young adult', pitch: 'moderate', style: '', accent: ''},
       },
     },
@@ -59,17 +66,20 @@ class WasmBackend {
   #speechReady;
   #speechWorker;
   #speechMode;
-  #ttsPending = new Map();
+  #ttsRequest;
   #ttsReady;
   #ttsWorker;
   #ttsLoadingId;
   #ttsLoadReject;
   #ttsMode;
-  #recentAudio = new RecentAudio();
+  #ttsUseGpu = false;
+  #ttsModelInfo;
+  #ttsVoiceKey;
+  #ttsVoiceSettingsKey;
+  #ttsControls = new Map();
   #worker;
   #resident = false;
   #reloading = false;
-  #nextAudioStream = 0x80000000;
 
   constructor() {
     try {
@@ -85,18 +95,152 @@ class WasmBackend {
     } catch {}
   }
 
+  #voiceDefinition(options, modelInfo = {}) {
+    const voiceSeed = Number.isSafeInteger(options.voice_seed) ? options.voice_seed : 0;
+    const configured = Array.isArray(options.reference_sentences) ?
+      options.reference_sentences.filter(value => typeof value === 'string' && value.trim()) : [];
+    const references = configured.length ? configured :
+      typeof options.reference_text === 'string' && options.reference_text.trim() ?
+        [options.reference_text.trim()] : VOICE_REFERENCES;
+    const index = ((voiceSeed % references.length) + references.length) % references.length;
+    const text = references[index];
+    const language = options.reference_language || 'English';
+    const precision = options.gpu_precision || 'f32';
+    const settings = {
+      model: this.#components.tts.directory,
+      precision,
+      codebooks: 8,
+      frameRate: 25,
+      vocabulary: 1024,
+      maximumSeconds: 20,
+      voice: options.voice || {},
+      reference: {
+        language,
+        text,
+        seed: voiceSeed,
+        steps: Number(options.steps) || 10,
+        guidanceScale: Number(options.guidance_scale ?? 2),
+        timeShift: Number(options.time_shift ?? 0.1),
+        layerPenalty: Number(options.layer_penalty ?? 5),
+        positionTemperature: Number(options.position_temperature ?? 5),
+      },
+    };
+    const identity = {
+      ...settings,
+      model: modelInfo.id || settings.model,
+      execution: modelInfo.backend || this.#settings.backend,
+      precision: modelInfo.matrix_precision || (modelInfo.backend === 'webgpu' ? precision : 'f32'),
+    };
+    return {identity, settingsKey: JSON.stringify(settings), text, language, voiceSeed, precision};
+  }
+
+  #controlTts(worker, data, expected) {
+    const requestId = `voice:${crypto.randomUUID()}`;
+    data.requestId = requestId;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#ttsControls.delete(requestId);
+        reject(new Error(`TTS voice preparation timed out: ${data.type}`));
+      }, 300000);
+      this.#ttsControls.set(requestId, {expected, resolve, reject, timer});
+      try {
+        const transfer = data.tokens instanceof ArrayBuffer ? [data.tokens] : [];
+        worker.postMessage(data, transfer);
+      } catch (error) {
+        clearTimeout(timer);
+        this.#ttsControls.delete(requestId);
+        reject(error);
+      }
+    });
+  }
+
+  #handleTtsControl(data, id) {
+    if (data.type === 'generating' && this.#ttsControls.size) {
+      this.#event(id, 'tts.progress', {phase: 'calibrating-voice', step: data.step, steps: data.steps});
+      return true;
+    }
+    const control = this.#ttsControls.get(data.requestId);
+    if (!control) return false;
+    if (data.type !== 'error' && data.type !== control.expected) return true;
+    clearTimeout(control.timer);
+    this.#ttsControls.delete(data.requestId);
+    if (data.type === 'error') control.reject(new Error(data.error || 'TTS voice preparation failed'));
+    else control.resolve(data);
+    return true;
+  }
+
+  async #prepareTtsVoice(worker, id, options, modelInfo) {
+    const definition = this.#voiceDefinition(options, modelInfo);
+    const descriptor = await describeVoicePrompt(definition.identity);
+    if (worker !== this.#ttsWorker) throw new DOMException('TTS worker changed', 'AbortError');
+    let cached = null;
+    try {
+      cached = await loadVoicePrompt(descriptor);
+    } catch (error) {
+      this.#event(id, 'tts.progress', {phase: 'voice-cache', message: `Ignoring cached voice: ${error.message}`});
+    }
+    if (cached) {
+      const buffer = cached.tokens.slice().buffer;
+      await this.#controlTts(worker, {type: 'voice-prompt', text: cached.text, tokens: buffer},
+        'voice-prompt-ready');
+    } else {
+      this.#event(id, 'tts.progress', {phase: 'calibrating-voice'});
+      const result = await this.#controlTts(worker, {
+        type: 'synthesize',
+        streamSegment: true,
+        text: definition.text,
+        options: {
+          ...options,
+          language: definition.language,
+          pace: 1,
+          seed: definition.voiceSeed,
+          use_voice_prompt: false,
+          cache_voice_prompt: true,
+          return_tokens: true,
+        },
+      }, 'audio');
+      if (result.voice_prompt_used === true || result.voice_prompt_cached !== true ||
+          !Array.isArray(result.token_ids) || !result.token_ids.length)
+        throw new Error('OmniVoice did not return a reusable calibration prompt');
+      const prompt = {text: definition.text, tokens: Int32Array.from(result.token_ids)};
+      const buffer = prompt.tokens.slice().buffer;
+      await this.#controlTts(worker, {type: 'voice-prompt', text: prompt.text, tokens: buffer},
+        'voice-prompt-ready');
+      try {
+        await storeVoicePrompt(descriptor, prompt);
+      } catch (error) {
+        this.#event(id, 'tts.progress', {phase: 'voice-cache', message: `Voice cache unavailable: ${error.message}`});
+      }
+    }
+    if (worker !== this.#ttsWorker) throw new DOMException('TTS worker changed', 'AbortError');
+    this.#ttsVoiceKey = descriptor.id;
+    this.#ttsVoiceSettingsKey = definition.settingsKey;
+    this.#event(id, 'tts.progress', {phase: 'voice-ready', cached: Boolean(cached)});
+  }
+
   #ensureTts(id, options) {
-    const precision = options?.gpu_precision || 'f32';
+    const definition = this.#voiceDefinition(options);
+    const precision = definition.precision;
     if (!['f32', 'mixed-f16', 'w8a8'].includes(precision))
       return Promise.reject(new Error('Unsupported browser speech precision'));
     const mode = JSON.stringify({backend: this.#settings.backend, precision});
-    if (this.#ttsReady && this.#ttsMode !== mode) {
-      this.#ttsWorker?.terminate();
-      this.#ttsWorker = null;
-      this.#ttsReady = null;
+    if (this.#ttsWorker && this.#ttsMode !== mode) this.#releaseTts();
+    if (this.#ttsWorker && this.#ttsModelInfo) {
+      if (this.#ttsReady && this.#ttsVoiceSettingsKey === definition.settingsKey) return this.#ttsReady;
+      this.#ttsLoadingId = id;
+      this.#ttsVoiceSettingsKey = definition.settingsKey;
+      this.#ttsReady = new Promise((resolve, reject) => {
+        this.#ttsLoadReject = reject;
+        this.#prepareTtsVoice(this.#ttsWorker, id, options, this.#ttsModelInfo).then(resolve, reject);
+      }).finally(() => {
+        this.#ttsLoadingId = null;
+        this.#ttsLoadReject = null;
+      });
+      return this.#ttsReady;
     }
     if (this.#ttsReady) return this.#ttsReady;
     this.#ttsMode = mode;
+    this.#ttsVoiceSettingsKey = definition.settingsKey;
     this.#ttsLoadingId = id;
     this.#ttsReady = new Promise((resolve, reject) => {
       this.#ttsLoadReject = reject;
@@ -106,10 +250,13 @@ class WasmBackend {
         const worker = useGpu ? createGpuWorker('tts') :
           new Worker(new URL('./tts-worker.mjs', import.meta.url), {type: 'module'});
         this.#ttsWorker = worker;
+        this.#ttsUseGpu = useGpu;
         let loaded = false;
         const failLoad = message => {
           if (worker !== this.#ttsWorker) return;
           worker.terminate();
+          this.#ttsWorker = null;
+          this.#ttsModelInfo = null;
           if (useGpu) {
             this.#event(id, 'tts.progress', {
               phase: 'fallback',
@@ -117,7 +264,6 @@ class WasmBackend {
             });
             start(false);
           } else {
-            this.#ttsWorker = null;
             this.#ttsReady = null;
             this.#ttsLoadingId = null;
             this.#ttsLoadReject = null;
@@ -126,15 +272,20 @@ class WasmBackend {
         };
         worker.onmessage = ({data}) => {
           if (worker !== this.#ttsWorker) return;
+          if (this.#handleTtsControl(data, id)) return;
           if (data.type === 'ready') {
             loaded = true;
+            this.#ttsModelInfo = data;
             this.#components.tts.threads = data.threads;
             this.#components.tts.accelerator = data.backend ||
               (data.threads > 1 ? 'wasm-threads' : 'wasm-cpu');
             this.#components.tts.gpu_precision = data.matrix_precision;
-            this.#ttsLoadingId = null;
-            this.#ttsLoadReject = null;
-            resolve();
+            this.#prepareTtsVoice(worker, id, options, data).then(() => {
+              if (worker !== this.#ttsWorker) return;
+              this.#ttsLoadingId = null;
+              this.#ttsLoadReject = null;
+              resolve();
+            }, error => failLoad(error.message));
           } else if (data.type === 'progress') {
             this.#event(id, 'tts.progress', {phase: 'loading', ...data});
           } else if (data.type === 'generating') {
@@ -145,12 +296,15 @@ class WasmBackend {
             });
           } else if (data.type === 'audio') {
             this.#ttsAudio(data);
+          } else if (data.type === 'residency' && data.state === 'evicted') {
+            this.#ttsReady = null;
+            this.#ttsVoiceKey = null;
           } else if (data.type === 'error') {
             if (!loaded) {
               failLoad(data.error || 'TTS worker failed');
             } else {
-              const pending = this.#ttsPending.get(data.requestId) || this.#ttsPending.values().next().value;
-              if (pending) this.#failSpeech(pending, data.error || 'Speech synthesis failed');
+              const request = this.#ttsRequest;
+              if (request) this.#failSpeech(request, data.error || 'Speech synthesis failed');
             }
           }
         };
@@ -158,8 +312,8 @@ class WasmBackend {
           if (worker !== this.#ttsWorker) return;
           if (!loaded) failLoad(event.message || 'TTS worker failed');
           else {
-            const pending = this.#ttsPending.values().next().value;
-            if (pending) this.#failSpeech(pending, event.message || 'TTS worker failed', 'tts_worker_failed');
+            const request = this.#ttsRequest;
+            if (request) this.#failSpeech(request, event.message || 'TTS worker failed', 'tts_worker_failed');
           }
         };
         const threads = !useGpu && globalThis.crossOriginIsolated
@@ -181,138 +335,81 @@ class WasmBackend {
     return this.#ttsReady;
   }
 
-  #synthesize(id, streamId, text, options, voice, finished = true) {
-    if (this.#ttsPending.size) {
-      this.#event(id, voice ? 'voice.audio.error' : 'error', {
-        code: 'busy', message: 'Another speech synthesis request is active',
-      });
-      return false;
+  #synthesize(id, streamId, text, options) {
+    if (this.#ttsRequest) {
+      this.#error(id, 'busy', 'Another speech synthesis request is active');
+      return;
     }
     const defaults = this.#components.tts.settings;
-    const pending = {id, streamId, voice,
-      options: {...defaults, ...options, voice: {...(options?.voice || defaults.voice)},
-        use_voice_prompt: false, cache_voice_prompt: false},
-      started: performance.now(), split: new SpeechSegments(),
-      queue: [], ready: false, ended: false, inFlight: false, delivering: false,
-      sequence: 0, samples: 0, chunks: 0, sampleRate: null};
-    this.#ttsPending.set(id, pending);
-    this.#appendSpeech(id, text, finished);
-    return true;
-  }
-
-  #appendSpeech(id, text, finished = false) {
-    const pending = this.#ttsPending.get(id);
-    if (!pending) return;
-    try {
-      pending.queue.push(...pending.split.push(text, finished));
-      pending.ended = finished;
-      this.#pumpSpeech(pending);
-    } catch (error) { this.#failSpeech(pending, error.message); }
-  }
-
-  #pumpSpeech(pending) {
-    if (this.#ttsPending.get(pending.id) !== pending || pending.loading || pending.inFlight || pending.delivering) return;
-    const segment = pending.queue[0];
-    if (segment) {
-      const options = pending.options;
-      segment.cacheKey = JSON.stringify([this.#components.tts.directory, this.#settings.backend, options, segment.text]);
-      const cached = this.#recentAudio.get(segment.cacheKey);
-      if (!cached && !pending.ready) {
-        pending.loading = true;
-        this.#ensureTts(pending.id, options).then(() => {
-          if (this.#ttsPending.get(pending.id) !== pending) return;
-          pending.loading = false;
-          pending.ready = true;
-          this.#pumpSpeech(pending);
-        }).catch(error => this.#failSpeech(pending, error.message, 'tts_load_failed'));
-        return;
-      }
-      pending.queue.shift();
-      pending.active = segment;
-      pending.inFlight = true;
-      pending.synthesisStarted = performance.now();
-      if (cached) {
-        this.#ttsAudio({requestId: pending.id, ...cached});
-        return;
-      }
-      this.#event(pending.id, 'tts.progress', {phase: 'synthesizing', segment_id: segment.id});
-      try {
-        this.#ttsWorker.postMessage({
-          type: 'synthesize', requestId: pending.id, streamSegment: true, text: segment.text, options,
-        });
-      } catch (error) { this.#failSpeech(pending, error.message); }
-    } else if (pending.ended) {
-      if (!pending.chunks) return this.#failSpeech(pending, 'No speech text was produced');
-      this.#ttsPending.delete(pending.id);
-      this.#releaseTts();
-      this.#event(pending.id, pending.voice ? 'voice.audio.completed' : 'tts.completed', {
-        stream_id: pending.streamId, sample_rate: pending.sampleRate, samples: pending.samples,
-        chunks: pending.chunks, voice_prompt_reused: false,
+    const effectiveOptions = {...defaults, ...options, voice: {...(options?.voice || defaults.voice)}};
+    const request = {id, streamId, text, options: effectiveOptions, started: performance.now()};
+    this.#ttsRequest = request;
+    this.#ensureTts(id, effectiveOptions).then(() => {
+      if (this.#ttsRequest !== request) return;
+      this.#event(id, 'tts.progress', {phase: 'synthesizing'});
+      this.#ttsWorker.postMessage({
+        type: 'synthesize', requestId: id, streamSegment: true, text,
+        options: {...effectiveOptions, use_voice_prompt: true, cache_voice_prompt: false},
       });
-    }
+    }).catch(error => this.#failSpeech(request, error.message, 'tts_load_failed'));
   }
 
   #releaseTts() {
     this.#ttsLoadReject?.(new DOMException('Speech request stopped', 'AbortError'));
     this.#ttsLoadReject = null;
+    for (const control of this.#ttsControls.values()) {
+      clearTimeout(control.timer);
+      control.reject(new DOMException('Speech request stopped', 'AbortError'));
+    }
+    this.#ttsControls.clear();
     this.#ttsWorker?.terminate();
     this.#ttsWorker = null;
     this.#ttsReady = null;
     this.#ttsLoadingId = null;
+    this.#ttsModelInfo = null;
+    this.#ttsUseGpu = false;
+    this.#ttsVoiceKey = null;
+    this.#ttsVoiceSettingsKey = null;
   }
 
   #cancelSpeech(id) {
-    if (!this.#ttsPending.has(id) && this.#ttsLoadingId !== id) return false;
-    this.#ttsPending.delete(id);
-    if (this.#current?.id === id) this.#current.speak = false;
+    if (this.#ttsRequest?.id !== id && this.#ttsLoadingId !== id) return false;
+    this.#ttsRequest = null;
     this.#releaseTts();
     return true;
   }
 
-  #failSpeech(pending, message, code = 'tts_failed') {
-    if (!pending || this.#ttsPending.get(pending.id) !== pending) return;
-    this.#ttsPending.delete(pending.id);
-    if (this.#current?.id === pending.id) this.#current.speak = false;
+  #failSpeech(request, message, code = 'tts_failed') {
+    if (!request || this.#ttsRequest !== request) return;
+    this.#ttsRequest = null;
     this.#releaseTts();
-    this.#event(pending.id, pending.voice ? 'voice.audio.error' : 'error', {code, message});
+    this.#error(request.id, code, message);
   }
 
   async #ttsAudio(data) {
-    const pending = this.#ttsPending.get(data.requestId);
-    if (!pending) return;
+    const request = this.#ttsRequest;
+    if (!request || request.id !== data.requestId) return;
     try {
-      if (!pending.inFlight || pending.delivering) throw new Error('Unexpected speech segment audio');
-      pending.inFlight = false;
-      pending.delivering = true;
       if (!(data.audio instanceof ArrayBuffer) || !data.audio.byteLength || data.audio.byteLength % 4 ||
           !Number.isInteger(data.sample_rate) || data.sample_rate <= 0)
         throw new Error('Speech worker returned invalid PCM');
-      const count = data.audio.byteLength / 4;
       const samples = new Float32Array(data.audio);
-      if (!data.cached) this.#recentAudio.put(pending.active.cacheKey, data.audio, data.sample_rate);
-      if (pending.sampleRate !== null && pending.sampleRate !== data.sample_rate)
-        throw new Error('Speech segments changed sample rate');
-      pending.sampleRate = data.sample_rate;
-      const segment = pending.active;
-      this.#event(pending.id, 'tts.segment', {stream_id: pending.streamId, segment_id: segment.id,
-        text: segment.text, start: segment.start, end: segment.end,
-        cached: data.cached === true, synthesis_ms: performance.now() - pending.synthesisStarted});
-      if (pending.voice && !pending.chunks) this.#event(pending.id, 'voice.audio.first', {
-        stream_id: pending.streamId, elapsed_ms: performance.now() - pending.started,
-      });
+      const sampleCount = samples.length;
+      if (data.voice_prompt_used !== true)
+        throw new Error('OmniVoice lost its prepared voice prompt');
       if (this.#callbacks?.onPcm) {
-        await this.#callbacks.onPcm({streamId: pending.streamId, sequence: pending.sequence++,
-          sampleRate: data.sample_rate, samples, segmentId: segment.id});
+        await this.#callbacks.onPcm({streamId: request.streamId, sequence: 0,
+          sampleRate: data.sample_rate, samples});
       } else {
         if (!this.#callbacks?.onAudio) throw new Error('No speech audio consumer is connected');
         for (let offset = 0; offset < samples.length; offset += 4096) {
-          if (this.#ttsPending.get(pending.id) !== pending) return;
+          if (this.#ttsRequest !== request) return;
           const length = Math.min(4096, samples.length - offset);
           const frame = new ArrayBuffer(24 + length * 2);
           new Uint8Array(frame).set([0x4b, 0x44, 0x41, 0x31, 1, 2], 0);
           const header = new DataView(frame);
-          header.setUint32(8, pending.streamId, true);
-          header.setUint32(12, pending.sequence++, true);
+          header.setUint32(8, request.streamId, true);
+          header.setUint32(12, offset / 4096, true);
           header.setUint32(16, data.sample_rate, true);
           header.setUint32(20, length * 2, true);
           const pcm = new Int16Array(frame, 24, length);
@@ -321,14 +418,19 @@ class WasmBackend {
           await this.#callbacks.onAudio(frame);
         }
       }
-      if (this.#ttsPending.get(pending.id) !== pending) return;
-      pending.samples += count;
-      pending.chunks++;
+      if (this.#ttsRequest !== request) return;
+      this.#ttsRequest = null;
+      if (!this.#ttsUseGpu) this.#releaseTts();
+      this.#event(request.id, 'tts.completed', {
+        stream_id: request.streamId,
+        sample_rate: data.sample_rate,
+        samples: sampleCount,
+        chunks: 1,
+        voice_prompt_reused: true,
+        synthesis_ms: performance.now() - request.started,
+      });
     } catch (error) {
-      this.#failSpeech(pending, error.message, 'tts_audio_failed');
-    } finally {
-      pending.delivering = false;
-      if (this.#ttsPending.get(pending.id) === pending) this.#pumpSpeech(pending);
+      this.#failSpeech(request, error.message, 'tts_audio_failed');
     }
   }
 
@@ -341,9 +443,20 @@ class WasmBackend {
   }
 
   listCachedFiles() { return listCachedFiles(); }
-  deleteCachedFile(id) { return deleteCachedFile(id); }
-  deleteCachedFiles(ids) { return deleteCachedFiles(ids); }
-  clearModelCache() { return clearModelCache(); }
+  async deleteCachedFile(id) {
+    const result = await deleteCachedFile(id);
+    await clearVoicePromptCache();
+    return result;
+  }
+  async deleteCachedFiles(ids) {
+    const result = await deleteCachedFiles(ids);
+    await clearVoicePromptCache();
+    return result;
+  }
+  async clearModelCache() {
+    const [models] = await Promise.all([clearModelCache(), clearVoicePromptCache()]);
+    return models;
+  }
 
   connect(callbacks) {
     this.#callbacks = callbacks;
@@ -406,17 +519,7 @@ class WasmBackend {
       this.#current = {
         id,
         text: '',
-        speak: payload.speak === true,
-        streamId: payload.speak === true ? this.#nextAudioStream++ : null,
-        ttsOptions: payload.tts_options || this.#components.tts.settings,
       };
-      if (this.#current.speak)
-        this.#event(id, 'voice.audio.started', {
-          stream_id: this.#current.streamId,
-          format: this.#callbacks?.onPcm ? 'pcm_f32le' : 'pcm_s16le',
-        });
-      if (this.#current.speak)
-        this.#current.speak = this.#synthesize(id, this.#current.streamId, '', this.#current.ttsOptions, true, false);
       this.#event(id, 'chat.started');
       this.#worker.postMessage({
         type: 'generate',
@@ -437,6 +540,7 @@ class WasmBackend {
         sequence: 0,
         transcribing: false,
         finalRequested: false,
+        language: this.#components.asr.settings.language || 'auto',
         partialSequence: 0,
         lastPartialSamples: 0,
       };
@@ -457,11 +561,10 @@ class WasmBackend {
     }
     if (type === 'cancel') {
       if (payload.scope === 'speech') {
-        const pending = this.#ttsPending.get(id);
-        if (pending) {
+        const request = this.#ttsRequest?.id === id ? this.#ttsRequest : null;
+        if (request) {
           this.#cancelSpeech(id);
-          this.#event(id, pending.voice ? 'voice.audio.error' : 'request.cancelled',
-            {message: payload.message || 'Speech playback stopped'});
+          this.#event(id, 'request.cancelled', {message: payload.message || 'Speech playback stopped'});
         }
         return;
       }
@@ -471,7 +574,7 @@ class WasmBackend {
         this.#asr = null;
         this.#event(id, 'request.cancelled');
       }
-      if (this.#ttsLoadingId === id || this.#ttsPending.has(id)) {
+      if (this.#ttsLoadingId === id || this.#ttsRequest?.id === id) {
         this.#cancelSpeech(id);
         this.#event(id, 'request.cancelled');
       }
@@ -593,7 +696,8 @@ class WasmBackend {
             resolve();
           } else if (data.type === 'result') {
             this.#speechResult(data);
-          } else if (data.type === 'partial' && this.#asr && String(data.requestId).includes(this.#asr.id)) {
+          } else if (data.type === 'partial' && this.#asr &&
+                     String(data.requestId).includes(this.#asr.id)) {
             this.#event(this.#asr.id, 'asr.partial', {
               stable: '', provisional: data.text || '', language: data.language || 'auto',
             });
@@ -617,7 +721,16 @@ class WasmBackend {
 
   #transcribe(final) {
     const request = this.#asr;
-    if (!request || request.transcribing || !request.samples.length) return;
+    if (!request || request.transcribing) return;
+    if (!request.samples.length) {
+      if (final) {
+        this.#event(request.id, 'asr.completed', {
+          text: '', language: request.language, stats: {feature_ms: 0, encode_ms: 0, decode_ms: 0},
+        });
+        this.#asr = null;
+      }
+      return;
+    }
     request.transcribing = true;
     if (!final) request.lastPartialSamples = request.samples.length;
     const audio = Float32Array.from(request.samples);
@@ -626,7 +739,7 @@ class WasmBackend {
       type: 'transcribe',
       requestId,
       audio: audio.buffer,
-      language: 'auto',
+      language: request.language,
       maximumTokens: 128,
     }, [audio.buffer]);
   }
@@ -708,12 +821,9 @@ class WasmBackend {
         if (item.text) {
           this.#current.text += item.text;
           this.#event(this.#current.id, 'chat.delta', {text: item.text});
-          if (this.#current.speak) this.#appendSpeech(this.#current.id, item.text);
         }
         if (item.completed) {
           const completed = item.completed;
-          const current = this.#current;
-          const text = completed.text || current.text;
           this.#event(this.#current.id, 'chat.completed', {
             text: completed.text || this.#current.text,
             stats: {
@@ -726,24 +836,17 @@ class WasmBackend {
             },
           });
           this.#current = null;
-          if (current.speak) {
-            if (text.startsWith(current.text)) this.#appendSpeech(current.id, text.slice(current.text.length), true);
-            else if (text.trim() === current.text.trim()) this.#appendSpeech(current.id, '', true);
-            else this.#failSpeech(this.#ttsPending.get(current.id), 'The streamed response was revised after speech started');
-          }
         }
       }
       return;
     }
     if (data.type === 'cancelled' && this.#current) {
-      this.#cancelSpeech(this.#current.id);
       this.#event(this.#current.id, 'request.cancelled');
       this.#current = null;
       return;
     }
     if (data.type === 'error') {
       const request = this.#current?.id || loadId;
-      this.#cancelSpeech(request);
       this.#error(request, 'wasm_error', data.error || 'Browser runtime failed');
       this.#current = null;
       if (data.fatal) {
