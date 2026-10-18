@@ -88,5 +88,4 @@ await copyFile(join(libraries, 'lucide-static/LICENSE'), join(destination, 'icon
 for (const icon of ['send-horizontal', 'square', 'download', 'trash-2', 'plus', 'settings', 'x', 'panel-left',
     'message-square', 'mic'])
     await copyFile(join(libraries, 'lucide-static/icons', `${icon}.svg`), join(destination, 'icons', `${icon}.svg`));
-await copyFile(join(root, 'docs/kidi-logo-small.png'), join(destination, 'icons/kidi-logo.png'));
 console.log(`Browser app: ${destination}`);

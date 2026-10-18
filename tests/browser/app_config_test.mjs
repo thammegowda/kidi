@@ -42,3 +42,15 @@ test('first-run browser UI requests model loading and exposes progress', async (
   assert.match(app, /\$\('onboarding-load-tts'\)\.addEventListener\('click'/);
   assert.match(app, /\$\('dismiss-model-onboarding'\)\.addEventListener\('click', dismissModelSetup\)/);
 });
+
+test('browser branding uses the square Kidi icon', async () => {
+  const html = await readFile(new URL('../../web/ui/index.html', import.meta.url), 'utf8');
+  const assets = await readFile(new URL('../../web/ui/assets.txt', import.meta.url), 'utf8');
+  const icon = await readFile(new URL('../../web/ui/icons/kidi-logo.png', import.meta.url));
+  assert.match(html, /rel="icon"[^>]+icons\/kidi-logo\.png/);
+  assert.match(html, /class="brand-mark"[^>]+icons\/kidi-logo\.png/);
+  assert.match(assets, /^icons\/kidi-logo\.png$/m);
+  assert.deepEqual([...icon.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  assert.equal(icon.readUInt32BE(16), 512);
+  assert.equal(icon.readUInt32BE(20), 512);
+});

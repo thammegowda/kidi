@@ -1424,6 +1424,7 @@ auto development_files(const std::filesystem::path& root) -> std::vector<liteapp
         const auto content_type = extension == ".html" ? "text/html; charset=utf-8" :
                                   extension == ".css"  ? "text/css; charset=utf-8" :
                                   extension == ".svg"  ? "image/svg+xml"
+                                  : extension == ".png" ? "image/png"
                                                        : text;
         add(file == "index.html" ? "/" : '/' + file, std::filesystem::path{"web/ui"} / file, content_type);
     }

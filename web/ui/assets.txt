@@ -2,6 +2,7 @@ app.js
 icons/audio-waveform.svg
 icons/book-open.svg
 icons/copy.svg
+icons/kidi-logo.png
 icons/pause.svg
 icons/play.svg
 icons/volume.svg

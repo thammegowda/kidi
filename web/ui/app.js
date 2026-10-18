@@ -648,8 +648,8 @@ function renderMessages() {
     article.className = `message ${message.role}`;
     article.dataset.messageId = message.id;
     article.setAttribute('aria-label', message.role === 'assistant' ? 'Kidi' : 'You');
-    const avatar = document.createElement('div');
-    avatar.className = 'avatar'; avatar.textContent = 'K'; avatar.setAttribute('aria-hidden', 'true');
+    const avatar = document.createElement('img');
+    avatar.className = 'avatar'; avatar.src = './icons/kidi-logo.png'; avatar.alt = '';
     const body = document.createElement('div');
     body.className = 'message-body';
     const content = document.createElement('div');
