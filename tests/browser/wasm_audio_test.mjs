@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {setImmediate} from 'node:timers/promises';
+import {setTimeout as delay, setImmediate} from 'node:timers/promises';
 
 let nextModule = 0;
 const TEST_APP_CONFIG = {
@@ -39,10 +39,11 @@ function asrFrame(streamId, sequence, samples = 320) {
 const visibleSynthesis = worker => worker.calls.filter(call =>
     call.type === 'synthesize' && call.options?.return_tokens !== true);
 async function waitFor(predicate, message = 'Timed out waiting for test state') {
-    for (let attempt = 0; attempt < 100; ++attempt) {
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
         const value = predicate();
         if (value) return value;
-        await setImmediate();
+        await delay(1);
     }
     throw new Error(message);
 }
