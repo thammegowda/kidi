@@ -15,6 +15,7 @@ markdown.js
 mermaid.js
 realtime-profile.js
 reader-position.js
+reader-translation.js
 speech-controller.js
 speech-highlights.js
 style.css

@@ -59,7 +59,7 @@ Every command and event is a JSON object:
 ```
 
 Client commands are `chat.start`, `image.start`, `image.finish`, `ebook.start`,
-`ebook.finish`, `ebook.chapter`, `asr.start`, `asr.stop`, `tts.start`,
+`ebook.finish`, `ebook.chapter`, `reader.translate`, `asr.start`, `asr.stop`, `tts.start`,
 `settings.system_prompt.set`, and `cancel`. Server events are `session.ready`,
 `settings.system_prompt.updated`, modality-specific `started`, `partial`/`delta`,
 and `completed` events, `request.cancelled`, and `error`. Sequence numbers are
@@ -87,6 +87,19 @@ selected word. The compact reader bar exposes diffusion steps, delivery,
 gender, age, pitch, style, accent, and browser GPU precision where available.
 Changing any setting restarts active narration at the current position. Its
 **TTS model settings…** action opens model loading and diagnostics.
+
+Choosing a reader translation language sends each bounded paragraph through
+`reader.translate`, with the preceding and following paragraphs as context.
+The server applies the YAML `translation_prompt`, emits
+`reader.translation.started`, `reader.translation.delta`, and
+`reader.translation.completed`, and shares the chat model's single-inference
+gate without adding messages to chat history. The UI displays source and
+translation pages as vertically aligned paragraph pairs in one shared scroll,
+caches completed chapter translations by source digest, and streams completed
+paragraphs into TTS while later paragraphs translate. Clicking either column
+switches narration, language, highlighting, and click-to-seek to that side.
+Translation pauses after the visible range plus three paragraphs and resumes
+only when the shared reader scrolls or target narration advances.
 
 Chat publishes each tokenizer-safe `GenerationEvent.text` delta immediately.
 ASR accepts rolling microphone audio and emits bounded partial snapshots before

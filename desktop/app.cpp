@@ -18,6 +18,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <atomic>
+#include <array>
 #include <bit>
 #include <charconv>
 #include <chrono>
@@ -183,6 +184,7 @@ struct AppConfig {
     std::size_t max_audio_queue_ms = 3000;
     std::size_t max_text_frame_bytes = 1024U * 1024U;
     std::string system_prompt;
+    std::string translation_prompt;
     Json asr_settings;
     Json tts_settings;
 
@@ -199,6 +201,7 @@ struct AppConfig {
                  {"precision", kidi::core::to_string(precision)},
                  {"kv_cache_precision", kidi::core::to_string(kv_cache_precision)},
                  {"system_prompt", system_prompt},
+                 {"translation_prompt", translation_prompt},
                  {"maximum_tokens", maximum_tokens},
                  {"context_tokens", context_tokens},
                  {"prefill_chunk_tokens", prefill_chunk_tokens},
@@ -338,6 +341,10 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
         if (!cache_precision) return invalid_config("Unknown chat KV-cache precision: " + cache_name);
         result.kv_cache_precision = *cache_precision;
         result.system_prompt = yaml_string(models["chat"], "system_prompt");
+        result.translation_prompt = yaml_string(
+            models["chat"], "translation_prompt",
+            "You are a literary translator. Translate <text_to_translate> into {target_language}. Use the "
+            "surrounding context only to resolve meaning and return only the translated text.");
         const auto generation = models["chat"]["generation"];
         result.maximum_tokens = positive_size(generation, "max_tokens", 512, 2048);
         result.context_tokens = positive_size(generation, "context_tokens", 8192, 32768);
@@ -535,6 +542,41 @@ public:
     auto chat(std::span<const ChatMessage> messages, std::string_view languages, std::string_view language_names,
               const std::function<bool()>& cancelled, const std::function<void(std::string_view)>& on_delta)
         -> kidi::Result<ChatRunResult> {
+        auto prompt = system_prompt();
+        if (!languages.empty())
+            prompt += languages.find(',') == std::string_view::npos
+                          ? "\nThe selected output language is " + std::string(language_names) +
+                                ". You must respond entirely in " + std::string(language_names) +
+                                ", regardless of the language of the user's message. This requirement overrides any "
+                                "earlier instruction to match the user's language."
+                          : "\nThe user may code-switch among " + std::string(language_names) +
+                                ". Respond in the same language or language mix as the latest user message.";
+        return generate(messages, std::move(prompt), cancelled, on_delta);
+    }
+
+    auto translate(std::string text, std::string previous, std::string next, std::string target_language,
+                   const std::function<bool()>& cancelled, const std::function<void(std::string_view)>& on_delta)
+        -> kidi::Result<ChatRunResult> {
+        if (!config_)
+            return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "chat model is not ready"});
+        auto prompt = config_->translation_prompt;
+        constexpr std::string_view PLACEHOLDER{"{target_language}"};
+        for (auto position = prompt.find(PLACEHOLDER); position != std::string::npos;
+             position = prompt.find(PLACEHOLDER, position + target_language.size())) {
+            prompt.replace(position, PLACEHOLDER.size(), target_language);
+        }
+        const auto request = "<preceding_context>\n" + std::move(previous) +
+                             "\n</preceding_context>\n<text_to_translate>\n" + std::move(text) +
+                             "\n</text_to_translate>\n<following_context>\n" + std::move(next) +
+                             "\n</following_context>";
+        const std::array messages{ChatMessage{.role = "user", .content = request, .images = {}}};
+        return generate(messages, std::move(prompt), cancelled, on_delta);
+    }
+
+private:
+    auto generate(std::span<const ChatMessage> messages, std::string prompt,
+                  const std::function<bool()>& cancelled, const std::function<void(std::string_view)>& on_delta)
+        -> kidi::Result<ChatRunResult> {
         std::scoped_lock lock(chat_mutex_);
         if (!generator_ || !config_)
             return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "chat model is not ready"});
@@ -546,15 +588,6 @@ public:
             .stream_text = true,
         };
         const auto started = Clock::now();
-        auto prompt = system_prompt();
-        if (!languages.empty())
-            prompt += languages.find(',') == std::string_view::npos
-                          ? "\nThe selected output language is " + std::string(language_names) +
-                                ". You must respond entirely in " + std::string(language_names) +
-                                ", regardless of the language of the user's message. This requirement overrides any "
-                                "earlier instruction to match the user's language."
-                          : "\nThe user may code-switch among " + std::string(language_names) +
-                                ". Respond in the same language or language mix as the latest user message.";
         std::vector<ChatMessage> conversation;
         conversation.reserve(messages.size() + !prompt.empty());
         if (!prompt.empty()) conversation.push_back({.role = "system", .content = prompt, .images = {}});
@@ -596,6 +629,8 @@ public:
                 },
         };
     }
+
+public:
 
     auto transcribe(std::span<const float> samples, const std::function<bool()>& cancelled,
                     const std::function<void(std::string_view, std::string_view)>& on_partial,
@@ -787,6 +822,9 @@ public:
                                 [this](liteapp::ServiceContext& context) { return finish_ebook(context); });
         router_.register_method("ebook.chapter",
                                 [this](liteapp::ServiceContext& context) { return read_ebook_chapter(context); });
+        router_.register_method("reader.translate", [this](liteapp::ServiceContext& context) {
+            return run_inference([&] { return run_reader_translation(context); });
+        });
         router_.register_method("chat.start", [this](liteapp::ServiceContext& context) {
             return run_inference([&] { return run_chat(context); });
         });
@@ -1065,6 +1103,42 @@ private:
             messages, languages, language_names, [&context] { return context.cancelled(); },
             [&context](std::string_view delta) { static_cast<void>(context.emit("chat.delta", {{"text", delta}})); });
         clear_uploaded_images();
+        if (!result) return inference_failure(result.error());
+        return Json{{"text", std::move(result->text)}, {"stats", std::move(result->stats)}};
+    }
+
+    auto run_reader_translation(liteapp::ServiceContext& context) -> liteapp::Result<Json> {
+        const auto& payload = context.payload();
+        for (const auto* field : {"text", "previous", "next", "target_language", "target_language_name"})
+            if (!payload.contains(field) || !payload[field].is_string())
+                return failure("invalid_translation", std::string{"Reader translation requires string field: "} + field);
+        const auto text = payload["text"].get<std::string>();
+        const auto previous = payload["previous"].get<std::string>();
+        const auto next = payload["next"].get<std::string>();
+        const auto target_language = payload["target_language"].get<std::string>();
+        const auto target_name = payload["target_language_name"].get<std::string>();
+        const auto contains_control = [](std::string_view value) {
+            return std::ranges::any_of(value, [](unsigned char character) {
+                return character < 0x20 && character != '\n' && character != '\t';
+            });
+        };
+        if (text.empty() || text.size() > 16384 || previous.size() > 8192 || next.size() > 8192 ||
+            target_name.empty() || target_name.size() > 100 || contains_control(text) || contains_control(previous) ||
+            contains_control(next) || contains_control(target_name) || !valid_language_setting(target_language) ||
+            target_language.contains(','))
+            return failure("invalid_translation", "Reader translation payload is invalid or too large");
+        if (!session_gate_.acquire("inference")) return failure("busy", "Another inference request is active");
+        if (!backend_->begin_request("chat")) {
+            session_gate_.release("inference");
+            return failure("busy", "Another inference request is active");
+        }
+        RequestLease lease{*backend_, session_gate_, "chat"};
+        static_cast<void>(context.emit("reader.translation.started"));
+        auto result = backend_->translate(
+            text, previous, next, target_name, [&context] { return context.cancelled(); },
+            [&context](std::string_view delta) {
+                static_cast<void>(context.emit("reader.translation.delta", {{"text", delta}}));
+            });
         if (!result) return inference_failure(result.error());
         return Json{{"text", std::move(result->text)}, {"stats", std::move(result->stats)}};
     }

@@ -1,9 +1,12 @@
 import {renderMarkdown, renderStreamingMarkdown} from './markdown.js';
 import {backend} from './backend.js';
-import {readEbook, removeEbook, storeEbook} from './ebooks.js';
+import {
+  readEbook, readEbookTranslation, removeEbook, storeEbook, storeEbookTranslation,
+} from './ebooks.js';
 import {MAX_IMAGE_BYTES, MAX_IMAGES, readImage, removeUnusedImages, storeImage} from './images.js';
 import {parseLanguages, resolveLanguages} from './languages.js';
 import {normalizeReaderText, readerProgressLabel, readerSpeechSlice} from './reader-position.js';
+import {READER_TRANSLATION_LOOKAHEAD, readerTranslationAttentionWindow} from './reader-translation.js';
 import {MINIMUM_TTS_STEPS, selectRealtimeProfile} from './realtime-profile.js';
 import {SpeechController, VoiceLatencyBenchmark} from './speech-controller.js';
 import {createSpeechIndex, renderSpeechHighlights, speechRanges, speechSearchOffset} from './speech-highlights.js';
@@ -33,6 +36,7 @@ const state = {
   modelSetupDismissed: false,
   ttsSettings: null,
   books: [],
+  readerLanguage: '',
   chats: [],
   active: null,
   view: 'chat',
@@ -68,10 +72,26 @@ let readerRenderToken = 0;
 let readerSeekToken = 0;
 let readerSpeechOffset = 0;
 let readerScrubbing = false;
+let readerSpeechSide = 'source';
 let readerHighlightIndex;
+let readerTranslationHighlightIndex;
+let readerTranslationRequest;
+let readerTranslationPromise;
+let readerTranslationCancellation = Promise.resolve();
+let readerTranslationReady = false;
+let readerTranslationComplete = false;
+let readerTranslationTtsIndex = -1;
+let readerTargetSpeechAnchor = -1;
+let readerSpeechPending = false;
+let readerTranslationToken = 0;
 let readerControlsTimer;
 let readerScrollTimer;
+let readerAlignmentFrame;
+let readerAlignmentEpoch = 0;
+let readerAligning = false;
+const readerTranslationWaiters = new Set();
 const ebookSessions = new Map();
+const translationRequests = new Map();
 const voiceLatency = new VoiceLatencyBenchmark();
 globalThis.kidiVoiceLatency = voiceLatency;
 const realtimeProfile = () => selectRealtimeProfile({
@@ -277,8 +297,408 @@ function readerContent() {
   return $('book-chapter-content').querySelector('.book-chapter-content');
 }
 
-function readerText() {
-  return normalizeReaderText(readerContent().innerText);
+function readerSourceContent() {
+  const aligned = $('book-source-aligned-content');
+  return aligned.hidden ? readerContent() : aligned;
+}
+
+function readerSpeechContent() {
+  return readerSpeechSide === 'target' && state.readerLanguage && readerTranslationReady ?
+    $('book-translation-content') : readerSourceContent();
+}
+
+function completedTranslationRows() {
+  return [...$('book-translation-content').querySelectorAll('.translation-aligned-block')]
+    .filter(row => row.children.length &&
+      [...row.children].every(element => element.dataset.translationComplete === 'true'));
+}
+
+function visibleTranslationRows() {
+  const viewport = $('book-document').getBoundingClientRect();
+  return completedTranslationRows().filter(row => {
+    const bounds = row.getBoundingClientRect();
+    return bounds.bottom > viewport.top && bounds.top < viewport.bottom;
+  });
+}
+
+function ensureReaderTargetSpeechAnchor() {
+  const rows = completedTranslationRows();
+  if (rows.some(row => Number(row.dataset.translationSourceIndex) === readerTargetSpeechAnchor)) return;
+  const visible = visibleTranslationRows();
+  readerTargetSpeechAnchor = Number((visible[0] || rows[0])?.dataset.translationSourceIndex ?? -1);
+}
+
+function readerTranslatedText() {
+  ensureReaderTargetSpeechAnchor();
+  if (readerTargetSpeechAnchor < 0) return '';
+  const rows = new Map(completedTranslationRows().map(row =>
+    [Number(row.dataset.translationSourceIndex), row]));
+  const text = [];
+  for (let index = readerTargetSpeechAnchor; rows.has(index); ++index)
+    text.push(normalizeReaderText(rows.get(index).innerText));
+  return text.filter(Boolean).join(' ');
+}
+
+function readerTargetHighlightOffset() {
+  const row = [...$('book-translation-content').querySelectorAll('.translation-aligned-block')]
+    .find(element => Number(element.dataset.translationSourceIndex) === readerTargetSpeechAnchor);
+  if (!row) return 0;
+  const range = document.createRange();
+  range.selectNodeContents($('book-translation-content'));
+  range.setEndBefore(row);
+  return normalizeReaderText(range.toString()).length;
+}
+
+function readerText(side = readerSpeechSide) {
+  return side === 'target' && state.readerLanguage && readerTranslationReady ?
+    normalizeReaderText(readerTranslatedText()) : normalizeReaderText(readerSourceContent().innerText);
+}
+
+const READER_TRANSLATION_BLOCKS = 'h1,h2,h3,h4,h5,h6,p,li,blockquote,figcaption,dt,dd,td,th,pre';
+const READER_TRANSLATION_CHARS = 1600;
+
+function readerTranslationBlocks() {
+  const content = readerContent();
+  const blocks = [...content.querySelectorAll(READER_TRANSLATION_BLOCKS)].filter(element =>
+    normalizeReaderText(element.textContent) &&
+    ![...element.querySelectorAll(READER_TRANSLATION_BLOCKS)].some(child => normalizeReaderText(child.textContent)));
+  return blocks.length ? blocks : normalizeReaderText(content.textContent) ? [content] : [];
+}
+
+function splitReaderTranslationText(value) {
+  const result = [];
+  let remaining = value;
+  while (remaining.length > READER_TRANSLATION_CHARS) {
+    const candidate = remaining.slice(0, READER_TRANSLATION_CHARS + 1);
+    const sentence = Math.max(candidate.lastIndexOf('. '), candidate.lastIndexOf('! '),
+      candidate.lastIndexOf('? '), candidate.lastIndexOf('। '));
+    const whitespace = candidate.lastIndexOf(' ');
+    const split = sentence > READER_TRANSLATION_CHARS / 2 ? sentence + 1 :
+      whitespace > READER_TRANSLATION_CHARS / 2 ? whitespace : READER_TRANSLATION_CHARS;
+    result.push(remaining.slice(0, split).trim());
+    remaining = remaining.slice(split).trim();
+  }
+  if (remaining) result.push(remaining);
+  return result;
+}
+
+function updateReaderReadAvailability() {
+  const textAvailable = readerSpeechSide === 'target' && state.readerLanguage ?
+    readerTranslationReady || Boolean(readerTranslationPromise) : Boolean(readerText());
+  $('read-book-chapter').disabled = !state.components.tts?.enabled || !textAvailable;
+}
+
+function setReaderSpeechSide(side) {
+  readerSpeechSide = side === 'target' && state.readerLanguage ? 'target' : 'source';
+  if (readerSpeechSide === 'source') readerTranslationTtsIndex = -1;
+  $('book-spread').dataset.speechSide = readerSpeechSide;
+  $('book-chapter-content').classList.toggle('speech-active', readerSpeechSide === 'source');
+  $('book-translation-page').classList.toggle('speech-active', readerSpeechSide === 'target');
+  updateReaderReadAvailability();
+}
+
+function scheduleReaderAlignment() {
+  const epoch = ++readerAlignmentEpoch;
+  cancelAnimationFrame(readerAlignmentFrame);
+  readerAlignmentFrame = requestAnimationFrame(() => {
+    readerAligning = true;
+    const sources = [...$('book-source-aligned-content').children];
+    const targets = [...$('book-translation-content').children];
+    const documentElement = $('book-document');
+    const documentBounds = documentElement.getBoundingClientRect();
+    const anchor = sources.find(element => element.getBoundingClientRect().bottom > documentBounds.top);
+    const anchorTop = anchor?.getBoundingClientRect().top;
+    for (const element of [...sources, ...targets]) element.style.minHeight = '';
+    for (let index = 0; index < Math.min(sources.length, targets.length); ++index) {
+      const height = Math.ceil(Math.max(
+        sources[index].getBoundingClientRect().height,
+        targets[index].getBoundingClientRect().height));
+      sources[index].style.minHeight = `${height}px`;
+      targets[index].style.minHeight = `${height}px`;
+    }
+    if (anchor && anchorTop !== undefined)
+      documentElement.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+    setTimeout(() => {
+      if (epoch !== readerAlignmentEpoch) return;
+      readerAligning = false;
+      wakeReaderTranslation();
+    }, 0);
+  });
+}
+
+function wakeReaderTranslation() {
+  for (const resolve of readerTranslationWaiters) resolve();
+  readerTranslationWaiters.clear();
+}
+
+function visibleReaderTranslationWindow() {
+  if (readerAligning || document.hidden || !readerBookId || $('book-reader').hidden) return null;
+  const viewport = $('book-document').getBoundingClientRect();
+  const rows = [...$('book-source-aligned-content').children, ...$('book-translation-content').children]
+    .map(element => {
+      const bounds = element.getBoundingClientRect();
+      return {
+        index: Number(element.dataset.translationSourceIndex),
+        top: bounds.top,
+        bottom: bounds.bottom,
+      };
+    });
+  return readerTranslationAttentionWindow(rows, viewport.top, viewport.bottom);
+}
+
+function currentReaderTranslationWindows() {
+  const result = [];
+  if (readerTranslationTtsIndex >= 0) result.push({
+    start: readerTranslationTtsIndex,
+    end: readerTranslationTtsIndex + READER_TRANSLATION_LOOKAHEAD,
+  });
+  const visible = visibleReaderTranslationWindow();
+  if (visible) result.push(visible);
+  return result;
+}
+
+async function nextReaderTranslationUnit(token, units, translations) {
+  while (token === readerTranslationToken) {
+    for (const window of currentReaderTranslationWindows()) {
+      const index = units.findIndex((unit, candidate) =>
+        translations[candidate] === undefined &&
+        unit.sourceIndex >= window.start && unit.sourceIndex <= window.end);
+      if (index >= 0) return index;
+    }
+    const completed = translations.filter(value => value !== undefined).length;
+    $('book-translation-status').textContent =
+      `Paused after ${completed} of ${units.length} · scroll to continue`;
+    await new Promise(resolve => readerTranslationWaiters.add(resolve));
+  }
+  return -1;
+}
+
+function setReaderSpeechPending(pending) {
+  readerSpeechPending = pending;
+  const button = $('read-book-chapter');
+  if (!pending) {
+    setReadAloudState(button, 'idle');
+    return;
+  }
+  button.classList.add('active');
+  button.classList.remove('paused');
+  button.setAttribute('aria-label', 'Cancel pending translated narration');
+  button.title = 'Cancel pending translated narration';
+  $('read-book-label').textContent = 'Waiting…';
+}
+
+async function stopReaderTranslation(message = 'Reader translation replaced') {
+  const token = ++readerTranslationToken;
+  readerTranslationTtsIndex = -1;
+  readerTargetSpeechAnchor = -1;
+  wakeReaderTranslation();
+  let cancellation = readerTranslationCancellation;
+  if (readerTranslationRequest) {
+    const id = readerTranslationRequest;
+    readerTranslationRequest = null;
+    const pending = translationRequests.get(id);
+    if (pending) {
+      cancellation = pending.promise.catch(() => {});
+      readerTranslationCancellation = cancellation;
+    }
+    try {
+      send('cancel', id, {message});
+    } catch (error) {
+      translationRequests.delete(id);
+      pending?.reject(error);
+    }
+  }
+  readerTranslationPromise = null;
+  readerTranslationReady = false;
+  readerTranslationComplete = false;
+  readerTranslationHighlightIndex = null;
+  await cancellation;
+  if (readerTranslationCancellation === cancellation)
+    readerTranslationCancellation = Promise.resolve();
+  return token;
+}
+
+function requestReaderTranslation(payload, element) {
+  const id = crypto.randomUUID();
+  readerTranslationRequest = id;
+  let resolveRequest, rejectRequest;
+  const promise = new Promise((resolve, reject) => {
+    resolveRequest = resolve;
+    rejectRequest = reject;
+  });
+  translationRequests.set(id, {
+    resolve: resolveRequest, reject: rejectRequest, element, text: '', promise,
+  });
+  try {
+    send('reader.translate', id, payload);
+  } catch (error) {
+    translationRequests.delete(id);
+    readerTranslationRequest = null;
+    rejectRequest(error);
+  }
+  return promise;
+}
+
+function translatedBlock(source, index) {
+  const preserved = /^(?:H[1-6]|BLOCKQUOTE|PRE)$/u.test(source.tagName) ? source.tagName.toLowerCase() : 'p';
+  const element = document.createElement(preserved);
+  element.dataset.translationIndex = String(index);
+  element.className = 'translation-pending';
+  element.textContent = 'Translating…';
+  return element;
+}
+
+function alignedSourceBlock(source, index) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'reader-aligned-block reader-source-block';
+  wrapper.dataset.translationSourceIndex = String(index);
+  wrapper.append(source.cloneNode(true));
+  return wrapper;
+}
+
+function syncReaderTranslationSpeech(finished = readerTranslationComplete) {
+  const target = $('book-translation-content');
+  const text = normalizeReaderText(readerTranslatedText());
+  readerTranslationReady = Boolean(text);
+  readerTranslationHighlightIndex = readerTranslationReady ? createSpeechIndex(target) : null;
+  if (readerSpeechSide === 'target') updateReaderSpeechPosition(readerSpeechOffset, text.length);
+  updateReaderReadAvailability();
+  const active = [...ttsStreams.values()].find(stream =>
+    stream.button === $('read-book-chapter') && stream.readerTranslationStreaming);
+  if (active) {
+    const appended = active.readerTranslationAppendedLength || 0;
+    if (text.length < appended) return;
+    const addition = text.slice(appended);
+    if (addition || finished) speech.append(active.requestId, addition, finished);
+    active.readerTranslationAppendedLength = text.length;
+    active.readerSpokenText += addition;
+    active.readerTextLength = text.length;
+    active.highlightIndex = readerTranslationHighlightIndex;
+    return;
+  }
+  if (readerSpeechPending && readerTranslationReady) {
+    setReaderSpeechPending(false);
+    startBookSpeech(readerSpeechOffset).catch(error => {
+      setBookReaderStatus(error.message || 'Unable to start translated narration', true);
+    });
+  }
+}
+
+async function translateReaderChapter() {
+  const token = await stopReaderTranslation();
+  if (token !== readerTranslationToken) return;
+  const book = currentReaderBook();
+  const language = state.readerLanguage;
+  const page = $('book-translation-page');
+  const spread = $('book-spread');
+  const target = $('book-translation-content');
+  const sourceAligned = $('book-source-aligned-content');
+  const sourceOriginal = readerContent();
+  target.replaceChildren();
+  if (!book || !language) {
+    $('book-source-header').hidden = true;
+    sourceOriginal.hidden = false;
+    sourceAligned.hidden = true;
+    sourceAligned.replaceChildren();
+    page.hidden = true;
+    spread.classList.remove('translated');
+    setReaderSpeechSide('source');
+    $('book-translation-status').textContent = '';
+    updateReaderSpeechPosition(0);
+    updateReaderReadAvailability();
+    return;
+  }
+  page.hidden = false;
+  spread.classList.add('translated');
+  $('book-source-header').hidden = false;
+  const sourceLanguage = book.language?.split(/[-_]/u)[0]?.toLowerCase();
+  $('book-source-title').textContent = languageNames.get(sourceLanguage) || book.language || 'Original';
+  sourceOriginal.hidden = true;
+  sourceAligned.hidden = false;
+  setReaderSpeechSide('target');
+  const languageName = languageNames.get(language) || language;
+  $('book-translation-title').textContent = languageName;
+  $('book-translation-status').textContent = 'Preparing translation…';
+  const groups = readerTranslationBlocks().map((block, index) => ({
+    block,
+    index,
+    texts: splitReaderTranslationText(normalizeReaderText(block.textContent)),
+  }));
+  const units = groups.flatMap(group =>
+    group.texts.map(text => ({block: group.block, sourceIndex: group.index, text})));
+  const source = units.map(unit => unit.text);
+  sourceAligned.replaceChildren(...groups.map(group => alignedSourceBlock(group.block, group.index)));
+  const elements = [];
+  target.append(...groups.map(group => {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'reader-aligned-block translation-aligned-block';
+    wrapper.dataset.translationSourceIndex = String(group.index);
+    for (let offset = 0; offset < group.texts.length; ++offset) {
+      const element = translatedBlock(group.block, elements.length);
+      elements.push(element);
+      wrapper.append(element);
+    }
+    return wrapper;
+  }));
+  scheduleReaderAlignment();
+  updateReaderSpeechPosition(0, 0);
+  updateReaderReadAvailability();
+  if (!units.length) {
+    $('book-translation-status').textContent = 'No translatable paragraphs';
+    return;
+  }
+  try {
+    const cached = await readEbookTranslation(book, readerChapterIndex, language, source.join('\n\n'));
+    if (token !== readerTranslationToken) return;
+    if (cached?.length === elements.length) {
+      cached.forEach((text, index) => {
+        elements[index].className = '';
+        elements[index].textContent = text;
+        elements[index].dataset.translationComplete = 'true';
+      });
+      readerTranslationComplete = true;
+      $('book-translation-status').textContent = 'Cached';
+      syncReaderTranslationSpeech(true);
+      scheduleReaderAlignment();
+      return;
+    }
+    const translations = new Array(source.length);
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    while (translations.includes(undefined)) {
+      const index = await nextReaderTranslationUnit(token, units, translations);
+      if (index < 0 || token !== readerTranslationToken) return;
+      const completed = translations.filter(value => value !== undefined).length;
+      $('book-translation-status').textContent = `Translating ${completed + 1} of ${source.length}`;
+      const translated = await requestReaderTranslation({
+        text: source[index],
+        previous: source[index - 1] || '',
+        next: source[index + 1] || '',
+        target_language: language,
+        target_language_name: languageName,
+      }, elements[index]);
+      if (token !== readerTranslationToken) return;
+      if (!translated.trim()) throw new Error(`Translation ${index + 1} returned empty text`);
+      elements[index].className = '';
+      elements[index].textContent = translated.trim();
+      elements[index].dataset.translationComplete = 'true';
+      translations[index] = translated.trim();
+      syncReaderTranslationSpeech(false);
+      scheduleReaderAlignment();
+    }
+    if (token !== readerTranslationToken) return;
+    readerTranslationComplete = true;
+    $('book-translation-status').textContent = 'Translated locally';
+    syncReaderTranslationSpeech(true);
+    await storeEbookTranslation(book, readerChapterIndex, language, source.join('\n\n'), translations);
+  } catch (error) {
+    if (token !== readerTranslationToken || error.name === 'AbortError') return;
+    readerTranslationComplete = true;
+    syncReaderTranslationSpeech(true);
+    $('book-translation-status').textContent = 'Translation failed';
+    setBookReaderStatus(error.message || 'Unable to translate this chapter', true);
+  } finally {
+    if (token === readerTranslationToken) readerTranslationRequest = null;
+  }
 }
 
 function updateReaderSpeechPosition(offset, length = readerText().length) {
@@ -324,12 +744,16 @@ function toggleReaderControls() {
 }
 
 async function stopReaderSpeech() {
+  if (readerSpeechPending) setReaderSpeechPending(false);
   const stream = [...ttsStreams.entries()].find(([, value]) => value.button === $('read-book-chapter'));
-  if (stream) await stopTts(stream[0]);
+  if (!stream) return;
+  await stopTts(stream[0]);
+  if (activeRequest?.kind === 'tts' &&
+      (activeRequest.streamId === stream[0] || activeRequest.id === stream[1].requestId))
+    finishRequest();
 }
 
-function readerCaretOffset(event) {
-  const root = readerContent();
+function readerCaretOffset(event, root = readerSpeechContent()) {
   const position = document.caretPositionFromPoint?.(event.clientX, event.clientY);
   const fallback = position ? null : document.caretRangeFromPoint?.(event.clientX, event.clientY);
   const node = position?.offsetNode || fallback?.startContainer;
@@ -345,37 +769,71 @@ function readerCaretOffset(event) {
   return normalizeReaderText(range.toString()).length;
 }
 
+function readerBlockOffset(root, element) {
+  if (!root.contains(element)) return null;
+  const range = document.createRange();
+  range.selectNodeContents(root);
+  try {
+    range.setEndBefore(element);
+  } catch {
+    return null;
+  }
+  return normalizeReaderText(range.toString()).length;
+}
+
 function scrollReaderSegmentIntoView(stream, segment) {
   const root = document.querySelector(stream.highlightRoot);
-  if (!root) return;
+  if (!root) return null;
   const cursor = stream.highlightOffset + speechSearchOffset(stream.readerSpokenText, segment.start);
   const match = speechRanges(root, [segment], cursor, stream.highlightIndex)[0]?.range;
   const element = match?.startContainer?.parentElement;
-  if (!element) return;
+  if (!element) return null;
   const documentRect = $('book-document').getBoundingClientRect();
   const elementRect = element.getBoundingClientRect();
   if (elementRect.top < documentRect.top + 32 || elementRect.bottom > documentRect.bottom - 32)
     element.scrollIntoView({behavior: 'smooth', block: 'center'});
+  return element.closest('[data-translation-source-index]');
 }
 
 async function startBookSpeech(requestedOffset = readerSpeechOffset) {
   if (readerBusy || !state.components.tts?.enabled) return;
-  const sliced = readerSpeechSlice(readerContent().innerText, requestedOffset);
+  if (readerSpeechSide === 'target' && state.readerLanguage && !readerTranslationReady) {
+    setReaderSpeechPending(true);
+    return true;
+  }
+  const sliced = readerSpeechSlice(readerText(), requestedOffset);
   const offset = sliced.speech ? sliced.offset : 0;
   const speechText = sliced.speech || sliced.text;
-  if (!speechText) return;
+  if (!speechText) return false;
   updateReaderSpeechPosition(offset, sliced.text.length);
-  const language = currentReaderBook()?.language?.split(/[-_]/u)[0]?.toLowerCase();
+  const translated = readerSpeechSide === 'target' && Boolean(state.readerLanguage && readerTranslationReady);
+  if (translated) {
+    readerTranslationTtsIndex = readerTargetSpeechAnchor;
+    wakeReaderTranslation();
+  }
+  const language = translated ? state.readerLanguage :
+    currentReaderBook()?.language?.split(/[-_]/u)[0]?.toLowerCase();
   const spokenLanguage = languageNames.get(language) || language || 'auto';
-  startTts(speechText, $('read-book-chapter'), false, voiceEpoch, {language: spokenLanguage}, {
-    highlightRoot: '#book-chapter-content .book-chapter-content',
-    highlightOffset: speechSearchOffset(sliced.text, offset),
+  const streaming = translated && !readerTranslationComplete;
+  const content = readerSpeechContent();
+  const alignedSource = content === $('book-source-aligned-content');
+  const highlightOffset = translated ?
+    readerTargetHighlightOffset() + speechSearchOffset(sliced.text, offset) :
+    speechSearchOffset(sliced.text, offset);
+  return startTts(speechText, $('read-book-chapter'), false, voiceEpoch, {language: spokenLanguage}, {
+    highlightRoot: translated ? '#book-translation-content' :
+      alignedSource ? '#book-source-aligned-content' : '#book-chapter-content .book-chapter-content',
+    highlightOffset,
     reader: true,
     readerSourceOffset: offset,
     readerSpokenText: speechText,
     readerTextLength: sliced.text.length,
-    highlightIndex: readerHighlightIndex,
-  });
+    highlightIndex: translated ? readerTranslationHighlightIndex :
+      alignedSource ? createSpeechIndex(content) : readerHighlightIndex,
+    readerTranslationStreaming: streaming,
+    readerTranslationAppendedLength: sliced.text.length,
+    readerSide: readerSpeechSide,
+  }, !streaming);
   scheduleReaderControlsHide(1000);
 }
 
@@ -386,7 +844,11 @@ async function seekBookSpeech(requestedOffset) {
   try {
     await stopReaderSpeech();
     if (token !== readerSeekToken || !readerBookId) return;
-    await startBookSpeech(readerSpeechOffset);
+    let started = await startBookSpeech(readerSpeechOffset);
+    if (!started && token === readerSeekToken && readerBookId) {
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      started = await startBookSpeech(readerSpeechOffset);
+    }
   } finally {
     if (token === readerSeekToken) readerScrubbing = false;
   }
@@ -398,6 +860,7 @@ async function loadBookChapter(chapterIndex, requestedScroll) {
   const index = Math.max(0, Math.min(Number(chapterIndex) || 0, book.chapters.length - 1));
   const token = ++readerRenderToken;
   readerBusy = true;
+  await stopReaderTranslation();
   setBookReaderStatus(`Opening ${book.chapters[index].title}…`);
   $('book-chapter').disabled = true;
   $('previous-book-chapter').disabled = true;
@@ -413,6 +876,9 @@ async function loadBookChapter(chapterIndex, requestedScroll) {
     const content = $('book-chapter-content').querySelector('.book-chapter-content');
     content.replaceChildren(sanitizeBookChapter(chapter.html));
     if (!content.textContent.trim()) throw new Error('This EPUB chapter has no readable text');
+    content.hidden = false;
+    $('book-source-aligned-content').hidden = true;
+    $('book-source-aligned-content').replaceChildren();
     readerHighlightIndex = createSpeechIndex(content);
     readerChapterIndex = index;
     book.progress.chapter = index;
@@ -424,6 +890,7 @@ async function loadBookChapter(chapterIndex, requestedScroll) {
     requestAnimationFrame(() => { $('book-document').scrollTop = Math.max(0, savedScroll); });
     persist();
     setBookReaderStatus();
+    readerTranslationPromise = translateReaderChapter();
   } catch (error) {
     if (token === readerRenderToken) {
       $('book-chapter-content').querySelector('.book-chapter-content').replaceChildren();
@@ -435,8 +902,7 @@ async function loadBookChapter(chapterIndex, requestedScroll) {
       $('book-chapter').disabled = false;
       $('previous-book-chapter').disabled = index === 0;
       $('next-book-chapter').disabled = index === book.chapters.length - 1;
-      $('read-book-chapter').disabled = !state.components.tts?.enabled ||
-        !$('book-chapter-content').querySelector('.book-chapter-content').textContent.trim();
+      updateReaderReadAvailability();
     }
   }
 }
@@ -449,6 +915,7 @@ async function openBook(bookId) {
   $('library-view').hidden = true;
   $('book-reader').hidden = false;
   showReaderControls();
+  renderBookTranslationLanguages();
   $('book-title').textContent = book.title;
   $('book-author').textContent = book.author;
   const chapters = $('book-chapter');
@@ -466,9 +933,12 @@ async function closeBook() {
   readerSeekToken++;
   clearTimeout(readerControlsTimer);
   clearTimeout(readerScrollTimer);
+  cancelAnimationFrame(readerAlignmentFrame);
   await stopReaderSpeech();
+  await stopReaderTranslation('Reader closed');
   readerBookId = null;
   readerHighlightIndex = null;
+  readerTranslationHighlightIndex = null;
   document.body.classList.remove('reading-mode');
   $('book-reader').classList.remove('controls-hidden');
   $('book-reader').hidden = true;
@@ -480,6 +950,10 @@ async function closeBook() {
 async function toggleBookSpeech() {
   if (readerBusy || !state.components.tts?.enabled) return;
   const button = $('read-book-chapter');
+  if (readerSpeechPending) {
+    setReaderSpeechPending(false);
+    return;
+  }
   const stream = [...ttsStreams.entries()].find(([, value]) => value.button === button);
   if (stream) {
     if (stream[1].paused) resumeTts(stream[0]);
@@ -855,6 +1329,7 @@ function loadLocal() {
     if (typeof saved.inputLanguage === 'string') state.inputLanguage = saved.inputLanguage;
     if (typeof (saved.outputLanguage ?? saved.activeLanguage) === 'string')
       state.outputLanguage = saved.outputLanguage ?? saved.activeLanguage;
+    if (typeof saved.readerLanguage === 'string') state.readerLanguage = saved.readerLanguage;
     state.asrSetupSkipped = saved.asrSetupSkipped === true;
     state.ttsSetupSkipped = saved.ttsSetupSkipped === true;
     state.modelSetupDismissed = saved.modelSetupDismissed === true;
@@ -868,6 +1343,7 @@ function persist() {
     localStorage.setItem(STORAGE, JSON.stringify({
       chats: state.chats, active: state.active, view: state.view, languages: state.languages,
       inputLanguage: state.inputLanguage, outputLanguage: state.outputLanguage,
+      readerLanguage: state.readerLanguage,
       asrSetupSkipped: state.asrSetupSkipped, ttsSetupSkipped: state.ttsSetupSkipped,
       modelSetupDismissed: state.modelSetupDismissed, tts: state.ttsSettings,
       books: state.books,
@@ -1398,6 +1874,20 @@ function selectedOutputLanguages() {
   return state.outputLanguage ? [state.outputLanguage] : selectedInputLanguages();
 }
 
+function renderBookTranslationLanguages() {
+  const select = $('book-translation-language');
+  if (select.options.length === 1) {
+    for (const language of languageTable.languages) {
+      const option = document.createElement('option');
+      option.value = language.code;
+      option.textContent = language.name;
+      select.append(option);
+    }
+  }
+  if (state.readerLanguage && !languageNames.has(state.readerLanguage)) state.readerLanguage = '';
+  select.value = state.readerLanguage;
+}
+
 function renderLanguageSwitchers() {
   const input = $('input-language'), output = $('output-language');
   if (state.inputLanguage && !languageNames.has(state.inputLanguage)) state.inputLanguage = 'en';
@@ -1409,6 +1899,7 @@ function renderLanguageSwitchers() {
   const summary = $('language-controls').querySelector('summary');
   summary.title = `Input: ${input.value}. Output: ${output.value}.`;
   summary.setAttribute('aria-description', summary.title);
+  renderBookTranslationLanguages();
 }
 
 function setupLanguagePicker(inputId, menuId, special, select) {
@@ -1688,6 +2179,27 @@ function handleEvent(event) {
   if (!event || event.v !== 1 || typeof event.type !== 'string') return;
   if (speech.handleEvent(event)) return;
   const payload = event.payload || {};
+  const translation = translationRequests.get(event.id);
+  if (translation) {
+    if (event.type === 'reader.translation.delta') {
+      translation.text += payload.text || '';
+      translation.element.className = 'translation-streaming';
+      translation.element.textContent = translation.text;
+    } else if (event.type === 'reader.translation.completed') {
+      translationRequests.delete(event.id);
+      readerTranslationRequest = null;
+      translation.resolve(payload.text || translation.text);
+    } else if (event.type === 'request.cancelled') {
+      translationRequests.delete(event.id);
+      readerTranslationRequest = null;
+      translation.reject(new DOMException(payload.message || 'Translation cancelled', 'AbortError'));
+    } else if (event.type === 'error') {
+      translationRequests.delete(event.id);
+      readerTranslationRequest = null;
+      translation.reject(new Error(payload.message || 'Reader translation failed'));
+    }
+    return;
+  }
   if (event.type === 'session.ready') {
     state.components = payload.components || {};
     state.config = payload.config || state.config;
@@ -1998,7 +2510,13 @@ async function ensurePlayback(sampleRate) {
             const offset = stream.readerSourceOffset +
               (data.type === 'segment-started' ? segment.start : segment.end);
             updateReaderSpeechPosition(offset, stream.readerTextLength);
-            if (data.type === 'segment-started') scrollReaderSegmentIntoView(stream, segment);
+            if (data.type === 'segment-started') {
+              const row = scrollReaderSegmentIntoView(stream, segment);
+              if (stream.readerSide === 'target' && row) {
+                readerTranslationTtsIndex = Number(row.dataset.translationSourceIndex);
+                wakeReaderTranslation();
+              }
+            }
           }
           renderRuntime();
         } else if (data.type === 'drained' && stream.completed) finishTts(stream.button, data.streamId, true);
@@ -2281,8 +2799,9 @@ function toggleVoiceMode() {
   startDictation(epoch);
 }
 
-function startTts(text, button, voiceTurn = false, epoch = voiceEpoch, optionOverrides = {}, streamMetadata = {}) {
-  if (state.busy) return;
+function startTts(text, button, voiceTurn = false, epoch = voiceEpoch, optionOverrides = {},
+  streamMetadata = {}, finished = true) {
+  if (state.busy) return false;
   const id = crypto.randomUUID();
   const audioId = streamId++;
   activeRequest = {id, kind: 'tts', streamId: audioId, voiceTurn, voiceEpoch: voiceTurn ? epoch : null};
@@ -2296,14 +2815,16 @@ function startTts(text, button, voiceTurn = false, epoch = voiceEpoch, optionOve
     const options = {...ttsRequestOptions(voiceTurn), ...optionOverrides};
     const profile = voiceTurn ? realtimeProfile() : null;
     speech.start({
-      id, streamId: audioId, text, options, voice: voiceTurn, finished: true,
+      id, streamId: audioId, text, options, voice: voiceTurn, finished,
       cacheIdentity: JSON.stringify([state.runtime.host, state.backend, state.components.tts?.directory]),
       segmentation: profile?.segmentation,
     });
+    return true;
   }
   catch (error) {
     finishTts(button, audioId);
     showNotice(error.message); finishRequest();
+    return false;
   }
 }
 
@@ -2314,6 +2835,10 @@ function finishTts(button, stream, drained = false) {
   setReadAloudState(button, 'idle');
   for (const resolve of entry?.capacityWaiters?.splice(0) || []) resolve();
   ttsStreams.delete(stream);
+  if (entry?.readerSide === 'target') {
+    readerTranslationTtsIndex = -1;
+    wakeReaderTranslation();
+  }
   renderSpeechHighlights(ttsStreams.values());
   if (entry?.reader && drained) updateReaderSpeechPosition(entry.readerTextLength, entry.readerTextLength);
   if (playbackStreamId === stream) playbackStreamId = null;
@@ -2495,6 +3020,14 @@ $('library-search').addEventListener('input', event => {
 $('library-sort').addEventListener('change', renderLibrary);
 $('close-book').addEventListener('click', closeBook);
 $('book-chapter').addEventListener('change', event => loadBookChapter(Number(event.target.value), 0));
+$('book-translation-language').addEventListener('change', async event => {
+  await stopReaderSpeech();
+  state.readerLanguage = event.target.value;
+  setReaderSpeechSide(state.readerLanguage ? 'target' : 'source');
+  persist();
+  updateReaderSpeechPosition(0);
+  readerTranslationPromise = translateReaderChapter();
+});
 $('previous-book-chapter').addEventListener('click', () => loadBookChapter(readerChapterIndex - 1, 0));
 $('next-book-chapter').addEventListener('click', () => loadBookChapter(readerChapterIndex + 1, 0));
 $('read-book-chapter').addEventListener('click', toggleBookSpeech);
@@ -2531,13 +3064,32 @@ $('book-speech-position').addEventListener('blur', () => { readerScrubbing = fal
 $('book-chapter-content').addEventListener('click', event => {
   if (!readerBookId || readerBusy || !state.components.tts?.enabled ||
       !document.getSelection()?.isCollapsed) return;
-  const offset = readerCaretOffset(event);
+  const root = readerSourceContent();
+  if (!root.contains(event.target)) return;
+  const block = event.target.closest('.reader-source-block');
+  const offset = readerCaretOffset(event, root) ?? readerBlockOffset(root, block);
   if (offset === null) return;
+  setReaderSpeechSide('source');
+  seekBookSpeech(offset);
+});
+$('book-translation-content').addEventListener('click', event => {
+  if (!readerBookId || readerBusy || !readerTranslationReady || !state.components.tts?.enabled ||
+      !document.getSelection()?.isCollapsed) return;
+  const block = event.target.closest('[data-translation-complete="true"]');
+  const row = block?.closest('.translation-aligned-block');
+  if (!block || !row) return;
+  readerTargetSpeechAnchor = Number(row.dataset.translationSourceIndex);
+  const offset = readerCaretOffset(event, row) ?? readerBlockOffset(row, block);
+  if (offset === null) return;
+  setReaderSpeechSide('target');
   seekBookSpeech(offset);
 });
 $('book-document').addEventListener('scroll', () => {
   const book = currentReaderBook();
   if (!book || readerBusy) return;
+  if (![...ttsStreams.values()].some(stream => stream.readerSide === 'target'))
+    readerTargetSpeechAnchor = -1;
+  if (!readerAligning) wakeReaderTranslation();
   scheduleReaderControlsHide(700);
   clearTimeout(readerScrollTimer);
   readerScrollTimer = setTimeout(() => {
@@ -2546,6 +3098,9 @@ $('book-document').addEventListener('scroll', () => {
     book.lastOpenedAt = Date.now();
     persist();
   }, 200);
+});
+window.addEventListener('resize', () => {
+  if (readerBookId && state.readerLanguage) scheduleReaderAlignment();
 });
 $('open-config').addEventListener('click', () => { renderConfig(); $('config-dialog').showModal(); });
 $('close-config').addEventListener('click', () => $('config-dialog').close());

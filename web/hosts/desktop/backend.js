@@ -5,6 +5,7 @@ import {connectWebSocket} from './websocket-transport.mjs';
 
 const COMPLETION_EVENTS = new Map([
   ['settings.system_prompt.set', 'settings.system_prompt.updated'],
+  ['reader.translate', 'reader.translation.completed'],
   ['chat.start', 'chat.completed'],
   ['asr.start', 'asr.completed'],
   ['tts.start', 'tts.completed'],

@@ -13,6 +13,7 @@ test('browser consumes the canonical desktop YAML configuration', async () => {
   assert.equal(config.models.asr.model_id, 'openai/whisper-small');
   assert.equal(config.models.tts.model_id, 'thammegowda/OmniVoice-q8');
   assert.equal(config.models.chat.system_prompt.includes('preserve natural code switching'), true);
+  assert.match(config.models.chat.translation_prompt, /\{target_language\}/);
   assert.equal(config.models.asr.vad.silence_ms, 800);
   assert.equal(config.models.tts.realtime_steps, 10);
   assert.equal(config.models.tts.steps, 16);
@@ -36,6 +37,8 @@ test('first-run browser UI requests model loading and exposes progress', async (
     'backend-activity', 'backend-memory', 'runtime-progress',
     'book-tts-controls', 'book-tts-steps', 'book-tts-pace', 'book-tts-gender', 'book-tts-age',
     'book-tts-pitch', 'book-tts-style', 'book-tts-accent', 'book-tts-gpu-precision', 'book-tts-more',
+    'book-translation-language', 'book-spread', 'book-translation-page', 'book-translation-content',
+    'book-source-header', 'book-source-aligned-content',
   ])
     assert.match(html, new RegExp(`id="${id}"`));
   assert.match(app, /function requestModelLoad\(\)/);
@@ -47,6 +50,15 @@ test('first-run browser UI requests model loading and exposes progress', async (
   assert.match(app, /\$\('dismiss-model-onboarding'\)\.addEventListener\('click', dismissModelSetup\)/);
   assert.match(app, /delete options\.gpu_precision_version;\s+delete options\.defaults_version;/);
   assert.match(app, /return state\.outputLanguage \? \[state\.outputLanguage\] : selectedInputLanguages\(\)/);
+  assert.match(app, /send\('reader\.translate', id, payload\)/);
+  assert.match(app, /await readEbookTranslation\(book, readerChapterIndex, language/);
+  assert.match(app, /const token = await stopReaderTranslation\(\);\s+if \(token !== readerTranslationToken\) return;/);
+  assert.match(app, /speech\.append\(active\.requestId, addition, finished\)/);
+  assert.match(app, /readerTranslationStreaming: streaming/);
+  assert.match(app, /const index = await nextReaderTranslationUnit\(token, units, translations\)/);
+  assert.match(app, /readerTranslationTtsIndex = readerTargetSpeechAnchor;\s+wakeReaderTranslation\(\)/);
+  assert.match(app, /setReaderSpeechSide\('source'\);\s+seekBookSpeech\(offset\)/);
+  assert.match(app, /setReaderSpeechSide\('target'\);\s+seekBookSpeech\(offset\)/);
 });
 
 test('browser branding uses the square Kidi icon', async () => {

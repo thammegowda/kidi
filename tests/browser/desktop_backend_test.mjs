@@ -79,6 +79,18 @@ test('desktop adapter uses LiteApp requests, binary uploads, and isolated speech
         await setImmediate();
         assert.deepEqual(events.slice(0, 2).map(value => value.type), ['chat.delta', 'chat.completed']);
 
+        backend.send('reader.translate', 'translate', {
+            text: 'A house.', previous: '', next: 'A garden.',
+            target_language: 'kn', target_language_name: 'Kannada',
+        });
+        assert.equal(message(main).method, 'reader.translate');
+        main.receive(event('translate', 0, 'reader.translation.delta', {text: 'ಮನೆ'}));
+        main.receive(event('translate', 1, 'completed', {text: 'ಒಂದು ಮನೆ.', stats: {}}));
+        await setImmediate();
+        assert.deepEqual(events.slice(2, 4).map(value => value.type),
+            ['reader.translation.delta', 'reader.translation.completed']);
+        assert.equal(events[3].payload.text, 'ಒಂದು ಮನೆ.');
+
         backend.send('settings.system_prompt.set', 'settings', {prompt: 7});
         main.receive(event('settings', 0, 'error',
             {code: 'invalid_system_prompt', message: 'Prompt must be text'}));

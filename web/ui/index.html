@@ -230,6 +230,11 @@
           <label class="book-chapter-picker"><span>Chapter</span>
             <select id="book-chapter"></select>
           </label>
+          <label class="book-translation-picker"><span>Translate</span>
+            <select id="book-translation-language" aria-label="Book translation language">
+              <option value="">Original</option>
+            </select>
+          </label>
           <details id="book-tts-controls" class="book-tts-controls">
             <summary aria-label="Narration settings" title="Narration settings">
               <span class="read-aloud-icon" aria-hidden="true"></span>
@@ -259,9 +264,24 @@
         </header>
         <div id="book-reader-status" class="book-reader-status" role="status"></div>
         <div id="book-document" class="book-document">
-          <article id="book-chapter-content" data-message-id="reader-chapter">
-            <div class="message-content book-chapter-content"></div>
-          </article>
+          <div id="book-spread" class="book-spread">
+            <article id="book-chapter-content" data-message-id="reader-chapter">
+              <header id="book-source-header" class="book-source-header" hidden>
+                <strong id="book-source-title">Original</strong>
+                <span>Source</span>
+              </header>
+              <div class="message-content book-chapter-content"></div>
+              <div id="book-source-aligned-content"
+                class="message-content book-chapter-content book-aligned-content" hidden></div>
+            </article>
+            <article id="book-translation-page" class="book-translation-page" hidden>
+              <header>
+                <strong id="book-translation-title">Translation</strong>
+                <span id="book-translation-status" role="status"></span>
+              </header>
+              <div id="book-translation-content" class="message-content book-chapter-content book-translation-content"></div>
+            </article>
+          </div>
         </div>
         <footer class="book-reader-footer">
           <button id="previous-book-chapter" type="button" aria-label="Previous chapter" title="Previous chapter">←</button>

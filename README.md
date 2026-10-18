@@ -123,7 +123,7 @@ build-release/kidi-app examples/kidi-app.yaml
 The app opens in the system browser on macOS and Linux and uses an embedded
 WebView on supported Windows builds. The command-line
 [`examples/kidi-app.yaml`](examples/kidi-app.yaml) is the single source for chat,
-ASR, and TTS model directories,
+ASR, and TTS model directories and the reader's literary-translation prompt,
 accelerators, generation limits, cache sizes, languages, and voice settings;
 relative model paths resolve from the YAML file. The example uses the models
 under `models/`, enables Gemma 4 and Whisper, and leaves OmniVoice disabled until
@@ -147,6 +147,20 @@ Markdown immediately while only the unfinished final line remains plain text.
 Open fenced-code blocks stream as unhighlighted code until their closing fence
 arrives.
 
+The Reader imports EPUB books into browser-local storage. Selecting a translation
+language displays the source and translated text side by side and translates
+paragraphs incrementally with the configured local chat model. Translations are
+cached by book, chapter, language, and source content. Source and target
+paragraphs remain vertically aligned in the shared scrolling surface. Read
+chapter can begin after the first translated paragraph and continues as later
+paragraphs arrive. Clicking a source paragraph switches narration, language,
+seeking, and highlighting to the original text; clicking a completed target
+paragraph switches them back to the translation. Reader translation requests do
+not enter conversation history. Background translation stops after the visible
+range plus three paragraphs, performs no inference while paused, and resumes
+when the reader scrolls or target-language narration approaches untranslated
+text.
+
 ### WebAssembly
 
 The self-hosted browser app runs Gemma E2B locally, with streaming replies, saved
@@ -154,6 +168,8 @@ chats, Markdown, code highlighting, diagrams, and Whisper microphone dictation.
 In a hosted instance, open Model settings and download the chat model; speech
 dictation has a separate model download. Models are cached in your browser.
 Once the complete model is cached, it loads automatically on later visits.
+The browser Reader uses the same local translation, caching, and translated
+read-aloud workflow as the desktop app.
 
 Microphone access requires permission and a secure browser context (HTTPS or
 localhost). Clearing site data removes downloaded models and saved browser data.

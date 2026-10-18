@@ -326,7 +326,7 @@ export class SpeechController {
     if (this.#current) throw new Error('Another speech stream is active');
     const current = {
       id, streamId, options, voice, cacheIdentity, split: new SpeechSegments(segmentation), queue: [],
-      ended: false, primitive: null, delivery: null, finishing: false,
+      ended: false, primitive: null, delivery: null, delivering: false, finishing: false,
       sequence: 0, samples: 0, chunks: 0, sampleRate: null, cancelled: false,
     };
     this.#current = current;
@@ -412,7 +412,8 @@ export class SpeechController {
   }
 
   #pump(current) {
-    if (this.#current !== current || current.cancelled || current.primitive || current.finishing) return;
+    if (this.#current !== current || current.cancelled || current.primitive ||
+        current.delivering || current.finishing) return;
     const segment = current.queue.shift();
     if (!segment) {
       if (current.ended) this.#finish(current);
@@ -423,7 +424,7 @@ export class SpeechController {
     ]);
     const cached = this.#cache.get(segment.cacheKey);
     if (cached) {
-      this.#deliver(current, segment, cached.sample_rate, new Float32Array(cached.audio), true)
+      this.#deliverInOrder(current, segment, cached.sample_rate, new Float32Array(cached.audio), true)
         .catch(error => this.#fail(current, error));
       return;
     }
@@ -456,7 +457,19 @@ export class SpeechController {
     const samples = combine(primitive.audio);
     current.primitive = null;
     this.#cache.put(primitive.segment.cacheKey, samples.buffer, sampleRate);
-    await this.#deliver(current, primitive.segment, sampleRate, samples, false);
+    await this.#deliverInOrder(current, primitive.segment, sampleRate, samples, false);
+  }
+
+  async #deliverInOrder(current, segment, sampleRate, samples, cached) {
+    if (current.delivering) throw new Error('Speech delivery overlap');
+    // append() may run while delivery waits for playback capacity; keep later segments behind this one.
+    current.delivering = true;
+    try {
+      await this.#deliver(current, segment, sampleRate, samples, cached);
+    } finally {
+      current.delivering = false;
+    }
+    this.#pump(current);
   }
 
   async #deliver(current, segment, sampleRate, samples, cached) {
@@ -477,7 +490,6 @@ export class SpeechController {
     }));
     current.samples += samples.length;
     current.chunks++;
-    this.#pump(current);
   }
 
   #finish(current) {

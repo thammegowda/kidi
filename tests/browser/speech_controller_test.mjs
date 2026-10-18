@@ -57,6 +57,45 @@ test('shared controller segments, tags, and pipelines exactly one request ahead'
   assert.equal(run.errors.length, 0);
 });
 
+test('unfinished speech streams accept translated text while playback is active', async () => {
+  const run = harness();
+  run.controller.start({
+    id: 'translation', streamId: 8, text: 'First translated sentence. ', finished: false,
+  });
+  assert.equal(run.primitive(0).payload.text, 'First translated sentence.');
+  run.audio(0);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(run.completed.length, 0);
+  run.controller.append('translation', 'Second translated sentence.', true);
+  assert.equal(run.primitive(1).payload.text, 'Second translated sentence.');
+  run.audio(1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(run.completed.length, 1);
+});
+
+test('appended translation cannot overtake a segment waiting for playback capacity', async () => {
+  const run = harness({blockFirstDelivery: true});
+  run.controller.start({
+    id: 'translation-order', streamId: 13,
+    text: 'First translated segment. Second translated segment. ',
+    finished: false,
+  });
+  run.audio(0);
+  await new Promise(resolve => setImmediate(resolve));
+  run.audio(1);
+  await new Promise(resolve => setImmediate(resolve));
+  run.controller.append('translation-order', 'Third translated segment.', true);
+  assert.equal(run.primitive(2), undefined);
+  assert.deepEqual(run.pcm.map(frame => frame.segmentId), [0]);
+  run.release();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(run.primitive(2).payload.text, 'Third translated segment.');
+  run.audio(2);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(run.pcm.map(frame => frame.segmentId), [0, 1, 2]);
+  assert.equal(run.completed.length, 1);
+});
+
 test('replacement waits for backend cancellation acknowledgement', async () => {
   const run = harness();
   run.controller.start({id: 'old', streamId: 1, text: 'Old sentence.', finished: true});
