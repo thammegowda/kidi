@@ -1,0 +1,76 @@
+# Kidi desktop application configuration.
+# Relative model paths are resolved from this file's directory.
+version: 1
+
+model_hub:
+  remote: https://huggingface.co
+  local: ~/.cache/kidi/model-hub
+
+runtime:
+  threads: 4
+  concurrency: single
+  idle_model_timeout_seconds: 300
+  preload_speech: true
+
+transport:
+  max_text_frame_bytes: 1048576
+  max_audio_queue_ms: 3000
+  heartbeat_seconds: 15
+
+models:
+  chat:
+    enabled: true
+    model_id: google/gemma-4-E2B-it-qat-mobile-transformers
+    revision: main
+    accelerator: auto
+    precision: checkpoint
+    kv_cache_precision: auto
+    metal_prefill_cache_mb: 512
+    system_prompt: >-
+      You are a helpful local AI assistant. Respond directly without
+      introductions, self-references, signatures, or name prefixes. If the user
+      explicitly asks your name, answer "Kidi". Be brief, concise, practical, respectful, and
+      polite. Reply in the language or mix of languages used by the user and
+      preserve natural code switching. Do not suggest harmful or unsafe actions.
+    generation:
+      max_tokens: 512
+      context_tokens: 8192
+      prefill_chunk_tokens: 128
+      prefix_cache_mb: 512
+
+  asr:
+    enabled: true
+    model_id: openai/whisper-small
+    revision: main
+    accelerator: cpu
+    language: auto
+    max_tokens: 128
+    partial_interval_ms: 600
+    sample_rate: 16000
+    frame_ms: 20
+    vad:
+      threshold: 0.012
+      minimum_speech_ms: 250
+      silence_ms: 800
+
+  tts:
+    enabled: true
+    model_id: thammegowda/OmniVoice-q8
+    revision: main
+    accelerator: auto
+    metal_prefill_cache_mb: 1024
+    language: auto
+    pace: 1.15
+    reference_language: English
+    reference_text: Nice to meet you.
+    steps: 10
+    realtime_steps: 10
+    gpu_precision: w8a8
+    wire_format: pcm_s16le
+    playback_buffer_ms: 150
+    voice:
+      gender: female
+      age: young adult
+      pitch: moderate
+      style: ""
+      accent: ""

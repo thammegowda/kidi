@@ -1,0 +1,103 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define MAX_KEYS 1024u
+#define QUERY_TILE 4u
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Query { float queryValues[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Key { float keyValues[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Value { float valueValues[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Mask { float maskValues[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer Output { float outputValues[]; };
+layout(push_constant) uniform Parameters {
+    uint batch;
+    uint queries;
+    uint keys;
+    uint heads;
+    uint keyHeads;
+    uint width;
+    uint maskBatch;
+    float scale;
+}
+parameters;
+
+shared float probabilities[QUERY_TILE * MAX_KEYS];
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint query0 = gl_WorkGroupID.x * QUERY_TILE;
+    uint head = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+    uint keyHead = head / (parameters.heads / parameters.keyHeads);
+    uint maskBatch = parameters.maskBatch == 1u ? 0u : batch;
+    float localMaximum[QUERY_TILE];
+    for (uint queryPart = 0u; queryPart < QUERY_TILE; ++queryPart)
+        localMaximum[queryPart] = -3.402823466e+38;
+
+    for (uint key = lane; key < parameters.keys; key += 64u) {
+        uint keyBase = ((batch * parameters.keys + key) * parameters.keyHeads + keyHead) * parameters.width;
+        float scores[QUERY_TILE];
+        for (uint queryPart = 0u; queryPart < QUERY_TILE; ++queryPart) scores[queryPart] = 0.0;
+        for (uint dimension = 0u; dimension < parameters.width; ++dimension) {
+            float keyValue = keyValues[keyBase + dimension];
+            for (uint queryPart = 0u; queryPart < QUERY_TILE; ++queryPart) {
+                uint query = query0 + queryPart;
+                if (query < parameters.queries) {
+                    uint queryBase =
+                        ((batch * parameters.queries + query) * parameters.heads + head) * parameters.width;
+                    scores[queryPart] += queryValues[queryBase + dimension] * keyValue;
+                }
+            }
+        }
+        for (uint queryPart = 0u; queryPart < QUERY_TILE; ++queryPart) {
+            uint query = query0 + queryPart;
+            if (query >= parameters.queries) continue;
+            uint maskBase = (maskBatch * parameters.queries + query) * parameters.keys;
+            float score = scores[queryPart] * parameters.scale + maskValues[maskBase + key];
+            probabilities[queryPart * MAX_KEYS + key] = score;
+            localMaximum[queryPart] = max(localMaximum[queryPart], score);
+        }
+    }
+
+    float maximum[QUERY_TILE];
+    float localSum[QUERY_TILE];
+    float sum[QUERY_TILE];
+    for (uint queryPart = 0u; queryPart < QUERY_TILE; ++queryPart) {
+        maximum[queryPart] = subgroupMax(localMaximum[queryPart]);
+        localSum[queryPart] = 0.0;
+    }
+    for (uint key = lane; key < parameters.keys; key += 64u)
+        for (uint queryPart = 0u; queryPart < QUERY_TILE; ++queryPart) {
+            uint query = query0 + queryPart;
+            if (query >= parameters.queries) continue;
+            float probability = exp(probabilities[queryPart * MAX_KEYS + key] - maximum[queryPart]);
+            probabilities[queryPart * MAX_KEYS + key] = probability;
+            localSum[queryPart] += probability;
+        }
+    for (uint queryPart = 0u; queryPart < QUERY_TILE; ++queryPart) {
+        sum[queryPart] = subgroupAdd(localSum[queryPart]);
+        for (uint key = lane; key < parameters.keys; key += 64u)
+            if (query0 + queryPart < parameters.queries)
+                probabilities[queryPart * MAX_KEYS + key] /= sum[queryPart];
+    }
+    barrier();
+
+    for (uint dimension = lane; dimension < parameters.width; dimension += 64u) {
+        float results[QUERY_TILE];
+        for (uint queryPart = 0u; queryPart < QUERY_TILE; ++queryPart) results[queryPart] = 0.0;
+        for (uint key = 0u; key < parameters.keys; ++key) {
+            uint valueBase = ((batch * parameters.keys + key) * parameters.keyHeads + keyHead) * parameters.width;
+            float value = valueValues[valueBase + dimension];
+            for (uint queryPart = 0u; queryPart < QUERY_TILE; ++queryPart)
+                if (query0 + queryPart < parameters.queries)
+                    results[queryPart] += probabilities[queryPart * MAX_KEYS + key] * value;
+        }
+        for (uint queryPart = 0u; queryPart < QUERY_TILE; ++queryPart) {
+            uint query = query0 + queryPart;
+            if (query >= parameters.queries) continue;
+            uint outputBase = ((batch * parameters.queries + query) * parameters.heads + head) * parameters.width;
+            outputValues[outputBase + dimension] = results[queryPart];
+        }
+    }
+}

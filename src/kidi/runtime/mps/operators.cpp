@@ -21,6 +21,17 @@ namespace {
 using ops::require;
 using tensor::DType;
 using tensor::Tensor;
+auto input_major_weight(const Tensor& weight) -> Tensor {
+    const auto output = weight.size(0), input = weight.size(1);
+    const auto bytes = require(weight.copy_to_host());
+    const auto source = std::span(reinterpret_cast<const std::int8_t*>(bytes.data()), weight.numel());
+    std::vector<std::int8_t> values(input * output);
+    for (std::size_t row = 0; row < output; ++row)
+        for (std::size_t column = 0; column < input; ++column)
+            values[column * output + row] = source[row * input + column];
+    return require(Tensor::from_host({static_cast<std::int64_t>(input), static_cast<std::int64_t>(output)},
+                                     std::span<const std::int8_t>(values)));
+}
 struct Stream {
     std::optional<mps::CommandBatch> batch;
     std::vector<Tensor> pending;
@@ -125,6 +136,8 @@ struct Stream {
 };
 class MetalOperator final : public Operator {
 public:
+    enum class AudioMode { NONE, CONV1D, SNAKE_CONV1D, SNAKE_LINEAR, CONV_TRANSPOSE_FOLD, SNAKE };
+
     Stream& stream;
     std::optional<mps::Executable> executable;
     std::optional<mps::QuantizedLinear> quantized;
@@ -133,10 +146,12 @@ public:
     float ffn_gate_up_output_scale = 0;
     float ffn_down_input_scale = 0, ffn_down_output_scale = 0;
     Tensor prefill_weight;
+    Tensor audio_constant;
     std::shared_ptr<const mps::Executable> prefill_executable;
     std::int32_t packed_bits = 0, packed_group = 0;
     float packed_input_scale = 0, packed_output_scale = 0;
     std::vector<std::int64_t> shape;
+    std::vector<std::int64_t> audio_intermediate_shape;
     DType dtype;
     std::size_t dynamic_count;
     bool scatter = false;
@@ -145,7 +160,9 @@ public:
     bool eager = false;
     bool quantize_int8 = false;
     bool gated_feed_forward = false;
+    AudioMode audio_mode = AudioMode::NONE;
     Operation operation;
+    std::array<std::int32_t, 4> audio_attributes{};
     float epsilon = 0;
     explicit MetalOperator(Stream& owner) : stream(owner) {}
     auto run(TensorInputs inputs) -> Tensor override {
@@ -158,6 +175,22 @@ public:
             require(mps::encode_greedy_token(stream.commands(), inputs[0], scratch, output));
         } else if (quantize_int8) {
             require(mps::encode_quantize_int8(stream.commands(), epsilon, inputs[0], output));
+        } else if (audio_mode == AudioMode::CONV1D || audio_mode == AudioMode::SNAKE_CONV1D) {
+            auto columns = stream.acquire(audio_intermediate_shape, DType::F32);
+            const auto* alpha = audio_mode == AudioMode::SNAKE_CONV1D ? &audio_constant : nullptr;
+            require(mps::encode_audio_unfold(stream.commands(), inputs[0], alpha, columns, audio_attributes[0],
+                                             audio_attributes[1], audio_attributes[2], audio_attributes[3]));
+            require(quantized->encode(stream.commands(), columns, output));
+        } else if (audio_mode == AudioMode::SNAKE_LINEAR) {
+            auto activated = stream.acquire(inputs[0].shape(), DType::F32);
+            require(mps::encode_snake(stream.commands(), inputs[0], audio_constant, activated));
+            require(quantized->encode(stream.commands(), activated, output));
+        } else if (audio_mode == AudioMode::CONV_TRANSPOSE_FOLD) {
+            require(mps::encode_conv_transpose_fold(stream.commands(), inputs[0], audio_constant, output,
+                                                    audio_attributes[0], audio_attributes[1], audio_attributes[2],
+                                                    audio_attributes[3]));
+        } else if (audio_mode == AudioMode::SNAKE) {
+            require(mps::encode_snake(stream.commands(), inputs[0], audio_constant, output));
         } else if (eager)
             require(mps::encode_eager(stream.commands(), operation, epsilon, inputs, output));
         else if (quantized)
@@ -253,6 +286,7 @@ public:
         stream_.packed_inputs.clear();
         stream_.packed_intermediates.clear();
         stream_.packed_input_source = nullptr;
+        prefill_programs_.clear();
     }
     auto copy_slice_(Tensor& destination, const Tensor& source, std::size_t outer, std::size_t source_bytes,
                      std::size_t destination_bytes, std::size_t offset_bytes) -> void override {
@@ -288,7 +322,8 @@ public:
              (inputs[0].dimensions() > 0 && inputs[1].dimensions() == 1 && inputs[1].size(0) == inputs[0].size(-1)));
         if (device_fp32 && (spec.operation == Operation::RMS_NORM || spec.operation == Operation::RMS_NORM_RESIDUAL ||
                             spec.operation == Operation::RMS_ROTARY || spec.operation == Operation::ROTARY ||
-                            spec.operation == Operation::GELU_MULTIPLY || spec.operation == Operation::TANH ||
+                            spec.operation == Operation::GELU_MULTIPLY || spec.operation == Operation::SILU_MULTIPLY ||
+                            spec.operation == Operation::SILU_GATE || spec.operation == Operation::TANH ||
                             spec.operation == Operation::STATIC_ROUND ||
                             (spec.operation == Operation::GELU && spec.attributes[0]) || simple_binary)) {
             result->eager = true;
@@ -296,18 +331,154 @@ public:
             result->epsilon = spec.epsilon;
             result->dynamic_count = inputs.size();
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            if (spec.operation == Operation::SILU_GATE) result->shape.back() /= 2;
             return result;
         }
         if (result->scatter && ops::is_inplace) {
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
             return result;
         }
-        if (spec.operation == Operation::QUANTIZED_LINEAR) {
+        if (spec.operation == Operation::CONV1D || spec.operation == Operation::SNAKE_CONV1D) {
+            const bool snake = spec.operation == Operation::SNAKE_CONV1D;
+            const auto weight_index = snake ? std::size_t{2} : std::size_t{1};
+            if (spec.attributes.size() != 4 || inputs.size() != weight_index + 3 ||
+                inputs[0].device() != tensor::Device::apple_gpu() || inputs[0].dtype() != DType::F32 ||
+                inputs[0].dimensions() != 3 || inputs[0].size(0) != 1 ||
+                inputs[weight_index].dtype() != DType::I8)
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported Metal Conv1d geometry"});
+            const auto kernel = spec.attributes[0], stride = spec.attributes[1], padding = spec.attributes[2],
+                       dilation = spec.attributes[3];
+            const auto receptive = dilation * (kernel - 1) + 1;
+            const auto numerator = static_cast<std::int64_t>(inputs[0].size(1)) + 2 * padding - receptive;
+            if (kernel <= 0 || stride <= 0 || padding < 0 || dilation <= 0 || numerator < 0)
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Metal Conv1d dimensions"});
+            const auto output_length = numerator / stride + 1;
+            result->audio_mode = snake ? MetalOperator::AudioMode::SNAKE_CONV1D
+                                       : MetalOperator::AudioMode::CONV1D;
+            result->audio_attributes = {static_cast<std::int32_t>(kernel), static_cast<std::int32_t>(stride),
+                                        static_cast<std::int32_t>(padding), static_cast<std::int32_t>(dilation)};
+            result->audio_intermediate_shape = {
+                1, output_length, static_cast<std::int64_t>(inputs[0].size(2)) * kernel};
+            result->shape = {1, output_length, static_cast<std::int64_t>(inputs[weight_index].size(0))};
+            result->dtype = DType::F32;
             result->dynamic_count = 1;
-            result->quantized = require(mps::QuantizedLinear::create(inputs[1], inputs[2], inputs[3]));
+            if (snake) result->audio_constant = require(inputs[1].to(tensor::Device::apple_gpu()));
+            const auto weight = input_major_weight(inputs[weight_index]);
+            result->quantized =
+                require(mps::QuantizedLinear::create(weight, inputs[weight_index + 1], inputs[weight_index + 2]));
+            auto prepared = require(Tensor::empty(result->audio_intermediate_shape, DType::F32,
+                                                  tensor::Device::apple_gpu()));
+            require(result->quantized->prepare(prepared));
+            return result;
+        }
+        if (spec.operation == Operation::SNAKE_QUANTIZED_LINEAR) {
+            if (spec.attributes.size() != 1 || inputs.size() != 5 ||
+                inputs[0].device() != tensor::Device::apple_gpu() || inputs[0].dtype() != DType::F32 ||
+                inputs[2].dtype() != DType::I8 || !spec.attributes[0])
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported Metal Snake projection"});
+            result->audio_mode = MetalOperator::AudioMode::SNAKE_LINEAR;
+            result->audio_constant = require(inputs[1].to(tensor::Device::apple_gpu()));
+            result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            result->shape.back() = inputs[2].size(0);
+            result->dtype = DType::F32;
+            result->dynamic_count = 1;
+            const auto weight = input_major_weight(inputs[2]);
+            result->quantized = require(mps::QuantizedLinear::create(weight, inputs[3], inputs[4]));
+            require(result->quantized->prepare(inputs[0]));
+            return result;
+        }
+        if (spec.operation == Operation::CONV_TRANSPOSE_FOLD) {
+            if (spec.attributes.size() != 5 || inputs.size() != 2 ||
+                inputs[0].device() != tensor::Device::apple_gpu() || inputs[0].dtype() != DType::F32 ||
+                inputs[0].dimensions() != 3 || inputs[0].size(0) != 1)
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported Metal transposed convolution"});
+            const auto kernel = spec.attributes[0], stride = spec.attributes[1], padding = spec.attributes[2],
+                       output_padding = spec.attributes[3], dilation = spec.attributes[4];
+            const auto output_length = (static_cast<std::int64_t>(inputs[0].size(1)) - 1) * stride - 2 * padding +
+                                       dilation * (kernel - 1) + output_padding + 1;
+            if (kernel <= 0 || stride <= 0 || padding < 0 || output_padding < 0 || output_padding >= stride ||
+                dilation <= 0 || output_length <= 0 || inputs[0].size(2) % kernel)
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Metal transposed convolution dimensions"});
+            result->audio_mode = MetalOperator::AudioMode::CONV_TRANSPOSE_FOLD;
+            result->audio_attributes = {static_cast<std::int32_t>(kernel), static_cast<std::int32_t>(stride),
+                                        static_cast<std::int32_t>(padding), static_cast<std::int32_t>(dilation)};
+            result->shape = {1, output_length, static_cast<std::int64_t>(inputs[0].size(2) / kernel)};
+            result->dtype = DType::F32;
+            result->dynamic_count = 1;
+            result->audio_constant = require(inputs[1].to(tensor::Device::apple_gpu()));
+            return result;
+        }
+        if (spec.operation == Operation::SNAKE) {
+            if (inputs.size() != 2 || inputs[0].device() != tensor::Device::apple_gpu() ||
+                inputs[0].dtype() != DType::F32 || inputs[0].dimensions() != 3)
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported Metal Snake activation"});
+            result->audio_mode = MetalOperator::AudioMode::SNAKE;
+            result->audio_constant = require(inputs[1].to(tensor::Device::apple_gpu()));
+            result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            result->dtype = DType::F32;
+            result->dynamic_count = 1;
+            return result;
+        }
+        if (spec.operation == Operation::QUANTIZED_LINEAR) {
+            const auto rows = inputs[0].numel() / inputs[0].size(-1);
+            const auto* fp16 = std::getenv("KIDI_MPS_Q_LINEAR_FP16");
+            const auto bias = inputs[3].data<float>();
+            const auto use_fp16 = (!fp16 || std::string_view(fp16) != "0") && rows >= 4 && spec.attributes[0] && bias &&
+                                  std::ranges::all_of(*bias, [](float value) { return value == 0.F; });
+            if (use_fp16) {
+                result->dynamic_count = 1;
+                result->packed_bits = 8;
+                result->packed_group = inputs[0].size(-1);
+                result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+                result->shape.back() = inputs[1].size(0);
+                const std::array<std::int64_t, 2> matrix_shape{static_cast<std::int64_t>(inputs[1].size(0)),
+                                                               static_cast<std::int64_t>(inputs[0].size(-1))};
+                const auto key =
+                    std::tuple{require(inputs[1].host_bytes()).data(), require(inputs[2].host_bytes()).data(),
+                               std::int32_t{8}, static_cast<std::int32_t>(inputs[0].size(-1))};
+                auto found = prefill_weights_.find(key);
+                const auto matrix_bytes =
+                    static_cast<std::size_t>(matrix_shape[0]) * matrix_shape[1] * sizeof(_Float16);
+                if (found == prefill_weights_.end()) {
+                    if (matrix_bytes > stream_.prefill_cache_limit - stream_.expanded_bytes)
+                        throw ops::Failure({ErrorCode::UNSUPPORTED, "Metal FP16 projection cache limit exceeded"});
+                    auto expanded = require(Tensor::empty({matrix_shape.begin(), matrix_shape.end()}, DType::F16,
+                                                          tensor::Device::apple_gpu()));
+                    auto device_weight = require(inputs[1].to(tensor::Device::apple_gpu()));
+                    auto device_scales = require(inputs[2].to(tensor::Device::apple_gpu()));
+                    stream_.retain(device_weight);
+                    stream_.retain(device_scales);
+                    stream_.retain(expanded);
+                    require(mps::encode_expand_packed_weight(stream_.commands(), device_weight, device_scales, expanded,
+                                                             8, result->packed_group));
+                    found =
+                        prefill_weights_.emplace(key, PrefillWeight{inputs[1], inputs[2], std::move(expanded)}).first;
+                    stream_.expanded_bytes += found->second.value.nbytes();
+                }
+                result->prefill_weight = found->second.value;
+                std::vector<std::int64_t> program_key(inputs[0].shape().begin(), inputs[0].shape().end());
+                program_key.push_back(matrix_shape[0]);
+                program_key.push_back(-8);
+                auto program = prefill_programs_.find(program_key);
+                if (program == prefill_programs_.end()) {
+                    auto graph = require(mps::Graph::create());
+                    const std::array feeds{graph.placeholder(inputs[0].shape(), DType::F32),
+                                           graph.placeholder(matrix_shape, DType::F16)};
+                    const auto hidden = graph.matmul(graph.cast(feeds[0], DType::F16), feeds[1], false, true);
+                    const std::array outputs{graph.cast(hidden, DType::F32)};
+                    auto executable = std::make_shared<mps::Executable>(require(graph.compile(feeds, outputs)));
+                    if (prefill_programs_.size() >= 128) prefill_programs_.clear();
+                    program = prefill_programs_.emplace(std::move(program_key), std::move(executable)).first;
+                }
+                result->prefill_executable = program->second;
+                return result;
+            }
+            result->dynamic_count = 1;
+            const auto weight = spec.attributes[0] ? input_major_weight(inputs[1]) : inputs[1];
+            result->quantized = require(mps::QuantizedLinear::create(weight, inputs[2], inputs[3]));
             require(result->quantized->prepare(inputs[0]));
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
-            result->shape.back() = inputs[1].size(1);
+            result->shape.back() = inputs[1].size(spec.attributes[0] ? 0 : 1);
             return result;
         }
         if (spec.operation == Operation::GATED_FEED_FORWARD && inputs.size() == 5 && spec.attributes[0] == 8) {
@@ -408,6 +579,10 @@ public:
         switch (spec.operation) {
             case Operation::GELU_MULTIPLY:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "GELU multiplication requires direct kernel"});
+            case Operation::SILU_MULTIPLY:
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "SiLU multiplication is not implemented on Metal"});
+            case Operation::SILU_GATE:
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "split SiLU is not implemented on Metal"});
             case Operation::RMS_ROTARY:
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "RMS rotary requires direct kernel"});
             case Operation::GATED_FEED_FORWARD:

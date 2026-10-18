@@ -68,8 +68,18 @@ enum class Operation {
     GREEDY_TOKEN,
     RMS_ROTARY,
     GELU_MULTIPLY,
+    SILU_MULTIPLY,
+    SILU_GATE,
     EMBEDDING,
-    GATED_FEED_FORWARD
+    GATED_FEED_FORWARD,
+    DIFFUSION_CANDIDATES,
+    DIFFUSION_UPDATE,
+    EMBEDDING_SUM,
+    CONV1D,
+    SNAKE_CONV1D,
+    SNAKE_QUANTIZED_LINEAR,
+    CONV_TRANSPOSE_FOLD,
+    SNAKE
 };
 struct BlockwiseQuantizationSpec {
     std::span<const float> scales;
@@ -104,7 +114,9 @@ public:
     /// Used to replay captured steps without allocating.
     virtual auto run_into(TensorInputs inputs, std::span<tensor::Tensor> outputs) -> void;
     virtual auto allocations() const -> AllocationStats { return {}; }
+    virtual auto release_workspaces() -> void {}
 };
+class StepExecutable;
 class OperatorBackend {
 public:
     virtual ~OperatorBackend() = default;
@@ -113,15 +125,17 @@ public:
     virtual auto release_cached_buffers() -> void {}
     /// True when every prepared operator implements `run_into`, so captured steps can replay.
     virtual auto supports_replay() const noexcept -> bool { return false; }
+    virtual auto prepare_graph(const graph::Graph&, std::string_view) -> std::unique_ptr<StepExecutable>;
     virtual auto copy_slice_(tensor::Tensor& destination, const tensor::Tensor& source, std::size_t outer,
-                             std::size_t source_bytes, std::size_t destination_bytes,
-                             std::size_t offset_bytes) -> void = 0;
+                             std::size_t source_bytes, std::size_t destination_bytes, std::size_t offset_bytes)
+        -> void = 0;
 };
 class OutputPool {
 public:
     explicit OutputPool(tensor::Arena* arena = nullptr) : arena_(arena) { buffers_.reserve(32); }
     auto acquire(std::span<const std::int64_t> shape, tensor::DType dtype, tensor::Device device) -> tensor::Tensor;
     auto allocations() const -> AllocationStats { return allocations_; }
+    auto clear() -> void { buffers_.clear(); }
 
 private:
     tensor::Arena* arena_;

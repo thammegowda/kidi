@@ -168,6 +168,20 @@ auto main() -> int {
                  "read-only host blob lost its external owner")) {
         return 1;
     }
+    auto mutable_owner = std::make_shared<std::array<float, 2>>(std::array<float, 2>{3, 4});
+    auto mutable_blob = Tensor::from_mutable_blob(
+        {2}, DType::F32, std::as_writable_bytes(std::span<float>(*mutable_owner)), mutable_owner);
+    mutable_owner.reset();
+    if (!require(mutable_blob.has_value(), "mutable host blob construction failed")) return 1;
+    auto mutable_values = mutable_blob->data<float>();
+    if (!require(mutable_values.has_value(), "mutable host blob rejected mutable access")) return 1;
+    (*mutable_values)[1] = 9;
+    const auto& readable_mutable_blob = *mutable_blob;
+    auto updated_values = readable_mutable_blob.data<float>();
+    if (!require(updated_values.has_value() && (*updated_values)[0] == 3 && (*updated_values)[1] == 9,
+                 "mutable host blob lost its external owner or write")) {
+        return 1;
+    }
 
     auto rows = std::make_shared<GeneratedRows>();
     const auto table = kidi::tensor::external_tensor({3, 4}, DType::U8, rows);

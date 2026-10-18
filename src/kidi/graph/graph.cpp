@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <bit>
 #include <limits>
+#include <map>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -79,10 +81,83 @@ auto Graph::bind(std::size_t slot, const Tensor& input) -> void {
     current = input;
 }
 
-auto Graph::replay(std::span<const Tensor> inputs) -> std::span<const Tensor> {
+auto Graph::rebind(std::span<const Tensor> inputs) -> void {
     if (inputs.size() != inputs_.size())
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "replayed step received a different number of inputs"});
     for (std::size_t slot = 0; slot < inputs.size(); ++slot) bind(slot, inputs[slot]);
+}
+
+auto Graph::plan_intermediates(const ScratchAllocator& allocate) -> BufferPlanStats {
+    struct Lifetime {
+        std::size_t first, last, elements = 0;
+        tensor::DType dtype;
+        tensor::Device device;
+        Tensor replacement;
+    };
+    std::set<const void*> pinned;
+    for (const auto& input : inputs_) pinned.insert(input.storage_identity());
+    for (const auto& output : outputs_) pinned.insert(output.storage_identity());
+    std::map<const void*, Lifetime> lifetimes;
+    for (std::size_t index = 0; index < nodes_.size(); ++index)
+        for (const auto& output : nodes_[index].outputs()) {
+            if (pinned.contains(output.storage_identity())) continue;
+            lifetimes.try_emplace(output.storage_identity(),
+                                  Lifetime{index, index, 0, output.dtype(), output.device()});
+        }
+    for (std::size_t index = 0; index < nodes_.size(); ++index)
+        for (const auto& value : nodes_[index].operands) {
+            const auto found = lifetimes.find(value.storage_identity());
+            if (found == lifetimes.end()) continue;
+            auto& lifetime = found->second;
+            lifetime.last = std::max(lifetime.last, index);
+            lifetime.elements =
+                std::max(lifetime.elements, static_cast<std::size_t>(value.storage_offset()) + value.numel());
+        }
+    std::vector<Lifetime*> ordered;
+    for (auto& [identity, lifetime] : lifetimes) ordered.push_back(&lifetime);
+    std::ranges::stable_sort(ordered, {}, &Lifetime::first);
+    struct Slot {
+        Tensor value;
+        std::size_t last;
+    };
+    std::vector<Slot> slots;
+    BufferPlanStats stats;
+    for (auto* lifetime : ordered) {
+        stats.original_bytes += lifetime->elements * tensor::element_size(lifetime->dtype);
+        Slot* selected = nullptr;
+        for (auto& slot : slots)
+            if (slot.last < lifetime->first && slot.value.dtype() == lifetime->dtype &&
+                slot.value.device() == lifetime->device && slot.value.numel() >= lifetime->elements &&
+                (!selected || slot.value.numel() < selected->value.numel()))
+                selected = &slot;
+        if (!selected) {
+            auto storage = allocate ? allocate(slots.size(), lifetime->elements, lifetime->dtype, lifetime->device)
+                                    : require(Tensor::empty({static_cast<std::int64_t>(lifetime->elements)},
+                                                             lifetime->dtype, lifetime->device));
+            if (storage.numel() < lifetime->elements || storage.dtype() != lifetime->dtype ||
+                storage.device() != lifetime->device)
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "graph scratch allocation is incompatible"});
+            stats.planned_bytes += storage.nbytes();
+            slots.push_back({std::move(storage), lifetime->last});
+            selected = &slots.back();
+        }
+        selected->last = lifetime->last;
+        lifetime->replacement = selected->value;
+    }
+    stats.slots = slots.size();
+    for (auto& node : nodes_)
+        for (auto& value : node.operands) {
+            const auto found = lifetimes.find(value.storage_identity());
+            if (found == lifetimes.end()) continue;
+            auto window = require(found->second.replacement.narrow(
+                0, value.storage_offset(), static_cast<std::int64_t>(value.numel())));
+            value = require(window.reshape({value.shape().begin(), value.shape().end()}));
+        }
+    return stats;
+}
+
+auto Graph::replay(std::span<const Tensor> inputs) -> std::span<const Tensor> {
+    rebind(inputs);
     for (auto& node : nodes_) {
         const runtime::TensorInputs operands(node.inputs());
         auto outputs = std::span(node.operands).subspan(node.input_count);

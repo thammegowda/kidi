@@ -127,8 +127,9 @@ important information before relying on it.
 A published APK does not require sideloaded model files. On a clean install, **Set up models** opens the in-app model
 downloads. Each download requires confirmation and displays an approximate transfer/storage size; the app does not
 silently start multi-gigabyte downloads on launch. The default public repositories work without a Hugging Face account.
-Chat and optional dictation downloads are separate. Internet is needed for setup; already installed models reopen
-offline. ADB commands in the development instructions are for building/testing, not the user installation flow.
+Chat and optional dictation downloads are separate. Read-aloud currently uses a manually installed converted
+OmniVoice package. Internet is needed for setup; already installed models reopen offline. ADB commands in the
+development instructions are for building/testing, not the user installation flow.
 
 The default chat model is `google/gemma-4-E2B-it-qat-mobile-transformers`. Model settings accepts another public dense
 Gemma 4 repository with the same supported file layout. Loading performs these steps:
@@ -195,6 +196,22 @@ are enabled; this does not add remote vision inference or restore Gemma audio in
 
 The APK bundles the Tahoma Vision and codec redistribution notices. PDF/SVG, codec command-line tools, and Python
 bindings are disabled in the embedded dependency build.
+
+### Read Aloud
+
+Completed assistant responses can be synthesized with a converted OmniVoice
+package. Copy `model.yaml`, `model.safetensors`, `tokenizer.json`,
+`sentence-prefixes.tsv`, `synthesis_template.jinja`, `NOTICE`, and the complete
+`licenses/` directory into the app-private `models/tts` directory shown in
+Settings. Preserve the package directory structure because `model.yaml` lists
+the required license files. The model is detected on the next app start.
+
+Read-aloud automatically tries the built-in Vulkan backend and falls back to
+CPU. It does not require QAIRT, QNN libraries, or a KidiOps package. Requests
+are capped at 512 UTF-8 bytes until sustained mobile synthesis is qualified.
+Synthesis reports chunk progress, can be cancelled, and streams the completed
+PCM through a bounded `AudioTrack` buffer. Settings expose language, diffusion
+steps, and the OmniVoice gender, age, pitch, style, and accent attributes.
 
 ### Speech Dictation
 

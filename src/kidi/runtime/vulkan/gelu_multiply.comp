@@ -8,6 +8,7 @@ layout(push_constant) uniform Parameters {
     uint intermediate;
     float gateUpScale;
     float inverseHiddenScale;
+    uint silu;
 }
 parameters;
 
@@ -25,7 +26,9 @@ void main() {
     for (uint lane = 0u; lane < 4u; ++lane) {
         float g = dequantize(gate, lane);
         float u = dequantize(up, lane);
-        float activated = 0.5 * g * (1.0 + tanh(0.7978845608 * (g + 0.044715 * g * g * g)));
+        float activated = parameters.silu != 0u
+                              ? g / (1.0 + exp(-g))
+                              : 0.5 * g * (1.0 + tanh(0.7978845608 * (g + 0.044715 * g * g * g)));
         float value = clamp(roundEven(activated * u * parameters.inverseHiddenScale), -128.0, 127.0);
         result |= (uint(int(value)) & 255u) << (8u * lane);
     }

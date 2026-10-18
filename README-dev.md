@@ -57,9 +57,46 @@ and `python -m kidi` share the same native implementation.
 
 The [getting-started guide](docs/getting-started.md) covers authentication,
 revision selection, offline use, and manual model setup. Gemma setup writes
-configuration only; original weights and tokenizers are not rewritten. Legacy
-RTG conversion needs the `convert` extra and a **trusted** training export:
+configuration only; original weights and tokenizers are not rewritten. Legacy RTG and OmniVoice conversion need the `convert` extra. RTG requires a
+**trusted** training export:
 PyTorch checkpoints can contain executable pickle data.
+
+OmniVoice conversion reads public Safetensors only and writes a decoder-only,
+all-parameter INT8 package:
+
+```bash
+python -m pip install '.[convert,hf]'
+SOURCE="$(hf download k2-fsa/OmniVoice)"
+python -m kidi.converters.omnivoice "$SOURCE" .cache/omnivoice-int8
+build-release/kidi inspect --model .cache/omnivoice-int8
+```
+
+The generated directory is ignored by Git and can be uploaded separately after
+reviewing the upstream model's CC-BY-NC terms. Do not commit the generated
+Safetensors file to this repository. The generated synthesis settings include
+the upstream rule-estimator calibration used by the default `--duration auto`;
+numeric seconds remain an explicit override. Voice controls enter the task API
+as a generic `key=value` map; model adapters own supported keys, normalization,
+and validation rather than adding model-specific CLI flags.
+
+Every generated TTS package declares `license_files` in `model.yaml`. Package
+loading and Hub resolution treat those paths as required payload rather than
+optional documentation. OmniVoice conversion includes CC BY-NC, Boson Higgs
+Audio 2, Meta Llama 3, its Acceptable Use Policy, and the mandated notice.
+It also emits `synthesis_template.jinja`; tokenizer++ renders this model-owned
+prompt with language, instruction, and text arguments.
+
+Kokoro conversion uses `torch.load(..., weights_only=True)`, fuses the
+checkpoint's weight-normalization tensors, packs the Misaki US-English
+pronunciation dictionaries, and embeds requested voice tables:
+
+```bash
+python -m kidi.converters.kokoro /path/to/Kokoro-82M .cache/kokoro-int8 \
+  --voices af_heart
+```
+
+Kokoro conversion includes separate Kokoro and Misaki Apache-2.0 texts and a
+source attribution notice.
 
 ## Android
 
@@ -103,6 +140,75 @@ instrumentation; do not install test APKs over a minified release.
 See [android/README.md](android/README.md) for SDK setup, JNI behavior, device
 tests and model storage. Moving only the Android directory is not supported:
 the project builds the shared repository C++ core.
+
+### Embedding TTS in Another Android App
+
+Kidi's TTS API is independent of the repository's Android application. An app
+can include this repository with `add_subdirectory`, link `kidi::kidi`, and
+provide its own JNI or native UI boundary:
+
+```cmake
+set(KIDI_BUILD_TESTS OFF CACHE BOOL "")
+set(KIDI_BUILD_BENCHMARKS OFF CACHE BOOL "")
+set(KIDI_ENABLE_VULKAN ON CACHE BOOL "")
+add_subdirectory(path/to/kidi)
+target_link_libraries(reader-native PRIVATE kidi::kidi)
+```
+
+Keep one synthesizer alive and reuse it for successive paragraphs so prepared
+operators, Qwen attention tables, and captured fixed-shape steps remain cached:
+
+```cpp
+#include "kidi/inference/synthesizer.h"
+#include "kidi/runtime/ynn/graph.h"
+
+kidi::runtime::ynn::set_thread_count(4);
+auto synthesizer = kidi::inference::Synthesizer::load(
+    model_directory, kidi::tensor::Device::vulkan());
+if (!synthesizer && synthesizer.error().code == kidi::ErrorCode::UNSUPPORTED)
+    synthesizer = kidi::inference::Synthesizer::load(
+        model_directory, kidi::tensor::Device::cpu());
+if (!synthesizer)
+    throw std::runtime_error(synthesizer.error().message);
+
+kidi::inference::SynthesisOptions options;
+options.language = "English";
+std::shared_ptr<const kidi::inference::VoicePrompt> narrator;
+options.voice_prompt = narrator;
+auto speech = synthesizer->synthesize(paragraph, options);
+if (!speech)
+    throw std::runtime_error(speech.error().message);
+narrator = speech->voice_prompt;
+// speech->samples contains mono FP32 PCM at speech->sample_rate.
+```
+
+Serialize calls through one worker per synthesizer; its execution context and
+replay caches are mutable. `Synthesizer::segment` exposes the same linguistic
+sentence boundaries used by `synthesize`; long-form synthesis processes those
+sentences serially and releases per-sentence workspaces automatically. Wrapped
+lines are unwrapped within paragraphs, while blank lines remain hard paragraph
+boundaries. Each TTS package supplies `sentence-prefixes.tsv` with
+language-specific `always` and `numeric` non-breaking prefix classes. This
+design follows the paragraph and prefix-table lessons from Moses' sentence
+splitter without invoking Perl or embedding model data in C++. Preserve
+`speech->voice_prompt` and pass it in the next request's
+`options.voice_prompt` to keep the same generated OmniVoice narrator across
+paragraphs or chapters. A multi-sentence request does this automatically.
+
+Android enables the Vulkan backend by default. OmniVoice runs compatible
+per-channel INT8 projections on Vulkan and uses CPU fallbacks for the remaining
+generator operators; its convolutional Higgs/DAC waveform decoder remains on
+CPU for Vulkan. The portable decoder parallelizes large independent ranges over
+the configured YNN thread pool. Native Metal and browser WebGPU execute the
+decoder on GPU.
+Model weights remain host-backed and are uploaded into reusable Vulkan
+projection layouts, avoiding a second full checkpoint allocation. The same
+package and API work with `Device::cpu()` on systems without suitable Vulkan
+1.3 INT8 dot-product support.
+
+This integration does not change the upstream model licenses. In particular,
+review OmniVoice's CC-BY-NC and bundled decoder licenses before integrating it
+into a distributed reader application.
 
 ### Google Play Releases
 
@@ -187,7 +293,7 @@ and Android model storage.
 ## Architecture and Models
 
 ```text
-Inference -> Models -> Neural Layers -> Eager Tensor Operations -> Runtime Backend
+Task API -> Inference -> Models -> Neural Layers -> Eager Tensor Operations -> Runtime Backend
 Checkpoint I/O -> Model-owned configuration and preparation hooks
 ```
 
@@ -203,7 +309,7 @@ I/O and atomic cache preparation. Format readers have their own `ggml/` and
 sidecars, compatibility checks, conversion/export rules and cache identity.
 
 Adding an architecture requires its model implementation, weight mappings and
-applicable checkpoint hooks. Gemma, Whisper and RTG are examples, not automatic
+applicable checkpoint hooks. Gemma, Whisper, OmniVoice and RTG are examples, not automatic
 support for arbitrary Hugging Face architectures.
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): ownership, execution, state and backend contracts.
@@ -281,7 +387,7 @@ and numerical contracts.
 Browser loader/generated-glue tests can also run directly:
 
 ```bash
-node --test tests/web/*.mjs
+node --test tests/browser/*.mjs
 ```
 
 Android model-download contracts run locally without installing over a phone app:
@@ -306,6 +412,45 @@ not promises for other devices or proof of quality equivalence across quantizers
 - [RTG](benchmarks/rtg/README.md): FP32/BF16/INT8 translation benchmarks.
 - [Apple Metal](benchmarks/metal/README.md): backend measurements and execution studies.
 - [Android](benchmarks/android/README.md): reproducible device benchmark setup.
+
+For reusable TTS latency, run repeated synthesis through one loaded model:
+
+```bash
+build-release/kidi_tts_bench .cache/omnivoice-int8 cpu 3 4
+# On a Vulkan-enabled Android build:
+build-release/kidi_tts_bench /data/local/tmp/omnivoice-int8 vulkan 3 4
+```
+
+The first record is cold. Later records retain prepared operators, attention
+tables, and graph replays, matching an embedding application that keeps one
+synthesizer alive.
+
+For the measured Apple CPU lower-latency profile, use eight threads and 25
+OmniVoice steps. The default 32-step path is intentionally quality-first:
+
+```bash
+build-release/kidi synthesize -m .cache/omnivoice-int8 \
+  --text 'Long-form sentence.' --language English --steps 25 -j 8 \
+  -o speech.wav
+```
+
+For Apple Metal, retain the quality-first 32 steps:
+
+```bash
+build-release/kidi synthesize -m .cache/omnivoice-int8 \
+  --backend mps --text 'Long-form sentence.' --language English \
+  --steps 32 -o speech.wav
+```
+
+Metal expands the INT8 Qwen projections to a shared FP16 cache because native
+half GEMM substantially outperforms per-tile INT8-to-half conversion on Apple
+GPU. Set `KIDI_MPS_Q_LINEAR_FP16=0` only for numerical/performance diagnostics.
+
+For multi-sentence input, the synthesizer first generates the shortest sentence
+estimated at least three seconds and uses its text plus generated codec tokens as the
+fixed OmniVoice reference for all remaining sentences. This retains a single
+narrator across sentence-sized workspaces. It does not require the external-WAV
+voice-cloning encoder, which is intentionally absent from the converted package.
 
 Keep generated model files, local reports and large binary artifacts out of Git.
 

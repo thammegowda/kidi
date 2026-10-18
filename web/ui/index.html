@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Kidi</title>
+  <link rel="icon" type="image/png" sizes="512x512" href="./icons/kidi-logo.png">
+  <link rel="apple-touch-icon" href="./icons/kidi-logo.png">
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <header class="app-header">
+      <div class="brand">
+        <img class="brand-mark" src="./icons/kidi-logo.png" alt="">
+        <div><strong>Kidi</strong><span>Local AI workspace</span></div>
+      </div>
+      <nav class="app-views" aria-label="Kidi views">
+        <button id="open-chat-view" class="active" type="button" aria-current="page">
+          <span class="chat-view-icon" aria-hidden="true"></span><span>Chat</span>
+        </button>
+        <button id="open-reader-view" type="button">
+          <span class="reader-view-icon" aria-hidden="true"></span><span>Reader</span>
+        </button>
+      </nav>
+      <div class="backend-telemetry" aria-label="Backend activity">
+        <span id="backend-activity">Idle</span>
+        <span id="backend-memory">Memory —</span>
+      </div>
+      <div class="language-switchers" aria-label="Conversation languages">
+        <label class="language-picker">
+          <span class="mic-icon" aria-hidden="true"></span>
+          <input id="input-language" class="language-switcher" aria-label="Input language" autocomplete="off">
+          <span id="input-language-menu" class="language-menu" hidden></span>
+        </label>
+        <span aria-hidden="true">→</span>
+        <label class="language-picker">
+          <span class="speaker-icon" aria-hidden="true"></span>
+          <input id="output-language" class="language-switcher" aria-label="Output language" autocomplete="off">
+          <span id="output-language-menu" class="language-menu" hidden></span>
+        </label>
+      </div>
+      <button class="icon-button config-button" id="open-config" type="button" aria-label="Settings">
+        <span class="config-icon" aria-hidden="true"></span>
+      </button>
+  </header>
+  <div class="shell" id="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <header class="chat-sidebar-heading">
+        <strong>Conversations</strong>
+        <button class="icon-button sidebar-close" id="close-menu" type="button" aria-label="Close navigation">×</button>
+      </header>
+      <section class="view-navigation" id="chat-navigation">
+      <div class="sidebar-actions">
+        <label class="chat-search">
+          <span aria-hidden="true">⌕</span>
+          <input id="chat-search" type="search" placeholder="Search conversations" aria-label="Search conversations">
+        </label>
+        <button class="icon-button new-chat" id="new-chat" type="button" aria-label="New conversation">＋</button>
+      </div>
+
+      <nav class="history" aria-label="Conversation history">
+        <div class="section-label">Recent</div>
+        <div id="chat-list"></div>
+      </nav>
+      </section>
+
+      <footer class="sidebar-footer">
+        <div class="privacy"><span class="status-dot"></span>Runs locally on this computer</div>
+      </footer>
+    </aside>
+    <button class="sidebar-backdrop" id="sidebar-backdrop" type="button" aria-label="Close navigation"></button>
+
+    <main class="workspace" id="chat-view">
+      <header class="topbar">
+        <button class="icon-button menu-button" id="menu" type="button" aria-label="Toggle navigation">☰</button>
+        <div>
+          <h1 id="conversation-title">New conversation</h1>
+          <div class="runtime-line">
+            <span class="runtime-dot" id="runtime-dot"></span>
+            <span id="runtime-label">No model loaded</span>
+          </div>
+        </div>
+        <progress id="runtime-progress" aria-label="Backend operation progress" hidden></progress>
+      </header>
+
+      <section class="messages" id="messages" aria-live="polite">
+        <section class="model-onboarding" id="model-onboarding" aria-labelledby="model-onboarding-title">
+          <button id="dismiss-model-onboarding" class="model-onboarding-close" type="button"
+            aria-label="Close model setup">×</button>
+          <div class="model-onboarding-kicker">One-time setup</div>
+          <h2 id="model-onboarding-title">Set up your local models</h2>
+          <p>The chat model is required. Speech recognition is recommended for dictation and voice mode. Text-to-speech is optional, but loading it now avoids a delay before the first spoken response.</p>
+          <div class="model-onboarding-options">
+            <section>
+              <div>
+                <span class="model-requirement">Required</span>
+                <strong>Chat / LLM</strong>
+                <small><span id="model-onboarding-name">Configured chat model</span> · <span id="model-onboarding-execution">Automatic</span></small>
+              </div>
+              <button id="onboarding-load-model" class="model-action" type="button">Load LLM model</button>
+            </section>
+            <section id="onboarding-asr-option">
+              <div>
+                <span class="model-requirement recommended">Recommended</span>
+                <strong>Speech recognition / ASR</strong>
+                <small id="model-onboarding-asr-name">Configured speech model</small>
+              </div>
+              <button id="onboarding-load-asr" class="model-action" type="button">Load ASR model</button>
+            </section>
+            <section id="onboarding-tts-option">
+              <div>
+                <span class="model-requirement optional">Optional</span>
+                <strong>Speech synthesis / TTS</strong>
+                <small id="model-onboarding-tts-name">Configured text-to-speech model</small>
+              </div>
+              <button id="onboarding-load-tts" class="model-action" type="button">Load TTS model</button>
+            </section>
+          </div>
+          <div id="onboarding-model-loading" class="model-loading" hidden>
+            <div id="onboarding-model-loading-stage" role="status">Preparing model</div>
+            <progress id="onboarding-model-loading-progress" aria-label="Initial model loading progress"></progress>
+            <div id="onboarding-model-loading-bytes"></div>
+            <div id="onboarding-model-loading-file"></div>
+          </div>
+          <div id="onboarding-asr-loading" class="model-loading" hidden>
+            <div id="onboarding-asr-loading-stage" role="status">Preparing speech recognition model</div>
+            <progress id="onboarding-asr-loading-progress" aria-label="Initial speech recognition loading progress"></progress>
+            <div id="onboarding-asr-loading-bytes"></div>
+            <div id="onboarding-asr-loading-file"></div>
+          </div>
+          <div id="onboarding-tts-loading" class="model-loading" hidden>
+            <div id="onboarding-tts-loading-stage" role="status">Preparing text-to-speech model</div>
+            <progress id="onboarding-tts-loading-progress" aria-label="Initial text-to-speech loading progress"></progress>
+            <div id="onboarding-tts-loading-bytes"></div>
+            <div id="onboarding-tts-loading-file"></div>
+          </div>
+          <p id="model-onboarding-error" class="model-onboarding-error" role="alert" hidden></p>
+          <p id="onboarding-asr-error" class="model-onboarding-error" role="alert" hidden></p>
+          <p id="onboarding-tts-error" class="model-onboarding-error" role="alert" hidden></p>
+          <footer>
+            <small>Downloaded files remain in this browser's local cache.</small>
+            <button id="skip-onboarding-asr" type="button">Continue without speech models</button>
+          </footer>
+        </section>
+        <div class="welcome" id="welcome">
+          <img class="welcome-mark" src="./icons/kidi-logo.png" alt="">
+          <h2>What would you like to explore?</h2>
+          <p>Private, local conversations powered by the model on your computer.</p>
+          <div class="suggestions">
+            <button type="button" data-prompt="Explain a difficult concept with a practical example.">
+              <strong>Learn something</strong><span>Explain a difficult concept</span>
+            </button>
+            <button type="button" data-prompt="Help me think through this idea: ">
+              <strong>Explore an idea</strong><span>Develop a thought together</span>
+            </button>
+            <button type="button" data-prompt="Review this plan and identify the biggest risks: ">
+              <strong>Review a plan</strong><span>Find risks and improvements</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <div class="composer-wrap">
+        <div class="notice" id="notice" hidden></div>
+        <div class="attachments" id="attachments" hidden></div>
+        <form class="composer" id="composer">
+          <input id="image-files" type="file" accept="image/jpeg,image/png" multiple hidden>
+          <button class="attach" id="attach" type="button" aria-label="Attach images" title="Attach images">＋</button>
+          <textarea id="prompt" rows="1" maxlength="100000"
+            placeholder="Message Kidi…" aria-label="Message Kidi"></textarea>
+          <button class="mic" id="mic" type="button" aria-label="Start dictation">
+            <span class="mic-icon" aria-hidden="true"></span>
+          </button>
+          <button class="voice-mode" id="voice-mode" type="button" aria-label="Start voice mode">
+            <span class="voice-mode-icon" aria-hidden="true"></span>
+          </button>
+          <button class="send" id="send" type="submit" aria-label="Send message">↑</button>
+          <button class="stop" id="stop" type="button" hidden>Stop</button>
+        </form>
+        <p class="disclaimer">Kidi can make mistakes. Verify important information.</p>
+      </div>
+    </main>
+
+    <main class="workspace reader-workspace" id="reader-view" hidden>
+      <header class="library-header">
+        <div>
+          <h1>Your library</h1>
+          <p>A home for your books and reading.</p>
+        </div>
+        <button class="library-add" type="button" disabled title="Book import is coming later">Add book</button>
+      </header>
+      <div class="library-toolbar">
+        <label>Search library<input type="search" placeholder="Search books" disabled></label>
+        <label>Sort by<select id="library-sort">
+          <option value="activity">Recent activity</option>
+          <option value="added">Recently added</option>
+          <option value="opened">Last opened</option>
+          <option value="title">Title</option>
+        </select></label>
+      </div>
+      <section class="reader-empty">
+        <span class="reader-mark" aria-hidden="true"></span>
+        <h2>Your next chapter starts here</h2>
+        <p>Your books will appear here. Open a book to read in a dedicated, full-width workspace with Kidi.</p>
+        <p class="library-planned">Book import and reading are coming next.</p>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="config-dialog">
+    <section class="config-card">
+      <header>
+        <div><h2>Settings</h2><p>Configure your local AI workspace.</p></div>
+        <button class="icon-button" id="close-config" type="button" aria-label="Close configuration">×</button>
+      </header>
+      <div class="settings-layout">
+      <nav class="settings-nav" aria-label="Settings sections">
+        <button type="button" data-settings-page="llm" aria-current="page">LLM</button>
+        <button type="button" data-settings-page="asr">ASR</button>
+        <button type="button" data-settings-page="speech">TTS</button>
+        <button type="button" data-settings-page="cache" hidden>Model Cache</button>
+      </nav>
+      <div class="settings-content">
+      <section data-settings-panel="llm">
+        <h3>LLM</h3>
+        <div id="config-summary"></div>
+        <div class="tts-grid">
+          <label class="wide-setting">
+            <span>Conversation languages</span>
+            <input id="conversation-languages" type="text" maxlength="96"
+              placeholder="English, Kannada, Telugu, Hindi">
+            <small>Comma-separated language names or codes. Auto uses the browser locale.</small>
+          </label>
+        </div>
+      <section class="system-prompt-preferences">
+        <div class="settings-section-heading">
+          <div><h3>System prompt</h3><p>Applied to future turns. Restarting restores the YAML value.</p></div>
+          <span id="system-prompt-status">From configuration</span>
+        </div>
+        <textarea id="system-prompt" rows="6" maxlength="32768" aria-label="System prompt"></textarea>
+        <div class="settings-actions">
+          <button id="reset-system-prompt" type="button">Reset to YAML</button>
+          <button id="apply-system-prompt" class="primary" type="button">Apply prompt</button>
+        </div>
+      </section>
+      <section class="wasm-preferences" id="wasm-preferences" hidden>
+        <div class="settings-section-heading">
+          <div><h3>Browser runtime</h3><p>Models run locally through WebAssembly or WebGPU.</p></div>
+          <span id="wasm-runtime-status">Offline</span>
+        </div>
+        <div id="model-loading" class="model-loading" hidden>
+          <div id="model-loading-stage" role="status">Preparing model</div>
+          <progress id="model-loading-progress" aria-label="Model loading progress"></progress>
+          <div id="model-loading-bytes"></div>
+          <div id="model-loading-file"></div>
+        </div>
+        <div class="tts-grid">
+          <label class="wide-setting"><span>Chat model ID</span>
+            <input id="wasm-model" type="text" value="google/gemma-4-E2B-it-qat-mobile-transformers">
+          </label>
+          <label><span>Execution</span><select id="wasm-backend">
+            <option value="webgpu">WebGPU</option><option value="cpu">WebAssembly CPU</option>
+          </select></label>
+          <label><span>CPU threads</span><input id="wasm-threads" type="number" min="1" max="8" value="4"></label>
+          <label><span>Output tokens</span><input id="wasm-tokens" type="number" min="1" max="8192" value="512"></label>
+        </div>
+        <div class="settings-actions">
+          <button id="load-wasm-model" class="primary" type="button">Load model</button>
+        </div>
+      </section>
+      </section>
+      <section data-settings-panel="asr" hidden>
+        <div class="settings-section-heading">
+          <div><h3>ASR</h3><p>Automatic speech recognition and microphone activity detection.</p></div>
+          <span id="asr-availability">Not loaded</span>
+        </div>
+        <div id="asr-config-summary" class="component-config-summary"></div>
+        <div id="asr-model-controls">
+          <div id="asr-model-loading" class="model-loading" hidden>
+            <div id="asr-model-loading-stage" role="status">Preparing speech recognition model</div>
+            <progress id="asr-model-loading-progress" aria-label="Speech recognition model loading progress"></progress>
+            <div id="asr-model-loading-bytes"></div>
+            <div id="asr-model-loading-file"></div>
+          </div>
+          <p id="asr-model-error" class="speech-model-error" role="alert" hidden></p>
+          <div class="settings-actions">
+            <button id="load-asr-model" class="primary" type="button">Load ASR model</button>
+          </div>
+        </div>
+      </section>
+      <section id="cache-management" data-settings-panel="cache" hidden>
+          <h3>Model cache</h3>
+          <p>Files stored in this browser at this address. Deletion does not unload running models. Missing files are fetched on the next load; incomplete models cannot restore offline.</p>
+          <div class="settings-actions">
+            <button id="refresh-model-cache" type="button">Refresh</button>
+            <button id="clear-model-cache" type="button">Clear model cache</button>
+          </div>
+          <p id="model-cache-status" role="status"></p>
+          <div id="model-cache-files"></div>
+      </section>
+      <section class="tts-preferences" data-settings-panel="speech" hidden>
+        <div class="settings-section-heading">
+          <div><h3>TTS</h3><p>Applied to future speech requests.</p></div>
+          <span id="tts-availability"></span>
+        </div>
+        <div id="tts-config-summary" class="component-config-summary"></div>
+        <div id="tts-model-controls">
+          <div id="tts-model-loading" class="model-loading" hidden>
+            <div id="tts-model-loading-stage" role="status">Preparing TTS (text-to-speech) model</div>
+            <progress id="tts-model-loading-progress" aria-label="Speech synthesis model loading progress"></progress>
+            <div id="tts-model-loading-bytes"></div>
+            <div id="tts-model-loading-file"></div>
+          </div>
+          <p id="tts-model-error" class="speech-model-error" role="alert" hidden></p>
+          <div class="settings-actions">
+            <button id="load-tts-model" class="primary" type="button">Load TTS model</button>
+          </div>
+        </div>
+        <div class="tts-grid">
+          <label id="tts-gpu-precision-row" class="wide-setting" hidden>
+            <span>Browser GPU precision</span>
+            <select id="tts-gpu-precision">
+              <option value="f32">FP32 activations (quality baseline)</option>
+              <option value="mixed-f16">Mixed FP16 (more GPU memory)</option>
+              <option value="w8a8">INT8 / W8A8 (recommended)</option>
+            </select>
+            <small>W8A8 is the fast browser default. Kidi keeps at least 10 diffusion steps because lower settings can make speech unintelligible.</small>
+          </label>
+          <label><span>Diffusion steps</span><input id="tts-steps" type="number" min="10" max="128"></label>
+          <label><span>Delivery</span><select id="tts-pace">
+            <option value="1.2">Mellow</option><option value="1.15">Relaxed</option>
+            <option value="1">Natural</option><option value="0.9">Brisk</option>
+          </select></label>
+          <label><span>Gender</span><select id="tts-gender">
+            <option value="female">Female</option><option value="male">Male</option>
+          </select></label>
+          <label><span>Age</span><select id="tts-age">
+            <option value="child">Child</option><option value="teenager">Teenager</option>
+            <option value="young adult">Young adult</option><option value="middle-aged">Middle-aged</option>
+            <option value="elderly">Elderly</option>
+          </select></label>
+          <label><span>Pitch</span><select id="tts-pitch">
+            <option value="very low">Very low</option><option value="low">Low</option>
+            <option value="moderate">Moderate</option><option value="high">High</option>
+            <option value="very high">Very high</option>
+          </select></label>
+          <label><span>Style</span><select id="tts-style">
+            <option value="">Natural</option><option value="whisper">Whisper</option>
+          </select></label>
+          <label><span>Accent</span><select id="tts-accent">
+            <option value="">Default</option><option value="american">American</option>
+            <option value="british">British</option><option value="australian">Australian</option>
+            <option value="indian">Indian</option>
+          </select></label>
+        </div>
+      </section>
+      </div>
+      </div>
+    </section>
+  </dialog>
+</body>
+</html>

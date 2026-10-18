@@ -1,10 +1,14 @@
 package ai.gowda.kidi
 
 import androidx.compose.foundation.layout.padding
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -12,6 +16,7 @@ import androidx.compose.ui.test.assertIsNotDisplayed
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onAllNodesWithTag
@@ -50,6 +55,106 @@ import org.junit.Assert.assertTrue
 
 class ChatUiTest {
     @get:Rule val compose = createComposeRule()
+
+    @Test
+    fun completedAssistantMessageOffersReadAloudAction() {
+        val message = ChatMessage(MessageRole.ASSISTANT, "A completed response.")
+        val state = mutableStateOf(KidiUiState(modelReady = true, messages = listOf(message)))
+        var selected: ChatMessage? = null
+        compose.setContent {
+            KidiTheme {
+                ChatWorkspace(
+                    state = state.value,
+                    snackbar = SnackbarHostState(),
+                    onNewChat = {},
+                    onSettings = {},
+                    onTextChange = {},
+                    onSend = {},
+                    onStop = {},
+                    onRecord = {},
+                    onStopRecording = {},
+                    onSpeak = { selected = it },
+                )
+            }
+        }
+
+        compose.onNodeWithContentDescription("Read response aloud").assertIsDisplayed().assertIsEnabled().performClick()
+        compose.runOnIdle { assertSame(message, selected) }
+        compose.runOnIdle { state.value = state.value.copy(speakingMessageId = message.id) }
+        compose.onNodeWithContentDescription("Stop reading response").assertIsDisplayed().assertIsEnabled()
+        compose.runOnIdle {
+            state.value = state.value.copy(loadingTts = true, loadingModel = true, loadingSpeech = true)
+        }
+        compose.onNodeWithTag("tts-progress-${message.id}").assertIsDisplayed().assert(
+            SemanticsMatcher.expectValue(
+                SemanticsProperties.ProgressBarRangeInfo,
+                ProgressBarRangeInfo.Indeterminate,
+            ),
+        )
+        compose.onNodeWithContentDescription("Stop synthesizing response").assertIsEnabled().performClick()
+        compose.runOnIdle { assertSame(message, selected) }
+        compose.runOnIdle {
+            state.value = state.value.copy(ttsCompletedChunks = 1, ttsTotalChunks = 4)
+        }
+        compose.onNodeWithTag("tts-progress-${message.id}").assert(
+            SemanticsMatcher.expectValue(
+                SemanticsProperties.ProgressBarRangeInfo,
+                ProgressBarRangeInfo(0.25f, 0f..1f, 0),
+            ),
+        )
+        compose.runOnIdle {
+            state.value = state.value.copy(loadingTts = false, loadingModel = false, loadingSpeech = false)
+        }
+        assertEquals(0, compose.onAllNodesWithTag("tts-progress-${message.id}").fetchSemanticsNodes().size)
+        compose.runOnIdle {
+            state.value = state.value.copy(
+                speakingMessageId = null,
+                messages = listOf(message.copy(status = MessageStatus.STOPPED)),
+            )
+        }
+        assertEquals(
+            0,
+            compose.onAllNodesWithContentDescription("Read response aloud").fetchSemanticsNodes().size,
+        )
+    }
+
+    @Test
+    fun settingsShowManualTtsModelAndDiffusionControls() {
+        compose.setContent {
+            KidiTheme {
+                SettingsSheet(
+                    state = KidiUiState(
+                        ttsReady = true,
+                        ttsModelDirectory = "/storage/models/tts",
+                        ttsSteps = 10,
+                        ttsLanguage = "English",
+                    ),
+                    onDismiss = {},
+                    onModelId = {},
+                    onSpeechModelId = {},
+                    onThreads = {},
+                    onTokens = {},
+                    onInstall = {},
+                    onCancelChat = {},
+                    onInstallSpeech = {},
+                    onCancelSpeech = {},
+                    onDelete = {},
+                    onDeleteSpeech = {},
+                )
+            }
+        }
+
+        compose.onNodeWithTag("tts-model-status").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("/storage/models/tts").assertIsDisplayed()
+        compose.onNodeWithText("Inference").performClick()
+        compose.onNodeWithText("Diffusion steps").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText(
+            "10 steps is the low-latency default. More steps can improve stability but increase synthesis time.",
+        ).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("TTS language").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Gender").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Young adult").performScrollTo().assertIsDisplayed()
+    }
 
     @Test
     fun streamingMathKeepsCompletedEquationsStable() {

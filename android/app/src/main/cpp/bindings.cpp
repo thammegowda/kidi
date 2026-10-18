@@ -1,11 +1,13 @@
 #include "kidi/checkpoint/prepare.h"
 #include "kidi/inference/generator.h"
+#include "kidi/inference/synthesizer.h"
 #include "kidi/inference/transcriber.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/tensor/backend.h"
 
 #include <algorithm>
 #include <array>
+#include <android/log.h>
 #include <cctype>
 #include <jni.h>
 #include <nlohmann/json.hpp>
@@ -14,10 +16,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 
 namespace {
@@ -27,11 +32,14 @@ constexpr std::size_t PREFIX_CACHE_BYTES = 512 * 1024 * 1024;
 
 // Chat and speech have separate locks so dictation never waits behind a model load or reply, as the web app gives
 // speech its own worker. The CPU thread pool accepts concurrent callers.
-std::mutex runtime_mutex, speech_mutex;
+std::mutex runtime_mutex, speech_mutex, tts_mutex;
 std::optional<kidi::inference::Generator> generator;
 std::optional<kidi::inference::Transcriber> transcriber;
+std::optional<kidi::inference::Synthesizer> synthesizer;
+std::uint32_t synthesis_sample_rate = 0;
 // Incremented to abandon the transcription in progress, for example a draft made stale by the final request.
 std::atomic<std::uint64_t> speech_generation = 0;
+std::atomic<bool> tts_cancelled = false;
 
 class JavaString {
 public:
@@ -80,6 +88,16 @@ auto loaded_transcriber() -> kidi::inference::Transcriber& {
     return *transcriber;
 }
 
+auto loaded_synthesizer() -> kidi::inference::Synthesizer& {
+    if (!synthesizer) throw std::runtime_error("Load a TTS model first");
+    return *synthesizer;
+}
+
+auto throw_java(JNIEnv* environment, const std::string& message) -> void {
+    const auto type = environment->FindClass("java/lang/IllegalStateException");
+    if (type) environment->ThrowNew(type, message.c_str());
+}
+
 auto messages(std::string_view source) -> std::vector<kidi::text::ChatMessage> {
     std::vector<kidi::text::ChatMessage> result;
     for (const auto& message : nlohmann::json::parse(source)) {
@@ -95,9 +113,14 @@ auto messages(std::string_view source) -> std::vector<kidi::text::ChatMessage> {
 /// an explicit accelerator is tried alone so failures stay visible.
 auto candidates(std::string_view accelerator, bool speech) -> std::vector<kidi::tensor::Device> {
     if (accelerator != "auto") return {kidi::ops::require(kidi::inference::select_device(accelerator, speech))};
-    if (speech) return {kidi::tensor::Device::cpu()};
+    if (speech) {
+        std::vector<kidi::tensor::Device> result;
+        if (auto device = kidi::inference::select_device("npu", true)) result.push_back(*device);
+        result.push_back(kidi::tensor::Device::cpu());
+        return result;
+    }
     std::vector<kidi::tensor::Device> result;
-    for (const auto choice : {"npu", "gpu"}) {
+    for (const auto choice : {"gpu"}) {
         auto device = kidi::inference::select_device(choice);
         if (device) result.push_back(*device);
     }
@@ -212,7 +235,7 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_configure(JNI
         std::scoped_lock configure_lock(configure_mutex);
         if (kidi::runtime::ynn::thread_count() == static_cast<std::size_t>(threads))
             return {{"configured", true}, {"threads", threads}, {"backend", "android-cpu"}};
-        std::scoped_lock lock(runtime_mutex, speech_mutex);
+        std::scoped_lock lock(runtime_mutex, speech_mutex, tts_mutex);
         kidi::runtime::ynn::set_thread_count(threads);
         kidi::ops::require(kidi::runtime::ynn::reserve_thread_pool(threads));
         return {{"configured", true}, {"threads", threads}, {"backend", "android-cpu"}};
@@ -238,10 +261,13 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_setDataDirect
         const std::filesystem::path root(JavaString(environment, directory).get());
         const auto dsp_directory_value = JavaString(environment, dsp_directory).get();
         // Packaged QNN libraries are preferred; files/qnn is a fallback for custom builds.
-        const auto libraries = root / "qnn", cache = root / "qnn-cache";
+        const std::filesystem::path packaged(dsp_directory_value);
+        const auto fallback = root / "qnn";
+        const auto libraries = std::filesystem::exists(packaged / "libQnnHtp.so") ? packaged : fallback;
+        const auto cache = root / "qnn-cache";
         std::filesystem::create_directories(cache);
-        setenv("KIDI_QNN_LIBRARY_DIR", libraries.c_str(), 0);
-        setenv("KIDI_QNN_CACHE_DIR", cache.c_str(), 0);
+        setenv("KIDI_QNN_LIBRARY_DIR", libraries.c_str(), 1);
+        setenv("KIDI_QNN_CACHE_DIR", cache.c_str(), 1);
         if (!dsp_directory_value.empty()) setenv("KIDI_QNN_SKEL_DIR", dsp_directory_value.c_str(), 1);
         return {{"qnn_library_dir", libraries.string()},
                 {"qnn_cache_dir", cache.string()},
@@ -265,12 +291,14 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_load(JNIEnv* 
         if (!kv_cache_precision)
             throw kidi::ops::Failure(
                 {kidi::ErrorCode::INVALID_ARGUMENT, "unknown KV-cache precision: " + kv_cache_precision_text});
-        std::scoped_lock lock(runtime_mutex);
+        std::scoped_lock lock(runtime_mutex, tts_mutex);
         const auto started = std::chrono::steady_clock::now();
         const auto milliseconds = [](auto from, auto to) {
             return std::chrono::duration<double, std::milli>(to - from).count();
         };
         generator.reset();
+        synthesizer.reset();
+        synthesis_sample_rate = 0;
         nlohmann::json attempts = nlohmann::json::array(), stages;
         for (const auto device : candidates(preference, false)) {
             const auto attempt_started = std::chrono::steady_clock::now();
@@ -380,8 +408,10 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_loadAsr(JNIEn
         JavaString path(environment, directory);
         const auto preference = JavaString(environment, accelerator).get();
         const auto devices = candidates(preference, true);
-        std::scoped_lock lock(speech_mutex);
+        std::scoped_lock lock(speech_mutex, tts_mutex);
         transcriber.reset();
+        synthesizer.reset();
+        synthesis_sample_rate = 0;
         const auto load_start = std::chrono::steady_clock::now();
         auto stage_start = load_start;
         nlohmann::json stages = nlohmann::json::object();
@@ -499,6 +529,136 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_transcription
     return static_cast<jlong>(speech_generation.load());
 }
 
+extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_loadTts(JNIEnv* environment, jobject,
+                                                                          jstring directory,
+                                                                          jstring accelerator) -> jstring {
+    return answer(environment, [&]() -> nlohmann::json {
+        JavaString path(environment, directory);
+        const auto preference = JavaString(environment, accelerator).get();
+        std::scoped_lock lock(runtime_mutex, speech_mutex, tts_mutex);
+        tts_cancelled.store(false, std::memory_order_relaxed);
+        generator.reset();
+        transcriber.reset();
+        synthesizer.reset();
+        synthesis_sample_rate = 0;
+        const auto started = std::chrono::steady_clock::now();
+        nlohmann::json attempts = nlohmann::json::array();
+        for (const auto device : candidates(preference, false)) {
+            auto loaded = kidi::inference::Synthesizer::load(path.get(), device);
+            if (loaded) {
+                synthesizer.emplace(std::move(*loaded));
+                break;
+            }
+            attempts.push_back({{"device", kidi::tensor::to_string(device)}, {"error", loaded.error().message}});
+            if (preference != "auto") throw kidi::ops::Failure(loaded.error());
+        }
+        if (!synthesizer) throw std::runtime_error(attempts.back()["error"].get<std::string>());
+        return {{"ready", true},
+                {"backend", synthesizer->execution()},
+                {"accelerator", preference},
+                {"fallbacks", attempts},
+                {"load_ms", std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - started)
+                                .count()}};
+    });
+}
+
+extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_synthesize(JNIEnv* environment, jobject,
+                                                                              jstring text,
+                                                                              jstring language,
+                                                                              jint steps,
+                                                                              jstring voice_json,
+                                                                              jobject listener) -> jshortArray {
+    try {
+        const auto source = JavaString(environment, text).get();
+        const auto language_name = JavaString(environment, language).get();
+        const auto voice = nlohmann::json::parse(JavaString(environment, voice_json).get());
+        if (source.empty() || source.size() > 512)
+            throw std::runtime_error("Android read-aloud text must be 1-512 UTF-8 bytes");
+        if (steps < 1 || steps > 128) throw std::runtime_error("TTS diffusion steps must be between 1 and 128");
+        if (!voice.is_object()) throw std::runtime_error("TTS voice settings must be a JSON object");
+        std::scoped_lock lock(tts_mutex);
+        kidi::inference::SynthesisOptions options;
+        options.language = language_name.empty() ? "English" : language_name;
+        options.steps = static_cast<std::size_t>(steps);
+        options.on_progress = [](std::size_t, std::size_t) {
+            if (tts_cancelled.load(std::memory_order_relaxed))
+                throw std::runtime_error("TTS synthesis cancelled");
+        };
+        if (listener) {
+            const auto listener_class = environment->GetObjectClass(listener);
+            if (!listener_class) {
+                environment->ExceptionClear();
+                throw std::runtime_error("Unable to read TTS progress listener");
+            }
+            const auto method = environment->GetMethodID(listener_class, "onProgress", "(II)V");
+            environment->DeleteLocalRef(listener_class);
+            if (!method) {
+                environment->ExceptionClear();
+                throw std::runtime_error("Invalid TTS progress listener");
+            }
+            options.on_chunk = [environment, listener, method](std::size_t completed, std::size_t total) {
+                environment->CallVoidMethod(listener, method, static_cast<jint>(completed), static_cast<jint>(total));
+                if (environment->ExceptionCheck()) {
+                    environment->ExceptionClear();
+                    throw kidi::ops::Failure({kidi::ErrorCode::RUNTIME, "TTS progress listener failed"});
+                }
+            };
+        }
+        for (const auto& [name, value] : voice.items()) {
+            if (!value.is_string()) throw std::runtime_error("TTS voice settings must be strings");
+            if (const auto selected = value.get<std::string>(); !selected.empty()) options.voice[name] = selected;
+        }
+        const auto result = kidi::ops::require(loaded_synthesizer().synthesize(source, options));
+        if (tts_cancelled.load(std::memory_order_relaxed)) throw std::runtime_error("TTS synthesis cancelled");
+        std::uint64_t token_hash = 1469598103934665603ULL;
+        for (const auto token : result.tokens) {
+            token_hash ^= static_cast<std::uint32_t>(token);
+            token_hash *= 1099511628211ULL;
+        }
+        __android_log_print(
+            ANDROID_LOG_INFO, "KidiTts",
+            "synthesis_stats generation_ms=%.3f decode_ms=%.3f preparation_ms=%.3f "
+            "audio_tokens=%zu chunks=%zu samples=%zu text_bytes=%zu token_hash=%016llx",
+            result.stats.generation_ns / 1e6, result.stats.decode_ns / 1e6, result.stats.preparation_ns / 1e6,
+            result.stats.audio_tokens, result.stats.chunks, result.samples.size(), source.size(),
+            static_cast<unsigned long long>(token_hash));
+        if (result.samples.size() > static_cast<std::size_t>(std::numeric_limits<jsize>::max()))
+            throw std::runtime_error("Synthesized audio is too large for Android");
+        synthesis_sample_rate = result.sample_rate;
+        std::vector<jshort> pcm(result.samples.size());
+        for (std::size_t index = 0; index < result.samples.size(); ++index) {
+            const auto scaled = std::nearbyint(result.samples[index] * 32768.F);
+            pcm[index] = static_cast<jshort>(std::clamp(scaled, -32768.F, 32767.F));
+        }
+        auto output = environment->NewShortArray(static_cast<jsize>(pcm.size()));
+        if (!output) throw std::runtime_error("Unable to allocate Android audio buffer");
+        environment->SetShortArrayRegion(output, 0, static_cast<jsize>(pcm.size()), pcm.data());
+        if (environment->ExceptionCheck()) return nullptr;
+        return output;
+    } catch (const kidi::ops::Failure& error) {
+        throw_java(environment, error.error().message);
+    } catch (const std::exception& error) {
+        throw_java(environment, error.what());
+    } catch (...) {
+        throw_java(environment, "Unknown C++ TTS failure");
+    }
+    return nullptr;
+}
+
+extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_ttsSampleRate(JNIEnv* environment, jobject) -> jint {
+    std::scoped_lock lock(tts_mutex);
+    if (!synthesis_sample_rate) {
+        throw_java(environment, "Synthesize audio before requesting its sample rate");
+        return 0;
+    }
+    return static_cast<jint>(synthesis_sample_rate);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_ai_gowda_kidi_NativeRuntime_cancelTts(JNIEnv*, jobject) {
+    tts_cancelled.store(true, std::memory_order_relaxed);
+}
+
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_unload(JNIEnv*, jobject) -> void {
     std::scoped_lock lock(runtime_mutex);
     generator.reset();
@@ -507,4 +667,11 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_unload(JNIEnv
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_unloadAsr(JNIEnv*, jobject) -> void {
     std::scoped_lock lock(speech_mutex);
     transcriber.reset();
+}
+
+extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_unloadTts(JNIEnv*, jobject) -> void {
+    tts_cancelled.store(true, std::memory_order_relaxed);
+    std::scoped_lock lock(tts_mutex);
+    synthesizer.reset();
+    synthesis_sample_rate = 0;
 }

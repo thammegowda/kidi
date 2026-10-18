@@ -12,6 +12,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -39,6 +40,7 @@ private class PendingDraft(val samples: Int, val job: Deferred<JSONObject?>)
 
 private const val DEFAULT_MODEL_ID = "google/gemma-4-E2B-it-qat-mobile-transformers"
 private const val DEFAULT_SPEECH_MODEL_ID = "openai/whisper-small"
+private const val DEFAULT_CHAT_ACCELERATOR = "cpu"
 
 internal data class HardwareDiagnostic(
     val name: String,
@@ -125,6 +127,20 @@ internal data class KidiUiState(
     val speechProgress: Float = 0f,
     val speechProgressPhase: ModelDownloadPhase = ModelDownloadPhase.CONNECTING,
     val speechModelError: String? = null,
+    val ttsReady: Boolean = false,
+    val loadingTts: Boolean = false,
+    val ttsCompletedChunks: Int = 0,
+    val ttsTotalChunks: Int = 0,
+    val speakingMessageId: String? = null,
+    val ttsExecution: String = "",
+    val ttsLanguage: String = "English",
+    val ttsSteps: Int = 10,
+    val ttsModelDirectory: String = "",
+    val ttsGender: String = "female",
+    val ttsAge: String = "young adult",
+    val ttsPitch: String = "moderate",
+    val ttsStyle: String = "",
+    val ttsAccent: String = "",
 )
 
 internal fun KidiUiState.withProvisionalTranscript(text: String, start: Int, complete: Boolean = false): KidiUiState {
@@ -177,12 +193,21 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             threadCount = preferences.getInt(THREADS_KEY, defaultThreadCount()).coerceIn(1, 8),
             maximumTokens = preferences.getInt(TOKENS_KEY, 1024).coerceIn(1, 8192),
             chatAccelerator = preferences.getString(CHAT_ACCELERATOR_KEY, null)
-                ?.takeIf { it in ACCELERATOR_LABELS } ?: DEFAULT_ACCELERATOR,
+                ?.takeIf { it in ACCELERATOR_LABELS } ?: DEFAULT_CHAT_ACCELERATOR,
             speechAccelerator = preferences.getString(SPEECH_ACCELERATOR_KEY, null)
                 ?.takeIf { it in ACCELERATOR_LABELS } ?: DEFAULT_ACCELERATOR,
             photoSource = preferences.captureSource(PHOTO_SOURCE_KEY),
             speechSource = preferences.captureSource(SPEECH_SOURCE_KEY),
             pairedAccessoryName = runCatching { accessoryProfiles.profiles().firstOrNull()?.name }.getOrNull(),
+            ttsReady = repository.installedTts() != null,
+            ttsLanguage = preferences.getString(TTS_LANGUAGE_KEY, "English") ?: "English",
+            ttsSteps = preferences.getInt(TTS_STEPS_KEY, 10).coerceIn(1, 32),
+            ttsModelDirectory = repository.ttsDirectory().absolutePath,
+            ttsGender = preferences.getString(TTS_GENDER_KEY, "female")?.takeIf(TTS_GENDERS::contains) ?: "female",
+            ttsAge = preferences.getString(TTS_AGE_KEY, "young adult")?.takeIf(TTS_AGES::contains) ?: "young adult",
+            ttsPitch = preferences.getString(TTS_PITCH_KEY, "moderate")?.takeIf(TTS_PITCHES::contains) ?: "moderate",
+            ttsStyle = preferences.getString(TTS_STYLE_KEY, "")?.takeIf(TTS_STYLES::contains) ?: "",
+            ttsAccent = preferences.getString(TTS_ACCENT_KEY, "")?.takeIf(TTS_ACCENTS::contains) ?: "",
         ),
     )
     val state: StateFlow<KidiUiState> = _state.asStateFlow()
@@ -190,8 +215,13 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     @Volatile
     private var requestId: Long? = null
     private val stopRequested = AtomicBoolean()
+    private val ttsPlayer = TtsPlayer(application)
     private var modelJob: Job? = null
     private var speechJob: Job? = null
+    private var ttsJob: Job? = null
+    private val ttsStopRequested = AtomicBoolean()
+    @Volatile
+    private var ttsRequest = 0L
     private var recordingJob: Job? = null
     private var historyJob: Job? = null
     private var responseAgent = ChatParticipant.LEGACY_AGENT
@@ -404,7 +434,9 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun attachImage(uri: Uri) {
         val current = _state.value
-        if (current.generating || current.recording || current.transcribing || current.importingImage) return
+        if (current.generating || current.recording || current.transcribing || current.importingImage ||
+            current.loadingTts)
+            return
         _state.update { it.copy(importingImage = true, error = null) }
         viewModelScope.launch {
             try {
@@ -420,7 +452,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
     }
 
     fun removePendingImage() {
-        if (_state.value.importingImage || _state.value.generating) return
+        if (_state.value.importingImage || _state.value.generating || _state.value.loadingTts) return
         val pending = _state.value.pendingImages
         _state.update { it.copy(pendingImages = emptyList()) }
         viewModelScope.launch(Dispatchers.IO) { pending.forEach(imageStore::removeDraft) }
@@ -428,7 +460,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun setThreadCount(value: Int) {
         if (value !in 1..8 || _state.value.loadingModel || _state.value.loadingSpeech || _state.value.generating ||
-            _state.value.recording || _state.value.transcribing)
+            _state.value.recording || _state.value.transcribing || _state.value.loadingTts)
             return
         val previous = _state.value.threadCount
         preferences.edit { putInt(THREADS_KEY, value) }
@@ -445,7 +477,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     private fun busy() = _state.value.let {
         it.loadingModel || it.loadingSpeech || it.generating || it.recording || it.transcribing ||
-            it.pairing || it.accessoryBusy
+            it.loadingTts || it.pairing || it.accessoryBusy
     }
 
     fun setChatAccelerator(value: String) {
@@ -468,9 +500,52 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         _state.update { it.copy(maximumTokens = value) }
     }
 
+    fun setTtsLanguage(value: String) {
+        val language = value.take(64)
+        preferences.edit { putString(TTS_LANGUAGE_KEY, language) }
+        _state.update { it.copy(ttsLanguage = language) }
+    }
+
+    fun setTtsSteps(value: Int) {
+        if (value !in 1..32 || busy()) return
+        preferences.edit { putInt(TTS_STEPS_KEY, value) }
+        _state.update { it.copy(ttsSteps = value) }
+    }
+
+    fun setTtsGender(value: String) = setTtsVoice(TTS_GENDER_KEY, value, TTS_GENDERS) {
+        copy(ttsGender = value)
+    }
+
+    fun setTtsAge(value: String) = setTtsVoice(TTS_AGE_KEY, value, TTS_AGES) {
+        copy(ttsAge = value)
+    }
+
+    fun setTtsPitch(value: String) = setTtsVoice(TTS_PITCH_KEY, value, TTS_PITCHES) {
+        copy(ttsPitch = value)
+    }
+
+    fun setTtsStyle(value: String) = setTtsVoice(TTS_STYLE_KEY, value, TTS_STYLES) {
+        copy(ttsStyle = value)
+    }
+
+    fun setTtsAccent(value: String) = setTtsVoice(TTS_ACCENT_KEY, value, TTS_ACCENTS) {
+        copy(ttsAccent = value)
+    }
+
+    private fun setTtsVoice(
+        key: String,
+        value: String,
+        allowed: Set<String>,
+        update: KidiUiState.() -> KidiUiState,
+    ) {
+        if (value !in allowed || busy()) return
+        preferences.edit { putString(key, value) }
+        _state.update { it.update() }
+    }
+
     fun installModel() {
         if (_state.value.loadingModel || _state.value.loadingSpeech || _state.value.generating ||
-            _state.value.recording || _state.value.transcribing)
+            _state.value.recording || _state.value.transcribing || _state.value.loadingTts)
             return
         val modelId = _state.value.modelId.trim()
         preferences.edit { putString(MODEL_ID_KEY, modelId) }
@@ -513,7 +588,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun installSpeechModel() {
         if (_state.value.loadingModel || _state.value.loadingSpeech || _state.value.generating ||
-            _state.value.recording || _state.value.transcribing)
+            _state.value.recording || _state.value.transcribing || _state.value.loadingTts)
             return
         val modelId = _state.value.speechModelId.trim()
         preferences.edit { putString(SPEECH_MODEL_ID_KEY, modelId) }
@@ -669,6 +744,171 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         _state.update { it.copy(stopping = true, status = "Stopping after current step") }
     }
 
+    fun speak(message: ChatMessage) {
+        val current = _state.value
+        if (message.role != MessageRole.ASSISTANT || message.status != MessageStatus.COMPLETE ||
+            message.content.isBlank())
+            return
+        if (current.speakingMessageId == message.id) {
+            if (current.loadingTts) {
+                ttsStopRequested.set(true)
+                NativeRuntime.cancelTts()
+                _state.update { it.copy(status = "Stopping speech") }
+                return
+            }
+            ttsPlayer.stop()
+            _state.update { it.copy(speakingMessageId = null, status = readyStatus(it)) }
+            return
+        }
+        if (message.content.toByteArray(Charsets.UTF_8).size > 512) {
+            _state.update { it.copy(error = "Read aloud supports responses up to 512 UTF-8 bytes") }
+            return
+        }
+        if (current.chatBusyState || current.loadingSpeech || current.loadingTts) return
+        val ttsModel = repository.installedTts()
+        if (ttsModel == null) {
+            _state.update {
+                it.copy(
+                    ttsReady = false,
+                    error = "Copy the converted OmniVoice model to ${repository.ttsDirectory().absolutePath}",
+                )
+            }
+            return
+        }
+        val chatModel = repository.installed()
+        val speechModel = repository.installedSpeech()
+        val ttsLanguage = current.ttsLanguage.ifBlank { "English" }
+        val ttsSteps = current.ttsSteps
+        val ttsVoice = JSONObject()
+            .put("gender", current.ttsGender)
+            .put("age", current.ttsAge)
+            .put("pitch", current.ttsPitch)
+            .put("style", current.ttsStyle)
+            .put("accent", current.ttsAccent)
+            .toString()
+        ttsPlayer.stop()
+        ttsStopRequested.set(false)
+        val request = ++ttsRequest
+        _state.update {
+            it.copy(
+                modelReady = false,
+                visionReady = false,
+                speechReady = false,
+                loadingTts = true,
+                ttsCompletedChunks = 0,
+                ttsTotalChunks = 0,
+                speakingMessageId = message.id,
+                ttsReady = true,
+                status = "Preparing speech",
+                error = null,
+            )
+        }
+        val job = viewModelScope.launch(runtimeDispatcher, start = CoroutineStart.LAZY) {
+            var ttsError: String? = null
+            try {
+                NativeRuntime.unload()
+                NativeRuntime.unloadAsr()
+                checked(NativeRuntime.configure(Runtime.getRuntime().availableProcessors().coerceIn(1, 8)))
+                val loaded = checked(NativeRuntime.loadTts(ttsModel.absolutePath, DEFAULT_ACCELERATOR))
+                if (ttsStopRequested.get()) {
+                    NativeRuntime.cancelTts()
+                    throw CancellationException("TTS synthesis cancelled")
+                }
+                _state.update { it.copy(status = "Synthesizing response") }
+                val samples = NativeRuntime.synthesize(
+                    message.content,
+                    ttsLanguage,
+                    ttsSteps,
+                    ttsVoice,
+                    NativeRuntime.TtsProgressListener { completed, total ->
+                        if (ttsRequest == request && !ttsStopRequested.get()) {
+                            require(total > 0 && completed in 1..total) { "Invalid synthesis progress" }
+                            _state.update {
+                                it.copy(
+                                    ttsCompletedChunks = completed,
+                                    ttsTotalChunks = total,
+                                    status = "Synthesizing speech ($completed/$total)",
+                                )
+                            }
+                        }
+                    },
+                )
+                val sampleRate = NativeRuntime.ttsSampleRate()
+                Log.i(
+                    "KidiTts",
+                    "backend=${loaded.optString("backend")} load_ms=${loaded.optDouble("load_ms")} " +
+                        "samples=${samples.size} sample_rate=$sampleRate",
+                )
+                withContext(Dispatchers.Main) {
+                    if (ttsStopRequested.get() || ttsRequest != request)
+                        throw CancellationException("TTS synthesis cancelled")
+                    _state.update {
+                        it.copy(
+                            loadingTts = false,
+                            ttsCompletedChunks = 0,
+                            ttsTotalChunks = 0,
+                            ttsExecution = loaded.optString("backend"),
+                            status = "Playing response",
+                        )
+                    }
+                    ttsPlayer.play(
+                        samples,
+                        sampleRate,
+                        onError = { error ->
+                            if (ttsRequest == request) {
+                                _state.update {
+                                    it.copy(
+                                        speakingMessageId = null,
+                                        status = readyStatus(it),
+                                        error = "Unable to play speech: ${error.userMessage()}",
+                                    )
+                                }
+                            }
+                        },
+                        onComplete = {
+                            if (ttsRequest == request)
+                                _state.update { it.copy(speakingMessageId = null, status = readyStatus(it)) }
+                        },
+                    )
+                }
+            } catch (error: CancellationException) {
+                _state.update {
+                    it.copy(
+                        loadingTts = false,
+                        ttsCompletedChunks = 0,
+                        ttsTotalChunks = 0,
+                        speakingMessageId = null,
+                        status = readyStatus(it),
+                    )
+                }
+                throw error
+            } catch (error: Throwable) {
+                val detail = error.userMessage()
+                if (!detail.contains("cancelled", ignoreCase = true))
+                    ttsError = "Unable to read response aloud: $detail"
+                _state.update {
+                    it.copy(
+                        loadingTts = false,
+                        ttsCompletedChunks = 0,
+                        ttsTotalChunks = 0,
+                        speakingMessageId = null,
+                        status = readyStatus(it),
+                    )
+                }
+            } finally {
+                NativeRuntime.unloadTts()
+                if (ttsRequest == request) {
+                    chatModel?.let(::load)
+                    speechModel?.let(::loadSpeech)
+                    ttsError?.let { messageText -> _state.update { it.copy(error = messageText) } }
+                    ttsJob = null
+                }
+            }
+        }
+        ttsJob = job
+        job.start()
+    }
+
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     fun startPhoneRecording() = startRecording(CaptureSource.PHONE)
 
@@ -682,7 +922,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
             return
         }
         if (current.generating || current.loadingSpeech || current.recording || current.transcribing ||
-            current.pairing || current.accessoryBusy)
+            current.loadingTts || current.pairing || current.accessoryBusy)
             return
         val accessoryProfile = if (source == CaptureSource.ACCESSORY) {
             runCatching { accessoryProfiles.profiles().firstOrNull() }.getOrNull() ?: run {
@@ -875,7 +1115,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun newChat() {
         if (_state.value.generating || _state.value.loadingChat || _state.value.importingImage ||
-            _state.value.recording || _state.value.transcribing)
+            _state.value.recording || _state.value.transcribing || _state.value.loadingTts)
             return
         removePendingImage()
         _state.update { it.copy(loadingChat = true) }
@@ -894,7 +1134,9 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun openChat(id: String) {
         val current = _state.value
-        if (current.generating || current.recording || current.transcribing || current.loadingChat || current.importingImage || id == current.activeChatId) return
+        if (current.generating || current.recording || current.transcribing || current.loadingChat ||
+            current.importingImage || current.loadingTts || id == current.activeChatId)
+            return
         removePendingImage()
         _state.update { it.copy(loadingChat = true) }
         viewModelScope.launch {
@@ -964,7 +1206,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun removeModel() {
         if (_state.value.generating || _state.value.loadingModel || _state.value.loadingSpeech ||
-            _state.value.recording || _state.value.transcribing)
+            _state.value.recording || _state.value.transcribing || _state.value.loadingTts)
             return
         viewModelScope.launch {
             withContext(runtimeDispatcher) { NativeRuntime.unload() }
@@ -977,7 +1219,7 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
 
     fun removeSpeechModel() {
         if (_state.value.generating || _state.value.loadingModel || _state.value.loadingSpeech ||
-            _state.value.recording || _state.value.transcribing)
+            _state.value.recording || _state.value.transcribing || _state.value.loadingTts)
             return
         viewModelScope.launch {
             withContext(speechDispatcher) { NativeRuntime.unloadAsr() }
@@ -1189,12 +1431,18 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         stopRequested.set(true)
         speechRecorder.stop()
         recordingJob?.cancel()
+        ttsStopRequested.set(true)
+        NativeRuntime.cancelTts()
+        ttsJob?.cancel()
+        ++ttsRequest
+        ttsPlayer.close()
         val id = requestId
         NativeRuntime.cancelTranscription()
         speechExecutor.execute { NativeRuntime.unloadAsr() }
         speechExecutor.shutdown()
         runtimeExecutor.execute {
             if (id != null) runCatching { NativeRuntime.cancel(id) }
+            NativeRuntime.unloadTts()
             NativeRuntime.unload()
             chats.close()
         }
@@ -1213,6 +1461,13 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         const val TOKENS_KEY = "tokens"
         const val CHAT_ACCELERATOR_KEY = "chat-accelerator"
         const val SPEECH_ACCELERATOR_KEY = "speech-accelerator"
+        const val TTS_LANGUAGE_KEY = "tts-language"
+        const val TTS_STEPS_KEY = "tts-steps"
+        const val TTS_GENDER_KEY = "tts-gender"
+        const val TTS_AGE_KEY = "tts-age"
+        const val TTS_PITCH_KEY = "tts-pitch"
+        const val TTS_STYLE_KEY = "tts-style"
+        const val TTS_ACCENT_KEY = "tts-accent"
         const val PHOTO_SOURCE_KEY = "photo-source"
         const val SPEECH_SOURCE_KEY = "speech-source"
         const val MESSAGES_KEY = "messages"
@@ -1220,12 +1475,29 @@ internal class ChatViewModel(application: Application) : AndroidViewModel(applic
         const val DRAFT_INTERVAL_SAMPLES = 19200
         const val PAUSE_SAMPLES = 4800
         const val SPEECH_TAIL_SAMPLES = 3200
+        val TTS_GENDERS = setOf("female", "male")
+        val TTS_AGES = setOf("child", "teenager", "young adult", "middle-aged", "elderly")
+        val TTS_PITCHES = setOf("very low", "low", "moderate", "high", "very high")
+        val TTS_STYLES = setOf("", "whisper")
+        val TTS_ACCENTS = setOf(
+            "",
+            "american",
+            "british",
+            "australian",
+            "chinese",
+            "canadian",
+            "indian",
+            "korean",
+            "portuguese",
+            "russian",
+            "japanese",
+        )
     }
 }
 
 private val KidiUiState.chatBusyState: Boolean
     get() = generating || recording || transcribing || loadingModel || loadingChat || importingImage ||
-        pairing || accessoryBusy
+        loadingTts || pairing || accessoryBusy
 
 private fun SharedPreferences.captureSource(key: String): CaptureSource =
     runCatching { CaptureSource.valueOf(getString(key, null) ?: CaptureSource.PHONE.name) }

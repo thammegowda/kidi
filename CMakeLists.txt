@@ -12,12 +12,14 @@ option(KIDI_BUILD_TESTS "Build kidi tests" ON)
 option(KIDI_BUILD_INTEGRATION_TESTS "Register Python, browser, and model regression tests" OFF)
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
+set(KIDI_DESKTOP_APP_DEFAULT ON)
+if(ANDROID OR EMSCRIPTEN)
+    set(KIDI_DESKTOP_APP_DEFAULT OFF)
+endif()
+option(KIDI_BUILD_DESKTOP_APP "Build the native LiteApp web UI" ${KIDI_DESKTOP_APP_DEFAULT})
 if(EMSCRIPTEN)
     option(KIDI_WASM_THREADS "Enable WebAssembly pthreads" ON)
     option(KIDI_WASM_WEBGPU "Build the WebGPU execution backend" OFF)
-    if(KIDI_WASM_WEBGPU AND KIDI_WASM_THREADS)
-        message(WARNING "WebGPU with pthreads is untested; the app pairs WebGPU with the single-thread build")
-    endif()
     # 64-bit C++ pointers lowered to a 4 GiB wasm32 memory, which every engine supports (Safari has no Memory64).
     set(KIDI_WASM_ADDRESS_FLAG -sMEMORY64=2)
     add_compile_options(${KIDI_WASM_ADDRESS_FLAG} -msimd128)
@@ -76,8 +78,11 @@ target_include_directories(kidi_argparse PUBLIC $<BUILD_INTERFACE:${CMAKE_CURREN
 target_compile_features(kidi_argparse PUBLIC cxx_std_23)
 
 add_library(kidi
+    src/kidi/audio/duration.cpp
+    src/kidi/audio/wav.cpp
     src/kidi/audio/whisper.cpp
     src/kidi/checkpoint/config.cpp
+    src/kidi/checkpoint/hub.cpp
     src/kidi/checkpoint/ggml/reader.cpp
     src/kidi/checkpoint/package.cpp
     src/kidi/checkpoint/prepare.cpp
@@ -89,14 +94,22 @@ add_library(kidi
     src/kidi/image/gemma4.cpp
     src/kidi/inference/decoder.cpp
     src/kidi/inference/generator.cpp
+    src/kidi/inference/synthesizer.cpp
     src/kidi/inference/transcriber.cpp
     src/kidi/inference/translator.cpp
     src/kidi/layers/position_encoding.cpp
+    src/kidi/layers/audio.cpp
     src/kidi/layers/gemma4.cpp
+    src/kidi/layers/higgs_audio.cpp
+    src/kidi/layers/qwen3.cpp
     src/kidi/layers/transformer.cpp
     src/kidi/layers/whisper.cpp
     src/kidi/model/gemma4.cpp
     src/kidi/model/gemma4_vision.cpp
+    src/kidi/model/kokoro.cpp
+    src/kidi/model/omnivoice.cpp
+    src/kidi/model/qwen3.cpp
+    src/kidi/model/registry.cpp
     src/kidi/model/transformer.cpp
     src/kidi/model/whisper.cpp
     src/kidi/ops/context.cpp
@@ -109,6 +122,8 @@ add_library(kidi
     src/kidi/tensor/cpu_backend.cpp
     src/kidi/tensor/external.cpp
     src/kidi/tensor/tensor.cpp
+    src/kidi/text/phonemizer.cpp
+    src/kidi/text/sentence.cpp
     src/kidi/text/tokenizer.cpp
 )
 add_library(kidi::kidi ALIAS kidi)
@@ -119,7 +134,7 @@ if(EMSCRIPTEN)
         target_link_libraries(kidi PRIVATE nlohmann_json::nlohmann_json)
         target_compile_definitions(kidi PUBLIC KIDI_HAS_WEBGPU=1)
     endif()
-    add_executable(kidi_wasm src/kidi/web/bindings.cpp)
+    add_executable(kidi_wasm src/kidi/platform/wasm/bindings.cpp)
     target_link_libraries(kidi_wasm PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
     set_target_properties(kidi_wasm PROPERTIES OUTPUT_NAME kidi SUFFIX .mjs)
     target_link_options(kidi_wasm PRIVATE
@@ -130,7 +145,7 @@ if(EMSCRIPTEN)
     )
     # The app never waits on the GPU inside Wasm. Only the backend test reads results inline, through JSPI.
     if(KIDI_WASM_WEBGPU AND KIDI_BUILD_TESTS)
-        add_executable(kidi_webgpu_test tests/web/backend_test.cpp)
+        add_executable(kidi_webgpu_test tests/browser/backend_test.cpp)
         target_link_libraries(kidi_webgpu_test PRIVATE kidi::kidi)
         set_target_properties(kidi_webgpu_test PROPERTIES SUFFIX .mjs)
         target_link_options(kidi_webgpu_test PRIVATE --no-entry -sMODULARIZE=1 -sJSPI=1
@@ -142,6 +157,7 @@ endif()
 option(KIDI_ENABLE_VULKAN "Build the Vulkan GPU backend" ${ANDROID})
 option(KIDI_ENABLE_QNN "Build the Qualcomm NPU step compiler (loads QNN at runtime)" ${ANDROID})
 set(KIDI_QNN_SDK "" CACHE PATH "QAIRT SDK root providing QNN headers for the NPU backend and benchmarks")
+add_subdirectory(kidi-ops EXCLUDE_FROM_ALL)
 if(KIDI_ENABLE_VULKAN)
     include(cmake/vulkan.cmake)
 endif()
@@ -150,6 +166,8 @@ if(KIDI_ENABLE_QNN)
 endif()
 
 if(KIDI_BUILD_BENCHMARKS)
+    add_executable(kidi_tts_bench benchmarks/tts/synthesis.cpp)
+    target_link_libraries(kidi_tts_bench PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
     add_executable(kidi_gemma4_quality benchmarks/gemma4/quality.cpp)
     target_link_libraries(kidi_gemma4_quality PRIVATE kidi::kidi)
     add_executable(kidi_whisper_quality benchmarks/whisper/quality.cpp)
@@ -231,6 +249,7 @@ target_link_libraries(kidi
         ynnpack_composites
         yaml-cpp::yaml-cpp
     PRIVATE
+        uni-algo::uni-algo
         tokenizerpp
         TahomaVision::Vision
         kidi::zlib
@@ -326,6 +345,91 @@ target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi spdlog::spd
 add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)
 set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
 target_link_libraries(kidi_cli PRIVATE kidi_cli_main)
+
+if(KIDI_BUILD_DESKTOP_APP)
+    set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "Build LiteApp's GoogleTest suite" FORCE)
+    add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
+    set(KIDI_DESKTOP_WEB_STAGE "${CMAKE_CURRENT_BINARY_DIR}/generated/desktop-web")
+    file(MAKE_DIRECTORY
+        "${KIDI_DESKTOP_WEB_STAGE}"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/marked"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/dompurify"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/highlightjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/icons"
+    )
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/web/ui/assets.txt")
+    file(STRINGS "web/ui/assets.txt" KIDI_SHARED_WEB_FILES)
+    set(KIDI_DESKTOP_WEB_FILES
+        backend.js
+        capture-worklet.js
+        playback-worklet.js
+    )
+    file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}/icons")
+    foreach(file IN LISTS KIDI_SHARED_WEB_FILES)
+        configure_file("web/ui/${file}" "${KIDI_DESKTOP_WEB_STAGE}/${file}" COPYONLY)
+    endforeach()
+    foreach(file IN LISTS KIDI_DESKTOP_WEB_FILES)
+        configure_file("web/hosts/desktop/${file}" "${KIDI_DESKTOP_WEB_STAGE}/${file}" COPYONLY)
+    endforeach()
+    configure_file("web/libs/marked/marked.esm.js"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/marked/marked.esm.js" COPYONLY)
+    configure_file("web/libs/dompurify/purify.es.mjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/dompurify/purify.es.mjs" COPYONLY)
+    configure_file("web/libs/highlightjs/highlight.min.js"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/highlightjs/highlight.min.js" COPYONLY)
+    configure_file("third_party/liteapp/web/transport/websocket-transport.mjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/websocket-transport.mjs" COPYONLY)
+    configure_file("third_party/liteapp/web/transport/channel.mjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/channel.mjs" COPYONLY)
+    configure_file("third_party/liteapp/web/host/event-client.mjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/event-client.mjs" COPYONLY)
+    configure_file("third_party/liteapp/web/transport/protocol.mjs"
+        "${KIDI_DESKTOP_WEB_STAGE}/protocol.mjs" COPYONLY)
+    file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}/libs/mermaid")
+    configure_file("web/libs/mermaid/mermaid.min.js"
+        "${KIDI_DESKTOP_WEB_STAGE}/libs/mermaid/mermaid.min.js" COPYONLY)
+    configure_file("web/libs/lucide-static/icons/mic.svg"
+        "${KIDI_DESKTOP_WEB_STAGE}/icons/mic.svg" COPYONLY)
+    configure_file("web/libs/lucide-static/icons/message-square.svg"
+        "${KIDI_DESKTOP_WEB_STAGE}/icons/message-square.svg" COPYONLY)
+    configure_file("web/libs/lucide-static/icons/square.svg"
+        "${KIDI_DESKTOP_WEB_STAGE}/icons/square.svg" COPYONLY)
+    configure_file("web/libs/lucide-static/icons/settings.svg"
+        "${KIDI_DESKTOP_WEB_STAGE}/icons/settings.svg" COPYONLY)
+    liteapp_embed_archive(
+        TARGET kidi_desktop_assets
+        NAMESPACE kidi::desktop_assets
+        HEADER kidi/desktop_assets.h
+        ROOT "${KIDI_DESKTOP_WEB_STAGE}"
+        FILES
+            ${KIDI_SHARED_WEB_FILES}
+            ${KIDI_DESKTOP_WEB_FILES}
+            libs/marked/marked.esm.js
+            libs/dompurify/purify.es.mjs
+            libs/highlightjs/highlight.min.js
+            libs/mermaid/mermaid.min.js
+            channel.mjs
+            event-client.mjs
+            protocol.mjs
+            websocket-transport.mjs
+            icons/mic.svg
+            icons/message-square.svg
+            icons/square.svg
+            icons/settings.svg
+    )
+    add_executable(kidi_app desktop/app.cpp)
+    set_target_properties(kidi_app PROPERTIES OUTPUT_NAME kidi-app)
+    target_link_libraries(kidi_app PRIVATE
+        kidi::kidi
+        kidi_desktop_assets
+        liteapp::app
+        liteapp::service
+        liteapp::vfs
+        nlohmann_json::nlohmann_json
+    )
+    liteapp_harden(kidi_app)
+endif()
 
 if(KIDI_BUILD_PYTHON)
     find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module Development.SABIModule)

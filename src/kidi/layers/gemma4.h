@@ -6,10 +6,13 @@ namespace kidi::layers {
 KIDI_MODULE(RmsNorm);
 class RmsNormImpl : public Module {
 public:
-    RmsNormImpl(std::int32_t width, float epsilon, bool learned = true);
+    RmsNormImpl(std::int32_t width, float epsilon, bool learned = true, bool quantized = false);
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
-    auto forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
-                        const Tensor& sine) const -> Tensor;
+    auto forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine, const Tensor& sine) const
+        -> Tensor;
+    auto forward_rotary_slice(ops::Context& context, const Tensor& input, const Tensor& cosine, const Tensor& sine,
+                              std::int64_t heads, std::int64_t width, std::int64_t channel_offset,
+                              std::int64_t sequence_offset, std::int64_t sequence_length) const -> Tensor;
     auto forward_axial_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
                               const Tensor& sine) const -> Tensor;
 
@@ -17,7 +20,11 @@ public:
                           const Tensor& output_scale = {}) const -> Tensor;
 
 private:
+    auto weight() const -> const Tensor&;
+
     Tensor weight_;
+    std::optional<QuantizedState> qstate_;
+    tensor::Device target_device_;
     float epsilon_;
 };
 
@@ -29,6 +36,7 @@ public:
     auto forward(ops::Context& context, std::span<const std::int32_t> tokens) const -> Tensor;
     /// Embeds an I32 `[tokens]` tensor as `[1, tokens, width]`, on the device where supported.
     auto forward(ops::Context& context, const Tensor& tokens) const -> Tensor;
+    auto forward_sum(ops::Context& context, const Tensor& tokens) const -> Tensor;
     /// True when the table lives outside linear memory. Lookups then gather rows on the host, so captured steps must
     /// pass the embedded rows in as step inputs instead of recording the lookup.
     auto external() const -> bool;
@@ -41,17 +49,20 @@ private:
 };
 
 KIDI_MODULE(GatedFeedForward);
+enum class GatedActivation { GELU, SILU };
 struct GatedFeedForwardStages {
     Tensor gate, up, hidden, output;
 };
 class GatedFeedForwardImpl : public Module {
 public:
-    GatedFeedForwardImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t packed_bits = 0);
+    GatedFeedForwardImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t packed_bits = 0,
+                         GatedActivation activation = GatedActivation::GELU);
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
     auto forward_stages(ops::Context& context, const Tensor& input) const -> GatedFeedForwardStages;
 
 private:
     Linear gate_up_, down_;
+    GatedActivation activation_;
 };
 
 KIDI_MODULE(Gemma4Attention);

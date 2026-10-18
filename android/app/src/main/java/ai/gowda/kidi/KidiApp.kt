@@ -46,6 +46,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddComment
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.CheckCircle
@@ -238,6 +239,7 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
         onStop = viewModel::stop,
         onRecord = startRecording,
         onStopRecording = viewModel::stopRecording,
+        onSpeak = viewModel::speak,
         onHistoryOpen = viewModel::refreshHistory,
         onHistoryQuery = viewModel::searchHistory,
         onOpenChat = viewModel::openChat,
@@ -302,6 +304,13 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
             onThreads = viewModel::setThreadCount,
             onChatAccelerator = viewModel::setChatAccelerator,
             onSpeechAccelerator = viewModel::setSpeechAccelerator,
+            onTtsLanguage = viewModel::setTtsLanguage,
+            onTtsSteps = viewModel::setTtsSteps,
+            onTtsGender = viewModel::setTtsGender,
+            onTtsAge = viewModel::setTtsAge,
+            onTtsPitch = viewModel::setTtsPitch,
+            onTtsStyle = viewModel::setTtsStyle,
+            onTtsAccent = viewModel::setTtsAccent,
             onTokens = viewModel::setMaximumTokens,
             onInstall = viewModel::installModel,
             onCancelChat = viewModel::cancelModelInstall,
@@ -347,16 +356,16 @@ private fun KidiScreen(state: KidiUiState, viewModel: ChatViewModel) {
 
 private val KidiUiState.runtimeBusy: Boolean
     get() = generating || recording || transcribing || loadingModel || loadingSpeech || loadingChat ||
-        importingImage || pairing || accessoryBusy
+        loadingTts || importingImage || pairing || accessoryBusy
 
 private val KidiUiState.chatBusy: Boolean
     get() = generating || recording || transcribing || loadingModel || loadingChat || importingImage ||
-        pairing || accessoryBusy
+        loadingTts || pairing || accessoryBusy
 
 /** Dictation runs on its own thread, so it stays available while the chat model loads. */
 private val KidiUiState.speechBusy: Boolean
     get() = generating || recording || transcribing || loadingSpeech || loadingChat || importingImage ||
-        pairing || accessoryBusy
+        loadingTts || pairing || accessoryBusy
 
 private fun modelLabel(modelId: String) = when (modelId) {
     "google/gemma-4-E2B-it-qat-mobile-transformers" -> "Gemma 4 E2B"
@@ -395,6 +404,7 @@ internal fun ChatWorkspace(
     onRemoveImage: () -> Unit = {},
     onPhotoSourceChange: (CaptureSource) -> Unit = {},
     onSpeechSourceChange: (CaptureSource) -> Unit = {},
+    onSpeak: (ChatMessage) -> Unit = {},
 ) {
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -422,7 +432,14 @@ internal fun ChatWorkspace(
                 onPickImage, onTakePhoto, onRemoveImage, onPhotoSourceChange, onSpeechSourceChange) },
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding), contentAlignment = Alignment.TopCenter) {
-                Conversation(state, onSettings, onTextChange, Modifier.widthIn(max = 760.dp).fillMaxSize(), onOlderMessages)
+                Conversation(
+                    state,
+                    onSettings,
+                    onTextChange,
+                    Modifier.widthIn(max = 760.dp).fillMaxSize(),
+                    onOlderMessages,
+                    onSpeak,
+                )
             }
         }
     }
@@ -553,6 +570,7 @@ private fun Conversation(
     onPrompt: (String) -> Unit,
     modifier: Modifier = Modifier,
     onOlderMessages: () -> Unit = {},
+    onSpeak: (ChatMessage) -> Unit = {},
 ) {
     val listState = rememberLazyListState()
     var followResponse by remember { mutableStateOf(true) }
@@ -583,7 +601,18 @@ private fun Conversation(
                     Text(if (state.loadingOlderMessages) "Loading messages" else "Earlier messages")
                 }
             }
-            items(state.messages.size, key = { state.messages[it].id }) { index -> MessageRow(state.messages[index]) }
+            items(state.messages.size, key = { state.messages[it].id }) { index ->
+                val message = state.messages[index]
+                MessageRow(
+                    message,
+                    speaking = state.speakingMessageId == message.id,
+                    synthesizing = state.loadingTts && state.speakingMessageId == message.id,
+                    synthesisProgress = if (state.ttsTotalChunks > 0)
+                        state.ttsCompletedChunks.toFloat() / state.ttsTotalChunks else null,
+                    canSpeak = !state.runtimeBusy || state.speakingMessageId == message.id,
+                    onSpeak = onSpeak,
+                )
+            }
             if (state.generating) item(key = "draft") {
                 MessageRow(ChatMessage(MessageRole.ASSISTANT, state.draft), active = true)
             }
@@ -649,7 +678,15 @@ private fun EmptyConversation(
 }
 
 @Composable
-private fun MessageRow(message: ChatMessage, active: Boolean = false) {
+private fun MessageRow(
+    message: ChatMessage,
+    active: Boolean = false,
+    speaking: Boolean = false,
+    synthesizing: Boolean = false,
+    synthesisProgress: Float? = null,
+    canSpeak: Boolean = false,
+    onSpeak: (ChatMessage) -> Unit = {},
+) {
     val user = message.role == MessageRole.USER
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -692,6 +729,41 @@ private fun MessageRow(message: ChatMessage, active: Boolean = false) {
                     Icon(Icons.Default.AttachFile, attachment.kind.name, Modifier.size(18.dp))
                     Text(attachment.name, Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis)
                 }
+                }
+            }
+            if (!user && !active && message.status == MessageStatus.COMPLETE && message.content.isNotBlank()) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (synthesizing) {
+                        val progressModifier = Modifier
+                            .width(96.dp)
+                            .height(3.dp)
+                            .testTag("tts-progress-${message.id}")
+                        if (synthesisProgress == null)
+                            LinearProgressIndicator(modifier = progressModifier)
+                        else
+                            LinearProgressIndicator(
+                                progress = { synthesisProgress.coerceIn(0f, 1f) },
+                                modifier = progressModifier,
+                            )
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    IconButton(
+                        onClick = { onSpeak(message) },
+                        enabled = canSpeak,
+                        modifier = Modifier.size(40.dp).testTag("speak-${message.id}"),
+                    ) {
+                        Icon(
+                            if (speaking) Icons.Default.Stop else Icons.AutoMirrored.Filled.VolumeUp,
+                            if (synthesizing) "Stop synthesizing response"
+                            else if (speaking) "Stop reading response"
+                            else "Read response aloud",
+                            Modifier.size(20.dp),
+                        )
+                    }
                 }
             }
             message.stats?.let { stats ->
@@ -937,6 +1009,13 @@ internal fun SettingsSheet(
     onUnpairAccessory: () -> Unit = {},
     onChatAccelerator: (String) -> Unit = {},
     onSpeechAccelerator: (String) -> Unit = {},
+    onTtsLanguage: (String) -> Unit = {},
+    onTtsSteps: (Int) -> Unit = {},
+    onTtsGender: (String) -> Unit = {},
+    onTtsAge: (String) -> Unit = {},
+    onTtsPitch: (String) -> Unit = {},
+    onTtsStyle: (String) -> Unit = {},
+    onTtsAccent: (String) -> Unit = {},
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var selectedTab by rememberSaveable { mutableStateOf(0) }
@@ -986,14 +1065,69 @@ internal fun SettingsSheet(
                         onModelId = onSpeechModelId, onInstall = onInstallSpeech, onCancel = onCancelSpeech,
                         onDelete = onDeleteSpeech, deleteLabel = "Remove speech model",
                     )
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    TtsModelSection(state)
                 } else if (selectedTab == 1) {
-                    InferenceSettings(state, onThreads, onChatAccelerator, onSpeechAccelerator, onTokens)
+                    InferenceSettings(
+                        state,
+                        onThreads,
+                        onChatAccelerator,
+                        onSpeechAccelerator,
+                        onTtsLanguage,
+                        onTtsSteps,
+                        onTtsGender,
+                        onTtsAge,
+                        onTtsPitch,
+                        onTtsStyle,
+                        onTtsAccent,
+                        onTokens,
+                    )
                 } else {
                     AccessorySettings(state, onUnpairAccessory)
                 }
                 LegalFooter(Modifier.padding(horizontal = 24.dp, vertical = 16.dp))
             }
         }
+    }
+}
+
+@Composable
+private fun TtsModelSection(state: KidiUiState) {
+    Column(
+        Modifier.fillMaxWidth().padding(24.dp).testTag("tts-model-status"),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Icon(Icons.AutoMirrored.Filled.VolumeUp, null, Modifier.size(20.dp),
+                tint = MaterialTheme.colorScheme.primary)
+            Text("Read aloud", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+            Text(
+                if (state.ttsReady) "Ready" else "Manual setup",
+                style = MaterialTheme.typography.labelMedium,
+                color = if (state.ttsReady) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Text(
+            "OmniVoice INT8 package",
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        SelectionContainer {
+            Text(
+                state.ttsModelDirectory,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Text(
+            if (state.ttsReady) {
+                "The speaker action appears on completed assistant responses."
+            } else {
+                "Copy the converted package to this directory, then tap a speaker icon to rescan it."
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -1145,9 +1279,17 @@ private fun InferenceSettings(
     onThreads: (Int) -> Unit,
     onChatAccelerator: (String) -> Unit,
     onSpeechAccelerator: (String) -> Unit,
+    onTtsLanguage: (String) -> Unit,
+    onTtsSteps: (Int) -> Unit,
+    onTtsGender: (String) -> Unit,
+    onTtsAge: (String) -> Unit,
+    onTtsPitch: (String) -> Unit,
+    onTtsStyle: (String) -> Unit,
+    onTtsAccent: (String) -> Unit,
     onTokens: (Int) -> Unit,
 ) {
     var threads by remember(state.threadCount) { mutableStateOf(state.threadCount.toFloat()) }
+    var ttsSteps by remember(state.ttsSteps) { mutableStateOf(state.ttsSteps.toFloat()) }
     var outputMenu by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1183,6 +1325,48 @@ private fun InferenceSettings(
         AcceleratorSetting("Speech accelerator", state.speechAccelerator, state.speechExecution, !state.runtimeBusy,
             onSpeechAccelerator)
         HorizontalDivider()
+        Text("Read aloud", style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("TTS accelerator", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+            Text(
+                if (state.ttsExecution.isEmpty()) "Auto" else executionLabel(state.ttsExecution),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        OutlinedTextField(
+            value = state.ttsLanguage,
+            onValueChange = onTtsLanguage,
+            enabled = !state.runtimeBusy,
+            label = { Text("TTS language") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Diffusion steps", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+            Text(ttsSteps.toInt().toString(), style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.primary)
+        }
+        Slider(
+            value = ttsSteps,
+            onValueChange = { ttsSteps = it },
+            onValueChangeFinished = { onTtsSteps(ttsSteps.toInt()) },
+            valueRange = 1f..32f,
+            steps = 30,
+            enabled = !state.runtimeBusy,
+        )
+        Text(
+            "10 steps is the low-latency default. More steps can improve stability but increase synthesis time.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        TtsChoiceSetting("Gender", state.ttsGender, TTS_GENDER_OPTIONS, !state.runtimeBusy, onTtsGender)
+        TtsChoiceSetting("Age", state.ttsAge, TTS_AGE_OPTIONS, !state.runtimeBusy, onTtsAge)
+        TtsChoiceSetting("Pitch", state.ttsPitch, TTS_PITCH_OPTIONS, !state.runtimeBusy, onTtsPitch)
+        TtsChoiceSetting("Style", state.ttsStyle, TTS_STYLE_OPTIONS, !state.runtimeBusy, onTtsStyle)
+        TtsChoiceSetting("Accent", state.ttsAccent, TTS_ACCENT_OPTIONS, !state.runtimeBusy, onTtsAccent)
+        HorizontalDivider()
         Text("Hardware diagnostics", style = MaterialTheme.typography.labelLarge,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
         HardwareDiagnosticRow("CPU", state.cpuDiagnostic)
@@ -1203,6 +1387,37 @@ private fun InferenceSettings(
         Row {
             Text("Context window", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
             Text("9,216 tokens", style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+@Composable
+private fun TtsChoiceSetting(
+    title: String,
+    selected: String,
+    options: Map<String, String>,
+    enabled: Boolean,
+    onSelect: (String) -> Unit,
+) {
+    var menu by remember { mutableStateOf(false) }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+        Box {
+            TextButton(onClick = { menu = true }, enabled = enabled) {
+                Text(options[selected] ?: selected)
+                Icon(Icons.Default.ExpandMore, null, Modifier.size(20.dp))
+            }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                options.forEach { (value, label) ->
+                    DropdownMenuItem(
+                        text = { Text(label) },
+                        onClick = {
+                            onSelect(value)
+                            menu = false
+                        },
+                    )
+                }
+            }
         }
     }
 }
@@ -1271,3 +1486,29 @@ internal fun executionLabel(execution: String) = when {
     execution.startsWith("cpu") -> "CPU (YNNPACK)"
     else -> execution
 }
+
+private val TTS_GENDER_OPTIONS = linkedMapOf("female" to "Female", "male" to "Male")
+private val TTS_AGE_OPTIONS = linkedMapOf(
+    "child" to "Child",
+    "teenager" to "Teenager",
+    "young adult" to "Young adult",
+    "middle-aged" to "Middle-aged",
+    "elderly" to "Elderly",
+)
+private val TTS_PITCH_OPTIONS =
+    linkedMapOf("very low" to "Very low", "low" to "Low", "moderate" to "Moderate", "high" to "High",
+        "very high" to "Very high")
+private val TTS_STYLE_OPTIONS = linkedMapOf("" to "Natural", "whisper" to "Whisper")
+private val TTS_ACCENT_OPTIONS = linkedMapOf(
+    "" to "Default",
+    "american" to "American",
+    "british" to "British",
+    "australian" to "Australian",
+    "chinese" to "Chinese",
+    "canadian" to "Canadian",
+    "indian" to "Indian",
+    "korean" to "Korean",
+    "portuguese" to "Portuguese",
+    "russian" to "Russian",
+    "japanese" to "Japanese",
+)

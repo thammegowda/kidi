@@ -1,6 +1,5 @@
 #include "kidi/runtime/ynn/graph.h"
 
-#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -14,41 +13,10 @@
 #include "ynnpack/base/arch.h"
 
 namespace kidi::runtime::ynn {
-namespace {
-
-class Scheduler {
-public:
-    explicit Scheduler(int worker_count) : implementation_(worker_count) {}
-
-    ~Scheduler() { implementation_.work_until_idle(); }
-
-    static auto interface() noexcept -> const ynn_scheduler* {
-        static const ynn_scheduler value = {
-            .num_threads =
-                [](void* context) { return static_cast<Scheduler*>(context)->implementation_.thread_count(); },
-            .schedule =
-                [](void* context, void* task_context, void (*task)(void*)) {
-                    auto& scheduler = *static_cast<Scheduler*>(context);
-                    scheduler.implementation_.enqueue([task_context, task] { task(task_context); });
-                },
-        };
-        return &value;
-    }
-
-private:
-    slinky::thread_pool_impl implementation_;
-};
-
-} // namespace
-
 class ThreadPool {
 public:
     static auto create(std::size_t total_threads) -> Result<std::shared_ptr<ThreadPool>> {
         auto result = std::shared_ptr<ThreadPool>(new ThreadPool(static_cast<int>(total_threads - 1)));
-        auto status =
-            check_status(ynn_create_threadpool(Scheduler::interface(), &result->scheduler_, 0, &result->handle_),
-                         "create thread pool");
-        if (!status) return std::unexpected(std::move(status.error()));
         return result;
     }
 
@@ -62,9 +30,9 @@ public:
     }
 
 private:
-    explicit ThreadPool(int worker_count) : scheduler_(worker_count) {}
+    explicit ThreadPool(int worker_count)
+        : handle_(reinterpret_cast<ynn_threadpool_t>(new slinky::thread_pool_impl(worker_count))) {}
 
-    Scheduler scheduler_;
     ynn_threadpool_t handle_ = nullptr;
 };
 

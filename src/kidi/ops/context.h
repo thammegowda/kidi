@@ -71,7 +71,8 @@ public:
     /// One fixed-shape step body: ordinary eager operations over `inputs`, returning the step outputs.
     using Step = std::function<std::vector<Tensor>(std::span<const Tensor> inputs)>;
 
-    explicit Context(tensor::Device device = tensor::Device::cpu(), bool packed_prefill = false);
+    explicit Context(tensor::Device device = tensor::Device::cpu(), bool packed_prefill = false,
+                     std::optional<bool> replay_enabled = std::nullopt);
     ~Context();
     Context(Context&&) noexcept;
     auto operator=(Context&&) noexcept -> Context&;
@@ -84,16 +85,20 @@ public:
     auto precision() const noexcept -> core::InferencePrecision;
     auto profile_phase(std::string_view phase) -> void;
 
-    /// Runs `step`, capturing its operators the first two times `key` is used and replaying them afterwards.
+    /// Runs `step`, normally capturing its operators twice to validate structure before replay.
     /// A step reads only `inputs`, parameters, and tensors whose storage stays fixed; values that change per call
     /// are written into `inputs` before calling. The two captures must match, which rejects host-computed
     /// temporaries and per-call operator arguments. Replay may rebind inputs of the same shape and dtype. Outputs
     /// belong to the captured step and are overwritten by the next call with the same key. Backends without replay,
-    /// or `KIDI_REPLAY=0`, run `step` eagerly on every call.
-    auto replay(std::string_view key, std::span<const Tensor> inputs, const Step& step) -> std::span<const Tensor>;
+    /// or `KIDI_REPLAY=0`, run `step` eagerly on every call. Trusted operator-only steps may disable validation.
+    auto replay(std::string_view key, std::span<const Tensor> inputs, const Step& step, bool validate_structure = true)
+        -> std::span<const Tensor>;
     auto replay_enabled() const noexcept -> bool;
+    auto set_replay_capacity(std::size_t capacity) -> void;
     auto clear_replays() -> void;
     auto release_workspaces() -> void;
+    /// Drops unreferenced output caches while retaining bounded prepared operators and captured graphs.
+    auto trim_workspaces() -> void;
     /// Evicts captured steps whose key begins with `prefix`, for example completed prefill shapes before decode.
     auto clear_replays(std::string_view prefix) -> void;
     /// Name of the accelerator compiling captured steps, or empty when steps replay on this context's device.
@@ -127,19 +132,41 @@ public:
                        std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F) -> Tensor;
     auto gelu(const Tensor& input, bool approximate = false) -> Tensor;
     auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
+    auto silu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
+    auto silu_gate(const Tensor& gate_up) -> Tensor;
     auto gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
                             const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
                             std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
-                            float gate_up_output_scale, float down_input_scale, float down_output_scale) -> Tensor;
+                            float gate_up_output_scale, float down_input_scale, float down_output_scale,
+                            bool silu = false) -> Tensor;
     auto gelu_(Tensor& input, bool approximate = false) -> Tensor&;
     auto tanh(const Tensor& input) -> Tensor;
     auto static_round(const Tensor& input, float scale) -> Tensor;
     auto greedy_token(const Tensor& logits) -> Tensor;
     auto embedding(const Tensor& indices, const Tensor& weight, const Tensor& scales, std::int32_t width,
                    std::int32_t bits, float multiplier) -> Tensor;
+    auto embedding_sum(const Tensor& tokens, const Tensor& weight, const Tensor& scales, std::int32_t width,
+                       std::int32_t bits, float multiplier) -> Tensor;
+    auto diffusion_candidates(const Tensor& logits, std::size_t target, std::int32_t codebooks, std::int32_t vocabulary,
+                              std::int32_t mask, float guidance) -> Tensor;
+    auto diffusion_update(const Tensor& tokens, const Tensor& candidates, const Tensor& noise, std::size_t count,
+                          std::int32_t mask, float penalty, float temperature) -> Tensor;
+    auto conv1d(const Tensor& input, const Tensor& weight, const Tensor& scales, const Tensor& bias,
+                std::int32_t kernel, std::int32_t stride, std::int32_t padding, std::int32_t dilation) -> Tensor;
+    auto snake_conv1d(const Tensor& input, const Tensor& alpha, const Tensor& weight, const Tensor& scales,
+                      const Tensor& bias, std::int32_t kernel, std::int32_t stride, std::int32_t padding,
+                      std::int32_t dilation) -> Tensor;
+    auto snake_quantized_linear(const Tensor& input, const Tensor& alpha, const Tensor& weight, const Tensor& scale,
+                                const Tensor& bias, bool transpose_weight = false) -> Tensor;
+    auto conv_transpose_fold(const Tensor& projected, const Tensor& bias, std::int32_t kernel, std::int32_t stride,
+                             std::int32_t padding, std::int32_t output_padding, std::int32_t dilation) -> Tensor;
+    auto snake(const Tensor& input, const Tensor& alpha) -> Tensor;
     auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
-    auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
-                    float epsilon) -> Tensor;
+    auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine, float epsilon)
+        -> Tensor;
+    auto rms_rotary_slice(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
+                          float epsilon, std::int64_t heads, std::int64_t width, std::int64_t channel_offset,
+                          std::int64_t sequence_offset, std::int64_t sequence_length) -> Tensor;
     auto rms_axial_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,
                           float epsilon) -> Tensor;
     auto rms_norm_residual(const Tensor& input, const Tensor& scale, const Tensor& residual, float epsilon,

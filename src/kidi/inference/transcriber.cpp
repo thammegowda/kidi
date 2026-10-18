@@ -45,8 +45,8 @@ Transcriber::Transcriber(YAML::Node config, YAML::Node generation, audio::Whispe
 
 auto Transcriber::load(const std::filesystem::path& directory, tensor::Device device) -> Result<Transcriber> {
     try {
-        if (device != tensor::Device::cpu())
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper currently requires the CPU backend"});
+        if (device != tensor::Device::cpu() && device != tensor::Device::web_gpu())
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper supports CPU and WebGPU execution"});
         const auto adapter = model::WhisperImpl::checkpoint_config();
         auto config = require(checkpoint::load_config(directory, adapter));
         if (config["weights_format"].as<std::string>("") == "whisper_ggml")
@@ -110,6 +110,25 @@ auto Transcriber::warm_up() -> Result<void> {
 
 auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t sample_rate,
                              const TranscriptionOptions& options) -> Result<Transcription> {
+    if (model_->device() == tensor::Device::web_gpu())
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "WebGPU transcription requires a stepped session"});
+    auto pending = start(waveform, sample_rate, options);
+    if (!pending) return std::unexpected(std::move(pending.error()));
+    for (;;) {
+        auto result = (*pending)->step();
+        if (!result) return std::unexpected(std::move(result.error()));
+        if (*result) return std::move(**result);
+    }
+}
+
+auto Transcriber::start(std::span<const float> waveform, std::uint32_t sample_rate,
+                        const TranscriptionOptions& options) -> Result<std::unique_ptr<TranscriptionSession>> {
+    return std::make_unique<Session>(transcription_session_(
+        std::vector<float>(waveform.begin(), waveform.end()), sample_rate, options));
+}
+
+auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint32_t sample_rate,
+                                         TranscriptionOptions options) -> Session {
     try {
         const auto task = generation_["task_to_id"][options.task];
         if (!task) throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Whisper task must be transcribe or translate"});
@@ -119,34 +138,86 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
         const auto feature_start = Clock::now();
         const auto features = require(extractor_.extract(waveform, sample_rate));
         const auto feature_ns = elapsed(feature_start);
+        const auto gpu = model_->device() == tensor::Device::web_gpu();
+        tensor::Tensor normal_mask, begin_mask, language_ids;
+        std::vector<std::string> language_names;
+        const auto detect_language = options.language == "auto" || options.language.find(',') != std::string::npos;
+        if (detect_language) {
+            if (options.language == "auto") {
+                for (const auto& [language, token] : languages_) language_names.push_back(language);
+            } else {
+                for (std::size_t start = 0; start <= options.language.size();) {
+                    const auto end = options.language.find(',', start);
+                    const auto language = options.language.substr(start, end - start);
+                    if (!languages_.contains(language))
+                        throw ops::Failure(
+                            {ErrorCode::INVALID_ARGUMENT, "unsupported Whisper language: " + language});
+                    if (!std::ranges::contains(language_names, language)) language_names.push_back(language);
+                    if (end == std::string::npos) break;
+                    start = end + 1;
+                }
+            }
+        }
+        if (gpu) {
+            const auto vocabulary = config_["model"]["vocab_size"].as<std::size_t>();
+            std::vector<float> mask(vocabulary, 0.F);
+            const auto no_timestamps = generation_["no_timestamps_token_id"].as<std::size_t>();
+            for (const auto token : suppress_) mask[token] = -std::numeric_limits<float>::infinity();
+            std::fill(mask.begin() + no_timestamps, mask.end(), -std::numeric_limits<float>::infinity());
+            normal_mask = require(tensor::Tensor::from_host({static_cast<std::int64_t>(vocabulary)},
+                                                            std::span<const float>(mask), model_->device()));
+            for (const auto token : begin_suppress_) mask[token] = -std::numeric_limits<float>::infinity();
+            begin_mask = require(tensor::Tensor::from_host({static_cast<std::int64_t>(vocabulary)},
+                                                           std::span<const float>(mask), model_->device()));
+            if (detect_language) {
+                std::vector<std::int32_t> ids;
+                for (const auto& language : language_names) ids.push_back(languages_.at(language));
+                language_ids = require(tensor::Tensor::from_host({static_cast<std::int64_t>(ids.size())},
+                                                                 std::span<const std::int32_t>(ids), model_->device()));
+            }
+        }
         std::string emitted;
         const auto check_cancelled = [&] {
             if (options.cancelled && options.cancelled())
                 throw ops::Failure({ErrorCode::RUNTIME, "transcription cancelled"});
         };
         // One encode and greedy decode over the first `frames` feature frames (all when zero).
-        const auto attempt = [&](std::size_t frames) {
+        const auto attempt = [&](std::size_t frames) -> Session {
             Transcription result;
             emitted.clear();
             const auto preparation = model_->preparation_ns();
             const auto encode_start = Clock::now();
             auto source = require(model_->encode(features, frames, options.cancelled));
+            if (gpu) co_yield std::monostate{};
             result.stats.encode_ns = elapsed(encode_start);
             check_cancelled();
             auto state = require(model_->create_state(options.maximum_tokens + 4));
             const auto decode_start = Clock::now();
             const auto start_token = generation_["decoder_start_token_id"].as<std::int32_t>();
             auto logits = require(model_->forward(source, std::span(&start_token, 1), state));
-            auto scores = require(logits.data<float>());
+            std::span<float> scores;
             std::int32_t language_token = -1;
-            if (options.language == "auto") {
-                auto best = -std::numeric_limits<float>::infinity();
-                for (const auto& [language, token] : languages_)
-                    if (scores[token] > best) {
-                        best = scores[token];
-                        result.language = language;
-                        language_token = token;
+            if (detect_language) {
+                if (gpu) {
+                    const auto selected = model_->select_language(logits, language_ids);
+                    co_yield std::monostate{};
+                    const auto index = require(selected.data<std::int32_t>())[0];
+                    if (index < 0 || static_cast<std::size_t>(index) >= language_names.size())
+                        throw ops::Failure({ErrorCode::RUNTIME, "Whisper language selection failed"});
+                    result.language = language_names[index];
+                    language_token = languages_.at(result.language);
+                } else {
+                    scores = require(logits.data<float>());
+                    auto best = -std::numeric_limits<float>::infinity();
+                    for (const auto& language : language_names) {
+                        const auto token = languages_.at(language);
+                        if (scores[token] > best) {
+                            best = scores[token];
+                            result.language = language;
+                            language_token = token;
+                        }
                     }
+                }
             } else {
                 const auto found = languages_.find(options.language);
                 if (found == languages_.end())
@@ -164,6 +235,14 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
             const auto end = generation_["eos_token_id"].as<std::int32_t>();
             for (std::size_t step = 0; step < options.maximum_tokens; ++step) {
                 check_cancelled();
+                std::int32_t selected;
+                if (gpu) {
+                    const auto token = model_->select_token(logits, step ? normal_mask : begin_mask);
+                    co_yield std::monostate{};
+                    selected = require(token.data<std::int32_t>())[0];
+                    if (selected < 0 || static_cast<std::size_t>(selected) >= vocabulary)
+                        throw ops::Failure({ErrorCode::RUNTIME, "Whisper token selection failed"});
+                } else {
                 scores = require(logits.data<float>());
                 const auto suppress = [&](std::int32_t token) {
                     if (token >= 0 && static_cast<std::size_t>(token) < scores.size())
@@ -175,7 +254,8 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
                 suppress(no_timestamps);
                 for (std::size_t token = static_cast<std::size_t>(no_timestamps + 1); token < vocabulary; ++token)
                     scores[token] = -std::numeric_limits<float>::infinity();
-                const auto selected = static_cast<std::int32_t>(std::ranges::max_element(scores) - scores.begin());
+                selected = static_cast<std::int32_t>(std::ranges::max_element(scores) - scores.begin());
+                }
                 if (selected == end) break;
                 result.token_ids.push_back(selected);
                 if (options.on_partial) {
@@ -188,7 +268,7 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
             result.stats.decode_ns = elapsed(decode_start);
             result.stats.preparation_ns = model_->preparation_ns() - preparation;
             result.text = require(tokenizer_.decode(result.token_ids));
-            return result;
+            co_return Result<Transcription>{std::move(result)};
         };
         std::size_t frames = 0;
         if (options.fit_audio) {
@@ -196,22 +276,33 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
             const auto audio = (waveform.size() * 100 + sample_rate - 1) / sample_rate;
             frames = std::min(features.frames, (audio + 100 + 255) / 256 * 256);
         }
-        auto result = attempt(frames);
-        // Whisper can loop on a shortened window; such output is decoded again over the full window.
-        if (frames && frames < features.frames && repetitive(result.token_ids)) {
-            const auto first = result.stats;
-            result = attempt(0);
-            result.stats.encode_ns += first.encode_ns;
-            result.stats.decode_ns += first.decode_ns;
-            result.stats.preparation_ns += first.preparation_ns;
+        auto pending = attempt(frames);
+        std::optional<Transcription> result;
+        while (!result) {
+            result = require(pending.step());
+            if (!result) co_yield std::monostate{};
         }
-        result.stats.feature_ns = feature_ns;
-        if (options.on_partial && result.text != emitted) options.on_partial(result.text, result.language);
-        return result;
+        // Whisper can loop on a shortened window; such output is decoded again over the full window.
+        if (frames && frames < features.frames && repetitive(result->token_ids)) {
+            const auto first = result->stats;
+            pending = attempt(0);
+            result.reset();
+            while (!result) {
+                result = require(pending.step());
+                if (!result) co_yield std::monostate{};
+            }
+            result->stats.encode_ns += first.encode_ns;
+            result->stats.decode_ns += first.decode_ns;
+            result->stats.preparation_ns += first.preparation_ns;
+            result->stats.attempts += first.attempts;
+        }
+        result->stats.feature_ns = feature_ns;
+        if (options.on_partial && result->text != emitted) options.on_partial(result->text, result->language);
+        co_return Result<Transcription>{std::move(*result)};
     } catch (const ops::Failure& error) {
-        return std::unexpected(error.error());
+        co_return std::unexpected(error.error());
     } catch (const YAML::Exception& error) {
-        return std::unexpected(
+        co_return std::unexpected(
             Error{ErrorCode::INVALID_MANIFEST, "invalid Whisper generation config: " + std::string(error.what())});
     }
 }

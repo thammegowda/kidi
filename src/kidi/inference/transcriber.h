@@ -11,6 +11,7 @@
 #include "kidi/audio/whisper.h"
 #include "kidi/model/whisper.h"
 #include "kidi/text/tokenizer.h"
+#include "kidi/inference/coroutine.h"
 
 namespace kidi::inference {
 
@@ -28,6 +29,7 @@ struct TranscriptionOptions {
 
 struct TranscriptionStats {
     std::uint64_t feature_ns = 0, encode_ns = 0, decode_ns = 0, preparation_ns = 0;
+    std::size_t attempts = 1;
 };
 
 struct Transcription {
@@ -36,12 +38,20 @@ struct Transcription {
     TranscriptionStats stats;
 };
 
+class TranscriptionSession {
+public:
+    virtual ~TranscriptionSession() = default;
+    virtual auto step() -> Result<std::optional<Transcription>> = 0;
+};
+
 class Transcriber {
 public:
     static auto load(const std::filesystem::path& directory,
                      tensor::Device device = tensor::Device::cpu()) -> Result<Transcriber>;
     auto transcribe(std::span<const float> waveform, std::uint32_t sample_rate,
                     const TranscriptionOptions& options = {}) -> Result<Transcription>;
+    auto start(std::span<const float> waveform, std::uint32_t sample_rate, const TranscriptionOptions& options = {})
+        -> Result<std::unique_ptr<TranscriptionSession>>;
     /// Transcribes a second of silence so weights are packed and operators prepared before the first request.
     auto warm_up() -> Result<void>;
 
@@ -49,6 +59,9 @@ public:
     auto execution() const -> std::string { return std::string(tensor::to_string(model_->device().kind)); }
 
 private:
+    using Session = CoroutineSession<Transcription, TranscriptionSession>;
+    auto transcription_session_(std::vector<float> waveform, std::uint32_t sample_rate,
+                                 TranscriptionOptions options) -> Session;
     Transcriber(YAML::Node config, YAML::Node generation, audio::WhisperFeatureExtractor extractor,
                 text::Tokenizer tokenizer, model::Whisper model, std::map<std::string, std::int32_t> languages,
                 std::vector<std::int32_t> suppress, std::vector<std::int32_t> begin_suppress);

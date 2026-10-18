@@ -16,6 +16,45 @@ import kidi
 
 
 class HubCliTest(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires kidi[convert]")
+    def test_omnivoice_activation_calibration(self):
+        from kidi.converters.omnivoice import _activation_quantization
+
+        edges = (
+            "attention_norm",
+            "qkv",
+            "attention_output",
+            "attention_residual",
+            "ffn_norm",
+            "gate_up",
+            "ffn_hidden",
+            "ffn_residual",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "calibration.json"
+            layers = {}
+            for layer in range(2):
+                layers[str(layer)] = {
+                    edge: {
+                        bucket: {
+                            "symmetric_int8_scale": 1.0,
+                            "symmetric_int8_scale_p99": 0.9,
+                            "symmetric_int8_scale_p99_9": 0.8,
+                            "symmetric_int8_scale_p99_99": 0.7 + layer / 10,
+                        }
+                        for bucket in ("early", "middle", "late")
+                    }
+                    for edge in edges
+                }
+            path.write_text(json.dumps({"format_version": 1, "layers": layers}))
+            result = _activation_quantization(path, 2, "p99.99")
+            self.assertEqual(result["bucket_order"], ["early", "middle", "late"])
+            self.assertEqual(result["edge_order"], list(edges))
+            self.assertEqual(result["scales"][0][0][0], 0.7)
+            self.assertAlmostEqual(result["scales"][1][2][-1], 0.8)
+            with self.assertRaisesRegex(ValueError, "expected 3"):
+                _activation_quantization(path, 3, "p99.99")
+
     def test_resolution_only_after_valid_arguments(self):
         with patch("kidi.hub.resolve") as resolve:
             self.assertEqual(kidi.main(["chat", "--help", "-m", "@google/example"]), 0)
@@ -146,6 +185,76 @@ class HubCliTest(unittest.TestCase):
                     config.write_text(yaml.safe_dump(document))
                     with self.assertRaisesRegex(ValueError, "Invalid package file path"):
                         resolve("owner/rtg", root)
+
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
+    def test_preconfigured_omnivoice_package(self):
+        import yaml
+        from kidi.hub import resolve
+
+        with tempfile.TemporaryDirectory() as root:
+            snapshot = Path(root).resolve() / ("d" * 40)
+            snapshot.mkdir()
+            document = {
+                "format_version": 1,
+                "task": "tts",
+                "model": {"type": "omnivoice"},
+                "synthesis": {},
+                "license_files": ["NOTICE"],
+                "weights_file": "model.safetensors",
+                "tokenizer_file": "tokenizer.json",
+                "template_file": "synthesis_template.jinja",
+                "sentence_prefixes_file": "sentence-prefixes.tsv",
+            }
+            config = snapshot / "model.yaml"
+            config.write_text(yaml.safe_dump(document))
+            for name in (
+                "model.safetensors",
+                "tokenizer.json",
+                "synthesis_template.jinja",
+                "sentence-prefixes.tsv",
+                "NOTICE",
+            ):
+                (snapshot / name).write_bytes(b"fixture")
+            with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
+                self.assertEqual(resolve("owner/omnivoice", root), snapshot)
+                patterns = download.call_args.kwargs["allow_patterns"]
+                self.assertIn("model.safetensors", patterns)
+                self.assertIn("tokenizer.json", patterns)
+                document.pop("task")
+                config.write_text(yaml.safe_dump(document))
+                with self.assertRaisesRegex(ValueError, "task: tts"):
+                    resolve("owner/omnivoice", root)
+
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
+    def test_preconfigured_kokoro_package(self):
+        import yaml
+        from kidi.hub import resolve
+
+        with tempfile.TemporaryDirectory() as root:
+            snapshot = Path(root).resolve() / ("e" * 40)
+            snapshot.mkdir()
+            document = {
+                "format_version": 1,
+                "task": "tts",
+                "model": {"type": "kokoro"},
+                "synthesis": {"default_voice": "af_heart"},
+                "license_files": ["NOTICE"],
+                "weights_file": "model.safetensors",
+                "lexicon_file": "lexicon-us.tsv",
+                "sentence_prefixes_file": "sentence-prefixes.tsv",
+            }
+            config = snapshot / "model.yaml"
+            config.write_text(yaml.safe_dump(document))
+            for name in ("model.safetensors", "lexicon-us.tsv", "sentence-prefixes.tsv", "NOTICE"):
+                (snapshot / name).write_bytes(b"fixture")
+            with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
+                self.assertEqual(resolve("owner/kokoro", root), snapshot)
+                patterns = download.call_args.kwargs["allow_patterns"]
+                self.assertIn("model.safetensors", patterns)
+                self.assertIn("lexicon-us.tsv", patterns)
+                (snapshot / "NOTICE").unlink()
+                with self.assertRaisesRegex(ValueError, "Missing NOTICE"):
+                    resolve("owner/kokoro", root)
 
 
 class PythonCliTest(unittest.TestCase):

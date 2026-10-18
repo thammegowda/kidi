@@ -7,6 +7,7 @@
 
 #include <tokenizers/tokenizer.h>
 #include <tokenizers/tokenizer_config.h>
+#include <nlohmann/json.hpp>
 #include <zlib.h>
 
 namespace kidi::text {
@@ -67,7 +68,7 @@ Tokenizer::Tokenizer(Tokenizer&&) noexcept = default;
 auto Tokenizer::operator=(Tokenizer&&) noexcept -> Tokenizer& = default;
 Tokenizer::~Tokenizer() = default;
 
-auto Tokenizer::load(const std::filesystem::path& path) -> Result<Tokenizer> {
+auto Tokenizer::load(const std::filesystem::path& path, const TemplateFiles& templates) -> Result<Tokenizer> {
     if (!std::filesystem::is_regular_file(path)) {
         return std::unexpected(Error{ErrorCode::IO, "tokenizer does not exist: " + path.string()});
     }
@@ -109,6 +110,13 @@ auto Tokenizer::load(const std::filesystem::path& path) -> Result<Tokenizer> {
         if (!source) return std::unexpected(std::move(source.error()));
         config.default_chat_template = std::move(*source);
     }
+    for (const auto& [name, template_path] : templates) {
+        if (name.empty())
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "tokenizer template name must not be empty"});
+        auto source = read_plain(template_path);
+        if (!source) return std::unexpected(std::move(source.error()));
+        config.named_chat_templates[name] = std::move(*source);
+    }
     tokenizer->with_config(std::move(config));
     return Tokenizer(std::make_unique<Impl>(std::move(*tokenizer)));
 }
@@ -128,6 +136,7 @@ auto Tokenizer::format_chat(std::span<const ChatMessage> messages) const -> Resu
                 Error{ErrorCode::INVALID_ARGUMENT, "supported roles: initial system/developer, user, assistant"});
         conversation.push_back({message.role, message.content});
     }
+
     if (!impl_->value.has_chat_template())
         return std::unexpected(
             Error{ErrorCode::INVALID_ARGUMENT, "chat requires tokenizer_config.json and a checkpoint chat template"});
@@ -135,6 +144,24 @@ auto Tokenizer::format_chat(std::span<const ChatMessage> messages) const -> Resu
     if (!result)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "chat template: " + result.error().message()});
     return std::move(*result);
+}
+
+auto Tokenizer::format_template(std::string_view name, const TemplateArguments& arguments) const
+    -> Result<std::string> {
+    nlohmann::json values = nlohmann::json::object();
+    for (const auto& [key, value] : arguments) values[key] = value;
+    auto result = impl_->value.apply_chat_template({}, false, std::string(name), values);
+    if (!result)
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT, std::string(name) + " template: " + result.error().message()});
+    return std::move(*result);
+}
+
+auto Tokenizer::encode_template(std::string_view name, const TemplateArguments& arguments) const
+    -> Result<std::vector<std::int32_t>> {
+    auto formatted = format_template(name, arguments);
+    if (!formatted) return std::unexpected(std::move(formatted.error()));
+    return encode(*formatted);
 }
 
 auto Tokenizer::encode(std::string_view text) const -> Result<std::vector<std::int32_t>> {

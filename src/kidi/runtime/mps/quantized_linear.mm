@@ -44,8 +44,8 @@ auto pipelines() -> Result<std::shared_ptr<Pipelines>> {
         NSError* error = nil;
         id<MTLLibrary> library =
             [result->device newLibraryWithSource:[NSString stringWithUTF8String:KIDI_QUANTIZED_LINEAR_METAL_SOURCE]
-                                                              options:options
-                                                                error:&error];
+                                         options:options
+                                           error:&error];
         if (!library)
             return std::unexpected(Error{ErrorCode::RUNTIME, "compile INT8 Metal kernels: " +
                                                                  std::string(error.localizedDescription.UTF8String)});
@@ -116,9 +116,10 @@ auto encode_expand_packed_weight(CommandBatch& batch, const Tensor& weight, cons
                                  std::int32_t bits, std::int32_t group_size) -> Result<void> {
     if (output.dtype() != DType::F16 || output.dimensions() != 2 || output.numel() > UINT32_MAX ||
         (bits != 2 && bits != 4 && bits != 8) || group_size <= 0 || output.size(1) % group_size ||
-        weight.dtype() != DType::U8 || weight.dimensions() != 2 || scales.dtype() != DType::F32 ||
-        scales.dimensions() != 2 || weight.size(0) != output.size(0) || weight.size(1) * (8 / bits) != output.size(1) ||
-        scales.size(0) != output.size(0) || scales.size(1) != output.size(1) / group_size)
+        (weight.dtype() != DType::U8 && !(bits == 8 && weight.dtype() == DType::I8)) || weight.dimensions() != 2 ||
+        scales.dtype() != DType::F32 || scales.dimensions() != 2 || weight.size(0) != output.size(0) ||
+        weight.size(1) * (8 / bits) != output.size(1) || scales.size(0) != output.size(0) ||
+        scales.size(1) != output.size(1) / group_size)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid streamed packed weight geometry"});
     static std::mutex mutex;
     static std::map<std::pair<std::uint32_t, std::uint32_t>, id<MTLComputePipelineState>> cached;
@@ -147,11 +148,7 @@ auto encode_expand_packed_weight(CommandBatch& batch, const Tensor& weight, cons
     const struct {
         std::uint32_t rows, width, columns;
         float input_scale, output_scale;
-    } geometry{1,
-               static_cast<std::uint32_t>(output.size(1)),
-               static_cast<std::uint32_t>(output.size(0)),
-               0,
-               0};
+    } geometry{1, static_cast<std::uint32_t>(output.size(1)), static_cast<std::uint32_t>(output.size(0)), 0, 0};
     MPSCommandBuffer* buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
     auto encoder = [buffer computeCommandEncoder];
     if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create streamed packed weight encoder"});
@@ -191,11 +188,8 @@ auto encode_packed_linear(CommandBatch& batch, const Tensor& input, const Tensor
     const struct {
         std::uint32_t rows, width, columns;
         float input_scale, output_scale;
-    } geometry{static_cast<std::uint32_t>(input.numel() / input.size(-1)),
-               static_cast<std::uint32_t>(input.size(-1)),
-               static_cast<std::uint32_t>(weight.size(0)),
-               input_scale,
-               output_scale};
+    } geometry{static_cast<std::uint32_t>(input.numel() / input.size(-1)), static_cast<std::uint32_t>(input.size(-1)),
+               static_cast<std::uint32_t>(weight.size(0)), input_scale, output_scale};
     MPSCommandBuffer* buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
     id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
     if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create packed projection encoder"});

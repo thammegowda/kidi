@@ -6,12 +6,14 @@ THREADS ?= 8
 MIN_CHRF ?= 99.0
 PORT ?= 8080
 WEB_DIR ?= build-web
+APP_CONFIG ?= examples/kidi-app.yaml
+APP_PORT ?= 10010
 TEST_PYTHON := .cache/test-venv/bin/python
 TEST_DIST := .cache/test-dist
 
 export KIDI_HUB PYTHON
 
-.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test regression-test test wasm serve apk apk-release
+.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test regression-test test app app-dev wasm serve apk apk-release
 
 setup-test:
 	bash tests/setup.sh
@@ -34,7 +36,7 @@ python-test: build-python-test
 	$(TEST_PYTHON) -m unittest discover -s tests -p python_cli_test.py
 
 web-test:
-	node --test tests/web/*.mjs
+	node --test tests/browser/*_test.mjs third_party/liteapp/tests/browser/*_test.mjs
 
 regression-test: setup-test build-test
 	$(TEST_PYTHON) tests/rtg_regression.py run --binary "$(KIDI_BIN)" --backend "$(BACKEND)" --threads "$(THREADS)" --min-chrf "$(MIN_CHRF)"
@@ -48,8 +50,15 @@ prepare-test: build-test build-python-test
 test: prepare-test
 	ctest --preset debug
 
+app:
+	cmake --preset release -DKIDI_BUILD_DESKTOP_APP=ON
+	cmake --build --preset release --target kidi_app
+
+app-dev: app
+	build-release/kidi-app "$(APP_CONFIG)" --port "$(APP_PORT)" --dev
+
 wasm:
-	node web/build.mjs "$(WEB_DIR)"
+	node web/tools/build.mjs "$(WEB_DIR)"
 
 serve:
 	$(PYTHON) -m http.server "$(PORT)" --bind 127.0.0.1 --directory "$(WEB_DIR)"

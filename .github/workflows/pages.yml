@@ -12,8 +12,9 @@ on:
       - 'src/**'
       - 'third_party/**'
       - 'web/**'
-      - 'tests/web/**'
+      - 'tests/browser/**'
       - 'docs/kidi-logo-small.png'
+      - 'examples/kidi-app.yaml'
   pull_request:
     branches: [main]
     paths:
@@ -25,8 +26,9 @@ on:
       - 'src/**'
       - 'third_party/**'
       - 'web/**'
-      - 'tests/web/**'
+      - 'tests/browser/**'
       - 'docs/kidi-logo-small.png'
+      - 'examples/kidi-app.yaml'
   workflow_dispatch:
 
 permissions:
@@ -92,9 +94,9 @@ jobs:
           "$RUNNER_TEMP/emsdk/emsdk" activate "$EMSCRIPTEN_VERSION"
 
       - name: Test browser model loader
-        run: node --test tests/web/model_cache_test.mjs
+        run: node --test tests/browser/*_test.mjs
 
-      - name: Build single-thread and pthread WebAssembly
+      - name: Build WebGPU and pthread WebAssembly
         shell: bash
         run: |
           source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
@@ -109,9 +111,11 @@ jobs:
         shell: bash
         run: |
           test -f build-pages/.nojekyll
-          for file in index.html coi-serviceworker.js single/kidi.mjs single/kidi.wasm threads/kidi.mjs threads/kidi.wasm; do
+          for file in index.html app-config.yaml app-config.mjs libs/js-yaml/js-yaml.mjs \
+              threads/kidi.mjs threads/kidi.wasm gpu/kidi.mjs gpu/kidi.wasm; do
             test -s "build-pages/$file"
           done
+          test ! -e build-pages/single
           test -z "$(find build-pages -type l -print -quit)"
           test -z "$(find build-pages -name '*.safetensors' -print -quit)"
 

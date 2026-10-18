@@ -88,6 +88,12 @@ Tensor::Tensor(std::shared_ptr<Backend> backend, std::shared_ptr<Storage> storag
 
 auto Tensor::defined() const noexcept -> bool { return backend_ != nullptr && storage_ != nullptr; }
 
+auto Tensor::copy_from_host(std::span<const std::byte> source, std::size_t offset) -> Result<void> {
+    if (!defined() || !is_contiguous() || offset > nbytes() || source.size() > nbytes() - offset)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "host write outside contiguous tensor"});
+    return backend_->copy_from_host(*storage_, storage_offset_ * element_size(dtype_) + offset, source);
+}
+
 auto Tensor::dtype() const noexcept -> DType { return dtype_; }
 
 auto Tensor::device() const noexcept -> Device { return defined() ? storage_->device() : Device::cpu(); }
@@ -301,6 +307,22 @@ auto Tensor::from_blob(std::vector<std::int64_t> shape, DType dtype, std::span<c
     auto backend = BackendRegistry::instance().backend(Device::cpu());
     if (!backend) return std::unexpected(std::move(backend.error()));
     auto storage = (*backend)->wrap_host(Device::cpu(), bytes, std::move(owner));
+    if (!storage) return std::unexpected(std::move(storage.error()));
+    auto strides = contiguous_strides(shape);
+    return Tensor(std::move(*backend), std::move(*storage), dtype, std::move(shape), std::move(strides), 0);
+}
+
+auto Tensor::from_mutable_blob(std::vector<std::int64_t> shape, DType dtype, std::span<std::byte> bytes,
+                               std::shared_ptr<void> owner) -> Result<Tensor> {
+    auto expected = checked_nbytes(shape, dtype);
+    if (!expected) return std::unexpected(std::move(expected.error()));
+    if (bytes.size() != *expected) {
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT, "mutable host blob byte count does not match tensor shape and dtype"});
+    }
+    auto backend = BackendRegistry::instance().backend(Device::cpu());
+    if (!backend) return std::unexpected(std::move(backend.error()));
+    auto storage = (*backend)->wrap_host_mutable(Device::cpu(), bytes, std::move(owner));
     if (!storage) return std::unexpected(std::move(storage.error()));
     auto strides = contiguous_strides(shape);
     return Tensor(std::move(*backend), std::move(*storage), dtype, std::move(shape), std::move(strides), 0);

@@ -6,7 +6,7 @@ recorded control flow. A fixed-shape step may be captured from that same eager
 code and replayed (see [Captured Steps](#captured-steps)).
 
 ```text
-inference::{Decoder, Transcriber} -> model::{Transformer, Gemma4, Whisper} -> layers -> ops::Context -> backend
+inference::{Decoder, Transcriber, Synthesizer} -> model::{Transformer, Gemma4, Whisper, OmniVoice} -> layers -> ops::Context -> backend
 ```
 
 ## Ownership
@@ -20,7 +20,7 @@ inference::{Decoder, Transcriber} -> model::{Transformer, Gemma4, Whisper} -> la
 | `layers` | Bound parameters and reusable neural equations |
 | `checkpoint` | Configuration/package I/O, format readers, serialization and generic cache preparation |
 | `model` | Neural network topology, parameter binding, checkpoint policies, source and decoder state |
-| `inference` | Generic generation/search, translation application, profiling |
+| `inference` | Generic generation/search, translation and synthesis applications, profiling |
 | `runtime/ynn` | Private prepared CPU operators and YNNPACK ownership |
 | `runtime/mps` | Private prepared Metal operators, command batches, INT8 kernels |
 | `text`, `cli` | Tokenization and command/input/output policy |
@@ -29,8 +29,8 @@ RTG is an import/package format, not the owner of general modeling code. Do not
 add independent CPU and GPU model implementations. Backend fusion belongs in
 operators, not duplicated Transformer equations.
 
-`kidi::model` contains Gemma 4, its vision tower, Transformer and Whisper model
-implementations. Model-specific validation, parameter binding and checkpoint
+`kidi::model` contains Gemma 4, its vision tower, Transformer, Whisper, Qwen3
+and OmniVoice model implementations. Model-specific validation, parameter binding and checkpoint
 customizations stay with the model. Models define metadata layout, required
 sidecars, source compatibility, conversion/export rules and cache identity.
 `kidi::checkpoint` invokes those hooks while owning filesystem access, source
@@ -105,6 +105,9 @@ before assignment. There is no separate encoding enum or YAML precision setting.
 The execution policy follows stored weights; any future compute-precision override
 is a separate runtime option, not a duplicate declaration of checkpoint metadata.
 The old flat manifest layout is not supported or automatically migrated.
+TTS manifests declare every redistributed legal artifact in `license_files`;
+configuration loading and Hub resolution require and path-check the complete
+list alongside weights and tokenizer/frontend data.
 `model.yaml` may list `external_tensors` (name, dtype, shape) that the embedder
 supplies through `Generator::load`'s `ExternalTensorSource`; `Weights::add`
 registers them beside the file's tensors. The browser uses this for the Gemma
@@ -112,6 +115,159 @@ per-layer embedding table: `tensor::external_tensor` wraps a `RowSource` whose r
 stay in JavaScript, and `gather_rows` copies only the requested rows. External
 tensors are CPU tensors without host addresses, so direct byte access and device
 transfers fail rather than materializing the table.
+
+`model::registered_models()` is the central model-to-task descriptor list.
+Commands validate a task (`TRANSLATION`, `TEXT_GENERATION`,
+`SPEECH_RECOGNITION`, or `TTS`) rather than equating a command with one model
+type. `inference::Synthesizer` currently dispatches TTS to OmniVoice; another TTS
+model can be registered without changing the public task. Its PImpl stores the
+generic `SynthesizerModel` interface. `OmniVoiceImpl` and `KokoroImpl` implement
+that interface directly, so each model's package loading, frontend, voice
+schema, prompt policy and neural equations stay together in its model file.
+`synthesizer.cpp` owns generic option parsing, model-type dispatch, sentence
+orchestration, and the model-neutral lifetime of generated voice prompts.
+Both synchronous and stepped synthesis use the same chunk orchestrator. A
+reference sentence may be generated first, but completed audio is emitted in
+playback order as soon as earlier sentences are available. Disabling
+`retain_audio` releases delivered waveforms instead of buffering every sentence.
+Models expose one session-oriented synthesis contract. The native synchronous
+frontend advances that session once; CPU/Metal/Vulkan models complete in that
+call, while a pending WebGPU session is rejected because JavaScript must await
+submitted work between steps. `SynthesisOptions::voice_prompt` is the sole owned
+reference carrier; there is no parallel borrowed-reference API.
+
+`SynthesisOptions::voice` is a model-independent string map populated by the
+repeatable `--voice KEY=VALUE` CLI option. Parsing validates only generic
+assignment syntax and duplicate keys. The active model adapter owns its schema:
+OmniVoice converts gender, age, pitch, style, accent, and dialect attributes to
+the checkpoint's instruction-token format. Future TTS models may accept
+different keys without extending the CLI.
+
+`Synthesis::voice_prompt` owns a model-native text/audio-token reference.
+Passing it through `SynthesisOptions::voice_prompt` keeps one narrator across
+separate synthesis calls without retaining sentence workspaces. Models that do
+not implement generated prompts reject the option rather than silently ignoring
+it.
+
+Kokoro demonstrates the second schema: `name` selects an embedded voice table
+and `speed` scales its predicted durations. Its backend uses a replaceable
+`text::LexiconPhonemizer`: input words are resolved through a pronunciation
+lexicon, then the resulting IPA is tokenized by Unicode codepoint. The acoustic
+backend uses shared-weight ALBERT, quantized BiLSTMs, StyleTTS2 duration/F0/noise
+prediction, AdaIN/Snake decoder blocks, a deterministic harmonic source, and a
+CPU iSTFT. The package is entirely INT8 at rest; matrices are lazily dequantized
+for FP32 compute because acoustic errors compound through the vocoder.
+
+The OmniVoice prototype uses reusable Qwen3 full-attention blocks for iterative
+masked audio-token generation. Conversion concatenates Q/K/V and gate/up
+projections along their output dimension before row quantization. The runtime
+therefore uses the canonical fused `Linear` and `GatedFeedForward` layers rather
+than Qwen-specific parallel projections. Classifier-free guidance packs its
+conditional and unconditional sequences behind a block-diagonal attention mask,
+so each diffusion step traverses Qwen once. Audio-codebook embeddings are shared
+between both segments, attention tables are bounded and cached by length, and
+fixed-shape Qwen steps use the generic graph replay path. SiLU multiplication is
+a canonical operator rather than a host-side synchronization point. On Apple
+CPU, split SiLU reads the fused gate/up projection directly through
+Accelerate/vForce, RMS normalization and rotary are one operator, and Qwen/DAC
+residual streams plus codebook sums reuse their input buffers. Unit-stride 1x1
+audio convolutions bypass im2col lowering.
+
+Neural audio APIs use shaped tensors, not flat token spans plus a separate
+length: codebook IDs are I32 `[codebooks, length]`, while OmniVoice `forward()`
+takes FP32 `[1, sequence, hidden]` embeddings. Higgs quantization/decoding has
+one tensor implementation for all supported devices. Host vectors remain at
+tokenization, CPU sampling, and serialized result boundaries. Reference
+embeddings are prepared once and concatenated with the current target
+embedding, rather than re-embedding the reference and target every step.
+
+WebGPU diffusion always uses device-side candidate selection, state updates,
+and codebook embedding sums. Experimental full-logit readback/host-sampling
+modes and forced guidance-layout environment switches have been removed.
+Guidance layout is selected automatically; separate conditional/unconditional
+passes remain the capacity fallback. Native CPU/Metal/Vulkan sampling is not
+an obsolete WebGPU fallback and remains supported.
+
+The Wasm speech ABI likewise uses only `start`/`step` for TTS and ASR. CPU
+workers complete on the start call; WebGPU workers continue while `pending`.
+Separate synchronous Wasm exports were removed, while native synchronous C++
+frontends remain.
+
+Qwen projection weights remain signed INT8 in output-major checkpoint layout.
+YNNPACK dynamically quantizes each FP32 activation directly to INT8 for its
+blockwise dot product; the path has no intermediate FP16/BF16 casts and does not
+dequantize full weight matrices. Output-major storage is intentional:
+conversion-time input-major storage was measured and reverted because it made
+YNNPACK preparation substantially slower. A trusted Qwen replay captures each
+fixed shape once, so constant weight transposition and packing are not repeated
+for every diffusion step.
+
+The Higgs Audio V2 subset contains only the eight RVQ decode tables, their output
+projections, and the DAC waveform decoder; HuBERT, semantic/acoustic encoders,
+and training state are not packaged. Every retained learned tensor is signed
+INT8. Matrices and embedding tables use per-output-row scales; vectors use one
+scale per tensor. Scale tensors are FP32 quantization metadata. Small vectors
+are dequantized on first use, while matrix and convolution weights stay INT8
+through the projection path.
+
+OmniVoice generation accepts CPU, Metal, or Vulkan execution. Vulkan keeps checkpoint
+parameters in host-backed storage, uploads reusable packed layouts for supported
+per-channel INT8 projections, and bridges unsupported operators to CPU. The
+Higgs/DAC waveform decoder remains on CPU for Vulkan. General Conv1d and ConvTranspose1d
+use INT8 projections plus explicit sequence lowering/overlap for correctness.
+The Android read-aloud surface reaches this API through JNI, selects Vulkan with
+CPU fallback, converts the completed waveform to PCM16, and streams it through
+`AudioTrack`. It does not require QNN or a custom HTP package. Browser TTS is not
+implemented. Another application can link the C++ library directly and select
+`Device::cpu()`, `Device::apple_gpu()`, or `Device::vulkan()`.
+
+On Apple GPU, OmniVoice retains INT8 package storage but expands each constant
+projection once to FP16 and feeds it to MPSGraph half GEMM. Shape-specific
+operators share that 898 MB expansion cache; temporary INT8 uploads are released
+after expansion, and sentence boundaries clear graph/output workspaces without
+discarding expanded weights. RMS/rotary, residuals, attention, and fused
+SiLU-gate stay on Metal, logits are copied to the host once per diffusion step
+for deterministic token selection. Higgs/DAC decoding uses Metal INT8
+projections with fused Snake/unfold and transposed-convolution fold kernels.
+CPU decoding partitions sufficiently large convolution and activation ranges
+over the shared bounded YNN thread pool; small ranges remain serial to avoid
+scheduling overhead.
+
+OmniVoice prompt syntax is package data rather than C++ policy:
+`synthesis_template.jinja` is rendered by tokenizer++ with `language`,
+`instruction`, and `text` arguments before tokenization. The manifest requires
+the template so Hub resolution cannot produce a package with missing prompt
+semantics.
+
+Long-form TTS uses `text::SentenceSegmenter` before model dispatch. It unwraps
+non-empty lines within a paragraph, preserves blank paragraph boundaries, and
+recognizes Unicode terminators, closing punctuation, decimals, initials,
+acronyms, and plausible Unicode sentence starters. Non-breaking prefixes are
+loaded from the package's `sentence-prefixes.tsv`; rows classify a prefix by
+language as `always` or `numeric`. The organization is informed by Moses'
+sentence splitter and language-prefix tables, while the implementation is
+native C++ and Unicode-algo based.
+
+OmniVoice long-form synthesis chooses the shortest sentence estimated at least
+three seconds as the narrator anchor and generates it first. Its transcript
+and codebook-major audio tokens become a fixed conditional prefix for every
+other sentence, matching upstream generated-prompt chunking without requiring
+the omitted waveform encoder. Results are assembled in source order. Each
+sentence still releases replay/operator workspaces before the next, so chapter
+memory is bounded by the largest reference-conditioned sentence rather than the
+whole chapter.
+
+OmniVoice selects classifier-free-guidance layout by target length. Short
+sentences concatenate conditional and unconditional sequences behind a
+block-diagonal mask, minimizing projection rows. At 128 or more audio frames,
+the runtime instead forms a two-row padded batch: this adds only the prompt
+padding rows while avoiding the packed layout's cross-segment attention-score
+rectangle. On the profiled 449-frame sentence this reduced 32-step generation
+from 22.38 to 19.16 seconds. Generated voice prompting adds the fixed reference
+prefix to long-form conditional attention: the current reference-conditioned
+25-step profile has RTF 1.195 on the reference 8-core Apple CPU. The
+unreferenced single-sentence path retains its previous latency, and 32 steps
+remain available as the quality-first setting.
 
 CLI diagnostics use spdlog on stderr. Translation results and inspection output
 remain on stdout; machine-readable metric/profile records retain their unadorned
@@ -915,7 +1071,7 @@ of a 128-token INT8-KV prefill step found element-wise work dominating (GELU-tan
 chain 30%, other multiply/add 26%, quantize/dequantize 20%, RMS norms 10%), while
 HMX matmuls were 3.6% and attention 1%.
 
-`src/kidi/runtime/qnn/htp/KidiOpsPackage` is a QNN HTP op package (QHPI,
+`kidi-ops` is a standalone QNN HTP op package (QHPI,
 multithreaded HVX) that restores those fusions on the NPU. `GeluMultiply` maps
 the UINT8 gate/up projection output directly to the UINT8 input of the down
 projection in one pass, and `RmsNorm` covers plain and residual norms with an

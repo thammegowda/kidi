@@ -93,6 +93,7 @@ public:
     auto host_bytes() -> Result<std::span<std::byte>>;
     auto host_bytes() const -> Result<std::span<const std::byte>>;
     auto copy_to_host() const -> Result<std::vector<std::byte>>;
+    auto copy_from_host(std::span<const std::byte> source, std::size_t offset = 0) -> Result<void>;
     auto to(Device target) const -> Result<Tensor>;
     auto reshape(std::vector<std::int64_t> shape) const -> Result<Tensor>;
     auto narrow(std::int64_t axis, std::int64_t start, std::int64_t length) const -> Result<Tensor>;
@@ -126,6 +127,8 @@ public:
                            Device device = Device::cpu()) -> Result<Tensor>;
     static auto from_blob(std::vector<std::int64_t> shape, DType dtype, std::span<const std::byte> bytes,
                           std::shared_ptr<const void> owner) -> Result<Tensor>;
+    static auto from_mutable_blob(std::vector<std::int64_t> shape, DType dtype, std::span<std::byte> bytes,
+                                  std::shared_ptr<void> owner) -> Result<Tensor>;
 
     template <typename Value>
     static auto from_host(std::vector<std::int64_t> shape, std::span<const Value> values, Device device = Device::cpu())

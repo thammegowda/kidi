@@ -4,6 +4,11 @@
 #include <utility>
 
 namespace kidi::tensor {
+auto Backend::wrap_host_mutable(Device, std::span<std::byte>, std::shared_ptr<void>) const
+    -> Result<std::shared_ptr<Storage>> {
+    return std::unexpected(Error{ErrorCode::UNSUPPORTED, "backend cannot wrap mutable host storage"});
+}
+
 namespace {
 
 class UnavailableBackend final : public Backend {
@@ -22,8 +27,8 @@ public:
         return std::unexpected(unavailable());
     }
 
-    auto wrap_host(Device, std::span<const std::byte>,
-                   std::shared_ptr<const void>) const -> Result<std::shared_ptr<Storage>> override {
+    auto wrap_host(Device, std::span<const std::byte>, std::shared_ptr<const void>) const
+        -> Result<std::shared_ptr<Storage>> override {
         return std::unexpected(unavailable());
     }
 
