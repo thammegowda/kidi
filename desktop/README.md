@@ -120,6 +120,27 @@ chat, TTS, playback drain, and delayed listen restarts. Exiting voice mode
 invalidates the epoch before sending cancellation, so stale completion events
 or timers cannot re-enter the loop.
 
+### Voice latency benchmark
+
+Development builds record user-visible timing for every completed voice turn.
+The clock starts at the last microphone frame above the VAD threshold and ends
+when the playback worklet begins consuming the first synthesized segment. Open
+the browser developer console while running with `--dev`, complete several
+voice turns, then inspect:
+
+```js
+kidiVoiceLatency.samples
+kidiVoiceLatency.summary()
+```
+
+Each completed turn also emits a `kidi_voice_latency|{...}` console record.
+`endpoint_ms` measures VAD silence, `transcription_ms` measures final ASR,
+`dispatch_ms` covers the ASR-to-chat handoff, `first_token_ms` and
+`end_to_end_ms` are measured from the user's last speech, and the remaining
+fields isolate text segmentation, TTS first-PCM, and browser playback queueing.
+Call `kidiVoiceLatency.clear()` before a benchmark run. The summary reports p50
+and p95 across the last 100 completed turns.
+
 ## Accelerator placement
 
 The example uses `auto` for Gemma and OmniVoice and CPU for Whisper. On Apple,
@@ -137,11 +158,11 @@ Whisper and the default OmniVoice voice prompt warm in the background after the
 loopback server starts. The first voice-mode recording therefore overlaps model
 preparation instead of paying it after chat completion.
 
-Desktop and Wasm now use the same sentence policy: complete sentences remain
-whole through 192 weighted units, and only oversized sentences use shared
-clause/word targets. Exactly one segment may synthesize ahead of playback. The
-same controller emits source offsets and segment IDs for highlighting on both
-backends.
+Desktop and Wasm now use the same sentence policy: the first segment is capped
+at 96 weighted units with a 64-unit natural-clause target, while later complete
+sentences remain whole through 192 units. Exactly one segment may synthesize
+ahead of playback. The same controller emits source offsets and segment IDs for
+highlighting on both backends.
 
 Metal FP16 projection expansion is bounded separately per constructed model:
 512 MiB for Gemma and 1 GiB for OmniVoice in the example. An unlimited cache

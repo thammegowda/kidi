@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {MAX_SPEECH_SEGMENT_UNITS, SpeechSegments, speechUnits} from '../../web/ui/speech-controller.js';
+import {
+    MAX_SPEECH_SEGMENT_UNITS, SpeechSegments, plainSpeechText, speechUnits,
+} from '../../web/ui/speech-controller.js';
 
 test('speech starts at complete sentences before the input stream finishes', () => {
     const stream = new SpeechSegments();
@@ -44,12 +46,28 @@ test('abbreviations wait for their sentence and oversized graphemes fail explici
     assert.throws(() => new SpeechSegments().push('e' + '\u0301'.repeat(300), true), /grapheme/);
 });
 
-test('normal sentences remain whole instead of splitting a noun phrase', () => {
+test('the first long sentence is split at a natural clause for lower latency', () => {
     const text = 'I can understand, generate, and debug code in many programming languages, including Python, JavaScript, Java, C++, and more.';
+    const expected = [
+        'I can understand, generate, and debug code in many programming languages,',
+        'including Python, JavaScript, Java, C++, and more.',
+    ];
     for (const size of [1, 7, text.length]) {
         const stream = new SpeechSegments(), output = [];
         for (let index = 0; index < text.length; index += size) output.push(...stream.push(text.slice(index, index + size)));
         output.push(...stream.push('', true));
-        assert.deepEqual(output.map(segment => segment.text), [text]);
+        assert.deepEqual(output.map(segment => segment.text), expected);
     }
+});
+
+test('markdown formatting and link destinations are not sent to speech', () => {
+    const source = '## Options\n\n1. **Fast:** use [Metal](https://example.test/gpu).\n' +
+        '2. *Portable:* use `CPU`.\n\n> Choose one.';
+    assert.equal(plainSpeechText(source), 'Options Fast: use Metal. Portable: use CPU. Choose one.');
+    const stream = new SpeechSegments();
+    const segments = stream.push(source, true);
+    assert.equal(segments.map(segment => segment.text).join(' '),
+        'Options Fast: use Metal. Portable: use CPU. Choose one.');
+    assert.ok(segments.every(segment => !/[*_`#>|[\]]/u.test(segment.text)));
+    assert.ok(segments.every(segment => !segment.text.includes('example.test')));
 });

@@ -1,5 +1,6 @@
 export const MAX_SPEECH_SEGMENT_UNITS = 192;
-const FIRST_TARGET_UNITS = 128;
+const FIRST_MAX_SPEECH_SEGMENT_UNITS = 96;
+const FIRST_TARGET_UNITS = 64;
 const NEXT_TARGET_UNITS = 160;
 const wideScript = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const graphemes = new Intl.Segmenter(undefined, {granularity: 'grapheme'});
@@ -15,6 +16,112 @@ export function speechUnits(text) {
   let units = 0;
   for (const {segment} of graphemes.segment(text)) units += wideScript.test(segment) ? 3 : segment.length;
   return units;
+}
+
+export function plainSpeechText(source) {
+  return source
+    .replace(/!\[([^\]]*)\]\([^)]*\)/gu, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/gu, '$1')
+    .replace(/<[^>]*>/gu, ' ')
+    .replace(/^\s{0,3}(?:#{1,6}\s+|>\s*|(?:[-+*]|\d+[.)])\s+)/gmu, '')
+    .replace(/^\s*(?:[-*_]\s*){3,}$/gmu, '')
+    .replace(/[*_`~]+/gu, '')
+    .replace(/\|+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
+const LATENCY_MILESTONES = [
+  'speech_end',
+  'capture_stop',
+  'asr_complete',
+  'chat_request',
+  'first_token',
+  'tts_request',
+  'first_pcm',
+  'playback_start',
+];
+
+function roundedLatency(value) {
+  return Math.round(value * 10) / 10;
+}
+
+function latencyPercentile(values, fraction) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  return roundedLatency(sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)]);
+}
+
+export class VoiceLatencyBenchmark {
+  #now;
+  #logger;
+  #maximumSamples;
+  #active = null;
+
+  constructor({now = () => performance.now(), logger = sample =>
+    console.info(`kidi_voice_latency|${JSON.stringify(sample)}`), maximumSamples = 100} = {}) {
+    if (typeof now !== 'function' || typeof logger !== 'function' ||
+        !Number.isSafeInteger(maximumSamples) || maximumSamples < 1)
+      throw new Error('Invalid voice latency benchmark options');
+    this.#now = now;
+    this.#logger = logger;
+    this.#maximumSamples = maximumSamples;
+    this.samples = [];
+  }
+
+  begin(speechEnd, captureStop = this.#now()) {
+    if (![speechEnd, captureStop].every(Number.isFinite) || captureStop < speechEnd)
+      throw new Error('Invalid voice latency start');
+    this.#active = {speech_end: speechEnd, capture_stop: captureStop};
+  }
+
+  mark(name, at = this.#now()) {
+    if (!this.#active || !LATENCY_MILESTONES.includes(name) || !Number.isFinite(at)) return;
+    if (this.#active[name] === undefined) this.#active[name] = at;
+  }
+
+  complete(at = this.#now()) {
+    this.mark('playback_start', at);
+    if (!this.#active?.playback_start) return null;
+    const marks = this.#active;
+    this.#active = null;
+    const sinceEnd = name => marks[name] === undefined ? null :
+      roundedLatency(marks[name] - marks.speech_end);
+    const between = (start, end) => marks[start] === undefined || marks[end] === undefined ? null :
+      roundedLatency(marks[end] - marks[start]);
+    const sample = {
+      endpoint_ms: between('speech_end', 'capture_stop'),
+      transcription_ms: between('capture_stop', 'asr_complete'),
+      dispatch_ms: between('asr_complete', 'chat_request'),
+      first_token_ms: sinceEnd('first_token'),
+      text_to_tts_ms: between('first_token', 'tts_request'),
+      tts_first_pcm_ms: between('tts_request', 'first_pcm'),
+      playback_queue_ms: between('first_pcm', 'playback_start'),
+      end_to_end_ms: sinceEnd('playback_start'),
+    };
+    this.samples.push(sample);
+    if (this.samples.length > this.#maximumSamples) this.samples.shift();
+    this.#logger(sample);
+    return sample;
+  }
+
+  cancel() {
+    this.#active = null;
+  }
+
+  clear() {
+    this.cancel();
+    this.samples.length = 0;
+  }
+
+  summary() {
+    const result = {turns: this.samples.length};
+    for (const name of Object.keys(this.samples[0] || {})) {
+      const values = this.samples.map(sample => sample[name]).filter(Number.isFinite);
+      result[name] = {p50: latencyPercentile(values, 0.5), p95: latencyPercentile(values, 0.95)};
+    }
+    return result;
+  }
 }
 
 export class SpeechSegments {
@@ -33,10 +140,11 @@ export class SpeechSegments {
       this.#buffer = this.#buffer.slice(leading);
       if (!this.#buffer) break;
       const target = this.#count ? NEXT_TARGET_UNITS : FIRST_TARGET_UNITS;
+      const limit = this.#count ? MAX_SPEECH_SEGMENT_UNITS : FIRST_MAX_SPEECH_SEGMENT_UNITS;
       let bounded = 0, units = 0, word = 0, targetWord = 0, clause = 0;
       for (const {segment, index} of graphemes.segment(this.#buffer)) {
         const next = units + (wideScript.test(segment) ? 3 : segment.length);
-        if (next > MAX_SPEECH_SEGMENT_UNITS) break;
+        if (next > limit) break;
         units = next;
         bounded = index + segment.length;
         if (/\s/u.test(segment)) {
@@ -49,7 +157,7 @@ export class SpeechSegments {
       let end = 0;
       for (const {segment, index} of sentences.segment(this.#buffer)) {
         const candidate = this.#buffer.slice(0, index + segment.length).trimEnd();
-        if (speechUnits(candidate) > MAX_SPEECH_SEGMENT_UNITS) break;
+        if (speechUnits(candidate) > limit) break;
         if (abbreviation.test(candidate)) continue;
         if ((finished || index + segment.length < this.#buffer.length ||
             /[.!?。！？]["'”’)\]]*\s+$/u.test(segment)) && /[.!?。！？]["'”’)\]]*\s*$/u.test(segment))
@@ -60,7 +168,8 @@ export class SpeechSegments {
       if (!end && finished) end = this.#buffer.length;
       if (!end) break;
       const raw = this.#buffer.slice(0, end), value = raw.trimEnd();
-      if (value) result.push({id: this.#count++, text: value,
+      const spoken = plainSpeechText(value);
+      if (spoken) result.push({id: this.#count++, text: spoken,
         start: this.#offset, end: this.#offset + value.length});
       this.#buffer = this.#buffer.slice(end);
       this.#offset += end;
@@ -139,6 +248,8 @@ export class SpeechController {
   #onStarted;
   #onProgress;
   #onSegment;
+  #onRequest;
+  #onWirePcm;
   #onPcm;
   #onCompleted;
   #onError;
@@ -146,12 +257,15 @@ export class SpeechController {
   #cache = new RecentAudio();
   #current = null;
 
-  constructor({send, nextWireStream, onStarted, onProgress, onSegment, onPcm, onCompleted, onError, onCancelled}) {
+  constructor({send, nextWireStream, onStarted, onProgress, onSegment, onRequest, onWirePcm, onPcm,
+    onCompleted, onError, onCancelled}) {
     this.#send = send;
     this.#nextWireStream = nextWireStream;
     this.#onStarted = onStarted;
     this.#onProgress = onProgress;
     this.#onSegment = onSegment;
+    this.#onRequest = onRequest;
+    this.#onWirePcm = onWirePcm;
     this.#onPcm = onPcm;
     this.#onCompleted = onCompleted;
     this.#onError = onError;
@@ -244,6 +358,7 @@ export class SpeechController {
       throw new Error('Speech segment changed sample rate');
     primitive.sampleRate = sampleRate;
     primitive.audio.push(samples.slice());
+    this.#onWirePcm?.(this.#current, primitive, {sequence, sampleRate, samples});
     return true;
   }
 
@@ -273,6 +388,7 @@ export class SpeechController {
     };
     current.primitive = primitive;
     try {
+      this.#onRequest?.(current, segment, primitive);
       this.#send('tts.start', primitive.requestId, {
         stream_id: primitive.wireStreamId,
         text: segment.text,

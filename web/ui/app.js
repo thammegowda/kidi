@@ -1,7 +1,7 @@
 import {renderMarkdown, renderStreamingMarkdown} from './markdown.js';
 import {backend} from './backend.js';
 import {MAX_IMAGE_BYTES, MAX_IMAGES, readImage, removeUnusedImages, storeImage} from './images.js';
-import {SpeechController} from './speech-controller.js';
+import {SpeechController, VoiceLatencyBenchmark} from './speech-controller.js';
 import {renderSpeechHighlights} from './speech-highlights.js';
 
 const $ = id => document.getElementById(id);
@@ -37,6 +37,8 @@ let runtimeLoadId;
 let modelLoadProgress;
 let cacheBusy = false;
 let cachePath = [];
+const voiceLatency = new VoiceLatencyBenchmark();
+globalThis.kidiVoiceLatency = voiceLatency;
 const speech = new SpeechController({
   send: (type, id, payload) => send(type, id, payload),
   nextWireStream: () => streamId++,
@@ -47,6 +49,12 @@ const speech = new SpeechController({
     stream.segments ||= new Map();
     stream.segments.set(segment.id, {...segment, status: 'ready'});
     renderSpeechHighlights(ttsStreams.values());
+  },
+  onRequest: current => {
+    if (current.voice) voiceLatency.mark('tts_request');
+  },
+  onWirePcm: current => {
+    if (current.voice) voiceLatency.mark('first_pcm');
   },
   onPcm: (_current, frame) => handlePcm(frame),
   onCompleted: current => completeAudioStream(current.streamId),
@@ -928,6 +936,7 @@ function handleEvent(event) {
   }
   if (event.type === 'chat.delta' && activeRequest?.id === event.id) {
     const delta = payload.text || '';
+    if (activeRequest.voiceTurn) voiceLatency.mark('first_token');
     streamText(delta);
     if (activeRequest.voiceTurn) speech.append(event.id, delta);
     return;
@@ -989,12 +998,13 @@ function handleEvent(event) {
     const submit = sendAfterTranscription || voiceTurn;
     sendAfterTranscription = false;
     asrFinalizing = false;
+    if (voiceTurn) voiceLatency.mark('asr_complete');
     stopCapture(false); $('prompt').value = payload.text || ''; finishRequest(); resizePrompt();
     if (submit) {
       if ($('prompt').value.trim())
         setTimeout(() => {
           if (!voiceTurn || (voiceMode && epoch === voiceEpoch)) sendMessage();
-        }, voiceTurn ? 600 : 25);
+        }, 25);
       else if (voiceTurn) scheduleVoiceListening(voiceEpoch);
       else showNotice('No speech was recognized');
     }
@@ -1090,6 +1100,7 @@ async function ensurePlayback(sampleRate) {
             for (const resolve of stream.capacityWaiters?.splice(0) || []) resolve();
           if (wasPlaying !== (stream.bufferedFrames > 0)) renderRuntime();
         } else if (data.type === 'segment-started' || data.type === 'segment-ended') {
+          if (data.type === 'segment-started' && stream.voiceTurn) voiceLatency.complete();
           const segment = stream.segments?.get(data.segmentId);
           if (segment) segment.status = data.type === 'segment-started' ? 'playing' : 'played';
           renderSpeechHighlights(ttsStreams.values());
@@ -1241,6 +1252,7 @@ async function beginCapture(id) {
     const rms = Math.sqrt(energy / Math.max(1, values.length));
     const frameMs = values.length / 16;
     const active = rms >= current.threshold;
+    if (active) current.lastSpeechAt = performance.now();
     if (!current.heardSpeech) {
       current.preRoll.push(values);
       current.preRollSamples += values.length;
@@ -1282,6 +1294,7 @@ function stopCapture(notify = true) {
   $('mic').classList.remove('recording'); $('mic').setAttribute('aria-label', 'Start dictation');
   if (notify && activeRequest?.kind === 'asr') {
     if (current.heardSpeech) {
+      if (voiceMode) voiceLatency.begin(current.lastSpeechAt || performance.now(), performance.now());
       asrFinalizing = true;
       send('asr.stop', activeRequest.id);
     } else {
@@ -1327,6 +1340,7 @@ function stopVoiceMode(cancel = true) {
   const requestId = activeRequest?.id;
   const speechId = speech.active?.id;
   voiceMode = false;
+  voiceLatency.cancel();
   voiceEpoch++;
   clearTimeout(voiceRestartTimer);
   if (recording) stopCapture(false);
@@ -1486,6 +1500,7 @@ async function sendMessage(event) {
     const preparedMessages = backend.prepareMessages
       ? await backend.prepareMessages(requestMessages, requestId)
       : requestMessages;
+    if (activeRequest.voiceTurn) voiceLatency.mark('chat_request');
     send('chat.start', requestId, {
       messages: preparedMessages,
       speak: false,

@@ -45,7 +45,7 @@ models:
     vad:
       threshold: 0.012
       minimum_speech_ms: 250
-      silence_ms: 2500
+      silence_ms: 1500
 
   tts:
     enabled: true
