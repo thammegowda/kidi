@@ -165,7 +165,7 @@ per-layer embeddings. WebGPU is used when the browser supports it. The browser
 defaults to 1,024 output tokens, allows up to 8,192, and shares a 9,216-token
 context between the conversation and reply. Its cache is separate from the CLI's.
 
-See the [browser guide](web/README.md) for detailed requirements and caching behavior.
+See the [browser guide](web/README.md) for getting started and browser requirements.
 
 ### Android
 

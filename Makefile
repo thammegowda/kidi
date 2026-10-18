@@ -13,7 +13,7 @@ TEST_DIST := .cache/test-dist
 
 export KIDI_HUB PYTHON
 
-.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test regression-test test app app-dev wasm serve apk apk-release
+.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test web-smoke-test regression-test test app app-dev wasm serve apk apk-release
 
 setup-test:
 	bash tests/setup.sh
@@ -37,6 +37,9 @@ python-test: build-python-test
 
 web-test:
 	node --test tests/browser/*_test.mjs third_party/liteapp/tests/browser/*_test.mjs
+
+web-smoke-test:
+	npm --prefix web run test:pages -- "$(abspath $(WEB_DIR))"
 
 regression-test: setup-test build-test
 	$(TEST_PYTHON) tests/rtg_regression.py run --binary "$(KIDI_BIN)" --backend "$(BACKEND)" --threads "$(THREADS)" --min-chrf "$(MIN_CHRF)"
