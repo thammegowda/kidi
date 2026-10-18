@@ -48,6 +48,21 @@ auto json_response(Json value, int status = 200) -> liteapp::Response {
     return liteapp::Response::json(value.dump(), status);
 }
 
+auto valid_language_setting(std::string_view language) -> bool {
+    if (language == "auto") return true;
+    std::size_t code = 0;
+    for (const auto value : language) {
+        if (value == ',') {
+            if (code < 2 || code > 3) return false;
+            code = 0;
+        } else if (value >= 'a' && value <= 'z')
+            ++code;
+        else
+            return false;
+    }
+    return code >= 2 && code <= 3;
+}
+
 auto milliseconds(Clock::time_point started) -> double {
     return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
 }
@@ -313,7 +328,7 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
             {"vad",
              {{"threshold", vad_threshold},
               {"minimum_speech_ms", positive_size(vad, "minimum_speech_ms", 250, 10000)},
-              {"silence_ms", positive_size(vad, "silence_ms", 1500, 10000)}}},
+             {"silence_ms", positive_size(vad, "silence_ms", 800, 10000)}}},
         };
         result.max_audio_queue_ms = positive_size(root["transport"], "max_audio_queue_ms", 3000, 30000);
         result.max_text_frame_bytes =
@@ -331,6 +346,7 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
              yaml_string(tts, "reference_text",
                          "Hello, I am Kidi, your helpful local assistant. I am here to help clearly and concisely.")},
             {"steps", positive_size(tts, "steps", 10, 128)},
+            {"realtime_steps", positive_size(tts, "realtime_steps", 6, 128)},
             {"voice",
              {
                  {"gender", yaml_string(voice, "gender", "female")},
@@ -386,7 +402,15 @@ public:
         generator_.emplace(std::move(*loaded));
         if (auto warmed = generator_->warm_up(); !warmed)
             return std::unexpected(liteapp::Error{"load_failed", warmed.error().message});
+        std::string speech_execution;
+        if (parsed->tts.enabled) {
+            const auto selected_speech = kidi::inference::select_device(parsed->tts.accelerator);
+            if (!selected_speech)
+                return std::unexpected(liteapp::Error{"unavailable", selected_speech.error().message});
+            speech_execution = std::string(kidi::tensor::to_string(selected_speech->kind));
+        }
         config_.emplace(std::move(*parsed));
+        speech_execution_ = std::move(speech_execution);
         {
             std::scoped_lock prompt_lock(prompt_mutex_);
             system_prompt_ = config_->system_prompt;
@@ -441,16 +465,25 @@ public:
         return json_response({
             {"ready", generator_.has_value()},
             {"config", config_ ? config_->source.string() : ""},
-            {"runtime", config_ ? Json{{"threads", config_->threads},
-                                       {"concurrency", "single"},
-                                       {"preload_speech", config_->preload_speech},
-                                       {"idle_model_timeout_seconds", config_->idle_model_timeout_seconds}}
-                                : Json::object()},
+            {"runtime", runtime()},
             {"components", components()},
             {"model", model_path_},
             {"backend", execution_},
             {"vision", vision_supported_},
         });
+    }
+
+    auto runtime() const -> Json {
+        if (!config_) return Json::object();
+        return {
+            {"host", "native"},
+            {"threads", config_->threads},
+            {"hardware_concurrency", std::max(1U, std::thread::hardware_concurrency())},
+            {"concurrency", "single"},
+            {"speech_backend", speech_execution_},
+            {"preload_speech", config_->preload_speech},
+            {"idle_model_timeout_seconds", config_->idle_model_timeout_seconds},
+        };
     }
 
     auto components() const -> Json {
@@ -471,7 +504,8 @@ public:
         system_prompt_ = std::move(value);
     }
 
-    auto chat(std::span<const ChatMessage> messages, const std::function<bool()>& cancelled,
+    auto chat(std::span<const ChatMessage> messages, std::string_view languages, std::string_view language_names,
+              const std::function<bool()>& cancelled,
               const std::function<void(std::string_view)>& on_delta) -> kidi::Result<ChatRunResult> {
         std::scoped_lock lock(chat_mutex_);
         if (!generator_ || !config_)
@@ -484,7 +518,13 @@ public:
             .stream_text = true,
         };
         const auto started = Clock::now();
-        const auto prompt = system_prompt();
+        auto prompt = system_prompt();
+        if (!languages.empty())
+            prompt += languages.find(',') == std::string_view::npos
+                          ? "\nThe user speaks " + std::string(language_names) +
+                                ". Respond in " + std::string(language_names) + " only."
+                          : "\nThe user may code-switch among " + std::string(language_names) +
+                                ". Respond in the same language or language mix as the latest user message.";
         std::vector<ChatMessage> conversation;
         conversation.reserve(messages.size() + !prompt.empty());
         if (!prompt.empty()) conversation.push_back({.role = "system", .content = prompt, .images = {}});
@@ -528,14 +568,16 @@ public:
     }
 
     auto transcribe(std::span<const float> samples, const std::function<bool()>& cancelled,
-                    const std::function<void(std::string_view, std::string_view)>& on_partial)
+                    const std::function<void(std::string_view, std::string_view)>& on_partial,
+                    std::string_view language = {})
         -> kidi::Result<kidi::inference::Transcription> {
         std::scoped_lock lock(asr_mutex_);
         if (auto prepared = prepare_asr_locked(); !prepared) return std::unexpected(prepared.error());
         return transcriber_->transcribe(
             samples, 16000,
             {
-                .language = config_->asr_settings.value("language", "auto"),
+                .language = language.empty() ? config_->asr_settings.value("language", "auto")
+                                             : std::string(language),
                 .maximum_tokens = config_->asr_settings.value("max_tokens", std::size_t{128}),
                 .fit_audio = true,
                 .on_partial = on_partial,
@@ -644,6 +686,7 @@ private:
         if (found != voice_prompts_.end()) return std::pair{found->second, true};
         auto reference_options = options;
         reference_options.language = config_->tts_settings.value("reference_language", "English");
+        reference_options.steps = config_->tts_settings.value("steps", std::size_t{10});
         reference_options.duration_scale = 1.F;
         reference_options.on_audio_chunk = {};
         reference_options.retain_audio = false;
@@ -672,6 +715,7 @@ private:
     std::string system_prompt_;
     std::string model_path_;
     std::string execution_;
+    std::string speech_execution_;
     bool vision_supported_ = false;
     std::jthread warmup_;
     std::jthread reaper_;
@@ -718,11 +762,7 @@ public:
         send_event("", "session.ready",
                    {{"components", backend_->components()},
                     {"config", backend_->config().source.string()},
-                    {"runtime",
-                     {{"threads", backend_->config().threads},
-                      {"concurrency", "single"},
-                      {"preload_speech", backend_->config().preload_speech},
-                      {"idle_model_timeout_seconds", backend_->config().idle_model_timeout_seconds}}},
+                    {"runtime", backend_->runtime()},
                     {"protocol", 1},
                     {"wire_audio", "pcm_s16le"}});
         while (socket_.is_open()) {
@@ -815,13 +855,20 @@ private:
         }
         if (task_.joinable()) task_.join();
         cancel_requested_.store(false);
+        const auto request_id = id;
         {
             std::scoped_lock lock(active_mutex_);
             active_id_ = std::move(id);
             active_kind_ = kind;
         }
-        task_ = std::jthread([this, kind, work = std::move(work)] {
-            work();
+        task_ = std::jthread([this, request_id, kind, work = std::move(work)] {
+            try {
+                work();
+            } catch (const kidi::ops::Failure& error) {
+                finish_error(request_id, error.error());
+            } catch (const std::exception& error) {
+                send_error(request_id, "internal_error", error.what());
+            }
             {
                 std::scoped_lock lock(active_mutex_);
                 active_id_.clear();
@@ -948,8 +995,29 @@ private:
                 send_error(id, "invalid_messages", messages.error().message);
                 return;
             }
+            if (payload.contains("languages") && !payload["languages"].is_string()) {
+                send_error(id, "invalid_languages", "languages must be a string");
+                return;
+            }
+            const auto languages = payload.value("languages", std::string{});
+            if (!languages.empty() && !valid_language_setting(languages)) {
+                send_error(id, "invalid_languages", "languages must contain comma-separated language codes");
+                return;
+            }
+            if (payload.contains("language_names") && !payload["language_names"].is_string()) {
+                send_error(id, "invalid_languages", "language_names must be a string");
+                return;
+            }
+            const auto language_names = payload.value("language_names", languages);
+            if (language_names.size() > 256 ||
+                std::ranges::any_of(language_names, [](unsigned char value) { return value < 0x20; })) {
+                send_error(id, "invalid_languages", "language_names contains invalid characters");
+                return;
+            }
             auto owned = std::move(*messages);
-            start_task(id, "chat", [this, id, messages = std::move(owned)] { run_chat(id, messages); });
+            start_task(id, "chat", [this, id, languages, language_names, messages = std::move(owned)] {
+                run_chat(id, messages, languages, language_names);
+            });
             return;
         }
         if (type == "asr.start") {
@@ -962,6 +1030,17 @@ private:
                 return;
             }
             const auto stream_id = payload["stream_id"].get<std::uint32_t>();
+            if (payload.contains("language") && !payload["language"].is_string()) {
+                send_error(id, "invalid_asr", "ASR language must be a string");
+                return;
+            }
+            const auto language = payload.contains("language")
+                                      ? payload["language"].get<std::string>()
+                                      : backend_->config().asr_settings.value("language", std::string{"auto"});
+            if (language.size() > 32 || !valid_language_setting(language)) {
+                send_error(id, "invalid_asr", "ASR language must be auto or comma-separated language codes");
+                return;
+            }
             if (payload.contains("voice_mode") && !payload["voice_mode"].is_boolean()) {
                 send_error(id, "invalid_message", "voice_mode must be a boolean");
                 return;
@@ -971,8 +1050,8 @@ private:
                                 ? tts_settings(id, payload.contains("tts_options") ? payload["tts_options"] : Json{})
                                 : std::optional<Json>{Json::object()};
             if (!settings) return;
-            start_task(id, "asr", [this, id, stream_id, voice_mode, settings = std::move(*settings)] {
-                run_asr(id, stream_id, voice_mode, settings);
+            start_task(id, "asr", [this, id, stream_id, voice_mode, language, settings = std::move(*settings)] {
+                run_asr(id, stream_id, voice_mode, language, settings);
             });
             return;
         }
@@ -1094,10 +1173,11 @@ private:
         image_uploads_.clear();
     }
 
-    void run_chat(const std::string& id, std::span<const ChatMessage> messages) {
+    void run_chat(const std::string& id, std::span<const ChatMessage> messages, std::string_view languages,
+                  std::string_view language_names) {
         send_event(id, "chat.started");
         auto result = backend_->chat(
-            messages, [this] { return cancelled(); },
+            messages, languages, language_names, [this] { return cancelled(); },
             [this, &id](std::string_view delta) {
                 send_event(id, "chat.delta", {{"text", delta}});
             });
@@ -1106,7 +1186,8 @@ private:
         if (!result) return finish_error(id, result.error());
     }
 
-    void run_asr(const std::string& id, std::uint32_t stream_id, bool voice_mode, const Json& speech_settings) {
+    void run_asr(const std::string& id, std::uint32_t stream_id, bool voice_mode, std::string_view language,
+                 const Json& speech_settings) {
         std::optional<kidi::Error> warm_error;
         std::jthread tts_warm;
         if (voice_mode) {
@@ -1143,7 +1224,7 @@ private:
                 snapshot = audio_samples_;
             }
             if (snapshot.size() < 1600 && !final) continue;
-            auto result = backend_->transcribe(snapshot, [this] { return cancelled(); }, {});
+            auto result = backend_->transcribe(snapshot, [this] { return cancelled(); }, {}, language);
             if (!result) return finish_error(id, result.error());
             processed = snapshot.size();
             {
@@ -1228,6 +1309,11 @@ private:
                     {"sample_rate", result->synthesis.sample_rate},
                     {"samples", total_samples},
                     {"chunks", result->synthesis.stats.chunks},
+                    {"stats",
+                     {{"generation_ms", result->synthesis.stats.generation_ns / 1e6},
+                      {"decode_ms", result->synthesis.stats.decode_ns / 1e6},
+                      {"preparation_ms", result->synthesis.stats.preparation_ns / 1e6},
+                      {"audio_tokens", result->synthesis.stats.audio_tokens}}},
                     {"voice_prompt_reused", result->voice_prompt_reused}});
     }
 

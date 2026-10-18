@@ -7,8 +7,11 @@ icons/play.svg
 icons/volume.svg
 index.html
 images.js
+languages.js
+languages.tsv
 markdown.js
 mermaid.js
+realtime-profile.js
 speech-controller.js
 speech-highlights.js
 style.css

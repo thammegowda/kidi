@@ -4,6 +4,16 @@ struct Geometry { uint count, width, other, heads, mode; float epsilon; };
 struct Quantization { uint count; float scale; };
 struct Candidate { float value; int token; };
 struct Selection { uint width, parts, final; };
+struct AudioGeometry {
+    uint count, input_length, input_channels, output_length, output_channels;
+    int kernel_size, stride, padding, dilation;
+    uint snake;
+};
+inline float snake_value(float value, float alpha) {
+    if (abs(alpha) < 1e-9f) return value;
+    float sine = precise::sin(alpha * value);
+    return value + precise::divide(sine * sine, alpha + 1e-9f);
+}
 kernel void greedy_token(device const float* input [[buffer(0)]], device Candidate* candidates [[buffer(1)]],
                          device int* output [[buffer(2)]], constant Selection& geometry [[buffer(3)]],
                          uint2 group [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]],
@@ -134,4 +144,42 @@ kernel void pointwise(device const float* input [[buffer(0)]], device const floa
         float rotated = channel < half_width ? -input[index + half_width] : input[index - half_width];
         output[index] = value * other[angle] + rotated * sine[angle];
     }
+}
+kernel void audio_unfold(device const float* input [[buffer(0)]], device const float* alpha [[buffer(1)]],
+                         device float* output [[buffer(2)]], constant AudioGeometry& geometry [[buffer(3)]],
+                         uint index [[thread_position_in_grid]]) {
+    if (index >= geometry.count) return;
+    uint kernel_index = index % uint(geometry.kernel_size);
+    uint row = index / uint(geometry.kernel_size);
+    uint channel = row % geometry.input_channels;
+    uint output_position = row / geometry.input_channels;
+    int input_position = int(output_position) * geometry.stride - geometry.padding +
+                         int(kernel_index) * geometry.dilation;
+    float value = input_position >= 0 && input_position < int(geometry.input_length)
+        ? input[(uint(input_position) * geometry.input_channels) + channel] : 0.0f;
+    output[index] = geometry.snake ? snake_value(value, alpha[channel]) : value;
+}
+kernel void snake_audio(device const float* input [[buffer(0)]], device const float* alpha [[buffer(1)]],
+                        device float* output [[buffer(2)]], constant AudioGeometry& geometry [[buffer(3)]],
+                        uint index [[thread_position_in_grid]]) {
+    if (index < geometry.count)
+        output[index] = snake_value(input[index], alpha[index % geometry.input_channels]);
+}
+kernel void conv_transpose_fold(device const float* projected [[buffer(0)]], device const float* bias [[buffer(1)]],
+                                device float* output [[buffer(2)]], constant AudioGeometry& geometry [[buffer(3)]],
+                                uint index [[thread_position_in_grid]]) {
+    if (index >= geometry.count) return;
+    uint channel = index % geometry.output_channels;
+    int output_position = int(index / geometry.output_channels);
+    float value = bias[channel];
+    for (int kernel_index = 0; kernel_index < geometry.kernel_size; ++kernel_index) {
+        int numerator = output_position + geometry.padding - kernel_index * geometry.dilation;
+        if (numerator < 0 || numerator % geometry.stride) continue;
+        uint input_position = uint(numerator / geometry.stride);
+        if (input_position >= geometry.input_length) continue;
+        uint projected_index =
+            (input_position * geometry.output_channels + channel) * uint(geometry.kernel_size) + uint(kernel_index);
+        value += projected[projected_index];
+    }
+    output[index] = value;
 }

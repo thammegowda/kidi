@@ -14,7 +14,7 @@ const DEFAULTS = {
   backend: 'webgpu',
   threads: 4,
   maximumTokens: 512,
-  systemPrompt: 'You are a helpful local AI assistant. Respond directly, briefly, and clearly.',
+  systemPrompt: 'You are a helpful local AI assistant. Respond directly, briefly, and in the language or language mix used by the user.',
 };
 
 class WasmBackend {
@@ -36,20 +36,22 @@ class WasmBackend {
     asr: {
       enabled: true,
       accelerator: 'wasm-cpu',
-      directory: 'openai/whisper-tiny',
+      directory: 'openai/whisper-small',
       settings: {
         language: 'auto',
         max_tokens: 128,
-        vad: {threshold: 0.012, minimum_speech_ms: 250, silence_ms: 1500},
+        vad: {threshold: 0.012, minimum_speech_ms: 250, silence_ms: 800},
       },
     },
     tts: {
       enabled: true,
-      accelerator: 'wasm-cpu',
+      accelerator: 'auto',
       directory: './models/omnivoice/manifest.json',
       settings: {
         language: 'auto',
         steps: 10,
+        realtime_steps: 6,
+        reference_steps: 6,
         pace: 1.15,
         gpu_precision: 'w8a8',
         reference_language: 'English',
@@ -106,6 +108,7 @@ class WasmBackend {
     const text = references[index];
     const language = options.reference_language || 'English';
     const precision = options.gpu_precision || 'f32';
+    const referenceSteps = Number(this.#components.tts.settings.reference_steps) || 6;
     const settings = {
       model: this.#components.tts.directory,
       precision,
@@ -118,7 +121,7 @@ class WasmBackend {
         language,
         text,
         seed: voiceSeed,
-        steps: Number(options.steps) || 10,
+        steps: referenceSteps,
         guidanceScale: Number(options.guidance_scale ?? 2),
         timeShift: Number(options.time_shift ?? 0.1),
         layerPenalty: Number(options.layer_penalty ?? 5),
@@ -131,7 +134,7 @@ class WasmBackend {
       execution: modelInfo.backend || this.#settings.backend,
       precision: modelInfo.matrix_precision || (modelInfo.backend === 'webgpu' ? precision : 'f32'),
     };
-    return {identity, settingsKey: JSON.stringify(settings), text, language, voiceSeed, precision};
+    return {identity, settingsKey: JSON.stringify(settings), text, language, voiceSeed, precision, referenceSteps};
   }
 
   #controlTts(worker, data, expected) {
@@ -193,6 +196,7 @@ class WasmBackend {
           ...options,
           language: definition.language,
           pace: 1,
+          steps: definition.referenceSteps,
           seed: definition.voiceSeed,
           use_voice_prompt: false,
           cache_voice_prompt: true,
@@ -370,6 +374,9 @@ class WasmBackend {
     this.#ttsUseGpu = false;
     this.#ttsVoiceKey = null;
     this.#ttsVoiceSettingsKey = null;
+    this.#components.tts.accelerator = 'auto';
+    delete this.#components.tts.threads;
+    delete this.#components.tts.gpu_precision;
   }
 
   #cancelSpeech(id) {
@@ -428,6 +435,12 @@ class WasmBackend {
         chunks: 1,
         voice_prompt_reused: true,
         synthesis_ms: performance.now() - request.started,
+        stats: {
+          generation_ms: data.generation_ms,
+          decode_ms: data.decode_ms,
+          preparation_ms: data.preparation_ms,
+          audio_tokens: data.audio_tokens,
+        },
       });
     } catch (error) {
       this.#failSpeech(request, error.message, 'tts_audio_failed');
@@ -514,8 +527,18 @@ class WasmBackend {
       if (!this.#ready || !this.#worker) return this.#error(id, 'not_ready', 'Load the browser model first');
       if (this.#current) return this.#error(id, 'busy', 'Another inference request is active');
       const messages = [...(payload.messages || [])];
-      if (this.#settings.systemPrompt)
-        messages.unshift({role: 'system', content: this.#settings.systemPrompt});
+      const languages = String(payload.languages || '');
+      if (languages && !/^[a-z]{2,3}(?:,[a-z]{2,3})*$/u.test(languages))
+        return this.#error(id, 'invalid_languages', 'languages must contain comma-separated language codes');
+      const languageNames = String(payload.language_names || languages);
+      if (languageNames.length > 256 || /[\u0000-\u001f]/u.test(languageNames))
+        return this.#error(id, 'invalid_languages', 'language_names contains invalid characters');
+      if (this.#settings.systemPrompt) {
+        const instruction = !languages ? '' : languages.includes(',')
+          ? `\nThe user may code-switch among ${languageNames}. Respond in the same language or language mix as the latest user message.`
+          : `\nThe user speaks ${languageNames}. Respond in ${languageNames} only.`;
+        messages.unshift({role: 'system', content: this.#settings.systemPrompt + instruction});
+      }
       this.#current = {
         id,
         text: '',
@@ -533,6 +556,9 @@ class WasmBackend {
       if (this.#asr) return this.#error(id, 'busy', 'Speech recognition is already active');
       if (!payload.stream_id || !Number.isInteger(payload.stream_id))
         return this.#error(id, 'invalid_stream', 'ASR stream_id must be an unsigned integer');
+      const language = payload.language ?? this.#components.asr.settings.language ?? 'en';
+      if (typeof language !== 'string' || !/^(?:auto|[a-z]{2,3}(?:,[a-z]{2,3})*)$/u.test(language))
+        return this.#error(id, 'invalid_asr', 'ASR language must be auto or comma-separated language codes');
       this.#asr = {
         id,
         streamId: payload.stream_id,
@@ -540,7 +566,7 @@ class WasmBackend {
         sequence: 0,
         transcribing: false,
         finalRequested: false,
-        language: this.#components.asr.settings.language || 'auto',
+        language,
         partialSequence: 0,
         lastPartialSamples: 0,
       };
@@ -618,6 +644,7 @@ class WasmBackend {
     const threads = Number.isInteger(requested.threads) && requested.threads >= 1 && requested.threads <= 8
       ? requested.threads : 1;
     const selectedBackend = requested.backend === 'webgpu' && !webGpuSupport() ? 'webgpu' : 'cpu';
+    if (selectedBackend !== this.#settings.backend) this.#releaseTts();
     this.#settings = {
       ...this.#settings,
       model: requested.model || DEFAULTS.model,
@@ -870,6 +897,8 @@ class WasmBackend {
       model_id: this.#settings.model,
       requested_backend: this.#settings.backend,
       maximum_tokens: this.#settings.maximumTokens,
+      speech_backend: this.#ttsWorker ? (this.#ttsUseGpu ? 'webgpu' : 'cpu') :
+        (this.#settings.backend === 'webgpu' ? 'webgpu' : 'cpu'),
       loading: Boolean(this.#worker && !this.#ready),
     };
   }

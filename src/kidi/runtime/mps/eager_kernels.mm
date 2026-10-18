@@ -12,6 +12,7 @@ namespace kidi::runtime::mps {
 namespace {
 struct Pipelines {
     id<MTLComputePipelineState> rms, pointwise, round_to_half, greedy_token, quantize_int8;
+    id<MTLComputePipelineState> audio_unfold, snake_audio, conv_transpose_fold;
 };
 auto pipelines() -> Result<std::shared_ptr<Pipelines>> {
     static std::mutex mutex;
@@ -40,12 +41,49 @@ auto pipelines() -> Result<std::shared_ptr<Pipelines>> {
                                                                      error:&error];
         result->quantize_int8 =
             [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"quantize_int8"] error:&error];
+        result->audio_unfold =
+            [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"audio_unfold"] error:&error];
+        result->snake_audio =
+            [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"snake_audio"] error:&error];
+        result->conv_transpose_fold = [device
+            newComputePipelineStateWithFunction:[library newFunctionWithName:@"conv_transpose_fold"] error:&error];
         if (!result->rms || !result->pointwise || !result->round_to_half || !result->greedy_token ||
-            !result->quantize_int8)
+            !result->quantize_int8 || !result->audio_unfold || !result->snake_audio ||
+            !result->conv_transpose_fold)
             return std::unexpected(Error{ErrorCode::RUNTIME, "create eager Metal pipelines"});
         cached = result;
         return result;
     }
+}
+
+struct AudioGeometry {
+    std::uint32_t count, input_length, input_channels, output_length, output_channels;
+    std::int32_t kernel, stride, padding, dilation;
+    std::uint32_t snake;
+};
+
+auto bind_audio(id<MTLComputeCommandEncoder> encoder, const tensor::Tensor& tensor, NSUInteger index) -> Result<void> {
+    auto view = tensor::metal_buffer(tensor);
+    if (!view) return std::unexpected(std::move(view.error()));
+    [encoder setBuffer:(__bridge id<MTLBuffer>)view->handle offset:view->offset_bytes atIndex:index];
+    return {};
+}
+
+auto encode_audio(CommandBatch& batch, id<MTLComputePipelineState> pipeline, const tensor::Tensor& first,
+                  const tensor::Tensor& second, tensor::Tensor& output, const AudioGeometry& geometry) -> Result<void> {
+    MPSCommandBuffer* buffer = (__bridge MPSCommandBuffer*)batch.native_handle();
+    id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
+    if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create audio Metal encoder"});
+    [encoder setComputePipelineState:pipeline];
+    auto status = bind_audio(encoder, first, 0);
+    if (status) status = bind_audio(encoder, second, 1);
+    if (status) status = bind_audio(encoder, output, 2);
+    [encoder setBytes:&geometry length:sizeof(geometry) atIndex:3];
+    if (status)
+        [encoder dispatchThreads:MTLSizeMake(geometry.count, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(std::min<std::uint32_t>(256, geometry.count), 1, 1)];
+    [encoder endEncoding];
+    return status;
 }
 } // namespace
 auto encode_greedy_token(CommandBatch& batch, const tensor::Tensor& input, tensor::Tensor& scratch,
@@ -158,5 +196,58 @@ auto encode_eager(CommandBatch& batch, Operation operation, float epsilon, Tenso
     }
     [encoder endEncoding];
     return status;
+}
+
+auto encode_audio_unfold(CommandBatch& batch, const tensor::Tensor& input, const tensor::Tensor* alpha,
+                         tensor::Tensor& output, std::int32_t kernel, std::int32_t stride, std::int32_t padding,
+                         std::int32_t dilation) -> Result<void> {
+    if (input.dtype() != tensor::DType::F32 || input.dimensions() != 3 || input.size(0) != 1 ||
+        output.dtype() != tensor::DType::F32 || output.dimensions() != 3 || output.size(0) != 1 ||
+        kernel <= 0 || stride <= 0 || padding < 0 || dilation <= 0 ||
+        output.size(2) != input.size(2) * static_cast<std::size_t>(kernel) ||
+        (alpha && (alpha->dtype() != tensor::DType::F32 || alpha->numel() != input.size(2))))
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Metal audio unfold"});
+    auto shared = pipelines();
+    if (!shared) return std::unexpected(std::move(shared.error()));
+    const AudioGeometry geometry{
+        static_cast<std::uint32_t>(output.numel()), static_cast<std::uint32_t>(input.size(1)),
+        static_cast<std::uint32_t>(input.size(2)), static_cast<std::uint32_t>(output.size(1)), 0,
+        kernel, stride, padding, dilation, alpha ? 1U : 0U,
+    };
+    return encode_audio(batch, (*shared)->audio_unfold, input, alpha ? *alpha : input, output, geometry);
+}
+
+auto encode_snake(CommandBatch& batch, const tensor::Tensor& input, const tensor::Tensor& alpha,
+                  tensor::Tensor& output) -> Result<void> {
+    if (input.dtype() != tensor::DType::F32 || input.dimensions() != 3 || alpha.dtype() != tensor::DType::F32 ||
+        alpha.numel() != input.size(2) || output.dtype() != tensor::DType::F32 ||
+        !std::ranges::equal(input.shape(), output.shape()))
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Metal Snake activation"});
+    auto shared = pipelines();
+    if (!shared) return std::unexpected(std::move(shared.error()));
+    const AudioGeometry geometry{
+        static_cast<std::uint32_t>(output.numel()), static_cast<std::uint32_t>(input.size(1)),
+        static_cast<std::uint32_t>(input.size(2)), static_cast<std::uint32_t>(output.size(1)),
+        static_cast<std::uint32_t>(output.size(2)), 0, 0, 0, 0, 1,
+    };
+    return encode_audio(batch, (*shared)->snake_audio, input, alpha, output, geometry);
+}
+
+auto encode_conv_transpose_fold(CommandBatch& batch, const tensor::Tensor& projected, const tensor::Tensor& bias,
+                                tensor::Tensor& output, std::int32_t kernel, std::int32_t stride,
+                                std::int32_t padding, std::int32_t dilation) -> Result<void> {
+    if (projected.dtype() != tensor::DType::F32 || projected.dimensions() != 3 || projected.size(0) != 1 ||
+        bias.dtype() != tensor::DType::F32 || bias.numel() != output.size(2) || output.dtype() != tensor::DType::F32 ||
+        output.dimensions() != 3 || output.size(0) != 1 || projected.size(2) != output.size(2) * kernel ||
+        kernel <= 0 || stride <= 0 || padding < 0 || dilation <= 0)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Metal transposed convolution fold"});
+    auto shared = pipelines();
+    if (!shared) return std::unexpected(std::move(shared.error()));
+    const AudioGeometry geometry{
+        static_cast<std::uint32_t>(output.numel()), static_cast<std::uint32_t>(projected.size(1)),
+        static_cast<std::uint32_t>(projected.size(2)), static_cast<std::uint32_t>(output.size(1)),
+        static_cast<std::uint32_t>(output.size(2)), kernel, stride, padding, dilation, 0,
+    };
+    return encode_audio(batch, (*shared)->conv_transpose_fold, projected, bias, output, geometry);
 }
 } // namespace kidi::runtime::mps

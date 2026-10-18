@@ -1,10 +1,16 @@
 import {renderMarkdown, renderStreamingMarkdown} from './markdown.js';
 import {backend} from './backend.js';
 import {MAX_IMAGE_BYTES, MAX_IMAGES, readImage, removeUnusedImages, storeImage} from './images.js';
+import {parseLanguages, resolveLanguages} from './languages.js';
+import {selectRealtimeProfile} from './realtime-profile.js';
 import {SpeechController, VoiceLatencyBenchmark} from './speech-controller.js';
 import {renderSpeechHighlights} from './speech-highlights.js';
 
 const $ = id => document.getElementById(id);
+const languageResponse = await fetch(new URL('./languages.tsv', import.meta.url));
+if (!languageResponse.ok) throw new Error(`Unable to load language table (${languageResponse.status})`);
+const languageTable = parseLanguages(await languageResponse.text());
+const languageNames = new Map(languageTable.languages.map(language => [language.code, language.name]));
 const STORAGE = 'kidi-app-v2';
 const state = {
   ready: false,
@@ -15,6 +21,9 @@ const state = {
   config: '',
   runtime: {},
   components: {},
+  languages: null,
+  inputLanguage: 'en',
+  outputLanguage: '',
   ttsSettings: null,
   chats: [],
   active: null,
@@ -39,6 +48,12 @@ let cacheBusy = false;
 let cachePath = [];
 const voiceLatency = new VoiceLatencyBenchmark();
 globalThis.kidiVoiceLatency = voiceLatency;
+const realtimeProfile = () => selectRealtimeProfile({
+  runtime: state.runtime,
+  backend: state.backend,
+  components: state.components,
+});
+globalThis.kidiRealtimeProfile = realtimeProfile;
 const speech = new SpeechController({
   send: (type, id, payload) => send(type, id, payload),
   nextWireStream: () => streamId++,
@@ -51,10 +66,24 @@ const speech = new SpeechController({
     renderSpeechHighlights(ttsStreams.values());
   },
   onRequest: current => {
-    if (current.voice) voiceLatency.mark('tts_request');
+    if (current.voice) {
+      voiceLatency.mark('tts_request');
+      voiceLatency.note({
+        first_tts_chars: current.primitive?.segment?.text?.length,
+        tts_steps: current.options.steps,
+      });
+    }
   },
   onWirePcm: current => {
     if (current.voice) voiceLatency.mark('first_pcm');
+  },
+  onPrimitiveCompleted: (current, _primitive, payload) => {
+    if (current.voice) voiceLatency.note({
+      tts_generation_ms: payload.stats?.generation_ms,
+      tts_decode_ms: payload.stats?.decode_ms,
+      tts_preparation_ms: payload.stats?.preparation_ms,
+      tts_audio_tokens: payload.stats?.audio_tokens,
+    });
   },
   onPcm: (_current, frame) => handlePcm(frame),
   onCompleted: current => completeAudioStream(current.streamId),
@@ -269,6 +298,11 @@ function loadLocal() {
     }
     state.active = typeof saved.active === 'string' ? saved.active : null;
     state.view = saved.view === 'reader' ? 'reader' : 'chat';
+    if (typeof (saved.languages || saved.asrLanguage) === 'string')
+      state.languages = saved.languages || saved.asrLanguage;
+    if (typeof saved.inputLanguage === 'string') state.inputLanguage = saved.inputLanguage;
+    if (typeof (saved.outputLanguage ?? saved.activeLanguage) === 'string')
+      state.outputLanguage = saved.outputLanguage ?? saved.activeLanguage;
     if (saved.tts && typeof saved.tts === 'object') state.ttsSettings = saved.tts;
   } catch {}
   if (!state.chats.some(chat => chat.id === state.active)) state.active = state.chats[0]?.id || null;
@@ -277,7 +311,8 @@ function loadLocal() {
 function persist() {
   try {
     localStorage.setItem(STORAGE, JSON.stringify({
-      chats: state.chats, active: state.active, view: state.view, tts: state.ttsSettings,
+      chats: state.chats, active: state.active, view: state.view, languages: state.languages,
+      inputLanguage: state.inputLanguage, outputLanguage: state.outputLanguage, tts: state.ttsSettings,
     }));
   }
   catch {}
@@ -542,7 +577,7 @@ function renderRuntime() {
 function render() {
   const chat = activeChat();
   $('conversation-title').textContent = chat?.title || 'New conversation';
-  renderHistory(); renderMessages(); renderRuntime();
+  renderHistory(); renderMessages(); renderRuntime(); renderLanguageSwitchers();
 }
 
 function selectView(view, updateRoute = true) {
@@ -588,11 +623,15 @@ function renderConfig() {
   const chat = state.components.chat || {};
   const asr = state.components.asr || {};
   const tts = state.components.tts || {};
+  const realtime = realtimeProfile();
   target.replaceChildren(
     configSection('Runtime', [
       configRow('Configuration', state.config, 'wide'),
       configRow('Threads', state.runtime.threads),
       configRow('Concurrency', state.runtime.concurrency),
+      configRow('Speech execution', state.runtime.speech_backend || tts.accelerator),
+      configRow('Realtime profile', realtime.id),
+      configRow('Realtime TTS', `${realtime.ttsSteps} steps · first ${realtime.segmentation.firstMaximumUnits} units`),
       configRow('Speech preload', state.runtime.preload_speech ? 'Enabled' : 'Disabled'),
       configRow('Speech idle unload', `${state.runtime.idle_model_timeout_seconds ?? '—'} seconds`),
     ]),
@@ -610,7 +649,7 @@ function renderConfig() {
   $('asr-config-summary').replaceChildren(
     configSection('Speech recognition', [
       configRow('ASR', asr.enabled ? `${asr.accelerator} · ${asr.directory}` : 'Disabled', 'wide'),
-      configRow('Language', asr.settings?.language || 'auto'),
+      configRow('Input languages', selectedInputLanguages().join(', ')),
       configRow('VAD threshold', asr.settings?.vad?.threshold ?? '—'),
       configRow('End silence', `${asr.settings?.vad?.silence_ms ?? '—'} ms`),
     ]),
@@ -620,14 +659,14 @@ function renderConfig() {
       configRow('TTS', tts.enabled ? `${tts.accelerator} · ${tts.directory}` : 'Disabled', 'wide'),
       configRow('CPU threads', tts.threads ?? '—'),
       configRow('TTS Metal cache', `${tts.metal_prefill_cache_mb ?? '—'} MiB`),
-      configRow('Language mode', tts.settings?.language || 'auto'),
+      configRow('Output languages', selectedOutputLanguages().map(code => languageNames.get(code) || code).join(', ')),
       configRow('Reference language', tts.settings?.reference_language || 'English'),
       configRow('Voice reference', tts.settings?.reference_text || 'Model default', 'wide prompt'),
     ]),
   );
   const settings = state.ttsSettings || {};
   const voice = settings.voice || {};
-  $('tts-language').value = settings.language || 'English';
+  $('conversation-languages').value = state.languages || 'auto';
   $('tts-steps').value = String(settings.steps || 10);
   const pace = Number(settings.pace || 1);
   $('tts-pace').value = pace >= 1.175 ? '1.2' : pace >= 1.075 ? '1.15' : pace >= .95 ? '1' : '0.9';
@@ -665,7 +704,6 @@ function initializeTtsSettings() {
     ? saved.gpu_precision : defaults.gpu_precision || 'w8a8';
   const migratePrecision = browserGpu && saved.gpu_precision_version !== 1 && savedPrecision === 'f32';
   state.ttsSettings = {
-    language: saved.language || defaults.language || 'English',
     steps: Number.isInteger(saved.steps) ? saved.steps : defaults.steps || 10,
     pace: Number.isFinite(saved.pace) ? saved.pace : defaults.pace || 1,
     gpu_precision: migratePrecision ? 'w8a8' : savedPrecision,
@@ -676,10 +714,66 @@ function initializeTtsSettings() {
   if (migratePrecision) queueMicrotask(persist);
 }
 
+function conversationLanguages(value) {
+  return resolveLanguages(value, navigator.languages?.[0] || navigator.language, languageTable.aliases);
+}
+
+function selectedInputLanguages() {
+  return state.inputLanguage ? [state.inputLanguage] : conversationLanguages(state.languages);
+}
+
+function selectedOutputLanguages() {
+  const configured = conversationLanguages(state.languages);
+  return state.outputLanguage && configured.includes(state.outputLanguage)
+    ? [state.outputLanguage] : selectedInputLanguages();
+}
+
+function renderLanguageSwitchers() {
+  const input = $('input-language'), output = $('output-language');
+  if (state.inputLanguage && !languageNames.has(state.inputLanguage)) state.inputLanguage = 'en';
+  if (state.outputLanguage && !languageNames.has(state.outputLanguage)) state.outputLanguage = '';
+  input.value = state.inputLanguage ? languageNames.get(state.inputLanguage) : 'Auto';
+  output.value = state.outputLanguage ? languageNames.get(state.outputLanguage) : 'Match input';
+}
+
+function setupLanguagePicker(inputId, menuId, special, select) {
+  const input = $(inputId), menu = $(menuId);
+  const show = (all = false) => {
+    const query = all ? '' : input.value.normalize('NFKC').trim().toLocaleLowerCase();
+    const matches = languageTable.languages.filter(language =>
+      !query || language.aliases.some(alias => alias.includes(query)));
+    const choices = (!query || special.toLocaleLowerCase().includes(query)
+      ? [{code: '', name: special}, ...matches] : matches).slice(0, 100);
+    menu.replaceChildren(...choices.map(language => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.innerHTML = `<span>${language.name}</span><small>${language.code}</small>`;
+      button.addEventListener('pointerdown', event => event.preventDefault());
+      button.addEventListener('click', () => {
+        select(language.code);
+        menu.hidden = true;
+      });
+      return button;
+    }));
+    menu.hidden = false;
+  };
+  input.addEventListener('focus', () => { input.select(); show(true); });
+  input.addEventListener('input', () => show());
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !menu.hidden && menu.firstElementChild) {
+      event.preventDefault();
+      menu.firstElementChild.click();
+    } else if (event.key === 'Escape') {
+      menu.hidden = true;
+      renderLanguageSwitchers();
+    }
+  });
+  input.addEventListener('blur', () => { menu.hidden = true; renderLanguageSwitchers(); });
+}
+
 function updateTtsSettings() {
   const steps = Number($('tts-steps').value);
   state.ttsSettings = {
-    language: $('tts-language').value.trim() || 'English',
     steps: Number.isInteger(steps) && steps >= 1 && steps <= 128 ? steps : 10,
     pace: Number($('tts-pace').value),
     gpu_precision: $('tts-gpu-precision').value,
@@ -695,10 +789,20 @@ function updateTtsSettings() {
   persist();
 }
 
-function ttsRequestOptions() {
+function ttsRequestOptions(realtime = false) {
   const options = {...state.ttsSettings};
+  const languages = selectedOutputLanguages();
+  options.language = languages.length === 1 ? languageNames.get(languages[0]) || languages[0] : 'auto';
   delete options.gpu_precision_version;
   if (state.runtime.host !== 'wasm') delete options.gpu_precision;
+  if (realtime) {
+    const realtimeSteps = Math.min(
+      Number(state.components.tts?.settings?.realtime_steps || 6),
+      realtimeProfile().ttsSteps,
+    );
+    if (Number.isInteger(realtimeSteps) && realtimeSteps > 0)
+      options.steps = Math.min(options.steps, realtimeSteps);
+  }
   return options;
 }
 
@@ -864,6 +968,7 @@ function handleEvent(event) {
     state.runtime = payload.runtime || state.runtime;
     if (typeof payload.ready === 'boolean') state.ready = payload.ready;
     if (typeof payload.backend === 'string') state.backend = payload.backend;
+    state.languages ||= state.components.asr?.settings?.language || 'auto';
     initializeTtsSettings();
     showNotice(); render();
     return;
@@ -1222,6 +1327,8 @@ async function beginCapture(id) {
   const silence = context.createGain(); silence.gain.value = 0;
   source.connect(node); node.connect(silence); silence.connect(context.destination);
   const vad = state.components.asr?.settings?.vad || {};
+  const profile = realtimeProfile();
+  const configuredSilenceMs = Number(vad.silence_ms || profile.endpointMs);
   const minimumSpeechMs = Number(vad.minimum_speech_ms || 250);
   recording = {
     id, sequence: 0, context, media, source, node,
@@ -1229,7 +1336,7 @@ async function beginCapture(id) {
     preRoll: [], preRollSamples: 0,
     threshold: Number(vad.threshold || .012),
     minimumSpeechMs,
-    silenceLimitMs: Number(vad.silence_ms || 1500),
+    silenceLimitMs: voiceMode ? Math.min(configuredSilenceMs, profile.endpointMs) : configuredSilenceMs,
     preRollLimitSamples: Math.max(8000, Math.ceil(minimumSpeechMs * 16)),
   };
   const sendFrame = (current, values) => {
@@ -1317,7 +1424,8 @@ function startDictation(epoch = voiceEpoch) {
     send('asr.start', id, {
       stream_id: audioId,
       voice_mode: voiceMode,
-      tts_options: voiceMode ? ttsRequestOptions() : undefined,
+      language: selectedInputLanguages().join(','),
+      tts_options: voiceMode ? ttsRequestOptions(true) : undefined,
     });
   }
   catch (error) { showNotice(error.message); finishRequest(); }
@@ -1379,10 +1487,12 @@ function startTts(text, button, voiceTurn = false, epoch = voiceEpoch) {
   state.busy = true; showNotice(); renderRuntime();
   ensurePlayback().catch(error => showNotice(error.message));
   try {
-    const options = ttsRequestOptions();
+    const options = ttsRequestOptions(voiceTurn);
+    const profile = voiceTurn ? realtimeProfile() : null;
     speech.start({
       id, streamId: audioId, text, options, voice: voiceTurn, finished: true,
       cacheIdentity: JSON.stringify([state.runtime.host, state.backend, state.components.tts?.directory]),
+      segmentation: profile?.segmentation,
     });
   }
   catch (error) {
@@ -1487,10 +1597,12 @@ async function sendMessage(event) {
         requestId, voiceEpoch, messageId: responseId,
       });
       playbackStreamId = audioId;
-      const options = ttsRequestOptions();
+      const options = ttsRequestOptions(true);
+      const profile = realtimeProfile();
       speech.start({
         id: requestId, streamId: audioId, text: '', options, voice: true, finished: false,
         cacheIdentity: JSON.stringify([state.runtime.host, state.backend, state.components.tts?.directory]),
+        segmentation: profile.segmentation,
       });
       ensurePlayback().catch(error => audioFailure(audioId, error));
     }
@@ -1503,6 +1615,8 @@ async function sendMessage(event) {
     if (activeRequest.voiceTurn) voiceLatency.mark('chat_request');
     send('chat.start', requestId, {
       messages: preparedMessages,
+      languages: selectedOutputLanguages().join(','),
+      language_names: selectedOutputLanguages().map(code => languageNames.get(code) || code).join(', '),
       speak: false,
     });
   } catch (error) {
@@ -1584,9 +1698,19 @@ $('clear-model-cache').addEventListener('click', () => {
 $('config-dialog').addEventListener('click', event => {
   if (event.target === $('config-dialog')) $('config-dialog').close();
 });
-for (const id of ['tts-language', 'tts-steps', 'tts-pace', 'tts-gender', 'tts-age', 'tts-pitch', 'tts-style', 'tts-accent',
+for (const id of ['tts-steps', 'tts-pace', 'tts-gender', 'tts-age', 'tts-pitch', 'tts-style', 'tts-accent',
   'tts-gpu-precision'])
   $(id).addEventListener('change', updateTtsSettings);
+$('conversation-languages').addEventListener('change', event => {
+  state.languages = event.target.value.trim().toLowerCase() || 'auto';
+  renderLanguageSwitchers(); persist(); renderConfig();
+});
+setupLanguagePicker('input-language', 'input-language-menu', 'Auto', code => {
+  state.inputLanguage = code; renderLanguageSwitchers(); persist();
+});
+setupLanguagePicker('output-language', 'output-language-menu', 'Match input', code => {
+  state.outputLanguage = code; renderLanguageSwitchers(); persist();
+});
 $('messages').addEventListener('scroll', () => {
   if (rebuildingMessages) return;
   const messages = $('messages');
@@ -1611,6 +1735,7 @@ try {
   const status = await backend.status();
   state.ready = status.ready; state.backend = status.backend || ''; state.model = status.model || '';
   state.config = status.config || ''; state.runtime = status.runtime || {}; state.components = status.components || {};
+  state.languages ||= state.components.asr?.settings?.language || 'auto';
   initializeTtsSettings();
 } catch (error) { showNotice(error.message); }
 connectBackend();

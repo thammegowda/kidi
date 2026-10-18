@@ -80,14 +80,14 @@ only when every required file is cached. Previously exported manifests and pinne
 compatibility, but are not shown in settings.
 
 The speech loader accepts `openai/whisper-tiny`, `openai/whisper-base`, or `openai/whisper-small`; the browser UI defaults
-to Tiny. Like
+to Whisper Small INT8, matching Android and desktop. Like
 the Android app, the browser downloads config and tokenizer files from that repository and the weights from
 whisper.cpp's Q8_0 GGML file of the same size (`ggerganov/whisper.cpp`, pinned revision): 264 MB for Small instead of
 the 967 MB FP32 Safetensors. The GGML bytes are cached beside the model's own files, so the cache manager lists and
 deletes them together; a previously cached FP32 checkpoint is removed. Dictation loads the model on demand and uses the
 shared GPU runtime when WebGPU is selected. Initialization failure is reported before retrying on a reusable CPU worker.
 CPU pthreads are used only on isolated pages. Microphone permission is requested only when recording starts.
-Tiny has real GPU numerical, transcription, and timing coverage; Base/Small loading remains supported but their
+Small has the primary multilingual quality coverage; Tiny retains fast numerical and timing coverage, while Base
 GPU quality/performance has not been measured in this redesign.
 
 Microphone capture keeps a bounded 500 ms pre-roll locally and does not send PCM
@@ -373,6 +373,15 @@ The adapter releases a logical TTS lease after delivery; the shared worker retai
 bounded weights/plans for reuse rather than destroying the device every utterance.
 The application never substitutes the browser's platform-dependent
 `speechSynthesis` voices.
+
+Continuous voice mode applies a hardware-dispatched WebGPU profile rather than
+the quality-oriented benchmark settings above: constrained browsers use four
+diffusion steps and a 96-unit first-segment ceiling, while higher-capacity
+browsers use five steps and 112 units. Manual read-aloud retains the selected quality setting.
+Voice calibration uses one persistent six-step reference independent of request
+step count, so switching between real-time and read-aloud modes does not
+regenerate or duplicate the voice prompt. Single PCM segments transfer through
+the shared speech controller without an additional combine copy.
 
 ### Images
 

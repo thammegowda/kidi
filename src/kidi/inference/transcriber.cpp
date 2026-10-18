@@ -141,6 +141,23 @@ auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint3
         const auto gpu = model_->device() == tensor::Device::web_gpu();
         tensor::Tensor normal_mask, begin_mask, language_ids;
         std::vector<std::string> language_names;
+        const auto detect_language = options.language == "auto" || options.language.find(',') != std::string::npos;
+        if (detect_language) {
+            if (options.language == "auto") {
+                for (const auto& [language, token] : languages_) language_names.push_back(language);
+            } else {
+                for (std::size_t start = 0; start <= options.language.size();) {
+                    const auto end = options.language.find(',', start);
+                    const auto language = options.language.substr(start, end - start);
+                    if (!languages_.contains(language))
+                        throw ops::Failure(
+                            {ErrorCode::INVALID_ARGUMENT, "unsupported Whisper language: " + language});
+                    if (!std::ranges::contains(language_names, language)) language_names.push_back(language);
+                    if (end == std::string::npos) break;
+                    start = end + 1;
+                }
+            }
+        }
         if (gpu) {
             const auto vocabulary = config_["model"]["vocab_size"].as<std::size_t>();
             std::vector<float> mask(vocabulary, 0.F);
@@ -152,13 +169,12 @@ auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint3
             for (const auto token : begin_suppress_) mask[token] = -std::numeric_limits<float>::infinity();
             begin_mask = require(tensor::Tensor::from_host({static_cast<std::int64_t>(vocabulary)},
                                                            std::span<const float>(mask), model_->device()));
-            std::vector<std::int32_t> ids;
-            for (const auto& [language, token] : languages_) {
-                language_names.push_back(language);
-                ids.push_back(token);
+            if (detect_language) {
+                std::vector<std::int32_t> ids;
+                for (const auto& language : language_names) ids.push_back(languages_.at(language));
+                language_ids = require(tensor::Tensor::from_host({static_cast<std::int64_t>(ids.size())},
+                                                                 std::span<const std::int32_t>(ids), model_->device()));
             }
-            language_ids = require(tensor::Tensor::from_host({static_cast<std::int64_t>(ids.size())},
-                                                             std::span<const std::int32_t>(ids), model_->device()));
         }
         std::string emitted;
         const auto check_cancelled = [&] {
@@ -181,7 +197,7 @@ auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint3
             auto logits = require(model_->forward(source, std::span(&start_token, 1), state));
             std::span<float> scores;
             std::int32_t language_token = -1;
-            if (options.language == "auto") {
+            if (detect_language) {
                 if (gpu) {
                     const auto selected = model_->select_language(logits, language_ids);
                     co_yield std::monostate{};
@@ -193,12 +209,14 @@ auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint3
                 } else {
                     scores = require(logits.data<float>());
                     auto best = -std::numeric_limits<float>::infinity();
-                    for (const auto& [language, token] : languages_)
+                    for (const auto& language : language_names) {
+                        const auto token = languages_.at(language);
                         if (scores[token] > best) {
                             best = scores[token];
                             result.language = language;
                             language_token = token;
                         }
+                    }
                 }
             } else {
                 const auto found = languages_.find(options.language);

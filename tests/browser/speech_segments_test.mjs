@@ -71,3 +71,19 @@ test('markdown formatting and link destinations are not sent to speech', () => {
     assert.ok(segments.every(segment => !/[*_`#>|[\]]/u.test(segment.text)));
     assert.ok(segments.every(segment => !segment.text.includes('example.test')));
 });
+
+test('hardware profiles can tighten the first speech segment safely', () => {
+    const stream = new SpeechSegments({
+        firstMaximumUnits: 48,
+        firstTargetUnits: 28,
+        nextTargetUnits: 112,
+        maximumUnits: 160,
+    });
+    const segments = stream.push(
+        'A constrained laptop should begin speaking before this deliberately extended sentence is complete', false);
+    assert.equal(segments[0].text, 'A constrained laptop should begin speaking');
+    assert.throws(() => new SpeechSegments({
+        firstMaximumUnits: 32,
+        firstTargetUnits: 40,
+    }), /Invalid speech segmentation profile/);
+});

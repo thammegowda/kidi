@@ -136,6 +136,8 @@ struct Stream {
 };
 class MetalOperator final : public Operator {
 public:
+    enum class AudioMode { NONE, CONV1D, SNAKE_CONV1D, SNAKE_LINEAR, CONV_TRANSPOSE_FOLD, SNAKE };
+
     Stream& stream;
     std::optional<mps::Executable> executable;
     std::optional<mps::QuantizedLinear> quantized;
@@ -144,10 +146,12 @@ public:
     float ffn_gate_up_output_scale = 0;
     float ffn_down_input_scale = 0, ffn_down_output_scale = 0;
     Tensor prefill_weight;
+    Tensor audio_constant;
     std::shared_ptr<const mps::Executable> prefill_executable;
     std::int32_t packed_bits = 0, packed_group = 0;
     float packed_input_scale = 0, packed_output_scale = 0;
     std::vector<std::int64_t> shape;
+    std::vector<std::int64_t> audio_intermediate_shape;
     DType dtype;
     std::size_t dynamic_count;
     bool scatter = false;
@@ -156,7 +160,9 @@ public:
     bool eager = false;
     bool quantize_int8 = false;
     bool gated_feed_forward = false;
+    AudioMode audio_mode = AudioMode::NONE;
     Operation operation;
+    std::array<std::int32_t, 4> audio_attributes{};
     float epsilon = 0;
     explicit MetalOperator(Stream& owner) : stream(owner) {}
     auto run(TensorInputs inputs) -> Tensor override {
@@ -169,6 +175,22 @@ public:
             require(mps::encode_greedy_token(stream.commands(), inputs[0], scratch, output));
         } else if (quantize_int8) {
             require(mps::encode_quantize_int8(stream.commands(), epsilon, inputs[0], output));
+        } else if (audio_mode == AudioMode::CONV1D || audio_mode == AudioMode::SNAKE_CONV1D) {
+            auto columns = stream.acquire(audio_intermediate_shape, DType::F32);
+            const auto* alpha = audio_mode == AudioMode::SNAKE_CONV1D ? &audio_constant : nullptr;
+            require(mps::encode_audio_unfold(stream.commands(), inputs[0], alpha, columns, audio_attributes[0],
+                                             audio_attributes[1], audio_attributes[2], audio_attributes[3]));
+            require(quantized->encode(stream.commands(), columns, output));
+        } else if (audio_mode == AudioMode::SNAKE_LINEAR) {
+            auto activated = stream.acquire(inputs[0].shape(), DType::F32);
+            require(mps::encode_snake(stream.commands(), inputs[0], audio_constant, activated));
+            require(quantized->encode(stream.commands(), activated, output));
+        } else if (audio_mode == AudioMode::CONV_TRANSPOSE_FOLD) {
+            require(mps::encode_conv_transpose_fold(stream.commands(), inputs[0], audio_constant, output,
+                                                    audio_attributes[0], audio_attributes[1], audio_attributes[2],
+                                                    audio_attributes[3]));
+        } else if (audio_mode == AudioMode::SNAKE) {
+            require(mps::encode_snake(stream.commands(), inputs[0], audio_constant, output));
         } else if (eager)
             require(mps::encode_eager(stream.commands(), operation, epsilon, inputs, output));
         else if (quantized)
@@ -314,6 +336,87 @@ public:
         }
         if (result->scatter && ops::is_inplace) {
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            return result;
+        }
+        if (spec.operation == Operation::CONV1D || spec.operation == Operation::SNAKE_CONV1D) {
+            const bool snake = spec.operation == Operation::SNAKE_CONV1D;
+            const auto weight_index = snake ? std::size_t{2} : std::size_t{1};
+            if (spec.attributes.size() != 4 || inputs.size() != weight_index + 3 ||
+                inputs[0].device() != tensor::Device::apple_gpu() || inputs[0].dtype() != DType::F32 ||
+                inputs[0].dimensions() != 3 || inputs[0].size(0) != 1 ||
+                inputs[weight_index].dtype() != DType::I8)
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported Metal Conv1d geometry"});
+            const auto kernel = spec.attributes[0], stride = spec.attributes[1], padding = spec.attributes[2],
+                       dilation = spec.attributes[3];
+            const auto receptive = dilation * (kernel - 1) + 1;
+            const auto numerator = static_cast<std::int64_t>(inputs[0].size(1)) + 2 * padding - receptive;
+            if (kernel <= 0 || stride <= 0 || padding < 0 || dilation <= 0 || numerator < 0)
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Metal Conv1d dimensions"});
+            const auto output_length = numerator / stride + 1;
+            result->audio_mode = snake ? MetalOperator::AudioMode::SNAKE_CONV1D
+                                       : MetalOperator::AudioMode::CONV1D;
+            result->audio_attributes = {static_cast<std::int32_t>(kernel), static_cast<std::int32_t>(stride),
+                                        static_cast<std::int32_t>(padding), static_cast<std::int32_t>(dilation)};
+            result->audio_intermediate_shape = {
+                1, output_length, static_cast<std::int64_t>(inputs[0].size(2)) * kernel};
+            result->shape = {1, output_length, static_cast<std::int64_t>(inputs[weight_index].size(0))};
+            result->dtype = DType::F32;
+            result->dynamic_count = 1;
+            if (snake) result->audio_constant = require(inputs[1].to(tensor::Device::apple_gpu()));
+            const auto weight = input_major_weight(inputs[weight_index]);
+            result->quantized =
+                require(mps::QuantizedLinear::create(weight, inputs[weight_index + 1], inputs[weight_index + 2]));
+            auto prepared = require(Tensor::empty(result->audio_intermediate_shape, DType::F32,
+                                                  tensor::Device::apple_gpu()));
+            require(result->quantized->prepare(prepared));
+            return result;
+        }
+        if (spec.operation == Operation::SNAKE_QUANTIZED_LINEAR) {
+            if (spec.attributes.size() != 1 || inputs.size() != 5 ||
+                inputs[0].device() != tensor::Device::apple_gpu() || inputs[0].dtype() != DType::F32 ||
+                inputs[2].dtype() != DType::I8 || !spec.attributes[0])
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported Metal Snake projection"});
+            result->audio_mode = MetalOperator::AudioMode::SNAKE_LINEAR;
+            result->audio_constant = require(inputs[1].to(tensor::Device::apple_gpu()));
+            result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            result->shape.back() = inputs[2].size(0);
+            result->dtype = DType::F32;
+            result->dynamic_count = 1;
+            const auto weight = input_major_weight(inputs[2]);
+            result->quantized = require(mps::QuantizedLinear::create(weight, inputs[3], inputs[4]));
+            require(result->quantized->prepare(inputs[0]));
+            return result;
+        }
+        if (spec.operation == Operation::CONV_TRANSPOSE_FOLD) {
+            if (spec.attributes.size() != 5 || inputs.size() != 2 ||
+                inputs[0].device() != tensor::Device::apple_gpu() || inputs[0].dtype() != DType::F32 ||
+                inputs[0].dimensions() != 3 || inputs[0].size(0) != 1)
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported Metal transposed convolution"});
+            const auto kernel = spec.attributes[0], stride = spec.attributes[1], padding = spec.attributes[2],
+                       output_padding = spec.attributes[3], dilation = spec.attributes[4];
+            const auto output_length = (static_cast<std::int64_t>(inputs[0].size(1)) - 1) * stride - 2 * padding +
+                                       dilation * (kernel - 1) + output_padding + 1;
+            if (kernel <= 0 || stride <= 0 || padding < 0 || output_padding < 0 || output_padding >= stride ||
+                dilation <= 0 || output_length <= 0 || inputs[0].size(2) % kernel)
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Metal transposed convolution dimensions"});
+            result->audio_mode = MetalOperator::AudioMode::CONV_TRANSPOSE_FOLD;
+            result->audio_attributes = {static_cast<std::int32_t>(kernel), static_cast<std::int32_t>(stride),
+                                        static_cast<std::int32_t>(padding), static_cast<std::int32_t>(dilation)};
+            result->shape = {1, output_length, static_cast<std::int64_t>(inputs[0].size(2) / kernel)};
+            result->dtype = DType::F32;
+            result->dynamic_count = 1;
+            result->audio_constant = require(inputs[1].to(tensor::Device::apple_gpu()));
+            return result;
+        }
+        if (spec.operation == Operation::SNAKE) {
+            if (inputs.size() != 2 || inputs[0].device() != tensor::Device::apple_gpu() ||
+                inputs[0].dtype() != DType::F32 || inputs[0].dimensions() != 3)
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported Metal Snake activation"});
+            result->audio_mode = MetalOperator::AudioMode::SNAKE;
+            result->audio_constant = require(inputs[1].to(tensor::Device::apple_gpu()));
+            result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            result->dtype = DType::F32;
+            result->dynamic_count = 1;
             return result;
         }
         if (spec.operation == Operation::QUANTIZED_LINEAR) {

@@ -40,7 +40,29 @@ button { color: inherit; }
 
 .app-header { height: 64px; display: flex; align-items: center; gap: 24px; padding: 0 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
 .app-header .brand { padding: 0; }
-.app-header > .config-button { margin-left: auto; }
+.app-header > .language-switchers { margin-left: auto; }
+.language-switchers { display: flex; align-items: center; gap: 5px; color: var(--muted); }
+.language-picker { position: relative; display: flex; align-items: center; }
+.language-picker .mic-icon, .speaker-icon {
+  position: absolute; left: 8px; z-index: 1; width: 13px; height: 13px; background: currentColor;
+}
+.speaker-icon { mask: url("./icons/volume.svg") center / contain no-repeat; }
+.language-switcher {
+  width: 120px; height: 32px; padding: 0 8px 0 27px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel-2); color: var(--text); font-size: 11px;
+}
+.language-menu {
+  position: absolute; z-index: 20; top: calc(100% + 5px); left: 0; width: 190px; max-height: 280px;
+  padding: 5px; overflow: auto; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--panel); box-shadow: var(--shadow);
+}
+.language-menu button {
+  display: flex; justify-content: space-between; width: 100%; padding: 7px 8px; border-radius: 6px;
+  background: transparent; text-align: left; font-size: 11px;
+}
+.language-menu button:hover, .language-menu button:focus { background: var(--panel-2); }
+.language-menu small { color: var(--muted); }
+.language-picker:last-of-type .language-menu { right: 0; left: auto; }
 .shell { display: grid; grid-template-columns: 232px minmax(0, 1fr); height: calc(100% - 64px); min-height: 0; overflow: hidden; }
 .shell.reader-active { grid-template-columns: minmax(0, 1fr); }
 .chat-sidebar-heading { display: flex; align-items: center; min-height: 34px; padding: 0 6px 12px; font-size: 12px; }
@@ -344,6 +366,7 @@ dialog::backdrop { background: rgb(0 0 0 / 62%); backdrop-filter: blur(3px); }
   .app-header { gap: 10px; padding: 0 12px; }
   .app-header .brand div > span { display: none; }
   .app-views { min-width: 140px; }
+  .language-switcher { width: 82px; }
   .library-header { padding: 22px 16px 16px; }
   .library-toolbar { padding-right: 16px; padding-left: 16px; }
   .shell { display: block; }

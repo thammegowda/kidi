@@ -1,6 +1,6 @@
 export const MAX_SPEECH_SEGMENT_UNITS = 192;
-const FIRST_MAX_SPEECH_SEGMENT_UNITS = 96;
-const FIRST_TARGET_UNITS = 64;
+const FIRST_MAX_SPEECH_SEGMENT_UNITS = 128;
+const FIRST_TARGET_UNITS = 48;
 const NEXT_TARGET_UNITS = 160;
 const wideScript = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const graphemes = new Intl.Segmenter(undefined, {granularity: 'grapheme'});
@@ -23,12 +23,23 @@ export function plainSpeechText(source) {
     .replace(/!\[([^\]]*)\]\([^)]*\)/gu, '$1')
     .replace(/\[([^\]]+)\]\([^)]*\)/gu, '$1')
     .replace(/<[^>]*>/gu, ' ')
-    .replace(/^\s{0,3}(?:#{1,6}\s+|>\s*|(?:[-+*]|\d+[.)])\s+)/gmu, '')
+    .replace(/^\s{0,3}(?:(?:#{1,6}|[-+*]|\d+[.)])(?:\s+|$)|>\s*)/gmu, '')
     .replace(/^\s*(?:[-*_]\s*){3,}$/gmu, '')
     .replace(/[*_`~]+/gu, '')
     .replace(/\|+/gu, ' ')
     .replace(/\s+/gu, ' ')
     .trim();
+}
+
+function safeMarkdownBoundary(text, proposed) {
+  const label = text.lastIndexOf('[', proposed - 1);
+  if (label < 0) return proposed;
+  const destination = text.indexOf('](', label + 1);
+  if (destination < 0 || destination >= proposed) return proposed;
+  const close = text.indexOf(')', destination + 2);
+  if (close < proposed) return proposed;
+  const construct = label > 0 && text[label - 1] === '!' ? label - 1 : label;
+  return construct ? construct : close + 1;
 }
 
 const LATENCY_MILESTONES = [
@@ -80,6 +91,13 @@ export class VoiceLatencyBenchmark {
     if (this.#active[name] === undefined) this.#active[name] = at;
   }
 
+  note(values) {
+    if (!this.#active || !values || typeof values !== 'object') return;
+    this.#active.notes ||= {};
+    for (const [name, value] of Object.entries(values))
+      if (Number.isFinite(value) && this.#active.notes[name] === undefined) this.#active.notes[name] = value;
+  }
+
   complete(at = this.#now()) {
     this.mark('playback_start', at);
     if (!this.#active?.playback_start) return null;
@@ -98,6 +116,7 @@ export class VoiceLatencyBenchmark {
       tts_first_pcm_ms: between('tts_request', 'first_pcm'),
       playback_queue_ms: between('first_pcm', 'playback_start'),
       end_to_end_ms: sinceEnd('playback_start'),
+      ...(marks.notes || {}),
     };
     this.samples.push(sample);
     if (this.samples.length > this.#maximumSamples) this.samples.shift();
@@ -129,6 +148,26 @@ export class SpeechSegments {
   #offset = 0;
   #count = 0;
   #finished = false;
+  #firstMaximumUnits;
+  #firstTargetUnits;
+  #nextTargetUnits;
+  #maximumUnits;
+
+  constructor({
+    firstMaximumUnits = FIRST_MAX_SPEECH_SEGMENT_UNITS,
+    firstTargetUnits = FIRST_TARGET_UNITS,
+    nextTargetUnits = NEXT_TARGET_UNITS,
+    maximumUnits = MAX_SPEECH_SEGMENT_UNITS,
+  } = {}) {
+    const values = [firstMaximumUnits, firstTargetUnits, nextTargetUnits, maximumUnits];
+    if (!values.every(value => Number.isSafeInteger(value) && value > 0) ||
+        firstTargetUnits > firstMaximumUnits || nextTargetUnits > maximumUnits)
+      throw new Error('Invalid speech segmentation profile');
+    this.#firstMaximumUnits = firstMaximumUnits;
+    this.#firstTargetUnits = firstTargetUnits;
+    this.#nextTargetUnits = nextTargetUnits;
+    this.#maximumUnits = maximumUnits;
+  }
 
   push(text, finished = false) {
     if (this.#finished || typeof text !== 'string') throw new Error('Invalid speech text stream');
@@ -139,9 +178,9 @@ export class SpeechSegments {
       this.#offset += leading;
       this.#buffer = this.#buffer.slice(leading);
       if (!this.#buffer) break;
-      const target = this.#count ? NEXT_TARGET_UNITS : FIRST_TARGET_UNITS;
-      const limit = this.#count ? MAX_SPEECH_SEGMENT_UNITS : FIRST_MAX_SPEECH_SEGMENT_UNITS;
-      let bounded = 0, units = 0, word = 0, targetWord = 0, clause = 0;
+      const target = this.#count ? this.#nextTargetUnits : this.#firstTargetUnits;
+      const limit = this.#count ? this.#maximumUnits : this.#firstMaximumUnits;
+      let bounded = 0, units = 0, word = 0, clause = 0;
       for (const {segment, index} of graphemes.segment(this.#buffer)) {
         const next = units + (wideScript.test(segment) ? 3 : segment.length);
         if (next > limit) break;
@@ -149,7 +188,6 @@ export class SpeechSegments {
         bounded = index + segment.length;
         if (/\s/u.test(segment)) {
           word = index;
-          if (!targetWord && units >= target) targetWord = index;
         }
         if (!clause && units >= target && /[,;:，；：]/u.test(segment)) clause = bounded;
       }
@@ -164,8 +202,11 @@ export class SpeechSegments {
           end = candidate.length;
         break;
       }
-      if (!end && bounded < this.#buffer.length) end = clause || targetWord || word || bounded;
+      if (!end && clause) end = clause;
+      if (!end && bounded < this.#buffer.length) end = word || bounded;
       if (!end && finished) end = this.#buffer.length;
+      if (!end) break;
+      end = safeMarkdownBoundary(this.#buffer, end);
       if (!end) break;
       const raw = this.#buffer.slice(0, end), value = raw.trimEnd();
       const spoken = plainSpeechText(value);
@@ -232,6 +273,10 @@ export class RecentAudio {
 }
 
 function combine(chunks) {
+  if (chunks.length === 1) {
+    const chunk = chunks[0];
+    return chunk.byteOffset || chunk.byteLength !== chunk.buffer.byteLength ? chunk.slice() : chunk;
+  }
   const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
   const result = new Float32Array(length);
   let offset = 0;
@@ -250,6 +295,7 @@ export class SpeechController {
   #onSegment;
   #onRequest;
   #onWirePcm;
+  #onPrimitiveCompleted;
   #onPcm;
   #onCompleted;
   #onError;
@@ -257,8 +303,8 @@ export class SpeechController {
   #cache = new RecentAudio();
   #current = null;
 
-  constructor({send, nextWireStream, onStarted, onProgress, onSegment, onRequest, onWirePcm, onPcm,
-    onCompleted, onError, onCancelled}) {
+  constructor({send, nextWireStream, onStarted, onProgress, onSegment, onRequest, onWirePcm,
+    onPrimitiveCompleted, onPcm, onCompleted, onError, onCancelled}) {
     this.#send = send;
     this.#nextWireStream = nextWireStream;
     this.#onStarted = onStarted;
@@ -266,6 +312,7 @@ export class SpeechController {
     this.#onSegment = onSegment;
     this.#onRequest = onRequest;
     this.#onWirePcm = onWirePcm;
+    this.#onPrimitiveCompleted = onPrimitiveCompleted;
     this.#onPcm = onPcm;
     this.#onCompleted = onCompleted;
     this.#onError = onError;
@@ -274,10 +321,11 @@ export class SpeechController {
 
   get active() { return this.#current; }
 
-  start({id, streamId, text = '', options = {}, voice = false, finished = true, cacheIdentity = ''}) {
+  start({id, streamId, text = '', options = {}, voice = false, finished = true, cacheIdentity = '',
+    segmentation}) {
     if (this.#current) throw new Error('Another speech stream is active');
     const current = {
-      id, streamId, options, voice, cacheIdentity, split: new SpeechSegments(), queue: [],
+      id, streamId, options, voice, cacheIdentity, split: new SpeechSegments(segmentation), queue: [],
       ended: false, primitive: null, delivery: null, finishing: false,
       sequence: 0, samples: 0, chunks: 0, sampleRate: null, cancelled: false,
     };
@@ -334,6 +382,7 @@ export class SpeechController {
         this.#finishCancelled(current, event.payload?.message || 'Speech playback stopped');
         return true;
       }
+      this.#onPrimitiveCompleted?.(current, primitive, event.payload || {});
       this.#completePrimitive(current, primitive, event.payload || {}).catch(error => this.#fail(current, error));
       return true;
     }
@@ -357,7 +406,7 @@ export class SpeechController {
     if (primitive.sampleRate !== null && primitive.sampleRate !== sampleRate)
       throw new Error('Speech segment changed sample rate');
     primitive.sampleRate = sampleRate;
-    primitive.audio.push(samples.slice());
+    primitive.audio.push(samples);
     this.#onWirePcm?.(this.#current, primitive, {sequence, sampleRate, samples});
     return true;
   }

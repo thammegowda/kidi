@@ -12,6 +12,7 @@ test('voice latency benchmark reports user-visible stages and percentiles', () =
         benchmark.mark('chat_request', now += 25);
         benchmark.mark('first_token', now += 400);
         benchmark.mark('tts_request', now += 100);
+        benchmark.note({first_tts_chars: 43, tts_steps: 6});
         benchmark.mark('first_pcm', now += 500);
         return benchmark.complete(now += 20);
     };
@@ -24,6 +25,8 @@ test('voice latency benchmark reports user-visible stages and percentiles', () =
         tts_first_pcm_ms: 500,
         playback_queue_ms: 20,
         end_to_end_ms: 2045,
+        first_tts_chars: 43,
+        tts_steps: 6,
     });
     turn(100);
     assert.equal(logged.length, 2);

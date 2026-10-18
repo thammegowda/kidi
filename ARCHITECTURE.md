@@ -213,7 +213,7 @@ through the projection path.
 OmniVoice generation accepts CPU, Metal, or Vulkan execution. Vulkan keeps checkpoint
 parameters in host-backed storage, uploads reusable packed layouts for supported
 per-channel INT8 projections, and bridges unsupported operators to CPU. The
-Higgs/DAC waveform decoder remains on CPU. General Conv1d and ConvTranspose1d
+Higgs/DAC waveform decoder remains on CPU for Vulkan. General Conv1d and ConvTranspose1d
 use INT8 projections plus explicit sequence lowering/overlap for correctness.
 The Android read-aloud surface reaches this API through JNI, selects Vulkan with
 CPU fallback, converts the completed waveform to PCM16, and streams it through
@@ -227,7 +227,11 @@ operators share that 898 MB expansion cache; temporary INT8 uploads are released
 after expansion, and sentence boundaries clear graph/output workspaces without
 discarding expanded weights. RMS/rotary, residuals, attention, and fused
 SiLU-gate stay on Metal, logits are copied to the host once per diffusion step
-for deterministic token selection, and Higgs/DAC decoding remains on CPU.
+for deterministic token selection. Higgs/DAC decoding uses Metal INT8
+projections with fused Snake/unfold and transposed-convolution fold kernels.
+CPU decoding partitions sufficiently large convolution and activation ranges
+over the shared bounded YNN thread pool; small ranges remain serial to avoid
+scheduling overhead.
 
 OmniVoice prompt syntax is package data rather than C++ policy:
 `synthesis_template.jinja` is rendered by tokenizer++ with `language`,

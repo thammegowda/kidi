@@ -10,6 +10,10 @@ namespace kidi::layers {
 using ops::require;
 namespace {
 
+auto audio_parameter_device() -> tensor::Device {
+    return module_device == tensor::Device::apple_gpu() ? tensor::Device::cpu() : module_device;
+}
+
 auto require_cpu(const Tensor& input, std::int32_t channels, std::string_view operation) -> void {
     if (input.device() != tensor::Device::cpu() || input.dtype() != tensor::DType::F32 || input.dimensions() != 3 ||
         input.size(0) != 1 || input.size(2) != channels)
@@ -19,11 +23,7 @@ auto require_cpu(const Tensor& input, std::int32_t channels, std::string_view op
 
 template <typename Function>
 auto for_independent_ranges(std::size_t size, std::size_t work_per_item, Function&& function) -> void {
-#if defined(__ANDROID__)
     const auto tasks = size * work_per_item < 32768 ? std::size_t{1} : std::min(runtime::ynn::thread_count(), size);
-#else
-    const auto tasks = std::size_t{1};
-#endif
     if (tasks <= 1) return function(0, size);
     const auto block = (size + tasks - 1) / tasks;
     require(runtime::ynn::parallel_for(tasks, [&](std::size_t task) {
@@ -45,12 +45,15 @@ Conv1dImpl::Conv1dImpl(std::int32_t input_channels, std::int32_t output_channels
     if (input_channels <= 0 || output_channels <= 0 || kernel_size <= 0 || stride <= 0 || padding < 0 ||
         dilation <= 0 || (module_dtype != tensor::DType::F32 && module_dtype != tensor::DType::I8))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Conv1d construction"});
-    register_parameter("weight", weight_, {output_channels, input_channels * kernel_size});
+    register_parameter("weight", weight_, {output_channels, input_channels * kernel_size}, module_dtype,
+                       allocate_parameters, audio_parameter_device());
     if (module_dtype == tensor::DType::I8) {
         qstate_.emplace();
-        register_parameter("scale", qstate_->scale, {output_channels, 1}, tensor::DType::F32);
+        register_parameter("scale", qstate_->scale, {output_channels, 1}, tensor::DType::F32, allocate_parameters,
+                           audio_parameter_device());
         bias_qstate_.emplace();
-        const auto vectors = module_device == tensor::Device::web_gpu() ? tensor::Device::cpu() : module_device;
+        const auto vectors = module_device == tensor::Device::web_gpu() ? tensor::Device::cpu()
+                                                                        : audio_parameter_device();
         register_parameter("bias", bias_, {output_channels}, tensor::DType::I8, allocate_parameters, vectors);
         register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32, allocate_parameters, vectors);
         if (allocate_parameters) {
@@ -58,7 +61,8 @@ Conv1dImpl::Conv1dImpl(std::int32_t input_channels, std::int32_t output_channels
             std::ranges::fill(require(bias_qstate_->scale.data<float>()), 1.F);
         }
     } else {
-        register_parameter("bias", bias_, {output_channels}, tensor::DType::F32);
+        register_parameter("bias", bias_, {output_channels}, tensor::DType::F32, allocate_parameters,
+                           audio_parameter_device());
     }
 }
 
@@ -67,7 +71,7 @@ auto Conv1dImpl::bias() const -> const Tensor& {
 }
 
 auto Conv1dImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    if (context.device() == tensor::Device::web_gpu())
+    if (context.device() == tensor::Device::web_gpu() || context.device() == tensor::Device::apple_gpu())
         return context.conv1d(input, weight_, qstate_ ? qstate_->scale : Tensor{}, bias(),
                                kernel_size_, stride_, padding_, dilation_);
     require_cpu(input, input_channels_, "Conv1d");
@@ -117,12 +121,15 @@ ConvTranspose1dImpl::ConvTranspose1dImpl(std::int32_t input_channels, std::int32
         output_padding < 0 || output_padding >= stride || dilation <= 0 ||
         (module_dtype != tensor::DType::F32 && module_dtype != tensor::DType::I8))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid ConvTranspose1d construction"});
-    register_parameter("weight", weight_, {output_channels * kernel_size, input_channels});
+    register_parameter("weight", weight_, {output_channels * kernel_size, input_channels}, module_dtype,
+                       allocate_parameters, audio_parameter_device());
     if (module_dtype == tensor::DType::I8) {
         qstate_.emplace();
-        register_parameter("scale", qstate_->scale, {output_channels * kernel_size, 1}, tensor::DType::F32);
+        register_parameter("scale", qstate_->scale, {output_channels * kernel_size, 1}, tensor::DType::F32,
+                           allocate_parameters, audio_parameter_device());
         bias_qstate_.emplace();
-        const auto vectors = module_device == tensor::Device::web_gpu() ? tensor::Device::cpu() : module_device;
+        const auto vectors = module_device == tensor::Device::web_gpu() ? tensor::Device::cpu()
+                                                                        : audio_parameter_device();
         register_parameter("bias", bias_, {output_channels}, tensor::DType::I8, allocate_parameters, vectors);
         register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32, allocate_parameters, vectors);
         if (allocate_parameters) {
@@ -130,7 +137,8 @@ ConvTranspose1dImpl::ConvTranspose1dImpl(std::int32_t input_channels, std::int32
             std::ranges::fill(require(bias_qstate_->scale.data<float>()), 1.F);
         }
     } else {
-        register_parameter("bias", bias_, {output_channels}, tensor::DType::F32);
+        register_parameter("bias", bias_, {output_channels}, tensor::DType::F32, allocate_parameters,
+                           audio_parameter_device());
     }
     projection_bias_ =
         require(Tensor::zeros({output_channels * kernel_size}, tensor::DType::F32, tensor::Device::cpu()));
@@ -141,7 +149,7 @@ auto ConvTranspose1dImpl::bias() const -> const Tensor& {
 }
 
 auto ConvTranspose1dImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    if (context.device() == tensor::Device::web_gpu()) {
+    if (context.device() == tensor::Device::web_gpu() || context.device() == tensor::Device::apple_gpu()) {
         const auto projected = qstate_
             ? context.quantized_linear(input, weight_, qstate_->scale, projection_bias_, true)
             : context.linear(input, weight_, projection_bias_, true);
@@ -188,7 +196,8 @@ auto ConvTranspose1dImpl::forward_snake(ops::Context& context, const Tensor& inp
 Snake1dImpl::Snake1dImpl(std::int32_t channels) : channels_(channels) {
     if (channels <= 0 || (module_dtype != tensor::DType::F32 && module_dtype != tensor::DType::I8))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Snake1d construction"});
-    const auto vectors = module_device == tensor::Device::web_gpu() ? tensor::Device::cpu() : module_device;
+    const auto vectors =
+        module_device == tensor::Device::web_gpu() ? tensor::Device::cpu() : audio_parameter_device();
     register_parameter("alpha", alpha_, {channels}, module_dtype, allocate_parameters, vectors);
     if (module_dtype == tensor::DType::I8) {
         qstate_.emplace();
@@ -204,7 +213,8 @@ auto Snake1dImpl::alpha() const -> const Tensor& {
 }
 
 auto Snake1dImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    if (context.device() == tensor::Device::web_gpu()) return context.snake(input, alpha());
+    if (context.device() == tensor::Device::web_gpu() || context.device() == tensor::Device::apple_gpu())
+        return context.snake(input, alpha());
     require_cpu(input, channels_, "Snake1d");
     context.synchronize();
     const auto source = require(input.data<float>());
@@ -226,13 +236,15 @@ auto Snake1dImpl::forward(ops::Context& context, const Tensor& input) const -> T
 }
 
 auto Snake1dImpl::forward(ops::Context& context, const Tensor& input, const Conv1d& convolution) const -> Tensor {
-    if (context.device() == tensor::Device::web_gpu()) return convolution->forward_snake(context, input, alpha());
+    if (context.device() == tensor::Device::web_gpu() || context.device() == tensor::Device::apple_gpu())
+        return convolution->forward_snake(context, input, alpha());
     return convolution->forward(context, forward(context, input));
 }
 
 auto Snake1dImpl::forward(ops::Context& context, const Tensor& input, const ConvTranspose1d& convolution) const
     -> Tensor {
-    if (context.device() == tensor::Device::web_gpu()) return convolution->forward_snake(context, input, alpha());
+    if (context.device() == tensor::Device::web_gpu() || context.device() == tensor::Device::apple_gpu())
+        return convolution->forward_snake(context, input, alpha());
     return convolution->forward(context, forward(context, input));
 }
 

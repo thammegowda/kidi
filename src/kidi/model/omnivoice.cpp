@@ -40,7 +40,8 @@ auto decoder_shape(const YAML::Node& config) -> layers::HiggsDecoderShape {
 }
 
 auto codec_device(tensor::Device device) -> tensor::Device {
-    return device == tensor::Device::web_gpu() ? device : tensor::Device::cpu();
+    return device == tensor::Device::web_gpu() || device == tensor::Device::apple_gpu() ? device
+                                                                                         : tensor::Device::cpu();
 }
 auto decoder_module(const YAML::Node& config, tensor::Device device) -> layers::HiggsDecoder {
     const ModuleScope scope(codec_device(device));

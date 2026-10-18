@@ -1,0 +1,100 @@
+# Whisper code, English name, and aliases; ISO names/codes derived from github.com/thammegowda/mtdata/tree/main/mtdata/iso
+af	Afrikaans	afr
+sq	Albanian	sqi
+am	Amharic	amh
+ar	Arabic	ara	العربية
+hy	Armenian	hye
+as	Assamese	asm
+az	Azerbaijani	aze
+ba	Bashkir	bak
+eu	Basque	eus
+be	Belarusian	bel
+bn	Bengali	ben	বাংলা
+bs	Bosnian	bos
+br	Breton	bre
+bg	Bulgarian	bul
+my	Burmese	mya
+ca	Catalan	cat
+zh	Chinese	zho	cmn
+hr	Croatian	hrv
+cs	Czech	ces
+da	Danish	dan
+nl	Dutch	nld
+en	English	eng
+et	Estonian	est
+fo	Faroese	fao
+fi	Finnish	fin
+fr	French	fra
+gl	Galician	glg
+ka	Georgian	kat
+de	German	deu
+gu	Gujarati	guj
+ht	Haitian	hat
+ha	Hausa	hau
+haw	Hawaiian	haw
+he	Hebrew	heb	iw
+hi	Hindi	hin	हिन्दी	हिंदी
+hu	Hungarian	hun
+is	Icelandic	isl
+id	Indonesian	ind	in
+it	Italian	ita
+ja	Japanese	jpn
+jw	Javanese	jav	jv
+kn	Kannada	kan	ಕನ್ನಡ
+kk	Kazakh	kaz
+km	Khmer	khm
+ko	Korean	kor
+lo	Lao	lao
+la	Latin	lat
+lv	Latvian	lav
+ln	Lingala	lin
+lt	Lithuanian	lit
+lb	Luxembourgish	ltz
+mk	Macedonian	mkd
+mg	Malagasy	mlg
+ms	Malay	msa
+ml	Malayalam	mal
+mt	Maltese	mlt
+mi	Maori	mri
+mr	Marathi	mar
+el	Greek	ell
+mn	Mongolian	mon
+ne	Nepali	nep
+no	Norwegian	nor	nb
+nn	Norwegian Nynorsk	nno
+oc	Occitan	oci
+pa	Punjabi	pan
+fa	Persian	fas
+pl	Polish	pol
+pt	Portuguese	por
+ps	Pashto	pus
+ro	Romanian	ron
+ru	Russian	rus
+sa	Sanskrit	san
+sr	Serbian	srp
+sn	Shona	sna
+sd	Sindhi	snd
+si	Sinhala	sin
+sk	Slovak	slk
+sl	Slovenian	slv
+so	Somali	som
+es	Spanish	spa
+su	Sundanese	sun
+sw	Swahili	swa
+sv	Swedish	swe
+tl	Tagalog	tgl	fil
+tg	Tajik	tgk
+ta	Tamil	tam
+tt	Tatar	tat
+te	Telugu	tel	తెలుగు
+th	Thai	tha
+bo	Tibetan	bod
+tr	Turkish	tur
+tk	Turkmen	tuk
+uk	Ukrainian	ukr
+ur	Urdu	urd
+uz	Uzbek	uzb
+vi	Vietnamese	vie
+cy	Welsh	cym
+yi	Yiddish	yid
+yo	Yoruba	yor

@@ -125,6 +125,18 @@ auto HiggsDecoderImpl::forward(ops::Context& context, const Tensor& tokens) cons
         tokens.size(0) != static_cast<std::size_t>(shape_.codebooks) || !tokens.size(1))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
                             "Higgs audio codes require an I32 [codebooks, length] tensor on the execution device"});
+    Tensor codes = tokens;
+    if (context.device() == tensor::Device::apple_gpu()) {
+        context.synchronize();
+        const auto bytes = ops::require(tokens.copy_to_host());
+        const auto values =
+            std::span(reinterpret_cast<const std::int32_t*>(bytes.data()), bytes.size() / sizeof(std::int32_t));
+        codes = ops::require(
+            ops::require(Tensor::from_host({static_cast<std::int64_t>(tokens.size(0)),
+                                            static_cast<std::int64_t>(tokens.size(1))},
+                                           values))
+                .to(context.device()));
+    }
     const auto project = [&](std::span<const Tensor> inputs) {
         Tensor quantized;
         for (std::int32_t codebook = 0; codebook < shape_.codebooks; ++codebook) {
@@ -140,10 +152,10 @@ auto HiggsDecoderImpl::forward(ops::Context& context, const Tensor& tokens) cons
     };
     Tensor acoustic;
     if (context.device() == tensor::Device::web_gpu()) {
-        const std::array inputs{tokens};
+        const std::array inputs{codes};
         acoustic = context.replay("higgs:codes:" + std::to_string(tokens.size(1)), inputs, project, false).front();
     } else {
-        acoustic = project(std::array{tokens}).front();
+        acoustic = project(std::array{codes}).front();
     }
     return decoder_->forward(context, acoustic);
 }

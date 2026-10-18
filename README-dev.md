@@ -197,7 +197,10 @@ paragraphs or chapters. A multi-sentence request does this automatically.
 
 Android enables the Vulkan backend by default. OmniVoice runs compatible
 per-channel INT8 projections on Vulkan and uses CPU fallbacks for the remaining
-generator operators; its convolutional Higgs/DAC waveform decoder is CPU-only.
+generator operators; its convolutional Higgs/DAC waveform decoder remains on
+CPU for Vulkan. The portable decoder parallelizes large independent ranges over
+the configured YNN thread pool. Native Metal and browser WebGPU execute the
+decoder on GPU.
 Model weights remain host-backed and are uploaded into reusable Vulkan
 projection layouts, avoiding a second full checkpoint allocation. The same
 package and API work with `Device::cpu()` on systems without suitable Vulkan

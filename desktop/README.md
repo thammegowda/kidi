@@ -78,6 +78,9 @@ recordings over 30 seconds, and audio queued beyond the YAML limit. TTS frames
 carry the model sample rate; the browser resamples to its `AudioContext` rate
 before adding samples to the playback worklet.
 
+`asr.start` may include `language` as `auto`, one lowercase Whisper language
+code, or a comma-separated allowlist such as `en,kn,te,hi`.
+
 ## Scheduling
 
 The shared JavaScript `SpeechController` owns sentence segmentation, logical
@@ -115,6 +118,20 @@ normal conversation history, and listening resumes only after the TTS worklet
 reports that playback drained. Clicking the waveform again cancels the current
 stage and exits voice mode.
 
+One central setting controls the available conversation languages. Searchable
+top-right microphone and speaker fields select input and output independently:
+input pins Whisper or uses the configured code-switch allowlist, while output
+controls the chat system prompt and TTS. Whisper still selects one dominant
+language token per recording but can retain code-switched words in the decoded
+text. The capture worklet averages each source-rate interval before emitting
+16 kHz PCM, preventing high-frequency microphone content from aliasing into
+Whisper's speech band.
+
+The setting accepts codes, English names, ISO-639-3 aliases, and listed native
+names from `web/ui/languages.tsv`. The table contains the 99 languages supported
+by the packaged Whisper model and is derived from mtdata's ISO resources; alias
+changes require no application logic changes.
+
 Every voice-mode activation increments a client epoch carried through ASR,
 chat, TTS, playback drain, and delayed listen restarts. Exiting voice mode
 invalidates the epoch before sending cancellation, so stale completion events
@@ -141,6 +158,31 @@ fields isolate text segmentation, TTS first-PCM, and browser playback queueing.
 Call `kidiVoiceLatency.clear()` before a benchmark run. The summary reports p50
 and p95 across the last 100 completed turns.
 
+Voice mode uses the configured `realtime_steps` ceiling (six in the example)
+while explicit read-aloud keeps the selected quality setting (ten steps in the
+example). The reusable voice prompt is always calibrated with the quality
+setting. This keeps continuous conversation responsive without lowering saved
+read-aloud quality.
+
+### Hardware-aware dispatch
+
+The shared UI selects a bounded real-time profile from the host, resolved speech
+backend, logical CPU count, and browser device-memory hint. Native reports its
+resolved CPU, Metal, Vulkan, or NPU speech backend. The browser reports whether
+speech is actually using WebGPU or its threaded Wasm fallback.
+
+- Native GPU uses six diffusion steps and a 128-unit first-segment ceiling.
+- WebGPU uses four steps with a 96-unit ceiling on constrained browsers, or
+  five steps and 112 units when more CPU and memory are available.
+- Constrained CPU systems use four steps and a 96-unit ceiling.
+- Balanced and high-end CPU systems use five or six steps with progressively
+  larger segment budgets.
+
+Configured TTS quality remains an upper bound: the dispatcher may reduce steps
+for continuous voice mode but never increases a user's chosen value. Manual
+read-aloud is not capped. The Settings runtime summary shows the active profile,
+and `kidiRealtimeProfile()` returns the complete decision for diagnostics.
+
 ## Accelerator placement
 
 The example uses `auto` for Gemma and OmniVoice and CPU for Whisper. On Apple,
@@ -150,6 +192,11 @@ Whisper remains CPU-only. On the tested 16 GB Apple M5:
 - Gemma load plus 64-token generation: 5.00 s CPU, 3.78 s Metal.
 - OmniVoice 2-second, 10-step synthesis: 2.23 s CPU, 0.88 s Metal.
 - Warm voice pipeline: first chat delta about 0.40-0.50 s and first PCM about 1.16 s.
+- Metal DAC decoding for a 43-character first segment takes about 0.13 s,
+  reduced from about 0.32 s on CPU; warm six-step synthesis drops from about
+  0.58 s to 0.40 s on the same Apple M5.
+- Four-thread CPU DAC decoding of the same segment takes about 0.22 s, reduced
+  from about 0.38 s when the portable decoder loops run serially.
 - Combined process after a real voice turn: about 5.55 GB.
 - After speech-model idle eviction: about 4.69 GB.
 
@@ -158,11 +205,11 @@ Whisper and the default OmniVoice voice prompt warm in the background after the
 loopback server starts. The first voice-mode recording therefore overlaps model
 preparation instead of paying it after chat completion.
 
-Desktop and Wasm now use the same sentence policy: the first segment is capped
-at 96 weighted units with a 64-unit natural-clause target, while later complete
-sentences remain whole through 192 units. Exactly one segment may synthesize
-ahead of playback. The same controller emits source offsets and segment IDs for
-highlighting on both backends.
+Desktop and Wasm now use the same sentence policy: complete sentences remain
+whole through the first-segment ceiling, strong clause punctuation may stream
+earlier after its target, and only oversized unpunctuated text falls back to the
+latest word boundary. Exactly one segment may synthesize ahead of playback. The
+same controller emits source offsets and segment IDs for highlighting.
 
 Metal FP16 projection expansion is bounded separately per constructed model:
 512 MiB for Gemma and 1 GiB for OmniVoice in the example. An unlimited cache

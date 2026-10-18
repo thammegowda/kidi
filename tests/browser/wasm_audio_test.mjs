@@ -110,7 +110,10 @@ test('browser PCM is Float32 and completion waits for transferable audio deliver
         await waitFor(() => visibleSynthesis(worker).length);
         assert.equal(worker.calls[0].matrixPrecision, 'w8a8');
         assert.equal(worker.calls[0].w8a8Kernel, 'float');
-        worker.audio('first');
+        worker.audio('first', [0.123456789, -0.25, 0.5], {
+            voice_prompt_cached: true, voice_prompt_used: true,
+            generation_ms: 120, decode_ms: 50, preparation_ms: 10, audio_tokens: 48,
+        });
         await setImmediate();
         assert.equal(frames[0].samples[0], Math.fround(0.123456789));
         assert.equal(frames[0].sampleRate, 24000);
@@ -118,7 +121,14 @@ test('browser PCM is Float32 and completion waits for transferable audio deliver
         structuredClone(frames[0].samples, {transfer: [frames[0].samples.buffer]});
         delivered.resolve();
         await setImmediate();
-        assert.equal(events.find(event => event.type === 'tts.completed').payload.samples, 3);
+        const completed = events.find(event => event.type === 'tts.completed').payload;
+        assert.equal(completed.samples, 3);
+        assert.deepEqual(completed.stats, {
+            generation_ms: 120,
+            decode_ms: 50,
+            preparation_ms: 10,
+            audio_tokens: 48,
+        });
         assert.equal(worker.terminated, true);
     });
 });
@@ -197,16 +207,36 @@ test('idle eviction remains available and worker failure clears ready state', as
     });
 });
 
+test('chat system prompt follows pinned and code-switched language settings', async () => {
+    await withBackend(async ({backend, workers, connect}) => {
+        connect({});
+        backend.send('runtime.load', 'load', {model: 'test/model', backend: 'cpu', threads: 1});
+        await setImmediate();
+        const worker = workers.find(value => value.url.includes('inference-worker'));
+        backend.send('chat.start', 'pinned', {
+            messages: [{role: 'user', content: 'Hello'}], languages: 'kn', language_names: 'Kannada',
+        });
+        assert.match(worker.calls.at(-1).messages[0].content, /speaks Kannada.*Kannada only/u);
+        worker.emit({type: 'step', events: [{completed: {text: 'ok', stats: {}}}]});
+        backend.send('chat.start', 'mixed', {
+            messages: [{role: 'user', content: 'Hello'}], languages: 'en,kn',
+            language_names: 'English, Kannada',
+        });
+        assert.match(worker.calls.at(-1).messages[0].content, /code-switch.*English, Kannada/u);
+    });
+});
+
 test('voice mode and dictation both expose partial recognition after VAD-gated audio', async () => {
     await withBackend(async ({backend, workers, events, connect}) => {
         connect({});
-        backend.send('asr.start', 'voice', {stream_id: 11, voice_mode: true});
+        backend.send('asr.start', 'voice', {stream_id: 11, voice_mode: true, language: 'en,kn,te,hi'});
         await setImmediate();
         const worker = workers.find(value => value.url.includes('asr-worker'));
         for (let sequence = 0; sequence < 40; ++sequence)
             backend.sendBinary(asrFrame(11, sequence));
         const partial = worker.calls.find(call => call.type === 'transcribe');
         assert.match(partial.requestId, /^partial:voice:/);
+        assert.equal(partial.language, 'en,kn,te,hi');
         worker.emit({type: 'result', requestId: partial.requestId, text: 'Hello', language: 'en'});
         assert.equal(events.at(-1).type, 'asr.partial');
         assert.equal(events.at(-1).payload.provisional, 'Hello');
@@ -220,6 +250,17 @@ test('voice mode and dictation both expose partial recognition after VAD-gated a
         for (let sequence = 0; sequence < 40; ++sequence)
             backend.sendBinary(asrFrame(12, sequence));
         assert.match(worker.calls.at(-1).requestId, /^partial:dictation:/);
+    });
+
+});
+
+test('ASR rejects malformed recognition language preferences', async () => {
+    await withBackend(async ({backend, workers, events, connect}) => {
+        connect({});
+        backend.send('asr.start', 'invalid-language', {stream_id: 14, language: 'English'});
+        assert.equal(workers.some(worker => worker.url.includes('asr-worker')), false);
+        const error = events.find(event => event.id === 'invalid-language' && event.type === 'error');
+        assert.equal(error.payload.code, 'invalid_asr');
     });
 });
 
@@ -239,18 +280,26 @@ test('stopping empty ASR completes without asking Whisper to decode silence', as
 test('a persisted voice prompt skips calibration after the worker is recreated', async () => {
     await withBackend(async ({backend, workers, connect}) => {
         connect({onPcm() {}});
-        backend.send('tts.start', 'one', {stream_id: 1, text: 'First uncached sentence.'});
+        backend.send('tts.start', 'one', {
+            stream_id: 1, text: 'First uncached sentence.', options: {steps: 4, gpu_precision: 'w8a8'},
+        });
         const first = await waitFor(() => workers[0]);
         await waitFor(() => visibleSynthesis(first).length);
-        assert.equal(first.calls.filter(call => call.type === 'synthesize' && call.options?.return_tokens).length, 1);
+        const calibration = first.calls.filter(call => call.type === 'synthesize' && call.options?.return_tokens);
+        assert.equal(calibration.length, 1);
+        assert.equal(calibration[0].options.steps, 6);
+        assert.equal(visibleSynthesis(first)[0].options.steps, 4);
         first.audio('one');
         await setImmediate();
 
-        backend.send('tts.start', 'two', {stream_id: 2, text: 'A different uncached sentence.'});
+        backend.send('tts.start', 'two', {
+            stream_id: 2, text: 'A different uncached sentence.', options: {steps: 10, gpu_precision: 'w8a8'},
+        });
         const second = await waitFor(() => workers.length === 2 && workers[1]);
         await waitFor(() => visibleSynthesis(second).length);
         assert.equal(second.calls.filter(call => call.type === 'voice-prompt').length, 1);
         assert.equal(second.calls.filter(call => call.type === 'synthesize' && call.options?.return_tokens).length, 0);
+        assert.equal(visibleSynthesis(second)[0].options.steps, 10);
         second.audio('two');
         await setImmediate();
     });

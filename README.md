@@ -203,7 +203,7 @@ Input must be a mono or multichannel 16 kHz PCM WAV of at most 30 seconds. Chann
 
 ```bash
 python -m kidi transcribe \
-  --model @openai/whisper-tiny \
+  --model @openai/whisper-small \
   --in speech.wav \
   --language auto
 ```
@@ -246,7 +246,8 @@ operators and the waveform decoder use the CPU. Applications embedding the C++
 library can select the same behavior with `tensor::Device::vulkan()`.
 Apple builds use Metal with `--backend mps` (and select it for `--backend auto`);
 the INT8 checkpoint is expanded once into a reusable FP16 projection cache for
-native Metal GEMM while the DAC waveform decoder remains on CPU.
+native Metal GEMM. The Higgs/DAC waveform decoder also runs on Metal using INT8
+projections and dedicated Snake/convolution layout kernels.
 
 The current converted package is about **618 MB**, including a **607 MB** INT8
 Safetensors file and tokenizer. `--duration auto` is the default and uses

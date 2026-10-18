@@ -701,7 +701,8 @@ auto Context::diffusion_update(const Tensor& tokens, const Tensor& candidates, c
 }
 auto Context::conv1d(const Tensor& input, const Tensor& weight, const Tensor& scales, const Tensor& bias,
                      std::int32_t kernel, std::int32_t stride, std::int32_t padding, std::int32_t dilation) -> Tensor {
-    if (device() != tensor::Device::web_gpu() || input.dtype() != tensor::DType::F32 || input.dimensions() != 3 ||
+    if ((device() != tensor::Device::web_gpu() && device() != tensor::Device::apple_gpu()) ||
+        input.dtype() != tensor::DType::F32 || input.dimensions() != 3 ||
         input.size(0) != 1 || kernel <= 0 || stride <= 0 || padding < 0 || dilation <= 0 || weight.dimensions() != 2 ||
         weight.size(1) != input.size(2) * kernel || bias.dtype() != tensor::DType::F32 ||
         bias.numel() != weight.size(0))
@@ -713,7 +714,8 @@ auto Context::conv1d(const Tensor& input, const Tensor& weight, const Tensor& sc
 auto Context::snake_conv1d(const Tensor& input, const Tensor& alpha, const Tensor& weight, const Tensor& scales,
                            const Tensor& bias, std::int32_t kernel, std::int32_t stride, std::int32_t padding,
                            std::int32_t dilation) -> Tensor {
-    if (device() != tensor::Device::web_gpu() || input.dtype() != tensor::DType::F32 || input.dimensions() != 3 ||
+    if ((device() != tensor::Device::web_gpu() && device() != tensor::Device::apple_gpu()) ||
+        input.dtype() != tensor::DType::F32 || input.dimensions() != 3 ||
         input.size(0) != 1 || alpha.dtype() != tensor::DType::F32 || alpha.dimensions() != 1 ||
         alpha.numel() != input.size(2) || kernel <= 0 || stride <= 0 || padding < 0 || dilation <= 0 ||
         weight.dimensions() != 2 || weight.size(1) != input.size(2) * kernel || bias.dtype() != tensor::DType::F32 ||
@@ -726,7 +728,8 @@ auto Context::snake_conv1d(const Tensor& input, const Tensor& alpha, const Tenso
 }
 auto Context::snake_quantized_linear(const Tensor& input, const Tensor& alpha, const Tensor& weight,
                                     const Tensor& scale, const Tensor& bias, bool transpose_weight) -> Tensor {
-    if (device() != tensor::Device::web_gpu() || input.dtype() != tensor::DType::F32 || input.dimensions() != 3 ||
+    if ((device() != tensor::Device::web_gpu() && device() != tensor::Device::apple_gpu()) ||
+        input.dtype() != tensor::DType::F32 || input.dimensions() != 3 ||
         input.size(0) != 1 || alpha.dtype() != tensor::DType::F32 || alpha.dimensions() != 1 ||
         alpha.numel() != input.size(2))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid device Snake projection"});
@@ -735,7 +738,8 @@ auto Context::snake_quantized_linear(const Tensor& input, const Tensor& alpha, c
 }
 auto Context::conv_transpose_fold(const Tensor& projected, const Tensor& bias, std::int32_t kernel, std::int32_t stride,
                                   std::int32_t padding, std::int32_t output_padding, std::int32_t dilation) -> Tensor {
-    if (device() != tensor::Device::web_gpu() || projected.dtype() != tensor::DType::F32 ||
+    if ((device() != tensor::Device::web_gpu() && device() != tensor::Device::apple_gpu()) ||
+        projected.dtype() != tensor::DType::F32 ||
         projected.dimensions() != 3 || projected.size(0) != 1 || kernel <= 0 || stride <= 0 || padding < 0 ||
         output_padding < 0 || output_padding >= stride || dilation <= 0 || projected.size(2) % kernel ||
         bias.dtype() != tensor::DType::F32 || bias.numel() != projected.size(2) / kernel)
@@ -744,7 +748,8 @@ auto Context::conv_transpose_fold(const Tensor& projected, const Tensor& bias, s
     return impl_->run({Operation::CONV_TRANSPOSE_FOLD, attributes}, {&projected, &bias});
 }
 auto Context::snake(const Tensor& input, const Tensor& alpha) -> Tensor {
-    if (device() != tensor::Device::web_gpu() || input.dtype() != tensor::DType::F32 || input.dimensions() != 3 ||
+    if ((device() != tensor::Device::web_gpu() && device() != tensor::Device::apple_gpu()) ||
+        input.dtype() != tensor::DType::F32 || input.dimensions() != 3 ||
         alpha.dtype() != tensor::DType::F32 || alpha.dimensions() != 1 || alpha.numel() != input.size(2))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid device Snake activation"});
     return impl_->run({Operation::SNAKE}, {&input, &alpha});

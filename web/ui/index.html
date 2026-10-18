@@ -22,6 +22,19 @@
           <span class="reader-view-icon" aria-hidden="true"></span><span>Reader</span>
         </button>
       </nav>
+      <div class="language-switchers" aria-label="Conversation languages">
+        <label class="language-picker">
+          <span class="mic-icon" aria-hidden="true"></span>
+          <input id="input-language" class="language-switcher" aria-label="Input language" autocomplete="off">
+          <span id="input-language-menu" class="language-menu" hidden></span>
+        </label>
+        <span aria-hidden="true">→</span>
+        <label class="language-picker">
+          <span class="speaker-icon" aria-hidden="true"></span>
+          <input id="output-language" class="language-switcher" aria-label="Output language" autocomplete="off">
+          <span id="output-language-menu" class="language-menu" hidden></span>
+        </label>
+      </div>
       <button class="icon-button config-button" id="open-config" type="button" aria-label="Settings">
         <span class="config-icon" aria-hidden="true"></span>
       </button>
@@ -148,6 +161,14 @@
       <section data-settings-panel="llm">
         <h3>LLM</h3>
         <div id="config-summary"></div>
+        <div class="tts-grid">
+          <label class="wide-setting">
+            <span>Conversation languages</span>
+            <input id="conversation-languages" type="text" maxlength="96"
+              placeholder="English, Kannada, Telugu, Hindi">
+            <small>Comma-separated language names or codes. Auto uses the browser locale.</small>
+          </label>
+        </div>
       <section class="system-prompt-preferences">
         <div class="settings-section-heading">
           <div><h3>System prompt</h3><p>Applied to future turns. Restarting restores the YAML value.</p></div>
@@ -216,7 +237,6 @@
             </select>
             <small>W8A8 is the browser default for speed and memory. FP32 is the quality baseline; pronunciation can vary by profile.</small>
           </label>
-          <label><span>Language</span><input id="tts-language" type="text" maxlength="64"></label>
           <label><span>Diffusion steps</span><input id="tts-steps" type="number" min="1" max="128"></label>
           <label><span>Delivery</span><select id="tts-pace">
             <option value="1.2">Mellow</option><option value="1.15">Relaxed</option>
