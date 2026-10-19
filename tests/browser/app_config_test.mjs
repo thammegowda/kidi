@@ -74,6 +74,7 @@ test('first-run browser UI requests model loading and exposes progress', async (
     'book-source-header', 'book-source-aligned-content',
     'book-view-mode', 'book-translation-progress', 'book-translation-counts',
     'book-translation-meter', 'toggle-book-translation', 'clear-book-translation',
+    'wasm-disclaimer',
   ])
     assert.match(html, new RegExp(`id="${id}"`));
   assert.match(app, /function requestModelLoad\(\)/);
@@ -97,6 +98,7 @@ test('first-run browser UI requests model loading and exposes progress', async (
   assert.match(app, /setReaderSpeechSide\('target'\);\s+seekBookSpeech\(offset\)/);
   assert.match(app, /readerLanguage: state\.readerLanguage, readerView: state\.readerView/);
   assert.match(app, /\$\('book-view-mode'\)\.addEventListener\('change'/);
+  assert.match(app, /\$\('wasm-disclaimer'\)\.hidden = state\.runtime\.host !== 'wasm'/);
   assert.match(app, /readerTranslationPaused: state\.readerTranslationPaused/);
   assert.match(app, /await removeEbookTranslation\(book, readerChapterIndex, state\.readerLanguage\)/);
 });

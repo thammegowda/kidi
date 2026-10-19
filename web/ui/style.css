@@ -151,6 +151,13 @@ button { color: inherit; }
   position: absolute; right: 10px; bottom: 12px; width: 28px; height: 28px; border-radius: 7px;
   background: var(--panel-2); color: var(--muted);
 }
+.wasm-disclaimer, .wasm-settings-disclaimer {
+  margin: 0; padding: 9px 10px; border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--line));
+  border-radius: 9px; background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+  color: var(--muted); font-size: 9px; line-height: 1.45;
+}
+.wasm-disclaimer strong, .wasm-settings-disclaimer strong { color: var(--text); }
+.wasm-settings-disclaimer { margin-bottom: 14px; font-size: 10px; }
 .book-reader { position: relative; flex: 1; min-height: 0; overflow: hidden; }
 .book-reader-header {
   position: absolute; z-index: 4; top: 8px; right: 12px; left: 12px;

@@ -1704,6 +1704,7 @@ function renderMessages() {
 }
 
 function renderRuntime() {
+  $('wasm-disclaimer').hidden = state.runtime.host !== 'wasm';
   const asrActive = activeRequest?.kind === 'asr';
   const playingVoiceReply = voiceMode && playbackStreamId !== null;
   const activeSpeech = ttsStreams.get(playbackStreamId);

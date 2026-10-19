@@ -75,6 +75,10 @@
       </section>
 
       <footer class="sidebar-footer">
+        <p id="wasm-disclaimer" class="wasm-disclaimer" role="note" hidden>
+          <strong>Experimental browser build.</strong>
+          WebAssembly is slower and more memory-constrained. For the best experience, use the native desktop app.
+        </p>
         <div class="privacy"><span class="status-dot"></span>Runs locally on this computer</div>
       </footer>
     </aside>
@@ -356,6 +360,10 @@
         </div>
       </section>
       <section class="wasm-preferences" id="wasm-preferences" hidden>
+        <p class="wasm-settings-disclaimer" role="note">
+          The browser runtime is experimental and slower than native Kidi. Use the native desktop app for the best
+          performance and reliability.
+        </p>
         <div class="settings-section-heading">
           <div><h3>Browser runtime</h3><p>Models run locally through WebAssembly or WebGPU.</p></div>
           <span id="wasm-runtime-status">Offline</span>
