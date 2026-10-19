@@ -21,6 +21,7 @@ const DEFAULTS = {
 class WasmBackend {
   #callbacks;
   #asr;
+  #ebooks = new Map();
   #components = {
     chat: {
       enabled: CHAT.enabled !== false,
@@ -30,6 +31,15 @@ class WasmBackend {
       kv_cache_precision: CHAT.kv_cache_precision,
       system_prompt: DEFAULTS.systemPrompt,
       configured_system_prompt: DEFAULTS.systemPrompt,
+      translation_prompt: CHAT.translation_prompt ||
+        'You are a literary translator. Translate <text_to_translate> into {target_language}. ' +
+        'Use surrounding context only to resolve meaning and return only the translated text.',
+      translation: {
+        target_chars: CHAT.translation?.target_chars || 800,
+        max_chars: CHAT.translation?.max_chars || 1200,
+        max_sentence_chars: CHAT.translation?.max_sentence_chars || 600,
+        max_input_tokens: CHAT.translation?.max_input_tokens || 1536,
+      },
       maximum_tokens: DEFAULTS.maximumTokens,
       context_tokens: CHAT.generation.context_tokens,
       prefix_cache_mb: CHAT.generation.prefix_cache_mb,
@@ -65,6 +75,7 @@ class WasmBackend {
       },
     },
   };
+  #epubProvider;
   #current;
   #ready = false;
   #settings = {...DEFAULTS};
@@ -467,6 +478,23 @@ class WasmBackend {
     return this.#snapshot();
   }
 
+  async importEbook(blob) {
+    this.#epubProvider ||= import('./browser-epub.js');
+    const book = await (await this.#epubProvider).openBrowserEpub(blob);
+    this.#ebooks.delete(book.metadata.book_id);
+    this.#ebooks.set(book.metadata.book_id, book);
+    while (this.#ebooks.size > 2) this.#ebooks.delete(this.#ebooks.keys().next().value);
+    return book.metadata;
+  }
+
+  async loadEbookChapter(bookId, chapter) {
+    const book = this.#ebooks.get(bookId);
+    if (!book) throw new Error('EPUB is not loaded in this browser session');
+    this.#ebooks.delete(bookId);
+    this.#ebooks.set(bookId, book);
+    return book.chapter(chapter);
+  }
+
   listCachedFiles() { return listCachedFiles(); }
   async deleteCachedFile(id) {
     const result = await deleteCachedFile(id);
@@ -558,6 +586,32 @@ class WasmBackend {
       this.#event(id, 'settings.system_prompt.updated', {prompt: payload.prompt});
       return;
     }
+    if (type === 'reader.translate') {
+      if (!this.#ready || !this.#worker) return this.#error(id, 'not_ready', 'Load the browser model first');
+      if (this.#current) return this.#error(id, 'busy', 'Another inference request is active');
+      const text = String(payload.text || ''), previous = String(payload.previous || '');
+      const next = String(payload.next || ''), targetLanguage = String(payload.target_language || '');
+      const targetName = String(payload.target_language_name || '');
+      const invalidControl = value => /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(value);
+      const maximumCharacters = this.#components.chat.translation.max_chars;
+      if (!text || [...text].length > maximumCharacters || [...previous].length > maximumCharacters ||
+          [...next].length > maximumCharacters ||
+          !/^[a-z]{2,3}$/u.test(targetLanguage) || !targetName || targetName.length > 100 ||
+          [text, previous, next, targetName].some(invalidControl))
+        return this.#error(id, 'invalid_translation', 'Reader translation payload is invalid or too large');
+      const prompt = this.#components.chat.translation_prompt.replaceAll('{target_language}', targetName);
+      const request = `<preceding_context>\n${previous}\n</preceding_context>\n` +
+        `<text_to_translate>\n${text}\n</text_to_translate>\n` +
+        `<following_context>\n${next}\n</following_context>`;
+      this.#current = {id, text: '', kind: 'reader.translation'};
+      this.#event(id, 'reader.translation.started');
+      this.#worker.postMessage({
+        type: 'generate',
+        messages: [{role: 'system', content: prompt}, {role: 'user', content: request}],
+        maximumTokens: this.#settings.maximumTokens,
+      });
+      return;
+    }
     if (type === 'chat.start') {
       if (!this.#ready || !this.#worker) return this.#error(id, 'not_ready', 'Load the browser model first');
       if (this.#current) return this.#error(id, 'busy', 'Another inference request is active');
@@ -571,12 +625,15 @@ class WasmBackend {
       if (this.#settings.systemPrompt) {
         const instruction = !languages ? '' : languages.includes(',')
           ? `\nThe user may code-switch among ${languageNames}. Respond in the same language or language mix as the latest user message.`
-          : `\nThe user speaks ${languageNames}. Respond in ${languageNames} only.`;
+          : `\nThe selected output language is ${languageNames}. You must respond entirely in ${languageNames}, ` +
+            `regardless of the language of the user's message. This requirement overrides any earlier instruction ` +
+            `to match the user's language.`;
         messages.unshift({role: 'system', content: this.#settings.systemPrompt + instruction});
       }
       this.#current = {
         id,
         text: '',
+        kind: 'chat',
       };
       this.#event(id, 'chat.started');
       this.#worker.postMessage({
@@ -894,14 +951,15 @@ class WasmBackend {
       return;
     }
     if (data.type === 'step' && this.#current) {
+      const kind = this.#current.kind || 'chat';
       for (const item of data.events || []) {
         if (item.text) {
           this.#current.text += item.text;
-          this.#event(this.#current.id, 'chat.delta', {text: item.text});
+          this.#event(this.#current.id, `${kind}.delta`, {text: item.text});
         }
         if (item.completed) {
           const completed = item.completed;
-          this.#event(this.#current.id, 'chat.completed', {
+          this.#event(this.#current.id, `${kind}.completed`, {
             text: completed.text || this.#current.text,
             stats: {
               elapsed_ms: data.stats?.elapsedMs || completed.generation_ms || 0,

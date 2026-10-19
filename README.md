@@ -123,7 +123,7 @@ build-release/kidi-app examples/kidi-app.yaml
 The app opens in the system browser on macOS and Linux and uses an embedded
 WebView on supported Windows builds. The command-line
 [`examples/kidi-app.yaml`](examples/kidi-app.yaml) is the single source for chat,
-ASR, and TTS model directories,
+ASR, and TTS model directories and the reader's literary-translation prompt,
 accelerators, generation limits, cache sizes, languages, and voice settings;
 relative model paths resolve from the YAML file. The example uses the models
 under `models/`, enables Gemma 4 and Whisper, and leaves OmniVoice disabled until
@@ -135,6 +135,12 @@ language, diffusion steps, and voice attributes are user preferences and may be
 overridden there for future Read aloud requests. Conversations and TTS
 preferences stay in browser-local storage; prompts are sent only to the local
 native process.
+
+Host-specific configuration is a deep override under `runtime.<host>` using the
+same root keys. The base configuration targets native desktop; for example,
+`runtime.wasm.models.chat.model_id` replaces only the browser chat model while
+inheriting prompts and generation settings. Kidi removes the `native`/`wasm`
+override blocks after resolving the active host.
 The executable embeds its frontend assets and does not need a separate web
 server or installed Node.js runtime. Chat tokens, live microphone PCM and
 partial transcripts, and TTS PCM chunks share one authenticated WebSocket; see
@@ -147,6 +153,31 @@ Markdown immediately while only the unfinished final line remains plain text.
 Open fenced-code blocks stream as unhighlighted code until their closing fence
 arrives.
 
+The Reader imports EPUB books into browser-local storage. Selecting a translation
+language displays the source and translated text side by side and translates
+paragraphs incrementally with the configured local chat model. Translations are
+cached incrementally by book, chapter, language, source content, and model/prompt
+identity, so partially translated pages survive close, reload, and native-app
+restarts. A compact progress bar reports done, cached, and remaining segments,
+supports immediate pause/resume, and provides a retranslate action that clears
+only the current chapter/language entry. Source and target
+paragraphs remain vertically aligned in the shared scrolling surface. Read
+chapter can begin after the first translated paragraph and continues as later
+paragraphs arrive. Clicking a source paragraph switches narration, language,
+seeking, and highlighting to the original text; clicking a completed target
+paragraph switches them back to the translation. Reader translation requests do
+not enter conversation history. Background translation stops after the visible
+range plus three paragraphs, performs no inference while paused, and resumes
+when the reader scrolls or target-language narration approaches untranslated
+text. Desktop translation stays strictly sequential while its independent TTS
+stream reads completed text. Oversized paragraphs split first at sentence
+boundaries and then at punctuation under hard character and token limits. A
+three-state page-view control shows Source, Both, or Translation, and reader
+pages use dedicated light/dark palettes and speech-highlight colors rather than
+chat-bubble styling. Semantic block breaks are preserved for narration, so
+titles and headings remain separate speech segments with a short audible pause
+before the following paragraph.
+
 ### WebAssembly
 
 The self-hosted browser app runs Gemma E2B locally, with streaming replies, saved
@@ -154,6 +185,8 @@ chats, Markdown, code highlighting, diagrams, and Whisper microphone dictation.
 In a hosted instance, open Model settings and download the chat model; speech
 dictation has a separate model download. Models are cached in your browser.
 Once the complete model is cached, it loads automatically on later visits.
+The browser Reader uses the same local translation, caching, and translated
+read-aloud workflow as the desktop app.
 
 Microphone access requires permission and a secure browser context (HTTPS or
 localhost). Clearing site data removes downloaded models and saved browser data.
@@ -289,8 +322,10 @@ explicit language conditioning and lets OmniVoice infer it from the text; its
 script-aware duration and voice-instruction paths continue to distinguish Han
 text automatically. Embedded clients may also set `duration_scale`: values
 above `1` allocate more acoustic frames for a slower, calmer delivery without
-resampling the waveform or lowering its pitch. The desktop presets are Brisk
-(`0.9`), Natural (`1.0`), Relaxed (`1.15`), and Mellow (`1.2`).
+resampling the waveform or lowering its pitch. Because OmniVoice's baseline is
+deliberate, Kidi linearly spaces its reading-oriented presets across the
+model-supported range: Briskyest (`0.50`), Briskier (`0.62`), Brisk (`0.74`),
+Natural (`0.86`), Relaxed (`0.98`), and Mellow (`1.10`).
 
 Metal is the preferred Apple backend: on the same 195-word fixture, quality-first
 consistent-voice 32-step synthesis produced 64.04 seconds of audio in 36.91

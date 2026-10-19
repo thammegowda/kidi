@@ -1,4 +1,5 @@
 app.js
+ebooks.js
 icons/audio-waveform.svg
 icons/book-open.svg
 icons/copy.svg
@@ -13,6 +14,8 @@ languages.tsv
 markdown.js
 mermaid.js
 realtime-profile.js
+reader-position.js
+reader-translation.js
 speech-controller.js
 speech-highlights.js
 style.css

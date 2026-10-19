@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    MAX_SPEECH_SEGMENT_UNITS, SpeechSegments, plainSpeechText, speechUnits,
+    MAX_SPEECH_SEGMENT_UNITS, SPEECH_BLOCK_PAUSE_MS, SpeechSegments, plainSpeechText, speechUnits,
 } from '../../web/ui/speech-controller.js';
+import {READER_BLOCK_BREAK} from '../../web/ui/reader-position.js';
 
 test('speech starts at complete sentences before the input stream finishes', () => {
     const stream = new SpeechSegments();
@@ -10,6 +11,15 @@ test('speech starts at complete sentences before the input stream finishes', () 
     assert.deepEqual(stream.push(' world. More'), [{id: 0, text: 'Hello world.', start: 0, end: 12}]);
     assert.deepEqual(stream.push(' text.', true), [{id: 1, text: 'More text.', start: 13, end: 23}]);
     assert.throws(() => stream.push('late'), /Invalid/);
+});
+
+test('short block titles remain separate and request a pause', () => {
+    const stream = new SpeechSegments();
+    const segments = stream.push(`Chapter One${READER_BLOCK_BREAK}It was a bright morning.`, true);
+    assert.deepEqual(segments, [
+        {id: 0, text: 'Chapter One', start: 0, end: 11, pauseAfterMs: SPEECH_BLOCK_PAUSE_MS},
+        {id: 1, text: 'It was a bright morning.', start: 12, end: 36},
+    ]);
 });
 
 test('long sentences are bounded without dropping or duplicating source text', () => {

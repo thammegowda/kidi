@@ -79,6 +79,18 @@ test('desktop adapter uses LiteApp requests, binary uploads, and isolated speech
         await setImmediate();
         assert.deepEqual(events.slice(0, 2).map(value => value.type), ['chat.delta', 'chat.completed']);
 
+        backend.send('reader.translate', 'translate', {
+            text: 'A house.', previous: '', next: 'A garden.',
+            target_language: 'kn', target_language_name: 'Kannada',
+        });
+        assert.equal(message(main).method, 'reader.translate');
+        main.receive(event('translate', 0, 'reader.translation.delta', {text: 'ಮನೆ'}));
+        main.receive(event('translate', 1, 'completed', {text: 'ಒಂದು ಮನೆ.', stats: {}}));
+        await setImmediate();
+        assert.deepEqual(events.slice(2, 4).map(value => value.type),
+            ['reader.translation.delta', 'reader.translation.completed']);
+        assert.equal(events[3].payload.text, 'ಒಂದು ಮನೆ.');
+
         backend.send('settings.system_prompt.set', 'settings', {prompt: 7});
         main.receive(event('settings', 0, 'error',
             {code: 'invalid_system_prompt', message: 'Prompt must be text'}));
@@ -114,6 +126,35 @@ test('desktop adapter uses LiteApp requests, binary uploads, and isolated speech
         assert.deepEqual(await prepared, [
             {role: 'user', content: 'describe', images: [started.payload.stream_id]},
         ]);
+
+        const importing = backend.importEbook(new Blob([new Uint8Array([4, 5, 6])]), 'sample.epub');
+        await setImmediate();
+        const ebookStarted = message(main);
+        assert.equal(ebookStarted.method, 'ebook.start');
+        main.receive(event(ebookStarted.id, 0, 'completed', {stream_id: ebookStarted.payload.stream_id}));
+        await setImmediate();
+        const ebookFrame = main.sent.at(-2);
+        assert.ok(ebookFrame instanceof Uint8Array);
+        assert.equal(ebookFrame[5], 4);
+        const ebookFinished = message(main);
+        assert.equal(ebookFinished.method, 'ebook.finish');
+        main.receive(event(ebookFinished.id, 0, 'completed', {
+            book_id: 'native-book',
+            title: 'Sample',
+            author: 'Writer',
+            language: 'en',
+            chapters: [{id: 'one', title: 'One'}],
+        }));
+        assert.equal((await importing).book_id, 'native-book');
+
+        const chapter = backend.loadEbookChapter('native-book', 0);
+        await setImmediate();
+        const chapterRequest = message(main);
+        assert.equal(chapterRequest.method, 'ebook.chapter');
+        main.receive(event(chapterRequest.id, 0, 'completed', {
+            book_id: 'native-book', chapter: 0, title: 'One', html: '<p>Hello</p>',
+        }));
+        assert.equal((await chapter).html, '<p>Hello</p>');
 
         speech.close();
         await setImmediate();

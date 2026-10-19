@@ -350,84 +350,70 @@ if(KIDI_BUILD_DESKTOP_APP)
     set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "Build LiteApp's GoogleTest suite" FORCE)
     add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
     set(KIDI_DESKTOP_WEB_STAGE "${CMAKE_CURRENT_BINARY_DIR}/generated/desktop-web")
-    file(MAKE_DIRECTORY
-        "${KIDI_DESKTOP_WEB_STAGE}"
-        "${KIDI_DESKTOP_WEB_STAGE}/libs/marked"
-        "${KIDI_DESKTOP_WEB_STAGE}/libs/dompurify"
-        "${KIDI_DESKTOP_WEB_STAGE}/libs/highlightjs"
-        "${KIDI_DESKTOP_WEB_STAGE}/icons"
-    )
+    file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}")
+    function(kidi_stage_desktop_asset source relative)
+        if(IS_ABSOLUTE "${relative}" OR relative MATCHES "(^|/)\\.\\.?(/|$)" OR
+           NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" OR
+           IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
+            message(FATAL_ERROR "Invalid desktop asset mapping: ${relative} -> ${source}")
+        endif()
+        set(output "${KIDI_DESKTOP_WEB_STAGE}/${relative}")
+        get_filename_component(output_directory "${output}" DIRECTORY)
+        add_custom_command(
+            OUTPUT "${output}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${output_directory}"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/${source}" "${output}"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+            VERBATIM
+        )
+    endfunction()
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/web/ui/assets.txt")
+        "${CMAKE_CURRENT_SOURCE_DIR}/web/ui/assets.txt"
+        "${CMAKE_CURRENT_SOURCE_DIR}/desktop/assets.txt")
     file(STRINGS "web/ui/assets.txt" KIDI_SHARED_WEB_FILES)
-    set(KIDI_DESKTOP_WEB_FILES
-        backend.js
-        capture-worklet.js
-        playback-worklet.js
-    )
-    file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}/icons")
+    set(KIDI_DESKTOP_ARCHIVE_FILES ${KIDI_SHARED_WEB_FILES})
     foreach(file IN LISTS KIDI_SHARED_WEB_FILES)
-        configure_file("web/ui/${file}" "${KIDI_DESKTOP_WEB_STAGE}/${file}" COPYONLY)
+        kidi_stage_desktop_asset("web/ui/${file}" "${file}")
     endforeach()
-    foreach(file IN LISTS KIDI_DESKTOP_WEB_FILES)
-        configure_file("web/hosts/desktop/${file}" "${KIDI_DESKTOP_WEB_STAGE}/${file}" COPYONLY)
+    file(STRINGS "desktop/assets.txt" KIDI_DESKTOP_ASSET_MAPPINGS)
+    foreach(mapping IN LISTS KIDI_DESKTOP_ASSET_MAPPINGS)
+        string(REPLACE "\t" ";" mapping_parts "${mapping}")
+        list(LENGTH mapping_parts mapping_size)
+        if(NOT mapping_size EQUAL 2)
+            message(FATAL_ERROR "Invalid desktop/assets.txt entry: ${mapping}")
+        endif()
+        list(GET mapping_parts 0 relative)
+        list(GET mapping_parts 1 source)
+        string(REGEX REPLACE "^/" "" relative "${relative}")
+        if(relative IN_LIST KIDI_DESKTOP_ARCHIVE_FILES)
+            message(FATAL_ERROR "Duplicate desktop asset destination: ${relative}")
+        endif()
+        kidi_stage_desktop_asset("${source}" "${relative}")
+        list(APPEND KIDI_DESKTOP_ARCHIVE_FILES "${relative}")
     endforeach()
-    configure_file("web/libs/marked/marked.esm.js"
-        "${KIDI_DESKTOP_WEB_STAGE}/libs/marked/marked.esm.js" COPYONLY)
-    configure_file("web/libs/dompurify/purify.es.mjs"
-        "${KIDI_DESKTOP_WEB_STAGE}/libs/dompurify/purify.es.mjs" COPYONLY)
-    configure_file("web/libs/highlightjs/highlight.min.js"
-        "${KIDI_DESKTOP_WEB_STAGE}/libs/highlightjs/highlight.min.js" COPYONLY)
-    configure_file("third_party/liteapp/web/transport/websocket-transport.mjs"
-        "${KIDI_DESKTOP_WEB_STAGE}/websocket-transport.mjs" COPYONLY)
-    configure_file("third_party/liteapp/web/transport/channel.mjs"
-        "${KIDI_DESKTOP_WEB_STAGE}/channel.mjs" COPYONLY)
-    configure_file("third_party/liteapp/web/host/event-client.mjs"
-        "${KIDI_DESKTOP_WEB_STAGE}/event-client.mjs" COPYONLY)
-    configure_file("third_party/liteapp/web/transport/protocol.mjs"
-        "${KIDI_DESKTOP_WEB_STAGE}/protocol.mjs" COPYONLY)
-    file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}/libs/mermaid")
-    configure_file("web/libs/mermaid/mermaid.min.js"
-        "${KIDI_DESKTOP_WEB_STAGE}/libs/mermaid/mermaid.min.js" COPYONLY)
-    configure_file("web/libs/lucide-static/icons/mic.svg"
-        "${KIDI_DESKTOP_WEB_STAGE}/icons/mic.svg" COPYONLY)
-    configure_file("web/libs/lucide-static/icons/message-square.svg"
-        "${KIDI_DESKTOP_WEB_STAGE}/icons/message-square.svg" COPYONLY)
-    configure_file("web/libs/lucide-static/icons/square.svg"
-        "${KIDI_DESKTOP_WEB_STAGE}/icons/square.svg" COPYONLY)
-    configure_file("web/libs/lucide-static/icons/settings.svg"
-        "${KIDI_DESKTOP_WEB_STAGE}/icons/settings.svg" COPYONLY)
     liteapp_embed_archive(
         TARGET kidi_desktop_assets
         NAMESPACE kidi::desktop_assets
         HEADER kidi/desktop_assets.h
         ROOT "${KIDI_DESKTOP_WEB_STAGE}"
-        FILES
-            ${KIDI_SHARED_WEB_FILES}
-            ${KIDI_DESKTOP_WEB_FILES}
-            libs/marked/marked.esm.js
-            libs/dompurify/purify.es.mjs
-            libs/highlightjs/highlight.min.js
-            libs/mermaid/mermaid.min.js
-            channel.mjs
-            event-client.mjs
-            protocol.mjs
-            websocket-transport.mjs
-            icons/mic.svg
-            icons/message-square.svg
-            icons/square.svg
-            icons/settings.svg
+        FILES ${KIDI_DESKTOP_ARCHIVE_FILES}
     )
+    add_library(kidi_desktop_ebook STATIC desktop/ebook.cpp)
+    target_include_directories(kidi_desktop_ebook PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/desktop")
+    target_link_libraries(kidi_desktop_ebook PUBLIC liteapp::vfs)
+    liteapp_harden(kidi_desktop_ebook)
     add_executable(kidi_app desktop/app.cpp)
     set_target_properties(kidi_app PROPERTIES OUTPUT_NAME kidi-app)
     target_link_libraries(kidi_app PRIVATE
         kidi::kidi
+        kidi_desktop_ebook
         kidi_desktop_assets
         liteapp::app
         liteapp::service
-        liteapp::vfs
         nlohmann_json::nlohmann_json
     )
+    liteapp_link_embedded_resources(kidi_app)
     liteapp_harden(kidi_app)
 endif()
 

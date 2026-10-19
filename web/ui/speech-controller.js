@@ -1,4 +1,7 @@
+import {READER_BLOCK_BREAK} from './reader-position.js';
+
 export const MAX_SPEECH_SEGMENT_UNITS = 192;
+export const SPEECH_BLOCK_PAUSE_MS = 180;
 const FIRST_MAX_SPEECH_SEGMENT_UNITS = 128;
 const FIRST_TARGET_UNITS = 48;
 const NEXT_TARGET_UNITS = 160;
@@ -174,12 +177,29 @@ export class SpeechSegments {
     this.#buffer += text;
     const result = [];
     for (;;) {
-      const leading = this.#buffer.match(/^\s+/u)?.[0].length || 0;
+      const leading = this.#buffer.match(/^[^\S\u2029]+/u)?.[0].length || 0;
       this.#offset += leading;
       this.#buffer = this.#buffer.slice(leading);
       if (!this.#buffer) break;
       const target = this.#count ? this.#nextTargetUnits : this.#firstTargetUnits;
       const limit = this.#count ? this.#maximumUnits : this.#firstMaximumUnits;
+      const block = this.#buffer.indexOf(READER_BLOCK_BREAK);
+      if (block === 0) {
+        this.#buffer = this.#buffer.slice(READER_BLOCK_BREAK.length);
+        this.#offset += READER_BLOCK_BREAK.length;
+        continue;
+      }
+      if (block > 0 && speechUnits(this.#buffer.slice(0, block)) <= limit) {
+        const value = this.#buffer.slice(0, block).trimEnd();
+        const spoken = plainSpeechText(value);
+        if (spoken) result.push({
+          id: this.#count++, text: spoken, start: this.#offset,
+          end: this.#offset + value.length, pauseAfterMs: SPEECH_BLOCK_PAUSE_MS,
+        });
+        this.#buffer = this.#buffer.slice(block + READER_BLOCK_BREAK.length);
+        this.#offset += block + READER_BLOCK_BREAK.length;
+        continue;
+      }
       let bounded = 0, units = 0, word = 0, clause = 0;
       for (const {segment, index} of graphemes.segment(this.#buffer)) {
         const next = units + (wideScript.test(segment) ? 3 : segment.length);
@@ -209,11 +229,14 @@ export class SpeechSegments {
       end = safeMarkdownBoundary(this.#buffer, end);
       if (!end) break;
       const raw = this.#buffer.slice(0, end), value = raw.trimEnd();
+      const blockTail = this.#buffer.slice(end).match(/^[^\S\u2029]*\u2029/u)?.[0] || '';
       const spoken = plainSpeechText(value);
       if (spoken) result.push({id: this.#count++, text: spoken,
-        start: this.#offset, end: this.#offset + value.length});
-      this.#buffer = this.#buffer.slice(end);
-      this.#offset += end;
+        start: this.#offset, end: this.#offset + value.length,
+        ...(blockTail ? {pauseAfterMs: SPEECH_BLOCK_PAUSE_MS} : {})});
+      const consumed = end + blockTail.length;
+      this.#buffer = this.#buffer.slice(consumed);
+      this.#offset += consumed;
     }
     this.#finished = finished;
     return result;
@@ -287,6 +310,14 @@ function combine(chunks) {
   return result;
 }
 
+function appendSilence(samples, sampleRate, milliseconds) {
+  const frames = Math.max(0, Math.round(sampleRate * milliseconds / 1000));
+  if (!frames) return samples;
+  const result = new Float32Array(samples.length + frames);
+  result.set(samples);
+  return result;
+}
+
 export class SpeechController {
   #send;
   #nextWireStream;
@@ -326,7 +357,7 @@ export class SpeechController {
     if (this.#current) throw new Error('Another speech stream is active');
     const current = {
       id, streamId, options, voice, cacheIdentity, split: new SpeechSegments(segmentation), queue: [],
-      ended: false, primitive: null, delivery: null, finishing: false,
+      ended: false, primitive: null, delivery: null, delivering: false, finishing: false,
       sequence: 0, samples: 0, chunks: 0, sampleRate: null, cancelled: false,
     };
     this.#current = current;
@@ -412,7 +443,8 @@ export class SpeechController {
   }
 
   #pump(current) {
-    if (this.#current !== current || current.cancelled || current.primitive || current.finishing) return;
+    if (this.#current !== current || current.cancelled || current.primitive ||
+        current.delivering || current.finishing) return;
     const segment = current.queue.shift();
     if (!segment) {
       if (current.ended) this.#finish(current);
@@ -423,7 +455,7 @@ export class SpeechController {
     ]);
     const cached = this.#cache.get(segment.cacheKey);
     if (cached) {
-      this.#deliver(current, segment, cached.sample_rate, new Float32Array(cached.audio), true)
+      this.#deliverInOrder(current, segment, cached.sample_rate, new Float32Array(cached.audio), true)
         .catch(error => this.#fail(current, error));
       return;
     }
@@ -456,7 +488,19 @@ export class SpeechController {
     const samples = combine(primitive.audio);
     current.primitive = null;
     this.#cache.put(primitive.segment.cacheKey, samples.buffer, sampleRate);
-    await this.#deliver(current, primitive.segment, sampleRate, samples, false);
+    await this.#deliverInOrder(current, primitive.segment, sampleRate, samples, false);
+  }
+
+  async #deliverInOrder(current, segment, sampleRate, samples, cached) {
+    if (current.delivering) throw new Error('Speech delivery overlap');
+    // append() may run while delivery waits for playback capacity; keep later segments behind this one.
+    current.delivering = true;
+    try {
+      await this.#deliver(current, segment, sampleRate, samples, cached);
+    } finally {
+      current.delivering = false;
+    }
+    this.#pump(current);
   }
 
   async #deliver(current, segment, sampleRate, samples, cached) {
@@ -468,16 +512,17 @@ export class SpeechController {
       throw new Error('Speech segments changed sample rate');
     current.sampleRate = sampleRate;
     this.#onSegment?.(current, segment, {cached});
+    const delivered = segment.pauseAfterMs ?
+      appendSilence(samples, sampleRate, segment.pauseAfterMs) : samples;
     current.delivery = Promise.resolve(this.#onPcm?.(current, {
       streamId: current.streamId,
       sequence: current.sequence++,
       sampleRate,
-      samples,
+      samples: delivered,
       segmentId: segment.id,
     }));
-    current.samples += samples.length;
+    current.samples += delivered.length;
     current.chunks++;
-    this.#pump(current);
   }
 
   #finish(current) {

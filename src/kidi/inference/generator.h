@@ -12,7 +12,7 @@
 namespace kidi::inference {
 struct GenerationOptions {
     std::size_t maximum_new_tokens = 0, context_size = 0, prefill_chunk_size = 128;
-    std::size_t prefix_cache_bytes = 0;
+    std::size_t prefix_cache_bytes = 0, maximum_prompt_tokens = 0;
     bool raw_prompt = false, ignore_eos = false, full_attention_cache = false;
     bool stream_text = false;
     std::int32_t image_tokens = 280;
@@ -109,6 +109,9 @@ public:
     /// Runs one throwaway decode step so operators are prepared and weights packed before the first request
     /// (YNNPACK packs on first use; WebGPU prepares kernels and uploads host-resident weights).
     auto warm_up() -> Result<void>;
+    /// Releases request-shaped execution graphs and workspaces while retaining model weights.
+    /// All queued and running requests must be drained first.
+    auto release_workspaces() -> Result<void>;
 
 private:
     Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model, std::array<std::int32_t, 3> special,

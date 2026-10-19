@@ -1,0 +1,78 @@
+const CACHE = 'kidi-ebooks-v1';
+const TRANSLATIONS = 'kidi-ebook-translations-v1';
+const TRANSLATION_ORIGIN =
+  `${import.meta.url.slice(0, import.meta.url.lastIndexOf('/') + 1)}__ebook_translations__/`;
+export const MAX_EBOOK_BYTES = 64 * 1024 * 1024;
+
+const ebookKey = id => {
+  if (!/^[a-f0-9]{64}$/.test(id)) throw new Error('Invalid ebook identifier');
+  return new URL(`./__ebooks__/${id}.epub`, import.meta.url).href;
+};
+
+const translationKey = (book, chapter, language) => {
+  if (!book || !/^[a-f0-9]{64}$/.test(book.id) || !Number.isSafeInteger(chapter) || chapter < 0 ||
+      !/^[a-z]{2,3}$/u.test(language))
+    throw new Error('Invalid ebook translation identifier');
+  return `${TRANSLATION_ORIGIN}${book.id}/${chapter}/${language}.json`;
+};
+
+async function textDigest(text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export async function storeEbook(blob, name) {
+  if (!(blob instanceof Blob) || !blob.size || blob.size > MAX_EBOOK_BYTES ||
+      !String(name || '').toLowerCase().endsWith('.epub'))
+    throw new Error('Choose an EPUB file no larger than 64 MiB');
+  const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+  const id = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  await (await caches.open(CACHE)).put(ebookKey(id), new Response(blob, {
+    headers: {'Content-Type': 'application/epub+zip'},
+  }));
+  return {id, name: String(name).slice(0, 256), size: blob.size};
+}
+
+export async function readEbook(book) {
+  const response = await (await caches.open(CACHE)).match(ebookKey(book.id));
+  if (!response) throw new Error(`Book unavailable: ${book.title || book.name || 'EPUB'}. Add it again.`);
+  const blob = await response.blob();
+  if (!blob.size || blob.size > MAX_EBOOK_BYTES) throw new Error('The cached EPUB is invalid');
+  return blob;
+}
+
+export async function removeEbook(book) {
+  await (await caches.open(CACHE)).delete(ebookKey(book.id));
+  const translations = await caches.open(TRANSLATIONS);
+  const prefix = `${TRANSLATION_ORIGIN}${book.id}/`;
+  for (const request of await translations.keys())
+    if (request.url.startsWith(prefix)) await translations.delete(request);
+}
+
+export async function readEbookTranslation(book, chapter, language, sourceText, identity = '') {
+  const response = await (await caches.open(TRANSLATIONS)).match(translationKey(book, chapter, language));
+  if (!response) return null;
+  const payload = await response.json();
+  const [source, configured] = await Promise.all([textDigest(sourceText), textDigest(identity)]);
+  if (payload?.version !== 2 || payload.source !== source || payload.identity !== configured ||
+      !Array.isArray(payload.translations) ||
+      payload.translations.some(value => value !== null && (typeof value !== 'string' || !value.trim())))
+    return null;
+  return payload.translations;
+}
+
+export async function storeEbookTranslation(book, chapter, language, sourceText, translations, identity = '') {
+  if (!Array.isArray(translations) || !translations.length ||
+      !translations.some(value => typeof value === 'string' && value.trim()) ||
+      translations.some(value => value !== null && (typeof value !== 'string' || !value.trim())))
+    throw new Error('Invalid ebook translation');
+  const [source, configured] = await Promise.all([textDigest(sourceText), textDigest(identity)]);
+  const payload = JSON.stringify({version: 2, source, identity: configured, translations});
+  if (payload.length > 8 * 1024 * 1024) throw new Error('Ebook translation exceeds the cache limit');
+  await (await caches.open(TRANSLATIONS)).put(translationKey(book, chapter, language),
+    new Response(payload, {headers: {'Content-Type': 'application/json'}}));
+}
+
+export async function removeEbookTranslation(book, chapter, language) {
+  return (await caches.open(TRANSLATIONS)).delete(translationKey(book, chapter, language));
+}

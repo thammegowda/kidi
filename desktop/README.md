@@ -17,6 +17,16 @@ window. Never use `--dev` with an exposed or forwarded port.
 `make app-dev` builds and runs this mode on port `10010`. Override the defaults
 with `APP_CONFIG=path/to/config.yaml` or `APP_PORT=another-loopback-port`.
 
+Release builds package the UI as one deterministic ZIP and link that binary
+resource directly into the executable through LiteApp's
+`liteapp_embed_archive()`. C++ compiles only the small `std::span` accessor and
+never parses generated JavaScript, CSS, HTML, or ZIP byte initializers. UI-only
+edits therefore restage assets, rebuild the resource object, and relink without
+recompiling the application.
+`web/ui/assets.txt` is the shared asset inventory; `desktop/assets.txt` adds
+desktop-only destination/source mappings. CMake derives every staging and
+archive dependency from those manifests and contains no asset path list.
+
 ## Shared application configuration
 
 Desktop and Wasm consume the same canonical YAML. The Web build copies it as
@@ -29,9 +39,15 @@ model_hub:
   remote: https://huggingface.co
   local: ~/.cache/kidi/model-hub
 
+runtime:
+  wasm:
+    models:
+      chat:
+        model_id: google/gemma-4-E2B-it-qat-mobile-transformers
+
 models:
   chat:
-    model_id: google/gemma-4-E2B-it-qat-mobile-transformers
+    model_id: google/gemma-4-E4B-it-qat-mobile-transformers
     revision: main
 ```
 
@@ -39,6 +55,12 @@ Native cache entries use Hugging Face's `models--OWNER--REPO/refs` and
 `snapshots` layout. `Hub::resolve()` returns a snapshot directory and
 `Hub::get_file()` resolves validated files inside it. Legacy `directory` values
 remain readable for migration but are absent from the shared example.
+
+The YAML root is the native/default configuration. A `runtime.native` mapping is
+deep-merged over matching root keys before desktop validation, while the browser
+loader applies `runtime.wasm`. This keeps one schema: overrides repeat the same
+paths such as `models.chat.model_id` rather than introducing host-specific model
+keys.
 
 ## Text messages
 
@@ -48,8 +70,9 @@ Every command and event is a JSON object:
 {"v":1,"id":"request UUID","type":"chat.start","seq":0,"payload":{}}
 ```
 
-Client commands are `chat.start`, `image.start`, `image.finish`, `asr.start`,
-`asr.stop`, `tts.start`, `settings.system_prompt.set`, and `cancel`. Server events are `session.ready`,
+Client commands are `chat.start`, `image.start`, `image.finish`, `ebook.start`,
+`ebook.finish`, `ebook.chapter`, `reader.translate`, `asr.start`, `asr.stop`, `tts.start`,
+`settings.system_prompt.set`, and `cancel`. Server events are `session.ready`,
 `settings.system_prompt.updated`, modality-specific `started`, `partial`/`delta`,
 and `completed` events, `request.cancelled`, and `error`. Sequence numbers are
 monotonic within each request.
@@ -61,6 +84,65 @@ each upload to 32 MiB, writes an unguessable request-scoped temporary file for
 the existing multimodal generator API, and removes it after completion,
 cancellation, or disconnect. Browser-provided filesystem paths are never
 accepted.
+
+The desktop reader uploads local EPUB files with binary kind `4`. Archives are
+limited to 64 MiB and opened with bounded entry, expanded-size, and path checks.
+The native session reads package metadata and spine chapters without exposing a
+host filesystem path. The UI stores the original EPUB in browser Cache Storage,
+keeps library metadata and chapter progress in local storage, and re-uploads the
+archive after a native reconnect. Chapter narration uses the same segmented TTS
+controller and playback worklet as chat read-aloud. The reading surface hides
+global chrome while a book is open and auto-hides its compact controls.
+Narration highlights the active text; clicking chapter text or releasing the
+draggable narration marker cancels the current stream and resumes from the
+selected word. The compact reader bar exposes diffusion steps, delivery,
+gender, age, pitch, style, accent, and browser GPU precision where available.
+Changing any setting restarts active narration at the current position. Its
+**TTS model settings…** action opens model loading and diagnostics.
+
+Choosing a reader translation language sends each bounded paragraph through
+`reader.translate`, with the preceding and following paragraphs as context.
+The server applies the YAML `translation_prompt`, emits
+`reader.translation.started`, `reader.translation.delta`, and
+`reader.translation.completed`, and shares the chat model's single-inference
+gate without adding messages to chat history. The UI displays source and
+translation pages as vertically aligned paragraph pairs in one shared scroll,
+persists each completed item to browser Cache Storage using source and
+model/prompt digests, and streams completed paragraphs into TTS while later
+paragraphs translate. Partial caches survive desktop restarts and are shared by
+the native and Wasm hosts. The reader progress bar reports done, cached, and
+remaining counts, pauses or resumes translation, and clears the current
+chapter/language cache for forced retranslation. Clicking either column
+switches narration, language, highlighting, and click-to-seek to that side.
+Translation pauses after the visible range plus three paragraphs and resumes
+only when the shared reader scrolls or target narration advances.
+The compact page-view control switches among source-only, aligned source and
+translation, and translation-only layouts. Reader pages and speech highlights
+use dedicated light/dark theme colors independent of chat message bubbles.
+Narration preserves semantic DOM block breaks: even a short unpunctuated title
+is synthesized separately and receives a 180 ms trailing pause before the next
+paragraph.
+
+Reader translation and narration are independent sequential streams: Gemma
+translates one bounded item while the speech model synthesizes one bounded
+segment. The canonical YAML controls translation segmentation:
+
+```yaml
+models:
+  chat:
+    translation:
+      target_chars: 800
+      max_chars: 1200
+      max_sentence_chars: 600
+      max_input_tokens: 1536
+```
+
+Paragraphs stay whole up to `target_chars`, split at sentence terminators before
+`max_chars`, and force-split an oversized sentence at multilingual clause
+punctuation before falling back to whitespace or a hard Unicode-character
+boundary. The native tokenizer independently enforces `max_input_tokens` across
+the system instruction, preceding context, requested text, and following
+context.
 
 Chat publishes each tokenizer-safe `GenerationEvent.text` delta immediately.
 ASR accepts rolling microphone audio and emits bounded partial snapshots before
@@ -89,7 +171,7 @@ with this 24-byte little-endian header:
 |---:|---:|---|
 | 0 | 4 | ASCII `KDA1` |
 | 4 | 1 | Protocol version (`1`) |
-| 5 | 1 | Kind: `1` ASR input, `2` TTS output, `3` image input |
+| 5 | 1 | Kind: `1` ASR input, `2` TTS output, `3` image input, `4` EPUB input |
 | 6 | 2 | Reserved |
 | 8 | 4 | Stream ID |
 | 12 | 4 | Sequence number |
@@ -249,3 +331,10 @@ after `runtime.idle_model_timeout_seconds`; the next voice turn reloads them
 lazily. CPU chat plus Metal TTS and Metal chat plus CPU TTS were both worse
 resident-memory placements on this machine (about 11 GB and 15 GB respectively),
 so the default keeps both large generative models on bounded Metal.
+
+Reader translation also releases request-shaped Gemma execution graphs after
+each paragraph while retaining model weights. Without this cleanup, varied
+paragraph shapes accumulated Metal operator buffers: an eight-paragraph E4B
+translation reached a 30.2 GB physical footprint. The same workload settles
+near 7.3 GB after cleanup; translated narration remains near 7.4 GB, with a
+14.4 GB transient peak while translation and speech preparation overlap.

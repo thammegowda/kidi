@@ -11,6 +11,10 @@ runtime:
   concurrency: single
   idle_model_timeout_seconds: 300
   preload_speech: true
+  wasm:
+    models:
+      chat:
+        model_id: google/gemma-4-E2B-it-qat-mobile-transformers
 
 transport:
   max_text_frame_bytes: 1048576
@@ -20,7 +24,7 @@ transport:
 models:
   chat:
     enabled: true
-    model_id: google/gemma-4-E2B-it-qat-mobile-transformers
+    model_id: google/gemma-4-E4B-it-qat-mobile-transformers
     revision: main
     accelerator: auto
     precision: checkpoint
@@ -32,6 +36,18 @@ models:
       explicitly asks your name, answer "Kidi". Be brief, concise, practical, respectful, and
       polite. Reply in the language or mix of languages used by the user and
       preserve natural code switching. Do not suggest harmful or unsafe actions.
+    translation_prompt: >-
+      You are a literary translator. Translate the text marked
+      <text_to_translate> into {target_language}. Use the preceding and following
+      context only to resolve meaning, tone, names, and references. Preserve the
+      source paragraph's meaning, register, emphasis, and dialogue naturally.
+      Return only the translated text without commentary, labels, quotation
+      wrappers, or the surrounding context.
+    translation:
+      target_chars: 800
+      max_chars: 1200
+      max_sentence_chars: 600
+      max_input_tokens: 1536
     generation:
       max_tokens: 512
       context_tokens: 8192
@@ -60,10 +76,10 @@ models:
     accelerator: auto
     metal_prefill_cache_mb: 1024
     language: auto
-    pace: 1.15
+    pace: 0.74
     reference_language: English
     reference_text: Nice to meet you.
-    steps: 10
+    steps: 16
     realtime_steps: 10
     gpu_precision: w8a8
     wire_format: pcm_s16le

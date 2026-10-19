@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFile} from 'node:fs/promises';
+import {access, readFile} from 'node:fs/promises';
 
 test('shared entry assets and audio worklets resolve within repository subpaths', async () => {
     const html = await readFile(new URL('../../web/ui/index.html', import.meta.url), 'utf8');
@@ -12,6 +12,7 @@ test('shared entry assets and audio worklets resolve within repository subpaths'
     const desktop = await readFile(new URL('../../desktop/app.cpp', import.meta.url), 'utf8');
     const cmake = await readFile(new URL('../../CMakeLists.txt', import.meta.url), 'utf8');
     const manifest = await readFile(new URL('../../web/ui/assets.txt', import.meta.url), 'utf8');
+    const desktopManifest = await readFile(new URL('../../desktop/assets.txt', import.meta.url), 'utf8');
     const assets = [...html.matchAll(/(?:src|href)="([^"]+)"/g)].map(match => match[1]);
     assets.push(...[...css.matchAll(/url\("([^"]+)"\)/g)].map(match => match[1]));
     const worklets = [...app.matchAll(/audioWorklet\.addModule\(new URL\('([^']+)', import\.meta\.url\)\)/g)];
@@ -33,4 +34,12 @@ test('shared entry assets and audio worklets resolve within repository subpaths'
         assert.match(manifest, new RegExp(asset.replace('.', '\\.')));
     }
     for (const consumer of [desktop, cmake, packager]) assert.match(consumer, /web\/ui\/assets\.txt/);
+    assert.match(packager, /browser-epub\.js/);
+    assert.match(cmake, /file\(STRINGS "desktop\/assets\.txt" KIDI_DESKTOP_ASSET_MAPPINGS\)/);
+    assert.doesNotMatch(cmake, /web\/libs\/mermaid\/mermaid\.min\.js/);
+    for (const line of desktopManifest.trim().split(/\r?\n/)) {
+        const [destination, source] = line.split('\t');
+        assert.ok(destination.startsWith('/') && source, `invalid desktop asset mapping: ${line}`);
+        await access(new URL(`../../${source}`, import.meta.url));
+    }
 });

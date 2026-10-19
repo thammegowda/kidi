@@ -296,7 +296,10 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     check("alpha beta gamma delta", uncached, 0);
     const auto cancelled = require(cached.enqueue("alpha beta gamma delta", options));
     require(cached.step());
+    if (cached.release_workspaces())
+        throw std::runtime_error("generator released workspaces with an active request");
     require(cached.cancel(cancelled));
+    require(cached.release_workspaces());
     check("alpha beta gamma delta", options, 2);
     auto smaller_context = options;
     smaller_context.context_size = 8;
@@ -308,6 +311,11 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     auto different_chunk = options;
     different_chunk.prefill_chunk_size = 1;
     check("alpha beta gamma delta", different_chunk, 0);
+    auto limited_prompt = uncached;
+    limited_prompt.maximum_prompt_tokens = 3;
+    if (cached.enqueue("alpha beta gamma delta", limited_prompt))
+        throw std::runtime_error("serving accepted a prompt above its token limit");
+    check("zeta eta", limited_prompt, 0);
     require(cached.configure_serving({2, 4, 32, 2}));
     check("alpha beta gamma delta", options, 0);
     const std::array prompts{"alpha beta gamma delta", "zeta eta gamma"};

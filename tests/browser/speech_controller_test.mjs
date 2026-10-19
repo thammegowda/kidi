@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {SpeechController} from '../../web/ui/speech-controller.js';
+import {SPEECH_BLOCK_PAUSE_MS, SpeechController} from '../../web/ui/speech-controller.js';
+import {READER_BLOCK_BREAK} from '../../web/ui/reader-position.js';
 
 function harness({blockFirstDelivery = false, failStart = false} = {}) {
   const sent = [], segments = [], pcm = [], completed = [], cancelled = [], errors = [];
@@ -55,6 +56,60 @@ test('shared controller segments, tags, and pipelines exactly one request ahead'
     [[7, 0, 0], [7, 1, 1], [7, 2, 2]]);
   assert.equal(run.completed.length, 1);
   assert.equal(run.errors.length, 0);
+});
+
+test('unfinished speech streams accept translated text while playback is active', async () => {
+  const run = harness();
+  run.controller.start({
+    id: 'translation', streamId: 8, text: 'First translated sentence. ', finished: false,
+  });
+
+  test('block boundaries add silence without changing synthesized text', async () => {
+    const run = harness();
+    run.controller.start({
+      id: 'blocks', streamId: 12,
+      text: `A short title${READER_BLOCK_BREAK}The first sentence.`, finished: true,
+    });
+    assert.equal(run.primitive(0).payload.text, 'A short title');
+    run.audio(0, [0.25, -0.25]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(run.pcm[0].samples.length, 2 + 24000 * SPEECH_BLOCK_PAUSE_MS / 1000);
+    assert.deepEqual([...run.pcm[0].samples.slice(0, 2)], [0.25, -0.25]);
+    assert.ok(run.pcm[0].samples.slice(2).every(value => value === 0));
+    assert.equal(run.primitive(1).payload.text, 'The first sentence.');
+  });
+  assert.equal(run.primitive(0).payload.text, 'First translated sentence.');
+  run.audio(0);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(run.completed.length, 0);
+  run.controller.append('translation', 'Second translated sentence.', true);
+  assert.equal(run.primitive(1).payload.text, 'Second translated sentence.');
+  run.audio(1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(run.completed.length, 1);
+});
+
+test('appended translation cannot overtake a segment waiting for playback capacity', async () => {
+  const run = harness({blockFirstDelivery: true});
+  run.controller.start({
+    id: 'translation-order', streamId: 13,
+    text: 'First translated segment. Second translated segment. ',
+    finished: false,
+  });
+  run.audio(0);
+  await new Promise(resolve => setImmediate(resolve));
+  run.audio(1);
+  await new Promise(resolve => setImmediate(resolve));
+  run.controller.append('translation-order', 'Third translated segment.', true);
+  assert.equal(run.primitive(2), undefined);
+  assert.deepEqual(run.pcm.map(frame => frame.segmentId), [0]);
+  run.release();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(run.primitive(2).payload.text, 'Third translated segment.');
+  run.audio(2);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(run.pcm.map(frame => frame.segmentId), [0, 1, 2]);
+  assert.equal(run.completed.length, 1);
 });
 
 test('replacement waits for backend cancellation acknowledgement', async () => {
