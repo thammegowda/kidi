@@ -6,7 +6,9 @@ import {
 import {MAX_IMAGE_BYTES, MAX_IMAGES, readImage, removeUnusedImages, storeImage} from './images.js';
 import {parseLanguages, resolveLanguages} from './languages.js';
 import {normalizeReaderText, readerProgressLabel, readerSpeechSlice} from './reader-position.js';
-import {READER_TRANSLATION_LOOKAHEAD, readerTranslationAttentionWindow} from './reader-translation.js';
+import {
+  READER_TRANSLATION_LOOKAHEAD, readerTranslationAttentionWindow, splitReaderTranslationText,
+} from './reader-translation.js';
 import {MINIMUM_TTS_STEPS, selectRealtimeProfile} from './realtime-profile.js';
 import {SpeechController, VoiceLatencyBenchmark} from './speech-controller.js';
 import {createSpeechIndex, renderSpeechHighlights, speechRanges, speechSearchOffset} from './speech-highlights.js';
@@ -355,8 +357,6 @@ function readerText(side = readerSpeechSide) {
 }
 
 const READER_TRANSLATION_BLOCKS = 'h1,h2,h3,h4,h5,h6,p,li,blockquote,figcaption,dt,dd,td,th,pre';
-const READER_TRANSLATION_CHARS = 1600;
-
 function readerTranslationBlocks() {
   const content = readerContent();
   const blocks = [...content.querySelectorAll(READER_TRANSLATION_BLOCKS)].filter(element =>
@@ -365,21 +365,19 @@ function readerTranslationBlocks() {
   return blocks.length ? blocks : normalizeReaderText(content.textContent) ? [content] : [];
 }
 
-function splitReaderTranslationText(value) {
-  const result = [];
-  let remaining = value;
-  while (remaining.length > READER_TRANSLATION_CHARS) {
-    const candidate = remaining.slice(0, READER_TRANSLATION_CHARS + 1);
-    const sentence = Math.max(candidate.lastIndexOf('. '), candidate.lastIndexOf('! '),
-      candidate.lastIndexOf('? '), candidate.lastIndexOf('। '));
-    const whitespace = candidate.lastIndexOf(' ');
-    const split = sentence > READER_TRANSLATION_CHARS / 2 ? sentence + 1 :
-      whitespace > READER_TRANSLATION_CHARS / 2 ? whitespace : READER_TRANSLATION_CHARS;
-    result.push(remaining.slice(0, split).trim());
-    remaining = remaining.slice(split).trim();
-  }
-  if (remaining) result.push(remaining);
-  return result;
+function readerTranslationConfig() {
+  const configured = state.components.chat?.translation || {};
+  const value = (name, fallback, maximum) => {
+    const candidate = Number(configured[name]);
+    return Number.isSafeInteger(candidate) && candidate > 0 && candidate <= maximum ? candidate : fallback;
+  };
+  const maximumCharacters = value('max_chars', 1200, 16384);
+  return {
+    targetCharacters: Math.min(value('target_chars', 800, 16384), maximumCharacters),
+    maximumCharacters,
+    maximumSentenceCharacters:
+      Math.min(value('max_sentence_chars', 600, 16384), maximumCharacters),
+  };
 }
 
 function updateReaderReadAvailability() {
@@ -459,6 +457,7 @@ function currentReaderTranslationWindows() {
 
 async function nextReaderTranslationUnit(token, units, translations) {
   while (token === readerTranslationToken) {
+    if (!translations.includes(undefined)) return -1;
     for (const window of currentReaderTranslationWindows()) {
       const index = units.findIndex((unit, candidate) =>
         translations[candidate] === undefined &&
@@ -617,12 +616,13 @@ async function translateReaderChapter() {
   sourceAligned.hidden = false;
   setReaderSpeechSide('target');
   const languageName = languageNames.get(language) || language;
+  const translationConfig = readerTranslationConfig();
   $('book-translation-title').textContent = languageName;
   $('book-translation-status').textContent = 'Preparing translation…';
   const groups = readerTranslationBlocks().map((block, index) => ({
     block,
     index,
-    texts: splitReaderTranslationText(normalizeReaderText(block.textContent)),
+    texts: splitReaderTranslationText(normalizeReaderText(block.textContent), translationConfig),
   }));
   const units = groups.flatMap(group =>
     group.texts.map(text => ({block: group.block, sourceIndex: group.index, text})));
@@ -696,8 +696,6 @@ async function translateReaderChapter() {
     syncReaderTranslationSpeech(true);
     $('book-translation-status').textContent = 'Translation failed';
     setBookReaderStatus(error.message || 'Unable to translate this chapter', true);
-  } finally {
-    if (token === readerTranslationToken) readerTranslationRequest = null;
   }
 }
 

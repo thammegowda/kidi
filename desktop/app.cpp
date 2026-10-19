@@ -1,4 +1,5 @@
 #include "kidi/core/precision.h"
+
 #include "kidi/checkpoint/hub.h"
 #include "ebook.h"
 #include "kidi/inference/generator.h"
@@ -17,6 +18,7 @@
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <bit>
@@ -164,6 +166,13 @@ struct ModelConfig {
     std::size_t metal_prefill_cache_bytes = 0;
 };
 
+struct TranslationConfig {
+    std::size_t target_chars = 800;
+    std::size_t max_chars = 1200;
+    std::size_t max_sentence_chars = 600;
+    std::size_t max_input_tokens = 1536;
+};
+
 struct AppConfig {
     std::filesystem::path source;
     std::string model_hub_remote{"https://huggingface.co"};
@@ -185,6 +194,7 @@ struct AppConfig {
     std::size_t max_text_frame_bytes = 1024U * 1024U;
     std::string system_prompt;
     std::string translation_prompt;
+    TranslationConfig translation;
     Json asr_settings;
     Json tts_settings;
 
@@ -202,6 +212,13 @@ struct AppConfig {
                  {"kv_cache_precision", kidi::core::to_string(kv_cache_precision)},
                  {"system_prompt", system_prompt},
                  {"translation_prompt", translation_prompt},
+                 {"translation",
+                  {
+                      {"target_chars", translation.target_chars},
+                      {"max_chars", translation.max_chars},
+                      {"max_sentence_chars", translation.max_sentence_chars},
+                      {"max_input_tokens", translation.max_input_tokens},
+                  }},
                  {"maximum_tokens", maximum_tokens},
                  {"context_tokens", context_tokens},
                  {"prefill_chunk_tokens", prefill_chunk_tokens},
@@ -345,12 +362,26 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
             models["chat"], "translation_prompt",
             "You are a literary translator. Translate <text_to_translate> into {target_language}. Use the "
             "surrounding context only to resolve meaning and return only the translated text.");
+        const auto translation = models["chat"]["translation"];
+        result.translation = {
+            .target_chars = positive_size(translation, "target_chars", 800, 16384),
+            .max_chars = positive_size(translation, "max_chars", 1200, 16384),
+            .max_sentence_chars = positive_size(translation, "max_sentence_chars", 600, 16384),
+            .max_input_tokens = positive_size(translation, "max_input_tokens", 1536, 8192),
+        };
+        if (result.translation.target_chars > result.translation.max_chars ||
+            result.translation.max_sentence_chars > result.translation.max_chars)
+            return invalid_config("Reader translation limits are inconsistent");
         const auto generation = models["chat"]["generation"];
         result.maximum_tokens = positive_size(generation, "max_tokens", 512, 2048);
         result.context_tokens = positive_size(generation, "context_tokens", 8192, 32768);
         result.prefill_chunk_tokens = positive_size(generation, "prefill_chunk_tokens", 128, 2048);
         const auto prefix_mb = positive_size(generation, "prefix_cache_mb", 512, 4096);
         result.prefix_cache_bytes = prefix_mb * 1024U * 1024U;
+        const auto translation_context =
+            (result.translation.max_input_tokens + result.maximum_tokens + 127) / 128 * 128;
+        if (translation_context > result.context_tokens)
+            return invalid_config("Reader translation token limit exceeds the shared chat context-token budget");
         const auto asr = models["asr"];
         result.asr_partial_interval_ms = positive_size(asr, "partial_interval_ms", 800, 5000);
         const auto vad = asr["vad"];
@@ -427,9 +458,10 @@ public:
         if (!loaded) return std::unexpected(liteapp::Error{"load_failed", loaded.error().message});
         auto configured = loaded->configure_serving({
             .maximum_active = 1,
-            .maximum_requests = 4,
+            .maximum_requests = 1,
             .cache_token_budget = parsed->context_tokens,
             .prefill_tokens_per_step = parsed->prefill_chunk_tokens,
+            .compact_cache = true,
         });
         if (!configured) return std::unexpected(liteapp::Error{"load_failed", configured.error().message});
         generator_.emplace(std::move(*loaded));
@@ -551,7 +583,7 @@ public:
                                 "earlier instruction to match the user's language."
                           : "\nThe user may code-switch among " + std::string(language_names) +
                                 ". Respond in the same language or language mix as the latest user message.";
-        return generate(messages, std::move(prompt), cancelled, on_delta);
+        return generate(messages, std::move(prompt), cancelled, on_delta, config_->context_tokens, 0, false);
     }
 
     auto translate(std::string text, std::string previous, std::string next, std::string target_language,
@@ -570,64 +602,74 @@ public:
                              "\n</text_to_translate>\n<following_context>\n" + std::move(next) +
                              "\n</following_context>";
         const std::array messages{ChatMessage{.role = "user", .content = request, .images = {}}};
-        return generate(messages, std::move(prompt), cancelled, on_delta);
+        const auto context =
+            (config_->translation.max_input_tokens + config_->maximum_tokens + 127) / 128 * 128;
+        return generate(messages, std::move(prompt), cancelled, on_delta, context,
+                        config_->translation.max_input_tokens, true);
     }
 
 private:
     auto generate(std::span<const ChatMessage> messages, std::string prompt,
-                  const std::function<bool()>& cancelled, const std::function<void(std::string_view)>& on_delta)
+                  const std::function<bool()>& cancelled, const std::function<void(std::string_view)>& on_delta,
+                  std::size_t context_tokens, std::size_t maximum_prompt_tokens, bool release_workspaces)
         -> kidi::Result<ChatRunResult> {
         std::scoped_lock lock(chat_mutex_);
         if (!generator_ || !config_)
             return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "chat model is not ready"});
-        GenerationOptions options{
-            .maximum_new_tokens = config_->maximum_tokens,
-            .context_size = config_->context_tokens,
-            .prefill_chunk_size = config_->prefill_chunk_tokens,
-            .prefix_cache_bytes = config_->prefix_cache_bytes,
-            .stream_text = true,
-        };
         const auto started = Clock::now();
-        std::vector<ChatMessage> conversation;
-        conversation.reserve(messages.size() + !prompt.empty());
-        if (!prompt.empty()) conversation.push_back({.role = "system", .content = prompt, .images = {}});
-        conversation.insert(conversation.end(), messages.begin(), messages.end());
-        auto queued = generator_->enqueue_chat(conversation, options);
-        if (!queued) return std::unexpected(queued.error());
-        const auto request_id = *queued;
-        std::optional<kidi::inference::TextGeneration> completed;
-        std::uint64_t prefill_ns = 0, decode_ns = 0, preparation_ns = 0;
-        while (generator_->pending_requests()) {
-            if (cancelled()) {
-                const auto cancellation = generator_->cancel(request_id);
-                if (!cancellation) return std::unexpected(cancellation.error());
-                return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "generation cancelled"});
+        auto run = [&]() -> kidi::Result<ChatRunResult> {
+            std::vector<ChatMessage> conversation;
+            conversation.reserve(messages.size() + !prompt.empty());
+            if (!prompt.empty())
+                conversation.push_back({.role = "system", .content = std::move(prompt), .images = {}});
+            conversation.insert(conversation.end(), messages.begin(), messages.end());
+            GenerationOptions options{
+                .maximum_new_tokens = config_->maximum_tokens,
+                .context_size = context_tokens,
+                .prefill_chunk_size = config_->prefill_chunk_tokens,
+                .prefix_cache_bytes = config_->prefix_cache_bytes,
+                .maximum_prompt_tokens = maximum_prompt_tokens,
+                .stream_text = true,
+            };
+            auto queued = generator_->enqueue_chat(conversation, options);
+            if (!queued) return std::unexpected(queued.error());
+            const auto request_id = *queued;
+            std::optional<kidi::inference::TextGeneration> completed;
+            while (generator_->pending_requests()) {
+                if (cancelled()) {
+                    auto cancellation = generator_->cancel(request_id);
+                    if (!cancellation) return std::unexpected(cancellation.error());
+                    return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "generation cancelled"});
+                }
+                auto step = generator_->step();
+                if (!step) return std::unexpected(step.error());
+                for (auto& event : step->events) {
+                    if (event.request_id != request_id) continue;
+                    if (!event.text.empty()) on_delta(event.text);
+                    if (event.completed) completed.emplace(std::move(*event.completed));
+                }
             }
-            auto step = generator_->step();
-            if (!step) return std::unexpected(step.error());
-            prefill_ns += step->prefill_ns;
-            decode_ns += step->decode_ns;
-            preparation_ns += step->preparation_ns;
-            for (auto& event : step->events) {
-                if (event.request_id != request_id) continue;
-                if (!event.text.empty()) on_delta(event.text);
-                if (event.completed) completed.emplace(std::move(*event.completed));
-            }
+            if (!completed)
+                return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME,
+                                                   "generation ended without a response"});
+            return ChatRunResult{
+                .text = std::move(completed->text),
+                .stats =
+                    {
+                        {"elapsed_ms", milliseconds(started)},
+                        {"prompt_tokens", completed->stats.prompt_tokens},
+                        {"decode_tokens", completed->stats.decode_tokens},
+                        {"prefill_ms", completed->stats.prefill_ns / 1e6},
+                        {"decode_ms", completed->stats.decode_ns / 1e6},
+                        {"preparation_ms", completed->stats.preparation_ns / 1e6},
+                    },
+            };
+        }();
+        if (release_workspaces && !generator_->pending_requests()) {
+            auto released = generator_->release_workspaces();
+            if (!released && run) return std::unexpected(released.error());
         }
-        if (!completed)
-            return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "generation ended without a response"});
-        return ChatRunResult{
-            .text = std::move(completed->text),
-            .stats =
-                {
-                    {"elapsed_ms", milliseconds(started)},
-                    {"prompt_tokens", completed->stats.prompt_tokens},
-                    {"decode_tokens", completed->stats.decode_tokens},
-                    {"prefill_ms", prefill_ns / 1e6},
-                    {"decode_ms", decode_ns / 1e6},
-                    {"preparation_ms", preparation_ns / 1e6},
-                },
-        };
+        return run;
     }
 
 public:
@@ -1122,7 +1164,13 @@ private:
                 return character < 0x20 && character != '\n' && character != '\t';
             });
         };
-        if (text.empty() || text.size() > 16384 || previous.size() > 8192 || next.size() > 8192 ||
+        const auto characters = [](std::string_view value) {
+            return static_cast<std::size_t>(
+                std::ranges::count_if(value, [](unsigned char character) { return (character & 0xc0U) != 0x80U; }));
+        };
+        const auto maximum = backend_->config().translation.max_chars;
+        if (text.empty() || characters(text) > maximum || characters(previous) > maximum ||
+            characters(next) > maximum ||
             target_name.empty() || target_name.size() > 100 || contains_control(text) || contains_control(previous) ||
             contains_control(next) || contains_control(target_name) || !valid_language_setting(target_language) ||
             target_language.contains(','))

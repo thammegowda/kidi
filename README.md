@@ -159,7 +159,9 @@ paragraph switches them back to the translation. Reader translation requests do
 not enter conversation history. Background translation stops after the visible
 range plus three paragraphs, performs no inference while paused, and resumes
 when the reader scrolls or target-language narration approaches untranslated
-text.
+text. Desktop translation stays strictly sequential while its independent TTS
+stream reads completed text. Oversized paragraphs split first at sentence
+boundaries and then at punctuation under hard character and token limits.
 
 ### WebAssembly
 

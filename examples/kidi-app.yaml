@@ -20,7 +20,7 @@ transport:
 models:
   chat:
     enabled: true
-    model_id: google/gemma-4-E2B-it-qat-mobile-transformers
+    model_id: google/gemma-4-E4B-it-qat-mobile-transformers
     revision: main
     accelerator: auto
     precision: checkpoint
@@ -39,6 +39,11 @@ models:
       source paragraph's meaning, register, emphasis, and dialogue naturally.
       Return only the translated text without commentary, labels, quotation
       wrappers, or the surrounding context.
+    translation:
+      target_chars: 800
+      max_chars: 1200
+      max_sentence_chars: 600
+      max_input_tokens: 1536
     generation:
       max_tokens: 512
       context_tokens: 8192

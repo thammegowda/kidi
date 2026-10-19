@@ -9,11 +9,17 @@ test('browser consumes the canonical desktop YAML configuration', async () => {
   const config = await loadAppConfig(load(source));
   assert.equal(config.model_hub.remote, 'https://huggingface.co');
   assert.equal(config.model_hub.local, '~/.cache/kidi/model-hub');
-  assert.equal(config.models.chat.model_id, 'google/gemma-4-E2B-it-qat-mobile-transformers');
+  assert.equal(config.models.chat.model_id, 'google/gemma-4-E4B-it-qat-mobile-transformers');
   assert.equal(config.models.asr.model_id, 'openai/whisper-small');
   assert.equal(config.models.tts.model_id, 'thammegowda/OmniVoice-q8');
   assert.equal(config.models.chat.system_prompt.includes('preserve natural code switching'), true);
   assert.match(config.models.chat.translation_prompt, /\{target_language\}/);
+  assert.deepEqual(config.models.chat.translation, {
+    target_chars: 800,
+    max_chars: 1200,
+    max_sentence_chars: 600,
+    max_input_tokens: 1536,
+  });
   assert.equal(config.models.asr.vad.silence_ms, 800);
   assert.equal(config.models.tts.realtime_steps, 10);
   assert.equal(config.models.tts.steps, 16);
@@ -57,6 +63,7 @@ test('first-run browser UI requests model loading and exposes progress', async (
   assert.match(app, /readerTranslationStreaming: streaming/);
   assert.match(app, /const index = await nextReaderTranslationUnit\(token, units, translations\)/);
   assert.match(app, /readerTranslationTtsIndex = readerTargetSpeechAnchor;\s+wakeReaderTranslation\(\)/);
+  assert.doesNotMatch(app, /translationConfig\.workers|readerTranslationRequests/);
   assert.match(app, /setReaderSpeechSide\('source'\);\s+seekBookSpeech\(offset\)/);
   assert.match(app, /setReaderSpeechSide\('target'\);\s+seekBookSpeech\(offset\)/);
 });

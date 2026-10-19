@@ -101,6 +101,27 @@ switches narration, language, highlighting, and click-to-seek to that side.
 Translation pauses after the visible range plus three paragraphs and resumes
 only when the shared reader scrolls or target narration advances.
 
+Reader translation and narration are independent sequential streams: Gemma
+translates one bounded item while the speech model synthesizes one bounded
+segment. The canonical YAML controls translation segmentation:
+
+```yaml
+models:
+  chat:
+    translation:
+      target_chars: 800
+      max_chars: 1200
+      max_sentence_chars: 600
+      max_input_tokens: 1536
+```
+
+Paragraphs stay whole up to `target_chars`, split at sentence terminators before
+`max_chars`, and force-split an oversized sentence at multilingual clause
+punctuation before falling back to whitespace or a hard Unicode-character
+boundary. The native tokenizer independently enforces `max_input_tokens` across
+the system instruction, preceding context, requested text, and following
+context.
+
 Chat publishes each tokenizer-safe `GenerationEvent.text` delta immediately.
 ASR accepts rolling microphone audio and emits bounded partial snapshots before
 the final result. TTS emits each sentence-sized waveform chunk in playback order
@@ -288,3 +309,10 @@ after `runtime.idle_model_timeout_seconds`; the next voice turn reloads them
 lazily. CPU chat plus Metal TTS and Metal chat plus CPU TTS were both worse
 resident-memory placements on this machine (about 11 GB and 15 GB respectively),
 so the default keeps both large generative models on bounded Metal.
+
+Reader translation also releases request-shaped Gemma execution graphs after
+each paragraph while retaining model weights. Without this cleanup, varied
+paragraph shapes accumulated Metal operator buffers: an eight-paragraph E4B
+translation reached a 30.2 GB physical footprint. The same workload settles
+near 7.3 GB after cleanup; translated narration remains near 7.4 GB, with a
+14.4 GB transient peak while translation and speech preparation overlap.

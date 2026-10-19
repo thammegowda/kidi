@@ -34,6 +34,12 @@ class WasmBackend {
       translation_prompt: CHAT.translation_prompt ||
         'You are a literary translator. Translate <text_to_translate> into {target_language}. ' +
         'Use surrounding context only to resolve meaning and return only the translated text.',
+      translation: {
+        target_chars: CHAT.translation?.target_chars || 800,
+        max_chars: CHAT.translation?.max_chars || 1200,
+        max_sentence_chars: CHAT.translation?.max_sentence_chars || 600,
+        max_input_tokens: CHAT.translation?.max_input_tokens || 1536,
+      },
       maximum_tokens: DEFAULTS.maximumTokens,
       context_tokens: CHAT.generation.context_tokens,
       prefix_cache_mb: CHAT.generation.prefix_cache_mb,
@@ -587,7 +593,9 @@ class WasmBackend {
       const next = String(payload.next || ''), targetLanguage = String(payload.target_language || '');
       const targetName = String(payload.target_language_name || '');
       const invalidControl = value => /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(value);
-      if (!text || text.length > 16384 || previous.length > 8192 || next.length > 8192 ||
+      const maximumCharacters = this.#components.chat.translation.max_chars;
+      if (!text || [...text].length > maximumCharacters || [...previous].length > maximumCharacters ||
+          [...next].length > maximumCharacters ||
           !/^[a-z]{2,3}$/u.test(targetLanguage) || !targetName || targetName.length > 100 ||
           [text, previous, next, targetName].some(invalidControl))
         return this.#error(id, 'invalid_translation', 'Reader translation payload is invalid or too large');

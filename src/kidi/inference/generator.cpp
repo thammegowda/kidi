@@ -189,6 +189,20 @@ auto Generator::warm_up() -> Result<void> {
         return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
     }
 }
+auto Generator::release_workspaces() -> Result<void> {
+    try {
+        if (pending_requests())
+            throw ops::Failure(
+                {ErrorCode::INVALID_ARGUMENT, "drain generation requests before releasing workspaces"});
+        model_->release_workspaces();
+        if (vision_) vision_->release_workspaces();
+        return {};
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
+    }
+}
 auto Generator::memory() const -> GeneratorMemory {
     GeneratorMemory result;
     const auto add_state = [&](const model::Gemma4State& state) {
@@ -567,6 +581,8 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
                                     ? std::string(prompt)
                                     : "<bos><|turn>user\n" + std::string(prompt) + "<turn|>\n<|turn>model\n";
         auto tokens = require(tokenizer_.encode(serialized));
+        if (options.maximum_prompt_tokens && tokens.size() > options.maximum_prompt_tokens)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prompt exceeds the configured input-token limit"});
         if (tokens.empty() || tokens.size() >= capacity || maximum > capacity - tokens.size())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prompt and generation must fit the reserved context"});
         if (serving_->compact_cache) {
