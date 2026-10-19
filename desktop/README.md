@@ -39,9 +39,15 @@ model_hub:
   remote: https://huggingface.co
   local: ~/.cache/kidi/model-hub
 
+runtime:
+  wasm:
+    models:
+      chat:
+        model_id: google/gemma-4-E2B-it-qat-mobile-transformers
+
 models:
   chat:
-    model_id: google/gemma-4-E2B-it-qat-mobile-transformers
+    model_id: google/gemma-4-E4B-it-qat-mobile-transformers
     revision: main
 ```
 
@@ -49,6 +55,12 @@ Native cache entries use Hugging Face's `models--OWNER--REPO/refs` and
 `snapshots` layout. `Hub::resolve()` returns a snapshot directory and
 `Hub::get_file()` resolves validated files inside it. Legacy `directory` values
 remain readable for migration but are absent from the shared example.
+
+The YAML root is the native/default configuration. A `runtime.native` mapping is
+deep-merged over matching root keys before desktop validation, while the browser
+loader applies `runtime.wasm`. This keeps one schema: overrides repeat the same
+paths such as `models.chat.model_id` rather than introducing host-specific model
+keys.
 
 ## Text messages
 

@@ -11,6 +11,10 @@ runtime:
   concurrency: single
   idle_model_timeout_seconds: 300
   preload_speech: true
+  wasm:
+    models:
+      chat:
+        model_id: google/gemma-4-E2B-it-qat-mobile-transformers
 
 transport:
   max_text_frame_bytes: 1048576

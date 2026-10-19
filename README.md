@@ -135,6 +135,12 @@ language, diffusion steps, and voice attributes are user preferences and may be
 overridden there for future Read aloud requests. Conversations and TTS
 preferences stay in browser-local storage; prompts are sent only to the local
 native process.
+
+Host-specific configuration is a deep override under `runtime.<host>` using the
+same root keys. The base configuration targets native desktop; for example,
+`runtime.wasm.models.chat.model_id` replaces only the browser chat model while
+inheriting prompts and generation settings. Kidi removes the `native`/`wasm`
+override blocks after resolving the active host.
 The executable embeds its frontend assets and does not need a separate web
 server or installed Node.js runtime. Chat tokens, live microphone PCM and
 partial transcripts, and TTS PCM chunks share one authenticated WebSocket; see

@@ -296,6 +296,18 @@ void configure_metal_prefill_cache(std::size_t bytes) {
 #endif
 }
 
+void merge_config(YAML::Node target, const YAML::Node& override) {
+    if (!override || !override.IsMap()) return;
+    for (const auto& entry : override) {
+        const auto key = entry.first.as<std::string>();
+        const auto value = entry.second;
+        if (target[key] && target[key].IsMap() && value.IsMap())
+            merge_config(target[key], value);
+        else
+            target[key] = YAML::Clone(value);
+    }
+}
+
 auto application_config(const std::filesystem::path& requested) -> kidi::Result<AppConfig> {
     try {
         std::error_code error;
@@ -303,9 +315,19 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
         if (error || !std::filesystem::is_regular_file(source, error))
             return invalid_config("Configuration file does not exist");
         source = source.lexically_normal();
-        const auto root = YAML::LoadFile(source.string());
+        auto root = YAML::LoadFile(source.string());
         if (!root.IsMap() || !root["version"] || root["version"].as<int>() != 1)
             return invalid_config("Configuration version must be 1");
+        const auto native_overrides = root["runtime"] ? root["runtime"]["native"] : YAML::Node{};
+        if (native_overrides && !native_overrides.IsNull() && !native_overrides.IsMap())
+            return invalid_config("runtime.native must be a mapping");
+        const auto runtime_overrides = native_overrides && native_overrides.IsMap() ?
+            YAML::Clone(native_overrides) : YAML::Node{};
+        merge_config(root, runtime_overrides);
+        if (root["runtime"]) {
+            root["runtime"].remove("native");
+            root["runtime"].remove("wasm");
+        }
         const auto models = root["models"];
         if (!models.IsMap() || !models["chat"].IsMap()) return invalid_config("models.chat configuration is required");
         AppConfig result;
