@@ -30,12 +30,12 @@ internal data class ModelDownloadProgress(
     val phase: ModelDownloadPhase = ModelDownloadPhase.DOWNLOADING,
 )
 
-internal class ModelRepository(context: Context) {
+internal class ModelRepository(context: Context, rootName: String = "models") {
     private data class RemoteFile(val name: String, val size: Long, val sha256: String?, val url: URL)
     private data class Revision(val modelId: String, val sha: String, val files: List<RemoteFile>,
         val weightsRevision: String? = null)
 
-    private val root = File(context.getExternalFilesDir(null) ?: context.filesDir, "models")
+    private val root = File(context.getExternalFilesDir(null) ?: context.filesDir, rootName)
     private val storageManager = context.getSystemService(StorageManager::class.java)
     private val prepareMutex = Mutex()
     private val downloader = ModelDownloader()
@@ -44,9 +44,10 @@ internal class ModelRepository(context: Context) {
 
     fun installedSpeech(): InstalledModel? = installed(SPEECH_CURRENT_FILE, SPEECH_FILES)
 
-    fun installedTts(): File? = ttsDirectory().takeIf { directory ->
-        directory.isDirectory && TTS_FILES.all { File(directory, it).isFile }
-    }
+    fun installedTts(): File? = installed(TTS_CURRENT_FILE, TTS_FILES)?.directory
+        ?: ttsDirectory().takeIf { directory ->
+            directory.isDirectory && TTS_FILES.all { File(directory, it).isFile }
+        }
 
     fun ttsDirectory(): File = File(root, TTS_DIRECTORY)
 
@@ -72,6 +73,9 @@ internal class ModelRepository(context: Context) {
 
     suspend fun prepareSpeech(modelId: String, progress: (ModelDownloadProgress) -> Unit): InstalledModel =
         prepareModel(modelId, SPEECH_FILES, SPEECH_CURRENT_FILE, ::validateSpeechModel, progress, ::resolveSpeech)
+
+    suspend fun prepareTts(modelId: String, progress: (ModelDownloadProgress) -> Unit): InstalledModel =
+        prepareModel(modelId, TTS_FILES, TTS_CURRENT_FILE, {}, progress)
 
     private suspend fun prepareModel(
         modelId: String,
@@ -116,7 +120,11 @@ internal class ModelRepository(context: Context) {
                 var completedBytes = 0L
                 for (file in revision.files) {
                     coroutineContext.ensureActive()
-                    downloader.download(file.url, File(directory, file.name),
+                    val target = File(directory, file.name)
+                    check(target.parentFile?.let { it.isDirectory || it.mkdirs() } != false) {
+                        "Unable to create model file directory"
+                    }
+                    downloader.download(file.url, target,
                         file.size, file.sha256) { update ->
                         val label = if (update.phase == ModelDownloadPhase.RETRYING)
                             "${file.name} (attempt ${update.attempt})" else file.name
@@ -320,6 +328,10 @@ internal class ModelRepository(context: Context) {
             "sentence-prefixes.tsv",
             "synthesis_template.jinja",
             "NOTICE",
+            "licenses/OMNIVOICE-CC-BY-NC-4.0.txt",
+            "licenses/META-LLAMA-3-LICENSE.txt",
+            "licenses/META-LLAMA-3-USE-POLICY.md",
+            "licenses/HIGGS-AUDIO-2-LICENSE.txt",
         )
         val SUPPORTED_WHISPER_SIGNATURES = setOf(
             listOf(384, 4, 4, 6, 6, 1536, 1536),
@@ -330,6 +342,7 @@ internal class ModelRepository(context: Context) {
         const val READY_FILE = "ready.json"
         const val CURRENT_FILE = "current.json"
         const val SPEECH_CURRENT_FILE = "speech-current.json"
+        const val TTS_CURRENT_FILE = "tts-current.json"
         const val TTS_DIRECTORY = "tts"
         const val DOWNLOAD_HEADROOM_BYTES = 256L * 1024 * 1024
         const val CONNECT_TIMEOUT_MS = 30_000

@@ -5,11 +5,6 @@ import java.net.URI
 import java.util.Base64
 import java.util.UUID
 
-internal enum class CaptureSource {
-    PHONE,
-    ACCESSORY,
-}
-
 internal data class PairingInvitation(
     val deviceId: String,
     val deviceName: String,

@@ -49,6 +49,12 @@ const state = {
 };
 const welcome = $('welcome');
 const modelOnboarding = $('model-onboarding');
+const legalDocuments = backend.legalDocuments?.();
+if (legalDocuments) {
+  $('host-privacy').href = legalDocuments.privacy;
+  $('host-terms').href = legalDocuments.terms;
+  $('host-legal-links').hidden = false;
+}
 let activeRequest;
 let streamId = 1;
 let recording;
@@ -1313,8 +1319,8 @@ function renderSpeechModelLoad(kind) {
   const loading = Boolean(load.id);
   const details = speechProgressDetails(kind, load.progress);
   const label = kind === 'asr' ? 'ASR' : 'TTS';
-  const wasm = state.runtime.host === 'wasm';
-  $(`${kind}-model-controls`).hidden = !wasm;
+  const downloadable = ['wasm', 'android'].includes(state.runtime.host);
+  $(`${kind}-model-controls`).hidden = !downloadable;
   $(`${kind}-availability`).textContent = loading ? details.stage :
     load.error ? 'Load failed' : component.loaded ? 'Ready' : component.enabled ? 'Not loaded' : 'Disabled';
   const container = $(`${kind}-model-loading`);
@@ -1331,10 +1337,10 @@ function renderSpeechModelLoad(kind) {
   error.textContent = load.error;
   error.hidden = !load.error;
   const button = $(`load-${kind}-model`);
-  button.disabled = !wasm || !state.socketReady || loading || !component.enabled || component.loaded;
+  button.disabled = !downloadable || !state.socketReady || loading || !component.enabled || component.loaded;
   renderLoadButton(button, label, loading, component.loaded);
   if (kind === 'asr' || kind === 'tts') {
-    $(`onboarding-${kind}-option`).hidden = !wasm;
+    $(`onboarding-${kind}-option`).hidden = !downloadable;
     const onboarding = $(`onboarding-${kind}-loading`);
     onboarding.hidden = !loading;
     $(`onboarding-${kind}-loading-stage`).textContent = details.stage;
@@ -1357,11 +1363,11 @@ function renderSpeechModelLoad(kind) {
 function renderSpeechModelLoads() {
   renderSpeechModelLoad('asr');
   renderSpeechModelLoad('tts');
-  const wasm = state.runtime.host === 'wasm';
+  const downloadable = ['wasm', 'android'].includes(state.runtime.host);
   const missingAsr = state.components.asr?.enabled && !state.components.asr?.loaded;
   const missingTts = state.components.tts?.enabled && !state.components.tts?.loaded;
   const skip = $('skip-onboarding-asr');
-  skip.hidden = !wasm || (!missingAsr && !missingTts);
+  skip.hidden = !downloadable || (!missingAsr && !missingTts);
   skip.textContent = missingAsr && missingTts ? 'Continue without speech models' :
     missingAsr ? 'Continue without ASR' : 'Continue without TTS';
 }
@@ -1644,7 +1650,7 @@ function renderMessages() {
   const needsAsr = !state.asrSetupSkipped && state.components.asr?.enabled && !state.components.asr?.loaded;
   const needsTts = !state.ttsSetupSkipped && state.components.tts?.enabled && !state.components.tts?.loaded;
   const needsOnboarding = !state.modelSetupDismissed &&
-    (!state.ready || (state.runtime.host === 'wasm' && (needsAsr || needsTts)));
+    (!state.ready || (['wasm', 'android'].includes(state.runtime.host) && (needsAsr || needsTts)));
   container.append(modelOnboarding);
   modelOnboarding.hidden = !needsOnboarding;
   if (!chat?.messages.length) {
@@ -1943,13 +1949,18 @@ function renderConfig() {
   $('system-prompt-status').textContent =
     (chat.system_prompt || '') === configured ? 'From configuration' : 'Modified for this session';
   const wasm = state.runtime.host === 'wasm';
+  const configurableRuntime = wasm || state.runtime.host === 'android';
   $('tts-gpu-precision-row').hidden = !wasm || state.runtime.requested_backend !== 'webgpu';
   document.querySelector('[data-settings-page="cache"]').hidden = !wasm;
-  $('wasm-preferences').hidden = !wasm;
+  $('wasm-preferences').hidden = !configurableRuntime;
+  $('runtime-execution-setting').hidden = !wasm;
+  $('runtime-settings-disclaimer').textContent = wasm
+    ? 'The browser runtime is experimental and slower than native Kidi. Use the native desktop app for the best performance and reliability.'
+    : 'Models execute in Kidi’s native Android runtime; the bundled WebView provides the shared interface.';
   selectSettingsPage(!wasm && settingsPage === 'cache' ? 'llm' : settingsPage);
-  if (wasm) {
+  if (configurableRuntime) {
     $('wasm-model').value = state.runtime.model_id || $('wasm-model').value;
-    $('wasm-backend').value = state.runtime.requested_backend || 'cpu';
+    $('wasm-backend').value = wasm ? state.runtime.requested_backend || 'cpu' : 'cpu';
     $('wasm-threads').value = String(state.runtime.threads || 1);
     $('wasm-tokens').value = String(state.runtime.maximum_tokens || 512);
     renderModelProgress();

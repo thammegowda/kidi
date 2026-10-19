@@ -608,6 +608,7 @@ textarea::placeholder { color: #727a84; }
 .voice-mode-icon { width: 16px; height: 16px; background: currentColor; mask: url("./icons/audio-waveform.svg") center / contain no-repeat; }
 .stop { height: 36px; padding: 0 14px; border-radius: 10px; background: #3b2429; color: var(--danger); font-weight: 700; }
 .disclaimer { margin: 0 0 6px; text-align: center; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.disclaimer a { margin-left: 7px; color: inherit; }
 .notice { margin: 0 0 8px; padding: 10px 13px; border: 1px solid #704047; border-radius: 10px; background: #29191d; color: #ffc0c0; font-size: 12px; }
 .reader-navigation { padding: 8px; }
 .reader-empty-nav { padding: 10px 8px; color: var(--muted); font-size: 11px; line-height: 1.5; }

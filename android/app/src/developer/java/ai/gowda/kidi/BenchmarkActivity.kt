@@ -75,7 +75,7 @@ class BenchmarkActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            KidiTheme {
+            MaterialTheme {
                 val benchmark by state.collectAsState()
                 BenchmarkScreen(benchmark, ::runBenchmark, ::returnToChat)
             }
