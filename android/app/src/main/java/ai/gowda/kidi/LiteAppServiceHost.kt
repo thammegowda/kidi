@@ -3,7 +3,9 @@ package ai.gowda.kidi
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.util.Log
 import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -54,6 +56,7 @@ internal class LiteAppServiceHost(
     )
 
     private val appContext = context.applicationContext
+    private val preferences = appContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
     private val repository = ModelRepository(appContext, "liteapp-models")
     private val rootJob = SupervisorJob()
     private val scope = CoroutineScope(rootJob + Dispatchers.Default)
@@ -84,13 +87,24 @@ internal class LiteAppServiceHost(
     @Volatile private var asrDirectory: String? = null
     @Volatile private var ttsDirectory: String? = null
     @Volatile private var chatBackend = ""
-    @Volatile private var speechBackend = ""
-    @Volatile private var threads = defaultThreads()
-    @Volatile private var maximumTokens = 512
+    @Volatile private var asrBackend = ""
+    @Volatile private var ttsBackend = ""
+    @Volatile private var chatAccelerator = DEFAULT_CHAT_ACCELERATOR
+    @Volatile private var threads = preferences.getInt(THREADS_KEY, defaultThreads()).coerceIn(1, 8)
+    @Volatile private var maximumTokens = preferences.getInt(TOKENS_KEY, 512).coerceIn(1, 8192)
     @Volatile private var modelId = DEFAULT_CHAT_MODEL
     @Volatile private var systemPrompt = DEFAULT_SYSTEM_PROMPT
 
     init {
+        val savedAccelerator = preferences.getString(CHAT_ACCELERATOR_KEY, null)
+            ?.takeIf(ACCELERATORS::contains)
+        val migrateAuto = preferences.getInt(ACCELERATOR_POLICY_VERSION_KEY, 0) < ACCELERATOR_POLICY_VERSION &&
+            savedAccelerator == "auto"
+        chatAccelerator = if (migrateAuto) DEFAULT_CHAT_ACCELERATOR else savedAccelerator ?: DEFAULT_CHAT_ACCELERATOR
+        preferences.edit {
+            putInt(ACCELERATOR_POLICY_VERSION_KEY, ACCELERATOR_POLICY_VERSION)
+            if (migrateAuto) putString(CHAT_ACCELERATOR_KEY, chatAccelerator)
+        }
         repository.installed()?.let { installed ->
             chatLoaded = true
             chatDirectory = installed.directory.absolutePath
@@ -170,10 +184,12 @@ internal class LiteAppServiceHost(
                 terminal(id, "cancelled", JSONObject().put("message", "Request cancelled"))
             } catch (failure: ServiceFailure) {
                 terminal(id, "error", JSONObject().put("code", failure.code).put("message", failure.message))
+                Log.e(TAG, "request_failed id=$id method=$method code=${failure.code}", failure)
             } catch (failure: Exception) {
                 terminal(id, "error", JSONObject()
                     .put("code", "service_error")
                     .put("message", failure.message ?: "Android service request failed"))
+                Log.e(TAG, "request_failed id=$id method=$method code=service_error", failure)
             } finally {
                 jobs.remove(id)
                 methods.remove(id)
@@ -191,6 +207,7 @@ internal class LiteAppServiceHost(
     private suspend fun dispatch(method: String, id: String, payload: JSONObject): JSONObject = when (method) {
         "session.status" -> snapshot()
         "permissions.microphone.request" -> requestMicrophone()
+        "runtime.restore" -> restoreRuntime(id)
         "runtime.load" -> loadChat(id, payload)
         "asr.preload" -> loadAsr(id)
         "tts.preload" -> loadTts(id)
@@ -211,6 +228,18 @@ internal class LiteAppServiceHost(
         return JSONObject().put("granted", true)
     }
 
+    private suspend fun restoreRuntime(id: String): JSONObject {
+        if (chatLoaded && !chatResident) {
+            event(id, "runtime.loading", JSONObject().put("runtime", runtime().put("loading", true)))
+            inferenceMutex.withLock { ensureChatResident() }
+        }
+        return JSONObject()
+            .put("ready", chatResident)
+            .put("backend", chatBackend)
+            .put("runtime", runtime())
+            .put("components", components())
+    }
+
     private suspend fun loadChat(id: String, payload: JSONObject): JSONObject {
         val requested = payload.optString("model", DEFAULT_CHAT_MODEL)
         if (!MODEL_ID.matches(requested))
@@ -220,15 +249,24 @@ internal class LiteAppServiceHost(
         val requestedTokens = payload.optInt("maximum_tokens", maximumTokens)
         if (requestedTokens !in 1..8192)
             throw ServiceFailure("invalid_tokens", "Output tokens must be between 1 and 8192")
+        val requestedAccelerator = payload.optString("backend", chatAccelerator)
+        if (requestedAccelerator !in ACCELERATORS)
+            throw ServiceFailure("invalid_accelerator", "Accelerator must be auto, npu, gpu, or cpu")
         threads = requestedThreads
         maximumTokens = requestedTokens
+        chatAccelerator = requestedAccelerator
+        preferences.edit {
+            putInt(THREADS_KEY, threads)
+            putInt(TOKENS_KEY, maximumTokens)
+            putString(CHAT_ACCELERATOR_KEY, chatAccelerator)
+        }
         event(id, "runtime.loading", JSONObject().put("runtime", runtime().put("loading", true)))
         val installed = repository.prepare(requested) { progress(id, "runtime.progress", it) }
         event(id, "runtime.progress", JSONObject().put("type", "initializing").put("file", "Native runtime"))
         val loaded = inferenceMutex.withLock {
             withContext(runtimeDispatcher) {
                 checked(NativeRuntime.configure(threads))
-                checked(NativeRuntime.load(installed.directory.absolutePath, "cpu"))
+                checked(NativeRuntime.load(installed.directory.absolutePath, chatAccelerator))
             }
         }
         modelId = requested
@@ -238,6 +276,7 @@ internal class LiteAppServiceHost(
         chatDirectory = installed.directory.absolutePath
         chatBackend = loaded.optString("backend", "android-cpu")
         return JSONObject()
+            .put("ready", true)
             .put("backend", chatBackend)
             .put("runtime", runtime())
             .put("components", components())
@@ -250,14 +289,14 @@ internal class LiteAppServiceHost(
         val loaded = inferenceMutex.withLock {
             withContext(speechDispatcher) {
                 checked(NativeRuntime.configure(threads))
-                checked(NativeRuntime.loadAsr(installed.directory.absolutePath, true, "cpu"))
+                checked(NativeRuntime.loadAsr(installed.directory.absolutePath, true, ASR_ACCELERATOR))
             }
         }
         asrLoaded = true
         asrResident = true
         ttsResident = false
         asrDirectory = installed.directory.absolutePath
-        speechBackend = loaded.optString("backend", "android-cpu")
+        asrBackend = loaded.optString("backend", "android-cpu")
         return JSONObject().put("component", asrComponent()).put("runtime", runtime())
     }
 
@@ -268,7 +307,7 @@ internal class LiteAppServiceHost(
         val loaded = inferenceMutex.withLock {
             withContext(ttsDispatcher) {
                 checked(NativeRuntime.configure(threads))
-                checked(NativeRuntime.loadTts(installed.directory.absolutePath, "cpu"))
+                checked(NativeRuntime.loadTts(installed.directory.absolutePath, TTS_ACCELERATOR))
             }
         }
         ttsLoaded = true
@@ -276,7 +315,7 @@ internal class LiteAppServiceHost(
         chatResident = false
         asrResident = false
         ttsDirectory = installed.directory.absolutePath
-        speechBackend = loaded.optString("backend", "android-cpu")
+        ttsBackend = loaded.optString("backend", "android-cpu")
         return JSONObject().put("component", ttsComponent()).put("runtime", runtime())
     }
 
@@ -363,10 +402,15 @@ internal class LiteAppServiceHost(
 
     private suspend fun generate(id: String, messages: JSONArray, eventPrefix: String): JSONObject =
         inferenceMutex.withLock {
+            if (!chatResident)
+                event(id, "runtime.loading", JSONObject().put("runtime", runtime().put("loading", true)))
             ensureChatResident()
             withContext(runtimeDispatcher) {
                 val started = System.nanoTime()
-                event(id, "$eventPrefix.started")
+                event(id, "$eventPrefix.started", JSONObject()
+                    .put("backend", chatBackend)
+                    .put("runtime", runtime())
+                    .put("components", components()))
                 val requestId = checked(NativeRuntime.enqueue(messages.toString(), maximumTokens)).getLong("request_id")
                 nativeRequests[id] = requestId
                 try {
@@ -555,7 +599,7 @@ internal class LiteAppServiceHost(
         val directory = chatDirectory ?: throw ServiceFailure("not_ready", "Load the Android chat model first")
         val loaded = withContext(runtimeDispatcher) {
             checked(NativeRuntime.configure(threads))
-            checked(NativeRuntime.load(directory, "cpu"))
+            checked(NativeRuntime.load(directory, chatAccelerator))
         }
         chatBackend = loaded.optString("backend", "android-cpu")
         chatResident = true
@@ -567,9 +611,9 @@ internal class LiteAppServiceHost(
         val directory = asrDirectory ?: throw ServiceFailure("asr_not_ready", "Load the Android ASR model first")
         val loaded = withContext(speechDispatcher) {
             checked(NativeRuntime.configure(threads))
-            checked(NativeRuntime.loadAsr(directory, true, "cpu"))
+            checked(NativeRuntime.loadAsr(directory, true, ASR_ACCELERATOR))
         }
-        speechBackend = loaded.optString("backend", "android-cpu")
+        asrBackend = loaded.optString("backend", "android-cpu")
         asrResident = true
         ttsResident = false
     }
@@ -579,16 +623,16 @@ internal class LiteAppServiceHost(
         val directory = ttsDirectory ?: throw ServiceFailure("tts_not_ready", "Load the Android TTS model first")
         val loaded = withContext(ttsDispatcher) {
             checked(NativeRuntime.configure(threads))
-            checked(NativeRuntime.loadTts(directory, "cpu"))
+            checked(NativeRuntime.loadTts(directory, TTS_ACCELERATOR))
         }
-        speechBackend = loaded.optString("backend", "android-cpu")
+        ttsBackend = loaded.optString("backend", "android-cpu")
         ttsResident = true
         chatResident = false
         asrResident = false
     }
 
     private fun snapshot() = JSONObject()
-        .put("ready", chatLoaded)
+        .put("ready", chatResident)
         .put("config", "Android app-private settings")
         .put("runtime", runtime())
         .put("components", components())
@@ -603,13 +647,14 @@ internal class LiteAppServiceHost(
         .put("concurrency", "native")
         .put("model_hub_remote", "https://huggingface.co")
         .put("model_hub_local", "Android app-private storage")
-        .put("speech_backend", speechBackend)
+        .put("speech_backend", ttsBackend.ifBlank { asrBackend })
         .put("preload_speech", false)
         .put("idle_model_timeout_seconds", 300)
         .put("model_id", modelId)
-        .put("requested_backend", "cpu")
+        .put("requested_backend", chatAccelerator)
+        .put("resident", chatResident)
         .put("maximum_tokens", maximumTokens)
-        .put("loading", false)
+        .put("loading", chatLoaded && !chatResident)
 
     private fun components() = JSONObject()
         .put("chat", JSONObject()
@@ -637,7 +682,7 @@ internal class LiteAppServiceHost(
         .put("loaded", asrLoaded)
         .put("model_id", DEFAULT_ASR_MODEL)
         .put("directory", DEFAULT_ASR_MODEL)
-        .put("accelerator", speechBackend.ifBlank { "android-cpu" })
+        .put("accelerator", asrBackend.ifBlank { "android-cpu" })
         .put("settings", JSONObject()
             .put("language", "auto").put("max_tokens", 128)
             .put("vad", JSONObject()
@@ -648,7 +693,7 @@ internal class LiteAppServiceHost(
         .put("loaded", ttsLoaded)
         .put("model_id", DEFAULT_TTS_MODEL)
         .put("directory", DEFAULT_TTS_MODEL)
-        .put("accelerator", speechBackend.ifBlank { "android-cpu" })
+        .put("accelerator", ttsBackend.ifBlank { "android-auto" })
         .put("settings", JSONObject()
             .put("language", "English").put("steps", 10).put("realtime_steps", 10)
             .put("pace", 0.74).put("reference_language", "English")
@@ -741,10 +786,21 @@ internal class LiteAppServiceHost(
         const val DEFAULT_CHAT_MODEL = "google/gemma-4-E2B-it-qat-mobile-transformers"
         const val DEFAULT_ASR_MODEL = "openai/whisper-small"
         const val DEFAULT_TTS_MODEL = "thammegowda/OmniVoice-q8"
+        const val DEFAULT_CHAT_ACCELERATOR = "cpu"
+        const val ASR_ACCELERATOR = "cpu"
+        const val TTS_ACCELERATOR = "auto"
+        const val PREFERENCES = "kidi-liteapp-runtime-v1"
+        const val CHAT_ACCELERATOR_KEY = "chat-accelerator"
+        const val ACCELERATOR_POLICY_VERSION_KEY = "accelerator-policy-version"
+        const val ACCELERATOR_POLICY_VERSION = 1
+        const val THREADS_KEY = "threads"
+        const val TOKENS_KEY = "tokens"
         const val DEFAULT_SYSTEM_PROMPT =
             "You are a helpful local AI assistant. Respond directly, briefly, respectfully, and safely."
         val MODEL_ID = Regex("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
         val LANGUAGES = Regex("(?:auto|[a-z]{2,3}(?:,[a-z]{2,3})*)")
+        val ACCELERATORS = setOf("auto", "npu", "gpu", "cpu")
+        const val TAG = "KidiLiteApp"
 
         fun defaultThreads() = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
 

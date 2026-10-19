@@ -5,6 +5,7 @@ import {EventClient} from './event-client.mjs';
 import {connectAndroid} from './android-transport.mjs';
 
 const COMPLETION_EVENTS = new Map([
+  ['runtime.restore', 'runtime.ready'],
   ['runtime.load', 'runtime.ready'],
   ['asr.preload', 'asr.ready'],
   ['tts.preload', 'tts.ready'],
@@ -83,6 +84,7 @@ class AndroidBackend {
         callbacks.onClose?.();
       });
       callbacks.onOpen?.();
+      this.#client.request('runtime.restore', 'android-runtime-restore', {});
     }).catch(error => {
       callbacks.onError?.(error);
       callbacks.onClose?.();

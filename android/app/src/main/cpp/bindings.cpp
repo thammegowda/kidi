@@ -109,20 +109,15 @@ auto messages(std::string_view source) -> std::vector<kidi::text::ChatMessage> {
     return result;
 }
 
-/// Devices to try for a preference: "auto" falls back from the NPU to the GPU to the CPU when loading fails;
-/// an explicit accelerator is tried alone so failures stay visible.
-auto candidates(std::string_view accelerator, bool speech) -> std::vector<kidi::tensor::Device> {
+/// Devices to try for a preference. Chat Auto prefers the NPU, TTS Auto prefers
+/// Vulkan, and ASR Auto stays on its quality-checked CPU INT8 path.
+auto candidates(std::string_view accelerator, bool speech, bool auto_npu) -> std::vector<kidi::tensor::Device> {
     if (accelerator != "auto") return {kidi::ops::require(kidi::inference::select_device(accelerator, speech))};
-    if (speech) {
-        std::vector<kidi::tensor::Device> result;
-        if (auto device = kidi::inference::select_device("npu", true)) result.push_back(*device);
-        result.push_back(kidi::tensor::Device::cpu());
-        return result;
-    }
     std::vector<kidi::tensor::Device> result;
-    for (const auto choice : {"gpu"}) {
-        auto device = kidi::inference::select_device(choice);
-        if (device) result.push_back(*device);
+    if (auto_npu)
+        if (auto device = kidi::inference::select_device("npu", speech)) result.push_back(*device);
+    if (!speech) {
+        if (auto device = kidi::inference::select_device("gpu")) result.push_back(*device);
     }
     result.push_back(kidi::tensor::Device::cpu());
     return result;
@@ -300,7 +295,7 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_load(JNIEnv* 
         synthesizer.reset();
         synthesis_sample_rate = 0;
         nlohmann::json attempts = nlohmann::json::array(), stages;
-        for (const auto device : candidates(preference, false)) {
+        for (const auto device : candidates(preference, false, true)) {
             const auto attempt_started = std::chrono::steady_clock::now();
             auto ready = [&]() -> kidi::Result<kidi::inference::Generator> {
                 auto loaded = kidi::inference::Generator::load(
@@ -407,7 +402,7 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_loadAsr(JNIEn
     return answer(environment, [&]() -> nlohmann::json {
         JavaString path(environment, directory);
         const auto preference = JavaString(environment, accelerator).get();
-        const auto devices = candidates(preference, true);
+        const auto devices = candidates(preference, true, false);
         std::scoped_lock lock(speech_mutex, tts_mutex);
         transcriber.reset();
         synthesizer.reset();
@@ -543,7 +538,7 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_loadTts(JNIEn
         synthesis_sample_rate = 0;
         const auto started = std::chrono::steady_clock::now();
         nlohmann::json attempts = nlohmann::json::array();
-        for (const auto device : candidates(preference, false)) {
+        for (const auto device : candidates(preference, false, false)) {
             auto loaded = kidi::inference::Synthesizer::load(path.get(), device);
             if (loaded) {
                 synthesizer.emplace(std::move(*loaded));

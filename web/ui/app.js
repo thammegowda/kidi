@@ -1618,6 +1618,9 @@ function formatStats(stats) {
 function executionLabel(value) {
   if (['a_gpu', 'apple_gpu', 'mps'].includes(value)) return 'Metal GPU';
   if (value === 'cpu' || value === 'ynnpack') return 'CPU';
+  if (value === 'auto') return 'Auto';
+  if (value === 'npu' || value?.includes('qnn')) return 'Qualcomm NPU';
+  if (value === 'gpu') return 'GPU';
   if (value === 'vulkan') return 'Vulkan GPU';
   return value || 'Model ready';
 }
@@ -1786,8 +1789,9 @@ function renderRuntime() {
     state.components.asr?.directory || 'Configured speech model';
   $('model-onboarding-tts-name').textContent = state.components.tts?.model_id ||
     state.components.tts?.directory || 'Configured text-to-speech model';
-  $('model-onboarding-execution').textContent =
-    $('wasm-backend').selectedOptions[0]?.textContent || executionLabel(state.backend);
+  $('model-onboarding-execution').textContent = executionLabel(
+    state.backend || state.runtime.requested_backend,
+  );
   $('send').disabled = (asrActive ? (!recording || sendAfterTranscription) :
     (state.busy || (!$('prompt').value.trim() && !draftImages.length))) || !state.ready || !state.socketReady;
   $('stop').hidden = !state.busy || asrActive || activeRequest?.kind === 'tts';
@@ -1961,18 +1965,39 @@ function renderConfig() {
   $('system-prompt-status').textContent =
     (chat.system_prompt || '') === configured ? 'From configuration' : 'Modified for this session';
   const wasm = state.runtime.host === 'wasm';
-  const configurableRuntime = wasm || state.runtime.host === 'android';
+  const android = state.runtime.host === 'android';
+  const configurableRuntime = wasm || android;
+  const execution = $('wasm-backend');
+  const executionHost = android ? 'android' : 'wasm';
+  if (execution.dataset.host !== executionHost) {
+    const choices = android ? [
+      ['auto', 'Auto (NPU → GPU → CPU)'],
+      ['npu', 'NPU'],
+      ['gpu', 'GPU'],
+      ['cpu', 'CPU'],
+    ] : [
+      ['webgpu', 'WebGPU'],
+      ['cpu', 'WebAssembly CPU'],
+    ];
+    execution.replaceChildren(...choices.map(([value, label]) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      return option;
+    }));
+    execution.dataset.host = executionHost;
+  }
   $('tts-gpu-precision-row').hidden = !wasm || state.runtime.requested_backend !== 'webgpu';
   document.querySelector('[data-settings-page="cache"]').hidden = !wasm;
   $('wasm-preferences').hidden = !configurableRuntime;
-  $('runtime-execution-setting').hidden = !wasm;
+  $('runtime-execution-setting').hidden = !configurableRuntime;
   $('runtime-settings-disclaimer').textContent = wasm
     ? 'The browser runtime is experimental and slower than native Kidi. Use the native desktop app for the best performance and reliability.'
     : 'Models execute in Kidi’s native Android runtime; the bundled WebView provides the shared interface.';
   selectSettingsPage(!wasm && settingsPage === 'cache' ? 'llm' : settingsPage);
   if (configurableRuntime) {
     $('wasm-model').value = state.runtime.model_id || $('wasm-model').value;
-    $('wasm-backend').value = wasm ? state.runtime.requested_backend || 'cpu' : 'cpu';
+    $('wasm-backend').value = state.runtime.requested_backend || (android ? 'auto' : 'cpu');
     $('wasm-threads').value = String(state.runtime.threads || 1);
     $('wasm-tokens').value = String(state.runtime.maximum_tokens || 512);
     renderModelProgress();
@@ -2431,7 +2456,7 @@ function handleEvent(event) {
   if (event.type === 'runtime.ready' && event.id === runtimeLoadId) {
     runtimeLoadId = null;
     modelLoadError = '';
-    state.ready = true;
+    state.ready = payload.ready ?? true;
     state.backend = payload.backend || state.backend;
     state.runtime = {...state.runtime, ...(payload.runtime || {}), loading: false};
     state.components = payload.components || state.components;
@@ -2483,6 +2508,15 @@ function handleEvent(event) {
     if (activeRequest.voiceTurn) voiceLatency.mark('first_token');
     streamText(delta);
     if (activeRequest.voiceTurn) speech.append(event.id, delta);
+    return;
+  }
+  if (event.type === 'chat.started' && activeRequest?.id === event.id) {
+    if (runtimeLoadId === event.id) runtimeLoadId = null;
+    state.ready = true;
+    if (typeof payload.backend === 'string') state.backend = payload.backend;
+    state.runtime = {...state.runtime, ...(payload.runtime || {}), resident: true, loading: false};
+    state.components = payload.components || state.components;
+    renderRuntime();
     return;
   }
   if (event.type === 'chat.completed' && activeRequest?.id === event.id) {

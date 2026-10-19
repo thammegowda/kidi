@@ -184,6 +184,9 @@ public:
     virtual auto captures_prefill() const -> bool { return true; }
     /// Preferred prompt chunk for this accelerator. Zero remains zero so caller validation still rejects it.
     virtual auto prefill_chunk_size(std::size_t requested) const -> std::size_t { return requested; }
+    /// Whether a fused operation may be emitted into a captured step. Returning false lets model composition expand
+    /// it into primitive operations supported by the compiler.
+    virtual auto supports_step_operation(Operation) const -> bool { return true; }
     /// Offers one eager CPU operator (for example a many-row projection) to the accelerator. Returns nullptr to keep
     /// it on the CPU. The context caches the result like any prepared operator, and captured steps record it.
     virtual auto prepare_operator(const OperatorSpec&, TensorInputs) -> std::unique_ptr<Operator> { return nullptr; }

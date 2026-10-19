@@ -172,7 +172,7 @@ class MainActivity : ComponentActivity() {
             }
 
             override fun onPageFinished(view: WebView, url: String) {
-                if (isAppUri(Uri.parse(url))) connectHost()
+                if (host == null && isAppUri(Uri.parse(url))) connectHost()
             }
 
             override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {

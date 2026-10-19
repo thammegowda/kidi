@@ -3188,6 +3188,9 @@ public:
     auto prefill_chunk_size(std::size_t requested) const -> std::size_t override {
         return whole_step() && requested ? std::max(requested, std::size_t{128}) : requested;
     }
+    auto supports_step_operation(Operation operation) const -> bool override {
+        return !whole_step() || operation != Operation::RMS_ROTARY;
+    }
 
     auto prepare_operator(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
         // Whole-step mode captures the CPU reference twice, then replaces every operator with one NPU executable.

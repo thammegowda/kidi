@@ -212,8 +212,8 @@ configured OmniVoice package. The shared one-time setup downloads the package,
 including its declared redistribution notices, into app-private storage and
 verifies each published LFS digest before making it current.
 
-Android currently runs this shared-host TTS path on CPU. Synthesis reports
-diffusion progress, can be cancelled, and plays PCM16 directly through Android
+Android TTS Auto tries Vulkan and then CPU. Synthesis reports diffusion
+progress, can be cancelled, and plays PCM16 directly through Android
 `AudioTrack`. The WebView receives only progress and completion events.
 Settings expose language, diffusion steps, and the OmniVoice gender, age,
 pitch, style, and accent attributes.
@@ -373,6 +373,9 @@ not yet representative of a short interactive request.
 
 - **Auto** tries the Qualcomm NPU, Vulkan GPU, then CPU for chat, falling back only when loading fails. Speech stays on
   the quality-checked CPU INT8 path.
+- **CPU is the app default** while the current fused whole-step QNN graph is
+  requalified. Auto and explicit NPU remain available for accelerator testing,
+  but they are not selected silently on startup.
 - **CPU, GPU, NPU** are explicit: if that accelerator is unavailable or fails to load, the error is shown and the
   model stays offline rather than silently running elsewhere.
 - **GPU (experimental)** runs Gemma 4 on Adreno through Kidi's Vulkan backend (built into the APK; no extra files).
