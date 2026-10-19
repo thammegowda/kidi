@@ -95,11 +95,21 @@ The server applies the YAML `translation_prompt`, emits
 `reader.translation.completed`, and shares the chat model's single-inference
 gate without adding messages to chat history. The UI displays source and
 translation pages as vertically aligned paragraph pairs in one shared scroll,
-caches completed chapter translations by source digest, and streams completed
-paragraphs into TTS while later paragraphs translate. Clicking either column
+persists each completed item to browser Cache Storage using source and
+model/prompt digests, and streams completed paragraphs into TTS while later
+paragraphs translate. Partial caches survive desktop restarts and are shared by
+the native and Wasm hosts. The reader progress bar reports done, cached, and
+remaining counts, pauses or resumes translation, and clears the current
+chapter/language cache for forced retranslation. Clicking either column
 switches narration, language, highlighting, and click-to-seek to that side.
 Translation pauses after the visible range plus three paragraphs and resumes
 only when the shared reader scrolls or target narration advances.
+The compact page-view control switches among source-only, aligned source and
+translation, and translation-only layouts. Reader pages and speech highlights
+use dedicated light/dark theme colors independent of chat message bubbles.
+Narration preserves semantic DOM block breaks: even a short unpunctuated title
+is synthesized separately and receives a 180 ms trailing pause before the next
+paragraph.
 
 Reader translation and narration are independent sequential streams: Gemma
 translates one bounded item while the speech model synthesizes one bounded

@@ -150,7 +150,11 @@ arrives.
 The Reader imports EPUB books into browser-local storage. Selecting a translation
 language displays the source and translated text side by side and translates
 paragraphs incrementally with the configured local chat model. Translations are
-cached by book, chapter, language, and source content. Source and target
+cached incrementally by book, chapter, language, source content, and model/prompt
+identity, so partially translated pages survive close, reload, and native-app
+restarts. A compact progress bar reports done, cached, and remaining segments,
+supports immediate pause/resume, and provides a retranslate action that clears
+only the current chapter/language entry. Source and target
 paragraphs remain vertically aligned in the shared scrolling surface. Read
 chapter can begin after the first translated paragraph and continues as later
 paragraphs arrive. Clicking a source paragraph switches narration, language,
@@ -161,7 +165,12 @@ range plus three paragraphs, performs no inference while paused, and resumes
 when the reader scrolls or target-language narration approaches untranslated
 text. Desktop translation stays strictly sequential while its independent TTS
 stream reads completed text. Oversized paragraphs split first at sentence
-boundaries and then at punctuation under hard character and token limits.
+boundaries and then at punctuation under hard character and token limits. A
+three-state page-view control shows Source, Both, or Translation, and reader
+pages use dedicated light/dark palettes and speech-highlight colors rather than
+chat-bubble styling. Semantic block breaks are preserved for narration, so
+titles and headings remain separate speech segments with a short audible pause
+before the following paragraph.
 
 ### WebAssembly
 

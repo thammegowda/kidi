@@ -11,6 +11,14 @@
   --accent-ink: #08261c;
   --danger: #ff9f9f;
   --shadow: 0 24px 70px rgb(0 0 0 / 42%);
+  --reader-canvas: #0b0d10;
+  --reader-page: #191c20;
+  --reader-text: #ece9e2;
+  --reader-muted: #a8a198;
+  --reader-line: #393d42;
+  --reader-highlight-ready: #315e50;
+  --reader-highlight-playing: #8fe0c0;
+  --reader-highlight-ink: #08261c;
   --app-header-height: 52px;
   font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
@@ -147,7 +155,7 @@ button { color: inherit; }
 .book-reader-header {
   position: absolute; z-index: 4; top: 8px; right: 12px; left: 12px;
   display: grid;
-  grid-template-columns: 32px minmax(100px, 1fr) minmax(130px, 220px) minmax(110px, 170px) auto auto;
+  grid-template-columns: 32px minmax(80px, 1fr) minmax(105px, 160px) minmax(82px, 120px) 82px auto 68px;
   align-items: center; gap: 8px; min-height: 42px; padding: 5px 7px;
   border: 1px solid color-mix(in srgb, var(--line) 86%, transparent); border-radius: 12px;
   background: color-mix(in srgb, var(--panel) 88%, transparent); box-shadow: 0 10px 34px rgb(0 0 0 / 20%);
@@ -188,11 +196,14 @@ button { color: inherit; }
 .book-reader-identity h1, .book-reader-identity p { overflow: hidden; margin: 0; text-overflow: ellipsis; white-space: nowrap; }
 .book-reader-identity h1 { display: inline; font-size: 12px; }
 .book-reader-identity p { display: inline; margin-left: 7px; color: var(--muted); font-size: 10px; }
-.book-chapter-picker, .book-translation-picker { min-width: 0; color: var(--muted); font-size: 0; }
-.book-chapter-picker select, .book-translation-picker select {
+.book-chapter-picker, .book-translation-picker, .book-view-picker {
+  min-width: 0; color: var(--muted); font-size: 0;
+}
+.book-chapter-picker select, .book-translation-picker select, .book-view-picker select {
   width: 100%; min-width: 0; height: 30px; padding: 3px 8px; border: 1px solid var(--line);
   border-radius: 7px; background: var(--bg); color: var(--text); font-size: 10px;
 }
+.book-reader-speech { justify-content: center; padding-right: 7px; padding-left: 7px; }
 .book-reader-status {
   position: absolute; z-index: 5; top: 60px; left: 50%; min-height: 0; padding: 5px 9px;
   border-radius: 7px; background: color-mix(in srgb, var(--panel) 90%, transparent);
@@ -200,25 +211,28 @@ button { color: inherit; }
 }
 .book-reader-status:empty { display: none; }
 .book-reader-status.error { color: var(--danger); }
-.book-document { position: absolute; inset: 0; overflow: auto; overflow-anchor: none; background: #171615; }
+.book-document {
+  position: absolute; inset: 0; overflow: auto; overflow-anchor: none; background: var(--reader-canvas);
+}
 .book-spread {
   display: grid; grid-template-columns: minmax(0, 900px); justify-content: center;
   gap: 16px; width: min(1500px, calc(100% - 32px)); min-height: calc(100% - 32px); margin: 16px auto;
 }
-.book-spread.translated { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.book-spread[data-view="both"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .book-spread > article {
   min-width: 0; min-height: 100%;
-  padding: clamp(32px, 6vw, 72px); border-radius: 4px; background: #f7f1e5; color: #302c27;
+  padding: clamp(32px, 6vw, 72px); border-radius: 4px;
+  background: var(--reader-page); color: var(--reader-text);
   box-shadow: 0 18px 48px rgb(0 0 0 / 28%);
 }
 .book-translation-page > header, .book-source-header {
   display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
-  margin-bottom: 24px; padding-bottom: 10px; border-bottom: 1px solid #d8d0c2;
-  color: #6b6258; font: 12px/1.4 ui-sans-serif, system-ui, sans-serif;
+  margin-bottom: 24px; padding-bottom: 10px; border-bottom: 1px solid var(--reader-line);
+  color: var(--reader-muted); font: 12px/1.4 ui-sans-serif, system-ui, sans-serif;
 }
-.book-translation-page > header span, .book-source-header span { color: #8b8175; font-size: 10px; }
-.book-translation-content .translation-pending { color: #8b8175; animation: pulse 1.2s infinite; }
-.book-translation-content .translation-streaming { color: #554d45; }
+.book-translation-page > header span, .book-source-header span { color: var(--reader-muted); font-size: 10px; }
+.book-translation-content .translation-pending { color: var(--reader-muted); animation: pulse 1.2s infinite; }
+.book-translation-content .translation-streaming { color: var(--reader-text); }
 .book-aligned-content { display: flex; flex-direction: column; }
 .reader-aligned-block { min-width: 0; padding: 0 0 1.2em; }
 .reader-aligned-block > :first-child { margin-top: 0; }
@@ -229,21 +243,65 @@ button { color: inherit; }
   outline: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
   outline-offset: -2px;
 }
-.book-chapter-content {
-  max-width: none; color: inherit; cursor: text;
+.book-spread .book-chapter-content {
+  max-width: none; padding: 0; border-radius: 0; background: transparent; color: inherit; cursor: text;
   font: 18px/1.75 Georgia, "Times New Roman", serif; overflow-wrap: anywhere;
 }
-.book-chapter-content h1, .book-chapter-content h2, .book-chapter-content h3 { line-height: 1.25; }
-.book-chapter-content img, .book-chapter-content svg, .book-chapter-content video, .book-chapter-content audio { display: none; }
-.book-chapter-content a { color: inherit; text-decoration: underline; }
+.book-spread .book-chapter-content h1, .book-spread .book-chapter-content h2,
+.book-spread .book-chapter-content h3, .book-spread .book-chapter-content h4,
+.book-spread .book-chapter-content h5, .book-spread .book-chapter-content h6 {
+  color: inherit; line-height: 1.25;
+}
+.book-spread .book-chapter-content img, .book-spread .book-chapter-content svg,
+.book-spread .book-chapter-content video, .book-spread .book-chapter-content audio { display: none; }
+.book-spread .book-chapter-content a { color: var(--accent); text-decoration: underline; }
+.book-spread .book-chapter-content code { border-color: var(--reader-line); background: transparent; }
+.book-spread .book-chapter-content pre {
+  border-color: var(--reader-line); background: color-mix(in srgb, var(--reader-canvas) 72%, transparent);
+}
+.book-spread .book-chapter-content blockquote { border-color: var(--reader-line); color: var(--reader-muted); }
+.book-spread .book-chapter-content::highlight(kidi-speech-ready) {
+  background-color: var(--reader-highlight-ready); color: inherit;
+}
+.book-spread .book-chapter-content::highlight(kidi-speech-playing) {
+  background-color: var(--reader-highlight-playing); color: var(--reader-highlight-ink);
+}
+.book-spread .book-chapter-content .speech-segment-ready {
+  background: var(--reader-highlight-ready); color: inherit;
+}
+.book-spread .book-chapter-content .speech-segment-playing {
+  background: var(--reader-highlight-playing); color: var(--reader-highlight-ink);
+}
+.book-translation-progress {
+  display: grid; grid-template-columns: minmax(130px, 1fr) minmax(70px, 120px) auto 28px;
+  min-width: 0; align-items: center; gap: 7px; padding-left: 8px;
+  border-left: 1px solid var(--line);
+}
+.book-translation-progress > div {
+  display: flex; min-width: 0; align-items: baseline; gap: 7px; font-size: 9px;
+}
+.book-translation-progress strong { color: var(--text); font-size: 10px; }
+.book-translation-progress span {
+  overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap;
+}
+.book-translation-progress progress { width: 100%; height: 7px; accent-color: var(--accent); }
+.book-translation-progress button {
+  min-height: 28px; padding: 3px 8px; border-radius: 7px; background: var(--panel-2);
+  color: var(--accent); font-size: 9px; font-weight: 700;
+}
+.book-translation-progress .icon-button { width: 28px; padding: 0; font-size: 14px; }
 .book-reader-footer {
   position: absolute; z-index: 4; right: 50%; bottom: 10px; display: grid;
-  grid-template-columns: 30px minmax(220px, 460px) 30px; align-items: center; gap: 8px;
-  width: min(560px, calc(100% - 24px)); padding: 6px;
+  grid-template-columns: 30px minmax(180px, 340px) minmax(260px, 1fr) 30px; align-items: center; gap: 8px;
+  width: min(900px, calc(100% - 24px)); padding: 6px;
   border: 1px solid color-mix(in srgb, var(--line) 86%, transparent); border-radius: 12px;
   background: color-mix(in srgb, var(--panel) 90%, transparent); box-shadow: 0 10px 34px rgb(0 0 0 / 24%);
   backdrop-filter: blur(16px); transform: translateX(50%);
   transition: transform .2s ease, opacity .18s ease;
+}
+.book-reader-footer:has(.book-translation-progress[hidden]) {
+  grid-template-columns: 30px minmax(220px, 460px) 30px;
+  width: min(560px, calc(100% - 24px));
 }
 .book-reader-footer button { width: 30px; padding: 0; }
 .book-position { display: grid; gap: 2px; min-width: 0; }
@@ -644,7 +702,8 @@ dialog::backdrop { background: rgb(0 0 0 / 62%); backdrop-filter: blur(3px); }
   .book-reader-header { grid-template-columns: 30px minmax(0, 1fr) 32px 32px; gap: 6px; padding: 5px 6px; }
   .book-reader-identity { display: none; }
   .book-chapter-picker { grid-column: 2; grid-row: 1; }
-  .book-translation-picker { grid-column: 2 / -1; grid-row: 2; }
+  .book-translation-picker { grid-column: 2; grid-row: 2; }
+  .book-view-picker { grid-column: 3 / -1; grid-row: 2; }
   .book-tts-controls > summary { justify-content: center; width: 32px; padding: 0; }
   .book-tts-controls > summary span:last-child { display: none; }
   .book-tts-panel {
@@ -652,11 +711,17 @@ dialog::backdrop { background: rgb(0 0 0 / 62%); backdrop-filter: blur(3px); }
     width: min(320px, calc(100vw - 24px)); transform: translateX(-50%);
   }
   .book-reader-speech span:last-child { display: none; }
-  .book-spread, .book-spread.translated {
+  .book-spread, .book-spread[data-view="both"] {
     grid-template-columns: minmax(0, 1fr); width: calc(100% - 20px); margin: 10px auto;
   }
   .book-spread > article { padding: 26px 22px; }
+  .book-translation-progress {
+    grid-column: 1 / -1; grid-row: 2; grid-template-columns: minmax(0, 1fr) 72px auto 28px;
+    gap: 6px; padding: 5px 0 0; border-top: 1px solid var(--line); border-left: 0;
+  }
+  .book-translation-progress > div { display: grid; gap: 0; }
   .book-reader-footer { grid-template-columns: 30px minmax(0, 1fr) 30px; padding: 6px; }
+  .book-reader-footer > #next-book-chapter { grid-column: 3; grid-row: 1; }
   .shell { display: block; }
   .sidebar { position: fixed; z-index: 5; inset: var(--app-header-height) auto 0 0; width: min(310px, 88vw); transform: translateX(-105%); transition: transform .2s; box-shadow: var(--shadow); }
   .sidebar.open { transform: translateX(0); }
@@ -697,11 +762,15 @@ dialog::backdrop { background: rgb(0 0 0 / 62%); backdrop-filter: blur(3px); }
     color-scheme: light; --bg: #f7f8f8; --panel: #fff; --panel-2: #eef1f0; --line: #dfe3e1;
     --text: #17201d; --muted: #69736f; --accent: #2c8b6c; --accent-strong: #25765c; --accent-ink: #fff;
     --danger: #b53845; --shadow: 0 24px 60px rgb(31 46 40 / 14%);
+    --reader-canvas: #d7d2c9; --reader-page: #fffaf0; --reader-text: #302c27;
+    --reader-muted: #6b6258; --reader-line: #d8d0c2; --reader-highlight-ready: #b9ead8;
+    --reader-highlight-playing: #2c8b6c; --reader-highlight-ink: #fff;
   }
 
   .sidebar { background: #f1f4f2; }
   .topbar { background: rgb(247 248 248 / 88%); }
   .message-content { color: #27332f; }
+  .book-spread .book-chapter-content { color: inherit; background: transparent; }
   .composer { background: #fff; }
   .config-row { background: #f7f9f8; }
   .tts-grid input, .tts-grid select { background: #f7f9f8; }

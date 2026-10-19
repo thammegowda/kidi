@@ -1,9 +1,19 @@
+export const READER_BLOCK_BREAK = '\u2029';
+
 export function normalizeReaderText(value) {
   return String(value ?? '').replace(/\s+/gu, ' ').trim();
 }
 
+export function normalizeReaderSpeechText(value) {
+  return String(value ?? '')
+    .split(/\u2029|\s*\n+\s*/gu)
+    .map(normalizeReaderText)
+    .filter(Boolean)
+    .join(READER_BLOCK_BREAK);
+}
+
 export function readerSpeechSlice(value, requestedOffset = 0) {
-  const text = normalizeReaderText(value);
+  const text = normalizeReaderSpeechText(value);
   let offset = Number.isFinite(requestedOffset) ? Math.trunc(requestedOffset) : 0;
   offset = Math.max(0, Math.min(offset, text.length));
   if (offset === text.length) return {text, offset, speech: ''};

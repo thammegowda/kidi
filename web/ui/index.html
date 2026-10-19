@@ -235,6 +235,13 @@
               <option value="">Original</option>
             </select>
           </label>
+          <label class="book-view-picker"><span>View</span>
+            <select id="book-view-mode" aria-label="Reader page view" hidden>
+              <option value="source">Source</option>
+              <option value="both">Both</option>
+              <option value="translation">Target</option>
+            </select>
+          </label>
           <details id="book-tts-controls" class="book-tts-controls">
             <summary aria-label="Narration settings" title="Narration settings">
               <span class="read-aloud-icon" aria-hidden="true"></span>
@@ -257,9 +264,9 @@
             </div>
           </details>
           <button id="read-book-chapter" class="book-reader-speech" type="button"
-            data-read-aloud-subject="chapter">
+            data-read-aloud-subject="chapter" data-read-aloud-label="Read">
             <span class="read-aloud-icon" aria-hidden="true"></span>
-            <span id="read-book-label" class="read-aloud-label">Read chapter</span>
+            <span id="read-book-label" class="read-aloud-label">Read</span>
           </button>
         </header>
         <div id="book-reader-status" class="book-reader-status" role="status"></div>
@@ -293,6 +300,19 @@
               <span id="book-speech-progress">Start</span>
             </div>
           </div>
+          <aside id="book-translation-progress" class="book-translation-progress"
+            aria-label="Translation progress" hidden>
+            <div>
+              <strong>Translation</strong>
+              <span id="book-translation-counts">0 of 0</span>
+            </div>
+            <progress id="book-translation-meter" max="1" value="0"
+              aria-label="Translated segments"></progress>
+            <button id="toggle-book-translation" type="button">Pause</button>
+            <button id="clear-book-translation" class="icon-button" type="button"
+              aria-label="Clear cached translation and translate again"
+              title="Clear cached translation and translate again">↻</button>
+          </aside>
           <button id="next-book-chapter" type="button" aria-label="Next chapter" title="Next chapter">→</button>
         </footer>
       </section>

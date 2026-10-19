@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {SpeechController} from '../../web/ui/speech-controller.js';
+import {SPEECH_BLOCK_PAUSE_MS, SpeechController} from '../../web/ui/speech-controller.js';
+import {READER_BLOCK_BREAK} from '../../web/ui/reader-position.js';
 
 function harness({blockFirstDelivery = false, failStart = false} = {}) {
   const sent = [], segments = [], pcm = [], completed = [], cancelled = [], errors = [];
@@ -61,6 +62,21 @@ test('unfinished speech streams accept translated text while playback is active'
   const run = harness();
   run.controller.start({
     id: 'translation', streamId: 8, text: 'First translated sentence. ', finished: false,
+  });
+
+  test('block boundaries add silence without changing synthesized text', async () => {
+    const run = harness();
+    run.controller.start({
+      id: 'blocks', streamId: 12,
+      text: `A short title${READER_BLOCK_BREAK}The first sentence.`, finished: true,
+    });
+    assert.equal(run.primitive(0).payload.text, 'A short title');
+    run.audio(0, [0.25, -0.25]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(run.pcm[0].samples.length, 2 + 24000 * SPEECH_BLOCK_PAUSE_MS / 1000);
+    assert.deepEqual([...run.pcm[0].samples.slice(0, 2)], [0.25, -0.25]);
+    assert.ok(run.pcm[0].samples.slice(2).every(value => value === 0));
+    assert.equal(run.primitive(1).payload.text, 'The first sentence.');
   });
   assert.equal(run.primitive(0).payload.text, 'First translated sentence.');
   run.audio(0);

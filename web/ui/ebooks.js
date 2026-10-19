@@ -49,22 +49,30 @@ export async function removeEbook(book) {
     if (request.url.startsWith(prefix)) await translations.delete(request);
 }
 
-export async function readEbookTranslation(book, chapter, language, sourceText) {
+export async function readEbookTranslation(book, chapter, language, sourceText, identity = '') {
   const response = await (await caches.open(TRANSLATIONS)).match(translationKey(book, chapter, language));
   if (!response) return null;
   const payload = await response.json();
-  if (payload?.source !== await textDigest(sourceText) || !Array.isArray(payload.translations) ||
-      payload.translations.some(value => typeof value !== 'string'))
+  const [source, configured] = await Promise.all([textDigest(sourceText), textDigest(identity)]);
+  if (payload?.version !== 2 || payload.source !== source || payload.identity !== configured ||
+      !Array.isArray(payload.translations) ||
+      payload.translations.some(value => value !== null && (typeof value !== 'string' || !value.trim())))
     return null;
   return payload.translations;
 }
 
-export async function storeEbookTranslation(book, chapter, language, sourceText, translations) {
+export async function storeEbookTranslation(book, chapter, language, sourceText, translations, identity = '') {
   if (!Array.isArray(translations) || !translations.length ||
-      translations.some(value => typeof value !== 'string' || !value.trim()))
+      !translations.some(value => typeof value === 'string' && value.trim()) ||
+      translations.some(value => value !== null && (typeof value !== 'string' || !value.trim())))
     throw new Error('Invalid ebook translation');
-  const payload = JSON.stringify({source: await textDigest(sourceText), translations});
+  const [source, configured] = await Promise.all([textDigest(sourceText), textDigest(identity)]);
+  const payload = JSON.stringify({version: 2, source, identity: configured, translations});
   if (payload.length > 8 * 1024 * 1024) throw new Error('Ebook translation exceeds the cache limit');
   await (await caches.open(TRANSLATIONS)).put(translationKey(book, chapter, language),
     new Response(payload, {headers: {'Content-Type': 'application/json'}}));
+}
+
+export async function removeEbookTranslation(book, chapter, language) {
+  return (await caches.open(TRANSLATIONS)).delete(translationKey(book, chapter, language));
 }

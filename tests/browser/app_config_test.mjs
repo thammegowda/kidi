@@ -45,6 +45,8 @@ test('first-run browser UI requests model loading and exposes progress', async (
     'book-tts-pitch', 'book-tts-style', 'book-tts-accent', 'book-tts-gpu-precision', 'book-tts-more',
     'book-translation-language', 'book-spread', 'book-translation-page', 'book-translation-content',
     'book-source-header', 'book-source-aligned-content',
+    'book-view-mode', 'book-translation-progress', 'book-translation-counts',
+    'book-translation-meter', 'toggle-book-translation', 'clear-book-translation',
   ])
     assert.match(html, new RegExp(`id="${id}"`));
   assert.match(app, /function requestModelLoad\(\)/);
@@ -57,7 +59,7 @@ test('first-run browser UI requests model loading and exposes progress', async (
   assert.match(app, /delete options\.gpu_precision_version;\s+delete options\.defaults_version;/);
   assert.match(app, /return state\.outputLanguage \? \[state\.outputLanguage\] : selectedInputLanguages\(\)/);
   assert.match(app, /send\('reader\.translate', id, payload\)/);
-  assert.match(app, /await readEbookTranslation\(book, readerChapterIndex, language/);
+  assert.match(app, /await readEbookTranslation\(\s*book, readerChapterIndex, language/);
   assert.match(app, /const token = await stopReaderTranslation\(\);\s+if \(token !== readerTranslationToken\) return;/);
   assert.match(app, /speech\.append\(active\.requestId, addition, finished\)/);
   assert.match(app, /readerTranslationStreaming: streaming/);
@@ -66,6 +68,10 @@ test('first-run browser UI requests model loading and exposes progress', async (
   assert.doesNotMatch(app, /translationConfig\.workers|readerTranslationRequests/);
   assert.match(app, /setReaderSpeechSide\('source'\);\s+seekBookSpeech\(offset\)/);
   assert.match(app, /setReaderSpeechSide\('target'\);\s+seekBookSpeech\(offset\)/);
+  assert.match(app, /readerLanguage: state\.readerLanguage, readerView: state\.readerView/);
+  assert.match(app, /\$\('book-view-mode'\)\.addEventListener\('change'/);
+  assert.match(app, /readerTranslationPaused: state\.readerTranslationPaused/);
+  assert.match(app, /await removeEbookTranslation\(book, readerChapterIndex, state\.readerLanguage\)/);
 });
 
 test('browser branding uses the square Kidi icon', async () => {
