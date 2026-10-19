@@ -106,7 +106,9 @@ target API is 36, and the current build packages ARM64 only.
 
 The production activity packages `web/ui/` with the Android host adapter from
 `web/hosts/android/`, serves it through `WebViewAssetLoader`, and connects it to
-the JNI runtime with LiteApp WebMessage envelopes and ArrayBuffer media frames.
+the JNI runtime with LiteApp WebMessage envelopes. Android microphone capture
+and TTS playback stay native through `AudioRecord` and `AudioTrack`; binary
+WebMessages remain available for bounded image uploads.
 `android/assets.txt` is the explicit host-asset mapping; Gradle combines it with
 `web/ui/assets.txt` and fails on missing or duplicate destinations. The
 developer build additionally contains the separate Compose accessory and

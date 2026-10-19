@@ -8,6 +8,8 @@ import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
+import android.view.View
+import android.view.WindowManager
 import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.ValueCallback
@@ -16,34 +18,46 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
-import androidx.activity.enableEdgeToEdge
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsAnimationCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updateLayoutParams
 import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebMessagePortCompat
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
+    private lateinit var root: FrameLayout
     private lateinit var webView: WebView
     private lateinit var assets: WebViewAssetLoader
     private var host: LiteAppServiceHost? = null
     private var port: WebMessagePortCompat? = null
     private var pendingPermission: PermissionRequest? = null
+    private var nativeMicrophonePermission: CompletableDeferred<Boolean>? = null
     private var pendingFiles: ValueCallback<Array<Uri>>? = null
     private var captureUri: Uri? = null
-    private val imageStore by lazy { CameraCaptureStore(this) }
+    private val cameraCapture by lazy { CameraCaptureStore(this) }
 
     private val microphonePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         pendingPermission?.let { request ->
             if (granted) request.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) else request.deny()
         }
         pendingPermission = null
+        nativeMicrophonePermission?.complete(granted)
+        nativeMicrophonePermission = null
     }
 
     private val files = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -53,7 +67,7 @@ class MainActivity : ComponentActivity() {
         }
         result.data?.data?.let(values::add)
         if (result.resultCode == RESULT_OK && values.isEmpty()) captureUri?.let(values::add)
-        captureUri?.takeIf { it !in values }?.let(imageStore::removeCapture)
+        captureUri?.takeIf { it !in values }?.let(cameraCapture::remove)
         pendingFiles?.onReceiveValue(values.toTypedArray().takeIf { it.isNotEmpty() })
         pendingFiles = null
         captureUri = null
@@ -62,18 +76,60 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
         assets = WebViewAssetLoader.Builder()
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
             .build()
+        root = FrameLayout(this)
         webView = WebView(this)
         configureWebView()
-        setContentView(webView)
+        root.addView(
+            webView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        setContentView(root)
+        configureInsets()
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (webView.canGoBack()) webView.goBack() else finish()
             }
         })
         if (savedInstanceState == null) webView.loadUrl(APP_URL) else webView.restoreState(savedInstanceState)
+    }
+
+    private fun configureInsets() {
+        fun apply(insets: WindowInsetsCompat) {
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            webView.updateLayoutParams<FrameLayout.LayoutParams> {
+                leftMargin = bars.left
+                topMargin = bars.top
+                rightMargin = bars.right
+                bottomMargin = maxOf(bars.bottom, ime.bottom)
+            }
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            apply(insets)
+            WindowInsetsCompat.CONSUMED
+        }
+        ViewCompat.setWindowInsetsAnimationCallback(
+            root,
+            object : WindowInsetsAnimationCompat.Callback(DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+                override fun onProgress(
+                    insets: WindowInsetsCompat,
+                    runningAnimations: MutableList<WindowInsetsAnimationCompat>,
+                ): WindowInsetsCompat {
+                    apply(insets)
+                    return insets
+                }
+            },
+        )
+        ViewCompat.requestApplyInsets(root)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -91,6 +147,7 @@ class MainActivity : ComponentActivity() {
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
+            textZoom = 112
             allowFileAccess = false
             allowContentAccess = false
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
@@ -161,7 +218,7 @@ class MainActivity : ComponentActivity() {
                     fileChooserParams.acceptTypes.any { type -> type.startsWith("image/") } &&
                         it.resolveActivity(packageManager) != null
                 }?.apply {
-                    captureUri = imageStore.captureUri()
+                    captureUri = cameraCapture.createUri()
                     putExtra(MediaStore.EXTRA_OUTPUT, captureUri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
                 }
@@ -187,7 +244,7 @@ class MainActivity : ComponentActivity() {
         val service = LiteAppServiceHost(
             context = this,
             sendText = { value -> webView.post { nativePort.postMessage(WebMessageCompat(value)) } },
-            sendBinary = { value -> webView.post { nativePort.postMessage(WebMessageCompat(value)) } },
+            requestMicrophonePermission = ::requestMicrophonePermission,
             fatal = { message -> webView.post { showFatal(message) } },
         )
         nativePort.setWebMessageCallback(object : WebMessagePortCompat.WebMessageCallbackCompat() {
@@ -207,6 +264,18 @@ class MainActivity : ComponentActivity() {
             WebMessageCompat(CONNECT_MESSAGE, arrayOf(channel[1])),
             Uri.parse(APP_ORIGIN),
         )
+    }
+
+    private suspend fun requestMicrophonePermission(): Boolean {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED) return true
+        val request = CompletableDeferred<Boolean>()
+        withContext(Dispatchers.Main.immediate) {
+            nativeMicrophonePermission?.complete(false)
+            nativeMicrophonePermission = request
+            microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
+        return request.await()
     }
 
     private fun showFatal(message: String) {
@@ -233,6 +302,8 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         pendingPermission?.deny()
         pendingPermission = null
+        nativeMicrophonePermission?.complete(false)
+        nativeMicrophonePermission = null
         pendingFiles?.onReceiveValue(null)
         pendingFiles = null
         closeHost()

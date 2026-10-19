@@ -1,6 +1,9 @@
 package ai.gowda.kidi
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -30,7 +33,7 @@ import kotlin.coroutines.coroutineContext
 internal class LiteAppServiceHost(
     context: Context,
     private val sendText: (String) -> Unit,
-    private val sendBinary: (ByteArray) -> Unit,
+    private val requestMicrophonePermission: suspend () -> Boolean,
     private val fatal: (String) -> Unit,
 ) : Closeable {
     private class ServiceFailure(val code: String, message: String) : Exception(message)
@@ -42,30 +45,12 @@ internal class LiteAppServiceHost(
         val bytes: ByteArrayOutputStream = ByteArrayOutputStream(),
     )
 
-    private class SampleBuffer {
-        private var values = ShortArray(16_000)
-        var size: Int = 0
-            private set
-
-        fun append(source: ByteBuffer) {
-            val count = source.remaining() / Short.SIZE_BYTES
-            require(size + count <= MAX_ASR_SAMPLES) { "ASR input exceeds 30 seconds" }
-            if (size + count > values.size) values = values.copyOf(maxOf(size + count, values.size * 2))
-            repeat(count) { values[size++] = source.short }
-        }
-
-        fun floats(): FloatArray = FloatArray(size) { values[it] / 32768f }
-    }
-
     private data class AsrInput(
         val requestId: String,
         val streamId: Int,
         val language: String,
-        val samples: SampleBuffer = SampleBuffer(),
-        var sequence: Int = 0,
-        var partialAt: Int = PARTIAL_ASR_SAMPLES,
+        val voiceMode: Boolean,
         var partialRunning: Boolean = false,
-        var finalRequested: Boolean = false,
     )
 
     private val appContext = context.applicationContext
@@ -84,6 +69,8 @@ internal class LiteAppServiceHost(
     private val images = mutableMapOf<Int, File>()
     private val asrLock = Any()
     private var asrInput: AsrInput? = null
+    private val audioRecorder = AndroidAudioRecorder()
+    private val audioPlayer = AndroidAudioPlayer()
     private val imageDirectory = File(appContext.cacheDir, "liteapp-images")
     private val inferenceMutex = Mutex()
 
@@ -104,6 +91,19 @@ internal class LiteAppServiceHost(
     @Volatile private var systemPrompt = DEFAULT_SYSTEM_PROMPT
 
     init {
+        repository.installed()?.let { installed ->
+            chatLoaded = true
+            chatDirectory = installed.directory.absolutePath
+            modelId = installed.modelId
+        }
+        repository.installedSpeech()?.let { installed ->
+            asrLoaded = true
+            asrDirectory = installed.directory.absolutePath
+        }
+        repository.installedTts()?.let { directory ->
+            ttsLoaded = true
+            ttsDirectory = directory.absolutePath
+        }
         scope.launch(runtimeDispatcher) {
             checked(NativeRuntime.setDataDirectory(
                 appContext.filesDir.absolutePath,
@@ -150,7 +150,6 @@ internal class LiteAppServiceHost(
         try {
             when (kind) {
                 IMAGE_INPUT -> appendImage(streamId, sequence, data, HEADER_BYTES)
-                AUDIO_ASR -> appendAudio(streamId, sequence, frame)
                 else -> fatal("Unknown Android binary service frame")
             }
         } catch (error: Exception) {
@@ -191,6 +190,7 @@ internal class LiteAppServiceHost(
 
     private suspend fun dispatch(method: String, id: String, payload: JSONObject): JSONObject = when (method) {
         "session.status" -> snapshot()
+        "permissions.microphone.request" -> requestMicrophone()
         "runtime.load" -> loadChat(id, payload)
         "asr.preload" -> loadAsr(id)
         "tts.preload" -> loadTts(id)
@@ -203,6 +203,12 @@ internal class LiteAppServiceHost(
         "asr.stop" -> stopAsr(payload)
         "tts.start" -> runTts(id, payload)
         else -> throw ServiceFailure("unknown_method", "Unknown service method: $method")
+    }
+
+    private suspend fun requestMicrophone(): JSONObject {
+        if (!requestMicrophonePermission())
+            throw ServiceFailure("microphone_permission", "Microphone permission is required for dictation")
+        return JSONObject().put("granted", true)
     }
 
     private suspend fun loadChat(id: String, payload: JSONObject): JSONObject {
@@ -359,6 +365,7 @@ internal class LiteAppServiceHost(
         inferenceMutex.withLock {
             ensureChatResident()
             withContext(runtimeDispatcher) {
+                val started = System.nanoTime()
                 event(id, "$eventPrefix.started")
                 val requestId = checked(NativeRuntime.enqueue(messages.toString(), maximumTokens)).getLong("request_id")
                 nativeRequests[id] = requestId
@@ -382,11 +389,13 @@ internal class LiteAppServiceHost(
                     JSONObject()
                         .put("text", result.optString("text"))
                         .put("stats", JSONObject()
-                            .put("tokenCount", result.optInt("output_tokens"))
-                            .put("elapsedMs", result.optDouble("generation_ms"))
-                            .put("decodeMs", result.optDouble("decode_ms"))
-                            .put("decodeTokens", result.optInt("decode_tokens"))
-                            .put("firstTokenMs", result.optDouble("first_token_ms")))
+                            .put("elapsed_ms", (System.nanoTime() - started) / 1e6)
+                            .put("prompt_tokens", result.optInt("prompt_tokens"))
+                            .put("decode_tokens", result.optInt("decode_tokens"))
+                            .put("prefill_ms", result.optDouble("prefill_ms"))
+                            .put("decode_ms", result.optDouble("decode_ms"))
+                            .put("preparation_ms", 0)
+                            .put("first_token_ms", result.optDouble("first_token_ms")))
                 } finally {
                     nativeRequests.remove(id)
                 }
@@ -397,26 +406,36 @@ internal class LiteAppServiceHost(
         if (!asrLoaded) loadAsr(id)
         val streamId = unsignedInt(payload, "stream_id")
         val language = payload.optString("language", "auto")
+        val voiceMode = payload.optBoolean("voice_mode")
         if (!LANGUAGES.matches(language))
             throw ServiceFailure("invalid_asr", "ASR language must be auto or comma-separated language codes")
-        val input = AsrInput(id, streamId, language)
+        val input = AsrInput(id, streamId, language, voiceMode)
         synchronized(asrLock) {
             if (asrInput != null) throw ServiceFailure("busy", "Speech recognition is already active")
             asrInput = input
         }
-        event(id, "asr.started", JSONObject().put("stream_id", streamId).put("sample_rate", SAMPLE_RATE))
         try {
-            while (true) {
-                coroutineContext.ensureActive()
-                val final = synchronized(asrLock) { input.finalRequested }
-                if (final) break
-                kotlinx.coroutines.delay(25)
+            inferenceMutex.withLock { ensureAsrResident() }
+            event(id, "asr.started", JSONObject()
+                .put("stream_id", streamId)
+                .put("sample_rate", AndroidAudioRecorder.SAMPLE_RATE)
+                .put("native_capture", true))
+            if (ContextCompat.checkSelfPermission(appContext, Manifest.permission.RECORD_AUDIO) !=
+                PackageManager.PERMISSION_GRANTED)
+                throw ServiceFailure("microphone_permission", "Microphone permission was revoked")
+            val vad = asrComponent().getJSONObject("settings").getJSONObject("vad")
+            val capture = audioRecorder.capture(
+                voiceMode = voiceMode,
+                threshold = vad.getDouble("threshold").toFloat(),
+                minimumSpeechMs = vad.getInt("minimum_speech_ms"),
+                silenceMs = vad.getInt("silence_ms"),
+            ) { samples ->
+                publishAsrSnapshot(input, samples)
             }
-            val samples = synchronized(asrLock) { input.samples.floats() }
             val result = inferenceMutex.withLock {
                 ensureAsrResident()
                 withContext(speechDispatcher) {
-                    checked(NativeRuntime.transcribe(samples, language, 128))
+                    checked(NativeRuntime.transcribe(capture.samples, language, 128))
                 }
             }
             return JSONObject()
@@ -431,33 +450,25 @@ internal class LiteAppServiceHost(
         }
     }
 
-    private fun appendAudio(streamId: Int, sequence: Int, frame: ByteBuffer) {
-        val input = synchronized(asrLock) {
-            asrInput?.takeIf { it.streamId == streamId }
-                ?: throw ServiceFailure("unknown_stream", "ASR stream is unavailable")
-        }
+    private fun publishAsrSnapshot(input: AsrInput, samples: FloatArray) {
         synchronized(asrLock) {
-            require(input.sequence == sequence) { "ASR chunks are out of order" }
-            input.samples.append(frame)
-            input.sequence++
-            if (input.samples.size >= input.partialAt && !input.partialRunning && !input.finalRequested) {
-                input.partialAt += PARTIAL_ASR_SAMPLES
-                input.partialRunning = true
-                val samples = input.samples.floats()
-                scope.launch(speechDispatcher) {
-                    try {
-                        val result = inferenceMutex.withLock {
-                            ensureAsrResident()
-                            checked(NativeRuntime.transcribe(samples, input.language, 128))
-                        }
-                        event(input.requestId, "asr.partial", JSONObject()
-                            .put("stable", "")
-                            .put("provisional", result.optString("text"))
-                            .put("language", result.optString("language", "auto")))
-                    } catch (_: Exception) {
-                    } finally {
-                        synchronized(asrLock) { input.partialRunning = false }
-                    }
+            if (asrInput !== input || input.partialRunning) return
+            input.partialRunning = true
+        }
+        scope.launch(speechDispatcher) {
+            try {
+                val result = inferenceMutex.withLock {
+                    ensureAsrResident()
+                    checked(NativeRuntime.transcribe(samples, input.language, 128))
+                }
+                event(input.requestId, "asr.partial", JSONObject()
+                    .put("stable", "")
+                    .put("provisional", result.optString("text"))
+                    .put("language", result.optString("language", "auto")))
+            } catch (_: Exception) {
+            } finally {
+                synchronized(asrLock) {
+                    if (asrInput === input) input.partialRunning = false
                 }
             }
         }
@@ -466,8 +477,9 @@ internal class LiteAppServiceHost(
     private fun stopAsr(payload: JSONObject): JSONObject {
         val requestId = payload.optString("request_id")
         val stopped = synchronized(asrLock) {
-            asrInput?.takeIf { it.requestId == requestId }?.also { it.finalRequested = true } != null
+            asrInput?.takeIf { it.requestId == requestId } != null
         }
+        if (stopped) audioRecorder.stop()
         return JSONObject().put("stopped", stopped)
     }
 
@@ -482,7 +494,7 @@ internal class LiteAppServiceHost(
         val steps = options.optInt("steps", 10)
         if (steps !in 1..128) throw ServiceFailure("invalid_tts", "TTS steps must be between 1 and 128")
         val voice = options.optJSONObject("voice") ?: JSONObject()
-        event(id, "tts.started", JSONObject().put("stream_id", streamId).put("format", "pcm_s16le"))
+        event(id, "tts.started", JSONObject().put("stream_id", streamId).put("format", "native"))
         val audio = inferenceMutex.withLock {
             ensureTtsResident()
             withContext(ttsDispatcher) {
@@ -493,24 +505,14 @@ internal class LiteAppServiceHost(
             }
         }
         val sampleRate = NativeRuntime.ttsSampleRate()
-        var sequence = 0
-        for (offset in audio.indices step TTS_FRAME_SAMPLES) {
-            val end = minOf(audio.size, offset + TTS_FRAME_SAMPLES)
-            val frame = ByteBuffer.allocate(HEADER_BYTES + (end - offset) * Short.SIZE_BYTES)
-                .order(ByteOrder.LITTLE_ENDIAN)
-            frame.put(byteArrayOf('K'.code.toByte(), 'D'.code.toByte(), 'A'.code.toByte(), '1'.code.toByte(), 1, AUDIO_TTS.toByte(), 0, 0))
-            frame.putInt(streamId)
-            frame.putInt(sequence++)
-            frame.putInt(sampleRate)
-            frame.putInt((end - offset) * Short.SIZE_BYTES)
-            for (index in offset until end) frame.putShort(audio[index])
-            sendBinary(frame.array())
-        }
+        event(id, "tts.progress", JSONObject().put("phase", "playing"))
+        audioPlayer.play(audio, sampleRate)
         return JSONObject()
             .put("stream_id", streamId)
             .put("sample_rate", sampleRate)
             .put("samples", audio.size)
-            .put("chunks", sequence)
+            .put("chunks", 1)
+            .put("native_playback", true)
             .put("stats", JSONObject()
                 .put("generation_ms", 0)
                 .put("decode_ms", 0)
@@ -689,9 +691,12 @@ internal class LiteAppServiceHost(
             }
             "asr.start" -> {
                 NativeRuntime.cancelTranscription()
-                synchronized(asrLock) { asrInput?.takeIf { it.requestId == id }?.finalRequested = true }
+                audioRecorder.stop()
             }
-            "tts.start" -> NativeRuntime.cancelTts()
+            "tts.start" -> {
+                NativeRuntime.cancelTts()
+                audioPlayer.stop()
+            }
         }
         jobs[id]?.cancel()
     }
@@ -714,6 +719,8 @@ internal class LiteAppServiceHost(
         scope.cancel()
         NativeRuntime.cancelTranscription()
         NativeRuntime.cancelTts()
+        audioRecorder.stop()
+        audioPlayer.stop()
         NativeRuntime.unload()
         NativeRuntime.unloadAsr()
         NativeRuntime.unloadTts()
@@ -729,14 +736,8 @@ internal class LiteAppServiceHost(
 
     private companion object {
         const val HEADER_BYTES = 24
-        const val AUDIO_ASR = 1
-        const val AUDIO_TTS = 2
         const val IMAGE_INPUT = 3
-        const val SAMPLE_RATE = 16_000
-        const val MAX_ASR_SAMPLES = SAMPLE_RATE * 30
-        const val PARTIAL_ASR_SAMPLES = SAMPLE_RATE
         const val MAX_IMAGE_BYTES = 32 * 1024 * 1024
-        const val TTS_FRAME_SAMPLES = 4096
         const val DEFAULT_CHAT_MODEL = "google/gemma-4-E2B-it-qat-mobile-transformers"
         const val DEFAULT_ASR_MODEL = "openai/whisper-small"
         const val DEFAULT_TTS_MODEL = "thammegowda/OmniVoice-q8"

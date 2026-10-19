@@ -64,6 +64,15 @@ test('Android adapter uses LiteApp requests, native binary streams, and browser 
         const events = [], audio = [];
         backend.connect({onEvent: event => events.push(event), onAudio: value => audio.push(value)});
         await setImmediate();
+        assert.equal(backend.nativeAudioCapture, true);
+        assert.equal(backend.nativeTtsPlayback, true);
+        const permission = backend.requestMicrophonePermission();
+        await setImmediate();
+        const permissionRequest = transport.sent.at(-1);
+        assert.equal(permissionRequest.method, 'permissions.microphone.request');
+        transport.receive(completed(permissionRequest, {granted: true}));
+        assert.deepEqual(await permission, {granted: true});
+
         backend.send('runtime.load', 'load', {model: 'owner/model'});
         const load = transport.sent.at(-1);
         assert.equal(load.method, 'runtime.load');

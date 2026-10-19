@@ -483,6 +483,14 @@ export class SpeechController {
 
   async #completePrimitive(current, primitive, payload) {
     if (this.#current !== current || current.primitive !== primitive || current.cancelled) return;
+    if (!primitive.audio.length && payload.native_playback === true) {
+      current.primitive = null;
+      current.samples += Number(payload.samples || 0);
+      current.chunks += Number(payload.chunks || 1);
+      this.#onSegment?.(current, primitive.segment, {cached: false, native: true});
+      this.#pump(current);
+      return;
+    }
     if (!primitive.audio.length) throw new Error('Speech synthesis completed without PCM');
     const sampleRate = primitive.sampleRate || payload.sample_rate;
     const samples = combine(primitive.audio);

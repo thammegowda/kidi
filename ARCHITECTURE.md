@@ -22,8 +22,10 @@ backend contract without duplicating UI behavior:
 All three use LiteApp's versioned request/event/cancellation envelopes. Android
 packages the UI in the APK and serves it from
 `https://appassets.androidplatform.net`; it does not load a hosted UI or start a
-loopback server. JSON carries control and progress, while ArrayBuffer messages
-carry bounded image, microphone, and TTS PCM frames.
+loopback server. JSON carries control, progress, transcripts, and completion;
+ArrayBuffer messages carry bounded image uploads. Android microphone capture
+and TTS playback stay native through `AudioRecord` and `AudioTrack`, so audio
+samples never enter JavaScript.
 
 ## Ownership
 

@@ -44,9 +44,11 @@ internal class ModelRepository(context: Context, rootName: String = "models") {
 
     fun installedSpeech(): InstalledModel? = installed(SPEECH_CURRENT_FILE, SPEECH_FILES)
 
-    fun installedTts(): File? = installed(TTS_CURRENT_FILE, TTS_FILES)?.directory
+    fun installedTts(): File? = installed(TTS_CURRENT_FILE, TTS_DOWNLOAD_FILES)?.directory
         ?: ttsDirectory().takeIf { directory ->
-            directory.isDirectory && TTS_FILES.all { File(directory, it).isFile }
+            directory.isDirectory &&
+                TTS_BASE_FILES.all { File(directory, it).isFile } &&
+                listOf("tokenizer.json", "tokenizer.json.gz").any { File(directory, it).isFile }
         }
 
     fun ttsDirectory(): File = File(root, TTS_DIRECTORY)
@@ -75,7 +77,7 @@ internal class ModelRepository(context: Context, rootName: String = "models") {
         prepareModel(modelId, SPEECH_FILES, SPEECH_CURRENT_FILE, ::validateSpeechModel, progress, ::resolveSpeech)
 
     suspend fun prepareTts(modelId: String, progress: (ModelDownloadProgress) -> Unit): InstalledModel =
-        prepareModel(modelId, TTS_FILES, TTS_CURRENT_FILE, {}, progress)
+        prepareModel(modelId, TTS_DOWNLOAD_FILES, TTS_CURRENT_FILE, {}, progress)
 
     private suspend fun prepareModel(
         modelId: String,
@@ -321,10 +323,9 @@ internal class ModelRepository(context: Context, rootName: String = "models") {
             "generation_config.json",
         )
         val SPEECH_FILES = SPEECH_METADATA_FILES + "model.safetensors"
-        val TTS_FILES = listOf(
+        val TTS_BASE_FILES = listOf(
             "model.yaml",
             "model.safetensors",
-            "tokenizer.json",
             "sentence-prefixes.tsv",
             "synthesis_template.jinja",
             "NOTICE",
@@ -333,6 +334,7 @@ internal class ModelRepository(context: Context, rootName: String = "models") {
             "licenses/META-LLAMA-3-USE-POLICY.md",
             "licenses/HIGGS-AUDIO-2-LICENSE.txt",
         )
+        val TTS_DOWNLOAD_FILES = TTS_BASE_FILES + "tokenizer.json.gz"
         val SUPPORTED_WHISPER_SIGNATURES = setOf(
             listOf(384, 4, 4, 6, 6, 1536, 1536),
             listOf(512, 6, 6, 8, 8, 2048, 2048),

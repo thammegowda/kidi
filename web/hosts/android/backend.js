@@ -28,6 +28,19 @@ class AndroidBackend {
     return this.#transport?.bufferedAmount || 0;
   }
 
+  get nativeAudioCapture() {
+    return true;
+  }
+
+  get nativeTtsPlayback() {
+    return true;
+  }
+
+  async requestMicrophonePermission() {
+    await this.#ensureConnection();
+    return this.#channel.request('permissions.microphone.request');
+  }
+
   legalDocuments() {
     return {
       privacy: './legal/PRIVACY.md',

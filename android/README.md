@@ -213,9 +213,10 @@ including its declared redistribution notices, into app-private storage and
 verifies each published LFS digest before making it current.
 
 Android currently runs this shared-host TTS path on CPU. Synthesis reports
-diffusion progress, can be cancelled, and sends bounded PCM16 ArrayBuffer frames
-to the shared playback worklet. Settings expose language, diffusion steps, and
-the OmniVoice gender, age, pitch, style, and accent attributes.
+diffusion progress, can be cancelled, and plays PCM16 directly through Android
+`AudioTrack`. The WebView receives only progress and completion events.
+Settings expose language, diffusion steps, and the OmniVoice gender, age,
+pitch, style, and accent attributes.
 
 ### Speech Dictation
 
@@ -251,28 +252,18 @@ Speech runs on the CPU INT8 path in Auto mode; see [Accelerators](#accelerators)
 Release builds enable R8/resource shrinking and discard unused native dependency sections while preserving JNI
 entry points and partial-transcript callbacks.
 
-Speech has its own native lock and runtime thread, like the web app's speech worker, so it loads alongside Gemma and
-dictation never queues behind chat loading. Loading memory-maps the cached INT8 checkpoint and then transcribes a second
-of silence, so weight packing and operator preparation (about 1.4 seconds on the SM8750 phone) happen before the first
-recording. Speech is ready about 1.8 seconds after launch, and the microphone stays available while the chat model loads.
-A new model or missing INT8 cache still incurs the one-time conversion cost. Typing stays editable during model loading,
-and sending is enabled once chat is ready even when speech is preparing.
+Speech has its own native lock and runtime thread. Loading memory-maps the cached
+INT8 checkpoint; a new model or missing INT8 cache still incurs the one-time
+conversion cost. Typing stays editable during model loading, and sending is
+enabled once chat is ready even when speech is preparing.
 
-The microphone button requests `RECORD_AUDIO` permission when first used. Recording captures mono PCM at 16 kHz for at
-most 30 seconds. During recording, the bottom-right send button becomes a red stop control; tap it to finish earlier.
-It returns to Send after transcript refinement, while generation uses the same button to stop the response.
-Kidi automatically detects the language. Like the web app, each pass encodes only the recorded audio plus at least a
-second of silence, rounded up to 128-position encoder slices, instead of a padded 30-second window; output that repeats
-itself is decoded again over the full window. Drafts run every 1.2 seconds while recording, and as soon as a pause of
-300 ms follows new speech; a stale draft still running then is cancelled so the covering one starts at once. Partial
-text is published during token decoding and replaces the dictation suffix in the composer while recording. A draft
-failure is shown as an error rather than silently hiding updates; recording continues and the final pass is still
-attempted. The transcript is never sent to Gemma automatically. Audio remains in memory only for the current
-transcription and is not uploaded or saved.
-
-Stopping reuses a completed (or nearly complete) draft when it already covers all detected speech plus 200 ms, so the
-final transcript usually appears immediately. Speech is tracked from 20 ms frame energy against a slowly rising noise
-floor and a fraction of the loudest speech; the thresholds err toward counting speech, which only costs a final pass.
+The microphone button requests `RECORD_AUDIO` permission when first used.
+Android `AudioRecord` captures mono PCM at 16 kHz for at most 30 seconds and
+passes snapshots directly to native Whisper for partial transcripts. Manual
+dictation stops from the same microphone control; voice mode uses bounded
+energy-based endpointing after speech followed by silence. The WebView receives
+only partial/final text and status events. Audio remains in memory for the
+current transcription and is never uploaded or saved.
 Otherwise drafts in progress are cancelled and one final pass runs over the whole recording. On the SM8750 phone,
 LibriSpeech clips played through a speaker and stopped after a natural pause took 37-86 ms from Stop to final text for
 5.5-17.7 seconds of audio; stopping mid-sentence ran the final pass in 0.44 seconds for 5.8 seconds of audio. The
