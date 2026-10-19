@@ -12,11 +12,12 @@ import {
   READER_TRANSLATION_LOOKAHEAD, readerTranslationAttentionWindow, splitReaderTranslationText,
 } from './reader-translation.js';
 import {MINIMUM_TTS_STEPS, selectRealtimeProfile} from './realtime-profile.js';
-import {SpeechController, VoiceLatencyBenchmark} from './speech-controller.js';
+import {plainSpeechText, speechUnits, SpeechController, VoiceLatencyBenchmark} from './speech-controller.js';
 import {createSpeechIndex, renderSpeechHighlights, speechRanges, speechSearchOffset} from './speech-highlights.js';
 
 const $ = id => document.getElementById(id);
 const nativeTtsPlayback = () => backend.nativeTtsPlayback === true;
+const ANDROID_MAX_TTS_UNITS = 96;
 const narrowLayout = matchMedia('(max-width: 760px)');
 const languageResponse = await fetch(new URL('./languages.tsv', import.meta.url));
 if (!languageResponse.ok) throw new Error(`Unable to load language table (${languageResponse.status})`);
@@ -3028,6 +3029,10 @@ function stopVoiceMode(cancel = true) {
 function toggleVoiceMode() {
   if (voiceMode) return stopVoiceMode();
   if (state.busy) return;
+  if (state.runtime.host === 'android') {
+    showNotice('Continuous voice is temporarily unavailable on Android while native TTS stability is improved.');
+    return;
+  }
   voiceMode = true;
   voiceEpoch++;
   const epoch = voiceEpoch;
@@ -3044,6 +3049,12 @@ function toggleVoiceMode() {
 function startTts(text, button, voiceTurn = false, epoch = voiceEpoch, optionOverrides = {},
   streamMetadata = {}, finished = true) {
   if (state.busy) return false;
+  if (state.runtime.host === 'android' && speechUnits(plainSpeechText(text)) > ANDROID_MAX_TTS_UNITS) {
+    showNotice(
+      'Android read-aloud is temporarily limited to short text to protect device stability.',
+    );
+    return false;
+  }
   const id = crypto.randomUUID();
   const audioId = streamId++;
   activeRequest = {id, kind: 'tts', streamId: audioId, voiceTurn, voiceEpoch: voiceTurn ? epoch : null};

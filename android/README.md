@@ -212,7 +212,11 @@ configured OmniVoice package. The shared one-time setup downloads the package,
 including its declared redistribution notices, into app-private storage and
 verifies each published LFS digest before making it current.
 
-Android TTS Auto tries Vulkan and then CPU. Synthesis reports diffusion
+Android read-aloud currently uses a stability-first CPU profile with
+classifier-free guidance disabled and at most four inference threads. It is
+temporarily limited to short text; longer responses and continuous voice are
+rejected before synthesis because sustained OmniVoice execution can trigger a
+device watchdog reset on the SM8750 test phone. Synthesis reports diffusion
 progress, can be cancelled, and plays PCM16 directly through Android
 `AudioTrack`. The WebView receives only progress and completion events.
 Settings expose language, diffusion steps, and the OmniVoice gender, age,

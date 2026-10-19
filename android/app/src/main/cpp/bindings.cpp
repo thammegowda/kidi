@@ -576,6 +576,7 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_synthesize(JN
         kidi::inference::SynthesisOptions options;
         options.language = language_name.empty() ? "English" : language_name;
         options.steps = static_cast<std::size_t>(steps);
+        options.guidance_scale = 0.F;
         options.on_progress = [](std::size_t, std::size_t) {
             if (tts_cancelled.load(std::memory_order_relaxed))
                 throw std::runtime_error("TTS synthesis cancelled");

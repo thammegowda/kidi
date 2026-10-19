@@ -531,8 +531,11 @@ internal class LiteAppServiceHost(
         if (!ttsLoaded) loadTts(id)
         val streamId = unsignedInt(payload, "stream_id")
         val text = payload.optString("text")
-        if (text.isBlank() || text.length > 65536)
-            throw ServiceFailure("invalid_tts", "TTS text must contain 1-65536 characters")
+        if (text.isBlank() || text.length > MAX_TTS_TEXT_LENGTH || text.toByteArray().size > MAX_TTS_UTF8_BYTES)
+            throw ServiceFailure(
+                "invalid_tts",
+                "Android read-aloud is temporarily limited to short text to protect device stability",
+            )
         val options = payload.optJSONObject("options") ?: JSONObject()
         val language = options.optString("language", "English")
         val steps = options.optInt("steps", 10)
@@ -622,7 +625,7 @@ internal class LiteAppServiceHost(
         if (ttsResident) return
         val directory = ttsDirectory ?: throw ServiceFailure("tts_not_ready", "Load the Android TTS model first")
         val loaded = withContext(ttsDispatcher) {
-            checked(NativeRuntime.configure(threads))
+            checked(NativeRuntime.configure(minOf(threads, TTS_MAX_THREADS)))
             checked(NativeRuntime.loadTts(directory, TTS_ACCELERATOR))
         }
         ttsBackend = loaded.optString("backend", "android-cpu")
@@ -788,7 +791,10 @@ internal class LiteAppServiceHost(
         const val DEFAULT_TTS_MODEL = "thammegowda/OmniVoice-q8"
         const val DEFAULT_CHAT_ACCELERATOR = "cpu"
         const val ASR_ACCELERATOR = "cpu"
-        const val TTS_ACCELERATOR = "auto"
+        const val TTS_ACCELERATOR = "cpu"
+        const val TTS_MAX_THREADS = 4
+        const val MAX_TTS_TEXT_LENGTH = 96
+        const val MAX_TTS_UTF8_BYTES = 192
         const val PREFERENCES = "kidi-liteapp-runtime-v1"
         const val CHAT_ACCELERATOR_KEY = "chat-accelerator"
         const val ACCELERATOR_POLICY_VERSION_KEY = "accelerator-policy-version"
