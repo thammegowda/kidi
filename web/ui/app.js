@@ -12,10 +12,12 @@ import {
   READER_TRANSLATION_LOOKAHEAD, readerTranslationAttentionWindow, splitReaderTranslationText,
 } from './reader-translation.js';
 import {MINIMUM_TTS_STEPS, selectRealtimeProfile} from './realtime-profile.js';
-import {SpeechController, VoiceLatencyBenchmark} from './speech-controller.js';
+import {plainSpeechText, speechUnits, SpeechController, VoiceLatencyBenchmark} from './speech-controller.js';
 import {createSpeechIndex, renderSpeechHighlights, speechRanges, speechSearchOffset} from './speech-highlights.js';
 
 const $ = id => document.getElementById(id);
+const nativeTtsPlayback = () => backend.nativeTtsPlayback === true;
+const ANDROID_MAX_TTS_UNITS = 96;
 const narrowLayout = matchMedia('(max-width: 760px)');
 const languageResponse = await fetch(new URL('./languages.tsv', import.meta.url));
 if (!languageResponse.ok) throw new Error(`Unable to load language table (${languageResponse.status})`);
@@ -49,6 +51,12 @@ const state = {
 };
 const welcome = $('welcome');
 const modelOnboarding = $('model-onboarding');
+const legalDocuments = backend.legalDocuments?.();
+if (legalDocuments) {
+  $('host-privacy').href = legalDocuments.privacy;
+  $('host-terms').href = legalDocuments.terms;
+  $('host-legal-links').hidden = false;
+}
 let activeRequest;
 let streamId = 1;
 let recording;
@@ -143,6 +151,10 @@ const speech = new SpeechController({
     if (current.voice) voiceLatency.mark('first_pcm');
   },
   onPrimitiveCompleted: (current, _primitive, payload) => {
+    if (current.voice && payload.native_playback) {
+      voiceLatency.mark('first_pcm');
+      voiceLatency.complete();
+    }
     if (current.voice) voiceLatency.note({
       tts_generation_ms: payload.stats?.generation_ms,
       tts_decode_ms: payload.stats?.decode_ms,
@@ -1079,6 +1091,10 @@ async function toggleBookSpeech() {
   }
   const stream = [...ttsStreams.entries()].find(([, value]) => value.button === button);
   if (stream) {
+    if (nativeTtsPlayback()) {
+      await stopTts(stream[0]);
+      return;
+    }
     if (stream[1].paused) resumeTts(stream[0]);
     else pauseTts(stream[0]);
     return;
@@ -1313,8 +1329,8 @@ function renderSpeechModelLoad(kind) {
   const loading = Boolean(load.id);
   const details = speechProgressDetails(kind, load.progress);
   const label = kind === 'asr' ? 'ASR' : 'TTS';
-  const wasm = state.runtime.host === 'wasm';
-  $(`${kind}-model-controls`).hidden = !wasm;
+  const downloadable = ['wasm', 'android'].includes(state.runtime.host);
+  $(`${kind}-model-controls`).hidden = !downloadable;
   $(`${kind}-availability`).textContent = loading ? details.stage :
     load.error ? 'Load failed' : component.loaded ? 'Ready' : component.enabled ? 'Not loaded' : 'Disabled';
   const container = $(`${kind}-model-loading`);
@@ -1331,10 +1347,10 @@ function renderSpeechModelLoad(kind) {
   error.textContent = load.error;
   error.hidden = !load.error;
   const button = $(`load-${kind}-model`);
-  button.disabled = !wasm || !state.socketReady || loading || !component.enabled || component.loaded;
+  button.disabled = !downloadable || !state.socketReady || loading || !component.enabled || component.loaded;
   renderLoadButton(button, label, loading, component.loaded);
   if (kind === 'asr' || kind === 'tts') {
-    $(`onboarding-${kind}-option`).hidden = !wasm;
+    $(`onboarding-${kind}-option`).hidden = !downloadable;
     const onboarding = $(`onboarding-${kind}-loading`);
     onboarding.hidden = !loading;
     $(`onboarding-${kind}-loading-stage`).textContent = details.stage;
@@ -1357,11 +1373,11 @@ function renderSpeechModelLoad(kind) {
 function renderSpeechModelLoads() {
   renderSpeechModelLoad('asr');
   renderSpeechModelLoad('tts');
-  const wasm = state.runtime.host === 'wasm';
+  const downloadable = ['wasm', 'android'].includes(state.runtime.host);
   const missingAsr = state.components.asr?.enabled && !state.components.asr?.loaded;
   const missingTts = state.components.tts?.enabled && !state.components.tts?.loaded;
   const skip = $('skip-onboarding-asr');
-  skip.hidden = !wasm || (!missingAsr && !missingTts);
+  skip.hidden = !downloadable || (!missingAsr && !missingTts);
   skip.textContent = missingAsr && missingTts ? 'Continue without speech models' :
     missingAsr ? 'Continue without ASR' : 'Continue without TTS';
 }
@@ -1603,6 +1619,9 @@ function formatStats(stats) {
 function executionLabel(value) {
   if (['a_gpu', 'apple_gpu', 'mps'].includes(value)) return 'Metal GPU';
   if (value === 'cpu' || value === 'ynnpack') return 'CPU';
+  if (value === 'auto') return 'Auto';
+  if (value === 'npu' || value?.includes('qnn')) return 'Qualcomm NPU';
+  if (value === 'gpu') return 'GPU';
   if (value === 'vulkan') return 'Vulkan GPU';
   return value || 'Model ready';
 }
@@ -1644,7 +1663,7 @@ function renderMessages() {
   const needsAsr = !state.asrSetupSkipped && state.components.asr?.enabled && !state.components.asr?.loaded;
   const needsTts = !state.ttsSetupSkipped && state.components.tts?.enabled && !state.components.tts?.loaded;
   const needsOnboarding = !state.modelSetupDismissed &&
-    (!state.ready || (state.runtime.host === 'wasm' && (needsAsr || needsTts)));
+    (!state.ready || (['wasm', 'android'].includes(state.runtime.host) && (needsAsr || needsTts)));
   container.append(modelOnboarding);
   modelOnboarding.hidden = !needsOnboarding;
   if (!chat?.messages.length) {
@@ -1771,8 +1790,9 @@ function renderRuntime() {
     state.components.asr?.directory || 'Configured speech model';
   $('model-onboarding-tts-name').textContent = state.components.tts?.model_id ||
     state.components.tts?.directory || 'Configured text-to-speech model';
-  $('model-onboarding-execution').textContent =
-    $('wasm-backend').selectedOptions[0]?.textContent || executionLabel(state.backend);
+  $('model-onboarding-execution').textContent = executionLabel(
+    state.backend || state.runtime.requested_backend,
+  );
   $('send').disabled = (asrActive ? (!recording || sendAfterTranscription) :
     (state.busy || (!$('prompt').value.trim() && !draftImages.length))) || !state.ready || !state.socketReady;
   $('stop').hidden = !state.busy || asrActive || activeRequest?.kind === 'tts';
@@ -1791,6 +1811,9 @@ function renderRuntime() {
 }
 
 function render() {
+  const androidHost = state.runtime.host === 'android';
+  document.documentElement.classList.toggle('android-host', androidHost);
+  $('prompt').rows = androidHost ? 2 : 1;
   const chat = activeChat();
   $('conversation-title').textContent = chat?.title || 'New conversation';
   renderHistory(); renderMessages(); renderRuntime(); renderLanguageSwitchers();
@@ -1943,13 +1966,39 @@ function renderConfig() {
   $('system-prompt-status').textContent =
     (chat.system_prompt || '') === configured ? 'From configuration' : 'Modified for this session';
   const wasm = state.runtime.host === 'wasm';
+  const android = state.runtime.host === 'android';
+  const configurableRuntime = wasm || android;
+  const execution = $('wasm-backend');
+  const executionHost = android ? 'android' : 'wasm';
+  if (execution.dataset.host !== executionHost) {
+    const choices = android ? [
+      ['auto', 'Auto (NPU → GPU → CPU)'],
+      ['npu', 'NPU'],
+      ['gpu', 'GPU'],
+      ['cpu', 'CPU'],
+    ] : [
+      ['webgpu', 'WebGPU'],
+      ['cpu', 'WebAssembly CPU'],
+    ];
+    execution.replaceChildren(...choices.map(([value, label]) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      return option;
+    }));
+    execution.dataset.host = executionHost;
+  }
   $('tts-gpu-precision-row').hidden = !wasm || state.runtime.requested_backend !== 'webgpu';
   document.querySelector('[data-settings-page="cache"]').hidden = !wasm;
-  $('wasm-preferences').hidden = !wasm;
+  $('wasm-preferences').hidden = !configurableRuntime;
+  $('runtime-execution-setting').hidden = !configurableRuntime;
+  $('runtime-settings-disclaimer').textContent = wasm
+    ? 'The browser runtime is experimental and slower than native Kidi. Use the native desktop app for the best performance and reliability.'
+    : 'Models execute in Kidi’s native Android runtime; the bundled WebView provides the shared interface.';
   selectSettingsPage(!wasm && settingsPage === 'cache' ? 'llm' : settingsPage);
-  if (wasm) {
+  if (configurableRuntime) {
     $('wasm-model').value = state.runtime.model_id || $('wasm-model').value;
-    $('wasm-backend').value = state.runtime.requested_backend || 'cpu';
+    $('wasm-backend').value = state.runtime.requested_backend || (android ? 'auto' : 'cpu');
     $('wasm-threads').value = String(state.runtime.threads || 1);
     $('wasm-tokens').value = String(state.runtime.maximum_tokens || 512);
     renderModelProgress();
@@ -2204,13 +2253,15 @@ function setReadAloudState(button, state) {
   button.classList.toggle('active', mode !== 'idle');
   button.classList.toggle('paused', mode === 'paused');
   const subject = button.dataset.readAloudSubject || 'response';
-  const label = mode === 'playing' ? `Pause reading ${subject}` :
+  const label = mode === 'playing' && nativeTtsPlayback() ? `Stop reading ${subject}` :
+    mode === 'playing' ? `Pause reading ${subject}` :
     mode === 'paused' ? `Resume reading ${subject}` : `Read ${subject} aloud`;
   button.setAttribute('aria-label', label);
   button.title = label;
   const visible = button.querySelector('.read-aloud-label');
   const idleLabel = button.dataset.readAloudLabel || `Read ${subject}`;
-  if (visible) visible.textContent = mode === 'playing' ? 'Pause' : mode === 'paused' ? 'Resume' : idleLabel;
+  if (visible) visible.textContent = mode === 'playing' && nativeTtsPlayback() ? 'Stop' :
+    mode === 'playing' ? 'Pause' : mode === 'paused' ? 'Resume' : idleLabel;
 }
 
 function appendReadAloud(body, text) {
@@ -2221,6 +2272,10 @@ function appendReadAloud(body, text) {
   read.addEventListener('click', async () => {
     const stream = [...ttsStreams.entries()].find(([, value]) => value.button === read);
     if (stream) {
+      if (nativeTtsPlayback()) {
+        await stopTts(stream[0]);
+        return;
+      }
       if (stream[1].paused) resumeTts(stream[0]);
       else pauseTts(stream[0]);
     } else {
@@ -2299,6 +2354,8 @@ function updateTtsProgress(id, payload) {
     activeRequest.ttsStatus = payload.steps > 0 && payload.step > 0
       ? `Synthesizing speech · ${payload.step}/${payload.steps}`
       : 'Synthesizing speech…';
+  } else if (payload.phase === 'playing') {
+    activeRequest.ttsStatus = 'Playing speech…';
   }
   renderRuntime();
 }
@@ -2400,7 +2457,7 @@ function handleEvent(event) {
   if (event.type === 'runtime.ready' && event.id === runtimeLoadId) {
     runtimeLoadId = null;
     modelLoadError = '';
-    state.ready = true;
+    state.ready = payload.ready ?? true;
     state.backend = payload.backend || state.backend;
     state.runtime = {...state.runtime, ...(payload.runtime || {}), loading: false};
     state.components = payload.components || state.components;
@@ -2454,6 +2511,15 @@ function handleEvent(event) {
     if (activeRequest.voiceTurn) speech.append(event.id, delta);
     return;
   }
+  if (event.type === 'chat.started' && activeRequest?.id === event.id) {
+    if (runtimeLoadId === event.id) runtimeLoadId = null;
+    state.ready = true;
+    if (typeof payload.backend === 'string') state.backend = payload.backend;
+    state.runtime = {...state.runtime, ...(payload.runtime || {}), resident: true, loading: false};
+    state.components = payload.components || state.components;
+    renderRuntime();
+    return;
+  }
   if (event.type === 'chat.completed' && activeRequest?.id === event.id) {
     const speak = voiceMode && activeRequest.voiceTurn && activeRequest.voiceEpoch === voiceEpoch;
     const message = activeMessage();
@@ -2491,9 +2557,23 @@ function handleEvent(event) {
     return;
   }
   if (event.type === 'asr.started' && activeRequest?.id === event.id) {
-    beginCapture(payload.stream_id).catch(error => {
-      showNotice(error.message); send('cancel', event.id); finishRequest();
-    });
+    if (backend.nativeAudioCapture) {
+      const vad = state.components.asr?.settings?.vad || {};
+      recording = {
+        id: event.id,
+        native: true,
+        heardSpeech: true,
+        silenceLimitMs: Number(vad.silence_ms || realtimeProfile().endpointMs),
+      };
+      activeRequest.asrStatus = 'Listening…';
+      $('mic').classList.add('recording');
+      $('mic').setAttribute('aria-label', 'Stop dictation');
+      renderRuntime();
+    } else {
+      beginCapture(payload.stream_id).catch(error => {
+        showNotice(error.message); send('cancel', event.id); finishRequest();
+      });
+    }
     return;
   }
   if (event.type === 'asr.partial' && activeRequest?.id === event.id) {
@@ -2737,6 +2817,10 @@ function completeAudioStream(id) {
   const stream = ttsStreams.get(id);
   if (!stream) return;
   stream.completed = true;
+  if (nativeTtsPlayback()) {
+    finishTts(stream.button, id, true);
+    return;
+  }
   Promise.resolve(stream.delivery).then(() => {
     if (ttsStreams.get(id) !== stream) return;
     if (!stream.audioStarted || !playback) throw new Error('Speech completed without audio');
@@ -2757,9 +2841,7 @@ function audioFailure(id, error) {
 
 async function beginCapture(id) {
   const media = activeRequest?.id === id && activeRequest.pendingMedia ?
-    activeRequest.pendingMedia : await navigator.mediaDevices.getUserMedia({audio: {
-      channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true,
-    }});
+    activeRequest.pendingMedia : await navigator.mediaDevices.getUserMedia({audio: microphoneConstraints()});
   if (activeRequest?.id === id) activeRequest.pendingMedia = null;
   const context = new AudioContext();
   await context.audioWorklet.addModule(new URL('./capture-worklet.js', import.meta.url));
@@ -2836,6 +2918,16 @@ async function beginCapture(id) {
 function stopCapture(notify = true) {
   if (!recording) return;
   const current = recording; recording = null;
+  if (current.native) {
+    $('mic').classList.remove('recording'); $('mic').setAttribute('aria-label', 'Start dictation');
+    if (notify && activeRequest?.kind === 'asr') {
+      if (voiceMode) voiceLatency.begin(performance.now(), performance.now());
+      asrFinalizing = true;
+      send('asr.stop', activeRequest.id);
+    }
+    renderRuntime();
+    return;
+  }
   current.source.disconnect(); current.node.disconnect();
   for (const track of current.media.getTracks()) track.stop();
   current.context.close();
@@ -2865,9 +2957,20 @@ async function startDictation(epoch = voiceEpoch) {
   asrFinalizing = false;
   state.busy = true; showNotice(); renderRuntime();
   try {
-    const media = await navigator.mediaDevices.getUserMedia({audio: {
-      channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true,
-    }});
+    if (backend.nativeAudioCapture) {
+      $('prompt').blur();
+      await backend.requestMicrophonePermission();
+      activeRequest.asrStatus = 'Preparing speech recognition…';
+      renderRuntime();
+      send('asr.start', id, {
+        stream_id: audioId,
+        voice_mode: voiceMode,
+        language: selectedInputLanguages().join(','),
+        tts_options: voiceMode ? ttsRequestOptions(true) : undefined,
+      });
+      return;
+    }
+    const media = await navigator.mediaDevices.getUserMedia({audio: microphoneConstraints()});
     if (activeRequest?.id !== id) {
       for (const track of media.getTracks()) track.stop();
       return;
@@ -2883,6 +2986,15 @@ async function startDictation(epoch = voiceEpoch) {
     });
   }
   catch (error) { showNotice(error.message); finishRequest(); }
+}
+
+function microphoneConstraints() {
+  return {
+    channelCount: 1,
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  };
 }
 
 function toggleDictation() {
@@ -2917,21 +3029,32 @@ function stopVoiceMode(cancel = true) {
 function toggleVoiceMode() {
   if (voiceMode) return stopVoiceMode();
   if (state.busy) return;
+  if (state.runtime.host === 'android') {
+    showNotice('Continuous voice is temporarily unavailable on Android while native TTS stability is improved.');
+    return;
+  }
   voiceMode = true;
   voiceEpoch++;
   const epoch = voiceEpoch;
   showNotice();
   renderRuntime();
-  ensurePlayback().catch(error => {
-    showNotice(error.message);
-    stopVoiceMode();
-  });
+  if (!nativeTtsPlayback())
+    ensurePlayback().catch(error => {
+      showNotice(error.message);
+      stopVoiceMode();
+    });
   startDictation(epoch);
 }
 
 function startTts(text, button, voiceTurn = false, epoch = voiceEpoch, optionOverrides = {},
   streamMetadata = {}, finished = true) {
   if (state.busy) return false;
+  if (state.runtime.host === 'android' && speechUnits(plainSpeechText(text)) > ANDROID_MAX_TTS_UNITS) {
+    showNotice(
+      'Android read-aloud is temporarily limited to short text to protect device stability.',
+    );
+    return false;
+  }
   const id = crypto.randomUUID();
   const audioId = streamId++;
   activeRequest = {id, kind: 'tts', streamId: audioId, voiceTurn, voiceEpoch: voiceTurn ? epoch : null};
@@ -2940,7 +3063,7 @@ function startTts(text, button, voiceTurn = false, epoch = voiceEpoch, optionOve
   playbackStreamId = audioId;
   setReadAloudState(button, 'playing');
   state.busy = true; showNotice(); renderRuntime();
-  ensurePlayback().catch(error => showNotice(error.message));
+  if (!nativeTtsPlayback()) ensurePlayback().catch(error => showNotice(error.message));
   try {
     const options = {...ttsRequestOptions(voiceTurn), ...optionOverrides};
     const profile = voiceTurn ? realtimeProfile() : null;
@@ -3066,7 +3189,7 @@ async function sendMessage(event) {
         cacheIdentity: JSON.stringify([state.runtime.host, state.backend, state.components.tts?.directory]),
         segmentation: profile.segmentation,
       });
-      ensurePlayback().catch(error => audioFailure(audioId, error));
+      if (!nativeTtsPlayback()) ensurePlayback().catch(error => audioFailure(audioId, error));
     }
     const requestMessages = chat.messages.filter(message => !message.pending)
       .map(({role, content, images}) =>
@@ -3270,9 +3393,14 @@ $('book-document').addEventListener('scroll', () => {
     persist();
   }, 200);
 });
-window.addEventListener('resize', () => {
+function handleViewportResize() {
+  if (globalThis.scrollX || globalThis.scrollY) globalThis.scrollTo(0, 0);
   if (readerBookId && state.readerLanguage) scheduleReaderAlignment();
-});
+  if (state.view === 'chat' && followOutput)
+    requestAnimationFrame(() => { $('messages').scrollTop = $('messages').scrollHeight; });
+}
+window.addEventListener('resize', handleViewportResize);
+globalThis.visualViewport?.addEventListener('resize', handleViewportResize);
 $('open-config').addEventListener('click', () => { renderConfig(); $('config-dialog').showModal(); });
 $('close-config').addEventListener('click', () => $('config-dialog').close());
 $('apply-system-prompt').addEventListener('click', () => applySystemPrompt($('system-prompt').value));

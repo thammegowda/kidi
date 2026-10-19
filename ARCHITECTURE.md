@@ -9,6 +9,24 @@ code and replayed (see [Captured Steps](#captured-steps)).
 inference::{Decoder, Transcriber, Synthesizer} -> model::{Transformer, Gemma4, Whisper, OmniVoice} -> layers -> ops::Context -> backend
 ```
 
+## Application hosts
+
+`web/ui/` is Kidi's shared application interface. Host adapters implement one
+backend contract without duplicating UI behavior:
+
+- `web/hosts/wasm/` runs the native ABI in browser workers;
+- `web/hosts/desktop/` uses LiteApp's authenticated loopback WebSocket; and
+- `web/hosts/android/` uses an origin-scoped Android WebMessage port and invokes
+  the JNI runtime in the app process.
+
+All three use LiteApp's versioned request/event/cancellation envelopes. Android
+packages the UI in the APK and serves it from
+`https://appassets.androidplatform.net`; it does not load a hosted UI or start a
+loopback server. JSON carries control, progress, transcripts, and completion;
+ArrayBuffer messages carry bounded image uploads. Android microphone capture
+and TTS playback stay native through `AudioRecord` and `AudioTrack`, so audio
+samples never enter JavaScript.
+
 ## Ownership
 
 | Module | Responsibility |

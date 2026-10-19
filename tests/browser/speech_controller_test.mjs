@@ -145,6 +145,33 @@ test('cached speech preserves the same logical segment contract', async () => {
   assert.deepEqual([...run.pcm.at(-1).samples], [0.25, -0.25]);
 });
 
+test('native playback completion advances without returning PCM to the UI', async () => {
+  const run = harness();
+  run.controller.start({
+    id: 'native', streamId: 14,
+    text: 'First native sentence. Second native sentence.', finished: true,
+  });
+  const first = run.primitive(0);
+  run.controller.handleEvent({
+    id: first.id,
+    type: 'tts.completed',
+    payload: {native_playback: true, sample_rate: 24000, samples: 12000, chunks: 1},
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const second = run.primitive(1);
+  assert.ok(second);
+  run.controller.handleEvent({
+    id: second.id,
+    type: 'tts.completed',
+    payload: {native_playback: true, sample_rate: 24000, samples: 16000, chunks: 1},
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(run.pcm.length, 0);
+  assert.deepEqual(run.segments.map(segment => [segment.id, segment.native]), [[0, true], [1, true]]);
+  assert.equal(run.completed.length, 1);
+  assert.equal(run.completed[0].samples, 28000);
+});
+
 test('transport reset releases an active stream without another command', () => {
   const run = harness();
   run.controller.start({id: 'active', streamId: 9, text: 'Interrupted sentence.', finished: true});

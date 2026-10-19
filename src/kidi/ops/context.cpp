@@ -1039,6 +1039,8 @@ auto Context::rms_rotary(const Tensor& input, const Tensor& scale, const Tensor&
         if (angle->dimensions() != 4 || angle->size(0) != 1 || angle->size(1) != input.size(1) || angle->size(2) != 1 ||
             angle->size(3) != input.size(3) / 2 || angle->dtype() != tensor::DType::F32)
             throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid RMS rotary angles"});
+    if (impl_->compiler && !impl_->compiler->supports_step_operation(Operation::RMS_ROTARY))
+        return rotary(rms_norm(input, scale, epsilon), cosine, sine);
     return impl_->run({Operation::RMS_ROTARY, {}, tensor::DType::F32, epsilon}, {&input, &scale, &cosine, &sine});
 }
 auto Context::rms_rotary_slice(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,

@@ -18,9 +18,10 @@ also require connections to third-party hosting services, as explained below.
 
 ## Data on Your Device
 
-- **Chats:** Prompts, responses, saved transcripts, conversation titles, and
-  associated metadata are stored in the app's private local storage so you can
-  reopen conversations. Chat search also runs locally.
+- **Chats and reader data:** Prompts, responses, saved transcripts,
+  conversation titles, EPUBs, reader progress, and translations are stored in
+  the bundled WebView's origin-private local/cache storage so you can reopen
+  them. Search and reader caching also run locally.
 - **Photos:** Photos you choose or capture for a message are copied into private
   app storage and processed on-device. Kidi does not browse your entire photo
   library. Original photos held by another app remain under that app's control.
@@ -29,8 +30,9 @@ also require connections to third-party hosting services, as explained below.
   text becomes part of a saved conversation if you send it as a message.
 - **Read-aloud audio:** Optional text-to-speech and playback run on-device from
   in-memory audio buffers. Kidi does not save or upload the generated audio.
-- **Settings and models:** Preferences, downloaded model files, and locally
-  generated model caches are stored on your device.
+- **Settings and models:** Preferences are stored in the app's private WebView
+  profile. Downloaded model files and locally generated native caches are stored
+  separately in app-private Android storage.
 
 The app does not include advertising or tracking SDKs, usage analytics, or an
 automatic crash-report upload service. Local performance measurements, such as
@@ -83,7 +85,10 @@ backup tools, and operating-system behavior may vary; we do not control them.
 ## Security
 
 Kidi uses Android's app-private storage and HTTPS for its model-hosting
-connections. No software or device can guarantee complete security. Protect
+connections. The UI is bundled in the APK, loaded from Android's trusted
+`appassets.androidplatform.net` origin, and connected to native code through an
+origin-scoped WebMessage port rather than a broad JavaScript interface or hosted
+site. No software or device can guarantee complete security. Protect
 your device and avoid entering sensitive information on shared or compromised
 devices. On-device processing is not a promise of anonymity or protection from
 someone with access to your device.

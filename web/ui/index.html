@@ -176,7 +176,13 @@
       <div class="composer-wrap">
         <div class="notice" id="notice" hidden></div>
         <div class="attachments" id="attachments" hidden></div>
-        <p class="disclaimer">Kidi can make mistakes. Verify important information.</p>
+        <p class="disclaimer">
+          Kidi can make mistakes. Verify important information.
+          <span id="host-legal-links" hidden>
+            <a id="host-privacy" href="">Privacy</a>
+            <a id="host-terms" href="">Terms</a>
+          </span>
+        </p>
         <form class="composer" id="composer">
           <input id="image-files" type="file" accept="image/jpeg,image/png" multiple hidden>
           <button class="attach" id="attach" type="button" aria-label="Attach images" title="Attach images">＋</button>
@@ -360,12 +366,12 @@
         </div>
       </section>
       <section class="wasm-preferences" id="wasm-preferences" hidden>
-        <p class="wasm-settings-disclaimer" role="note">
+        <p class="wasm-settings-disclaimer" id="runtime-settings-disclaimer" role="note">
           The browser runtime is experimental and slower than native Kidi. Use the native desktop app for the best
           performance and reliability.
         </p>
         <div class="settings-section-heading">
-          <div><h3>Browser runtime</h3><p>Models run locally through WebAssembly or WebGPU.</p></div>
+          <div><h3>Local runtime</h3><p>Manage the models that run on this device.</p></div>
           <span id="wasm-runtime-status">Offline</span>
         </div>
         <div id="model-loading" class="model-loading" hidden>
@@ -378,7 +384,7 @@
           <label class="wide-setting"><span>Chat model ID</span>
             <input id="wasm-model" type="text" value="google/gemma-4-E2B-it-qat-mobile-transformers">
           </label>
-          <label><span>Execution</span><select id="wasm-backend">
+          <label id="runtime-execution-setting"><span>Execution</span><select id="wasm-backend">
             <option value="webgpu">WebGPU</option><option value="cpu">WebAssembly CPU</option>
           </select></label>
           <label><span>CPU threads</span><input id="wasm-threads" type="number" min="1" max="8" value="4"></label>

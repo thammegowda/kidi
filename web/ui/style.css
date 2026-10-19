@@ -49,8 +49,11 @@
 ::highlight(kidi-speech-playing) { background-color: var(--accent); color: var(--accent-ink); text-decoration: underline; }
 .speech-segment-ready { background: color-mix(in srgb, var(--accent) 22%, transparent); color: inherit; }
 .speech-segment-playing { background: var(--accent); color: var(--accent-ink); text-decoration: underline; }
-html, body { height: 100%; }
-body { height: 100dvh; margin: 0; overflow: hidden; background: var(--bg); color: var(--text); }
+html { height: 100%; overflow: hidden; }
+body {
+  position: fixed; inset: 0; margin: 0; overflow: hidden;
+  background: var(--bg); color: var(--text);
+}
 button, input, select, textarea { font: inherit; }
 button { color: inherit; }
 
@@ -606,8 +609,13 @@ textarea::placeholder { color: #727a84; }
 .voice-mode:hover { background: var(--panel-2); color: var(--text); }
 .voice-mode.active { background: #18342c; color: var(--accent); box-shadow: inset 0 0 0 1px #315a4c; }
 .voice-mode-icon { width: 16px; height: 16px; background: currentColor; mask: url("./icons/audio-waveform.svg") center / contain no-repeat; }
+.android-host .composer { gap: 10px; padding: 9px 9px 9px 12px; }
+.android-host .composer textarea { min-height: 48px; }
+.android-host .attach, .android-host .mic, .android-host .voice-mode { width: 38px; height: 40px; }
+.android-host .send { width: 40px; height: 40px; }
 .stop { height: 36px; padding: 0 14px; border-radius: 10px; background: #3b2429; color: var(--danger); font-weight: 700; }
 .disclaimer { margin: 0 0 6px; text-align: center; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.disclaimer a { margin-left: 7px; color: inherit; }
 .notice { margin: 0 0 8px; padding: 10px 13px; border: 1px solid #704047; border-radius: 10px; background: #29191d; color: #ffc0c0; font-size: 12px; }
 .reader-navigation { padding: 8px; }
 .reader-empty-nav { padding: 10px 8px; color: var(--muted); font-size: 11px; line-height: 1.5; }

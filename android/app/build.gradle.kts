@@ -86,6 +86,7 @@ android {
     packaging.jniLibs.keepDebugSymbols += "**/libQnnHtpV79Skel.so"
     sourceSets.getByName("main").res.srcDir(layout.buildDirectory.dir("generated/visionNotices"))
     sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/legalDocuments"))
+    sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/webAssets"))
     sourceSets.getByName("main").jniLibs.srcDir(layout.buildDirectory.dir("generated/qnnJniLibs"))
     ndkVersion = "28.0.13004108"
     externalNativeBuild {
@@ -99,16 +100,14 @@ android {
 tasks.named("preBuild").configure { dependsOn(stageQnnRuntime) }
 
 dependencies {
+    implementation("androidx.activity:activity-ktx:1.10.1")
     implementation(platform("androidx.compose:compose-bom:2025.04.01"))
-    implementation("androidx.activity:activity-compose:1.10.1")
-    implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-extended")
-    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.0")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.0")
+    implementation("androidx.compose.runtime:runtime")
+    implementation("androidx.webkit:webkit:1.13.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("io.noties.markwon:core:4.6.2")
-    implementation("io.noties.markwon:ext-latex:4.6.2")
+    "developerImplementation"("com.squareup.okhttp3:okhttp:4.12.0")
+    "developerImplementation"("androidx.activity:activity-compose:1.10.1")
+    "developerImplementation"("androidx.compose.material3:material3")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
@@ -116,11 +115,8 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
-    androidTestImplementation(platform("androidx.compose:compose-bom:2025.04.01"))
-    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
     androidTestImplementation("androidx.test.uiautomator:uiautomator:2.3.0")
-    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
 
 val visionNotices by tasks.registering(Sync::class) {
@@ -145,4 +141,32 @@ val legalDocuments by tasks.registering(Sync::class) {
     from(rootProject.file("PRIVACY.md"), rootProject.file("TERMS.md"))
     into(layout.buildDirectory.dir("generated/legalDocuments/legal"))
 }
-tasks.named("preBuild") { dependsOn(visionNotices, legalDocuments) }
+
+val sharedWebFiles = rootProject.file("../web/ui/assets.txt").readLines()
+    .map(String::trim).filter(String::isNotEmpty)
+val androidWebMappings = rootProject.file("assets.txt").readLines()
+    .map(String::trim).filter(String::isNotEmpty).associate { line ->
+        val fields = line.split('\t')
+        require(fields.size == 2) { "Invalid android/assets.txt entry: $line" }
+        fields[0].removePrefix("/") to fields[1]
+    }
+val webDestinations = sharedWebFiles + androidWebMappings.keys
+require(webDestinations.size == webDestinations.toSet().size) { "Duplicate Android web asset destination" }
+
+val webAssets by tasks.registering(Sync::class) {
+    into(layout.buildDirectory.dir("generated/webAssets"))
+    sharedWebFiles.forEach { relative ->
+        from(rootProject.file("../web/ui/$relative")) {
+            into(relative.substringBeforeLast('/', ""))
+            rename { relative.substringAfterLast('/') }
+        }
+    }
+    androidWebMappings.forEach { (relative, source) ->
+        from(rootProject.file("../$source")) {
+            into(relative.substringBeforeLast('/', ""))
+            rename { relative.substringAfterLast('/') }
+        }
+    }
+}
+
+tasks.named("preBuild") { dependsOn(visionNotices, legalDocuments, webAssets) }

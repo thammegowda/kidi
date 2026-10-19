@@ -1,9 +1,16 @@
 # Kidi for Android
 
-Kidi's Android app is a native ARM64 chat client for Gemma 4 with Whisper microphone dictation. Jetpack Compose owns
-the interface, a small JNI bridge owns application/runtime translation, and the existing C++ `inference::Generator`,
-`inference::Transcriber`, and YNNPACK backend perform inference. There is no WebView, remote inference service, or
-second implementation of either model.
+Kidi's Android app packages the same HTML/CSS/JavaScript interface used by the
+desktop and Wasm hosts. A hardened Android WebView loads those assets from the
+local `appassets.androidplatform.net` origin, exchanges LiteApp protocol messages
+with an origin-scoped WebMessage port, and delegates chat, translation, Whisper,
+and OmniVoice execution to the existing native C++ runtime through JNI. There is
+no hosted UI, loopback server, remote inference service, or second model
+implementation.
+
+The production app uses the shared Chat, Reader, model setup, vision, dictation,
+read-aloud, and continuous-voice surfaces. Jetpack Compose remains only in the
+developer build's separate accessory and benchmark activities.
 
 ## Requirements
 
@@ -24,19 +31,19 @@ sdkmanager --sdk_root="$HOME/Library/Android/sdk" \
 
 ## Camera and microphone accessory prototype
 
-Kidi has an opt-in client for the ESP32-P4/ESP32-C6 accessory protocol. A
-`kidi://pair/v1#...` invitation launches a confirmation dialog, pairs over BLE,
-and stores the resulting controller profile encrypted with Android Keystore.
-The existing photo and dictation controls then offer remembered **Phone** and
-**Accessory** sources.
+The `developer` build has an opt-in client for the ESP32-P4/ESP32-C6 accessory protocol. A
+`kidi://pair/v1#...` invitation opens a focused native accessory activity,
+pairs over BLE, and stores the resulting controller profile encrypted with
+Android Keystore. That developer-only screen lists saved accessories, verifies
+camera capture over the local Wi-Fi channel, and can unpair them. The production
+shared Chat/Reader UI does not expose prototype accessory controls.
 
 Accessory traffic uses an Android local-only Wi-Fi request and the returned
 network's socket factory; Kidi never rebinds the process-wide network. Control
-and media TLS certificates are pinned independently. Photos are bounded,
-digest-checked JPEGs imported through the normal image path. Audio is bounded
-16 kHz mono PCM16 and feeds the same voice-activity and Whisper pipeline as the
-phone microphone. A failed accessory capture is reported and never silently
-retried on a phone sensor.
+and media TLS certificates are pinned independently. Diagnostic photos are
+bounded and digest-checked, and audio protocol support remains covered by the
+accessory client tests. Failures are reported without silently retrying against
+phone sensors.
 
 Concurrent use with an existing Wi-Fi internet connection requires Android 12
 or newer and a phone that supports STA concurrency for local-only connections.
@@ -157,7 +164,7 @@ Keep the app in the foreground for large downloads. If Android terminates it,
 open settings and start the download again; downloaded partial bytes are retained.
 This retry handling does not guarantee continuation through process death.
 
-The current permission set is `INTERNET` and runtime `RECORD_AUDIO`. App-private
+The production permission set is `INTERNET` and runtime `RECORD_AUDIO`. App-private
 model/image storage needs no shared-storage permission. The system photo picker
 and camera activity use URI grants, so Kidi does not request broad gallery access
 or direct camera permission. Adding storage permissions will not fix a slow or
@@ -182,10 +189,11 @@ With the default Gemma 4 mobile model loaded, the composer offers camera and pho
 system camera app or select an image through Android's photo picker, inspect/remove the preview, and send a question.
 Sending only a photo uses "What is in this image?". Tap a photo in the conversation to view it larger.
 
-The app copies selected images into private storage, applies orientation/color conversion, and bounds them to a
-2048-pixel longest edge before saving JPEG. No broad photo-library permission is requested; camera capture uses a
-temporary, narrowly shared FileProvider URI. The private copy stays with the message when reopening a chat. Audio,
-video, and document attachments are not model inputs yet.
+The shared UI keeps selected JPEG/PNG blobs in origin-private browser storage
+and uploads bounded binary chunks to a request-scoped native cache before
+generation. No broad photo-library permission is requested; camera capture uses
+a temporary, narrowly shared FileProvider URI. Audio, video, and document
+attachments are not model inputs.
 
 Tahoma Vision decodes JPEG/PNG in the shared C++ core. Gemma's vision tower, image projection, and text-model image
 embeddings run on device using the vision weights already present in the default checkpoint. The tower loads lazily,
@@ -199,19 +207,20 @@ bindings are disabled in the embedded dependency build.
 
 ### Read Aloud
 
-Completed assistant responses can be synthesized with a converted OmniVoice
-package. Copy `model.yaml`, `model.safetensors`, `tokenizer.json`,
-`sentence-prefixes.tsv`, `synthesis_template.jinja`, `NOTICE`, and the complete
-`licenses/` directory into the app-private `models/tts` directory shown in
-Settings. Preserve the package directory structure because `model.yaml` lists
-the required license files. The model is detected on the next app start.
+Completed assistant responses and Reader chapters can be synthesized with the
+configured OmniVoice package. The shared one-time setup downloads the package,
+including its declared redistribution notices, into app-private storage and
+verifies each published LFS digest before making it current.
 
-Read-aloud automatically tries the built-in Vulkan backend and falls back to
-CPU. It does not require QAIRT, QNN libraries, or a KidiOps package. Requests
-are capped at 512 UTF-8 bytes until sustained mobile synthesis is qualified.
-Synthesis reports chunk progress, can be cancelled, and streams the completed
-PCM through a bounded `AudioTrack` buffer. Settings expose language, diffusion
-steps, and the OmniVoice gender, age, pitch, style, and accent attributes.
+Android read-aloud currently uses a stability-first CPU profile with
+classifier-free guidance disabled and at most four inference threads. It is
+temporarily limited to short text; longer responses and continuous voice are
+rejected before synthesis because sustained OmniVoice execution can trigger a
+device watchdog reset on the SM8750 test phone. Synthesis reports diffusion
+progress, can be cancelled, and plays PCM16 directly through Android
+`AudioTrack`. The WebView receives only progress and completion events.
+Settings expose language, diffusion steps, and the OmniVoice gender, age,
+pitch, style, and accent attributes.
 
 ### Speech Dictation
 
@@ -247,28 +256,18 @@ Speech runs on the CPU INT8 path in Auto mode; see [Accelerators](#accelerators)
 Release builds enable R8/resource shrinking and discard unused native dependency sections while preserving JNI
 entry points and partial-transcript callbacks.
 
-Speech has its own native lock and runtime thread, like the web app's speech worker, so it loads alongside Gemma and
-dictation never queues behind chat loading. Loading memory-maps the cached INT8 checkpoint and then transcribes a second
-of silence, so weight packing and operator preparation (about 1.4 seconds on the SM8750 phone) happen before the first
-recording. Speech is ready about 1.8 seconds after launch, and the microphone stays available while the chat model loads.
-A new model or missing INT8 cache still incurs the one-time conversion cost. Typing stays editable during model loading,
-and sending is enabled once chat is ready even when speech is preparing.
+Speech has its own native lock and runtime thread. Loading memory-maps the cached
+INT8 checkpoint; a new model or missing INT8 cache still incurs the one-time
+conversion cost. Typing stays editable during model loading, and sending is
+enabled once chat is ready even when speech is preparing.
 
-The microphone button requests `RECORD_AUDIO` permission when first used. Recording captures mono PCM at 16 kHz for at
-most 30 seconds. During recording, the bottom-right send button becomes a red stop control; tap it to finish earlier.
-It returns to Send after transcript refinement, while generation uses the same button to stop the response.
-Kidi automatically detects the language. Like the web app, each pass encodes only the recorded audio plus at least a
-second of silence, rounded up to 128-position encoder slices, instead of a padded 30-second window; output that repeats
-itself is decoded again over the full window. Drafts run every 1.2 seconds while recording, and as soon as a pause of
-300 ms follows new speech; a stale draft still running then is cancelled so the covering one starts at once. Partial
-text is published during token decoding and replaces the dictation suffix in the composer while recording. A draft
-failure is shown as an error rather than silently hiding updates; recording continues and the final pass is still
-attempted. The transcript is never sent to Gemma automatically. Audio remains in memory only for the current
-transcription and is not uploaded or saved.
-
-Stopping reuses a completed (or nearly complete) draft when it already covers all detected speech plus 200 ms, so the
-final transcript usually appears immediately. Speech is tracked from 20 ms frame energy against a slowly rising noise
-floor and a fraction of the loudest speech; the thresholds err toward counting speech, which only costs a final pass.
+The microphone button requests `RECORD_AUDIO` permission when first used.
+Android `AudioRecord` captures mono PCM at 16 kHz for at most 30 seconds and
+passes snapshots directly to native Whisper for partial transcripts. Manual
+dictation stops from the same microphone control; voice mode uses bounded
+energy-based endpointing after speech followed by silence. The WebView receives
+only partial/final text and status events. Audio remains in memory for the
+current transcription and is never uploaded or saved.
 Otherwise drafts in progress are cancelled and one final pass runs over the whole recording. On the SM8750 phone,
 LibriSpeech clips played through a speaker and stopped after a natural pause took 37-86 ms from Stop to final text for
 5.5-17.7 seconds of audio; stopping mid-sentence ran the final pass in 0.44 seconds for 5.8 seconds of audio. The
@@ -290,61 +289,39 @@ across changing audio, since Whisper's encoder is bidirectional; encoding remain
 
 ## Interface
 
-The chat interface follows the system light/dark theme and uses the canonical Kidi logo. A model-status strip opens
-settings, which separates model management from inference controls. Repository details and pinned revisions are
-expandable, and downloads are distinguished from native model preparation.
+Android uses the responsive shared interface documented in the
+[browser guide](../web/README.md). It follows system light/dark mode and provides
+the same Chat and Reader views, searchable local history, Markdown and diagrams,
+streaming metrics, image questions, microphone dictation, read aloud, continuous
+voice, model settings, EPUB import, incremental translation, and cached reader
+progress as the desktop/Wasm UI.
 
-Replies render Markdown, with selectable text and Android's contextual Copy action instead of permanent copy icons.
-During generation, reply text and token counters are batched at 100 ms intervals, with an immediate flush on completion,
-stop or failure. Inference does not wait for the UI interval. Closed LaTeX equations render while the response streams;
-unfinished equations remain text. Existing math drawables are retained as later text arrives, avoiding repeated
-placeholder/layout changes. Theme and text-size changes rebuild the renderer and its drawables.
-During generation, a fixed status strip shows the current phase, elapsed time, generated tokens, and live decode tok/s.
-It does not imply a completion percentage or use the small bouncing response bar. Live decode speed excludes image
-analysis and prompt prefill; elapsed time includes them. Final per-message metrics remain available after completion.
-Remote images are not loaded. Recording status stays above the composer so live transcript text remains readable.
-The microphone has a larger glyph and a 48 dp touch target; model names and device-status text are not repeated beside it.
-The composer respects keyboard insets, and conversation width is constrained on larger displays.
+Android owns only platform integration: the trusted WebView origin, microphone
+permission, system camera/photo/file pickers, external-link policy, keyboard and
+system-bar insets, and the WebMessage bridge. The bridge requires a current
+Android System WebView with ArrayBuffer WebMessage support; an unsupported
+WebView produces an explicit update message instead of falling back to a broad
+JavaScript interface or base64 media channel.
 
 The chat footer and the bottom of settings show an experimental-AI notice with
 Privacy and Terms links. Both documents open in a scrollable, selectable in-app
-reader and are bundled from [PRIVACY.md](PRIVACY.md) and [TERMS.md](TERMS.md), so
+WebView page and are bundled from [PRIVACY.md](PRIVACY.md) and [TERMS.md](TERMS.md), so
 they remain available offline. Links between those policies stay inside the app;
 external links open only when selected. The notice sets expectations, not a
 guarantee of accuracy, safety, legal protection, or user consent to new data uses.
 
-Lato is bundled for offline typography under the [SIL Open Font License](app/src/main/res/raw/lato_license.txt).
-Markdown uses [Markwon](https://github.com/noties/Markwon), licensed under Apache 2.0.
-
 ## Chat History and Storage
 
-The header logo opens the left chat drawer. It initially reads 30 recent thread summaries, then loads the next page
-as the list scrolls. Search uses an on-device full-text index over all saved message bodies, not just the visible page;
-words support prefix matching. Opening a thread reads its latest 50 messages, with earlier messages fetched on demand.
-Starting a new chat preserves the previous thread. The formerly saved single conversation is imported once on startup;
-conversations discarded by older app versions cannot be recovered.
+The shared UI stores chats and preferences in the WebView profile and stores
+images, EPUBs, and reader translations in origin-private browser storage. Native
+model packages and prepared caches use a separate app-private
+`liteapp-models` directory. Clearing Android app storage or uninstalling removes
+both stores.
 
-The SQLite database is private to the app and uses foreign keys, transactions, and write-ahead logging:
-
-| Record | Ownership and purpose |
-|---|---|
-| `threads` | Stable ID, title, last-message preview, creation/activity timestamps |
-| `participants` | User or agent identity, display name, optional model ID |
-| `thread_participants` | Thread membership; multiple agents can belong to a thread |
-| `messages` | Individual message ID, stable ordering, thread, sender, text, completion status, generation metrics |
-| `attachments` | Message-owned ordered image/document/audio/video references, MIME type, name, size, optional dimensions/duration |
-| `message_search` | Transactionally maintained full-text index |
-| `app_state` | Active thread and one-time legacy-import marker |
-
-Messages are appended individually, not serialized as one growing conversation blob. A sender must belong to the
-thread; participant kind/model identity cannot silently change. Thread deletion cascades to message and attachment
-metadata and the search index. Thread and message pagination use stable cursors rather than large SQL offsets.
-
-Attachment rows reference local `content://` or `file://` URIs; media bytes do not live in message/database rows.
-Image imports own private file copies; removing an unsent photo deletes that copy. Other attachment types remain
-storage-only and are rejected as model input. Agent membership records identify actual senders; they do not
-implement automatic agent scheduling. The current UI sends to the loaded agent, preserving previous agent identities
-when a different model is used in the same thread. Failed/stopped replies remain in history.
+The unified host intentionally starts with a fresh storage namespace. It does
+not import the retired Compose SQLite history, copied images, preferences, or
+model installation markers, and it does not silently delete those legacy files
+during this transition.
 
 ## Physical Hardware
 
@@ -400,6 +377,9 @@ not yet representative of a short interactive request.
 
 - **Auto** tries the Qualcomm NPU, Vulkan GPU, then CPU for chat, falling back only when loading fails. Speech stays on
   the quality-checked CPU INT8 path.
+- **CPU is the app default** while the current fused whole-step QNN graph is
+  requalified. Auto and explicit NPU remain available for accelerator testing,
+  but they are not selected silently on startup.
 - **CPU, GPU, NPU** are explicit: if that accelerator is unavailable or fails to load, the error is shown and the
   model stays offline rather than silently running elsewhere.
 - **GPU (experimental)** runs Gemma 4 on Adreno through Kidi's Vulkan backend (built into the APK; no extra files).
