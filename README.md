@@ -202,10 +202,13 @@ See the [browser guide](web/README.md) for getting started and browser requireme
 
 ### Android
 
-The Android app supports streaming chat, searchable conversation history, camera
-and photo-picker questions, and microphone dictation. It needs an **ARM64 phone
-running Android 10 or later**, enough RAM for the selected model, and several GB
-of free storage. Not every compatible phone will have the same performance.
+The Android app packages the same responsive LiteApp web interface as desktop
+and Wasm while executing chat, reader translation, vision, Whisper, and
+OmniVoice through the native JNI runtime. It supports streaming chat, searchable
+history, camera/photo questions, dictation, read aloud and continuous voice,
+plus EPUB reading and translation. It needs an **ARM64 phone running Android 10
+or later**, a current Android System WebView, enough RAM for the selected model,
+and several GB of free storage.
 
 Use an APK or Google Play testing invitation supplied by the maintainer. A Play
 test requires joining with the invited Google account; do not assume the beta
@@ -216,8 +219,8 @@ is available through public store search.
 3. Optionally download speech and allow microphone access to dictate. The current
   Whisper Small Q8 download is about **267 MB**, with a separate **249 MB** prepared
   cache. Existing Tiny/Base selections are not automatically replaced.
-4. Tap the logo to find earlier conversations. After setup, installed models
-  reopen offline.
+4. Use Chat or Reader; tap the logo to find earlier conversations. After setup,
+  installed models and the bundled UI reopen offline.
 
 Downloads require confirmation; model weights are not bundled in the APK. Keep
 the app open during initial downloads. Chats and copied photos are stored

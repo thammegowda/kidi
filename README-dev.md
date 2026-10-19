@@ -104,6 +104,14 @@ Requirements: JDK 17, SDK Platform 36, Build Tools 36.0.0, NDK 28.0.13004108,
 and Android CMake 3.31.6. The app ID is `ai.gowda.kidi`, minimum API is 29,
 target API is 36, and the current build packages ARM64 only.
 
+The production activity packages `web/ui/` with the Android host adapter from
+`web/hosts/android/`, serves it through `WebViewAssetLoader`, and connects it to
+the JNI runtime with LiteApp WebMessage envelopes and ArrayBuffer media frames.
+`android/assets.txt` is the explicit host-asset mapping; Gradle combines it with
+`web/ui/assets.txt` and fails on missing or duplicate destinations. The
+developer build additionally contains the separate Compose accessory and
+benchmark activities.
+
 From the repository root:
 
 ```bash
