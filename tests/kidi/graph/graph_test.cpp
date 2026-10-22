@@ -10,6 +10,7 @@
 
 #include "kidi/graph/graph.h"
 #include "kidi/ops/context.h"
+#include "kidi/runtime/operator.h"
 
 namespace {
 using kidi::ops::Context;
@@ -34,6 +35,23 @@ auto fill(Tensor& tensor, float start) -> void {
 auto expect(bool condition, const char* message) -> bool {
     if (!condition) std::cerr << "FAILED: " << message << '\n';
     return condition;
+}
+
+auto tensor_inputs_borrow_operands() -> bool {
+    const std::array<Tensor, 2> operands{};
+    const auto check = [&](kidi::runtime::TensorInputs inputs) {
+        const auto copied = inputs;
+        const auto prefix = copied.first(1);
+        return expect(inputs.size() == 2 && &inputs[0] == &operands[0] && &inputs[1] == &operands[1],
+                      "tensor inputs borrow the original operands") &&
+               expect(copied.size() == 2 && &copied.front() == &operands[0] && &copied.back() == &operands[1],
+                      "copied tensor inputs preserve borrowed operands") &&
+               expect(prefix.size() == 1 && &prefix.front() == &operands[0] && &prefix.back() == &operands[0],
+                      "tensor input prefixes preserve borrowing without changing the original view");
+    };
+    const kidi::runtime::TensorInputs empty{};
+    return check(operands) && check({&operands[0], &operands[1]}) &&
+           expect(empty.size() == 0, "tensor inputs support an empty operand list");
 }
 
 auto fails_with(const std::function<void()>& call, std::string_view text) -> bool {
@@ -434,6 +452,7 @@ auto planned_intermediates_preserve_rebinding() -> bool {
 } // namespace
 
 auto main() -> int {
+    if (!tensor_inputs_borrow_operands()) return 1;
     try {
         return planned_intermediates_preserve_rebinding() && replay_matches_eager() &&
                        replay_rebinds_inputs_and_views() && replay_updates_state_in_place() &&

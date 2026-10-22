@@ -115,6 +115,7 @@ constexpr auto to_string(DeviceKind kind) noexcept -> std::string_view {
         case DeviceKind::COUNT:
             return "unknown";
     }
+    std::unreachable();
 }
 
 inline auto to_string(Device device) -> std::string {

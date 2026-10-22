@@ -17,14 +17,13 @@ namespace kidi::runtime {
 class TensorInputs {
 public:
     TensorInputs(std::span<const tensor::Tensor> inputs) : contiguous_(inputs.data()), size_(inputs.size()) {}
-    TensorInputs(std::initializer_list<const tensor::Tensor*> inputs)
-        : indirect_(inputs.begin()), size_(inputs.size()) {}
+    TensorInputs(std::initializer_list<const tensor::Tensor*> inputs) : indirect_(inputs), size_(inputs.size()) {}
     template <std::size_t Size>
     TensorInputs(const std::array<tensor::Tensor, Size>& inputs)
         : TensorInputs(std::span<const tensor::Tensor>(inputs)) {}
     TensorInputs(const std::vector<tensor::Tensor>& inputs) : TensorInputs(std::span<const tensor::Tensor>(inputs)) {}
     auto operator[](std::size_t index) const -> const tensor::Tensor& {
-        return indirect_ ? *indirect_[index] : contiguous_[index];
+        return indirect_.size() != 0 ? *indirect_.begin()[index] : contiguous_[index];
     }
     auto front() const -> const tensor::Tensor& { return (*this)[0]; }
     auto back() const -> const tensor::Tensor& { return (*this)[size_ - 1]; }
@@ -37,7 +36,7 @@ public:
 
 private:
     const tensor::Tensor* contiguous_ = nullptr;
-    const tensor::Tensor* const* indirect_ = nullptr;
+    std::initializer_list<const tensor::Tensor*> indirect_;
     std::size_t size_;
 };
 
