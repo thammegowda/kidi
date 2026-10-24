@@ -90,7 +90,9 @@ self.onmessage = async ({data}) => {
                 throw new Error('The CPU backend requires cross-origin isolation');
             const unsupported = useGpu && webGpuSupport();
             if (unsupported) throw new Error(`WebGPU is unavailable: ${unsupported}. Use the WebAssembly CPU backend.`);
-            const {default: createKidi} = await import(useGpu ? './gpu/kidi.mjs' : './threads/kidi.mjs');
+            const runtimeModule = useGpu ? './gpu/kidi.mjs' :
+                data.singleThread ? './single/kidi.mjs' : './threads/kidi.mjs';
+            const {default: createKidi} = await import(runtimeModule);
             module = await createKidi({printErr: text => self.postMessage({type: 'log', text})});
             if (useGpu) {
                 const {createWebGpu} = await import('./webgpu.mjs');
@@ -123,6 +125,18 @@ self.onmessage = async ({data}) => {
                 result = await call('kidi_enqueue', ['string', 'number', 'number'],
                     [JSON.stringify(staged.messages), data.maximumTokens, data.imageMaxPixels ?? 3000000]);
             } finally { staged.dispose(); }
+            requestId = result.request_id;
+            inFlight = false;
+            setTimeout(step, 0);
+        } else if (data.type === 'editor') {
+            if (!ready || active || inFlight) throw new Error('Runtime is not ready for a new request');
+            active = true;
+            inFlight = true;
+            cancelRequested = false;
+            generationStarted = performance.now();
+            generation = {tokenCount: 0, elapsedMs: 0, decodeMs: 0, decodeTokens: 0, firstTokenMs: null};
+            const result = await call('kidi_editor_enqueue', ['string', 'number'],
+                [JSON.stringify(data.request), data.maximumTokens]);
             requestId = result.request_id;
             inFlight = false;
             setTimeout(step, 0);

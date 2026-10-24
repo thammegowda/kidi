@@ -341,6 +341,48 @@ async function modelFor(payload, emit, signal) {
     }
 }
 
+async function streamGeneration({payload, emit, signal}, enqueue) {
+    const {model, client} = await modelFor(payload, emit, signal);
+    let requestId;
+    let completed = false;
+    try {
+        const data = payload.data;
+        const hasImages = data.messages?.some(message => message.images?.length);
+        await reserve(model, (hasImages ? 1536 : 1024) * 1024 * 1024,
+            (hasImages ? 512 : 64) * 1024 * 1024, signal);
+        const enqueued = await enqueue(model, data, emit, signal);
+        requestId = enqueued.request_id;
+        cancelled(signal);
+        const started = performance.now();
+        let firstTokenMs = null, decodeMs = 0, decodeTokens = 0, tokens = 0;
+        for (;;) {
+            const stepStart = performance.now();
+            const step = await call(model, 'kidi_step', [], [], signal);
+            completed = !step.pending;
+            cancelled(signal);
+            const count = step.events.filter(event => event.token !== undefined).length;
+            if (count && model.reservation) {
+                model.reservation = {gpu: runtime.gpu.ownedBytes(model.key) + 64 * 1024 * 1024,
+                    host: hostOwned(model) + 16 * 1024 * 1024};
+            }
+            if (firstTokenMs !== null) { decodeMs += performance.now() - stepStart; decodeTokens += count; }
+            else if (count) firstTokenMs = performance.now() - started;
+            tokens += count;
+            emit('worker', {
+                type: 'step', ...step,
+                stats: {tokenCount: tokens, elapsedMs: performance.now() - started, decodeMs, decodeTokens, firstTokenMs},
+                gpuStats: {...runtime.gpu.stats},
+            });
+            if (completed) { model.warmed = true; return; }
+        }
+    } finally {
+        try {
+            if (!completed && requestId !== undefined && !reportedFailure)
+                await call(model, 'kidi_cancel', ['number'], [requestId]);
+        } finally { finishRequest(model, client); }
+    }
+}
+
 const router = new ServiceRouter(new MessageTransport(self));
 router.register('runtime.status', async () => ({
     type: 'runtime-status', memory: await memoryTotals(), gpuStats: runtime ? {...runtime.gpu.stats} : null,
@@ -382,53 +424,19 @@ router.register('load', async ({payload, emit, signal}) => {
     }
 });
 
-router.register('generate', async ({payload, emit, signal}) => {
-    const {model, client} = await modelFor(payload, emit, signal);
-    let requestId;
-    let completed = false;
+router.register('generate', request => streamGeneration(request, async (model, data, emit, signal) => {
+    const staged = await stageImages(runtime.module, data.messages, {directory: `/images/request-${nextDirectory++}`});
     try {
-        const data = payload.data;
-        const hasImages = data.messages?.some(message => message.images?.length);
-        await reserve(model, (hasImages ? 1536 : 1024) * 1024 * 1024,
-            (hasImages ? 512 : 64) * 1024 * 1024, signal);
-        const staged = await stageImages(runtime.module, data.messages, {directory: `/images/request-${nextDirectory++}`});
-        try {
-            if (staged.messages.some(message => message.images.length))
-                emit('worker', {type: 'encoding-images'});
-            const enqueued = await call(model, 'kidi_enqueue', ['string', 'number', 'number'],
-                [JSON.stringify(staged.messages), data.maximumTokens, data.imageMaxPixels ?? 3000000], signal);
-            requestId = enqueued.request_id;
-            cancelled(signal);
-        } finally { staged.dispose(); }
-        const started = performance.now();
-        let firstTokenMs = null, decodeMs = 0, decodeTokens = 0, tokens = 0;
-        for (;;) {
-            const stepStart = performance.now();
-            const step = await call(model, 'kidi_step', [], [], signal);
-            completed = !step.pending;
-            cancelled(signal);
-            const count = step.events.filter(event => event.token !== undefined).length;
-            if (count && model.reservation) {
-                model.reservation = {gpu: runtime.gpu.ownedBytes(model.key) + 64 * 1024 * 1024,
-                    host: hostOwned(model) + 16 * 1024 * 1024};
-            }
-            if (firstTokenMs !== null) { decodeMs += performance.now() - stepStart; decodeTokens += count; }
-            else if (count) firstTokenMs = performance.now() - started;
-            tokens += count;
-            emit('worker', {
-                type: 'step', ...step,
-                stats: {tokenCount: tokens, elapsedMs: performance.now() - started, decodeMs, decodeTokens, firstTokenMs},
-                gpuStats: {...runtime.gpu.stats},
-            });
-            if (completed) { model.warmed = true; return; }
-        }
-    } finally {
-        try {
-            if (!completed && requestId !== undefined && !reportedFailure)
-                await call(model, 'kidi_cancel', ['number'], [requestId]);
-        } finally { finishRequest(model, client); }
-    }
-});
+        if (staged.messages.some(message => message.images.length))
+            emit('worker', {type: 'encoding-images'});
+        return await call(model, 'kidi_enqueue', ['string', 'number', 'number'],
+            [JSON.stringify(staged.messages), data.maximumTokens, data.imageMaxPixels ?? 3000000], signal);
+    } finally { staged.dispose(); }
+}));
+
+router.register('editor', request => streamGeneration(request, (model, data, _emit, signal) =>
+    call(model, 'kidi_editor_enqueue', ['string', 'number'],
+        [JSON.stringify(data.request), data.maximumTokens], signal)));
 
 router.register('synthesize', async ({payload, emit, signal}) => {
     const {model, client} = await modelFor(payload, emit, signal);

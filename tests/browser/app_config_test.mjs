@@ -17,6 +17,11 @@ test('browser consumes the canonical desktop YAML configuration', async () => {
   assert.equal(config.models.tts.model_id, 'thammegowda/OmniVoice-q8');
   assert.equal(config.models.chat.system_prompt.includes('preserve natural code switching'), true);
   assert.match(config.models.chat.translation_prompt, /\{target_language\}/);
+  assert.deepEqual(Object.keys(config.models.chat.editor.prompts).sort(), [
+    'concise', 'custom', 'explain', 'formalize', 'friendly', 'polish', 'summarize',
+  ]);
+  assert.match(config.models.chat.editor.prompts.polish, /untrusted\s+data/);
+  assert.match(config.models.chat.editor.prompts.explain, /Return only the\s+explanation/);
   assert.deepEqual(config.models.chat.translation, {
     target_chars: 800,
     max_chars: 1200,

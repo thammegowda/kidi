@@ -2,6 +2,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test:extension": "node tools/test-extension.mjs",
     "test:pages": "node tools/test-pages.mjs"
   },
   "devDependencies": {

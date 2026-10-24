@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Kidi AI</title>
+  <link rel="stylesheet" href="./editor.css">
+  <script type="module" src="./editor.mjs"></script>
+</head>
+<body>
+  <header class="app-bar">
+    <img src="./icons/kidi-logo.png" alt="">
+    <div class="brand">
+      <strong>Kidi AI</strong>
+    </div>
+    <div id="runtime-status" class="runtime-status offline">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="runtime-status-label">Offline</span>
+    </div>
+  </header>
+  <div id="diagnostics" class="diagnostics" aria-label="Runtime diagnostics" hidden></div>
+  <main>
+    <section id="setup" class="model-setup" aria-labelledby="model-title">
+      <div class="model-row">
+        <div class="model-copy">
+          <span class="eyebrow">ON-DEVICE MODEL</span>
+          <strong id="model-title">Gemma 4 E2B</strong>
+          <span>2.49 GB setup · stored locally</span>
+        </div>
+        <button id="load-model" class="compact-button" type="button">Load</button>
+      </div>
+      <div id="model-progress" class="model-progress" hidden>
+        <div class="progress-heading">
+          <span id="load-stage">Preparing model</span>
+          <strong id="load-percent"></strong>
+        </div>
+        <progress id="load-progress" aria-label="Model loading progress"></progress>
+        <div class="progress-details">
+          <span id="load-bytes"></span>
+          <span id="load-transfer"></span>
+        </div>
+        <div id="load-file" class="progress-file"></div>
+        <div id="load-warning" class="progress-warning" hidden></div>
+      </div>
+    </section>
+
+    <section class="editor-workspace" aria-label="Text editor">
+      <div class="command-bar">
+        <label class="task-field">
+          <span>Action</span>
+          <select id="task">
+            <option value="polish">Polish</option>
+            <option value="explain">Explain</option>
+            <option value="summarize">Summarize</option>
+            <option value="formalize">Make formal</option>
+            <option value="friendly">Make friendly</option>
+            <option value="concise">Make concise</option>
+            <option value="custom">Custom instruction</option>
+          </select>
+        </label>
+        <button id="prompt-toggle" class="quiet-button" type="button"
+          aria-expanded="false" aria-controls="prompt-editor">Prompt</button>
+        <button id="run" class="primary-button" type="button">Run</button>
+        <button id="cancel" class="quiet-button" type="button" hidden>Cancel</button>
+      </div>
+      <label id="instruction-row" class="instruction-field" hidden>
+        <span>Instruction</span>
+        <input id="instruction" maxlength="2048" placeholder="Describe the requested edit">
+      </label>
+      <section id="prompt-editor" class="prompt-editor" hidden>
+        <div class="prompt-heading">
+          <label id="prompt-label" for="system-prompt">System prompt · Polish</label>
+          <button id="prompt-default" class="text-button" type="button" title="Reset to the configured default">
+            Default
+          </button>
+        </div>
+        <textarea id="system-prompt" rows="7" maxlength="16384"
+          aria-describedby="prompt-state"></textarea>
+        <span id="prompt-state">Configured default</span>
+      </section>
+
+      <div class="text-panel">
+        <div class="panel-heading">
+          <label for="source">Source</label>
+          <span id="source-count">0 characters</span>
+        </div>
+        <textarea id="source" rows="10" maxlength="65536"
+          placeholder="Select text on a page, or paste text here"></textarea>
+      </div>
+    </section>
+
+    <section id="result-card" class="text-panel result-panel" hidden>
+      <div class="panel-heading">
+        <label for="result">Result</label>
+        <span id="result-count">0 characters</span>
+      </div>
+      <textarea id="result" rows="10"></textarea>
+      <div class="result-actions">
+        <button id="replace" class="primary-button" type="button" hidden>Replace selection</button>
+        <button id="copy" class="quiet-button" type="button">Copy</button>
+      </div>
+    </section>
+    <p id="notice" role="status" aria-live="polite"></p>
+  </main>
+</body>
+</html>

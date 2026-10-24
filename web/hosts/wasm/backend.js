@@ -31,6 +31,7 @@ class WasmBackend {
       kv_cache_precision: CHAT.kv_cache_precision,
       system_prompt: DEFAULTS.systemPrompt,
       configured_system_prompt: DEFAULTS.systemPrompt,
+      editor_prompts: {...(CHAT.editor?.prompts || {})},
       translation_prompt: CHAT.translation_prompt ||
         'You are a literary translator. Translate <text_to_translate> into {target_language}. ' +
         'Use surrounding context only to resolve meaning and return only the translated text.',
@@ -612,6 +613,19 @@ class WasmBackend {
       });
       return;
     }
+    if (type === 'editor.run') {
+      if (!this.#ready || !this.#worker) return this.#error(id, 'not_ready', 'Load the browser model first');
+      if (this.#current) return this.#error(id, 'busy', 'Another inference request is active');
+      this.#current = {id, text: '', kind: 'editor'};
+      this.#event(id, 'editor.started');
+      this.#worker.postMessage({
+        type: 'editor',
+        request: payload,
+        maximumTokens: Number.isInteger(payload.maximum_tokens)
+          ? payload.maximum_tokens : Math.min(this.#settings.maximumTokens, 512),
+      });
+      return;
+    }
     if (type === 'chat.start') {
       if (!this.#ready || !this.#worker) return this.#error(id, 'not_ready', 'Load the browser model first');
       if (this.#current) return this.#error(id, 'busy', 'Another inference request is active');
@@ -738,6 +752,8 @@ class WasmBackend {
     const threads = Number.isInteger(requested.threads) && requested.threads >= 1 && requested.threads <= 8
       ? requested.threads : 1;
     const selectedBackend = requested.backend === 'webgpu' && !webGpuSupport() ? 'webgpu' : 'cpu';
+    const singleThread = selectedBackend === 'cpu' && !globalThis.crossOriginIsolated &&
+      globalThis.KIDI_SINGLE_THREAD_WASM === true;
     if (selectedBackend !== this.#settings.backend) this.#releaseTts();
     this.#settings = {
       ...this.#settings,
@@ -766,8 +782,9 @@ class WasmBackend {
     worker.postMessage({
       type: 'load',
       manifest: this.#settings.model,
-      threads: selectedBackend === 'webgpu' ? 1 : threads,
+      threads: selectedBackend === 'webgpu' || singleThread ? 1 : threads,
       backend: selectedBackend,
+      singleThread,
       cacheOnly: requested.cacheOnly === true,
       reload: requested.cacheOnly !== true,
     });
@@ -955,7 +972,16 @@ class WasmBackend {
       for (const item of data.events || []) {
         if (item.text) {
           this.#current.text += item.text;
-          this.#event(this.#current.id, `${kind}.delta`, {text: item.text});
+          this.#event(this.#current.id, `${kind}.delta`, {
+            text: item.text,
+            stats: {
+              elapsed_ms: data.stats?.elapsedMs || 0,
+              decode_tokens: data.stats?.decodeTokens || 0,
+              decode_ms: data.stats?.decodeMs || 0,
+              first_token_ms: data.stats?.firstTokenMs,
+              token_count: data.stats?.tokenCount || 0,
+            },
+          });
         }
         if (item.completed) {
           const completed = item.completed;
@@ -968,6 +994,8 @@ class WasmBackend {
               prefill_ms: 0,
               decode_ms: completed.decode_ms || data.stats?.decodeMs || 0,
               preparation_ms: 0,
+              first_token_ms: data.stats?.firstTokenMs,
+              token_count: data.stats?.tokenCount || completed.decode_tokens || 0,
             },
           });
           this.#current = null;

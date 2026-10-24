@@ -24,7 +24,8 @@ node web/tools/build.mjs build-web
 ```
 
 The packaged site contains two runtimes: the primary non-pthread WebGPU module
-and a pthread CPU fallback. There is no single-thread CPU artifact.
+and a pthread CPU fallback. Extension packages additionally include a
+single-thread CPU fallback for browsers that cannot isolate extension pages.
 
 ## Serve
 
@@ -115,6 +116,60 @@ The JavaScript files have distinct roles:
 Only browser assets and their licenses are copied to the deployment directory.
 Do not deploy build scripts or the build-only parsers. Serving via Python does not replace the
 JavaScript that runs in the browser. No Node server or model-export step is used.
+
+## Browser extensions
+
+Kidi packages the text editor as Manifest V3 extensions for Chromium browsers
+and Firefox:
+
+```bash
+make extension
+```
+
+The build compiles WebGPU, pthread CPU, and single-thread CPU Wasm runtimes,
+then produces:
+
+```text
+build-extension/chromium/
+build-extension/firefox/
+dist/kidi-chromium.zip
+dist/kidi-firefox.zip
+```
+
+Chrome and Edge use the Chromium package. Load
+`build-extension/chromium/` through the browser's extension developer page.
+For Firefox development, open `about:debugging`, choose **This Firefox**, and
+load `build-extension/firefox/manifest.json` as a temporary add-on.
+
+The extension adds **Polish with Kidi**, **Explain with Kidi**, and
+**Summarize with Kidi** to the selection context menu. Chromium opens a side
+panel; Firefox opens a sidebar. Editable input, textarea, and contenteditable
+selections can be replaced only while the captured text still matches. Other
+results remain available to copy. The compact **Prompt** control exposes the
+configured system prompt for each action. Edits are saved automatically per
+action in extension-local storage; **Default** removes the override and restores
+the shared YAML prompt.
+
+Once the model is ready, a compact diagnostics strip reports the active backend,
+host RAM, WebGPU buffer memory, live decode speed, output-token count, and
+time-to-first-token. Memory values come from the runtime allocator and WebGPU
+buffer accounting rather than browser-wide estimates.
+
+The extension contains executable JavaScript and Wasm locally. It downloads
+only model data from Hugging Face. The Chromium manifest opts into
+cross-origin isolation for pthread CPU inference. Firefox prefers WebGPU and
+uses the packaged single-thread CPU runtime when its extension page is not
+isolated.
+
+Run the installed Chromium smoke test after packaging:
+
+```bash
+make extension-smoke-test
+```
+
+The smoke test loads the unpacked extension in Chromium and verifies its
+service worker, editor page, extension origin, cross-origin isolation, and
+`SharedArrayBuffer` availability. It does not download the model.
 
 ## Model Source
 

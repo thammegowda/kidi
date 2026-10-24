@@ -13,7 +13,7 @@ TEST_DIST := .cache/test-dist
 
 export KIDI_HUB PYTHON
 
-.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test web-smoke-test regression-test test app app-dev wasm serve apk apk-release
+.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test web-smoke-test extension-smoke-test regression-test test app app-dev wasm extension serve apk apk-release
 
 setup-test:
 	bash tests/setup.sh
@@ -62,6 +62,12 @@ app-dev: app
 
 wasm:
 	node web/tools/build.mjs "$(WEB_DIR)"
+
+extension:
+	node web/tools/build-extension.mjs
+
+extension-smoke-test:
+	npm --prefix web run test:extension -- "$(abspath build-extension/chromium)"
 
 serve:
 	$(PYTHON) -m http.server "$(PORT)" --bind 127.0.0.1 --directory "$(WEB_DIR)"

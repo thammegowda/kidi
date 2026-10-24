@@ -1,3 +1,4 @@
+#include "kidi/app/editor.h"
 #include "kidi/core/memory.h"
 #include "kidi/inference/generator.h"
 #include "kidi/inference/synthesizer.h"
@@ -142,6 +143,30 @@ auto messages(const char* messages_json) -> std::vector<kidi::text::ChatMessage>
         result.push_back(std::move(item));
     }
     return result;
+}
+auto editor_request(const char* request_json) -> kidi::app::EditorRequest {
+    const auto value = nlohmann::json::parse(request_json);
+    if (!value.is_object()) throw std::runtime_error("Editor request must be an object");
+    auto task = kidi::ops::require(kidi::app::parse_editor_task(value.value("task", "")));
+    auto length = kidi::ops::require(kidi::app::parse_length_preference(value.value("length", "preserve")));
+    kidi::app::EditorRequest request{
+        .task = task,
+        .text = value.value("text", ""),
+        .length = length,
+    };
+    if (value.contains("system_prompt")) {
+        if (!value["system_prompt"].is_string()) throw std::runtime_error("Editor system prompt must be a string");
+        request.system_prompt = value["system_prompt"].get<std::string>();
+    }
+    if (value.contains("instruction")) {
+        if (!value["instruction"].is_string()) throw std::runtime_error("Editor instruction must be a string");
+        request.instruction = value["instruction"].get<std::string>();
+    }
+    if (value.contains("tone")) {
+        if (!value["tone"].is_string()) throw std::runtime_error("Editor tone must be a string");
+        request.tone = value["tone"].get<std::string>();
+    }
+    return kidi::ops::require(kidi::app::validate_editor_request(std::move(request)));
 }
 auto options(int maximum_tokens) -> kidi::inference::GenerationOptions {
     if (maximum_tokens < 1 || maximum_tokens > MAXIMUM_OUTPUT_TOKENS)
@@ -317,6 +342,15 @@ EMSCRIPTEN_KEEPALIVE auto kidi_enqueue(const char* messages_json, int maximum_to
         auto settings = options(maximum_tokens);
         settings.image_max_pixels = static_cast<std::size_t>(image_max_pixels);
         auto id = kidi::ops::require(loaded().enqueue_chat(request, settings));
+        return {{"request_id", id}};
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_editor_enqueue(const char* request_json, int maximum_tokens) -> const char* {
+    return answer([&]() -> nlohmann::json {
+        const auto request = editor_request(request_json);
+        auto id = kidi::ops::require(loaded().enqueue_chat(kidi::app::editor_messages(request),
+                                                          options(maximum_tokens)));
         return {{"request_id", id}};
     });
 }
