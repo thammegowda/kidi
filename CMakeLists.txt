@@ -79,6 +79,8 @@ target_compile_features(kidi_argparse PUBLIC cxx_std_23)
 
 add_library(kidi
     src/kidi/app/editor.cpp
+    src/kidi/app/prompts.cpp
+    src/kidi/app/document.cpp
     src/kidi/audio/duration.cpp
     src/kidi/audio/wav.cpp
     src/kidi/audio/whisper.cpp

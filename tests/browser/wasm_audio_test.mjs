@@ -7,9 +7,10 @@ const TEST_APP_CONFIG = {
     version: 1,
     model_hub: {remote: 'https://huggingface.co', local: '~/.cache/kidi/model-hub'},
     runtime: {threads: 4},
+    prompts: {system: 'Test prompt', translate: 'Translate into {target_language}.'},
     models: {
         chat: {enabled: true, model_id: 'google/test', accelerator: 'auto', precision: 'checkpoint',
-            kv_cache_precision: 'auto', system_prompt: 'Test prompt',
+            kv_cache_precision: 'auto',
             generation: {max_tokens: 128, context_tokens: 1024, prefix_cache_mb: 0}},
         asr: {enabled: true, model_id: 'openai/whisper-small', language: 'auto', max_tokens: 128,
             vad: {threshold: .012, minimum_speech_ms: 250, silence_ms: 800}},
@@ -124,6 +125,10 @@ test('browser PCM is Float32 and completion waits for transferable audio deliver
         connect({onPcm: frame => { frames.push(frame); return delivered.promise; }});
         backend.send('tts.start', 'first', {stream_id: 1, text: 'Hello', options: {gpu_precision: 'w8a8'}});
         const worker = await waitFor(() => workers.find(worker => worker.url.includes('tts-worker')));
+        assert.equal(worker.calls[0].modelHubRemote, 'https://huggingface.co');
+        worker.emit({type: 'initializing'});
+        assert.ok(events.some(event => event.type === 'tts.progress' && event.payload.type === 'initializing'),
+            'voice initialization is distinct from a completed download');
         await waitFor(() => visibleSynthesis(worker).length);
         assert.equal(worker.calls[0].matrixPrecision, 'w8a8');
         assert.equal(worker.calls[0].w8a8Kernel, 'float');

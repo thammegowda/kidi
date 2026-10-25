@@ -11,22 +11,20 @@
 <body>
   <header class="app-bar">
     <img src="./icons/kidi-logo.png" alt="">
-    <div class="brand">
-      <strong>Kidi AI</strong>
-    </div>
+    <strong>Kidi AI</strong>
     <div id="runtime-status" class="runtime-status offline">
       <span class="status-dot" aria-hidden="true"></span>
       <span id="runtime-status-label">Offline</span>
     </div>
+    <button id="new-chat" class="text-button" type="button" title="Clear this conversation">New chat</button>
   </header>
   <div id="diagnostics" class="diagnostics" aria-label="Runtime diagnostics" hidden></div>
   <main>
     <section id="setup" class="model-setup" aria-labelledby="model-title">
       <div class="model-row">
         <div class="model-copy">
-          <span class="eyebrow">ON-DEVICE MODEL</span>
           <strong id="model-title">Gemma 4 E2B</strong>
-          <span>2.49 GB setup · stored locally</span>
+          <span>2.49 GB setup · inference stays on this device</span>
         </div>
         <button id="load-model" class="compact-button" type="button">Load</button>
       </div>
@@ -37,71 +35,96 @@
         </div>
         <progress id="load-progress" aria-label="Model loading progress"></progress>
         <div class="progress-details">
-          <span id="load-bytes"></span>
-          <span id="load-transfer"></span>
+          <span id="load-bytes"></span><span id="load-transfer"></span>
         </div>
         <div id="load-file" class="progress-file"></div>
         <div id="load-warning" class="progress-warning" hidden></div>
       </div>
     </section>
 
-    <section class="editor-workspace" aria-label="Text editor">
-      <div class="command-bar">
-        <label class="task-field">
-          <span>Action</span>
-          <select id="task">
-            <option value="polish">Polish</option>
-            <option value="explain">Explain</option>
-            <option value="summarize">Summarize</option>
-            <option value="formalize">Make formal</option>
-            <option value="friendly">Make friendly</option>
-            <option value="concise">Make concise</option>
-            <option value="custom">Custom instruction</option>
-          </select>
-        </label>
-        <button id="prompt-toggle" class="quiet-button" type="button"
-          aria-expanded="false" aria-controls="prompt-editor">Prompt</button>
-        <button id="run" class="primary-button" type="button">Run</button>
-        <button id="cancel" class="quiet-button" type="button" hidden>Cancel</button>
+    <section class="context-tools" aria-label="Page context">
+      <div id="gmail-connect" class="gmail-connect" hidden>
+        <span>Work with drafts and opened emails in Gmail.</span>
+        <button id="enable-gmail" class="quiet-button" type="button">Enable Gmail</button>
       </div>
-      <label id="instruction-row" class="instruction-field" hidden>
-        <span>Instruction</span>
-        <input id="instruction" maxlength="2048" placeholder="Describe the requested edit">
+      <label id="draft-picker" hidden>
+        <span>Gmail draft</span>
+        <select id="gmail-draft" aria-label="Choose Gmail draft"></select>
       </label>
-      <section id="prompt-editor" class="prompt-editor" hidden>
-        <div class="prompt-heading">
-          <label id="prompt-label" for="system-prompt">System prompt · Polish</label>
-          <button id="prompt-default" class="text-button" type="button" title="Reset to the configured default">
-            Default
-          </button>
+      <div id="suggestions" class="suggestions" aria-label="Suggested actions"></div>
+      <div id="context-card" class="context-card" hidden>
+        <div class="context-heading">
+          <strong id="context-label"></strong>
+          <button id="clear-context" class="text-button" type="button" aria-label="Remove attached context">Remove</button>
         </div>
-        <textarea id="system-prompt" rows="7" maxlength="16384"
-          aria-describedby="prompt-state"></textarea>
-        <span id="prompt-state">Configured default</span>
-      </section>
+        <details>
+          <summary>View attached text</summary>
+          <pre id="context-text"></pre>
+        </details>
+        <p id="context-warning" class="context-warning" hidden></p>
+        <p id="context-followup" class="subtle" hidden></p>
+      </div>
+      <label id="translation-tools" class="language-tools" hidden>
+        <span>Translate to</span>
+        <select id="target-language" aria-label="Translation language">
+          <option value="">Choose a language…</option>
+        </select>
+      </label>
+      <span id="context-status" class="subtle"></span>
+    </section>
 
-      <div class="text-panel">
-        <div class="panel-heading">
-          <label for="source">Source</label>
-          <span id="source-count">0 characters</span>
-        </div>
-        <textarea id="source" rows="10" maxlength="65536"
-          placeholder="Select text on a page, or paste text here"></textarea>
+    <section id="conversation" class="conversation" aria-label="Conversation" aria-live="polite">
+      <div id="welcome" class="welcome">
+        <h1>How can I help?</h1>
+        <p>Chat privately, write an email, summarize an article, or translate a page.</p>
+        <p class="subtle">You can also select text on a page and choose Kidi from its right-click menu.</p>
       </div>
     </section>
 
-    <section id="result-card" class="text-panel result-panel" hidden>
-      <div class="panel-heading">
-        <label for="result">Result</label>
-        <span id="result-count">0 characters</span>
-      </div>
-      <textarea id="result" rows="10"></textarea>
-      <div class="result-actions">
-        <button id="replace" class="primary-button" type="button" hidden>Replace selection</button>
-        <button id="copy" class="quiet-button" type="button">Copy</button>
-      </div>
+    <section id="speech-player" class="speech-player" aria-label="Read aloud" hidden>
+      <span id="speech-status" role="status"></span>
+      <button id="speech-pause" class="text-button" type="button">Pause</button>
+      <button id="speech-stop" class="text-button" type="button">Stop audio</button>
     </section>
+
+    <section id="prompt-editor" class="prompt-editor" hidden>
+      <div class="prompt-heading">
+        <label for="prompt-action">System prompt</label>
+        <button id="prompt-default" class="text-button" type="button" title="Reset this action to its default">Default</button>
+      </div>
+      <select id="prompt-action" aria-label="Prompt for action"></select>
+      <textarea id="system-prompt" rows="5" maxlength="16384" aria-describedby="prompt-state"></textarea>
+      <span id="prompt-state" class="subtle">Configured default</span>
+    </section>
+
+    <form id="composer" class="composer">
+      <label for="message" class="visually-hidden">Message to Kidi</label>
+      <textarea id="message" rows="3" maxlength="2048" placeholder="Ask Kidi, or describe the email you want to write…"></textarea>
+      <div class="composer-actions">
+        <button id="prompt-toggle" class="text-button" type="button"
+          aria-expanded="false" aria-controls="prompt-editor">Prompt</button>
+        <span id="action-label" class="subtle">Chat</span>
+        <button id="cancel" class="quiet-button" type="button" hidden>Stop</button>
+        <button id="send" class="primary-button" type="submit">Send</button>
+      </div>
+    </form>
     <p id="notice" role="status" aria-live="polite"></p>
   </main>
+  <dialog id="speech-dialog" class="speech-dialog" aria-labelledby="speech-title">
+    <form id="speech-form">
+      <h2 id="speech-title">Read aloud on this device</h2>
+      <p id="speech-description"></p>
+      <p id="speech-model" class="subtle"></p>
+      <label for="speech-language">Narration language</label>
+      <select id="speech-language" required>
+        <option value="">Choose the text’s language…</option>
+      </select>
+      <p class="subtle">Languages are passed explicitly to the voice model; pronunciation quality varies by language.</p>
+      <div class="dialog-actions">
+        <button id="speech-decline" class="quiet-button" type="button">Not now</button>
+        <button class="primary-button" type="submit">Read aloud</button>
+      </div>
+    </form>
+  </dialog>
 </body>
 </html>

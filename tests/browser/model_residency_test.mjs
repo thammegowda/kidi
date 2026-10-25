@@ -41,6 +41,8 @@ test('model reuse includes execution precision and validates sources before devi
         modelIdentity('tts', {source: 'speech', matrixPrecision: 'w8a8', w8a8Kernel: 'float'}));
     assert.notEqual(modelIdentity('tts', {source: 'speech', matrixPrecision: 'w8a8'}),
         modelIdentity('tts', {source: 'speech', matrixPrecision: 'w8a8', w8a8Kernel: 'packed'}));
+    assert.notEqual(modelIdentity('chat', {source: 'model', modelHubRemote: 'https://huggingface.co'}),
+        modelIdentity('chat', {source: 'model', modelHubRemote: 'http://127.0.0.1:8765'}));
     assert.throws(() => modelIdentity('unknown', {source: 'speech'}), /valid kind/);
     assert.throws(() => modelIdentity('chat', {}), /valid kind/);
     assert.throws(() => modelIdentity('tts', {source: 'speech', matrixPrecision: 'invalid'}), /precision/);

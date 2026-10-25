@@ -1,6 +1,6 @@
 import {MessageTransport, ServiceRouter} from '../../../third_party/liteapp/web/liteapp.mjs';
 import {createWebGpu} from './webgpu.mjs';
-import {loadModel, storeConvertedSpeech} from './model-cache.mjs';
+import {configureModelHub, loadModel, storeConvertedSpeech} from './model-cache.mjs';
 import {stageImages} from './images.js';
 import {scopedModel} from './scoped-model.mjs';
 import {RuntimeScheduler, awaitWithSignal} from './runtime-scheduler.mjs';
@@ -219,6 +219,7 @@ async function prepareModel(model) {
         instance = await ensureRuntime(model.data);
         const {module, gpu} = instance;
         model.scope ||= scopedModel(module, model.directory);
+        configureModelHub(model.data.modelHubRemote || 'https://huggingface.co');
         if (model.matrixPrecision === 'mixed-f16' && !gpu.features.has('shader-f16'))
             throw new Error('Mixed FP16 matrices are unavailable; select the portable F32 profile');
         await reserve(model, (model.kind === 'chat' ? 1024 : model.kind === 'tts' ? 640 : 128) * mib,
@@ -357,7 +358,7 @@ async function streamGeneration({payload, emit, signal}, enqueue) {
         let firstTokenMs = null, decodeMs = 0, decodeTokens = 0, tokens = 0;
         for (;;) {
             const stepStart = performance.now();
-            const step = await call(model, 'kidi_step', [], [], signal);
+            const step = await call(model, payload.data.type === 'document' ? 'kidi_document_step' : 'kidi_step', [], [], signal);
             completed = !step.pending;
             cancelled(signal);
             const count = step.events.filter(event => event.token !== undefined).length;
@@ -366,7 +367,8 @@ async function streamGeneration({payload, emit, signal}, enqueue) {
                     host: hostOwned(model) + 16 * 1024 * 1024};
             }
             if (firstTokenMs !== null) { decodeMs += performance.now() - stepStart; decodeTokens += count; }
-            else if (count) firstTokenMs = performance.now() - started;
+            else if (payload.data.type === 'document' ? step.events.some(event => event.text) : count)
+                firstTokenMs = performance.now() - started;
             tokens += count;
             emit('worker', {
                 type: 'step', ...step,
@@ -377,8 +379,10 @@ async function streamGeneration({payload, emit, signal}, enqueue) {
         }
     } finally {
         try {
-            if (!completed && requestId !== undefined && !reportedFailure)
-                await call(model, 'kidi_cancel', ['number'], [requestId]);
+            if (!completed && requestId !== undefined && !reportedFailure) {
+                if (payload.data.type === 'document') await call(model, 'kidi_document_cancel');
+                else await call(model, 'kidi_cancel', ['number'], [requestId]);
+            }
         } finally { finishRequest(model, client); }
     }
 }
@@ -436,6 +440,10 @@ router.register('generate', request => streamGeneration(request, async (model, d
 
 router.register('editor', request => streamGeneration(request, (model, data, _emit, signal) =>
     call(model, 'kidi_editor_enqueue', ['string', 'number'],
+        [JSON.stringify(data.request), data.maximumTokens], signal)));
+
+router.register('document', request => streamGeneration(request, (model, data, _emit, signal) =>
+    call(model, 'kidi_document_enqueue', ['string', 'number'],
         [JSON.stringify(data.request), data.maximumTokens], signal)));
 
 router.register('synthesize', async ({payload, emit, signal}) => {

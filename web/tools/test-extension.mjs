@@ -7,9 +7,10 @@ import {chromium} from 'playwright';
 
 const extension = resolve(process.argv[2] || new URL('../../build-extension/chromium', import.meta.url).pathname);
 const screenshot = process.argv[3] ? resolve(process.argv[3]) : null;
+const channel = process.env.KIDI_BROWSER_CHANNEL || 'chromium';
 const profile = await mkdtemp(join(tmpdir(), 'kidi-extension-profile-'));
 const context = await chromium.launchPersistentContext(profile, {
-    channel: 'chromium',
+    channel,
     colorScheme: 'dark',
     headless: true,
     viewport: {width: 390, height: 800},
@@ -35,11 +36,15 @@ try {
     assert.equal(await page.locator('header strong').textContent(), 'Kidi AI');
     const header = await page.locator('.app-bar').boundingBox();
     assert.ok(header && header.height <= 42, `application header is compact: ${JSON.stringify(header)}`);
-    assert.equal(await page.locator('#task option').count(), 7);
+    assert.equal(await page.locator('#task').count(), 0, 'chat replaces the action dropdown');
+    assert.equal(await page.locator('#prompt-action option').count(), 13);
     await page.locator('#prompt-toggle').click();
     await page.locator('#prompt-editor').waitFor({state: 'visible'});
     const defaultPrompt = await page.locator('#system-prompt').inputValue();
-    assert.match(defaultPrompt, /untrusted data/);
+    const configuredSystem = await page.evaluate(async () =>
+        (await (await import('./backend.js')).backend.status()).components.chat.configured_system_prompt);
+    assert.equal(defaultPrompt, configuredSystem, 'extension chat uses the shared prompts.system default');
+    assert.match(defaultPrompt, /untrusted reference material/);
     const customPrompt = 'Use the company writing style. Return only the revised text.';
     await page.locator('#system-prompt').fill(customPrompt);
     assert.match(await page.locator('#prompt-state').textContent(), /saved automatically/);
@@ -54,8 +59,31 @@ try {
     const loadButton = await page.locator('#load-model').boundingBox();
     assert.ok(loadButton && loadButton.width <= 80 && loadButton.height <= 34,
         `model load action is compact: ${JSON.stringify(loadButton)}`);
-    const source = await page.locator('#source').boundingBox();
-    assert.ok(source && source.height >= 170, 'source editor receives the primary panel space');
+    const conversation = await page.locator('#conversation').boundingBox();
+    assert.ok(conversation && conversation.height >= 150, 'conversation receives the primary panel space');
+    const routes = await page.evaluate(async () => {
+        const {createGpuWorker} = await import('./runtime-client.mjs');
+        const results = [];
+        for (const type of ['editor', 'document']) {
+        const worker = createGpuWorker('chat');
+        try {
+            results.push(await new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('GPU editor route timed out')), 10000);
+                worker.onmessage = ({data}) => { clearTimeout(timer); resolve(data); };
+                worker.onerror = event => { clearTimeout(timer); reject(new Error(event.message)); };
+                worker.postMessage({
+                    type, request: {task: 'email_reply', mode: 'summarize', text: 'Can we meet?'}, maximumTokens: 8,
+                });
+            }));
+        } finally { worker.terminate(); }
+        }
+        return results;
+    });
+    for (const routed of routes) {
+        assert.equal(routed.type, 'error');
+        assert.match(routed.error, /Load the model session before inference/);
+        assert.doesNotMatch(routed.error, /Unknown service method/);
+    }
     const runtime = await page.evaluate(() => ({
         isolated: crossOriginIsolated,
         sharedArrayBuffer: typeof SharedArrayBuffer,
@@ -68,7 +96,7 @@ try {
     });
     assert.deepEqual(errors, []);
     if (screenshot) await page.screenshot({path: screenshot, fullPage: true});
-    console.log(`Chromium extension smoke test passed: ${extensionId}`);
+    console.log(`${channel} extension smoke test passed: ${extensionId}`);
 } finally {
     await context.close();
     await rm(profile, {recursive: true, force: true});

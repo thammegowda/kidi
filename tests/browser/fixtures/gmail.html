@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Gmail test mailbox</title></head>
+<body>
+  <nav>Inbox: unrelated private snippet that must not enter a prompt</nav>
+  <main role="main">
+    <h2>Project update</h2>
+    <section class="adn" data-message-id="received-one">
+      <span email="alex@example.invalid">Alex</span>
+      <div class="a3s" id="received-body">
+        <div>Could we meet on Friday to review the report?</div>
+        <div class="gmail_quote">Older quoted message which must not be included</div>
+      </div>
+    </section>
+    <section class="adn" id="inline-reply" hidden>
+      <div id="reply-body" role="textbox" contenteditable="true" g_editable="true" aria-label="Reply text">
+        <div class="gmail_signature">My reply signature</div>
+      </div>
+      <button type="button" data-send>Send reply</button>
+    </section>
+  </main>
+  <section role="dialog" aria-label="Compose one">
+    <form>
+      <input name="subjectbox" value="Launch plan">
+      <div id="draft-one" role="textbox" contenteditable="true" g_editable="true" aria-label="Nachrichtentext">
+        <div>hello sam, this is my rough launch draft.</div>
+        <div>the report will be ready monday.</div>
+        <div class="gmail_signature"><b>My signature</b><br>Example team</div>
+        <div class="gmail_quote"><i>Original quoted reply</i></div>
+      </div>
+      <button type="button" data-send>Send first email</button>
+    </form>
+  </section>
+  <section role="dialog" aria-label="Compose two">
+    <form>
+      <input name="subjectbox" value="Different recipient">
+      <div id="draft-two" role="textbox" contenteditable="true" g_editable="true" aria-label="Message Body">
+        <div>This other draft must not be replaced.</div>
+        <div data-smartmail="gmail_signature"><em>Second signature</em></div>
+      </div>
+      <button type="button" data-send>Send second email</button>
+    </form>
+  </section>
+</body>
+</html>

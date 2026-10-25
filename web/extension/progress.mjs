@@ -67,7 +67,7 @@ export function runtimeDiagnostics(snapshot = {}, stats = {}) {
     return [
         {key: 'backend', label: 'Backend', value: backend},
         ...(hostBytes ? [{key: 'ram', label: 'RAM', value: formatBytes(hostBytes)}] : []),
-        ...(gpuBytes ? [{key: 'gpu', label: 'GPU', value: formatBytes(gpuBytes)}] : []),
+        ...(gpuBytes ? [{key: 'gpu', label: 'GPU mem', value: formatBytes(gpuBytes)}] : []),
         ...(decodeTokens && decodeMs
             ? [{key: 'speed', label: 'Speed', value: `${(decodeTokens * 1000 / decodeMs).toFixed(1)} tok/s`}]
             : []),

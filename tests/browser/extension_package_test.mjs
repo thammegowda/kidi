@@ -25,8 +25,12 @@ test('packages Chromium and Firefox extensions without hosted-page isolation scr
         assert.match(manifest.content_security_policy.extension_pages, /wasm-unsafe-eval/);
         assert.doesNotMatch(manifest.content_security_policy.extension_pages, /(?:^|\s)'unsafe-eval'/);
         for (const file of ['background.mjs', 'editor.html', 'editor.mjs', 'editor.css',
-            'progress.mjs', 'selection-bridge.js', 'single/kidi.mjs', 'single/kidi.wasm'])
+            'progress.mjs', 'selection-bridge.js', 'gmail-bridge.js', 'article-bridge.js',
+            'read-aloud.js', 'audio-playback.js', 'speech-controller.js', 'playback-worklet.js',
+            'libs/readability/Readability.js', 'libs/readability/LICENSE', 'single/kidi.mjs', 'single/kidi.wasm'])
             await access(join(output, file));
+        assert.deepEqual(manifest.optional_host_permissions, ['https://mail.google.com/*']);
+        assert.equal(manifest.host_permissions, undefined);
         await assert.rejects(access(join(output, 'coi-serviceworker.js')));
         assert.doesNotMatch(await readFile(join(output, 'index.html'), 'utf8'), /coi-serviceworker/);
     }

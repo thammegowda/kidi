@@ -21,9 +21,10 @@ const hex = bytes => Array.from(new Uint8Array(bytes), byte => byte.toString(16)
 
 export function configureModelHub(remote) {
     const url = new URL(remote);
-    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash ||
+    const loopback = url.protocol === 'http:' && url.hostname === '127.0.0.1';
+    if ((!loopback && url.protocol !== 'https:') || url.username || url.password || url.search || url.hash ||
         (url.pathname !== '/' && url.pathname !== ''))
-        throw new Error('Model Hub remote must be a public HTTPS origin');
+        throw new Error('Model Hub remote must be a public HTTPS or loopback HTTP origin');
     MODEL_HUB_REMOTE = url.origin;
 }
 const referenceKey = modelId =>
@@ -517,8 +518,14 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
         }
         if (probe) return null;
         if (cacheOnly) throw new Error('Model cache incomplete or damaged. Click Load model to download missing data.');
-        const response = await fetch(cacheUrl === url ? key : url, {mode: 'cors', credentials: 'omit',
-            headers: ranged ? {Range: `bytes=${start}-${end}`} : {}, signal: AbortSignal.timeout(120000)});
+        const request = cacheUrl === url ? key : url;
+        let response;
+        try {
+            response = await fetch(request, {mode: 'cors', credentials: 'omit',
+                headers: ranged ? {Range: `bytes=${start}-${end}`} : {}, signal: AbortSignal.timeout(120000)});
+        } catch (error) {
+            throw new Error(`Model fetch failed for ${request.href}: ${error.message}`, {cause: error});
+        }
         let total;
         if (ranged) {
             const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range') || '');

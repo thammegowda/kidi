@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Kidi AI",
   "short_name": "Kidi AI",
-  "description": "Polish, explain, and summarize selected text using a private on-device model.",
+  "description": "Private local chat, Gmail draft editing, and reply suggestions powered by an on-device model.",
   "version": "0.1.0",
   "minimum_chrome_version": "121",
   "permissions": [
@@ -13,6 +13,7 @@
     "storage",
     "unlimitedStorage"
   ],
+  "optional_host_permissions": ["https://mail.google.com/*"],
   "background": {
     "service_worker": "background.mjs",
     "type": "module"
@@ -27,7 +28,7 @@
     "128": "icons/kidi-logo.png"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; object-src 'self';"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https://huggingface.co http://127.0.0.1:*; object-src 'self';"
   },
   "cross_origin_embedder_policy": {
     "value": "require-corp"

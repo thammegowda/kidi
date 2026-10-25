@@ -14,3 +14,10 @@ python tests/gemma4_reference.py tests/data/gemma4
 
 Normal CTest execution reads the checked-in fixtures and does not require Python,
 PyTorch, Transformers, a network connection, or a pretrained checkpoint.
+
+The extension's CPU Wasm test also creates an in-memory variant: it zeros the
+matrix projections and sets three token embeddings to produce a fixed word
+followed by EOS. This tests multi-section summary/translation sequencing, token
+budgets, rolling summary replacement, and cancellation through actual inference
+without relying on random stopping behavior. It does not change this checkpoint
+or measure writing quality.

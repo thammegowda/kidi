@@ -1,8 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {deleteCachedModel, interleavePacked, isModelCached, listCachedModels, loadModel, resolveModelSource,
+import {configureModelHub, deleteCachedModel, interleavePacked, isModelCached, listCachedModels, loadModel, resolveModelSource,
     storeConvertedSpeech, weightLayout} from '../../web/hosts/wasm/model-cache.mjs';
 import {unsignedHeapIndices} from '../../web/tools/wasm-glue.mjs';
+
+test('model Hub configuration permits only HTTPS or explicit IPv4 loopback HTTP', () => {
+    assert.doesNotThrow(() => configureModelHub('https://huggingface.co'));
+    assert.doesNotThrow(() => configureModelHub('http://127.0.0.1:8765'));
+    for (const remote of [
+        'http://localhost:8765', 'http://0.0.0.0:8765', 'http://192.168.1.2:8765',
+        'http://example.com', 'file:///tmp/models', 'http://127.0.0.1:8765/path',
+    ]) assert.throws(() => configureModelHub(remote), /public HTTPS or loopback HTTP/);
+    configureModelHub('https://huggingface.co');
+});
 
 test('built wasm32 runtime addresses memory above 2 GiB within its 4 GiB limit', {skip: !process.env.KIDI_TEST_WASM}, async () => {
     const {pathToFileURL} = await import('node:url');

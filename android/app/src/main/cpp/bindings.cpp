@@ -1,4 +1,5 @@
 #include "kidi/checkpoint/prepare.h"
+#include "kidi/app/prompts.h"
 #include "kidi/inference/generator.h"
 #include "kidi/inference/synthesizer.h"
 #include "kidi/inference/transcriber.h"
@@ -13,6 +14,7 @@
 #include <nlohmann/json.hpp>
 #include <sys/system_properties.h>
 #include <uni_algo/conv.h>
+#include <yaml-cpp/yaml.h>
 
 #include <atomic>
 #include <chrono>
@@ -220,8 +222,17 @@ auto hardware_info() -> nlohmann::json {
 }
 } // namespace
 
-extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_configure(JNIEnv* environment, jobject,
-                                                                             jint threads) -> jstring {
+extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_applicationPrompts(JNIEnv* environment, jobject,
+                                                                                      jstring configuration)
+    -> jstring {
+    return answer(environment, [&]() -> nlohmann::json {
+        const auto root = YAML::Load(JavaString(environment, configuration).get());
+        return {{"prompts", kidi::ops::require(kidi::app::application_prompts(root, "native"))}};
+    });
+}
+
+extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_configure(JNIEnv* environment, jobject, jint threads)
+    -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
         if (threads < 1 || threads > 8) throw std::runtime_error("Threads must be between 1 and 8");
         // Chat and speech both configure before loading on their own threads. Serializing configuration lets the
@@ -298,12 +309,10 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_load(JNIEnv* 
         for (const auto device : candidates(preference, false, true)) {
             const auto attempt_started = std::chrono::steady_clock::now();
             auto ready = [&]() -> kidi::Result<kidi::inference::Generator> {
-                auto loaded = kidi::inference::Generator::load(
-                    path.get(),
-                    {.device = device,
-                     .precision = *precision,
-                     .kv_cache_precision = *kv_cache_precision,
-                     .packed_prefill = true});
+                auto loaded = kidi::inference::Generator::load(path.get(), {.device = device,
+                                                                            .precision = *precision,
+                                                                            .kv_cache_precision = *kv_cache_precision,
+                                                                            .packed_prefill = true});
                 if (!loaded) return loaded;
                 const auto loaded_at = std::chrono::steady_clock::now();
                 if (auto configured = loaded->configure_serving({1, 1, CONTEXT_TOKENS, 32}); !configured)
@@ -348,8 +357,8 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_load(JNIEnv* 
 }
 
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_enqueue(JNIEnv* environment, jobject,
-                                                                           jstring messages_json,
-                                                                           jint maximum_tokens) -> jstring {
+                                                                           jstring messages_json, jint maximum_tokens)
+    -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
         JavaString source(environment, messages_json);
         std::scoped_lock lock(runtime_mutex);
@@ -525,8 +534,8 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_transcription
 }
 
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_loadTts(JNIEnv* environment, jobject,
-                                                                          jstring directory,
-                                                                          jstring accelerator) -> jstring {
+                                                                           jstring directory, jstring accelerator)
+    -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
         JavaString path(environment, directory);
         const auto preference = JavaString(environment, accelerator).get();
@@ -548,21 +557,18 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_loadTts(JNIEn
             if (preference != "auto") throw kidi::ops::Failure(loaded.error());
         }
         if (!synthesizer) throw std::runtime_error(attempts.back()["error"].get<std::string>());
-        return {{"ready", true},
-                {"backend", synthesizer->execution()},
-                {"accelerator", preference},
-                {"fallbacks", attempts},
-                {"load_ms", std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - started)
-                                .count()}};
+        return {
+            {"ready", true},
+            {"backend", synthesizer->execution()},
+            {"accelerator", preference},
+            {"fallbacks", attempts},
+            {"load_ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count()}};
     });
 }
 
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_synthesize(JNIEnv* environment, jobject,
-                                                                              jstring text,
-                                                                              jstring language,
-                                                                              jint steps,
-                                                                              jstring voice_json,
+                                                                              jstring text, jstring language,
+                                                                              jint steps, jstring voice_json,
                                                                               jobject listener) -> jshortArray {
     try {
         const auto source = JavaString(environment, text).get();
@@ -578,8 +584,7 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_synthesize(JN
         options.steps = static_cast<std::size_t>(steps);
         options.guidance_scale = 0.F;
         options.on_progress = [](std::size_t, std::size_t) {
-            if (tts_cancelled.load(std::memory_order_relaxed))
-                throw std::runtime_error("TTS synthesis cancelled");
+            if (tts_cancelled.load(std::memory_order_relaxed)) throw std::runtime_error("TTS synthesis cancelled");
         };
         if (listener) {
             const auto listener_class = environment->GetObjectClass(listener);
@@ -612,13 +617,12 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_synthesize(JN
             token_hash ^= static_cast<std::uint32_t>(token);
             token_hash *= 1099511628211ULL;
         }
-        __android_log_print(
-            ANDROID_LOG_INFO, "KidiTts",
-            "synthesis_stats generation_ms=%.3f decode_ms=%.3f preparation_ms=%.3f "
-            "audio_tokens=%zu chunks=%zu samples=%zu text_bytes=%zu token_hash=%016llx",
-            result.stats.generation_ns / 1e6, result.stats.decode_ns / 1e6, result.stats.preparation_ns / 1e6,
-            result.stats.audio_tokens, result.stats.chunks, result.samples.size(), source.size(),
-            static_cast<unsigned long long>(token_hash));
+        __android_log_print(ANDROID_LOG_INFO, "KidiTts",
+                            "synthesis_stats generation_ms=%.3f decode_ms=%.3f preparation_ms=%.3f "
+                            "audio_tokens=%zu chunks=%zu samples=%zu text_bytes=%zu token_hash=%016llx",
+                            result.stats.generation_ns / 1e6, result.stats.decode_ns / 1e6,
+                            result.stats.preparation_ns / 1e6, result.stats.audio_tokens, result.stats.chunks,
+                            result.samples.size(), source.size(), static_cast<unsigned long long>(token_hash));
         if (result.samples.size() > static_cast<std::size_t>(std::numeric_limits<jsize>::max()))
             throw std::runtime_error("Synthesized audio is too large for Android");
         synthesis_sample_rate = result.sample_rate;

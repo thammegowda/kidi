@@ -66,7 +66,7 @@ test('extension runtime diagnostics report backend, memory, speed, tokens, and l
     assert.deepEqual(diagnostics, [
         {key: 'backend', label: 'Backend', value: 'WebGPU'},
         {key: 'ram', label: 'RAM', value: '768 MB'},
-        {key: 'gpu', label: 'GPU', value: '1.00 GB'},
+        {key: 'gpu', label: 'GPU mem', value: '1.00 GB'},
         {key: 'speed', label: 'Speed', value: '32.0 tok/s'},
         {key: 'tokens', label: 'Output', value: '128 tok'},
         {key: 'latency', label: 'TTFT', value: '0.75 s'},
