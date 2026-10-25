@@ -49,6 +49,8 @@ try {
   const errors = [];
   panel.on('pageerror', error => errors.push(error.message));
   await panel.goto(`chrome-extension://${extensionId}/editor.html?tab=${tabId}`);
+  await panel.locator('#enable-gmail').waitFor({state: 'visible'});
+  await panel.locator('#enable-gmail').click();
   await panel.getByRole('button', {name: 'Polish draft', exact: true}).waitFor();
   assert.equal(await panel.locator('#task').count(), 0, 'chat does not contain the old action dropdown');
   assert.equal(await panel.locator('#conversation').getAttribute('aria-label'), 'Conversation');

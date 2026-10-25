@@ -46,10 +46,16 @@ async function background() {
       contains: async () => state.enabled,
       onAdded: new ExtensionEvent(), onRemoved: new ExtensionEvent(),
     },
-    storage: {session: {
-      get: async key => structuredClone({[key]: storage[key]}),
-      set: async value => { Object.assign(storage, structuredClone(value)); },
-    }},
+    storage: {
+      session: {
+        get: async key => structuredClone({[key]: storage[key]}),
+        set: async value => { Object.assign(storage, structuredClone(value)); },
+      },
+      local: {
+        get: async key => structuredClone({[key]: storage[key]}),
+        set: async value => { Object.assign(storage, structuredClone(value)); },
+      },
+    },
     scripting: {
       getRegisteredContentScripts: async () => [...registered.values()],
       registerContentScripts: async descriptors => {
@@ -112,7 +118,7 @@ test('Gmail bridge activation requires optional permission and an exact Gmail or
   assert.equal(capture.ok, false);
   assert.equal(env.injections.length, 0);
   env.state.enabled = true;
-  env.api.permissions.onAdded.fire({origins: ['https://mail.google.com/*']});
+  assert.equal((await env.send({type: 'kidi.gmail.enable'})).ok, true);
   await waitFor(() => env.registered.size === 1 && env.injections.length > 0);
   assert.equal(env.registered.get('kidi-gmail').js[0], 'gmail-bridge.js');
   assert.equal(env.sent.some(item => item.message.type === 'kidi.gmail.capture'), false,
@@ -138,6 +144,7 @@ test('toolbar action captures an ordinary page while activeTab is valid and open
 test('Gmail capture rejects webpage callers and remains copy-only after permission revocation', async () => {
   const env = await background();
   env.state.enabled = true;
+  assert.equal((await env.send({type: 'kidi.gmail.enable'})).ok, true);
   const external = await env.send({type: 'kidi.gmail.capture', windowId: 7},
     {id: env.api.runtime.id, url: 'https://mail.google.com/', tab: env.tabs.get(5)});
   assert.equal(external, undefined);

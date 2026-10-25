@@ -2,6 +2,7 @@ const api = globalThis.browser || globalThis.chrome;
 const menus = api.contextMenus || api.menus;
 const STORAGE_KEY = 'kidi-extension-tasks-v2';
 const GMAIL_ORIGIN = 'https://mail.google.com/*';
+const GMAIL_ENABLED_KEY = 'kidi-gmail-enabled-v1';
 const GMAIL_SCRIPT = 'kidi-gmail';
 const TTL = 30 * 60 * 1000;
 const COMMANDS = [
@@ -15,7 +16,7 @@ const PAGE_COMMANDS = [
   {id: 'kidi-page-read', title: 'Read article with Kidi', task: 'page_read'},
 ];
 const UI_MESSAGES = new Set([
-  'kidi.pending.take', 'kidi.context.inspect', 'kidi.gmail.capture',
+  'kidi.pending.take', 'kidi.context.inspect', 'kidi.gmail.enable', 'kidi.gmail.capture',
   'kidi.page.capture', 'kidi.context.apply', 'kidi.context.discard',
 ]);
 const lastTabs = new Map();
@@ -89,7 +90,8 @@ async function currentTab(message = {}) {
   return tab;
 }
 async function gmailEnabled() {
-  return api.permissions.contains({origins: [GMAIL_ORIGIN]});
+  const configured = (await api.storage.local.get(GMAIL_ENABLED_KEY))[GMAIL_ENABLED_KEY] === true;
+  return configured && api.permissions.contains({origins: [GMAIL_ORIGIN]});
 }
 async function ensureGmail(tab) {
   if (!isGmail(tab.url) || !await gmailEnabled())
@@ -228,6 +230,13 @@ async function inspectContext(message) {
 }
 async function handleMessage(message) {
   if (message.type === 'kidi.context.inspect') return inspectContext(message);
+  if (message.type === 'kidi.gmail.enable') {
+    if (!await api.permissions.contains({origins: [GMAIL_ORIGIN]}))
+      throw new Error('Gmail permission was not granted.');
+    await api.storage.local.set({[GMAIL_ENABLED_KEY]: true});
+    await syncGmail();
+    return {ok: true};
+  }
   if (message.type === 'kidi.pending.take') {
     const tab = await currentTab(message);
     return updateState(state => {

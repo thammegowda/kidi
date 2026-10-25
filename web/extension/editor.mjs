@@ -9,6 +9,7 @@ const {backend} = await import('./backend.js');
 const $ = id => document.getElementById(id);
 const PROMPT_STORAGE = 'kidi-editor-prompts-v1';
 const GMAIL_ORIGIN = 'https://mail.google.com/*';
+const WEB_ORIGINS = ['https://*/*', 'http://*/*'];
 const SPEECH_CONSENT = 'kidi-read-aloud-consent-v1';
 const LANGUAGE_STORAGE = 'kidi-translation-language-v1';
 const DOCUMENT_ACTIONS = new Set(['page_summarize', 'page_translate']);
@@ -292,7 +293,7 @@ async function refreshContext() {
       details.onGmail && details.gmailEnabled && !drafts.length && !details.emailAvailable
         ? 'Open a compose window or an email in Gmail.'
         : !details.onGmail && !details.pageAvailable
-          ? 'Open Kidi from the toolbar on the webpage to grant temporary access.'
+          ? 'Choose a page action to grant optional webpage access.'
           : '';
     renderSuggestions();
   } catch (error) {
@@ -371,6 +372,14 @@ async function captureGmail(kind, task) {
 }
 async function pageAction(task) {
   if (capturing || activeRequest || queued) return;
+  if (!inspection.pageAvailable) {
+    const granted = await api.permissions.request({origins: WEB_ORIGINS});
+    if (!granted)
+      throw new Error('Webpage access was not granted. You can still paste or select text for Kidi.');
+    await refreshContext();
+    if (!inspection.pageAvailable)
+      throw new Error('This browser page cannot be accessed by extensions. Select or paste the text instead.');
+  }
   const current = context?.kind === 'article' && context.tabId === inspection.tabId &&
     context.sourceUrl === inspection.pageUrl;
   if (!current) {
@@ -685,6 +694,7 @@ $('speech-dialog').addEventListener('cancel', () => { pendingSpeech = null; });
 $('enable-gmail').addEventListener('click', () => {
   api.permissions.request({origins: [GMAIL_ORIGIN]}).then(async granted => {
     if (!granted) return notice('Gmail access was not granted. You can still paste text into chat.');
+    await sendIntegration('kidi.gmail.enable');
     await refreshContext();
   }).catch(error => notice(error.message || String(error), true));
 });

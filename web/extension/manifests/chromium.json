@@ -13,7 +13,11 @@
     "storage",
     "unlimitedStorage"
   ],
-  "optional_host_permissions": ["https://mail.google.com/*"],
+  "optional_host_permissions": [
+    "https://mail.google.com/*",
+    "https://*/*",
+    "http://*/*"
+  ],
   "background": {
     "service_worker": "background.mjs",
     "type": "module"

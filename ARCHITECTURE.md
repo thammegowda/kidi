@@ -47,6 +47,10 @@ Webpage workflows are deterministic, not an agent/tool-selection loop. A
 user-triggered content script runs packaged Mozilla Readability against a
 filtered document clone (or uses the current selection). The panel previews
 the read-only source and explicitly discloses its 64 KiB capture limit.
+Toolbar invocation captures while temporary `activeTab` access is valid. If an
+Edge side-panel entry point omits that grant, page actions may request the
+manifest's optional HTTP/HTTPS host permission; Gmail remains separately
+enabled and whole-mailbox extraction stays prohibited.
 Shared `kidi::app::DocumentSession` owns Unicode-safe sectioning, ordered
 translation, rolling cumulative summarization, current-request cancellation,
 and aggregate inference statistics. Output-limited translation sections are

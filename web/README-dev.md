@@ -274,15 +274,15 @@ progress, initialization/calibration state, and synthesis steps when available.
 The player remains active until queued audio is actually played, not merely
 until synthesis finishes.
 
-No blanket website permission is requested. `activeTab` access comes from
-invoking the toolbar/context menu; a panel left open while browsing does not
-automatically gain access to a new origin. On access errors, invoke Kidi on
-that page again. Chromium/Edge use the explicit action-click handler to open
-the side panel; do not enable `openPanelOnActionClick`, because Edge can open
-the panel through that behavior without retaining the `activeTab` grant needed
-by a later page action. Browser-internal pages, PDFs without accessible page text,
-and articles that Readability cannot identify may require selecting/pasting
-text. Mailbox-page extraction is explicitly refused; use Gmail writing actions.
+Kidi first uses temporary `activeTab` access from the toolbar or context menu
+and captures the page while that grant is valid. Some Edge side-panel entry
+points do not provide `activeTab`; in that case, the first page action offers
+an explicit optional HTTP/HTTPS host-permission prompt. Granting it enables
+persistent access to ordinary webpages and can be revoked from Edge's extension
+settings. Gmail DOM integration remains separately opt-in, and mailbox-page
+article extraction is always refused. Browser-internal pages, PDFs without
+accessible page text, and articles that Readability cannot identify may require
+selecting or pasting text.
 
 The C++ document pipeline processes every captured section rather than
 silently dropping text beyond one model window. Translation preserves section

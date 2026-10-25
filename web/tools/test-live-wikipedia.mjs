@@ -9,7 +9,9 @@ import {chromium} from 'playwright';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const source = join(root, 'build-extension/chromium');
-const articleUrl = 'https://en.wikipedia.org/wiki/Artificial_intelligence';
+const articleUrl = process.env.KIDI_LIVE_PAGE_URL ||
+  'https://en.wikipedia.org/wiki/Artificial_intelligence';
+const expectedText = new RegExp(process.env.KIDI_LIVE_EXPECT || 'artificial intelligence', 'iu');
 const edge = '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge';
 const keepOpen = process.env.KIDI_E2E_KEEP_OPEN === '1';
 const stepDelay = Math.max(0, Number(process.env.KIDI_E2E_STEP_DELAY_MS) || 0);
@@ -61,7 +63,7 @@ try {
   assert.ok(context, 'Edge did not expose its persistent browser context');
   const article = await waitFor(
     () => context.pages().find(page => page.url() === articleUrl),
-    'Edge did not open the Wikipedia article',
+    'Edge did not open the requested webpage',
   );
   await article.locator('h1').first().waitFor({state: 'visible', timeout: 60000});
   const articleErrors = [];
@@ -74,7 +76,7 @@ try {
   const extensionUrl = `chrome-extension://${installed.id}/editor.html`;
   const targets = await browserCdp.send('Target.getTargets', {filter: [{}]});
   const articleTarget = targets.targetInfos.find(target => target.type === 'tab' && target.url === articleUrl);
-  assert.ok(articleTarget, 'Edge did not expose the Wikipedia tab target');
+  assert.ok(articleTarget, 'Edge did not expose the requested tab target');
   await browserCdp.send('Extensions.triggerAction', {
     id: installed.id, targetId: articleTarget.targetId,
   });
@@ -146,7 +148,7 @@ try {
   try {
     await waitFor(
       () => evaluate(`document.querySelectorAll('.turn.assistant .result-actions').length === 1`),
-      'Wikipedia summary did not complete',
+      'Live webpage summary did not complete',
       60000,
     );
   } catch (error) {
@@ -185,9 +187,9 @@ try {
     };
   })()`);
   assert.equal(result.request?.payload?.mode, 'summarize');
-  assert.match(result.request.payload.text, /artificial intelligence/iu);
+  assert.match(result.request.payload.text, expectedText);
   assert.equal(result.notice, 'Completed on this device.');
-  assert.match(result.context, /Artificial intelligence - Wikipedia/);
+  assert.match(result.context, /^Article: /u);
   assert.match(result.summary, /local-first approach/);
   assert.deepEqual(articleErrors, []);
   assert.deepEqual(panelErrors, []);
