@@ -111,11 +111,39 @@ auto document_parts(std::string_view text, std::size_t maximum_characters, bool 
         append(decoded);
     }
     if (result.empty()) return invalid("document has no readable text");
-    if (result.size() > MAXIMUM_PARTS) return invalid("document has too many sections; select a shorter passage");
     return result;
 }
 
 namespace {
+
+auto translation_segments(std::string_view text) -> Result<std::vector<DocumentPart>> {
+    auto atoms = document_parts(text, TRANSLATION_CHARACTERS, true);
+    if (!atoms) return std::unexpected(atoms.error());
+    std::vector<DocumentPart> result;
+    std::string current;
+    std::size_t characters = 0;
+    bool paragraph_end = false;
+    for (auto& atom : *atoms) {
+        const auto atom_characters = una::utf8to32u(atom.text).size();
+        const auto separator_characters = current.empty() ? 0 : paragraph_end ? 2 : 1;
+        if (!current.empty() && characters + separator_characters + atom_characters > TRANSLATION_CHARACTERS) {
+            result.push_back({std::move(current), paragraph_end});
+            current.clear();
+            characters = 0;
+        }
+        if (!current.empty()) {
+            current += paragraph_end ? "\n\n" : " ";
+            characters += paragraph_end ? 2 : 1;
+        }
+        current += std::move(atom.text);
+        characters += atom_characters;
+        paragraph_end = atom.paragraph_end;
+    }
+    if (!current.empty()) result.push_back({std::move(current), paragraph_end});
+    if (result.empty() || result.size() > MAXIMUM_PARTS)
+        return invalid("document has too many model-sized sections; select a shorter passage");
+    return result;
+}
 
 auto summary_segments(inference::Generator& generator, const DocumentRequest& request)
     -> Result<std::vector<DocumentPart>> {
@@ -172,8 +200,7 @@ auto DocumentSession::start(inference::Generator& generator, DocumentRequest req
     const bool translating = request.task == DocumentTask::TRANSLATE;
     if (!translating && options.context_size && options.context_size < SUMMARY_INPUT_TOKENS + SUMMARY_OUTPUT_TOKENS)
         return invalid("summary requires at least 5120 context tokens");
-    auto parts =
-        translating ? document_parts(request.text, TRANSLATION_CHARACTERS, true) : summary_segments(generator, request);
+    auto parts = translating ? translation_segments(request.text) : summary_segments(generator, request);
     if (!parts) return std::unexpected(parts.error());
     DocumentSession session(generator, std::move(request), std::move(options), std::move(*parts));
     auto queued = session.enqueue_part();

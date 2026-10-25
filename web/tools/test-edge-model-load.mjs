@@ -8,6 +8,8 @@ import {chromium} from 'playwright';
 const profile = resolve(process.env.KIDI_EDGE_PROFILE || join(homedir(), '.cache/kidi/edge-extension-profile'));
 const timeout = Number(process.env.KIDI_MODEL_LOAD_TIMEOUT_MS) || 10 * 60 * 1000;
 const runSummary = process.env.KIDI_TEST_SUMMARY === '1';
+const translateLanguage = process.env.KIDI_TEST_TRANSLATE || '';
+const sourceUrl = process.env.KIDI_EDGE_SOURCE_URL || '';
 const delay = milliseconds => new Promise(resolveDelay => setTimeout(resolveDelay, milliseconds));
 const [port] = (await readFile(join(profile, 'DevToolsActivePort'), 'utf8')).split(/\r?\n/u);
 const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
@@ -16,7 +18,8 @@ const extensions = await cdp.send('Extensions.getExtensions');
 const installed = extensions.extensions.find(item => item.name === 'Kidi AI');
 assert.ok(installed?.enabled, 'Kidi AI is not enabled in the stable Edge profile');
 const targets = await cdp.send('Target.getTargets', {filter: [{}]});
-const source = targets.targetInfos.find(target => target.type === 'tab' && /^https?:/u.test(target.url));
+const source = targets.targetInfos.find(target => target.type === 'tab' &&
+  (sourceUrl ? target.url === sourceUrl : /^https?:/u.test(target.url)));
 assert.ok(source, 'Open an HTTP or HTTPS page before testing the extension');
 await cdp.send('Extensions.triggerAction', {id: installed.id, targetId: source.targetId});
 
@@ -113,20 +116,44 @@ const report = {
   finalStatus: current.status,
   warning: current.warning,
 };
-if (runSummary) {
+if (runSummary || translateLanguage) {
   await evaluate(`document.querySelector('#new-chat').click()`);
   await delay(250);
-  await evaluate(`(() => {
-    const button = [...document.querySelectorAll('button')]
-      .find(item => item.textContent.trim() === 'Summarize page');
-    if (!button || button.disabled) throw new Error('Summarize page is unavailable');
-    button.click();
-  })()`);
+  if (runSummary) {
+    await evaluate(`(() => {
+      const button = [...document.querySelectorAll('button')]
+        .find(item => item.textContent.trim() === 'Summarize page');
+      if (!button || button.disabled) throw new Error('Summarize page is unavailable');
+      button.click();
+    })()`);
+  } else {
+    await evaluate(`(() => {
+      const button = [...document.querySelectorAll('button')]
+        .find(item => item.textContent.trim() === 'Translate page');
+      if (!button || button.disabled) throw new Error('Translate page is unavailable');
+      button.click();
+    })()`);
+    const language = JSON.stringify(translateLanguage);
+    const deadline = Date.now() + 10000;
+    let ready = false;
+    while (!ready && Date.now() < deadline) {
+      ready = await evaluate(`!document.querySelector('#translation-tools').hidden &&
+        [...document.querySelector('#target-language').options].some(option => option.value === ${language})`);
+      if (!ready) await delay(100);
+    }
+    if (!ready) throw new Error(`Translation language is unavailable: ${translateLanguage}`);
+    await evaluate(`(() => {
+      const select = document.querySelector('#target-language');
+      select.value = ${language};
+      select.dispatchEvent(new Event('change', {bubbles: true}));
+      document.querySelector('#send').click();
+    })()`);
+  }
   const started = Date.now();
   let previous = '';
-  let summary;
+  let result;
   while (Date.now() - started < timeout) {
-    summary = await evaluate(`(async () => {
+    result = await evaluate(`(async () => {
       const {backend} = await import('./backend.js');
       const turns = [...document.querySelectorAll('.turn.assistant')];
       return {
@@ -138,22 +165,23 @@ if (runSummary) {
         completed: Boolean(turns.at(-1)?.querySelector('.result-actions')),
       };
     })()`);
-    const status = JSON.stringify({notice: summary.notice, status: summary.status,
-      characters: summary.text.length, memory: summary.snapshot.runtime.memory});
+    const status = JSON.stringify({notice: result.notice, status: result.status,
+      characters: result.text.length, memory: result.snapshot.runtime.memory});
     if (status !== previous) {
       console.log(status);
       previous = status;
     }
-    if (summary.completed) break;
-    if (summary.noticeError) throw new Error(`${summary.notice}; ${summary.status}`);
+    if (result.completed) break;
+    if (result.noticeError) throw new Error(`${result.notice}; ${result.status}`);
     await delay(500);
   }
-  if (!summary?.completed) throw new Error(`Wikipedia summary timed out after ${timeout} ms`);
-  report.summary = {
+  const operation = runSummary ? 'summary' : 'translation';
+  if (!result?.completed) throw new Error(`Wikipedia ${operation} timed out after ${timeout} ms`);
+  report[operation] = {
     elapsed_ms: Date.now() - started,
-    characters: summary.text.length,
-    preview: summary.text.slice(0, 300),
-    memory: summary.snapshot.runtime.memory,
+    characters: result.text.length,
+    preview: result.text.slice(0, 300),
+    memory: result.snapshot.runtime.memory,
   };
 }
 console.log(JSON.stringify(report, null, 2));

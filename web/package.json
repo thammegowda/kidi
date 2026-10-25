@@ -8,6 +8,7 @@
     "test:live-wikipedia": "node tools/test-live-wikipedia.mjs",
     "test:edge-model-load": "node tools/test-edge-model-load.mjs",
     "test:edge-summary": "KIDI_TEST_SUMMARY=1 node tools/test-edge-model-load.mjs",
+    "test:edge-translate": "node tools/test-edge-model-load.mjs",
     "test:edge-read-aloud": "node tools/test-edge-read-aloud.mjs",
     "test:pages": "node tools/test-pages.mjs"
   },

@@ -31,7 +31,8 @@ auto main() -> int {
         return fail("accepted invalid document input");
     std::string many;
     for (std::size_t index = 0; index < 300; ++index) many += "Paragraph.\n\n";
-    if (kidi::app::document_parts(many, 1200, true)) return fail("accepted too many document sections");
+    auto many_parts = kidi::app::document_parts(many, 1200, true);
+    if (!many_parts || many_parts->size() != 300) return fail("raw paragraph segmentation lost document blocks");
 
     auto request = kidi::app::validate_editor_request({
         .task = kidi::app::EditorTask::TRANSLATE,

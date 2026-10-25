@@ -88,11 +88,22 @@ function document(request, maximum = 3) {
   }
   assert.fail('document generation did not complete within its step budget');
 }
-const translated = document({mode: 'translate', text: 'alpha.\n\nbeta.\n\ngamma.', target_language: 'French'});
+const translated = document({
+  mode: 'translate',
+  text: Array.from({length: 3}, () => `${'alpha '.repeat(150).trim()}.`).join('\n\n'),
+  target_language: 'French',
+});
 assert.equal(translated.completed.text, 'alpha\n\nalpha\n\nalpha');
 assert.equal(translated.text, translated.completed.text);
 assert.ok(translated.progress.some(progress => progress.part === 3));
 assert.equal(translated.completed.output_limited, false);
+const manyParagraphs = document({
+  mode: 'translate',
+  text: Array.from({length: 300}, () => 'alpha.').join('\n\n'),
+  target_language: 'French',
+});
+assert.ok(Math.max(...manyParagraphs.progress.map(progress => progress.parts)) < 10,
+  'small paragraphs are packed into model-sized translation segments');
 const summarized = document({mode: 'summarize', text: 'alpha '.repeat(5000)});
 assert.equal(summarized.completed.text, 'alpha');
 assert.ok(summarized.progress.some(progress => progress.parts === 2));
