@@ -177,20 +177,16 @@ composition, email polishing, email replies, and the existing text actions.
    is used instead of the complete draft when it is inside that editor.
 5. For an opened email, choose **Draft a reply**, optionally entering guidance
    in the chat composer first.
-6. Review and refine the result in chat. Click **Replace draft** or
-   **Insert into reply** to apply it, or **Copy** to use it elsewhere.
+6. Review and refine the result in chat, then click **Copy** and paste it into
+   Gmail yourself.
 
 The Gmail bridge observes only draft/email availability until an action
 explicitly captures content. It extracts the latest visible opened message,
 not inbox snippets, hidden messages, or the complete thread. Use **View attached
-text** to inspect exactly what is sent to the local model.
-
-Insertion is plain text and preserves signature and quoted-history nodes.
-It targets the captured compose window, validates the original document URL
-and draft content, and refuses stale edits. To insert a suggested reply, open
-an empty inline reply in the same Gmail thread; existing reply text is never
-overwritten. Kidi never clicks Send, creates recipients, or changes a subject.
-After applying a result, recapture the draft before another replacement.
+text** to inspect exactly what is sent to the local model. Gmail integration is
+deliberately read-only: Kidi does not mutate drafts, insert replies, click Send,
+create recipients, or change subjects. Copy/paste keeps Gmail autosave, undo,
+signatures, quotations, and editor behavior under the user's control.
 
 Source snapshots live in extension session storage (or volatile memory when
 that API is unavailable), expire after 30 minutes, and are bounded to 16

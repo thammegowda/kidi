@@ -4,7 +4,6 @@
   const api = globalThis.browser || globalThis.chrome;
   const protectedContent = '.gmail_signature, [data-smartmail="gmail_signature"], .gmail_quote, blockquote[type="cite"]';
   const draftIds = new WeakMap();
-  const captures = new Map();
   let lastEditor;
   let notificationTimer;
 
@@ -80,40 +79,24 @@
       if (editor.contains(range.startContainer) && editor.contains(range.endContainer)) {
         if ([...editor.querySelectorAll(protectedContent)].some(node => range.intersectsNode(node)))
           throw new Error('Select only the email body, excluding the signature and quoted history.');
-        return {range: range.cloneRange(), selected: true};
+        return range.cloneRange();
       }
     }
-    return {range: bodyRange(editor), selected: false};
-  }
-  function remember(capture) {
-    for (const [id, value] of captures)
-      if (Date.now() - value.createdAt > 30 * 60 * 1000) captures.delete(id);
-    while (captures.size >= 16) captures.delete(captures.keys().next().value);
-    const id = crypto.randomUUID();
-    captures.set(id, {...capture, createdAt: Date.now(), url: location.href});
-    return id;
+    return bodyRange(editor);
   }
   function captureDraft(id) {
     const available = editors();
     const editor = available.find(element => draftId(element) === id) ||
       (!id && available.length === 1 ? available[0] : null);
     if (!editor) throw new Error('Choose an available Gmail draft first.');
-    const {range, selected} = editableRange(editor);
+    const range = editableRange(editor);
     const text = plainText(range.cloneContents());
-    const target = remember({kind: 'draft', editor, range, html: editor.innerHTML});
     return {
-      target,
       kind: 'gmail-draft',
       title: subject(editor),
       text,
-      operation: 'replace',
-      operationLabel: selected ? 'Replace selection' : 'Replace draft',
+      operation: null,
     };
-  }
-  function replyEditors() {
-    const main = document.querySelector('[role="main"]');
-    return editors().filter(editor => main?.contains(editor) && !editor.closest('[role="dialog"]') &&
-      !editor.closest('form')?.querySelector('input[name="subjectbox"]'));
   }
   function captureEmail() {
     const email = emailBody();
@@ -122,75 +105,12 @@
     const title = document.querySelector('[role="main"] h2')?.textContent?.trim() || 'Opened email';
     const from = root?.querySelector('[email]')?.getAttribute('email') || '';
     const text = plainText(email);
-    const replies = replyEditors();
-    const editor = replies.length === 1 ? replies[0] : null;
-    const target = remember({
-      kind: 'reply', email, emailHtml: email.innerHTML,
-      editor, html: editor?.innerHTML,
-    });
     return {
-      target,
       kind: 'gmail-email',
       title,
       text: `Subject: ${title}${from ? `\nFrom: ${from}` : ''}\n\n${text}`,
-      operation: 'reply',
-      operationLabel: 'Insert into reply',
+      operation: null,
     };
-  }
-  function inputEvent(type, text, cancelable = false) {
-    return new InputEvent(type, {
-      bubbles: true, composed: true, cancelable, inputType: 'insertText', data: text,
-    });
-  }
-  function insert(editor, range, expectedHtml, text) {
-    if (!visible(editor) || editor.innerHTML !== expectedHtml ||
-        !editor.contains(range.commonAncestorContainer))
-      throw new Error('The draft changed. Capture it again before applying this result.');
-    editor.focus();
-    if (!editor.dispatchEvent(inputEvent('beforeinput', text, true)))
-      throw new Error('Gmail rejected the insertion. Copy the result instead.');
-    if (editor.innerHTML !== expectedHtml)
-      throw new Error('The draft changed before insertion. Capture it again.');
-    const selection = getSelection();
-    const fragment = document.createDocumentFragment();
-    for (const [index, line] of text.replace(/\r\n?/gu, '\n').split('\n').entries()) {
-      if (index) fragment.append(document.createElement('br'));
-      fragment.append(document.createTextNode(line));
-    }
-    const last = fragment.lastChild;
-    // insertText can merge the following signature paragraph into the selection.
-    range.deleteContents();
-    range.insertNode(fragment);
-    range.setStartAfter(last);
-    range.collapse(true);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    editor.dispatchEvent(inputEvent('input', text));
-  }
-  function apply(target, text) {
-    const capture = captures.get(target);
-    if (!capture || Date.now() - capture.createdAt > 30 * 60 * 1000)
-      throw new Error('This Gmail context expired. Capture it again.');
-    if (capture.url !== location.href)
-      throw new Error('Gmail navigated to another view. Capture the current email again.');
-    if (typeof text !== 'string' || !text.trim() || new TextEncoder().encode(text).length > 64 * 1024)
-      throw new Error('The result is empty or exceeds the insertion limit.');
-    if (capture.kind === 'draft') {
-      insert(capture.editor, capture.range, capture.html, text);
-    } else {
-      if (!visible(capture.email) || capture.email.innerHTML !== capture.emailHtml)
-        throw new Error('The source email changed. Capture it again.');
-      const replies = replyEditors();
-      const editor = capture.editor || (replies.length === 1 ? replies[0] : null);
-      if (!editor || !replies.includes(editor))
-        throw new Error('Open a reply to this email in Gmail, then try Insert into reply again.');
-      const range = bodyRange(editor);
-      if (plainText(range.cloneContents()).trim())
-        throw new Error('The reply already contains text. Use Polish draft, or copy this result.');
-      insert(editor, range, capture.html ?? editor.innerHTML, text);
-    }
-    captures.delete(target);
-    return {applied: true};
   }
   function notify() {
     clearTimeout(notificationTimer);
@@ -216,14 +136,12 @@
   observer.observe(document.body, {childList: true, subtree: true});
   addEventListener('hashchange', notify);
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (sender.id !== api.runtime.id || !['kidi.gmail.inspect', 'kidi.gmail.capture', 'kidi.gmail.apply']
+    if (sender.id !== api.runtime.id || !['kidi.gmail.inspect', 'kidi.gmail.capture']
       .includes(message?.type)) return false;
     try {
       let result;
       if (message.type === 'kidi.gmail.inspect') result = inspect();
-      else if (message.type === 'kidi.gmail.capture')
-        result = message.kind === 'email' ? captureEmail() : captureDraft(message.draftId);
-      else result = apply(message.target, message.text);
+      else result = message.kind === 'email' ? captureEmail() : captureDraft(message.draftId);
       if (result.text && new TextEncoder().encode(result.text).length > 64 * 1024)
         throw new Error('This email exceeds the 64 KiB context limit. Select a shorter passage.');
       sendResponse({ok: true, ...result});

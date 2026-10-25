@@ -97,7 +97,8 @@ if (!installed) {
   extensions = await cdp.send('Extensions.getExtensions');
   installed = extensions.extensions.find(item => item.id === loaded.id);
 }
-assert.ok(installed?.enabled, 'Kidi AI is not enabled in the stable Edge profile');
+assert.ok(installed?.enabled,
+  'Kidi AI was disabled after its unpacked directory changed; close this test Edge instance and run the launcher again');
 assert.equal(await realpath(installed.path), await realpath(extension));
 
 const context = browser.contexts()[0];

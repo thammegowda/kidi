@@ -67,8 +67,7 @@ try {
     document.querySelectorAll('.turn.assistant .result-actions').length === expected, count);
   const launchDraftId = (await integration('kidi.context.inspect')).drafts.find(draft => draft.title === 'Launch plan').id;
   await panel.locator('#gmail-draft').selectOption(launchDraftId);
-  const signature = await gmail.locator('#draft-one .gmail_signature').innerHTML();
-  const quotation = await gmail.locator('#draft-one .gmail_quote').innerHTML();
+  const originalDraft = await gmail.locator('#draft-one').innerHTML();
   const otherDraft = await gmail.locator('#draft-two').innerHTML();
   await panel.getByRole('button', {name: 'Polish draft', exact: true}).click();
   await waitForAnswers(1);
@@ -83,11 +82,8 @@ try {
   assert.equal(editorRequests.at(-1).payload.history.length, 2);
   assert.equal(editorRequests.at(-1).payload.instruction, 'Make it warmer.');
   if (screenshot) await panel.screenshot({path: resolve(screenshot)});
-  await panel.getByRole('button', {name: 'Replace draft', exact: true}).last().click();
-  await panel.waitForFunction(() => document.querySelector('#notice').textContent.includes('has not been sent'));
-  assert.match(await gmail.locator('#draft-one').innerText(), /The report will be ready on Monday/);
-  assert.equal(await gmail.locator('#draft-one .gmail_signature').innerHTML(), signature);
-  assert.equal(await gmail.locator('#draft-one .gmail_quote').innerHTML(), quotation);
+  assert.equal(await panel.getByRole('button', {name: /Replace draft|Insert into reply|Apply/u}).count(), 0);
+  assert.equal(await gmail.locator('#draft-one').innerHTML(), originalDraft);
   assert.equal(await gmail.locator('#draft-two').innerHTML(), otherDraft);
 
   await panel.locator('#message').fill('Ask to move the meeting to Monday.');
@@ -97,67 +93,27 @@ try {
   assert.equal(editorRequests.at(-1).payload.task, 'email_reply');
   assert.match(editorRequests.at(-1).payload.text, /Could we meet on Friday/);
   assert.doesNotMatch(editorRequests.at(-1).payload.text, /unrelated private|Older quoted|launch draft/);
-  await panel.getByRole('button', {name: 'Insert into reply', exact: true}).click();
-  await panel.waitForFunction(() => document.querySelector('#notice').textContent.includes('Open a reply'));
-  await gmail.locator('#inline-reply').evaluate(element => { element.hidden = false; });
-  await panel.getByRole('button', {name: 'Insert into reply', exact: true}).click();
-  await panel.waitForFunction(() => document.querySelector('#notice').textContent.includes('has not been sent'));
-  assert.match(await gmail.locator('#reply-body').innerText(), /Monday instead/);
-  assert.equal(await gmail.locator('#reply-body .gmail_signature').innerText(), 'My reply signature');
+  assert.equal(await panel.getByRole('button', {name: 'Insert into reply', exact: true}).count(), 0);
+  assert.equal(await gmail.locator('#draft-one').innerHTML(), originalDraft);
   assert.equal(await gmail.locator('#draft-two').innerHTML(), otherDraft);
-
-  await panel.locator('#gmail-draft').selectOption(launchDraftId);
-  await panel.getByRole('button', {name: 'Polish draft', exact: true}).click();
-  await waitForAnswers(1);
-  await gmail.locator('#draft-one').evaluate(element => {
-    element.insertBefore(document.createTextNode('A newer edit. '), element.firstChild);
-  });
-  const changed = await gmail.locator('#draft-one').innerHTML();
-  await panel.getByRole('button', {name: 'Replace draft', exact: true}).click();
-  await panel.waitForFunction(() => document.querySelector('#notice').textContent.includes('draft changed'));
-  assert.equal(await gmail.locator('#draft-one').innerHTML(), changed, 'stale generation must not overwrite edits');
 
   const details = await integration('kidi.context.inspect');
   const draftId = details.drafts.find(draft => draft.title === 'Launch plan').id;
-  const captured = await integration('kidi.gmail.capture', {kind: 'draft', draftId});
-  await gmail.locator('#draft-one').evaluate(element => {
-    element.addEventListener('beforeinput', event => event.preventDefault(), {once: true});
-  });
-  const rejected = await integration('kidi.context.apply', {id: captured.task.id, text: 'Rejected edit'});
-  assert.equal(rejected.ok, false);
-  assert.match(rejected.error, /rejected the insertion/);
-  assert.equal(await gmail.locator('#draft-one').innerHTML(), changed);
-  const literal = 'Literal <img src=x onerror=alert(1)> text & punctuation';
-  const applied = await integration('kidi.context.apply', {id: captured.task.id, text: literal});
-  assert.equal(applied.ok, true);
-  assert.equal(await gmail.locator('#draft-one img').count(), 0, 'generated text cannot inject HTML');
-  assert.match(await gmail.locator('#draft-one').innerText(), /Literal <img/);
-  assert.equal(await gmail.locator('#draft-one .gmail_signature').innerHTML(), signature);
-  assert.equal(await gmail.locator('#draft-one .gmail_quote').innerHTML(), quotation);
-
   await gmail.locator('#draft-one').evaluate(element => {
     const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
     let node;
-    while ((node = walker.nextNode()) && !node.textContent.includes('Literal')) {}
+    while ((node = walker.nextNode()) && !node.textContent.includes('hello')) {}
     const range = document.createRange();
     range.setStart(node, 0);
-    range.setEnd(node, 7);
+    range.setEnd(node, 5);
     const selection = getSelection();
     selection.removeAllRanges();
     selection.addRange(range);
   });
   const passage = await integration('kidi.gmail.capture', {kind: 'draft', draftId});
-  assert.equal(passage.task.text, 'Literal');
-  assert.equal(passage.task.operationLabel, 'Replace selection');
-  assert.equal((await integration('kidi.context.apply', {id: passage.task.id, text: 'Revised'})).ok, true);
-  assert.match(await gmail.locator('#draft-one').innerText(), /Revised <img/);
-  const beforeNavigation = await integration('kidi.gmail.capture', {kind: 'email'});
-  await gmail.evaluate(() => { location.hash = '#inbox/other-thread'; });
-  const stalePage = await integration('kidi.context.apply', {
-    id: beforeNavigation.task.id, text: 'This must not enter another thread',
-  });
-  assert.equal(stalePage.ok, false);
-  assert.match(stalePage.error, /source page changed/);
+  assert.equal(passage.task.text, 'hello');
+  assert.equal(passage.task.operation, null);
+  assert.equal(await gmail.locator('#draft-one').innerHTML(), originalDraft);
   assert.equal(await gmail.evaluate(() => globalThis.sendClicks), 0, 'no generated action sends an email');
 
   await panel.locator('#new-chat').click();
@@ -193,7 +149,7 @@ try {
   assert.equal(await panel.locator('#system-prompt').inputValue(), defaultPrompt);
   assert.deepEqual(unexpectedNetwork, [], 'tests never contact Hugging Face or a real mailbox');
   assert.deepEqual(errors, []);
-  console.log('Gmail/chat integration passed: capture, follow-up, guarded apply, reply, prompts, cancellation.');
+  console.log('Gmail/chat integration passed: read-only capture, follow-up, reply, copy, prompts, cancellation.');
 } finally {
   await context?.close();
   await rm(temporary, {recursive: true, force: true});

@@ -18,9 +18,7 @@ const LABELS = {
   formalize: 'Make formal', friendly: 'Make friendly', concise: 'Make concise', custom: 'Custom edit',
   page_summarize: 'Summarize page', page_translate: 'Translate page',
 };
-const WRITING_ACTIONS = new Set([
-  'email_compose', 'email_polish', 'email_reply', 'polish', 'formalize', 'friendly', 'concise', 'custom',
-]);
+const REPLACE_ACTIONS = new Set(['polish', 'formalize', 'friendly', 'concise', 'custom']);
 const windowInfo = await api.windows.getCurrent();
 const tabParameter = new URL(location.href).searchParams.get('tab');
 const sourceTabId = tabParameter !== null && /^\d+$/u.test(tabParameter) ? Number(tabParameter) : null;
@@ -437,13 +435,13 @@ function resultActions(request) {
     notice('Copied.');
   }));
   actions.append(suggestion('Read aloud', () => requestRead(request.text, request.language)));
-  if (request.context?.operation && WRITING_ACTIONS.has(request.action)) {
+  if (request.context?.operation === 'selection' && REPLACE_ACTIONS.has(request.action)) {
     const apply = suggestion(request.context.operationLabel || 'Apply', async () => {
       await sendIntegration('kidi.context.apply', {id: request.context.id, text: request.text});
       apply.disabled = true;
       apply.textContent = 'Applied';
       if (context?.id === request.context.id) context.operation = null;
-      notice('Applied in Gmail or the original editor. Your message has not been sent.');
+      notice('Replaced the captured selection in its original editor.');
     });
     actions.prepend(apply);
   }

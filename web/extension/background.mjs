@@ -265,18 +265,10 @@ async function handleMessage(message) {
       throw new Error('The result is empty or exceeds the insertion limit.');
     const tab = await api.tabs.get(task.tabId);
     if (tab.url !== task.pageUrl) throw new Error('The source page changed. Capture it again.');
-    let result;
-    if (task.kind.startsWith('gmail-')) {
-      if (!await gmailEnabled()) throw new Error('Gmail access was revoked.');
-      result = await api.tabs.sendMessage(task.tabId, {
-        type: 'kidi.gmail.apply', target: task.target, text: message.text,
-      }, {frameId: task.frameId});
-    } else {
-      result = await api.tabs.sendMessage(task.tabId, {
-        type: 'liteapp.selection.replace',
-        id: task.target, expected: task.text, replacement: message.text,
-      }, {frameId: task.frameId});
-    }
+    const result = await api.tabs.sendMessage(task.tabId, {
+      type: 'liteapp.selection.replace',
+      id: task.target, expected: task.text, replacement: message.text,
+    }, {frameId: task.frameId});
     if (!result?.ok) throw new Error(result?.error || 'The source editor rejected the change.');
     await updateState(current => { delete current.tasks[task.id]; });
     return {ok: true};

@@ -29,7 +29,8 @@ samples never enter JavaScript.
 
 The browser extension has a compact chat UI under `web/extension/` and reuses
 the Wasm backend. Its Gmail bridge is browser integration only: optional-origin
-permission, DOM capture, opaque draft targets, and guarded plain-text insertion.
+permission and explicit read-only DOM capture. Generated drafts and replies are
+copied by the user; Kidi never mutates Gmail's private editor DOM.
 It does not build prompts or run inference. `kidi::app` owns typed text/email
 actions, bounded conversational history, validation, and message construction
 without browser dependencies, so native/Android callers can reuse them.

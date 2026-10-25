@@ -79,7 +79,7 @@ async function background() {
           return {ok: true, drafts: [{id: 'draft-one', title: 'Launch plan'}], activeDraftId: 'draft-one'};
         if (message.type === 'kidi.gmail.capture')
           return {ok: true, kind: 'gmail-draft', title: 'Launch plan', text: 'Private draft text',
-            operation: 'replace', operationLabel: 'Replace draft', target: 'opaque-target'};
+            operation: null};
         if (message.type === 'liteapp.selection.capture')
           return {ok: true, text: `Selection from ${tabId}`, editable: true};
         return {ok: true};
@@ -131,7 +131,7 @@ test('toolbar action explicitly opens the panel without Edge automatic side-pane
   await waitFor(() => env.steps.includes('open:6'));
 });
 
-test('Gmail operations reject webpage callers and stop after permission revocation', async () => {
+test('Gmail capture rejects webpage callers and remains copy-only after permission revocation', async () => {
   const env = await background();
   env.state.enabled = true;
   const external = await env.send({type: 'kidi.gmail.capture', windowId: 7},
@@ -145,9 +145,10 @@ test('Gmail operations reject webpage callers and stop after permission revocati
   env.state.enabled = false;
   env.api.permissions.onRemoved.fire({origins: ['https://mail.google.com/*']});
   await waitFor(() => Object.values(env.storage['kidi-extension-tasks-v2']?.tasks || {}).length === 0);
+  const sent = env.sent.length;
   const result = await env.send({type: 'kidi.context.apply', id: captured.task.id, text: 'Generated text'});
   assert.equal(result.ok, false);
-  assert.equal(env.sent.some(item => item.message.type === 'kidi.gmail.apply'), false);
+  assert.equal(env.sent.length, sent);
   assert.equal(await env.send({type: 'unknown.message'}), undefined);
 });
 
