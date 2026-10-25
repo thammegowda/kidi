@@ -37,6 +37,8 @@ try {
     const header = await page.locator('.app-bar').boundingBox();
     assert.ok(header && header.height <= 32, `session controls are compact: ${JSON.stringify(header)}`);
     assert.equal(await page.locator('#task').count(), 0, 'chat replaces the action dropdown');
+    for (const action of ['Summarize page', 'Translate page', 'Read article'])
+        await page.getByRole('button', {name: action, exact: true}).waitFor();
     assert.equal(await page.locator('#prompt-action option').count(), 13);
     await page.locator('#prompt-toggle').click();
     await page.locator('#prompt-editor').waitFor({state: 'visible'});

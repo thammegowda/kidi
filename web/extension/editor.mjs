@@ -262,7 +262,7 @@ function renderSuggestions() {
     for (const task of ['polish', 'explain', 'summarize'])
       buttons.push(suggestion(LABELS[task], () => submit(task)));
   } else {
-    if (inspection.pageAvailable) buttons.push(
+    if (!inspection.onGmail) buttons.push(
       suggestion('Summarize page', () => pageAction('page_summarize')),
       suggestion('Translate page', () => pageAction('page_translate')),
       suggestion('Read article', () => {
@@ -270,11 +270,6 @@ function renderSuggestions() {
         return pageAction('page_read');
       }),
     );
-    if (!inspection.pageAvailable) buttons.push(suggestion('Compose email', () => {
-      chooseAction('email_compose');
-      $('message').placeholder = 'Describe the email, or paste your rough notes…';
-      $('message').focus();
-    }));
   }
   $('suggestions').replaceChildren(...buttons);
 }
@@ -293,8 +288,12 @@ async function refreshContext() {
       choices.push(new Option(`${draft.title}${drafts.length > 1 ? ` (${index + 1})` : ''}`, draft.id));
     $('gmail-draft').replaceChildren(...choices);
     $('gmail-draft').value = selectedDraft;
-    $('context-status').textContent = details.onGmail && details.gmailEnabled && !drafts.length && !details.emailAvailable
-      ? 'Open a compose window or an email in Gmail.' : '';
+    $('context-status').textContent =
+      details.onGmail && details.gmailEnabled && !drafts.length && !details.emailAvailable
+        ? 'Open a compose window or an email in Gmail.'
+        : !details.onGmail && !details.pageAvailable
+          ? 'Open Kidi from the toolbar on the webpage to grant temporary access.'
+          : '';
     renderSuggestions();
   } catch (error) {
     if (sequence !== refreshSequence) return;
