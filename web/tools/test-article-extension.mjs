@@ -95,7 +95,7 @@ try {
   assert.equal(summary.payload.mode, 'summarize');
   assert.match(summary.payload.text, /carefully controlled experiment/);
   assert.doesNotMatch(summary.payload.text, /PRIVATE_MARKER/);
-  assert.match(await panel.locator('#context-followup').textContent(), /generated summary, not the full article/);
+  assert.match(await panel.locator('#context-followup').textContent(), /uses this summary/);
   await panel.locator('#message').fill('What are its limitations?');
   await panel.locator('#send').click();
   await answers(2);

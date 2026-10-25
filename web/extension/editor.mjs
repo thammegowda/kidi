@@ -132,14 +132,18 @@ function renderDiagnostics() {
 }
 function renderRuntime(stage = '') {
   $('runtime-status').className = `runtime-status ${ready ? 'ready' : modelLoadId ? 'loading' : 'offline'}`;
-  $('runtime-status-label').textContent = ready ? 'Ready' : stage || (modelLoadId ? 'Loading' : 'Offline');
+  const backendLabel = snapshot.runtime?.requested_backend === 'webgpu' ? 'WebGPU' :
+    snapshot.runtime?.requested_backend === 'cpu' ? 'CPU' : 'Ready';
+  $('runtime-status-label').textContent = ready ? backendLabel : stage || (modelLoadId ? 'Loading' : 'Offline');
   $('setup').hidden = ready;
   $('load-model').disabled = Boolean(modelLoadId);
   $('load-model').textContent = modelLoadId ? 'Loading…' : 'Load';
   $('send').disabled = Boolean(activeRequest || queued || capturing) ||
     (!$('message').value.trim() && !(DOCUMENT_ACTIONS.has(action) && context?.text)) ||
     (action === 'page_translate' && !$('target-language').value);
-  $('send').textContent = DOCUMENT_ACTIONS.has(action) ? action === 'page_translate' ? 'Translate' : 'Summarize' : 'Send';
+  const sendLabel = DOCUMENT_ACTIONS.has(action) ? action === 'page_translate' ? 'Translate' : 'Summarize' : 'Send';
+  $('send').title = sendLabel;
+  $('send').setAttribute('aria-label', sendLabel);
   $('new-chat').disabled = capturing;
   $('clear-context').disabled = capturing;
   $('cancel').hidden = !activeRequest;
@@ -222,6 +226,18 @@ function suggestion(label, handler) {
   });
   return button;
 }
+function iconAction(label, icon, handler) {
+  const button = suggestion(label, handler);
+  button.className = 'icon-button';
+  button.textContent = '';
+  button.title = label;
+  button.setAttribute('aria-label', label);
+  const image = document.createElement('img');
+  image.src = `./icons/${icon}.svg`;
+  image.alt = '';
+  button.append(image);
+  return button;
+}
 function renderSuggestions() {
   const buttons = [];
   const drafts = inspection.drafts || [];
@@ -246,7 +262,7 @@ function renderSuggestions() {
     for (const task of ['polish', 'explain', 'summarize'])
       buttons.push(suggestion(LABELS[task], () => submit(task)));
   } else {
-    if (!inspection.onGmail) buttons.push(
+    if (inspection.pageAvailable) buttons.push(
       suggestion('Summarize page', () => pageAction('page_summarize')),
       suggestion('Translate page', () => pageAction('page_translate')),
       suggestion('Read article', () => {
@@ -254,7 +270,7 @@ function renderSuggestions() {
         return pageAction('page_read');
       }),
     );
-    buttons.push(suggestion('Compose email', () => {
+    if (!inspection.pageAvailable) buttons.push(suggestion('Compose email', () => {
       chooseAction('email_compose');
       $('message').placeholder = 'Describe the email, or paste your rough notes…';
       $('message').focus();
@@ -296,8 +312,7 @@ function renderContext() {
   $('context-warning').textContent = context?.warning || '';
   $('context-warning').hidden = !context?.warning;
   $('context-followup').textContent = context?.summaryText
-    ? 'Follow-up chat uses the generated summary, not the full article. Page actions still use the attached source.'
-    : context?.kind === 'article' ? 'Read-only snapshot. Page actions use the attached text; the webpage is not changed.' : '';
+    ? 'Follow-up chat uses this summary; page actions still use the attached source.' : '';
   $('context-followup').hidden = !$('context-followup').textContent;
   renderSuggestions();
 }
@@ -430,11 +445,11 @@ function appendTurn(role, text) {
 function resultActions(request) {
   const actions = document.createElement('div');
   actions.className = 'result-actions';
-  actions.append(suggestion('Copy', async () => {
+  actions.append(iconAction('Copy', 'copy', async () => {
     await navigator.clipboard.writeText(request.text);
     notice('Copied.');
   }));
-  actions.append(suggestion('Read aloud', () => requestRead(request.text, request.language)));
+  actions.append(iconAction('Read aloud', 'volume', () => requestRead(request.text, request.language)));
   if (request.context?.operation === 'selection' && REPLACE_ACTIONS.has(request.action)) {
     const apply = suggestion(request.context.operationLabel || 'Apply', async () => {
       await sendIntegration('kidi.context.apply', {id: request.context.id, text: request.text});
@@ -704,6 +719,10 @@ $('prompt-default').addEventListener('click', () => {
   renderPrompt();
   if (!saved) $('prompt-state').textContent = 'Default restored for this panel, but storage is unavailable.';
 });
+addEventListener('pointerdown', event => {
+  if ($('runtime-details').open && !$('runtime-status').contains(event.target))
+    $('runtime-details').open = false;
+}, true);
 api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.windowId !== undefined && message.windowId !== windowInfo.id) return false;
   if (message?.type === 'kidi.context.pending' || message?.type === 'kidi.context.error') {

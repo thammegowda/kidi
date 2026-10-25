@@ -12,13 +12,17 @@
   <header class="app-bar">
     <img src="./icons/kidi-logo.png" alt="">
     <strong>Kidi AI</strong>
-    <div id="runtime-status" class="runtime-status offline">
-      <span class="status-dot" aria-hidden="true"></span>
-      <span id="runtime-status-label">Offline</span>
-    </div>
-    <button id="new-chat" class="text-button" type="button" title="Clear this conversation">New chat</button>
+    <details id="runtime-details" class="runtime-details">
+      <summary id="runtime-status" class="runtime-status offline" title="Runtime status and diagnostics">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="runtime-status-label">Offline</span>
+      </summary>
+      <div id="diagnostics" class="diagnostics" aria-label="Runtime diagnostics" hidden></div>
+    </details>
+    <button id="new-chat" class="icon-button" type="button" title="New chat" aria-label="New chat">
+      <img src="./icons/plus.svg" alt="">
+    </button>
   </header>
-  <div id="diagnostics" class="diagnostics" aria-label="Runtime diagnostics" hidden></div>
   <main>
     <section id="setup" class="model-setup" aria-labelledby="model-title">
       <div class="model-row">
@@ -101,11 +105,15 @@
       <label for="message" class="visually-hidden">Message to Kidi</label>
       <textarea id="message" rows="3" maxlength="2048" placeholder="Ask Kidi, or describe the email you want to write…"></textarea>
       <div class="composer-actions">
-        <button id="prompt-toggle" class="text-button" type="button"
-          aria-expanded="false" aria-controls="prompt-editor">Prompt</button>
+        <button id="prompt-toggle" class="icon-button composer-tool" type="button" title="System prompt"
+          aria-label="System prompt" aria-expanded="false" aria-controls="prompt-editor">
+          <img src="./icons/settings.svg" alt="">
+        </button>
         <span id="action-label" class="subtle">Chat</span>
         <button id="cancel" class="quiet-button" type="button" hidden>Stop</button>
-        <button id="send" class="primary-button" type="submit">Send</button>
+        <button id="send" class="primary-button icon-button send-button" type="submit" title="Send" aria-label="Send">
+          <img src="./icons/send-horizontal.svg" alt="">
+        </button>
       </div>
     </form>
     <p id="notice" role="status" aria-live="polite"></p>

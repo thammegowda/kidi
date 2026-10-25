@@ -53,6 +53,7 @@ try {
   assert.equal(await panel.locator('#task').count(), 0, 'chat does not contain the old action dropdown');
   assert.equal(await panel.locator('#conversation').getAttribute('aria-label'), 'Conversation');
   await panel.locator('#load-model').click();
+  await panel.locator('#runtime-status').click();
   await panel.locator('#diagnostics').waitFor({state: 'visible'});
   assert.match(await panel.locator('#diagnostics').textContent(), /RAM128 MB/);
   const requests = () => panel.evaluate(async () => (await import('./backend.js')).backend.requests);
