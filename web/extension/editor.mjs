@@ -627,8 +627,9 @@ async function takePending() {
     return;
   }
   const task = response.task.task || 'polish';
-  await attachContext(response.task, task === 'page_read' ? 'chat' : task);
-  if (task === 'page_read') notice('Article attached. Click Read article to begin narration; no chat model is needed.');
+  await attachContext(response.task, ['page_read', 'page_attach'].includes(task) ? 'chat' : task);
+  if (task === 'page_attach') notice('Page attached. Choose Summarize, Translate, or Read article.');
+  else if (task === 'page_read') notice('Article attached. Click Read article to begin narration; no chat model is needed.');
   else if (task === 'page_translate') notice('Choose a language, then click Translate.');
   else submit();
 }

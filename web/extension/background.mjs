@@ -171,7 +171,7 @@ async function capturePage(tab, task, pending = false) {
   if (!isWebPage(tab.url))
     throw new Error(tab.url
       ? 'Only HTTP and HTTPS webpages can be captured. Open an article or select its text.'
-      : 'Click the Kidi toolbar icon on this webpage to grant temporary page access, then retry.');
+      : 'Edge did not expose this tab to Kidi. Reopen Kidi from the page toolbar or use its right-click menu.');
   if (isGmail(tab.url)) throw new Error('Use the Gmail writing actions instead of capturing the mailbox page.');
   try {
     await api.scripting.executeScript({
@@ -189,13 +189,16 @@ async function capturePage(tab, task, pending = false) {
 async function createPageTask(info, tab) {
   const command = PAGE_COMMANDS.find(item => item.id === info.menuItemId);
   if (!command || !tab?.id) return;
+  return openCapturedPage(tab, command.task);
+}
+async function openCapturedPage(tab, task) {
   lastTabs.set(tab.windowId, tab.id);
   const opening = openEditor(tab).then(() => null, error => error);
   try {
-    const task = await capturePage(tab, command.task, true);
+    const captured = await capturePage(tab, task, true);
     const error = await opening;
     if (error) throw error;
-    notify({type: 'kidi.context.pending', windowId: tab.windowId, id: task.id});
+    notify({type: 'kidi.context.pending', windowId: tab.windowId, id: captured.id});
   } catch (error) {
     await opening;
     await updateState(state => {
@@ -295,8 +298,14 @@ menus.onClicked.addListener((info, tab) => {
 });
 api.action?.onClicked.addListener(tab => {
   if (!tab?.id) return;
-  lastTabs.set(tab.windowId, tab.id);
-  openEditor(tab).catch(console.error);
+  let action;
+  if (isWebPage(tab.url) && !isGmail(tab.url)) {
+    action = openCapturedPage(tab, 'page_attach');
+  } else {
+    lastTabs.set(tab.windowId, tab.id);
+    action = openEditor(tab);
+  }
+  action.catch(console.error);
 });
 api.tabs.onActivated.addListener(({tabId, windowId}) => {
   api.tabs.get(tabId).then(tab => {

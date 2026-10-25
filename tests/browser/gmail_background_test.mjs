@@ -122,13 +122,17 @@ test('Gmail bridge activation requires optional permission and an exact Gmail or
   assert.equal(env.injections.some(request => request.target.tabId === 9), false);
 });
 
-test('toolbar action explicitly opens the panel without Edge automatic side-panel behavior', async () => {
+test('toolbar action captures an ordinary page while activeTab is valid and opens the panel', async () => {
   const env = await background();
   env.api.runtime.onInstalled.fire();
   await waitFor(() => env.notifications.length > 0);
   assert.equal(env.steps.includes('automatic-panel-behavior'), false);
   env.api.action.onClicked.fire(env.tabs.get(6));
-  await waitFor(() => env.steps.includes('open:6'));
+  await waitFor(() => env.storage['kidi-extension-tasks-v2']?.pending?.['8']);
+  assert.ok(env.steps.indexOf('open:6') < env.steps.indexOf('inject:6'));
+  const pending = await env.send({type: 'kidi.pending.take', windowId: 8});
+  assert.equal(pending.task.task, 'page_attach');
+  assert.equal(pending.task.text, 'Readable source paragraphs.');
 });
 
 test('Gmail capture rejects webpage callers and remains copy-only after permission revocation', async () => {
@@ -193,7 +197,7 @@ test('page capture rejects navigation and restricted protocols with actionable e
   env.tabs.get(6).url = 'file:///private/document.html';
   assert.match((await env.send({type: 'kidi.page.capture', tabId: 6})).error, /Only HTTP and HTTPS/);
   delete env.tabs.get(6).url;
-  assert.match((await env.send({type: 'kidi.page.capture', tabId: 6})).error, /toolbar.*temporary page access/);
+  assert.match((await env.send({type: 'kidi.page.capture', tabId: 6})).error, /did not expose this tab/);
 });
 
 test('page menu failures survive panel startup, and success clears the old error', async () => {
