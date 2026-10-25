@@ -82,17 +82,15 @@ button:disabled { cursor: default; opacity: .45; }
 .subtle { color: var(--muted); font-size: 11px; line-height: 1.4; }
 .app-bar {
   align-items: center;
-  border-bottom: 1px solid var(--border);
   display: flex;
   flex-shrink: 0;
-  gap: 7px;
-  height: 36px;
-  padding: 0 8px;
+  gap: 5px;
+  height: 30px;
+  justify-content: flex-end;
+  padding: 2px 8px 0;
   position: relative;
   z-index: 5;
 }
-.app-bar > img { height: 19px; width: 19px; }
-.app-bar > strong { flex: 1; font-size: 13px; }
 .runtime-details { position: relative; }
 .runtime-details > summary { list-style: none; }
 .runtime-details > summary::-webkit-details-marker { display: none; }
@@ -114,7 +112,7 @@ button:disabled { cursor: default; opacity: .45; }
   pointer-events: none;
   position: absolute;
   right: 0;
-  top: 27px;
+  top: 25px;
 }
 .diagnostic { color: var(--muted); display: inline-flex; font-size: 10px; gap: 4px; white-space: nowrap; }
 .diagnostic strong { color: var(--text); font-size: 10px; font-variant-numeric: tabular-nums; }

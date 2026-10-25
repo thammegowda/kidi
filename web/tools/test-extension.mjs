@@ -31,11 +31,11 @@ try {
         if (message.type() === 'error') errors.push(message.text());
     });
     await page.goto(`chrome-extension://${extensionId}/editor.html`);
-    await page.locator('header strong').waitFor({state: 'visible'});
+    await page.locator('.app-bar').waitFor({state: 'visible'});
     await page.waitForFunction(() => document.querySelector('#system-prompt')?.value.length > 20);
-    assert.equal(await page.locator('header strong').textContent(), 'Kidi AI');
+    assert.equal(await page.locator('.app-bar > strong').count(), 0, 'browser chrome owns the only Kidi AI title');
     const header = await page.locator('.app-bar').boundingBox();
-    assert.ok(header && header.height <= 42, `application header is compact: ${JSON.stringify(header)}`);
+    assert.ok(header && header.height <= 32, `session controls are compact: ${JSON.stringify(header)}`);
     assert.equal(await page.locator('#task').count(), 0, 'chat replaces the action dropdown');
     assert.equal(await page.locator('#prompt-action option').count(), 13);
     await page.locator('#prompt-toggle').click();
