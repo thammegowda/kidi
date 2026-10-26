@@ -30,6 +30,7 @@ let promptOverrides = {};
 let ready = snapshot.ready === true;
 let activeRequest = null;
 let context = null;
+let useCurrentPage = true;
 let inspection = {};
 let selectedDraft = '';
 let action = 'chat';
@@ -244,6 +245,8 @@ function renderSuggestions() {
   const drafts = inspection.drafts || [];
   $('gmail-connect').hidden = !inspection.onGmail || inspection.gmailEnabled;
   $('draft-picker').hidden = drafts.length < 2;
+  if (!inspection.onGmail)
+    buttons.push(suggestion('Use current page', () => pageAction('page_attach')));
   if (inspection.onGmail && inspection.gmailEnabled) {
     if (drafts.length) {
       buttons.push(
@@ -274,28 +277,35 @@ function renderSuggestions() {
   }
   $('suggestions').replaceChildren(...buttons);
 }
+function renderContextStatus() {
+  $('context-status').textContent = inspection.onGmail
+    ? inspection.gmailEnabled && !inspection.drafts?.length && !inspection.emailAvailable
+      ? 'Open a compose window or an email in Gmail.'
+      : !context ? 'Use a Gmail writing action to attach a draft or opened email.' : ''
+    : !inspection.pageAvailable && (useCurrentPage || !context)
+      ? 'Current page content is unavailable. Click Use current page to grant access, or paste text into chat.'
+      : useCurrentPage ? 'Chat includes the current page. Its text is refreshed before each message.' : '';
+}
+function renderInspection(details) {
+  inspection = details;
+  const drafts = details.drafts || [];
+  if (!drafts.some(draft => draft.id === selectedDraft))
+    selectedDraft = details.activeDraftId || (drafts.length === 1 ? drafts[0].id : '');
+  const choices = [];
+  if (drafts.length > 1) choices.push(new Option('Choose a draft…', ''));
+  for (const [index, draft] of drafts.entries())
+    choices.push(new Option(`${draft.title}${drafts.length > 1 ? ` (${index + 1})` : ''}`, draft.id));
+  $('gmail-draft').replaceChildren(...choices);
+  $('gmail-draft').value = selectedDraft;
+  renderContextStatus();
+  renderSuggestions();
+}
 async function refreshContext() {
   const sequence = ++refreshSequence;
   try {
     const details = await sendIntegration('kidi.context.inspect');
     if (sequence !== refreshSequence) return;
-    inspection = details;
-    const drafts = details.drafts || [];
-    if (!drafts.some(draft => draft.id === selectedDraft))
-      selectedDraft = details.activeDraftId || (drafts.length === 1 ? drafts[0].id : '');
-    const choices = [];
-    if (drafts.length > 1) choices.push(new Option('Choose a draft…', ''));
-    for (const [index, draft] of drafts.entries())
-      choices.push(new Option(`${draft.title}${drafts.length > 1 ? ` (${index + 1})` : ''}`, draft.id));
-    $('gmail-draft').replaceChildren(...choices);
-    $('gmail-draft').value = selectedDraft;
-    $('context-status').textContent =
-      details.onGmail && details.gmailEnabled && !drafts.length && !details.emailAvailable
-        ? 'Open a compose window or an email in Gmail.'
-        : !details.onGmail && !details.pageAvailable
-          ? 'Choose a page action to grant optional webpage access.'
-          : '';
-    renderSuggestions();
+    renderInspection(details);
   } catch (error) {
     if (sequence !== refreshSequence) return;
     $('context-status').textContent = error.message;
@@ -305,7 +315,7 @@ function renderContext() {
   $('context-card').hidden = !context;
   $('context-label').textContent = context
     ? `${context.kind === 'gmail-draft' ? 'Draft' : context.kind === 'gmail-email' ? 'Email'
-      : context.kind === 'article' ? 'Article' : 'Selection'}: ${context.title}`
+      : context.kind === 'article' ? useCurrentPage ? 'Page' : 'Article' : 'Selection'}: ${context.title}`
     : '';
   $('context-label').title = context?.sourceUrl || '';
   $('context-text').textContent = context?.text || '';
@@ -314,6 +324,7 @@ function renderContext() {
   $('context-followup').textContent = context?.summaryText
     ? 'Follow-up chat uses this summary; page actions still use the attached source.' : '';
   $('context-followup').hidden = !$('context-followup').textContent;
+  renderContextStatus();
   renderSuggestions();
 }
 async function clearConversation({detach = true} = {}) {
@@ -325,6 +336,7 @@ async function clearConversation({detach = true} = {}) {
   history = [];
   queued = null;
   generationStats = {};
+  if (detach) useCurrentPage = false;
   $('conversation').replaceChildren($('welcome') || createWelcome());
   $('welcome').hidden = false;
   if (detach && context) {
@@ -334,7 +346,7 @@ async function clearConversation({detach = true} = {}) {
     catch (error) { notice(error.message, true); }
   }
   chooseAction('chat');
-  $('message').placeholder = 'Ask Kidi, or describe the email you want to write…';
+  $('message').placeholder = 'Ask about this page, or chat with Kidi…';
   renderContext();
   renderRuntime();
 }
@@ -344,13 +356,14 @@ function createWelcome() {
   welcome.className = 'welcome';
   const heading = document.createElement('h1'), paragraph = document.createElement('p');
   heading.textContent = 'How can I help?';
-  paragraph.textContent = 'Chat privately, write an email, summarize an article, or translate a page.';
+  paragraph.textContent = 'Ask about the current page, chat privately, or write an email.';
   welcome.append(heading, paragraph);
   return welcome;
 }
 async function attachContext(task, taskAction) {
   await clearConversation();
   context = task;
+  useCurrentPage = task.task === 'page_attach';
   chooseAction(taskAction);
   renderContext();
   if (task.warning) notice(task.warning);
@@ -382,18 +395,23 @@ async function pageAction(task) {
   }
   const current = context?.kind === 'article' && context.tabId === inspection.tabId &&
     context.sourceUrl === inspection.pageUrl;
-  if (!current) {
+  if (!current || task === 'page_attach') {
     capturing = true;
     renderRuntime();
     try {
       const captured = await sendIntegration('kidi.page.capture', {task});
-      await attachContext(captured.task, task === 'page_read' ? 'chat' : task);
+      await attachContext(captured.task, ['page_read', 'page_attach'].includes(task) ? 'chat' : task);
     } finally {
       capturing = false;
       renderRuntime();
     }
   } else if (task !== 'page_read') chooseAction(task);
-  if (task === 'page_read') return requestRead(context.text, context.language);
+  useCurrentPage = task === 'page_attach';
+  renderContext();
+  if (task === 'page_attach') {
+    notice('Current page attached. Ask a question, or choose a page action.');
+    $('message').focus();
+  } else if (task === 'page_read') return requestRead(context.text, context.language);
   else if (task === 'page_translate') {
     notice('Choose a language, then click Translate. The webpage stays unchanged.');
     $('target-language').focus();
@@ -481,13 +499,40 @@ function failRequest(message, cancelled = false) {
   notice(message, !cancelled);
   renderRuntime();
 }
-function submit(task = action, instruction = $('message').value.trim()) {
+async function refreshChatPage() {
+  const previous = context;
+  const sequence = ++refreshSequence;
+  const details = await sendIntegration('kidi.context.inspect');
+  if (sequence === refreshSequence) renderInspection(details);
+  const captured = details.pageAvailable
+    ? (await sendIntegration('kidi.page.capture', {tabId: details.tabId, task: 'page_attach'})).task : null;
+  if (context !== previous || !useCurrentPage) {
+    if (captured) await sendIntegration('kidi.context.discard', {id: captured.id});
+    throw new Error('The attached context changed while reading the page. Send your message again.');
+  }
+  context = captured;
+  renderContext();
+  if (previous) await sendIntegration('kidi.context.discard', {id: previous.id});
+}
+async function submit(task = action, instruction = $('message').value.trim()) {
   if (activeRequest || queued || capturing) return;
   chooseAction(task);
   if (!instruction && !context?.text) {
     notice('Add a message or rough notes first.');
     $('message').focus();
     return;
+  }
+  if (task === 'chat' && useCurrentPage) {
+    capturing = true;
+    renderRuntime();
+    try { await refreshChatPage(); }
+    catch (error) {
+      notice(`Unable to attach the current page: ${error.message || String(error)}`, true);
+      return;
+    } finally {
+      capturing = false;
+      renderRuntime();
+    }
   }
   if (!ready) {
     queued = {task, instruction, contextId: context?.id};
@@ -637,7 +682,7 @@ async function takePending() {
   }
   const task = response.task.task || 'polish';
   await attachContext(response.task, ['page_read', 'page_attach'].includes(task) ? 'chat' : task);
-  if (task === 'page_attach') notice('Page attached. Choose Summarize, Translate, or Read article.');
+  if (task === 'page_attach') notice('Current page attached. Ask a question, or choose a page action.');
   else if (task === 'page_read') notice('Article attached. Click Read article to begin narration; no chat model is needed.');
   else if (task === 'page_translate') notice('Choose a language, then click Translate.');
   else submit();

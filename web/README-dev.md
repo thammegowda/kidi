@@ -142,8 +142,19 @@ For Firefox development, open `about:debugging`, choose **This Firefox**, and
 load `build-extension/firefox/manifest.json` as a temporary add-on.
 
 The panel keeps a conversation in memory while it is open. Type a message and
-press **Send** (Enter; Shift+Enter inserts a newline). **New chat** clears the
-conversation and detaches source context without unloading the model. Follow-up
+press **Send** (Enter; Shift+Enter inserts a newline). Normal chat automatically
+includes readable text from the current page when webpage access is available;
+you do not need to summarize it first. The page is captured again before each
+message, so navigation, tab changes, and edits do not leave chat using an old
+snapshot. **Use current page** explicitly attaches the page without generating
+an answer and offers optional webpage access when needed. **View attached text**
+shows the source passed to the local model. Capture failures stop the request
+and display an error rather than answering with stale page text.
+**New chat** clears the conversation and detaches source context without
+unloading the model. **Remove** also detaches it. Both disable automatic page
+context until **Use current page** or the toolbar action attaches a page again.
+Explicit selections, Gmail captures, and page summaries remain attached to their
+original source rather than following the active tab. Follow-up
 instructions reuse completed user/assistant turns; conversations that exceed
 the turn, byte, or model context budget fail explicitly rather than silently
 dropping messages.
@@ -243,9 +254,11 @@ protected signatures/quotes, and explicit insertion.
 
 ### Articles, translation, and read aloud (M2/M3)
 
-1. Open an HTTP/HTTPS article and invoke Kidi using its toolbar icon. The panel
-   offers **Summarize page**, **Translate page**, and **Read article** outside
-   Gmail. You can also invoke these actions from the page's right-click menu.
+1. Open an HTTP/HTTPS article and invoke Kidi using its toolbar icon. Ask a
+   question about the page directly, or choose **Summarize page**, **Translate
+   page**, or **Read article** outside Gmail. **Use current page** restores page
+   context after it has been removed. You can also invoke the transformation
+   actions from the page's right-click menu.
 2. **Summarize page** extracts the article and produces a summary. Readability
    runs locally against a document clone with navigation, hidden content, and
    forms removed. A selection takes precedence over the full article.
@@ -276,7 +289,7 @@ until synthesis finishes.
 
 Kidi first uses temporary `activeTab` access from the toolbar or context menu
 and captures the page while that grant is valid. Some Edge side-panel entry
-points do not provide `activeTab`; in that case, the first page action offers
+points do not provide `activeTab`; in that case, **Use current page** or a page action offers
 an explicit optional HTTP/HTTPS host-permission prompt. Granting it enables
 persistent access to ordinary webpages and can be revoked from Edge's extension
 settings. Gmail DOM integration remains separately opt-in, and mailbox-page
@@ -306,7 +319,8 @@ make extension-article-test
 ```
 
 These checks serve only synthetic articles and use a fixture backend/PCM, not
-pretrained language/voice models. They verify source filtering and Unicode
+pretrained language/voice models. They verify direct page-aware chat, refreshed
+page text and active-tab changes, explicit detachment, source filtering and Unicode
 limits, summary follow-up context, target-language routing, progressive results,
 download approval, narration controls, and cancellation. Unit tests also
 exercise bounded playback, late events, and drain-before-completion. Live model

@@ -26,8 +26,13 @@ try {
   });
   const unexpectedNetwork = [];
   await browser.route('https://**/*', route => {
-    if (new URL(route.request().url()).hostname === 'example.org')
-      return route.fulfill({status: 200, contentType: 'text/html', body: fixture});
+    const url = new URL(route.request().url());
+    if (['example.org', 'ungranted.example.net'].includes(url.hostname)) {
+      const marker = url.pathname === '/other-article' ? 'OTHER_PAGE_MARKER'
+        : url.pathname === '/next-article' ? 'NAVIGATED_PAGE_MARKER' : '';
+      const body = marker ? fixture.replace('carefully controlled experiment', marker) : fixture;
+      return route.fulfill({status: 200, contentType: 'text/html', body});
+    }
     unexpectedNetwork.push(route.request().url());
     return route.abort();
   });
@@ -46,6 +51,83 @@ try {
     chrome.runtime.sendMessage({type: 'kidi.page.capture', tabId}), tabId);
   const answers = count => panel.waitForFunction(expected =>
     document.querySelectorAll('.turn.assistant .result-actions').length === expected, count);
+  const ask = async (text, count) => {
+    await panel.locator('#message').fill(text);
+    await panel.locator('#send').click();
+    await answers(count);
+    return (await requests()).filter(request => request.type === 'editor.run').at(-1).payload;
+  };
+
+  const direct = await ask('What did the research team study?', 1);
+  assert.equal(direct.task, 'chat');
+  assert.equal(direct.instruction, 'What did the research team study?');
+  assert.match(direct.text, /carefully controlled experiment/);
+  assert.doesNotMatch(direct.text, /PRIVATE_MARKER/);
+  assert.deepEqual(direct.history, []);
+  assert.equal((await requests()).filter(request => request.type === 'document.run').length, 0,
+    'asking about a page does not require a summary action');
+  await article.locator('#first-paragraph').evaluate(element => {
+    element.append(' CURRENT_PAGE_EDIT: The updated trial included thirty participants.');
+  });
+  const updated = await ask('How many participants were in the updated trial?', 2);
+  assert.match(updated.text, /CURRENT_PAGE_EDIT/);
+  assert.equal(updated.history.length, 2, 'recapturing a page preserves conversational history');
+
+  const otherArticle = await browser.newPage();
+  await otherArticle.goto('https://example.org/other-article');
+  await panel.bringToFront();
+  await panel.goto(`chrome-extension://${extensionId}/editor.html`);
+  await panel.waitForFunction(() => document.querySelector('#target-language').options.length > 50);
+  const other = await ask('What is on the current page?', 1);
+  assert.match(other.text, /OTHER_PAGE_MARKER/);
+  assert.doesNotMatch(other.text, /CURRENT_PAGE_EDIT/);
+  await article.bringToFront();
+  await panel.bringToFront();
+  const switched = await ask('What about this tab?', 2);
+  assert.match(switched.text, /CURRENT_PAGE_EDIT/);
+  assert.doesNotMatch(switched.text, /OTHER_PAGE_MARKER/);
+  assert.equal(switched.history.length, 2);
+  await article.goto('https://example.org/next-article');
+  const navigated = await ask('What is on the page after navigation?', 3);
+  assert.match(navigated.text, /NAVIGATED_PAGE_MARKER/);
+  assert.doesNotMatch(navigated.text, /CURRENT_PAGE_EDIT|OTHER_PAGE_MARKER/);
+
+  await panel.locator('#new-chat').click();
+  await panel.locator('#context-card').waitFor({state: 'hidden'});
+  await panel.evaluate(() => dispatchEvent(new Event('focus')));
+  const detached = await ask('A general question without the page.', 1);
+  assert.equal(detached.text, '', 'New chat disables automatic page context, including after focus');
+  assert.deepEqual(detached.history, []);
+  const generated = (await requests()).filter(request => request.type === 'editor.run').length;
+  await panel.getByRole('button', {name: 'Use current page', exact: true}).click();
+  await panel.locator('#context-card').waitFor({state: 'visible'});
+  assert.equal((await requests()).filter(request => request.type === 'editor.run').length, generated,
+    'attaching a page does not generate an answer');
+  const reattached = await ask('Use the page again.', 1);
+  assert.match(reattached.text, /NAVIGATED_PAGE_MARKER/);
+  assert.deepEqual(reattached.history, []);
+  await panel.getByRole('button', {name: 'Remove attached context', exact: true}).click();
+  await panel.locator('#context-card').waitFor({state: 'hidden'});
+  const removed = await ask('Another general question.', 1);
+  assert.equal(removed.text, '', 'Remove does not silently reattach the page');
+
+  await panel.getByRole('button', {name: 'Use current page', exact: true}).click();
+  await panel.locator('#context-card').waitFor({state: 'visible'});
+  await article.goto('https://ungranted.example.net/article');
+  const unavailable = await ask('Chat without webpage access.', 1);
+  assert.equal(unavailable.text, '', 'an inaccessible current tab never reuses the preceding page');
+  assert.equal(await panel.locator('#context-card').isVisible(), false);
+  assert.match(await panel.locator('#context-status').textContent(), /unavailable.*Use current page/);
+  const beforeDenied = (await requests()).length;
+  await panel.evaluate(() => { chrome.permissions.request = async () => false; });
+  await panel.getByRole('button', {name: 'Use current page', exact: true}).click();
+  await panel.waitForFunction(() => document.querySelector('#notice').textContent.includes('not granted'));
+  assert.equal((await requests()).length, beforeDenied, 'denied permission never starts inference');
+
+  await article.goto('https://example.org/article');
+  await otherArticle.close();
+  await panel.goto(`chrome-extension://${extensionId}/editor.html?tab=${tabId}`);
+  await panel.waitForFunction(() => document.querySelector('#target-language').options.length > 50);
 
   const captured = await capture();
   assert.equal(captured.ok, true);
@@ -167,9 +249,15 @@ try {
   await panel.reload();
   await panel.waitForFunction(() => document.querySelector('#target-language').options.length > 50);
   assert.equal(await panel.locator('#target-language').inputValue(), 'fr', 'translation preference is restored');
+  await panel.locator('#message').fill('What does this empty page say?');
+  await panel.locator('#send').click();
+  await panel.waitForFunction(() => document.querySelector('#notice').textContent.includes('Unable to attach'));
+  assert.match(await panel.locator('#notice').textContent(), /No readable article/);
+  assert.equal((await requests()).length, 0, 'failed page capture blocks inference and model loading');
+  assert.equal(await panel.locator('#message').inputValue(), 'What does this empty page say?');
   assert.deepEqual(errors, []);
   assert.deepEqual(unexpectedNetwork, [], 'all executable assets and fixture inference remain local');
-  console.log('Article extension passed: extraction, Unicode bounds, summary/follow-up, translation, consent, narration and stop.');
+  console.log('Article extension passed: current-page chat, tab/navigation updates, permissions, detachment, extraction, Unicode bounds, summary/follow-up, translation, consent, narration and stop.');
 } finally {
   if (browser) await browser.close();
   await rm(temporary, {recursive: true, force: true});
