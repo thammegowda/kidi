@@ -24,7 +24,8 @@ node web/tools/build.mjs build-web
 ```
 
 The packaged site contains two runtimes: the primary non-pthread WebGPU module
-and a pthread CPU fallback. There is no single-thread CPU artifact.
+and a pthread CPU fallback. Extension packages additionally include a
+single-thread CPU fallback for browsers that cannot isolate extension pages.
 
 ## Serve
 
@@ -115,6 +116,268 @@ The JavaScript files have distinct roles:
 Only browser assets and their licenses are copied to the deployment directory.
 Do not deploy build scripts or the build-only parsers. Serving via Python does not replace the
 JavaScript that runs in the browser. No Node server or model-export step is used.
+
+## Browser extensions
+
+Kidi packages a chat-first writing assistant as Manifest V3 extensions for Chromium browsers
+and Firefox:
+
+```bash
+make extension
+```
+
+The build compiles WebGPU, pthread CPU, and single-thread CPU Wasm runtimes,
+then produces:
+
+```text
+build-extension/chromium/
+build-extension/firefox/
+dist/kidi-chromium.zip
+dist/kidi-firefox.zip
+```
+
+Chrome and Edge use the Chromium package. Load
+`build-extension/chromium/` through the browser's extension developer page.
+For Firefox development, open `about:debugging`, choose **This Firefox**, and
+load `build-extension/firefox/manifest.json` as a temporary add-on.
+
+The panel keeps a conversation in memory while it is open. Type a message and
+press **Send** (Enter; Shift+Enter inserts a newline). Normal chat automatically
+includes readable text from the current page when webpage access is available;
+you do not need to summarize it first. The page is captured again before each
+message, so navigation, tab changes, and edits do not leave chat using an old
+snapshot. **Use current page** explicitly attaches the page without generating
+an answer and offers optional webpage access when needed. **View attached text**
+shows the source passed to the local model. Capture failures stop the request
+and display an error rather than answering with stale page text.
+**New chat** clears the conversation and detaches source context without
+unloading the model. **Remove** also detaches it. Both disable automatic page
+context until **Use current page** or the toolbar action attaches a page again.
+Explicit selections, Gmail captures, and page summaries remain attached to their
+original source rather than following the active tab. Follow-up
+instructions reuse completed user/assistant turns; conversations that exceed
+the turn, byte, or model context budget fail explicitly rather than silently
+dropping messages.
+
+The extension also adds **Polish with Kidi**, **Explain with Kidi**, and
+**Summarize with Kidi** to the selection context menu. Chromium opens a side
+panel; Firefox opens a sidebar. Editable input, textarea, and contenteditable
+selections can be replaced only while the captured text still matches. Other
+results remain available to copy. The compact **Prompt** control exposes the
+configured system prompt for each action. Edits are saved automatically per
+action in extension-local storage; **Default** removes the override and restores
+the shared YAML prompt. All defaults are under the top-level `prompts` map:
+`system` supplies the shared chat system prompt, `translate` supplies reader
+translation, and keys such as `polish`, `email_reply`, and `page_summarize`
+supply action prompts. `runtime.wasm.prompts` may override individual defaults.
+The old `models.chat.system_prompt`, `translation_prompt`, and `editor.prompts`
+locations must be moved to this map; they are rejected rather than silently
+ignored. Existing locally customized prompts are retained.
+The action selector lives inside the prompt inspector,
+not in the main chat UI. Prompt overrides remain separate for chat, email
+composition, email polishing, email replies, and the existing text actions.
+
+### Gmail writing (M1)
+
+1. Open `https://mail.google.com/` and open the Kidi panel.
+2. Click **Enable Gmail** and grant the optional permission for that origin.
+   No Gmail OAuth or blanket access to other websites is requested.
+3. Open a compose window or an email. Suggestions update as Gmail changes.
+4. For a compose window, choose **Polish draft** or **Compose from notes**.
+   With multiple drafts, choose the draft by subject first. A selected passage
+   is used instead of the complete draft when it is inside that editor.
+5. For an opened email, choose **Draft a reply**, optionally entering guidance
+   in the chat composer first.
+6. Review and refine the result in chat, then click **Copy** and paste it into
+   Gmail yourself.
+
+The Gmail bridge observes only draft/email availability until an action
+explicitly captures content. It extracts the latest visible opened message,
+not inbox snippets, hidden messages, or the complete thread. Use **View attached
+text** to inspect exactly what is sent to the local model. Gmail integration is
+deliberately read-only: Kidi does not mutate drafts, insert replies, click Send,
+create recipients, or change subjects. Copy/paste keeps Gmail autosave, undo,
+signatures, quotations, and editor behavior under the user's control.
+
+Source snapshots live in extension session storage (or volatile memory when
+that API is unavailable), expire after 30 minutes, and are bounded to 16
+contexts. Email text and conversations are not saved in local storage.
+Revoking Gmail permission unregisters its content script and rejects further
+captures or insertions. Browser reloads can require recapturing a draft.
+Gmail's DOM is not a public editing API; retain manual Gmail smoke coverage
+for autosave, inline replies, and multiple-account layouts when Gmail changes.
+
+Once the model is ready, a compact diagnostics strip reports the active backend,
+host RAM, WebGPU buffer memory, live decode speed, output-token count, and
+time-to-first-token. Memory values come from the runtime allocator and WebGPU
+buffer accounting rather than browser-wide estimates. **GPU mem** is allocated
+buffer memory, not a utilization percentage; browsers do not expose portable
+GPU-utilization telemetry. Assistant results use the shared vendored
+Marked/DOMPurify renderer for sanitized streaming Markdown, links, lists,
+tables, and fenced code.
+
+The extension contains executable JavaScript and Wasm locally. Production
+configuration downloads only model data from Hugging Face; the explicit
+development bridge described below can instead populate Cache Storage from the
+native loopback cache. The Chromium manifest opts into
+cross-origin isolation for pthread CPU inference. Firefox prefers WebGPU and
+uses the packaged single-thread CPU runtime when its extension page is not
+isolated.
+
+Run the installed Chromium smoke test after packaging:
+
+```bash
+make extension-smoke-test
+```
+
+The smoke test loads the unpacked extension in Chromium and verifies its
+service worker, chat page, extension origin, cross-origin isolation, prompt
+persistence/reset, and the actual shared WebGPU worker's editor/document service routes.
+It does not download the model.
+
+Additional Gmail/chat checks:
+
+```bash
+make extension-gmail-test
+```
+
+The Gmail test uses an isolated temporary extension and a synthetic mailbox;
+it never opens a real account or downloads model data. Its backend fixture
+tests UI transport, not model quality. The separate CPU Wasm test loads the
+small checked-in Gemma numerical fixture and runs real inference for
+chat, email composition/polishing/replies, conversational history, and document
+processing. A controlled in-memory variant emits a word followed by EOS to
+verify ordered translation, rolling summary replacement, changing native
+request IDs, input/output token budgets, and output-limit retries. Tests
+also cover optional permissions, multiple windows/drafts, stale captures,
+protected signatures/quotes, and explicit insertion.
+
+### Articles, translation, and read aloud (M2/M3)
+
+1. Open an HTTP/HTTPS article and invoke Kidi using its toolbar icon. Ask a
+   question about the page directly, or choose **Summarize page**, **Translate
+   page**, or **Read article** outside Gmail. **Use current page** restores page
+   context after it has been removed. You can also invoke the transformation
+   actions from the page's right-click menu.
+2. **Summarize page** extracts the article and produces a summary. Readability
+   runs locally against a document clone with navigation, hidden content, and
+   forms removed. A selection takes precedence over the full article.
+3. **Translate page** attaches the source and opens a language picker. Choose
+   the target, then click **Translate**. Its preference is saved locally.
+4. Expand **View attached text** to review the exact read-only source. Only the
+   first 64 KiB is retained for unusually long pages, with a persistent warning.
+   Kidi translates the extracted text in the panel, not page navigation,
+   advertisements, or an in-place rewrite of the website.
+5. Use **Read article** for the source, or **Read aloud** under a result. On first
+   use, approve the separate local voice model download/setup. No voice files
+   are fetched before approval. Cached files and voice calibration are reused.
+   Unknown source languages require an explicit narration-language choice;
+   supported pronunciation/translation quality depends on the installed models.
+6. Use **Pause**/**Resume** and **Stop audio** in the compact playback strip.
+   Stopping discards buffered audio immediately and cancels pending synthesis.
+   Closing or clearing the conversation stops narration.
+
+Original article narration does not load or invoke the chat model, including
+when chat files are already cached. The extension loads chat only on explicit
+**Load** or a text-generation action; other web hosts keep automatic cache
+restore. Starting
+from a right-click **Read article** request attaches the source first; click
+the panel's reading action to activate audio. Voice loading shows real byte
+progress, initialization/calibration state, and synthesis steps when available.
+The player remains active until queued audio is actually played, not merely
+until synthesis finishes.
+
+Kidi first uses temporary `activeTab` access from the toolbar or context menu
+and captures the page while that grant is valid. Some Edge side-panel entry
+points do not provide `activeTab`; in that case, **Use current page** or a page action offers
+an explicit optional HTTP/HTTPS host-permission prompt. Granting it enables
+persistent access to ordinary webpages and can be revoked from Edge's extension
+settings. Gmail DOM integration remains separately opt-in, and mailbox-page
+article extraction is always refused. Browser-internal pages, PDFs without
+accessible page text, and articles that Readability cannot identify may require
+selecting or pasting text.
+
+The C++ document pipeline processes every captured section rather than
+silently dropping text beyond one model window. Translation preserves section
+and paragraph order, publishes completed sections, and retries output-limited
+sections in smaller pieces. Summaries maintain one cumulative result: each
+4096-token input combines the previous summary with the next source segment,
+and the model returns a revised summary of at most 1024 tokens. The panel
+replaces its visible summary after every segment, so useful output appears
+before the document finishes. Segment progress accompanies generation, and
+token/throughput statistics aggregate the underlying inference calls.
+
+After a summary, follow-up chat explicitly uses that generated summary instead
+of the complete article; the source stays attached for another transformation.
+Without a summary, normal context-budget errors remain explicit. Summary and
+translation have separate editable/default-reset prompts in **Prompt**.
+
+Run the installed-package article checks:
+
+```bash
+make extension-article-test
+```
+
+These checks serve only synthetic articles and use a fixture backend/PCM, not
+pretrained language/voice models. They verify direct page-aware chat, refreshed
+page text and active-tab changes, explicit detachment, source filtering and Unicode
+limits, summary follow-up context, target-language routing, progressive results,
+download approval, narration controls, and cancellation. Unit tests also
+exercise bounded playback, late events, and drain-before-completion. Live model
+quality/performance, real Gmail autosave, and Firefox runtime behavior still
+need device/browser smoke testing; synthetic output is not a quality benchmark.
+
+For a network-dependent Microsoft Edge check against the current Wikipedia
+article, run:
+
+```bash
+make extension-edge-e2e-test
+```
+
+This first runs every deterministic installed-extension test in Edge, then
+copies the packaged extension unchanged to a temporary Edge profile, uses the
+DevTools Protocol `Extensions.triggerAction` command to invoke its real toolbar
+action and grant `activeTab`, verifies Readability extraction with the
+shipped background/content scripts, and exercises the actual side-panel
+Summarize button with the deterministic backend fixture, so it never downloads
+Gemma. Temporary profiles and copies are deleted. Set `KIDI_E2E_KEEP_OPEN=1`
+to keep the one successful test window available for inspection, and
+`KIDI_E2E_STEP_DELAY_MS=1500` to make each visible transition easier to follow.
+The live portion detects upstream page/DOM and toolbar-permission regressions
+but is intentionally outside `web-test` because it requires Edge and network
+access.
+
+For manual testing with the real backend and a reusable model cache, run:
+
+```bash
+make extension-edge-open
+```
+
+This opens (or reuses) exactly one isolated profile at
+`~/.cache/kidi/edge-extension-profile`. Unlike automated test profiles, it is
+not deleted, so the extension's Cache Storage, model ranges, voice calibration,
+prompt overrides, and other browser-local settings survive Edge restarts. The
+script reconnects to an already-running profile instead of opening duplicates.
+It loads the real package from `build-extension/chromium`; deterministic E2E
+tests continue to use disposable fixture profiles and never alter this cache.
+
+To fill that browser cache from Kidi's existing native Hub cache instead of
+downloading model bytes from Hugging Face, use:
+
+```bash
+make extension-edge-open-local
+```
+
+The launcher starts a loopback-only bridge on `127.0.0.1:8765`, stores that
+development override in this extension's local settings, and reuses the same
+stable Edge profile. The bridge exposes only validated cached Hub revisions and
+supports the exact byte-range/CORS/CORP contract used by the browser loader.
+Model bytes remain on the machine; the normal loader still performs its layout
+normalization and writes the browser's persistent Cache Storage once. Later
+loads use the browser cache without the bridge. Running
+`make extension-edge-open` removes the override and returns the profile to the
+configured HTTPS Hub. Shipped ZIPs retain the HTTPS default and never enable
+the bridge automatically.
 
 ## Model Source
 

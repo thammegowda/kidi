@@ -6,16 +6,24 @@ import {clearVoicePromptCache, describeVoicePrompt, loadVoicePrompt, storeVoiceP
 import {loadAppConfig} from './app-config.mjs';
 
 const SETTINGS_KEY = 'kidi-wasm-host-v1';
+const MODEL_HUB_OVERRIDE_KEY = 'kidi-model-hub-remote-v1';
 const APP_CONFIG = await loadAppConfig();
+const extensionStorage = globalThis.browser?.storage?.local || globalThis.chrome?.storage?.local;
+if (extensionStorage) {
+  const stored = await extensionStorage.get(MODEL_HUB_OVERRIDE_KEY);
+  if (typeof stored?.[MODEL_HUB_OVERRIDE_KEY] === 'string')
+    APP_CONFIG.model_hub.remote = stored[MODEL_HUB_OVERRIDE_KEY];
+}
 configureModelHub(APP_CONFIG.model_hub.remote);
 const CHAT = APP_CONFIG.models.chat, ASR = APP_CONFIG.models.asr, TTS = APP_CONFIG.models.tts;
+const PROMPTS = APP_CONFIG.prompts;
 const VOICE_REFERENCES = TTS.reference_sentences || [TTS.reference_text];
 const DEFAULTS = {
   model: CHAT.model_id,
   backend: CHAT.accelerator === 'cpu' ? 'cpu' : 'webgpu',
   threads: APP_CONFIG.runtime.threads,
   maximumTokens: CHAT.generation.max_tokens,
-  systemPrompt: CHAT.system_prompt,
+  systemPrompt: PROMPTS.system,
 };
 
 class WasmBackend {
@@ -31,9 +39,8 @@ class WasmBackend {
       kv_cache_precision: CHAT.kv_cache_precision,
       system_prompt: DEFAULTS.systemPrompt,
       configured_system_prompt: DEFAULTS.systemPrompt,
-      translation_prompt: CHAT.translation_prompt ||
-        'You are a literary translator. Translate <text_to_translate> into {target_language}. ' +
-        'Use surrounding context only to resolve meaning and return only the translated text.',
+      editor_prompts: {...PROMPTS},
+      translation_prompt: PROMPTS.translate,
       translation: {
         target_chars: CHAT.translation?.target_chars || 800,
         max_chars: CHAT.translation?.max_chars || 1200,
@@ -309,7 +316,7 @@ class WasmBackend {
               this.#ttsLoadReject = null;
               resolve();
             }, error => failLoad(error.message));
-          } else if (data.type === 'progress') {
+          } else if (data.type === 'progress' || data.type === 'initializing') {
             this.#event(id, 'tts.progress', {phase: 'loading', ...data});
           } else if (data.type === 'generating') {
             this.#event(id, 'tts.progress', {
@@ -349,7 +356,9 @@ class WasmBackend {
           source: this.#components.tts.directory,
           backend: useGpu ? 'webgpu' : 'cpu',
           threads,
+          singleThread: !useGpu && !globalThis.crossOriginIsolated && globalThis.KIDI_SINGLE_THREAD_WASM === true,
           cacheOnly: false,
+          modelHubRemote: APP_CONFIG.model_hub.remote,
           matrixPrecision: precision,
           w8a8Kernel: 'float',
         });
@@ -511,7 +520,7 @@ class WasmBackend {
     return models;
   }
 
-  connect(callbacks) {
+  connect(callbacks, {loadCachedModel = true} = {}) {
     this.#callbacks = callbacks;
     queueMicrotask(() => {
       callbacks.onOpen?.();
@@ -527,6 +536,7 @@ class WasmBackend {
           wire_audio: 'float32',
         },
       });
+      if (!loadCachedModel) return;
       isModelCached(this.#settings.model).then(cached => {
         if (cached && !this.#ready && !this.#worker)
           this.#load(crypto.randomUUID(), {...this.#settings, cacheOnly: true});
@@ -609,6 +619,36 @@ class WasmBackend {
         type: 'generate',
         messages: [{role: 'system', content: prompt}, {role: 'user', content: request}],
         maximumTokens: this.#settings.maximumTokens,
+      });
+      return;
+    }
+    if (type === 'editor.run') {
+      if (!this.#ready || !this.#worker) return this.#error(id, 'not_ready', 'Load the browser model first');
+      if (this.#current) return this.#error(id, 'busy', 'Another inference request is active');
+      this.#current = {id, text: '', kind: 'editor'};
+      this.#event(id, 'editor.started');
+      this.#worker.postMessage({
+        type: 'editor',
+        request: Object.hasOwn(payload, 'system_prompt') ? payload : {
+          ...payload, system_prompt: payload.task === 'chat' ? this.#settings.systemPrompt : PROMPTS[payload.task],
+        },
+        maximumTokens: Number.isInteger(payload.maximum_tokens)
+          ? payload.maximum_tokens : Math.min(this.#settings.maximumTokens, 512),
+      });
+      return;
+    }
+    if (type === 'document.run') {
+      if (!this.#ready || !this.#worker) return this.#error(id, 'not_ready', 'Load the browser model first');
+      if (this.#current) return this.#error(id, 'busy', 'Another inference request is active');
+      this.#current = {id, text: '', kind: 'document'};
+      this.#event(id, 'document.started');
+      this.#worker.postMessage({
+        type: 'document', request: Object.hasOwn(payload, 'system_prompt') ? payload : {
+          ...payload, system_prompt: payload.mode === 'translate'
+            ? PROMPTS.page_translate ?? PROMPTS.translate : PROMPTS.page_summarize ?? PROMPTS.summarize,
+        },
+        maximumTokens: Number.isInteger(payload.maximum_tokens)
+          ? payload.maximum_tokens : Math.min(this.#settings.maximumTokens, 512),
       });
       return;
     }
@@ -738,6 +778,8 @@ class WasmBackend {
     const threads = Number.isInteger(requested.threads) && requested.threads >= 1 && requested.threads <= 8
       ? requested.threads : 1;
     const selectedBackend = requested.backend === 'webgpu' && !webGpuSupport() ? 'webgpu' : 'cpu';
+    const singleThread = selectedBackend === 'cpu' && !globalThis.crossOriginIsolated &&
+      globalThis.KIDI_SINGLE_THREAD_WASM === true;
     if (selectedBackend !== this.#settings.backend) this.#releaseTts();
     this.#settings = {
       ...this.#settings,
@@ -766,10 +808,12 @@ class WasmBackend {
     worker.postMessage({
       type: 'load',
       manifest: this.#settings.model,
-      threads: selectedBackend === 'webgpu' ? 1 : threads,
+      threads: selectedBackend === 'webgpu' || singleThread ? 1 : threads,
       backend: selectedBackend,
+      singleThread,
       cacheOnly: requested.cacheOnly === true,
       reload: requested.cacheOnly !== true,
+      modelHubRemote: APP_CONFIG.model_hub.remote,
     });
   }
 
@@ -845,6 +889,7 @@ class WasmBackend {
           source: this.#components.asr.directory,
           backend: useGpu ? 'webgpu' : 'cpu',
           threads: !useGpu && globalThis.crossOriginIsolated ? Math.max(1, this.#settings.threads) : 1,
+          modelHubRemote: APP_CONFIG.model_hub.remote,
         });
       };
       start(preferredGpu);
@@ -952,15 +997,29 @@ class WasmBackend {
     }
     if (data.type === 'step' && this.#current) {
       const kind = this.#current.kind || 'chat';
+      if (data.document_progress)
+        this.#event(this.#current.id, 'document.progress', data.document_progress);
       for (const item of data.events || []) {
         if (item.text) {
-          this.#current.text += item.text;
-          this.#event(this.#current.id, `${kind}.delta`, {text: item.text});
+          if (item.replace) this.#current.text = item.text;
+          else this.#current.text += item.text;
+          this.#event(this.#current.id, `${kind}.delta`, {
+            text: item.text,
+            replace: item.replace === true,
+            stats: {
+              elapsed_ms: data.stats?.elapsedMs || 0,
+              decode_tokens: data.stats?.decodeTokens || 0,
+              decode_ms: data.stats?.decodeMs || 0,
+              first_token_ms: data.stats?.firstTokenMs,
+              token_count: data.stats?.tokenCount || 0,
+            },
+          });
         }
         if (item.completed) {
           const completed = item.completed;
           this.#event(this.#current.id, `${kind}.completed`, {
             text: completed.text || this.#current.text,
+            output_limited: completed.output_limited === true,
             stats: {
               elapsed_ms: data.stats?.elapsedMs || completed.generation_ms || 0,
               prompt_tokens: completed.prompt_tokens || 0,
@@ -968,6 +1027,8 @@ class WasmBackend {
               prefill_ms: 0,
               decode_ms: completed.decode_ms || data.stats?.decodeMs || 0,
               preparation_ms: 0,
+              first_token_ms: data.stats?.firstTokenMs,
+              token_count: data.stats?.tokenCount || completed.decode_tokens || 0,
             },
           });
           this.#current = null;

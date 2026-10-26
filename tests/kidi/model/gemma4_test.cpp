@@ -23,8 +23,8 @@ public:
     auto prefill_chunk_size(std::size_t requested) const -> std::size_t override {
         return std::max(requested, std::size_t{16});
     }
-    auto compile(const kidi::graph::Graph&,
-                 std::string_view key) -> std::unique_ptr<kidi::runtime::StepExecutable> override {
+    auto compile(const kidi::graph::Graph&, std::string_view key)
+        -> std::unique_ptr<kidi::runtime::StepExecutable> override {
         keys.emplace_back(key);
         return nullptr;
     }
@@ -121,8 +121,8 @@ auto check_image_prefill_rebinding(const YAML::Node& config, const kidi::checkpo
     for (std::size_t layer = 0; layer < rebound.layers.size(); ++layer) {
         for (const auto pair : {std::pair{&first.layers[layer].key, &rebound.layers[layer].key},
                                 std::pair{&first.layers[layer].value, &rebound.layers[layer].value}}) {
-            distinct = distinct ||
-                       !std::ranges::equal(require(pair.first->host_bytes()), require(pair.second->host_bytes()));
+            distinct =
+                distinct || !std::ranges::equal(require(pair.first->host_bytes()), require(pair.second->host_bytes()));
         }
         for (const auto pair : {std::pair{&rebound.layers[layer].key, &expected.layers[layer].key},
                                 std::pair{&rebound.layers[layer].value, &expected.layers[layer].value}})
@@ -135,9 +135,9 @@ auto check_image_prefill_rebinding(const YAML::Node& config, const kidi::checkpo
         std::cerr << "distinct image embeddings produced identical caches\n";
         return false;
     }
-    return std::ranges::any_of(compiler->keys,
-                               [](const std::string& key) { return key.starts_with("gemma4_prefill:16:") &&
-                                                                  key.ends_with(":images"); });
+    return std::ranges::any_of(compiler->keys, [](const std::string& key) {
+        return key.starts_with("gemma4_prefill:16:") && key.ends_with(":images");
+    });
 }
 
 auto fixture_directory(std::string_view fixture) -> std::filesystem::path {
@@ -174,8 +174,8 @@ private:
 
 /// A per-layer embedding table supplied outside the checkpoint generates the same tokens through eager prefill and
 /// captured decode steps, and a declared external table without a source fails to load.
-auto check_external_rows(const std::filesystem::path& fixture, const YAML::Node& config,
-                         kidi::tensor::Device device) -> void {
+auto check_external_rows(const std::filesystem::path& fixture, const YAML::Node& config, kidi::tensor::Device device)
+    -> void {
     using kidi::ops::require;
     const std::string table_name = "model.language_model.embed_tokens_per_layer.weight";
     const auto state = require(require(kidi::checkpoint::Weights::load(fixture / "model.safetensors")).state_dict());
@@ -228,8 +228,8 @@ auto check_external_rows(const std::filesystem::path& fixture, const YAML::Node&
     std::filesystem::remove_all(directory);
 }
 
-auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node& config,
-                         kidi::tensor::Device device) -> void {
+auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node& config, kidi::tensor::Device device)
+    -> void {
     using kidi::ops::require;
     const auto directory = std::filesystem::temp_directory_path() / "kidi-serving-cache-test";
     std::filesystem::remove_all(directory);
@@ -296,11 +296,12 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     check("alpha beta gamma delta", uncached, 0);
     const auto cancelled = require(cached.enqueue("alpha beta gamma delta", options));
     require(cached.step());
-    if (cached.release_workspaces())
-        throw std::runtime_error("generator released workspaces with an active request");
+    if (cached.release_workspaces()) throw std::runtime_error("generator released workspaces with an active request");
+    if (cached.trim_workspaces()) throw std::runtime_error("generator trimmed workspaces with an active request");
     require(cached.cancel(cancelled));
-    require(cached.release_workspaces());
+    require(cached.trim_workspaces());
     check("alpha beta gamma delta", options, 2);
+    require(cached.release_workspaces());
     auto smaller_context = options;
     smaller_context.context_size = 8;
     check("alpha beta gamma delta", smaller_context, 0);
@@ -333,9 +334,11 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     // Deferred tokens report each selection one step later, alone and batched, without changing the generation.
     auto deferred = require(kidi::inference::Generator::load(directory, device));
     for (const std::size_t active : {1, 2}) {
-        require(deferred.configure_serving(
-            {.maximum_active = active, .maximum_requests = 4, .cache_token_budget = 32, .prefill_tokens_per_step = 2,
-             .deferred_tokens = true}));
+        require(deferred.configure_serving({.maximum_active = active,
+                                            .maximum_requests = 4,
+                                            .cache_token_budget = 32,
+                                            .prefill_tokens_per_step = 2,
+                                            .deferred_tokens = true}));
         const std::array deferred_ids{require(deferred.enqueue(prompts[0], uncached)),
                                       require(deferred.enqueue(prompts[1], uncached))};
         std::array<std::optional<kidi::inference::TextGeneration>, 2> deferred_results;
@@ -466,7 +469,8 @@ auto main() -> int {
                     const auto gate =
                         ops::require(checkpoint.tensor("model.language_model." + prefix + "gate_proj.weight"));
                     const auto& combined = parameters.at(prefix + "gate_up_proj.weight");
-                    if (combined.size(0) != 2 * gate.size(0) || combined.size(1) != gate.size(1)) return failed(__LINE__);
+                    if (combined.size(0) != 2 * gate.size(0) || combined.size(1) != gate.size(1))
+                        return failed(__LINE__);
                 }
                 auto full = ops::require(model->create_state(8));
                 const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
@@ -500,12 +504,12 @@ auto main() -> int {
                 model->set_kv_cache_precision(core::KVCachePrecision::AUTO);
                 if (fixture == std::string_view("gemma4-qat") && device == tensor::Device::cpu()) {
                     std::vector precisions{
-                        core::InferencePrecision::FP32,      core::InferencePrecision::BF16,
-                        core::InferencePrecision::Q2A16,     core::InferencePrecision::Q4A16,
-                        core::InferencePrecision::Q8A16,     core::InferencePrecision::Q2AE4M3,
-                        core::InferencePrecision::Q4AE4M3,   core::InferencePrecision::Q8AE4M3,
-                        core::InferencePrecision::Q2AE5M2,   core::InferencePrecision::Q4AE5M2,
-                        core::InferencePrecision::Q8AE5M2,   core::InferencePrecision::QAT_FP32,
+                        core::InferencePrecision::FP32,    core::InferencePrecision::BF16,
+                        core::InferencePrecision::Q2A16,   core::InferencePrecision::Q4A16,
+                        core::InferencePrecision::Q8A16,   core::InferencePrecision::Q2AE4M3,
+                        core::InferencePrecision::Q4AE4M3, core::InferencePrecision::Q8AE4M3,
+                        core::InferencePrecision::Q2AE5M2, core::InferencePrecision::Q4AE5M2,
+                        core::InferencePrecision::Q8AE5M2, core::InferencePrecision::QAT_FP32,
                     };
 #if defined(__APPLE__)
                     precisions.push_back(core::InferencePrecision::LOWBIT_PARITY);
@@ -655,7 +659,8 @@ auto main() -> int {
                         std::abs(tail_values[index] - reference_tail[index]) > 2e-4F)
                         return failed(__LINE__);
                 const std::array<std::int32_t, 1> invalid{-1};
-                if (model->forward(invalid, incremental) || incremental.position != tokens.size()) return failed(__LINE__);
+                if (model->forward(invalid, incremental) || incremental.position != tokens.size())
+                    return failed(__LINE__);
                 if (model->set_checkpoint(checkpoint, 4, 3)) return failed(__LINE__);
                 ops::require(model->set_checkpoint(checkpoint));
                 if (config["quantization_config"]) {
@@ -752,15 +757,15 @@ auto main() -> int {
                         std::vector<std::int32_t> generated{
                             static_cast<std::int32_t>(std::ranges::max_element(logits) - logits.begin())};
                         for (int step = 0; step < 3; ++step) {
-                            const auto next = ops::require(extended->forward_token(std::span(generated).last(1), state));
+                            const auto next =
+                                ops::require(extended->forward_token(std::span(generated).last(1), state));
                             generated.push_back(next);
                         }
                         return generated;
                     };
-                    const std::array generated{continuation(bucket_values, bucket_state),
-                                               continuation(prefix_values, prefix_state),
-                                               continuation(history_values, history_state),
-                                               continuation(larger_values, larger_state)};
+                    const std::array generated{
+                        continuation(bucket_values, bucket_state), continuation(prefix_values, prefix_state),
+                        continuation(history_values, history_state), continuation(larger_values, larger_state)};
                     for (std::size_t index = 1; index < generated.size(); ++index)
                         if (generated[index] != generated[0]) {
                             std::cerr << "length " << length << ": chunking " << index

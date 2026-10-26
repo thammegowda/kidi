@@ -13,6 +13,7 @@ No package-manager installation is required to build Kidi's browser app.
 | `dompurify/` | 3.4.15 | [dompurify-3.4.15.tgz](https://registry.npmjs.org/dompurify/-/dompurify-3.4.15.tgz) | `dist/purify.es.mjs` | Apache-2.0 OR MPL-2.0 |
 | `highlightjs/` | 11.12.0 | [cdn-assets-11.12.0.tgz](https://registry.npmjs.org/@highlightjs/cdn-assets/-/cdn-assets-11.12.0.tgz) | `es/highlight.min.js` (common languages) | BSD-3-Clause |
 | `mermaid/` | 12.0.0 | [mermaid-12.0.0.tgz](https://registry.npmjs.org/mermaid/-/mermaid-12.0.0.tgz) | `dist/mermaid.min.js` (standalone, lazy-loaded) | MIT |
+| `readability/` | 0.6.0 | [readability-0.6.0.tgz](https://registry.npmjs.org/@mozilla/readability/-/readability-0.6.0.tgz) | `Readability.js` (extension article capture only) | Apache-2.0 |
 
 Each directory includes its upstream `LICENSE`. The build copies the service
 worker, selected icons, and Markdown modules, with their licenses, into the deployment directory.

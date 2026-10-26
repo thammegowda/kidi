@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Kidi AI",
+  "short_name": "Kidi AI",
+  "description": "Private local chat, Gmail writing, and reply suggestions powered by an on-device model.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "121",
+  "permissions": [
+    "activeTab",
+    "contextMenus",
+    "scripting",
+    "sidePanel",
+    "storage",
+    "unlimitedStorage"
+  ],
+  "optional_host_permissions": [
+    "https://mail.google.com/*",
+    "https://*/*",
+    "http://*/*"
+  ],
+  "background": {
+    "service_worker": "background.mjs",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Open Kidi AI"
+  },
+  "side_panel": {
+    "default_path": "editor.html"
+  },
+  "icons": {
+    "128": "icons/kidi-logo.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https://huggingface.co http://127.0.0.1:*; object-src 'self';"
+  },
+  "cross_origin_embedder_policy": {
+    "value": "require-corp"
+  },
+  "cross_origin_opener_policy": {
+    "value": "same-origin"
+  }
+}

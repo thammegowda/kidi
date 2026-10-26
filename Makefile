@@ -13,7 +13,7 @@ TEST_DIST := .cache/test-dist
 
 export KIDI_HUB PYTHON
 
-.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test web-smoke-test regression-test test app app-dev wasm serve apk apk-release
+.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
 
 setup-test:
 	bash tests/setup.sh
@@ -62,6 +62,45 @@ app-dev: app
 
 wasm:
 	node web/tools/build.mjs "$(WEB_DIR)"
+
+extension:
+	node web/tools/build-extension.mjs
+
+extension-smoke-test:
+	npm --prefix web run test:extension -- "$(abspath build-extension/chromium)"
+
+extension-gmail-test:
+	npm --prefix web run test:gmail -- "$(abspath build-extension/chromium)"
+	node web/tools/test-editor-wasm.mjs
+
+extension-article-test:
+	npm --prefix web run test:articles -- "$(abspath build-extension/chromium)"
+
+extension-edge-test:
+	KIDI_BROWSER_CHANNEL=msedge npm --prefix web run test:extension -- "$(abspath build-extension/chromium)"
+	KIDI_BROWSER_CHANNEL=msedge npm --prefix web run test:gmail -- "$(abspath build-extension/chromium)"
+	node web/tools/test-editor-wasm.mjs
+	KIDI_BROWSER_CHANNEL=msedge npm --prefix web run test:articles -- "$(abspath build-extension/chromium)"
+
+extension-edge-e2e-test: extension-edge-test
+	KIDI_BROWSER_CHANNEL=msedge npm --prefix web run test:live-wikipedia
+
+extension-edge-open:
+	KIDI_EDGE_PROFILE="$(HOME)/.cache/kidi/edge-extension-profile" \
+		node web/tools/open-edge-extension.mjs "$(abspath build-extension/chromium)"
+
+extension-edge-open-local:
+	KIDI_EDGE_PROFILE="$(HOME)/.cache/kidi/edge-extension-profile" \
+		KIDI_LOCAL_MODEL_CACHE="$(KIDI_HUB)" \
+		node web/tools/open-edge-extension.mjs "$(abspath build-extension/chromium)"
+
+extension-edge-load-local: extension-edge-open-local
+	KIDI_EDGE_PROFILE="$(HOME)/.cache/kidi/edge-extension-profile" \
+		npm --prefix web run test:edge-model-load
+
+extension-edge-summary-local: extension-edge-open-local
+	KIDI_EDGE_PROFILE="$(HOME)/.cache/kidi/edge-extension-profile" \
+		KIDI_MODEL_LOAD_TIMEOUT_MS=900000 npm --prefix web run test:edge-summary
 
 serve:
 	$(PYTHON) -m http.server "$(PORT)" --bind 127.0.0.1 --directory "$(WEB_DIR)"

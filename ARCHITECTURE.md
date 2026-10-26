@@ -27,6 +27,51 @@ ArrayBuffer messages carry bounded image uploads. Android microphone capture
 and TTS playback stay native through `AudioRecord` and `AudioTrack`, so audio
 samples never enter JavaScript.
 
+The browser extension has a compact chat UI under `web/extension/` and reuses
+the Wasm backend. Its Gmail bridge is browser integration only: optional-origin
+permission and explicit read-only DOM capture. Generated drafts and replies are
+copied by the user; Kidi never mutates Gmail's private editor DOM.
+It does not build prompts or run inference. `kidi::app` owns typed text/email
+actions, bounded conversational history, validation, and message construction
+without browser dependencies, so native/Android callers can reuse them.
+All application prompt defaults live in the shared YAML's top-level `prompts`
+map, independently of model configuration. `prompts.system` is the shared chat
+system prompt; named action prompts remain independent. Reader translation
+uses `prompts.translate`, with page defaults sharing its YAML alias. Native and
+Android hosts parse the same prompt map through `kidi::app::application_prompts`;
+the browser config loader enforces the same layout. Existing service request
+fields and session/per-action overrides remain compatible. Gmail context is captured
+only on user action and stays separate from editable user instructions.
+
+Webpage workflows are deterministic, not an agent/tool-selection loop. A
+user-triggered content script runs packaged Mozilla Readability against a
+filtered document clone (or uses the current selection). The panel previews
+the read-only source and explicitly discloses its 64 KiB capture limit.
+Toolbar invocation captures while temporary `activeTab` access is valid. If an
+Edge side-panel entry point omits that grant, page actions may request the
+manifest's optional HTTP/HTTPS host permission; Gmail remains separately
+enabled and whole-mailbox extraction stays prohibited.
+Shared `kidi::app::DocumentSession` owns Unicode-safe sectioning, ordered
+translation, rolling cumulative summarization, current-request cancellation,
+and aggregate inference statistics. Output-limited translation sections are
+split and retried before publication. Summaries use actual tokenizer counts:
+each request contains at most 4096 input tokens and generates at most 1024
+tokens. Every new source segment revises the previous cumulative summary and
+publishes a replacement result immediately. Request-shaped GPU replays are
+trimmed between segments while compiled operators and model weights remain
+resident. CPU and WebGPU workers pump the same C++ session API.
+
+Optional narration reuses `SpeechController`, the shared resampler, and the
+existing playback worklet. The browser adapter owns AudioContext activation,
+a six-second playback queue, pause/resume, and immediate stop; completion
+waits for playback to drain. A separate voice model requires explicit
+approval, and unknown narration languages require a user choice. Reading
+the source article does not run or load the chat model, even if it is cached.
+The extension disables cached-chat autoload while ordinary web hosting retains
+its existing automatic restore behavior. These browser
+capture/playback adapters are separate from the Android-reusable C++ text
+operations; Android Gmail or webpage integration is not introduced here.
+
 ## Ownership
 
 | Module | Responsibility |
@@ -39,6 +84,7 @@ samples never enter JavaScript.
 | `checkpoint` | Configuration/package I/O, format readers, serialization and generic cache preparation |
 | `model` | Neural network topology, parameter binding, checkpoint policies, source and decoder state |
 | `inference` | Generic generation/search, translation and synthesis applications, profiling |
+| `app` | Typed assistant actions, request validation, and prompt/message policy |
 | `runtime/ynn` | Private prepared CPU operators and YNNPACK ownership |
 | `runtime/mps` | Private prepared Metal operators, command batches, INT8 kernels |
 | `text`, `cli` | Tokenization and command/input/output policy |

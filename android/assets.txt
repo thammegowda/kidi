@@ -1,4 +1,5 @@
 /backend.js	web/hosts/android/backend.js
+/app-config.yaml	examples/kidi-app.yaml
 /browser-epub.js	web/hosts/wasm/browser-epub.js
 /capture-worklet.js	web/hosts/desktop/capture-worklet.js
 /playback-worklet.js	web/hosts/desktop/playback-worklet.js

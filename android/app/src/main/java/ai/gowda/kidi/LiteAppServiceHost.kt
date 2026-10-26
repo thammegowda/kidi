@@ -56,6 +56,9 @@ internal class LiteAppServiceHost(
     )
 
     private val appContext = context.applicationContext
+    private val prompts = checked(NativeRuntime.applicationPrompts(
+        appContext.assets.open("app-config.yaml").bufferedReader().use { it.readText() },
+    )).getJSONObject("prompts")
     private val preferences = appContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
     private val repository = ModelRepository(appContext, "liteapp-models")
     private val rootJob = SupervisorJob()
@@ -93,7 +96,7 @@ internal class LiteAppServiceHost(
     @Volatile private var threads = preferences.getInt(THREADS_KEY, defaultThreads()).coerceIn(1, 8)
     @Volatile private var maximumTokens = preferences.getInt(TOKENS_KEY, 512).coerceIn(1, 8192)
     @Volatile private var modelId = DEFAULT_CHAT_MODEL
-    @Volatile private var systemPrompt = DEFAULT_SYSTEM_PROMPT
+    @Volatile private var systemPrompt = prompts.getString("system")
 
     init {
         val savedAccelerator = preferences.getString(CHAT_ACCELERATOR_KEY, null)
@@ -389,8 +392,7 @@ internal class LiteAppServiceHost(
         if (text.isBlank() || target.isBlank() || text.length > 16384 ||
             previous.length > 16384 || next.length > 16384)
             throw ServiceFailure("invalid_translation", "Reader translation payload is invalid or too large")
-        val prompt = "You are a literary translator. Translate <text_to_translate> into $target. " +
-            "Use surrounding context only to resolve meaning and return only the translated text."
+        val prompt = prompts.getString("translate").replace("{target_language}", target)
         val request = "<preceding_context>\n$previous\n</preceding_context>\n" +
             "<text_to_translate>\n$text\n</text_to_translate>\n" +
             "<following_context>\n$next\n</following_context>"
@@ -669,8 +671,9 @@ internal class LiteAppServiceHost(
             .put("precision", "checkpoint")
             .put("kv_cache_precision", "auto")
             .put("system_prompt", systemPrompt)
-            .put("configured_system_prompt", DEFAULT_SYSTEM_PROMPT)
-            .put("translation_prompt", "Translate the selected reader text into {target_language}.")
+            .put("configured_system_prompt", prompts.getString("system"))
+            .put("translation_prompt", prompts.getString("translate"))
+            .put("editor_prompts", prompts)
             .put("translation", JSONObject()
                 .put("target_chars", 800).put("max_chars", 1200)
                 .put("max_sentence_chars", 600).put("max_input_tokens", 1536))
@@ -801,8 +804,6 @@ internal class LiteAppServiceHost(
         const val ACCELERATOR_POLICY_VERSION = 1
         const val THREADS_KEY = "threads"
         const val TOKENS_KEY = "tokens"
-        const val DEFAULT_SYSTEM_PROMPT =
-            "You are a helpful local AI assistant. Respond directly, briefly, respectfully, and safely."
         val MODEL_ID = Regex("[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
         val LANGUAGES = Regex("(?:auto|[a-z]{2,3}(?:,[a-z]{2,3})*)")
         val ACCELERATORS = setOf("auto", "npu", "gpu", "cpu")

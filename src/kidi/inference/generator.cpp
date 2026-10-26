@@ -99,7 +99,8 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             for (auto candidate = 0; candidate <= static_cast<int>(tensor::DType::E5M2); ++candidate)
                 if (tensor::to_string(static_cast<tensor::DType>(candidate)) == dtype_name)
                     dtype = static_cast<tensor::DType>(candidate);
-            if (!dtype) throw ops::Failure({ErrorCode::INVALID_MANIFEST, "unknown external tensor dtype: " + dtype_name});
+            if (!dtype)
+                throw ops::Failure({ErrorCode::INVALID_MANIFEST, "unknown external tensor dtype: " + dtype_name});
             const auto shape = declared["shape"].as<std::vector<std::int64_t>>();
             require(weights.add(name, require(external(name, *dtype, shape))));
         }
@@ -192,9 +193,21 @@ auto Generator::warm_up() -> Result<void> {
 auto Generator::release_workspaces() -> Result<void> {
     try {
         if (pending_requests())
-            throw ops::Failure(
-                {ErrorCode::INVALID_ARGUMENT, "drain generation requests before releasing workspaces"});
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "drain generation requests before releasing workspaces"});
         model_->release_workspaces();
+        if (vision_) vision_->release_workspaces();
+        return {};
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
+    }
+}
+auto Generator::trim_workspaces() -> Result<void> {
+    try {
+        if (pending_requests())
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "drain generation requests before trimming workspaces"});
+        model_->trim_workspaces();
         if (vision_) vision_->release_workspaces();
         return {};
     } catch (const ops::Failure& error) {
@@ -217,8 +230,9 @@ auto Generator::memory() const -> GeneratorMemory {
 }
 auto Generator::require_immediate_tokens() const -> void {
     if (tensor::DEVICE_CAPABILITIES[model_->device().kind].deferred_host_reads)
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "this device reports tokens on a later call; use serving with "
-                                                    "deferred_tokens"});
+        throw ops::Failure({ErrorCode::UNSUPPORTED,
+                            "this device reports tokens on a later call; use serving with "
+                            "deferred_tokens"});
 }
 auto Generator::generate(std::string_view prompt, GenerationOptions options) -> Result<TextGeneration> {
     try {
@@ -339,8 +353,8 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
-auto Generator::generate_batch(std::span<const std::string> prompts,
-                               GenerationOptions options) -> Result<GenerationBatch> {
+auto Generator::generate_batch(std::span<const std::string> prompts, GenerationOptions options)
+    -> Result<GenerationBatch> {
     try {
         require_immediate_tokens();
         options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
@@ -458,8 +472,8 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
-auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
-                             GenerationOptions options) -> Result<std::uint64_t> {
+auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options)
+    -> Result<std::uint64_t> {
     try {
         if (options.image_max_pixels < image::MIN_RESIZED_PIXELS ||
             options.image_max_pixels > image::MAX_RESIZED_PIXELS)
@@ -557,6 +571,15 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
         waiting_.back().image_key = std::move(image_key);
         images_ = std::move(current);
         return id;
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
+    }
+}
+auto Generator::chat_prompt_tokens(std::span<const text::ChatMessage> messages) const -> Result<std::size_t> {
+    try {
+        return require(tokenizer_.encode(require(tokenizer_.format_chat(messages)))).size();
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     } catch (const std::exception& error) {
@@ -766,10 +789,9 @@ auto Generator::step() -> Result<GenerationStep> {
         if (count && serving_->deferred_tokens) {
             const auto started = Clock::now();
             const auto prepared = model_->preparation_ns();
-            const auto selected =
-                count == 1 ? require(model_->select_token(std::span(tokens).first(1), *states[0]))
-                           : require(model_->select_batch_tokens(std::span(tokens).first(count),
-                                                                 std::span(states).first(count)));
+            const auto selected = count == 1 ? require(model_->select_token(std::span(tokens).first(1), *states[0]))
+                                             : require(model_->select_batch_tokens(std::span(tokens).first(count),
+                                                                                   std::span(states).first(count)));
             for (std::size_t index = 0; index < count; ++index)
                 pending_tokens_.push_back({running_[rows[index]].id, selected, index, started, false});
             result.decode_ns = elapsed(started);

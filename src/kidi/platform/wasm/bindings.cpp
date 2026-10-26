@@ -1,3 +1,5 @@
+#include "kidi/app/editor.h"
+#include "kidi/app/document.h"
 #include "kidi/core/memory.h"
 #include "kidi/inference/generator.h"
 #include "kidi/inference/synthesizer.h"
@@ -23,6 +25,7 @@ constexpr int MAXIMUM_OUTPUT_TOKENS = 8192;
 constexpr std::size_t CONTEXT_TOKENS = 9216;
 struct ModelSession {
     std::optional<kidi::inference::Generator> generator;
+    std::optional<kidi::app::DocumentSession> document;
     std::optional<kidi::inference::Synthesizer> synthesizer;
     std::optional<kidi::inference::Transcriber> transcriber;
     std::unique_ptr<kidi::inference::TranscriptionSession> transcription;
@@ -143,6 +146,50 @@ auto messages(const char* messages_json) -> std::vector<kidi::text::ChatMessage>
     }
     return result;
 }
+auto editor_request(const char* request_json) -> kidi::app::EditorRequest {
+    const auto value = nlohmann::json::parse(request_json);
+    if (!value.is_object()) throw std::runtime_error("Editor request must be an object");
+    auto task = kidi::ops::require(kidi::app::parse_editor_task(value.value("task", "")));
+    auto length = kidi::ops::require(kidi::app::parse_length_preference(value.value("length", "preserve")));
+    kidi::app::EditorRequest request{
+        .task = task,
+        .text = value.value("text", ""),
+        .length = length,
+    };
+    if (value.contains("system_prompt")) {
+        if (!value["system_prompt"].is_string()) throw std::runtime_error("Editor system prompt must be a string");
+        request.system_prompt = value["system_prompt"].get<std::string>();
+    }
+    if (value.contains("instruction")) {
+        if (!value["instruction"].is_string()) throw std::runtime_error("Editor instruction must be a string");
+        request.instruction = value["instruction"].get<std::string>();
+    }
+    if (value.contains("tone")) {
+        if (!value["tone"].is_string()) throw std::runtime_error("Editor tone must be a string");
+        request.tone = value["tone"].get<std::string>();
+    }
+    if (value.contains("target_language")) {
+        if (!value["target_language"].is_string()) throw std::runtime_error("Target language must be a string");
+        request.target_language = value["target_language"].get<std::string>();
+    }
+    if (value.contains("history")) {
+        if (!value["history"].is_array() || value["history"].size() > kidi::app::EditorLimits{}.maximum_history_turns)
+            throw std::runtime_error("Conversation history must be a bounded array");
+        for (const auto& turn : value["history"]) {
+            if (!turn.is_object() || !turn.contains("role") || !turn["role"].is_string() || !turn.contains("content") ||
+                !turn["content"].is_string())
+                throw std::runtime_error("Conversation history contains an invalid turn");
+            const auto role = turn["role"].get<std::string>();
+            if (role != "user" && role != "assistant")
+                throw std::runtime_error("Conversation history only accepts user and assistant roles");
+            request.history.push_back({
+                role == "user" ? kidi::app::EditorTurn::Role::USER : kidi::app::EditorTurn::Role::ASSISTANT,
+                turn["content"].get<std::string>(),
+            });
+        }
+    }
+    return kidi::ops::require(kidi::app::validate_editor_request(std::move(request)));
+}
 auto options(int maximum_tokens) -> kidi::inference::GenerationOptions {
     if (maximum_tokens < 1 || maximum_tokens > MAXIMUM_OUTPUT_TOKENS)
         throw std::runtime_error("Output tokens must be between 1 and 8192");
@@ -153,6 +200,26 @@ auto options(int maximum_tokens) -> kidi::inference::GenerationOptions {
     result.stream_text = true;
     result.on_image_progress = [](std::string_view stage) { image_progress(std::string(stage).c_str()); };
     return result;
+}
+auto generation_step(const kidi::inference::GenerationStep& step) -> nlohmann::json {
+    auto events = nlohmann::json::array();
+    for (const auto& event : step.events) {
+        nlohmann::json item{{"request_id", event.request_id}, {"text", event.text}};
+        if (event.token) item["token"] = *event.token;
+        if (event.replace) item["replace"] = true;
+        if (event.completed) {
+            const auto& result = *event.completed;
+            item["completed"] = {{"text", result.text},
+                                 {"output_limited", result.generation.truncated},
+                                 {"token_ids", result.generation.token_ids},
+                                 {"prompt_tokens", result.stats.prompt_tokens},
+                                 {"generation_ms", result.stats.generation_ns / 1e6},
+                                 {"decode_ms", result.stats.decode_ns / 1e6},
+                                 {"decode_tokens", result.stats.decode_tokens}};
+        }
+        events.push_back(std::move(item));
+    }
+    return {{"events", events}, {"pending", loaded().pending_requests()}};
 }
 auto synthesis_options(const nlohmann::json& values) -> kidi::inference::SynthesisOptions {
     kidi::inference::SynthesisOptions options;
@@ -178,22 +245,23 @@ auto synthesis_options(const nlohmann::json& values) -> kidi::inference::Synthes
 }
 auto synthesis_result(kidi::inference::Synthesis result) -> nlohmann::json {
     auto& state = session();
-    if (!state.voice_prompt && result.voice_prompt && state.cache_voice_prompt) state.voice_prompt = result.voice_prompt;
+    if (!state.voice_prompt && result.voice_prompt && state.cache_voice_prompt)
+        state.voice_prompt = result.voice_prompt;
     const auto bytes = result.samples.size() * sizeof(float);
     auto* audio = static_cast<float*>(std::malloc(bytes));
     if (!audio && bytes) throw std::runtime_error("Unable to allocate synthesized audio output");
     std::ranges::copy(result.samples, audio);
     nlohmann::json payload{{"pending", false},
-            {"audio_address", reinterpret_cast<std::uintptr_t>(audio)},
-            {"samples", result.samples.size()},
-            {"sample_rate", result.sample_rate},
-            {"chunks", result.stats.chunks},
-            {"audio_tokens", result.stats.audio_tokens},
-            {"generation_ms", result.stats.generation_ns / 1e6},
-            {"decode_ms", result.stats.decode_ns / 1e6},
-            {"preparation_ms", result.stats.preparation_ns / 1e6},
-            {"voice_prompt_cached", static_cast<bool>(state.voice_prompt)},
-            {"voice_prompt_used", state.used_voice_prompt}};
+                           {"audio_address", reinterpret_cast<std::uintptr_t>(audio)},
+                           {"samples", result.samples.size()},
+                           {"sample_rate", result.sample_rate},
+                           {"chunks", result.stats.chunks},
+                           {"audio_tokens", result.stats.audio_tokens},
+                           {"generation_ms", result.stats.generation_ns / 1e6},
+                           {"decode_ms", result.stats.decode_ns / 1e6},
+                           {"preparation_ms", result.stats.preparation_ns / 1e6},
+                           {"voice_prompt_cached", static_cast<bool>(state.voice_prompt)},
+                           {"voice_prompt_used", state.used_voice_prompt}};
     if (state.diagnostics) payload["token_ids"] = result.tokens;
     return payload;
 }
@@ -211,9 +279,14 @@ auto advance_synthesis() -> nlohmann::json {
     return result;
 }
 auto transcription_result(kidi::inference::Transcription result) -> nlohmann::json {
-    return {{"pending", false}, {"text", result.text}, {"language", result.language}, {"token_ids", result.token_ids},
-            {"feature_ms", result.stats.feature_ns / 1e6}, {"encode_ms", result.stats.encode_ns / 1e6},
-            {"decode_ms", result.stats.decode_ns / 1e6}, {"preparation_ms", result.stats.preparation_ns / 1e6},
+    return {{"pending", false},
+            {"text", result.text},
+            {"language", result.language},
+            {"token_ids", result.token_ids},
+            {"feature_ms", result.stats.feature_ns / 1e6},
+            {"encode_ms", result.stats.encode_ns / 1e6},
+            {"decode_ms", result.stats.decode_ns / 1e6},
+            {"preparation_ms", result.stats.preparation_ns / 1e6},
             {"attempts", result.stats.attempts}};
 }
 auto advance_transcription() -> nlohmann::json {
@@ -224,8 +297,8 @@ auto advance_transcription() -> nlohmann::json {
         state.transcription.reset();
         throw kidi::ops::Failure(std::move(advanced.error()));
     }
-    if (!*advanced) return {{"pending", true}, {"text", state.transcription_text},
-                            {"language", state.transcription_language}};
+    if (!*advanced)
+        return {{"pending", true}, {"text", state.transcription_text}, {"language", state.transcription_language}};
     auto result = transcription_result(std::move(**advanced));
     state.transcription.reset();
     return result;
@@ -290,6 +363,7 @@ EMSCRIPTEN_KEEPALIVE auto kidi_configure(int threads) -> const char* {
 EMSCRIPTEN_KEEPALIVE auto kidi_load(const char* directory) -> const char* {
     return answer([&]() -> nlohmann::json {
         if (!configured_threads) throw std::runtime_error("Configure the runtime before loading the model");
+        session().document.reset();
         auto& generator = session().generator;
         generator.emplace(
             kidi::ops::require(kidi::inference::Generator::load(directory, DEVICE, 0, 128, true, external_tensor)));
@@ -321,6 +395,64 @@ EMSCRIPTEN_KEEPALIVE auto kidi_enqueue(const char* messages_json, int maximum_to
     });
 }
 
+EMSCRIPTEN_KEEPALIVE auto kidi_editor_enqueue(const char* request_json, int maximum_tokens) -> const char* {
+    return answer([&]() -> nlohmann::json {
+        if (session().document) throw std::runtime_error("A document operation is active");
+        const auto request = editor_request(request_json);
+        auto id =
+            kidi::ops::require(loaded().enqueue_chat(kidi::app::editor_messages(request), options(maximum_tokens)));
+        return {{"request_id", id}};
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_document_enqueue(const char* request_json, int maximum_tokens) -> const char* {
+    return answer([&]() -> nlohmann::json {
+        if (session().document) throw std::runtime_error("A document operation is already active");
+        const auto value = nlohmann::json::parse(request_json);
+        const auto mode = value.at("mode").get<std::string>();
+        if (mode != "summarize" && mode != "translate") throw std::runtime_error("Unsupported document operation");
+        kidi::app::DocumentRequest request{
+            .task = mode == "translate" ? kidi::app::DocumentTask::TRANSLATE : kidi::app::DocumentTask::SUMMARIZE,
+            .text = value.at("text").get<std::string>(),
+        };
+        if (value.contains("system_prompt")) request.system_prompt = value.at("system_prompt").get<std::string>();
+        if (value.contains("target_language")) request.target_language = value.at("target_language").get<std::string>();
+        if (value.contains("instruction") && !value.at("instruction").get<std::string>().empty())
+            request.instruction = value.at("instruction").get<std::string>();
+        auto document = kidi::ops::require(
+            kidi::app::DocumentSession::start(loaded(), std::move(request), options(maximum_tokens)));
+        const auto id = document.id();
+        session().document.emplace(std::move(document));
+        return {{"request_id", id}};
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_document_step() -> const char* {
+    return answer([]() -> nlohmann::json {
+        auto& document = session().document;
+        if (!document) throw std::runtime_error("No document operation is active");
+        auto step = kidi::ops::require(document->step());
+        auto result = generation_step(step);
+        const auto progress = document->progress();
+        result["document_progress"] = {{"part", progress.part},
+                                       {"parts", progress.parts},
+                                       {"round", progress.round},
+                                       {"translating", progress.translating},
+                                       {"completed", progress.completed}};
+        if (progress.completed) document.reset();
+        return result;
+    });
+}
+
+EMSCRIPTEN_KEEPALIVE auto kidi_document_cancel() -> const char* {
+    return answer([]() -> nlohmann::json {
+        if (!session().document) throw std::runtime_error("No document operation is active");
+        kidi::ops::require(session().document->cancel());
+        session().document.reset();
+        return {{"cancelled", true}};
+    });
+}
+
 EMSCRIPTEN_KEEPALIVE auto kidi_load_asr(const char* directory) -> const char* {
     return answer([&]() -> nlohmann::json {
         if (!configured_threads) throw std::runtime_error("Configure the runtime before loading the speech model");
@@ -333,7 +465,7 @@ EMSCRIPTEN_KEEPALIVE auto kidi_load_asr(const char* directory) -> const char* {
 }
 
 EMSCRIPTEN_KEEPALIVE auto kidi_asr_start(const float* samples, std::uint32_t count, const char* language,
-                                        int maximum_tokens) -> const char* {
+                                         int maximum_tokens) -> const char* {
     return answer([&]() -> nlohmann::json {
         auto& state = session();
         if (state.transcription) throw std::runtime_error("A transcription session is already active");
@@ -341,9 +473,10 @@ EMSCRIPTEN_KEEPALIVE auto kidi_asr_start(const float* samples, std::uint32_t cou
             throw std::runtime_error("Invalid speech input or output token limit");
         state.transcription_text.clear();
         state.transcription_language.clear();
-        kidi::inference::TranscriptionOptions options{
-            .language = language ? language : "auto", .task = "transcribe",
-            .maximum_tokens = static_cast<std::size_t>(maximum_tokens), .fit_audio = true};
+        kidi::inference::TranscriptionOptions options{.language = language ? language : "auto",
+                                                      .task = "transcribe",
+                                                      .maximum_tokens = static_cast<std::size_t>(maximum_tokens),
+                                                      .fit_audio = true};
         options.on_partial = [&state](std::string_view text, std::string_view language) {
             state.transcription_text = text;
             state.transcription_language = language;
@@ -362,8 +495,7 @@ EMSCRIPTEN_KEEPALIVE auto kidi_load_tts(const char* directory) -> const char* {
         if (!configured_threads) throw std::runtime_error("Configure the runtime before loading the TTS model");
         auto& synthesizer = session().synthesizer;
         session().directory = directory;
-        synthesizer.emplace(kidi::ops::require(
-            kidi::inference::Synthesizer::load(directory, DEVICE)));
+        synthesizer.emplace(kidi::ops::require(kidi::inference::Synthesizer::load(directory, DEVICE)));
         session().voice_prompt.reset();
         return {{"ready", true},
                 {"backend", synthesizer->execution()},
@@ -371,14 +503,13 @@ EMSCRIPTEN_KEEPALIVE auto kidi_load_tts(const char* directory) -> const char* {
     });
 }
 
-EMSCRIPTEN_KEEPALIVE auto kidi_tts_set_voice_prompt(const char* text, const std::int32_t* tokens,
-                                                    std::uint32_t count) -> const char* {
+EMSCRIPTEN_KEEPALIVE auto kidi_tts_set_voice_prompt(const char* text, const std::int32_t* tokens, std::uint32_t count)
+    -> const char* {
     return answer([&]() -> nlohmann::json {
         auto& state = session();
         if (!state.synthesizer || !state.synthesizer->supports_voice_prompt())
             throw std::runtime_error("The loaded TTS model does not support voice prompts");
-        if (!text || !*text || !tokens || !count || count > 80000)
-            throw std::runtime_error("Invalid TTS voice prompt");
+        if (!text || !*text || !tokens || !count || count > 80000) throw std::runtime_error("Invalid TTS voice prompt");
         const auto package =
             kidi::ops::require(kidi::checkpoint::load_config(std::filesystem::path(state.directory) / "model.yaml"));
         const auto model = package["model"];
@@ -386,8 +517,7 @@ EMSCRIPTEN_KEEPALIVE auto kidi_tts_set_voice_prompt(const char* text, const std:
         const auto vocabulary = model["audio_vocab_size"].as<std::int32_t>();
         const auto frame_rate = model["codec_config"]["frame_rate"].as<std::size_t>();
         if (!codebooks || !vocabulary || !frame_rate || count % codebooks || count / codebooks > frame_rate * 20 ||
-            std::ranges::any_of(std::span(tokens, count),
-                                [&](auto token) { return token < 0 || token >= vocabulary; }))
+            std::ranges::any_of(std::span(tokens, count), [&](auto token) { return token < 0 || token >= vocabulary; }))
             throw std::runtime_error("Invalid TTS voice prompt tokens");
         state.voice_prompt = std::make_shared<kidi::inference::VoicePrompt>(
             kidi::inference::VoicePrompt{text, std::vector<std::int32_t>(tokens, tokens + count)});
@@ -436,22 +566,7 @@ EMSCRIPTEN_KEEPALIVE auto kidi_tts_decode_reference(const std::int32_t* tokens, 
 EMSCRIPTEN_KEEPALIVE auto kidi_step() -> const char* {
     return answer([]() -> nlohmann::json {
         auto step = kidi::ops::require(loaded().step());
-        auto events = nlohmann::json::array();
-        for (const auto& event : step.events) {
-            nlohmann::json item{{"request_id", event.request_id}, {"text", event.text}};
-            if (event.token) item["token"] = *event.token;
-            if (event.completed) {
-                const auto& result = *event.completed;
-                item["completed"] = {{"text", result.text},
-                                     {"token_ids", result.generation.token_ids},
-                                     {"prompt_tokens", result.stats.prompt_tokens},
-                                     {"generation_ms", result.stats.generation_ns / 1e6},
-                                     {"decode_ms", result.stats.decode_ns / 1e6},
-                                     {"decode_tokens", result.stats.decode_tokens}};
-            }
-            events.push_back(std::move(item));
-        }
-        return {{"events", events}, {"pending", loaded().pending_requests()}};
+        return generation_step(step);
     });
 }
 

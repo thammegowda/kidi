@@ -13,7 +13,9 @@ export function modelIdentity(kind, data) {
         throw new Error('WebGPU matrix precision must be f32, mixed-f16, or w8a8');
     const w8a8Kernel = data.w8a8Kernel ?? 'float';
     if (!['packed', 'float'].includes(w8a8Kernel)) throw new Error('WebGPU W8A8 kernel must be packed or float');
-    return JSON.stringify({kind, source, matrixPrecision, packedDot: data.packedDot !== false, w8a8Kernel});
+    const modelHubRemote = data.modelHubRemote || 'https://huggingface.co';
+    return JSON.stringify({kind, source, modelHubRemote, matrixPrecision,
+        packedDot: data.packedDot !== false, w8a8Kernel});
 }
 
 export function evictionCandidate(models, {now, pressure = false, idleMs = MODEL_IDLE_MS, maximum = MAX_RESIDENT_MODELS}) {

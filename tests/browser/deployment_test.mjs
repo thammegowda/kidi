@@ -25,7 +25,7 @@ test('shared entry assets and audio worklets resolve within repository subpaths'
     assert.doesNotMatch(app, /startTts\(content\.textContent/);
     assert.match(worker, /useGpu \? '\.\/gpu\/kidi\.mjs'/);
     assert.match(worker, /'\.\/threads\/kidi\.mjs'/);
-    assert.doesNotMatch(worker, /single\/kidi/);
+    assert.match(worker, /data\.singleThread \? '\.\/single\/kidi\.mjs'/);
     assert.doesNotMatch(build, /\['single'/);
     const shared = new Set(manifest.split(/\r?\n/).filter(Boolean));
     for (const match of app.matchAll(/from '\.\/([^']+)'/g))

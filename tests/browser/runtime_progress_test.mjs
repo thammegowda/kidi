@@ -6,10 +6,13 @@ async function backendSource() {
   let source = await readFile(new URL('../../web/hosts/wasm/backend.js', import.meta.url), 'utf8');
   source = source.replace("import {loadAppConfig} from './app-config.mjs';",
     `const loadAppConfig = async () => ({version:1,model_hub:{remote:'https://huggingface.co',local:'cache'},
-      runtime:{threads:4},models:{
+      runtime:{threads:4},prompts:{
+        system:'Test',translate:'Translate into {target_language}; return only the translation.',
+        polish:'Polish configured text.',page_summarize:'Summarize configured page.',
+        page_translate:'Translate configured page into {target_language}.'
+      },models:{
         chat:{enabled:true,model_id:'google/test',accelerator:'auto',precision:'checkpoint',
-          kv_cache_precision:'auto',system_prompt:'Test',
-          translation_prompt:'Translate into {target_language}; return only the translation.',
+          kv_cache_precision:'auto',
           generation:{max_tokens:128,context_tokens:1024,prefix_cache_mb:0}},
         asr:{enabled:true,model_id:'openai/whisper-small',language:'auto',max_tokens:128,
           vad:{threshold:.012,minimum_speech_ms:250,silence_ms:800}},
@@ -51,6 +54,10 @@ test('automatic cache restore announces its request before progress and readines
       .replace("new URL('./inference-worker.mjs', import.meta.url)", "'inference-worker.mjs'");
     const {backend} = await import(`data:text/javascript,${encodeURIComponent(isolated)}`);
     const events = [];
+    backend.connect({onEvent: event => events.push(event)}, {loadCachedModel: false});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(workers.length, 0, 'voice-only panels do not load even a fully cached chat model');
+    assert.equal(events.some(event => event.type === 'runtime.loading'), false);
     backend.connect({onEvent: event => events.push(event)});
     await new Promise(resolve => setImmediate(resolve));
     const started = events.find(event => event.type === 'runtime.loading');
@@ -76,7 +83,7 @@ test('automatic cache restore announces its request before progress and readines
   }
 });
 
-test('reader translation uses its configured prompt and dedicated events', async () => {
+test('chat, reader, editor and documents use unified prompts and preserve explicit overrides', async () => {
   const source = await backendSource();
   const workers = [];
   globalThis.localStorage = {getItem: () => null, setItem() {}};
@@ -120,6 +127,54 @@ test('reader translation uses its configured prompt and dedicated events', async
       'reader.translation.completed',
     ]);
     assert.equal(events.at(-1).payload.text, 'ಹಳೆಯ ಮನೆ.');
+    const component = (await backend.status()).components.chat;
+    assert.equal(component.configured_system_prompt, 'Test');
+    assert.equal(component.editor_prompts.system, component.configured_system_prompt);
+    assert.equal(component.translation_prompt, component.editor_prompts.translate);
+    const finish = () => workers[0].onmessage({data: {type: 'step', events: [
+      {completed: {text: 'Done', prompt_tokens: 10, decode_tokens: 1}},
+    ]}});
+    for (const [task, system] of [['chat', 'Test'], ['polish', 'Polish configured text.']]) {
+      backend.send('editor.run', task, {task, text: 'Source', instruction: 'Guidance'});
+      assert.equal(workers[0].messages.at(-1).request.system_prompt, system);
+      finish();
+    }
+    backend.send('settings.system_prompt.set', 'settings', {prompt: 'Session system'});
+    backend.send('editor.run', 'session-chat', {task: 'chat', instruction: 'Hello'});
+    assert.equal(workers[0].messages.at(-1).request.system_prompt, 'Session system');
+    finish();
+    backend.send('editor.run', 'custom', {task: 'polish', text: 'Source', system_prompt: 'Explicit override'});
+    assert.equal(workers[0].messages.at(-1).request.system_prompt, 'Explicit override');
+    finish();
+    for (const [mode, system] of [
+      ['summarize', 'Summarize configured page.'], ['translate', 'Translate configured page into {target_language}.'],
+    ]) {
+      backend.send('document.run', mode, {mode, text: 'Source', target_language: 'French'});
+      assert.equal(workers[0].messages.at(-1).request.system_prompt, system);
+      finish();
+    }
+    backend.send('document.run', 'custom-document', {mode: 'summarize', text: 'Source', system_prompt: 'Override'});
+    assert.equal(workers[0].messages.at(-1).request.system_prompt, 'Override');
+    finish();
+    backend.send('document.run', 'rolling-document', {mode: 'summarize', text: 'Source'});
+    workers[0].onmessage({data: {type: 'step', events: [{text: 'First summary', replace: true}]}});
+    assert.equal(events.at(-1).type, 'document.delta');
+    assert.deepEqual(events.at(-1).payload, {
+      text: 'First summary',
+      replace: true,
+      stats: {elapsed_ms: 0, decode_tokens: 0, decode_ms: 0, first_token_ms: undefined, token_count: 0},
+    });
+    workers[0].onmessage({data: {type: 'step', events: [
+      {text: 'Revised summary', replace: true},
+      {completed: {text: 'Revised summary', prompt_tokens: 10, decode_tokens: 2}},
+    ]}});
+    assert.equal(events.at(-1).type, 'document.completed');
+    assert.equal(events.at(-1).payload.text, 'Revised summary');
+    backend.send('editor.run', 'invalid', {task: 'polish', text: 'Source', system_prompt: null});
+    assert.equal(workers[0].messages.at(-1).request.system_prompt, null,
+      'invalid explicit values are forwarded to C++ validation, not silently replaced');
+    workers[0].onmessage({data: {type: 'error', error: 'Editor system prompt must be text'}});
+    assert.equal(events.at(-1).type, 'error');
   } finally {
     delete globalThis.localStorage;
     delete globalThis.Worker;

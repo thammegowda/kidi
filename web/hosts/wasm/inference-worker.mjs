@@ -1,4 +1,4 @@
-import {loadModel, MAX_WASM_MEMORY, webGpuSupport} from './model-cache.mjs';
+import {configureModelHub, loadModel, MAX_WASM_MEMORY, webGpuSupport} from './model-cache.mjs';
 import {stageImages} from './images.js';
 
 let module;
@@ -12,6 +12,7 @@ let inFlight = false;
 let cancelRequested = false;
 let loaded = {};
 let nativeMemory;
+let documentMode = false;
 // Native allocator statistics walk the heap (tens of milliseconds), so they refresh only when a phase ends; heap and
 // GPU sizes below stay live.
 function memory(fresh = false) {
@@ -42,7 +43,8 @@ async function cancel() {
     if (!active || inFlight) return;
     inFlight = true;
     try {
-        await call('kidi_cancel', ['number'], [requestId]);
+        if (documentMode) await call('kidi_document_cancel');
+        else await call('kidi_cancel', ['number'], [requestId]);
         active = false;
         cancelRequested = false;
         generation.elapsedMs = performance.now() - generationStarted;
@@ -56,13 +58,14 @@ async function step() {
     inFlight = true;
     try {
         const started = performance.now();
-        const result = await call('kidi_step');
+        const result = await call(documentMode ? 'kidi_document_step' : 'kidi_step');
         const elapsed = performance.now() - started;
         const tokens = result.events.filter(event => event.token !== undefined).length;
         if (generation.firstTokenMs !== null) {
             generation.decodeMs += elapsed;
             generation.decodeTokens += tokens;
-        } else if (tokens) generation.firstTokenMs = performance.now() - generationStarted;
+        } else if (documentMode ? result.events.some(event => event.text) : tokens)
+            generation.firstTokenMs = performance.now() - generationStarted;
         generation.tokenCount += tokens;
         generation.elapsedMs = performance.now() - generationStarted;
         const completed = result.events.find(event => event.completed)?.completed;
@@ -86,11 +89,13 @@ self.onmessage = async ({data}) => {
             if (module) throw new Error('Restart the worker to change runtime settings');
             const started = performance.now();
             const useGpu = data.backend === 'webgpu';
-            if (!useGpu && !self.crossOriginIsolated)
+            if (!useGpu && !self.crossOriginIsolated && !data.singleThread)
                 throw new Error('The CPU backend requires cross-origin isolation');
             const unsupported = useGpu && webGpuSupport();
             if (unsupported) throw new Error(`WebGPU is unavailable: ${unsupported}. Use the WebAssembly CPU backend.`);
-            const {default: createKidi} = await import(useGpu ? './gpu/kidi.mjs' : './threads/kidi.mjs');
+            const runtimeModule = useGpu ? './gpu/kidi.mjs' :
+                data.singleThread ? './single/kidi.mjs' : './threads/kidi.mjs';
+            const {default: createKidi} = await import(runtimeModule);
             module = await createKidi({printErr: text => self.postMessage({type: 'log', text})});
             if (useGpu) {
                 const {createWebGpu} = await import('./webgpu.mjs');
@@ -100,6 +105,7 @@ self.onmessage = async ({data}) => {
                 gpu.device.lost.then(info => fail(new Error(`WebGPU device lost: ${info.message || info.reason}`), true));
             }
             await call('kidi_configure', ['number'], [useGpu ? 1 : data.threads]);
+            configureModelHub(data.modelHubRemote || 'https://huggingface.co');
             const cache = await loadModel(module, data.manifest,
                 metrics => post({type: 'progress', ...metrics}),
                 {cacheOnly: data.cacheOnly, gpu});
@@ -113,6 +119,7 @@ self.onmessage = async ({data}) => {
             active = true;
             inFlight = true;
             cancelRequested = false;
+            documentMode = false;
             generationStarted = performance.now();
             generation = {tokenCount: 0, elapsedMs: 0, decodeMs: 0, decodeTokens: 0, firstTokenMs: null};
             const staged = await stageImages(module, data.messages);
@@ -123,6 +130,32 @@ self.onmessage = async ({data}) => {
                 result = await call('kidi_enqueue', ['string', 'number', 'number'],
                     [JSON.stringify(staged.messages), data.maximumTokens, data.imageMaxPixels ?? 3000000]);
             } finally { staged.dispose(); }
+            requestId = result.request_id;
+            inFlight = false;
+            setTimeout(step, 0);
+        } else if (data.type === 'editor') {
+            if (!ready || active || inFlight) throw new Error('Runtime is not ready for a new request');
+            active = true;
+            inFlight = true;
+            cancelRequested = false;
+            documentMode = false;
+            generationStarted = performance.now();
+            generation = {tokenCount: 0, elapsedMs: 0, decodeMs: 0, decodeTokens: 0, firstTokenMs: null};
+            const result = await call('kidi_editor_enqueue', ['string', 'number'],
+                [JSON.stringify(data.request), data.maximumTokens]);
+            requestId = result.request_id;
+            inFlight = false;
+            setTimeout(step, 0);
+        } else if (data.type === 'document') {
+            if (!ready || active || inFlight) throw new Error('Runtime is not ready for a new request');
+            documentMode = true;
+            active = true;
+            inFlight = true;
+            cancelRequested = false;
+            generationStarted = performance.now();
+            generation = {tokenCount: 0, elapsedMs: 0, decodeMs: 0, decodeTokens: 0, firstTokenMs: null};
+            const result = await call('kidi_document_enqueue', ['string', 'number'],
+                [JSON.stringify(data.request), data.maximumTokens]);
             requestId = result.request_id;
             inFlight = false;
             setTimeout(step, 0);

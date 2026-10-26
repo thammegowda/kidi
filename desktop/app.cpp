@@ -1,4 +1,5 @@
 #include "kidi/core/precision.h"
+#include "kidi/app/prompts.h"
 
 #include "kidi/checkpoint/hub.h"
 #include "ebook.h"
@@ -192,8 +193,7 @@ struct AppConfig {
     std::size_t asr_partial_interval_ms = 800;
     std::size_t max_audio_queue_ms = 3000;
     std::size_t max_text_frame_bytes = 1024U * 1024U;
-    std::string system_prompt;
-    std::string translation_prompt;
+    kidi::app::Prompts prompts;
     TranslationConfig translation;
     Json asr_settings;
     Json tts_settings;
@@ -210,8 +210,9 @@ struct AppConfig {
                  {"metal_prefill_cache_mb", chat.metal_prefill_cache_bytes / (1024U * 1024U)},
                  {"precision", kidi::core::to_string(precision)},
                  {"kv_cache_precision", kidi::core::to_string(kv_cache_precision)},
-                 {"system_prompt", system_prompt},
-                 {"translation_prompt", translation_prompt},
+                 {"system_prompt", prompts.at("system")},
+                 {"translation_prompt", prompts.at("translate")},
+                 {"editor_prompts", prompts},
                  {"translation",
                   {
                       {"target_chars", translation.target_chars},
@@ -321,8 +322,8 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
         const auto native_overrides = root["runtime"] ? root["runtime"]["native"] : YAML::Node{};
         if (native_overrides && !native_overrides.IsNull() && !native_overrides.IsMap())
             return invalid_config("runtime.native must be a mapping");
-        const auto runtime_overrides = native_overrides && native_overrides.IsMap() ?
-            YAML::Clone(native_overrides) : YAML::Node{};
+        const auto runtime_overrides =
+            native_overrides && native_overrides.IsMap() ? YAML::Clone(native_overrides) : YAML::Node{};
         merge_config(root, runtime_overrides);
         if (root["runtime"]) {
             root["runtime"].remove("native");
@@ -330,7 +331,10 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
         }
         const auto models = root["models"];
         if (!models.IsMap() || !models["chat"].IsMap()) return invalid_config("models.chat configuration is required");
+        auto prompts = kidi::app::application_prompts(root);
+        if (!prompts) return invalid_config(prompts.error().message);
         AppConfig result;
+        result.prompts = std::move(*prompts);
         result.source = source;
         const auto hub = root["model_hub"];
         const kidi::checkpoint::Hub model_hub{yaml_string(hub, "remote", "https://huggingface.co"),
@@ -379,11 +383,6 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
         const auto cache_precision = kidi::core::parse_kv_cache_precision(cache_name);
         if (!cache_precision) return invalid_config("Unknown chat KV-cache precision: " + cache_name);
         result.kv_cache_precision = *cache_precision;
-        result.system_prompt = yaml_string(models["chat"], "system_prompt");
-        result.translation_prompt = yaml_string(
-            models["chat"], "translation_prompt",
-            "You are a literary translator. Translate <text_to_translate> into {target_language}. Use the "
-            "surrounding context only to resolve meaning and return only the translated text.");
         const auto translation = models["chat"]["translation"];
         result.translation = {
             .target_chars = positive_size(translation, "target_chars", 800, 16384),
@@ -500,7 +499,7 @@ public:
         speech_execution_ = std::move(speech_execution);
         {
             std::scoped_lock prompt_lock(prompt_mutex_);
-            system_prompt_ = config_->system_prompt;
+            system_prompt_ = config_->prompts.at("system");
         }
         configure_metal_prefill_cache(config_->tts.metal_prefill_cache_bytes);
         model_path_ = config_->chat.directory.string();
@@ -578,7 +577,7 @@ public:
     auto components() const -> Json {
         if (!config_) return Json::object();
         auto result = config_->components();
-        result["chat"]["configured_system_prompt"] = config_->system_prompt;
+        result["chat"]["configured_system_prompt"] = config_->prompts.at("system");
         result["chat"]["system_prompt"] = system_prompt();
         return result;
     }
@@ -611,9 +610,8 @@ public:
     auto translate(std::string text, std::string previous, std::string next, std::string target_language,
                    const std::function<bool()>& cancelled, const std::function<void(std::string_view)>& on_delta)
         -> kidi::Result<ChatRunResult> {
-        if (!config_)
-            return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "chat model is not ready"});
-        auto prompt = config_->translation_prompt;
+        if (!config_) return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "chat model is not ready"});
+        auto prompt = config_->prompts.at("translate");
         constexpr std::string_view PLACEHOLDER{"{target_language}"};
         for (auto position = prompt.find(PLACEHOLDER); position != std::string::npos;
              position = prompt.find(PLACEHOLDER, position + target_language.size())) {
@@ -624,17 +622,15 @@ public:
                              "\n</text_to_translate>\n<following_context>\n" + std::move(next) +
                              "\n</following_context>";
         const std::array messages{ChatMessage{.role = "user", .content = request, .images = {}}};
-        const auto context =
-            (config_->translation.max_input_tokens + config_->maximum_tokens + 127) / 128 * 128;
+        const auto context = (config_->translation.max_input_tokens + config_->maximum_tokens + 127) / 128 * 128;
         return generate(messages, std::move(prompt), cancelled, on_delta, context,
                         config_->translation.max_input_tokens, true);
     }
 
 private:
-    auto generate(std::span<const ChatMessage> messages, std::string prompt,
-                  const std::function<bool()>& cancelled, const std::function<void(std::string_view)>& on_delta,
-                  std::size_t context_tokens, std::size_t maximum_prompt_tokens, bool release_workspaces)
-        -> kidi::Result<ChatRunResult> {
+    auto generate(std::span<const ChatMessage> messages, std::string prompt, const std::function<bool()>& cancelled,
+                  const std::function<void(std::string_view)>& on_delta, std::size_t context_tokens,
+                  std::size_t maximum_prompt_tokens, bool release_workspaces) -> kidi::Result<ChatRunResult> {
         std::scoped_lock lock(chat_mutex_);
         if (!generator_ || !config_)
             return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "chat model is not ready"});
@@ -642,8 +638,7 @@ private:
         auto run = [&]() -> kidi::Result<ChatRunResult> {
             std::vector<ChatMessage> conversation;
             conversation.reserve(messages.size() + !prompt.empty());
-            if (!prompt.empty())
-                conversation.push_back({.role = "system", .content = std::move(prompt), .images = {}});
+            if (!prompt.empty()) conversation.push_back({.role = "system", .content = std::move(prompt), .images = {}});
             conversation.insert(conversation.end(), messages.begin(), messages.end());
             GenerationOptions options{
                 .maximum_new_tokens = config_->maximum_tokens,
@@ -672,8 +667,7 @@ private:
                 }
             }
             if (!completed)
-                return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME,
-                                                   "generation ended without a response"});
+                return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "generation ended without a response"});
             return ChatRunResult{
                 .text = std::move(completed->text),
                 .stats =
@@ -695,7 +689,6 @@ private:
     }
 
 public:
-
     auto transcribe(std::span<const float> samples, const std::function<bool()>& cancelled,
                     const std::function<void(std::string_view, std::string_view)>& on_partial,
                     std::string_view language = {}) -> kidi::Result<kidi::inference::Transcription> {
@@ -1067,8 +1060,7 @@ private:
             std::unique_lock lock{ebook_mutex_};
             const auto found = ebook_uploads_.find(stream_id);
             if (found == ebook_uploads_.end()) return failure("invalid_ebook", "EPUB upload is incomplete");
-            if (found->second.finishing)
-                return failure("invalid_ebook", "EPUB upload is already being finalized");
+            if (found->second.finishing) return failure("invalid_ebook", "EPUB upload is already being finalized");
             found->second.finishing = true;
             ebook_ready_.wait_for(lock, std::chrono::seconds{5}, [&] {
                 return found->second.error || found->second.bytes.size() == found->second.expected_size;
@@ -1092,8 +1084,7 @@ private:
         if (!parsed) return std::unexpected(parsed.error());
         auto book = std::make_shared<kidi::desktop::Ebook>(std::move(*parsed));
         Json chapters = Json::array();
-        for (const auto& chapter : book->chapters)
-            chapters.push_back({{"id", chapter.id}, {"title", chapter.title}});
+        for (const auto& chapter : book->chapters) chapters.push_back({{"id", chapter.id}, {"title", chapter.title}});
         const auto result = Json{
             {"book_id", book->id},
             {"title", book->title},
@@ -1175,7 +1166,8 @@ private:
         const auto& payload = context.payload();
         for (const auto* field : {"text", "previous", "next", "target_language", "target_language_name"})
             if (!payload.contains(field) || !payload[field].is_string())
-                return failure("invalid_translation", std::string{"Reader translation requires string field: "} + field);
+                return failure("invalid_translation",
+                               std::string{"Reader translation requires string field: "} + field);
         const auto text = payload["text"].get<std::string>();
         const auto previous = payload["previous"].get<std::string>();
         const auto next = payload["next"].get<std::string>();
@@ -1192,10 +1184,9 @@ private:
         };
         const auto maximum = backend_->config().translation.max_chars;
         if (text.empty() || characters(text) > maximum || characters(previous) > maximum ||
-            characters(next) > maximum ||
-            target_name.empty() || target_name.size() > 100 || contains_control(text) || contains_control(previous) ||
-            contains_control(next) || contains_control(target_name) || !valid_language_setting(target_language) ||
-            target_language.contains(','))
+            characters(next) > maximum || target_name.empty() || target_name.size() > 100 || contains_control(text) ||
+            contains_control(previous) || contains_control(next) || contains_control(target_name) ||
+            !valid_language_setting(target_language) || target_language.contains(','))
             return failure("invalid_translation", "Reader translation payload is invalid or too large");
         if (!session_gate_.acquire("inference")) return failure("busy", "Another inference request is active");
         if (!backend_->begin_request("chat")) {
@@ -1448,13 +1439,11 @@ private:
             if (sequence != upload->second.sequence++ || sample_rate ||
                 payload_bytes != frame.size() - AUDIO_HEADER_BYTES ||
                 upload->second.bytes.size() + payload_bytes > upload->second.expected_size) {
-                upload->second.error =
-                    liteapp::Error{"invalid_ebook", "EPUB upload frame is invalid or out of order"};
+                upload->second.error = liteapp::Error{"invalid_ebook", "EPUB upload frame is invalid or out of order"};
                 ebook_ready_.notify_all();
                 return;
             }
-            upload->second.bytes.insert(
-                upload->second.bytes.end(), bytes.begin() + AUDIO_HEADER_BYTES, bytes.end());
+            upload->second.bytes.insert(upload->second.bytes.end(), bytes.begin() + AUDIO_HEADER_BYTES, bytes.end());
             if (upload->second.bytes.size() == upload->second.expected_size) ebook_ready_.notify_all();
             return;
         }

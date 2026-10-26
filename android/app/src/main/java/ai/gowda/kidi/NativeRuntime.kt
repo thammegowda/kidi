@@ -20,6 +20,7 @@ internal object NativeRuntime {
     }
 
     external fun configure(threads: Int): String
+    external fun applicationPrompts(configuration: String): String
     external fun deviceInfo(): String
     external fun setDiagnosticLogging(enabled: Boolean): String
     /** Points native code at packaged/staged NPU libraries and the persistent compiled-graph cache. */

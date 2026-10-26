@@ -49,6 +49,7 @@ struct GenerationEvent {
     std::optional<std::int32_t> token;
     std::optional<TextGeneration> completed;
     std::string text;
+    bool replace = false;
 };
 struct GenerationStep {
     std::vector<GenerationEvent> events;
@@ -62,14 +63,14 @@ auto select_device(std::string_view accelerator, bool speech = false) -> Result<
 
 /// Live bytes held by generation state, on whichever device owns it.
 struct GeneratorMemory {
-    std::size_t cache_bytes = 0;  // KV caches of running requests and retained prompt prefixes
-    std::size_t image_bytes = 0;  // reusable image embeddings
+    std::size_t cache_bytes = 0; // KV caches of running requests and retained prompt prefixes
+    std::size_t image_bytes = 0; // reusable image embeddings
 };
 
 /// Creates a tensor that model.yaml lists under `external_tensors`: checkpoint data the embedder keeps outside
 /// linear memory, such as browser-held lookup tables.
-using ExternalTensorSource =
-    std::function<Result<tensor::Tensor>(std::string_view name, tensor::DType dtype, std::span<const std::int64_t> shape)>;
+using ExternalTensorSource = std::function<Result<tensor::Tensor>(std::string_view name, tensor::DType dtype,
+                                                                  std::span<const std::int64_t> shape)>;
 
 struct ModelLoadOptions {
     tensor::Device device = tensor::Device::cpu();
@@ -92,12 +93,13 @@ public:
     /// Where text generation runs, e.g. "cpu", "vulkan", or "cpu+qnn-htp".
     auto execution() const -> std::string;
     auto generate(std::string_view prompt, GenerationOptions options = {}) -> Result<TextGeneration>;
-    auto generate_batch(std::span<const std::string> prompts,
-                        GenerationOptions options = {}) -> Result<GenerationBatch>;
+    auto generate_batch(std::span<const std::string> prompts, GenerationOptions options = {})
+        -> Result<GenerationBatch>;
     auto configure_serving(ServingOptions options) -> Result<void>;
     auto enqueue(std::string_view prompt, GenerationOptions options = {}) -> Result<std::uint64_t>;
-    auto enqueue_chat(std::span<const text::ChatMessage> messages,
-                      GenerationOptions options = {}) -> Result<std::uint64_t>;
+    auto enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options = {})
+        -> Result<std::uint64_t>;
+    auto chat_prompt_tokens(std::span<const text::ChatMessage> messages) const -> Result<std::size_t>;
     auto step() -> Result<GenerationStep>;
     auto cancel(std::uint64_t request_id) -> Result<void>;
     auto pending_requests() const -> std::size_t { return waiting_.size() + running_.size(); }
@@ -112,6 +114,7 @@ public:
     /// Releases request-shaped execution graphs and workspaces while retaining model weights.
     /// All queued and running requests must be drained first.
     auto release_workspaces() -> Result<void>;
+    auto trim_workspaces() -> Result<void>;
 
 private:
     Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model, std::array<std::int32_t, 3> special,
