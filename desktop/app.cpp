@@ -356,8 +356,8 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
             if (model->enabled && model->directory.empty())
                 return invalid_config("Enabled model is not present in model_hub.local: " + model->model_id);
             if (model->accelerator != "auto" && model->accelerator != "cpu" && model->accelerator != "gpu" &&
-                model->accelerator != "npu")
-                return invalid_config("Model accelerator must be auto, cpu, gpu, or npu");
+                model->accelerator != "npu" && !kidi::tensor::parse_cuda_device(model->accelerator))
+                return invalid_config("Model accelerator must be auto, cpu, gpu, npu, or cuda[:INDEX]");
             if (model->enabled && !std::filesystem::is_directory(model->directory, error))
                 return invalid_config("Enabled model directory does not exist: " + model->directory.string());
         }

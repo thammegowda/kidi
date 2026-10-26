@@ -12,32 +12,19 @@ namespace kidi::layers {
 using ops::require;
 
 namespace {
-#if defined(__EMSCRIPTEN__)
-// The fused CPU kernel keeps its own transposed copy of every FFN weight. WebAssembly prefill measured no faster with
-// it, and the copy costs ~0.35 GiB of a 4 GiB heap, so browser builds use the separate projections.
-constexpr bool FUSED_CPU_FEED_FORWARD = false;
-#else
-constexpr bool FUSED_CPU_FEED_FORWARD = true;
-#endif
 auto gate_up_width(std::int32_t intermediate) -> std::int32_t {
     if (intermediate <= 0 || intermediate > std::numeric_limits<std::int32_t>::max() / 2)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid gated feed-forward width"});
     return 2 * intermediate;
 }
-auto table_device() -> tensor::Device {
-    return module_device == tensor::Device::vulkan() || module_device == tensor::Device::apple_gpu()
-               ? tensor::Device::cpu()
-               : module_device;
-}
-auto vector_device() -> tensor::Device {
-    return module_device == tensor::Device::vulkan() ? tensor::Device::cpu() : module_device;
-}
+auto table_device() -> tensor::Device { return module_device.parameter_device(tensor::ParameterRole::EMBEDDING); }
 } // namespace
 
 RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned, bool quantized)
     : target_device_(module_device), epsilon_(epsilon) {
-    const auto storage =
-        quantized && module_device == tensor::Device::web_gpu() ? tensor::Device::cpu() : vector_device();
+    const auto storage = module_device.parameter_device(
+        tensor::ParameterRole::NORMALIZATION,
+        quantized ? tensor::ParameterKind::PREPARED_VECTOR : tensor::ParameterKind::FLOAT);
     if (quantized && (!learned || module_dtype != tensor::DType::I8))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "quantized RMS normalization requires learned INT8 state"});
     if (learned && quantized) {
@@ -50,7 +37,7 @@ RmsNormImpl::RmsNormImpl(std::int32_t width, float epsilon, bool learned, bool q
         weight_ = require(Tensor::empty({width}, tensor::DType::F32, device()));
     if (weight_.defined() && !quantized) {
         const std::vector<float> ones(width, 1.F);
-        weight_ = require(Tensor::from_host({width}, std::span<const float>(ones), device()));
+        require(weight_.copy_from_host(std::as_bytes(std::span(ones))));
     }
 }
 auto RmsNormImpl::weight() const -> const Tensor& {
@@ -104,7 +91,7 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int
     if (!weight_.defined() || tokens.empty())
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "uninitialized embedding or empty tokens"});
     const bool outside = external();
-    if (!outside && tensor::DEVICE_CAPABILITIES[context.device().kind].device_embedding)
+    if (!outside && context.device().capabilities().compute.embedding)
         return forward(
             context, require(Tensor::from_host({static_cast<std::int64_t>(tokens.size())}, tokens, context.device())));
     for (auto token : tokens)
@@ -161,7 +148,7 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, const Tensor& tokens) co
         const auto bytes = require(tokens.copy_to_host());
         return forward(context, std::span(reinterpret_cast<const std::int32_t*>(bytes.data()), tokens.numel()));
     }
-    if (!tensor::DEVICE_CAPABILITIES[context.device().kind].device_embedding) {
+    if (!context.device().capabilities().compute.embedding) {
         context.synchronize();
         return forward(context, require(tokens.data<std::int32_t>()));
     }
@@ -182,17 +169,17 @@ GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t int
 }
 auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
     const auto rows = input.numel() / input.size(-1);
-    const bool web_fusion = context.device() == tensor::Device::web_gpu() && rows < 4 &&
-                            gate_up_->input_size_ % 128 == 0 && down_->input_size_ % 32 == 0;
-    const bool cpu_fusion = (context.device() == tensor::Device::cpu() && FUSED_CPU_FEED_FORWARD) ||
-                            context.device() == tensor::Device::vulkan();
-    const bool metal_fusion = tensor::DEVICE_CAPABILITIES[context.device().kind].fused_packed_feed_forward &&
-                              rows >= 4 && gate_up_->packed_bits_ == 8;
-    const bool fused_gelu =
-        activation_ == GatedActivation::GELU && ((cpu_fusion && rows >= 32) || web_fusion || metal_fusion);
-    const bool fused_silu =
-        activation_ == GatedActivation::SILU && context.device() == tensor::Device::vulkan() && rows >= 4;
-    if ((fused_gelu || fused_silu) && gate_up_->packed_bits_ && gate_up_->packed_bits_ == down_->packed_bits_) {
+    const auto& policy = context.device().policy().transformer;
+    const auto kernel = activation_ == GatedActivation::GELU ? policy.gelu : policy.silu;
+    const bool small_fusion = kernel == tensor::FeedForwardKernel::PACKED_SMALL && rows < 4 &&
+                              gate_up_->input_size_ % 128 == 0 && down_->input_size_ % 32 == 0;
+    const bool large_fusion =
+        kernel == tensor::FeedForwardKernel::PACKED_LARGE && rows >= (activation_ == GatedActivation::GELU ? 32 : 4);
+    const bool packed_fusion =
+        kernel == tensor::FeedForwardKernel::PACKED_INT8 && rows >= 4 && gate_up_->packed_bits_ == 8;
+    const bool fused_silu = activation_ == GatedActivation::SILU;
+    if ((large_fusion || small_fusion || packed_fusion) && gate_up_->packed_bits_ &&
+        gate_up_->packed_bits_ == down_->packed_bits_) {
         const Tensor& gate_input = gate_up_->input_scale_;
         const Tensor& gate_output = gate_up_->output_scale_;
         const Tensor& down_input = down_->input_scale_;
@@ -208,13 +195,12 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
                 down_input_scale, down_output_scale, fused_silu);
             return output;
         }
-        if (!web_fusion)
+        if (!small_fusion)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "fused feed-forward requires positive trained scales"});
     }
-    if (activation_ == GatedActivation::SILU &&
-        (context.device() == tensor::Device::cpu() || context.device() == tensor::Device::apple_gpu())) {
+    if (kernel == tensor::FeedForwardKernel::PACKED_GATE && (fused_silu || input.dtype() == tensor::DType::BF16)) {
         const auto projected = gate_up_->forward(context, input);
-        return down_->forward(context, context.silu_gate(projected));
+        return down_->forward(context, fused_silu ? context.silu_gate(projected) : context.gelu_gate(projected));
     }
     return forward_stages(context, input).output;
 }

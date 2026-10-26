@@ -12,6 +12,8 @@ option(KIDI_BUILD_TESTS "Build kidi tests" ON)
 option(KIDI_BUILD_INTEGRATION_TESTS "Register Python, browser, and model regression tests" OFF)
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
+option(KIDI_ENABLE_CUDA "Build the NVIDIA CUDA backend" OFF)
+set(YNNPACK_ENABLE_CUDA ${KIDI_ENABLE_CUDA} CACHE BOOL "Build YNNPACK CUDA" FORCE)
 set(KIDI_DESKTOP_APP_DEFAULT ON)
 if(ANDROID OR EMSCRIPTEN)
     set(KIDI_DESKTOP_APP_DEFAULT OFF)
@@ -90,7 +92,9 @@ add_library(kidi
     src/kidi/core/memory.cpp
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
+    src/kidi/graph/compiler.cpp
     src/kidi/graph/graph.cpp
+    src/kidi/graph/session.cpp
     src/kidi/image/gemma4.cpp
     src/kidi/inference/decoder.cpp
     src/kidi/inference/generator.cpp
@@ -127,6 +131,16 @@ add_library(kidi
     src/kidi/text/tokenizer.cpp
 )
 add_library(kidi::kidi ALIAS kidi)
+
+if(KIDI_ENABLE_CUDA)
+    target_sources(kidi PRIVATE src/kidi/tensor/cuda_backend.cpp src/kidi/runtime/cuda/operators.cpp)
+    target_link_libraries(kidi PUBLIC ynnpack_cuda)
+    target_compile_definitions(kidi PUBLIC KIDI_HAS_CUDA=1)
+    if(KIDI_BUILD_TESTS)
+        add_executable(kidi_cuda_test tests/kidi/runtime/cuda/operators_test.cpp)
+        target_link_libraries(kidi_cuda_test PRIVATE kidi::kidi)
+    endif()
+endif()
 
 if(EMSCRIPTEN)
     if(KIDI_WASM_WEBGPU)

@@ -6,6 +6,7 @@
 namespace kidi::core {
 auto default_module_device() -> tensor::Device {
     for (auto device : {tensor::Device::apple_gpu(), tensor::Device::cuda()}) {
+        if (!device.capabilities().compute.supports(tensor::TransformerSupport::GENERAL)) continue;
         auto backend = tensor::BackendRegistry::instance().backend(device);
         if (backend && (*backend)->is_available(device) && (*backend)->supports_execution()) return device;
     }

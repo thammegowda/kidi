@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "kidi/graph/graph.h"
+#include "kidi/graph/compiler.h"
 #include "kidi/ops/context.h"
 #include "kidi/runtime/operator.h"
 
@@ -223,7 +224,7 @@ auto least_recently_used_steps_are_recaptured() -> bool {
 }
 
 /// Doubles its input on the host, standing in for an accelerator executable.
-class Doubler final : public kidi::runtime::StepExecutable {
+class Doubler final : public kidi::graph::Executable {
 public:
     explicit Doubler(std::atomic<int>& runs) : runs_(runs) {}
     auto run(std::span<const Tensor> inputs, std::span<Tensor> outputs) -> void override {
@@ -238,13 +239,13 @@ private:
 };
 
 /// Compiles on a background thread once released, or fails there when `fail` is set.
-class BackgroundCompiler final : public kidi::runtime::StepCompiler {
+class BackgroundCompiler final : public kidi::graph::Compiler {
 public:
     explicit BackgroundCompiler(bool fail) : fail_(fail) {}
     auto name() const -> std::string_view override { return "background-test"; }
     auto compiles_in_background() const -> bool override { return true; }
     auto compile(const kidi::graph::Graph& graph, std::string_view)
-        -> std::unique_ptr<kidi::runtime::StepExecutable> override {
+        -> std::unique_ptr<kidi::graph::Executable> override {
         ++compiles;
         released_.wait();
         ++completed;
@@ -261,13 +262,14 @@ private:
     std::shared_future<void> released_ = release_.get_future().share();
 };
 
-class SingleCaptureCompiler final : public kidi::runtime::StepCompiler {
+class SingleCaptureCompiler final : public kidi::graph::Compiler {
 public:
+    explicit SingleCaptureCompiler(std::optional<bool> validation = false) : validation_(validation) {}
     auto name() const -> std::string_view override { return "single-capture-test"; }
-    auto requires_second_capture(std::string_view) const -> bool override { return false; }
+    auto requires_second_capture(std::string_view) const -> std::optional<bool> override { return validation_; }
     auto captures_prefill() const -> bool override { return true; }
     auto compile(const kidi::graph::Graph& graph, std::string_view)
-        -> std::unique_ptr<kidi::runtime::StepExecutable> override {
+        -> std::unique_ptr<kidi::graph::Executable> override {
         ++compiles;
         if (graph.nodes().empty())
             throw kidi::ops::Failure({kidi::core::ErrorCode::UNSUPPORTED, "empty single-capture test graph"});
@@ -275,7 +277,92 @@ public:
     }
     int compiles = 0;
     std::atomic<int> runs{0};
+
+private:
+    std::optional<bool> validation_;
 };
+
+auto compiler_can_defer_capture_validation_to_caller() -> bool {
+    for (const bool validation : {false, true}) {
+        auto compiler = std::make_shared<SingleCaptureCompiler>(std::nullopt);
+        const kidi::ops::StepCompilerScope scope(compiler);
+        Context context;
+        const auto input = tensor({2}, {1, 2});
+        int captures = 0;
+        const auto step = [&](std::span<const Tensor> inputs) {
+            ++captures;
+            return std::vector{context.add(inputs[0], inputs[0])};
+        };
+        for (int call = 0; call < 3; ++call) {
+            const auto output = context.replay("validation", std::array{input}, step, validation);
+            if (!expect(values(output[0]) == std::vector<float>{2, 4}, "caller-selected captures preserve outputs"))
+                return false;
+        }
+        if (!expect(captures == (validation ? 2 : 1) && compiler->compiles == 1,
+                    "a compiler without a capture override follows caller validation"))
+            return false;
+    }
+    return true;
+}
+
+auto compiled_replay_validates_bindings() -> bool {
+    auto compiler = std::make_shared<SingleCaptureCompiler>();
+    const kidi::ops::StepCompilerScope scope(compiler);
+    Context context;
+    const auto input = tensor({2}, {1, 2});
+    const auto step = [&](std::span<const Tensor> inputs) { return std::vector{context.add(inputs[0], inputs[0])}; };
+    context.replay("compiled", std::array{input}, step);
+    const auto wrong_shape = tensor({3}, {1, 2, 3});
+    const auto wrong_dtype = require(Tensor::zeros({2}, DType::I32));
+    const auto non_contiguous = require(tensor({2, 2}, {1, 2, 3, 4}).narrow(1, 0, 1));
+    const bool rejected =
+        fails_with([&] { context.replay("compiled", {}, step); }, "input count") &&
+        fails_with([&] { context.replay("compiled", std::array{wrong_shape}, step); }, "changed shape") &&
+        fails_with([&] { context.replay("compiled", std::array{wrong_dtype}, step); }, "dtype") &&
+        fails_with([&] { context.replay("compiled", std::array{non_contiguous}, step); }, "changed shape");
+    const auto output = context.replay("compiled", std::array{input}, step);
+    return expect(rejected && compiler->runs == 1, "compiled replay rejects incompatible bindings before execution") &&
+           expect(values(output[0]) == std::vector<float>{2, 4}, "invalid bindings do not poison a compiled step");
+}
+
+auto capture_recovers_after_exception() -> bool {
+    Context context;
+    const auto input = tensor({2}, {1, 2});
+    const bool rejected = fails_with(
+        [&] {
+            context.replay("exception", std::array{input}, [&](std::span<const Tensor>) -> std::vector<Tensor> {
+                throw kidi::ops::Failure({kidi::ErrorCode::RUNTIME, "capture failure"});
+            });
+        },
+        "capture failure");
+    const auto step = [&](std::span<const Tensor> inputs) { return std::vector{context.add(inputs[0], inputs[0])}; };
+    for (int call = 0; call < 3; ++call)
+        if (!expect(values(context.replay("exception", std::array{input}, step)[0]) == std::vector<float>{2, 4},
+                    "failed capture restores recording state"))
+            return false;
+    return rejected;
+}
+
+auto compiled_sessions_keep_independent_outputs() -> bool {
+    auto compiler = std::make_shared<SingleCaptureCompiler>();
+    const kidi::ops::StepCompilerScope scope(compiler);
+    Context first, second;
+    const auto input = tensor({2}, {1, 2}), other = tensor({2}, {3, 4});
+    const auto first_step = [&](std::span<const Tensor> inputs) {
+        return std::vector{first.add(inputs[0], inputs[0])};
+    };
+    const auto second_step = [&](std::span<const Tensor> inputs) {
+        return std::vector{second.add(inputs[0], inputs[0])};
+    };
+    const auto first_output = first.replay("shared", std::array{input}, first_step)[0];
+    const auto second_output = second.replay("shared", std::array{other}, second_step)[0];
+    second.replay("shared", std::array{input}, second_step);
+    first.replay("shared", std::array{other}, first_step);
+    return expect(first_output.storage_identity() != second_output.storage_identity(),
+                  "sessions sharing a compiler retain separate output storage") &&
+           expect(values(first_output) == std::vector<float>{6, 8} && values(second_output) == std::vector<float>{2, 4},
+                  "compiled session output updates do not overwrite another session");
+}
 
 auto single_capture_compiles_and_rebinds_inputs() -> bool {
     auto compiler = std::make_shared<SingleCaptureCompiler>();
@@ -460,6 +547,8 @@ auto main() -> int {
                        least_recently_used_steps_are_recaptured() && bounded_replay_cache_evicts_old_shapes() &&
                        replay_capacity_can_be_changed() && disabled_replay_runs_eagerly() &&
                        single_capture_compiles_and_rebinds_inputs() && attached_accelerator_enables_replay() &&
+                       compiler_can_defer_capture_validation_to_caller() && compiled_replay_validates_bindings() &&
+                       capture_recovers_after_exception() && compiled_sessions_keep_independent_outputs() &&
                        background_compilation_hands_over_from_cpu_replay(false) &&
                        background_compilation_hands_over_from_cpu_replay(true) &&
                        pending_background_compilation_does_not_block_eviction()

@@ -6,6 +6,7 @@
 // pieces, compares every producer layer's K/V rows, times each chunk, and compares greedy continuations.
 #include "kidi/checkpoint/config.h"
 #include "kidi/core/module.h"
+#include "kidi/graph/compiler.h"
 #include "kidi/model/gemma4.h"
 #include "kidi/ops/context.h"
 #include "kidi/runtime/operator.h"

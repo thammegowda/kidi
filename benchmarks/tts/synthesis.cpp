@@ -16,7 +16,11 @@
 #include <nlohmann/json.hpp>
 
 #include "kidi/inference/synthesizer.h"
+#include "kidi/audio/wav.h"
 #include "kidi/runtime/ynn/graph.h"
+#if defined(KIDI_HAS_CUDA)
+#include "ynnpack/include/ynnpack_cuda.h"
+#endif
 
 namespace {
 auto positive_integer(std::string_view value, std::string_view name) -> std::size_t {
@@ -61,18 +65,21 @@ auto text_chunks(std::string_view argument) -> std::vector<std::string> {
 
 auto main(int argc, char** argv) -> int {
     if (argc < 2 || argc > 8) {
-        std::cerr << "usage: kidi_tts_bench MODEL [cpu|mps|vulkan|npu] [REPETITIONS] [THREADS] [TEXT|@FILE] [STEPS] [OPTIONS_JSON]\n";
+        std::cerr << "usage: kidi_tts_bench MODEL [cpu|cuda[:INDEX]|mps|vulkan|npu] [REPETITIONS] [THREADS] "
+                     "[TEXT|@FILE] [STEPS] [OPTIONS_JSON]\n";
         return 2;
     }
     try {
         const std::filesystem::path model(argv[1]);
         const std::string_view backend = argc >= 3 ? argv[2] : "cpu";
-        const auto device = backend == "cpu"      ? kidi::tensor::Device::cpu()
+        const auto cuda = kidi::tensor::parse_cuda_device(backend);
+        const auto device = cuda                  ? *cuda
+                            : backend == "cpu"    ? kidi::tensor::Device::cpu()
                             : backend == "mps"    ? kidi::tensor::Device::apple_gpu()
                             : backend == "vulkan" ? kidi::tensor::Device::vulkan()
                             : backend == "npu"
                                 ? kidi::tensor::Device::qualcomm_npu()
-                                : throw std::invalid_argument("backend must be cpu, mps, vulkan, or npu");
+                                : throw std::invalid_argument("backend must be cpu, cuda[:INDEX], mps, vulkan, or npu");
         const auto repetitions = argc >= 4 ? nonnegative_integer(argv[3], "repetitions") : 3;
         const auto available = std::max(1U, std::thread::hardware_concurrency());
         const auto threads = argc >= 5 ? positive_integer(argv[4], "threads") : std::min<std::size_t>(4, available);
@@ -123,6 +130,8 @@ auto main(int argc, char** argv) -> int {
             std::uint64_t generation_ns = 0, decode_ns = 0, preparation_ns = 0;
             std::size_t audio_tokens = 0, samples = 0, synthesized_chunks = 0;
             std::uint32_t sample_rate = 0;
+            const auto* waveform_output = repetition == 0 ? std::getenv("KIDI_TTS_WAV_OUT") : nullptr;
+            std::vector<float> waveform;
             options.on_chunk = [repetition](std::size_t index, std::size_t total) {
                 std::cerr << "kidi_tts_chunk|repetition=" << repetition << "|index=" << index << "|total=" << total
                           << '\n';
@@ -137,10 +146,16 @@ auto main(int argc, char** argv) -> int {
                 synthesized_chunks += speech->stats.chunks;
                 samples += speech->samples.size();
                 sample_rate = speech->sample_rate;
+                if (waveform_output && *waveform_output)
+                    waveform.insert(waveform.end(), speech->samples.begin(), speech->samples.end());
                 tokens.insert(tokens.end(), speech->tokens.begin(), speech->tokens.end());
                 options.voice_prompt = speech->voice_prompt;
             }
             const auto total_ns = elapsed(start);
+            if (waveform_output && *waveform_output) {
+                auto saved = kidi::audio::save_wav(waveform_output, waveform, sample_rate);
+                if (!saved) throw std::runtime_error(saved.error().message);
+            }
             const auto audio_seconds = static_cast<double>(samples) / sample_rate;
             if (repetition == 0)
                 reference = tokens;
@@ -161,8 +176,13 @@ auto main(int argc, char** argv) -> int {
                       << "|load_ns=" << load_ns << "|total_ns=" << total_ns << "|generation_ns=" << generation_ns
                       << "|decode_ns=" << decode_ns << "|preparation_ns=" << preparation_ns
                       << "|audio_tokens=" << audio_tokens << "|samples=" << samples << "|sample_rate=" << sample_rate
-                      << "|rtf=" << (total_ns / 1e9 / audio_seconds)
-                      << "|token_hash=" << token_hash(tokens) << '\n';
+                      << "|rtf=" << (total_ns / 1e9 / audio_seconds) << "|token_hash=" << token_hash(tokens);
+#if defined(KIDI_HAS_CUDA)
+            if (cuda)
+                std::cout << "|gpu_live_bytes=" << ynn::cuda::allocated_bytes(device.index)
+                          << "|gpu_peak_bytes=" << ynn::cuda::peak_allocated_bytes(device.index);
+#endif
+            std::cout << '\n';
         }
         return 0;
     } catch (const std::exception& error) {

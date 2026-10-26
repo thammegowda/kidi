@@ -49,6 +49,18 @@ to kidi-owned C++ code. Code under `third_party/` follows its upstream project.
   layer or read them during forward execution. `set_state` binds validated checkpoint
   state after construction; same-device buffers are shared, cross-device buffers are
   transferred. Respect parameter ties and atomic loading on failure.
+- Infer execution placement from the captured model, input tensor, or context.
+  Query the compute, sampling, attention, and memory groups in
+  `device.capabilities()` for supported operation contracts. Derive composite
+  requirements rather than adding a flag for each branch or model. Keep placement,
+  fusion, prefill, replay, and dispatch choices in `device.policy()`, not in the
+  capabilities. Prefer typed strategies over overlapping booleans. Both are
+  declared in the central `tensor::DEVICE_PROFILES` dictionary; parameter placement
+  is resolved by `device.parameter_device(role, kind)`.
+  Do not enumerate backend identities in model/layer equations. Backend selection,
+  registration, and backend implementations may identify devices explicitly.
+  Use tensor transfer APIs for device initialization and host readback; preserve
+  deferred-read lifetimes and reject mismatched activation devices.
 
 ## Naming
 
@@ -87,6 +99,13 @@ to kidi-owned C++ code. Code under `third_party/` follows its upstream project.
   host values into step inputs, write caches with `scatter_` and index inputs,
   and never read computed tensors on the host inside a step. Use `ops::Failure` within eager computation; translate it
   to `Result<T>` at model/application boundaries. Synchronize before host reads.
+- Keep graph recording, validation, session caches, and compiler/executable
+  contracts in `kidi::graph`. Backends expose optional graph compilers through
+  `OperatorBackend::graph_compiler()`; attached accelerators use the same contract.
+  Keep native compilation and command encoding in the backend, and YNNPACK
+  operators/packing in YNNPACK. Do not add backend-specific branches to the shared
+  capture or replay lifecycle. Preserve output ownership and pending-job lifetimes
+  when clearing or evicting sessions.
 - Keep implementation details in unnamed namespaces in `.cpp` files.
 - Prefer a focused free function over a new class when no state or lifetime is
   being modeled.

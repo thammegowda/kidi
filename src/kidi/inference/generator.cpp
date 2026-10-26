@@ -1,4 +1,6 @@
+#include "kidi/graph/compiler.h"
 #include "kidi/inference/generator.h"
+#include <cstring>
 #include "kidi/core/memory.h"
 #include "kidi/runtime/operator.h"
 #include "kidi/tensor/backend.h"
@@ -51,24 +53,27 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
 auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions options,
                      const ExternalTensorSource& external) -> Result<Generator> {
     try {
-        auto config = require(checkpoint::load_config(directory / "model.yaml"));
+        auto config = require(std::filesystem::is_regular_file(directory / "model.yaml")
+                                  ? checkpoint::load_config(directory / "model.yaml")
+                                  : checkpoint::load_config(directory, model::Gemma4Impl::checkpoint_config()));
         require(model::Gemma4Impl::validate_config(config["model"]));
         const bool qat = static_cast<bool>(config["model"]["quantization_config"]);
-        if (options.precision != core::InferencePrecision::CHECKPOINT && !qat)
+        const auto checkpoint_bf16 = !qat && options.precision == core::InferencePrecision::BF16;
+        if (options.precision != core::InferencePrecision::CHECKPOINT && !qat && !checkpoint_bf16)
             throw ops::Failure(
                 {ErrorCode::UNSUPPORTED, "explicit projection precision currently requires a native QAT checkpoint"});
         if (options.precision != core::InferencePrecision::CHECKPOINT && options.weight_bits)
             throw ops::Failure(
                 {ErrorCode::INVALID_ARGUMENT, "precision and load-time weight packing cannot be combined"});
-        if (options.precision != core::InferencePrecision::CHECKPOINT && options.device != tensor::Device::cpu())
+        if (options.precision != core::InferencePrecision::CHECKPOINT && !checkpoint_bf16 &&
+            !options.device.capabilities().compute.host())
             throw ops::Failure(
                 {ErrorCode::UNSUPPORTED, "selected precision is currently implemented only by the CPU backend"});
 #if !defined(__APPLE__)
         if (options.precision == core::InferencePrecision::LOWBIT_PARITY)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "lowbit-parity currently requires Apple Accelerate"});
 #endif
-        if (options.kv_cache_precision == core::KVCachePrecision::BF16 ||
-            options.kv_cache_precision == core::KVCachePrecision::E4M3 ||
+        if (options.kv_cache_precision == core::KVCachePrecision::E4M3 ||
             options.kv_cache_precision == core::KVCachePrecision::E5M2)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "selected KV-cache precision is not implemented"});
         if (options.kv_cache_precision == core::KVCachePrecision::INT8 && !qat)
@@ -99,7 +104,8 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             for (auto candidate = 0; candidate <= static_cast<int>(tensor::DType::E5M2); ++candidate)
                 if (tensor::to_string(static_cast<tensor::DType>(candidate)) == dtype_name)
                     dtype = static_cast<tensor::DType>(candidate);
-            if (!dtype) throw ops::Failure({ErrorCode::INVALID_MANIFEST, "unknown external tensor dtype: " + dtype_name});
+            if (!dtype)
+                throw ops::Failure({ErrorCode::INVALID_MANIFEST, "unknown external tensor dtype: " + dtype_name});
             const auto shape = declared["shape"].as<std::vector<std::int64_t>>();
             require(weights.add(name, require(external(name, *dtype, shape))));
         }
@@ -115,6 +121,8 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
         const auto parameter = require(weights.tensor(config["model"]["quantization_config"]
                                                           ? "model.language_model.norm.weight"
                                                           : "model.language_model.embed_tokens.weight"));
+        if (checkpoint_bf16 && parameter.dtype() != tensor::DType::BF16)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "BF16 execution requires BF16 checkpoint weights"});
         std::optional<ops::StepCompilerScope> accelerator;
         auto device = options.device;
         if (device.kind == tensor::DeviceKind::Q_NPU) {
@@ -151,6 +159,12 @@ auto select_device(std::string_view accelerator, bool speech) -> Result<tensor::
         return false;
     };
     if (accelerator == "cpu") return tensor::Device::cpu();
+    if (const auto device = tensor::parse_cuda_device(accelerator)) {
+        if (!available(*device))
+            return std::unexpected(
+                Error{ErrorCode::UNSUPPORTED, "CUDA execution is not available on " + tensor::to_string(*device)});
+        return *device;
+    }
     if (accelerator == "gpu") {
         if (!available(gpu))
             return std::unexpected(Error{ErrorCode::UNSUPPORTED, "no GPU backend is available on this device"});
@@ -162,7 +176,8 @@ auto select_device(std::string_view accelerator, bool speech) -> Result<tensor::
         return tensor::Device::qualcomm_npu();
     }
     if (accelerator != "auto")
-        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "accelerator must be auto, cpu, gpu, or npu"});
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT, "accelerator must be auto, cpu, gpu, npu, or cuda[:INDEX]"});
     if (speech) return tensor::Device::cpu();
     if (runtime::npu_step_compiler()) return tensor::Device::qualcomm_npu();
     // Vulkan is an explicit, experimental choice until it measures faster than the CPU; Metal is Apple's default.
@@ -192,9 +207,10 @@ auto Generator::warm_up() -> Result<void> {
 auto Generator::release_workspaces() -> Result<void> {
     try {
         if (pending_requests())
-            throw ops::Failure(
-                {ErrorCode::INVALID_ARGUMENT, "drain generation requests before releasing workspaces"});
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "drain generation requests before releasing workspaces"});
         model_->release_workspaces();
+        retired_.clear();
+        reserved_cache_tokens_ = 0;
         if (vision_) vision_->release_workspaces();
         return {};
     } catch (const ops::Failure& error) {
@@ -210,15 +226,18 @@ auto Generator::memory() const -> GeneratorMemory {
     };
     for (const auto& request : running_)
         if (request.state) add_state(*request.state);
+    for (const auto& request : retired_)
+        if (request.state) add_state(*request.state);
     if (prefix_) add_state(prefix_->state);
     if (serving_prefix_) add_state(serving_prefix_->state);
     for (const auto& image : images_) result.image_bytes += image.embeddings.nbytes();
     return result;
 }
 auto Generator::require_immediate_tokens() const -> void {
-    if (tensor::DEVICE_CAPABILITIES[model_->device().kind].deferred_host_reads)
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "this device reports tokens on a later call; use serving with "
-                                                    "deferred_tokens"});
+    if (model_->device().capabilities().memory.deferred())
+        throw ops::Failure({ErrorCode::UNSUPPORTED,
+                            "this device reports tokens on a later call; use serving with "
+                            "deferred_tokens"});
 }
 auto Generator::generate(std::string_view prompt, GenerationOptions options) -> Result<TextGeneration> {
     try {
@@ -228,6 +247,29 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
                                 "drain serving requests before serial generation; reload after a serving failure"});
         serving_prefix_.reset();
+        const auto decode_ahead =
+            serving_ ? serving_->decode_ahead_tokens : model_->device().policy().transformer.decode_ahead_tokens;
+        if (decode_ahead > 1 && !options.prefix_cache_bytes && model_->supports_device_tokens()) {
+            struct Restore {
+                std::optional<ServingOptions>& target;
+                std::optional<ServingOptions> previous;
+                ~Restore() { target = std::move(previous); }
+            } restore{serving_, serving_};
+            const auto capacity =
+                options.context_size ? options.context_size : config_["decode"]["context_size"].as<std::size_t>();
+            require(configure_serving({.maximum_active = 1,
+                                       .maximum_requests = 1,
+                                       .cache_token_budget = capacity,
+                                       .prefill_tokens_per_step = options.prefill_chunk_size,
+                                       .decode_ahead_tokens = decode_ahead}));
+            require(enqueue(prompt, options));
+            std::optional<TextGeneration> completed;
+            while (pending_requests())
+                for (auto& event : require(step()).events)
+                    if (event.completed) completed = std::move(event.completed);
+            if (!completed) throw ops::Failure({ErrorCode::RUNTIME, "asynchronous generation did not complete"});
+            return std::move(*completed);
+        }
         const auto started = Clock::now();
         const auto preparation = model_->preparation_ns();
         TextGeneration result;
@@ -278,7 +320,8 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
                                    .stop_on_eos = !options.ignore_eos};
         tensor::Tensor storage;
         std::optional<std::int32_t> selected;
-        result.stats.device_selection = model_->device() != tensor::Device::cpu();
+        result.stats.device_selection =
+            model_->device().capabilities().sampling.supports(tensor::TokenSelection::DEVICE);
         const auto project = [&](std::span<const std::int32_t> input) -> Result<void> {
             if (result.stats.device_selection) {
                 auto token = model_->forward_token(input, state);
@@ -339,8 +382,8 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
-auto Generator::generate_batch(std::span<const std::string> prompts,
-                               GenerationOptions options) -> Result<GenerationBatch> {
+auto Generator::generate_batch(std::span<const std::string> prompts, GenerationOptions options)
+    -> Result<GenerationBatch> {
     try {
         require_immediate_tokens();
         options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
@@ -378,7 +421,8 @@ auto Generator::generate_batch(std::span<const std::string> prompts,
             auto& stats = result.rows[row].stats;
             stats.tokenize_ns = elapsed(tokenizing);
             stats.prompt_tokens = tokens.size();
-            stats.device_selection = model_->device() == tensor::Device::apple_gpu();
+            stats.device_selection =
+                model_->device().capabilities().sampling.supports(tensor::TokenSelection::BATCHED_DEVICE);
             stats.last_token_prefill = model_->last_token_prefill();
             stats.shared_prefill_tail = model_->shared_prefill_tail();
             if (!maximum || tokens.empty() || tokens.size() >= capacity || maximum > capacity - tokens.size())
@@ -440,11 +484,14 @@ auto Generator::generate_batch(std::span<const std::string> prompts,
 }
 auto Generator::configure_serving(ServingOptions options) -> Result<void> {
     try {
+        reap_retired();
+        if (!options.decode_ahead_tokens)
+            options.decode_ahead_tokens = model_->device().policy().transformer.decode_ahead_tokens;
         options.prefill_tokens_per_step = model_->prefill_chunk_size(options.prefill_tokens_per_step);
         if (!options.deferred_tokens) require_immediate_tokens();
-        if (pending_requests() || serving_failed_ || !options.maximum_active || options.maximum_active > 16 ||
-            options.maximum_requests < options.maximum_active || !options.cache_token_budget ||
-            !options.prefill_tokens_per_step)
+        if (pending_requests() || !retired_.empty() || serving_failed_ || !options.maximum_active ||
+            options.maximum_active > 16 || options.maximum_requests < options.maximum_active ||
+            !options.cache_token_budget || !options.prefill_tokens_per_step || options.decode_ahead_tokens > 64)
             throw ops::Failure(
                 {ErrorCode::INVALID_ARGUMENT, "invalid serving limits, outstanding requests or failed engine"});
         prefix_.reset();
@@ -458,8 +505,8 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
-auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
-                             GenerationOptions options) -> Result<std::uint64_t> {
+auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options)
+    -> Result<std::uint64_t> {
     try {
         if (options.image_max_pixels < image::MIN_RESIZED_PIXELS ||
             options.image_max_pixels > image::MAX_RESIZED_PIXELS)
@@ -490,7 +537,7 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
                 if (cached != images_.end()) {
                     embeddings = cached->embeddings;
                 } else {
-                    if (model_->device() == tensor::Device::cpu() && model_->accelerator().empty()) {
+                    if (model_->device().capabilities().compute.host() && model_->accelerator().empty()) {
                         model_->release_workspaces();
                         if (vision_) vision_->release_workspaces();
                     }
@@ -511,7 +558,7 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages,
                     }
                     if (options.on_image_progress) options.on_image_progress("Encoding images");
                     auto features = vision_->forward(pixels);
-                    if (vision_->device() == tensor::Device::cpu()) vision_->release_workspaces();
+                    if (vision_->device().capabilities().compute.host()) vision_->release_workspaces();
                     embeddings = require(require(std::move(features)).to(model_->device()));
                     if (options.on_image_progress) options.on_image_progress("Image encoded");
                 }
@@ -587,8 +634,7 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prompt and generation must fit the reserved context"});
         if (serving_->compact_cache) {
             auto required = tokens.size() + maximum;
-            const auto byte_cache_limit =
-                tensor::DEVICE_CAPABILITIES[model_->device().kind].blockwise_int8_attention_max_tokens;
+            const auto byte_cache_limit = model_->device().capabilities().attention.int8_cache_tokens;
             if (capacity > byte_cache_limit) required = std::max(required, byte_cache_limit + 1);
             capacity = std::min(capacity, required + (128 - required % 128) % 128);
         }
@@ -604,7 +650,7 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         GenerationStats stats;
         stats.tokenize_ns = elapsed(started);
         stats.prompt_tokens = tokens.size();
-        stats.device_selection = model_->device() != tensor::Device::cpu();
+        stats.device_selection = model_->device().capabilities().sampling.supports(tensor::TokenSelection::DEVICE);
         stats.last_token_prefill = model_->last_token_prefill();
         stats.shared_prefill_tail = model_->shared_prefill_tail();
         waiting_.push_back(
@@ -640,6 +686,16 @@ auto Generator::retain_serving_prefix(QueuedGeneration& request) -> void {
     request.state.reset();
 }
 
+auto Generator::reap_retired() -> void {
+    std::erase_if(retired_, [&](const auto& request) {
+        if (request.decode && !request.decode->pending.empty() &&
+            !require(request.decode->pending.back().transfer->ready()))
+            return false;
+        reserved_cache_tokens_ -= request.capacity;
+        return true;
+    });
+}
+
 auto Generator::cancel(std::uint64_t request_id) -> Result<void> {
     const auto waiting = std::ranges::find(waiting_, request_id, &QueuedGeneration::id);
     if (waiting != waiting_.end()) {
@@ -648,8 +704,12 @@ auto Generator::cancel(std::uint64_t request_id) -> Result<void> {
     }
     const auto running = std::ranges::find(running_, request_id, &QueuedGeneration::id);
     if (running != running_.end()) {
-        retain_serving_prefix(*running);
-        reserved_cache_tokens_ -= running->capacity;
+        if (running->decode && !running->decode->pending.empty())
+            retired_.push_back(std::move(*running));
+        else {
+            reserved_cache_tokens_ -= running->capacity;
+            retain_serving_prefix(*running);
+        }
         running_.erase(running);
         return {};
     }
@@ -660,6 +720,7 @@ auto Generator::step() -> Result<GenerationStep> {
         return std::unexpected(
             Error{ErrorCode::INVALID_ARGUMENT, "serving is unconfigured or failed; reload after failure"});
     try {
+        reap_retired();
         GenerationStep result;
         result.events.reserve(serving_->maximum_active + 1);
         const auto preparation = model_->preparation_ns();
@@ -692,10 +753,22 @@ auto Generator::step() -> Result<GenerationStep> {
         };
         const auto retire = [&] {
             std::erase_if(running_, [&](const auto& request) {
-                if (!request.search.finished()) return false;
+                if (!request.completion_emitted) return false;
                 reserved_cache_tokens_ -= request.capacity;
                 return true;
             });
+        };
+        const auto complete = [&](QueuedGeneration& request) {
+            if (request.decode && request.state) request.state->position = request.decode->logical_position;
+            retain_serving_prefix(request);
+            TextGeneration completed;
+            completed.generation = std::move(request.search).result();
+            completed.text = require(tokenizer_.decode(completed.generation.token_ids));
+            completed.stats = request.stats;
+            completed.stats.decode_tokens = completed.generation.decoder_steps - 1;
+            completed.stats.generation_ns = elapsed(request.enqueued);
+            request.completion_emitted = true;
+            return completed;
         };
         const auto accept = [&](QueuedGeneration& request, std::int32_t token) {
             const auto previous = request.search.result().token_ids.size();
@@ -707,16 +780,8 @@ auto Generator::step() -> Result<GenerationStep> {
             if (request.options.stream_text)
                 event.text = require(tokenizer_.decode_delta(request.search.result().token_ids, request.streamed_text,
                                                              request.search.finished()));
-            if (request.search.finished()) {
-                retain_serving_prefix(request);
-                TextGeneration completed;
-                completed.generation = std::move(request.search).result();
-                completed.text = require(tokenizer_.decode(completed.generation.token_ids));
-                completed.stats = request.stats;
-                completed.stats.decode_tokens = completed.generation.decoder_steps - 1;
-                completed.stats.generation_ns = elapsed(request.enqueued);
-                event.completed = std::move(completed);
-            }
+            if (request.search.finished() && (!request.decode || request.decode->pending.empty()))
+                event.completed = complete(request);
             result.events.push_back(std::move(event));
         };
         admit();
@@ -758,7 +823,57 @@ auto Generator::step() -> Result<GenerationStep> {
         std::size_t count = 0;
         for (std::size_t row = 0; row < running_.size() && !prefill_selects; ++row) {
             auto& request = running_[row];
-            if (!request.search.result().decoder_steps) continue;
+            if (!request.search.result().decoder_steps || request.completion_emitted) continue;
+            if (serving_->maximum_active == 1 && !serving_->deferred_tokens && serving_->decode_ahead_tokens > 1 &&
+                model_->supports_device_tokens()) {
+                const auto started = Clock::now();
+                const auto prepared = model_->preparation_ns();
+                if (!request.decode) {
+                    const std::array initial{request.search.token()};
+                    request.decode.emplace();
+                    request.decode->token = require(
+                        tensor::Tensor::from_host({1}, std::span<const std::int32_t>(initial), model_->device()));
+                    request.decode->submitted = request.search.result().decoder_steps;
+                    request.decode->logical_position = request.state->position;
+                    request.decode->started = started;
+                }
+                auto& decode = *request.decode;
+                const bool poll = started >= decode.next_poll;
+                if (poll) decode.next_poll = started + std::chrono::microseconds(50);
+                while (poll && !decode.pending.empty() && require(decode.pending.front().transfer->ready())) {
+                    auto pending = std::move(decode.pending.front());
+                    decode.pending.pop_front();
+                    if (request.search.finished()) continue;
+                    const auto bytes = require(pending.transfer->bytes());
+                    if (bytes.size() != sizeof(std::int32_t))
+                        throw ops::Failure({ErrorCode::RUNTIME, "invalid asynchronous token readback size"});
+                    std::int32_t token = -1;
+                    std::memcpy(&token, bytes.data(), sizeof(token));
+                    if (token < 0) throw ops::Failure({ErrorCode::RUNTIME, "Gemma 4 returned invalid token scores"});
+                    decode.logical_position = pending.position;
+                    request.stats.decode_ns = elapsed(decode.started);
+                    accept(request, token);
+                }
+                if (request.search.finished() && decode.pending.empty() && !request.completion_emitted) {
+                    GenerationEvent event{request.id, {}, {}};
+                    event.completed = complete(request);
+                    result.events.push_back(std::move(event));
+                }
+                const auto maximum = request.options.maximum_new_tokens
+                                         ? request.options.maximum_new_tokens
+                                         : config_["decode"]["maximum_new_tokens"].as<std::size_t>();
+                while (!request.search.finished() && decode.pending.size() < serving_->decode_ahead_tokens &&
+                       decode.submitted < maximum) {
+                    decode.token = require(model_->forward_token(decode.token, *request.state));
+                    decode.pending.push_back({require(decode.token.readback()), request.state->position});
+                    ++decode.submitted;
+                    ++request.stats.decode_submitted_tokens;
+                    request.stats.decode_queue_peak = std::max(request.stats.decode_queue_peak, decode.pending.size());
+                }
+                request.stats.preparation_ns += model_->preparation_ns() - prepared;
+                result.decode_ns += elapsed(started);
+                continue;
+            }
             tokens[count] = request.search.token();
             states[count] = &*request.state;
             rows[count++] = row;
@@ -766,10 +881,9 @@ auto Generator::step() -> Result<GenerationStep> {
         if (count && serving_->deferred_tokens) {
             const auto started = Clock::now();
             const auto prepared = model_->preparation_ns();
-            const auto selected =
-                count == 1 ? require(model_->select_token(std::span(tokens).first(1), *states[0]))
-                           : require(model_->select_batch_tokens(std::span(tokens).first(count),
-                                                                 std::span(states).first(count)));
+            const auto selected = count == 1 ? require(model_->select_token(std::span(tokens).first(1), *states[0]))
+                                             : require(model_->select_batch_tokens(std::span(tokens).first(count),
+                                                                                   std::span(states).first(count)));
             for (std::size_t index = 0; index < count; ++index)
                 pending_tokens_.push_back({running_[rows[index]].id, selected, index, started, false});
             result.decode_ns = elapsed(started);

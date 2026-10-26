@@ -36,8 +36,11 @@ namespace {
 
 auto inference_device(const kidi::cli::Namespace& arguments) -> kidi::tensor::Device {
     const auto& backend = arguments.get<std::string>("backend");
+    if (const auto device = kidi::tensor::parse_cuda_device(backend)) return *device;
     if (backend == "vulkan") return kidi::tensor::Device::vulkan();
     if (backend == "npu") return kidi::tensor::Device::qualcomm_npu();
+    if (backend != "mps" && backend != "auto" && backend != "ynnpack")
+        throw std::invalid_argument("unknown backend; expected auto, ynnpack, mps, vulkan, npu, or cuda[:INDEX]");
     return backend == "mps" || (backend == "auto" && kidi::module_device == kidi::tensor::Device::apple_gpu())
                ? kidi::tensor::Device::apple_gpu()
                : kidi::tensor::Device::cpu();
@@ -45,13 +48,17 @@ auto inference_device(const kidi::cli::Namespace& arguments) -> kidi::tensor::De
 
 /// Stable label for machine-readable stderr records.
 auto backend_label(kidi::tensor::Device device) -> std::string_view {
+    if (device.kind == kidi::tensor::DeviceKind::CUDA) return "cuda_gpu";
     if (device == kidi::tensor::Device::apple_gpu()) return "mps_gpu";
     if (device == kidi::tensor::Device::vulkan()) return "vulkan_gpu";
     return "ynnpack_cpu";
 }
 
 auto inspect(const std::filesystem::path& directory) -> int {
-    if (!std::filesystem::is_regular_file(directory / "model.yaml")) {
+    const auto manifest = std::filesystem::is_regular_file(directory / "model.yaml");
+    auto document = manifest ? kidi::checkpoint::load_config(directory / "model.yaml")
+                             : kidi::checkpoint::load_config(directory, kidi::model::Gemma4Impl::checkpoint_config());
+    if (!manifest && !document && document.error().code == kidi::ErrorCode::UNSUPPORTED) {
         auto config = kidi::checkpoint::load_config(directory, kidi::model::WhisperImpl::checkpoint_config());
         if (!config) {
             spdlog::error("{}", config.error().message);
@@ -83,7 +90,6 @@ auto inspect(const std::filesystem::path& directory) -> int {
                   << "execution device: cpu\n";
         return 0;
     }
-    auto document = kidi::checkpoint::load_config(directory / "model.yaml");
     if (!document) {
         spdlog::error("{}", document.error().message);
         return 1;
@@ -393,8 +399,8 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started)
                     .count();
             std::cerr << "kidi_serving|requests=" << completed << "|max_active=" << limits.maximum_active
-                      << "|backend=" << backend_label(device) << "|load_ns=" << load_ns
-                      << "|native_qat=" << generator.native_qat()
+                      << "|backend=" << backend_label(device) << "|device=" << kidi::tensor::to_string(device)
+                      << "|load_ns=" << load_ns << "|native_qat=" << generator.native_qat()
                       << "|packed_prefill=" << arguments.get<bool>("packed_prefill")
                       << "|cache_tokens=" << limits.cache_token_budget
                       << "|peak_reserved_cache_tokens=" << peak_cache_tokens << "|prefill_ns=" << prefill_ns
@@ -509,7 +515,10 @@ auto prepare_command(const kidi::cli::Namespace& arguments, const std::filesyste
         return 2;
     }
     kidi::runtime::ynn::set_thread_count(threads);
-    auto config = kidi::checkpoint::load_config(directory / "model.yaml");
+    auto config =
+        task == kidi::model::Task::TEXT_GENERATION && !std::filesystem::is_regular_file(directory / "model.yaml")
+            ? kidi::checkpoint::load_config(directory, kidi::model::Gemma4Impl::checkpoint_config())
+            : kidi::checkpoint::load_config(directory / "model.yaml");
     if (!config) {
         spdlog::error("{}", config.error().message);
         return 1;
@@ -587,13 +596,14 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
         return 2;
     }
     const auto& backend = arguments.get<std::string>("backend");
-    if (backend != "auto" && backend != "ynnpack") {
-        spdlog::error("Whisper currently requires the YNNPACK backend");
+    if (backend != "auto" && backend != "ynnpack" && !kidi::tensor::parse_cuda_device(backend)) {
+        spdlog::error("Whisper requires the YNNPACK or CUDA backend");
         return 2;
     }
     kidi::runtime::ynn::set_thread_count(threads);
     const auto started = std::chrono::steady_clock::now();
-    auto transcriber = kidi::inference::Transcriber::load(directory, kidi::tensor::Device::cpu());
+    const auto device = inference_device(arguments);
+    auto transcriber = kidi::inference::Transcriber::load(directory, device);
     if (!transcriber) {
         spdlog::error("{}", transcriber.error().message);
         return 1;
@@ -632,7 +642,8 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
         return 1;
     }
     if (arguments.get<bool>("profile"))
-        std::cerr << "kidi_profile|backend=ynnpack|threads=" << threads << "|model_load_ns=" << load_ns
+        std::cerr << "kidi_profile|backend=" << backend_label(device) << "|device=" << kidi::tensor::to_string(device)
+                  << "|threads=" << threads << "|model_load_ns=" << load_ns
                   << "|feature_ns=" << result->stats.feature_ns << "|encoder_ns=" << result->stats.encode_ns
                   << "|decode_ns=" << result->stats.decode_ns << "|preparation_ns=" << result->stats.preparation_ns
                   << "|tokens=" << result->token_ids.size() << "|language=" << result->language << '\n';
@@ -753,7 +764,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             .help("Hugging Face model cache directory");
         command_parser->add_argument("--backend")
             .default_value(std::string("auto"))
-            .choices({"auto", "ynnpack", "mps", "vulkan", "npu"});
+            .help("auto, ynnpack, mps, vulkan, npu, or cuda[:INDEX]");
         command_parser->add_argument("-j", "--threads").default_value<std::int32_t>(4);
         command_parser->add_argument("--profile").action(kidi::cli::Action::STORE_TRUE);
     }

@@ -1256,12 +1256,26 @@ public:
                                 binary(ynn_binary_multiply, operands[0], unary(ynn_unary_sigmoid, operands[0])),
                                 operands[1]);
                 break;
+            case Operation::GELU_GATE:
             case Operation::SILU_GATE: {
                 const std::int32_t axis = static_cast<std::int32_t>(inputs[0].dimensions() - 1);
                 const std::int64_t begin = 0, middle = inputs[0].size(-1) / 2, end = inputs[0].size(-1), stride = 1;
                 auto gate = YNN_INVALID_VALUE_ID, up = YNN_INVALID_VALUE_ID;
                 check(ynn_define_static_slice(native, 1, &axis, &begin, &middle, &stride, operands[0], &gate, 0));
                 check(ynn_define_static_slice(native, 1, &axis, &middle, &end, &stride, operands[0], &up, 0));
+                if (spec.operation == Operation::GELU_GATE) {
+                    auto square = binary(ynn_binary_multiply, gate, gate);
+                    auto cubic = binary(ynn_binary_multiply, square, gate);
+                    auto inner = binary(ynn_binary_add, gate, binary(ynn_binary_multiply, cubic, scalar(0.044715F)));
+                    auto probability = binary(
+                        ynn_binary_add, scalar(1.F),
+                        unary(ynn_unary_tanh,
+                              binary(ynn_binary_multiply, inner, scalar(std::sqrt(2.F / 3.14159265358979323846F)))));
+                    result = binary(
+                        ynn_binary_multiply,
+                        binary(ynn_binary_multiply, binary(ynn_binary_multiply, gate, scalar(0.5F)), probability), up);
+                    break;
+                }
                 result =
                     binary(ynn_binary_multiply, binary(ynn_binary_multiply, gate, unary(ynn_unary_sigmoid, gate)), up);
                 break;

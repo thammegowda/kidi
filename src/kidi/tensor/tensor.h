@@ -61,6 +61,7 @@ private:
 } // namespace detail
 
 struct MetalBufferView;
+struct CudaBufferView;
 struct WebGpuBufferView;
 class RowSource;
 class Tensor;
@@ -93,6 +94,10 @@ public:
     auto host_bytes() -> Result<std::span<std::byte>>;
     auto host_bytes() const -> Result<std::span<const std::byte>>;
     auto copy_to_host() const -> Result<std::vector<std::byte>>;
+    auto readback() const -> Result<std::shared_ptr<Readback>>;
+    /// Keep the source and destination alive until device work completes. Deferred backends require the embedder
+    /// to await submitted work after returning from the current call before accessing the destination.
+    auto copy_to_host_later(std::span<std::byte> destination) const -> Result<void>;
     auto copy_from_host(std::span<const std::byte> source, std::size_t offset = 0) -> Result<void>;
     auto to(Device target) const -> Result<Tensor>;
     auto reshape(std::vector<std::int64_t> shape) const -> Result<Tensor>;
@@ -141,6 +146,7 @@ private:
            detail::Dimensions strides, std::int64_t storage_offset) noexcept;
 
     friend auto metal_buffer(const Tensor& tensor) -> Result<MetalBufferView>;
+    friend auto cuda_buffer(const Tensor& tensor) -> Result<CudaBufferView>;
     friend auto web_gpu_buffer(const Tensor& tensor) -> Result<WebGpuBufferView>;
     friend auto adopt_web_gpu_buffer(std::uint32_t handle, std::vector<std::int64_t> shape, DType dtype,
                                      std::int32_t packed_layout) -> Result<Tensor>;

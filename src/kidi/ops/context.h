@@ -8,11 +8,12 @@
 #include "kidi/core/precision.h"
 #include "kidi/tensor/tensor.h"
 
-namespace kidi::runtime {
-class StepCompiler;
+namespace kidi::graph {
+class Compiler;
 }
 
 namespace kidi::ops {
+enum class TokenOutput { HOST, DEVICE };
 class DecodeScope {
 public:
     explicit DecodeScope(bool enabled);
@@ -27,13 +28,13 @@ private:
 /// steps run on an accelerator. Scopes nest and restore the previous compiler.
 class StepCompilerScope {
 public:
-    explicit StepCompilerScope(std::shared_ptr<runtime::StepCompiler> compiler);
+    explicit StepCompilerScope(std::shared_ptr<graph::Compiler> compiler);
     ~StepCompilerScope();
     StepCompilerScope(const StepCompilerScope&) = delete;
     auto operator=(const StepCompilerScope&) -> StepCompilerScope& = delete;
 
 private:
-    std::shared_ptr<runtime::StepCompiler> previous_;
+    std::shared_ptr<graph::Compiler> previous_;
 };
 using tensor::Tensor;
 
@@ -72,13 +73,17 @@ public:
     using Step = std::function<std::vector<Tensor>(std::span<const Tensor> inputs)>;
 
     explicit Context(tensor::Device device = tensor::Device::cpu(), bool packed_prefill = false,
-                     std::optional<bool> replay_enabled = std::nullopt);
+                     std::optional<bool> replay_enabled = std::nullopt,
+                     tensor::DType parameter_dtype = tensor::DType::F32);
     ~Context();
     Context(Context&&) noexcept;
     auto operator=(Context&&) noexcept -> Context&;
     Context(const Context&) = delete;
     auto operator=(const Context&) -> Context& = delete;
     auto device() const noexcept -> tensor::Device;
+    auto activation_dtype() const noexcept -> tensor::DType;
+    auto stage_inputs(std::span<const Tensor> inputs) -> std::vector<Tensor>;
+    auto execution() const -> std::string;
     auto synchronize() -> void;
     auto preparation_ns() const noexcept -> std::uint64_t;
     auto set_precision(core::InferencePrecision precision) noexcept -> void;
@@ -104,7 +109,7 @@ public:
     /// Name of the accelerator compiling captured steps, or empty when steps replay on this context's device.
     auto accelerator() const noexcept -> std::string_view;
     /// The attached step compiler, e.g. to keep it when a model re-creates its context.
-    auto step_compiler() const noexcept -> std::shared_ptr<runtime::StepCompiler>;
+    auto step_compiler() const noexcept -> std::shared_ptr<graph::Compiler>;
     /// Attention key extent for a captured step needing `required` keys from a cache of `capacity`.
     auto step_extent(std::size_t required, std::size_t capacity) const -> std::size_t;
     /// Whether captured steps may crop local-attention keys (each crop offset is a separate step shape).
@@ -133,6 +138,7 @@ public:
     auto gelu(const Tensor& input, bool approximate = false) -> Tensor;
     auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
     auto silu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
+    auto gelu_gate(const Tensor& gate_up) -> Tensor;
     auto silu_gate(const Tensor& gate_up) -> Tensor;
     auto gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
                             const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
@@ -142,7 +148,7 @@ public:
     auto gelu_(Tensor& input, bool approximate = false) -> Tensor&;
     auto tanh(const Tensor& input) -> Tensor;
     auto static_round(const Tensor& input, float scale) -> Tensor;
-    auto greedy_token(const Tensor& logits) -> Tensor;
+    auto greedy_token(const Tensor& logits, TokenOutput output = TokenOutput::HOST) -> Tensor;
     auto embedding(const Tensor& indices, const Tensor& weight, const Tensor& scales, std::int32_t width,
                    std::int32_t bits, float multiplier) -> Tensor;
     auto embedding_sum(const Tensor& tokens, const Tensor& weight, const Tensor& scales, std::int32_t width,
