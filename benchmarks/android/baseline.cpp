@@ -6,6 +6,10 @@
 #include "kidi/inference/transcriber.h"
 #include "kidi/model/gemma4_vision.h"
 #include "kidi/runtime/ynn/graph.h"
+#if defined(KIDI_HAS_CUDA)
+#include "ynnpack/include/ynnpack_cuda.h"
+#include <cuda_profiler_api.h>
+#endif
 
 #include <nlohmann/json.hpp>
 #include <sys/resource.h>
@@ -52,15 +56,47 @@ auto gemma_device() -> kidi::tensor::Device {
 
 auto emit(nlohmann::json record, int threads) -> void {
     record["threads"] = threads;
-    if (const auto* accelerator = std::getenv("KIDI_ACCELERATOR")) record["accelerator"] = accelerator;
+    if (const auto* accelerator = std::getenv("KIDI_ACCELERATOR")) {
+        record["accelerator"] = accelerator;
+#if defined(KIDI_HAS_CUDA)
+        if (const auto device = kidi::tensor::parse_cuda_device(accelerator)) {
+            record["gpu_live_bytes"] = ynn::cuda::allocated_bytes(device->index);
+            record["gpu_peak_bytes"] = ynn::cuda::peak_allocated_bytes(device->index);
+        }
+#endif
+    }
     record["peak_rss_kib"] = peak_rss_kib();
     std::cout << record.dump() << std::endl;
 }
 
-auto benchmark_gemma(const std::filesystem::path& directory, int threads, int repeats) -> void {
+auto benchmark_gemma(const std::filesystem::path& directory, int threads, int repeats,
+                     const nlohmann::json& settings = nlohmann::json::object()) -> void {
+    const auto context = settings.value("context_tokens", CONTEXT);
+    const auto chunk = settings.value("prefill_chunk_tokens", CHUNK);
+    const auto output_tokens = settings.value("output_tokens", OUTPUT_TOKENS);
+    const auto warmups = settings.value("warmups", std::size_t{1});
+    const auto packed_prefill = settings.value("packed_prefill", true);
+    const auto short_copies = settings.value("short_prompt_copies", 1);
+    const auto long_copies = settings.value("long_prompt_copies", 16);
+    const auto decode_ahead = settings.value("decode_ahead_tokens", std::size_t{0});
+    if (!context || !chunk || output_tokens < 2 || output_tokens >= context || !warmups || warmups > 20)
+        throw std::invalid_argument(
+            "Gemma benchmark requires positive context/chunk/warmups and 2 <= output < context");
+    if (short_copies < 1 || long_copies < 1 || short_copies > 4096 || long_copies > 4096)
+        throw std::invalid_argument("Gemma prompt copies must be between 1 and 4096");
+    if (decode_ahead > 64) throw std::invalid_argument("Gemma decode-ahead window must not exceed 64");
     const auto started = Clock::now();
-    auto generator = require(kidi::inference::Generator::load(directory, gemma_device(), 0, 128, true));
-    require(generator.configure_serving({1, 1, CONTEXT, CHUNK}));
+    auto generator = require(kidi::inference::Generator::load(directory, gemma_device(), 0, 128, packed_prefill));
+    require(generator.configure_serving({.maximum_active = 1,
+                                         .maximum_requests = 1,
+                                         .cache_token_budget = context,
+                                         .prefill_tokens_per_step = chunk,
+                                         .decode_ahead_tokens = decode_ahead}));
+    const auto config =
+        require(std::filesystem::is_regular_file(directory / "model.yaml")
+                    ? kidi::checkpoint::load_config(directory / "model.yaml")
+                    : kidi::checkpoint::load_config(directory, kidi::model::Gemma4Impl::checkpoint_config()));
+    auto tokenizer = require(kidi::text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
     emit({{"stage", "load"},
           {"execution", generator.execution()},
           {"model", "gemma"},
@@ -68,43 +104,78 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
           {"native_qat", generator.native_qat()}},
          threads);
 
-    for (const int copies : {1, 16}) {
+    for (const bool long_prompt : {false, true}) {
+        const auto copies = long_prompt ? long_copies : short_copies;
         std::string prompt;
         for (int copy = 0; copy < copies; ++copy)
             prompt +=
                 "Binary search repeatedly halves a sorted search range. It is useful for lookup and boundary finding. ";
         prompt += "Explain the main idea and give practical examples.";
-        const std::array messages{kidi::text::ChatMessage{"user", prompt}};
-        for (int iteration = 0; iteration <= repeats; ++iteration) {
+        const auto serialized = "<bos><|turn>user\n" + prompt + "<turn|>\n<|turn>model\n";
+        const auto prompt_ids = require(tokenizer.encode(serialized));
+        if (prompt_ids.size() + output_tokens > context)
+            throw std::invalid_argument("Gemma benchmark prompt and output exceed context");
+        for (std::size_t iteration = 0; iteration < warmups + static_cast<std::size_t>(repeats); ++iteration) {
             kidi::inference::GenerationOptions options;
-            options.maximum_new_tokens = OUTPUT_TOKENS;
-            options.context_size = CONTEXT;
-            options.prefill_chunk_size = CHUNK;
+            options.maximum_new_tokens = output_tokens;
+            options.context_size = context;
+            options.prefill_chunk_size = chunk;
+            options.raw_prompt = true;
             options.stream_text = true;
             options.ignore_eos = true;
-            require(generator.enqueue_chat(messages, options));
+#if defined(KIDI_HAS_CUDA)
+            const bool profile_cuda = std::getenv("KIDI_CUDA_PROFILE") && iteration >= warmups &&
+                                      gemma_device().kind == kidi::tensor::DeviceKind::CUDA;
+            if (profile_cuda && cudaProfilerStart() != cudaSuccess)
+                throw std::runtime_error("CUDA profiler start failed");
+#endif
+            require(generator.enqueue(serialized, options));
+            const auto submitted = Clock::now();
+            std::optional<Clock::time_point> first_token, last_token;
+            std::size_t observed_tokens = 0;
             bool completed = false;
             while (generator.pending_requests()) {
                 auto step = require(generator.step());
                 for (const auto& event : step.events) {
+                    if (event.token) {
+                        const auto observed = Clock::now();
+                        if (!first_token) first_token = observed;
+                        last_token = observed;
+                        ++observed_tokens;
+                    }
                     if (!event.completed) continue;
                     const auto& result = *event.completed;
                     const auto& stats = result.stats;
-                    if (result.generation.token_ids.size() != OUTPUT_TOKENS || !stats.decode_ns || !stats.prefill_ns)
+                    if (result.generation.token_ids.size() != output_tokens || observed_tokens != output_tokens ||
+                        !first_token || !last_token || !stats.decode_ns || !stats.prefill_ns)
                         throw std::runtime_error("incomplete benchmark generation");
+                    const auto first_seconds = std::chrono::duration<double>(*first_token - submitted).count();
+                    const auto decode_seconds = std::chrono::duration<double>(*last_token - *first_token).count();
+                    if (first_seconds <= 0 || decode_seconds <= 0) throw std::runtime_error("invalid benchmark timing");
                     emit({{"stage", "generation"},
                           {"model", "gemma"},
-                          {"workload", copies == 1 ? "short" : "long"},
+                          {"workload", long_prompt ? "long" : "short"},
                           {"iteration", iteration},
-                          {"warmup", iteration == 0},
-                          {"context_tokens", CONTEXT},
-                          {"prefill_chunk", CHUNK},
+                          {"warmup", iteration < warmups},
+                          {"context_tokens", context},
+                          {"prefill_chunk", chunk},
+                          {"input_token_ids", prompt_ids},
+                          {"observed_output_tokens", observed_tokens},
+                          {"submitted_steady_ns",
+                           std::chrono::duration_cast<std::chrono::nanoseconds>(submitted.time_since_epoch()).count()},
+                          {"first_token_seconds", first_seconds},
+                          {"decode_seconds", decode_seconds},
+                          {"prefill_through_first_token_tps", stats.prompt_tokens / first_seconds},
+                          {"decode_interval_tps", (output_tokens - 1) / decode_seconds},
+                          {"request_seconds", first_seconds + decode_seconds},
                           {"prompt_tokens", stats.prompt_tokens},
                           {"output_tokens", result.generation.token_ids.size()},
                           {"prefill_ms", rounded(stats.prefill_ns / 1e6)},
                           {"prefill_tps", rounded(stats.prompt_tokens * 1e9 / stats.prefill_ns)},
                           {"decode_ms", rounded(stats.decode_ns / 1e6)},
                           {"decode_tokens", stats.decode_tokens},
+                          {"decode_submitted_tokens", stats.decode_submitted_tokens},
+                          {"decode_queue_peak", stats.decode_queue_peak},
                           {"decode_tps", rounded(stats.decode_tokens * 1e9 / stats.decode_ns)},
                           {"first_token_ms", rounded(stats.time_to_first_token_ns / 1e6)},
                           {"generation_ms", rounded(stats.generation_ns / 1e6)},
@@ -116,6 +187,10 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
                 }
             }
             if (!completed) throw std::runtime_error("missing generation completion");
+#if defined(KIDI_HAS_CUDA)
+            if (profile_cuda && cudaProfilerStop() != cudaSuccess)
+                throw std::runtime_error("CUDA profiler stop failed");
+#endif
         }
     }
 }
@@ -228,14 +303,13 @@ auto compare(std::span<const float> actual, std::span<const float> expected) -> 
         norm += static_cast<double>(actual[index]) * actual[index];
         maximum = std::max(maximum, std::abs(delta));
     }
-    return {std::sqrt(error / std::max(energy, 1e-30)),
-            dot / std::max(std::sqrt(energy * norm), 1e-30), maximum};
+    return {std::sqrt(error / std::max(energy, 1e-30)), dot / std::max(std::sqrt(energy * norm), 1e-30), maximum};
 }
 
 auto host_copy(const kidi::tensor::Tensor& tensor) -> kidi::tensor::Tensor {
     const auto bytes = require(tensor.copy_to_host());
-    return require(kidi::tensor::Tensor::from_bytes(
-        {tensor.shape().begin(), tensor.shape().end()}, tensor.dtype(), bytes));
+    return require(
+        kidi::tensor::Tensor::from_bytes({tensor.shape().begin(), tensor.shape().end()}, tensor.dtype(), bytes));
 }
 
 /// Vision-only path: preprocessing, checkpoint binding, the 16-block tower, pooling, and text-space projection.
@@ -246,8 +320,7 @@ auto benchmark_vision(const std::filesystem::path& directory, std::span<const st
     const auto load_started = Clock::now();
     const auto device = gemma_device();
     const kidi::ModuleScope scope(kidi::tensor::DType::F32, false, device);
-    auto vision = kidi::model::Gemma4Vision(config["vision_config"],
-                                            config["text_config"]["hidden_size"].as<int>(),
+    auto vision = kidi::model::Gemma4Vision(config["vision_config"], config["text_config"]["hidden_size"].as<int>(),
                                             static_cast<bool>(config["quantization_config"]));
     const auto* precision_name = std::getenv("KIDI_VISION_PRECISION");
     const auto precision =
@@ -290,8 +363,7 @@ auto benchmark_vision(const std::filesystem::path& directory, std::span<const st
                                       {"patch_columns", pixels.patch_columns},
                                       {"patches", static_cast<std::size_t>(pixels.patch_rows) * pixels.patch_columns}};
         if (reference_directory) {
-            const auto path =
-                std::filesystem::path(reference_directory) / (image.stem().string() + ".safetensors");
+            const auto path = std::filesystem::path(reference_directory) / (image.stem().string() + ".safetensors");
             reference.emplace(require(kidi::checkpoint::Weights::load(path)));
             const auto expected_patches = require(reference->tensor("patches"));
             const auto expected = require(expected_patches.data<float>());
@@ -361,62 +433,58 @@ auto benchmark_vision(const std::filesystem::path& directory, std::span<const st
             if (dump_directory) {
                 const auto length =
                     static_cast<std::int64_t>(diagnostic_pixels.patch_rows) * diagnostic_pixels.patch_columns;
-                dump.emplace(
-                    "patches",
-                    require(kidi::tensor::Tensor::from_host(
-                        {1, length, 768}, std::span<const float>(diagnostic_pixels.patches))));
+                dump.emplace("patches", require(kidi::tensor::Tensor::from_host(
+                                            {1, length, 768}, std::span<const float>(diagnostic_pixels.patches))));
                 std::vector<std::int64_t> positions(static_cast<std::size_t>(2 * length));
                 for (std::int64_t patch = 0; patch < length; ++patch) {
                     positions[2 * patch] = patch % diagnostic_pixels.patch_columns;
                     positions[2 * patch + 1] = patch / diagnostic_pixels.patch_columns;
                 }
-                dump.emplace(
-                    "position_ids",
-                    require(kidi::tensor::Tensor::from_host(
-                        {1, length, 2}, std::span<const std::int64_t>(positions))));
+                dump.emplace("position_ids", require(kidi::tensor::Tensor::from_host(
+                                                 {1, length, 2}, std::span<const std::int64_t>(positions))));
             }
-            kidi::model::Gemma4VisionImpl::BlockObserver block_observer =
-                [&](std::size_t block, const kidi::tensor::Tensor& output) {
-                    std::ostringstream name;
-                    name << "block_" << std::setfill('0') << std::setw(2) << block;
-                    if (dump_directory) dump.emplace(name.str(), host_copy(output));
-                    if (!reference_blocks.empty()) {
-                        const auto actual = require(output.data<float>());
-                        const auto expected = require(std::as_const(reference_blocks.at(block)).data<float>());
-                        const auto result = compare(actual, expected);
-                        emit({{"stage", "vision_block"},
-                              {"image", image.filename().string()},
-                              {"image_index", image_index},
-                              {"block", block},
-                              {"relative_rmse", result.relative_rmse},
-                              {"cosine", result.cosine},
-                              {"max_abs", result.maximum}},
-                             threads);
-                    }
-                };
-            kidi::model::Gemma4VisionImpl::StageObserver stage_observer =
-                [&](std::size_t layer, std::string_view stage, const kidi::tensor::Tensor& output) {
-                    std::ostringstream name;
-                    name << "layer_" << std::setfill('0') << std::setw(2) << layer << '_' << stage;
-                    if (dump_directory) dump.emplace(name.str(), host_copy(output));
-                    if (reference && reference->contains(name.str())) {
-                        const auto expected_tensor = require(reference->tensor(name.str()));
-                        const auto actual = require(output.data<float>());
-                        const auto expected = require(expected_tensor.data<float>());
-                        const auto result = compare(actual, expected);
-                        emit({{"stage", "vision_stage"},
-                              {"image", image.filename().string()},
-                              {"image_index", image_index},
-                              {"layer", layer},
-                              {"name", stage},
-                              {"relative_rmse", result.relative_rmse},
-                              {"cosine", result.cosine},
-                              {"max_abs", result.maximum}},
-                             threads);
-                    }
-                };
-            const auto diagnostic_output = require(vision->forward(
-                reference_pixels ? *reference_pixels : pixels, block_observer, stage_observer, stage_layers));
+            kidi::model::Gemma4VisionImpl::BlockObserver block_observer = [&](std::size_t block,
+                                                                              const kidi::tensor::Tensor& output) {
+                std::ostringstream name;
+                name << "block_" << std::setfill('0') << std::setw(2) << block;
+                if (dump_directory) dump.emplace(name.str(), host_copy(output));
+                if (!reference_blocks.empty()) {
+                    const auto actual = require(output.data<float>());
+                    const auto expected = require(std::as_const(reference_blocks.at(block)).data<float>());
+                    const auto result = compare(actual, expected);
+                    emit({{"stage", "vision_block"},
+                          {"image", image.filename().string()},
+                          {"image_index", image_index},
+                          {"block", block},
+                          {"relative_rmse", result.relative_rmse},
+                          {"cosine", result.cosine},
+                          {"max_abs", result.maximum}},
+                         threads);
+                }
+            };
+            kidi::model::Gemma4VisionImpl::StageObserver stage_observer = [&](std::size_t layer, std::string_view stage,
+                                                                              const kidi::tensor::Tensor& output) {
+                std::ostringstream name;
+                name << "layer_" << std::setfill('0') << std::setw(2) << layer << '_' << stage;
+                if (dump_directory) dump.emplace(name.str(), host_copy(output));
+                if (reference && reference->contains(name.str())) {
+                    const auto expected_tensor = require(reference->tensor(name.str()));
+                    const auto actual = require(output.data<float>());
+                    const auto expected = require(expected_tensor.data<float>());
+                    const auto result = compare(actual, expected);
+                    emit({{"stage", "vision_stage"},
+                          {"image", image.filename().string()},
+                          {"image_index", image_index},
+                          {"layer", layer},
+                          {"name", stage},
+                          {"relative_rmse", result.relative_rmse},
+                          {"cosine", result.cosine},
+                          {"max_abs", result.maximum}},
+                         threads);
+                }
+            };
+            const auto diagnostic_output = require(vision->forward(reference_pixels ? *reference_pixels : pixels,
+                                                                   block_observer, stage_observer, stage_layers));
             if (dump_directory) {
                 dump.emplace("encoder_hidden", dump.at("block_15"));
                 dump.emplace("visual_embeddings", host_copy(diagnostic_output));
@@ -440,7 +508,7 @@ auto benchmark_whisper(const std::filesystem::path& directory, const std::filesy
     if (waveform.sample_rate != 16000 || waveform.samples.size() < 32000 || waveform.samples.size() > 480000)
         throw std::runtime_error("benchmark WAV must be 2-30 seconds at 16 kHz");
     const auto started = Clock::now();
-    auto transcriber = require(kidi::inference::Transcriber::load(directory));
+    auto transcriber = require(kidi::inference::Transcriber::load(directory, gemma_device()));
     emit({{"stage", "load"}, {"model", "whisper"}, {"ms", rounded(elapsed_ms(started))}}, threads);
     for (const auto size : {std::size_t{32000}, waveform.samples.size()}) {
         for (int iteration = 0; iteration <= repeats; ++iteration) {
@@ -495,9 +563,9 @@ auto benchmark_dictation(const std::filesystem::path& directory, const std::file
     for (int iteration = 0; iteration < repeats; ++iteration)
         for (const auto size : sizes) {
             const auto before = Clock::now();
-            const auto result = require(transcriber.transcribe(
-                std::span(waveform.samples).first(size), 16000,
-                {.language = "auto", .maximum_tokens = 128, .fit_audio = fit}));
+            const auto result =
+                require(transcriber.transcribe(std::span(waveform.samples).first(size), 16000,
+                                               {.language = "auto", .maximum_tokens = 128, .fit_audio = fit}));
             emit({{"stage", "transcription"},
                   {"iteration", iteration},
                   {"fit_audio", fit},
@@ -517,7 +585,7 @@ auto benchmark_dictation(const std::filesystem::path& directory, const std::file
 auto main(int argc, char** argv) -> int {
     if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
         std::cout << "usage: kidi_android_baseline gemma|chat|whisper|image|vision|dictation MODEL THREADS REPEATS "
-                     "[MEDIA ...]\n";
+                     "[MEDIA ... | GEMMA_SETTINGS_JSON]\n";
         return 0;
     }
     try {
@@ -525,7 +593,7 @@ auto main(int argc, char** argv) -> int {
         const std::string mode(argv[1]);
         const auto threads = std::stoi(argv[3]), repeats = std::stoi(argv[4]);
         if (threads < 1 || threads > 8 || repeats < 1 || repeats > 20 ||
-            !(((mode == "gemma" || mode == "chat") && argc == 5) ||
+            !((mode == "gemma" && (argc == 5 || argc == 6)) || (mode == "chat" && argc == 5) ||
               ((mode == "whisper" || mode == "image" || mode == "dictation") && argc == 6) ||
               (mode == "vision" && argc >= 6)))
             throw std::runtime_error("invalid mode, thread count, repeat count, or WAV argument");
@@ -534,10 +602,12 @@ auto main(int argc, char** argv) -> int {
         emit({{"stage", "runtime"},
               {"arch", kidi::runtime::ynn::supported_arch_names()},
               {"warm_repeats", repeats},
-              {"build", "release-native-cpu"}},
+              {"build", "release-native"},
+              {"device", kidi::tensor::to_string(gemma_device())}},
              threads);
         if (mode == "gemma")
-            benchmark_gemma(argv[2], threads, repeats);
+            benchmark_gemma(argv[2], threads, repeats,
+                            argc == 6 ? nlohmann::json::parse(argv[5]) : nlohmann::json::object());
         else if (mode == "chat")
             benchmark_chat_turns(argv[2], threads, repeats);
         else if (mode == "image")
@@ -546,8 +616,7 @@ auto main(int argc, char** argv) -> int {
             std::vector<std::filesystem::path> images;
             for (int index = 5; index < argc; ++index) images.emplace_back(argv[index]);
             benchmark_vision(argv[2], images, threads, repeats);
-        }
-        else if (mode == "dictation")
+        } else if (mode == "dictation")
             benchmark_dictation(argv[2], argv[5], threads, repeats);
         else
             benchmark_whisper(argv[2], argv[5], threads, repeats);

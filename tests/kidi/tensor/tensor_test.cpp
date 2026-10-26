@@ -43,6 +43,37 @@ auto main() -> int {
     using kidi::tensor::DType;
     using kidi::tensor::Tensor;
 
+    static_assert(&Device::cuda().capabilities() == &Device::cuda(7).capabilities());
+    static_assert(&Device::cuda().policy() == &Device::cuda(7).policy());
+    static_assert(Device::cpu().capabilities().supports_audio_transformer());
+    static_assert(Device::cuda().capabilities().supports_audio_transformer());
+    static_assert(Device::web_gpu().capabilities().supports_audio_transformer());
+    static_assert(!Device::apple_gpu().capabilities().supports_audio_transformer());
+    static_assert(!Device::vulkan().capabilities().supports_audio_transformer());
+    static_assert(!Device::qualcomm_npu().capabilities().supports_audio_transformer());
+    static_assert(Device::web_gpu().capabilities().memory.deferred());
+    static_assert(!Device::web_gpu().capabilities().memory.requires_staging());
+    static_assert(Device::cuda().capabilities().memory.requires_staging());
+    static_assert(Device::cpu().capabilities().compute.host());
+    static_assert(!Device::cuda().capabilities().compute.host());
+    static_assert(Device::cuda().capabilities().sampling.diffusion);
+    static_assert(Device::cuda().policy().transformer.prefill == kidi::tensor::PrefillStrategy::FULL);
+    static_assert(Device::apple_gpu().policy().transformer.prefill == kidi::tensor::PrefillStrategy::SHARED_KV_TAIL);
+    static_assert(Device::cuda().parameter_device(kidi::tensor::ParameterRole::AUDIO) == Device::cpu());
+    static_assert(Device::cuda(7).parameter_device(kidi::tensor::ParameterRole::EMBEDDING) == Device::cuda(7));
+    static_assert(Device::cuda(7).parameter_device(kidi::tensor::ParameterRole::PROJECTION) == Device::cuda(7));
+    static_assert(!Device::cuda().capabilities().sampling.supports(kidi::tensor::TokenSelection::BATCHED_DEVICE));
+    static_assert(Device::apple_gpu().capabilities().sampling.supports(kidi::tensor::TokenSelection::BATCHED_DEVICE));
+    static_assert(Device::apple_gpu().capabilities().sampling.supports(kidi::tensor::TokenSelection::DEVICE));
+    static_assert(!Device::cpu().capabilities().sampling.supports(kidi::tensor::TokenSelection::DEVICE));
+    static_assert(!Device::cuda().capabilities().compute.supports(kidi::tensor::TransformerSupport::GENERAL));
+    static_assert(Device::apple_gpu().capabilities().compute.supports(kidi::tensor::TransformerSupport::GENERAL));
+    static_assert(Device::apple_gpu().capabilities().compute.supports(kidi::tensor::TransformerSupport::QUANTIZED));
+    static_assert(Device::apple_gpu().parameter_device(kidi::tensor::ParameterRole::EMBEDDING) == Device::cpu());
+    static_assert(Device::apple_gpu().parameter_device(kidi::tensor::ParameterRole::PROJECTION,
+                                                       kidi::tensor::ParameterKind::QUANTIZED) == Device::cpu());
+    static_assert(Device::apple_gpu().parameter_device(kidi::tensor::ParameterRole::PROJECTION) == Device::apple_gpu());
+
     const auto backends = BackendRegistry::instance().backends();
     if (!require(backends.size() == static_cast<std::size_t>(DeviceKind::COUNT), "missing tensor backend family"))
         return 1;
@@ -108,6 +139,18 @@ auto main() -> int {
         return 1;
     }
 
+    std::array<float, 3> copied_row{};
+    const auto row_copy = row->copy_to_host_later(std::as_writable_bytes(std::span(copied_row)));
+    if (!require(row_copy.has_value() && std::ranges::equal(copied_row, *row_values),
+                 "deferred host copy must preserve a contiguous view's offset"))
+        return 1;
+    std::array<float, 4> oversized{};
+    if (!require(!Tensor{}.copy_to_host_later({}).has_value() &&
+                     !row->copy_to_host_later(std::as_writable_bytes(std::span(oversized))).has_value() &&
+                     !columns->copy_to_host_later(std::as_writable_bytes(std::span(copied_row))).has_value(),
+                 "deferred host copies must reject undefined tensors, excess bytes, and non-contiguous views"))
+        return 1;
+
     auto same_device = tensor->to(Device::cpu());
     if (!require(same_device.has_value(), same_device ? "" : same_device.error().message)) return 1;
     auto same_values = same_device->data<float>();
@@ -148,11 +191,28 @@ auto main() -> int {
         return 1;
     if (!require(!invalid_shape.has_value(), "negative shape unexpectedly succeeded")) return 1;
     for (const auto device : {Device::qualcomm_npu(), Device::cuda()}) {
-        auto unavailable = tensor->to(device);
-        if (!require(!unavailable.has_value() && unavailable.error().code == kidi::ErrorCode::UNSUPPORTED &&
-                         unavailable.error().message.find("not implemented") != std::string::npos,
-                     "placeholder backend transfer unexpectedly succeeded")) {
-            return 1;
+        const auto available = std::ranges::any_of(backends, [&](const auto& backend) {
+            return backend.device_kind == device.kind && backend.storage_available;
+        });
+        auto transferred = tensor->to(device);
+        if (available) {
+            if (!require(transferred && transferred->device() == device, "available backend transfer failed")) return 1;
+            std::array<float, VALUES.size()> copied{};
+            const auto copy = transferred->copy_to_host_later(std::as_writable_bytes(std::span(copied)));
+            if (!require(copy.has_value() && std::ranges::equal(copied, *values),
+                         "backend-neutral host copy changed values"))
+                return 1;
+            const auto restored = transferred->to(Device::cpu());
+            if (!require(restored.has_value(), "backend round-trip transfer failed")) return 1;
+            const auto restored_values = restored->data<float>();
+            if (!require(restored_values && std::ranges::equal(*restored_values, *values),
+                         "backend round-trip transfer changed values"))
+                return 1;
+        } else {
+            if (!require(!transferred && transferred.error().code == kidi::ErrorCode::UNSUPPORTED &&
+                             !transferred.error().message.empty(),
+                         "unavailable backend transfer succeeded"))
+                return 1;
         }
     }
     auto blob_owner = std::make_shared<std::array<float, 2>>(std::array<float, 2>{7, 8});

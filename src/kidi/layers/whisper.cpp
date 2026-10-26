@@ -13,7 +13,7 @@ constexpr std::int64_t ENCODER_ROWS = 128;
 template <typename Function>
 auto by_rows(ops::Context& context, const Tensor& input, Function&& function) -> Tensor {
     const auto length = static_cast<std::int64_t>(input.size(1));
-    if (context.device() != tensor::Device::cpu() || length <= ENCODER_ROWS) return function(input, 0);
+    if (!context.device().capabilities().compute.host() || length <= ENCODER_ROWS) return function(input, 0);
     Tensor output;
     for (std::int64_t start = 0; start < length; start += ENCODER_ROWS) {
         const auto part = function(context.slice(input, 1, start, std::min(ENCODER_ROWS, length - start)), start);
@@ -38,11 +38,11 @@ WhisperConv1dImpl::WhisperConv1dImpl(std::int32_t input_channels, std::int32_t o
 }
 
 auto WhisperConv1dImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    if (context.device() == tensor::Device::web_gpu()) {
+    if (context.device().capabilities().compute.native_audio()) {
         const auto weight = context.reshape(weight_, {output_channels_, input_channels_ * 3});
         return context.conv1d(input, weight, scale_, bias_, 3, stride_, 1, 1);
     }
-    if (context.device() != tensor::Device::cpu() || input.device() != context.device() ||
+    if (!context.device().capabilities().compute.host() || input.device() != context.device() ||
         input.dtype() != tensor::DType::F32 || input.dimensions() != 3 || input.size(2) != input_channels_)
         throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper convolution requires FP32 CPU input"});
     if (input.size(0) != 1) throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper convolution takes one sequence"});

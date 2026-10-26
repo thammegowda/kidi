@@ -6,6 +6,7 @@
 #include "kidi/checkpoint/config.h"
 #include "kidi/checkpoint/prepare.h"
 #include "kidi/model/whisper.h"
+#include "kidi/model/gemma4.h"
 
 namespace {
 auto write(const std::filesystem::path& path, std::string_view content = {}) -> void { std::ofstream(path) << content; }
@@ -130,6 +131,42 @@ decode: {beam_size: 4}
     write(directory / "tokenizer.json");
     write(directory / "preprocessor_config.json");
     write(directory / "generation_config.json");
+    for (const int hidden : {1536, 2560})
+        for (const bool quantized : {false, true}) {
+            YAML::Node document;
+            document["model_type"] = "gemma4";
+            document["text_config"]["model_type"] = "gemma4_text";
+            document["text_config"]["hidden_size"] = hidden;
+            document["text_config"]["max_position_embeddings"] = 131072;
+            document["tie_word_embeddings"] = true;
+            if (quantized) {
+                document["quantization_config"]["quant_method"] = "gemma";
+                document["quantization_config"]["num_bits"] = 4;
+            } else
+                document["quantization_config"] = YAML::Null;
+            write(directory / "config.json", YAML::Dump(document));
+            const auto imported =
+                kidi::checkpoint::load_config(directory, kidi::model::Gemma4Impl::checkpoint_config());
+            if (!imported || (*imported)["model"]["type"].as<std::string>() != "gemma4_text" ||
+                (*imported)["model"]["hidden_size"].as<int>() != hidden ||
+                !(*imported)["model"]["tie_word_embeddings"].as<bool>() ||
+                static_cast<bool>((*imported)["model"]["quantization_config"]) != quantized ||
+                (*imported)["weights_file"].as<std::string>() != (directory / "model.safetensors").string()) {
+                std::cerr << "Gemma runtime import failed for hidden=" << hidden << " quantized=" << quantized << ": "
+                          << (imported ? YAML::Dump(*imported) : imported.error().message) << '\n';
+                return 1;
+            }
+        }
+    write(directory / "config.json",
+          R"({"model_type":"gemma4_text","hidden_size":2048,"tie_word_embeddings":true,"quantization_config":null})");
+    const auto text_only = kidi::checkpoint::load_config(directory, kidi::model::Gemma4Impl::checkpoint_config());
+    if (!text_only || (*text_only)["model"]["hidden_size"].as<int>() != 2048 ||
+        (*text_only)["model"]["quantization_config"]) {
+        std::cerr << "Gemma text config import failed: "
+                  << (text_only ? YAML::Dump(*text_only) : text_only.error().message) << '\n';
+        return 1;
+    }
+    write(directory / "config.json", R"({"model_type":"whisper","d_model":384})");
     const auto adapter = kidi::model::WhisperImpl::checkpoint_config();
     auto whisper = kidi::checkpoint::load_config(directory, adapter);
     if (!whisper || (*whisper)["model"]["type"].as<std::string>() != "whisper" ||

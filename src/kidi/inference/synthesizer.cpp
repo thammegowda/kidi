@@ -1,3 +1,4 @@
+#include "kidi/graph/compiler.h"
 #include "kidi/inference/synthesizer.h"
 
 #include <cctype>
@@ -82,6 +83,7 @@ auto synthesis_elapsed_ns(std::chrono::steady_clock::time_point start) -> std::u
 struct Synthesizer::Impl {
     std::shared_ptr<SynthesizerModel> model;
     text::SentenceSegmenter sentences;
+    tensor::Device device;
 };
 
 namespace {
@@ -193,8 +195,9 @@ private:
 };
 } // namespace
 
-Synthesizer::Synthesizer(std::shared_ptr<SynthesizerModel> model, text::SentenceSegmenter sentences)
-    : impl_(std::make_unique<Impl>(std::move(model), std::move(sentences))) {
+Synthesizer::Synthesizer(std::shared_ptr<SynthesizerModel> model, text::SentenceSegmenter sentences,
+                         tensor::Device device)
+    : impl_(std::make_unique<Impl>(std::move(model), std::move(sentences), device)) {
     if (!impl_->model) throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "a synthesizer requires a model"});
 }
 Synthesizer::Synthesizer(Synthesizer&&) noexcept = default;
@@ -223,7 +226,7 @@ auto Synthesizer::load(const std::filesystem::path& directory, tensor::Device de
             model = require(model::KokoroImpl::load(std::move(config), device)).ptr();
         else
             throw ops::Failure({ErrorCode::UNSUPPORTED, "no TTS loader for model type: " + type});
-        return Synthesizer(std::move(model), std::move(sentences));
+        return Synthesizer(std::move(model), std::move(sentences), device);
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     } catch (const std::exception& error) {
@@ -232,12 +235,15 @@ auto Synthesizer::load(const std::filesystem::path& directory, tensor::Device de
 }
 
 auto Synthesizer::synthesize(std::string_view text, const SynthesisOptions& options) const -> Result<Synthesis> {
+    if (impl_->device.capabilities().memory.deferred())
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "deferred synthesis requires a stepped session"});
     auto session = create_session(text, options, false);
     if (!session) return std::unexpected(std::move(session.error()));
-    auto result = (*session)->step();
-    if (!result) return std::unexpected(std::move(result.error()));
-    if (!*result) return std::unexpected(Error{ErrorCode::RUNTIME, "synchronous synthesis did not complete"});
-    return std::move(**result);
+    for (;;) {
+        auto result = (*session)->step();
+        if (!result) return std::unexpected(std::move(result.error()));
+        if (*result) return std::move(**result);
+    }
 }
 
 auto Synthesizer::start(std::string_view text, const SynthesisOptions& options) const

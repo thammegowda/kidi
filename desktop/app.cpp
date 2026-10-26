@@ -268,7 +268,7 @@ auto positive_size(const YAML::Node& node, std::string_view key, std::size_t fal
     -> std::size_t;
 
 auto model_config(const std::filesystem::path& source, const YAML::Node& node, bool default_enabled) -> ModelConfig {
-    if (!node || !node.IsMap()) return {.enabled = default_enabled};
+    if (!node || !node.IsMap()) return {.enabled = default_enabled, .model_id = {}, .directory = {}};
     return {
         .enabled = node["enabled"] ? node["enabled"].as<bool>() : default_enabled,
         .model_id = yaml_string(node, "model_id"),
@@ -356,8 +356,8 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
             if (model->enabled && model->directory.empty())
                 return invalid_config("Enabled model is not present in model_hub.local: " + model->model_id);
             if (model->accelerator != "auto" && model->accelerator != "cpu" && model->accelerator != "gpu" &&
-                model->accelerator != "npu")
-                return invalid_config("Model accelerator must be auto, cpu, gpu, or npu");
+                model->accelerator != "npu" && !kidi::tensor::parse_cuda_device(model->accelerator))
+                return invalid_config("Model accelerator must be auto, cpu, gpu, npu, or cuda[:INDEX]");
             if (model->enabled && !std::filesystem::is_directory(model->directory, error))
                 return invalid_config("Enabled model directory does not exist: " + model->directory.string());
         }
@@ -652,6 +652,7 @@ private:
                 .prefix_cache_bytes = config_->prefix_cache_bytes,
                 .maximum_prompt_tokens = maximum_prompt_tokens,
                 .stream_text = true,
+                .on_image_progress = {},
             };
             auto queued = generator_->enqueue_chat(conversation, options);
             if (!queued) return std::unexpected(queued.error());
@@ -681,9 +682,9 @@ private:
                         {"elapsed_ms", milliseconds(started)},
                         {"prompt_tokens", completed->stats.prompt_tokens},
                         {"decode_tokens", completed->stats.decode_tokens},
-                        {"prefill_ms", completed->stats.prefill_ns / 1e6},
-                        {"decode_ms", completed->stats.decode_ns / 1e6},
-                        {"preparation_ms", completed->stats.preparation_ns / 1e6},
+                        {"prefill_ms", static_cast<double>(completed->stats.prefill_ns) / 1e6},
+                        {"decode_ms", static_cast<double>(completed->stats.decode_ns) / 1e6},
+                        {"preparation_ms", static_cast<double>(completed->stats.preparation_ns) / 1e6},
                     },
             };
         }();
@@ -1010,6 +1011,8 @@ private:
         image_uploads_.emplace(stream_id, ImageUpload{
                                               .content_type = content_type,
                                               .expected_size = size,
+                                              .bytes = {},
+                                              .error = {},
                                           });
         return Json{{"stream_id", stream_id}};
     }
@@ -1053,7 +1056,7 @@ private:
         std::scoped_lock lock{ebook_mutex_};
         if (!size || size > 64U * 1024U * 1024U || ebook_uploads_.contains(stream_id))
             return failure("invalid_ebook", "EPUB must use a unique stream and be no larger than 64 MiB");
-        ebook_uploads_.emplace(stream_id, EbookUpload{.expected_size = size});
+        ebook_uploads_.emplace(stream_id, EbookUpload{.expected_size = size, .bytes = {}, .error = {}});
         return Json{{"stream_id", stream_id}};
     }
 
@@ -1255,6 +1258,8 @@ private:
             audio_.emplace(AudioInput{
                 .request_id = std::string{context.id()},
                 .stream_id = stream_id,
+                .samples = {},
+                .error = {},
             });
         }
         const auto clear_audio = [this, id = std::string{context.id()}] {
@@ -1305,9 +1310,9 @@ private:
                     {"text", result->text},
                     {"language", result->language},
                     {"stats",
-                     {{"feature_ms", result->stats.feature_ns / 1e6},
-                      {"encode_ms", result->stats.encode_ns / 1e6},
-                      {"decode_ms", result->stats.decode_ns / 1e6}}},
+                     {{"feature_ms", static_cast<double>(result->stats.feature_ns) / 1e6},
+                      {"encode_ms", static_cast<double>(result->stats.encode_ns) / 1e6},
+                      {"decode_ms", static_cast<double>(result->stats.decode_ns) / 1e6}}},
                 };
             }
             std::size_t common = 0;
@@ -1381,9 +1386,9 @@ private:
             {"samples", total_samples},
             {"chunks", result->synthesis.stats.chunks},
             {"stats",
-             {{"generation_ms", result->synthesis.stats.generation_ns / 1e6},
-              {"decode_ms", result->synthesis.stats.decode_ns / 1e6},
-              {"preparation_ms", result->synthesis.stats.preparation_ns / 1e6},
+             {{"generation_ms", static_cast<double>(result->synthesis.stats.generation_ns) / 1e6},
+              {"decode_ms", static_cast<double>(result->synthesis.stats.decode_ns) / 1e6},
+              {"preparation_ms", static_cast<double>(result->synthesis.stats.preparation_ns) / 1e6},
               {"audio_tokens", result->synthesis.stats.audio_tokens}}},
             {"voice_prompt_reused", result->voice_prompt_reused},
         };

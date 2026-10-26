@@ -17,7 +17,6 @@
 #include <uni_algo/script.h>
 
 #include "kidi/audio/duration.h"
-#include "kidi/tensor/web_gpu.h"
 #include "kidi/text/tokenizer.h"
 namespace kidi::model {
 using ops::require;
@@ -40,8 +39,7 @@ auto decoder_shape(const YAML::Node& config) -> layers::HiggsDecoderShape {
 }
 
 auto codec_device(tensor::Device device) -> tensor::Device {
-    return device == tensor::Device::web_gpu() || device == tensor::Device::apple_gpu() ? device
-                                                                                         : tensor::Device::cpu();
+    return device.capabilities().compute.native_audio() ? device : tensor::Device::cpu();
 }
 auto decoder_module(const YAML::Node& config, tensor::Device device) -> layers::HiggsDecoder {
     const ModuleScope scope(codec_device(device));
@@ -157,8 +155,7 @@ auto unsupported_value(std::string_view key, std::string_view value) -> std::une
 
 auto generator_replay(tensor::Device device) -> std::optional<bool> {
 #if defined(__ANDROID__)
-    if ((device == tensor::Device::cpu() || device == tensor::Device::vulkan()) && !std::getenv("KIDI_REPLAY"))
-        return false;
+    if (device.policy().replay.generator_opt_in && !std::getenv("KIDI_REPLAY")) return false;
 #endif
     return std::nullopt;
 }
@@ -188,14 +185,14 @@ struct OmniVoiceImpl::State {
           audio_embeddings(codebooks * audio_vocabulary, llm->hidden_size(), 1.F),
           audio_heads(llm->hidden_size(), codebooks * audio_vocabulary, true, false),
           audio_tokenizer(decoder_module(config, device)) {
-        if (device == tensor::Device::web_gpu()) decoder_context.set_replay_capacity(7);
+        if (device.policy().replay.region_layers) decoder_context.set_replay_capacity(7);
     }
 
     auto embed_audio(const tensor::Tensor& tokens) -> tensor::Tensor {
         if (tokens.dtype() != tensor::DType::I32 || tokens.dimensions() != 2 ||
             tokens.size(0) != static_cast<std::size_t>(codebooks) || !tokens.size(1))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid OmniVoice audio token dimensions"});
-        if (context.device() == tensor::Device::web_gpu()) return audio_embeddings->forward_sum(context, tokens);
+        if (context.device().capabilities().sampling.diffusion) return audio_embeddings->forward_sum(context, tokens);
         const auto length = tokens.size(1);
         const auto codes = require(tokens.data<std::int32_t>());
         tensor::Tensor audio;
@@ -263,10 +260,9 @@ OmniVoiceImpl::OmniVoiceImpl(const YAML::Node& config) {
     auto valid = validate_config(config);
     if (!valid) throw ops::Failure(valid.error());
     if (module_dtype != tensor::DType::I8 ||
-        (module_device != tensor::Device::cpu() && module_device != tensor::Device::vulkan() &&
-         module_device != tensor::Device::apple_gpu() && module_device != tensor::Device::web_gpu()))
+        !device().capabilities().compute.supports(tensor::TransformerSupport::QUANTIZED))
         throw ops::Failure(
-            {ErrorCode::UNSUPPORTED, "OmniVoice requires INT8 parameters on CPU, Metal, Vulkan, or WebGPU"});
+            {ErrorCode::UNSUPPORTED, "OmniVoice requires INT8 parameters and quantized projection support"});
     impl_ = std::make_unique<State>(config, device());
     register_module("llm", impl_->llm);
     register_module("audio_embeddings", impl_->audio_embeddings);
@@ -290,10 +286,8 @@ auto OmniVoiceImpl::create(const YAML::Node& config) -> Result<OmniVoice> {
 
 auto OmniVoiceImpl::load(YAML::Node package, tensor::Device device) -> Result<OmniVoice> {
     try {
-        if (device != tensor::Device::cpu() && device != tensor::Device::vulkan() &&
-            device != tensor::Device::apple_gpu() && device != tensor::Device::web_gpu())
-            throw ops::Failure(
-                {ErrorCode::UNSUPPORTED, "OmniVoice supports CPU, Metal, Vulkan, and WebGPU generation"});
+        if (!device.capabilities().compute.supports(tensor::TransformerSupport::QUANTIZED))
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "OmniVoice requires quantized projection support"});
         auto tokenizer = require(text::Tokenizer::load(package["tokenizer_file"].as<std::string>(),
                                                        {{"synthesis", package["template_file"].as<std::string>()}}));
         auto weights = require(checkpoint::Weights::load(package["weights_file"].as<std::string>()));
@@ -424,12 +418,13 @@ auto OmniVoiceImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result
 
 auto OmniVoiceImpl::decode(const tensor::Tensor& tokens, bool normalize) -> Result<std::vector<float>> {
     try {
-        if (impl_->decoder_context.device() == tensor::Device::web_gpu())
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "WebGPU codec output requires stepped synthesis"});
+        if (impl_->decoder_context.device().capabilities().memory.deferred())
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "deferred codec output requires stepped synthesis"});
         const auto codes = require(tokens.to(impl_->decoder_context.device()));
         auto decoded = impl_->audio_tokenizer->forward(impl_->decoder_context, codes);
         impl_->decoder_context.synchronize();
-        const auto values = require(decoded.data<float>());
+        const auto host_decoded = require(decoded.to(tensor::Device::cpu()));
+        const auto values = require(host_decoded.data<float>());
         auto samples = std::vector<float>(values.begin(), values.end());
         return normalize ? postprocess(std::move(samples), impl_->sample_rate) : std::move(samples);
     } catch (const ops::Failure& error) {
@@ -560,7 +555,7 @@ auto OmniVoiceImpl::synthesis_session_(std::string text, inference::SynthesisOpt
         const auto packed_length = conditional_length + target;
         const auto guidance = options.guidance_scale != 0.F;
         const auto automatic_batch =
-            impl_->context.device() != tensor::Device::cpu() && target >= BATCH_GUIDANCE_MIN_TOKENS;
+            !impl_->context.device().capabilities().compute.host() && target >= BATCH_GUIDANCE_MIN_TOKENS;
         const auto batch_guidance = guidance &&
                                     conditional_length <= static_cast<std::size_t>(impl_->llm->maximum_position()) &&
                                     automatic_batch;
@@ -606,23 +601,23 @@ auto OmniVoiceImpl::synthesis_session_(std::string text, inference::SynthesisOpt
         std::uniform_real_distribution<float> uniform(std::nextafter(0.F, 1.F), 1.F);
         std::vector<float> conditional_copy;
         std::vector<float> logits_host;
-        const auto webgpu = impl_->context.device() == tensor::Device::web_gpu();
+        const auto device_diffusion = impl_->context.device().capabilities().sampling.diffusion;
         tensor::Tensor device_tokens, device_candidates, reference_embedding;
-        if (webgpu) device_tokens = require(host_tokens.to(impl_->context.device()));
+        if (device_diffusion) device_tokens = require(host_tokens.to(impl_->context.device()));
         if (reference)
             reference_embedding = impl_->embed_audio(
                 require(tensor::Tensor::from_host({impl_->codebooks, static_cast<std::int64_t>(reference_length)},
                                                   std::span<const std::int32_t>(reference->tokens),
-                                                  webgpu ? impl_->context.device() : tensor::Device::cpu())));
+                                                  device_diffusion ? impl_->context.device() : tensor::Device::cpu())));
         auto remaining_tokens = tokens.size();
-        std::vector<float> guided(webgpu ? 0 : static_cast<std::size_t>(impl_->audio_vocabulary));
+        std::vector<float> guided(device_diffusion ? 0 : static_cast<std::size_t>(impl_->audio_vocabulary));
         std::vector<Candidate> candidates;
-        if (!webgpu) candidates.reserve(tokens.size());
+        if (!device_diffusion) candidates.reserve(tokens.size());
         const auto generation_start = std::chrono::steady_clock::now();
         for (std::size_t step = 0; step < options.steps; ++step) {
             const auto step_stage = "diffusion step " + std::to_string(step + 1);
             stage = step_stage + " audio embedding";
-            const auto target_audio_embedding = impl_->embed_audio(webgpu ? device_tokens : host_tokens);
+            const auto target_audio_embedding = impl_->embed_audio(device_diffusion ? device_tokens : host_tokens);
             tensor::Tensor conditional_audio_embedding = target_audio_embedding;
             if (reference)
                 conditional_audio_embedding =
@@ -660,7 +655,7 @@ auto OmniVoiceImpl::synthesis_session_(std::string text, inference::SynthesisOpt
             } else {
                 stage = step_stage + " conditional transformer";
                 auto conditional_logits = impl_->project(conditional_embedding, conditional_target_start, target);
-                if (webgpu) {
+                if (device_diffusion) {
                     const auto unconditional_logits = impl_->project(target_audio_embedding, 0, target);
                     logits = impl_->context.concat(std::array{conditional_logits, unconditional_logits}, 1);
                 } else {
@@ -680,7 +675,7 @@ auto OmniVoiceImpl::synthesis_session_(std::string text, inference::SynthesisOpt
                 stage = step_stage + " audio projection";
                 logits = impl_->audio_heads->forward(impl_->context, hidden);
             }
-            if (webgpu) {
+            if (device_diffusion) {
                 device_candidates =
                     impl_->context.diffusion_candidates(logits, target, impl_->codebooks, impl_->audio_vocabulary,
                                                         impl_->mask_id, guidance ? options.guidance_scale : 0.F);
@@ -752,13 +747,14 @@ auto OmniVoiceImpl::synthesis_session_(std::string text, inference::SynthesisOpt
             for (const auto& candidate : std::span(candidates).first(count)) tokens[candidate.index] = candidate.token;
             if (options.on_progress) options.on_progress(step + 1, options.steps);
         }
-#if defined(KIDI_HAS_WEBGPU)
-        if (webgpu) {
-            require(tensor::web_gpu_read_later(device_tokens, std::as_writable_bytes(std::span(tokens))));
+        if (device_diffusion) {
             impl_->context.synchronize();
-            co_yield std::monostate{};
+            require(device_tokens.copy_to_host_later(std::as_writable_bytes(tokens)));
+            if (device_tokens.device().capabilities().memory.deferred()) {
+                impl_->context.synchronize();
+                co_yield std::monostate{};
+            }
         }
-#endif
         const auto generation_ns = inference::synthesis_elapsed_ns(generation_start);
         if (std::ranges::any_of(tokens, [&](auto token) {
                 return token < 0 || token >= impl_->audio_vocabulary || token == impl_->mask_id;
@@ -768,16 +764,14 @@ auto OmniVoiceImpl::synthesis_session_(std::string text, inference::SynthesisOpt
         stage = "audio codec";
         const auto decode_start = std::chrono::steady_clock::now();
         std::vector<float> samples;
-        const auto& codes = webgpu ? device_tokens : host_tokens;
-#if defined(KIDI_HAS_WEBGPU)
-        if (impl_->decoder_context.device() == tensor::Device::web_gpu()) {
+        const auto& codes = device_diffusion ? device_tokens : host_tokens;
+        if (impl_->decoder_context.device().capabilities().memory.deferred()) {
             const auto decoded = impl_->audio_tokenizer->forward(impl_->decoder_context, codes);
             samples.resize(decoded.numel());
-            require(tensor::web_gpu_read_later(decoded, std::as_writable_bytes(std::span(samples))));
+            require(decoded.copy_to_host_later(std::as_writable_bytes(std::span(samples))));
             impl_->decoder_context.synchronize();
             co_yield std::monostate{};
         } else
-#endif
             samples = require(decode(codes));
         samples = postprocess(std::move(samples), impl_->sample_rate);
         co_return Result<inference::Synthesis>{inference::Synthesis{
@@ -802,23 +796,17 @@ auto OmniVoiceImpl::synthesis_session_(std::string text, inference::SynthesisOpt
     }
 }
 
-auto OmniVoiceImpl::execution() const -> std::string {
-    if (const auto accelerator = impl_->context.accelerator(); !accelerator.empty())
-        return "cpu+" + std::string(accelerator);
-    if (impl_->context.device() == tensor::Device::apple_gpu()) return "mps+ynnpack";
-    if (impl_->context.device() == tensor::Device::web_gpu()) return "webgpu";
-    return impl_->context.device() == tensor::Device::vulkan() ? "vulkan+ynnpack" : "ynnpack";
-}
+auto OmniVoiceImpl::execution() const -> std::string { return impl_->context.execution(); }
 auto OmniVoiceImpl::release_workspaces() -> void {
-    if (impl_->context.device() == tensor::Device::web_gpu())
+    if (impl_->context.device().policy().replay.region_layers)
         impl_->context.trim_workspaces();
     else
         impl_->context.release_workspaces();
-    if (impl_->decoder_context.device() == tensor::Device::web_gpu())
+    if (impl_->decoder_context.device().policy().replay.region_layers)
         impl_->decoder_context.trim_workspaces();
     else
         impl_->decoder_context.release_workspaces();
-    if (impl_->context.device() != tensor::Device::web_gpu()) impl_->llm->clear_attention();
+    if (!impl_->context.device().policy().replay.region_layers) impl_->llm->clear_attention();
 }
 
 } // namespace kidi::model

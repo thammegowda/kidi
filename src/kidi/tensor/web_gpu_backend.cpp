@@ -121,6 +121,15 @@ public:
             return std::unexpected(web_gpu_error());
         return {};
     }
+    auto copy_to_host_later(const Storage& source, std::size_t offset, std::span<std::byte> destination) const
+        -> Result<void> override {
+        if (offset > source.size_bytes() || destination.size() > source.size_bytes() - offset)
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "WebGPU read outside storage"});
+        if (queue_read(static_cast<int>(static_cast<const WebGpuStorage&>(source).handle()), offset, destination.data(),
+                       destination.size()))
+            return std::unexpected(web_gpu_error());
+        return {};
+    }
     auto host_view(Storage&) const -> Result<std::span<std::byte>> override {
         return std::unexpected(Error{ErrorCode::UNSUPPORTED, "WebGPU storage requires an explicit host transfer"});
     }
@@ -148,13 +157,8 @@ auto web_gpu_buffer(const Tensor& tensor) -> Result<WebGpuBufferView> {
                             storage.packed_layout()};
 }
 auto web_gpu_read_later(const Tensor& source, std::span<std::byte> destination) -> Result<void> {
-    auto view = web_gpu_buffer(source);
-    if (!view) return std::unexpected(std::move(view.error()));
-    if (destination.size() > source.nbytes())
-        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "WebGPU deferred read exceeds tensor storage"});
-    if (queue_read(static_cast<int>(view->handle), view->offset_bytes, destination.data(), destination.size()))
-        return std::unexpected(web_gpu_error());
-    return {};
+    if (auto view = web_gpu_buffer(source); !view) return std::unexpected(std::move(view.error()));
+    return source.copy_to_host_later(destination);
 }
 auto adopt_web_gpu_buffer(std::uint32_t handle, std::vector<std::int64_t> shape, DType dtype,
                           std::int32_t packed_layout) -> Result<Tensor> {

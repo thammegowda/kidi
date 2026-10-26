@@ -308,7 +308,8 @@ Checkpoint I/O -> Model-owned configuration and preparation hooks
 ```
 
 Kidi uses C++23 with a shared model implementation across backends. CPU uses
-YNNPACK; Apple GPUs use Metal. Models are ordinary C++ composed from reusable
+YNNPACK; Apple GPUs use Metal; NVIDIA GPUs can use the optional YNNPACK CUDA
+runtime (`KIDI_ENABLE_CUDA=ON`). Models are ordinary C++ composed from reusable
 layers and concrete tensors, not exported model graphs. Backend-specific
 operator preparation and fusion remain internal to the runtime.
 
@@ -325,6 +326,7 @@ support for arbitrary Hugging Face architectures.
 - [ARCHITECTURE.md](ARCHITECTURE.md): ownership, execution, state and backend contracts.
 - [CODING_GUIDELINES.md](CODING_GUIDELINES.md): APIs, naming, formatting and testing rules.
 - [Manual model setup](docs/getting-started.md#optional-manual-setup): configuration and converter entry points.
+- [Benchmarks](benchmarks/README.md): build options, CPU/CUDA/Metal runners, precision, and validation.
 
 ## GGML and GGUF Import
 
@@ -424,9 +426,9 @@ its chats and downloaded models.
 Results depend on hardware, precision, memory pressure and workload. They are
 not promises for other devices or proof of quality equivalence across quantizers.
 
-- [Gemma 4](benchmarks/gemma4/README.md): CPU/Metal comparisons with GGML and LiteRT-LM, quality and memory.
+- [Gemma 4](benchmarks/README.md#gemma-4): CPU/Metal comparisons with GGML and LiteRT-LM, quality and memory.
 - [RTG](benchmarks/rtg/README.md): FP32/BF16/INT8 translation benchmarks.
-- [Apple Metal](benchmarks/metal/README.md): backend measurements and execution studies.
+- [Apple Metal](benchmarks/README.md#metal): projection and kernel measurements.
 - [Android](benchmarks/android/README.md): reproducible device benchmark setup.
 
 For reusable TTS latency, run repeated synthesis through one loaded model:

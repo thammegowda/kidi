@@ -34,7 +34,7 @@ auto Qwen3AttentionImpl::forward(ops::Context& context, const Tensor& input, con
     const auto projected = qkv_->forward(context, input);
     auto value = context.slice(projected, -1, query_width_ + key_value_width_, key_value_width_);
     Tensor query, key;
-    if (context.device() == tensor::Device::cpu()) {
+    if (context.device().capabilities().compute.host()) {
         query = query_norm_->forward_rotary_slice(context, projected, cosine, sine, heads_, head_width_, 0, 0,
                                                   input.size(1));
         key = key_norm_->forward_rotary_slice(context, projected, cosine, sine, key_value_heads_, head_width_,
@@ -60,7 +60,7 @@ auto Qwen3AttentionImpl::forward(ops::Context& context, const Tensor& input,
     const auto projected = qkv_->forward(context, input);
     const auto value = context.slice(projected, -1, query_width_ + key_value_width_, key_value_width_);
     Tensor query, key;
-    if (context.device() != tensor::Device::cpu()) {
+    if (!context.device().capabilities().compute.host()) {
         query = context.slice(projected, -1, 0, query_width_);
         key = context.slice(projected, -1, query_width_, key_value_width_);
     }
@@ -69,7 +69,7 @@ auto Qwen3AttentionImpl::forward(ops::Context& context, const Tensor& input,
     for (const auto& segment : segments) {
         const auto segment_value = context.slice(value, 1, segment.offset, segment.length);
         Tensor segment_query, segment_key;
-        if (context.device() == tensor::Device::cpu()) {
+        if (context.device().capabilities().compute.host()) {
             segment_query = query_norm_->forward_rotary_slice(context, projected, *segment.cosine, *segment.sine,
                                                               heads_, head_width_, 0, segment.offset, segment.length);
             segment_key =

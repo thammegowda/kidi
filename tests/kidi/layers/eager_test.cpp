@@ -99,6 +99,14 @@ auto main() -> int {
                 context.synchronize();
                 if (!std::ranges::equal(ops::require(separate.data<float>()), ops::require(fused.data<float>())))
                     return 1;
+                if (device == tensor::Device::cpu()) {
+                    const std::array parts{gate, factor};
+                    const auto combined = context.concat(parts, 1);
+                    const auto packed = context.gelu_gate(combined);
+                    context.synchronize();
+                    if (!std::ranges::equal(ops::require(fused.data<float>()), ops::require(packed.data<float>())))
+                        return 1;
+                }
                 bool rejected = false;
                 try {
                     context.gelu_multiply(gate, ops::require(factor.reshape({8})));
@@ -421,7 +429,7 @@ auto main() -> int {
                 if (std::abs(attention_values[head * 2] - probability) > 1e-5F ||
                     std::abs(attention_values[head * 2 + 1] - (1.F - probability)) > 1e-5F)
                     return 1;
-            if (tensor::DEVICE_CAPABILITIES[device.kind].blockwise_int8_attention) {
+            if (device.capabilities().attention.int8_cache_tokens) {
                 constexpr std::int64_t HEADS = 4, KEY_HEADS = 2, WIDTH = 40, QUERIES = 3, KEYS = 259, START = 5;
                 constexpr float KEY_SCALE = 0.05F, VALUE_SCALE = 0.02F;
                 std::vector<float> query_values(QUERIES * HEADS * WIDTH);

@@ -11,6 +11,16 @@ auto Backend::wrap_host_mutable(Device, std::span<std::byte>, std::shared_ptr<vo
 
 namespace {
 
+class ImmediateReadback final : public Readback {
+public:
+    explicit ImmediateReadback(std::vector<std::byte> bytes) : bytes_(std::move(bytes)) {}
+    auto ready() const -> Result<bool> override { return true; }
+    auto bytes() const -> Result<std::span<const std::byte>> override { return bytes_; }
+
+private:
+    std::vector<std::byte> bytes_;
+};
+
 class UnavailableBackend final : public Backend {
 public:
     UnavailableBackend(DeviceKind kind, std::string name, std::string reason)
@@ -77,6 +87,20 @@ auto Backend::clear(Storage& storage) const -> Result<void> {
     return copy_from_host(storage, 0, zeros);
 }
 
+auto Backend::copy_to_host_later(const Storage& source, std::size_t source_offset,
+                                 std::span<std::byte> destination) const -> Result<void> {
+    return copy_to_host(source, source_offset, destination);
+}
+
+auto Backend::readback(std::shared_ptr<const Storage> source, std::size_t offset, std::size_t bytes) const
+    -> Result<std::shared_ptr<Readback>> {
+    if (!source || offset > source->size_bytes() || bytes > source->size_bytes() - offset)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "readback is out of bounds"});
+    std::vector<std::byte> result(bytes);
+    if (auto status = copy_to_host(*source, offset, result); !status) return std::unexpected(std::move(status.error()));
+    return std::shared_ptr<Readback>(std::make_shared<ImmediateReadback>(std::move(result)));
+}
+
 auto BackendRegistry::instance() -> BackendRegistry& {
     static BackendRegistry registry;
     return registry;
@@ -91,7 +115,12 @@ BackendRegistry::BackendRegistry() {
                       make_unavailable_backend(DeviceKind::A_GPU, "metal-mps", "Metal backend is not built"));
 #endif
     backends_.emplace(DeviceKind::Q_NPU, make_unavailable_backend(DeviceKind::Q_NPU, "hexagon-qnn", "not implemented"));
-    backends_.emplace(DeviceKind::CUDA, make_unavailable_backend(DeviceKind::CUDA, "cuda-cudnn", "not implemented"));
+#if defined(KIDI_HAS_CUDA)
+    backends_.emplace(DeviceKind::CUDA, make_cuda_backend());
+#else
+    backends_.emplace(DeviceKind::CUDA,
+                      make_unavailable_backend(DeviceKind::CUDA, "cuda", "CUDA backend is not built"));
+#endif
 #if defined(KIDI_HAS_WEBGPU)
     backends_.emplace(DeviceKind::WEB_GPU, make_web_gpu_backend());
 #else
