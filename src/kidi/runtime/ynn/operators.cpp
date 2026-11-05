@@ -47,9 +47,10 @@ auto type(DType dtype) -> ynn_type {
     }
 }
 auto check(ynn_status status) -> void { require(ynn::check_status(status, "eager CPU operator")); }
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) || defined(__x86_64__)
 // Single-row calibrated projections use the same INT8 dot as multi-row ones, so YNNPACK's constant cache shares one
-// packed copy of each weight between prefill and decode. WebAssembly decode measured no slower this way.
+// packed copy of each weight between prefill and decode. WebAssembly decode measured no slower this way, and x86
+// decode measured faster.
 constexpr bool SHARED_DECODE_PACKING = true;
 #else
 constexpr bool SHARED_DECODE_PACKING = false;

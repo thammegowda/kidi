@@ -30,6 +30,7 @@
 #include "kidi/model/kokoro.h"
 #include "kidi/model/registry.h"
 #include "kidi/runtime/ynn/graph.h"
+#include "kidi/runtime/ynn/numa.h"
 #include "kidi/tensor/backend.h"
 
 namespace {
@@ -52,6 +53,15 @@ auto backend_label(kidi::tensor::Device device) -> std::string_view {
     if (device == kidi::tensor::Device::apple_gpu()) return "mps_gpu";
     if (device == kidi::tensor::Device::vulkan()) return "vulkan_gpu";
     return "ynnpack_cpu";
+}
+
+/// Applies the CPU thread count. Commands that compute on the CPU also keep those threads on one NUMA node, so the
+/// weights they stream every token are read from local memory.
+auto configure_cpu_threads(const kidi::cli::Namespace& arguments, std::int32_t threads) -> void {
+    kidi::runtime::ynn::set_thread_count(threads);
+    const auto& backend = arguments.get<std::string>("backend");
+    if (backend == "auto" || backend == "ynnpack")
+        kidi::runtime::ynn::confine_to_numa_node(static_cast<std::size_t>(threads));
 }
 
 auto inspect(const std::filesystem::path& directory) -> int {
@@ -514,7 +524,7 @@ auto prepare_command(const kidi::cli::Namespace& arguments, const std::filesyste
         spdlog::error("thread count must be positive");
         return 2;
     }
-    kidi::runtime::ynn::set_thread_count(threads);
+    configure_cpu_threads(arguments, threads);
     auto config =
         task == kidi::model::Task::TEXT_GENERATION && !std::filesystem::is_regular_file(directory / "model.yaml")
             ? kidi::checkpoint::load_config(directory, kidi::model::Gemma4Impl::checkpoint_config())
@@ -600,7 +610,7 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
         spdlog::error("Whisper requires the YNNPACK or CUDA backend");
         return 2;
     }
-    kidi::runtime::ynn::set_thread_count(threads);
+    configure_cpu_threads(arguments, threads);
     const auto started = std::chrono::steady_clock::now();
     const auto device = kidi::tensor::parse_cuda_device(backend).value_or(kidi::tensor::Device::cpu());
     auto transcriber = kidi::inference::Transcriber::load(directory, device);

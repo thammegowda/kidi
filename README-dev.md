@@ -457,6 +457,15 @@ not promises for other devices or proof of quality equivalence across quantizers
 - [Apple Metal](benchmarks/README.md#metal): projection and kernel measurements.
 - [Android](benchmarks/android/README.md): reproducible device benchmark setup.
 
+On Linux hosts with several NUMA nodes, `kidi` commands that run on the CPU keep
+their `-j` threads on one node (`kidi::runtime::ynn::confine_to_numa_node`).
+A decoding step reads every weight once, and the weights live on the node of the
+thread that first wrote them, so threads spread over two sockets read about half
+of them remotely. On a two-socket Xeon at 16 threads this was worth 1.1-1.3x.
+It only acts when the process may run on several nodes and the threads fit within
+one, so `taskset`, `numactl` and cgroup cpusets are respected; `KIDI_NUMA=off`
+disables it. Applications embedding Kidi should call it before loading a model.
+
 For reusable TTS latency, run repeated synthesis through one loaded model:
 
 ```bash

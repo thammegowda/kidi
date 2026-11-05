@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <utility>
 
-#include "slinky/base/thread_pool_impl.h"
+#include "kidi/runtime/ynn/worker_pool.h"
 #include "ynnpack/base/arch.h"
 
 namespace kidi::runtime::ynn {
@@ -30,8 +30,7 @@ public:
     }
 
 private:
-    explicit ThreadPool(int worker_count)
-        : handle_(reinterpret_cast<ynn_threadpool_t>(new slinky::thread_pool_impl(worker_count))) {}
+    explicit ThreadPool(int worker_count) : handle_(reinterpret_cast<ynn_threadpool_t>(new WorkerPool(worker_count))) {}
 
     ynn_threadpool_t handle_ = nullptr;
 };

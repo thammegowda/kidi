@@ -122,6 +122,8 @@ add_library(kidi
     src/kidi/runtime/parity_math.cpp
     src/kidi/runtime/ynn/operators.cpp
     src/kidi/runtime/ynn/graph.cpp
+    src/kidi/runtime/ynn/numa.cpp
+    src/kidi/runtime/ynn/worker_pool.cpp
     src/kidi/tensor/backend.cpp
     src/kidi/tensor/cpu_backend.cpp
     src/kidi/tensor/external.cpp

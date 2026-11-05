@@ -198,7 +198,8 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
         if (!small_fusion)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "fused feed-forward requires positive trained scales"});
     }
-    if (kernel == tensor::FeedForwardKernel::PACKED_GATE && (fused_silu || input.dtype() == tensor::DType::BF16)) {
+    if ((kernel == tensor::FeedForwardKernel::PACKED_GATE && (fused_silu || input.dtype() == tensor::DType::BF16)) ||
+        (kernel == tensor::FeedForwardKernel::PACKED_LARGE && !large_fusion)) {
         const auto projected = gate_up_->forward(context, input);
         return down_->forward(context, fused_silu ? context.silu_gate(projected) : context.gelu_gate(projected));
     }

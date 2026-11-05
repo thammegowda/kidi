@@ -60,6 +60,56 @@ auto main() -> int {
                 if (!std::ranges::equal(ops::require(calibrated.data<std::int8_t>()), std::array{4, 8, -4, -8}))
                     return 1;
             }
+            if (device == tensor::Device::cpu()) {
+                for (const int bits : {2, 4, 8}) {
+                    for (const std::int64_t columns : {3, 35, 67, 257, 513}) {
+                        constexpr std::int64_t WIDTH = 256;
+                        const auto values_per_byte = 8 / bits;
+                        auto bytes = std::make_shared<std::vector<std::uint8_t>>(columns * WIDTH / values_per_byte);
+                        auto factors = std::make_shared<std::vector<float>>(columns, 0.001953125F);
+                        std::vector<std::int32_t> integers(columns * WIDTH);
+                        for (std::size_t index = 0; index < integers.size(); ++index) {
+                            integers[index] =
+                                static_cast<int>((index * 13 + index / WIDTH * 7 + index / (WIDTH * 3) + 3) %
+                                                 (1 << bits)) -
+                                (1 << (bits - 1));
+                            (*bytes)[index / values_per_byte] |= (integers[index] & ((1 << bits) - 1))
+                                                                 << (index % values_per_byte * bits);
+                        }
+                        const auto weight = ops::require(
+                            tensor::Tensor::from_blob({columns, WIDTH / values_per_byte}, tensor::DType::U8,
+                                                      std::as_bytes(std::span<const std::uint8_t>(*bytes)), bytes));
+                        const auto scales = ops::require(
+                            tensor::Tensor::from_blob({columns, 1}, tensor::DType::F32,
+                                                      std::as_bytes(std::span<const float>(*factors)), factors));
+                        std::array<float, WIDTH> values{};
+                        for (std::size_t index = 0; index < values.size(); ++index)
+                            values[index] = (static_cast<int>(index % 17) - 8) * 0.125F;
+                        values[0] = -1000.F;
+                        values[1] = 1000.F;
+                        const auto input =
+                            ops::require(tensor::Tensor::from_host({1, WIDTH}, std::span<const float>(values)));
+                        const auto output = context.packed_linear(input, weight, scales, bits, WIDTH, 0.25F, 0.125F);
+                        const auto actual = ops::require(output.data<float>());
+                        for (std::size_t column = 0; column < actual.size(); ++column) {
+                            std::int32_t sum = 0;
+                            for (std::size_t channel = 0; channel < values.size(); ++channel)
+                                sum += static_cast<std::int32_t>(
+                                           std::clamp(std::nearbyint(values[channel] / 0.25F), -128.F, 127.F)) *
+                                       integers[column * WIDTH + channel];
+                            const auto expected =
+                                std::clamp(std::nearbyint(sum * (*factors)[column] * 0.25F / 0.125F), -128.F, 127.F) *
+                                0.125F;
+                            if (actual[column] != expected) {
+                                std::cerr << "native calibrated projection mismatch bits=" << bits
+                                          << " columns=" << columns << " column=" << column << ": " << actual[column]
+                                          << " vs " << expected << '\n';
+                                return 1;
+                            }
+                        }
+                    }
+                }
+            }
             for (const std::int64_t rows : {1, 8}) {
                 auto matrix = ops::require(tensor::Tensor::zeros({8, 8}, tensor::DType::F32));
                 auto entries = ops::require(matrix.data<float>());
