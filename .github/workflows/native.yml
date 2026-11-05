@@ -17,6 +17,7 @@ on:
       - 'tests/data/**'
       - 'tests/*_test.py'
       - 'benchmarks/cuda/run.py'
+      - 'benchmarks/cpu/**'
   pull_request:
     branches: [main]
     paths:
@@ -33,6 +34,7 @@ on:
       - 'tests/data/**'
       - 'tests/*_test.py'
       - 'benchmarks/cuda/run.py'
+      - 'benchmarks/cpu/**'
   workflow_dispatch:
 
 permissions:

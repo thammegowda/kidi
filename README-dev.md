@@ -456,6 +456,7 @@ not promises for other devices or proof of quality equivalence across quantizers
 - [RTG](benchmarks/rtg/README.md): FP32/BF16/INT8 translation benchmarks.
 - [Apple Metal](benchmarks/README.md#metal): projection and kernel measurements.
 - [Android](benchmarks/android/README.md): reproducible device benchmark setup.
+- [CPU harness](benchmarks/cpu/README.md): repeatable desktop CPU decode measurements and operator profiles.
 
 On Linux hosts with several NUMA nodes, `kidi` commands that run on the CPU keep
 their `-j` threads on one node (`kidi::runtime::ynn::confine_to_numa_node`).

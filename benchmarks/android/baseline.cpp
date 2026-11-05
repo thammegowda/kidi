@@ -6,6 +6,7 @@
 #include "kidi/inference/transcriber.h"
 #include "kidi/model/gemma4_vision.h"
 #include "kidi/runtime/ynn/graph.h"
+#include "kidi/runtime/ynn/numa.h"
 #if defined(KIDI_HAS_CUDA)
 #include "ynnpack/include/ynnpack_cuda.h"
 #include <cuda_profiler_api.h>
@@ -79,12 +80,18 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
     const auto short_copies = settings.value("short_prompt_copies", 1);
     const auto long_copies = settings.value("long_prompt_copies", 16);
     const auto decode_ahead = settings.value("decode_ahead_tokens", std::size_t{0});
+    const auto workload = settings.value("workload", std::string("both"));
+    const auto custom_prompt = settings.value("prompt", std::string{});
     if (!context || !chunk || output_tokens < 2 || output_tokens >= context || !warmups || warmups > 20)
         throw std::invalid_argument(
             "Gemma benchmark requires positive context/chunk/warmups and 2 <= output < context");
     if (short_copies < 1 || long_copies < 1 || short_copies > 4096 || long_copies > 4096)
         throw std::invalid_argument("Gemma prompt copies must be between 1 and 4096");
     if (decode_ahead > 64) throw std::invalid_argument("Gemma decode-ahead window must not exceed 64");
+    if (workload != "short" && workload != "long" && workload != "both")
+        throw std::invalid_argument("Gemma workload must be short, long, or both");
+    if (settings.contains("prompt") && custom_prompt.empty())
+        throw std::invalid_argument("Gemma benchmark prompt must not be empty");
     const auto started = Clock::now();
     auto generator = require(kidi::inference::Generator::load(directory, gemma_device(), 0, 128, packed_prefill));
     require(generator.configure_serving({.maximum_active = 1,
@@ -105,12 +112,19 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
          threads);
 
     for (const bool long_prompt : {false, true}) {
+        if (workload == (long_prompt ? "short" : "long")) continue;
         const auto copies = long_prompt ? long_copies : short_copies;
         std::string prompt;
-        for (int copy = 0; copy < copies; ++copy)
-            prompt +=
-                "Binary search repeatedly halves a sorted search range. It is useful for lookup and boundary finding. ";
-        prompt += "Explain the main idea and give practical examples.";
+        for (int copy = 0; copy < copies; ++copy) {
+            if (settings.contains("prompt")) {
+                if (copy) prompt += ' ';
+                prompt += custom_prompt;
+            } else
+                prompt +=
+                    "Binary search repeatedly halves a sorted search range. It is useful for lookup and boundary "
+                    "finding. ";
+        }
+        if (!settings.contains("prompt")) prompt += "Explain the main idea and give practical examples.";
         const auto serialized = "<bos><|turn>user\n" + prompt + "<turn|>\n<|turn>model\n";
         const auto prompt_ids = require(tokenizer.encode(serialized));
         if (prompt_ids.size() + output_tokens > context)
@@ -169,6 +183,7 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
                           {"decode_interval_tps", (output_tokens - 1) / decode_seconds},
                           {"request_seconds", first_seconds + decode_seconds},
                           {"prompt_tokens", stats.prompt_tokens},
+                          {"reused_prompt_tokens", stats.reused_prompt_tokens},
                           {"output_tokens", result.generation.token_ids.size()},
                           {"prefill_ms", rounded(stats.prefill_ns / 1e6)},
                           {"prefill_tps", rounded(stats.prompt_tokens * 1e9 / stats.prefill_ns)},
@@ -592,15 +607,18 @@ auto main(int argc, char** argv) -> int {
         if (argc < 5) throw std::runtime_error("missing benchmark arguments");
         const std::string mode(argv[1]);
         const auto threads = std::stoi(argv[3]), repeats = std::stoi(argv[4]);
-        if (threads < 1 || threads > 8 || repeats < 1 || repeats > 20 ||
+        if (threads < 1 || repeats < 1 || repeats > 20 ||
             !((mode == "gemma" && (argc == 5 || argc == 6)) || (mode == "chat" && argc == 5) ||
               ((mode == "whisper" || mode == "image" || mode == "dictation") && argc == 6) ||
               (mode == "vision" && argc >= 6)))
             throw std::runtime_error("invalid mode, thread count, repeat count, or WAV argument");
         kidi::runtime::ynn::set_thread_count(threads);
+        const auto numa_node = kidi::runtime::ynn::confine_to_numa_node(static_cast<std::size_t>(threads));
         require(kidi::runtime::ynn::reserve_thread_pool(threads));
         emit({{"stage", "runtime"},
               {"arch", kidi::runtime::ynn::supported_arch_names()},
+              {"arch_flags", kidi::runtime::ynn::supported_arch_flags()},
+              {"numa_node", numa_node.value_or(-1)},
               {"warm_repeats", repeats},
               {"build", "release-native"},
               {"device", kidi::tensor::to_string(gemma_device())}},
