@@ -175,6 +175,22 @@ auto Tensor::copy_to_host() const -> Result<std::vector<std::byte>> {
     return result;
 }
 
+auto Tensor::readback() const -> Result<std::shared_ptr<Readback>> {
+    if (!defined() || !is_contiguous())
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "readback requires a defined contiguous tensor"});
+    return backend_->readback(storage_, static_cast<std::size_t>(storage_offset_) * element_size(dtype_), nbytes());
+}
+
+auto Tensor::copy_to_host_later(std::span<std::byte> destination) const -> Result<void> {
+    if (!defined()) return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "cannot copy an undefined tensor"});
+    if (!is_contiguous())
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "host copy requires a contiguous tensor"});
+    if (destination.size() > nbytes())
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "host copy exceeds tensor storage"});
+    const auto offset = static_cast<std::size_t>(storage_offset_) * element_size(dtype_);
+    return backend_->copy_to_host_later(*storage_, offset, destination);
+}
+
 auto Tensor::to(Device target) const -> Result<Tensor> {
     if (!defined()) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "cannot transfer an undefined tensor"});

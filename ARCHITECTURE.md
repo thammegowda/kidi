@@ -33,14 +33,15 @@ samples never enter JavaScript.
 |---|---|
 | `tensor` | Storage, dtype, device, views, explicit transfers |
 | `core::Module` | Shared module ownership, named parameter/child registration, state dictionaries |
-| `ops::Context` | Immediate operator dispatch, validation, bounded prepared-operator cache, step replay |
-| `graph` | Captured fixed-shape steps: recorded operators, structural validation, input rebinding, replay |
+| `ops::Context` | Immediate operator dispatch, validation, bounded prepared-operator cache, model-facing replay API |
+| `graph` | Captured steps, compiler/executable contracts, replay sessions, structural validation, binding, and eviction |
 | `layers` | Bound parameters and reusable neural equations |
 | `checkpoint` | Configuration/package I/O, format readers, serialization and generic cache preparation |
 | `model` | Neural network topology, parameter binding, checkpoint policies, source and decoder state |
 | `inference` | Generic generation/search, translation and synthesis applications, profiling |
 | `runtime/ynn` | Private prepared CPU operators and YNNPACK ownership |
 | `runtime/mps` | Private prepared Metal operators, command batches, INT8 kernels |
+| `runtime/cuda` | Private prepared CUDA operators, quantized YNNPACK CUDA execution |
 | `text`, `cli` | Tokenization and command/input/output policy |
 
 RTG is an import/package format, not the owner of general modeling code. Do not
@@ -73,6 +74,23 @@ resolution; it does not encode a model's required files or dimensions.
 `WhisperImpl::checkpoint_config()` supplies the Hugging Face layout and GGML
 header compatibility rules without writing a manifest. `Package::config()`
 exposes RTG package documents.
+
+`Gemma4Impl::checkpoint_config()` adapts an ordinary Gemma 4 checkpoint directory
+when no `model.yaml` is present. It reads the wrapper's `text_config`, or a direct
+text-model config, and keeps the architecture and quantization metadata intact.
+Generation and inspection accept either representation. Dense E2B/E4B topology
+comes from dimensions and layer metadata; there is no model-size/name switch.
+Actual tensor headers select the construction dtype, while registration checks
+the checkpoint shapes and encoding. Native QAT calibration is not silently
+replaced with BF16 arithmetic.
+
+An eager backend resolves activation dtype from the model's parameter dtype.
+Gemma passes this captured construction setting when creating/recreating its
+context. CUDA keeps ordinary BF16 checkpoints in native BF16 matrix/activation
+storage with FP32 accumulation/reductions and BF16 KV by default, without full
+FP32 weight expansion. QAT retains its existing FP32/calibrated INT8 path. Other
+backends keep their existing arithmetic policy. Public score tensors remain FP32;
+dtype alignment does not imply bit-identical results across different kernels.
 
 `checkpoint::prepare` takes a config adapter and model-owned preparation hook.
 The returned `Preparation` describes the source, cache directory/version,
@@ -532,14 +550,13 @@ and caller-visible tensor ownership still use reference counting where required.
 
 This removes identified Kidi allocation/refcount churn, not every allocation inside
 YNNPACK, MPSGraph, Objective-C descriptors, or cold preparation. Profiles distinguish
-output-slot allocations from those internal allocations. See
-[benchmarks/metal/ALLOCATION_REUSE.md](benchmarks/metal/ALLOCATION_REUSE.md) for results.
+output-slot allocations from those internal allocations.
 With `KIDI_PROFILE_MEMORY=1`, Metal also reports cumulative explicit output
 allocations, prepared calibration scratch, expanded weights, external-owner slots,
 and native `currentAllocatedSize` sampled at completion boundaries. The observed
 native high-water mark can miss intra-batch transients and is not physical RSS or
-system swap usage. Current results are in the
-[Gemma 4 optimization journal](benchmarks/gemma4/JOURNAL.md).
+system swap usage. Benchmark entrypoints and measurement constraints are in the
+[benchmark guide](benchmarks/README.md).
 
 ## Backend Internals
 
@@ -578,9 +595,8 @@ single-row INT8 projections with at most 4,194,304 weight elements and batch-one
 single-query attention with at most 262,144 key elements use one thread. Larger
 work retains the configured pool. This measured scheduling policy is backend
 private, not a change to model equations or a globally toggled thread setting.
-Other platforms retain default scheduling. See the
-[matched scheduling comparison](benchmarks/metal/scheduling-20260919/README.md),
-including preparation costs and quality differences from the old graph runtime.
+Other platforms retain default scheduling. The
+[benchmark guide](benchmarks/README.md) lists the current measurement entrypoints.
 
 FP32 attention with at most eight query rows, such as a Whisper or RTG decoder
 step, bypasses the generic YNNPACK graph, which re-lays out every key and value
@@ -596,6 +612,34 @@ tests remain. CPU wrappers no longer maintain unused dynamic-shape or concurrenc
 query APIs; the eager cache prepares a separate executable for each signature.
 
 ## Captured Steps
+
+The graph framework belongs to Kidi. `graph::Compiler` and `graph::Executable`
+are declared in `kidi/graph/compiler.h`; they are separate from individual
+`runtime::Operator` contracts. `graph::Session` owns capture validation, recorded
+graphs, compilation handoff, bounded LRU entries, and output storage.
+`Context::replay` delegates that lifecycle to its session and retains dispatch
+recording and profiling. Model-facing replay and compiler scopes are unchanged.
+
+An eager backend may supply a compiler through `OperatorBackend::graph_compiler()`.
+An explicitly attached compiler takes precedence. Both go through the same session
+and `Compiler::compile` entry point; backends without a compiler use the recorded
+operator sequence. A compiler may decline by returning null. Single- versus
+double-capture requirements are optional compiler overrides; without an override,
+the caller's structural-validation setting applies.
+
+Sessions validate compiled input count, shape, dtype, device, and contiguity before
+execution. Rebinding does not replace output storage, and sessions sharing a
+compiler still own independent outputs. A pending background job owns its compiler
+and a graph snapshot, not a session reference, so eviction does not join the job or
+allow it to adopt an executable into an evicted entry. A session and its context
+remain single-caller objects, not concurrent execution instances.
+
+YNNPACK continues to own operators, packing, kernels, and its internal Slinky
+optimization. Native command buffers, QNN binaries, and WebGPU dispatch descriptions
+remain private to backend compilers/executables in Kidi. `Executable::run` preserves
+the backend's existing queued/completed behavior; context synchronization and the
+browser's deferred completion rules remain in effect. This reorganization does not
+add native CUDA Graph capture or change a backend's replay support.
 
 `Context::replay(key, inputs, step)` runs one fixed-shape step, such as a decoder
 token, as ordinary eager code. The first two calls with a key run `step` while
@@ -667,16 +711,16 @@ until profiling shows a CPU benefit.
 
 Devices with a full eager backend (CPU, Metal, WebGPU, Vulkan) run every operator
 and replay captured steps on themselves. An accelerator without eager operators,
-such as the Qualcomm NPU, is a `runtime::StepCompiler` attached to a CPU context
+such as the Qualcomm NPU, uses a `graph::Compiler` attached to a CPU context
 with `ops::StepCompilerScope` while a model is constructed. After a step's two
-captures match, `Context::replay` asks the compiler to compile the recorded graph;
-later calls run the returned `StepExecutable` with the step inputs and the
+captures match, the context's `graph::Session` asks the compiler to compile the recorded graph;
+later calls run the returned `graph::Executable` with the step inputs and the
 captured output buffers, and the CPU intermediates are released. A compiler may
 decline a step, which keeps CPU replay. A compiler whose `compiles_in_background()`
 is true compiles a copy of the graph on a worker thread while CPU replay keeps
 serving the step, so a slow first compile (tens of seconds on the NPU) does not
 stall generation; the executable takes over on the first call after it is ready,
-and a failed background compile logs `kidi_step|...|fallback=cpu` and keeps CPU
+and a failed background compile logs `kidi_step|...|fallback=replay` and keeps CPU
 replay. `KIDI_BACKGROUND_COMPILE=0` compiles synchronously, which benchmarks use
 to measure the accelerated steady state. Its `key_extent` and
 `crop_local_attention` policies let models choose few, coarse step shapes, for
@@ -709,6 +753,7 @@ execution engine.
 ModuleScope construction(tensor::DType::BF16, false, tensor::Device::cpu());
 layers::Linear projection(768, 2048);
 ops::require(projection->set_state(weights));
+ops::Context context(projection->device());
 auto output = projection->forward(context, input);
 const auto& implementation = *projection;
 auto another = implementation.forward(context, input);
@@ -740,10 +785,50 @@ backends do not qualify. Explicit unsupported devices are not silently substitut
 
 Each module captures its device at construction. The model's context and state
 buffers use that device, independent of later scopes. Parameter allocation honors
-it; with allocation disabled only parameter metadata is created, and derived
+it, except for parameter roles explicitly prepared in host storage by the backend
+policy. With allocation disabled only parameter metadata is created, and derived
 embedding positions are allocated lazily. Low-level tensor/ops APIs still accept
 explicit devices. CLI `--backend auto` follows the GPU-first default; explicit
 `ynnpack` and `mps` override it.
+
+Device identity belongs at application selection, backend registration, and
+runtime implementation boundaries. Model and layer equations must not enumerate
+CPU, CUDA, Metal, WebGPU, Vulkan, or NPU alternatives. During construction, infer
+placement from `module_device`; during execution, use the captured model device,
+input tensor, or execution context. The central `tensor::DEVICE_PROFILES` dictionary
+keeps supported contracts separate from execution choices. Lookup is independent
+of the device index; allocation and dispatch retain the complete indexed device.
+
+`device.capabilities()` exposes four cohesive groups:
+
+- `compute`: transformer support, native or lowered audio, and embedding execution.
+- `sampling`: a host/device/batched token-selection mode and device diffusion.
+- `attention`: the supported attention pipeline and INT8 cache extent.
+- `memory`: direct, explicit, or deferred host access and offset-view support.
+
+Requirements spanning operations are derived from these groups, for example
+`supports_audio_transformer()`, rather than adding a flag for each model or branch.
+Token-selection and transformer support modes encode their supported subsets.
+An INT8 cache limit of zero denotes unsupported, without a second support flag.
+
+`device.policy()` owns parameter residency, transformer kernel/prefill strategies,
+replay granularity and cache budgets, and parameter-binding/dispatch preferences.
+These are not capabilities. Use enums for mutually exclusive strategies instead
+of independent booleans. Constructors call `device.parameter_device(role, kind)`
+to resolve storage; they do not duplicate placement rules. Host preparation of
+audio parameters does not imply host placement of projection weights, embedding
+tables, or normalization vectors. Prepared operators own any resident copies
+needed for compute. A host-prepared constant is
+not permission to run a mismatched activation on another backend: context input
+validation rejects that mismatch rather than silently transferring or falling back.
+Initialize device parameters through tensor transfers, not direct host pointers.
+
+Host output is also a tensor/backend contract. `Tensor::copy_to_host_later`
+completes immediately on synchronous backends and queues readback on deferred
+backends. The source and destination must remain alive until work completes.
+Callers inspect `capabilities().memory.deferred()` and return/yield so the embedder can await
+submitted work before reading the destination; model code does not call a
+backend-specific readback API. `Context::execution()` owns execution reporting.
 
 Allocated weights and biases are zeroed, LayerNorm weights and quantization scales
 start at one. Callers can initialize writable floating tensors via `state_dict()`
@@ -759,8 +844,9 @@ adapts RTG names once when loading the package; layer constructors never receive
 checkpoint paths or prefixes.
 
 `set_state(weights)` and `set_state(StateDict)` bind tensors after construction.
-On the same device they retain incoming storage, including read-only mapped weights;
-cross-device tensors are transferred to the module's captured device. Caller-retained
+On the same storage device they retain incoming storage, including read-only mapped weights;
+cross-device tensors are transferred to each parameter's registered storage device,
+normally the module's captured device. Caller-retained
 state shares same-device storage, so it must not be mutated during inference.
 `load_state_dict(state, strict=true)` instead copies into fresh storage. Both validate all
 keys, shapes, and dtypes before changes; strict mode requires exact keys, while
@@ -945,10 +1031,11 @@ FP32 tensors; no input is mutated. Gemma 4 uses it for post-attention, post-MLP,
 post-per-layer-input residuals. CPU and Metal implement the same equation without
 duplicating model topology or introducing model-level graphs.
 
-CUDA is a registered placeholder: the device kind and integration points exist,
-but operations fail with a "not implemented" error. QNN is implemented as the
-captured-step compiler described below. Unsupported execution does not silently
-fall back to CPU.
+CUDA is an optional eager backend using YNNPACK CUDA operators for native quantized
+projections, attention, normalization, embeddings, token selection, and audio
+operations. It uses the same models and capability contract as other backends;
+unsupported CUDA operations fail rather than falling back to CPU. QNN is
+implemented as the captured-step compiler described below.
 
 ### Native Gemma 4 Mobile QAT
 
@@ -1018,8 +1105,8 @@ embedding offsets, quantized tails/constant rows/long contractions, plus eager
 lifetimes, failures, and generic greedy/beam/batched search. Legacy CTest names
 are retained for scripts, despite the removal of their old graph implementations.
 
-See [benchmarks/metal/EAGER_MIGRATION.md](benchmarks/metal/EAGER_MIGRATION.md) for
-actual corpus and performance results. The eager migration is not claimed to be
+See the [benchmark guide](benchmarks/README.md#metal) for performance and corpus
+entrypoints. The eager migration is not claimed to be
 bit-identical for INT8. Non-Apple builds have not been run in this environment.
 
 ## Vulkan GPU Backend
@@ -1041,7 +1128,7 @@ pointwise coverage as backend optimization work.
 
 When Kidi is built with `KIDI_ENABLE_QNN=ON` and a QAIRT SDK,
 `runtime::npu_step_compiler()` loads the Qualcomm QNN HTP runtime with `dlopen`
-and attaches a `StepCompiler` to CPU Gemma 4 contexts selected with
+and attaches a `graph::Compiler` to CPU Gemma 4 contexts selected with
 `Device::qualcomm_npu()`. Model code records its normal operators twice; the
 compiler then lowers the entire captured prefill or decode step to chained QNN
 graphs. There is no operator-by-operator CPU/NPU alternation in accelerated

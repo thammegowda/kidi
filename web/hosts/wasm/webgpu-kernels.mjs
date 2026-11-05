@@ -40,7 +40,7 @@ fn invocation_index(id:vec3<u32>)->u32{return id.x+id.y*param(63u)*128u;}
 // Register-blocked products shared by multi-row projections and prefill attention. 256 threads form a 16x16 grid;
 // each accumulates TILE.m x TILE.n outputs, so a workgroup covers 16*m rows by 16*n columns. Shared tiles hold
 // `entries` four-channel entries per row plus one padding entry against bank conflicts, within 16 KiB.
-// Larger blocks were no faster on Apple M5 (benchmarks/gemma4/JOURNAL.md, "Register Block Sweep").
+// Larger blocks were no faster in the Apple M5 register-block sweep.
 const TILE = {m: 4, n: 4}, TILE_ROWS = 16 * TILE.m, TILE_COLUMNS = 16 * TILE.n;
 // `prelude` defines a_entry(row,e), b_entry(column,e) (entry e covers depth 4e..4e+3) and put_out(row,column,value);
 // `setup` defines row_start, column_start, rows, columns and depth_entries from the workgroup index `tile`.

@@ -1,3 +1,4 @@
+#include "kidi/graph/compiler.h"
 #include "kidi/model/gemma4.h"
 #include "kidi/checkpoint/safetensors/mapped.h"
 #include "kidi/inference/generator.h"
@@ -16,15 +17,14 @@
 
 namespace {
 /// A step compiler that declines every step, so accelerator-shaped steps (captured prefill chunks) replay on CPU.
-class DecliningCompiler final : public kidi::runtime::StepCompiler {
+class DecliningCompiler final : public kidi::graph::Compiler {
 public:
     auto name() const -> std::string_view override { return "declining"; }
-    auto requires_second_capture(std::string_view) const -> bool override { return false; }
+    auto requires_second_capture(std::string_view) const -> std::optional<bool> override { return false; }
     auto prefill_chunk_size(std::size_t requested) const -> std::size_t override {
         return std::max(requested, std::size_t{16});
     }
-    auto compile(const kidi::graph::Graph&,
-                 std::string_view key) -> std::unique_ptr<kidi::runtime::StepExecutable> override {
+    auto compile(const kidi::graph::Graph&, std::string_view key) -> std::unique_ptr<kidi::graph::Executable> override {
         keys.emplace_back(key);
         return nullptr;
     }
@@ -121,8 +121,8 @@ auto check_image_prefill_rebinding(const YAML::Node& config, const kidi::checkpo
     for (std::size_t layer = 0; layer < rebound.layers.size(); ++layer) {
         for (const auto pair : {std::pair{&first.layers[layer].key, &rebound.layers[layer].key},
                                 std::pair{&first.layers[layer].value, &rebound.layers[layer].value}}) {
-            distinct = distinct ||
-                       !std::ranges::equal(require(pair.first->host_bytes()), require(pair.second->host_bytes()));
+            distinct =
+                distinct || !std::ranges::equal(require(pair.first->host_bytes()), require(pair.second->host_bytes()));
         }
         for (const auto pair : {std::pair{&rebound.layers[layer].key, &expected.layers[layer].key},
                                 std::pair{&rebound.layers[layer].value, &expected.layers[layer].value}})
@@ -135,9 +135,9 @@ auto check_image_prefill_rebinding(const YAML::Node& config, const kidi::checkpo
         std::cerr << "distinct image embeddings produced identical caches\n";
         return false;
     }
-    return std::ranges::any_of(compiler->keys,
-                               [](const std::string& key) { return key.starts_with("gemma4_prefill:16:") &&
-                                                                  key.ends_with(":images"); });
+    return std::ranges::any_of(compiler->keys, [](const std::string& key) {
+        return key.starts_with("gemma4_prefill:16:") && key.ends_with(":images");
+    });
 }
 
 auto fixture_directory(std::string_view fixture) -> std::filesystem::path {
@@ -174,8 +174,8 @@ private:
 
 /// A per-layer embedding table supplied outside the checkpoint generates the same tokens through eager prefill and
 /// captured decode steps, and a declared external table without a source fails to load.
-auto check_external_rows(const std::filesystem::path& fixture, const YAML::Node& config,
-                         kidi::tensor::Device device) -> void {
+auto check_external_rows(const std::filesystem::path& fixture, const YAML::Node& config, kidi::tensor::Device device)
+    -> void {
     using kidi::ops::require;
     const std::string table_name = "model.language_model.embed_tokens_per_layer.weight";
     const auto state = require(require(kidi::checkpoint::Weights::load(fixture / "model.safetensors")).state_dict());
@@ -228,8 +228,8 @@ auto check_external_rows(const std::filesystem::path& fixture, const YAML::Node&
     std::filesystem::remove_all(directory);
 }
 
-auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node& config,
-                         kidi::tensor::Device device) -> void {
+auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node& config, kidi::tensor::Device device)
+    -> void {
     using kidi::ops::require;
     const auto directory = std::filesystem::temp_directory_path() / "kidi-serving-cache-test";
     std::filesystem::remove_all(directory);
@@ -296,8 +296,7 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     check("alpha beta gamma delta", uncached, 0);
     const auto cancelled = require(cached.enqueue("alpha beta gamma delta", options));
     require(cached.step());
-    if (cached.release_workspaces())
-        throw std::runtime_error("generator released workspaces with an active request");
+    if (cached.release_workspaces()) throw std::runtime_error("generator released workspaces with an active request");
     require(cached.cancel(cancelled));
     require(cached.release_workspaces());
     check("alpha beta gamma delta", options, 2);
@@ -333,9 +332,11 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     // Deferred tokens report each selection one step later, alone and batched, without changing the generation.
     auto deferred = require(kidi::inference::Generator::load(directory, device));
     for (const std::size_t active : {1, 2}) {
-        require(deferred.configure_serving(
-            {.maximum_active = active, .maximum_requests = 4, .cache_token_budget = 32, .prefill_tokens_per_step = 2,
-             .deferred_tokens = true}));
+        require(deferred.configure_serving({.maximum_active = active,
+                                            .maximum_requests = 4,
+                                            .cache_token_budget = 32,
+                                            .prefill_tokens_per_step = 2,
+                                            .deferred_tokens = true}));
         const std::array deferred_ids{require(deferred.enqueue(prompts[0], uncached)),
                                       require(deferred.enqueue(prompts[1], uncached))};
         std::array<std::optional<kidi::inference::TextGeneration>, 2> deferred_results;
@@ -358,7 +359,7 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     bounded.context_size = 1024;
     require(compact.enqueue(prompts[0], bounded));
     const auto step = require(compact.step());
-    const auto byte_limit = kidi::tensor::DEVICE_CAPABILITIES[device.kind].blockwise_int8_attention_max_tokens;
+    const auto byte_limit = device.capabilities().attention.int8_cache_tokens;
     const auto expected_capacity = byte_limit < 1024 ? ((byte_limit + 128) / 128) * 128 : 128;
     if (step.reserved_cache_tokens != expected_capacity)
         throw std::runtime_error("compact reservation changed the cache precision policy or exceeded its bucket");
@@ -392,6 +393,197 @@ auto failed(int line) -> int {
     std::cerr << "gemma4_test check at line " << line << " failed for " << current_fixture << " on " << current_device
               << '\n';
     return 1;
+}
+
+auto check_async_serving(const YAML::Node& config) -> void {
+    using namespace kidi;
+    using ops::require;
+    const auto device = tensor::Device::cuda();
+    const auto backend = tensor::BackendRegistry::instance().backend(device);
+    if (!backend || !(*backend)->is_available(device) || !(*backend)->supports_execution()) return;
+    const auto directory = std::filesystem::temp_directory_path() / "kidi-async-decode-test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    auto model_config = YAML::Clone(config);
+    model_config["max_position_embeddings"] = 64;
+    StateDict state;
+    {
+        const ModuleScope construction(tensor::DType::F32, true, tensor::Device::cpu());
+        auto skeleton = require(model::Gemma4Impl::create(model_config));
+        ops::Context context;
+        bool embedding = false, gate = false, projection = false;
+        for (const auto& [name, parameter] : skeleton->state_dict()) {
+            std::vector<float> values(parameter.numel(), parameter.dimensions() < 2 ? 1.F : 0.F);
+            const auto width = parameter.dimensions() == 2 ? parameter.size(1) : 0;
+            if (name.ends_with("embed_tokens.weight") || name.ends_with("lm_head.weight")) {
+                values[6 * width] = values[7 * width + 1] = values[width + 2] = values[8 * width + 3] = 1.F;
+                embedding = true;
+            }
+            if (name.ends_with("embed_tokens_per_layer.weight")) std::ranges::fill(values, 1.F);
+            if (name.ends_with("layers.3.per_layer_input_gate.weight")) {
+                values[0] = values[width + 1] = 1.F;
+                gate = true;
+            }
+            if (name.ends_with("layers.3.per_layer_projection.weight")) {
+                values[0] = values[width + 1] = -1.F;
+                values[width] = values[2 * width + 1] = 1.F;
+                projection = true;
+            }
+            auto value = require(tensor::Tensor::from_host({parameter.shape().begin(), parameter.shape().end()},
+                                                           std::span<const float>(values)));
+            if (parameter.dimensions() == 2) value = context.cast(value, tensor::DType::BF16);
+            if (name == "lm_head.weight") continue;
+            constexpr std::string_view GATE_UP = "gate_up_proj.weight";
+            const auto key = "model.language_model." + name;
+            if (name.ends_with(GATE_UP)) {
+                const auto prefix = key.substr(0, key.size() - GATE_UP.size());
+                const auto middle = static_cast<std::int64_t>(value.size(0) / 2);
+                state.emplace(prefix + "gate_proj.weight", require(value.narrow(0, 0, middle)));
+                state.emplace(prefix + "up_proj.weight", require(value.narrow(0, middle, middle)));
+            } else {
+                state.emplace(key, std::move(value));
+            }
+        }
+        if (!embedding || !gate || !projection) throw std::runtime_error("async EOS fixture lacks transition weights");
+    }
+    require(checkpoint::Weights::save(directory / "model.safetensors", state));
+    YAML::Node manifest;
+    manifest["format_version"] = 1;
+    manifest["weights_file"] = "model.safetensors";
+    manifest["tokenizer_file"] = "tokenizer.json";
+    manifest["model"] = model_config;
+    manifest["decode"]["maximum_new_tokens"] = 12;
+    manifest["decode"]["context_size"] = 64;
+    std::ofstream(directory / "model.yaml") << manifest;
+    write_tokenizer(directory / "tokenizer.json");
+    auto pipelined = require(inference::Generator::load(directory, device));
+    auto serial = require(inference::Generator::load(directory, device));
+    require(pipelined.configure_serving({.maximum_active = 1,
+                                         .maximum_requests = 1,
+                                         .cache_token_budget = 64,
+                                         .prefill_tokens_per_step = 4,
+                                         .decode_ahead_tokens = 8}));
+    require(serial.configure_serving({.maximum_active = 1,
+                                      .maximum_requests = 1,
+                                      .cache_token_budget = 64,
+                                      .prefill_tokens_per_step = 4,
+                                      .decode_ahead_tokens = 1}));
+    inference::GenerationOptions options;
+    options.maximum_new_tokens = 12;
+    options.context_size = 64;
+    options.prefill_chunk_size = 4;
+    options.raw_prompt = true;
+    options.stream_text = true;
+    options.prefix_cache_bytes = 1024 * 1024;
+    const auto run = [&](auto& generator, std::string_view prompt, auto settings) {
+        require(generator.enqueue(prompt, settings));
+        std::optional<inference::TextGeneration> completed;
+        std::vector<std::int32_t> streamed;
+        while (generator.pending_requests())
+            for (auto& event : require(generator.step()).events) {
+                if (event.token) streamed.push_back(*event.token);
+                if (event.completed) completed = std::move(event.completed);
+            }
+        if (!completed || streamed != completed->generation.token_ids)
+            throw std::runtime_error("asynchronous token events were lost or reordered");
+        return std::move(*completed);
+    };
+    const auto eos = run(pipelined, "alpha", options);
+    const auto expected = run(serial, "alpha", options);
+    if (eos.generation.token_ids != std::vector<std::int32_t>{7} || eos.generation.decoder_steps != 2 ||
+        eos.generation.token_ids != expected.generation.token_ids || eos.stats.decode_queue_peak != 8 ||
+        eos.stats.decode_submitted_tokens < 8)
+        throw std::runtime_error("asynchronous EOS handling published queued post-EOS tokens");
+    const auto continued = run(pipelined, "alpha beta gamma", options);
+    if (continued.stats.reused_prompt_tokens != 2)
+        throw std::runtime_error("EOS rewind retained the speculative rather than logical KV prefix");
+    options.prefix_cache_bytes = 0;
+    options.ignore_eos = true;
+    const auto maximum = run(pipelined, "gamma", options);
+    const auto synchronous = run(serial, "gamma", options);
+    if (maximum.generation.token_ids != synchronous.generation.token_ids || maximum.generation.token_ids.size() != 12 ||
+        maximum.stats.decode_submitted_tokens != 11 || maximum.stats.decode_queue_peak != 8)
+        throw std::runtime_error("decode-ahead violated the maximum or changed synchronous tokens");
+    const auto generated = require(pipelined.generate("gamma", options));
+    if (generated.generation.token_ids != synchronous.generation.token_ids || generated.stats.decode_queue_peak != 8)
+        throw std::runtime_error("serial generation bypassed the device-feedback pipeline");
+    const auto cancelled = require(pipelined.enqueue("gamma", options));
+    require(pipelined.step());
+    require(pipelined.step());
+    require(pipelined.cancel(cancelled));
+    if (pipelined.pending_requests()) throw std::runtime_error("cancelled decode request remained active");
+    const auto cancelled_cache = pipelined.memory().cache_bytes;
+    require(pipelined.enqueue("gamma", options));
+    while (pipelined.pending_requests()) {
+        const auto step = require(pipelined.step());
+        if (step.reserved_cache_tokens > 64 || pipelined.memory().cache_bytes > cancelled_cache)
+            throw std::runtime_error("cancelled in-flight decode released its cache budget before completion");
+    }
+    require(pipelined.release_workspaces());
+    std::filesystem::remove_all(directory);
+}
+
+auto check_bfloat_model(const YAML::Node& config, const kidi::checkpoint::Weights& checkpoint,
+                        std::span<const std::int32_t> tokens) -> bool {
+    using namespace kidi;
+    using ops::require;
+    const auto backend = tensor::BackendRegistry::instance().backend(tensor::Device::cuda());
+    if (!backend || !(*backend)->is_available(tensor::Device::cuda()) || !(*backend)->supports_execution()) return true;
+    StateDict state;
+    {
+        const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
+        auto source = require(model::Gemma4Impl::create(config));
+        require(source->set_checkpoint(checkpoint));
+        ops::Context context(tensor::Device::cpu());
+        for (const auto& [name, value] : source->state_dict())
+            state.emplace(name, value.dimensions() == 2 ? context.cast(value, tensor::DType::BF16) : value);
+    }
+    model::Gemma4 reference{nullptr}, actual{nullptr};
+    {
+        const ModuleScope construction(tensor::DType::BF16, false, tensor::Device::cpu());
+        reference = require(model::Gemma4Impl::create(config));
+        require(reference->set_state(state));
+    }
+    {
+        const ModuleScope construction(tensor::DType::BF16, false, tensor::Device::cuda());
+        actual = require(model::Gemma4Impl::create(config));
+        require(actual->set_state(state));
+    }
+    auto reference_state = require(reference->create_state(8));
+    auto actual_state = require(actual->create_state(8));
+    if (actual_state.layers.front().key.dtype() != tensor::DType::BF16) return false;
+    const auto expected = require(reference->forward(tokens, reference_state, true));
+    const auto output = require(require(actual->forward(tokens, actual_state, true)).to(tensor::Device::cpu()));
+    if (output.dtype() != tensor::DType::F32 || !std::ranges::equal(output.shape(), expected.shape())) return false;
+    const auto expected_values = require(expected.data<float>()), actual_values = require(output.data<float>());
+    for (std::size_t index = 0; index < actual_values.size(); ++index)
+        if (!std::isfinite(actual_values[index]) ||
+            std::abs(actual_values[index] - expected_values[index]) > 0.03F + 0.02F * std::abs(expected_values[index]))
+            return false;
+    auto extended_config = YAML::Clone(config);
+    extended_config["max_position_embeddings"] = 384;
+    model::Gemma4 extended{nullptr};
+    {
+        const ModuleScope construction(tensor::DType::BF16, false, tensor::Device::cuda());
+        extended = require(model::Gemma4Impl::create(extended_config));
+        require(extended->set_state(state));
+    }
+    std::vector<std::int32_t> sequence(258);
+    for (std::size_t index = 0; index < sequence.size(); ++index) sequence[index] = tokens[index % tokens.size()];
+    auto cropped = require(extended->create_state(384)), uncropped = require(extended->create_state(384));
+    uncropped.crop_local_attention = false;
+    require(extended->prefill(sequence, cropped));
+    require(extended->prefill(sequence, uncropped));
+    for (int iteration = 0; iteration < 4; ++iteration) {
+        const auto token = tokens[iteration % tokens.size()];
+        const std::array input{token};
+        const auto first = require(extended->forward(input, cropped));
+        const auto second = require(extended->forward(input, uncropped));
+        const auto first_values = require(require(first.to(tensor::Device::cpu())).copy_to_host());
+        const auto second_values = require(require(second.to(tensor::Device::cpu())).copy_to_host());
+        if (first_values != second_values) return false;
+    }
+    return true;
 }
 
 auto main() -> int {
@@ -435,6 +627,9 @@ auto main() -> int {
             const auto token_tensor = ops::require(reference.tensor("tokens"));
             const auto expected = ops::require(reference.tensor("logits"));
             const auto tokens = ops::require(token_tensor.data<std::int32_t>());
+            if (fixture == std::string_view("gemma4") && !check_bfloat_model(config, checkpoint, tokens))
+                return failed(__LINE__);
+            if (fixture == std::string_view("gemma4")) check_async_serving(config);
             const auto values = ops::require(expected.data<float>());
             auto invalid_config = YAML::Clone(config);
             invalid_config.remove("global_head_dim");
@@ -466,16 +661,17 @@ auto main() -> int {
                     const auto gate =
                         ops::require(checkpoint.tensor("model.language_model." + prefix + "gate_proj.weight"));
                     const auto& combined = parameters.at(prefix + "gate_up_proj.weight");
-                    if (combined.size(0) != 2 * gate.size(0) || combined.size(1) != gate.size(1)) return failed(__LINE__);
+                    if (combined.size(0) != 2 * gate.size(0) || combined.size(1) != gate.size(1))
+                        return failed(__LINE__);
                 }
                 auto full = ops::require(model->create_state(8));
                 const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
-                const auto& capabilities = tensor::DEVICE_CAPABILITIES[device.kind];
+                const auto& capabilities = device.capabilities();
                 const auto cache_dtype =
                     fixture == std::string_view("gemma4-qat") &&
                             (cache_override == nullptr || std::string_view(cache_override) != "0") &&
-                            capabilities.calibrated_int8_cast && capabilities.blockwise_int8_attention &&
-                            8 <= capabilities.blockwise_int8_attention_max_tokens
+                            capabilities.compute.supports(tensor::TransformerSupport::QUANTIZED) &&
+                            8 <= capabilities.attention.int8_cache_tokens
                         ? tensor::DType::I8
                         : tensor::DType::F32;
                 for (const auto& cache : full.layers)
@@ -500,12 +696,12 @@ auto main() -> int {
                 model->set_kv_cache_precision(core::KVCachePrecision::AUTO);
                 if (fixture == std::string_view("gemma4-qat") && device == tensor::Device::cpu()) {
                     std::vector precisions{
-                        core::InferencePrecision::FP32,      core::InferencePrecision::BF16,
-                        core::InferencePrecision::Q2A16,     core::InferencePrecision::Q4A16,
-                        core::InferencePrecision::Q8A16,     core::InferencePrecision::Q2AE4M3,
-                        core::InferencePrecision::Q4AE4M3,   core::InferencePrecision::Q8AE4M3,
-                        core::InferencePrecision::Q2AE5M2,   core::InferencePrecision::Q4AE5M2,
-                        core::InferencePrecision::Q8AE5M2,   core::InferencePrecision::QAT_FP32,
+                        core::InferencePrecision::FP32,    core::InferencePrecision::BF16,
+                        core::InferencePrecision::Q2A16,   core::InferencePrecision::Q4A16,
+                        core::InferencePrecision::Q8A16,   core::InferencePrecision::Q2AE4M3,
+                        core::InferencePrecision::Q4AE4M3, core::InferencePrecision::Q8AE4M3,
+                        core::InferencePrecision::Q2AE5M2, core::InferencePrecision::Q4AE5M2,
+                        core::InferencePrecision::Q8AE5M2, core::InferencePrecision::QAT_FP32,
                     };
 #if defined(__APPLE__)
                     precisions.push_back(core::InferencePrecision::LOWBIT_PARITY);
@@ -571,7 +767,7 @@ auto main() -> int {
                     for (std::size_t step = 0; step + 1 < fed.capacity; ++step) {
                         const auto selected = ops::require(model->forward_token(token, fed));
                         next = ops::require(model->forward_token(std::span(&next, 1), integer));
-                        if (ops::require(selected.data<std::int32_t>())[0] != next) {
+                        if (selected.device() != device || ops::require(selected.data<std::int32_t>())[0] != next) {
                             std::cerr << "Gemma token tensor feedback differs at step " << step << '\n';
                             return failed(__LINE__);
                         }
@@ -655,7 +851,8 @@ auto main() -> int {
                         std::abs(tail_values[index] - reference_tail[index]) > 2e-4F)
                         return failed(__LINE__);
                 const std::array<std::int32_t, 1> invalid{-1};
-                if (model->forward(invalid, incremental) || incremental.position != tokens.size()) return failed(__LINE__);
+                if (model->forward(invalid, incremental) || incremental.position != tokens.size())
+                    return failed(__LINE__);
                 if (model->set_checkpoint(checkpoint, 4, 3)) return failed(__LINE__);
                 ops::require(model->set_checkpoint(checkpoint));
                 if (config["quantization_config"]) {
@@ -699,8 +896,9 @@ auto main() -> int {
                     const auto extended_cache_dtype =
                         fixture == std::string_view("gemma4-qat") &&
                                 (cache_override == nullptr || std::string_view(cache_override) != "0") &&
-                                capabilities.calibrated_int8_cast && capabilities.blockwise_int8_attention &&
-                                capacity <= capabilities.blockwise_int8_attention_max_tokens
+                                capabilities.compute.supports(tensor::TransformerSupport::QUANTIZED) &&
+                                capabilities.attention.int8_cache_tokens &&
+                                capacity <= capabilities.attention.int8_cache_tokens
                             ? tensor::DType::I8
                             : tensor::DType::F32;
                     for (const auto& cache : prefix_state.layers)
@@ -752,15 +950,15 @@ auto main() -> int {
                         std::vector<std::int32_t> generated{
                             static_cast<std::int32_t>(std::ranges::max_element(logits) - logits.begin())};
                         for (int step = 0; step < 3; ++step) {
-                            const auto next = ops::require(extended->forward_token(std::span(generated).last(1), state));
+                            const auto next =
+                                ops::require(extended->forward_token(std::span(generated).last(1), state));
                             generated.push_back(next);
                         }
                         return generated;
                     };
-                    const std::array generated{continuation(bucket_values, bucket_state),
-                                               continuation(prefix_values, prefix_state),
-                                               continuation(history_values, history_state),
-                                               continuation(larger_values, larger_state)};
+                    const std::array generated{
+                        continuation(bucket_values, bucket_state), continuation(prefix_values, prefix_state),
+                        continuation(history_values, history_state), continuation(larger_values, larger_state)};
                     for (std::size_t index = 1; index < generated.size(); ++index)
                         if (generated[index] != generated[0]) {
                             std::cerr << "length " << length << ": chunking " << index

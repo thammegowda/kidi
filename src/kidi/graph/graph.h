@@ -59,6 +59,7 @@ public:
     auto rebind(std::span<const Tensor> inputs) -> void;
     using ScratchAllocator = std::function<Tensor(std::size_t, std::size_t, tensor::DType, tensor::Device)>;
     auto plan_intermediates(const ScratchAllocator& allocate = {}) -> BufferPlanStats;
+    auto nodes() noexcept -> std::span<Node> { return nodes_; }
     auto nodes() const noexcept -> std::span<const Node> { return nodes_; }
     auto inputs() const noexcept -> std::span<const Tensor> { return inputs_; }
     auto outputs() const noexcept -> std::span<const Tensor> { return outputs_; }

@@ -33,7 +33,7 @@ build-python-test: setup-test
 	wheel=$$(find "$(TEST_DIST)" -name 'kidi-*.whl' -print -quit); test -n "$$wheel"; $(TEST_PYTHON) -m pip install --disable-pip-version-check --force-reinstall --no-deps "$$wheel"
 
 python-test: build-python-test
-	$(TEST_PYTHON) -m unittest discover -s tests -p python_cli_test.py
+	$(TEST_PYTHON) -m unittest discover -s tests -p '*_test.py'
 
 web-test:
 	node --test tests/browser/*_test.mjs third_party/liteapp/tests/browser/*_test.mjs

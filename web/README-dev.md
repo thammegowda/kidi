@@ -644,8 +644,7 @@ tokens/s and described an attached photo correctly. The CPU table is Node
 measurements of the same modules. Safari 26.6 ran
 the current wasm32 build on the same prompt with the same 32 token IDs: one
 thread at 18.8 prompt / 4.4 decode tokens/s and four threads at 52.7 / 11.8,
-both peaking at 2.24 GiB. Native wasm64 parity and an image request are in the
-[optimization journal](../benchmarks/gemma4/JOURNAL.md).
+both peaking at 2.24 GiB.
 
 ### Memory diagnostics
 
@@ -832,8 +831,8 @@ with JSPI, such as current Chromium): its checks read GPU results inline through
 a test-only `set_web_gpu_wait` hook. Disable HTTP caching when iterating on shader modules. Checks cover
 packed projections, attention, float/QAT Gemma references, replay rebinding,
 token readback, cache scatter aliasing and errors, and buffer lifetime/budgets.
-Full-model observations and performance limitations are recorded in the
-[optimization journal](../benchmarks/gemma4/JOURNAL.md).
+Browser benchmark entrypoints are listed in the
+[benchmark guide](../benchmarks/README.md#browser).
 
 ### Historical CPU Measurements
 

@@ -49,9 +49,14 @@ __pycache__/
 /tests/**/*.log
 /tests/data/**/*.out.txt
 
-# Generated benchmark output; keep source, reports, and corpus inputs.
+# Generated benchmark output; retain only canonical references and reports.
 /benchmarks/**/.cache/
 /benchmarks/**/*.log
+/benchmarks/**/*.json
+!/benchmarks/cpu/reference.json
+!/benchmarks/cuda/2026-10-25-controlled-e2b-four-way-tgpc01.json
+!/benchmarks/cuda/2026-10-25-bf16-pipelined-long-tgpc01.json
+!/benchmarks/cuda/2026-10-25-async-decode-validation-tgpc01.json
 /benchmarks/**/*.quality.json
 /benchmarks/**/*.jsonl
 /benchmarks/**/results.json

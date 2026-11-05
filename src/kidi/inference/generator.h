@@ -27,6 +27,7 @@ struct GenerationStats {
     std::uint64_t generation_ns = 0;
     std::size_t prompt_tokens = 0, decode_tokens = 0;
     std::size_t reused_prompt_tokens = 0, prefix_cache_bytes = 0, prefix_reserved_bytes = 0;
+    std::size_t decode_submitted_tokens = 0, decode_queue_peak = 0;
 };
 struct TextGeneration {
     std::string text;
@@ -43,6 +44,7 @@ struct ServingOptions {
     /// `step()` submits work and reports the tokens it selects on the following call, so a device may finish
     /// asynchronously in between without the caller blocking (the browser awaits WebGPU between calls).
     bool deferred_tokens = false;
+    std::size_t decode_ahead_tokens = 0;
 };
 struct GenerationEvent {
     std::uint64_t request_id;
@@ -62,14 +64,14 @@ auto select_device(std::string_view accelerator, bool speech = false) -> Result<
 
 /// Live bytes held by generation state, on whichever device owns it.
 struct GeneratorMemory {
-    std::size_t cache_bytes = 0;  // KV caches of running requests and retained prompt prefixes
-    std::size_t image_bytes = 0;  // reusable image embeddings
+    std::size_t cache_bytes = 0; // KV caches of running requests and retained prompt prefixes
+    std::size_t image_bytes = 0; // reusable image embeddings
 };
 
 /// Creates a tensor that model.yaml lists under `external_tensors`: checkpoint data the embedder keeps outside
 /// linear memory, such as browser-held lookup tables.
-using ExternalTensorSource =
-    std::function<Result<tensor::Tensor>(std::string_view name, tensor::DType dtype, std::span<const std::int64_t> shape)>;
+using ExternalTensorSource = std::function<Result<tensor::Tensor>(std::string_view name, tensor::DType dtype,
+                                                                  std::span<const std::int64_t> shape)>;
 
 struct ModelLoadOptions {
     tensor::Device device = tensor::Device::cpu();
@@ -92,12 +94,12 @@ public:
     /// Where text generation runs, e.g. "cpu", "vulkan", or "cpu+qnn-htp".
     auto execution() const -> std::string;
     auto generate(std::string_view prompt, GenerationOptions options = {}) -> Result<TextGeneration>;
-    auto generate_batch(std::span<const std::string> prompts,
-                        GenerationOptions options = {}) -> Result<GenerationBatch>;
+    auto generate_batch(std::span<const std::string> prompts, GenerationOptions options = {})
+        -> Result<GenerationBatch>;
     auto configure_serving(ServingOptions options) -> Result<void>;
     auto enqueue(std::string_view prompt, GenerationOptions options = {}) -> Result<std::uint64_t>;
-    auto enqueue_chat(std::span<const text::ChatMessage> messages,
-                      GenerationOptions options = {}) -> Result<std::uint64_t>;
+    auto enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options = {})
+        -> Result<std::uint64_t>;
     auto step() -> Result<GenerationStep>;
     auto cancel(std::uint64_t request_id) -> Result<void>;
     auto pending_requests() const -> std::size_t { return waiting_.size() + running_.size(); }
@@ -139,6 +141,17 @@ private:
     };
     std::optional<PrefixEntry> prefix_;
     std::optional<PrefixEntry> serving_prefix_;
+    struct DecodeReadback {
+        std::shared_ptr<tensor::Readback> transfer;
+        std::size_t position;
+    };
+    struct DeviceDecode {
+        tensor::Tensor token;
+        std::deque<DecodeReadback> pending;
+        std::size_t submitted = 0, logical_position = 0;
+        std::chrono::steady_clock::time_point started;
+        std::chrono::steady_clock::time_point next_poll;
+    };
     struct QueuedGeneration {
         std::uint64_t id;
         std::vector<std::int32_t> prompt;
@@ -151,8 +164,11 @@ private:
         std::string streamed_text;
         std::vector<model::Gemma4ImageTokens> images;
         std::string image_key;
+        std::optional<DeviceDecode> decode;
+        bool completion_emitted = false;
     };
     auto retain_serving_prefix(QueuedGeneration& request) -> void;
+    auto reap_retired() -> void;
     /// Throws on devices whose selected tokens reach the host only on a later call (see `deferred_tokens`).
     auto require_immediate_tokens() const -> void;
     struct PendingToken {
@@ -166,6 +182,7 @@ private:
     std::optional<ServingOptions> serving_;
     std::deque<QueuedGeneration> waiting_;
     std::vector<QueuedGeneration> running_;
+    std::vector<QueuedGeneration> retired_;
     std::size_t reserved_cache_tokens_ = 0;
     std::uint64_t next_request_id_ = 1, prefill_after_ = 0;
     bool serving_failed_ = false;

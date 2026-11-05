@@ -80,6 +80,16 @@ python -m kidi chat \
 
 The backend and color settings both default to `auto`. To force CPU
 execution, use `--backend ynnpack`; to require Apple Metal, use `--backend mps`.
+For an [NVIDIA CUDA build](../README-dev.md#cuda), use `--backend cuda:0`:
+
+```bash
+python -m kidi chat -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0
+```
+
+`cuda` also selects GPU 0; `cuda:INDEX` selects a different device. CUDA is an
+explicit choice rather than part of `auto` selection and requires a package
+built with `KIDI_ENABLE_CUDA=ON`.
+
 You can also use
 `kidi chat` instead of `python -m kidi chat` when `kidi` is the pip-installed
 launcher. On first use, Kidi downloads the necessary files into

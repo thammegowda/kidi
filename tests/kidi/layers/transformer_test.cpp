@@ -74,7 +74,20 @@ auto main() -> int {
             if (backend.device_kind == tensor::DeviceKind::A_GPU && backend.execution_available &&
                 default_device != tensor::Device::apple_gpu())
                 return 1;
+        if (!core::default_module_device().capabilities().compute.supports(tensor::TransformerSupport::GENERAL))
+            return 1;
         const ModuleScope cpu_parameters(tensor::Device::cpu());
+        {
+            const ModuleScope indexed(tensor::DType::F32, false, tensor::Device::cuda(7));
+            layers::Linear pending(4, 3);
+            if (pending->device() != tensor::Device::cuda(7) || pending->state_dict().at("weight").defined()) return 1;
+            {
+                const ModuleScope nested(tensor::Device::cpu());
+                if (module_device != tensor::Device::cpu() || allocate_parameters) return 1;
+            }
+            if (module_device != pending->device() || allocate_parameters) return 1;
+        }
+        if (module_device != tensor::Device::cpu() || !allocate_parameters) return 1;
         layers::Linear scoped{nullptr};
         {
             const ModuleScope outer(tensor::DType::BF16, false, default_device);

@@ -45,8 +45,8 @@ Transcriber::Transcriber(YAML::Node config, YAML::Node generation, audio::Whispe
 
 auto Transcriber::load(const std::filesystem::path& directory, tensor::Device device) -> Result<Transcriber> {
     try {
-        if (device != tensor::Device::cpu() && device != tensor::Device::web_gpu())
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper supports CPU and WebGPU execution"});
+        if (!device.capabilities().supports_audio_transformer())
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "device lacks the operations required for Whisper inference"});
         const auto adapter = model::WhisperImpl::checkpoint_config();
         auto config = require(checkpoint::load_config(directory, adapter));
         if (config["weights_format"].as<std::string>("") == "whisper_ggml")
@@ -110,7 +110,7 @@ auto Transcriber::warm_up() -> Result<void> {
 
 auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t sample_rate,
                              const TranscriptionOptions& options) -> Result<Transcription> {
-    if (model_->device() == tensor::Device::web_gpu())
+    if (model_->device().capabilities().memory.deferred())
         return std::unexpected(Error{ErrorCode::UNSUPPORTED, "WebGPU transcription requires a stepped session"});
     auto pending = start(waveform, sample_rate, options);
     if (!pending) return std::unexpected(std::move(pending.error()));
@@ -138,7 +138,7 @@ auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint3
         const auto feature_start = Clock::now();
         const auto features = require(extractor_.extract(waveform, sample_rate));
         const auto feature_ns = elapsed(feature_start);
-        const auto gpu = model_->device() == tensor::Device::web_gpu();
+        const auto gpu = model_->device().capabilities().sampling.supports(tensor::TokenSelection::DEVICE);
         tensor::Tensor normal_mask, begin_mask, language_ids;
         std::vector<std::string> language_names;
         const auto detect_language = options.language == "auto" || options.language.find(',') != std::string::npos;

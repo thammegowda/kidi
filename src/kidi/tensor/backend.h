@@ -22,6 +22,13 @@ public:
     virtual auto size_bytes() const noexcept -> std::size_t = 0;
 };
 
+class Readback {
+public:
+    virtual ~Readback() = default;
+    virtual auto ready() const -> Result<bool> = 0;
+    virtual auto bytes() const -> Result<std::span<const std::byte>> = 0;
+};
+
 class Backend {
 public:
     virtual ~Backend() = default;
@@ -48,6 +55,10 @@ public:
                                 std::span<const std::byte> source) const -> Result<void> = 0;
     virtual auto copy_to_host(const Storage& source, std::size_t source_offset, std::span<std::byte> destination) const
         -> Result<void> = 0;
+    virtual auto copy_to_host_later(const Storage& source, std::size_t source_offset,
+                                    std::span<std::byte> destination) const -> Result<void>;
+    virtual auto readback(std::shared_ptr<const Storage> source, std::size_t offset, std::size_t bytes) const
+        -> Result<std::shared_ptr<Readback>>;
     virtual auto host_view(Storage& storage) const -> Result<std::span<std::byte>> = 0;
     virtual auto host_view(const Storage& storage) const -> Result<std::span<const std::byte>> = 0;
     virtual auto synchronize(Device device) const -> Result<void> = 0;
@@ -82,6 +93,7 @@ private:
 };
 
 auto make_ynnpack_backend() -> std::shared_ptr<Backend>;
+auto make_cuda_backend() -> std::shared_ptr<Backend>;
 auto make_metal_backend() -> std::shared_ptr<Backend>;
 auto make_web_gpu_backend() -> std::shared_ptr<Backend>;
 auto make_vulkan_backend() -> std::shared_ptr<Backend>;

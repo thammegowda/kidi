@@ -1,4 +1,5 @@
 #include "kidi/runtime/operator.h"
+#include "kidi/graph/compiler.h"
 
 #include <QnnInterface.h>
 #include <QnnOpDef.h>
@@ -1202,7 +1203,7 @@ private:
     std::vector<std::uint8_t> input_buffer_, output_buffer_;
 };
 
-class QnnStepExecutable final : public StepExecutable {
+class QnnStepExecutable final : public graph::Executable {
 public:
     QnnStepExecutable(std::shared_ptr<QnnRuntime> runtime, std::unique_ptr<QnnContext> context, std::vector<Node> nodes,
                       std::vector<Tensor> inputs, std::vector<QnnPartition> partitions)
@@ -2028,7 +2029,7 @@ auto whole_fingerprint(const Graph& graph, std::string_view key, const QnnRuntim
 }
 
 /// Runs a complete captured prefill or decode step through chained HTP graphs.
-class WholeStepExecutable final : public StepExecutable {
+class WholeStepExecutable final : public graph::Executable {
 public:
     WholeStepExecutable(std::shared_ptr<QnnRuntime> runtime, std::unique_ptr<QnnContext> context,
                         std::unique_ptr<SharedMemory> memory, std::vector<Node> nodes, std::vector<Tensor> inputs,
@@ -2289,7 +2290,7 @@ public:
           constant_blocks_(constant_blocks) {}
 
     auto lower(const std::filesystem::path& binary_path = {}, const std::filesystem::path& metadata_path = {},
-               std::string_view id = {}) -> std::unique_ptr<StepExecutable> {
+               std::string_view id = {}) -> std::unique_ptr<graph::Executable> {
         const auto nodes = graph_.nodes();
         analyze();
         context_ = std::make_unique<QnnContext>(runtime_);
@@ -2320,8 +2321,8 @@ public:
         return executable();
     }
 
-    auto load(std::span<const std::uint8_t> binary, const std::filesystem::path& metadata_path,
-              std::string_view id) -> std::unique_ptr<StepExecutable> {
+    auto load(std::span<const std::uint8_t> binary, const std::filesystem::path& metadata_path, std::string_view id)
+        -> std::unique_ptr<graph::Executable> {
         const auto document = nlohmann::json::parse(read_file(metadata_path));
         if (document.value("version", "") != CACHE_VERSION || document.value("id", "") != id ||
             document.value("prefill", !prefill_) != prefill_)
@@ -2366,7 +2367,7 @@ public:
     }
 
 private:
-    auto executable() -> std::unique_ptr<StepExecutable> {
+    auto executable() -> std::unique_ptr<graph::Executable> {
         const auto nodes = graph_.nodes();
         return std::make_unique<WholeStepExecutable>(
             runtime_, std::move(context_), std::move(memory_), std::vector<Node>(nodes.begin(), nodes.end()),
@@ -3150,12 +3151,12 @@ private:
     std::size_t exported_count_ = 0;
 };
 
-class QnnStepCompiler final : public StepCompiler {
+class QnnStepCompiler final : public graph::Compiler {
 public:
     explicit QnnStepCompiler(std::shared_ptr<QnnRuntime> runtime) : runtime_(std::move(runtime)) {}
 
     auto name() const -> std::string_view override { return "qnn-htp"; }
-    auto requires_second_capture(std::string_view key) const -> bool override {
+    auto requires_second_capture(std::string_view key) const -> std::optional<bool> override {
         return !key.starts_with("gemma4_prefill:");
     }
 
@@ -3267,7 +3268,7 @@ public:
         }
     }
 
-    auto compile(const Graph& graph, std::string_view key) -> std::unique_ptr<StepExecutable> override {
+    auto compile(const Graph& graph, std::string_view key) -> std::unique_ptr<graph::Executable> override {
         const bool decode = key.starts_with("gemma4_decode:") && key.ends_with(":token");
         const bool prefill = key.starts_with("gemma4_prefill:");
         if ((!decode && !prefill) || getenv_string("KIDI_QNN_STEPS") == "0") return nullptr;
@@ -3287,7 +3288,7 @@ public:
                 }
                 const bool diagnostics =
                     !getenv_string("KIDI_QNN_NODE_LIMIT").empty() || !getenv_string("KIDI_QNN_VERIFY_CAPTURE").empty();
-                std::unique_ptr<StepExecutable> executable;
+                std::unique_ptr<graph::Executable> executable;
                 bool loaded = false;
                 if (!diagnostics && std::filesystem::exists(binary_path) && std::filesystem::exists(metadata_path)) {
                     executable = StepLowering(runtime_, graph, prefill, constant_mutex_, constant_blocks_)
@@ -3411,10 +3412,10 @@ auto cache_has_entries() -> bool {
 
 } // namespace
 
-auto npu_step_compiler() -> Result<std::shared_ptr<StepCompiler>> {
+auto npu_step_compiler() -> Result<std::shared_ptr<graph::Compiler>> {
     static std::mutex mutex;
     // QNN/FastRPC teardown can outlive C++ static destruction; keep the singleton alive until process exit.
-    static auto* compiler = new std::shared_ptr<StepCompiler>;
+    static auto* compiler = new std::shared_ptr<graph::Compiler>;
     static auto* error = new std::optional<Error>;
     std::scoped_lock lock(mutex);
     if (*compiler) return *compiler;

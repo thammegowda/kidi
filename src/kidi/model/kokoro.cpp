@@ -196,7 +196,7 @@ private:
 };
 
 auto shape(const Tensor& input, std::int64_t time, std::int64_t channels) -> void {
-    if (input.dtype() != DType::F32 || input.device() != tensor::Device::cpu() || input.dimensions() != 3 ||
+    if (input.dtype() != DType::F32 || !input.device().capabilities().compute.host() || input.dimensions() != 3 ||
         input.size(0) != 1 || input.size(1) != time || input.size(2) != channels)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Kokoro tensor shape mismatch"});
 }
@@ -922,7 +922,7 @@ auto KokoroImpl::load(YAML::Node config, checkpoint::Weights weights) -> Result<
 
 auto KokoroImpl::load(YAML::Node package, tensor::Device device) -> Result<Kokoro> {
     try {
-        if (device != tensor::Device::cpu())
+        if (!device.capabilities().compute.host())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "Kokoro currently supports the CPU only"});
         auto phonemizer = require(text::LexiconPhonemizer::load(package["lexicon_file"].as<std::string>(),
                                                                 package["model"]["config"]["vocab"]));

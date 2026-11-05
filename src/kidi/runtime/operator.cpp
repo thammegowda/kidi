@@ -7,19 +7,17 @@
 
 namespace kidi::runtime {
 
+auto OperatorBackend::stage_inputs(std::span<const tensor::Tensor> inputs, tensor::Device device)
+    -> std::vector<tensor::Tensor> {
+    std::vector<tensor::Tensor> staged;
+    staged.reserve(inputs.size());
+    for (const auto& input : inputs) staged.push_back(ops::require(input.to(device)));
+    return staged;
+}
+
 auto Operator::run_into(TensorInputs, std::span<tensor::Tensor>) -> void {
     throw ops::Failure({ErrorCode::UNSUPPORTED, "this backend cannot replay captured steps"});
 }
-auto OperatorBackend::prepare_graph(const graph::Graph&, std::string_view) -> std::unique_ptr<StepExecutable> {
-    return nullptr;
-}
-
-#if !defined(KIDI_HAS_QNN)
-auto npu_step_compiler() -> Result<std::shared_ptr<StepCompiler>> {
-    return std::unexpected(Error{ErrorCode::UNSUPPORTED, "the Qualcomm NPU backend is not built"});
-}
-#endif
-
 auto operation_name(Operation operation) -> std::string_view {
     constexpr std::array names{"add",
                                "multiply",
@@ -58,7 +56,8 @@ auto operation_name(Operation operation) -> std::string_view {
                                "snake_conv1d",
                                "snake_quantized_linear",
                                "conv_transpose_fold",
-                               "snake"};
+                               "snake",
+                               "gelu_gate"};
     return names.at(static_cast<std::size_t>(operation));
 }
 
