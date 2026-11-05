@@ -586,12 +586,15 @@ public:
             bindings.push_back(std::move(binding));
         }
         auto executable = std::make_unique<CudaExecutable>(source, device_, std::move(bindings), std::string(key));
-        const auto timestamp =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-                .count();
-        std::cerr << "kidi_cuda_graph|key=" << key << "|nodes=" << source.nodes().size()
-                  << "|projection_groups=" << executable->projection_groups()
-                  << "|capture=completed|steady_ns=" << timestamp << '\n';
+        // Parsed by benchmarks/cuda/compare_gemma.py.
+        if (const auto* log = std::getenv("KIDI_CUDA_GRAPH_LOG"); log && std::string_view(log) == "1") {
+            const auto timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count();
+            std::cerr << "kidi_cuda_graph|key=" << key << "|nodes=" << source.nodes().size()
+                      << "|projection_groups=" << executable->projection_groups()
+                      << "|capture=completed|steady_ns=" << timestamp << '\n';
+        }
         return executable;
     }
 

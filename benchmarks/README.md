@@ -99,8 +99,10 @@ existing scheduling. Ordinary `generate()` uses the pipeline without prefix cach
 
 Diagnostic overrides: `KIDI_PROFILE_OPS=graph` profiles replay phases; `=events`
 profiles captured operators; `KIDI_CUDA_PROFILE=1` brackets measured native
-requests for `nsys --capture-range=cudaProfilerApi`. The comparison driver clears
-these overrides. Store raw traces and logs under `.cache/`.
+requests for `nsys --capture-range=cudaProfilerApi`; `KIDI_CUDA_GRAPH_LOG=1`
+prints one `kidi_cuda_graph|...` stderr line per graph capture. The comparison
+driver clears the profiling overrides and sets the log so it can reject captures
+inside measured requests. Store raw traces and logs under `.cache/`.
 
 ### Multi-Model Runner
 
