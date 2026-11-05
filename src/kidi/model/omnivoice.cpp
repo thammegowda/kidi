@@ -192,7 +192,8 @@ struct OmniVoiceImpl::State {
         if (tokens.dtype() != tensor::DType::I32 || tokens.dimensions() != 2 ||
             tokens.size(0) != static_cast<std::size_t>(codebooks) || !tokens.size(1))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid OmniVoice audio token dimensions"});
-        if (context.device().capabilities().sampling.diffusion) return audio_embeddings->forward_sum(context, tokens);
+        if (context.device().capabilities().compute.embedding_sum)
+            return audio_embeddings->forward_sum(context, require(tokens.to(context.device())));
         const auto length = tokens.size(1);
         const auto codes = require(tokens.data<std::int32_t>());
         tensor::Tensor audio;
@@ -601,7 +602,7 @@ auto OmniVoiceImpl::synthesis_session_(std::string text, inference::SynthesisOpt
         std::uniform_real_distribution<float> uniform(std::nextafter(0.F, 1.F), 1.F);
         std::vector<float> conditional_copy;
         std::vector<float> logits_host;
-        const auto device_diffusion = impl_->context.device().capabilities().sampling.diffusion;
+        const auto device_diffusion = impl_->context.device().capabilities().supports_diffusion_feedback();
         tensor::Tensor device_tokens, device_candidates, reference_embedding;
         if (device_diffusion) device_tokens = require(host_tokens.to(impl_->context.device()));
         if (reference)

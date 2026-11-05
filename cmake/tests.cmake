@@ -78,7 +78,7 @@ if(KIDI_BUILD_INTEGRATION_TESTS)
     find_program(KIDI_TEST_NODE node REQUIRED)
 
     add_test(NAME kidi_python_test COMMAND "${KIDI_TEST_PYTHON}" -m unittest discover
-        -s "${PROJECT_SOURCE_DIR}/tests" -p python_cli_test.py)
+        -s "${PROJECT_SOURCE_DIR}/tests" -p "*_test.py")
     set_tests_properties(kidi_python_test PROPERTIES LABELS python WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
 
     add_test(NAME kidi_browser_test COMMAND "${KIDI_TEST_NODE}" --test

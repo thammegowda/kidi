@@ -602,7 +602,7 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
     }
     kidi::runtime::ynn::set_thread_count(threads);
     const auto started = std::chrono::steady_clock::now();
-    const auto device = inference_device(arguments);
+    const auto device = kidi::tensor::parse_cuda_device(backend).value_or(kidi::tensor::Device::cpu());
     auto transcriber = kidi::inference::Transcriber::load(directory, device);
     if (!transcriber) {
         spdlog::error("{}", transcriber.error().message);

@@ -45,6 +45,7 @@ struct ComputeCapabilities {
     TransformerSupport transformer = TransformerSupport::NONE;
     AudioExecution audio = AudioExecution::NONE;
     bool embedding = false;
+    bool embedding_sum = false;
 
     constexpr auto host() const noexcept -> bool { return execution == ExecutionDomain::HOST; }
     constexpr auto supports(TransformerSupport required) const noexcept -> bool { return transformer >= required; }
@@ -75,6 +76,10 @@ struct DeviceCapabilities {
     constexpr auto supports_audio_transformer() const noexcept -> bool {
         return compute.supports(TransformerSupport::QUANTIZED) && compute.embedding &&
                compute.audio != AudioExecution::NONE;
+    }
+
+    constexpr auto supports_diffusion_feedback() const noexcept -> bool {
+        return compute.embedding_sum && sampling.diffusion;
     }
 };
 
@@ -113,6 +118,7 @@ enum class FeedForwardKernel { COMPOSED, PACKED_GATE, PACKED_SMALL, PACKED_LARGE
 enum class PrefillStrategy { FULL, LAST_TOKEN, SHARED_KV_TAIL };
 enum class ParameterBinding { PREPARED, DYNAMIC_LINEAR, DYNAMIC };
 enum class ProjectionDispatch { DEFAULT, VECTOR_DECODE };
+enum class CodecTokenInput { DEVICE, HOST_STAGED };
 
 struct TransformerPolicy {
     FeedForwardKernel gelu = FeedForwardKernel::COMPOSED;
@@ -121,6 +127,10 @@ struct TransformerPolicy {
     bool crop_history = false;
     std::size_t attention_query_rows = 512;
     std::size_t decode_ahead_tokens = 1;
+};
+
+struct AudioPolicy {
+    CodecTokenInput codec_tokens = CodecTokenInput::DEVICE;
 };
 
 struct ReplayPolicy {
@@ -138,6 +148,7 @@ struct DispatchPolicy {
 struct DevicePolicy {
     ParameterPolicy parameters{};
     TransformerPolicy transformer{};
+    AudioPolicy audio{};
     ReplayPolicy replay{};
     DispatchPolicy dispatch{};
 };
@@ -191,7 +202,8 @@ inline constexpr EnumMap<DeviceKind, DeviceProfile, static_cast<std::size_t>(Dev
         std::pair{DeviceKind::CUDA,
                   DeviceProfile{.capabilities = {.compute = {.transformer = TransformerSupport::QUANTIZED,
                                                              .audio = AudioExecution::NATIVE,
-                                                             .embedding = true},
+                                                             .embedding = true,
+                                                             .embedding_sum = true},
                                                  .sampling = {TokenSelection::CHAINED_DEVICE, true}},
                                 .policy = {.parameters = {.audio = ParameterResidency::HOST},
                                            .transformer = {.gelu = FeedForwardKernel::PACKED_GATE,
@@ -210,13 +222,15 @@ inline constexpr EnumMap<DeviceKind, DeviceProfile, static_cast<std::size_t>(Dev
                                            .transformer = {.gelu = FeedForwardKernel::PACKED_INT8,
                                                            .silu = FeedForwardKernel::PACKED_GATE,
                                                            .prefill = PrefillStrategy::SHARED_KV_TAIL},
+                                           .audio = {.codec_tokens = CodecTokenInput::HOST_STAGED},
                                            .dispatch = {.parameters = ParameterBinding::DYNAMIC_LINEAR,
                                                         .projection = ProjectionDispatch::VECTOR_DECODE}}}},
         std::pair{
             DeviceKind::WEB_GPU,
             DeviceProfile{.capabilities = {.compute = {.transformer = TransformerSupport::QUANTIZED,
                                                        .audio = AudioExecution::NATIVE,
-                                                       .embedding = true},
+                                                       .embedding = true,
+                                                       .embedding_sum = true},
                                            .sampling = {TokenSelection::DEVICE, true},
                                            .attention = {.int8_cache_tokens = std::numeric_limits<std::size_t>::max()},
                                            .memory = {HostAccess::DEFERRED_TRANSFER, true}},

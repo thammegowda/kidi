@@ -126,8 +126,7 @@ auto HiggsDecoderImpl::forward(ops::Context& context, const Tensor& tokens) cons
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
                             "Higgs audio codes require an I32 [codebooks, length] tensor on the execution device"});
     Tensor codes = tokens;
-    const auto& capabilities = context.device().capabilities();
-    if (!capabilities.memory.offset_views && !capabilities.compute.embedding) {
+    if (context.device().policy().audio.codec_tokens == tensor::CodecTokenInput::HOST_STAGED) {
         context.synchronize();
         const auto bytes = ops::require(tokens.copy_to_host());
         const auto values =

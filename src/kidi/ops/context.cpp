@@ -600,7 +600,7 @@ auto Context::add_(Tensor& left, const Tensor& right) -> Tensor& {
 }
 auto Context::embedding_sum(const Tensor& tokens, const Tensor& weight, const Tensor& scales, std::int32_t width,
                             std::int32_t bits, float multiplier) -> Tensor {
-    if (!device().capabilities().sampling.diffusion || tokens.dtype() != tensor::DType::I32 ||
+    if (!device().capabilities().compute.embedding_sum || tokens.dtype() != tensor::DType::I32 ||
         tokens.dimensions() != 2 || !tokens.size(0) || !tokens.size(1) || weight.dimensions() != 2 ||
         weight.size(0) % tokens.size(0) || (bits != 0 && bits != 2 && bits != 4 && bits != 8))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid device embedding sum"});

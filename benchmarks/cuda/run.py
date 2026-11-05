@@ -142,7 +142,7 @@ def main():
               "inputs": inputs, "host": reference["host"], "protocol": dict(reference["protocol"]), "runs": {}}
     report["protocol"].update({"backend": arguments.device, "measured_repeats": arguments.repeats,
                                 "kv_cache_note": "CPU auto policy" if cpu else "CUDA FP32; CPU reference retains auto policy"})
-    report["gpu_inventory"] = subprocess.check_output(["nvidia-smi", "--query-gpu=index,name,driver_version,memory.total,compute_cap", "--format=csv"], text=True)
+    report["gpu_inventory"] = None if cpu else subprocess.check_output(["nvidia-smi", "--query-gpu=index,name,driver_version,memory.total,compute_cap", "--format=csv"], text=True)
     report["cuda_visible_devices"] = os.environ.get("CUDA_VISIBLE_DEVICES")
     report["source"] = {"kidi_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                          "ynnpack_commit": subprocess.check_output(["git", "-C", "third_party/ynnpack-dev", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()}

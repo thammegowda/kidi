@@ -39,6 +39,32 @@ accepts local model paths only. The Python launcher supplies Hugging Face Hub
 resolution. Executable/wheel sizes vary by platform and build; model weights and
 runtime memory must be measured separately from artifact size.
 
+### CUDA
+
+The optional NVIDIA backend requires the CUDA 13+ toolkit and a compatible GPU.
+From an initialized checkout, enable it for the standalone CLI:
+
+```bash
+cmake --preset release -DKIDI_ENABLE_CUDA=ON
+cmake --build --preset release --target kidi_cli
+build-release/kidi chat --model /path/to/gemma-model --backend cuda:0
+```
+
+For the Python launcher, build and install a CUDA-enabled package separately:
+
+```bash
+python -m pip install '.[hf]' -Ccmake.define.KIDI_ENABLE_CUDA=ON
+python -m kidi chat -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0
+```
+
+CUDA is disabled in default builds. Installing a CPU-only wheel does not gain
+CUDA support just because the toolkit is present. `--backend cuda` selects GPU 0;
+`--backend cuda:INDEX` selects another GPU using CUDA's device numbering, which
+respects `CUDA_VISIBLE_DEVICES`. `auto` retains the existing Metal/CPU selection.
+An explicitly requested CUDA backend fails rather than falling back to CPU when
+unavailable. The same backend option is accepted by interactive `chat` and
+scripted `generate`.
+
 ## Python Package
 
 From an activated Python 3.12+ environment in the checkout:

@@ -15,7 +15,8 @@ on:
       - 'pyproject.toml'
       - 'tests/kidi/**'
       - 'tests/data/**'
-      - 'tests/python_cli_test.py'
+      - 'tests/*_test.py'
+      - 'benchmarks/cuda/run.py'
   pull_request:
     branches: [main]
     paths:
@@ -30,7 +31,8 @@ on:
       - 'pyproject.toml'
       - 'tests/kidi/**'
       - 'tests/data/**'
-      - 'tests/python_cli_test.py'
+      - 'tests/*_test.py'
+      - 'benchmarks/cuda/run.py'
   workflow_dispatch:
 
 permissions:
@@ -108,7 +110,7 @@ jobs:
           python -m pip install "${wheels[0]}[hf]"
 
       - name: Test installed Python package without model downloads
-        run: python -m unittest discover -s tests -p python_cli_test.py
+        run: python -m unittest discover -s tests -p '*_test.py'
 
       - name: Report compiler cache statistics
         if: always()

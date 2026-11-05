@@ -565,6 +565,38 @@ auto check_scoped_layers() -> bool {
            allocate_parameters == previous_allocate;
 }
 
+auto check_diffusion_feedback() -> bool {
+    using namespace kidi;
+    using ops::require;
+    using tensor::Tensor;
+    ops::Context context(tensor::Device::cuda());
+    constexpr std::array<std::int32_t, 4> MASKED{3, 3, 3, 3};
+    constexpr std::array LOGITS{0.F, 8.F, 0.F, -9.F, 0.F, 0.F, 6.F, -9.F, 5.F, 0.F, 0.F, -9.F, 0.F, 4.F, 0.F, -9.F};
+    constexpr std::array NOISE{0.F};
+    const auto tokens = require(Tensor::from_host({2, 2}, std::span<const std::int32_t>(MASKED), context.device()));
+    const auto logits = require(Tensor::from_host({1, 2, 8}, std::span<const float>(LOGITS), context.device()));
+    const auto noise = require(Tensor::from_host({1}, std::span<const float>(NOISE), context.device()));
+    const auto candidates = context.diffusion_candidates(logits, 2, 2, 4, 3, 0.F);
+    const auto partial = context.diffusion_update(tokens, candidates, noise, 2, 3, 0.F, 0.F);
+    const auto copied_partial = require(partial.to(tensor::Device::cpu()));
+    if (!std::ranges::equal(require(copied_partial.data<std::int32_t>()), std::array<std::int32_t, 4>{1, 3, 2, 3}))
+        return false;
+    const auto completed = context.diffusion_update(partial, candidates, noise, 2, 3, 0.F, 0.F);
+    const auto copied_tokens = require(completed.to(tensor::Device::cpu()));
+    if (completed.device() != context.device() ||
+        !std::ranges::equal(require(copied_tokens.data<std::int32_t>()), std::array<std::int32_t, 4>{1, 0, 2, 1}))
+        return false;
+    constexpr std::array<std::int8_t, 16> WEIGHTS{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    constexpr std::array SCALES{0.5F, 0.5F, 0.5F, 0.5F, 0.5F, 0.5F, 0.5F, 0.5F};
+    const auto weight = require(Tensor::from_host({8, 2}, std::span<const std::int8_t>(WEIGHTS)));
+    const auto scales = require(Tensor::from_host({8, 1}, std::span<const float>(SCALES)));
+    const auto embedding = context.embedding_sum(completed, weight, scales, 2, 8, 1.F);
+    const auto copied_embedding = require(embedding.to(tensor::Device::cpu()));
+    return embedding.device() == context.device() &&
+           std::ranges::equal(embedding.shape(), std::array<std::int64_t, 3>{1, 2, 2}) &&
+           std::ranges::equal(require(copied_embedding.data<float>()), std::array{8.F, 9.F, 6.F, 7.F});
+}
+
 auto check_projection_paths() -> bool {
     using namespace kidi;
     using ops::require;
@@ -645,6 +677,7 @@ auto main() -> int {
         if (!check_bfloat_context()) throw std::runtime_error("CUDA BF16 context pipeline failed");
         if (!check_scatter_updates()) throw std::runtime_error("CUDA sparse cache scatter failed");
         if (!check_scoped_layers()) throw std::runtime_error("CUDA scoped placement or layer parity failed");
+        if (!check_diffusion_feedback()) throw std::runtime_error("CUDA diffusion embedding feedback failed");
         if (!check_projection_paths()) throw std::runtime_error("accelerated projection CPU parity failed");
         if (tensor::parse_cuda_device("cuda") != tensor::Device::cuda(0) ||
             tensor::parse_cuda_device("cuda:0") != tensor::Device::cuda(0) ||
