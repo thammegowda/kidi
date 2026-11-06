@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -122,6 +123,7 @@ public:
     virtual auto prepare(const OperatorSpec&, TensorInputs) -> std::unique_ptr<Operator> = 0;
     virtual auto synchronize() -> void = 0;
     virtual auto release_cached_buffers() -> void {}
+    virtual auto configure_cache(const std::filesystem::path&, const std::filesystem::path&) -> void {}
     virtual auto activation_dtype(tensor::DType) const noexcept -> tensor::DType { return tensor::DType::F32; }
     /// True when every prepared operator implements `run_into`, so captured steps can replay.
     virtual auto supports_replay() const noexcept -> bool { return false; }

@@ -1,5 +1,6 @@
 #include "kidi/runtime/operator.h"
 #include "kidi/runtime/parity_math.h"
+#include "kidi/runtime/ynn/feed_forward_cache.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/ops/context.h"
 #include "ynnpack/composites/composites.h"
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <limits>
 #include <cstdlib>
+#include <unordered_map>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -877,13 +879,15 @@ private:
 class CpuOperator final : public Operator {
 public:
     CpuOperator(ynn::Executable executable, std::size_t count, std::size_t dynamic_count, DType dtype,
-                std::vector<std::int64_t> shape, tensor::Arena& arena)
+                std::vector<std::int64_t> shape, tensor::Arena& arena,
+                std::vector<std::shared_ptr<const void>> constant_owners = {})
         : executable_(std::move(executable)),
           count_(count),
           dynamic_count_(dynamic_count),
           dtype_(dtype),
           shape_(std::move(shape)),
-          pool_(&arena) {}
+          pool_(&arena),
+          constant_owners_(std::move(constant_owners)) {}
     auto run(TensorInputs inputs) -> Tensor override {
         for (std::size_t index = 0; index < dynamic_count_; ++index) require(executable_.bind(index, inputs[index]));
         auto output = pool_.acquire(shape_, dtype_, tensor::Device::cpu());
@@ -920,12 +924,16 @@ private:
     DType dtype_;
     std::vector<std::int64_t> shape_;
     OutputPool pool_;
+    std::vector<std::shared_ptr<const void>> constant_owners_;
 };
 class CpuBackend final : public OperatorBackend {
 public:
     CpuBackend() { require(arena_.reserve(8 * 1024 * 1024)); }
     auto synchronize() -> void override {}
     auto release_cached_buffers() -> void override { arena_ = tensor::Arena{}; }
+    auto configure_cache(const std::filesystem::path& directory, const std::filesystem::path& source) -> void override {
+        feed_forward_cache_.configure(directory, source);
+    }
     auto supports_replay() const noexcept -> bool override { return true; }
     auto copy_slice_(Tensor& destination, const Tensor& source, std::size_t outer, std::size_t source_bytes,
                      std::size_t destination_bytes, std::size_t offset_bytes) -> void override {
@@ -1035,6 +1043,7 @@ public:
         auto result = YNN_INVALID_VALUE_ID;
         auto residual = YNN_INVALID_VALUE_ID;
         auto dtype = spec.dtype;
+        std::vector<std::shared_ptr<const void>> constant_owners;
         switch (spec.operation) {
             case Operation::ADD:
                 result = binary(ynn_binary_add, operands[0], operands[1]);
@@ -1190,17 +1199,42 @@ public:
                 const auto down_output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[5]));
                 constexpr std::size_t TILE_SIZE = 2048;
                 const auto tiles = (intermediate + TILE_SIZE - 1) / TILE_SIZE;
+                const auto [cache_index, inserted] = feed_forward_indices_.try_emplace(
+                    inputs[1].storage_identity(), static_cast<std::uint32_t>(feed_forward_indices_.size()));
+                (void)inserted;
+                ynn::FeedForwardCacheSpec cache_spec{.index = cache_index->second,
+                                                     .bits = static_cast<std::uint32_t>(bits),
+                                                     .input_size = input_size,
+                                                     .intermediate_size = intermediate};
+                const auto payload_size = 3 * input_size * intermediate / (8 / bits);
+                auto cached = feed_forward_cache_.load(cache_spec, payload_size);
+                if (cached) constant_owners.push_back(cached.owner);
+                std::vector<std::uint8_t> payload;
+                if (!cached) payload.reserve(payload_size);
+                std::size_t payload_offset = 0;
                 std::vector<std::uint32_t> gate_weight_ids(tiles), gate_scale_ids(tiles), up_weight_ids(tiles),
                     up_scale_ids(tiles), down_weight_ids(tiles);
                 const auto define_weight = [&](const Tensor& weight, std::size_t row_start, std::size_t row_count,
                                                std::size_t column_start, std::size_t column_count) {
-                    const auto bytes =
-                        transpose_packed_tile(weight, bits, row_start, row_count, column_start, column_count);
+                    const auto size = column_count * row_count / (8 / bits);
+                    std::vector<std::uint8_t> generated;
+                    std::span<const std::uint8_t> bytes;
+                    if (cached) {
+                        if (payload_offset > cached.bytes.size() || size > cached.bytes.size() - payload_offset)
+                            throw ops::Failure({ErrorCode::RUNTIME, "invalid cached feed-forward payload"});
+                        bytes = cached.bytes.subspan(payload_offset, size);
+                    } else {
+                        generated =
+                            transpose_packed_tile(weight, bits, row_start, row_count, column_start, column_count);
+                        bytes = generated;
+                        payload.insert(payload.end(), bytes.begin(), bytes.end());
+                    }
+                    payload_offset += size;
                     const std::array<std::size_t, 2> shape{column_count, row_count};
                     auto id = YNN_INVALID_VALUE_ID;
                     const auto dtype = bits == 2 ? ynn_type_int2 : bits == 4 ? ynn_type_int4 : ynn_type_int8;
                     check(ynn_define_tensor(native, dtype, shape.size(), shape.data(), bytes.data(),
-                                            YNN_VALUE_FLAG_COPY_DATA, &id));
+                                            cached ? 0 : YNN_VALUE_FLAG_COPY_DATA, &id));
                     return id;
                 };
                 const auto& scales_tensor = inputs[2];
@@ -1221,6 +1255,7 @@ public:
                     up_scale_ids[tile] = define_scales(intermediate + begin, length);
                     down_weight_ids[tile] = define_weight(inputs[3], 0, input_size, begin, length);
                 }
+                if (!cached) feed_forward_cache_.store(cache_spec, payload);
                 check(::ynn::define_packed_feed_forward(
                     native, operands[0], scalar(spec.epsilon), gate_weight_ids.data(), gate_scale_ids.data(),
                     up_weight_ids.data(), up_scale_ids.data(), scalar(gate_output_scale), down_weight_ids.data(),
@@ -1417,11 +1452,14 @@ public:
         require(executable.reshape());
         auto shape = require(executable.shape(output_id));
         return std::make_unique<CpuOperator>(std::move(executable), inputs.size(), dynamic_count, dtype,
-                                             std::vector<std::int64_t>(shape.begin(), shape.end()), arena_);
+                                             std::vector<std::int64_t>(shape.begin(), shape.end()), arena_,
+                                             std::move(constant_owners));
     }
 
 private:
     tensor::Arena arena_;
+    ynn::FeedForwardCache feed_forward_cache_;
+    std::unordered_map<const void*, std::uint32_t> feed_forward_indices_;
 };
 } // namespace
 auto cpu_operators() -> std::unique_ptr<OperatorBackend> { return std::make_unique<CpuBackend>(); }
