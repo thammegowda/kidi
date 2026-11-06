@@ -131,7 +131,7 @@ def main():
         prompt_reference = {}
         for label, encoding, device in cells:
             print(f"Starting {label}", flush=True)
-            environment = dict(os.environ, KIDI_ACCELERATOR=device, CUDA_VISIBLE_DEVICES="0", OMP_NUM_THREADS=str(arguments.threads))
+            environment = dict(os.environ, KIDI_ACCELERATOR=device, KIDI_CUDA_GRAPH_LOG="1", CUDA_VISIBLE_DEVICES="0", OMP_NUM_THREADS=str(arguments.threads))
             for key in ("KIDI_PROFILE_OPS", "KIDI_PROFILE_OPS_SKIP", "KIDI_REPLAY", "KIDI_REPLAY_CAPACITY", "KIDI_INT8_KV_CACHE", "KIDI_CUDA_PROFILE"):
                 environment.pop(key, None)
             directory = report["checkpoints"][encoding]["directory"]
@@ -174,6 +174,8 @@ def main():
                         capture = dict(part.split("=", 1) for part in line.split("|")[1:])
                         capture["steady_ns"] = int(capture["steady_ns"])
                         captures.append(capture)
+                if device.startswith("cuda") and not captures:
+                    raise RuntimeError(f"{label}: no CUDA graph captures logged (KIDI_CUDA_GRAPH_LOG=1)")
                 for row in records:
                     if row["warmup"]:
                         continue

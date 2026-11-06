@@ -101,24 +101,23 @@ stage first merely because it is easy to fuse.
 
 ## Tahoma Reference Findings
 
-Reviewed repository: `/home/thammegowda/work/repos/tahoma`, branch `dev-v1`, commit
-`e3e17d5e064418da987eafc8fac1248fe59d26bf`. Findings below refer to inspected source,
-not a claim that its H100 measurements reproduce on the A4000.
+Findings below refer to inspected Tahoma source, not a claim that its H100
+measurements reproduce on the A4000.
 
-| Tahoma Reference, Relative to Its Repository | Useful Mechanism | Kidi Adaptation or Caveat |
+| Tahoma Component | Useful Mechanism | Kidi Adaptation or Caveat |
 | --- | --- | --- |
-| `src/runtime/tahoma/inference/graph_step.h` | Device-resident, pointer-stable step state; explicit reset; shape identity | Reuse the existing Kidi step contract and add missing device-side control, not another model hierarchy. |
-| `src/runtime/tahoma/inference/cuda_graph_decode.{h,cpp}` | Warm-up before capture, side stream, thread-local capture mode, replay workspace cache, RNG registration | Native CUDA equivalents; capture mutations must not corrupt live KV, positions, done flags, or RNG state. |
-| `src/runtime/tahoma/inference/lm_continuous_decode.cpp` | Reusable pinned staging, decode bursts, precaptured batch buckets | Bounded per-lane caches; no lazy capture stalls in measured request execution. |
-| `src/runtime/tahoma/ir/eval.cpp` | Capturability checks; invalidation on parameter pointer, device, dtype, and math-policy changes; capture-cost heuristic | Adopt the invariants, not Tahoma's IR. Copying large inputs merely to capture one fused kernel can cost more than replay saves. |
-| `src/runtime/tahoma/ops/qk_norm_rope.cu` | Warp/block reductions; fused Q/K normalization, RoPE, and V handling | Support actual Gemma head geometry, shared KV, explicit attention scale, and calibration boundaries. |
-| `src/runtime/tahoma/ops/linear/dispatch.{h,cu}` | Prepared layouts, prequantized activations, shape-specific kernel dispatch | Preserve native checkpoint layout semantics and avoid quantizing the same normalized activation separately for Q/K/V. |
-| `src/runtime/tahoma/ops/linear/int8_gemm.cu` and `cutlass_int8_gemm.cu` | Quantize once; integer Tensor Core GEMM; fused row/channel-scale epilogue | The inspected implementation uses symmetric quantization, BF16 inputs/output, and Hopper SM90. Kidi needs affine INT8 correction and FP32-output support on SM86. |
-| `src/runtime/tahoma/ops/linear/w4a8_gemm.cu` | Persistent packing and M/N/K-dependent schedules | Its A8 is FP8 E4M3, not Kidi's INT8. It is not a native-QAT drop-in. |
-| `src/runtime/tahoma/ops/attention/paged_decode_attention.cu` | Coalesced KV loads, online softmax, GQA, live sequence lengths, sliding windows, typed KV storage | Separate decode and prefill paths; preserve calibrated KV semantics and Gemma's explicit scaling. |
-| `src/runtime/tahoma/ops/attention/paged_varlen_attention.cpp` | Packed variable-length prefill; direct current-KV use; avoid padding copies | Adopt after single-request attention is efficient; library dtype/head-dimension support must be checked. |
-| `src/runtime/tahoma/fuse/{fuse,codegen,jit,ir}.*` | Narrow elementwise/reduction fusion, memoized launch plans, NVRTC disk cache, current-stream launch | Start with curated prepared fusions. Extract only useful dependency-light components after license review; keep compilation outside requests/capture. |
-| `benchmarks/cudagraph-vs/run.sh` and `notes/gemma4-moe-optimization-journal.md` | Graph on/off comparisons, quality gates, launch/sync counts, memory headroom, capture cost | Reproduce the methodology, not MoE/H100/BF16 speedup numbers. |
+| Graph-step state | Device-resident, pointer-stable step state; explicit reset; shape identity | Reuse the existing Kidi step contract and add missing device-side control, not another model hierarchy. |
+| CUDA-graph decode driver | Warm-up before capture, side stream, thread-local capture mode, replay workspace cache, RNG registration | Native CUDA equivalents; capture mutations must not corrupt live KV, positions, done flags, or RNG state. |
+| Continuous LM decode | Reusable pinned staging, decode bursts, precaptured batch buckets | Bounded per-lane caches; no lazy capture stalls in measured request execution. |
+| IR evaluator | Capturability checks; invalidation on parameter pointer, device, dtype, and math-policy changes; capture-cost heuristic | Adopt the invariants, not Tahoma's IR. Copying large inputs merely to capture one fused kernel can cost more than replay saves. |
+| Q/K normalization and RoPE kernel | Warp/block reductions; fused Q/K normalization, RoPE, and V handling | Support actual Gemma head geometry, shared KV, explicit attention scale, and calibration boundaries. |
+| Linear dispatch | Prepared layouts, prequantized activations, shape-specific kernel dispatch | Preserve native checkpoint layout semantics and avoid quantizing the same normalized activation separately for Q/K/V. |
+| INT8 GEMM kernels | Quantize once; integer Tensor Core GEMM; fused row/channel-scale epilogue | The inspected implementation uses symmetric quantization, BF16 inputs/output, and Hopper SM90. Kidi needs affine INT8 correction and FP32-output support on SM86. |
+| W4A8 GEMM kernel | Persistent packing and M/N/K-dependent schedules | Its A8 is FP8 E4M3, not Kidi's INT8. It is not a native-QAT drop-in. |
+| Paged decode attention | Coalesced KV loads, online softmax, GQA, live sequence lengths, sliding windows, typed KV storage | Separate decode and prefill paths; preserve calibrated KV semantics and Gemma's explicit scaling. |
+| Paged variable-length attention | Packed variable-length prefill; direct current-KV use; avoid padding copies | Adopt after single-request attention is efficient; library dtype/head-dimension support must be checked. |
+| Fusion and JIT | Narrow elementwise/reduction fusion, memoized launch plans, NVRTC disk cache, current-stream launch | Start with curated prepared fusions. Extract only useful dependency-light components after license review; keep compilation outside requests/capture. |
+| CUDA-graph benchmark script and MoE optimization journal | Graph on/off comparisons, quality gates, launch/sync counts, memory headroom, capture cost | Reproduce the methodology, not MoE/H100/BF16 speedup numbers. |
 
 Inspect source rather than treating journal/README claims as current guarantees.
 Verify Tahoma and vendored-kernel licenses and preserve required notices before
