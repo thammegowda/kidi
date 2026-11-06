@@ -70,5 +70,6 @@ __pycache__/
 
 # Local model directory.
 /models/
+**/.kidi-cache/
 
 tmp*

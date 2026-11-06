@@ -20,6 +20,17 @@ using ops::require;
 namespace {
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t QNN_PREFILL_CAPTURE_TOKENS = 2048;
+constexpr std::size_t CPU_PREFILL_BUCKET = 128;
+auto uses_padded_prefill(tensor::Device device) -> bool {
+#if defined(__EMSCRIPTEN__)
+    return false;
+#else
+    return device == tensor::Device::cpu();
+#endif
+}
+auto prefill_bucket(tensor::Device device, std::size_t requested) -> std::size_t {
+    return uses_padded_prefill(device) ? std::min(requested, CPU_PREFILL_BUCKET) : requested;
+}
 
 auto elapsed(Clock::time_point start) -> std::uint64_t {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
@@ -135,6 +146,12 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             const core::MemoryScope memory("load:bind_weights");
             require(model->set_checkpoint(weights, options.weight_bits, options.group_size, options.packed_prefill));
         }
+#if !defined(__EMSCRIPTEN__)
+        if (device == tensor::Device::cpu()) {
+            const auto cache_root = std::filesystem::is_directory(directory) ? directory : directory.parent_path();
+            model->configure_cache(cache_root / ".kidi-cache" / "ynn-gff-v1", config["weights_file"].as<std::string>());
+        }
+#endif
         model->set_precision(options.precision);
         model->set_kv_cache_precision(options.kv_cache_precision);
         return Generator(std::move(config), std::move(tokenizer), std::move(model), special, options.precision,
@@ -190,13 +207,35 @@ auto Generator::execution() const -> std::string {
     if (!accelerator.empty()) result += "+" + std::string(accelerator);
     return result;
 }
-auto Generator::warm_up() -> Result<void> {
+auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size) -> Result<void> {
     try {
-        auto state = require(model_->create_state(
-            std::min<std::size_t>(128, config_["model"]["max_position_embeddings"].as<std::size_t>())));
-        const std::array token{*tokenizer_.token_id("<bos>")};
-        // The selected token is never read, so devices that finish asynchronously need no wait here.
-        require(model_->select_token(token, state));
+        const auto maximum_context = config_["model"]["max_position_embeddings"].as<std::size_t>();
+        auto capacity = std::min(context_size ? context_size : config_["decode"]["context_size"].as<std::size_t>(),
+                                 maximum_context);
+#if defined(__EMSCRIPTEN__)
+        capacity = std::min(capacity, std::size_t{128});
+#endif
+        if (capacity < 2) throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "warm-up context is too small"});
+        const auto maximum =
+            std::min(prefill_bucket(model_->device(), model_->prefill_chunk_size(prefill_chunk_size)), capacity - 1);
+        const auto token = *tokenizer_.token_id("<bos>");
+        if (uses_padded_prefill(model_->device())) {
+            {
+                auto state = require(model_->create_state(capacity));
+                const std::vector prefill_tokens(maximum, token);
+                require(model_->prefill(prefill_tokens, state));
+            }
+            {
+                auto state = require(model_->create_state(capacity));
+                const std::array decode_token{token};
+                require(model_->select_token(decode_token, state));
+            }
+        } else {
+            auto state = require(model_->create_state(capacity));
+            const std::array tokens{token};
+            // The selected token is never read, so devices that finish asynchronously need no wait here.
+            require(model_->select_token(tokens, state));
+        }
         return {};
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
@@ -809,8 +848,12 @@ auto Generator::step() -> Result<GenerationStep> {
             return prefill;
         };
         const auto chunk_length = [&](const QueuedGeneration& request) {
-            return std::min({request.prompt.size() - request.state->position, request.options.prefill_chunk_size,
-                             serving_->prefill_tokens_per_step});
+            const auto remaining = request.prompt.size() - request.state->position;
+            const auto maximum = prefill_bucket(
+                model_->device(), std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
+            if (!uses_padded_prefill(model_->device())) return std::min(remaining, maximum);
+            if (remaining == 1) return remaining;
+            return std::min(remaining - 1, maximum);
         };
         // Captured steps reuse their output buffers, and deferred selections are read only on the next call, so a
         // deferred step submits one selection: a final prefill chunk takes the step and decoding resumes next call.
@@ -925,7 +968,16 @@ auto Generator::step() -> Result<GenerationStep> {
                     {request.id, require(model_->select_token(input, *request.state)), 0, started, true});
             else if (final_chunk)
                 selected = require(model_->forward_token(input, *request.state));
-            else
+            else if (uses_padded_prefill(model_->device())) {
+                const auto maximum = prefill_bucket(
+                    model_->device(), std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
+                const auto available = request.state->capacity - request.state->position;
+                const auto execution_length = maximum <= available ? maximum : length;
+                std::vector<std::int32_t> padded(execution_length, special_[2]);
+                std::ranges::copy(input, padded.begin());
+                require(model_->prefill(padded, *request.state));
+                request.state->position -= execution_length - length;
+            } else
                 require(model_->prefill(input, *request.state));
             result.prefill_ns = elapsed(started);
             if (!deferred) request.stats.prefill_ns += result.prefill_ns;

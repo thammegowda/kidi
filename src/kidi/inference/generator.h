@@ -108,9 +108,8 @@ public:
     auto native_qat() const -> bool { return static_cast<bool>(config_["model"]["quantization_config"]); }
     auto vision_supported() const -> bool { return static_cast<bool>(config_["vision"]); }
     auto memory() const -> GeneratorMemory;
-    /// Runs one throwaway decode step so operators are prepared and weights packed before the first request
-    /// (YNNPACK packs on first use; WebGPU prepares kernels and uploads host-resident weights).
-    auto warm_up() -> Result<void>;
+    /// Prepares reusable request shapes and weights before the first request.
+    auto warm_up(std::size_t prefill_chunk_size = 128, std::size_t context_size = 0) -> Result<void>;
     /// Releases request-shaped execution graphs and workspaces while retaining model weights.
     /// All queued and running requests must be drained first.
     auto release_workspaces() -> Result<void>;

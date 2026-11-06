@@ -500,6 +500,9 @@ auto Context::profile_phase(std::string_view phase) -> void {
     impl_->phase = phase;
 }
 auto Context::preparation_ns() const noexcept -> std::uint64_t { return impl_->preparation; }
+auto Context::configure_cache(const std::filesystem::path& directory, const std::filesystem::path& source) -> void {
+    impl_->backend->configure_cache(directory, source);
+}
 auto Context::set_precision(core::InferencePrecision precision) noexcept -> void {
     if (impl_->precision == precision) return;
     impl_->replays.clear();

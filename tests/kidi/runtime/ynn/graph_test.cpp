@@ -2,12 +2,15 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <span>
 
 #include <ynnpack.h>
 
+#include "kidi/runtime/ynn/feed_forward_cache.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/tensor/tensor.h"
 
@@ -33,6 +36,38 @@ auto run(kidi::runtime::ynn::Executable& executable, const kidi::tensor::Tensor&
 } // namespace
 
 auto main() -> int {
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    const auto cache_root = std::filesystem::temp_directory_path() / "kidi-ynn-feed-forward-cache-test";
+    std::filesystem::remove_all(cache_root);
+    std::filesystem::create_directories(cache_root);
+    const auto source = cache_root / "weights.bin";
+    std::ofstream(source, std::ios::binary).write("source", 6);
+    kidi::runtime::ynn::FeedForwardCache cache;
+    cache.configure(cache_root / "cache", source);
+    kidi::runtime::ynn::FeedForwardCacheSpec cache_spec{
+        .bits = 4, .input_size = 8, .intermediate_size = 16, .source_hash = 17};
+    const std::array<std::uint8_t, 6> cached_bytes{1, 2, 3, 5, 8, 13};
+    cache.store(cache_spec, cached_bytes);
+    const auto cached = cache.load(cache_spec, cached_bytes.size());
+    if (!cached || !cached.owner || !std::ranges::equal(cached.bytes, cached_bytes)) return 1;
+    auto incompatible = cache_spec;
+    incompatible.bits = 8;
+    if (cache.load(incompatible, cached_bytes.size())) return 1;
+    const auto source_time = std::filesystem::last_write_time(source);
+    std::ofstream(source, std::ios::binary | std::ios::trunc).write("change", 6);
+    std::filesystem::last_write_time(source, source_time);
+    auto replaced = cache_spec;
+    replaced.source_hash = 18;
+    kidi::runtime::ynn::FeedForwardCache replacement;
+    replacement.configure(cache_root / "cache", source);
+    if (replacement.load(replaced, cached_bytes.size())) return 1;
+    std::ofstream(source, std::ios::binary | std::ios::app).write("changed", 7);
+    kidi::runtime::ynn::FeedForwardCache stale;
+    stale.configure(cache_root / "cache", source);
+    if (stale.load(cache_spec, cached_bytes.size())) return 1;
+    std::filesystem::remove_all(cache_root);
+#endif
+
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
     if (kidi::runtime::ynn::supported_arch_flags() == 0) {
         std::cerr << "Apple arm64 YNNPACK feature detection returned no supported kernels\n";

@@ -104,6 +104,10 @@ For checkout installation and building your own wheel, see the
 
 Type a message and replies stream as they are generated. The model stays loaded
 between turns. Each completed reply reports tokens, speed, latency, and memory.
+Native CPU chat on Linux, macOS, and Android prepares a fixed execution shape on
+first use and stores reusable FFN layouts under `.kidi-cache/` in the model directory.
+Later startups memory-map this cache. It rebuilds when the checkpoint or cache
+format changes; delete the directory to reclaim its model-dependent space.
 
 | Action | Command |
 |---|---|

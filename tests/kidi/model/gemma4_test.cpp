@@ -264,6 +264,17 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
         if (!completed) throw std::runtime_error("missing serving completion");
         return std::move(*completed);
     };
+    auto warmed = require(kidi::inference::Generator::load(directory, device));
+    require(warmed.warm_up(2, 16));
+    require(warmed.configure_serving({1, 4, 16, 2}));
+    const auto warmed_result = run(warmed, "alpha beta gamma delta", options);
+    auto warm_reference = options;
+    warm_reference.prefix_cache_bytes = 0;
+    auto exact = require(kidi::inference::Generator::load(directory, device));
+    const auto expected_warm = require(exact.generate("alpha beta gamma delta", warm_reference));
+    if (warmed_result.generation.token_ids != expected_warm.generation.token_ids ||
+        (device == kidi::tensor::Device::cpu() && warmed_result.stats.preparation_ns != 0))
+        throw std::runtime_error("serving bucket warm-up changed output or left operators unprepared");
     const auto check = [&](std::string_view prompt, auto settings, std::size_t reused) {
         const auto actual = run(cached, prompt, settings);
         settings.prefix_cache_bytes = 0;
