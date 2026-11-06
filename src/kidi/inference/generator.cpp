@@ -20,12 +20,16 @@ using ops::require;
 namespace {
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t QNN_PREFILL_CAPTURE_TOKENS = 2048;
+constexpr std::size_t CPU_PREFILL_BUCKET = 128;
 auto uses_padded_prefill(tensor::Device device) -> bool {
 #if defined(__EMSCRIPTEN__)
     return false;
 #else
     return device == tensor::Device::cpu();
 #endif
+}
+auto prefill_bucket(tensor::Device device, std::size_t requested) -> std::size_t {
+    return uses_padded_prefill(device) ? std::min(requested, CPU_PREFILL_BUCKET) : requested;
 }
 
 auto elapsed(Clock::time_point start) -> std::uint64_t {
@@ -206,18 +210,26 @@ auto Generator::execution() const -> std::string {
 auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size) -> Result<void> {
     try {
         const auto maximum_context = config_["model"]["max_position_embeddings"].as<std::size_t>();
-        const auto capacity = std::min(
-            context_size ? context_size : config_["decode"]["context_size"].as<std::size_t>(), maximum_context);
+        auto capacity = std::min(context_size ? context_size : config_["decode"]["context_size"].as<std::size_t>(),
+                                 maximum_context);
+#if defined(__EMSCRIPTEN__)
+        capacity = std::min(capacity, std::size_t{128});
+#endif
         if (capacity < 2) throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "warm-up context is too small"});
-        const auto maximum = std::min(model_->prefill_chunk_size(prefill_chunk_size), capacity - 1);
+        const auto maximum =
+            std::min(prefill_bucket(model_->device(), model_->prefill_chunk_size(prefill_chunk_size)), capacity - 1);
         const auto token = *tokenizer_.token_id("<bos>");
         if (uses_padded_prefill(model_->device())) {
-            auto state = require(model_->create_state(capacity));
-            const std::vector prefill_tokens(maximum, token);
-            require(model_->prefill(prefill_tokens, state));
-            state = require(model_->create_state(capacity));
-            const std::array decode_token{token};
-            require(model_->select_token(decode_token, state));
+            {
+                auto state = require(model_->create_state(capacity));
+                const std::vector prefill_tokens(maximum, token);
+                require(model_->prefill(prefill_tokens, state));
+            }
+            {
+                auto state = require(model_->create_state(capacity));
+                const std::array decode_token{token};
+                require(model_->select_token(decode_token, state));
+            }
         } else {
             auto state = require(model_->create_state(capacity));
             const std::array tokens{token};
@@ -837,7 +849,8 @@ auto Generator::step() -> Result<GenerationStep> {
         };
         const auto chunk_length = [&](const QueuedGeneration& request) {
             const auto remaining = request.prompt.size() - request.state->position;
-            const auto maximum = std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step);
+            const auto maximum = prefill_bucket(
+                model_->device(), std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
             if (!uses_padded_prefill(model_->device())) return std::min(remaining, maximum);
             if (remaining == 1) return remaining;
             return std::min(remaining - 1, maximum);
@@ -956,7 +969,8 @@ auto Generator::step() -> Result<GenerationStep> {
             else if (final_chunk)
                 selected = require(model_->forward_token(input, *request.state));
             else if (uses_padded_prefill(model_->device())) {
-                const auto maximum = std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step);
+                const auto maximum = prefill_bucket(
+                    model_->device(), std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
                 const auto available = request.state->capacity - request.state->position;
                 const auto execution_length = maximum <= available ? maximum : length;
                 std::vector<std::int32_t> padded(execution_length, special_[2]);

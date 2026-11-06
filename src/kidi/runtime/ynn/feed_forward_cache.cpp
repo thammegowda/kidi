@@ -1,8 +1,9 @@
 #include "kidi/runtime/ynn/feed_forward_cache.h"
 
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <cstring>
-#include <fstream>
 #include <system_error>
 #include <type_traits>
 
@@ -16,7 +17,7 @@
 namespace kidi::runtime::ynn {
 namespace {
 constexpr std::array<char, 8> MAGIC{'K', 'I', 'D', 'I', 'G', 'F', 'F', '1'};
-constexpr std::uint32_t FORMAT_VERSION = 3;
+constexpr std::uint32_t FORMAT_VERSION = 1;
 constexpr std::size_t PAYLOAD_OFFSET = 4096;
 
 struct Header {
@@ -60,14 +61,28 @@ private:
 #endif
 
 auto same_spec(const FeedForwardCacheSpec& left, const FeedForwardCacheSpec& right) -> bool {
-    return left.index == right.index && left.bits == right.bits && left.input_size == right.input_size &&
-           left.intermediate_size == right.intermediate_size;
+    return left.bits == right.bits && left.input_size == right.input_size &&
+           left.intermediate_size == right.intermediate_size && left.source_hash == right.source_hash;
 }
 
 auto filename(const FeedForwardCacheSpec& spec) -> std::string {
-    return "gff-" + std::to_string(spec.index) + "-b" + std::to_string(spec.bits) + "-i" +
+    return "gff-" + std::to_string(spec.source_hash) + "-b" + std::to_string(spec.bits) + "-i" +
            std::to_string(spec.input_size) + "-m" + std::to_string(spec.intermediate_size) + ".bin";
 }
+
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+auto write_all(int descriptor, const void* data, std::size_t size) -> bool {
+    const auto* bytes = static_cast<const std::byte*>(data);
+    while (size) {
+        const auto written = ::write(descriptor, bytes, size);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return false;
+        bytes += written;
+        size -= static_cast<std::size_t>(written);
+    }
+    return true;
+}
+#endif
 } // namespace
 
 auto FeedForwardCache::configure(const std::filesystem::path& directory,
@@ -121,7 +136,14 @@ auto FeedForwardCache::store(const FeedForwardCacheSpec& spec, std::span<const s
         if (!enabled_ || payload.empty()) return;
         std::filesystem::create_directories(directory_);
         const auto destination = directory_ / filename(spec);
-        temporary = destination.string() + ".tmp." + std::to_string(::getpid());
+        static std::atomic<std::uint64_t> sequence = 0;
+        int descriptor = -1;
+        while (descriptor < 0) {
+            temporary = destination.string() + ".tmp." + std::to_string(::getpid()) + "." +
+                        std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+            descriptor = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+            if (descriptor < 0 && errno != EEXIST) return;
+        }
         Header header{.magic = MAGIC,
                       .version = FORMAT_VERSION,
                       .header_size = PAYLOAD_OFFSET,
@@ -131,17 +153,11 @@ auto FeedForwardCache::store(const FeedForwardCacheSpec& spec, std::span<const s
                       .payload_size = payload.size()};
         std::array<std::byte, PAYLOAD_OFFSET> prefix{};
         std::memcpy(prefix.data(), &header, sizeof(header));
-        {
-            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-            if (!output) return;
-            output.write(reinterpret_cast<const char*>(prefix.data()), prefix.size());
-            output.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
-            output.flush();
-            if (!output) {
-                output.close();
-                std::filesystem::remove(temporary);
-                return;
-            }
+        const auto written = write_all(descriptor, prefix.data(), prefix.size()) &&
+                             write_all(descriptor, payload.data(), payload.size());
+        if (::close(descriptor) != 0 || !written) {
+            std::filesystem::remove(temporary);
+            return;
         }
         std::error_code error;
         std::filesystem::rename(temporary, destination, error);
