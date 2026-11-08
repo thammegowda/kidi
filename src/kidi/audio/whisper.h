@@ -20,6 +20,7 @@ class WhisperFeatureExtractor {
 public:
     static auto load(const std::filesystem::path& path) -> Result<WhisperFeatureExtractor>;
     auto extract(std::span<const float> waveform, std::uint32_t sample_rate) const -> Result<WhisperFeatures>;
+    auto bins() const noexcept -> std::size_t { return filters_.size() / 201; }
 
 private:
     explicit WhisperFeatureExtractor(std::vector<float> filters) : filters_(std::move(filters)) {}

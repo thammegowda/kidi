@@ -774,8 +774,9 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     chat_parser.description("Chat in the terminal with a loaded model. Type /help for shell commands.");
     auto& transcribe_parser = commands.add_parser("transcribe", "transcribe a 16 kHz WAV file with Whisper");
     transcribe_parser.description(
-        "Transcribe or translate speech with Whisper Tiny, Base, or Small. Long WAV files are processed in bounded "
-        "windows with one loaded model.");
+        "Transcribe or translate speech with Whisper Tiny, Base, Small, Large-v3, or Large-v3-Turbo. Long WAV files "
+        "are processed "
+        "in bounded windows with one loaded model.");
     auto& synthesize_parser = commands.add_parser("synthesize", "synthesize speech from text");
     synthesize_parser.description("Synthesize a mono WAV file with a TTS model.");
     chat_parser.add_argument("--system").default_value(std::string{}).help("system instruction");

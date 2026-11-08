@@ -42,6 +42,8 @@ public:
     auto size() const noexcept -> std::size_t;
     auto names() const -> std::vector<std::string>;
     auto tensor(std::string_view name) const -> Result<tensor::Tensor>;
+    /// Expands FP16/BF16 checkpoint parameters to FP32; FP32 parameters remain zero-copy.
+    auto float32_tensor(std::string_view name) const -> Result<tensor::Tensor>;
     auto state_dict() const -> Result<StateDict>;
 
 private:

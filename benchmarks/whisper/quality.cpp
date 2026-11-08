@@ -77,15 +77,16 @@ auto main(int argc, char** argv) -> int {
 
         auto state = require(model->create_state(32));
         kidi::tensor::Tensor logits;
-        for (const std::int32_t token : {50258, 50259, 50359, 50363})
-            logits = require(model->forward(source, std::span(&token, 1), state));
+        const auto metadata = YAML::LoadFile((reference / "reference.json").string());
+        const auto prefix = metadata["prefix"].as<std::vector<std::int32_t>>();
+        if (prefix.size() != 4) throw std::runtime_error("invalid Whisper reference prefix");
+        for (const auto token : prefix) logits = require(model->forward(source, std::span(&token, 1), state));
         const auto actual_logits = require(logits.data<float>());
         const auto expected_logits = read_f32(reference / "logits.f32");
         compare("logits", actual_logits, expected_logits);
         auto prefixed_state = require(model->create_state(32));
-        const std::array<std::int32_t, 3> prefix{50258, 50259, 50359};
-        require(model->prefill(source, prefix, prefixed_state));
-        const std::int32_t final_prefix = 50363;
+        require(model->prefill(source, std::span(prefix).first(3), prefixed_state));
+        const auto final_prefix = prefix.back();
         const auto prefixed_logits = require(model->forward(source, std::span(&final_prefix, 1), prefixed_state));
         if (!std::ranges::equal(actual_logits, require(prefixed_logits.data<float>())))
             throw std::runtime_error("Whisper prefix-only decoding changed logits");

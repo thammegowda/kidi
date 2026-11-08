@@ -49,10 +49,11 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
             throw ops::Failure({ErrorCode::UNSUPPORTED, "Whisper supports CPU and WebGPU execution"});
         const auto adapter = model::WhisperImpl::checkpoint_config();
         auto config = require(checkpoint::load_config(directory, adapter));
-        if (config["weights_format"].as<std::string>("") == "whisper_ggml")
-            config = require(checkpoint::load_config(
-                require(checkpoint::prepare(directory, adapter, model::WhisperImpl::int8_preparation)), adapter));
         require(model::WhisperImpl::validate_config(config["model"]));
+        auto extractor =
+            require(audio::WhisperFeatureExtractor::load(config["preprocessor_config_file"].as<std::string>()));
+        if (extractor.bins() != config["model"]["num_mel_bins"].as<std::size_t>())
+            throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Whisper preprocessor mel bins do not match the model"});
         auto tokenizer = require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
         if (tokenizer.vocabulary_size() != config["model"]["vocab_size"].as<std::size_t>())
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Whisper tokenizer vocabulary mismatch"});
@@ -78,13 +79,21 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
         for (const auto* name : {"decoder_start_token_id", "eos_token_id", "no_timestamps_token_id"})
             if (!valid_token(generation[name].as<std::int32_t>()))
                 throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Whisper special token is outside vocabulary"});
-        auto weights = require(checkpoint::Weights::load(config["model_file"].as<std::string>()));
-        const auto parameter = require(weights.tensor("model.encoder.layers.0.fc1.weight"));
+        std::optional<checkpoint::Weights> weights;
+        if (config["weights_format"].as<std::string>("") != "whisper_ggml") {
+            weights.emplace(require(checkpoint::Weights::load(config["model_file"].as<std::string>())));
+            const auto precision = require(weights->tensor("model.encoder.layers.0.fc1.weight")).dtype();
+            if (precision == tensor::DType::F16 || precision == tensor::DType::BF16) weights.reset();
+        }
+        if (!weights) {
+            config = require(checkpoint::load_config(
+                require(checkpoint::prepare(directory, adapter, model::WhisperImpl::int8_preparation)), adapter));
+            weights.emplace(require(checkpoint::Weights::load(config["model_file"].as<std::string>())));
+        }
+        const auto parameter = require(weights->tensor("model.encoder.layers.0.fc1.weight"));
         const ModuleScope construction(parameter.dtype(), false, device);
         auto whisper = require(model::WhisperImpl::create(config["model"]));
-        require(whisper->set_checkpoint(weights));
-        auto extractor =
-            require(audio::WhisperFeatureExtractor::load(config["preprocessor_config_file"].as<std::string>()));
+        require(whisper->set_checkpoint(*weights));
         auto suppress = token_list(generation["suppress_tokens"]);
         auto begin_suppress = token_list(generation["begin_suppress_tokens"]);
         if (!std::ranges::all_of(suppress, valid_token) || !std::ranges::all_of(begin_suppress, valid_token))
@@ -121,10 +130,10 @@ auto Transcriber::transcribe(std::span<const float> waveform, std::uint32_t samp
     }
 }
 
-auto Transcriber::start(std::span<const float> waveform, std::uint32_t sample_rate,
-                        const TranscriptionOptions& options) -> Result<std::unique_ptr<TranscriptionSession>> {
-    return std::make_unique<Session>(transcription_session_(
-        std::vector<float>(waveform.begin(), waveform.end()), sample_rate, options));
+auto Transcriber::start(std::span<const float> waveform, std::uint32_t sample_rate, const TranscriptionOptions& options)
+    -> Result<std::unique_ptr<TranscriptionSession>> {
+    return std::make_unique<Session>(
+        transcription_session_(std::vector<float>(waveform.begin(), waveform.end()), sample_rate, options));
 }
 
 auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint32_t sample_rate,
@@ -150,8 +159,7 @@ auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint3
                     const auto end = options.language.find(',', start);
                     const auto language = options.language.substr(start, end - start);
                     if (!languages_.contains(language))
-                        throw ops::Failure(
-                            {ErrorCode::INVALID_ARGUMENT, "unsupported Whisper language: " + language});
+                        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "unsupported Whisper language: " + language});
                     if (!std::ranges::contains(language_names, language)) language_names.push_back(language);
                     if (end == std::string::npos) break;
                     start = end + 1;
@@ -243,18 +251,18 @@ auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint3
                     if (selected < 0 || static_cast<std::size_t>(selected) >= vocabulary)
                         throw ops::Failure({ErrorCode::RUNTIME, "Whisper token selection failed"});
                 } else {
-                scores = require(logits.data<float>());
-                const auto suppress = [&](std::int32_t token) {
-                    if (token >= 0 && static_cast<std::size_t>(token) < scores.size())
+                    scores = require(logits.data<float>());
+                    const auto suppress = [&](std::int32_t token) {
+                        if (token >= 0 && static_cast<std::size_t>(token) < scores.size())
+                            scores[token] = -std::numeric_limits<float>::infinity();
+                    };
+                    for (const auto token : suppress_) suppress(token);
+                    if (!step)
+                        for (const auto token : begin_suppress_) suppress(token);
+                    suppress(no_timestamps);
+                    for (std::size_t token = static_cast<std::size_t>(no_timestamps + 1); token < vocabulary; ++token)
                         scores[token] = -std::numeric_limits<float>::infinity();
-                };
-                for (const auto token : suppress_) suppress(token);
-                if (!step)
-                    for (const auto token : begin_suppress_) suppress(token);
-                suppress(no_timestamps);
-                for (std::size_t token = static_cast<std::size_t>(no_timestamps + 1); token < vocabulary; ++token)
-                    scores[token] = -std::numeric_limits<float>::infinity();
-                selected = static_cast<std::int32_t>(std::ranges::max_element(scores) - scores.begin());
+                    selected = static_cast<std::int32_t>(std::ranges::max_element(scores) - scores.begin());
                 }
                 if (selected == end) break;
                 result.token_ids.push_back(selected);

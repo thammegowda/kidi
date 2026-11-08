@@ -27,7 +27,7 @@ the command line for chat, audio files, and translation.
 | Model | Capabilities |
 |---|---|
 | Gemma 4 E2B-it | Text chat and generation; Android photo questions with the default mobile model |
-| Whisper Tiny/Base/Small | Multilingual speech transcription and speech-to-English translation |
+| Whisper Tiny/Base/Small/Large-v3/Turbo | Multilingual speech transcription and speech-to-English translation |
 | OmniVoice | Experimental multilingual text-to-speech in the native CLI and Android read-aloud |
 | Kokoro-82M | Experimental US-English text-to-speech with selectable voice and speed |
 | RTG Transformer | Text translation, including the public 500-language-to-English model |
@@ -41,8 +41,10 @@ Model support is explicit: an arbitrary Hugging Face URL does not make a new
 architecture compatible. Terminal chat and JSONL generation are currently
 text-only and greedy. Photo input is available in the Android app, not every
 interface. Tool execution, video/document input, CUDA, and Apple Neural Engine
-execution are not supported. Whisper runs on CPU and accepts at most 30 seconds
-of 16 kHz audio per request. TTS runs from the native CLI and Android read-aloud;
+execution are not supported. Whisper runs on CPU with 30-second inference windows;
+the native CLI streams longer 16 kHz WAV files through one loaded model.
+Microphone and embedded inference requests remain limited to 30 seconds.
+TTS runs from the native CLI and Android read-aloud;
 the Android app automatically tries Vulkan and then CPU. Browser TTS and
 external-audio OmniVoice voice cloning are not implemented. Long-form native
 synthesis uses sentence-sized chunks with a consistent generated reference.
@@ -233,9 +235,10 @@ and publishing Play test releases are covered in [README-dev.md](README-dev.md#a
 
 ### Whisper Transcription
 
-Whisper Tiny, Base, and Small load directly from their original Hugging Face directories; no export or Kidi
-manifest is created.
-Input must be a mono or multichannel 16 kHz PCM WAV of at most 30 seconds. Channels are averaged to mono.
+Whisper Tiny, Base, Small, Large-v3, and Large-v3-Turbo load from their original Hugging Face directories.
+Source files are not changed and no `model.yaml` is required. FP16/BF16 checkpoints, including
+`openai/whisper-large-v3-turbo`, prepare a reusable native INT8 cache on first load to reduce CPU memory use.
+Input must be a mono or multichannel 16 kHz PCM WAV. Channels are averaged to mono.
 
 ```bash
 python -m kidi transcribe \
@@ -249,6 +252,28 @@ supported speech into English; the default task transcribes in the detected or s
 CPU-only, so use `--backend ynnpack` rather than Metal. Hub downloads handle the
 required files for you. Advanced local-checkpoint import is documented in
 [README-dev.md](README-dev.md#ggml-and-gguf-import).
+
+For a long recording with the faster Large-v3-Turbo:
+
+```bash
+python -m kidi transcribe \
+  --model @openai/whisper-large-v3-turbo \
+  --in recording-16k.wav \
+  --language auto \
+  --max-new-tokens 444 \
+  --out transcript.txt \
+  --profile
+```
+
+The original Large-v3-Turbo download is about **1.62 GB**, plus the derived INT8 cache.
+The CLI reads bounded windows, keeps the model loaded, and flushes one transcript line per window.
+`--chunk-seconds` defaults to 30 and accepts 1-30; smaller windows can help dense speech.
+Windows do not overlap or share text context, so words at a boundary may be affected; this is not
+Whisper's timestamp-based long-form decoder. Timestamps and speaker diarization are not emitted.
+Text-only decoding can also stop early after pauses within a window. For completeness-sensitive
+recordings, use Whisper's timestamp-aware long-form decoding instead of this native windowed path.
+If a long-file window reaches its token limit, the command fails explicitly rather than
+silently skipping the rest; already completed lines remain in the output.
 
 ### OmniVoice Text-to-Speech
 

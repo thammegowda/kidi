@@ -79,24 +79,37 @@ class HubCliTest(unittest.TestCase):
     def test_whisper_checkpoint_stays_unchanged(self):
         from kidi.hub import resolve
 
-        with tempfile.TemporaryDirectory() as root:
-            cache = Path(root).resolve()
-            snapshot = cache / "models--openai--whisper-tiny" / "snapshots" / ("c" * 40)
-            snapshot.mkdir(parents=True)
-            config = {"model_type": "whisper", "architectures": ["WhisperForConditionalGeneration"],
-                      "d_model": 384, "encoder_layers": 4, "decoder_layers": 4,
-                      "encoder_attention_heads": 6, "decoder_attention_heads": 6,
-                      "encoder_ffn_dim": 1536, "decoder_ffn_dim": 1536,
-                      "num_mel_bins": 80, "vocab_size": 51865}
-            (snapshot / "config.json").write_text(json.dumps(config))
-            for name in ("model.safetensors", "tokenizer.json", "preprocessor_config.json", "generation_config.json"):
-                (snapshot / name).write_text("{}")
-            with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
-                self.assertEqual(resolve("openai/whisper-tiny", cache), snapshot)
-                self.assertFalse((snapshot / "model.yaml").exists())
-                patterns = download.call_args.kwargs["allow_patterns"]
-                self.assertIn("preprocessor_config.json", patterns)
-                self.assertIn("generation_config.json", patterns)
+        for model, hidden, layers, heads, ffn, bins, vocabulary in [
+            ("whisper-tiny", 384, 4, 6, 1536, 80, 51865),
+            ("whisper-large-v3", 1280, 32, 20, 5120, 128, 51866),
+            ("whisper-large-v3-turbo", 1280, 32, 20, 5120, 128, 51866),
+        ]:
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as root:
+                cache = Path(root).resolve()
+                snapshot = cache / f"models--openai--{model}" / "snapshots" / ("c" * 40)
+                snapshot.mkdir(parents=True)
+                config = {"model_type": "whisper", "architectures": ["WhisperForConditionalGeneration"],
+                          "d_model": hidden, "encoder_layers": layers,
+                          "decoder_layers": 4 if model.endswith("-turbo") else layers,
+                          "encoder_attention_heads": heads, "decoder_attention_heads": heads,
+                          "encoder_ffn_dim": ffn, "decoder_ffn_dim": ffn,
+                          "num_mel_bins": bins, "vocab_size": vocabulary}
+                (snapshot / "config.json").write_text(json.dumps(config))
+                for name in ("model.safetensors", "tokenizer.json", "preprocessor_config.json", "generation_config.json"):
+                    (snapshot / name).write_text("{}")
+                with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
+                    self.assertEqual(resolve(f"openai/{model}", cache), snapshot)
+                    self.assertFalse((snapshot / "model.yaml").exists())
+                    patterns = download.call_args.kwargs["allow_patterns"]
+                    self.assertIn("preprocessor_config.json", patterns)
+                    self.assertIn("generation_config.json", patterns)
+                if model == "whisper-large-v3":
+                    config["num_mel_bins"] = 80
+                    (snapshot / "config.json").write_text(json.dumps(config))
+                    with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
+                        with self.assertRaisesRegex(ValueError, "Automatic setup supports"):
+                            resolve(f"openai/{model}", cache)
+                        self.assertEqual(download.call_count, 1)
 
     def test_whisper_window_validation(self):
         import wave

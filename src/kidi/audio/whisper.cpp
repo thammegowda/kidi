@@ -13,7 +13,6 @@ namespace {
 constexpr std::size_t SAMPLE_RATE = 16000;
 constexpr std::size_t FFT_SIZE = 400;
 constexpr std::size_t HOP_LENGTH = 160;
-constexpr std::size_t MEL_BINS = 80;
 constexpr std::size_t FREQUENCY_BINS = FFT_SIZE / 2 + 1;
 constexpr std::size_t SAMPLE_COUNT = 480000;
 constexpr std::size_t FRAME_COUNT = 3000;
@@ -32,6 +31,26 @@ struct FftCache {
 };
 
 const FftCache FFT_CACHE;
+
+auto mel_filters(std::size_t bins) -> std::vector<float> {
+    const auto log_step = std::log(6.4) / 27.0;
+    const auto maximum_mel = 15.0 + std::log(8.0) / log_step;
+    std::vector<double> edges(bins + 2);
+    for (std::size_t index = 0; index < edges.size(); ++index) {
+        const auto mel = maximum_mel * index / (bins + 1);
+        edges[index] = mel < 15.0 ? mel * (200.0 / 3.0) : 1000.0 * std::exp(log_step * (mel - 15.0));
+    }
+    std::vector<float> filters(bins * FREQUENCY_BINS);
+    for (std::size_t mel = 0; mel < bins; ++mel)
+        for (std::size_t frequency = 0; frequency < FREQUENCY_BINS; ++frequency) {
+            const auto hz = static_cast<double>(frequency * SAMPLE_RATE) / FFT_SIZE;
+            const auto lower = (hz - edges[mel]) / (edges[mel + 1] - edges[mel]);
+            const auto upper = (edges[mel + 2] - hz) / (edges[mel + 2] - edges[mel + 1]);
+            filters[mel * FREQUENCY_BINS + frequency] =
+                static_cast<float>(std::max(0.0, std::min(lower, upper)) * 2.0 / (edges[mel + 2] - edges[mel]));
+        }
+    return filters;
+}
 
 auto dft(const float* input, int size, float* output) -> void {
     const int step = FFT_SIZE / size;
@@ -84,19 +103,27 @@ auto WhisperFeatureExtractor::load(const std::filesystem::path& path) -> Result<
         if (!std::filesystem::is_regular_file(path))
             return std::unexpected(Error{ErrorCode::IO, "preprocessor config does not exist: " + path.string()});
         const auto config = YAML::LoadFile(path.string());
+        const auto bins = config["feature_size"].as<std::size_t>();
         if (config["feature_extractor_type"].as<std::string>() != "WhisperFeatureExtractor" ||
-            config["sampling_rate"].as<std::size_t>() != SAMPLE_RATE ||
-            config["feature_size"].as<std::size_t>() != MEL_BINS ||
+            config["sampling_rate"].as<std::size_t>() != SAMPLE_RATE || (bins != 80 && bins != 128) ||
             config["hop_length"].as<std::size_t>() != HOP_LENGTH || config["n_fft"].as<std::size_t>() != FFT_SIZE ||
             config["n_samples"].as<std::size_t>() != SAMPLE_COUNT ||
-            config["nb_max_frames"].as<std::size_t>() != FRAME_COUNT || config["mel_filters"].size() != MEL_BINS)
+            config["nb_max_frames"].as<std::size_t>() != FRAME_COUNT)
             return std::unexpected(Error{ErrorCode::UNSUPPORTED, "unsupported Whisper preprocessing configuration"});
+        if (!config["mel_filters"]) return WhisperFeatureExtractor(mel_filters(bins));
+        if (config["mel_filters"].size() != bins)
+            return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "invalid Whisper mel filter shape"});
         std::vector<float> filters;
-        filters.reserve(MEL_BINS * FREQUENCY_BINS);
+        filters.reserve(bins * FREQUENCY_BINS);
         for (const auto& row : config["mel_filters"]) {
             if (row.size() != FREQUENCY_BINS)
                 return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "invalid Whisper mel filter shape"});
-            for (const auto& value : row) filters.push_back(value.as<float>());
+            for (const auto& value : row) {
+                const auto filter = value.as<float>();
+                if (!std::isfinite(filter) || filter < 0.F)
+                    return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "invalid Whisper mel filter value"});
+                filters.push_back(filter);
+            }
         }
         return WhisperFeatureExtractor(std::move(filters));
     } catch (const YAML::Exception& error) {
@@ -113,8 +140,9 @@ auto WhisperFeatureExtractor::extract(std::span<const float> waveform, std::uint
     if (waveform.size() > SAMPLE_COUNT)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "Whisper audio exceeds the 30-second limit"});
     const auto count = waveform.size();
-    WhisperFeatures result{{}, MEL_BINS, FRAME_COUNT};
-    result.values.assign(MEL_BINS * FRAME_COUNT, -10.F);
+    const auto mel_bins = bins();
+    WhisperFeatures result{{}, mel_bins, FRAME_COUNT};
+    result.values.assign(mel_bins * FRAME_COUNT, -10.F);
     std::array<float, FFT_SIZE * 2> fft_input{};
     std::array<float, FFT_SIZE * 8> fft_output{};
     std::array<float, FREQUENCY_BINS> power{};
@@ -133,7 +161,7 @@ auto WhisperFeatureExtractor::extract(std::span<const float> waveform, std::uint
             const auto real = fft_output[2 * frequency], imaginary = fft_output[2 * frequency + 1];
             power[frequency] = real * real + imaginary * imaginary;
         }
-        for (std::size_t mel = 0; mel < MEL_BINS; ++mel) {
+        for (std::size_t mel = 0; mel < mel_bins; ++mel) {
             double sum = 0;
             for (std::size_t frequency = 0; frequency < FREQUENCY_BINS; ++frequency)
                 sum += power[frequency] * filters_[mel * FREQUENCY_BINS + frequency];

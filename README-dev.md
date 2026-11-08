@@ -400,6 +400,19 @@ required. Individual targets are `native-test`, `python-test`, `web-test`, and
 `regression-test`. See [tests/data/README.md](tests/data/README.md) for fixtures
 and numerical contracts.
 
+To check long-file Whisper processing with a local checkpoint and a short English
+mono PCM16 16 kHz WAV (at most 30 seconds):
+
+```bash
+KIDI_BIN="$PWD/build-release/kidi" \
+KIDI_WHISPER_MODEL=/path/to/whisper-large-v3-turbo \
+KIDI_WHISPER_WAV=/path/to/speech.wav \
+PYTHONPATH=tests python -m unittest python_cli_test.PythonCliTest.test_whisper_long_file
+```
+
+This verifies three windows reuse the transcription path, preserve the complete
+sample in each output line, and fail explicitly when the per-window token limit is reached.
+
 Browser unit, loader, generated-glue, and site-packaging tests:
 
 ```bash
