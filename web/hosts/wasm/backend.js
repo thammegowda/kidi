@@ -622,31 +622,19 @@ class WasmBackend {
       });
       return;
     }
-    if (type === 'editor.run') {
+    if (type === 'editor.run' || type === 'document.run') {
       if (!this.#ready || !this.#worker) return this.#error(id, 'not_ready', 'Load the browser model first');
       if (this.#current) return this.#error(id, 'busy', 'Another inference request is active');
-      this.#current = {id, text: '', kind: 'editor'};
-      this.#event(id, 'editor.started');
+      const kind = type === 'document.run' ? 'document' : 'editor';
+      const defaultPrompt = kind === 'document'
+        ? (payload.mode === 'translate'
+            ? PROMPTS.page_translate ?? PROMPTS.translate : PROMPTS.page_summarize ?? PROMPTS.summarize)
+        : (payload.task === 'chat' ? this.#settings.systemPrompt : PROMPTS[payload.task]);
+      this.#current = {id, text: '', kind};
+      this.#event(id, `${kind}.started`);
       this.#worker.postMessage({
-        type: 'editor',
-        request: Object.hasOwn(payload, 'system_prompt') ? payload : {
-          ...payload, system_prompt: payload.task === 'chat' ? this.#settings.systemPrompt : PROMPTS[payload.task],
-        },
-        maximumTokens: Number.isInteger(payload.maximum_tokens)
-          ? payload.maximum_tokens : Math.min(this.#settings.maximumTokens, 512),
-      });
-      return;
-    }
-    if (type === 'document.run') {
-      if (!this.#ready || !this.#worker) return this.#error(id, 'not_ready', 'Load the browser model first');
-      if (this.#current) return this.#error(id, 'busy', 'Another inference request is active');
-      this.#current = {id, text: '', kind: 'document'};
-      this.#event(id, 'document.started');
-      this.#worker.postMessage({
-        type: 'document', request: Object.hasOwn(payload, 'system_prompt') ? payload : {
-          ...payload, system_prompt: payload.mode === 'translate'
-            ? PROMPTS.page_translate ?? PROMPTS.translate : PROMPTS.page_summarize ?? PROMPTS.summarize,
-        },
+        type: kind,
+        request: Object.hasOwn(payload, 'system_prompt') ? payload : {...payload, system_prompt: defaultPrompt},
         maximumTokens: Number.isInteger(payload.maximum_tokens)
           ? payload.maximum_tokens : Math.min(this.#settings.maximumTokens, 512),
       });

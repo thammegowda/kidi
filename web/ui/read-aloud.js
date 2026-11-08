@@ -17,9 +17,6 @@ export class ReadAloud {
       send,
       nextWireStream: () => this.#nextStream++,
       onProgress: (_current, progress) => this.#publish('Synthesizing speech', progress),
-      onSegment: (_current, segment) => {
-        if (this.#current) this.#current.segment = segment.id + 1;
-      },
       onPcm: (_current, frame) => this.#deliver(frame),
       onCompleted: current => {
         if (this.#current?.id !== current.id) return;

@@ -632,9 +632,8 @@ function event(message) {
       activeRequest.view.section.append(status);
       activeRequest.view.status = status;
     }
-    activeRequest.view.status.textContent = payload.translating ? `Translating section ${payload.part}/${payload.parts}`
-      : `${payload.round > 1 ? 'Combining summaries' : 'Summarizing'} · section ${payload.part}/${payload.parts}` +
-        (payload.round > 1 ? ` · pass ${payload.round}` : '');
+    activeRequest.view.status.textContent =
+      `${payload.translating ? 'Translating' : 'Summarizing'} section ${payload.part}/${payload.parts}`;
   } else if ((type === 'editor.delta' || type === 'document.delta') && id === activeRequest?.id) {
     const nearBottom = $('conversation').scrollHeight - $('conversation').scrollTop - $('conversation').clientHeight < 80;
     if (payload.replace) activeRequest.text = payload.text || '';

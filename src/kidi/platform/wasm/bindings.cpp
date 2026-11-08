@@ -146,6 +146,12 @@ auto messages(const char* messages_json) -> std::vector<kidi::text::ChatMessage>
     }
     return result;
 }
+auto optional_string(const nlohmann::json& value, std::string_view key, std::string_view label)
+    -> std::optional<std::string> {
+    if (!value.contains(key)) return std::nullopt;
+    if (!value[key].is_string()) throw std::runtime_error(std::string(label) + " must be a string");
+    return value[key].get<std::string>();
+}
 auto editor_request(const char* request_json) -> kidi::app::EditorRequest {
     const auto value = nlohmann::json::parse(request_json);
     if (!value.is_object()) throw std::runtime_error("Editor request must be an object");
@@ -154,24 +160,12 @@ auto editor_request(const char* request_json) -> kidi::app::EditorRequest {
     kidi::app::EditorRequest request{
         .task = task,
         .text = value.value("text", ""),
+        .system_prompt = optional_string(value, "system_prompt", "Editor system prompt"),
+        .instruction = optional_string(value, "instruction", "Editor instruction"),
+        .tone = optional_string(value, "tone", "Editor tone"),
+        .target_language = optional_string(value, "target_language", "Target language"),
         .length = length,
     };
-    if (value.contains("system_prompt")) {
-        if (!value["system_prompt"].is_string()) throw std::runtime_error("Editor system prompt must be a string");
-        request.system_prompt = value["system_prompt"].get<std::string>();
-    }
-    if (value.contains("instruction")) {
-        if (!value["instruction"].is_string()) throw std::runtime_error("Editor instruction must be a string");
-        request.instruction = value["instruction"].get<std::string>();
-    }
-    if (value.contains("tone")) {
-        if (!value["tone"].is_string()) throw std::runtime_error("Editor tone must be a string");
-        request.tone = value["tone"].get<std::string>();
-    }
-    if (value.contains("target_language")) {
-        if (!value["target_language"].is_string()) throw std::runtime_error("Target language must be a string");
-        request.target_language = value["target_language"].get<std::string>();
-    }
     if (value.contains("history")) {
         if (!value["history"].is_array() || value["history"].size() > kidi::app::EditorLimits{}.maximum_history_turns)
             throw std::runtime_error("Conversation history must be a bounded array");
@@ -414,11 +408,11 @@ EMSCRIPTEN_KEEPALIVE auto kidi_document_enqueue(const char* request_json, int ma
         kidi::app::DocumentRequest request{
             .task = mode == "translate" ? kidi::app::DocumentTask::TRANSLATE : kidi::app::DocumentTask::SUMMARIZE,
             .text = value.at("text").get<std::string>(),
+            .system_prompt = optional_string(value, "system_prompt", "Document system prompt"),
+            .target_language = optional_string(value, "target_language", "Target language"),
+            .instruction = optional_string(value, "instruction", "Document instruction"),
         };
-        if (value.contains("system_prompt")) request.system_prompt = value.at("system_prompt").get<std::string>();
-        if (value.contains("target_language")) request.target_language = value.at("target_language").get<std::string>();
-        if (value.contains("instruction") && !value.at("instruction").get<std::string>().empty())
-            request.instruction = value.at("instruction").get<std::string>();
+        if (request.instruction && request.instruction->empty()) request.instruction.reset();
         auto document = kidi::ops::require(
             kidi::app::DocumentSession::start(loaded(), std::move(request), options(maximum_tokens)));
         const auto id = document.id();
@@ -436,7 +430,6 @@ EMSCRIPTEN_KEEPALIVE auto kidi_document_step() -> const char* {
         const auto progress = document->progress();
         result["document_progress"] = {{"part", progress.part},
                                        {"parts", progress.parts},
-                                       {"round", progress.round},
                                        {"translating", progress.translating},
                                        {"completed", progress.completed}};
         if (progress.completed) document.reset();

@@ -107,7 +107,6 @@ assert.ok(Math.max(...manyParagraphs.progress.map(progress => progress.parts)) <
 const summarized = document({mode: 'summarize', text: 'alpha '.repeat(5000)});
 assert.equal(summarized.completed.text, 'alpha');
 assert.ok(summarized.progress.some(progress => progress.parts === 2));
-assert.ok(summarized.progress.every(progress => progress.round === 1));
 assert.deepEqual(summarized.replacements, ['alpha', 'alpha'],
   'each segment publishes a replacement cumulative summary');
 assert.equal(summarized.completed.token_ids.length, 2, 'diagnostics aggregate both rolling summary requests');

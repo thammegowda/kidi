@@ -68,16 +68,10 @@
     const result = bounded(text);
     return {
       kind: 'article', title, language, sourceKind, sourceUrl: url,
-      originalCharacters: characterCount(text), returnedCharacters: characterCount(result.text),
       ...result, operation: null,
       warning: result.truncated
         ? 'Only the first 64 KiB of readable text was captured. Results and narration cover the attached text only.' : '',
     };
-  }
-  function characterCount(text) {
-    let count = 0;
-    for (const _character of text) count++;
-    return count;
   }
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (sender.id !== api.runtime.id || message?.type !== 'kidi.page.capture') return false;

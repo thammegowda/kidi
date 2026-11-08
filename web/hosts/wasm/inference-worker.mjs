@@ -114,48 +114,28 @@ self.onmessage = async ({data}) => {
             const result = await call('kidi_load', ['string'], ['/model']);
             ready = true;
             post({type: 'ready', ...result, ...cache, loadMs: performance.now() - started}, true);
-        } else if (data.type === 'generate') {
+        } else if (['generate', 'editor', 'document'].includes(data.type)) {
             if (!ready || active || inFlight) throw new Error('Runtime is not ready for a new request');
+            documentMode = data.type === 'document';
             active = true;
             inFlight = true;
             cancelRequested = false;
-            documentMode = false;
             generationStarted = performance.now();
             generation = {tokenCount: 0, elapsedMs: 0, decodeMs: 0, decodeTokens: 0, firstTokenMs: null};
-            const staged = await stageImages(module, data.messages);
             let result;
-            try {
-                if (staged.messages.some(message => message.images.length))
-                    post({type: 'encoding-images'});
-                result = await call('kidi_enqueue', ['string', 'number', 'number'],
-                    [JSON.stringify(staged.messages), data.maximumTokens, data.imageMaxPixels ?? 3000000]);
-            } finally { staged.dispose(); }
-            requestId = result.request_id;
-            inFlight = false;
-            setTimeout(step, 0);
-        } else if (data.type === 'editor') {
-            if (!ready || active || inFlight) throw new Error('Runtime is not ready for a new request');
-            active = true;
-            inFlight = true;
-            cancelRequested = false;
-            documentMode = false;
-            generationStarted = performance.now();
-            generation = {tokenCount: 0, elapsedMs: 0, decodeMs: 0, decodeTokens: 0, firstTokenMs: null};
-            const result = await call('kidi_editor_enqueue', ['string', 'number'],
-                [JSON.stringify(data.request), data.maximumTokens]);
-            requestId = result.request_id;
-            inFlight = false;
-            setTimeout(step, 0);
-        } else if (data.type === 'document') {
-            if (!ready || active || inFlight) throw new Error('Runtime is not ready for a new request');
-            documentMode = true;
-            active = true;
-            inFlight = true;
-            cancelRequested = false;
-            generationStarted = performance.now();
-            generation = {tokenCount: 0, elapsedMs: 0, decodeMs: 0, decodeTokens: 0, firstTokenMs: null};
-            const result = await call('kidi_document_enqueue', ['string', 'number'],
-                [JSON.stringify(data.request), data.maximumTokens]);
+            if (data.type === 'generate') {
+                const staged = await stageImages(module, data.messages);
+                try {
+                    if (staged.messages.some(message => message.images.length))
+                        post({type: 'encoding-images'});
+                    result = await call('kidi_enqueue', ['string', 'number', 'number'],
+                        [JSON.stringify(staged.messages), data.maximumTokens, data.imageMaxPixels ?? 3000000]);
+                } finally { staged.dispose(); }
+            } else {
+                const method = documentMode ? 'kidi_document_enqueue' : 'kidi_editor_enqueue';
+                result = await call(method, ['string', 'number'],
+                    [JSON.stringify(data.request), data.maximumTokens]);
+            }
             requestId = result.request_id;
             inFlight = false;
             setTimeout(step, 0);

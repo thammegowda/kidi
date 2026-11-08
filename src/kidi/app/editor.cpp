@@ -104,30 +104,24 @@ auto validate_editor_request(EditorRequest request, EditorLimits limits) -> Resu
         return invalid("editor limits must be positive");
     if (request.text.size() > limits.maximum_text_bytes) return invalid("editor text exceeds the byte limit");
     if (!valid_utf8(request.text)) return invalid("editor text is not valid UTF-8");
-    if (request.system_prompt) {
-        if (request.system_prompt->empty())
-            request.system_prompt.reset();
-        else if (request.system_prompt->size() > limits.maximum_system_prompt_bytes)
-            return invalid("editor system prompt exceeds the byte limit");
-        else if (!valid_utf8(*request.system_prompt))
-            return invalid("editor system prompt is not valid UTF-8");
-    }
-    if (request.instruction) {
-        if (request.instruction->empty())
-            request.instruction.reset();
-        else if (request.instruction->size() > limits.maximum_instruction_bytes)
-            return invalid("editor instruction exceeds the byte limit");
-        else if (!valid_utf8(*request.instruction))
-            return invalid("editor instruction is not valid UTF-8");
-    }
-    if (request.tone) {
-        if (request.tone->empty())
-            request.tone.reset();
-        else if (request.tone->size() > limits.maximum_tone_bytes)
-            return invalid("editor tone exceeds the byte limit");
-        else if (!valid_utf8(*request.tone))
-            return invalid("editor tone is not valid UTF-8");
-    }
+    const auto check_optional = [](std::optional<std::string>& field, std::size_t limit,
+                                   std::string_view name) -> Result<void> {
+        if (!field) return {};
+        if (field->empty()) {
+            field.reset();
+            return {};
+        }
+        if (field->size() > limit) return invalid("editor " + std::string(name) + " exceeds the byte limit");
+        if (!valid_utf8(*field)) return invalid("editor " + std::string(name) + " is not valid UTF-8");
+        return {};
+    };
+    if (auto checked = check_optional(request.system_prompt, limits.maximum_system_prompt_bytes, "system prompt");
+        !checked)
+        return std::unexpected(checked.error());
+    if (auto checked = check_optional(request.instruction, limits.maximum_instruction_bytes, "instruction"); !checked)
+        return std::unexpected(checked.error());
+    if (auto checked = check_optional(request.tone, limits.maximum_tone_bytes, "tone"); !checked)
+        return std::unexpected(checked.error());
     if (request.task == EditorTask::CUSTOM && !request.instruction)
         return invalid("custom editor task requires an instruction");
     if (request.target_language) {

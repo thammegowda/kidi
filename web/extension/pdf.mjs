@@ -78,7 +78,7 @@ export async function extractPdf(url) {
     return {
       text, title: typeof info.Title === 'string' ? info.Title.trim() : '',
       language: typeof languageCode === 'string' ? languageCode.trim() : '',
-      pageCount: document.numPages, pagesRead, returnedCharacters: [...text].length,
+      pageCount: document.numPages,
       truncated: textLimited || pageLimited,
       warning: warning ? `${warning} Results and narration cover the attached text only.` : '',
     };

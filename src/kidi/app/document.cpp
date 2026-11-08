@@ -72,7 +72,7 @@ auto document_parts(std::string_view text, std::size_t maximum_characters, bool 
     una::error error;
     auto decoded = una::strict::utf8to32u(text, error);
     if (error) return invalid("document text is not valid UTF-8");
-    decoded.erase(std::remove(decoded.begin(), decoded.end(), U'\r'), decoded.end());
+    std::erase(decoded, U'\r');
     std::vector<DocumentPart> result;
     const auto append = [&](std::u32string_view paragraph) {
         paragraph = trimmed(paragraph);
@@ -115,6 +115,20 @@ auto document_parts(std::string_view text, std::size_t maximum_characters, bool 
 }
 
 namespace {
+
+auto halve_part(std::vector<DocumentPart>& parts, std::size_t index, bool preserve_paragraphs, std::string_view message)
+    -> Result<void> {
+    const auto characters = una::utf8to32u(parts[index].text).size();
+    if (characters < 2) return invalid(std::string(message));
+    auto split = document_parts(parts[index].text, characters / 2, preserve_paragraphs);
+    if (!split || split->size() < 2) return invalid(std::string(message));
+    if (parts.size() + split->size() - 1 > MAXIMUM_PARTS)
+        return invalid("document has too many sections; select a shorter passage");
+    split->back().paragraph_end = parts[index].paragraph_end;
+    const auto position = parts.erase(parts.begin() + static_cast<std::ptrdiff_t>(index));
+    parts.insert(position, std::make_move_iterator(split->begin()), std::make_move_iterator(split->end()));
+    return {};
+}
 
 auto translation_segments(std::string_view text) -> Result<std::vector<DocumentPart>> {
     auto atoms = document_parts(text, TRANSLATION_CHARACTERS, true);
@@ -172,15 +186,10 @@ auto summary_segments(inference::Generator& generator, const DocumentRequest& re
             paragraph_end = false;
             continue;
         }
-        const auto characters = una::utf8to32u((*atoms)[index].text).size();
-        if (characters < 2) return invalid("a summary source character exceeds the 4096-token input budget");
-        auto split = document_parts((*atoms)[index].text, characters / 2, false);
-        if (!split || split->size() < 2)
-            return invalid("summary source cannot be split to fit the 4096-token input budget");
-        split->back().paragraph_end = (*atoms)[index].paragraph_end;
-        const auto position = atoms->erase(atoms->begin() + index);
-        atoms->insert(position, std::make_move_iterator(split->begin()), std::make_move_iterator(split->end()));
-        if (atoms->size() > MAXIMUM_PARTS) return invalid("document has too many sections; select a shorter passage");
+        if (auto halved =
+                halve_part(*atoms, index, false, "summary source cannot be split to fit the 4096-token input budget");
+            !halved)
+            return std::unexpected(halved.error());
     }
     if (!current.empty()) result.push_back({std::move(current), paragraph_end});
     if (result.empty() || result.size() > MAXIMUM_PARTS)
@@ -226,16 +235,10 @@ auto DocumentSession::enqueue_part() -> Result<void> {
                 current_id_ = *queued;
                 return {};
             }
-            const auto characters = una::utf8to32u(parts_[part_].text).size();
-            if (characters < 2) return invalid("rolling summary exceeds the 4096-token input budget");
-            auto split = document_parts(parts_[part_].text, characters / 2, false);
-            if (!split || split->size() < 2)
-                return invalid("rolling summary segment cannot fit the 4096-token input budget");
-            split->back().paragraph_end = parts_[part_].paragraph_end;
-            const auto position = parts_.erase(parts_.begin() + part_);
-            parts_.insert(position, std::make_move_iterator(split->begin()), std::make_move_iterator(split->end()));
-            if (parts_.size() > MAXIMUM_PARTS)
-                return invalid("document has too many sections; select a shorter passage");
+            if (auto halved =
+                    halve_part(parts_, part_, false, "rolling summary segment cannot fit the 4096-token input budget");
+                !halved)
+                return halved;
         }
     }
     EditorRequest edit{
@@ -259,7 +262,7 @@ auto DocumentSession::enqueue_part() -> Result<void> {
 }
 
 auto DocumentSession::progress() const -> DocumentProgress {
-    return {std::min(part_ + 1, parts_.size()), parts_.size(), 1, request_.task == DocumentTask::TRANSLATE, completed_};
+    return {std::min(part_ + 1, parts_.size()), parts_.size(), request_.task == DocumentTask::TRANSLATE, completed_};
 }
 
 auto DocumentSession::cancel() -> Result<void> {
@@ -299,15 +302,10 @@ auto DocumentSession::step() -> Result<inference::GenerationStep> {
     if (!translating && finished->generation.truncated)
         return invalid("cumulative summary reached the 1024-token output budget; request a more concise summary");
     if (translating && finished->generation.truncated) {
-        const auto characters = una::utf8to32u(parts_[part_].text).size();
-        if (characters < 2) return invalid("translation reached its output budget; use a more concise prompt");
-        auto smaller = document_parts(parts_[part_].text, characters / 2, true);
-        if (!smaller) return std::unexpected(smaller.error());
-        if (parts_.size() + smaller->size() - 1 > MAXIMUM_PARTS)
-            return invalid("translation exceeded its section budget; select a shorter passage");
-        smaller->back().paragraph_end = parts_[part_].paragraph_end;
-        const auto position = parts_.erase(parts_.begin() + part_);
-        parts_.insert(position, std::make_move_iterator(smaller->begin()), std::make_move_iterator(smaller->end()));
+        if (auto halved =
+                halve_part(parts_, part_, true, "translation reached its output budget; use a more concise prompt");
+            !halved)
+            return std::unexpected(halved.error());
         auto queued = enqueue_part();
         if (!queued) return std::unexpected(queued.error());
         step->waiting_requests = generator_.get().pending_requests();

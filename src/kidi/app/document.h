@@ -27,7 +27,7 @@ struct DocumentPart {
 };
 
 struct DocumentProgress {
-    std::size_t part, parts, round;
+    std::size_t part, parts;
     bool translating, completed;
 };
 

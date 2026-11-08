@@ -966,7 +966,6 @@ async function startBookSpeech(requestedOffset = readerSpeechOffset) {
     readerTranslationAppendedLength: sliced.text.length,
     readerSide: readerSpeechSide,
   }, !streaming);
-  scheduleReaderControlsHide(1000);
 }
 
 async function seekBookSpeech(requestedOffset) {
