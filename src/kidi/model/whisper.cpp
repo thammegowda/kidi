@@ -225,7 +225,7 @@ auto WhisperImpl::encode(const audio::WhisperFeatures& features, std::size_t fra
                          const std::function<bool()>& cancelled) -> Result<WhisperEncoderState> {
     try {
         if (!frames) frames = features.frames;
-        if ((device() != tensor::Device::cpu() && device() != tensor::Device::web_gpu()) ||
+        if (!device().capabilities().supports_audio_transformer() ||
             features.bins != static_cast<std::size_t>(impl_->mel_bins) || features.frames != 3000 ||
             features.values.size() != features.bins * features.frames || frames % 2 || frames > features.frames)
             throw ops::Failure(
@@ -237,7 +237,7 @@ auto WhisperImpl::encode(const audio::WhisperFeatures& features, std::size_t fra
         const auto input =
             require(Tensor::from_host({1, static_cast<std::int64_t>(frames), static_cast<std::int64_t>(features.bins)},
                                       std::span<const float>(values), device()));
-        if (device() == tensor::Device::web_gpu()) {
+        if (device().policy().replay.region_layers) {
             const auto outputs = impl_->context.replay(
                 "whisper_encoder:" + std::to_string(frames), std::array{input},
                 [&](std::span<const Tensor> inputs) {

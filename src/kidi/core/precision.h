@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <string_view>
+#include <utility>
 
 namespace kidi::core {
 
@@ -65,6 +66,7 @@ constexpr auto to_string(InferencePrecision precision) noexcept -> std::string_v
         case InferencePrecision::QAT_FP32:
             return "qat-fp32";
     }
+    std::unreachable();
 }
 
 constexpr auto parse_precision(std::string_view name) noexcept -> std::optional<InferencePrecision> {
@@ -131,6 +133,7 @@ constexpr auto to_string(KVCachePrecision precision) noexcept -> std::string_vie
         case KVCachePrecision::E5M2:
             return "e5m2";
     }
+    std::unreachable();
 }
 
 constexpr auto parse_kv_cache_precision(std::string_view name) noexcept -> std::optional<KVCachePrecision> {

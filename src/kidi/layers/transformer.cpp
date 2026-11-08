@@ -12,10 +12,9 @@ auto check_precision(tensor::DType precision) -> void {
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "unsupported parameter precision"});
 }
 auto parameter_device(bool packed) -> tensor::Device {
-    return module_device == tensor::Device::vulkan() ||
-                   (module_device == tensor::Device::apple_gpu() && (module_dtype == tensor::DType::I8 || packed))
-               ? tensor::Device::cpu()
-               : module_device;
+    const auto kind =
+        module_dtype == tensor::DType::I8 || packed ? tensor::ParameterKind::QUANTIZED : tensor::ParameterKind::FLOAT;
+    return module_device.parameter_device(tensor::ParameterRole::PROJECTION, kind);
 }
 auto split_qkv(ops::Context& context, const Tensor& projected) -> std::array<Tensor, 3> {
     auto width = static_cast<std::int64_t>(projected.size(-1) / 3);
@@ -70,7 +69,8 @@ LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool t
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "quantized linear bias requires INT8 weights and a bias"});
     if (bias && quantized_bias) {
         bias_qstate_.emplace();
-        const auto vector_storage = module_device == tensor::Device::web_gpu() ? tensor::Device::cpu() : storage;
+        const auto vector_storage =
+            module_device.parameter_device(tensor::ParameterRole::PROJECTION, tensor::ParameterKind::PREPARED_VECTOR);
         register_parameter("bias", bias_, {output_size}, tensor::DType::I8, allocate_parameters, vector_storage);
         register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32, allocate_parameters, vector_storage);
     } else if (bias) {
@@ -80,7 +80,12 @@ LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool t
     if (module_dtype == tensor::DType::I8) {
         qstate_.emplace();
         register_parameter("scale", qstate_->scale, {output_size, 1}, tensor::DType::F32, allocate_parameters, storage);
-        if (allocate_parameters) std::ranges::fill(require(qstate_->scale.data<float>()), 1.F);
+        if (allocate_parameters) {
+            const std::vector<float> ones(output_size, 1.F);
+            const auto bytes = std::as_bytes(std::span(ones));
+            require(qstate_->scale.copy_from_host(bytes));
+            if (bias_qstate_) require(bias_qstate_->scale.copy_from_host(bytes.first(sizeof(float))));
+        }
     }
 }
 auto LinearImpl::bias() const -> const Tensor& {
@@ -101,7 +106,10 @@ LayerNormImpl::LayerNormImpl(std::int32_t hidden_size, float epsilon) : epsilon_
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid normalization epsilon"});
     register_parameter("weight", scale_, {hidden_size}, tensor::DType::F32);
     register_parameter("bias", bias_, {hidden_size}, tensor::DType::F32);
-    if (allocate_parameters) std::ranges::fill(require(scale_.data<float>()), 1.F);
+    if (allocate_parameters) {
+        const std::vector<float> ones(hidden_size, 1.F);
+        require(scale_.copy_from_host(std::as_bytes(std::span(ones))));
+    }
 }
 auto LayerNormImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
     return context.layer_norm(input, scale_, bias_, epsilon_);
@@ -118,7 +126,10 @@ EmbeddingImpl::EmbeddingImpl(std::int32_t vocabulary_size, std::int32_t hidden_s
     register_parameter("weight", weight_, {vocabulary_size, hidden_size});
     if (module_dtype == tensor::DType::I8) {
         register_parameter("scale", scale_, {vocabulary_size, 1}, tensor::DType::F32);
-        if (allocate_parameters) std::ranges::fill(require(scale_.data<float>()), 1.F);
+        if (allocate_parameters) {
+            const std::vector<float> ones(vocabulary_size, 1.F);
+            require(scale_.copy_from_host(std::as_bytes(std::span(ones))));
+        }
     }
     if (allocate_parameters)
         positions_ = require(sinusoidal_position_encoding(maximum_position_, hidden_size_, device()));

@@ -23,18 +23,17 @@ constexpr std::int64_t VISION_ROWS = 256;
 #else
 constexpr std::int64_t VISION_ROWS = 32;
 #endif
-constexpr std::size_t VISION_REGION_LAYERS = 4;
 auto slice_rows(const ops::Context& context, bool attention) -> std::int64_t {
-    if (context.device() == tensor::Device::cpu()) {
+    const auto& capabilities = context.device().capabilities();
+    if (capabilities.compute.host()) {
         const auto precision = context.precision();
         if (precision == core::InferencePrecision::LOWBIT_PARITY ||
             (attention && precision == core::InferencePrecision::QAT_FP32))
             return std::numeric_limits<std::int64_t>::max();
     }
-    if (context.device() == tensor::Device::cpu()) return VISION_ROWS;
-    if (attention && context.device() != tensor::Device::web_gpu() &&
-        !tensor::DEVICE_CAPABILITIES[context.device().kind].fused_full_attention)
-        return 512;
+    if (capabilities.compute.host()) return VISION_ROWS;
+    if (attention && !capabilities.attention.fused())
+        return static_cast<std::int64_t>(context.device().policy().transformer.attention_query_rows);
     return std::numeric_limits<std::int64_t>::max();
 }
 
@@ -309,9 +308,9 @@ struct Gemma4VisionImpl::State {
           theta(config["rope_parameters"]["rope_theta"].as<float>()),
           tower(config, quantized),
           projection(hidden, text_width, config["rms_norm_eps"].as<float>()) {
-        if (module_device == tensor::Device::web_gpu())
+        if (const auto region_layers = context.device().policy().replay.region_layers; region_layers)
             context.set_replay_capacity(std::max<std::size_t>(
-                1, (config["num_hidden_layers"].as<std::size_t>() + VISION_REGION_LAYERS - 1) / VISION_REGION_LAYERS));
+                1, (config["num_hidden_layers"].as<std::size_t>() + region_layers - 1) / region_layers));
     }
 };
 
@@ -331,7 +330,8 @@ auto Gemma4VisionImpl::set_precision(core::InferencePrecision precision) noexcep
     impl_->context.set_precision(precision);
 }
 auto Gemma4VisionImpl::release_workspaces() -> void {
-    if (device() == tensor::Device::web_gpu()) impl_->context.trim_workspaces();
+    if (device().policy().replay.region_layers)
+        impl_->context.trim_workspaces();
     else impl_->context.release_workspaces();
 }
 
@@ -474,11 +474,12 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image, const BlockObser
         const auto mask = require(Tensor::zeros({1, 1, 1, length}, DType::F32, device()));
         auto hidden = context.add(project_rows(context, state.tower->patch->projection, patches), positions);
         const auto& layers = *state.tower->encoder->layers;
-        if (device() == tensor::Device::web_gpu() && !block_observer && !stage_observer) {
+        const auto region_layers = context.device().policy().replay.region_layers;
+        if (region_layers && !block_observer && !stage_observer) {
             std::size_t region = 0;
             for (auto first = layers.begin(); first != layers.end(); ++region) {
                 auto last = first;
-                for (std::size_t count = 0; count < VISION_REGION_LAYERS && last != layers.end(); ++count) ++last;
+                for (std::size_t count = 0; count < region_layers && last != layers.end(); ++count) ++last;
                 const std::array inputs{hidden, cos, sin, mask};
                 hidden = context.replay(
                     "vision:" + std::to_string(length) + ':' + std::to_string(region), inputs,

@@ -1,3 +1,4 @@
+#include "kidi/graph/compiler.h"
 #include "kidi/ops/context.h"
 #include "kidi/runtime/operator.h"
 

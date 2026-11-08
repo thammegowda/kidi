@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <utility>
 
 namespace kidi::tensor {
 
@@ -46,6 +47,7 @@ constexpr auto element_size(DType dtype) noexcept -> std::size_t {
         case DType::F64:
             return 8;
     }
+    std::unreachable();
 }
 
 constexpr auto to_string(DType dtype) noexcept -> std::string_view {
@@ -81,6 +83,7 @@ constexpr auto to_string(DType dtype) noexcept -> std::string_view {
         case DType::E5M2:
             return "e5m2";
     }
+    std::unreachable();
 }
 
 template <typename Value>

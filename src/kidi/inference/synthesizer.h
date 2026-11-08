@@ -108,7 +108,7 @@ public:
 
 private:
     struct Impl;
-    Synthesizer(std::shared_ptr<SynthesizerModel> model, text::SentenceSegmenter sentences);
+    Synthesizer(std::shared_ptr<SynthesizerModel> model, text::SentenceSegmenter sentences, tensor::Device device);
     auto create_session(std::string_view text, const SynthesisOptions& options, bool stepped) const
         -> Result<std::unique_ptr<SynthesisSession>>;
 

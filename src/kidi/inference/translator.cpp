@@ -74,7 +74,7 @@ Translator::Translator(checkpoint::Package package, model::Transformer model) no
 
 auto Translator::load(const std::filesystem::path& model_directory, tensor::Device device, InferenceStats* stats,
                       std::size_t batch_size) -> Result<Translator> {
-    if (device != tensor::Device::cpu() && device != tensor::Device::apple_gpu())
+    if (!device.capabilities().compute.supports(tensor::TransformerSupport::GENERAL))
         return std::unexpected(
             Error{ErrorCode::UNSUPPORTED, "no translation backend for " + tensor::to_string(device)});
     if (batch_size == 0 || batch_size > 256)

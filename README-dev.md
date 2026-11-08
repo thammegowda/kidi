@@ -45,6 +45,32 @@ accepts local model paths only. The Python launcher supplies Hugging Face Hub
 resolution. Executable/wheel sizes vary by platform and build; model weights and
 runtime memory must be measured separately from artifact size.
 
+### CUDA
+
+The optional NVIDIA backend requires the CUDA 13+ toolkit and a compatible GPU.
+From an initialized checkout, enable it for the standalone CLI:
+
+```bash
+cmake --preset release -DKIDI_ENABLE_CUDA=ON
+cmake --build --preset release --target kidi_cli
+build-release/kidi chat --model /path/to/gemma-model --backend cuda:0
+```
+
+For the Python launcher, build and install a CUDA-enabled package separately:
+
+```bash
+python -m pip install '.[hf]' -Ccmake.define.KIDI_ENABLE_CUDA=ON
+python -m kidi chat -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0
+```
+
+CUDA is disabled in default builds. Installing a CPU-only wheel does not gain
+CUDA support just because the toolkit is present. `--backend cuda` selects GPU 0;
+`--backend cuda:INDEX` selects another GPU using CUDA's device numbering, which
+respects `CUDA_VISIBLE_DEVICES`. `auto` retains the existing Metal/CPU selection.
+An explicitly requested CUDA backend fails rather than falling back to CPU when
+unavailable. The same backend option is accepted by interactive `chat` and
+scripted `generate`.
+
 ## Python Package
 
 From an activated Python 3.12+ environment in the checkout:
@@ -314,7 +340,8 @@ Checkpoint I/O -> Model-owned configuration and preparation hooks
 ```
 
 Kidi uses C++23 with a shared model implementation across backends. CPU uses
-YNNPACK; Apple GPUs use Metal. Models are ordinary C++ composed from reusable
+YNNPACK; Apple GPUs use Metal; NVIDIA GPUs can use the optional YNNPACK CUDA
+runtime (`KIDI_ENABLE_CUDA=ON`). Models are ordinary C++ composed from reusable
 layers and concrete tensors, not exported model graphs. Backend-specific
 operator preparation and fusion remain internal to the runtime.
 
@@ -331,6 +358,7 @@ support for arbitrary Hugging Face architectures.
 - [ARCHITECTURE.md](ARCHITECTURE.md): ownership, execution, state and backend contracts.
 - [CODING_GUIDELINES.md](CODING_GUIDELINES.md): APIs, naming, formatting and testing rules.
 - [Manual model setup](docs/getting-started.md#optional-manual-setup): configuration and converter entry points.
+- [Benchmarks](benchmarks/README.md): build options, CPU/CUDA/Metal runners, precision, and validation.
 
 ## GGML and GGUF Import
 
@@ -443,10 +471,20 @@ its chats and downloaded models.
 Results depend on hardware, precision, memory pressure and workload. They are
 not promises for other devices or proof of quality equivalence across quantizers.
 
-- [Gemma 4](benchmarks/gemma4/README.md): CPU/Metal comparisons with GGML and LiteRT-LM, quality and memory.
+- [Gemma 4](benchmarks/README.md#gemma-4): CPU/Metal comparisons with GGML and LiteRT-LM, quality and memory.
 - [RTG](benchmarks/rtg/README.md): FP32/BF16/INT8 translation benchmarks.
-- [Apple Metal](benchmarks/metal/README.md): backend measurements and execution studies.
+- [Apple Metal](benchmarks/README.md#metal): projection and kernel measurements.
 - [Android](benchmarks/android/README.md): reproducible device benchmark setup.
+- [CPU harness](benchmarks/cpu/README.md): repeatable desktop CPU decode measurements and operator profiles.
+
+On Linux hosts with several NUMA nodes, `kidi` commands that run on the CPU keep
+their `-j` threads on one node (`kidi::runtime::ynn::confine_to_numa_node`).
+A decoding step reads every weight once, and the weights live on the node of the
+thread that first wrote them, so threads spread over two sockets read about half
+of them remotely. On a two-socket Xeon at 16 threads this was worth 1.1-1.3x.
+It only acts when the process may run on several nodes and the threads fit within
+one, so `taskset`, `numactl` and cgroup cpusets are respected; `KIDI_NUMA=off`
+disables it. Applications embedding Kidi should call it before loading a model.
 
 For reusable TTS latency, run repeated synthesis through one loaded model:
 

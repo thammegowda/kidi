@@ -3,6 +3,7 @@
 #include "kidi/core/precision.h"
 #include "kidi/layers/gemma4.h"
 #include "kidi/checkpoint/weights.h"
+#include "kidi/checkpoint/config.h"
 #include <yaml-cpp/yaml.h>
 
 namespace kidi::model {
@@ -33,6 +34,7 @@ public:
     explicit Gemma4Impl(const YAML::Node& config);
     ~Gemma4Impl();
     static auto validate_config(const YAML::Node& config) -> Result<void>;
+    static auto checkpoint_config() -> checkpoint::ConfigAdapter;
     static auto create(const YAML::Node& config) -> Result<Gemma4>;
     auto set_checkpoint(const checkpoint::Weights& weights, std::int32_t weight_bits = 0, std::int32_t group_size = 128,
                         bool packed_prefill = false) -> Result<void>;
@@ -66,6 +68,7 @@ public:
     auto prefill_chunk_size(std::size_t requested) const -> std::size_t;
     auto last_token_prefill() const -> bool;
     auto shared_prefill_tail() const -> bool;
+    auto supports_device_tokens() const -> bool;
 
 private:
     struct State;
@@ -75,13 +78,15 @@ private:
     auto attention_inputs(Gemma4State& state, std::span<Gemma4State*> batch_states, std::size_t step_count)
         -> Attention;
     auto per_layer_input(const tensor::Tensor& per_layer, int layer, std::int64_t length) -> tensor::Tensor;
-    auto head(const tensor::Tensor& hidden, bool select) -> tensor::Tensor;
+    auto head(const tensor::Tensor& hidden, bool select, ops::TokenOutput output = ops::TokenOutput::HOST)
+        -> tensor::Tensor;
     /// Decodes one token as a captured step: host values are written into `state.step`, caches by index.
-    auto decode_step(const tensor::Tensor& token, Gemma4State& state, bool select) -> tensor::Tensor;
+    auto decode_step(const tensor::Tensor& token, Gemma4State& state, bool select,
+                     ops::TokenOutput output = ops::TokenOutput::HOST) -> tensor::Tensor;
     /// Runs I32 `tokens` at the state position as a captured step: decoding runs every layer and the output head;
     /// prefill writes the producer layers' K/V and returns an undefined tensor.
     auto captured_step(const tensor::Tensor& tokens, Gemma4State& state, Gemma4StepInputs& inputs, bool prefill,
-                       bool select) -> tensor::Tensor;
+                       bool select, ops::TokenOutput output = ops::TokenOutput::HOST) -> tensor::Tensor;
     auto can_decode_step(const Gemma4State& state) const -> bool;
     auto run_batch(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states, bool select)
         -> Result<tensor::Tensor>;

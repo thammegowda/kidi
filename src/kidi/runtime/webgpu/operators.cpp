@@ -2,6 +2,7 @@
 #include "kidi/ops/context.h"
 #include "kidi/tensor/web_gpu.h"
 #include "kidi/graph/graph.h"
+#include "kidi/graph/compiler.h"
 
 #include <emscripten.h>
 #include <nlohmann/json.hpp>
@@ -231,7 +232,7 @@ private:
     OutputPool pool_, host_pool_;
 };
 
-class GpuRegion final : public StepExecutable {
+class GpuRegion final : public graph::Executable {
 public:
     GpuRegion(int program, graph::Graph graph, std::vector<tensor::Tensor> retained)
         : program_(program), graph_(std::move(graph)), retained_(std::move(retained)) {}
@@ -255,10 +256,10 @@ private:
     std::vector<tensor::Tensor> retained_;
 };
 
-class GpuBackend final : public OperatorBackend {
+class GpuCompiler final : public graph::Compiler {
 public:
-    auto supports_replay() const noexcept -> bool override { return true; }
-    auto prepare_graph(const graph::Graph& graph, std::string_view key) -> std::unique_ptr<StepExecutable> override {
+    auto name() const -> std::string_view override { return "webgpu"; }
+    auto compile(const graph::Graph& graph, std::string_view key) -> std::unique_ptr<graph::Executable> override {
         if (!lower_regions()) return nullptr;
         for (const auto& input : graph.inputs())
             if (input.device() != tensor::Device::web_gpu()) return nullptr;
@@ -290,6 +291,15 @@ public:
         for (const auto& node : planned.nodes()) static_cast<GpuOperator*>(node.prepared.get())->release_workspaces();
         return std::make_unique<GpuRegion>(region, std::move(planned), std::move(retained));
     }
+
+private:
+    std::map<std::pair<int, std::size_t>, tensor::Tensor> scratch_;
+};
+
+class GpuBackend final : public OperatorBackend {
+public:
+    auto supports_replay() const noexcept -> bool override { return true; }
+    auto graph_compiler() -> std::shared_ptr<graph::Compiler> override { return compiler_; }
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
         static const std::map<Operation, std::string> names{{Operation::ADD, "add"},
                                                             {Operation::MULTIPLY, "multiply"},
@@ -401,7 +411,7 @@ public:
     }
 
 private:
-    std::map<std::pair<int, std::size_t>, tensor::Tensor> scratch_;
+    std::shared_ptr<GpuCompiler> compiler_ = std::make_shared<GpuCompiler>();
     std::map<std::tuple<const void*, std::int64_t, std::int32_t>, std::pair<tensor::Tensor, tensor::Tensor>> constants_;
 };
 } // namespace

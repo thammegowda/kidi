@@ -11,9 +11,9 @@ namespace {
 template <typename Layers, typename Step>
 auto replay_regions(ops::Context& context, std::string_view key, std::span<const tensor::Tensor> inputs,
                     const Layers& layers, const Step& step) -> tensor::Tensor {
-    constexpr std::size_t region_layers = 4;
+    const auto region_layers = context.device().policy().replay.region_layers;
     const auto count = static_cast<std::size_t>(std::distance(layers.begin(), layers.end()));
-    if (context.device() != tensor::Device::web_gpu() || count <= region_layers)
+    if (!region_layers || count <= region_layers)
         return context.replay(key, inputs, [&](std::span<const tensor::Tensor> operands) {
             return std::vector{step(operands, layers.begin(), layers.end(), true)};
         }, false).front();
@@ -80,9 +80,8 @@ Qwen3Impl::Qwen3Impl(const YAML::Node& config)
     const auto valid = validate_config(config);
     if (!valid) throw ops::Failure(valid.error());
     if (module_dtype != tensor::DType::I8 ||
-        (module_device != tensor::Device::cpu() && module_device != tensor::Device::vulkan() &&
-         module_device != tensor::Device::apple_gpu() && module_device != tensor::Device::web_gpu()))
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "Qwen3 requires INT8 parameters on CPU, Metal, Vulkan, or WebGPU"});
+        !device().capabilities().compute.supports(tensor::TransformerSupport::QUANTIZED))
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "Qwen3 requires INT8 parameters and quantized projection support"});
     const layers::Qwen3Shape shape{
         .hidden = hidden_,
         .intermediate = config["intermediate_size"].as<std::int32_t>(),

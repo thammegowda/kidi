@@ -60,13 +60,22 @@ current Xcode Command Line Tools. It does not install PyTorch or Transformers.
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install "kidi[hf] @ git+https://github.com/thammegowda/kidi.git@main"
+python -m pip install -v "kidi[hf] @ git+https://github.com/thammegowda/kidi.git@main"
 python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers
 ```
 
 The first launch downloads about **2.49 GB** of model files and configures them.
 Later launches reuse the download cache. Metal is selected when available,
 otherwise CPU; add `--backend ynnpack` to require CPU execution.
+
+With a [CUDA-enabled build](README-dev.md#cuda), select an NVIDIA GPU explicitly:
+
+```bash
+python -m kidi chat -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0 -j 8
+```
+
+`cuda` selects GPU 0; `cuda:INDEX` selects another device. CUDA is opt-in and
+does not change the default backend selection.
 
 Download size is not RAM usage. The native defaults are a 16,384-token context
 and up to 8,192 output tokens. For a smaller memory budget, add
