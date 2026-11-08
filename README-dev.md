@@ -26,6 +26,12 @@ C/C++ dependencies are pinned submodules under `third_party/`.
 cpuinfo, GoogleTest, and Google Benchmark dependencies. Initialize recursively;
 do not edit vendored dependencies as part of unrelated application changes.
 
+Desktop, Android, and browser frontend builds also require **Node.js 24+ and npm**.
+Compact libraries and selected icons are vendored. The larger Mermaid and PDF.js
+distributions are acquired from `web/package-lock.json` and staged as ignored
+local assets; see [web dependency policy](web/libs/README.md).
+CLI-only and Python wheel targets do not acquire web packages or require Node.js.
+
 ## Native Build
 
 ```bash
@@ -100,7 +106,7 @@ source attribution notice.
 
 ## Android
 
-Requirements: JDK 17, SDK Platform 36, Build Tools 36.0.0, NDK 28.0.13004108,
+Requirements: Node.js 24+, npm, JDK 17, SDK Platform 36, Build Tools 36.0.0, NDK 28.0.13004108,
 and Android CMake 3.31.6. The app ID is `ai.gowda.kidi`, minimum API is 29,
 target API is 36, and the current build packages ARM64 only.
 

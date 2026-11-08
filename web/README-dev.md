@@ -16,7 +16,7 @@ Requirements:
 
 - a recursive Kidi checkout;
 - Emscripten 6.0.9 or later;
-- CMake, Ninja, Python 3.10+, and Node.js.
+- CMake, Ninja, Python 3.10+, Node.js 24+, and npm.
 
 ```bash
 brew install emscripten node
@@ -48,9 +48,12 @@ Browser runtime settings show the progress bar, loaded/total bytes, separate
 download and cache byte counts, and the current file. Model initialization
 uses an indeterminate indicator rather than a misleading completed download bar.
 Cached automatic restores report the same progress as manual loads.
-The required libraries and icons are vendored in
-[`web/libs/`](./libs/README.md), with versions and licenses recorded
-there. No npm installation or dependency download is needed for the web build.
+Compact libraries and selected icons are vendored in
+[`web/libs/`](./libs/README.md), with pinned upstream versions and archive checksums.
+Only Mermaid and PDF.js are acquired during the build, with exact npm pins and
+integrity hashes in [`package-lock.json`](./package-lock.json). Their generated
+directories are ignored by Git. All deployment assets and licenses remain local;
+initial acquisition needs network access, and unchanged builds reuse prepared files.
 
 On phones, the 52px header keeps Settings in view and combines the input/output
 language pickers into one compact control. Matching selections show one name
@@ -76,7 +79,7 @@ browser module tree is shipped rather than a hand-maintained list of imports.
 To test a built site in a real browser:
 
 ```bash
-npm ci --prefix web --ignore-scripts --no-audit --no-fund
+make web-deps
 npm --prefix web exec -- playwright install chromium
 make wasm WEB_DIR=build-pages
 make web-smoke-test WEB_DIR=build-pages
@@ -110,8 +113,8 @@ The JavaScript files have distinct roles:
 | `backend.js`, `runtime-client.mjs` | Browser main thread | Shared UI adapter and logical GPU model leases |
 | `gpu-runtime-worker.mjs`, `runtime-scheduler.mjs`, `model-residency.mjs`, `scoped-model.mjs` | One GPU worker | One device/Wasm heap, isolated native model sessions, priority scheduling, scoped files/weights, and residency |
 | `inference-worker.mjs`, `asr-worker.mjs`, `tts-worker.mjs`, `model-cache.mjs` | Workers | CPU execution, standalone benchmark/reference execution, Hub downloads, and persistent model cache |
-| `build.mjs`, `package-site.mjs`, `wasm-glue.mjs` | Node.js during build | Compile/package the wasm32 variants and fix their generated heap indexing above 2 GiB |
-| `web/libs/` | Build inputs | Pinned isolation helper, selected icons, and JavaScript parser dependencies |
+| `prepare-libs.mjs`, `build.mjs`, `package-site.mjs`, `wasm-glue.mjs` | Node.js during build | Acquire locked dependencies, compile/package the wasm32 variants, and fix their generated heap indexing above 2 GiB |
+| `web/libs/` | Build inputs | Vendored compact libraries/icons and build-only parsers; Mermaid/PDF.js distributions are acquired and ignored |
 
 Only browser assets and their licenses are copied to the deployment directory.
 Do not deploy build scripts or the build-only parsers. Serving via Python does not replace the
@@ -212,7 +215,7 @@ host RAM, WebGPU buffer memory, live decode speed, output-token count, and
 time-to-first-token. Memory values come from the runtime allocator and WebGPU
 buffer accounting rather than browser-wide estimates. **GPU mem** is allocated
 buffer memory, not a utilization percentage; browsers do not expose portable
-GPU-utilization telemetry. Assistant results use the shared vendored
+GPU-utilization telemetry. Assistant results use the shared locally packaged
 Marked/DOMPurify renderer for sanitized streaming Markdown, links, lists,
 tables, and fenced code.
 
@@ -825,7 +828,7 @@ Use Load model to repair an incomplete or corrupt chat cache. Speech loading is
 independent and can download missing files when first requested.
 
 Messages render Markdown, including lists, links, tables, and fenced code,
-using vendored Marked and DOMPurify. Raw Markdown is kept in chat history and
+using locally packaged Marked and DOMPurify. Raw Markdown is kept in chat history and
 model requests. Executable HTML, embedded media, and remote images are removed.
 Long completed replies have Show more / Show less controls; active streams stay
 expanded. Fenced code uses Highlight.js common languages, with plain-text fallback.

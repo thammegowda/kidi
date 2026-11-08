@@ -13,7 +13,7 @@ TEST_DIST := .cache/test-dist
 
 export KIDI_HUB PYTHON
 
-.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
+.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
 
 setup-test:
 	bash tests/setup.sh
@@ -35,10 +35,13 @@ build-python-test: setup-test
 python-test: build-python-test
 	$(TEST_PYTHON) -m unittest discover -s tests -p python_cli_test.py
 
-web-test:
+web-deps:
+	node web/tools/prepare-libs.mjs
+
+web-test: web-deps
 	node --test tests/browser/*_test.mjs third_party/liteapp/tests/browser/*_test.mjs
 
-web-smoke-test:
+web-smoke-test: web-deps
 	npm --prefix web run test:pages -- "$(abspath $(WEB_DIR))"
 
 regression-test: setup-test build-test

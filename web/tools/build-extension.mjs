@@ -3,6 +3,7 @@ import {fileURLToPath} from 'node:url';
 import {join, resolve} from 'node:path';
 
 import {packageExtensions} from './package-extension.mjs';
+import {prepareWebLibraries} from './prepare-libs.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const outputRoot = resolve(process.argv[2] || join(root, 'build-extension'));
@@ -12,6 +13,7 @@ const runtimeBuilds = {
     gpu: join(root, 'build-webgpu'),
     single: join(root, 'build-wasm-single'),
 };
+await prepareWebLibraries();
 
 function run(command, args, options = {}) {
     const result = spawnSync(command, args, {stdio: 'inherit', ...options});

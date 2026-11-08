@@ -119,9 +119,8 @@ jobs:
           test -z "$(find build-pages -type l -print -quit)"
           test -z "$(find build-pages -name '*.safetensors' -print -quit)"
 
-      - name: Install browser smoke test tools
+      - name: Install Chromium smoke test browser
         run: |
-          npm ci --prefix web --ignore-scripts --no-audit --no-fund
           npm --prefix web exec -- playwright install --with-deps chromium
 
       - name: Test packaged Pages app in Chromium

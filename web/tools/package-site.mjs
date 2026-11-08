@@ -1,6 +1,7 @@
 import {mkdir, cp, copyFile, readdir, readFile, rm, writeFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {join, dirname} from 'node:path';
+import {prepareWebLibraries} from './prepare-libs.mjs';
 import {unsignedHeapIndices} from './wasm-glue.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
@@ -10,6 +11,7 @@ export async function packageSite(destination, runtimes = {
     threads: join(root, 'build-wasm-threads'),
     gpu: join(root, 'build-webgpu'),
 }, {isolationServiceWorker = true} = {}) {
+    await prepareWebLibraries();
     await rm(destination, {recursive: true, force: true});
     for (const [name, build] of Object.entries(runtimes)) {
         await mkdir(join(destination, name), {recursive: true});

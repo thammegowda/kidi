@@ -17,6 +17,11 @@ window. Never use `--dev` with an exposed or forwarded port.
 `make app-dev` builds and runs this mode on port `10010`. Override the defaults
 with `APP_CONFIG=path/to/config.yaml` or `APP_PORT=another-loopback-port`.
 
+Frontend builds require Node.js 24+ and npm to acquire Mermaid. Compact libraries
+and icons are vendored; CMake prepares the larger, ignored distributions before
+staging or embedding assets. See [dependency policy](../web/libs/README.md).
+All assets remain local; users do not need Node.js at runtime.
+
 Release builds package the UI as one deterministic ZIP and link that binary
 resource directly into the executable through LiteApp's
 `liteapp_embed_archive()`. C++ compiles only the small `std::span` accessor and

@@ -2,9 +2,11 @@ import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {resolve, join} from 'node:path';
 import {packageSite} from './package-site.mjs';
+import {prepareWebLibraries} from './prepare-libs.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const destination = resolve(process.argv[2] || join(root, 'build-web'));
+await prepareWebLibraries();
 for (const [name, threads, gpu] of [
     ['threads', 'ON', 'OFF'],
     ['gpu', 'OFF', 'ON'],
