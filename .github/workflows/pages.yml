@@ -50,6 +50,7 @@ jobs:
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_COMPILERCHECK: content
       CCACHE_MAXSIZE: 500M
+      CMAKE_GENERATOR: Ninja
       EM_COMPILER_WRAPPER: ccache
     steps:
       - name: Check out source and dependencies
@@ -62,11 +63,13 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
 
       - name: Install build tools
         run: |
           sudo -n apt-get update
-          sudo -n apt-get install --yes cmake ninja-build ccache
+          sudo -n apt-get install --yes --no-install-recommends ninja-build ccache
 
       - name: Restore Emscripten SDK and system libraries
         id: emsdk
@@ -119,9 +122,17 @@ jobs:
           test -z "$(find build-pages -type l -print -quit)"
           test -z "$(find build-pages -name '*.safetensors' -print -quit)"
 
+      - name: Restore Chromium smoke test browser
+        id: playwright
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-${{ hashFiles('web/package-lock.json') }}
+
       - name: Install Chromium smoke test browser
+        if: steps.playwright.outputs.cache-hit != 'true'
         run: |
-          npm --prefix web exec -- playwright install --with-deps chromium
+          npm --prefix web exec -- playwright install --only-shell chromium
 
       - name: Test packaged Pages app in Chromium
         run: make web-smoke-test WEB_DIR=build-pages
