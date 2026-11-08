@@ -123,6 +123,7 @@ add_library(kidi
     src/kidi/ops/quantization.cpp
     src/kidi/runtime/operator.cpp
     src/kidi/runtime/parity_math.cpp
+    src/kidi/runtime/ynn/feed_forward_cache.cpp
     src/kidi/runtime/ynn/operators.cpp
     src/kidi/runtime/ynn/graph.cpp
     src/kidi/runtime/ynn/numa.cpp

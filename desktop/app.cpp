@@ -486,7 +486,7 @@ public:
         });
         if (!configured) return std::unexpected(liteapp::Error{"load_failed", configured.error().message});
         generator_.emplace(std::move(*loaded));
-        if (auto warmed = generator_->warm_up(); !warmed)
+        if (auto warmed = generator_->warm_up(parsed->prefill_chunk_tokens, parsed->context_tokens); !warmed)
             return std::unexpected(liteapp::Error{"load_failed", warmed.error().message});
         std::string speech_execution;
         if (parsed->tts.enabled) {

@@ -1,5 +1,6 @@
 #include "kidi/cli/interactive.h"
 
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -80,6 +81,12 @@ auto print_text(std::string_view text) -> void {
             std::cout.put(static_cast<char>(character));
 }
 
+using Clock = std::chrono::steady_clock;
+
+auto elapsed_ns(Clock::time_point from, Clock::time_point to) -> std::uint64_t {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count();
+}
+
 auto memory_summary() -> std::string {
     std::optional<std::uint64_t> process_bytes, total;
 #if defined(__APPLE__)
@@ -137,6 +144,13 @@ auto memory_summary() -> std::string {
 
 auto interactive_chat(inference::Generator& generator, inference::GenerationOptions options, const Namespace& arguments,
                       std::uint64_t load_ns) -> int {
+    const auto warmup_started = Clock::now();
+    auto warmed = generator.warm_up(options.prefill_chunk_size, options.context_size);
+    if (!warmed) {
+        std::cerr << warmed.error().message << '\n';
+        return 2;
+    }
+    load_ns += elapsed_ns(warmup_started, Clock::now());
     auto configured = generator.configure_serving({.maximum_active = 1,
                                                    .maximum_requests = 1,
                                                    .cache_token_budget = arguments.get<std::size_t>("cache_tokens"),
@@ -222,6 +236,7 @@ auto interactive_chat(inference::Generator& generator, inference::GenerationOpti
             continue;
         }
         if (prompt.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+        const auto entered = Clock::now();
         history.push_back({"user", std::move(prompt)});
         auto queued = generator.enqueue_chat(history, options);
         if (!queued) {
@@ -231,8 +246,10 @@ auto interactive_chat(inference::Generator& generator, inference::GenerationOpti
             std::cout << "\nUse /clear to reset history or submit a shorter message.\n";
             continue;
         }
+        const auto enqueued = Clock::now();
         label("Assistant> ", "\033[1;36m");
         std::optional<inference::TextGeneration> completed;
+        std::optional<Clock::time_point> first_text, finished;
         while (generator.pending_requests() && !interrupted) {
             auto step = generator.step();
             if (!step) {
@@ -243,7 +260,11 @@ auto interactive_chat(inference::Generator& generator, inference::GenerationOpti
             for (auto& event : step->events) {
                 print_text(event.text);
                 std::cout.flush();
-                if (event.completed) completed = std::move(event.completed);
+                if (!first_text && !event.text.empty()) first_text = Clock::now();
+                if (event.completed) {
+                    completed = std::move(event.completed);
+                    finished = Clock::now();
+                }
             }
             if (!std::cout) {
                 if (generator.pending_requests()) generator.cancel(*queued);
@@ -267,16 +288,21 @@ auto interactive_chat(inference::Generator& generator, inference::GenerationOpti
             const auto decode_speed = stats.decode_tokens && stats.decode_ns
                                           ? fmt::format("{:.1f}tok/s", stats.decode_tokens * 1e9 / stats.decode_ns)
                                           : std::string("n/a tok/s");
+            const auto first_ns = elapsed_ns(entered, first_text.value_or(*finished));
+            const auto last_ns = elapsed_ns(entered, *finished);
             label(fmt::format("[{}tok @ {} | 1st {:.2f}s last {:.2f}s | {}]\n", completed->generation.token_ids.size(),
-                              decode_speed, stats.time_to_first_token_ns / 1e9, stats.generation_ns / 1e9,
-                              memory_summary()),
+                              decode_speed, first_ns / 1e9, last_ns / 1e9, memory_summary()),
                   "\033[2m");
             if (arguments.get<bool>("profile"))
                 std::cerr << "kidi_chat|request_id=" << *queued << "|prompt_tokens=" << completed->stats.prompt_tokens
                           << "|generated_tokens=" << completed->generation.token_ids.size()
                           << "|decode_tokens=" << stats.decode_tokens << "|decode_ns=" << stats.decode_ns
                           << "|ttft_ns=" << completed->stats.time_to_first_token_ns
-                          << "|generation_ns=" << completed->stats.generation_ns << '\n';
+                          << "|generation_ns=" << completed->stats.generation_ns << "|user_ttft_ns=" << first_ns
+                          << "|user_total_ns=" << last_ns << "|enqueue_ns=" << elapsed_ns(entered, enqueued)
+                          << "|tokenize_ns=" << stats.tokenize_ns << "|prefill_ns=" << stats.prefill_ns
+                          << "|preparation_ns=" << stats.preparation_ns
+                          << "|reused_prompt_tokens=" << stats.reused_prompt_tokens << '\n';
         }
     }
     return 1;

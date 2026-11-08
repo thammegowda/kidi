@@ -388,6 +388,9 @@ class PythonCliTest(unittest.TestCase):
         self.assertEqual(single.returncode, 0, single.stderr)
         self.assertIn("n/a tok/s", single.stdout)
         self.assertIn("|decode_tokens=0|decode_ns=0", single.stderr)
+        timings = {key: int(value) for key, value in re.findall(r"\|(\w+_ns)=(\d+)", single.stderr)}
+        self.assertGreaterEqual(timings["user_ttft_ns"], timings["ttft_ns"])
+        self.assertGreaterEqual(timings["user_total_ns"], max(timings["user_ttft_ns"], timings["generation_ns"]))
         for color, expected in [("auto", False), ("always", True)]:
             with self.subTest(color=color):
                 session = subprocess.run(command + ["chat", *options, "--color", color],

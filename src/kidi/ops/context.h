@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <memory>
 #include <array>
 #include <functional>
@@ -86,6 +87,7 @@ public:
     auto execution() const -> std::string;
     auto synchronize() -> void;
     auto preparation_ns() const noexcept -> std::uint64_t;
+    auto configure_cache(const std::filesystem::path& directory, const std::filesystem::path& source) -> void;
     auto set_precision(core::InferencePrecision precision) noexcept -> void;
     auto precision() const noexcept -> core::InferencePrecision;
     auto profile_phase(std::string_view phase) -> void;

@@ -38,6 +38,7 @@ public:
     static auto create(const YAML::Node& config) -> Result<Gemma4>;
     auto set_checkpoint(const checkpoint::Weights& weights, std::int32_t weight_bits = 0, std::int32_t group_size = 128,
                         bool packed_prefill = false) -> Result<void>;
+    auto configure_cache(const std::filesystem::path& directory, const std::filesystem::path& source) -> void;
     auto set_precision(core::InferencePrecision precision) noexcept -> void;
     auto set_kv_cache_precision(core::KVCachePrecision precision) noexcept -> void;
     auto create_state(std::size_t capacity) -> Result<Gemma4State>;
