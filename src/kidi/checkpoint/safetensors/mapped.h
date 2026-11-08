@@ -11,12 +11,14 @@
 #ifndef SAFETENSORS_MAPPED_HPP
 #define SAFETENSORS_MAPPED_HPP
 
+#include <algorithm>
 #include <array>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -24,10 +26,12 @@
 #include <unordered_map>
 #include <vector>
 
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 // Arbitrary but reasonable limits; keep in sync with any consumer expectations.
 #ifndef SAFETENSORS_MAX_DIM
@@ -37,21 +41,20 @@
 #define SAFETENSORS_MAX_TENSORS 1000000
 #endif
 #ifndef SAFETENSORS_MAX_FILE_SIZE
-#define SAFETENSORS_MAX_FILE_SIZE (2ULL << 40)  // 2 TiB
+#define SAFETENSORS_MAX_FILE_SIZE (2ULL << 40) // 2 TiB
 #endif
 #ifndef SAFETENSORS_MAX_STRING_SIZE
 #define SAFETENSORS_MAX_STRING_SIZE 8192
 #endif
 #ifndef SAFETENSORS_MAX_METADATA_SIZE
-#define SAFETENSORS_MAX_METADATA_SIZE (2ULL << 22)  // 4 MiB
+#define SAFETENSORS_MAX_METADATA_SIZE (2ULL << 22) // 4 MiB
 #endif
 
 namespace kidi::checkpoint::safetensors {
 
 class SafetensorsException : public std::runtime_error {
 public:
-    explicit SafetensorsException(const std::string& message)
-        : std::runtime_error(message) {}
+    explicit SafetensorsException(const std::string& message) : std::runtime_error(message) {}
 };
 
 // Parsed header entry for one tensor. Offsets are relative to the start of the
@@ -84,8 +87,7 @@ inline T swap_endian(T value) {
     return dest.value;
 }
 
-inline void validate_string_length(
-        const std::string& value, const std::string& context) {
+inline void validate_string_length(const std::string& value, const std::string& context) {
     if (value.length() > SAFETENSORS_MAX_STRING_SIZE) {
         throw SafetensorsException(context + " exceeds maximum allowed length");
     }
@@ -93,8 +95,7 @@ inline void validate_string_length(
 
 // Byte width of a safetensors dtype string. Throws for unknown dtypes.
 inline size_t dtype_byte_size(std::string_view dtype) {
-    if (dtype == "BOOL" || dtype == "U8" || dtype == "I8" ||
-        dtype == "F8_E4M3" || dtype == "F8_E5M2") {
+    if (dtype == "BOOL" || dtype == "U8" || dtype == "I8" || dtype == "F8_E4M3" || dtype == "F8_E5M2") {
         return 1;
     }
     if (dtype == "U16" || dtype == "I16" || dtype == "F16" || dtype == "BF16") {
@@ -114,8 +115,7 @@ inline size_t dtype_byte_size(std::string_view dtype) {
 // header raises SafetensorsException instead of reading past the mapped region.
 class HeaderParser {
 public:
-    HeaderParser(const char* data, size_t length)
-        : data_{data}, length_{length}, position_{0} {}
+    HeaderParser(const char* data, size_t length) : data_{data}, length_{length}, position_{0} {}
 
     std::unordered_map<std::string, TensorInfo> parse() {
         std::unordered_map<std::string, TensorInfo> result;
@@ -134,10 +134,8 @@ public:
             skip_whitespace();
             if (key == "__metadata__") {
                 skip_value();
-            } else if (!result.emplace(std::move(key), parse_tensor_info())
-                            .second) {
-                throw SafetensorsException(
-                    "duplicate tensor name in safetensors header");
+            } else if (!result.emplace(std::move(key), parse_tensor_info()).second) {
+                throw SafetensorsException("duplicate tensor name in safetensors header");
             }
             skip_whitespace();
             const char separator = next();
@@ -153,9 +151,7 @@ private:
     size_t length_;
     size_t position_;
 
-    [[noreturn]] void fail_truncated() const {
-        throw SafetensorsException("truncated safetensors header");
-    }
+    [[noreturn]] void fail_truncated() const { throw SafetensorsException("truncated safetensors header"); }
 
     char peek() const {
         if (position_ >= length_) fail_truncated();
@@ -177,8 +173,7 @@ private:
     void skip_whitespace() {
         while (position_ < length_) {
             const char value = data_[position_];
-            if (value != ' ' && value != '\n' && value != '\r' &&
-                value != '\t') {
+            if (value != ' ' && value != '\n' && value != '\r' && value != '\t') {
                 break;
             }
             ++position_;
@@ -196,27 +191,44 @@ private:
                 if (position_ >= length_) fail_truncated();
                 const char escaped = data_[position_++];
                 switch (escaped) {
-                    case '"': value.push_back('"'); break;
-                    case '\\': value.push_back('\\'); break;
-                    case '/': value.push_back('/'); break;
-                    case 'b': value.push_back('\b'); break;
-                    case 'f': value.push_back('\f'); break;
-                    case 'n': value.push_back('\n'); break;
-                    case 'r': value.push_back('\r'); break;
-                    case 't': value.push_back('\t'); break;
+                    case '"':
+                        value.push_back('"');
+                        break;
+                    case '\\':
+                        value.push_back('\\');
+                        break;
+                    case '/':
+                        value.push_back('/');
+                        break;
+                    case 'b':
+                        value.push_back('\b');
+                        break;
+                    case 'f':
+                        value.push_back('\f');
+                        break;
+                    case 'n':
+                        value.push_back('\n');
+                        break;
+                    case 'r':
+                        value.push_back('\r');
+                        break;
+                    case 't':
+                        value.push_back('\t');
+                        break;
                     case 'u':
                         if (position_ + 4 > length_) fail_truncated();
                         position_ += 4;
                         value.push_back('?');
                         break;
-                    default: value.push_back(escaped); break;
+                    default:
+                        value.push_back(escaped);
+                        break;
                 }
             } else {
                 value.push_back(character);
             }
             if (value.size() > SAFETENSORS_MAX_STRING_SIZE) {
-                throw SafetensorsException(
-                    "string exceeds maximum allowed length");
+                throw SafetensorsException("string exceeds maximum allowed length");
             }
         }
         return value;
@@ -224,18 +236,14 @@ private:
 
     uint64_t parse_uint() {
         skip_whitespace();
-        if (position_ >= length_ || data_[position_] < '0' ||
-            data_[position_] > '9') {
+        if (position_ >= length_ || data_[position_] < '0' || data_[position_] > '9') {
             throw SafetensorsException("expected number in safetensors header");
         }
         uint64_t value = 0;
-        while (position_ < length_ && data_[position_] >= '0' &&
-               data_[position_] <= '9') {
-            const uint64_t digit =
-                static_cast<uint64_t>(data_[position_] - '0');
+        while (position_ < length_ && data_[position_] >= '0' && data_[position_] <= '9') {
+            const uint64_t digit = static_cast<uint64_t>(data_[position_] - '0');
             if (value > (UINT64_MAX - digit) / 10) {
-                throw SafetensorsException(
-                    "number overflow in safetensors header");
+                throw SafetensorsException("number overflow in safetensors header");
             }
             value = value * 10 + digit;
             ++position_;
@@ -255,13 +263,11 @@ private:
             skip_whitespace();
             const uint64_t value = parse_uint();
             if (value > static_cast<uint64_t>(INT64_MAX)) {
-                throw SafetensorsException(
-                    "dimension overflow in safetensors header");
+                throw SafetensorsException("dimension overflow in safetensors header");
             }
             result.push_back(static_cast<int64_t>(value));
             if (result.size() > SAFETENSORS_MAX_DIM) {
-                throw SafetensorsException(
-                    "Tensor dimension exceeds maximum allowed");
+                throw SafetensorsException("Tensor dimension exceeds maximum allowed");
             }
             skip_whitespace();
             const char separator = next();
@@ -294,8 +300,7 @@ private:
         expect('{');
         skip_whitespace();
         if (peek() == '}') {
-            throw SafetensorsException(
-                "empty tensor entry in safetensors header");
+            throw SafetensorsException("empty tensor entry in safetensors header");
         }
         while (true) {
             skip_whitespace();
@@ -319,12 +324,10 @@ private:
             const char separator = next();
             if (separator == ',') continue;
             if (separator == '}') break;
-            throw SafetensorsException(
-                "malformed tensor entry in safetensors header");
+            throw SafetensorsException("malformed tensor entry in safetensors header");
         }
         if (!has_dtype || !has_shape || !has_offsets) {
-            throw SafetensorsException(
-                "incomplete tensor entry in safetensors header");
+            throw SafetensorsException("incomplete tensor entry in safetensors header");
         }
         return info;
     }
@@ -349,8 +352,7 @@ private:
                 const char separator = next();
                 if (separator == ',') continue;
                 if (separator == ']') break;
-                throw SafetensorsException(
-                    "malformed array in safetensors header");
+                throw SafetensorsException("malformed array in safetensors header");
             }
             return;
         }
@@ -371,13 +373,11 @@ private:
                 const char separator = next();
                 if (separator == ',') continue;
                 if (separator == '}') break;
-                throw SafetensorsException(
-                    "malformed object in safetensors header");
+                throw SafetensorsException("malformed object in safetensors header");
             }
             return;
         }
-        while (position_ < length_ && data_[position_] != ',' &&
-               data_[position_] != '}' && data_[position_] != ']') {
+        while (position_ < length_ && data_[position_] != ',' && data_[position_] != '}' && data_[position_] != ']') {
             ++position_;
         }
     }
@@ -392,7 +392,7 @@ public:
         if (descriptor == -1) {
             throw SafetensorsException("failed to open file: " + path);
         }
-        struct stat status {};
+        struct stat status{};
         if (::fstat(descriptor, &status) == -1) {
             ::close(descriptor);
             throw SafetensorsException("failed to stat file: " + path);
@@ -404,42 +404,42 @@ public:
         }
         if (size_ > SAFETENSORS_MAX_FILE_SIZE) {
             ::close(descriptor);
-            throw SafetensorsException(
-                "file size exceeds maximum allowed size: " + path);
+            throw SafetensorsException("file size exceeds maximum allowed size: " + path);
         }
-        void* mapped =
-            ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, descriptor, 0);
-        ::close(descriptor);
+        void* mapped = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, descriptor, 0);
         if (mapped == MAP_FAILED) {
+            ::close(descriptor);
             throw SafetensorsException("failed to memory map file: " + path);
         }
+        descriptor_ = descriptor;
         data_ = static_cast<const std::byte*>(mapped);
+        register_mapping(this);
     }
 
-    ~MappedFile() {
-        if (data_ != nullptr) {
-            ::munmap(const_cast<std::byte*>(data_), size_);
-        }
-    }
+    ~MappedFile() { reset(); }
 
     MappedFile(const MappedFile&) = delete;
     MappedFile& operator=(const MappedFile&) = delete;
 
-    MappedFile(MappedFile&& other) noexcept
-        : data_{other.data_}, size_{other.size_} {
+    MappedFile(MappedFile&& other) noexcept : data_{other.data_}, size_{other.size_}, descriptor_{other.descriptor_} {
+        unregister_mapping(&other);
         other.data_ = nullptr;
         other.size_ = 0;
+        other.descriptor_ = -1;
+        register_mapping(this);
     }
 
     MappedFile& operator=(MappedFile&& other) noexcept {
         if (this != &other) {
-            if (data_ != nullptr) {
-                ::munmap(const_cast<std::byte*>(data_), size_);
-            }
+            reset();
+            unregister_mapping(&other);
             data_ = other.data_;
             size_ = other.size_;
+            descriptor_ = other.descriptor_;
             other.data_ = nullptr;
             other.size_ = 0;
+            other.descriptor_ = -1;
+            register_mapping(this);
         }
         return *this;
     }
@@ -447,9 +447,89 @@ public:
     const std::byte* data() const { return data_; }
     size_t size() const { return size_; }
 
+    void release_pages(const void* address, size_t length) const noexcept {
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+        if (data_ == nullptr || address == nullptr || length == 0) return;
+        const auto base = reinterpret_cast<uintptr_t>(data_);
+        const auto begin = reinterpret_cast<uintptr_t>(address);
+        if (begin < base || begin - base >= size_) return;
+        const size_t max_length = size_ - static_cast<size_t>(begin - base);
+        if (length > max_length) length = max_length;
+        const long raw_page = ::sysconf(_SC_PAGESIZE);
+        if (raw_page <= 0) return;
+        const auto page_size = static_cast<uintptr_t>(raw_page);
+        const uintptr_t aligned_begin = (begin + page_size - 1) & ~(page_size - 1);
+        const uintptr_t aligned_end = (begin + length) & ~(page_size - 1);
+        if (aligned_end <= aligned_begin) return;
+        const size_t aligned_length = static_cast<size_t>(aligned_end - aligned_begin);
+#if defined(__APPLE__)
+        if (descriptor_ >= 0) {
+            const auto file_offset = static_cast<off_t>(aligned_begin - base);
+            (void)::mmap(reinterpret_cast<void*>(aligned_begin), aligned_length, PROT_READ, MAP_PRIVATE | MAP_FIXED,
+                         descriptor_, file_offset);
+            return;
+        }
+#endif
+        (void)::madvise(reinterpret_cast<void*>(aligned_begin), aligned_length, MADV_DONTNEED);
+#else
+        (void)address;
+        (void)length;
+#endif
+    }
+
+    static bool release_any_pages(const void* address, size_t length) noexcept {
+        if (address == nullptr || length == 0) return false;
+        std::scoped_lock lock(registry_mutex());
+        const auto ptr = reinterpret_cast<uintptr_t>(address);
+        for (const auto* file : registry()) {
+            const auto base = reinterpret_cast<uintptr_t>(file->data_);
+            if (ptr >= base && ptr - base < file->size_) {
+                file->release_pages(address, length);
+                return true;
+            }
+        }
+        return false;
+    }
+
 private:
+    static std::mutex& registry_mutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    static std::vector<const MappedFile*>& registry() {
+        static std::vector<const MappedFile*> files;
+        return files;
+    }
+
+    static void register_mapping(const MappedFile* file) {
+        if (file == nullptr || file->data_ == nullptr) return;
+        std::scoped_lock lock(registry_mutex());
+        registry().push_back(file);
+    }
+
+    static void unregister_mapping(const MappedFile* file) noexcept {
+        std::scoped_lock lock(registry_mutex());
+        auto& files = registry();
+        files.erase(std::remove(files.begin(), files.end(), file), files.end());
+    }
+
+    void reset() noexcept {
+        if (data_ != nullptr) {
+            unregister_mapping(this);
+            ::munmap(const_cast<std::byte*>(data_), size_);
+            data_ = nullptr;
+            size_ = 0;
+        }
+        if (descriptor_ >= 0) {
+            ::close(descriptor_);
+            descriptor_ = -1;
+        }
+    }
+
     const std::byte* data_ = nullptr;
     size_t size_ = 0;
+    int descriptor_ = -1;
 };
 
 // One tensor as an immutable view into the mapped file. `data`/`nbytes` point
@@ -463,8 +543,7 @@ struct MappedTensor {
 
     std::span<const std::byte> bytes() const { return {data, nbytes}; }
     bool is_aligned(size_t alignment) const {
-        return alignment != 0 &&
-               reinterpret_cast<std::uintptr_t>(data) % alignment == 0;
+        return alignment != 0 && reinterpret_cast<std::uintptr_t>(data) % alignment == 0;
     }
 };
 
@@ -473,20 +552,15 @@ struct MappedTensor {
 // range before exposing any view.
 class MappedCheckpoint {
 public:
-    explicit MappedCheckpoint(const std::string& path)
-        : file_{std::make_shared<MappedFile>(path)} {
+    explicit MappedCheckpoint(const std::string& path) : file_{std::make_shared<MappedFile>(path)} {
         parse_and_validate(path);
     }
 
-    const std::unordered_map<std::string, MappedTensor>& tensors() const {
-        return tensors_;
-    }
+    const std::unordered_map<std::string, MappedTensor>& tensors() const { return tensors_; }
 
     std::shared_ptr<const MappedFile> owner() const { return file_; }
 
-    bool contains(const std::string& name) const {
-        return tensors_.find(name) != tensors_.end();
-    }
+    bool contains(const std::string& name) const { return tensors_.find(name) != tensors_.end(); }
 
     const MappedTensor& at(const std::string& name) const {
         const auto found = tensors_.find(name);
@@ -509,63 +583,51 @@ private:
             header_size = swap_endian(header_size);
         }
         if (header_size > SAFETENSORS_MAX_METADATA_SIZE) {
-            throw SafetensorsException(
-                "safetensors header exceeds metadata limit: " + path);
+            throw SafetensorsException("safetensors header exceeds metadata limit: " + path);
         }
         if (header_size > file_size - 8) {
-            throw SafetensorsException(
-                "safetensors header exceeds file size: " + path);
+            throw SafetensorsException("safetensors header exceeds file size: " + path);
         }
         const char* header = reinterpret_cast<const char*>(base + 8);
         HeaderParser parser(header, static_cast<size_t>(header_size));
         const auto infos = parser.parse();
         if (infos.size() > SAFETENSORS_MAX_TENSORS) {
-            throw SafetensorsException(
-                "number of tensors exceeds maximum allowed: " + path);
+            throw SafetensorsException("number of tensors exceeds maximum allowed: " + path);
         }
         const std::byte* data_start = base + 8 + header_size;
-        const size_t data_length =
-            file_size - 8 - static_cast<size_t>(header_size);
+        const size_t data_length = file_size - 8 - static_cast<size_t>(header_size);
         tensors_.reserve(infos.size());
         for (const auto& [name, info] : infos) {
             validate_string_length(name, "Tensor name");
             if (info.shape.size() > SAFETENSORS_MAX_DIM) {
-                throw SafetensorsException(
-                    "Tensor dimension exceeds maximum allowed");
+                throw SafetensorsException("Tensor dimension exceeds maximum allowed");
             }
             const size_t element_size = dtype_byte_size(info.dtype);
             uint64_t element_count = 1;
             for (const int64_t dimension : info.shape) {
                 if (dimension < 0) {
-                    throw SafetensorsException(
-                        "negative dimension for tensor '" + name + "'");
+                    throw SafetensorsException("negative dimension for tensor '" + name + "'");
                 }
                 const uint64_t extent = static_cast<uint64_t>(dimension);
                 if (extent != 0 && element_count > UINT64_MAX / extent) {
-                    throw SafetensorsException(
-                        "element count overflow for tensor '" + name + "'");
+                    throw SafetensorsException("element count overflow for tensor '" + name + "'");
                 }
                 element_count *= extent;
             }
             const size_t begin = info.data_offsets[0];
             const size_t end = info.data_offsets[1];
             if (end < begin) {
-                throw SafetensorsException(
-                    "inverted data offsets for tensor '" + name + "'");
+                throw SafetensorsException("inverted data offsets for tensor '" + name + "'");
             }
             const uint64_t span = static_cast<uint64_t>(end - begin);
             if (element_count > UINT64_MAX / element_size) {
-                throw SafetensorsException(
-                    "byte length overflow for tensor '" + name + "'");
+                throw SafetensorsException("byte length overflow for tensor '" + name + "'");
             }
             if (span != element_count * element_size) {
-                throw SafetensorsException(
-                    "byte length does not match shape for tensor '" + name +
-                    "'");
+                throw SafetensorsException("byte length does not match shape for tensor '" + name + "'");
             }
             if (begin > data_length || span > data_length - begin) {
-                throw SafetensorsException(
-                    "data range exceeds file for tensor '" + name + "'");
+                throw SafetensorsException("data range exceeds file for tensor '" + name + "'");
             }
             MappedTensor tensor;
             tensor.dtype = info.dtype;
@@ -580,10 +642,8 @@ private:
     std::unordered_map<std::string, MappedTensor> tensors_;
 };
 
-inline MappedCheckpoint load_mapped(const std::string& path) {
-    return MappedCheckpoint(path);
-}
+inline MappedCheckpoint load_mapped(const std::string& path) { return MappedCheckpoint(path); }
 
-}  // namespace kidi::checkpoint::safetensors
+} // namespace kidi::checkpoint::safetensors
 
-#endif  // SAFETENSORS_MAPPED_HPP
+#endif // SAFETENSORS_MAPPED_HPP

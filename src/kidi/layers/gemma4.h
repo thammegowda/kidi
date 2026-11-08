@@ -40,12 +40,14 @@ public:
     /// True when the table lives outside linear memory. Lookups then gather rows on the host, so captured steps must
     /// pass the embedded rows in as step inputs instead of recording the lookup.
     auto external() const -> bool;
+    auto set_unsigned_packed(bool unsigned_packed) noexcept -> void { unsigned_packed_ = unsigned_packed; }
 
 private:
     Tensor weight_;
     Tensor quantization_scale_;
     std::int32_t width_, packed_bits_;
     float scale_;
+    bool unsigned_packed_ = false;
 };
 
 KIDI_MODULE(GatedFeedForward);
@@ -56,7 +58,7 @@ struct GatedFeedForwardStages {
 class GatedFeedForwardImpl : public Module {
 public:
     GatedFeedForwardImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t packed_bits = 0,
-                         GatedActivation activation = GatedActivation::GELU);
+                         GatedActivation activation = GatedActivation::GELU, std::int32_t group_size = 0);
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
     auto forward_stages(ops::Context& context, const Tensor& input) const -> GatedFeedForwardStages;
 
@@ -78,7 +80,7 @@ struct Gemma4AttentionSegment {
 class Gemma4AttentionImpl : public Module {
 public:
     Gemma4AttentionImpl(std::int32_t hidden, std::int32_t heads, std::int32_t key_heads, std::int32_t head_width,
-                        float epsilon, bool shared, std::int32_t packed_bits = 0);
+                        float epsilon, bool shared, std::int32_t packed_bits = 0, std::int32_t group_size = 0);
     auto forward(ops::Context& context, const Tensor& input, KeyValue& cache, std::size_t position, const Tensor& mask,
                  const Tensor& cosine, const Tensor& sine, std::int64_t key_start = 0) const -> Tensor;
     auto forward_segments(ops::Context& context, const Tensor& input, std::span<const Gemma4AttentionSegment> segments,
@@ -97,7 +99,9 @@ class Gemma4BlockImpl : public Module {
 public:
     Gemma4BlockImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t heads, std::int32_t key_heads,
                     std::int32_t head_width, std::int32_t per_layer_width, float epsilon, bool shared,
-                    std::int32_t mlp_bits = 0, std::int32_t attention_bits = 0, std::int32_t per_layer_bits = 0);
+                    std::int32_t mlp_bits = 0, std::int32_t attention_bits = 0, std::int32_t per_layer_bits = 0,
+                    std::int32_t mlp_group_size = 0, std::int32_t attention_group_size = 0,
+                    std::int32_t per_layer_group_size = 0);
     auto forward(ops::Context& context, const Tensor& input, const Tensor& per_layer_input, KeyValue& cache,
                  std::size_t position, const Tensor& mask, const Tensor& cosine, const Tensor& sine,
                  std::int64_t key_start = 0) const -> Tensor;

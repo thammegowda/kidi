@@ -134,6 +134,7 @@ private:
     std::array<std::int32_t, 3> special_;
     core::InferencePrecision precision_;
     core::KVCachePrecision kv_cache_precision_;
+    bool prefill_warmed_ = false;
     struct PrefixEntry {
         std::vector<std::int32_t> tokens;
         model::Gemma4State state;

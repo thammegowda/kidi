@@ -1,0 +1,135 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <numeric>
+#include <stdexcept>
+#include <string>
+#include <sys/resource.h>
+#include <thread>
+#include <vector>
+
+#include <executorch/extension/module/module.h>
+#include <executorch/extension/tensor/tensor.h>
+#include <executorch/extension/threadpool/threadpool.h>
+#include <executorch/runtime/platform/runtime.h>
+#include <nlohmann/json.hpp>
+
+namespace {
+using Clock = std::chrono::steady_clock;
+using executorch::extension::Module;
+using nlohmann::json;
+
+auto seconds(Clock::time_point begin, Clock::time_point end) -> double {
+    return std::chrono::duration<double>(end - begin).count();
+}
+
+auto peak_rss_kib() -> long {
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) throw std::runtime_error("getrusage failed");
+#ifdef __APPLE__
+    return usage.ru_maxrss / 1024;
+#else
+    return usage.ru_maxrss;
+#endif
+}
+
+auto emit(json record) -> void {
+    record["peak_rss_kib"] = peak_rss_kib();
+    std::cout << record.dump() << std::endl;
+}
+
+auto execute(Module& module, std::vector<std::int64_t>& ids, std::vector<std::int64_t>& positions) -> std::int64_t {
+    const auto length = static_cast<executorch::aten::SizesType>(ids.size());
+    auto tokens = executorch::extension::from_blob(ids.data(), {1, length}, executorch::aten::ScalarType::Long);
+    auto offsets = executorch::extension::from_blob(positions.data(), {length}, executorch::aten::ScalarType::Long);
+    auto result = module.execute("forward", {*tokens, *offsets});
+    if (!result.ok()) {
+        throw std::runtime_error("ExecuTorch forward failed: " + std::to_string(static_cast<int>(result.error())));
+    }
+    if (result->size() != 1 || !result->front().isTensor()) throw std::runtime_error("expected one logits tensor");
+    const auto& logits = result->front().toTensor();
+    if (logits.scalar_type() != executorch::aten::ScalarType::Float || logits.numel() != 262144)
+        throw std::runtime_error("expected last-token FP32 Gemma 4 E2B logits");
+    const auto* values = logits.const_data_ptr<float>();
+    for (std::size_t index = 0; index < logits.numel(); ++index) {
+        if (!std::isfinite(values[index])) throw std::runtime_error("non-finite logits");
+    }
+    return std::max_element(values, values + logits.numel()) - values;
+}
+} // namespace
+
+auto main(int argc, char** argv) -> int {
+    try {
+        if (argc != 3) throw std::invalid_argument("usage: arm_gemma4_bench MODEL.pte PROTOCOL.json");
+        std::ifstream stream(argv[2]);
+        if (!stream) throw std::runtime_error("cannot open benchmark protocol");
+        const auto protocol = json::parse(stream);
+        const auto prompt = protocol.at("input_token_ids").get<std::vector<std::int64_t>>();
+        const auto outputs = protocol.at("output_tokens").get<std::size_t>();
+        const auto warmups = protocol.at("warmups").get<std::size_t>();
+        const auto repeats = protocol.at("repeats").get<std::size_t>();
+        const auto context = protocol.at("context_tokens").get<std::size_t>();
+        const auto threads = protocol.at("threads").get<std::size_t>();
+        if (prompt.empty() || outputs < 2 || context != 1024 || prompt.size() + outputs > context || !warmups ||
+            warmups > 20 || !repeats || repeats > 20 || !threads || threads > std::thread::hardware_concurrency() ||
+            std::ranges::any_of(prompt, [](auto id) { return id < 0 || id >= 262144; }))
+            throw std::invalid_argument("invalid Gemma benchmark protocol");
+
+        executorch::runtime::runtime_init();
+        auto* pool = executorch::extension::threadpool::get_threadpool();
+        // Configure before any model load or worker jobs, as in Arm's LLM-Runner.
+        if (!pool->_unsafe_reset_threadpool(static_cast<std::uint32_t>(threads)) || pool->get_thread_count() != threads)
+            throw std::runtime_error("ExecuTorch failed to configure the requested thread count");
+        emit({{"stage", "runtime"},
+              {"device", "cpu:0"},
+              {"backend", "XNNPACK"},
+              {"kleidiai_enabled", true},
+              {"threads", pool->get_thread_count()}});
+
+        const auto loading = Clock::now();
+        Module module(argv[1], Module::LoadMode::Mmap);
+        const auto loaded = module.load_method("forward");
+        if (loaded != executorch::runtime::Error::Ok)
+            throw std::runtime_error("ExecuTorch load failed: " + std::to_string(static_cast<int>(loaded)));
+        emit({{"stage", "load"}, {"ms", seconds(loading, Clock::now()) * 1000}});
+
+        for (std::size_t iteration = 0; iteration < warmups + repeats; ++iteration) {
+            auto ids = prompt;
+            std::vector<std::int64_t> positions(ids.size());
+            std::iota(positions.begin(), positions.end(), 0);
+            std::vector<std::int64_t> generated;
+            generated.reserve(outputs);
+            const auto submitted = Clock::now();
+            generated.push_back(execute(module, ids, positions));
+            const auto first = Clock::now();
+            for (std::size_t index = 1; index < outputs; ++index) {
+                ids.assign(1, generated.back());
+                positions.assign(1, static_cast<std::int64_t>(prompt.size() + index - 1));
+                generated.push_back(execute(module, ids, positions));
+            }
+            const auto last = Clock::now();
+            const auto prefill = seconds(submitted, first), decode = seconds(first, last);
+            if (prefill <= 0 || decode <= 0) throw std::runtime_error("invalid benchmark timing");
+            emit({{"stage", "generation"},
+                  {"iteration", iteration},
+                  {"warmup", iteration < warmups},
+                  {"input_token_ids", prompt},
+                  {"token_ids", generated},
+                  {"prompt_tokens", prompt.size()},
+                  {"output_tokens", generated.size()},
+                  {"decode_tokens", generated.size() - 1},
+                  {"reused_prompt_tokens", 0},
+                  {"first_token_seconds", prefill},
+                  {"decode_seconds", decode},
+                  {"prefill_through_first_token_tps", prompt.size() / prefill},
+                  {"decode_interval_tps", (outputs - 1) / decode}});
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "Arm Gemma benchmark failed: " << error.what() << '\n';
+        return 1;
+    }
+}

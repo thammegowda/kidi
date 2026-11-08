@@ -92,8 +92,11 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
         throw std::invalid_argument("Gemma workload must be short, long, or both");
     if (settings.contains("prompt") && custom_prompt.empty())
         throw std::invalid_argument("Gemma benchmark prompt must not be empty");
+    const auto weight_bits = settings.value("weight_bits", 0);
+    const auto group_size = settings.value("group_size", 128);
     const auto started = Clock::now();
-    auto generator = require(kidi::inference::Generator::load(directory, gemma_device(), 0, 128, packed_prefill));
+    auto generator =
+        require(kidi::inference::Generator::load(directory, gemma_device(), weight_bits, group_size, packed_prefill));
     require(generator.configure_serving({.maximum_active = 1,
                                          .maximum_requests = 1,
                                          .cache_token_budget = context,

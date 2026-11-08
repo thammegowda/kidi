@@ -75,7 +75,10 @@ struct Context::Impl {
     struct PackedBinding {
         Tensor source;
         PackedWeight packed;
-        bool packed_prefill;
+        std::int32_t bits = 0;
+        std::int32_t group_size = 0;
+        bool packed_prefill = false;
+        bool released = false;
     };
     struct DequantizedBinding {
         Tensor weight, scales, value;
@@ -588,11 +591,12 @@ auto Context::greedy_token(const Tensor& logits, TokenOutput output) -> Tensor {
     return impl_->run({Operation::GREEDY_TOKEN, attributes, tensor::DType::I32}, {&logits});
 }
 auto Context::embedding(const Tensor& indices, const Tensor& weight, const Tensor& scales, std::int32_t width,
-                        std::int32_t bits, float multiplier) -> Tensor {
+                        std::int32_t bits, float multiplier, bool unsigned_packed) -> Tensor {
     if (indices.dtype() != tensor::DType::I32 || indices.dimensions() != 1 || weight.dimensions() != 2 || width <= 0 ||
         (bits != 0 && bits != 2 && bits != 4 && bits != 8) || !std::isfinite(multiplier))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid embedding operands"});
-    const std::array<std::int64_t, 3> attributes{width, bits, bits ? static_cast<std::int64_t>(scales.size(1)) : 1};
+    const std::array<std::int64_t, 4> attributes{width, bits, bits ? static_cast<std::int64_t>(scales.size(1)) : 1,
+                                                 unsigned_packed ? 1 : 0};
     const OperatorSpec spec{Operation::EMBEDDING, attributes, impl_->activation_dtype, multiplier};
     if (bits) return impl_->run(spec, {&indices, &weight, &scales});
     return impl_->run(spec, {&indices, &weight});
@@ -727,8 +731,26 @@ auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bi
         if (found != impl_->packed_weights.end() && found->second.source.dtype() == weight.dtype() &&
             std::ranges::equal(found->second.source.shape(), weight.shape()) &&
             (found->second.packed_prefill || (input.dimensions() > 0 && input.numel() == input.size(-1)))) {
-            const auto& packed = found->second.packed;
-            return packed_linear(input, packed.values, packed.scales, packed.bits, packed.group_size);
+            auto& binding = found->second;
+            if (!binding.packed.values.defined()) {
+                const auto started = Clock::now();
+                auto packed = require(pack_weight(binding.source, binding.bits, binding.group_size));
+                binding.source.release_pages(false);
+                packed.values = require(packed.values.to(device()));
+                packed.scales = require(packed.scales.to(device()));
+                binding.packed = std::move(packed);
+                impl_->preparation += nanoseconds(started);
+            }
+            auto output = packed_linear(input, binding.packed.values, binding.packed.scales, binding.packed.bits,
+                                        binding.packed.group_size);
+            if (!binding.released && device().kind == tensor::DeviceKind::CPU &&
+                impl_->precision == core::InferencePrecision::CHECKPOINT && input.dimensions() > 0 &&
+                input.numel() == input.size(-1) && binding.packed.values.nbytes() >= (std::size_t{1} << 20) &&
+                binding.packed.values.size(0) % (8 / binding.packed.bits) == 0) {
+                binding.packed.values.release_pages(true);
+                binding.released = true;
+            }
+            return output;
         }
     }
     const auto activation = weight.dtype() == tensor::DType::BF16 ? cast(input, tensor::DType::BF16) : input;
@@ -741,18 +763,32 @@ auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bi
 }
 auto Context::prepare_linear_weights(const Tensor& weight, std::int32_t bits, std::int32_t group_size,
                                      bool packed_prefill) -> void {
+    if (!weight.defined() || weight.dimensions() != 2 || !weight.is_contiguous() ||
+        (weight.dtype() != tensor::DType::F16 && weight.dtype() != tensor::DType::BF16 &&
+         weight.dtype() != tensor::DType::F32) ||
+        (bits != 2 && bits != 4 && bits != 8) || group_size <= 0 || group_size % (8 / bits) ||
+        weight.size(1) % group_size || !weight.size(0) || !weight.size(1))
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed weight dimensions, precision or group size"});
     const auto address = require(weight.host_bytes()).data();
     if (const auto found = impl_->packed_weights.find(address); found != impl_->packed_weights.end()) {
-        if (found->second.packed.bits != bits || found->second.packed.group_size != group_size ||
+        if (found->second.bits != bits || found->second.group_size != group_size ||
             found->second.packed_prefill != packed_prefill ||
             !std::ranges::equal(found->second.source.shape(), weight.shape()))
             throw Failure({ErrorCode::INVALID_ARGUMENT, "weight already packed with a different layout"});
         return;
     }
+    if (device().kind == tensor::DeviceKind::CPU && weight.nbytes() >= (std::size_t{1} << 20) &&
+        weight.nbytes() < (std::size_t{256} << 20)) {
+        impl_->packed_weights.emplace(address,
+                                      Impl::PackedBinding{weight, {}, bits, group_size, packed_prefill, false});
+        return;
+    }
     auto packed = require(pack_weight(weight, bits, group_size));
+    weight.release_pages(false);
     packed.values = require(packed.values.to(device()));
     packed.scales = require(packed.scales.to(device()));
-    impl_->packed_weights.emplace(address, Impl::PackedBinding{weight, std::move(packed), packed_prefill});
+    impl_->packed_weights.emplace(
+        address, Impl::PackedBinding{weight, std::move(packed), bits, group_size, packed_prefill, false});
 }
 auto Context::quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias,
                                bool transpose_weight) -> Tensor {

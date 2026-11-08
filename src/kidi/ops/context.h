@@ -152,7 +152,7 @@ public:
     auto static_round(const Tensor& input, float scale) -> Tensor;
     auto greedy_token(const Tensor& logits, TokenOutput output = TokenOutput::HOST) -> Tensor;
     auto embedding(const Tensor& indices, const Tensor& weight, const Tensor& scales, std::int32_t width,
-                   std::int32_t bits, float multiplier) -> Tensor;
+                   std::int32_t bits, float multiplier, bool unsigned_packed = false) -> Tensor;
     auto embedding_sum(const Tensor& tokens, const Tensor& weight, const Tensor& scales, std::int32_t width,
                        std::int32_t bits, float multiplier) -> Tensor;
     auto diffusion_candidates(const Tensor& logits, std::size_t target, std::int32_t codebooks, std::int32_t vocabulary,

@@ -43,17 +43,21 @@ auto QuantizedState::decode_vector(const Tensor& values, std::string_view name, 
 }
 
 LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose, bool bias,
-                       std::int32_t packed_bits, bool quantized_bias)
-    : packed_bits_(packed_bits), input_size_(input_size), transpose_(transpose), has_bias_(bias) {
+                       std::int32_t packed_bits, bool quantized_bias, std::int32_t group_size)
+    : packed_bits_(packed_bits),
+      input_size_(input_size),
+      group_size_(group_size ? group_size : input_size),
+      transpose_(transpose),
+      has_bias_(bias) {
     const auto storage = parameter_device(packed_bits != 0);
     if (packed_bits) {
-        if ((packed_bits != 2 && packed_bits != 4 && packed_bits != 8) || !transpose || bias ||
-            input_size % (8 / packed_bits))
+        if ((packed_bits != 2 && packed_bits != 4 && packed_bits != 8) || !transpose || bias || group_size_ <= 0 ||
+            group_size_ % (8 / packed_bits) || input_size % group_size_)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed linear construction"});
         register_parameter("weight", weight_, {output_size, input_size / (8 / packed_bits)}, tensor::DType::U8,
                            allocate_parameters, storage);
-        register_parameter("weight_scale", packed_scale_, {output_size, 1}, tensor::DType::F32, allocate_parameters,
-                           storage);
+        register_parameter("weight_scale", packed_scale_, {output_size, input_size / group_size_}, tensor::DType::F32,
+                           allocate_parameters, storage);
         register_parameter("input_activation_scale", input_scale_, {}, tensor::DType::F32, allocate_parameters,
                            tensor::Device::cpu());
         register_parameter("output_activation_scale", output_scale_, {}, tensor::DType::F32, allocate_parameters,
@@ -72,7 +76,8 @@ LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool t
         const auto vector_storage =
             module_device.parameter_device(tensor::ParameterRole::PROJECTION, tensor::ParameterKind::PREPARED_VECTOR);
         register_parameter("bias", bias_, {output_size}, tensor::DType::I8, allocate_parameters, vector_storage);
-        register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32, allocate_parameters, vector_storage);
+        register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32, allocate_parameters,
+                           vector_storage);
     } else if (bias) {
         register_parameter("bias", bias_, {output_size}, tensor::DType::F32, allocate_parameters, storage);
     } else if (module_dtype == tensor::DType::I8)
@@ -95,7 +100,7 @@ auto LinearImpl::forward(ops::Context& context, const Tensor& input) const -> Te
     if (!weight_.defined() || (has_bias_ && !bias_.defined()))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "linear state has not been initialized"});
     if (packed_bits_) {
-        return context.packed_linear(input, weight_, packed_scale_, packed_bits_, input_size_,
+        return context.packed_linear(input, weight_, packed_scale_, packed_bits_, group_size_,
                                      require(input_scale_.data<float>())[0], require(output_scale_.data<float>())[0]);
     }
     if (qstate_) return context.quantized_linear(input, weight_, qstate_->scale, bias(), transpose_);

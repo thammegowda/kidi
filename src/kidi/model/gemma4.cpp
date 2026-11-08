@@ -46,14 +46,28 @@ auto quant_bits(const YAML::Node& config, const std::string& name) -> std::int32
     if (bits != 2 && bits != 4 && bits != 8) throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported QAT bit width"});
     return bits;
 }
+auto quant_group_size(const YAML::Node& config, const std::string& name) -> std::int32_t {
+    const auto quantization = config["quantization_config"];
+    if (!quantization) return 0;
+    for (const auto& item : quantization["modules_to_not_convert"])
+        if (name.find(item.as<std::string>()) != std::string::npos) return 0;
+    auto group_size = quantization["group_size"].as<int>(0);
+    for (const auto& item : quantization["module_quant_configs"])
+        if (std::regex_search(name, std::regex(item.first.as<std::string>()))) {
+            group_size = item.second["group_size"].as<int>(group_size);
+            break;
+        }
+    return group_size;
+}
 auto embedding(std::int32_t vocabulary, std::int32_t width, float scale, std::int32_t bits = 0, std::int32_t groups = 1)
     -> layers::TokenEmbedding {
     const ModuleScope storage(tensor::Device::cpu());
     return layers::TokenEmbedding(vocabulary, width, scale, bits, groups);
 }
-auto output_projection(std::int32_t hidden, std::int32_t vocabulary, std::int32_t bits = 0) -> layers::Linear {
+auto output_projection(std::int32_t hidden, std::int32_t vocabulary, std::int32_t bits = 0, std::int32_t group_size = 0)
+    -> layers::Linear {
     const ModuleScope host(tensor::Device::cpu());
-    return layers::Linear(hidden, vocabulary, true, false, bits);
+    return layers::Linear(hidden, vocabulary, true, false, bits, false, group_size);
 }
 auto float_parameter(const Tensor& input) -> Tensor {
     if (input.dtype() == DType::F32) return input;
@@ -65,6 +79,7 @@ auto float_parameter(const Tensor& input) -> Tensor {
     auto values = require(output.data<float>());
     for (std::size_t index = 0; index < values.size(); ++index)
         values[index] = std::bit_cast<float>(static_cast<std::uint32_t>(source[index]) << 16);
+    input.release_pages(false);
     return output;
 }
 auto concatenate_projection_rows(const Tensor& first, const Tensor& second) -> Tensor {
@@ -88,6 +103,8 @@ auto concatenate_projection_rows(const Tensor& first, const Tensor& second) -> T
     const auto second_bytes = require(second_host.host_bytes());
     std::ranges::copy(first_bytes, destination.begin());
     std::ranges::copy(second_bytes, destination.begin() + first_bytes.size());
+    first.release_pages(false);
+    second.release_pages(false);
     return output;
 }
 } // namespace
@@ -103,6 +120,7 @@ struct Gemma4Impl::State {
     YAML::Node construction_config;
     bool qat;
     core::KVCachePrecision kv_cache_precision = core::KVCachePrecision::AUTO;
+    std::int32_t weight_bits = 0;
     bool packed_prefill = false;
     std::int32_t vocabulary, per_layer_vocabulary;
     std::vector<std::size_t> cache_layer;
@@ -137,8 +155,11 @@ struct Gemma4Impl::State {
           per_layer_tokens(embedding(config["vocab_size_per_layer_input"].as<int>(), layer_count * per_layer_width,
                                      std::sqrt(static_cast<float>(per_layer_width)),
                                      quant_bits(config, "model.language_model.embed_tokens_per_layer"), layer_count)),
-          per_layer_projection(hidden, layer_count * per_layer_width, true, false),
-          lm_head(output_projection(hidden, config["vocab_size"].as<int>(), quant_bits(config, "lm_head"))),
+          per_layer_projection(hidden, layer_count * per_layer_width, true, false,
+                               quant_bits(config, "model.language_model.per_layer_model_projection"), false,
+                               quant_group_size(config, "model.language_model.per_layer_model_projection")),
+          lm_head(output_projection(hidden, config["vocab_size"].as<int>(), quant_bits(config, "lm_head"),
+                                    quant_group_size(config, "lm_head"))),
           per_layer_norm(per_layer_width, config["rms_norm_eps"].as<float>()),
           norm(hidden, config["rms_norm_eps"].as<float>()),
           projection_scale(scalar(1.F / std::sqrt(static_cast<float>(hidden)), module_device)),
@@ -164,7 +185,11 @@ struct Gemma4Impl::State {
                 config["rms_norm_eps"].as<float>(), shared,
                 quant_bits(config, "model.language_model.layers." + std::to_string(index) + ".mlp.gate_proj"),
                 quant_bits(config, "model.language_model.layers." + std::to_string(index) + ".self_attn.q_proj"),
-                quant_bits(config, "model.language_model.layers." + std::to_string(index) + ".per_layer_input_gate")));
+                quant_bits(config, "model.language_model.layers." + std::to_string(index) + ".per_layer_input_gate"),
+                quant_group_size(config, "model.language_model.layers." + std::to_string(index) + ".mlp.gate_proj"),
+                quant_group_size(config, "model.language_model.layers." + std::to_string(index) + ".self_attn.q_proj"),
+                quant_group_size(config,
+                                 "model.language_model.layers." + std::to_string(index) + ".per_layer_input_gate")));
         }
     }
     auto positions(int type, std::size_t start, std::size_t length) -> std::array<Tensor, 2> {
@@ -347,12 +372,22 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
                 if (!bits || (bits < 8 && value.dtype() != DType::U8) || (bits == 8 && value.dtype() != DType::I8))
                     throw ops::Failure(
                         {ErrorCode::INVALID_ARGUMENT, "QAT weight storage does not match configured precision"});
-                auto converted = require(Tensor::empty({value.shape().begin(), value.shape().end()}, DType::U8));
                 const auto source = require(value.host_bytes());
+                if (bits == 8) {
+                    state.emplace(name, require(Tensor::from_blob({value.shape().begin(), value.shape().end()},
+                                                                  DType::U8, source, std::make_shared<Tensor>(value))));
+                    continue;
+                }
+                if (name.ends_with(".embedding_quantized") && device().kind == tensor::DeviceKind::CPU) {
+                    state.emplace(name, value);
+                    continue;
+                }
+                auto converted = require(Tensor::empty({value.shape().begin(), value.shape().end()}, DType::U8));
                 auto destination = require(converted.data<std::uint8_t>());
                 const std::uint8_t sign_mask = bits == 2 ? 0xaa : bits == 4 ? 0x88 : 0;
                 for (std::size_t offset = 0; offset < destination.size(); ++offset)
                     destination[offset] = std::to_integer<std::uint8_t>(source[offset]) ^ sign_mask;
+                value.release_pages(false);
                 state.emplace(name, std::move(converted));
             } else {
                 const bool quantization_scale = name.ends_with("weight_scale") || name.ends_with("embedding_scale") ||
@@ -360,11 +395,12 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
                                                 name.ends_with("output_activation_scale") ||
                                                 name.ends_with("k_cache_scale") || name.ends_with("v_cache_scale");
                 if (impl_->qat && quantization_scale) {
-                    const bool activation_scale =
-                        name.ends_with("input_activation_scale") || name.ends_with("output_activation_scale");
+                    const bool calibration_scale = name.ends_with("input_activation_scale") ||
+                                                   name.ends_with("output_activation_scale") ||
+                                                   name.ends_with("k_cache_scale") || name.ends_with("v_cache_scale");
                     const auto scales = require(value.data<float>());
                     if (std::ranges::any_of(scales, [&](float scale) {
-                            return !std::isfinite(scale) || scale < 0 || (!activation_scale && scale == 0);
+                            return !std::isfinite(scale) || scale < 0 || (!calibration_scale && scale == 0);
                         }))
                         throw ops::Failure(
                             {ErrorCode::INVALID_ARGUMENT, "invalid trained quantization scale: " + name});
@@ -414,19 +450,23 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
                         {ErrorCode::INVALID_ARGUMENT, "quantization group must divide projection width"});
         impl_->context.synchronize();
         require(set_state(state));
+        const bool unsigned_embeddings = impl_->qat && device().kind == tensor::DeviceKind::CPU &&
+                                         !impl_->construction_config["packed_weights_signed"].as<bool>(false);
+        impl_->tokens->set_unsigned_packed(unsigned_embeddings);
+        impl_->per_layer_tokens->set_unsigned_packed(unsigned_embeddings);
         const ops::StepCompilerScope compiler(impl_->context.step_compiler());
         impl_->context = ops::Context(device(), packed_prefill, std::nullopt, impl_->parameter_dtype);
+        impl_->weight_bits = weight_bits;
         impl_->packed_prefill = packed_prefill;
         if (weight_bits)
             for (const auto& [name, weight] : state_dict())
                 if (weight.dimensions() == 2 && name != "embed_tokens.weight" &&
-                    name != "embed_tokens_per_layer.weight")
+                    name != "embed_tokens_per_layer.weight") {
+                    const bool group_quantized = weight_bits == 4 && weight.size(1) % group_size == 0;
                     impl_->context.prepare_linear_weights(
-                        weight, weight_bits == 4 && name.find(".mlp.") == std::string::npos ? 8 : weight_bits,
-                        weight_bits == 8 || name.find(".mlp.") == std::string::npos
-                            ? static_cast<std::int32_t>(weight.size(1))
-                            : group_size,
-                        packed_prefill);
+                        weight, group_quantized ? 4 : 8,
+                        group_quantized ? group_size : static_cast<std::int32_t>(weight.size(1)), packed_prefill);
+                }
         return {};
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
@@ -989,7 +1029,8 @@ auto Gemma4Impl::prefill_chunk_size(std::size_t requested) const -> std::size_t 
     return impl_->context.prefill_chunk_size(requested);
 }
 auto Gemma4Impl::last_token_prefill() const -> bool {
-    return impl_->qat && device().policy().transformer.prefill == tensor::PrefillStrategy::LAST_TOKEN;
+    return (impl_->qat || impl_->weight_bits != 0) &&
+           device().policy().transformer.prefill == tensor::PrefillStrategy::LAST_TOKEN;
 }
 auto Gemma4Impl::shared_prefill_tail() const -> bool {
     return impl_->qat && device().policy().transformer.prefill == tensor::PrefillStrategy::SHARED_KV_TAIL &&

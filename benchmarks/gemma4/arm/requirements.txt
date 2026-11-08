@@ -1,0 +1,5 @@
+executorch==1.5.1
+torch==2.14.1
+torchao==0.18.0
+safetensors>=0.4,<1
+tokenizers>=0.21,<1

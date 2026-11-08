@@ -1,23 +1,39 @@
 #include "kidi/tensor/backend.h"
+#include "kidi/checkpoint/safetensors/mapped.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <new>
 #include <utility>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace kidi::tensor {
 namespace {
 
 constexpr std::size_t YNNPACK_ALIGNMENT = 64;
+constexpr std::size_t MAPPED_THRESHOLD = std::size_t{1} << 20;
 
 class CpuStorage final : public Storage {
 public:
     CpuStorage(Device device, std::size_t size_bytes, std::size_t alignment)
         : device_(device), size_bytes_(size_bytes), writable_(true) {
+#if (defined(__unix__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
+        if (size_bytes >= MAPPED_THRESHOLD && alignment <= 4096) {
+            void* mapping = ::mmap(nullptr, size_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (mapping != MAP_FAILED) {
+                owner_ = std::shared_ptr<const void>(
+                    mapping, [size_bytes](const void* pointer) { ::munmap(const_cast<void*>(pointer), size_bytes); });
+                data_ = static_cast<const std::byte*>(mapping);
+                anonymous_mapped_ = true;
+                return;
+            }
+        }
+#endif
         auto* allocation = ::operator new(std::max<std::size_t>(size_bytes, 1), std::align_val_t(alignment));
         owner_ = std::shared_ptr<const void>(allocation, [alignment](const void* pointer) {
             ::operator delete(const_cast<void*>(pointer), std::align_val_t(alignment));
@@ -30,14 +46,14 @@ public:
     struct Zeroed {};
     CpuStorage(Device device, std::size_t size_bytes, std::size_t alignment, Zeroed)
         : device_(device), size_bytes_(size_bytes), writable_(true) {
-#if defined(__unix__) || defined(__APPLE__)
-        constexpr std::size_t MAPPED_THRESHOLD = std::size_t{1} << 20;
+#if (defined(__unix__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
         if (size_bytes >= MAPPED_THRESHOLD && alignment <= 4096) {
             void* mapping = ::mmap(nullptr, size_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (mapping != MAP_FAILED) {
                 owner_ = std::shared_ptr<const void>(
                     mapping, [size_bytes](const void* pointer) { ::munmap(const_cast<void*>(pointer), size_bytes); });
                 data_ = static_cast<const std::byte*>(mapping);
+                anonymous_mapped_ = true;
                 return;
             }
         }
@@ -64,12 +80,39 @@ public:
     auto data() const noexcept -> const std::byte* { return data_; }
     auto writable() const noexcept -> bool { return writable_; }
 
+    auto release_pages(std::size_t offset, std::size_t size_bytes, bool allow_anonymous) const noexcept
+        -> void override {
+        if (data_ == nullptr || offset >= size_bytes_ || size_bytes == 0) return;
+        const auto length = std::min(size_bytes, size_bytes_ - offset);
+        if (checkpoint::safetensors::MappedFile::release_any_pages(data_ + offset, length)) return;
+#if (defined(__unix__) || defined(__APPLE__)) && !defined(__EMSCRIPTEN__)
+        if (!allow_anonymous || !anonymous_mapped_) return;
+        const long raw_page = ::sysconf(_SC_PAGESIZE);
+        if (raw_page <= 0) return;
+        const auto page_size = static_cast<std::uintptr_t>(raw_page);
+        const auto begin = reinterpret_cast<std::uintptr_t>(data_ + offset);
+        const auto aligned_begin = (begin + page_size - 1) & ~(page_size - 1);
+        const auto aligned_end = (begin + length) & ~(page_size - 1);
+        if (aligned_end <= aligned_begin) return;
+        const auto aligned_length = static_cast<std::size_t>(aligned_end - aligned_begin);
+#if defined(__APPLE__)
+        (void)::mmap(reinterpret_cast<void*>(aligned_begin), aligned_length, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+#else
+        (void)::madvise(reinterpret_cast<void*>(aligned_begin), aligned_length, MADV_DONTNEED);
+#endif
+#else
+        (void)allow_anonymous;
+#endif
+    }
+
 private:
     Device device_;
     std::size_t size_bytes_;
     std::shared_ptr<const void> owner_;
     const std::byte* data_;
     bool writable_;
+    bool anonymous_mapped_ = false;
 };
 
 auto cpu_storage(Storage& storage) -> Result<CpuStorage*> {

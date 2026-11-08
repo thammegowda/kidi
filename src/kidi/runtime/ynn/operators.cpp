@@ -6,10 +6,12 @@
 #include "ynnpack/composites/composites.h"
 #include "ynnpack/kernels/unary/unary.h"
 #include <array>
+#include <compare>
 #include <functional>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <numeric>
 #include <algorithm>
 #include <limits>
@@ -22,6 +24,7 @@
 #if defined(__APPLE__)
 #define ACCELERATE_NEW_LAPACK
 #include <Accelerate/Accelerate.h>
+#include <malloc/malloc.h>
 #endif
 
 namespace kidi::runtime {
@@ -629,6 +632,7 @@ public:
         : width_(static_cast<std::size_t>(spec.attributes[0])),
           bits_(static_cast<int>(spec.attributes[1])),
           groups_(static_cast<std::size_t>(spec.attributes[2])),
+          unsigned_packed_(spec.attributes[3] != 0),
           multiplier_(spec.epsilon),
           pool_(&arena) {
         const auto& weight = inputs[1];
@@ -669,10 +673,12 @@ private:
             const auto group_width = width_ / groups_, per_byte = static_cast<std::size_t>(8 / bits_);
             const auto data = reinterpret_cast<const std::uint8_t*>(bytes.data());
             const auto sign = 1 << (bits_ - 1);
+            const std::uint8_t sign_mask = unsigned_packed_ ? (bits_ == 2 ? 0xaaU : bits_ == 4 ? 0x88U : 0U) : 0U;
             for (std::size_t row = 0; row < tokens.size(); ++row)
                 for (std::size_t channel = 0; channel < width_; ++channel) {
                     const auto offset = static_cast<std::size_t>(tokens[row]) * width_ + channel;
-                    const auto raw = (data[offset / per_byte] >> ((offset % per_byte) * bits_)) & ((1 << bits_) - 1);
+                    const auto byte = static_cast<std::uint8_t>(data[offset / per_byte] ^ sign_mask);
+                    const auto raw = (byte >> ((offset % per_byte) * bits_)) & ((1 << bits_) - 1);
                     const auto integer = (raw ^ sign) - sign;
                     values[row * width_ + channel] =
                         integer * scales[tokens[row] * groups_ + channel / group_width] * multiplier_;
@@ -695,6 +701,7 @@ private:
     std::size_t width_;
     int bits_;
     std::size_t groups_;
+    bool unsigned_packed_ = false;
     float multiplier_;
     OutputPool pool_;
 };
@@ -1164,8 +1171,11 @@ public:
             }
             case Operation::PACKED_LINEAR:
             case Operation::QUANTIZED_LINEAR: {
+                const bool packed = spec.operation == Operation::PACKED_LINEAR;
+                const auto block_size = packed ? static_cast<std::size_t>(spec.attributes[1]) : inputs[0].size(-1);
+                const bool transposed = packed || (!spec.attributes.empty() && spec.attributes[0]);
                 auto zero = YNN_INVALID_VALUE_ID, scale = YNN_INVALID_VALUE_ID, quantized = YNN_INVALID_VALUE_ID;
-                if (spec.operation == Operation::PACKED_LINEAR && spec.epsilon > 0) {
+                if (packed && spec.epsilon > 0) {
                     const std::int32_t origin = 0;
                     check(ynn_define_tensor(native, ynn_type_int32, 0, nullptr, &origin, YNN_VALUE_FLAG_COPY_DATA,
                                             &zero));
@@ -1176,13 +1186,12 @@ public:
                 }
                 check(ynn_define_quantize(native, operands[0], ynn_type_int8, zero, scale, &quantized, 0));
                 auto weight = operands[1];
-                const bool packed = spec.operation == Operation::PACKED_LINEAR;
-                if (packed || (!spec.attributes.empty() && spec.attributes[0])) {
+                if (transposed) {
                     const std::array<std::int32_t, 2> axes{1, 0};
                     weight = YNN_INVALID_VALUE_ID;
                     check(ynn_define_static_transpose(native, 2, axes.data(), operands[1], &weight, 0));
                 }
-                if (packed && spec.epsilon > 0 && spec.attributes[1] == inputs[0].size(-1) &&
+                if (packed && spec.epsilon > 0 && block_size == inputs[0].size(-1) &&
                     (SHARED_DECODE_PACKING || inputs[0].numel() > inputs[0].size(-1))) {
                     const std::size_t columns = padded_columns;
                     auto channel_scale = YNN_INVALID_VALUE_ID;
@@ -1190,10 +1199,9 @@ public:
                     check(ynn_define_dot(native, 1, quantized, weight, YNN_INVALID_VALUE_ID, &result, 0));
                     result = binary(ynn_binary_multiply, binary(ynn_binary_multiply, result, channel_scale), scale);
                 } else
-                    check(::ynn::define_blockwise_dot(native, quantized, zero, scale, weight, YNN_INVALID_VALUE_ID,
-                                                      operands[2], packed ? spec.attributes[1] : inputs[0].size(-1),
-                                                      packed ? YNN_INVALID_VALUE_ID : operands[3], ynn_type_fp32,
-                                                      result, 0));
+                    check(::ynn::define_blockwise_dot(
+                        native, quantized, zero, scale, weight, YNN_INVALID_VALUE_ID, operands[2], block_size,
+                        packed ? YNN_INVALID_VALUE_ID : operands[3], ynn_type_fp32, result, 0));
                 if (packed) {
                     const auto output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]));
                     if (output_scale > 0) {
@@ -1466,6 +1474,15 @@ public:
         if (small_projection || small_attention) operator_threads = 1;
 #endif
         auto executable = require(std::move(graph).compile(operator_threads));
+        if (constant) {
+            const bool release_anonymous =
+                spec.operation == Operation::PACKED_LINEAR && inputs[0].numel() == inputs[0].size(-1) && !pad_columns;
+            for (std::size_t index = dynamic_count; index < inputs.size(); ++index)
+                inputs[index].release_pages(release_anonymous && index == 1);
+#if defined(__APPLE__)
+            if (inputs[1].nbytes() >= (std::size_t{8} << 20)) ::malloc_zone_pressure_relief(nullptr, 0);
+#endif
+        }
         require(executable.reshape());
         auto shape = require(executable.shape(output_id));
         return std::make_unique<CpuOperator>(std::move(executable), inputs.size(), dynamic_count, dtype,
