@@ -215,6 +215,7 @@ async function sendIntegration(type, payload = {}) {
     const current = await sendIntegration('kidi.context.inspect', {tabId: result.task.tabId});
     if (current.pageUrl !== result.task.sourceUrl)
       throw new Error('The PDF tab navigated during capture. Try again.');
+    renderInspection(current);
     result.task = {...result.task, ...extracted, title: extracted.title || result.task.title};
   }
   return result;
@@ -395,7 +396,9 @@ async function captureGmail(kind, task) {
 }
 async function pageAction(task) {
   if (capturing || activeRequest || queued) return;
-  if (!inspection.pageAvailable) {
+  const current = ['article', 'pdf'].includes(context?.kind) &&
+    (!inspection.pageAvailable || (context.tabId === inspection.tabId && context.sourceUrl === inspection.pageUrl));
+  if ((!current || task === 'page_attach') && !inspection.pageAvailable) {
     const granted = await api.permissions.request({origins: WEB_ORIGINS});
     if (!granted)
       throw new Error('Webpage access was not granted. You can still paste or select text for Kidi.');
@@ -403,8 +406,6 @@ async function pageAction(task) {
     if (!inspection.pageAvailable)
       throw new Error('This browser page cannot be accessed by extensions. Select or paste the text instead.');
   }
-  const current = ['article', 'pdf'].includes(context?.kind) && context.tabId === inspection.tabId &&
-    context.sourceUrl === inspection.pageUrl;
   if (!current || task === 'page_attach') {
     capturing = true;
     renderRuntime();
@@ -695,6 +696,7 @@ async function takePending() {
     const response = await sendIntegration('kidi.pending.take');
     if (!response.task) return;
     task = response.task.task || 'polish';
+    if (response.task.kind !== 'pdf') await refreshContext();
     await attachContext(response.task, ['page_read', 'page_attach'].includes(task) ? 'chat' : task);
   } finally {
     capturing = false;

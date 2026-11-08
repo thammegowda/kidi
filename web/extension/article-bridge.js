@@ -23,6 +23,12 @@
     if (location.hostname === 'mail.google.com')
       throw new Error('Use the Gmail draft or reply actions instead of reading the whole mailbox page.');
     const selection = getSelection()?.toString()?.trim();
+    if (!selection && document.contentType === 'application/pdf') {
+      return {
+        kind: 'pdf', title: document.title || 'PDF document', language: '',
+        sourceKind: 'pdf', sourceUrl: url, text: '', operation: null, warning: '',
+      };
+    }
     let text, title = document.title, language = document.documentElement.lang || '', sourceKind;
     if (selection) {
       text = selection;

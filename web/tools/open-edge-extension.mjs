@@ -13,7 +13,7 @@ const profile = resolve(process.env.KIDI_EDGE_PROFILE || join(homedir(), '.cache
 const startUrl = process.env.KIDI_EDGE_START_URL ||
   'https://en.wikipedia.org/wiki/Artificial_intelligence';
 const edge = '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge';
-const forceReload = process.env.KIDI_EDGE_RELOAD === '1';
+const forceReload = process.env.KIDI_EDGE_RELOAD !== '0';
 const modelHubKey = 'kidi-model-hub-remote-v1';
 const localCache = process.env.KIDI_LOCAL_MODEL_CACHE ?
   resolve(process.env.KIDI_LOCAL_MODEL_CACHE.replace(/^~(?=\/)/u, homedir())) : '';

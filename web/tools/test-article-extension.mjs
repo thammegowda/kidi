@@ -38,11 +38,10 @@ try {
   const largePdf = await printPdf(`<title>Large text fixture</title><p>${
     'PDF_LIMIT_MARKER: caf&eacute; and text stay on the device. '.repeat(3000)}</p>`);
   const imageOnlyPdf = await printPdf('<div style="width:200px;height:200px;background:#888"></div>');
-  const unexpectedNetwork = [], probes = [];
+  const unexpectedNetwork = [];
   await browser.route('https://**/*', route => {
     const request = route.request(), url = new URL(request.url());
     if (url.hostname === 'arxiv.org' || url.pathname.endsWith('.pdf') || url.pathname === '/download') {
-      if (request.method() === 'HEAD') probes.push(url.href);
       const body = url.pathname === '/large.pdf' ? largePdf
         : url.pathname === '/scan.pdf' ? imageOnlyPdf
         : url.pathname === '/broken.pdf' ? Buffer.from('%PDF-1.7\nbroken') : currentPdf;
@@ -298,7 +297,7 @@ try {
   await panel.locator('#new-chat').click();
   await panel.getByRole('button', {name: 'Use current page', exact: true}).click();
   await panel.locator('#context-card').waitFor({state: 'visible'});
-  assert.ok(probes.includes('https://example.org/download?id=42'));
+  assert.match(await panel.locator('#context-label').textContent(), /^PDF: /);
   const largeExtractedPdf = await extractPdf('https://example.org/large.pdf');
   assert.equal(largeExtractedPdf.truncated, true);
   assert.ok(new TextEncoder().encode(largeExtractedPdf.text).length <= 64 * 1024);

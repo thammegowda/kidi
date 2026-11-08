@@ -13,7 +13,7 @@ TEST_DIST := .cache/test-dist
 
 export KIDI_HUB PYTHON
 
-.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
+.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
 
 setup-test:
 	bash tests/setup.sh
@@ -78,6 +78,10 @@ extension-gmail-test:
 
 extension-article-test:
 	npm --prefix web run test:articles -- "$(abspath build-extension/chromium)"
+
+extension-pdf-test:
+	KIDI_LIVE_PAGE_URL=https://arxiv.org/pdf/1706.03762 KIDI_LIVE_EXPECT='Attention' \
+		npm --prefix web run test:live-wikipedia
 
 extension-edge-test:
 	KIDI_BROWSER_CHANNEL=msedge npm --prefix web run test:extension -- "$(abspath build-extension/chromium)"
