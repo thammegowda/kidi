@@ -177,6 +177,18 @@ private:
         const auto width = logits.size(-1), rows = logits.numel() / width;
         const auto values = require(logits.data<float>());
         auto tokens = require(output.data<std::int32_t>());
+#if defined(__APPLE__)
+        for (std::size_t row = 0; row < rows; ++row) {
+            const float* row_values = values.data() + row * width;
+            float best = -std::numeric_limits<float>::infinity();
+            vDSP_Length best_index = 0;
+            vDSP_maxvi(row_values, 1, &best, &best_index, width);
+            bool invalid = std::isnan(best) || best == std::numeric_limits<float>::infinity();
+            for (std::size_t column = 0; !invalid && column < width; ++column) invalid = std::isnan(row_values[column]);
+            tokens[row] =
+                invalid || best == -std::numeric_limits<float>::infinity() ? -1 : static_cast<std::int32_t>(best_index);
+        }
+#else
         for (std::size_t row = 0; row < rows; ++row) {
             float best = -std::numeric_limits<float>::infinity();
             std::int32_t token = -1;
@@ -191,6 +203,7 @@ private:
             }
             tokens[row] = invalid ? -1 : token;
         }
+#endif
     }
 
     OutputPool pool_;
@@ -312,6 +325,85 @@ private:
 
     std::size_t rows_, width_, tasks_;
     std::vector<float> scratch_;
+    std::vector<std::int64_t> shape_;
+    OutputPool pool_;
+};
+
+class GeluGate final : public Operator {
+public:
+    GeluGate(const Tensor& input, tensor::Arena& arena)
+        : rows_(input.numel() / input.size(-1)),
+          width_(input.size(-1) / 2),
+          tasks_(rows_ * input.size(-1) < 32768 ? 1 : std::min(ynn::thread_count(), rows_)),
+          pool_(&arena) {
+        shape_.assign(input.shape().begin(), input.shape().end());
+        shape_.back() = static_cast<std::int64_t>(width_);
+    }
+
+    static auto supports(TensorInputs inputs) -> bool {
+        return inputs.size() == 1 && inputs[0].dtype() == DType::F32 && inputs[0].dimensions() > 0 &&
+               inputs[0].is_contiguous() && inputs[0].size(-1) > 0 && inputs[0].size(-1) % 2 == 0;
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, DType::F32, tensor::Device::cpu());
+        apply(inputs[0], output);
+        return output;
+    }
+
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "GELU gate is not an in-place operation"});
+    }
+
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs[0]); }
+
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(const Tensor& input, Tensor& output) -> void {
+        const auto* source = require(input.data<float>()).data();
+        auto* target = require(output.data<float>()).data();
+        static const auto tanh_kernel = ::ynn::get_unary_kernel(ynn_unary_tanh, ynn_type_fp32, ynn_type_fp32);
+        static const auto tanh_params = ::ynn::get_unary_params(ynn_unary_tanh);
+        if (!tanh_kernel) throw ops::Failure({ErrorCode::UNSUPPORTED, "FP32 tanh kernel is unavailable"});
+        const auto rows_per_task = (rows_ + tasks_ - 1) / tasks_;
+        const auto run_task = [&](std::size_t task) {
+            const auto begin = task * rows_per_task, end = std::min(rows_, begin + rows_per_task);
+            constexpr float SCALE = 0.79788456080286535588F; // sqrt(2 / pi)
+            for (auto row = begin; row < end; ++row) {
+                const auto* gate = source + row * 2 * width_;
+                const auto* up = gate + width_;
+                auto* hidden = target + row * width_;
+                constexpr std::size_t CHUNK = 1024;
+                for (std::size_t offset = 0; offset < width_; offset += CHUNK) {
+                    const auto count = std::min(CHUNK, width_ - offset);
+                    {
+#pragma clang fp contract(off)
+                        for (std::size_t i = 0; i < count; ++i) {
+                            const auto g = gate[offset + i];
+                            hidden[offset + i] = (g + (g * g * g) * 0.044715F) * SCALE;
+                        }
+                    }
+                    tanh_kernel(1, count, count * sizeof(float), hidden + offset, count * sizeof(float),
+                                hidden + offset, &tanh_params);
+                    {
+#pragma clang fp contract(off)
+                        for (std::size_t i = 0; i < count; ++i) {
+                            hidden[offset + i] =
+                                ((gate[offset + i] * 0.5F) * (1.F + hidden[offset + i])) * up[offset + i];
+                        }
+                    }
+                }
+            }
+        };
+        if (tasks_ <= 1) {
+            run_task(0);
+            return;
+        }
+        require(ynn::parallel_for(tasks_, run_task));
+    }
+
+    std::size_t rows_, width_, tasks_;
     std::vector<std::int64_t> shape_;
     OutputPool pool_;
 };
@@ -810,13 +902,29 @@ class FewQueryAttention final : public Operator {
 public:
     static constexpr std::int64_t MAXIMUM_QUERIES = 8;
     static auto supports(const OperatorSpec& spec, TensorInputs inputs) -> bool {
-        if (spec.attributes.size() != 1 || inputs[0].size(1) > MAXIMUM_QUERIES) return false;
+        if (spec.attributes.size() == 1) {
+            if (inputs[0].size(1) > MAXIMUM_QUERIES) return false;
+        } else if (spec.attributes.size() == 4) {
+            if (inputs[0].size(1) != 1) return false;
+        } else {
+            return false;
+        }
+        if (!spec.quantization[0].scales.empty() || !spec.quantization[1].scales.empty()) return false;
+        const auto heads = static_cast<std::size_t>(spec.attributes[0]);
+        const auto key_heads = spec.attributes.size() >= 2 ? static_cast<std::size_t>(spec.attributes[1]) : heads;
+        if (!heads || !key_heads || heads % key_heads != 0) return false;
         for (std::size_t index = 0; index < inputs.size(); ++index)
-            if (inputs[index].dtype() != DType::F32) return false;
+            if (inputs[index].dtype() != DType::F32 || !inputs[index].is_contiguous()) return false;
         return true;
     }
     FewQueryAttention(const OperatorSpec& spec, tensor::Arena& arena)
-        : heads_(static_cast<std::size_t>(spec.attributes[0])), pool_(&arena) {}
+        : heads_(static_cast<std::size_t>(spec.attributes[0])),
+          key_heads_(spec.attributes.size() >= 2 ? static_cast<std::size_t>(spec.attributes[1]) : heads_),
+          key_start_(spec.attributes.size() >= 4 ? static_cast<std::size_t>(spec.attributes[2]) : 0),
+          key_length_(spec.attributes.size() >= 4 ? static_cast<std::size_t>(spec.attributes[3]) : 0),
+          explicit_scale_(spec.attributes.size() >= 2),
+          scale_(spec.epsilon),
+          pool_(&arena) {}
     auto run(TensorInputs inputs) -> Tensor override {
         auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
         attend(inputs, output);
@@ -845,8 +953,11 @@ private:
         const auto& query = inputs[0];
         const auto batch = static_cast<std::size_t>(query.size(0)), rows = static_cast<std::size_t>(query.size(1));
         const auto width = static_cast<std::size_t>(query.size(2)), head_width = width / heads_;
-        const auto keys = static_cast<std::size_t>(inputs[1].size(1));
-        const auto key_batch_stride = inputs[1].size(0) == 1 ? 0 : keys * width;
+        const auto kv_width = key_heads_ * head_width;
+        const auto group_size = heads_ / key_heads_;
+        const auto total_keys = static_cast<std::size_t>(inputs[1].size(1));
+        const auto keys = key_length_ ? key_length_ : total_keys;
+        const auto key_batch_stride = inputs[1].size(0) == 1 ? 0 : total_keys * kv_width;
         std::array<std::size_t, 4> mask_strides{};
         const float* mask = nullptr;
         if (inputs.size() == 4) {
@@ -861,41 +972,144 @@ private:
         const auto* key_data = require(inputs[1].data<float>()).data();
         const auto* value_data = require(inputs[2].data<float>()).data();
         auto* output_data = require(output.data<float>()).data();
-        const auto scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_width)));
+        const auto scale =
+            explicit_scale_ ? scale_ : static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_width)));
         const auto items = batch * heads_ * rows;
         if (!items) return;
-        const auto tasks = std::min(ynn::thread_count(), items);
+        if (batch == 1 && rows == 1 && key_heads_ == 1 && heads_ == 8 && mask_strides[1] == 0) {
+            const auto* k_base = key_data + key_start_ * head_width;
+            const auto* v_base = value_data + key_start_ * head_width;
+            const auto* bias = mask;
+#if defined(__APPLE__)
+            std::size_t valid_keys = 0;
+            bool prefix_zero_mask = true;
+            for (std::size_t key = 0; key < keys; ++key) {
+                const auto b = bias ? bias[key * mask_strides[3]] : 0.F;
+                if (b == 0.F && valid_keys == key) {
+                    ++valid_keys;
+                } else if (b > -1e8F) {
+                    prefix_zero_mask = false;
+                    break;
+                }
+            }
+            if (prefix_zero_mask && valid_keys > 0) {
+                scratch_.resize(8 * valid_keys);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 8, static_cast<int>(valid_keys),
+                            static_cast<int>(head_width), scale, query_data, static_cast<int>(head_width), k_base,
+                            static_cast<int>(head_width), 0.F, scratch_.data(), static_cast<int>(valid_keys));
+                for (std::size_t h = 0; h < 8; ++h) {
+                    auto* scores = scratch_.data() + h * valid_keys;
+                    float largest = scores[0];
+                    for (std::size_t key = 1; key < valid_keys; ++key) largest = std::max(largest, scores[key]);
+                    const float neg_largest = -largest;
+                    vDSP_vsadd(scores, 1, &neg_largest, scores, 1, valid_keys);
+                    const int count = static_cast<int>(valid_keys);
+                    vvexpf(scores, scores, &count);
+                    float total = 0.F;
+                    vDSP_sve(scores, 1, &total, valid_keys);
+                    const float inv_total = 1.F / total;
+                    vDSP_vsmul(scores, 1, &inv_total, scores, 1, valid_keys);
+                }
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 8, static_cast<int>(head_width),
+                            static_cast<int>(valid_keys), 1.F, scratch_.data(), static_cast<int>(valid_keys), v_base,
+                            static_cast<int>(head_width), 0.F, output_data, static_cast<int>(head_width));
+                return;
+            }
+#endif
+            scratch_.resize(8 * keys);
+            std::array<float, 8> largest;
+            largest.fill(-std::numeric_limits<float>::infinity());
+            for (std::size_t key = 0; key < keys; ++key) {
+                const auto b = bias ? bias[key * mask_strides[3]] : 0.F;
+                if (b <= -1e8F) {
+                    for (std::size_t h = 0; h < 8; ++h)
+                        scratch_[h * keys + key] = -std::numeric_limits<float>::infinity();
+                    continue;
+                }
+                const auto* k_row = k_base + key * head_width;
+                for (std::size_t h = 0; h < 8; ++h) {
+                    const auto s = dot(query_data + h * head_width, k_row, head_width) * scale + b;
+                    scratch_[h * keys + key] = s;
+                    largest[h] = std::max(largest[h], s);
+                }
+            }
+            std::array<float, 8> inv_total{};
+            for (std::size_t h = 0; h < 8; ++h) {
+                float total = 0;
+                auto* scores = scratch_.data() + h * keys;
+                for (std::size_t key = 0; key < keys; ++key) {
+                    scores[key] = scores[key] == -std::numeric_limits<float>::infinity()
+                                      ? 0.F
+                                      : std::exp(scores[key] - largest[h]);
+                    total += scores[key];
+                }
+                inv_total[h] = 1.F / total;
+            }
+            std::fill_n(output_data, width, 0.F);
+            for (std::size_t key = 0; key < keys; ++key) {
+                const auto b = bias ? bias[key * mask_strides[3]] : 0.F;
+                if (b <= -1e8F) continue;
+                const auto* v_row = v_base + key * head_width;
+                std::array<float, 8> weights;
+                for (std::size_t h = 0; h < 8; ++h) weights[h] = scratch_[h * keys + key] * inv_total[h];
+                for (std::size_t index = 0; index < head_width; ++index) {
+                    const float v_val = v_row[index];
+                    for (std::size_t h = 0; h < 8; ++h) output_data[h * head_width + index] += weights[h] * v_val;
+                }
+            }
+            return;
+        }
+        const auto tasks = items * keys * head_width <= 524288 ? std::size_t{1} : std::min(ynn::thread_count(), items);
         scratch_.resize(tasks * keys);
         const auto per_task = (items + tasks - 1) / tasks;
-        require(ynn::parallel_for(tasks, [&](std::size_t task) {
+        const auto run_task = [&](std::size_t task) {
             auto* scores = scratch_.data() + task * keys;
             for (auto item = task * per_task; item < std::min(items, (task + 1) * per_task); ++item) {
                 const auto row = item % rows, head = item / rows % heads_, sample = item / rows / heads_;
+                const auto kv_head = head / group_size;
                 const auto* q = query_data + (sample * rows + row) * width + head * head_width;
-                const auto* k = key_data + sample * key_batch_stride + head * head_width;
-                const auto* v = value_data + sample * key_batch_stride + head * head_width;
+                const auto* k = key_data + sample * key_batch_stride + (key_start_ * key_heads_ + kv_head) * head_width;
+                const auto* v =
+                    value_data + sample * key_batch_stride + (key_start_ * key_heads_ + kv_head) * head_width;
                 const auto* bias =
                     mask ? mask + sample * mask_strides[0] + head * mask_strides[1] + row * mask_strides[2] : nullptr;
                 auto largest = -std::numeric_limits<float>::infinity();
                 for (std::size_t key = 0; key < keys; ++key) {
-                    scores[key] = dot(q, k + key * width, head_width) * scale;
-                    if (bias) scores[key] += bias[key * mask_strides[3]];
+                    const auto b = bias ? bias[key * mask_strides[3]] : 0.F;
+                    if (b <= -1e8F) {
+                        scores[key] = -std::numeric_limits<float>::infinity();
+                        continue;
+                    }
+                    scores[key] = dot(q, k + key * kv_width, head_width) * scale + b;
                     largest = std::max(largest, scores[key]);
                 }
                 float total = 0;
-                for (std::size_t key = 0; key < keys; ++key) total += scores[key] = std::exp(scores[key] - largest);
+                for (std::size_t key = 0; key < keys; ++key) {
+                    scores[key] =
+                        scores[key] == -std::numeric_limits<float>::infinity() ? 0.F : std::exp(scores[key] - largest);
+                    total += scores[key];
+                }
+                const auto inv_total = 1.F / total;
                 auto* out = output_data + (sample * rows + row) * width + head * head_width;
                 std::fill_n(out, head_width, 0.F);
                 for (std::size_t key = 0; key < keys; ++key) {
-                    const auto weight = scores[key] / total;
-                    const auto* source = v + key * width;
+                    if (scores[key] == 0.F) continue;
+                    const auto weight = scores[key] * inv_total;
+                    const auto* source = v + key * kv_width;
                     for (std::size_t index = 0; index < head_width; ++index) out[index] += weight * source[index];
                 }
             }
-        }));
+        };
+        if (tasks <= 1) {
+            run_task(0);
+            return;
+        }
+        require(ynn::parallel_for(tasks, run_task));
     }
 
-    std::size_t heads_;
+    std::size_t heads_, key_heads_, key_start_, key_length_;
+    bool explicit_scale_;
+    float scale_;
     std::vector<float> scratch_;
     OutputPool pool_;
 };
@@ -979,6 +1193,8 @@ public:
         if (spec.operation == Operation::EMBEDDING) return std::make_unique<Embedding>(spec, inputs, arena_);
         if (spec.operation == Operation::SILU_GATE && SiluGate::supports(inputs))
             return std::make_unique<SiluGate>(inputs[0], arena_);
+        if (spec.operation == Operation::GELU_GATE && GeluGate::supports(inputs))
+            return std::make_unique<GeluGate>(inputs[0], arena_);
         if (spec.operation == Operation::ROTARY && Rotary::supports(inputs)) return std::make_unique<Rotary>(arena_);
         if ((spec.operation == Operation::RMS_NORM || spec.operation == Operation::RMS_NORM_RESIDUAL) &&
             RmsNorm::supports(spec, inputs))
@@ -1460,12 +1676,17 @@ public:
             check(ynn_define_copy(native, residual, &residual_id, 0));
         }
         std::size_t operator_threads = 0;
-#if defined(__EMSCRIPTEN__)
         const bool small_packed_projection = spec.operation == Operation::PACKED_LINEAR &&
                                              inputs[0].numel() == inputs[0].size(-1) &&
                                              inputs[1].nbytes() <= 512 * 1024;
-        if (small_packed_projection) operator_threads = 1;
-#endif
+        const bool small_elementwise =
+            (spec.operation == Operation::GELU_GATE || spec.operation == Operation::SILU_GATE ||
+             spec.operation == Operation::GELU_MULTIPLY || spec.operation == Operation::SILU_MULTIPLY ||
+             spec.operation == Operation::GELU || spec.operation == Operation::ADD ||
+             spec.operation == Operation::MULTIPLY || spec.operation == Operation::TANH ||
+             spec.operation == Operation::STATIC_ROUND) &&
+            inputs[0].numel() <= 65536;
+        if (small_packed_projection || small_elementwise) operator_threads = 1;
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
         const bool small_projection = spec.operation == Operation::QUANTIZED_LINEAR &&
                                       inputs[0].numel() == inputs[0].size(-1) && inputs[1].numel() <= 4 * 1024 * 1024;

@@ -86,9 +86,11 @@ public:
     auto forward_segments(ops::Context& context, const Tensor& input, std::span<const Gemma4AttentionSegment> segments,
                           const Tensor& cosine, const Tensor& sine, bool cache_only = false) const -> Tensor;
     auto has_cache_scales() const -> bool;
+    auto fuse_projections(ops::Context& context, std::int32_t weight_bits, std::int32_t group_size, bool packed_prefill)
+        -> bool;
 
 private:
-    Linear query_, key_{nullptr}, value_{nullptr}, output_;
+    Linear query_, key_{nullptr}, value_{nullptr}, qkv_{nullptr}, kv_{nullptr}, output_;
     RmsNorm query_norm_, key_norm_{nullptr}, value_norm_{nullptr};
     Tensor key_scale_, value_scale_;
     std::int32_t heads_, key_heads_, head_width_;
@@ -109,6 +111,10 @@ public:
                           std::span<const Gemma4AttentionSegment> segments, const Tensor& cosine, const Tensor& sine,
                           bool cache_only = false) const -> Tensor;
     auto has_cache_scales() const -> bool { return attention_->has_cache_scales(); }
+    auto fuse_projections(ops::Context& context, std::int32_t weight_bits, std::int32_t group_size, bool packed_prefill)
+        -> bool {
+        return attention_->fuse_projections(context, weight_bits, group_size, packed_prefill);
+    }
 
 private:
     Gemma4Attention attention_;

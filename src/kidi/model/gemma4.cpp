@@ -458,10 +458,26 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
         impl_->context = ops::Context(device(), packed_prefill, std::nullopt, impl_->parameter_dtype);
         impl_->weight_bits = weight_bits;
         impl_->packed_prefill = packed_prefill;
+        std::vector<bool> qkv_fused(static_cast<std::size_t>(impl_->layer_count), false);
+        if (device().kind == tensor::DeviceKind::CPU) {
+            for (std::int32_t index = 0; index < impl_->layer_count; ++index)
+                qkv_fused[static_cast<std::size_t>(index)] =
+                    impl_->layers->at(static_cast<std::size_t>(index))
+                        ->fuse_projections(impl_->context, weight_bits, group_size, packed_prefill);
+        }
         if (weight_bits)
             for (const auto& [name, weight] : state_dict())
                 if (weight.dimensions() == 2 && name != "embed_tokens.weight" &&
                     name != "embed_tokens_per_layer.weight") {
+                    if (name.starts_with("layers.") && (name.find(".self_attn.q_proj.") != std::string::npos ||
+                                                        name.find(".self_attn.k_proj.") != std::string::npos ||
+                                                        name.find(".self_attn.v_proj.") != std::string::npos)) {
+                        const auto layer_idx = std::stoi(name.substr(7, name.find('.', 7) - 7));
+                        if (qkv_fused[static_cast<std::size_t>(layer_idx)] &&
+                            (layer_idx + 1 != impl_->shared_begin ||
+                             name.find(".self_attn.q_proj.") != std::string::npos))
+                            continue;
+                    }
                     const bool group_quantized = weight_bits == 4 && weight.size(1) % group_size == 0;
                     impl_->context.prepare_linear_weights(
                         weight, group_quantized ? 4 : 8,

@@ -45,6 +45,7 @@ public:
 
 private:
     friend class GatedFeedForwardImpl;
+    friend class Gemma4AttentionImpl;
     auto bias() const -> const Tensor&;
 
     Tensor weight_, bias_;

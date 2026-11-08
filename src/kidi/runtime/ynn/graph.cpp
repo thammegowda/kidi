@@ -49,11 +49,21 @@ auto default_thread_pool(std::size_t total_threads) -> Result<std::shared_ptr<Th
     if (total_threads == 0) total_threads = thread_count();
     if (total_threads > static_cast<std::size_t>(std::numeric_limits<int>::max()))
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "CPU thread count exceeds supported range"});
+    struct LocalPool {
+        std::size_t threads = 0;
+        std::shared_ptr<ThreadPool> pool;
+    };
+    thread_local LocalPool local;
+    if (local.pool && local.threads == total_threads) return local.pool;
     std::scoped_lock lock(cache.mutex);
-    if (auto existing = cache.pools[total_threads].lock()) return existing;
+    if (auto existing = cache.pools[total_threads].lock()) {
+        local = {total_threads, existing};
+        return existing;
+    }
     auto created = ThreadPool::create(total_threads);
     if (!created) return std::unexpected(std::move(created.error()));
     cache.pools[total_threads] = *created;
+    local = {total_threads, *created};
     return *created;
 }
 
