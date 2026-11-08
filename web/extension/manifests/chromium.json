@@ -32,7 +32,7 @@
     "128": "icons/kidi-logo.png"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https://huggingface.co http://127.0.0.1:*; object-src 'self';"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https: http:; object-src 'self';"
   },
   "cross_origin_embedder_policy": {
     "value": "require-corp"

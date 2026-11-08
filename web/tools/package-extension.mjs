@@ -14,6 +14,7 @@ const extensionAssets = [
     ['web/extension/progress.mjs', 'progress.mjs'],
     ['web/extension/gmail-bridge.js', 'gmail-bridge.js'],
     ['web/extension/article-bridge.js', 'article-bridge.js'],
+    ['web/extension/pdf.mjs', 'pdf.mjs'],
     ['third_party/liteapp/web/extension/selection-bridge.js', 'selection-bridge.js'],
 ];
 
@@ -28,7 +29,8 @@ export async function packageExtensions(outputRoot, runtimes, {
     await packageSite(base, runtimes, {isolationServiceWorker: false});
     for (const [source, destination] of extensionAssets)
         await copyFile(join(root, source), join(base, destination));
-    await cp(join(root, 'web/libs/readability'), join(base, 'libs/readability'), {recursive: true});
+    for (const library of ['readability', 'pdfjs'])
+        await cp(join(root, 'web/libs', library), join(base, 'libs', library), {recursive: true});
 
     if (distribution) await mkdir(resolve(distribution), {recursive: true});
     const packages = {};

@@ -25,10 +25,14 @@ test('packages Chromium and Firefox extensions without hosted-page isolation scr
         assert.match(manifest.content_security_policy.extension_pages, /wasm-unsafe-eval/);
         assert.doesNotMatch(manifest.content_security_policy.extension_pages, /(?:^|\s)'unsafe-eval'/);
         for (const file of ['background.mjs', 'editor.html', 'editor.mjs', 'editor.css',
-            'progress.mjs', 'selection-bridge.js', 'gmail-bridge.js', 'article-bridge.js',
+            'progress.mjs', 'selection-bridge.js', 'gmail-bridge.js', 'article-bridge.js', 'pdf.mjs',
             'read-aloud.js', 'audio-playback.js', 'speech-controller.js', 'playback-worklet.js',
-            'libs/readability/Readability.js', 'libs/readability/LICENSE', 'single/kidi.mjs', 'single/kidi.wasm'])
+            'libs/readability/Readability.js', 'libs/readability/LICENSE',
+            'libs/pdfjs/pdf.min.mjs', 'libs/pdfjs/pdf.worker.min.mjs', 'libs/pdfjs/LICENSE',
+            'libs/pdfjs/cmaps/Adobe-Japan1-UCS2.bcmap', 'libs/pdfjs/standard_fonts/FoxitSerif.pfb',
+            'single/kidi.mjs', 'single/kidi.wasm'])
             await access(join(output, file));
+        assert.match(manifest.content_security_policy.extension_pages, /connect-src 'self' https: http:/);
         assert.deepEqual(manifest.optional_host_permissions, [
             'https://mail.google.com/*', 'https://*/*', 'http://*/*',
         ]);

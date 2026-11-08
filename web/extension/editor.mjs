@@ -208,6 +208,15 @@ function loadModel() {
 async function sendIntegration(type, payload = {}) {
   const result = await api.runtime.sendMessage({type, ...pageContext(), ...payload});
   if (!result?.ok) throw new Error(result?.error || 'The page integration is unavailable. Reload the extension.');
+  if (result.task?.kind === 'pdf') {
+    notice('Reading PDF text locally…');
+    const {extractPdf} = await import('./pdf.mjs');
+    const extracted = await extractPdf(result.task.sourceUrl);
+    const current = await sendIntegration('kidi.context.inspect', {tabId: result.task.tabId});
+    if (current.pageUrl !== result.task.sourceUrl)
+      throw new Error('The PDF tab navigated during capture. Try again.');
+    result.task = {...result.task, ...extracted, title: extracted.title || result.task.title};
+  }
   return result;
 }
 function chooseAction(task) {
@@ -315,6 +324,7 @@ function renderContext() {
   $('context-card').hidden = !context;
   $('context-label').textContent = context
     ? `${context.kind === 'gmail-draft' ? 'Draft' : context.kind === 'gmail-email' ? 'Email'
+      : context.kind === 'pdf' ? 'PDF'
       : context.kind === 'article' ? useCurrentPage ? 'Page' : 'Article' : 'Selection'}: ${context.title}`
     : '';
   $('context-label').title = context?.sourceUrl || '';
@@ -393,7 +403,7 @@ async function pageAction(task) {
     if (!inspection.pageAvailable)
       throw new Error('This browser page cannot be accessed by extensions. Select or paste the text instead.');
   }
-  const current = context?.kind === 'article' && context.tabId === inspection.tabId &&
+  const current = ['article', 'pdf'].includes(context?.kind) && context.tabId === inspection.tabId &&
     context.sourceUrl === inspection.pageUrl;
   if (!current || task === 'page_attach') {
     capturing = true;
@@ -674,16 +684,24 @@ function event(message) {
   }
 }
 async function takePending() {
-  const response = await sendIntegration('kidi.pending.take');
-  if (!response.task) return;
-  if (activeRequest) {
-    notice('Finish or stop the current answer before attaching a new selection.');
+  if (activeRequest || queued || capturing) {
+    notice('Finish or stop the current request before attaching a new source.');
     return;
   }
-  const task = response.task.task || 'polish';
-  await attachContext(response.task, ['page_read', 'page_attach'].includes(task) ? 'chat' : task);
+  let task;
+  capturing = true;
+  renderRuntime();
+  try {
+    const response = await sendIntegration('kidi.pending.take');
+    if (!response.task) return;
+    task = response.task.task || 'polish';
+    await attachContext(response.task, ['page_read', 'page_attach'].includes(task) ? 'chat' : task);
+  } finally {
+    capturing = false;
+    renderRuntime();
+  }
   if (task === 'page_attach') notice('Current page attached. Ask a question, or choose a page action.');
-  else if (task === 'page_read') notice('Article attached. Click Read article to begin narration; no chat model is needed.');
+  else if (task === 'page_read') notice('Source attached. Click Read article to begin narration; no chat model is needed.');
   else if (task === 'page_translate') notice('Choose a language, then click Translate.');
   else submit();
 }

@@ -296,9 +296,30 @@ points do not provide `activeTab`; in that case, **Use current page** or a page 
 an explicit optional HTTP/HTTPS host-permission prompt. Granting it enables
 persistent access to ordinary webpages and can be revoked from Edge's extension
 settings. Gmail DOM integration remains separately opt-in, and mailbox-page
-article extraction is always refused. Browser-internal pages, PDFs without
-accessible page text, and articles that Readability cannot identify may require
-selecting or pasting text.
+article extraction is always refused. Browser-internal pages and articles that
+Readability cannot identify may require selecting or pasting text.
+
+### PDF page context
+
+Direct `.pdf` URLs and arXiv `/pdf/` URLs (such as <https://arxiv.org/pdf/1706.03762>)
+are recognized without injecting scripts into the browser's protected PDF viewer;
+other extensionless URLs fall back to a `HEAD` content-type check when script
+injection is unavailable. The panel downloads the PDF (up to 32 MiB / 60s) using
+the current webpage permission and extracts up to 1000 pages and 64 KiB of text
+locally via the packaged PDF.js worker. Extracted text stays in panel memory
+with `[Page N]` markers and feeds the same chat, summary, translation, and
+read-aloud actions as HTML articles. Scanned/image-only, password-protected, and
+`file:` PDFs are rejected with explicit messages.
+
+`make extension-article-test` covers both HTML article and PDF page workflows.
+To verify a live PDF in Microsoft Edge with a real toolbar `activeTab` grant:
+
+```bash
+KIDI_LIVE_PAGE_URL=https://arxiv.org/pdf/1706.03762 \
+KIDI_LIVE_EXPECT='Attention' npm --prefix web run test:live-wikipedia
+```
+
+### Document processing limits
 
 The C++ document pipeline processes every captured section rather than
 silently dropping text beyond one model window. Translation preserves section

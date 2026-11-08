@@ -33,6 +33,12 @@ function isWebPage(url) {
   try { return ['http:', 'https:'].includes(new URL(url).protocol); }
   catch { return false; }
 }
+function isPdfUrl(url) {
+  const parsed = new URL(url);
+  return /\.pdf$/iu.test(parsed.pathname) ||
+    ((parsed.hostname === 'arxiv.org' || parsed.hostname.endsWith('.arxiv.org')) &&
+      parsed.pathname.startsWith('/pdf/'));
+}
 function isPanel(sender) {
   return sender.id === api.runtime.id && typeof sender.url === 'string' &&
     sender.url.split(/[?#]/u)[0] === api.runtime.getURL('editor.html');
@@ -175,16 +181,34 @@ async function capturePage(tab, task, pending = false) {
       ? 'Only HTTP and HTTPS webpages can be captured. Open an article or select its text.'
       : 'Edge did not expose this tab to Kidi. Reopen Kidi from the page toolbar or use its right-click menu.');
   if (isGmail(tab.url)) throw new Error('Use the Gmail writing actions instead of capturing the mailbox page.');
+  const pdfTask = () => saveTask(tab, 0, {
+    kind: 'pdf', sourceKind: 'pdf', title: tab.title || 'PDF document', text: '',
+    sourceUrl: tab.url, language: '', operation: null, task,
+  }, pending);
+  if (isPdfUrl(tab.url)) return pdfTask();
+  let captured;
   try {
     await api.scripting.executeScript({
       target: {tabId: tab.id, frameIds: [0]},
       files: ['libs/readability/Readability.js', 'article-bridge.js'],
     });
+    captured = await api.tabs.sendMessage(tab.id, {type: 'kidi.page.capture'}, {frameId: 0});
+    if (!captured?.ok) throw new Error(captured?.error || 'Unable to extract this article.');
   } catch (error) {
+    let response;
+    try {
+      response = await fetch(tab.url, {
+        method: 'HEAD', credentials: 'include', signal: AbortSignal.timeout(15000),
+      });
+    } catch (pdfError) {
+      throw new Error(`${error.message} Unable to check for a PDF: ${pdfError.message}`);
+    }
+    if (!response.ok)
+      throw new Error(`${error.message} PDF detection returned HTTP ${response.status}.`);
+    if (response.headers.get('content-type')?.split(';')[0].trim().toLowerCase() === 'application/pdf')
+      return pdfTask();
     throw new Error(`Unable to read this page. Click Kidi in its toolbar or use the page's right-click menu. ${error.message}`);
   }
-  const captured = await api.tabs.sendMessage(tab.id, {type: 'kidi.page.capture'}, {frameId: 0});
-  if (!captured?.ok) throw new Error(captured?.error || 'Unable to extract this article.');
   if (captured.sourceUrl !== tab.url) throw new Error('The page navigated during capture. Try again.');
   return saveTask(tab, 0, {...captured, task}, pending);
 }

@@ -15,8 +15,8 @@ let browser;
 try {
   await cp(source, extension, {recursive: true});
   const manifest = JSON.parse(await readFile(join(extension, 'manifest.json'), 'utf8'));
-  // This synthetic package alone receives the fixture origin; shipped packages use activeTab.
-  manifest.host_permissions = ['https://example.org/*'];
+  // This synthetic package alone receives the fixture origins; shipped packages use activeTab.
+  manifest.host_permissions = ['https://example.org/*', 'https://arxiv.org/*'];
   await writeFile(join(extension, 'manifest.json'), JSON.stringify(manifest));
   await cp(join(root, 'tests/browser/fixtures/extension-backend.mjs'), join(extension, 'backend.js'));
   const fixture = await readFile(join(root, 'tests/browser/fixtures/article.html'), 'utf8');
@@ -24,21 +24,41 @@ try {
     channel, headless: true, colorScheme: 'dark', viewport: {width: 390, height: 800},
     args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
   });
-  const unexpectedNetwork = [];
+  const article = await browser.newPage();
+  const printPdf = async html => {
+    await article.setContent(html);
+    return article.pdf({format: 'A4', printBackground: true});
+  };
+  const pdfHtml = `<title>Kidi PDF fixture</title>
+    <h1>PDF_PAGE_ONE_MARKER</h1><p>A local PDF can contain readable text, including caf&eacute;.</p>
+    <section style="break-before:page"><h1>PDF_PAGE_TWO_MARKER</h1>
+      <p>The second page reports thirty participants and keeps its source unchanged.</p></section>`;
+  let currentPdf = await printPdf(pdfHtml);
+  const updatedPdf = await printPdf(pdfHtml.replace('thirty participants', 'PDF_UPDATED_MARKER: forty participants'));
+  const largePdf = await printPdf(`<title>Large text fixture</title><p>${
+    'PDF_LIMIT_MARKER: caf&eacute; and text stay on the device. '.repeat(3000)}</p>`);
+  const imageOnlyPdf = await printPdf('<div style="width:200px;height:200px;background:#888"></div>');
+  const unexpectedNetwork = [], probes = [];
   await browser.route('https://**/*', route => {
-    const url = new URL(route.request().url());
+    const request = route.request(), url = new URL(request.url());
+    if (url.hostname === 'arxiv.org' || url.pathname.endsWith('.pdf') || url.pathname === '/download') {
+      if (request.method() === 'HEAD') probes.push(url.href);
+      const body = url.pathname === '/large.pdf' ? largePdf
+        : url.pathname === '/scan.pdf' ? imageOnlyPdf
+        : url.pathname === '/broken.pdf' ? Buffer.from('%PDF-1.7\nbroken') : currentPdf;
+      return route.fulfill({status: 200, contentType: 'application/pdf', headers: {'cache-control': 'no-store'}, body});
+    }
     if (['example.org', 'ungranted.example.net'].includes(url.hostname)) {
       const marker = url.pathname === '/other-article' ? 'OTHER_PAGE_MARKER'
         : url.pathname === '/next-article' ? 'NAVIGATED_PAGE_MARKER' : '';
       const body = marker ? fixture.replace('carefully controlled experiment', marker) : fixture;
       return route.fulfill({status: 200, contentType: 'text/html', body});
     }
-    unexpectedNetwork.push(route.request().url());
+    unexpectedNetwork.push(request.url());
     return route.abort();
   });
   const worker = browser.serviceWorkers()[0] || await browser.waitForEvent('serviceworker');
   const extensionId = new URL(worker.url()).host;
-  const article = await browser.newPage();
   await article.goto('https://example.org/article');
   const tabId = await worker.evaluate(async () => (await chrome.tabs.query({url: 'https://example.org/*'}))[0].id);
   const panel = await browser.newPage();
@@ -255,9 +275,45 @@ try {
   assert.match(await panel.locator('#notice').textContent(), /No readable article/);
   assert.equal((await requests()).length, 0, 'failed page capture blocks inference and model loading');
   assert.equal(await panel.locator('#message').inputValue(), 'What does this empty page say?');
+
+  const extractPdf = url => panel.evaluate(async url => (await import('./pdf.mjs')).extractPdf(url), url);
+  const extractedPdf = await extractPdf('https://arxiv.org/pdf/1706.03762');
+  assert.equal(extractedPdf.pageCount, 2);
+  assert.equal(extractedPdf.truncated, false);
+  assert.match(extractedPdf.text, /\[Page 1\][\s\S]*PDF_PAGE_ONE_MARKER[\s\S]*\[Page 2\][\s\S]*PDF_PAGE_TWO_MARKER/);
+  assert.match(extractedPdf.text, /caf\u00e9/);
+  await article.goto('https://arxiv.org/pdf/1706.03762', {waitUntil: 'commit'});
+  await panel.getByRole('button', {name: 'Use current page', exact: true}).click();
+  await panel.locator('#context-card').waitFor({state: 'visible'});
+  assert.match(await panel.locator('#context-label').textContent(), /^PDF: /);
+  const pdfChat = await ask('How many participants are on page two?', 1);
+  assert.equal(pdfChat.text, extractedPdf.text);
+  currentPdf = updatedPdf;
+  await article.reload({waitUntil: 'commit'});
+  const updatedPdfChat = await ask('What changed after reloading this PDF?', 2);
+  assert.match(updatedPdfChat.text, /PDF_UPDATED_MARKER/);
+  const storedSession = await worker.evaluate(async () => JSON.stringify(await chrome.storage.session.get(null)));
+  assert.doesNotMatch(storedSession, /PDF_PAGE_ONE_MARKER|PDF_UPDATED_MARKER/);
+  await article.goto('https://example.org/download?id=42', {waitUntil: 'commit'});
+  await panel.locator('#new-chat').click();
+  await panel.getByRole('button', {name: 'Use current page', exact: true}).click();
+  await panel.locator('#context-card').waitFor({state: 'visible'});
+  assert.ok(probes.includes('https://example.org/download?id=42'));
+  const largeExtractedPdf = await extractPdf('https://example.org/large.pdf');
+  assert.equal(largeExtractedPdf.truncated, true);
+  assert.ok(new TextEncoder().encode(largeExtractedPdf.text).length <= 64 * 1024);
+  assert.doesNotMatch(largeExtractedPdf.text, /\uFFFD/);
+  for (const [path, message] of [['/scan.pdf', /no extractable text[\s\S]*OCR/], ['/broken.pdf', /Invalid PDF/]]) {
+    await article.goto(`https://example.org${path}`, {waitUntil: 'commit'});
+    await panel.evaluate(() => { document.querySelector('#notice').className = 'notice'; });
+    await panel.getByRole('button', {name: 'Use current page', exact: true}).click();
+    await panel.waitForFunction(() =>
+      !document.querySelector('#new-chat').disabled && document.querySelector('#notice').classList.contains('error'));
+    assert.match(await panel.locator('#notice').textContent(), message);
+  }
   assert.deepEqual(errors, []);
   assert.deepEqual(unexpectedNetwork, [], 'all executable assets and fixture inference remain local');
-  console.log('Article extension passed: current-page chat, tab/navigation updates, permissions, detachment, extraction, Unicode bounds, summary/follow-up, translation, consent, narration and stop.');
+  console.log('Article and PDF extension passed: current-page chat, tab/navigation updates, permissions, detachment, HTML/PDF extraction, Unicode bounds, summary/follow-up, translation, consent, narration and stop.');
 } finally {
   if (browser) await browser.close();
   await rm(temporary, {recursive: true, force: true});

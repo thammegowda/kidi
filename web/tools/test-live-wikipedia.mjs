@@ -65,7 +65,7 @@ try {
     () => context.pages().find(page => page.url() === articleUrl),
     'Edge did not open the requested webpage',
   );
-  await article.locator('h1').first().waitFor({state: 'visible', timeout: 60000});
+  await article.waitForLoadState('domcontentloaded', {timeout: 60000});
   const articleErrors = [];
   article.on('pageerror', error => articleErrors.push(error.message));
 
@@ -129,9 +129,25 @@ try {
   await send('Runtime.enable');
   await waitFor(
     () => evaluate(`document.readyState === 'complete' &&
-      [...document.querySelectorAll('button')].some(button => button.textContent.trim() === 'Summarize page')`),
+      [...document.querySelectorAll('button')].some(button =>
+        button.textContent.trim() === 'Summarize page' && !button.disabled)`),
     'The Summarize page action did not become available',
   );
+  await evaluate(`(() => {
+    const input = document.querySelector('#message');
+    input.value = 'What is this document about?';
+    input.dispatchEvent(new Event('input', {bubbles: true}));
+    document.querySelector('#composer').requestSubmit();
+  })()`);
+  await waitFor(
+    () => evaluate(`document.querySelectorAll('.turn.assistant .result-actions').length === 1`),
+    'Direct live-page chat did not complete',
+    60000,
+  );
+  const chat = await evaluate(`(async () =>
+    (await import('./backend.js')).backend.requests.find(request => request.type === 'editor.run'))()`);
+  assert.equal(chat?.payload?.task, 'chat');
+  assert.match(chat.payload.text, expectedText);
   await evaluate(`(() => {
     globalThis.__kidiProgress = [];
     new MutationObserver(() => {
@@ -147,7 +163,7 @@ try {
   await delay(stepDelay);
   try {
     await waitFor(
-      () => evaluate(`document.querySelectorAll('.turn.assistant .result-actions').length === 1`),
+      () => evaluate(`document.querySelectorAll('.turn.assistant .result-actions').length === 2`),
       'Live webpage summary did not complete',
       60000,
     );
@@ -189,7 +205,7 @@ try {
   assert.equal(result.request?.payload?.mode, 'summarize');
   assert.match(result.request.payload.text, expectedText);
   assert.equal(result.notice, 'Completed on this device.');
-  assert.match(result.context, /^Article: /u);
+  assert.match(result.context, /^(?:Article|PDF): /u);
   assert.match(result.summary, /local-first approach/);
   assert.deepEqual(articleErrors, []);
   assert.deepEqual(panelErrors, []);
@@ -197,6 +213,7 @@ try {
     browser: 'Microsoft Edge',
     extensionId: installed.id,
     activeTab: true,
+    chatSourceBytes: new TextEncoder().encode(chat.payload.text).length,
     source: {
       url: articleUrl,
       bytes: new TextEncoder().encode(result.request.payload.text).length,

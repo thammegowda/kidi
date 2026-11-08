@@ -18,7 +18,7 @@ async function waitFor(predicate) {
 }
 async function background() {
   const source = await readFile(new URL('../../web/extension/background.mjs', import.meta.url), 'utf8');
-  const storage = {}, registered = new Map(), notifications = [], injections = [], sent = [], steps = [];
+  const storage = {}, registered = new Map(), notifications = [], injections = [], sent = [], steps = [], probes = [];
   const tabs = new Map([
     [5, {id: 5, windowId: 7, url: 'https://mail.google.com/mail/u/0/#inbox/thread-one', title: 'First Gmail'}],
     [6, {id: 6, windowId: 8, url: 'https://example.org/article', title: 'Another window'}],
@@ -62,7 +62,11 @@ async function background() {
         for (const item of descriptors) registered.set(item.id, item);
       },
       unregisterContentScripts: async ({ids}) => { for (const id of ids) registered.delete(id); },
-      executeScript: async request => { injections.push(request); steps.push(`inject:${request.target.tabId}`); },
+      executeScript: async request => {
+        injections.push(request);
+        steps.push(`inject:${request.target.tabId}`);
+        if (state.injectionError) throw new Error(state.injectionError);
+      },
     },
     tabs: {
       get: async id => {
@@ -94,7 +98,13 @@ async function background() {
     },
   };
   const sandbox = vm.createContext({
-    chrome: api, URL, TextEncoder, Date, crypto: webcrypto,
+    chrome: api, URL, TextEncoder, Date, crypto: webcrypto, AbortSignal,
+    fetch: async (url, options) => {
+      probes.push({url, options});
+      if (state.probeError) throw new Error(state.probeError);
+      return new Response(null, {status: state.probeStatus ?? 200,
+        headers: {'content-type': state.contentType || 'text/html'}});
+    },
     console: {error() {}, warn() {}, debug() {}},
   });
   vm.runInContext(source, sandbox, {filename: 'background.mjs'});
@@ -105,7 +115,7 @@ async function background() {
       value => resolve(JSON.parse(JSON.stringify(value))));
     if (!handled) resolve(undefined);
   });
-  return {api, send, tabs, storage, state, registered, notifications, injections, sent, steps};
+  return {api, send, tabs, storage, state, registered, notifications, injections, sent, steps, probes};
 }
 
 test('Gmail bridge activation requires optional permission and an exact Gmail origin', async () => {
@@ -205,6 +215,58 @@ test('page capture rejects navigation and restricted protocols with actionable e
   assert.match((await env.send({type: 'kidi.page.capture', tabId: 6})).error, /Only HTTP and HTTPS/);
   delete env.tabs.get(6).url;
   assert.match((await env.send({type: 'kidi.page.capture', tabId: 6})).error, /did not expose this tab/);
+});
+
+test('PDF files and arXiv PDF routes bypass the inaccessible viewer DOM', async () => {
+  const env = await background();
+  for (const url of [
+    'https://example.org/paper.PDF?download=1#page=2',
+    'https://arxiv.org/pdf/1706.03762',
+    'https://export.arxiv.org/pdf/hep-th/9901001',
+  ]) {
+    env.tabs.get(6).url = url;
+    const captured = await env.send({type: 'kidi.page.capture', tabId: 6, task: 'page_read'});
+    assert.equal(captured.ok, true);
+    assert.equal(captured.task.kind, 'pdf');
+    assert.equal(captured.task.sourceUrl, url);
+    assert.equal(captured.task.task, 'page_read');
+    assert.equal(captured.task.text, '', 'the panel worker extracts PDF text, not the service worker');
+    assert.equal(captured.task.operation, null);
+    assert.equal((await env.send({type: 'kidi.context.apply', id: captured.task.id, text: 'Change'})).ok, false);
+  }
+  assert.equal(env.injections.length, 0);
+  assert.equal(env.probes.length, 0);
+  env.tabs.get(6).url = 'https://arxiv.org.attacker.invalid/pdf/1706.03762';
+  assert.equal((await env.send({type: 'kidi.page.capture', tabId: 6})).task.kind, 'article');
+});
+
+test('extensionless PDFs are recognized by content type after viewer injection fails', async () => {
+  const env = await background();
+  env.tabs.get(6).url = 'https://example.org/download?id=42';
+  env.state.injectionError = 'Cannot access the PDF viewer';
+  env.state.contentType = 'application/pdf; charset=binary';
+  const captured = await env.send({type: 'kidi.page.capture', tabId: 6});
+  assert.equal(captured.ok, true);
+  assert.equal(captured.task.kind, 'pdf');
+  assert.equal(env.probes[0].url, env.tabs.get(6).url);
+  assert.equal(env.probes[0].options.method, 'HEAD');
+  env.state.contentType = 'text/html';
+  assert.match((await env.send({type: 'kidi.page.capture', tabId: 6})).error, /Cannot access the PDF viewer/);
+  env.state.probeError = 'Access denied';
+  assert.match((await env.send({type: 'kidi.page.capture', tabId: 6})).error, /Unable to check for a PDF: Access denied/);
+});
+
+test('toolbar PDF captures retain the page action and a pending read-only source', async () => {
+  const env = await background();
+  env.tabs.get(6).url = 'https://arxiv.org/pdf/1706.03762';
+  env.api.action.onClicked.fire(env.tabs.get(6));
+  await waitFor(() => env.storage['kidi-extension-tasks-v2']?.pending?.['8']);
+  const pending = await env.send({type: 'kidi.pending.take', windowId: 8});
+  assert.equal(pending.task.kind, 'pdf');
+  assert.equal(pending.task.task, 'page_attach');
+  assert.equal(pending.task.sourceUrl, env.tabs.get(6).url);
+  assert.ok(env.steps.includes('open:6'));
+  assert.equal(env.injections.length, 0);
 });
 
 test('page menu failures survive panel startup, and success clears the old error', async () => {
