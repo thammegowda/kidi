@@ -1676,9 +1676,9 @@ public:
             check(ynn_define_copy(native, residual, &residual_id, 0));
         }
         std::size_t operator_threads = 0;
-        const bool small_packed_projection = spec.operation == Operation::PACKED_LINEAR &&
-                                             inputs[0].numel() == inputs[0].size(-1) &&
-                                             inputs[1].nbytes() <= 512 * 1024;
+        const bool small_packed_projection =
+            spec.operation == Operation::PACKED_LINEAR && inputs[0].numel() == inputs[0].size(-1) &&
+            static_cast<std::size_t>(inputs[0].size(-1)) * static_cast<std::size_t>(inputs[1].size(0)) <= 384 * 1024;
         const bool small_elementwise =
             (spec.operation == Operation::GELU_GATE || spec.operation == Operation::SILU_GATE ||
              spec.operation == Operation::GELU_MULTIPLY || spec.operation == Operation::SILU_MULTIPLY ||

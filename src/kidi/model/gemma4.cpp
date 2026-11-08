@@ -349,6 +349,9 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
             for (const auto marker : {std::string_view(".mlp.gate_proj."), std::string_view(".mlp.up_proj.")})
                 if (const auto position = name.find(marker); position != std::string::npos)
                     declaration.replace(position, marker.size(), ".mlp.gate_up_proj.");
+            for (const auto marker : {std::string_view(".self_attn.k_proj."), std::string_view(".self_attn.v_proj.")})
+                if (const auto position = name.find(marker); position != std::string::npos)
+                    declaration.replace(position, marker.size(), ".self_attn.kv_proj.");
             if (!declared.contains(declaration)) {
                 if (name.starts_with("layers.") &&
                     (name.find(".self_attn.k_proj.") != std::string::npos ||
@@ -410,36 +413,43 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
                                         : value);
             }
         }
-        for (std::int32_t layer = 0; layer < impl_->layer_count; ++layer) {
-            const auto prefix = "layers." + std::to_string(layer) + ".mlp.";
+        const auto fuse_pair = [&](std::string_view prefix, std::string_view first_stem, std::string_view second_stem,
+                                   std::string_view fused_stem) {
             for (const auto suffix :
                  {std::string_view("weight"), std::string_view("weight_scale"),
                   std::string_view("input_activation_scale"), std::string_view("output_activation_scale")}) {
                 if (!impl_->qat && suffix != "weight") continue;
                 // Loaders that place weights on a device may supply the pair already fused.
-                if (state.contains(prefix + "gate_up_proj." + std::string(suffix))) continue;
-                const auto gate_name = prefix + "gate_proj." + std::string(suffix);
-                const auto up_name = prefix + "up_proj." + std::string(suffix);
-                const auto gate = state.find(gate_name), up = state.find(up_name);
-                if (gate == state.end() || up == state.end())
+                const auto fused_name = std::string(prefix) + std::string(fused_stem) + "." + std::string(suffix);
+                if (state.contains(fused_name)) continue;
+                const auto first_name = std::string(prefix) + std::string(first_stem) + "." + std::string(suffix);
+                const auto second_name = std::string(prefix) + std::string(second_stem) + "." + std::string(suffix);
+                const auto first = state.find(first_name), second = state.find(second_name);
+                if (first == state.end() || second == state.end())
                     throw ops::Failure(
-                        {ErrorCode::INVALID_ARGUMENT, "missing gate/up checkpoint parameter: " + prefix});
+                        {ErrorCode::INVALID_ARGUMENT, "missing paired checkpoint parameter: " + std::string(prefix)});
                 Tensor combined;
                 if (suffix.ends_with("activation_scale")) {
-                    const auto& gate_scale = gate->second;
-                    const auto& up_scale = up->second;
-                    if (gate_scale.numel() != 1 || up_scale.numel() != 1 ||
-                        require(gate_scale.data<float>())[0] != require(up_scale.data<float>())[0])
-                        throw ops::Failure({ErrorCode::UNSUPPORTED,
-                                            "gate/up activation scales must match for a fused linear: " + prefix});
-                    combined = gate->second;
+                    const auto& first_scale = first->second;
+                    const auto& second_scale = second->second;
+                    if (first_scale.numel() != 1 || second_scale.numel() != 1 ||
+                        require(first_scale.data<float>())[0] != require(second_scale.data<float>())[0])
+                        throw ops::Failure(
+                            {ErrorCode::UNSUPPORTED,
+                             "paired activation scales must match for a fused linear: " + std::string(prefix)});
+                    combined = first->second;
                 } else {
-                    combined = concatenate_projection_rows(gate->second, up->second);
+                    combined = concatenate_projection_rows(first->second, second->second);
                 }
-                state.emplace(prefix + "gate_up_proj." + std::string(suffix), std::move(combined));
-                state.erase(gate);
-                state.erase(up);
+                state.emplace(fused_name, std::move(combined));
+                state.erase(first);
+                state.erase(second);
             }
+        };
+        for (std::int32_t layer = 0; layer < impl_->layer_count; ++layer) {
+            const auto layer_prefix = "layers." + std::to_string(layer);
+            fuse_pair(layer_prefix + ".mlp.", "gate_proj", "up_proj", "gate_up_proj");
+            if (layer < impl_->shared_begin) fuse_pair(layer_prefix + ".self_attn.", "k_proj", "v_proj", "kv_proj");
         }
         if (weight_bits)
             for (const auto& [name, value] : state)
@@ -458,26 +468,10 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
         impl_->context = ops::Context(device(), packed_prefill, std::nullopt, impl_->parameter_dtype);
         impl_->weight_bits = weight_bits;
         impl_->packed_prefill = packed_prefill;
-        std::vector<bool> qkv_fused(static_cast<std::size_t>(impl_->layer_count), false);
-        if (device().kind == tensor::DeviceKind::CPU) {
-            for (std::int32_t index = 0; index < impl_->layer_count; ++index)
-                qkv_fused[static_cast<std::size_t>(index)] =
-                    impl_->layers->at(static_cast<std::size_t>(index))
-                        ->fuse_projections(impl_->context, weight_bits, group_size, packed_prefill);
-        }
         if (weight_bits)
             for (const auto& [name, weight] : state_dict())
                 if (weight.dimensions() == 2 && name != "embed_tokens.weight" &&
                     name != "embed_tokens_per_layer.weight") {
-                    if (name.starts_with("layers.") && (name.find(".self_attn.q_proj.") != std::string::npos ||
-                                                        name.find(".self_attn.k_proj.") != std::string::npos ||
-                                                        name.find(".self_attn.v_proj.") != std::string::npos)) {
-                        const auto layer_idx = std::stoi(name.substr(7, name.find('.', 7) - 7));
-                        if (qkv_fused[static_cast<std::size_t>(layer_idx)] &&
-                            (layer_idx + 1 != impl_->shared_begin ||
-                             name.find(".self_attn.q_proj.") != std::string::npos))
-                            continue;
-                    }
                     const bool group_quantized = weight_bits == 4 && weight.size(1) % group_size == 0;
                     impl_->context.prepare_linear_weights(
                         weight, group_quantized ? 4 : 8,

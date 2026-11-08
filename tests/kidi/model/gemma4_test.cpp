@@ -447,12 +447,18 @@ auto check_async_serving(const YAML::Node& config) -> void {
             if (parameter.dimensions() == 2) value = context.cast(value, tensor::DType::BF16);
             if (name == "lm_head.weight") continue;
             constexpr std::string_view GATE_UP = "gate_up_proj.weight";
+            constexpr std::string_view KV = "kv_proj.weight";
             const auto key = "model.language_model." + name;
             if (name.ends_with(GATE_UP)) {
                 const auto prefix = key.substr(0, key.size() - GATE_UP.size());
                 const auto middle = static_cast<std::int64_t>(value.size(0) / 2);
                 state.emplace(prefix + "gate_proj.weight", require(value.narrow(0, 0, middle)));
                 state.emplace(prefix + "up_proj.weight", require(value.narrow(0, middle, middle)));
+            } else if (name.ends_with(KV)) {
+                const auto prefix = key.substr(0, key.size() - KV.size());
+                const auto middle = static_cast<std::int64_t>(value.size(0) / 2);
+                state.emplace(prefix + "k_proj.weight", require(value.narrow(0, 0, middle)));
+                state.emplace(prefix + "v_proj.weight", require(value.narrow(0, middle, middle)));
             } else {
                 state.emplace(key, std::move(value));
             }
@@ -690,8 +696,12 @@ auto main() -> int {
                 const auto parameters = model->state_dict();
                 for (const auto& [name, parameter] : parameters)
                     if (name.find(".mlp.gate_proj.") != std::string::npos ||
-                        name.find(".mlp.up_proj.") != std::string::npos)
+                        name.find(".mlp.up_proj.") != std::string::npos ||
+                        name.find(".self_attn.k_proj.") != std::string::npos ||
+                        name.find(".self_attn.v_proj.") != std::string::npos)
                         return failed(__LINE__);
+                const auto shared_begin =
+                    config["num_hidden_layers"].as<int>() - config["num_kv_shared_layers"].as<int>();
                 for (int layer = 0; layer < config["num_hidden_layers"].as<int>(); ++layer) {
                     const auto prefix = "layers." + std::to_string(layer) + ".mlp.";
                     const auto gate =
@@ -699,6 +709,13 @@ auto main() -> int {
                     const auto& combined = parameters.at(prefix + "gate_up_proj.weight");
                     if (combined.size(0) != 2 * gate.size(0) || combined.size(1) != gate.size(1))
                         return failed(__LINE__);
+                    if (layer < shared_begin) {
+                        const auto attn_prefix = "layers." + std::to_string(layer) + ".self_attn.";
+                        const auto key =
+                            ops::require(checkpoint.tensor("model.language_model." + attn_prefix + "k_proj.weight"));
+                        const auto& kv = parameters.at(attn_prefix + "kv_proj.weight");
+                        if (kv.size(0) != 2 * key.size(0) || kv.size(1) != key.size(1)) return failed(__LINE__);
+                    }
                 }
                 auto full = ops::require(model->create_state(8));
                 const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");

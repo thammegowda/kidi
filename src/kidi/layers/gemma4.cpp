@@ -236,12 +236,10 @@ Gemma4AttentionImpl::Gemma4AttentionImpl(std::int32_t hidden, std::int32_t heads
     register_module("o_proj", output_);
     register_module("q_norm", query_norm_);
     if (!shared) {
-        key_ = Linear(hidden, key_heads * head_width, true, false, packed_bits, false, group_size);
-        value_ = Linear(hidden, key_heads * head_width, true, false, packed_bits, false, group_size);
+        key_value_ = Linear(hidden, 2 * key_heads * head_width, true, false, packed_bits, false, group_size);
         key_norm_ = RmsNorm(head_width, epsilon);
         value_norm_ = RmsNorm(head_width, epsilon, false);
-        register_module("k_proj", key_);
-        register_module("v_proj", value_);
+        register_module("kv_proj", key_value_);
         register_module("k_norm", key_norm_);
         if (packed_bits) {
             register_parameter("k_cache_scale", key_scale_, {}, tensor::DType::F32, allocate_parameters,
@@ -258,88 +256,9 @@ auto Gemma4AttentionImpl::forward(ops::Context& context, const Tensor& input, Ke
     return forward_segments(context, input, segments, cosine, sine);
 }
 auto Gemma4AttentionImpl::has_cache_scales() const -> bool {
-    if (!key_ || !key_scale_.defined() || !value_scale_.defined()) return false;
+    if (!key_value_ || !key_scale_.defined() || !value_scale_.defined()) return false;
     const auto key_scale = key_scale_.data<float>(), value_scale = value_scale_.data<float>();
     return key_scale && value_scale && (*key_scale)[0] > 0 && (*value_scale)[0] > 0;
-}
-auto Gemma4AttentionImpl::fuse_projections(ops::Context& context, std::int32_t weight_bits, std::int32_t group_size,
-                                           bool packed_prefill) -> bool {
-    qkv_ = Linear{nullptr};
-    kv_ = Linear{nullptr};
-    if (!key_ || !value_ || context.device().kind != tensor::DeviceKind::CPU) return false;
-    if (key_->packed_bits_ != value_->packed_bits_ || key_->group_size_ != value_->group_size_ ||
-        key_->input_size_ != value_->input_size_)
-        return false;
-    const auto concat_rows = [](std::span<const Tensor> parts) -> Tensor {
-        std::int64_t rows = 0;
-        const auto columns = static_cast<std::int64_t>(parts.front().size(1));
-        const auto dtype = parts.front().dtype();
-        for (const auto& part : parts) rows += static_cast<std::int64_t>(part.size(0));
-        if (parts.front().is_host_accessible()) {
-            const auto first_view = parts.front().host_bytes();
-            bool adjacent = static_cast<bool>(first_view);
-            std::size_t total_bytes = first_view ? first_view->size() : 0;
-            for (std::size_t i = 1; adjacent && i < parts.size(); ++i) {
-                const auto view = parts[i].host_bytes();
-                adjacent = view && first_view->data() + total_bytes == view->data();
-                if (adjacent) total_bytes += view->size();
-            }
-            if (adjacent)
-                return require(Tensor::from_blob({rows, columns}, dtype, {first_view->data(), total_bytes},
-                                                 std::make_shared<std::vector<Tensor>>(parts.begin(), parts.end())));
-        }
-        auto output = require(Tensor::empty({rows, columns}, dtype));
-        auto destination = require(output.host_bytes());
-        std::size_t offset = 0;
-        for (const auto& part : parts) {
-            const auto host = require(part.to(tensor::Device::cpu()));
-            const auto bytes = require(host.host_bytes());
-            std::ranges::copy(bytes, destination.begin() + static_cast<std::ptrdiff_t>(offset));
-            offset += bytes.size();
-        }
-        return output;
-    };
-    const auto q_rows = heads_ * head_width_;
-    const auto kv_rows = key_heads_ * head_width_;
-    const ModuleScope scope(query_->weight_.dtype(), false, context.device());
-    if (key_->packed_bits_) {
-        const auto k_in = require(std::as_const(key_->input_scale_).data<float>())[0];
-        const auto v_in = require(std::as_const(value_->input_scale_).data<float>())[0];
-        const auto k_out = require(std::as_const(key_->output_scale_).data<float>())[0];
-        const auto v_out = require(std::as_const(value_->output_scale_).data<float>())[0];
-        if (k_in != v_in || k_out != v_out) return false;
-        const auto q_in = require(std::as_const(query_->input_scale_).data<float>())[0];
-        const auto q_out = require(std::as_const(query_->output_scale_).data<float>())[0];
-        if (query_->packed_bits_ == key_->packed_bits_ && query_->group_size_ == key_->group_size_ &&
-            query_->input_size_ == key_->input_size_ && q_in == k_in && q_out == k_out) {
-            qkv_ = Linear(query_->input_size_, q_rows + 2 * kv_rows, true, false, query_->packed_bits_, false,
-                          query_->group_size_);
-            const std::array weights{query_->weight_, key_->weight_, value_->weight_};
-            const std::array scales{query_->packed_scale_, key_->packed_scale_, value_->packed_scale_};
-            qkv_->weight_ = concat_rows(weights);
-            qkv_->packed_scale_ = concat_rows(scales);
-            qkv_->input_scale_ = query_->input_scale_;
-            qkv_->output_scale_ = query_->output_scale_;
-            return true;
-        }
-        kv_ = Linear(key_->input_size_, 2 * kv_rows, true, false, key_->packed_bits_, false, key_->group_size_);
-        const std::array weights{key_->weight_, value_->weight_};
-        const std::array scales{key_->packed_scale_, value_->packed_scale_};
-        kv_->weight_ = concat_rows(weights);
-        kv_->packed_scale_ = concat_rows(scales);
-        kv_->input_scale_ = key_->input_scale_;
-        kv_->output_scale_ = key_->output_scale_;
-        return false;
-    }
-    if (!weight_bits) return false;
-    qkv_ = Linear(query_->input_size_, q_rows + 2 * kv_rows, true, false, 0, false, group_size);
-    const std::array weights{query_->weight_, key_->weight_, value_->weight_};
-    qkv_->weight_ = concat_rows(weights);
-    const bool group_quantized = weight_bits == 4 && qkv_->weight_.size(1) % group_size == 0;
-    const auto bits = group_quantized ? 4 : 8;
-    const auto effective_group = group_quantized ? group_size : static_cast<std::int32_t>(qkv_->weight_.size(1));
-    context.prepare_linear_weights(qkv_->weight_, bits, effective_group, packed_prefill);
-    return true;
 }
 auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& input,
                                            std::span<const Gemma4AttentionSegment> segments, const Tensor& cosine,
@@ -359,36 +278,21 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
         return context.reshape(value, {1, length, heads, head_width_});
     };
     Tensor query, key, value;
+    if (!cache_only)
+        query = query_norm_->forward_rotary(context, reshape(query_->forward(context, input), heads_), cosine, sine);
     ops::BlockwiseQuantization key_quantization, value_quantization;
     // A byte cache rounds and clamps inside its own cast, so the separate rounding pass would be redundant.
     const auto byte_cache = segments.front().cache->key.dtype() == tensor::DType::I8;
-    const bool use_fused = context.precision() == core::InferencePrecision::CHECKPOINT;
-    if (!cache_only && use_fused && qkv_) {
-        const auto q_width = static_cast<std::int64_t>(heads_ * head_width_);
+    if (key_value_) {
         const auto kv_width = static_cast<std::int64_t>(key_heads_ * head_width_);
-        const auto qkv = qkv_->forward(context, input);
-        query = query_norm_->forward_rotary_slice(context, qkv, cosine, sine, heads_, head_width_, 0, 0, length);
-        key = key_norm_->forward_rotary_slice(context, qkv, cosine, sine, key_heads_, head_width_, q_width, 0, length);
-        value =
-            value_norm_->forward(context, reshape(context.slice(qkv, -1, q_width + kv_width, kv_width), key_heads_));
-    } else {
-        if (!cache_only)
-            query =
-                query_norm_->forward_rotary(context, reshape(query_->forward(context, input), heads_), cosine, sine);
-        if (key_) {
-            if (use_fused && kv_) {
-                const auto kv_width = static_cast<std::int64_t>(key_heads_ * head_width_);
-                const auto kv = kv_->forward(context, input);
-                key = key_norm_->forward_rotary_slice(context, kv, cosine, sine, key_heads_, head_width_, 0, 0, length);
-                value = value_norm_->forward(context, reshape(context.slice(kv, -1, kv_width, kv_width), key_heads_));
-            } else {
-                key = key_norm_->forward_rotary(context, reshape(key_->forward(context, input), key_heads_), cosine,
-                                                sine);
-                value = value_norm_->forward(context, reshape(value_->forward(context, input), key_heads_));
-            }
+        const auto kv = key_value_->forward(context, input);
+        if (context.device().capabilities().compute.host()) {
+            key = key_norm_->forward_rotary_slice(context, kv, cosine, sine, key_heads_, head_width_, 0, 0, length);
+        } else {
+            key = key_norm_->forward_rotary(context, reshape(context.slice(kv, -1, 0, kv_width), key_heads_), cosine,
+                                            sine);
         }
-    }
-    if (key_) {
+        value = value_norm_->forward(context, reshape(context.slice(kv, -1, kv_width, kv_width), key_heads_));
         if (key_scale_.defined()) {
             const auto key_scale = require(key_scale_.data<float>())[0];
             const auto value_scale = require(value_scale_.data<float>())[0];
@@ -416,7 +320,7 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
     std::size_t offset = 0;
     for (const auto& segment : segments) {
         auto& cache = *segment.cache;
-        if (key_) {
+        if (key_value_) {
             auto keys = context.slice(key, 1, offset, segment.length);
             auto values = context.slice(value, 1, offset, segment.length);
             if (byte_cache) {
