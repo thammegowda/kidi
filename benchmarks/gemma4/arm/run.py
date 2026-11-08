@@ -432,7 +432,68 @@ def measure(command, work, name, protocol, timeout):
     if completed.returncode:
         raise RuntimeError(f"{name} exited {completed.returncode}: {completed.stderr[-3000:]}")
     records = records_from(completed.stdout)
-    return {"command": command, "records": records, "summary": summarize(records, protocol)}
+    return {"command": command, "records": records, "summary": summarize(records, protocol), "cached": False}
+
+
+def save_cached_run(work, name, run, protocol):
+    results_dir = work / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "name": name,
+        "protocol": protocol,
+        "command": run["command"],
+        "binary_sha256": run["binary_sha256"],
+        "records": run["records"],
+        "summary": run["summary"],
+    }
+    save(results_dir / f"{name}.json", payload)
+
+
+def load_cached_run(work, name, command, binary_sha256, protocol, tokenizer=None):
+    candidates = [work / "results" / f"{name}.json"]
+    report_path = work / "benchmark.json"
+    if report_path.exists():
+        candidates.append(report_path)
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            document = json.loads(path.read_text())
+            if path.name == "benchmark.json":
+                if document.get("protocol") != protocol:
+                    continue
+                entry = document.get("runs", {}).get(name)
+                if not isinstance(entry, dict):
+                    continue
+            else:
+                if document.get("protocol") != protocol:
+                    continue
+                entry = document
+            if entry.get("command") != command or entry.get("binary_sha256") != binary_sha256:
+                continue
+            records = entry["records"]
+            summary = summarize(records, protocol)
+            if name == "kidi":
+                loads = [row for row in records if row.get("stage") == "load"]
+                if len(loads) != 1 or loads[0].get("native_qat") is not True:
+                    continue
+            if tokenizer is not None:
+                summary["text"] = tokenizer.decode(summary["token_ids"], skip_special_tokens=False)
+            elif "text" in entry.get("summary", {}):
+                summary["text"] = entry["summary"]["text"]
+            result = {
+                "command": command,
+                "records": records,
+                "summary": summary,
+                "binary_sha256": binary_sha256,
+                "cached": True,
+            }
+            if path.name == "benchmark.json":
+                save_cached_run(work, name, result, protocol)
+            return result
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return None
 
 
 def main(argv=None):
@@ -442,6 +503,8 @@ def main(argv=None):
     parser.add_argument("--executorch-source", type=Path, default=ROOT / ".cache/arm-gemma/1.5.1/executorch")
     parser.add_argument("--profile", choices=tuple(PROFILES), default="int4-g128")
     parser.add_argument("--include-kidi-base", action="store_true")
+    parser.add_argument("--include-onnx", action="store_true")
+    parser.add_argument("--onnx-python", type=Path, default=ROOT / ".cache/ort-venv/bin/python")
     parser.add_argument("--llamacpp-model", type=Path)
     parser.add_argument("--litert-model", type=Path)
     parser.add_argument("--litert-python", type=Path, default=ROOT / ".cache/gemma-venv/bin/python")
@@ -449,6 +512,8 @@ def main(argv=None):
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--force", action="store_true", help="ignore cached per-runtime JSON results and rerun all")
+    parser.add_argument("--rerun", action="append", default=[], help="force rerunning specific runtime(s) by name")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=900)
@@ -509,6 +574,18 @@ def main(argv=None):
                 str(arguments.model.expanduser().resolve()),
                 str(arguments.threads), "3", json.dumps(base_settings),
             ]
+        if arguments.include_onnx:
+            onnx_python = str(arguments.onnx_python.expanduser().absolute())
+            if arguments.prepare or not (work / "gemma4-e2b-shared.onnx").exists():
+                subprocess.run(
+                    [onnx_python, str(HERE / "onnx_bench.py"), str(work / "shared"),
+                     str(work / "protocol.json"), "--export-only"],
+                    cwd=ROOT, check=True, timeout=arguments.timeout,
+                )
+            commands["onnx"] = [
+                onnx_python, str(HERE / "onnx_bench.py"),
+                str(work / "shared"), str(work / "protocol.json"),
+            ]
         if arguments.llamacpp_model:
             commands["llamacpp"] = [
                 str(work / "build-arm/llamacpp_gemma4_bench"),
@@ -536,24 +613,32 @@ def main(argv=None):
                     "diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=ROOT)).hexdigest(),
                     "benchmark_files": {name: digest(HERE / name) for name in
                                         ("run.py", "executorch_bench.cpp", "llamacpp_bench.cpp",
-                                         "litert_bench.py", "CMakeLists.txt", "requirements.txt")}},
+                                         "litert_bench.py", "onnx_bench.py", "CMakeLists.txt", "requirements.txt")}},
         )
         if sys.platform == "darwin":
             report["host"]["cpu_brand"] = subprocess.check_output(
                 ["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
             report["host"]["ram_bytes"] = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True))
+        rerun_set = set(arguments.rerun)
         for name, command in commands.items():
             checksum = digest(Path(command[0]))
-            report["runs"][name] = measure(command, work, name, protocol, arguments.timeout)
-            report["runs"][name]["binary_sha256"] = checksum
-            report["runs"][name]["summary"]["text"] = tokenizer.decode(
-                report["runs"][name]["summary"]["token_ids"], skip_special_tokens=False)
-            if name == "kidi":
-                loads = [row for row in report["runs"][name]["records"] if row.get("stage") == "load"]
-                if len(loads) != 1 or loads[0].get("native_qat") is not True:
-                    raise ValueError("KIDI did not execute the frozen packed-weight checkpoint")
-            if digest(Path(command[0])) != checksum:
-                raise ValueError(f"{name} binary changed during measurement")
+            cached = None
+            if not arguments.force and not arguments.prepare and name not in rerun_set:
+                cached = load_cached_run(work, name, command, checksum, protocol, tokenizer)
+            if cached is not None:
+                report["runs"][name] = cached
+            else:
+                report["runs"][name] = measure(command, work, name, protocol, arguments.timeout)
+                report["runs"][name]["binary_sha256"] = checksum
+                report["runs"][name]["summary"]["text"] = tokenizer.decode(
+                    report["runs"][name]["summary"]["token_ids"], skip_special_tokens=False)
+                if name == "kidi":
+                    loads = [row for row in report["runs"][name]["records"] if row.get("stage") == "load"]
+                    if len(loads) != 1 or loads[0].get("native_qat") is not True:
+                        raise ValueError("KIDI did not execute the frozen packed-weight checkpoint")
+                if digest(Path(command[0])) != checksum:
+                    raise ValueError(f"{name} binary changed during measurement")
+                save_cached_run(work, name, report["runs"][name], protocol)
             save(work / "benchmark.json", report)
         for filename, checksum in manifest["files"].items():
             if digest(work / filename) != checksum:
@@ -566,10 +651,11 @@ def main(argv=None):
         report["output_comparison"] = comparison["outputs"]
         report.update(status="completed", completed=datetime.now(timezone.utc).isoformat())
         save(work / "benchmark.json", report)
-        print("runtime       prefill tok/s   decode tok/s   TTFT ms   peak GiB")
+        print("runtime       prefill tok/s   decode tok/s   TTFT ms   peak GiB   source")
         for name, row in summaries.items():
+            source_tag = "cached" if report["runs"][name].get("cached") else "measured"
             print(f'{name:12} {row["prefill_tps"]:13.2f} {row["decode_tps"]:14.2f}'
-                  f' {row["ttft_ms"]:9.2f} {row["peak_rss_gib"]:10.2f}')
+                  f' {row["ttft_ms"]:9.2f} {row["peak_rss_gib"]:10.2f}   {source_tag}')
         print(f'Output comparison: {report["output_comparison"]}')
         print(f'Report: {work / "benchmark.json"}')
         return 0

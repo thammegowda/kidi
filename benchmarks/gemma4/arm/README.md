@@ -28,11 +28,19 @@ disabled. Passing `--include-kidi-base` also benchmarks KIDI quantizing
 directly from the unquantized BF16 checkpoint at load/first-use time.
 Optional flags also benchmark:
 
+- `--include-onnx`: ONNX Runtime CPU (`onnx_bench.py`, using `MatMulNBits` with
+  `block_size=128` for `int4-g128` and `DynamicQuantizeLinear` +
+  `MatMulIntegerToFloat` for `int8` over the shared quantized weights, backed
+  by MLAS + Arm KleidiAI).
 - `--llamacpp-model PATH`: `llama.cpp` + GGML with `GGML_CPU_KLEIDIAI=ON`
   (`llamacpp_bench.cpp` on `Q4_0` or `Q8_0` GGUF).
 - `--litert-model PATH` & `--kidi-qat-model PATH`: Google's `litert-lm`
   (`litert_bench.py` on `gemma-4-E2B-it.litertlm`) paired with KIDI on Google's
   mixed 2/4/8-bit QAT checkpoint (`gemma-4-E2B-it-qat-mobile-transformers`).
+- Per-runtime results are stored under `<work-dir>/results/<runtime>.json` and
+  reused automatically when the protocol, command, and binary SHA-256 match.
+  Pass `--rerun <runtime>` to rerun specific runtimes or `--force` for a clean
+  rerun of all requested runtimes.
 
 ## Setup and run
 

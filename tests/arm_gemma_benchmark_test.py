@@ -115,6 +115,28 @@ class ArmGemmaBenchmarkTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no existing"):
                 BENCHMARK.consolidate_weights(directory, ["model-0000.safetensors"])
 
+    def test_cached_run_reuse_and_invalidation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            protocol = self.protocol()
+            records = self.records()
+            records.insert(1, {"stage": "load", "native_qat": True})
+            run = {
+                "command": ["bench", "model"],
+                "binary_sha256": "abc123",
+                "records": records,
+                "summary": BENCHMARK.summarize(records, protocol),
+            }
+            BENCHMARK.save_cached_run(work, "kidi", run, protocol)
+            loaded = BENCHMARK.load_cached_run(work, "kidi", ["bench", "model"], "abc123", protocol)
+            self.assertIsNotNone(loaded)
+            self.assertTrue(loaded["cached"])
+            self.assertEqual(loaded["summary"]["decode_tps"], 20)
+            self.assertIsNone(BENCHMARK.load_cached_run(work, "kidi", ["bench", "other"], "abc123", protocol))
+            self.assertIsNone(BENCHMARK.load_cached_run(work, "kidi", ["bench", "model"], "changed", protocol))
+            changed_protocol = {**protocol, "threads": 8}
+            self.assertIsNone(BENCHMARK.load_cached_run(work, "kidi", ["bench", "model"], "abc123", changed_protocol))
+
 
 if __name__ == "__main__":
     unittest.main()
