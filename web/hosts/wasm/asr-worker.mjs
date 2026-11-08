@@ -1,4 +1,4 @@
-import {loadModel, storeConvertedSpeech} from './model-cache.mjs';
+import {configureModelHub, loadModel, storeConvertedSpeech} from './model-cache.mjs';
 
 let module;
 let gpu;
@@ -26,6 +26,7 @@ self.onmessage = async ({data}) => {
                     matrixPrecision: data.matrixPrecision, packedDot: data.packedDot, w8a8Kernel: data.w8a8Kernel});
             }
             await call('kidi_configure', ['number'], [useGpu ? 1 : data.threads]);
+            configureModelHub(data.modelHubRemote || 'https://huggingface.co');
             const cache = await loadModel(module, data.source,
                 metrics => self.postMessage({type: 'progress', ...metrics}),
                 {cacheOnly: data.cacheOnly === true, gpu});

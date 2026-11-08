@@ -15,8 +15,22 @@ test('browser consumes the canonical desktop YAML configuration', async () => {
   assert.equal(config.runtime.wasm, undefined);
   assert.equal(config.models.asr.model_id, 'openai/whisper-small');
   assert.equal(config.models.tts.model_id, 'thammegowda/OmniVoice-q8');
-  assert.equal(config.models.chat.system_prompt.includes('preserve natural code switching'), true);
-  assert.match(config.models.chat.translation_prompt, /\{target_language\}/);
+  assert.equal(config.prompts.system.includes('preserve natural code switching'), true);
+  assert.match(config.prompts.system, /untrusted reference material/);
+  assert.match(config.prompts.translate, /\{target_language\}/);
+  assert.equal(config.models.chat.system_prompt, undefined);
+  assert.equal(config.models.chat.translation_prompt, undefined);
+  assert.equal(config.models.chat.editor, undefined);
+  assert.deepEqual(Object.keys(config.prompts).sort(), [
+    'concise', 'custom', 'email_compose', 'email_polish', 'email_reply',
+    'explain', 'formalize', 'friendly', 'page_summarize', 'page_translate', 'polish', 'summarize', 'system', 'translate',
+  ]);
+  assert.match(config.prompts.polish, /untrusted\s+data/);
+  assert.match(config.prompts.explain, /Return only the\s+explanation/);
+  assert.match(config.prompts.email_reply, /Do not invent facts/);
+  assert.equal(config.prompts.page_translate, config.prompts.translate);
+  assert.match(config.prompts.page_summarize, /cumulative summary/);
+  assert.notEqual(config.prompts.page_summarize, config.prompts.summarize);
   assert.deepEqual(config.models.chat.translation, {
     target_chars: 800,
     max_chars: 1200,
@@ -29,7 +43,9 @@ test('browser consumes the canonical desktop YAML configuration', async () => {
       runtime: {threads: 4, wasm: {
         runtime: {threads: 2},
         models: {chat: {model_id: 'example/e2b', generation: {max_tokens: 256}}},
+        prompts: {system: 'Browser system'},
       }},
+      prompts: {system: 'Shared system', translate: 'Translate'},
       models: {
         chat: {model_id: 'example/e4b', generation: {max_tokens: 512, context_tokens: 8192}},
         tts: {model_id: 'example/tts'},
@@ -38,6 +54,7 @@ test('browser consumes the canonical desktop YAML configuration', async () => {
     const wasm = resolveRuntimeConfig(base, 'wasm');
     assert.equal(wasm.runtime.threads, 2);
     assert.equal(wasm.runtime.wasm, undefined);
+    assert.deepEqual(wasm.prompts, {system: 'Browser system', translate: 'Translate'});
     assert.deepEqual(wasm.models.chat, {
       model_id: 'example/e2b',
       generation: {max_tokens: 256, context_tokens: 8192},
@@ -46,6 +63,7 @@ test('browser consumes the canonical desktop YAML configuration', async () => {
     const native = resolveRuntimeConfig(base, 'native');
     assert.equal(native.runtime.threads, 4);
     assert.equal(native.models.chat.model_id, 'example/e4b');
+    assert.equal(native.prompts.system, 'Shared system');
   });
   assert.equal(config.models.asr.vad.silence_ms, 800);
   assert.equal(config.models.tts.realtime_steps, 10);
@@ -58,6 +76,29 @@ test('browser consumes the canonical desktop YAML configuration', async () => {
 test('browser rejects incomplete shared model configuration', async () => {
   await assert.rejects(loadAppConfig({version: 1, model_hub: {remote: 'http://example.com'}, models: {}}),
     /runtime|model_hub.remote|models/);
+});
+
+test('browser validates unified prompts and rejects model-local definitions', async () => {
+  const document = load(await readFile(new URL('../../examples/kidi-app.yaml', import.meta.url), 'utf8'));
+  for (const prompts of [
+    undefined, null, [], 'text', {system: 'Chat'}, {translate: 'Translate'},
+    {system: '', translate: 'Translate'}, {system: 42, translate: 'Translate'},
+    {system: true, translate: 'Translate'}, {system: [], translate: 'Translate'},
+    {system: 'Chat', translate: 'Translate', custom: {}},
+    {system: 'Chat', translate: 'Translate', chat: 'Duplicate'},
+  ]) await assert.rejects(loadAppConfig({...document, prompts}), /prompts/);
+  for (const legacy of [
+    {system_prompt: 'Old system'}, {translation_prompt: 'Old translation'}, {editor: {prompts: {polish: 'Old'}}},
+  ]) {
+    const old = structuredClone(document);
+    Object.assign(old.models.chat, legacy);
+    await assert.rejects(loadAppConfig(old), /Move model-local prompts/);
+  }
+  const overridden = structuredClone(document);
+  overridden.runtime.wasm.prompts = {system: 'Browser system'};
+  assert.equal((await loadAppConfig(overridden)).prompts.system, 'Browser system');
+  overridden.runtime.wasm.prompts.system = false;
+  await assert.rejects(loadAppConfig(overridden), /prompts.system/);
 });
 
 test('first-run browser UI requests model loading and exposes progress', async () => {

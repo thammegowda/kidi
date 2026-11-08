@@ -19,7 +19,7 @@ auto main() -> int {
     };
     auto generated = Decoder::generate(std::array<std::int32_t, 2>{1, 2}, greedy, language_model);
     if (!generated || !prefixes_valid || generated->token_ids != std::vector<std::int32_t>{4} ||
-        generated->decoder_steps != 2)
+        generated->decoder_steps != 2 || generated->truncated)
         return 1;
     const std::array<std::int32_t, 1> additional_stops{4};
     auto multi_stop = greedy;
@@ -74,7 +74,13 @@ auto main() -> int {
     auto limited = greedy;
     limited.maximum_steps = 1;
     auto truncated = Decoder::generate(std::array<std::int32_t, 2>{1, 2}, limited, language_model);
-    if (!truncated || truncated->token_ids != std::vector<std::int32_t>{4} || truncated->decoder_steps != 1) return 1;
+    if (!truncated || truncated->token_ids != std::vector<std::int32_t>{4} || truncated->decoder_steps != 1 ||
+        !truncated->truncated)
+        return 1;
+    auto exact_end = greedy;
+    exact_end.maximum_steps = 2;
+    auto exact = Decoder::generate(std::array<std::int32_t, 2>{1, 2}, exact_end, language_model);
+    if (!exact || exact->truncated) return 1;
     auto malformed = Decoder::generate(std::array<std::int32_t, 1>{2}, greedy,
                                        [](const DecodeRequest&) -> kidi::Result<TokenScores> { return TokenScores{}; });
     if (malformed) return 1;
@@ -133,7 +139,7 @@ auto main() -> int {
         incremental->result().decoder_steps != 0 || !incremental->accept(TokenScores{{}, ScoreKind::LOGITS, 4}) ||
         incremental->finished() || !incremental->accept(TokenScores{{}, ScoreKind::LOGITS, 3}) ||
         !incremental->finished() || incremental->result().token_ids != std::vector<std::int32_t>{4} ||
-        incremental->accept(TokenScores{{}, ScoreKind::LOGITS, 4}))
+        incremental->result().truncated || incremental->accept(TokenScores{{}, ScoreKind::LOGITS, 4}))
         return 1;
     for (auto invalid : {-1, 5}) {
         chosen.fill(invalid);

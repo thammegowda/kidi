@@ -2,6 +2,7 @@
 #include <cmath>
 
 #include "kidi/model/whisper.h"
+#include "kidi/ops/quantization.h"
 
 auto main() -> int {
     auto config = YAML::Load(R"({
@@ -34,6 +35,27 @@ auto main() -> int {
     if (!kidi::model::WhisperImpl::validate_config(config)) return 1;
     config["d_model"] = 1024;
     if (kidi::model::WhisperImpl::validate_config(config)) return 1;
+    config["d_model"] = 1280;
+    config["encoder_layers"] = 32;
+    config["decoder_layers"] = 32;
+    config["encoder_attention_heads"] = 20;
+    config["decoder_attention_heads"] = 20;
+    config["encoder_ffn_dim"] = 5120;
+    config["decoder_ffn_dim"] = 5120;
+    config["num_mel_bins"] = 128;
+    config["vocab_size"] = 51866;
+    if (!kidi::model::WhisperImpl::validate_config(config)) return 1;
+    for (const auto* name : {"num_mel_bins", "vocab_size", "decoder_layers", "decoder_attention_heads"}) {
+        const auto original = config[name].as<int>();
+        config[name] = original - 1;
+        if (kidi::model::WhisperImpl::validate_config(config)) return 1;
+        config[name] = original;
+    }
+    config["decoder_layers"] = 4;
+    if (!kidi::model::WhisperImpl::validate_config(config)) return 1;
+    config["decoder_layers"] = 3;
+    if (kidi::model::WhisperImpl::validate_config(config)) return 1;
+    if ((*model)->encode({std::vector<float>(128 * 3000), 128, 3000})) return 1;
     {
         using kidi::ops::require;
         using kidi::tensor::Tensor;
@@ -73,6 +95,17 @@ auto main() -> int {
             for (std::size_t index = 0; index < values.size(); ++index)
                 if (std::abs(values[index] - bias_values[index % 3]) > 1e-6F) return 1;
         }
+        const std::array<std::uint16_t, 4> fp16_bits{0x3c00, 0xc000, 0x3800, 0x0000};
+        const std::array<float, 4> fp32_values{1.F, -2.F, 0.5F, 0.F};
+        const auto fp16_weight = require(
+            Tensor::from_bytes({2, 2}, kidi::tensor::DType::F16,
+                               std::span(reinterpret_cast<const std::byte*>(fp16_bits.data()), sizeof(fp16_bits))));
+        const auto fp32_weight = require(Tensor::from_host({2, 2}, std::span<const float>(fp32_values)));
+        const auto packed_fp16 = require(kidi::ops::pack_weight(fp16_weight, 8, 2));
+        const auto packed_fp32 = require(kidi::ops::pack_weight(fp32_weight, 8, 2));
+        if (!std::ranges::equal(require(packed_fp16.values.host_bytes()), require(packed_fp32.values.host_bytes())) ||
+            !std::ranges::equal(require(packed_fp16.scales.data<float>()), require(packed_fp32.scales.data<float>())))
+            return 1;
     }
     return 0;
 }

@@ -92,13 +92,14 @@ def resolve(reference: str, cache: str | Path = DEFAULT_CACHE) -> Path:
               and original.get("architectures") == ["WhisperForConditionalGeneration"]
               and (original.get("d_model"), original.get("encoder_layers"), original.get("decoder_layers"),
                    original.get("encoder_attention_heads"), original.get("decoder_attention_heads"),
-                   original.get("encoder_ffn_dim"), original.get("decoder_ffn_dim")) in {
-                       (384, 4, 4, 6, 6, 1536, 1536),
-                       (512, 6, 6, 8, 8, 2048, 2048),
-                       (768, 12, 12, 12, 12, 3072, 3072),
-                   }
-              and original.get("num_mel_bins") == 80
-              and original.get("vocab_size") == 51865):
+                   original.get("encoder_ffn_dim"), original.get("decoder_ffn_dim"),
+                   original.get("num_mel_bins"), original.get("vocab_size")) in {
+                       (384, 4, 4, 6, 6, 1536, 1536, 80, 51865),
+                       (512, 6, 6, 8, 8, 2048, 2048, 80, 51865),
+                       (768, 12, 12, 12, 12, 3072, 3072, 80, 51865),
+                       (1280, 32, 32, 20, 20, 5120, 5120, 128, 51866),
+                       (1280, 32, 4, 20, 20, 5120, 5120, 128, 51866),
+                   }):
             files = ["config.json", "model.safetensors", "tokenizer.json", "preprocessor_config.json",
                      "generation_config.json"]
             gemma = False

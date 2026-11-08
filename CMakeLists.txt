@@ -80,6 +80,9 @@ target_include_directories(kidi_argparse PUBLIC $<BUILD_INTERFACE:${CMAKE_CURREN
 target_compile_features(kidi_argparse PUBLIC cxx_std_23)
 
 add_library(kidi
+    src/kidi/app/editor.cpp
+    src/kidi/app/prompts.cpp
+    src/kidi/app/document.cpp
     src/kidi/audio/duration.cpp
     src/kidi/audio/wav.cpp
     src/kidi/audio/whisper.cpp
@@ -367,11 +370,17 @@ if(KIDI_BUILD_DESKTOP_APP)
     set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "Build LiteApp's GoogleTest suite" FORCE)
     add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
     set(KIDI_DESKTOP_WEB_STAGE "${CMAKE_CURRENT_BINARY_DIR}/generated/desktop-web")
+    set(KIDI_DESKTOP_WEB_DEPENDENCY_FILES)
     file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}")
     function(kidi_stage_desktop_asset source relative)
-        if(IS_ABSOLUTE "${relative}" OR relative MATCHES "(^|/)\\.\\.?(/|$)" OR
-           NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" OR
-           IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
+        if(IS_ABSOLUTE "${relative}" OR relative MATCHES "(^|/)\\.\\.?(/|$)")
+            message(FATAL_ERROR "Invalid desktop asset destination: ${relative}")
+        endif()
+        if(source MATCHES "^web/libs/mermaid/")
+            list(APPEND KIDI_DESKTOP_WEB_DEPENDENCY_FILES "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
+            set(KIDI_DESKTOP_WEB_DEPENDENCY_FILES "${KIDI_DESKTOP_WEB_DEPENDENCY_FILES}" PARENT_SCOPE)
+        elseif(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" OR
+               IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
             message(FATAL_ERROR "Invalid desktop asset mapping: ${relative} -> ${source}")
         endif()
         set(output "${KIDI_DESKTOP_WEB_STAGE}/${relative}")
@@ -409,6 +418,17 @@ if(KIDI_BUILD_DESKTOP_APP)
         kidi_stage_desktop_asset("${source}" "${relative}")
         list(APPEND KIDI_DESKTOP_ARCHIVE_FILES "${relative}")
     endforeach()
+    list(REMOVE_DUPLICATES KIDI_DESKTOP_WEB_DEPENDENCY_FILES)
+    add_custom_target(kidi_web_dependencies
+        COMMAND node "${CMAKE_CURRENT_SOURCE_DIR}/web/tools/prepare-libs.mjs"
+        BYPRODUCTS ${KIDI_DESKTOP_WEB_DEPENDENCY_FILES}
+        DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/web/package.json"
+            "${CMAKE_CURRENT_SOURCE_DIR}/web/package-lock.json"
+            "${CMAKE_CURRENT_SOURCE_DIR}/web/tools/prepare-libs.mjs"
+        COMMENT "Preparing locked web dependencies"
+        VERBATIM
+    )
     liteapp_embed_archive(
         TARGET kidi_desktop_assets
         NAMESPACE kidi::desktop_assets
@@ -416,6 +436,7 @@ if(KIDI_BUILD_DESKTOP_APP)
         ROOT "${KIDI_DESKTOP_WEB_STAGE}"
         FILES ${KIDI_DESKTOP_ARCHIVE_FILES}
     )
+    add_dependencies(kidi_desktop_assets kidi_web_dependencies)
     add_library(kidi_desktop_ebook STATIC desktop/ebook.cpp)
     target_include_directories(kidi_desktop_ebook PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/desktop")
     target_link_libraries(kidi_desktop_ebook PUBLIC liteapp::vfs)

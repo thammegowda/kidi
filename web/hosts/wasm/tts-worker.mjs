@@ -1,4 +1,4 @@
-import {loadModel} from './model-cache.mjs';
+import {configureModelHub, loadModel} from './model-cache.mjs';
 
 let module;
 let ready = false;
@@ -77,9 +77,11 @@ self.onmessage = async ({data}) => {
         if (data.type === 'load') {
             if (module) throw new Error('TTS runtime is already loaded');
             const useGpu = data.backend === 'webgpu';
-            if (!useGpu && !self.crossOriginIsolated)
+            if (!useGpu && !self.crossOriginIsolated && !data.singleThread)
                 throw new Error('The CPU backend requires cross-origin isolation');
-            const {default: createKidi} = await import(useGpu ? './gpu/kidi.mjs' : './threads/kidi.mjs');
+            const runtimeModule = useGpu ? './gpu/kidi.mjs' :
+                data.singleThread ? './single/kidi.mjs' : './threads/kidi.mjs';
+            const {default: createKidi} = await import(runtimeModule);
             module = await createKidi({printErr: text => self.postMessage({type: 'log', text})});
             if (useGpu) {
                 const {createWebGpu} = await import('./webgpu.mjs');
@@ -92,9 +94,11 @@ self.onmessage = async ({data}) => {
                 }));
             }
             await call('kidi_configure', ['number'], [data.threads]);
+            configureModelHub(data.modelHubRemote || 'https://huggingface.co');
             const cache = await loadModel(module, data.source,
                 metrics => self.postMessage({type: 'progress', ...metrics}),
                 {cacheOnly: data.cacheOnly === true, gpu});
+            self.postMessage({type: 'initializing', ...cache});
             const result = await call('kidi_load_tts', ['string'], ['/model']);
             ready = true;
             self.postMessage({type: 'ready', threads: data.threads, ...result, ...cache,

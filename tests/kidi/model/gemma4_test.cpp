@@ -308,9 +308,11 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     const auto cancelled = require(cached.enqueue("alpha beta gamma delta", options));
     require(cached.step());
     if (cached.release_workspaces()) throw std::runtime_error("generator released workspaces with an active request");
+    if (cached.trim_workspaces()) throw std::runtime_error("generator trimmed workspaces with an active request");
     require(cached.cancel(cancelled));
-    require(cached.release_workspaces());
+    require(cached.trim_workspaces());
     check("alpha beta gamma delta", options, 2);
+    require(cached.release_workspaces());
     auto smaller_context = options;
     smaller_context.context_size = 8;
     check("alpha beta gamma delta", smaller_context, 0);

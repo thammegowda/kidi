@@ -45,6 +45,7 @@ struct Generation {
     std::vector<std::int32_t> token_ids;
     float score;
     std::size_t decoder_steps;
+    bool truncated = false;
 };
 
 struct GreedyRequest {

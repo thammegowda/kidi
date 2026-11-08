@@ -50,7 +50,7 @@ test('site packaging includes transitive modules and relocates worker assets', a
     await verifyModuleAssets(destination);
     const liteapp = await import(pathToFileURL(join(destination, 'liteapp/liteapp.mjs')));
     for (const name of ['RequestChannel', 'MessageTransport', 'WebSocketTransport',
-        'createVariantClient', 'EventClient', 'ServiceRouter'])
+        'createVariantClient', 'EventClient', 'ServiceRouter', 'ExtensionPortTransport', 'ServiceBroker'])
         assert.equal(typeof liteapp[name], 'function', `packaged LiteApp export: ${name}`);
     for (const name of ['threads', 'gpu']) {
         assert.match(await readFile(join(destination, name, 'kidi.mjs'), 'utf8'), /index >>> 0/);

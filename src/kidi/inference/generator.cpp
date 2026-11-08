@@ -258,6 +258,19 @@ auto Generator::release_workspaces() -> Result<void> {
         return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
     }
 }
+auto Generator::trim_workspaces() -> Result<void> {
+    try {
+        if (pending_requests())
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "drain generation requests before trimming workspaces"});
+        model_->trim_workspaces();
+        if (vision_) vision_->release_workspaces();
+        return {};
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
+    }
+}
 auto Generator::memory() const -> GeneratorMemory {
     GeneratorMemory result;
     const auto add_state = [&](const model::Gemma4State& state) {
@@ -643,6 +656,15 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, Genera
         waiting_.back().image_key = std::move(image_key);
         images_ = std::move(current);
         return id;
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
+    }
+}
+auto Generator::chat_prompt_tokens(std::span<const text::ChatMessage> messages) const -> Result<std::size_t> {
+    try {
+        return require(tokenizer_.encode(require(tokenizer_.format_chat(messages)))).size();
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     } catch (const std::exception& error) {

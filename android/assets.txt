@@ -1,4 +1,5 @@
 /backend.js	web/hosts/android/backend.js
+/app-config.yaml	examples/kidi-app.yaml
 /browser-epub.js	web/hosts/wasm/browser-epub.js
 /capture-worklet.js	web/hosts/desktop/capture-worklet.js
 /playback-worklet.js	web/hosts/desktop/playback-worklet.js
@@ -14,3 +15,9 @@
 /libs/dompurify/purify.es.mjs	web/libs/dompurify/purify.es.mjs
 /libs/highlightjs/highlight.min.js	web/libs/highlightjs/highlight.min.js
 /libs/mermaid/mermaid.min.js	web/libs/mermaid/mermaid.min.js
+/icons/LICENSE.txt	web/libs/lucide-static/LICENSE
+/libs/marked/LICENSE	web/libs/marked/LICENSE
+/libs/dompurify/LICENSE	web/libs/dompurify/LICENSE
+/libs/dompurify/LICENSE-MPL	web/libs/dompurify/LICENSE-MPL
+/libs/highlightjs/LICENSE	web/libs/highlightjs/LICENSE
+/libs/mermaid/LICENSE	web/libs/mermaid/LICENSE

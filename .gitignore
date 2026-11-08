@@ -8,6 +8,11 @@
 __pycache__/
 *.pyc
 /web/node_modules/
+/web/libs/mermaid/
+/web/libs/pdfjs/
+/web/libs/.stamp
+/web/libs/.stamp.tmp
+/web/libs/.acquiring/
 
 # Android and Gradle build state; keep gradle/wrapper committed.
 /android/.gradle/

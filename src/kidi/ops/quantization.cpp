@@ -1,4 +1,5 @@
 #include "kidi/ops/quantization.h"
+#include "kidi/checkpoint/ggml/dequantize.h"
 #include "kidi/ops/context.h"
 
 #include <algorithm>
@@ -9,7 +10,8 @@ namespace kidi::ops {
 auto pack_weight(const tensor::Tensor& weight, std::int32_t bits, std::int32_t group_size) -> Result<PackedWeight> {
     try {
         if (!weight.defined() || weight.dimensions() != 2 || !weight.is_contiguous() ||
-            (weight.dtype() != tensor::DType::BF16 && weight.dtype() != tensor::DType::F32) ||
+            (weight.dtype() != tensor::DType::F16 && weight.dtype() != tensor::DType::BF16 &&
+             weight.dtype() != tensor::DType::F32) ||
             (bits != 2 && bits != 4 && bits != 8) || group_size <= 0 || group_size % (8 / bits) ||
             weight.size(1) % group_size || !weight.size(0) || !weight.size(1))
             throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed weight dimensions, precision or group size"});
@@ -62,8 +64,10 @@ auto pack_weight(const tensor::Tensor& weight, std::int32_t bits, std::int32_t g
             pack([source](std::size_t offset) { return source[offset]; });
         } else {
             const auto* source = reinterpret_cast<const std::uint16_t*>(bytes.data());
-            pack([source](std::size_t offset) {
-                return std::bit_cast<float>(static_cast<std::uint32_t>(source[offset]) << 16);
+            const bool fp16 = weight.dtype() == tensor::DType::F16;
+            pack([source, fp16](std::size_t offset) {
+                return fp16 ? checkpoint::ggml::detail::fp16_to_fp32(source[offset])
+                            : std::bit_cast<float>(static_cast<std::uint32_t>(source[offset]) << 16);
             });
         }
         return PackedWeight{std::move(values), std::move(scales), bits, group_size};

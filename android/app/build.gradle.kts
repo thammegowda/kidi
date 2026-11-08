@@ -153,7 +153,18 @@ val androidWebMappings = rootProject.file("assets.txt").readLines()
 val webDestinations = sharedWebFiles + androidWebMappings.keys
 require(webDestinations.size == webDestinations.toSet().size) { "Duplicate Android web asset destination" }
 
+val prepareWebLibraries by tasks.registering(Exec::class) {
+    workingDir(rootProject.file(".."))
+    commandLine("node", "web/tools/prepare-libs.mjs")
+    inputs.files(rootProject.file("../web/package.json"), rootProject.file("../web/package-lock.json"),
+        rootProject.file("../web/tools/prepare-libs.mjs"))
+    outputs.file(rootProject.file("../web/libs/.stamp"))
+    outputs.files(androidWebMappings.values.filter { it.startsWith("web/libs/mermaid/") }
+        .map { rootProject.file("../$it") })
+}
+
 val webAssets by tasks.registering(Sync::class) {
+    dependsOn(prepareWebLibraries)
     into(layout.buildDirectory.dir("generated/webAssets"))
     sharedWebFiles.forEach { relative ->
         from(rootProject.file("../web/ui/$relative")) {
