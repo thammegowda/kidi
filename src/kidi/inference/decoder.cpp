@@ -92,6 +92,7 @@ auto GreedyState::accept(TokenScores scores) -> Result<void> {
     if (!ended && (!options_.stop_on_eos || token_ != options_.pad_id)) result_.token_ids.push_back(token_);
     finished_ = ended || result_.decoder_steps == options_.maximum_steps;
     if (finished_) {
+        result_.truncated = !ended && options_.stop_on_eos;
         const auto length =
             ended ? result_.decoder_steps : options_.unfinished_score_length.value_or(options_.maximum_steps);
         result_.score = normalized_score(result_.score, length, options_.length_penalty);
@@ -231,7 +232,8 @@ auto Decoder::generate(std::span<const std::int32_t> prompt, const SearchOptions
         end != result.end())
         result.erase(end, result.end());
     if (options.stop_on_eos) std::erase(result, options.pad_id);
-    return Generation{std::move(result), normalized_score(best->score, best->length, options.length_penalty), steps};
+    return Generation{std::move(result), normalized_score(best->score, best->length, options.length_penalty), steps,
+                      best->active && options.stop_on_eos};
 }
 } // namespace kidi::inference
 

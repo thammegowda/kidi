@@ -18,6 +18,7 @@
 
 #include "kidi/checkpoint/safetensors/mapped.h"
 #include "kidi/checkpoint/ggml/reader.h"
+#include "kidi/checkpoint/ggml/dequantize.h"
 #include "kidi/ops/context.h"
 
 namespace kidi::checkpoint {
@@ -365,6 +366,26 @@ auto Weights::tensor(std::string_view name) const -> Result<tensor::Tensor> {
     std::shared_ptr<const void> owner = impl_;
     return tensor::Tensor::from_blob(std::vector<std::int64_t>(raw.shape.begin(), raw.shape.end()), raw.data_type,
                                      raw.bytes, std::move(owner));
+}
+
+auto Weights::float32_tensor(std::string_view name) const -> Result<tensor::Tensor> {
+    const auto value = tensor(name);
+    if (!value) return std::unexpected(value.error());
+    if (value->dtype() == DataType::F32) return value;
+    if (value->dtype() != DataType::F16 && value->dtype() != DataType::BF16)
+        return std::unexpected(
+            Error{ErrorCode::UNSUPPORTED, "weight is not FP16, BF16, or FP32: " + std::string(name)});
+    const auto bytes = value->host_bytes();
+    if (!bytes) return std::unexpected(bytes.error());
+    std::vector<float> floating(value->numel());
+    for (std::size_t index = 0; index < floating.size(); ++index) {
+        std::uint16_t bits;
+        std::memcpy(&bits, bytes->data() + index * sizeof(bits), sizeof(bits));
+        floating[index] = value->dtype() == DataType::F16
+                              ? ggml::detail::fp16_to_fp32(bits)
+                              : std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16);
+    }
+    return tensor::Tensor::from_host({value->shape().begin(), value->shape().end()}, std::span<const float>(floating));
 }
 
 } // namespace kidi::checkpoint

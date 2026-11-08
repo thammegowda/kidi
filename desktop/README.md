@@ -17,6 +17,11 @@ window. Never use `--dev` with an exposed or forwarded port.
 `make app-dev` builds and runs this mode on port `10010`. Override the defaults
 with `APP_CONFIG=path/to/config.yaml` or `APP_PORT=another-loopback-port`.
 
+Frontend builds require Node.js 24+ and npm to acquire Mermaid. Compact libraries
+and icons are vendored; CMake prepares the larger, ignored distributions before
+staging or embedding assets. See [dependency policy](../web/libs/README.md).
+All assets remain local; users do not need Node.js at runtime.
+
 Release builds package the UI as one deterministic ZIP and link that binary
 resource directly into the executable through LiteApp's
 `liteapp_embed_archive()`. C++ compiles only the small `std::span` accessor and
@@ -102,7 +107,7 @@ Changing any setting restarts active narration at the current position. Its
 
 Choosing a reader translation language sends each bounded paragraph through
 `reader.translate`, with the preceding and following paragraphs as context.
-The server applies the YAML `translation_prompt`, emits
+The server applies the YAML `prompts.translate`, emits
 `reader.translation.started`, `reader.translation.delta`, and
 `reader.translation.completed`, and shares the chat model's single-inference
 gate without adding messages to chat history. The UI displays source and
@@ -155,7 +160,15 @@ TTS use separate model locks, so PCM can begin before `chat.completed` without
 unbounded buffering. Markdown markers and link destinations are removed from
 spoken segments.
 
-The chat system prompt is injected server-side as the first message; clients
+All application prompts are defined in the top-level `prompts` map of the shared
+YAML, not under `models.chat`. `system` is reserved for the chat system prompt;
+`translate` is the reader translation prompt, and the other keys name text/email
+actions. `runtime.native.prompts` can override individual entries without
+repeating the map. Android packages and reads the same YAML defaults.
+Model-local `system_prompt`, `translation_prompt`, and `editor.prompts` fields
+are rejected with a migration message instead of being silently ignored.
+
+The chat system prompt (`prompts.system`) is injected server-side as the first message; clients
 cannot submit system or developer roles. The settings UI can replace it for
 future turns with `settings.system_prompt.set`. That override is held only in
 process memory, so restarting the app restores the YAML value. `tts.start` may

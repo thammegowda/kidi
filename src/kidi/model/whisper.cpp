@@ -1,7 +1,9 @@
 #include "kidi/model/whisper.h"
 #include "kidi/ops/quantization.h"
 
+#include <algorithm>
 #include <cmath>
+#include <tuple>
 #include <utility>
 
 namespace kidi::model {
@@ -11,7 +13,7 @@ using tensor::Tensor;
 
 struct WhisperImpl::State {
     ops::Context context;
-    std::int32_t hidden, encoder_layers, decoder_layers, maximum_target, vocabulary;
+    std::int32_t hidden, encoder_layers, decoder_layers, maximum_target, vocabulary, mel_bins;
     layers::WhisperEncoder encoder;
     layers::WhisperDecoder decoder;
     layers::Linear output;
@@ -25,6 +27,7 @@ struct WhisperImpl::State {
           decoder_layers(config["decoder_layers"].as<int>()),
           maximum_target(config["max_target_positions"].as<int>()),
           vocabulary(config["vocab_size"].as<int>()),
+          mel_bins(config["num_mel_bins"].as<int>()),
           encoder(config["num_mel_bins"].as<int>(), hidden, config["encoder_ffn_dim"].as<int>(),
                   config["encoder_attention_heads"].as<int>(), encoder_layers, config["max_source_positions"].as<int>(),
                   config["layer_norm_eps"].as<float>(1e-5F)),
@@ -55,24 +58,29 @@ auto WhisperImpl::validate_config(const YAML::Node& config) -> Result<void> {
         if (hidden % config["encoder_attention_heads"].as<int>() ||
             hidden % config["decoder_attention_heads"].as<int>())
             return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "invalid Whisper attention dimensions"});
-        const auto encoder_layers = config["encoder_layers"].as<int>();
-        const auto decoder_layers = config["decoder_layers"].as<int>();
-        const auto encoder_heads = config["encoder_attention_heads"].as<int>();
-        const auto decoder_heads = config["decoder_attention_heads"].as<int>();
-        const auto encoder_feed_forward = config["encoder_ffn_dim"].as<int>();
-        const auto decoder_feed_forward = config["decoder_ffn_dim"].as<int>();
-        const bool supported_size =
-            (hidden == 384 && encoder_layers == 4 && decoder_layers == 4 && encoder_heads == 6 && decoder_heads == 6 &&
-             encoder_feed_forward == 1536 && decoder_feed_forward == 1536) ||
-            (hidden == 512 && encoder_layers == 6 && decoder_layers == 6 && encoder_heads == 8 && decoder_heads == 8 &&
-             encoder_feed_forward == 2048 && decoder_feed_forward == 2048) ||
-            (hidden == 768 && encoder_layers == 12 && decoder_layers == 12 && encoder_heads == 12 &&
-             decoder_heads == 12 && encoder_feed_forward == 3072 && decoder_feed_forward == 3072);
-        if (!supported_size || config["num_mel_bins"].as<int>() != 80 ||
-            config["max_source_positions"].as<int>() != 1500 || config["max_target_positions"].as<int>() != 448 ||
-            config["vocab_size"].as<int>() != 51865)
+        const std::tuple geometry{
+            hidden,
+            config["encoder_layers"].as<int>(),
+            config["decoder_layers"].as<int>(),
+            config["encoder_attention_heads"].as<int>(),
+            config["decoder_attention_heads"].as<int>(),
+            config["encoder_ffn_dim"].as<int>(),
+            config["decoder_ffn_dim"].as<int>(),
+            config["num_mel_bins"].as<int>(),
+            config["vocab_size"].as<int>(),
+        };
+        constexpr std::array SUPPORTED{
+            std::tuple{384, 4, 4, 6, 6, 1536, 1536, 80, 51865},
+            std::tuple{512, 6, 6, 8, 8, 2048, 2048, 80, 51865},
+            std::tuple{768, 12, 12, 12, 12, 3072, 3072, 80, 51865},
+            std::tuple{1280, 32, 32, 20, 20, 5120, 5120, 128, 51866},
+            std::tuple{1280, 32, 4, 20, 20, 5120, 5120, 128, 51866},
+        };
+        if (!std::ranges::contains(SUPPORTED, geometry) || config["max_source_positions"].as<int>() != 1500 ||
+            config["max_target_positions"].as<int>() != 448)
             return std::unexpected(
-                Error{ErrorCode::UNSUPPORTED, "supported multilingual Whisper sizes are Tiny, Base, and Small"});
+                Error{ErrorCode::UNSUPPORTED,
+                      "supported multilingual Whisper sizes are Tiny, Base, Small, Large-v3, and Large-v3-Turbo"});
         return {};
     } catch (const YAML::Exception& error) {
         return std::unexpected(
@@ -169,7 +177,6 @@ auto WhisperImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<v
     try {
         StateDict state;
         for (const auto& key : weights.names()) {
-            const auto value = require(weights.tensor(key));
             constexpr std::string_view PREFIX = "model.";
             if (!key.starts_with(PREFIX))
                 return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "unknown Whisper parameter: " + key});
@@ -178,7 +185,8 @@ auto WhisperImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<v
                 name.ends_with(".weight") &&
                 (name.starts_with("encoder.conv2") || name.ends_with("_proj.weight") || name.ends_with(".fc1.weight") ||
                  name.ends_with(".fc2.weight") || name == "decoder.embed_tokens.weight");
-            if (impl_->precision == DType::I8 && projection && value.dtype() == DType::F32) {
+            auto value = require(weights.tensor(key));
+            if (impl_->precision == DType::I8 && projection && value.dtype() != DType::I8) {
                 const auto rows = static_cast<std::int64_t>(value.size(0));
                 const auto width = static_cast<std::int64_t>(value.numel() / value.size(0));
                 const auto matrix = require(value.reshape({rows, width}));
@@ -191,7 +199,9 @@ auto WhisperImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<v
                 state.emplace(name, std::move(quantized));
                 state.emplace(name.substr(0, name.size() - 7) + ".scale", packed.scales);
             } else {
-                state.emplace(name, value);
+                if (value.dtype() == DType::F16 || value.dtype() == DType::BF16)
+                    value = require(weights.float32_tensor(key));
+                state.emplace(name, std::move(value));
             }
         }
         for (const auto& [name, value] : state) {
@@ -215,16 +225,18 @@ auto WhisperImpl::encode(const audio::WhisperFeatures& features, std::size_t fra
                          const std::function<bool()>& cancelled) -> Result<WhisperEncoderState> {
     try {
         if (!frames) frames = features.frames;
-        if (!device().capabilities().supports_audio_transformer() || features.bins != 80 || features.frames != 3000 ||
+        if (!device().capabilities().supports_audio_transformer() ||
+            features.bins != static_cast<std::size_t>(impl_->mel_bins) || features.frames != 3000 ||
             features.values.size() != features.bins * features.frames || frames % 2 || frames > features.frames)
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Whisper requires 80 x 3000 features"});
+            throw ops::Failure(
+                {ErrorCode::INVALID_ARGUMENT, "Whisper features must match the model's mel bins and 3000 frames"});
         std::vector<float> values(frames * features.bins);
         for (std::size_t frame = 0; frame < frames; ++frame)
             for (std::size_t bin = 0; bin < features.bins; ++bin)
                 values[frame * features.bins + bin] = features.values[bin * features.frames + frame];
-        const auto input = require(Tensor::from_host(
-            {1, static_cast<std::int64_t>(frames), static_cast<std::int64_t>(features.bins)},
-            std::span<const float>(values), device()));
+        const auto input =
+            require(Tensor::from_host({1, static_cast<std::int64_t>(frames), static_cast<std::int64_t>(features.bins)},
+                                      std::span<const float>(values), device()));
         if (device().policy().replay.region_layers) {
             const auto outputs = impl_->context.replay(
                 "whisper_encoder:" + std::to_string(frames), std::array{input},
@@ -235,7 +247,8 @@ auto WhisperImpl::encode(const audio::WhisperFeatures& features, std::size_t fra
                     std::vector<Tensor> result{convolution, hidden};
                     for (const auto& layer : memory) result.insert(result.end(), {layer.key, layer.value});
                     return result;
-                }, false);
+                },
+                false);
             WhisperEncoderState result{outputs[0], outputs[1], {}};
             for (std::size_t layer = 0; layer < static_cast<std::size_t>(impl_->decoder_layers); ++layer)
                 result.layers.push_back({outputs[2 + 2 * layer], outputs[3 + 2 * layer]});
@@ -259,8 +272,8 @@ auto WhisperImpl::create_state(std::size_t capacity) -> Result<WhisperDecoderSta
         WhisperDecoderState result;
         result.capacity = capacity;
         const std::vector<float> mask(capacity, -1e9F);
-        result.mask = require(Tensor::from_host({1, 1, 1, static_cast<std::int64_t>(capacity)},
-                                                 std::span<const float>(mask), device()));
+        result.mask = require(
+            Tensor::from_host({1, 1, 1, static_cast<std::int64_t>(capacity)}, std::span<const float>(mask), device()));
         result.index = require(Tensor::empty({1}, DType::I32, device()));
         result.tokens = require(Tensor::empty({1}, DType::I32, device()));
         const std::vector<std::int64_t> shape{1, static_cast<std::int64_t>(capacity), impl_->hidden};
@@ -315,14 +328,14 @@ auto WhisperImpl::decode(const WhisperEncoderState& source, std::int32_t token, 
             const auto key = "whisper_decode_" + std::to_string(state.capacity) + '_' +
                              std::to_string(source.layers.front().key.size(1));
             output = context.replay(key, inputs, [&](std::span<const Tensor> step) {
-                    std::vector<layers::KeyValue> memory, cache;
-                    for (std::size_t layer = 0; layer < count; ++layer) {
-                        memory.push_back({step[3 + 2 * layer], step[4 + 2 * layer]});
-                        cache.push_back({step[3 + 2 * (count + layer)], step[4 + 2 * (count + layer)]});
-                    }
-                    const auto hidden = impl_->decoder->forward(context, step[0], memory, step[1], cache, step[2]);
-                    return std::vector{impl_->output->forward(context, hidden)};
-                })[0];
+                std::vector<layers::KeyValue> memory, cache;
+                for (std::size_t layer = 0; layer < count; ++layer) {
+                    memory.push_back({step[3 + 2 * layer], step[4 + 2 * layer]});
+                    cache.push_back({step[3 + 2 * (count + layer)], step[4 + 2 * (count + layer)]});
+                }
+                const auto hidden = impl_->decoder->forward(context, step[0], memory, step[1], cache, step[2]);
+                return std::vector{impl_->output->forward(context, hidden)};
+            })[0];
         } else {
             output =
                 impl_->decoder->forward(context, state.tokens, source.layers, state.mask, state.layers, state.index);

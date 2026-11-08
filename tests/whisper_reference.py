@@ -22,7 +22,7 @@ def main() -> None:
 
     processor = WhisperProcessor.from_pretrained(args.model, local_files_only=True)
     model = WhisperForConditionalGeneration.from_pretrained(
-        args.model, local_files_only=True, attn_implementation="eager"
+        args.model, local_files_only=True, attn_implementation="eager", torch_dtype=torch.float32
     ).eval()
     waveform, sample_rate = sf.read(args.wav, dtype="float32", always_2d=True)
     waveform = waveform.mean(axis=1)

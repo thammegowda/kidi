@@ -1,8 +1,24 @@
 {
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
+    "deps": "node tools/prepare-libs.mjs",
+    "test:extension": "node tools/test-extension.mjs",
+    "test:gmail": "node tools/test-gmail.mjs",
+    "test:articles": "node tools/test-article-extension.mjs",
+    "test:live-wikipedia": "node tools/test-live-wikipedia.mjs",
+    "test:edge-model-load": "node tools/test-edge-model-load.mjs",
+    "test:edge-summary": "KIDI_TEST_SUMMARY=1 node tools/test-edge-model-load.mjs",
+    "test:edge-translate": "node tools/test-edge-model-load.mjs",
+    "test:edge-read-aloud": "node tools/test-edge-read-aloud.mjs",
     "test:pages": "node tools/test-pages.mjs"
+  },
+  "dependencies": {
+    "mermaid": "12.0.0",
+    "pdfjs-dist": "6.4.299"
   },
   "devDependencies": {
     "playwright": "1.64.1"

@@ -1,6 +1,7 @@
 import {mkdir, cp, copyFile, readdir, readFile, rm, writeFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {join, dirname} from 'node:path';
+import {prepareWebLibraries} from './prepare-libs.mjs';
 import {unsignedHeapIndices} from './wasm-glue.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
@@ -9,7 +10,8 @@ const libraries = join(root, 'web/libs');
 export async function packageSite(destination, runtimes = {
     threads: join(root, 'build-wasm-threads'),
     gpu: join(root, 'build-webgpu'),
-}) {
+}, {isolationServiceWorker = true} = {}) {
+    await prepareWebLibraries();
     await rm(destination, {recursive: true, force: true});
     for (const [name, build] of Object.entries(runtimes)) {
         await mkdir(join(destination, name), {recursive: true});
@@ -55,18 +57,21 @@ export async function packageSite(destination, runtimes = {
     const integrationChecks = await readFile(join(root, 'tests/browser/gpu_runtime_integration.mjs'), 'utf8');
     await writeFile(join(destination, 'gpu-runtime-checks.mjs'),
         integrationChecks.replace('../../web/hosts/wasm/', './'));
-    await writeFile(join(destination, 'index.html'),
-        sharedIndex.replace('<script type="module" src="./app.js"></script>',
-            '<script src="./coi-serviceworker.js"></script>\n  <script type="module" src="./app.js"></script>'));
+    await writeFile(join(destination, 'index.html'), isolationServiceWorker
+        ? sharedIndex.replace('<script type="module" src="./app.js"></script>',
+            '<script src="./coi-serviceworker.js"></script>\n  <script type="module" src="./app.js"></script>')
+        : sharedIndex);
     for (const name of ['marked', 'dompurify', 'highlightjs', 'mermaid', 'js-yaml']) {
         await mkdir(join(destination, 'libs', name), {recursive: true});
         for (const file of await readdir(join(libraries, name)))
             await copyFile(join(libraries, name, file), join(destination, 'libs', name, file));
     }
-    await copyFile(join(libraries, 'coi-serviceworker/coi-serviceworker.js'),
-        join(destination, 'coi-serviceworker.js'));
-    await copyFile(join(libraries, 'coi-serviceworker/LICENSE'),
-        join(destination, 'coi-serviceworker.LICENSE.txt'));
+    if (isolationServiceWorker) {
+        await copyFile(join(libraries, 'coi-serviceworker/coi-serviceworker.js'),
+            join(destination, 'coi-serviceworker.js'));
+        await copyFile(join(libraries, 'coi-serviceworker/LICENSE'),
+            join(destination, 'coi-serviceworker.LICENSE.txt'));
+    }
     await copyFile(join(root, 'src/kidi/checkpoint/ggml/LICENSE'), join(destination, 'ggml.LICENSE.txt'));
     await writeFile(join(destination, '.nojekyll'), '');
     await mkdir(join(destination, 'icons'), {recursive: true});

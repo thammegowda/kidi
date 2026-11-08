@@ -62,6 +62,7 @@ public:
         -> Result<tensor::Tensor>;
     auto preparation_ns() const -> std::uint64_t;
     auto release_workspaces() -> void;
+    auto trim_workspaces() -> void;
     /// Accelerator compiling this model's captured steps, or empty.
     auto accelerator() const -> std::string_view;
     auto prefill_chunk_size(std::size_t requested) const -> std::size_t;

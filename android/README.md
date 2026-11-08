@@ -15,6 +15,7 @@ developer build's separate accessory and benchmark activities.
 ## Requirements
 
 - a recursive Kidi checkout;
+- Node.js 24+ and npm for acquiring the Mermaid frontend bundle;
 - JDK 17;
 - Android SDK Platform 36 and Build Tools 36.0.0;
 - Android NDK 28.0.13004108;
@@ -64,7 +65,10 @@ make apk
 
 This performs a clean optimized release build and lint, aligns/signs/verifies the
 APK, and writes `dist/kidi-release.apk`. It does not install anything or change
-phone data. By default it uses your existing `~/.android/debug.keystore`, so this
+phone data. Compact frontend libraries and icons are vendored; Gradle acquires
+the pinned Mermaid bundle and packages local assets with their licenses.
+See [dependency policy](../web/libs/README.md).
+By default it uses your existing `~/.android/debug.keystore`, so this
 is a release-mode APK signed for **local testing**, not public distribution.
 If that key does not exist, build `assembleDeveloper` once using the commands below.
 

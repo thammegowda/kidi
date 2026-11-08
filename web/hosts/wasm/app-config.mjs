@@ -50,5 +50,15 @@ export async function loadAppConfig(source = globalThis.KIDI_APP_CONFIG ||
         if (model.enabled !== false && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(model.model_id || ''))
             throw new Error(`models.${name}.model_id must be a Hugging Face model ID`);
     }
+    const chat = models.chat;
+    if ('system_prompt' in chat || 'translation_prompt' in chat || chat.editor?.prompts !== undefined)
+        throw new Error('Move model-local prompts to top-level prompts.system, prompts.translate, and prompts.<action>');
+    const prompts = object(root.prompts, 'prompts');
+    for (const [name, text] of Object.entries(prompts))
+        if (!name || typeof text !== 'string' || !text.trim())
+            throw new Error(`prompts.${name} must be non-empty text`);
+    for (const name of ['system', 'translate'])
+        if (!Object.hasOwn(prompts, name)) throw new Error(`prompts.${name} is required`);
+    if (Object.hasOwn(prompts, 'chat')) throw new Error('Use prompts.system for chat instead of prompts.chat');
     return root;
 }

@@ -144,9 +144,10 @@ History is re-prefilled each turn, not retained as a cross-turn KV cache.
 
 ## Whisper Transcription
 
-Kidi supports the multilingual `openai/whisper-tiny`, `openai/whisper-base`, and `openai/whisper-small` layouts directly
-from their Hugging Face `config.json`, FP32 Safetensors, tokenizer, preprocessor, and generation metadata. It does not
-create `model.yaml` or convert the checkpoint.
+Kidi supports the multilingual `openai/whisper-tiny`, `openai/whisper-base`, `openai/whisper-small`, and
+`openai/whisper-large-v3`, and `openai/whisper-large-v3-turbo` layouts from their Hugging Face `config.json`, Safetensors, tokenizer, preprocessor,
+and generation metadata. It does not require `model.yaml` or modify the original checkpoint.
+FP16/BF16 weights are prepared once into a reusable native INT8 cache; original FP32 models still load directly.
 
 ```bash
 python -m kidi transcribe \
@@ -156,9 +157,33 @@ python -m kidi transcribe \
   --max-new-tokens 128
 ```
 
-The input must be a 16 kHz PCM WAV and is limited to 30 seconds. Multichannel files are averaged to mono. Language
+The input must be a 16 kHz PCM WAV. Multichannel files are averaged to mono. Language
 `auto` selects among the checkpoint's multilingual language tokens; pass an explicit code to skip detection. Add
 `--task translate` to request speech-to-English translation. Whisper currently runs on YNNPACK CPU only.
+For long recordings, the native CLI reuses one loaded model across bounded, non-overlapping windows
+and flushes one transcript line after each window. `--chunk-seconds` defaults to 30 (range 1-30).
+Use `--max-new-tokens 444` for dense, full-length windows; the default is 128 tokens per window.
+Reaching the limit in a multi-window file fails with the completed output preserved.
+Window boundaries can affect words; windows do not share text context, and timestamps and speaker
+diarization are not supported. Text-only decoding can also stop early after pauses inside a window;
+use Whisper's timestamp-aware long-form decoder when transcript completeness is required.
+Individual embedded/microphone requests still accept at most 30 seconds.
+
+```bash
+python -m kidi transcribe --model @openai/whisper-large-v3-turbo \
+  --in recording-16k.wav --out transcript.txt --max-new-tokens 444 --profile
+```
+
+Large-v3-Turbo downloads about 1.62 GB and needs additional disk space for the derived INT8 cache.
+For other audio formats or sample rates, convert to 16 kHz PCM WAV before running Kidi.
+On macOS, CoreAudio-supported inputs can be converted locally with:
+
+```bash
+afconvert -f WAVE -d LEI16@16000 -c 1 recording.m4a recording-16k.wav
+```
+
+Classic and extensible PCM WAV containers are supported.
+
 In the browser, choose the speech model by Hub ID. Draft transcription replaces the composer text while recording; the
 last pass after stop may revise that draft.
 

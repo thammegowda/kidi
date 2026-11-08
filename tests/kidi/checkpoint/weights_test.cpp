@@ -102,7 +102,8 @@ auto write_fixture(const std::filesystem::path& path) -> void {
                          R"("weight2":{"dtype":"F32","shape":[2],"data_offsets":[12,20]},)"
                          R"("int8":{"dtype":"I8","shape":[2],"data_offsets":[20,22]},)"
                          R"("e4m3":{"dtype":"F8_E4M3","shape":[2],"data_offsets":[22,24]},)"
-                         R"("e5m2":{"dtype":"F8_E5M2","shape":[2],"data_offsets":[24,26]}})";
+                         R"("e5m2":{"dtype":"F8_E5M2","shape":[2],"data_offsets":[24,26]},)"
+                         R"("f16":{"dtype":"F16","shape":[4],"data_offsets":[26,34]}})";
     while (header.size() % 8 != 0) {
         header.push_back(' ');
     }
@@ -126,6 +127,8 @@ auto write_fixture(const std::filesystem::path& path) -> void {
     output.write(reinterpret_cast<const char*>(INT8.data()), sizeof(INT8));
     output.write(reinterpret_cast<const char*>(E4M3.data()), sizeof(E4M3));
     output.write(reinterpret_cast<const char*>(E5M2.data()), sizeof(E5M2));
+    const std::array<std::uint16_t, 4> f16{0x3c00, 0xc000, 1, 0x8000};
+    output.write(reinterpret_cast<const char*>(f16.data()), sizeof(f16));
 }
 
 } // namespace
@@ -219,7 +222,7 @@ auto main(int argc, char** argv) -> int {
     write_fixture(path);
 
     auto weights = kidi::checkpoint::Weights::load(path);
-    if (!weights || weights->size() != 6 || !weights->contains("weight")) {
+    if (!weights || weights->size() != 7 || !weights->contains("weight")) {
         std::cerr << "failed to map Safetensors fixture\n";
         return 1;
     }
@@ -238,9 +241,26 @@ auto main(int argc, char** argv) -> int {
     const auto e4m3 = weights->tensor("e4m3");
     const auto e5m2 = weights->tensor("e5m2");
     if (!bf16 || bf16->dtype() != kidi::checkpoint::DataType::BF16 || kidi::tensor::element_size(bf16->dtype()) != 2 ||
-        !int8 || int8->dtype() != kidi::checkpoint::DataType::I8 || !e4m3 || e4m3->dtype() != kidi::checkpoint::DataType::E4M3 ||
-        !e5m2 || e5m2->dtype() != kidi::checkpoint::DataType::E5M2) {
+        !int8 || int8->dtype() != kidi::checkpoint::DataType::I8 || !e4m3 ||
+        e4m3->dtype() != kidi::checkpoint::DataType::E4M3 || !e5m2 ||
+        e5m2->dtype() != kidi::checkpoint::DataType::E5M2) {
         std::cerr << "Safetensors dtype mapping is incorrect\n";
+        return 1;
+    }
+    const auto expanded = weights->float32_tensor("f16");
+    const auto expanded_bf16 = weights->float32_tensor("bf16");
+    const auto unchanged = weights->float32_tensor("weight");
+    if (!expanded || !expanded_bf16 || !unchanged ||
+        unchanged->host_bytes()->data() != std::as_const(*tensor).host_bytes()->data() ||
+        weights->float32_tensor("int8") || weights->float32_tensor("missing")) {
+        std::cerr << "checkpoint FP32 expansion or zero-copy contract failed\n";
+        return 1;
+    }
+    const auto half_values = expanded->data<float>(), bf16_values = expanded_bf16->data<float>();
+    if (!half_values || (*half_values)[0] != 1.F || (*half_values)[1] != -2.F ||
+        (*half_values)[2] != std::ldexp(1.F, -24) || !std::signbit((*half_values)[3]) || !bf16_values ||
+        (*bf16_values)[0] != 1.25F || (*bf16_values)[1] != -2.5F) {
+        std::cerr << "FP16/BF16 expansion produced incorrect values\n";
         return 1;
     }
 
@@ -253,7 +273,7 @@ auto main(int argc, char** argv) -> int {
     auto fused = mapped ? mapped->tensor("fused") : kidi::Result<kidi::tensor::Tensor>{std::unexpected(mapped.error())};
     auto fused_values = fused ? std::as_const(*fused).data<float>()
                               : kidi::Result<std::span<const float>>{std::unexpected(fused.error())};
-    if (!mapped || mapped->size() != 5 || mapped->contains("weight") || mapped->contains("weight2") || !fused ||
+    if (!mapped || mapped->size() != 6 || mapped->contains("weight") || mapped->contains("weight2") || !fused ||
         !fused_values || fused->shape().size() != 1 || fused->shape()[0] != 4 || (*fused_values)[0] != 1.25F ||
         (*fused_values)[1] != -2.5F || (*fused_values)[2] != 3.0F || (*fused_values)[3] != 4.0F) {
         std::cerr << "state mapping fusion is incorrect\n";
@@ -262,7 +282,8 @@ auto main(int argc, char** argv) -> int {
 
     const auto saved_path = std::filesystem::temp_directory_path() / "kidi-weights-roundtrip.safetensors";
     const auto state = weights->state_dict();
-    if (!state || !kidi::checkpoint::Weights::save(saved_path, *state) || kidi::checkpoint::Weights::save(saved_path, *state)) {
+    if (!state || !kidi::checkpoint::Weights::save(saved_path, *state) ||
+        kidi::checkpoint::Weights::save(saved_path, *state)) {
         std::cerr << "checkpoint serialization or no-overwrite contract failed\n";
         return 1;
     }
