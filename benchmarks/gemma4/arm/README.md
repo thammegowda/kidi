@@ -42,6 +42,69 @@ Optional flags also benchmark:
   Pass `--rerun <runtime>` to rerun specific runtimes or `--force` for a clean
   rerun of all requested runtimes.
 
+## Benchmark results
+
+Measured on an **Apple M5** CPU (`arm64`, 16 GB unified memory, macOS) using:
+
+- **Model:** `google/gemma-4-E2B-it` (35 layers, 1,536 hidden dim, 15 KV-donor
+  layers + 20 KV-sharing layers, 262,144 vocab + per-layer embeddings)
+- **Workload:** 4 CPU threads, batch 1, 1,024-token context, 31-token prompt
+  (`"Explain how binary search works in at least 300 words, including an example and its time complexity."`),
+  64 greedy output tokens (31 prefill tokens + first token for prefill/TTFT;
+  63 decode steps for decode throughput), 1 excluded warmup + 3 measured
+  independent runs (median reported, with min–max decode range).
+
+### 1. Matched `int4-g128` profile (`--profile int4-g128`)
+
+`kidi`, `arm`, and `onnx` execute over the **exact same** exported `int4-g128`
+weights and FP32 scales (`shared/model.safetensors`); `kidi_base` quantizes the
+original BF16 checkpoint on the fly into `int4-g128`; `llamacpp` runs a pure
+`Q4_0` (`g=32`) GGUF with `GGML_CPU_KLEIDIAI=ON`.
+
+| Runtime | Engine / Backend | Weight Format | Prefill (tok/s) | Decode (tok/s) | Decode Range (tok/s) | TTFT (ms) | Peak RSS (GiB) |
+|---|---|---|---:|---:|---:|---:|---:|
+| **KIDI (`kidi`)** | YNNPACK (`arm64` SME/DOTPROD) | Symmetric INT4 (`g=128`) | **531.24** | **50.67** | 50.65–50.70 | **58.35** | 1.68 |
+| **KIDI (`kidi_base`)** | YNNPACK (runtime-packed from BF16) | Symmetric INT4 (`g=128`) | **526.43** | **49.95** | 49.94–50.03 | **58.89** | 1.80 |
+| **ONNX Runtime v1.31.1 (`onnx`)** | MLAS + Arm KleidiAI (`MatMulNBits`) | Symmetric INT4 (`g=128`) | 396.27 | 50.65 | 50.31–50.91 | 78.23 | **1.45** |
+| **llama.cpp (`llamacpp`)** | GGML CPU + Arm KleidiAI | `Q4_0` (`g=32`) | 145.93 | 47.82 | 47.30–47.89 | 212.42 | 3.88 |
+| **Arm ExecuTorch v1.5.1 (`arm`)** | XNNPACK + Arm KleidiAI (`8da4w+emb4`) | Symmetric INT4 (`g=128`) | 234.11 | 43.51 | 43.44–43.64 | 132.42 | 1.84 |
+
+- **vs. Arm ExecuTorch v1.5.1 (`XNNPACK + KleidiAI`):** KIDI achieves **2.27x
+  faster prefill** (`531.24` vs. `234.11 tok/s`, reducing TTFT from `132.42 ms`
+  to `58.35 ms`) and **1.16x faster decode** (`50.67` vs. `43.51 tok/s`) with
+  lower peak RSS (`1.68 GiB` vs. `1.84 GiB`).
+
+### 2. Matched `int8` per-channel profile (`--profile int8`)
+
+`kidi`, `arm`, and `onnx` execute over the **exact same** per-channel symmetric
+INT8 weights and FP32 scales; `kidi_base` quantizes the BF16 checkpoint on the
+fly into per-channel INT8; `llamacpp` runs a pure `Q8_0` (`g=32`) GGUF with
+`GGML_CPU_KLEIDIAI=ON`.
+
+| Runtime | Engine / Backend | Weight Format | Prefill (tok/s) | Decode (tok/s) | Decode Range (tok/s) | TTFT (ms) | Peak RSS (GiB) |
+|---|---|---|---:|---:|---:|---:|---:|
+| **KIDI (`kidi_base`)** | YNNPACK (runtime-packed from BF16) | Symmetric INT8 per-channel | **586.03** | **33.46** | 29.14–33.48 | **52.90** | 2.96 |
+| **KIDI (`kidi`)** | YNNPACK (`arm64` SME/DOTPROD) | Symmetric INT8 per-channel | **578.64** | **33.34** | 32.29–33.40 | **53.57** | 3.16 |
+| **llama.cpp (`llamacpp`)** | GGML CPU + Arm KleidiAI | `Q8_0` (`g=32`) | 184.33 | 33.30 | 33.25–33.39 | 168.17 | 6.58 |
+| **ONNX Runtime v1.31.1 (`onnx`)** | MLAS + Arm KleidiAI (`MatMulIntegerToFloat`) | Symmetric INT8 per-channel | 309.40 | 31.29 | 31.18–31.39 | 100.19 | **2.25** |
+| **Arm ExecuTorch v1.5.1 (`arm`)** | XNNPACK + Arm KleidiAI (`8da8w+emb8`) | Symmetric INT8 per-channel | 436.82 | 28.42 | 28.42–28.66 | 70.97 | 2.44 |
+
+- **vs. Arm ExecuTorch v1.5.1 (`XNNPACK + KleidiAI`):** KIDI achieves **1.32x
+  faster prefill** (`578.64` vs. `436.82 tok/s`) and **1.17x faster decode**
+  (`33.34` vs. `28.42 tok/s`), sharing the first **30 generated tokens** before
+  floating-point tie-breaking diverges at token 31.
+
+### 3. Production mixed-precision / QAT reference models
+
+Google distributes official mixed-precision mobile checkpoints for Gemma 4 E2B
+that combine 4-bit transformer projections with 2-bit vocabulary/embedding
+tables:
+
+| Runtime | Checkpoint | Weight Format | Prefill (tok/s) | Decode (tok/s) | Decode Range (tok/s) | TTFT (ms) | Peak RSS (GiB) |
+|---|---|---|---:|---:|---:|---:|---:|
+| **KIDI (`kidi_qat`)** | `gemma-4-E2B-it-qat-mobile-transformers` | Static INT8 act + INT4 FFN/Attn + INT2 LM head + INT4 PLE | **863.39** | **70.49** | 70.15–70.55 | **35.91** | 2.06 |
+| **Google LiteRT-LM v0.17.1 (`litert`)** | `gemma-4-E2B-it.litertlm` (`XNNPACK`) | `.litertlm` mixed INT4/INT2 | 159.74 | 47.54 | 47.49–47.77 | 194.07 | **1.31** |
+
 ## Setup and run
 
 From the repository root, create an isolated export/build environment:
