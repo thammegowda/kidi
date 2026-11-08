@@ -591,6 +591,28 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
         spdlog::error("Whisper currently requires the YNNPACK backend");
         return 2;
     }
+    const auto chunk_seconds = arguments.get<std::size_t>("chunk_seconds");
+    const auto maximum_tokens = arguments.get<std::size_t>("max_new_tokens");
+    if (!chunk_seconds || chunk_seconds > 30 || !maximum_tokens || maximum_tokens > 444) {
+        spdlog::error("Whisper requires --chunk-seconds from 1 to 30 and --max-new-tokens from 1 to 444");
+        return 2;
+    }
+    const auto& input_path = arguments.get<std::filesystem::path>("input");
+    auto reader = kidi::audio::WavReader::open(input_path);
+    if (!reader) {
+        spdlog::error("{}", reader.error().message);
+        return 2;
+    }
+    if (reader->sample_rate() != 16000) {
+        spdlog::error("Whisper requires a 16 kHz PCM WAV; resample the input before transcription");
+        return 2;
+    }
+    const auto& output_path = arguments.get<std::string>("output");
+    if (output_path != "-" && std::filesystem::exists(output_path) &&
+        std::filesystem::equivalent(input_path, output_path)) {
+        spdlog::error("transcript output must not overwrite the input audio");
+        return 2;
+    }
     kidi::runtime::ynn::set_thread_count(threads);
     const auto started = std::chrono::steady_clock::now();
     auto transcriber = kidi::inference::Transcriber::load(directory, kidi::tensor::Device::cpu());
@@ -600,24 +622,13 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
     }
     const auto load_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-    auto waveform = kidi::audio::load_wav(arguments.get<std::filesystem::path>("input"));
-    if (!waveform) {
-        spdlog::error("{}", waveform.error().message);
-        return 2;
-    }
     const kidi::inference::TranscriptionOptions options{
         .language = arguments.get<std::string>("language"),
         .task = arguments.get<std::string>("task"),
-        .maximum_tokens = arguments.get<std::size_t>("max_new_tokens"),
+        .maximum_tokens = maximum_tokens,
     };
-    auto result = transcriber->transcribe(waveform->samples, waveform->sample_rate, options);
-    if (!result) {
-        spdlog::error("{}", result.error().message);
-        return result.error().code == kidi::ErrorCode::INVALID_ARGUMENT ? 2 : 1;
-    }
     std::ofstream file;
     std::ostream* output = &std::cout;
-    const auto& output_path = arguments.get<std::string>("output");
     if (output_path != "-") {
         file.open(output_path);
         if (!file) {
@@ -626,16 +637,50 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
         }
         output = &file;
     }
-    *output << result->text << '\n';
-    if (!*output) {
-        spdlog::error("cannot write transcription: {}", output_path);
-        return 1;
+    const auto chunk_samples = chunk_seconds * 16000;
+    const auto chunks = (reader->sample_count() + chunk_samples - 1) / chunk_samples;
+    kidi::inference::TranscriptionStats stats;
+    std::size_t tokens = 0;
+    std::string language;
+    for (std::uint64_t chunk = 0; chunk < chunks; ++chunk) {
+        auto samples = reader->read(chunk_samples);
+        if (!samples) {
+            spdlog::error("{}", samples.error().message);
+            return 2;
+        }
+        if (chunks > 1) spdlog::info("transcribing chunk {}/{}", chunk + 1, chunks);
+        auto result = transcriber->transcribe(*samples, reader->sample_rate(), options);
+        if (!result) {
+            spdlog::error("chunk {}: {}", chunk + 1, result.error().message);
+            return result.error().code == kidi::ErrorCode::INVALID_ARGUMENT ? 2 : 1;
+        }
+        if (result->token_ids.size() == maximum_tokens) {
+            spdlog::warn(
+                "chunk {} reached --max-new-tokens {}; output may be incomplete. "
+                "Increase the token limit (up to 444) or reduce --chunk-seconds",
+                chunk + 1, maximum_tokens);
+            if (chunks > 1) return 1;
+        }
+        *output << result->text << '\n' << std::flush;
+        if (!*output) {
+            spdlog::error("cannot write transcription: {}", output_path);
+            return 1;
+        }
+        stats.feature_ns += result->stats.feature_ns;
+        stats.encode_ns += result->stats.encode_ns;
+        stats.decode_ns += result->stats.decode_ns;
+        stats.preparation_ns += result->stats.preparation_ns;
+        tokens += result->token_ids.size();
+        if (language.empty())
+            language = result->language;
+        else if (language != result->language)
+            language = "mixed";
     }
     if (arguments.get<bool>("profile"))
         std::cerr << "kidi_profile|backend=ynnpack|threads=" << threads << "|model_load_ns=" << load_ns
-                  << "|feature_ns=" << result->stats.feature_ns << "|encoder_ns=" << result->stats.encode_ns
-                  << "|decode_ns=" << result->stats.decode_ns << "|preparation_ns=" << result->stats.preparation_ns
-                  << "|tokens=" << result->token_ids.size() << "|language=" << result->language << '\n';
+                  << "|feature_ns=" << stats.feature_ns << "|encoder_ns=" << stats.encode_ns
+                  << "|decode_ns=" << stats.decode_ns << "|preparation_ns=" << stats.preparation_ns
+                  << "|tokens=" << tokens << "|language=" << language << "|chunks=" << chunks << '\n';
     return 0;
 }
 
@@ -729,8 +774,8 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     chat_parser.description("Chat in the terminal with a loaded model. Type /help for shell commands.");
     auto& transcribe_parser = commands.add_parser("transcribe", "transcribe a 16 kHz WAV file with Whisper");
     transcribe_parser.description(
-        "Transcribe or translate speech with Whisper Tiny, Base, or Small: Hugging Face directory or GGML file with HF "
-        "sidecars.");
+        "Transcribe or translate speech with Whisper Tiny, Base, or Small. Long WAV files are processed in bounded "
+        "windows with one loaded model.");
     auto& synthesize_parser = commands.add_parser("synthesize", "synthesize speech from text");
     synthesize_parser.description("Synthesize a mono WAV file with a TTS model.");
     chat_parser.add_argument("--system").default_value(std::string{}).help("system instruction");
@@ -773,6 +818,10 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         .default_value(std::string("transcribe"))
         .choices({"transcribe", "translate"});
     transcribe_parser.add_argument("--max-new-tokens").dest("max_new_tokens").default_value<std::size_t>(128);
+    transcribe_parser.add_argument("--chunk-seconds")
+        .dest("chunk_seconds")
+        .default_value<std::size_t>(30)
+        .help("audio seconds per window (1 to 30); output is flushed after each window");
     synthesize_parser.add_argument("--text").required().help("text to synthesize");
     synthesize_parser.add_argument("-o", "--out")
         .dest("output")

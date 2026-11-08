@@ -2,10 +2,7 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
-#include <cstring>
-#include <fstream>
 #include <numbers>
 
 #include <yaml-cpp/yaml.h>
@@ -81,81 +78,6 @@ auto fft(float* input, int size, float* output) -> void {
 }
 
 } // namespace
-
-auto load_wav(const std::filesystem::path& path) -> Result<Waveform> {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) return std::unexpected(Error{ErrorCode::IO, "cannot open audio file: " + path.string()});
-    input.seekg(0, std::ios::end);
-    const auto size = input.tellg();
-    if (size < 0) return std::unexpected(Error{ErrorCode::IO, "cannot size audio file: " + path.string()});
-    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
-    input.seekg(0);
-    if (!input.read(reinterpret_cast<char*>(bytes.data()), size))
-        return std::unexpected(Error{ErrorCode::IO, "cannot read audio file: " + path.string()});
-    const auto equal = [&](std::size_t offset, const char* value) {
-        return offset + 4 <= bytes.size() && std::memcmp(bytes.data() + offset, value, 4) == 0;
-    };
-    const auto u16 = [&](std::size_t offset) {
-        return static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(bytes[offset]) |
-                                          std::to_integer<std::uint8_t>(bytes[offset + 1]) << 8);
-    };
-    const auto u32 = [&](std::size_t offset) {
-        return static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(bytes[offset]) |
-                                          std::to_integer<std::uint8_t>(bytes[offset + 1]) << 8 |
-                                          std::to_integer<std::uint8_t>(bytes[offset + 2]) << 16 |
-                                          std::to_integer<std::uint8_t>(bytes[offset + 3]) << 24);
-    };
-    if (bytes.size() < 12 || !equal(0, "RIFF") || !equal(8, "WAVE"))
-        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "audio input is not a RIFF/WAVE file"});
-    std::uint16_t format = 0, channels = 0, bits = 0;
-    std::uint32_t sample_rate = 0;
-    std::span<const std::byte> data;
-    for (std::size_t offset = 12; offset + 8 <= bytes.size();) {
-        const auto chunk_size = u32(offset + 4);
-        if (offset + 8 + chunk_size > bytes.size())
-            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "truncated WAVE chunk"});
-        if (equal(offset, "fmt ") && chunk_size >= 16) {
-            format = u16(offset + 8);
-            channels = u16(offset + 10);
-            sample_rate = u32(offset + 12);
-            bits = u16(offset + 22);
-        } else if (equal(offset, "data")) {
-            data = std::span(bytes).subspan(offset + 8, chunk_size);
-        }
-        offset += 8 + chunk_size + (chunk_size & 1);
-    }
-    if ((format != 1 && format != 3) || !channels || !sample_rate || !bits || data.empty() ||
-        (format == 1 && bits != 16 && bits != 24 && bits != 32) || (format == 3 && bits != 32))
-        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "unsupported WAVE sample format"});
-    const auto bytes_per_sample = bits / 8;
-    const auto frame_bytes = static_cast<std::size_t>(channels) * bytes_per_sample;
-    if (data.size() % frame_bytes)
-        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "misaligned WAVE sample data"});
-    Waveform result{{}, sample_rate};
-    result.samples.resize(data.size() / frame_bytes);
-    for (std::size_t frame = 0; frame < result.samples.size(); ++frame) {
-        double sum = 0;
-        for (std::size_t channel = 0; channel < channels; ++channel) {
-            const auto offset = frame * frame_bytes + channel * bytes_per_sample;
-            if (format == 3) {
-                const auto raw = static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(data[offset]) |
-                                                            std::to_integer<std::uint8_t>(data[offset + 1]) << 8 |
-                                                            std::to_integer<std::uint8_t>(data[offset + 2]) << 16 |
-                                                            std::to_integer<std::uint8_t>(data[offset + 3]) << 24);
-                sum += std::bit_cast<float>(raw);
-            } else {
-                std::int32_t value = 0;
-                for (std::size_t byte = 0; byte < bytes_per_sample; ++byte)
-                    value |= std::to_integer<std::uint8_t>(data[offset + byte]) << (byte * 8);
-                const auto shift = 32 - bits;
-                value = value << shift >> shift;
-                sum += static_cast<double>(value) / static_cast<double>(std::uint64_t{1} << (bits - 1));
-            }
-        }
-        result.samples[frame] = static_cast<float>(sum / channels);
-    }
-    return result;
-}
 
 auto WhisperFeatureExtractor::load(const std::filesystem::path& path) -> Result<WhisperFeatureExtractor> {
     try {

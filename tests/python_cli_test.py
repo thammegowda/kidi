@@ -98,6 +98,29 @@ class HubCliTest(unittest.TestCase):
                 self.assertIn("preprocessor_config.json", patterns)
                 self.assertIn("generation_config.json", patterns)
 
+    def test_whisper_window_validation(self):
+        import wave
+
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "speech.wav"
+            for rate in (8000, 16000):
+                with wave.open(str(path), "wb") as audio:
+                    audio.setparams((1, 2, rate, 0, "NONE", "not compressed"))
+                    audio.writeframes(b"\0\0" * 100)
+                original = path.read_bytes()
+                base = ["transcribe", "-m", "/nonexistent-kidi-test", "--in", str(path)]
+                for option, value in [("--chunk-seconds", "0"), ("--chunk-seconds", "31"),
+                                      ("--max-new-tokens", "0"), ("--max-new-tokens", "445")]:
+                    self.assertEqual(kidi.main([*base, option, value]), 2)
+                if rate == 8000:
+                    self.assertEqual(kidi.main(base), 2)
+                else:
+                    self.assertEqual(kidi.main([*base, "--out", str(path)]), 2)
+                    alias = Path(root) / "alias.wav"
+                    alias.hardlink_to(path)
+                    self.assertEqual(kidi.main([*base, "--out", str(alias)]), 2)
+                self.assertEqual(path.read_bytes(), original)
+
     @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
     def test_cached_setup_and_validation(self):
         import yaml
@@ -258,6 +281,45 @@ class HubCliTest(unittest.TestCase):
 
 
 class PythonCliTest(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("KIDI_WHISPER_MODEL") and os.environ.get("KIDI_WHISPER_WAV"),
+                         "set KIDI_WHISPER_MODEL and KIDI_WHISPER_WAV to an English PCM16 mono 16 kHz fixture")
+    def test_whisper_long_file(self):
+        import wave
+
+        command = ([os.environ["KIDI_BIN"]] if "KIDI_BIN" in os.environ else [sys.executable, "-m", "kidi"])
+        command += ["transcribe", "-m", os.environ["KIDI_WHISPER_MODEL"], "--language", "en"]
+        source = os.environ["KIDI_WHISPER_WAV"]
+        with wave.open(source, "rb") as audio:
+            self.assertEqual((audio.getnchannels(), audio.getsampwidth(), audio.getframerate()), (1, 2, 16000))
+            frames = audio.readframes(audio.getnframes())
+        self.assertGreater(len(frames), 0)
+        self.assertLessEqual(len(frames), 30 * 16000 * 2)
+        baseline = subprocess.run(command + ["--in", source, "--max-new-tokens", "444"],
+                                  text=True, capture_output=True, timeout=180)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        self.assertTrue(baseline.stdout.strip())
+        with tempfile.TemporaryDirectory() as root:
+            recording = Path(root) / "long.wav"
+            window = frames + bytes(30 * 16000 * 2 - len(frames))
+            with wave.open(str(recording), "wb") as audio:
+                audio.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                audio.writeframes(window + window + frames)
+            transcript = Path(root) / "transcript.txt"
+            result = subprocess.run(command + ["--in", str(recording), "--out", str(transcript),
+                                                "--max-new-tokens", "444", "--profile"],
+                                    text=True, capture_output=True, timeout=180)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([line.strip() for line in transcript.read_text().splitlines()],
+                             [baseline.stdout.strip()] * 3)
+            self.assertIn("|chunks=3", result.stderr)
+            limited = Path(root) / "limited.txt"
+            result = subprocess.run(command + ["--in", str(recording), "--out", str(limited),
+                                                "--max-new-tokens", "1"],
+                                    text=True, capture_output=True, timeout=180)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("reached --max-new-tokens", result.stderr)
+            self.assertEqual(limited.read_text(), "")
+
     @unittest.skipUnless(os.environ.get("KIDI_CHAT_MODEL"), "set KIDI_CHAT_MODEL for real chat CLI checks")
     def test_interactive_chat(self):
         command = ([os.environ["KIDI_BIN"]] if "KIDI_BIN" in os.environ else [sys.executable, "-m", "kidi"])
