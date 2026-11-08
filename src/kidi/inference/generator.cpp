@@ -21,15 +21,16 @@ namespace {
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t QNN_PREFILL_CAPTURE_TOKENS = 2048;
 constexpr std::size_t CPU_PREFILL_BUCKET = 128;
-auto uses_padded_prefill(tensor::Device device) -> bool {
+auto uses_padded_prefill(const model::Gemma4& model) -> bool {
 #if defined(__EMSCRIPTEN__)
+    (void)model;
     return false;
 #else
-    return device == tensor::Device::cpu();
+    return model->device() == tensor::Device::cpu() && model->accelerator().empty();
 #endif
 }
-auto prefill_bucket(tensor::Device device, std::size_t requested) -> std::size_t {
-    return uses_padded_prefill(device) ? std::min(requested, CPU_PREFILL_BUCKET) : requested;
+auto prefill_bucket(const model::Gemma4& model, std::size_t requested) -> std::size_t {
+    return uses_padded_prefill(model) ? std::min(requested, CPU_PREFILL_BUCKET) : requested;
 }
 
 auto elapsed(Clock::time_point start) -> std::uint64_t {
@@ -147,7 +148,7 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             require(model->set_checkpoint(weights, options.weight_bits, options.group_size, options.packed_prefill));
         }
 #if !defined(__EMSCRIPTEN__)
-        if (device == tensor::Device::cpu()) {
+        if (uses_padded_prefill(model)) {
             const auto cache_root = std::filesystem::is_directory(directory) ? directory : directory.parent_path();
             model->configure_cache(cache_root / ".kidi-cache" / "ynn-gff-v1", config["weights_file"].as<std::string>());
         }
@@ -210,18 +211,16 @@ auto Generator::execution() const -> std::string {
 auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size) -> Result<void> {
     try {
         const auto maximum_context = config_["model"]["max_position_embeddings"].as<std::size_t>();
-        auto capacity = std::min(context_size ? context_size : config_["decode"]["context_size"].as<std::size_t>(),
-                                 maximum_context);
-#if defined(__EMSCRIPTEN__)
-        capacity = std::min(capacity, std::size_t{128});
-#endif
-        if (capacity < 2) throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "warm-up context is too small"});
+        const auto requested = std::min(
+            context_size ? context_size : config_["decode"]["context_size"].as<std::size_t>(), maximum_context);
+        if (requested < 2) throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "warm-up context is too small"});
+        const auto capacity = std::min(requested, CPU_PREFILL_BUCKET);
         const auto maximum =
-            std::min(prefill_bucket(model_->device(), model_->prefill_chunk_size(prefill_chunk_size)), capacity - 1);
+            std::min(prefill_bucket(model_, model_->prefill_chunk_size(prefill_chunk_size)), requested - 1);
         const auto token = *tokenizer_.token_id("<bos>");
-        if (uses_padded_prefill(model_->device())) {
+        if (uses_padded_prefill(model_)) {
             {
-                auto state = require(model_->create_state(capacity));
+                auto state = require(model_->create_state(std::max(capacity, maximum)));
                 const std::vector prefill_tokens(maximum, token);
                 require(model_->prefill(prefill_tokens, state));
             }
@@ -230,11 +229,14 @@ auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size
                 const std::array decode_token{token};
                 require(model_->select_token(decode_token, state));
             }
+            model_->trim_workspaces();
         } else {
             auto state = require(model_->create_state(capacity));
             const std::array tokens{token};
             // The selected token is never read, so devices that finish asynchronously need no wait here.
             require(model_->select_token(tokens, state));
+            if (model_->accelerator().empty() && !model_->device().capabilities().memory.deferred())
+                model_->trim_workspaces();
         }
         return {};
     } catch (const ops::Failure& error) {
@@ -871,9 +873,9 @@ auto Generator::step() -> Result<GenerationStep> {
         };
         const auto chunk_length = [&](const QueuedGeneration& request) {
             const auto remaining = request.prompt.size() - request.state->position;
-            const auto maximum = prefill_bucket(
-                model_->device(), std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
-            if (!uses_padded_prefill(model_->device())) return std::min(remaining, maximum);
+            const auto maximum =
+                prefill_bucket(model_, std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
+            if (!uses_padded_prefill(model_)) return std::min(remaining, maximum);
             if (remaining == 1) return remaining;
             return std::min(remaining - 1, maximum);
         };
@@ -990,9 +992,9 @@ auto Generator::step() -> Result<GenerationStep> {
                     {request.id, require(model_->select_token(input, *request.state)), 0, started, true});
             else if (final_chunk)
                 selected = require(model_->forward_token(input, *request.state));
-            else if (uses_padded_prefill(model_->device())) {
+            else if (uses_padded_prefill(model_)) {
                 const auto maximum = prefill_bucket(
-                    model_->device(), std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
+                    model_, std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
                 const auto available = request.state->capacity - request.state->position;
                 const auto execution_length = maximum <= available ? maximum : length;
                 std::vector<std::int32_t> padded(execution_length, special_[2]);

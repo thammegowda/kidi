@@ -26,13 +26,15 @@ public:
     auto configure(const std::filesystem::path& directory, const std::filesystem::path& source) noexcept -> void;
     auto load(const FeedForwardCacheSpec& spec, std::size_t payload_size) const noexcept -> FeedForwardCacheEntry;
     auto store(const FeedForwardCacheSpec& spec, std::span<const std::uint8_t> payload) const noexcept -> void;
-    auto enabled() const noexcept -> bool { return enabled_; }
+    auto enabled() const noexcept -> bool { return readable_ || writable_; }
+    auto writable() const noexcept -> bool { return writable_; }
 
 private:
     std::filesystem::path directory_;
     std::uint64_t source_size_ = 0;
     std::int64_t source_mtime_ = 0;
-    bool enabled_ = false;
+    bool readable_ = false;
+    bool writable_ = false;
 };
 
 } // namespace kidi::runtime::ynn

@@ -3,7 +3,9 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 
@@ -38,7 +40,7 @@ public:
     explicit Mapping(const std::filesystem::path& path) {
         const auto descriptor = ::open(path.c_str(), O_RDONLY);
         if (descriptor < 0) return;
-        struct stat status {};
+        struct stat status{};
         if (::fstat(descriptor, &status) == 0 && status.st_size > 0) {
             size_ = static_cast<std::size_t>(status.st_size);
             auto* mapped = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, descriptor, 0);
@@ -85,17 +87,30 @@ auto write_all(int descriptor, const void* data, std::size_t size) -> bool {
 #endif
 } // namespace
 
-auto FeedForwardCache::configure(const std::filesystem::path& directory,
-                                 const std::filesystem::path& source) noexcept -> void {
-    enabled_ = false;
+auto FeedForwardCache::configure(const std::filesystem::path& directory, const std::filesystem::path& source) noexcept
+    -> void {
+    readable_ = false;
+    writable_ = false;
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
     try {
-        if (!std::filesystem::is_regular_file(source)) return;
-        directory_ = directory;
+        std::filesystem::path target = directory;
+        if (const auto* configured = std::getenv("KIDI_FFN_CACHE")) {
+            const std::string_view value(configured);
+            if (value.empty() || value == "0" || value == "off" || value == "false") return;
+            target = std::filesystem::path(value);
+        }
+        if (target.empty() || !std::filesystem::is_regular_file(source)) return;
+        std::error_code error;
+        if (!std::filesystem::is_directory(target, error)) std::filesystem::create_directories(target, error);
+        if (!std::filesystem::is_directory(target, error)) return;
+        directory_ = std::move(target);
         source_size_ = std::filesystem::file_size(source);
         source_mtime_ = std::filesystem::last_write_time(source).time_since_epoch().count();
-        enabled_ = true;
+        readable_ = ::access(directory_.c_str(), R_OK | X_OK) == 0;
+        writable_ = readable_ && ::access(directory_.c_str(), W_OK | X_OK) == 0;
     } catch (...) {
+        readable_ = false;
+        writable_ = false;
     }
 #else
     (void)directory;
@@ -107,7 +122,7 @@ auto FeedForwardCache::load(const FeedForwardCacheSpec& spec, std::size_t payloa
     -> FeedForwardCacheEntry {
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
     try {
-        if (!enabled_) return {};
+        if (!readable_) return {};
         auto mapping = std::make_shared<Mapping>(directory_ / filename(spec));
         if (!mapping->data() || mapping->size() != PAYLOAD_OFFSET + payload_size) return {};
         Header header;
@@ -133,7 +148,7 @@ auto FeedForwardCache::store(const FeedForwardCacheSpec& spec, std::span<const s
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
     std::filesystem::path temporary;
     try {
-        if (!enabled_ || payload.empty()) return;
+        if (!writable_ || payload.empty()) return;
         std::filesystem::create_directories(directory_);
         const auto destination = directory_ / filename(spec);
         static std::atomic<std::uint64_t> sequence = 0;

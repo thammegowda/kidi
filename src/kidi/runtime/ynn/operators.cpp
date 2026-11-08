@@ -1215,17 +1215,19 @@ public:
                 const auto down_output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[5]));
                 constexpr std::size_t TILE_SIZE = 2048;
                 const auto tiles = (intermediate + TILE_SIZE - 1) / TILE_SIZE;
-                const bool persistent = feed_forward_cache_.enabled();
-                const auto source_hash = persistent ? hash_tensor(inputs[3], hash_tensor(inputs[1])) : 0;
+                const bool lookup_cache = feed_forward_cache_.enabled();
+                const auto source_hash = lookup_cache ? hash_tensor(inputs[3], hash_tensor(inputs[1])) : 0;
                 ynn::FeedForwardCacheSpec cache_spec{.bits = static_cast<std::uint32_t>(bits),
                                                      .input_size = input_size,
                                                      .intermediate_size = intermediate,
                                                      .source_hash = source_hash};
                 const auto payload_size = 3 * input_size * intermediate / (8 / bits);
-                auto cached = feed_forward_cache_.load(cache_spec, payload_size);
+                auto cached =
+                    lookup_cache ? feed_forward_cache_.load(cache_spec, payload_size) : ynn::FeedForwardCacheEntry{};
+                const bool store_cache = !cached && feed_forward_cache_.writable();
                 if (cached) constant_owners.push_back(cached.owner);
                 std::vector<std::uint8_t> payload;
-                if (!cached && persistent) payload.reserve(payload_size);
+                if (store_cache) payload.reserve(payload_size);
                 std::size_t payload_offset = 0;
                 std::vector<std::uint32_t> gate_weight_ids(tiles), gate_scale_ids(tiles), up_weight_ids(tiles),
                     up_scale_ids(tiles), down_weight_ids(tiles);
@@ -1242,7 +1244,7 @@ public:
                         generated =
                             transpose_packed_tile(weight, bits, row_start, row_count, column_start, column_count);
                         bytes = generated;
-                        if (persistent) payload.insert(payload.end(), bytes.begin(), bytes.end());
+                        if (store_cache) payload.insert(payload.end(), bytes.begin(), bytes.end());
                     }
                     payload_offset += size;
                     const std::array<std::size_t, 2> shape{column_count, row_count};
@@ -1270,7 +1272,7 @@ public:
                     up_scale_ids[tile] = define_scales(intermediate + begin, length);
                     down_weight_ids[tile] = define_weight(inputs[3], 0, input_size, begin, length);
                 }
-                if (!cached && persistent) feed_forward_cache_.store(cache_spec, payload);
+                if (store_cache) feed_forward_cache_.store(cache_spec, payload);
                 check(::ynn::define_packed_feed_forward(
                     native, operands[0], scalar(spec.epsilon), gate_weight_ids.data(), gate_scale_ids.data(),
                     up_weight_ids.data(), up_scale_ids.data(), scalar(gate_output_scale), down_weight_ids.data(),
