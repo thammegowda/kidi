@@ -199,7 +199,7 @@ Kidi is built atop modular, open-source C++ libraries and quantization research:
 
 ### Citation
 
-If you use Kidi or its quantization recipes in your research or engineering work, please cite our [WMT 2026 paper](https://aclanthology.org/2026.wmt-main.136/):
+If you use the asymmetric quantization with MSE outlier clipping recipe in your work, please cite our [WMT 2026 paper](https://aclanthology.org/2026.wmt-main.136/):
 
 ```bibtex
 @inproceedings{gowda-2026-quantize,
