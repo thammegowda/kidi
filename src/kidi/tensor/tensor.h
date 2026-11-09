@@ -90,6 +90,7 @@ public:
     auto is_host_accessible() const noexcept -> bool;
     auto owns_unique_storage() const noexcept -> bool { return storage_ && storage_.use_count() == 1; }
     auto storage_identity() const noexcept -> const void* { return storage_.get(); }
+    auto release_pages(bool allow_anonymous = false) const noexcept -> void;
 
     auto host_bytes() -> Result<std::span<std::byte>>;
     auto host_bytes() const -> Result<std::span<const std::byte>>;

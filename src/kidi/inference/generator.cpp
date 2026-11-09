@@ -248,6 +248,7 @@ auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size
                 require(model_->select_token(decode_token, state));
             }
             model_->trim_workspaces();
+            prefill_warmed_ = true;
         } else {
             auto state = require(model_->create_state(capacity));
             const std::array tokens{token};
@@ -893,7 +894,7 @@ auto Generator::step() -> Result<GenerationStep> {
             const auto remaining = request.prompt.size() - request.state->position;
             const auto maximum =
                 prefill_bucket(model_, std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
-            if (!uses_padded_prefill(model_)) return std::min(remaining, maximum);
+            if (!prefill_warmed_ || !uses_padded_prefill(model_)) return std::min(remaining, maximum);
             if (remaining == 1) return remaining;
             return std::min(remaining - 1, maximum);
         };

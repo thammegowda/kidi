@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <utility>
@@ -88,12 +89,15 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
     if (short_copies < 1 || long_copies < 1 || short_copies > 4096 || long_copies > 4096)
         throw std::invalid_argument("Gemma prompt copies must be between 1 and 4096");
     if (decode_ahead > 64) throw std::invalid_argument("Gemma decode-ahead window must not exceed 64");
-    if (workload != "short" && workload != "long" && workload != "both")
-        throw std::invalid_argument("Gemma workload must be short, long, or both");
+    if (workload != "short" && workload != "long" && workload != "both" && workload != "eval")
+        throw std::invalid_argument("Gemma workload must be short, long, both, or eval");
     if (settings.contains("prompt") && custom_prompt.empty())
         throw std::invalid_argument("Gemma benchmark prompt must not be empty");
+    const auto weight_bits = settings.value("weight_bits", 0);
+    const auto group_size = settings.value("group_size", 128);
     const auto started = Clock::now();
-    auto generator = require(kidi::inference::Generator::load(directory, gemma_device(), 0, 128, packed_prefill));
+    auto generator =
+        require(kidi::inference::Generator::load(directory, gemma_device(), weight_bits, group_size, packed_prefill));
     require(generator.configure_serving({.maximum_active = 1,
                                          .maximum_requests = 1,
                                          .cache_token_budget = context,
@@ -110,6 +114,80 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
           {"ms", rounded(elapsed_ms(started))},
           {"native_qat", generator.native_qat()}},
          threads);
+
+    if (workload == "eval") {
+        std::ifstream eval_stream(settings.at("eval_protocol").get<std::string>());
+        if (!eval_stream) throw std::runtime_error("cannot open Gemma eval protocol");
+        const auto eval_protocol = nlohmann::json::parse(eval_stream);
+        const auto prompts = eval_protocol.at("prompts").get<std::vector<std::string>>();
+        std::vector<std::size_t> item_ids(prompts.size());
+        if (eval_protocol.contains("item_ids"))
+            item_ids = eval_protocol.at("item_ids").get<std::vector<std::size_t>>();
+        else
+            std::iota(item_ids.begin(), item_ids.end(), std::size_t{0});
+        const auto max_outputs = eval_protocol.value("max_output_tokens", output_tokens);
+        if (prompts.empty() || item_ids.size() != prompts.size())
+            throw std::invalid_argument("Gemma eval requires matching non-empty prompts and item_ids");
+        auto run_one = [&](const std::string& raw_prompt, std::size_t max_new) -> kidi::inference::TextGeneration {
+            kidi::inference::GenerationOptions options;
+            options.maximum_new_tokens = max_new;
+            options.context_size = context;
+            options.prefill_chunk_size = chunk;
+            options.raw_prompt = true;
+            options.stream_text = false;
+            options.ignore_eos = false;
+            require(generator.enqueue(raw_prompt, options));
+            std::optional<kidi::inference::TextGeneration> done;
+            while (generator.pending_requests()) {
+                auto step = require(generator.step());
+                for (auto& event : step.events)
+                    if (event.completed) done = std::move(*event.completed);
+            }
+            if (!done) throw std::runtime_error("missing eval completion");
+            return std::move(*done);
+        };
+        require(generator.warm_up(chunk, context));
+        const auto longest = *std::ranges::max_element(prompts, {}, &std::string::size);
+        for (std::size_t w = 0; w < warmups; ++w) {
+            (void)run_one(prompts.front(), std::min<std::size_t>(8, max_outputs));
+            if (longest != prompts.front()) (void)run_one(longest, std::min<std::size_t>(4, max_outputs));
+        }
+        std::vector<std::vector<std::int32_t>> all_token_ids;
+        std::vector<std::string> outputs;
+        all_token_ids.reserve(prompts.size());
+        outputs.reserve(prompts.size());
+        std::size_t total_prompt_tokens = 0, total_output_tokens = 0;
+        const auto eval_started = Clock::now();
+        for (std::size_t idx = 0; idx < prompts.size(); ++idx) {
+            const auto item_started = Clock::now();
+            auto res = run_one(prompts[idx], max_outputs);
+            const auto item_seconds = std::chrono::duration<double>(Clock::now() - item_started).count();
+            total_prompt_tokens += res.stats.prompt_tokens;
+            auto ids = std::move(res.generation.token_ids);
+            while (!ids.empty() && (ids.back() == 1 || ids.back() == 106)) ids.pop_back();
+            total_output_tokens += ids.size();
+            emit({{"stage", "eval_item"},
+                  {"id", item_ids[idx]},
+                  {"seconds", item_seconds},
+                  {"prompt_tokens", res.stats.prompt_tokens},
+                  {"output_tokens", ids.size()},
+                  {"token_ids", ids}},
+                 threads);
+            all_token_ids.push_back(std::move(ids));
+            outputs.push_back(std::move(res.text));
+        }
+        const auto eval_seconds = std::chrono::duration<double>(Clock::now() - eval_started).count();
+        emit({{"stage", "eval"},
+              {"model", "gemma"},
+              {"items", prompts.size()},
+              {"eval_seconds", eval_seconds},
+              {"prompt_tokens", total_prompt_tokens},
+              {"output_tokens", total_output_tokens},
+              {"outputs", outputs},
+              {"token_ids", all_token_ids}},
+             threads);
+        return;
+    }
 
     for (const bool long_prompt : {false, true}) {
         if (workload == (long_prompt ? "short" : "long")) continue;

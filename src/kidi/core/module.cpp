@@ -101,7 +101,11 @@ auto Module::assign_state(const StateDict& state, bool strict, bool copy) -> Res
         auto found = state.find(name);
         if (found == state.end()) continue;
         const auto& value = found->second;
-        if (!value.defined() || !value.is_contiguous() || value.dtype() != parameter.dtype ||
+        const bool compatible_scale_dtype =
+            parameter.dtype == tensor::DType::F32 && value.dtype() == tensor::DType::F16 &&
+            (name.ends_with("weight_scale") || name.ends_with("embedding_scale"));
+        if (!value.defined() || !value.is_contiguous() ||
+            (value.dtype() != parameter.dtype && !compatible_scale_dtype) ||
             !std::ranges::equal(value.shape(), parameter.shape))
             return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "parameter shape or dtype mismatch: " + name});
     }

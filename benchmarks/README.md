@@ -17,6 +17,14 @@ its directory name does not require running it on Android. Model loading and
 warm-up must be excluded from steady-state measurements. Label checkpoint,
 precision, input/output counts, context, threads, and timing boundaries explicitly.
 
+For a multi-framework Gemma 4 E2B CPU comparison against Arm's
+ExecuTorch/XNNPACK/KleidiAI stack, ONNX Runtime + KleidiAI, `llama.cpp` +
+KleidiAI, and Google's LiteRT-LM, see the
+[Arm CPU benchmark](gemma4/arm/README.md). It supports matched group-128 INT4
+(`int4-g128`) and per-channel INT8 (`int8`) profiles, caches per-runtime JSON
+results for incremental reruns, checks per-runtime determinism, and reports
+differences between the runtimes' independent greedy outputs.
+
 ## CUDA
 
 CUDA is optional and requires CUDA Toolkit 13 and cuBLAS. CPU-only builds do not

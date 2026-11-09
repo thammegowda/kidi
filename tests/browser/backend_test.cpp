@@ -30,7 +30,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_test() -> int {
         using namespace kidi;
         for (const auto* format : {"png", "jpeg"}) {
             std::ifstream stream(std::string("/fixtures/image.") + format, std::ios::binary);
-            const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+            const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream),
+                                                  std::istreambuf_iterator<char>()};
             const auto image = ops::require(image::prepare_gemma4(bytes, 70));
             if (image.patch_rows * image.patch_columns / 9 > 70 || image.patches.empty())
                 throw std::runtime_error("invalid browser image patches");
@@ -321,7 +322,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_test() -> int {
         std::cout << "Fused Q2/Q4/Q8 FFN decode/prefill and replay parity passed\n";
         {
             std::ifstream stream("/fixtures/image.jpeg", std::ios::binary);
-            const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+            const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(stream),
+                                                  std::istreambuf_iterator<char>()};
             ops::require(image::prepare_gemma4(bytes, 70));
             std::cout << "Tahoma JPEG preprocessing after JSPI resume passed\n";
         }
@@ -351,7 +353,8 @@ rope_parameters: {rope_theta: 10000}
                     } else {
                         auto values = ops::require(value.data<float>());
                         for (std::size_t index = 0; index < values.size(); ++index)
-                            values[index] = name.ends_with("scale") ? 0.125F : (static_cast<int>(index % 13) - 5) * 0.02F;
+                            values[index] =
+                                name.ends_with("scale") ? 0.125F : (static_cast<int>(index % 13) - 5) * 0.02F;
                     }
                     parameters.emplace("model." + name, std::move(value));
                 }
@@ -460,7 +463,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_diagnose() -> int {
         auto host_normalized = cpu.rms_norm(host_hidden, norm_weight, epsilon);
         auto gpu_normalized = gpu.rms_norm(device_hidden, norm_weight, epsilon);
         compare("input_norm", host_normalized, gpu_normalized);
-        for (const auto* name : {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"}) {
+        for (const auto* name : {"self_attn.q_proj", "self_attn.kv_proj"}) {
             const auto prefix = first + name + '.';
             const auto weight = state.at(prefix + "weight");
             const auto scales = state.at(prefix + "weight_scale");

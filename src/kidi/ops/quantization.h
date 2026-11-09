@@ -4,9 +4,9 @@
 
 namespace kidi::ops {
 struct PackedWeight {
-    tensor::Tensor values, scales;
+    tensor::Tensor values, scales, zeros;
     std::int32_t bits, group_size;
 };
-auto pack_weight(const tensor::Tensor& weight, std::int32_t bits = 4, std::int32_t group_size = 128)
-    -> Result<PackedWeight>;
+auto pack_weight(const tensor::Tensor& weight, std::int32_t bits = 4, std::int32_t group_size = 128,
+                 bool asymmetric_clip = false) -> Result<PackedWeight>;
 } // namespace kidi::ops
