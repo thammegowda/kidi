@@ -92,6 +92,12 @@ class ArmGemmaBenchmarkTest(unittest.TestCase):
         int8_values, int8_scales = BENCHMARK.pack_int8(torch.tensor([[-127., 0., 63.5, 127.]]), chunk_rows=1)
         self.assertTrue(torch.equal(int8_scales, torch.tensor([[1.]])))
         self.assertEqual(int8_values.view(torch.int8).tolist(), [[-127, 0, 64, 127]])
+        asym_values, asym_scales, asym_zeros = BENCHMARK.pack_int4_asym_clip(
+            torch.tensor([[-0.2, 0.0, 0.5, 1.0]]), group_size=2, chunk_rows=1, asymmetric=True
+        )
+        self.assertEqual(asym_values.shape, (1, 2))
+        self.assertEqual(asym_scales.shape, (1, 2))
+        self.assertEqual(asym_zeros.shape, (1, 2))
         with self.assertRaisesRegex(ValueError, "non-finite"):
             BENCHMARK.pack_int4(torch.tensor([[float("nan"), 0.]]))
 
@@ -136,6 +142,56 @@ class ArmGemmaBenchmarkTest(unittest.TestCase):
             self.assertIsNone(BENCHMARK.load_cached_run(work, "kidi", ["bench", "model"], "changed", protocol))
             changed_protocol = {**protocol, "threads": 8}
             self.assertIsNone(BENCHMARK.load_cached_run(work, "kidi", ["bench", "model"], "abc123", changed_protocol))
+
+    def test_eval_cleaning_and_cache_jsonl(self):
+        self.assertEqual(
+            BENCHMARK.clean_translation_text("<|channel>thought\n thinking <channel|>\nHello world\n<turn|>"),
+            "Hello world",
+        )
+        if importlib.util.find_spec("sacrebleu") is None:
+            self.skipTest("optional sacrebleu dependency is not installed")
+
+        class FakeTokenizer:
+            def decode(self, ids, skip_special_tokens=True):
+                return "Photo: t.me/qr_tjm" if ids == [10, 11] else "Great backpack"
+
+        eval_protocol = {
+            "mode": "eval",
+            "task": "wmt23",
+            "langs": ["ja", "uk"],
+            "seed": 42,
+            "items": 2,
+            "prompts": ["p0", "p1"],
+            "input_token_ids_list": [[1, 2], [3, 4]],
+            "sources": ["s0", "s1"],
+            "references": ["Photo: t.me/qr_tjm", "Great backpack"],
+            "item_langs": ["ja", "uk"],
+            "max_output_tokens": 32,
+            "context_tokens": 1024,
+            "warmups": 1,
+            "threads": 4,
+        }
+        records = [{
+            "stage": "eval",
+            "items": 2,
+            "eval_seconds": 0.5,
+            "prompt_tokens": 20,
+            "output_tokens": 4,
+            "token_ids": [[10, 11, 106], [12, 13, 1]],
+        }]
+        summary = BENCHMARK.summarize_eval(records, eval_protocol, FakeTokenizer())
+        self.assertAlmostEqual(summary["chrf"], 100.0, places=3)
+        self.assertEqual(summary["output_tokens"], 4)
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            eval_run = {"command": ["bench"], "binary_sha256": "abc", "records": records, "summary": summary}
+            BENCHMARK.save_cached_eval(work, "kidi", eval_run, eval_protocol)
+            output_jsonl = (work / "results" / "kidi_eval.output.jsonl").read_text().splitlines()
+            self.assertEqual(len(output_jsonl), 2)
+            loaded = BENCHMARK.load_cached_eval(work, "kidi", ["bench"], "abc", eval_protocol, FakeTokenizer())
+            self.assertIsNotNone(loaded)
+            self.assertTrue(loaded["cached"])
+            self.assertAlmostEqual(loaded["summary"]["chrf"], 100.0, places=3)
 
 
 if __name__ == "__main__":

@@ -340,11 +340,15 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
                 {ErrorCode::INVALID_ARGUMENT, "QAT checkpoint precision is trained; do not override weight bits"});
         const auto checkpoint = require(weights.state_dict());
         const auto declared = state_dict();
-        StateDict state;
+        StateDict state, zeros_state;
         for (const auto& [key, value] : checkpoint) {
             constexpr std::string_view PREFIX = "model.language_model.";
             if (!key.starts_with(PREFIX) && !(impl_->qat && key.starts_with("lm_head."))) continue;
             const auto name = key.starts_with(PREFIX) ? key.substr(PREFIX.size()) : key;
+            if (name.ends_with(".weight_zero")) {
+                zeros_state.emplace(name, value);
+                continue;
+            }
             auto declaration = name;
             for (const auto marker : {std::string_view(".mlp.gate_proj."), std::string_view(".mlp.up_proj.")})
                 if (const auto position = name.find(marker); position != std::string::npos)
@@ -445,6 +449,15 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
                 state.erase(first);
                 state.erase(second);
             }
+            const auto first_zero = zeros_state.find(std::string(prefix) + std::string(first_stem) + ".weight_zero");
+            const auto second_zero = zeros_state.find(std::string(prefix) + std::string(second_stem) + ".weight_zero");
+            if (first_zero != zeros_state.end() && second_zero != zeros_state.end()) {
+                const auto fused_zero = std::string(prefix) + std::string(fused_stem) + ".weight_zero";
+                zeros_state.emplace(fused_zero,
+                                    concatenate_projection_rows(first_zero->second, second_zero->second));
+                zeros_state.erase(first_zero);
+                zeros_state.erase(second_zero);
+            }
         };
         for (std::int32_t layer = 0; layer < impl_->layer_count; ++layer) {
             const auto layer_prefix = "layers." + std::to_string(layer);
@@ -468,15 +481,28 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
         impl_->context = ops::Context(device(), packed_prefill, std::nullopt, impl_->parameter_dtype);
         impl_->weight_bits = weight_bits;
         impl_->packed_prefill = packed_prefill;
-        if (weight_bits)
+        if (!zeros_state.empty()) {
+            const auto bound = state_dict();
+            for (auto& [zero_name, zero_tensor] : zeros_state) {
+                const auto scale_name =
+                    zero_name.substr(0, zero_name.size() - std::string_view(".weight_zero").size()) + ".weight_scale";
+                if (const auto found = bound.find(scale_name); found != bound.end())
+                    impl_->context.bind_packed_zero(found->second, require(zero_tensor.to(device())));
+            }
+        }
+        if (weight_bits) {
+            const bool asym_clip = std::getenv("KIDI_ASYMMETRIC_CLIP") != nullptr &&
+                                   std::string_view(std::getenv("KIDI_ASYMMETRIC_CLIP")) == "1";
             for (const auto& [name, weight] : state_dict())
                 if (weight.dimensions() == 2 && name != "embed_tokens.weight" &&
                     name != "embed_tokens_per_layer.weight") {
                     const bool group_quantized = weight_bits == 4 && weight.size(1) % group_size == 0;
                     impl_->context.prepare_linear_weights(
                         weight, group_quantized ? 4 : 8,
-                        group_quantized ? group_size : static_cast<std::int32_t>(weight.size(1)), packed_prefill);
+                        group_quantized ? group_size : static_cast<std::int32_t>(weight.size(1)), packed_prefill,
+                        group_quantized && asym_clip);
                 }
+        }
         return {};
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());

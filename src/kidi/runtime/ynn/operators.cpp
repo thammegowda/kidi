@@ -980,64 +980,36 @@ private:
             const auto* k_base = key_data + key_start_ * head_width;
             const auto* v_base = value_data + key_start_ * head_width;
             const auto* bias = mask;
-#if defined(__APPLE__)
-            std::size_t valid_keys = 0;
-            bool prefix_zero_mask = true;
-            for (std::size_t key = 0; key < keys; ++key) {
-                const auto b = bias ? bias[key * mask_strides[3]] : 0.F;
-                if (b == 0.F && valid_keys == key) {
-                    ++valid_keys;
-                } else if (b > -1e8F) {
-                    prefix_zero_mask = false;
-                    break;
-                }
+            std::size_t active_keys = keys;
+            if (bias) {
+                while (active_keys > 0 && bias[(active_keys - 1) * mask_strides[3]] <= -1e8F) --active_keys;
             }
-            if (prefix_zero_mask && valid_keys > 0) {
-                scratch_.resize(8 * valid_keys);
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 8, static_cast<int>(valid_keys),
-                            static_cast<int>(head_width), scale, query_data, static_cast<int>(head_width), k_base,
-                            static_cast<int>(head_width), 0.F, scratch_.data(), static_cast<int>(valid_keys));
-                for (std::size_t h = 0; h < 8; ++h) {
-                    auto* scores = scratch_.data() + h * valid_keys;
-                    float largest = scores[0];
-                    for (std::size_t key = 1; key < valid_keys; ++key) largest = std::max(largest, scores[key]);
-                    const float neg_largest = -largest;
-                    vDSP_vsadd(scores, 1, &neg_largest, scores, 1, valid_keys);
-                    const int count = static_cast<int>(valid_keys);
-                    vvexpf(scores, scores, &count);
-                    float total = 0.F;
-                    vDSP_sve(scores, 1, &total, valid_keys);
-                    const float inv_total = 1.F / total;
-                    vDSP_vsmul(scores, 1, &inv_total, scores, 1, valid_keys);
-                }
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 8, static_cast<int>(head_width),
-                            static_cast<int>(valid_keys), 1.F, scratch_.data(), static_cast<int>(valid_keys), v_base,
-                            static_cast<int>(head_width), 0.F, output_data, static_cast<int>(head_width));
+            if (!active_keys) {
+                std::fill_n(output_data, width, 0.F);
                 return;
             }
-#endif
-            scratch_.resize(8 * keys);
+            scratch_.resize(8 * active_keys);
             std::array<float, 8> largest;
             largest.fill(-std::numeric_limits<float>::infinity());
-            for (std::size_t key = 0; key < keys; ++key) {
+            for (std::size_t key = 0; key < active_keys; ++key) {
                 const auto b = bias ? bias[key * mask_strides[3]] : 0.F;
                 if (b <= -1e8F) {
                     for (std::size_t h = 0; h < 8; ++h)
-                        scratch_[h * keys + key] = -std::numeric_limits<float>::infinity();
+                        scratch_[h * active_keys + key] = -std::numeric_limits<float>::infinity();
                     continue;
                 }
                 const auto* k_row = k_base + key * head_width;
                 for (std::size_t h = 0; h < 8; ++h) {
                     const auto s = dot(query_data + h * head_width, k_row, head_width) * scale + b;
-                    scratch_[h * keys + key] = s;
+                    scratch_[h * active_keys + key] = s;
                     largest[h] = std::max(largest[h], s);
                 }
             }
             std::array<float, 8> inv_total{};
             for (std::size_t h = 0; h < 8; ++h) {
                 float total = 0;
-                auto* scores = scratch_.data() + h * keys;
-                for (std::size_t key = 0; key < keys; ++key) {
+                auto* scores = scratch_.data() + h * active_keys;
+                for (std::size_t key = 0; key < active_keys; ++key) {
                     scores[key] = scores[key] == -std::numeric_limits<float>::infinity()
                                       ? 0.F
                                       : std::exp(scores[key] - largest[h]);
@@ -1046,15 +1018,14 @@ private:
                 inv_total[h] = 1.F / total;
             }
             std::fill_n(output_data, width, 0.F);
-            for (std::size_t key = 0; key < keys; ++key) {
+            for (std::size_t key = 0; key < active_keys; ++key) {
                 const auto b = bias ? bias[key * mask_strides[3]] : 0.F;
                 if (b <= -1e8F) continue;
                 const auto* v_row = v_base + key * head_width;
-                std::array<float, 8> weights;
-                for (std::size_t h = 0; h < 8; ++h) weights[h] = scratch_[h * keys + key] * inv_total[h];
-                for (std::size_t index = 0; index < head_width; ++index) {
-                    const float v_val = v_row[index];
-                    for (std::size_t h = 0; h < 8; ++h) output_data[h * head_width + index] += weights[h] * v_val;
+                for (std::size_t h = 0; h < 8; ++h) {
+                    const float w = scratch_[h * active_keys + key] * inv_total[h];
+                    auto* out_h = output_data + h * head_width;
+                    for (std::size_t index = 0; index < head_width; ++index) out_h[index] += w * v_row[index];
                 }
             }
             return;
@@ -1117,19 +1088,31 @@ class CpuOperator final : public Operator {
 public:
     CpuOperator(ynn::Executable executable, std::size_t count, std::size_t dynamic_count, DType dtype,
                 std::vector<std::int64_t> shape, tensor::Arena& arena,
-                std::vector<std::shared_ptr<const void>> constant_owners = {})
+                std::vector<std::shared_ptr<const void>> constant_owners = {}, const Tensor& block_zeros = {},
+                std::size_t block_size = 0)
         : executable_(std::move(executable)),
           count_(count),
           dynamic_count_(dynamic_count),
           dtype_(dtype),
           shape_(std::move(shape)),
           pool_(&arena),
-          constant_owners_(std::move(constant_owners)) {}
+          constant_owners_(std::move(constant_owners)),
+          block_size_(block_size) {
+        if (block_zeros.defined() && block_size_ > 0) {
+            zeros_n_ = static_cast<std::size_t>(block_zeros.size(0));
+            zeros_b_ = static_cast<std::size_t>(block_zeros.size(1));
+            const auto* src = require(block_zeros.data<float>()).data();
+            zeros_t_.resize(zeros_b_ * zeros_n_);
+            for (std::size_t n = 0; n < zeros_n_; ++n)
+                for (std::size_t b = 0; b < zeros_b_; ++b) zeros_t_[b * zeros_n_ + n] = src[n * zeros_b_ + b];
+        }
+    }
     auto run(TensorInputs inputs) -> Tensor override {
         for (std::size_t index = 0; index < dynamic_count_; ++index) require(executable_.bind(index, inputs[index]));
         auto output = pool_.acquire(shape_, dtype_, tensor::Device::cpu());
         require(executable_.bind(count_, output));
         require(executable_.invoke());
+        if (!zeros_t_.empty()) apply_block_zeros(inputs[0], output);
         return output;
     }
     auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
@@ -1152,16 +1135,60 @@ public:
         require(executable_.bind(count_, outputs.back()));
         if (outputs.size() == 2) require(executable_.bind(count_ + 1, outputs.front()));
         require(executable_.invoke());
+        if (!zeros_t_.empty()) apply_block_zeros(inputs[0], outputs.back());
     }
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
+    auto apply_block_zeros(const Tensor& input, Tensor& output) -> void {
+        const auto* x = require(input.data<float>()).data();
+        auto* y = require(output.data<float>()).data();
+        const auto K = zeros_b_ * block_size_;
+        const auto M = input.numel() / K;
+        block_sums_.resize(M * zeros_b_);
+        for (std::size_t m = 0; m < M; ++m) {
+            for (std::size_t b = 0; b < zeros_b_; ++b) {
+                const auto* x_block = x + (m * zeros_b_ + b) * block_size_;
+                float sum = 0.F;
+                for (std::size_t k = 0; k < block_size_; ++k) sum += x_block[k];
+                block_sums_[m * zeros_b_ + b] = sum;
+            }
+        }
+        constexpr std::size_t TILE_N = 1024;
+        const auto tiles = (zeros_n_ + TILE_N - 1) / TILE_N;
+        const auto tasks = M * zeros_b_ * zeros_n_ <= 65536 ? std::size_t{1} : std::min(ynn::thread_count(), tiles);
+        const auto tiles_per_task = (tiles + tasks - 1) / tasks;
+        const auto run_task = [&](std::size_t task) {
+            const auto t_begin = task * tiles_per_task, t_end = std::min(tiles, t_begin + tiles_per_task);
+            for (std::size_t tile = t_begin; tile < t_end; ++tile) {
+                const auto n_begin = tile * TILE_N;
+                const auto n_count = std::min(TILE_N, zeros_n_ - n_begin);
+                for (std::size_t m = 0; m < M; ++m) {
+                    auto* y_row = y + m * zeros_n_ + n_begin;
+                    const auto* sums = block_sums_.data() + m * zeros_b_;
+                    for (std::size_t b = 0; b < zeros_b_; ++b) {
+                        const float s = sums[b];
+                        const auto* z_row = zeros_t_.data() + b * zeros_n_ + n_begin;
+                        for (std::size_t i = 0; i < n_count; ++i) y_row[i] += s * z_row[i];
+                    }
+                }
+            }
+        };
+        if (tasks <= 1) {
+            run_task(0);
+            return;
+        }
+        require(ynn::parallel_for(tasks, run_task));
+    }
+
     ynn::Executable executable_;
     std::size_t count_, dynamic_count_;
     DType dtype_;
     std::vector<std::int64_t> shape_;
     OutputPool pool_;
     std::vector<std::shared_ptr<const void>> constant_owners_;
+    std::vector<float> zeros_t_, block_sums_;
+    std::size_t block_size_ = 0, zeros_n_ = 0, zeros_b_ = 0;
 };
 class CpuBackend final : public OperatorBackend {
 public:
@@ -1216,14 +1243,16 @@ public:
         }
         const auto flags = inputs[0].dtype() == DType::BF16 ? YNN_FLAG_NO_EXCESS_PRECISION : 0;
         const bool paired = spec.operation == Operation::RESIDUAL_NORM;
-        auto graph = require(ynn::Graph::create(inputs.size() + (paired ? 2 : 1), flags));
+        const bool has_packed_zero = spec.operation == Operation::PACKED_LINEAR && inputs.size() == 4;
+        const auto graph_input_count = has_packed_zero ? 3U : inputs.size();
+        auto graph = require(ynn::Graph::create(graph_input_count + (paired ? 2 : 1), flags));
         auto native = graph.get();
         const auto constant =
             !spec.dynamic_parameters &&
             (spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
              spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RMS_NORM ||
              spec.operation == Operation::PACKED_LINEAR || spec.operation == Operation::GATED_FEED_FORWARD || paired);
-        const std::size_t dynamic_count = constant ? (paired ? 2 : 1) : inputs.size();
+        const std::size_t dynamic_count = constant ? (paired ? 2 : 1) : graph_input_count;
         const std::size_t column_alignment = spec.operation == Operation::PACKED_LINEAR ? 8 / spec.attributes[0] : 1;
         const auto padded_columns =
             spec.operation == Operation::PACKED_LINEAR
@@ -1231,7 +1260,7 @@ public:
                 : 0;
         const bool pad_columns = spec.operation == Operation::PACKED_LINEAR && padded_columns != inputs[1].size(0);
         std::vector<std::uint32_t> operands;
-        for (std::size_t index = 0; index < inputs.size(); ++index) {
+        for (std::size_t index = 0; index < graph_input_count; ++index) {
             auto id = static_cast<std::uint32_t>(index);
             std::vector<std::size_t> shape(inputs[index].shape().begin(), inputs[index].shape().end());
             const bool parameter = index >= dynamic_count;
@@ -1659,7 +1688,7 @@ public:
             case Operation::SNAKE_QUANTIZED_LINEAR:
                 break;
         }
-        auto output_id = static_cast<std::uint32_t>(inputs.size());
+        auto output_id = static_cast<std::uint32_t>(graph_input_count);
         if (pad_columns) {
             const std::int32_t axis = -1;
             const std::int64_t start = 0, end = inputs[1].size(0), stride = 1;
@@ -1695,20 +1724,20 @@ public:
         if (small_projection || small_attention) operator_threads = 1;
 #endif
         auto executable = require(std::move(graph).compile(operator_threads));
+        require(executable.reshape());
+        auto shape = require(executable.shape(output_id));
+        auto op = std::make_unique<CpuOperator>(
+            std::move(executable), graph_input_count, dynamic_count, dtype,
+            std::vector<std::int64_t>(shape.begin(), shape.end()), arena_, std::move(constant_owners),
+            has_packed_zero ? inputs[3] : Tensor{},
+            has_packed_zero ? static_cast<std::size_t>(spec.attributes[1]) : 0);
         if (constant) {
-            const bool release_anonymous =
-                spec.operation == Operation::PACKED_LINEAR && inputs[0].numel() == inputs[0].size(-1) && !pad_columns;
-            for (std::size_t index = dynamic_count; index < inputs.size(); ++index)
-                inputs[index].release_pages(release_anonymous && index == 1);
+            for (std::size_t index = dynamic_count; index < inputs.size(); ++index) inputs[index].release_pages();
 #if defined(__APPLE__)
             if (inputs[1].nbytes() >= (std::size_t{8} << 20)) ::malloc_zone_pressure_relief(nullptr, 0);
 #endif
         }
-        require(executable.reshape());
-        auto shape = require(executable.shape(output_id));
-        return std::make_unique<CpuOperator>(std::move(executable), inputs.size(), dynamic_count, dtype,
-                                             std::vector<std::int64_t>(shape.begin(), shape.end()), arena_,
-                                             std::move(constant_owners));
+        return op;
     }
 
 private:

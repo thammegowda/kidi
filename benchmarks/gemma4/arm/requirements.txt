@@ -3,3 +3,6 @@ torch==2.14.1
 torchao==0.18.0
 safetensors>=0.4,<1
 tokenizers>=0.21,<1
+sacrebleu==2.6.0
+lxml>=5,<7
+

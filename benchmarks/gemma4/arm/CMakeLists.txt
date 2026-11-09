@@ -39,8 +39,11 @@ foreach(target optimized_native_cpu_ops_lib quantized_ops_lib)
     executorch_target_link_options_shared_lib(${target})
 endforeach()
 
-if(DEFINED LLAMACPP_SOURCE_DIR AND DEFINED LLAMACPP_BUILD_DIR AND
-   EXISTS "${LLAMACPP_SOURCE_DIR}/include/llama.h")
+set(LLAMACPP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../.cache/llama.cpp-bench"
+    CACHE PATH "Path to llama.cpp checkout")
+set(LLAMACPP_BUILD_DIR "${LLAMACPP_SOURCE_DIR}/build-cpu"
+    CACHE PATH "Path to llama.cpp CPU build directory")
+if(EXISTS "${LLAMACPP_SOURCE_DIR}/include/llama.h" AND EXISTS "${LLAMACPP_BUILD_DIR}/bin")
     add_executable(llamacpp_gemma4_bench llamacpp_bench.cpp)
     target_include_directories(llamacpp_gemma4_bench PRIVATE
         "${LLAMACPP_SOURCE_DIR}/include"

@@ -78,6 +78,7 @@ struct Context::Impl {
         std::int32_t bits = 0;
         std::int32_t group_size = 0;
         bool packed_prefill = false;
+        bool asymmetric_clip = false;
         bool released = false;
     };
     struct DequantizedBinding {
@@ -93,6 +94,7 @@ struct Context::Impl {
         auto operator<=>(const DequantizedKey&) const = default;
     };
     std::map<const std::byte*, PackedBinding> packed_weights;
+    std::map<const void*, Tensor> packed_zeros;
     std::map<DequantizedKey, DequantizedBinding> dequantized_weights;
     core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
     std::uint64_t preparation = 0;
@@ -734,15 +736,16 @@ auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bi
             auto& binding = found->second;
             if (!binding.packed.values.defined()) {
                 const auto started = Clock::now();
-                auto packed = require(pack_weight(binding.source, binding.bits, binding.group_size));
+                auto packed = require(pack_weight(binding.source, binding.bits, binding.group_size, binding.asymmetric_clip));
                 binding.source.release_pages(false);
                 packed.values = require(packed.values.to(device()));
                 packed.scales = require(packed.scales.to(device()));
+                if (packed.zeros.defined()) packed.zeros = require(packed.zeros.to(device()));
                 binding.packed = std::move(packed);
                 impl_->preparation += nanoseconds(started);
             }
             auto output = packed_linear(input, binding.packed.values, binding.packed.scales, binding.packed.bits,
-                                        binding.packed.group_size);
+                                        binding.packed.group_size, 0.F, 0.F, binding.packed.zeros);
             if (!binding.released && device().kind == tensor::DeviceKind::CPU &&
                 impl_->precision == core::InferencePrecision::CHECKPOINT && input.dimensions() > 0 &&
                 input.numel() == input.size(-1) && binding.packed.values.nbytes() >= (std::size_t{1} << 20) &&
@@ -762,7 +765,7 @@ auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bi
     return impl_->run({Operation::LINEAR, attributes, dtype}, {&activation, &weight, &bias});
 }
 auto Context::prepare_linear_weights(const Tensor& weight, std::int32_t bits, std::int32_t group_size,
-                                     bool packed_prefill) -> void {
+                                     bool packed_prefill, bool asymmetric_clip) -> void {
     if (!weight.defined() || weight.dimensions() != 2 || !weight.is_contiguous() ||
         (weight.dtype() != tensor::DType::F16 && weight.dtype() != tensor::DType::BF16 &&
          weight.dtype() != tensor::DType::F32) ||
@@ -772,23 +775,27 @@ auto Context::prepare_linear_weights(const Tensor& weight, std::int32_t bits, st
     const auto address = require(weight.host_bytes()).data();
     if (const auto found = impl_->packed_weights.find(address); found != impl_->packed_weights.end()) {
         if (found->second.bits != bits || found->second.group_size != group_size ||
-            found->second.packed_prefill != packed_prefill ||
+            found->second.packed_prefill != packed_prefill || found->second.asymmetric_clip != asymmetric_clip ||
             !std::ranges::equal(found->second.source.shape(), weight.shape()))
             throw Failure({ErrorCode::INVALID_ARGUMENT, "weight already packed with a different layout"});
         return;
     }
     if (device().kind == tensor::DeviceKind::CPU && weight.nbytes() >= (std::size_t{1} << 20) &&
         weight.nbytes() < (std::size_t{256} << 20)) {
-        impl_->packed_weights.emplace(address,
-                                      Impl::PackedBinding{weight, {}, bits, group_size, packed_prefill, false});
+        impl_->packed_weights.emplace(
+            address, Impl::PackedBinding{weight, {}, bits, group_size, packed_prefill, asymmetric_clip, false});
         return;
     }
-    auto packed = require(pack_weight(weight, bits, group_size));
+    auto packed = require(pack_weight(weight, bits, group_size, asymmetric_clip));
     weight.release_pages(false);
     packed.values = require(packed.values.to(device()));
     packed.scales = require(packed.scales.to(device()));
-    impl_->packed_weights.emplace(
-        address, Impl::PackedBinding{weight, std::move(packed), bits, group_size, packed_prefill, false});
+    if (packed.zeros.defined()) packed.zeros = require(packed.zeros.to(device()));
+    impl_->packed_weights.emplace(address, Impl::PackedBinding{weight, std::move(packed), bits, group_size,
+                                                               packed_prefill, asymmetric_clip, false});
+}
+auto Context::bind_packed_zero(const Tensor& scales, Tensor zeros) -> void {
+    if (scales.defined() && zeros.defined()) impl_->packed_zeros[scales.storage_identity()] = std::move(zeros);
 }
 auto Context::quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias,
                                bool transpose_weight) -> Tensor {
@@ -796,9 +803,16 @@ auto Context::quantized_linear(const Tensor& input, const Tensor& weight, const 
     return impl_->run({Operation::QUANTIZED_LINEAR, attributes}, {&input, &weight, &scale, &bias});
 }
 auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Tensor& scales, std::int32_t bits,
-                            std::int32_t group_size, float input_scale, float output_scale) -> Tensor {
+                            std::int32_t group_size, float input_scale, float output_scale, const Tensor& zeros)
+    -> Tensor {
     if (!std::isfinite(input_scale) || input_scale < 0 || !std::isfinite(output_scale) || output_scale < 0)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid calibrated projection scales"});
+    const Tensor* bound_zero = zeros.defined() ? &zeros : nullptr;
+    if (!bound_zero) {
+        if (const auto found = impl_->packed_zeros.find(scales.storage_identity());
+            found != impl_->packed_zeros.end() && found->second.defined())
+            bound_zero = &found->second;
+    }
     if (impl_->precision != core::InferencePrecision::CHECKPOINT &&
         impl_->precision != core::InferencePrecision::LOWBIT_PARITY) {
         const auto valid_bits = bits == 2 || bits == 4 || bits == 8;
@@ -901,6 +915,9 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
             runtime::parity::packed_linear(input, weight, scales, bits, group_size, input_scale, output_scale));
     }
     const std::array<std::int64_t, 3> attributes{bits, group_size, std::bit_cast<std::int32_t>(output_scale)};
+    if (bound_zero && bound_zero->defined())
+        return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
+                          {&input, &weight, &scales, bound_zero});
     return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
                       {&input, &weight, &scales});
 }

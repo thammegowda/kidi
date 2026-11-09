@@ -118,7 +118,8 @@ public:
     auto crop_local_attention() const noexcept -> bool;
     auto prefill_chunk_size(std::size_t requested) const -> std::size_t;
     auto prepare_linear_weights(const Tensor& weight, std::int32_t bits, std::int32_t group_size = 128,
-                                bool packed_prefill = true) -> void;
+                                bool packed_prefill = true, bool asymmetric_clip = false) -> void;
+    auto bind_packed_zero(const Tensor& scales, Tensor zeros) -> void;
     auto add(const Tensor& left, const Tensor& right) -> Tensor;
     auto add_(Tensor& left, const Tensor& right) -> Tensor&;
     auto multiply(const Tensor& left, const Tensor& right) -> Tensor;
@@ -136,7 +137,8 @@ public:
     auto quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias,
                           bool transpose_weight = false) -> Tensor;
     auto packed_linear(const Tensor& input, const Tensor& weight, const Tensor& scales, std::int32_t bits,
-                       std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F) -> Tensor;
+                       std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F,
+                       const Tensor& zeros = {}) -> Tensor;
     auto gelu(const Tensor& input, bool approximate = false) -> Tensor;
     auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
     auto silu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;

@@ -24,9 +24,7 @@ FP32 scales to both runtimes:
 
 Normalizations and layer scalars remain FP32. Activation and cache calibration
 scales are zero: dynamic activations are enabled, and cache rounding is
-disabled. Passing `--include-kidi-base` also benchmarks KIDI quantizing
-directly from the unquantized BF16 checkpoint at load/first-use time.
-Optional flags also benchmark:
+disabled. Optional flags also benchmark:
 
 - `--include-onnx`: ONNX Runtime CPU (`onnx_bench.py`, using `MatMulNBits` with
   `block_size=128` for `int4-g128` and `DynamicQuantizeLinear` +
@@ -37,7 +35,8 @@ Optional flags also benchmark:
 - `--litert-model PATH` & `--kidi-qat-model PATH`: Google's `litert-lm`
   (`litert_bench.py` on `gemma-4-E2B-it.litertlm`) paired with KIDI on Google's
   mixed 2/4/8-bit QAT checkpoint (`gemma-4-E2B-it-qat-mobile-transformers`).
-- Per-runtime results are stored under `<work-dir>/results/<runtime>.json` and
+- `--eval-lines N` (default `5`): Prepares pre-templated WMT23 (`ja,uk,de` $\rightarrow$ `en`, `--eval-seed 42`) translation requests in `<work-dir>/eval_input.jsonl` and aligned human references in `<work-dir>/eval_references.jsonl`, feeds the identical JSONL prompts to every runtime, writes `<work-dir>/results/<runtime>_eval.output.jsonl`, and computes SacreBLEU **chrF** (`sacrebleu==2.6.0`) along with total evaluation inference time (`eval s`).
+- Per-runtime results are stored under `<work-dir>/results/<runtime>.json` (and `<runtime>_eval.json`) and
   reused automatically when the protocol, command, and binary SHA-256 match.
   Pass `--rerun <runtime>` to rerun specific runtimes or `--force` for a clean
   rerun of all requested runtimes.
@@ -48,62 +47,75 @@ Measured on an **Apple M5** CPU (`arm64`, 16 GB unified memory, macOS) using:
 
 - **Model:** `google/gemma-4-E2B-it` (35 layers, 1,536 hidden dim, 15 KV-donor
   layers + 20 KV-sharing layers, 262,144 vocab + per-layer embeddings)
-- **Workload:** 4 CPU threads, batch 1, 1,024-token context, 31-token prompt
+- **Speed workload:** 4 CPU threads, batch 1, 1,024-token context, 31-token prompt
   (`"Explain how binary search works in at least 300 words, including an example and its time complexity."`),
   64 greedy output tokens (31 prefill tokens + first token for prefill/TTFT;
   63 decode steps for decode throughput), 1 excluded warmup + 3 measured
   independent runs (median reported, with min–max decode range).
+- **Translation quality workload (`--eval-lines 5`):** 5 deterministic WMT23
+  (`ja,uk,de` $\rightarrow$ `en`, seed `42`) sentences pre-formatted with the
+  Gemma 4 chat template in `eval_input.jsonl`, greedy decoding until `<turn|>` /
+  `<eos>`, scored with SacreBLEU corpus **chrF** (`chrF2`) against
+  `eval_references.jsonl`.
 
-### 1. Matched `int4-g128` profile (`--profile int4-g128`)
+### Unified Comparison by Precision Group (`BF16` $\rightarrow$ `8-bit` $\rightarrow$ `4-bit`)
 
-`kidi`, `arm`, and `onnx` execute over the **exact same** exported `int4-g128`
-weights and FP32 scales (`shared/model.safetensors`); `kidi_base` quantizes the
-original BF16 checkpoint on the fly into `int4-g128`; `llamacpp` runs a pure
-`Q4_0` (`g=32`) GGUF with `GGML_CPU_KLEIDIAI=ON`.
+| Precision Group | Runtime | Engine / Backend | Weight Format | Prefill (tok/s) | Decode (tok/s) | Decode Range (tok/s) | TTFT (ms) | Peak RSS (GiB) | Binary Size (MiB) | WMT23 chrF | Eval (s) |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **BF16 (16-bit)** | **HF Transformers (`hf_bf16`)** | Transformers v5.17.0 + PyTorch v2.14.0 | Unquantized BF16 (Reference) | 30.18 | 14.13 | 14.04–14.37 | 1027.09 | 4.56 | 310.11 | **63.56** | 15.61 |
+| **BF16 (16-bit)** | **KIDI (`kidi_bf16`)** | YNNPACK (`arm64` BF16) | Unquantized BF16 | **243.47** | **16.40** | 16.37–16.68 | **127.33** | 4.57 | **7.54** | 62.88 | **5.58** |
+| **───** | **───** | **───** | **───** | **───** | **───** | **───** | **───** | **───** | **───** | **───** | **───** |
+| **8-bit** | **KIDI (`kidi`)** | YNNPACK (`arm64` SME/DOTPROD) | Symmetric INT8 per-channel | **583.12** | 32.92 | 31.33–33.34 | **53.16** | 3.19 | 7.54 | **63.57** | **2.88** |
+| **8-bit** | **Arm ExecuTorch v1.5.1 (`arm`)** | XNNPACK + Arm KleidiAI (`8da8w+emb8`) | Symmetric INT8 per-channel | 436.82 | 28.42 | 28.42–28.66 | 70.97 | 2.44 | 7.87 | 59.11 | 3.51 |
+| **8-bit** | **ONNX Runtime v1.31.1 (`onnx`)** | MLAS + Arm KleidiAI (`MatMulIntegerToFloat`) | Symmetric INT8 per-channel | 309.40 | 31.29 | 31.18–31.39 | 100.19 | **2.25** | 20.10 | 62.20 | 3.41 |
+| **8-bit** | **llama.cpp (`llamacpp`)** | GGML CPU + Arm KleidiAI | `Q8_0` (`g=32`) | 184.33 | **33.30** | 33.25–33.39 | 168.17 | 6.58 | **4.48** | 62.67 | 3.35 |
+| **───** | **───** | **───** | **───** | **───** | **───** | **───** | **───** | **───** | **───** | **───** | **───** |
+| **4-bit** | **KIDI (`kidi`)** | YNNPACK (`arm64` SME/DOTPROD) | Symmetric INT4 (`g=128`) | **532.26** | 50.00 | 48.92–50.65 | **58.24** | 1.93 | 7.57 | 60.37 | 2.27 |
+| **4-bit** | **KIDI (`kidi_asym_clip`)** | YNNPACK (`arm64` SME/DOTPROD) | Asymmetric INT4 (`g=128`) + MSE Clip | 464.44 | 46.97 | 40.56–46.99 | 66.75 | 1.97 | 7.57 | **65.37** | 2.60 |
+| **4-bit** | **Arm ExecuTorch v1.5.1 (`arm`)** | XNNPACK + Arm KleidiAI (`8da4w+emb4`) | Symmetric INT4 (`g=128`) | 234.11 | 43.51 | 43.44–43.64 | 132.42 | 1.84 | 7.87 | 59.63 | 2.91 |
+| **4-bit** | **ONNX Runtime v1.31.1 (`onnx`)** | MLAS + Arm KleidiAI (`MatMulNBits`) | Symmetric INT4 (`g=128`) | 396.27 | **50.65** | 50.31–50.91 | 78.23 | **1.45** | 20.10 | 59.55 | **2.18** |
+| **4-bit** | **llama.cpp (`llamacpp`)** | GGML CPU + Arm KleidiAI | `Q4_0` (`g=32`) | 145.93 | 47.82 | 47.30–47.89 | 212.42 | 3.88 | **4.48** | 58.60 | 2.74 |
+| **4-bit (QAT / Mixed)** | **KIDI (`kidi_qat`)** | YNNPACK (`arm64` SME/DOTPROD) | Static INT8 act + INT4 FFN/Attn + INT2 LM head | **847.81** | **67.68** | 67.24–68.00 | **36.56** | 2.36 | **7.57** | 51.09 | **1.57** |
+| **4-bit (QAT / Mixed)** | **Google LiteRT-LM v0.17.1 (`litert`)** | LiteRT-LM + XNNPACK | `.litertlm` mixed INT4/INT2 | 159.74 | 47.54 | 47.49–47.77 | 194.07 | **1.31** | 52.18 | **51.97** | 2.72 |
 
-| Runtime | Engine / Backend | Weight Format | Prefill (tok/s) | Decode (tok/s) | Decode Range (tok/s) | TTFT (ms) | Peak RSS (GiB) |
-|---|---|---|---:|---:|---:|---:|---:|
-| **KIDI (`kidi`)** | YNNPACK (`arm64` SME/DOTPROD) | Symmetric INT4 (`g=128`) | **531.24** | **50.67** | 50.65–50.70 | **58.35** | 1.68 |
-| **KIDI (`kidi_base`)** | YNNPACK (runtime-packed from BF16) | Symmetric INT4 (`g=128`) | **526.43** | **49.95** | 49.94–50.03 | **58.89** | 1.80 |
-| **ONNX Runtime v1.31.1 (`onnx`)** | MLAS + Arm KleidiAI (`MatMulNBits`) | Symmetric INT4 (`g=128`) | 396.27 | 50.65 | 50.31–50.91 | 78.23 | **1.45** |
-| **llama.cpp (`llamacpp`)** | GGML CPU + Arm KleidiAI | `Q4_0` (`g=32`) | 145.93 | 47.82 | 47.30–47.89 | 212.42 | 3.88 |
-| **Arm ExecuTorch v1.5.1 (`arm`)** | XNNPACK + Arm KleidiAI (`8da4w+emb4`) | Symmetric INT4 (`g=128`) | 234.11 | 43.51 | 43.44–43.64 | 132.42 | 1.84 |
+- **BF16 Reference vs. KIDI BF16:** KIDI (`kidi_bf16`) achieves **8.07x faster
+  prefill** (`243.47` vs. `30.18 tok/s`), **1.16x faster decode** (`16.40` vs.
+  `14.13 tok/s`), and **2.80x faster WMT23 evaluation** (`5.58 s` vs. `15.61 s`)
+  with a **41x smaller runtime binary** (`7.57 MiB` vs. `310.11 MiB`) and
+  comparable translation quality (`62.88` vs. `63.56` chrF).
+- **8-bit (`int8`) vs. Arm ExecuTorch v1.5.1:** On identical `int8` weights and
+  scales, KIDI achieves **1.33x faster prefill** (`583.12` vs. `436.82 tok/s`),
+  **1.16x faster decode** (`32.92` vs. `28.42 tok/s`), and **63.57 chrF**
+  (matching the unquantized `hf_bf16` reference at `63.56` chrF), while sharing
+  the first **58 out of 64 generated tokens** with Arm ExecuTorch before
+  floating-point tie-breaking diverges at token 59.
+- **4-bit (`int4-g128` Symmetric vs. Asymmetric + MSE Outlier Clipping):**
+  - On matched **symmetric `int4-g128`** weights (`amax / 7`, `[-7, 7]`), KIDI
+    (`kidi`) achieves **2.27x faster prefill** (`532.26` vs. `234.11 tok/s`) and
+    **1.15x faster decode** (`50.00` vs. `43.51 tok/s`) than Arm ExecuTorch
+    (`60.37` vs. `59.63` chrF), though all symmetric 4-bit runtimes show a
+    ~3–5 chrF drop relative to BF16 (`63.56`).
+  - Applying **blockwise asymmetric 4-bit quantization (`0..15` full 16-level
+    lattice with per-block zero point) + 11-step data-free MSE outlier clipping
+    search (`f in {1.00, 0.95, ..., 0.50}`)** ([gowda.ai](https://gowda.ai/posts/2026/08/llm-fast-inference/))
+    in **`kidi_asym_clip`** recovers the full BF16 translation quality (**65.37
+    chrF** vs. `63.56` on `hf_bf16`) while still outperforming Arm ExecuTorch in
+    both prefill (**464.44 vs. 234.11 tok/s**, **1.98x**) and decode (**46.97 vs.
+    43.51 tok/s**, **1.08x**) at `1.97 GiB` peak RSS.
 
-- **vs. Arm ExecuTorch v1.5.1 (`XNNPACK + KleidiAI`):** KIDI achieves **2.27x
-  faster prefill** (`531.24` vs. `234.11 tok/s`, reducing TTFT from `132.42 ms`
-  to `58.35 ms`) and **1.16x faster decode** (`50.67` vs. `43.51 tok/s`) with
-  lower peak RSS (`1.68 GiB` vs. `1.84 GiB`).
+### Self-contained runtime binary size breakdown
 
-### 2. Matched `int8` per-channel profile (`--profile int8`)
+The **Binary Size (MiB)** column reports the stripped (`strip -x`) footprint of
+the native executable plus any non-OS shared libraries it links against:
 
-`kidi`, `arm`, and `onnx` execute over the **exact same** per-channel symmetric
-INT8 weights and FP32 scales; `kidi_base` quantizes the BF16 checkpoint on the
-fly into per-channel INT8; `llamacpp` runs a pure `Q8_0` (`g=32`) GGUF with
-`GGML_CPU_KLEIDIAI=ON`.
-
-| Runtime | Engine / Backend | Weight Format | Prefill (tok/s) | Decode (tok/s) | Decode Range (tok/s) | TTFT (ms) | Peak RSS (GiB) |
-|---|---|---|---:|---:|---:|---:|---:|
-| **KIDI (`kidi_base`)** | YNNPACK (runtime-packed from BF16) | Symmetric INT8 per-channel | **586.03** | **33.46** | 29.14–33.48 | **52.90** | 2.96 |
-| **KIDI (`kidi`)** | YNNPACK (`arm64` SME/DOTPROD) | Symmetric INT8 per-channel | **578.64** | **33.34** | 32.29–33.40 | **53.57** | 3.16 |
-| **llama.cpp (`llamacpp`)** | GGML CPU + Arm KleidiAI | `Q8_0` (`g=32`) | 184.33 | 33.30 | 33.25–33.39 | 168.17 | 6.58 |
-| **ONNX Runtime v1.31.1 (`onnx`)** | MLAS + Arm KleidiAI (`MatMulIntegerToFloat`) | Symmetric INT8 per-channel | 309.40 | 31.29 | 31.18–31.39 | 100.19 | **2.25** |
-| **Arm ExecuTorch v1.5.1 (`arm`)** | XNNPACK + Arm KleidiAI (`8da8w+emb8`) | Symmetric INT8 per-channel | 436.82 | 28.42 | 28.42–28.66 | 70.97 | 2.44 |
-
-- **vs. Arm ExecuTorch v1.5.1 (`XNNPACK + KleidiAI`):** KIDI achieves **1.32x
-  faster prefill** (`578.64` vs. `436.82 tok/s`) and **1.17x faster decode**
-  (`33.34` vs. `28.42 tok/s`), sharing the first **30 generated tokens** before
-  floating-point tie-breaking diverges at token 31.
-
-### 3. Production mixed-precision / QAT reference models
-
-Google distributes official mixed-precision mobile checkpoints for Gemma 4 E2B
-that combine 4-bit transformer projections with 2-bit vocabulary/embedding
-tables:
-
-| Runtime | Checkpoint | Weight Format | Prefill (tok/s) | Decode (tok/s) | Decode Range (tok/s) | TTFT (ms) | Peak RSS (GiB) |
-|---|---|---|---:|---:|---:|---:|---:|
-| **KIDI (`kidi_qat`)** | `gemma-4-E2B-it-qat-mobile-transformers` | Static INT8 act + INT4 FFN/Attn + INT2 LM head + INT4 PLE | **863.39** | **70.49** | 70.15–70.55 | **35.91** | 2.06 |
-| **Google LiteRT-LM v0.17.1 (`litert`)** | `gemma-4-E2B-it.litertlm` (`XNNPACK`) | `.litertlm` mixed INT4/INT2 | 159.74 | 47.54 | 47.49–47.77 | 194.07 | **1.31** |
+| Runtime | Artifacts Measured | Stripped (MiB) | Unstripped (MiB) | Notes |
+|---|---|---:|---:|---|
+| **`llamacpp`** | `llamacpp_gemma4_bench` + `libllama.0.dylib` + `libggml*.dylib` | **4.46** | 5.10 | C++ probe + GGML CPU/KleidiAI shared libraries (no SentencePiece/HF JSON tokenizer needed when reading GGUF vocabulary) |
+| **`kidi` / `kidi_qat`** | `kidi_android_baseline` (single static binary) | **7.54** | 9.28 | Zero external non-OS dylibs; **6.29 MiB** with `-Wl,-dead_strip`. Includes built-in C++ Hugging Face tokenizer (`tokenizerpp` + `uni-algo` + `re2`, ~1.35 MiB) and multi-model CLI (Whisper, Kokoro, OmniVoice, Qwen3, Gemma 4 vision/audio); core Gemma 4 + YNNPACK runtime is **~3.3 MiB** |
+| **`arm`** | `arm_gemma4_bench` (single static binary) | **7.87** | 10.28 | Zero external non-OS dylibs; **6.22 MiB** with `-Wl,-dead_strip`. Links ExecuTorch runtime + XNNPACK + KleidiAI + threadpool (excludes tokenizer; reads pre-tokenized prompt IDs) |
+| **`onnx`** | `libonnxruntime.1.31.1.dylib` | **20.10** | 31.51 | Standalone native ONNX Runtime C/C++ shared library (excludes Python interpreter and `onnxruntime_pybind11_state.so`) |
+| **`litert`** | `liblitert-lm.dylib` | **52.18** | 66.01 | Standalone native Google LiteRT-LM C++ shared library (excludes Python interpreter) |
+| **`hf_bf16`** | `libtorch_cpu.dylib` | **310.11** | 370.52 | PyTorch CPU native shared library used by Hugging Face `transformers` (excludes Python interpreter and other torch dylibs) |
 
 ## Setup and run
 

@@ -67,15 +67,11 @@ auto main(int argc, char** argv) -> int {
         std::ifstream stream(argv[2]);
         if (!stream) throw std::runtime_error("cannot open benchmark protocol");
         const auto protocol = json::parse(stream);
-        const auto prompt = protocol.at("input_token_ids").get<std::vector<std::int64_t>>();
-        const auto outputs = protocol.at("output_tokens").get<std::size_t>();
-        const auto warmups = protocol.at("warmups").get<std::size_t>();
-        const auto repeats = protocol.at("repeats").get<std::size_t>();
+        const auto mode = protocol.value("mode", std::string("speed"));
         const auto context = protocol.at("context_tokens").get<std::size_t>();
         const auto threads = protocol.at("threads").get<std::size_t>();
-        if (prompt.empty() || outputs < 2 || context != 1024 || prompt.size() + outputs > context || !warmups ||
-            warmups > 20 || !repeats || repeats > 20 || !threads || threads > std::thread::hardware_concurrency() ||
-            std::ranges::any_of(prompt, [](auto id) { return id < 0 || id >= 262144; }))
+        const auto warmups = protocol.value("warmups", std::size_t{1});
+        if (context != 1024 || !warmups || warmups > 20 || !threads || threads > std::thread::hardware_concurrency())
             throw std::invalid_argument("invalid Gemma benchmark protocol");
 
         executorch::runtime::runtime_init();
@@ -95,6 +91,54 @@ auto main(int argc, char** argv) -> int {
         if (loaded != executorch::runtime::Error::Ok)
             throw std::runtime_error("ExecuTorch load failed: " + std::to_string(static_cast<int>(loaded)));
         emit({{"stage", "load"}, {"ms", seconds(loading, Clock::now()) * 1000}});
+
+        if (mode == "eval") {
+            const auto inputs_list = protocol.at("input_token_ids_list").get<std::vector<std::vector<std::int64_t>>>();
+            const auto max_outputs = protocol.at("max_output_tokens").get<std::size_t>();
+            if (inputs_list.empty() || !max_outputs) throw std::invalid_argument("invalid Gemma eval protocol");
+            auto run_seq = [&](const std::vector<std::int64_t>& prompt_ids, std::size_t limit) {
+                auto ids = prompt_ids;
+                std::vector<std::int64_t> positions(ids.size());
+                std::iota(positions.begin(), positions.end(), 0);
+                std::vector<std::int64_t> generated;
+                generated.reserve(limit);
+                auto tok = execute(module, ids, positions);
+                for (std::size_t index = 1; index <= limit; ++index) {
+                    if (tok == 1 || tok == 106) break;
+                    generated.push_back(tok);
+                    if (index == limit) break;
+                    ids.assign(1, tok);
+                    positions.assign(1, static_cast<std::int64_t>(prompt_ids.size() + index - 1));
+                    tok = execute(module, ids, positions);
+                }
+                return generated;
+            };
+            for (std::size_t w = 0; w < warmups; ++w) (void)run_seq(inputs_list.front(), std::min<std::size_t>(8, max_outputs));
+            std::vector<std::vector<std::int64_t>> all_token_ids;
+            all_token_ids.reserve(inputs_list.size());
+            std::size_t total_prompt_tokens = 0, total_output_tokens = 0;
+            const auto eval_started = Clock::now();
+            for (const auto& prompt_ids : inputs_list) {
+                total_prompt_tokens += prompt_ids.size();
+                auto gen = run_seq(prompt_ids, max_outputs);
+                total_output_tokens += gen.size();
+                all_token_ids.push_back(std::move(gen));
+            }
+            emit({{"stage", "eval"},
+                  {"items", inputs_list.size()},
+                  {"eval_seconds", seconds(eval_started, Clock::now())},
+                  {"prompt_tokens", total_prompt_tokens},
+                  {"output_tokens", total_output_tokens},
+                  {"token_ids", all_token_ids}});
+            return 0;
+        }
+
+        const auto prompt = protocol.at("input_token_ids").get<std::vector<std::int64_t>>();
+        const auto outputs = protocol.at("output_tokens").get<std::size_t>();
+        const auto repeats = protocol.at("repeats").get<std::size_t>();
+        if (prompt.empty() || outputs < 2 || prompt.size() + outputs > context || !repeats || repeats > 20 ||
+            std::ranges::any_of(prompt, [](auto id) { return id < 0 || id >= 262144; }))
+            throw std::invalid_argument("invalid Gemma benchmark protocol");
 
         for (std::size_t iteration = 0; iteration < warmups + repeats; ++iteration) {
             auto ids = prompt;

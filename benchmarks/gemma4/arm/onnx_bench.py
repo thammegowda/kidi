@@ -433,10 +433,8 @@ def main(argv=None):
 
     import onnxruntime as ort
 
-    prompt = protocol["input_token_ids"]
-    outputs = int(protocol["output_tokens"])
-    warmups = int(protocol["warmups"])
-    repeats = int(protocol["repeats"])
+    mode = protocol.get("mode", "speed")
+    warmups = int(protocol.get("warmups", 1))
     context = int(protocol["context_tokens"])
     threads = int(protocol["threads"])
 
@@ -469,6 +467,14 @@ def main(argv=None):
         output_names.append(f"present_k_{i}")
         output_names.append(f"present_v_{i}")
 
+    def empty_kv():
+        kv = {}
+        for i in range(num_self_layers):
+            dim = head_dim_s if layer_types[i] == "sliding_attention" else head_dim_f
+            kv[f"past_k_{i}"] = np.zeros((1, 1, 0, dim), dtype=np.float32)
+            kv[f"past_v_{i}"] = np.zeros((1, 1, 0, dim), dtype=np.float32)
+        return kv
+
     def step(ids_list, start_pos, kv_caches):
         seq_len = len(ids_list)
         kv_len = start_pos + seq_len
@@ -492,12 +498,50 @@ def main(argv=None):
             next_kv[f"past_v_{i}"] = results[2 + 2 * i]
         return int(np.argmax(logits)), next_kv
 
+    if mode == "eval":
+        inputs_list = protocol["input_token_ids_list"]
+        max_outputs = int(protocol["max_output_tokens"])
+
+        def run_seq(prompt_ids, limit):
+            kv = empty_kv()
+            generated = []
+            tok, kv = step(prompt_ids, 0, kv)
+            for idx in range(1, limit + 1):
+                if tok in (1, 106):
+                    break
+                generated.append(tok)
+                if idx == limit:
+                    break
+                tok, kv = step([tok], len(prompt_ids) + idx - 1, kv)
+            return generated
+
+        for _ in range(warmups):
+            run_seq(inputs_list[0], min(8, max_outputs))
+        all_token_ids = []
+        total_prompt_tokens = 0
+        total_output_tokens = 0
+        eval_started = time.perf_counter()
+        for prompt_ids in inputs_list:
+            total_prompt_tokens += len(prompt_ids)
+            gen = run_seq(prompt_ids, max_outputs)
+            total_output_tokens += len(gen)
+            all_token_ids.append(gen)
+        emit({
+            "stage": "eval",
+            "items": len(inputs_list),
+            "eval_seconds": time.perf_counter() - eval_started,
+            "prompt_tokens": total_prompt_tokens,
+            "output_tokens": total_output_tokens,
+            "token_ids": all_token_ids,
+        })
+        return 0
+
+    prompt = protocol["input_token_ids"]
+    outputs = int(protocol["output_tokens"])
+    repeats = int(protocol["repeats"])
+
     for iteration in range(warmups + repeats):
-        kv_caches = {}
-        for i in range(num_self_layers):
-            dim = head_dim_s if layer_types[i] == "sliding_attention" else head_dim_f
-            kv_caches[f"past_k_{i}"] = np.zeros((1, 1, 0, dim), dtype=np.float32)
-            kv_caches[f"past_v_{i}"] = np.zeros((1, 1, 0, dim), dtype=np.float32)
+        kv_caches = empty_kv()
 
         generated = []
         submitted = time.perf_counter()
