@@ -70,6 +70,21 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
                                   : checkpoint::load_config(directory, model::Gemma4Impl::checkpoint_config()));
         require(model::Gemma4Impl::validate_config(config["model"]));
         const bool qat = static_cast<bool>(config["model"]["quantization_config"]);
+        std::filesystem::path lm_head_index;
+        if (!options.dense_lm_head && options.device.capabilities().compute.host()) {
+            const auto checkpoint_directory =
+                std::filesystem::is_directory(directory) ? directory : directory.parent_path();
+            const auto index = checkpoint_directory / "lm_head.hnsw";
+            std::error_code error;
+            const auto status = std::filesystem::symlink_status(index, error);
+            if (error && error != std::errc::no_such_file_or_directory)
+                throw ops::Failure({ErrorCode::IO, "cannot inspect checkpoint HNSW index: " + error.message()});
+            if (status.type() != std::filesystem::file_type::not_found) {
+                if (!std::filesystem::is_regular_file(index, error) || error)
+                    throw ops::Failure({ErrorCode::IO, "checkpoint lm_head.hnsw is not a readable regular file"});
+                lm_head_index = index;
+            }
+        }
         const auto checkpoint_bf16 = !qat && options.precision == core::InferencePrecision::BF16;
         if (options.precision != core::InferencePrecision::CHECKPOINT && !qat && !checkpoint_bf16)
             throw ops::Failure(
@@ -155,6 +170,9 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
 #endif
         model->set_precision(options.precision);
         model->set_kv_cache_precision(options.kv_cache_precision);
+        if (!lm_head_index.empty() && options.weight_bits)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "HNSW head does not support load-time weight packing"});
+        if (!lm_head_index.empty()) require(model->configure_lm_head(lm_head_index));
         return Generator(std::move(config), std::move(tokenizer), std::move(model), special, options.precision,
                          options.kv_cache_precision);
     } catch (const ops::Failure& error) {

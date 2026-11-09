@@ -42,6 +42,7 @@ public:
     LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose = false, bool bias = true,
                std::int32_t packed_bits = 0, bool quantized_bias = false);
     auto forward(ops::Context&, const Tensor&) const -> Tensor;
+    auto weight() const -> const Tensor& { return weight_; }
 
 private:
     friend class GatedFeedForwardImpl;

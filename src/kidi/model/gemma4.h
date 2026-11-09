@@ -41,6 +41,7 @@ public:
     auto configure_cache(const std::filesystem::path& directory, const std::filesystem::path& source) -> void;
     auto set_precision(core::InferencePrecision precision) noexcept -> void;
     auto set_kv_cache_precision(core::KVCachePrecision precision) noexcept -> void;
+    auto configure_lm_head(const std::filesystem::path& index) -> Result<void>;
     auto create_state(std::size_t capacity) -> Result<Gemma4State>;
     auto fork_state(const Gemma4State& source, std::size_t prefix_length, std::size_t capacity) -> Result<Gemma4State>;
     auto prefill(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void>;
@@ -81,6 +82,8 @@ private:
     auto per_layer_input(const tensor::Tensor& per_layer, int layer, std::int64_t length) -> tensor::Tensor;
     auto head(const tensor::Tensor& hidden, bool select, ops::TokenOutput output = ops::TokenOutput::HOST)
         -> tensor::Tensor;
+    auto select_head(const tensor::Tensor& query) -> tensor::Tensor;
+    auto check_head_binding() const -> void;
     /// Decodes one token as a captured step: host values are written into `state.step`, caches by index.
     auto decode_step(const tensor::Tensor& token, Gemma4State& state, bool select,
                      ops::TokenOutput output = ops::TokenOutput::HOST) -> tensor::Tensor;

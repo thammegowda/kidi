@@ -360,6 +360,72 @@ support for arbitrary Hugging Face architectures.
 - [Manual model setup](docs/getting-started.md#optional-manual-setup): configuration and converter entry points.
 - [Benchmarks](benchmarks/README.md): build options, CPU/CUDA/Metal runners, precision, and validation.
 
+### CPU HNSW indexes
+
+`kidi::core::HnswIndex` provides deterministic HNSW learning, versioned
+serialization, loading and inner-product search over an external FP32/BF16
+tensor table. The index stores graph topology and row labels, not a duplicate
+vector table, so other Kidi search features can reuse it.
+
+Build a Gemma output-head index natively:
+
+```bash
+build-release/kidi index --model /path/to/gemma-4 \
+  --m 32 --ef-construction 200 --candidates 8 --ef-search 800 --threads 4
+```
+
+Both the core `save` API and the command refuse to overwrite any existing
+path. Each save uses its own staging directory, checks write/flush/close errors,
+and atomically publishes a complete graph-only file. The command installs
+`MODEL/lm_head.hnsw`. It supports original dense Gemma FP32/BF16 checkpoints;
+native QAT and load-time packed weights are intentionally excluded. Index
+learning keeps insertions and pruning ordered, and can use the existing CPU worker
+pool for distance calculations. `--threads` controls parallelism (default: 1);
+one- and multi-threaded builds produce the same graph with a fixed seed on the
+same hardware. More threads are not always faster for small graph expansions:
+on the Xeon test host, 2,048 E4B rows took 7.36/16.80/28.30 seconds with 1/4/14
+threads, respectively. CPU distance kernels use AVX-512/FMA where supported.
+Progress includes row counts, percentage, elapsed time, rate and an interval-based
+ETA. A full vocabulary can still take substantial offline time.
+
+For fast offline construction, an optional native cuVS backend builds the graph
+on CUDA and exports it for CPU search. Enable it on Linux with
+`KIDI_ENABLE_CUDA=ON`, `KIDI_ENABLE_CUVS=ON`, and `KIDI_CUVS_ROOT` pointing at a
+cuVS SDK; DLPack headers and the cuVS shared-library dependencies must be available.
+`--builder auto` selects this backend when compiled and a CUDA device is present;
+`--builder cpu` forces the deterministic builder. For example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 build-release/kidi index --model /path/to/gemma-4 --builder cuda --threads 4
+```
+
+The native `kidi-index-cuda` helper runs in a separate process, so a cuVS SDK
+built against another CUDA major version cannot interfere with inference's
+CUDA libraries. Keep the helper beside `kidi` or on `PATH`. No Python runtime is
+used. GPU construction uses raw FP32 representations of the original weights,
+then verifies every exported vector, label and ordered live edge before packing
+the graph. cuVS does not expose per-node progress or a seeded construction API;
+its stage heartbeats explicitly report progress/ETA as unavailable rather than
+inventing a percentage, and GPU builds do not claim seed determinism.
+
+On the RTX A6000 test host, native cuVS construction, export validation and packing
+of all 262,144 E4B rows completed in **37.95 seconds**, producing a **53,115,573-byte**
+graph-only file. A fresh CPU batch-1 control on four frozen multilingual sentences
+produced identical dense/HNSW tokens and chrF **76.13394**. This validates that
+specific index and sample; it is not an exact-search guarantee or evidence for
+every native CPU-built graph.
+
+CPU generation automatically loads `lm_head.hnsw`, verifies its dimensions and
+vector-table checksum, retrieves the stored candidate count/search effort, then
+scores only those original output rows. Add `--dense-lm-head` to disable it for
+a paired control. CUDA and attached accelerators ignore automatic HNSW discovery
+and retain their device-native dense head.
+
+`HnswIndex` exposes typed metadata without exposing its graph buffers or disk
+format. It has no dependency on `ops::Context`. LM-head search binds the model's
+actual output weights and retains reference candidate re-projection; approximate
+search distances are not substituted for the model's scores.
+
 ## GGML and GGUF Import
 
 `checkpoint::Weights::load` reads Safetensors, little-endian GGUF v2/v3 and the

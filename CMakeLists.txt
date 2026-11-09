@@ -13,6 +13,8 @@ option(KIDI_BUILD_INTEGRATION_TESTS "Register Python, browser, and model regress
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
 option(KIDI_ENABLE_CUDA "Build the NVIDIA CUDA backend" OFF)
+option(KIDI_ENABLE_CUVS "Build optional GPU-accelerated offline HNSW indexing" OFF)
+set(KIDI_CUVS_ROOT "" CACHE PATH "cuVS SDK root for optional offline HNSW construction")
 set(YNNPACK_ENABLE_CUDA ${KIDI_ENABLE_CUDA} CACHE BOOL "Build YNNPACK CUDA" FORCE)
 set(KIDI_DESKTOP_APP_DEFAULT ON)
 if(ANDROID OR EMSCRIPTEN)
@@ -92,6 +94,7 @@ add_library(kidi
     src/kidi/checkpoint/package.cpp
     src/kidi/checkpoint/prepare.cpp
     src/kidi/checkpoint/weights.cpp
+    src/kidi/core/hnsw.cpp
     src/kidi/core/memory.cpp
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
@@ -359,8 +362,27 @@ if(APPLE)
     endif()
 endif()
 
-add_library(kidi_cli_main STATIC src/kidi/cli/main.cpp src/kidi/cli/interactive.cpp)
+add_library(kidi_cli_main STATIC src/kidi/cli/index.cpp src/kidi/cli/interactive.cpp src/kidi/cli/main.cpp)
 target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi spdlog::spdlog nlohmann_json::nlohmann_json)
+if(KIDI_ENABLE_CUVS)
+    if(NOT KIDI_ENABLE_CUDA OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "Optional cuVS construction currently requires a Linux CUDA-enabled build")
+    endif()
+    find_package(CUDAToolkit REQUIRED)
+    find_package(Threads REQUIRED)
+    find_path(KIDI_CUVS_INCLUDE_DIR cuvs/neighbors/hnsw.h HINTS "${KIDI_CUVS_ROOT}/include" REQUIRED)
+    find_path(KIDI_DLPACK_INCLUDE_DIR dlpack/dlpack.h REQUIRED)
+    find_library(KIDI_CUVS_C_LIBRARY cuvs_c HINTS "${KIDI_CUVS_ROOT}/lib64" "${KIDI_CUVS_ROOT}/lib" REQUIRED)
+    add_executable(kidi_index_cuda_helper src/kidi/cli/index_cuda_helper.cpp)
+    set_target_properties(kidi_index_cuda_helper PROPERTIES OUTPUT_NAME kidi-index-cuda)
+    target_include_directories(kidi_index_cuda_helper PRIVATE
+        "${KIDI_CUVS_INCLUDE_DIR}" "${KIDI_DLPACK_INCLUDE_DIR}" ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(kidi_index_cuda_helper PRIVATE "${KIDI_CUVS_C_LIBRARY}" Threads::Threads)
+    install(TARGETS kidi_index_cuda_helper RUNTIME DESTINATION bin)
+    target_sources(kidi_cli_main PRIVATE src/kidi/cli/index_cuda.cpp)
+    add_dependencies(kidi_cli_main kidi_index_cuda_helper)
+    target_compile_definitions(kidi_cli_main PRIVATE KIDI_HAS_CUVS=1)
+endif()
 
 add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)
 set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
