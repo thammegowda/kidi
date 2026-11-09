@@ -202,6 +202,9 @@ class ArmGemmaBenchmarkTest(unittest.TestCase):
         readme = (BENCHMARK.HERE / "README.md").read_text(encoding="utf-8")
         for block in rendered.split("\n\n"):
             self.assertIn(block, readme)
+        svg = BENCHMARK.render_pareto_svg()
+        svg_path = ROOT / "docs/gemma4-arm-pareto.svg"
+        self.assertEqual(svg, svg_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

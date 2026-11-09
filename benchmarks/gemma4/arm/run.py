@@ -1139,12 +1139,12 @@ TABLE_SPECS = (
 BINARY_TABLE_ROWS = (
     ("llama.cpp (`llamacpp`)", "`llamacpp_gemma4_bench` + `libllama.0.dylib` + `libggml*.dylib`", "4.48", "5.10",
      "C++ probe + GGML CPU/KleidiAI shared libraries (reads GGUF vocabulary)"),
-    ("KIDI (`kidi` / `kidi_bf16` / `kidi_qat`)", "`kidi_android_baseline` (single static binary)", "7.62", "9.39",
-     "Zero external non-OS dylibs (**6.29 MiB** with `-Wl,-dead_strip`); includes built-in C++ Hugging Face tokenizer (~1.35 MiB); core Gemma 4 + YNNPACK runtime is **~3.3 MiB**"),
+    ("Kidi (`kidi` / `kidi_bf16` / `kidi_qat`)", "`kidi_android_baseline` (single static binary)", "7.62", "9.39",
+     "Zero external non-OS dylibs (**6.29 MiB** with `-Wl,-dead_strip`). Includes C++ HF tokenizer ([`tokenizerspp`](https://github.com/thammegowda/tokenizerspp) + `uni-algo` + `RE2`), vision codecs ([`tahoma-vision`](https://github.com/thammegowda/tahoma-vision) + `libjpeg-turbo` + PNG/[`pigzpp`](https://github.com/thammegowda/pigzpp)/`zlib-ng`), WAV/Mel audio, Safetensors/GGUF/YAML/JSON parsers, and 6 model families; core Gemma 4 + [`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) is **~3.3 MiB**"),
     ("Arm ExecuTorch v1.5.1 (`arm`)", "`arm_gemma4_bench` (single static binary)", "7.87", "10.28",
-     "Zero external non-OS dylibs (**6.22 MiB** with `-Wl,-dead_strip`); ExecuTorch runtime + XNNPACK + KleidiAI (excludes tokenizer)"),
+     "Zero external non-OS dylibs (**6.22 MiB** with `-Wl,-dead_strip`); ExecuTorch runtime + XNNPACK + KleidiAI (excludes tokenizer, vision/audio codecs, and checkpoint parsers)"),
     ("ONNX Runtime v1.31.1 (`onnx`)", "`libonnxruntime.1.31.1.dylib`", "20.10", "31.51",
-     "Standalone native ONNX Runtime C/C++ shared library (excludes Python interpreter)"),
+     "Standalone native ONNX Runtime C/C++ shared library (excludes Python interpreter and tokenizer)"),
     ("Google LiteRT-LM v0.17.1 (`litert`)", "`liblitert-lm.dylib`", "52.18", "66.01",
      "Standalone native Google LiteRT-LM C++ shared library (excludes Python interpreter)"),
 )
@@ -1197,6 +1197,274 @@ def render_markdown_tables(tsv_path: Path = HERE / "results.tsv") -> str:
     return "\n\n".join(sections)
 
 
+def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
+    rows = load_results_tsv(tsv_path)
+    by_id = {r["runtime_id"]: r for r in rows}
+
+    # Publication-style two-panel scatter plot:
+    # Panel A (Left):  Prefill Throughput (tokens/s) vs. WMT23 chrF (ref)
+    # Panel B (Right): Decode Throughput (tokens/s)  vs. WMT23 chrF (ref)
+    ymin, ymax = 54.4, 57.7
+    bf16_y = float(by_id["kidi_bf16"]["chrf_ref"])
+
+    # Seaborn "colorblind" (Okabe-Ito) accessible palette:
+    #   Kidi (Ours):      Vermilion (#D55E00)
+    #   Arm ExecuTorch:   Blue (#0173B2)
+    #   ONNX Runtime:     Bluish Green (#029E73)
+    #   llama.cpp:        Reddish Purple (#CC78BC)
+    #   Google LiteRT-LM: Orange (#DE8F05)
+    #   BF16 Reference:   Deep Slate (#0f172a)
+    #
+    # Shapes by precision family:
+    #   "star"     -> BF16 reference
+    #   "solid"    -> 8-bit (Q8)
+    #   "hollow"   -> 4-bit (Q4, g=32 / g=128)
+    #   "triangle" -> MixedQ (QAT mixed 2/4/8-bit)
+    meta = {
+        "kidi_bf16":      ("#0f172a", "star",     "Kidi BF16"),
+        "kidi_int8":      ("#D55E00", "solid",    "Kidi Q8"),
+        "arm_int8":       ("#0173B2", "solid",    "Arm ET Q8"),
+        "onnx_int8":      ("#029E73", "solid",    "ONNX Q8"),
+        "llamacpp_int8":  ("#CC78BC", "solid",    "llama.cpp Q8"),
+        "kidi_asym_g32":  ("#D55E00", "hollow",   "Kidi Q4 Asym (g=32)"),
+        "llamacpp_q4_0":  ("#CC78BC", "hollow",   "llama.cpp Q4 (g=32)"),
+        "litert":         ("#DE8F05", "triangle", "LiteRT-LM MixedQ"),
+        "kidi_qat":       ("#D55E00", "triangle", "Kidi MixedQ"),
+        "kidi_asym_clip": ("#D55E00", "hollow",   "Kidi Q4 Asym (g=128)"),
+        "kidi_int4_g128": ("#D55E00", "hollow",   "Kidi Q4 Sym (g=128)"),
+        "onnx_int4_g128": ("#029E73", "hollow",   "ONNX Q4 (g=128)"),
+        "arm_int4_g128":  ("#0173B2", "hollow",   "Arm ET Q4 (g=128)"),
+    }
+
+    # Label offsets (dx, dy, text_anchor) with leader lines so zero labels collide
+    prefill_labels = {
+        "kidi_bf16":      ( 14,  18, "start"),
+        "llamacpp_int8":  ( -4,  21, "middle"),
+        "onnx_int8":      ( -8, -16, "end"),
+        "arm_int8":       (  8, -15, "start"),
+        "kidi_int8":      ( 15, -13, "start"),
+        "llamacpp_q4_0":  ( 14, -14, "start"),
+        "litert":         ( 12,  19, "start"),
+        "kidi_asym_g32":  ( 15, -14, "start"),
+        "kidi_asym_clip": (-16,  -4, "end"),
+        "kidi_int4_g128": ( 16,  17, "start"),
+        "kidi_qat":       ( -6, -17, "end"),
+        "onnx_int4_g128": ( 14,  15, "start"),
+        "arm_int4_g128":  (  0, -15, "middle"),
+    }
+
+    decode_labels = {
+        "kidi_bf16":      ( 14,  20, "start"),
+        "arm_int8":       (-15,  -8, "end"),
+        "onnx_int8":      ( -4, -18, "middle"),
+        "kidi_int8":      ( 16, -12, "start"),
+        "llamacpp_int8":  ( 16,  15, "start"),
+        "kidi_asym_g32":  ( 16, -15, "start"),
+        "llamacpp_q4_0":  (-16, -13, "end"),
+        "litert":         (-16,   5, "end"),
+        "kidi_asym_clip": (-16,  -5, "end"),
+        "kidi_int4_g128": ( 14,  16, "start"),
+        "kidi_qat":       (  0, -17, "middle"),
+        "onnx_int4_g128": ( 14,  15, "start"),
+        "arm_int4_g128":  (-14,  14, "end"),
+    }
+
+    # Comparable precision & group-size tiers connected within each subplot
+    comparable_groups = [
+        ("q8",       ["llamacpp_int8", "onnx_int8", "arm_int8", "kidi_int8"],              "none"),
+        ("q4_g32",   ["llamacpp_q4_0", "kidi_asym_g32"],                                   "7,4"),
+        ("q4_g128",  ["arm_int4_g128", "onnx_int4_g128", "kidi_asym_clip", "kidi_int4_g128"], "3,3"),
+        ("mixedq",   ["litert", "kidi_qat"],                                               "7,3,2,3"),
+    ]
+
+    def star_points(cx: float, cy: float, r_outer: float = 8.8, r_inner: float = 3.8) -> str:
+        pts = []
+        for i in range(10):
+            angle = -math.pi / 2 + i * math.pi / 5
+            r = r_outer if i % 2 == 0 else r_inner
+            pts.append(f"{cx + r * math.cos(angle):.1f},{cy + r * math.sin(angle):.1f}")
+        return " ".join(pts)
+
+    def triangle_points(cx: float, cy: float, r: float = 7.2) -> str:
+        return f"{cx:.1f},{cy - r:.1f} {cx - r * 0.92:.1f},{cy + r * 0.72:.1f} {cx + r * 0.92:.1f},{cy + r * 0.72:.1f}"
+
+    svg = [
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="100%" height="100%" '
+        'style="font-family: \'Inter\', -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif;">',
+        '  <defs>',
+        '    <linearGradient id="bg-grad" x1="0" y1="0" x2="0" y2="1">',
+        '      <stop offset="0%" stop-color="#f8fafc"/>',
+        '      <stop offset="100%" stop-color="#f1f5f9"/>',
+        '    </linearGradient>',
+        '    <linearGradient id="pareto-fill" x1="0" y1="0" x2="1" y2="1">',
+        '      <stop offset="0%" stop-color="#D55E00" stop-opacity="0.10"/>',
+        '      <stop offset="100%" stop-color="#D55E00" stop-opacity="0.02"/>',
+        '    </linearGradient>',
+        '    <filter id="card-shadow" x="-2%" y="-2%" width="104%" height="106%">',
+        '      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.05"/>',
+        '    </filter>',
+        '  </defs>',
+        '  <rect width="1200" height="560" rx="14" fill="url(#bg-grad)" stroke="#cbd5e1" stroke-width="1.2"/>',
+        '  <text x="600" y="31" text-anchor="middle" font-size="17.5" font-weight="800" letter-spacing="-0.3" fill="#0f172a">'
+        'Gemma 4 E2B on Arm CPU (Apple M5, 4 Threads) — Speed vs. Translation Quality</text>',
+        '  <text x="600" y="51" text-anchor="middle" font-size="12.5" font-weight="500" fill="#475569">'
+        '150 WMT23 test sentences (ja, uk, de → en) · SacreBLEU chrF vs. human reference · Upper-right is faster &amp; higher quality (↗)</text>',
+    ]
+
+    panels = [
+        ("A. Prefill Throughput vs. Translation Quality",
+         "prefill_tps", 74.0, 562.0, 100.0, 900.0,
+         [100, 200, 300, 400, 500, 600, 700, 800, 900],
+         "Prefill Speed (tokens / sec) →",
+         prefill_labels),
+        ("B. Decode Throughput vs. Translation Quality",
+         "decode_tps", 648.0, 1136.0, 12.0, 73.0,
+         [15, 25, 35, 45, 55, 65],
+         "Autoregressive Decode Speed (tokens / sec) →",
+         decode_labels),
+    ]
+
+    y0, y1 = 92.0, 428.0
+    yticks = [54.5, 55.0, 55.5, 56.0, 56.5, 57.0, 57.5]
+
+    def sy(val: float) -> float:
+        return y1 - (val - ymin) / (ymax - ymin) * (y1 - y0)
+
+    for title, x_key, x0, x1, xmin, xmax, xticks, xlabel, lbl_map in panels:
+        def sx(val: float) -> float:
+            return x0 + (val - xmin) / (xmax - xmin) * (x1 - x0)
+
+        # Panel card
+        svg.append(f'  <rect x="{x0}" y="{y0}" width="{x1 - x0}" height="{y1 - y0}" rx="6" fill="#ffffff" '
+                   f'stroke="#e2e8f0" stroke-width="1.2" filter="url(#card-shadow)"/>')
+        svg.append(f'  <text x="{x0}" y="{y0 - 11}" text-anchor="start" font-size="13.5" font-weight="700" fill="#0f172a">{title}</text>')
+
+        # "Better ↗" badge in top-right of panel header
+        svg.append(f'  <rect x="{x1 - 74}" y="{y0 - 25}" width="74" height="19" rx="9.5" fill="#ffedd5" stroke="#fed7aa" stroke-width="1"/>')
+        svg.append(f'  <text x="{x1 - 37}" y="{y0 - 12}" text-anchor="middle" font-size="10.5" font-weight="700" fill="#9a3412">Better ↗</text>')
+
+        # Gridlines & ticks
+        for xt in xticks:
+            px = sx(xt)
+            if x0 < px < x1:
+                svg.append(f'  <line x1="{px:.1f}" y1="{y0}" x2="{px:.1f}" y2="{y1}" stroke="#f1f5f9" stroke-width="1"/>')
+            svg.append(f'  <line x1="{px:.1f}" y1="{y1}" x2="{px:.1f}" y2="{y1 + 5}" stroke="#64748b" stroke-width="1.2"/>')
+            svg.append(f'  <text x="{px:.1f}" y="{y1 + 18}" text-anchor="middle" font-size="11" font-weight="500" fill="#475569">{xt}</text>')
+
+        for yt in yticks:
+            py = sy(yt)
+            if y0 < py < y1:
+                svg.append(f'  <line x1="{x0}" y1="{py:.1f}" x2="{x1}" y2="{py:.1f}" stroke="#f1f5f9" stroke-width="1"/>')
+            svg.append(f'  <line x1="{x0 - 5}" y1="{py:.1f}" x2="{x0}" y2="{py:.1f}" stroke="#64748b" stroke-width="1.2"/>')
+            svg.append(f'  <text x="{x0 - 9}" y="{py + 4:.1f}" text-anchor="end" font-size="11" font-weight="500" fill="#475569">{yt:.1f}</text>')
+
+        # Left & bottom primary axis spines
+        svg.append(f'  <line x1="{x0}" y1="{y0}" x2="{x0}" y2="{y1}" stroke="#64748b" stroke-width="1.4"/>')
+        svg.append(f'  <line x1="{x0}" y1="{y1}" x2="{x1}" y2="{y1}" stroke="#64748b" stroke-width="1.4"/>')
+
+        # Axis titles
+        svg.append(f'  <text x="{(x0 + x1) / 2:.1f}" y="{y1 + 38}" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">{xlabel}</text>')
+        yl_x = x0 - 44
+        svg.append(f'  <text x="{yl_x:.1f}" y="{(y0 + y1) / 2:.1f}" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b" '
+                   f'transform="rotate(-90 {yl_x:.1f} {(y0 + y1) / 2:.1f})">WMT23 chrF (0–100) ↑</text>')
+
+        # Horizontal dotted BF16 reference line + subtle right-aligned label
+        py_bf16 = sy(bf16_y)
+        svg.append(f'  <line x1="{x0}" y1="{py_bf16:.1f}" x2="{x1}" y2="{py_bf16:.1f}" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="3,4"/>')
+        svg.append(f'  <text x="{x1 - 8}" y="{py_bf16 + 13:.1f}" text-anchor="end" font-size="9.5" font-weight="600" '
+                   f'font-style="italic" fill="#64748b">BF16 baseline (57.05)</text>')
+
+        # Connect comparable quantization & group-size variants (ordered left-to-right along X)
+        for _, grp_ids, dash in comparable_groups:
+            ordered = sorted(grp_ids, key=lambda k: float(by_id[k][x_key]))
+            pts = " ".join(f"{sx(float(by_id[k][x_key])):.1f},{sy(float(by_id[k]['chrf_ref'])):.1f}" for k in ordered)
+            dash_attr = f' stroke-dasharray="{dash}"' if dash != "none" else ""
+            svg.append(f'  <polyline points="{pts}" fill="none" stroke="#e2e8f0" stroke-width="6.0" '
+                       f'stroke-linecap="round" stroke-linejoin="round" opacity="0.75"/>')
+            svg.append(f'  <polyline points="{pts}" fill="none" stroke="#64748b" stroke-width="2.1" '
+                       f'stroke-linecap="round" stroke-linejoin="round"{dash_attr}/>')
+
+        # Leader lines first (underneath markers)
+        for rid, (color, shape, short_label) in meta.items():
+            r = by_id[rid]
+            px = sx(float(r[x_key]))
+            py = sy(float(r["chrf_ref"]))
+            dx, dy, anchor = lbl_map[rid]
+            lx = px + dx * 0.80
+            ly = py + dy * 0.76
+            lcol = "#fdba74" if rid.startswith("kidi") and rid != "kidi_bf16" else "#cbd5e1"
+            svg.append(f'  <line x1="{px:.1f}" y1="{py:.1f}" x2="{lx:.1f}" y2="{ly:.1f}" stroke="{lcol}" stroke-width="1.1"/>')
+
+        # Markers & labels (with white halo paint-order on text for crisp legibility)
+        for rid, (color, shape, short_label) in meta.items():
+            r = by_id[rid]
+            px = sx(float(r[x_key]))
+            py = sy(float(r["chrf_ref"]))
+            dx, dy, anchor = lbl_map[rid]
+            is_kidi = rid.startswith("kidi") and rid != "kidi_bf16"
+            if is_kidi:
+                svg.append(f'  <circle cx="{px:.1f}" cy="{py:.1f}" r="10.0" fill="{color}" opacity="0.12"/>')
+            if shape == "star":
+                svg.append(f'  <polygon points="{star_points(px, py)}" fill="{color}" stroke="#ffffff" stroke-width="1.2"/>')
+            elif shape == "triangle":
+                svg.append(f'  <polygon points="{triangle_points(px, py)}" fill="{color}" stroke="#ffffff" stroke-width="1.4"/>')
+            elif shape == "solid":
+                svg.append(f'  <circle cx="{px:.1f}" cy="{py:.1f}" r="6.0" fill="{color}" stroke="#ffffff" stroke-width="1.6"/>')
+            else:
+                svg.append(f'  <circle cx="{px:.1f}" cy="{py:.1f}" r="5.6" fill="#ffffff" stroke="{color}" stroke-width="2.6"/>')
+            fw = "700" if rid.startswith("kidi") else "600"
+            svg.append(f'  <text x="{px + dx:.1f}" y="{py + dy + 3.5:.1f}" text-anchor="{anchor}" font-size="10.5" '
+                       f'font-weight="{fw}" fill="{color}" stroke="#ffffff" stroke-width="3.2" '
+                       f'stroke-linejoin="round" paint-order="stroke">{short_label}</text>')
+
+    # Sleek bottom legend pill bar
+    svg.append('  <rect x="64" y="482" width="1072" height="62" rx="10" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2"/>')
+    leg_y1 = 504.0
+    runtime_entries = [
+        ("#D55E00", "Kidi (Ours)"),
+        ("#0173B2", "Arm ExecuTorch v1.5.1"),
+        ("#029E73", "ONNX Runtime v1.31.1"),
+        ("#CC78BC", "llama.cpp"),
+        ("#DE8F05", "Google LiteRT-LM v0.17.1"),
+    ]
+    lx_cur = 212.0
+    svg.append(f'  <text x="90" y="{leg_y1}" font-size="11" font-weight="700" fill="#475569">Runtimes:</text>')
+    for col, text in runtime_entries:
+        svg.append(f'  <rect x="{lx_cur}" y="{leg_y1 - 9.5}" width="11" height="11" rx="3" fill="{col}"/>')
+        fw = "700" if "Kidi" in text else "600"
+        svg.append(f'  <text x="{lx_cur + 16}" y="{leg_y1}" font-size="11" font-weight="{fw}" fill="#0f172a">{text}</text>')
+        lx_cur += len(text) * 6.3 + 42
+
+    leg_y2 = 530.0
+    shape_entries = [
+        ("star",     "none",     "BF16 Reference"),
+        ("solid",    "none",     "Q8 (8-bit)"),
+        ("hollow",   "7,4",      "Q4 (4-bit, g=32)"),
+        ("hollow",   "3,3",      "Q4 (4-bit, g=128)"),
+        ("triangle", "7,3,2,3",  "MixedQ (2/4/8-bit QAT)"),
+    ]
+    lx_cur = 212.0
+    svg.append(f'  <text x="90" y="{leg_y2}" font-size="11" font-weight="700" fill="#475569">Comparable Tiers:</text>')
+    for shape, dash, text in shape_entries:
+        if shape != "star":
+            dash_attr = f' stroke-dasharray="{dash}"' if dash != "none" else ""
+            svg.append(f'  <line x1="{lx_cur - 6}" y1="{leg_y2 - 4}" x2="{lx_cur + 22}" y2="{leg_y2 - 4}" '
+                       f'stroke="#64748b" stroke-width="2.1"{dash_attr}/>')
+        if shape == "star":
+            svg.append(f'  <polygon points="{star_points(lx_cur + 8, leg_y2 - 4, 6.8, 2.9)}" fill="#0f172a"/>')
+        elif shape == "solid":
+            svg.append(f'  <circle cx="{lx_cur + 8}" cy="{leg_y2 - 4}" r="4.8" fill="#334155" stroke="#ffffff" stroke-width="1.2"/>')
+        elif shape == "hollow":
+            svg.append(f'  <circle cx="{lx_cur + 8}" cy="{leg_y2 - 4}" r="4.6" fill="#ffffff" stroke="#334155" stroke-width="2.3"/>')
+        elif shape == "triangle":
+            svg.append(f'  <polygon points="{triangle_points(lx_cur + 8, leg_y2 - 3.5, 6.0)}" fill="#334155" stroke="#ffffff" stroke-width="1.0"/>')
+        svg.append(f'  <text x="{lx_cur + 28}" y="{leg_y2}" font-size="11" font-weight="600" fill="#0f172a">{text}</text>')
+        lx_cur += len(text) * 5.9 + 52
+
+    svg.append('</svg>')
+    return "\n".join(svg) + "\n"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=ROOT / "tmp.models/gemma-4-E2B-it")
@@ -1219,6 +1487,8 @@ def main(argv=None):
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--render-tables", action="store_true",
                         help="render the four Markdown benchmark tables from results.tsv and exit")
+    parser.add_argument("--render-svg", type=Path,
+                        help="render the Pareto frontier and throughput SVG chart to the given path and exit")
     parser.add_argument("--tsv", type=Path, default=HERE / "results.tsv",
                         help="path to results.tsv used by --render-tables")
     parser.add_argument("--force", action="store_true", help="ignore cached per-runtime JSON results and rerun all")
@@ -1228,6 +1498,12 @@ def main(argv=None):
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=900)
     arguments = parser.parse_args(argv)
+    if arguments.render_svg:
+        svg_path = arguments.render_svg.expanduser().resolve()
+        svg_path.parent.mkdir(parents=True, exist_ok=True)
+        svg_path.write_text(render_pareto_svg(arguments.tsv.expanduser().resolve()), encoding="utf-8")
+        print(f"Wrote {svg_path}")
+        return 0
     if arguments.render_tables:
         print(render_markdown_tables(arguments.tsv.expanduser().resolve()))
         return 0
