@@ -1,9 +1,13 @@
 #include "kidi/tensor/backend.h"
 
 #include <array>
+#include <atomic>
 #include <utility>
 
 namespace kidi::tensor {
+namespace {
+std::atomic<std::uint64_t> registry_version{1};
+} // namespace
 auto Backend::wrap_host_mutable(Device, std::span<std::byte>, std::shared_ptr<void>) const
     -> Result<std::shared_ptr<Storage>> {
     return std::unexpected(Error{ErrorCode::UNSUPPORTED, "backend cannot wrap mutable host storage"});
@@ -141,6 +145,7 @@ auto BackendRegistry::register_backend(std::shared_ptr<Backend> backend) -> Resu
     }
     std::scoped_lock lock(mutex_);
     backends_.insert_or_assign(backend->device_kind(), std::move(backend));
+    registry_version.fetch_add(1, std::memory_order_release);
     return {};
 }
 
@@ -148,12 +153,30 @@ auto BackendRegistry::backend(Device device) const -> Result<std::shared_ptr<Bac
     if (device.index < 0) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "tensor device index cannot be negative"});
     }
-    std::scoped_lock lock(mutex_);
-    const auto found = backends_.find(device.kind);
-    if (found == backends_.end()) {
+    const auto kind_index = static_cast<std::size_t>(device.kind);
+    if (kind_index >= static_cast<std::size_t>(DeviceKind::COUNT)) {
         return std::unexpected(Error{ErrorCode::UNSUPPORTED, "no tensor backend registered for " + to_string(device)});
     }
-    return found->second;
+    struct LocalCache {
+        std::uint64_t version = 0;
+        std::array<std::shared_ptr<Backend>, static_cast<std::size_t>(DeviceKind::COUNT)> backends{};
+    };
+    thread_local LocalCache local;
+    const auto current_version = registry_version.load(std::memory_order_acquire);
+    if (local.version != current_version) {
+        std::scoped_lock lock(mutex_);
+        local.backends.fill(nullptr);
+        for (const auto& [kind, ptr] : backends_) {
+            const auto idx = static_cast<std::size_t>(kind);
+            if (idx < local.backends.size()) local.backends[idx] = ptr;
+        }
+        local.version = current_version;
+    }
+    const auto& cached = local.backends[kind_index];
+    if (!cached) {
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "no tensor backend registered for " + to_string(device)});
+    }
+    return cached;
 }
 
 auto BackendRegistry::backends(std::int32_t device_index) const -> std::vector<BackendInfo> {

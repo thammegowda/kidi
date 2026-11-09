@@ -88,6 +88,12 @@ Tensor::Tensor(std::shared_ptr<Backend> backend, std::shared_ptr<Storage> storag
 
 auto Tensor::defined() const noexcept -> bool { return backend_ != nullptr && storage_ != nullptr; }
 
+auto Tensor::release_pages(bool allow_anonymous) const noexcept -> void {
+    if (!defined() || !is_contiguous()) return;
+    storage_->release_pages(static_cast<std::size_t>(storage_offset_) * element_size(dtype_), nbytes(),
+                            allow_anonymous);
+}
+
 auto Tensor::copy_from_host(std::span<const std::byte> source, std::size_t offset) -> Result<void> {
     if (!defined() || !is_contiguous() || offset > nbytes() || source.size() > nbytes() - offset)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "host write outside contiguous tensor"});

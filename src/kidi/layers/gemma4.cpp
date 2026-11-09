@@ -114,13 +114,15 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, std::span<const std::int
     auto values = require(output.data<float>());
     if (packed_bits_ || weight_.dtype() == tensor::DType::I8) {
         const auto bits = packed_bits_ ? packed_bits_ : 8;
+        const std::uint8_t sign_mask = unsigned_packed_ ? (bits == 2 ? 0xaaU : bits == 4 ? 0x88U : 0U) : 0U;
         const auto scales = require(quantization_scale_.data<float>());
         const auto groups = quantization_scale_.size(1), group_width = width / groups;
         const auto data = reinterpret_cast<const std::uint8_t*>(bytes.data());
         for (std::size_t index = 0; index < tokens.size(); ++index)
             for (std::size_t channel = 0; channel < width; ++channel) {
                 const auto offset = row(index) * width + channel;
-                const auto raw = (data[offset / (8 / bits)] >> ((offset % (8 / bits)) * bits)) & ((1 << bits) - 1);
+                const auto byte = static_cast<std::uint8_t>(data[offset / (8 / bits)] ^ sign_mask);
+                const auto raw = (byte >> ((offset % (8 / bits)) * bits)) & ((1 << bits) - 1);
                 const auto integer = (raw ^ (1 << (bits - 1))) - (1 << (bits - 1));
                 values[index * width + channel] =
                     integer * scales[tokens[index] * groups + channel / group_width] * scale_;
@@ -153,16 +155,16 @@ auto TokenEmbeddingImpl::forward(ops::Context& context, const Tensor& tokens) co
         return forward(context, require(tokens.data<std::int32_t>()));
     }
     const auto bits = packed_bits_ ? packed_bits_ : weight_.dtype() == tensor::DType::I8 ? 8 : 0;
-    return context.embedding(tokens, weight_, quantization_scale_, width_, bits, scale_);
+    return context.embedding(tokens, weight_, quantization_scale_, width_, bits, scale_, unsigned_packed_);
 }
 auto TokenEmbeddingImpl::forward_sum(ops::Context& context, const Tensor& tokens) const -> Tensor {
     const auto bits = packed_bits_ ? packed_bits_ : weight_.dtype() == tensor::DType::I8 ? 8 : 0;
     return context.embedding_sum(tokens, weight_, quantization_scale_, width_, bits, scale_);
 }
 GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t packed_bits,
-                                           GatedActivation activation)
-    : gate_up_(hidden, gate_up_width(intermediate), true, false, packed_bits),
-      down_(intermediate, hidden, true, false, packed_bits),
+                                           GatedActivation activation, std::int32_t group_size)
+    : gate_up_(hidden, gate_up_width(intermediate), true, false, packed_bits, false, group_size),
+      down_(intermediate, hidden, true, false, packed_bits, false, group_size),
       activation_(activation) {
     register_module("gate_up_proj", gate_up_);
     register_module("down_proj", down_);
@@ -171,12 +173,13 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
     const auto rows = input.numel() / input.size(-1);
     const auto& policy = context.device().policy().transformer;
     const auto kernel = activation_ == GatedActivation::GELU ? policy.gelu : policy.silu;
-    const bool small_fusion = kernel == tensor::FeedForwardKernel::PACKED_SMALL && rows < 4 &&
+    const bool per_channel = gate_up_->group_size_ == gate_up_->input_size_ && down_->group_size_ == down_->input_size_;
+    const bool small_fusion = kernel == tensor::FeedForwardKernel::PACKED_SMALL && rows < 4 && per_channel &&
                               gate_up_->input_size_ % 128 == 0 && down_->input_size_ % 32 == 0;
-    const bool large_fusion =
-        kernel == tensor::FeedForwardKernel::PACKED_LARGE && rows >= (activation_ == GatedActivation::GELU ? 32 : 4);
+    const bool large_fusion = kernel == tensor::FeedForwardKernel::PACKED_LARGE && per_channel &&
+                              rows >= (activation_ == GatedActivation::GELU ? 32 : 4);
     const bool packed_fusion =
-        kernel == tensor::FeedForwardKernel::PACKED_INT8 && rows >= 4 && gate_up_->packed_bits_ == 8;
+        kernel == tensor::FeedForwardKernel::PACKED_INT8 && rows >= 4 && per_channel && gate_up_->packed_bits_ == 8;
     const bool fused_silu = activation_ == GatedActivation::SILU;
     if ((large_fusion || small_fusion || packed_fusion) && gate_up_->packed_bits_ &&
         gate_up_->packed_bits_ == down_->packed_bits_) {
@@ -195,7 +198,9 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
                 down_input_scale, down_output_scale, fused_silu);
             return output;
         }
-        if (!small_fusion)
+        const bool uncalibrated =
+            gate_input_scale == 0 && gate_output_scale == 0 && down_input_scale == 0 && down_output_scale == 0;
+        if (!small_fusion && !uncalibrated)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "fused feed-forward requires positive trained scales"});
     }
     if ((kernel == tensor::FeedForwardKernel::PACKED_GATE && (fused_silu || input.dtype() == tensor::DType::BF16)) ||
@@ -219,9 +224,10 @@ auto GatedFeedForwardImpl::forward_stages(ops::Context& context, const Tensor& i
     return {gate, up, hidden, down_->forward(context, hidden)};
 }
 Gemma4AttentionImpl::Gemma4AttentionImpl(std::int32_t hidden, std::int32_t heads, std::int32_t key_heads,
-                                         std::int32_t head_width, float epsilon, bool shared, std::int32_t packed_bits)
-    : query_(hidden, heads * head_width, true, false, packed_bits),
-      output_(heads * head_width, hidden, true, false, packed_bits),
+                                         std::int32_t head_width, float epsilon, bool shared, std::int32_t packed_bits,
+                                         std::int32_t group_size)
+    : query_(hidden, heads * head_width, true, false, packed_bits, false, group_size),
+      output_(heads * head_width, hidden, true, false, packed_bits, false, group_size),
       query_norm_(head_width, epsilon),
       heads_(heads),
       key_heads_(key_heads),
@@ -230,12 +236,10 @@ Gemma4AttentionImpl::Gemma4AttentionImpl(std::int32_t hidden, std::int32_t heads
     register_module("o_proj", output_);
     register_module("q_norm", query_norm_);
     if (!shared) {
-        key_ = Linear(hidden, key_heads * head_width, true, false, packed_bits);
-        value_ = Linear(hidden, key_heads * head_width, true, false, packed_bits);
+        key_value_ = Linear(hidden, 2 * key_heads * head_width, true, false, packed_bits, false, group_size);
         key_norm_ = RmsNorm(head_width, epsilon);
         value_norm_ = RmsNorm(head_width, epsilon, false);
-        register_module("k_proj", key_);
-        register_module("v_proj", value_);
+        register_module("kv_proj", key_value_);
         register_module("k_norm", key_norm_);
         if (packed_bits) {
             register_parameter("k_cache_scale", key_scale_, {}, tensor::DType::F32, allocate_parameters,
@@ -252,7 +256,7 @@ auto Gemma4AttentionImpl::forward(ops::Context& context, const Tensor& input, Ke
     return forward_segments(context, input, segments, cosine, sine);
 }
 auto Gemma4AttentionImpl::has_cache_scales() const -> bool {
-    if (!key_ || !key_scale_.defined() || !value_scale_.defined()) return false;
+    if (!key_value_ || !key_scale_.defined() || !value_scale_.defined()) return false;
     const auto key_scale = key_scale_.data<float>(), value_scale = value_scale_.data<float>();
     return key_scale && value_scale && (*key_scale)[0] > 0 && (*value_scale)[0] > 0;
 }
@@ -273,16 +277,22 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
     const auto reshape = [&](const Tensor& value, std::int32_t heads) {
         return context.reshape(value, {1, length, heads, head_width_});
     };
-    Tensor query;
+    Tensor query, key, value;
     if (!cache_only)
         query = query_norm_->forward_rotary(context, reshape(query_->forward(context, input), heads_), cosine, sine);
-    Tensor key, value;
     ops::BlockwiseQuantization key_quantization, value_quantization;
     // A byte cache rounds and clamps inside its own cast, so the separate rounding pass would be redundant.
     const auto byte_cache = segments.front().cache->key.dtype() == tensor::DType::I8;
-    if (key_) {
-        key = key_norm_->forward_rotary(context, reshape(key_->forward(context, input), key_heads_), cosine, sine);
-        value = value_norm_->forward(context, reshape(value_->forward(context, input), key_heads_));
+    if (key_value_) {
+        const auto kv_width = static_cast<std::int64_t>(key_heads_ * head_width_);
+        const auto kv = key_value_->forward(context, input);
+        if (context.device().capabilities().compute.host()) {
+            key = key_norm_->forward_rotary_slice(context, kv, cosine, sine, key_heads_, head_width_, 0, 0, length);
+        } else {
+            key = key_norm_->forward_rotary(context, reshape(context.slice(kv, -1, 0, kv_width), key_heads_), cosine,
+                                            sine);
+        }
+        value = value_norm_->forward(context, reshape(context.slice(kv, -1, kv_width, kv_width), key_heads_));
         if (key_scale_.defined()) {
             const auto key_scale = require(key_scale_.data<float>())[0];
             const auto value_scale = require(value_scale_.data<float>())[0];
@@ -310,7 +320,7 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
     std::size_t offset = 0;
     for (const auto& segment : segments) {
         auto& cache = *segment.cache;
-        if (key_) {
+        if (key_value_) {
             auto keys = context.slice(key, 1, offset, segment.length);
             auto values = context.slice(value, 1, offset, segment.length);
             if (byte_cache) {
@@ -349,16 +359,17 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
 Gemma4BlockImpl::Gemma4BlockImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t heads,
                                  std::int32_t key_heads, std::int32_t head_width, std::int32_t per_layer_width,
                                  float epsilon, bool shared, std::int32_t mlp_bits, std::int32_t attention_bits,
-                                 std::int32_t per_layer_bits)
-    : attention_(hidden, heads, key_heads, head_width, epsilon, shared, attention_bits),
-      feed_forward_(hidden, intermediate, mlp_bits),
+                                 std::int32_t per_layer_bits, std::int32_t mlp_group_size,
+                                 std::int32_t attention_group_size, std::int32_t per_layer_group_size)
+    : attention_(hidden, heads, key_heads, head_width, epsilon, shared, attention_bits, attention_group_size),
+      feed_forward_(hidden, intermediate, mlp_bits, GatedActivation::GELU, mlp_group_size),
       input_norm_(hidden, epsilon),
       attention_norm_(hidden, epsilon),
       pre_feed_forward_norm_(hidden, epsilon),
       post_feed_forward_norm_(hidden, epsilon),
       per_layer_norm_(hidden, epsilon),
-      per_layer_gate_(hidden, per_layer_width, true, false, per_layer_bits),
-      per_layer_projection_(per_layer_width, hidden, true, false, per_layer_bits) {
+      per_layer_gate_(hidden, per_layer_width, true, false, per_layer_bits, false, per_layer_group_size),
+      per_layer_projection_(per_layer_width, hidden, true, false, per_layer_bits, false, per_layer_group_size) {
     register_module("self_attn", attention_);
     register_module("mlp", feed_forward_);
     register_module("input_layernorm", input_norm_);

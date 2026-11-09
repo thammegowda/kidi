@@ -447,12 +447,18 @@ auto check_async_serving(const YAML::Node& config) -> void {
             if (parameter.dimensions() == 2) value = context.cast(value, tensor::DType::BF16);
             if (name == "lm_head.weight") continue;
             constexpr std::string_view GATE_UP = "gate_up_proj.weight";
+            constexpr std::string_view KV = "kv_proj.weight";
             const auto key = "model.language_model." + name;
             if (name.ends_with(GATE_UP)) {
                 const auto prefix = key.substr(0, key.size() - GATE_UP.size());
                 const auto middle = static_cast<std::int64_t>(value.size(0) / 2);
                 state.emplace(prefix + "gate_proj.weight", require(value.narrow(0, 0, middle)));
                 state.emplace(prefix + "up_proj.weight", require(value.narrow(0, middle, middle)));
+            } else if (name.ends_with(KV)) {
+                const auto prefix = key.substr(0, key.size() - KV.size());
+                const auto middle = static_cast<std::int64_t>(value.size(0) / 2);
+                state.emplace(prefix + "k_proj.weight", require(value.narrow(0, 0, middle)));
+                state.emplace(prefix + "v_proj.weight", require(value.narrow(0, middle, middle)));
             } else {
                 state.emplace(key, std::move(value));
             }
@@ -614,14 +620,18 @@ auto main() -> int {
                     std::filesystem::temp_directory_path() / "kidi-gemma4-zero-scale.safetensors";
                 std::filesystem::copy_file(directory / "model.safetensors", sentinel_path,
                                            std::filesystem::copy_options::overwrite_existing);
-                std::array<std::streamoff, 2> offsets;
+                std::array<std::streamoff, 4> offsets;
+                std::streamoff weight_scale_offset;
                 {
                     const kidi::checkpoint::safetensors::MappedCheckpoint mapped(sentinel_path.string());
                     const auto base = mapped.owner()->data();
                     offsets = {
                         mapped.at("lm_head.input_activation_scale").data - base,
                         mapped.at("lm_head.output_activation_scale").data - base,
+                        mapped.at("model.language_model.layers.0.self_attn.k_cache_scale").data - base,
+                        mapped.at("model.language_model.layers.0.self_attn.v_cache_scale").data - base,
                     };
+                    weight_scale_offset = mapped.at("lm_head.weight_scale").data - base;
                 }
                 {
                     std::fstream output(sentinel_path, std::ios::binary | std::ios::in | std::ios::out);
@@ -635,6 +645,25 @@ auto main() -> int {
                 const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
                 auto sentinel_model = ops::require(model::Gemma4Impl::create(config));
                 ops::require(sentinel_model->set_checkpoint(sentinel_checkpoint));
+                auto state =
+                    ops::require(sentinel_model->create_state(config["max_position_embeddings"].as<std::size_t>()));
+                if (std::ranges::any_of(state.layers, [](const auto& layer) {
+                        return layer.key.dtype() != tensor::DType::F32 || layer.value.dtype() != tensor::DType::F32;
+                    }))
+                    return failed(__LINE__);
+                const std::array<std::int32_t, 2> uncalibrated_tokens{2, 6};
+                const auto uncalibrated_logits = ops::require(sentinel_model->forward(uncalibrated_tokens, state));
+                if (std::ranges::any_of(ops::require(uncalibrated_logits.data<float>()),
+                                        [](float value) { return !std::isfinite(value); }))
+                    return failed(__LINE__);
+                {
+                    std::fstream output(sentinel_path, std::ios::binary | std::ios::in | std::ios::out);
+                    constexpr float ZERO = 0.F;
+                    output.seekp(weight_scale_offset);
+                    output.write(reinterpret_cast<const char*>(&ZERO), sizeof(ZERO));
+                }
+                auto invalid_checkpoint = ops::require(checkpoint::Weights::load(sentinel_path));
+                if (sentinel_model->set_checkpoint(invalid_checkpoint)) return failed(__LINE__);
                 std::filesystem::remove(sentinel_path);
             }
             const auto token_tensor = ops::require(reference.tensor("tokens"));
@@ -667,8 +696,12 @@ auto main() -> int {
                 const auto parameters = model->state_dict();
                 for (const auto& [name, parameter] : parameters)
                     if (name.find(".mlp.gate_proj.") != std::string::npos ||
-                        name.find(".mlp.up_proj.") != std::string::npos)
+                        name.find(".mlp.up_proj.") != std::string::npos ||
+                        name.find(".self_attn.k_proj.") != std::string::npos ||
+                        name.find(".self_attn.v_proj.") != std::string::npos)
                         return failed(__LINE__);
+                const auto shared_begin =
+                    config["num_hidden_layers"].as<int>() - config["num_kv_shared_layers"].as<int>();
                 for (int layer = 0; layer < config["num_hidden_layers"].as<int>(); ++layer) {
                     const auto prefix = "layers." + std::to_string(layer) + ".mlp.";
                     const auto gate =
@@ -676,6 +709,13 @@ auto main() -> int {
                     const auto& combined = parameters.at(prefix + "gate_up_proj.weight");
                     if (combined.size(0) != 2 * gate.size(0) || combined.size(1) != gate.size(1))
                         return failed(__LINE__);
+                    if (layer < shared_begin) {
+                        const auto attn_prefix = "layers." + std::to_string(layer) + ".self_attn.";
+                        const auto key =
+                            ops::require(checkpoint.tensor("model.language_model." + attn_prefix + "k_proj.weight"));
+                        const auto& kv = parameters.at(attn_prefix + "kv_proj.weight");
+                        if (kv.size(0) != 2 * key.size(0) || kv.size(1) != key.size(1)) return failed(__LINE__);
+                    }
                 }
                 auto full = ops::require(model->create_state(8));
                 const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
@@ -707,6 +747,18 @@ auto main() -> int {
                 if (unsupported_cache || unsupported_cache.error().code != ErrorCode::UNSUPPORTED)
                     return failed(__LINE__);
                 model->set_kv_cache_precision(core::KVCachePrecision::AUTO);
+                if (fixture == std::string_view("gemma4") && device == tensor::Device::cpu()) {
+                    for (const auto bits : {4, 8}) {
+                        auto quantized = ops::require(model::Gemma4Impl::create(config));
+                        ops::require(quantized->set_checkpoint(checkpoint, bits, 2));
+                        if (!quantized->last_token_prefill()) return failed(__LINE__);
+                        auto quantized_state = ops::require(quantized->create_state(8));
+                        const auto first = ops::require(quantized->forward_token(tokens.first(2), quantized_state));
+                        const std::array next_input{first};
+                        const auto second = ops::require(quantized->forward_token(next_input, quantized_state));
+                        if (first < 0 || second < 0) return failed(__LINE__);
+                    }
+                }
                 if (fixture == std::string_view("gemma4-qat") && device == tensor::Device::cpu()) {
                     std::vector precisions{
                         core::InferencePrecision::FP32,    core::InferencePrecision::BF16,

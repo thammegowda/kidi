@@ -411,7 +411,8 @@ export function weightLayout(header, ranges, gemma, gpu = false) {
             const bytes = range.end - range.start;
             if (adjacent) {
                 const entry = layout.device.at(-1);
-                entry.name = entry.name.replace('.mlp.gate_proj.', '.mlp.gate_up_proj.');
+                entry.name = entry.name.replace('.mlp.gate_proj.', '.mlp.gate_up_proj.')
+                                       .replace('.self_attn.k_proj.', '.self_attn.kv_proj.');
                 entry.shape = [entry.shape[0] * 2, ...entry.shape.slice(1)];
                 range.device = entry;
                 range.offset = entry.bytes;
@@ -440,10 +441,13 @@ export function weightLayout(header, ranges, gemma, gpu = false) {
         layout.tensors.push(range);
     };
     for (const range of ranges) {
-        if (range.name.includes('.mlp.up_proj.') && byName.has(range.name.replace('.mlp.up_proj.', '.mlp.gate_proj.')))
+        if ((range.name.includes('.mlp.up_proj.') && byName.has(range.name.replace('.mlp.up_proj.', '.mlp.gate_proj.'))) ||
+            (range.name.includes('.self_attn.v_proj.') && byName.has(range.name.replace('.self_attn.v_proj.', '.self_attn.k_proj.'))))
             continue;
         place(range, false);
-        const partner = byName.get(range.name.replace('.mlp.gate_proj.', '.mlp.up_proj.'));
+        const partner = byName.get(range.name.includes('.mlp.gate_proj.')
+            ? range.name.replace('.mlp.gate_proj.', '.mlp.up_proj.')
+            : range.name.replace('.self_attn.k_proj.', '.self_attn.v_proj.'));
         if (partner && partner !== range) place(partner, range.target === 'heap' || range.target === 'gpu');
     }
     layout.dataBytes = cursor;

@@ -118,7 +118,8 @@ public:
     auto crop_local_attention() const noexcept -> bool;
     auto prefill_chunk_size(std::size_t requested) const -> std::size_t;
     auto prepare_linear_weights(const Tensor& weight, std::int32_t bits, std::int32_t group_size = 128,
-                                bool packed_prefill = true) -> void;
+                                bool packed_prefill = true, bool asymmetric_clip = false) -> void;
+    auto bind_packed_zero(const Tensor& scales, Tensor zeros) -> void;
     auto add(const Tensor& left, const Tensor& right) -> Tensor;
     auto add_(Tensor& left, const Tensor& right) -> Tensor&;
     auto multiply(const Tensor& left, const Tensor& right) -> Tensor;
@@ -136,7 +137,8 @@ public:
     auto quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias,
                           bool transpose_weight = false) -> Tensor;
     auto packed_linear(const Tensor& input, const Tensor& weight, const Tensor& scales, std::int32_t bits,
-                       std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F) -> Tensor;
+                       std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F,
+                       const Tensor& zeros = {}) -> Tensor;
     auto gelu(const Tensor& input, bool approximate = false) -> Tensor;
     auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
     auto silu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
@@ -152,7 +154,7 @@ public:
     auto static_round(const Tensor& input, float scale) -> Tensor;
     auto greedy_token(const Tensor& logits, TokenOutput output = TokenOutput::HOST) -> Tensor;
     auto embedding(const Tensor& indices, const Tensor& weight, const Tensor& scales, std::int32_t width,
-                   std::int32_t bits, float multiplier) -> Tensor;
+                   std::int32_t bits, float multiplier, bool unsigned_packed = false) -> Tensor;
     auto embedding_sum(const Tensor& tokens, const Tensor& weight, const Tensor& scales, std::int32_t width,
                        std::int32_t bits, float multiplier) -> Tensor;
     auto diffusion_candidates(const Tensor& logits, std::size_t target, std::int32_t codebooks, std::int32_t vocabulary,

@@ -1,0 +1,14 @@
+table_group	runtime_id	runtime	backend	weight_format	model_gib	prefill_tps	decode_tps	decode_range	ttft_ms	peak_rss_gib	binary_mib	chrf_ref	chrf_bf16	wmt23_eval_s
+bf16_int8	kidi_bf16	KIDI BF16 (kidi_bf16)	YNNPACK (arm64 BF16)	BF16 (Reference)	8.50	255.48	16.80	16.37-16.86	121.34	5.31	7.62	57.05	100.00	277.45
+bf16_int8	kidi_int8	KIDI (kidi)	YNNPACK (arm64 SME/DOTPROD)	INT8 per-channel (tied emb)	4.37	583.12	32.92	31.33-33.34	53.16	3.19	7.62	57.16	94.34	146.32
+bf16_int8	arm_int8	Arm ExecuTorch v1.5.1 (arm)	XNNPACK + KleidiAI (8da8w+emb8)	INT8 per-channel (tied emb)	4.70	436.82	28.42	28.42-28.66	70.97	2.44	7.87	57.25	94.80	184.43
+bf16_int8	onnx_int8	ONNX Runtime v1.31.1 (onnx)	MLAS + KleidiAI (MatMulIntegerToFloat)	INT8 per-channel	4.69	309.40	31.29	31.18-31.39	100.19	2.25	20.10	57.21	94.05	170.99
+bf16_int8	llamacpp_int8	llama.cpp (llamacpp)	GGML CPU + KleidiAI	Q8_0 (g=32, tied emb)	4.61	184.33	33.30	33.25-33.39	168.17	6.58	4.48	56.95	94.48	177.41
+int4_g128	kidi_int4_g128	KIDI Symmetric (kidi)	YNNPACK + NEON sdot (BlockwiseInt4Linear)	Symmetric INT4 (g=128, tied emb)	2.27	544.13	58.23	56.10-58.42	56.97	1.44	7.62	55.45	81.50	103.57
+int4_g128	kidi_asym_clip	KIDI Asymmetric+Clip (kidi_asym_clip)	YNNPACK + NEON sdot (BlockwiseInt4Linear)	Asymmetric INT4 + MSE Clip (g=128, tied emb)	2.27	537.91	56.37	55.97-57.10	57.63	1.50	7.62	55.63	84.65	101.54
+int4_g128	arm_int4_g128	Arm ExecuTorch v1.5.1 (arm)	XNNPACK + KleidiAI (8da4w+emb4)	Symmetric INT4 (g=128, tied emb)	2.39	234.11	43.51	43.44-43.64	132.42	1.84	7.87	54.87	80.23	160.32
+int4_g128	onnx_int4_g128	ONNX Runtime v1.31.1 (onnx)	MLAS + KleidiAI (MatMulNBits)	Symmetric INT4 (g=128, tied emb)	2.41	396.27	50.65	50.31-50.91	78.23	1.45	20.10	54.96	80.49	103.67
+int4_g32	kidi_asym_g32	KIDI Asymmetric+Clip (kidi_asym_g32)	YNNPACK + NEON sdot (BlockwiseInt4Linear)	Asymmetric INT4 + MSE Clip (g=32, tied emb)	2.47	432.00	48.52	48.20-49.40	71.76	1.69	7.62	56.27	87.79	129.60
+int4_g32	llamacpp_q4_0	llama.cpp (llamacpp)	GGML CPU + KleidiAI	Q4_0 (g=32 + BF16 PLE proj, tied emb)	2.47	145.93	47.82	47.30-47.89	212.42	3.88	4.48	56.21	86.61	126.74
+qat_mixed	kidi_qat	KIDI QAT (kidi_qat)	YNNPACK (arm64 SME/DOTPROD)	Static INT8 act + INT4 FFN/Attn + INT2 LM head	2.29	844.83	68.56	68.12-72.93	36.69	2.36	7.62	55.71	84.76	76.04
+qat_mixed	litert	Google LiteRT-LM v0.17.1 (litert)	LiteRT-LM + XNNPACK	.litertlm mixed INT4/INT2	2.41	159.74	47.54	47.49-47.77	194.07	1.31	52.18	56.01	85.92	115.68

@@ -20,6 +20,12 @@ public:
 
     virtual auto device() const noexcept -> Device = 0;
     virtual auto size_bytes() const noexcept -> std::size_t = 0;
+    virtual auto release_pages(std::size_t offset, std::size_t size_bytes, bool allow_anonymous = false) const noexcept
+        -> void {
+        (void)offset;
+        (void)size_bytes;
+        (void)allow_anonymous;
+    }
 };
 
 class Readback {
