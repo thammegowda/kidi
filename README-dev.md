@@ -47,14 +47,20 @@ runtime memory must be measured separately from artifact size.
 
 ### CUDA
 
-The optional NVIDIA backend requires the CUDA 13+ toolkit and a compatible GPU.
-From an initialized checkout, enable it for the standalone CLI:
+The optional NVIDIA backend requires Linux, the CUDA 13+ toolkit, a cuVS SDK
+with its C API and shared-library dependencies, DLPack headers, and a compatible
+GPU. `KIDI_ENABLE_CUDA=ON` enables both CUDA inference and GPU HNSW index
+construction. From an initialized checkout, enable it for the standalone CLI:
 
 ```bash
 cmake --preset release -DKIDI_ENABLE_CUDA=ON
 cmake --build --preset release --target kidi_cli
 build-release/kidi chat --model /path/to/gemma-model --backend cuda:0
 ```
+
+For a nonstandard SDK installation, add `-DKIDI_CUVS_ROOT=/path/to/cuvs` and,
+if needed, `-DKIDI_DLPACK_INCLUDE_DIR=/path/to/include` to the configure command.
+CUDA configuration fails if these required dependencies cannot be found.
 
 For the Python launcher, build and install a CUDA-enabled package separately:
 
@@ -388,10 +394,10 @@ threads, respectively. CPU distance kernels use AVX-512/FMA where supported.
 Progress includes row counts, percentage, elapsed time, rate and an interval-based
 ETA. A full vocabulary can still take substantial offline time.
 
-For fast offline construction, an optional native cuVS backend builds the graph
-on CUDA and exports it for CPU search. Enable it on Linux with
-`KIDI_ENABLE_CUDA=ON`, `KIDI_ENABLE_CUVS=ON`, and `KIDI_CUVS_ROOT` pointing at a
-cuVS SDK; DLPack headers and the cuVS shared-library dependencies must be available.
+CUDA-enabled builds also include native cuVS offline construction, which builds
+the graph on CUDA and exports it for CPU search. The existing
+`KIDI_ENABLE_CUDA=ON` setting enables inference and indexing together; there is
+no separate vector-search feature switch. See the [CUDA requirements](#cuda).
 `--builder auto` selects this backend when compiled and a CUDA device is present;
 `--builder cpu` forces the deterministic builder. For example:
 
@@ -402,7 +408,10 @@ CUDA_VISIBLE_DEVICES=0 build-release/kidi index --model /path/to/gemma-4 --build
 The native `kidi-index-cuda` helper runs in a separate process, so a cuVS SDK
 built against another CUDA major version cannot interfere with inference's
 CUDA libraries. Keep the helper beside `kidi` or on `PATH`. No Python runtime is
-used. GPU construction uses raw FP32 representations of the original weights,
+used. The command has only three source files: `cli/index.h`, `cli/index.cpp`,
+and `cli/index.cu`. The existing `KIDI_HAS_CUDA` macro selects CUDA dispatch or
+unavailable-backend stubs; only the CUDA-only `index.cu` target links the cuVS SDK.
+GPU construction uses raw FP32 representations of the original weights,
 then verifies every exported vector, label and ordered live edge before packing
 the graph. cuVS does not expose per-node progress or a seeded construction API;
 its stage heartbeats explicitly report progress/ETA as unavailable rather than

@@ -2,6 +2,7 @@
 #include "kidi/core/hnsw.h"
 #include "kidi/inference/generator.h"
 #include "kidi/ops/context.h"
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -90,6 +91,18 @@ auto main() -> int {
         serial_command.insert(serial_command.end(), {"--output", (root / "serial.hnsw").string()});
         check(run(serial_command).first == 0 && read(root / "serial.hnsw") == original,
               "CLI graph depends on thread count");
+#if !defined(KIDI_HAS_CUDA)
+        auto automatic_command = serial_command;
+        const auto builder = std::ranges::find(automatic_command, "--builder");
+        automatic_command.erase(builder, builder + 2);
+        automatic_command.back() = (root / "automatic.hnsw").string();
+        const auto [automatic_status, automatic_output] = run(automatic_command);
+        check(automatic_status == 0 && nlohmann::json::parse(automatic_output)["builder"] == "cpu" &&
+                  read(root / "automatic.hnsw") == original,
+              "CPU-only build did not automatically select native CPU indexing");
+        automatic_command.insert(automatic_command.end(), {"--builder", "cuda"});
+        check(run(automatic_command).first == 2, "CPU-only build accepted CUDA indexing");
+#endif
         auto invalid_threads = command;
         invalid_threads.back() = "0";
         check(run(invalid_threads).first == 2, "zero indexing threads were accepted");
