@@ -1,304 +1,124 @@
 # Kidi <a href="docs/kidi-logo.png"><img src="docs/kidi-logo-small.png" alt="Kidi logo" width="48" height="48"></a>
 
-**Local AI chat, image questions, speech transcription and synthesis, and translation.**
+**Fast, self-contained C++23 on-device AI runtime and app suite for chat, vision, speech transcription, speech synthesis, and 500-language translation.**
 
-Kidi ("spark" in Kannada) runs models on your device. Use the Android app for
-chat, photos, and dictation, the browser app for local chat and dictation, or
-the command line for chat, audio files, and translation.
+Kidi (*"spark"* in Kannada) runs modern generative AI models locally on your hardware — from **Arm & x86 CPUs**, **Apple Metal**, **NVIDIA CUDA**, **Vulkan**, and **Qualcomm QNN NPUs** to **Android phones**, **Desktop apps**, and **WebAssembly / WebGPU browsers** — without requiring PyTorch, Hugging Face `transformers`, or cloud APIs.
 
-[Quick Start](#quick-start) | [Android](#android) | [Browser](#webassembly) | [Chat](#interactive-chat) |
-[Transcription](#whisper-transcription) | [Synthesis](#omnivoice-text-to-speech) |
-[Translation](#rtg-model-package) | [Developer Guide](README-dev.md) |
-[Getting Started Guide](docs/getting-started.md)
+[Why Kidi?](#why-kidi) | [Benchmarks](#performance-highlights) | [Models & Backends](#supported-models--backends) | [Quick Start](#quick-start) | [CLI Tasks](#command-line-tasks) | [Desktop, Web & Android Apps](#applications) | [Ecosystem & Citation](#companion-projects--publications) | [Developer Guide](README-dev.md)
+
+---
 
 ## Why Kidi?
 
-- **Private inference.** Prompts are processed locally, not sent to a remote
-  inference server. Internet is needed to download models, not to run them afterward.
-- **Chat and more.** Stream replies, ask follow-up questions, dictate a message,
-  or ask about a photo in the Android app.◊
-- **No heavyweight inference install.** Running Kidi does not require PyTorch or
-  Transformers. Model downloads and memory requirements are separate from app size.
-- **Interactive or scripted.** Use a chat interface or process text and audio
-  files from the command line.
+- **Batteries-Included Single Binary (`~7.6 MiB`):** Zero runtime dependency on PyTorch, Transformers, OpenCV, Pillow, or Python. A single static binary compiles in our purpose-built C++ libraries:
+  - **Compute & Shaders ([`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev)):** Our extended fork of YNNPACK (`ARM64` NEON/DOTPROD/SME2, `x86` AVX2/AVX-512, `Wasm` SIMD128, CUDA) + embedded Apple Metal kernels
+  - **Tokenization & Text ([`tokenizerspp`](https://github.com/thammegowda/tokenizerspp)):** Native C++ Hugging Face `tokenizer.json` engine, Unicode (`uni-algo`), regex (`RE2`), G2P phonemizer, and linguistic sentence splitter
+  - **Vision & Image Codecs ([`tahoma-vision`](https://github.com/thammegowda/tahoma-vision) & [`pigzpp`](https://github.com/thammegowda/pigzpp)):** SIMD-accelerated **JPEG (`libjpeg-turbo`)**, **PNG ([`pigzpp`](https://github.com/thammegowda/pigzpp) + `zlib-ng`)**, and PPM decoding + vision tensor preprocessing
+  - **Audio & Speech:** WAV PCM I/O, Whisper log-Mel spectrogram frontend, and neural vocoders (Higgs Audio 2 / Kokoro)
+  - **Checkpoints & Formats:** Zero-copy `mmap` Safetensors, GGUF/GGML, YAML (`yaml-cpp`), JSON (`nlohmann/json`), and parallel gzip ([`pigzpp`](https://github.com/thammegowda/pigzpp) / `zlib-ng`)
+  - **Desktop Server & UI ([`liteapp`](https://github.com/thammegowda/liteapp)):** Embedded C++ HTTP + WebSocket loopback server, EPUB/ZIP virtual filesystem, and bundled web/Android UI bridge (`kidi-app`)
+- **State-of-the-Art Edge CPU & GPU Speed:** Custom ARM64 SME2 and fused zero-copy NEON `sdot` kernels (`BlockwiseInt4Linear`), graph capture/replay, and `mmap`-backed weight streaming deliver faster prefill, faster decode, and lower RAM usage than ExecuTorch, ONNX Runtime, `llama.cpp`, and LiteRT-LM.
+- **High-Fidelity Low-Bit Quantization:** Built on findings from our [**WMT 2026 LLM compression paper**](https://aclanthology.org/2026.wmt-main.136/) (*Quantize, Qualify, Rerank: A Recipe for Compressing LLMs Without Losing Quality*) and [**engineering blog post**](https://gowda.ai/posts/2026/08/llm-fast-inference/). Supports native mixed 2/4/8-bit QAT checkpoints, blockwise symmetric INT4/INT8, and **blockwise asymmetric INT4 (`g=128` and `g=32`) with 11-step MSE outlier clipping** that recovers near-BF16 translation quality at 4-bit memory footprints.
+- **One Engine, Every Surface:** Use the CLI and Python package for scripting, or launch the **Desktop App**, **Android App**, or **WebAssembly / WebGPU Browser App** for streaming chat, continuous voice conversations, camera/photo Q&A, and side-by-side bilingual EPUB book reading with read-aloud narration.
 
-## What Works Today
+---
 
-| Model | Capabilities |
-|---|---|
-| Gemma 4 E2B-it | Text chat and generation; Android photo questions with the default mobile model |
-| Whisper Tiny/Base/Small/Large-v3/Turbo | Multilingual speech transcription and speech-to-English translation |
-| OmniVoice | Experimental multilingual text-to-speech in the native CLI and Android read-aloud |
-| Kokoro-82M | Experimental US-English text-to-speech with selectable voice and speed |
-| RTG Transformer | Text translation, including the public 500-language-to-English model |
+## Performance Highlights
 
-The tested command-line setup is **Apple Silicon, macOS 26+, and Python 3.12+**.
-Gemma E2B, OmniVoice, and Kokoro have been tested on a 16 GiB Apple M5. Browser inference has been tested
-in current 64-bit Chromium. Native Linux/Windows and Gemma E4B have not been
-validated end to end here.
+### Gemma 4 E2B (`google/gemma-4-E2B-it`) on Arm CPU (Apple M5, 4 Threads, Batch 1)
 
-Model support is explicit: an arbitrary Hugging Face URL does not make a new
-architecture compatible. Terminal chat and JSONL generation are currently
-text-only and greedy. Photo input is available in the Android app, not every
-interface. Tool execution, video/document input, CUDA, and Apple Neural Engine
-execution are not supported. Whisper runs on CPU with 30-second inference windows;
-the native CLI streams longer 16 kHz WAV files through one loaded model.
-Microphone and embedded inference requests remain limited to 30 seconds.
-TTS runs from the native CLI and Android read-aloud;
-the Android app automatically tries Vulkan and then CPU. Browser TTS and
-external-audio OmniVoice voice cloning are not implemented. Long-form native
-synthesis uses sentence-sized chunks with a consistent generated reference.
-The first Kokoro package supports US English and one or more explicitly embedded
-voice packs.
+Measured against **Arm ExecuTorch v1.5.1** (`XNNPACK + KleidiAI`), **ONNX Runtime v1.31.1** (`MLAS + KleidiAI`), **`llama.cpp`** (`GGML + KleidiAI`), and **Google LiteRT-LM v0.17.1** (`XNNPACK`) across both throughput (`tokens/s`) and 150-sentence WMT23 (`ja, uk, de -> en`) translation quality (`chrF` vs. human reference translations). Full methodology and 4-table breakdown in [`benchmarks/gemma4/arm/README.md`](benchmarks/gemma4/arm/README.md):
+
+<p align="center">
+  <img src="docs/gemma4-arm-pareto.svg" alt="Gemma 4 E2B on Arm CPU: Speed vs. Translation Quality Pareto Frontier" width="100%">
+</p>
+
+- **Dominates the 4-bit & 8-bit Pareto frontier on both Prefill and Decode:**
+  - **4-bit QAT (`2.29 GiB`):** Kidi reaches **844.8 tok/s prefill** (**5.29x faster** than Google LiteRT-LM at `159.7 tok/s`) and **68.6 tok/s decode** (**1.44x faster** than LiteRT-LM at `47.5 tok/s`).
+  - **4-bit `g=128` (`2.27 GiB`):** On matched weights, Kidi runs **2.32x faster on prefill** (`544.1` vs. `234.1 tok/s`) and **1.34x faster on decode** (`58.2` vs. `43.5 tok/s`) than Arm ExecuTorch in **1.44 GiB RAM**, and **1.37x faster on prefill** (`544.1` vs. `396.3 tok/s`) and **1.15x faster on decode** (`58.2` vs. `50.7 tok/s`) than ONNX Runtime.
+  - **4-bit `g=32` (`2.47 GiB`):** Kidi's asymmetric INT4 + MSE outlier clipping reaches **`56.27` `chrF (ref)` / `87.79` `chrF (bf16)`** at **432.0 tok/s prefill** (**2.96x faster** than `llama.cpp` `Q4_0`) and **48.5 tok/s decode** while using **2.30x less RAM** (`1.69 GiB` vs. `3.88 GiB`).
+  - **8-bit (`4.37 GiB`):** Kidi reaches **583.1 tok/s prefill** (**1.33x faster** than Arm ExecuTorch, **1.88x faster** than ONNX Runtime, and **3.16x faster** than `llama.cpp` `Q8_0`) at near-lossless BF16 quality (`57.16` `chrF`).
+- **CUDA Graph Pipelining:** On an NVIDIA RTX A4000 (2,322-token prompt, BF16), Kidi reaches **11,285.9 tok/s prefill** (**1.40x faster** than compiled `vLLM` at `8,062.7 tok/s`) and **64.4 tok/s decode** (see [`benchmarks/README.md`](benchmarks/README.md)).
+
+---
+
+## Supported Models & Backends
+
+### Models & Modalities
+
+| Model Family | Tasks | Highlights |
+|---|---|---|
+| **Gemma 4 (`E2B-it`, `E4B-it`)** | Chat, JSONL Generation, Vision (Photo Q&A) | Native QAT (mixed 2/4/8-bit), BF16, Per-Channel INT8, and Group-32/128 Symmetric & Asymmetric INT4 with tied embeddings |
+| **Qwen 3** | Chat & Text Generation | Grouped-query attention, SwiGLU, RMSNorm, and quantized linear execution |
+| **Whisper (`Tiny`, `Base`, `Small`, `Large-v3`, `Turbo`)** | Speech-to-Text (`transcribe`) & Speech-to-English (`translate`) | Loads directly from Hugging Face checkpoints; automatic INT8 weight caching and 30s windowed long-audio streaming |
+| **OmniVoice** | Multilingual Text-to-Speech (`synthesize`) | 600+ MB INT8 package with controllable voice attributes (`gender`, `age`, `pitch`, `accent`, `style`) and consistent long-form narrator conditioning |
+| **Kokoro-82M** | US-English Text-to-Speech (`synthesize`) | Compact INT8 model with bundled offline Misaki pronunciation lexicon and selectable voice packs |
+| **RTG Transformer** | Machine Translation (`translate`) | Supports the public [500-language-to-English (`rtg-500eng-v1`)](https://huggingface.co/thammegowda/rtg-500eng-v1) model |
+
+### Hardware Acceleration Backends
+
+| Backend | Flag / Target | Supported Platforms & Notes |
+|---|---|---|
+| **[`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) + ARM64 NEON/SME2 / x86 AVX** | `--backend ynnpack` | Portable default on macOS, Linux, Windows, Android (`arm64`), and WebAssembly SIMD |
+| **Apple Metal (MPS)** | `--backend mps` | Default on Apple Silicon macOS for supported chat and OmniVoice TTS models |
+| **NVIDIA CUDA** | `--backend cuda:0` | Opt-in CUDA 13 + cuBLAS backend with asynchronous graph capture/replay pipelining |
+| **Vulkan** | `--backend vulkan` | Cross-platform GPU compute used on Android and desktop |
+| **Qualcomm QNN (Hexagon NPU)** | Android / Snapdragon | Step-compiled NPU graph execution for mobile inference |
+| **WebAssembly + WebGPU** | Browser (`make wasm`) | Runs entirely in Chrome/Edge/Firefox/Safari with IndexedDB/OPFS model caching |
+
+---
 
 ## Quick Start
 
-For the command line, use Python 3.12 or later. The Git installation below
-compiles Kidi, so it also needs Git and a C++23 compiler; on macOS, install
-current Xcode Command Line Tools. It does not install PyTorch or Transformers.
+Install from Git in a Python 3.12+ virtual environment (requires Git and a C++23 compiler such as Xcode Command Line Tools on macOS; **no PyTorch or Transformers needed**):
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -v "kidi[hf] @ git+https://github.com/thammegowda/kidi.git@main"
+
+# Launch interactive streaming chat (downloads ~2.49 GB once and caches locally)
 python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers
 ```
 
-The first launch downloads about **2.49 GB** of model files and configures them.
-Later launches reuse the download cache. Metal is selected when available,
-otherwise CPU; add `--backend ynnpack` to require CPU execution.
+- **Select a backend:** Metal is chosen automatically on Apple Silicon when supported; pass `--backend ynnpack` for CPU or `--backend cuda:0` on CUDA builds.
+- **Control memory:** Native defaults use a 16,384-token context and up to 8,192 output tokens. For tighter RAM budgets, pass `--context-size 2048 --max-new-tokens 256`.
+- **Standalone C++ binary:** Build `build-release/kidi` via CMake (`make app` or `cmake --preset release`) to run local checkpoints with zero Python dependency. See the [Getting Started Guide](docs/getting-started.md) and [Developer Guide](README-dev.md).
 
-With a [CUDA-enabled build](README-dev.md#cuda), select an NVIDIA GPU explicitly:
+---
+
+## Command-Line Tasks
+
+### 1. Interactive Chat & Batch JSONL Generation (`chat` / `generate`)
+
+In `kidi chat`, replies stream token-by-token and report throughput, TTFT, and memory usage after each turn (commands: `/clear`, `/system <prompt>`, `/multiline`, `/send`, `/help`, `/exit`).
+
+For scripted pipelines, `kidi generate` streams JSONL requests to JSONL responses:
 
 ```bash
-python -m kidi chat -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0 -j 8
+printf '%s\n' '{"messages":[{"role":"user","content":"Explain binary search in three bullet points."}],"max_tokens":128}' | \
+  kidi generate -m @google/gemma-4-E2B-it-qat-mobile-transformers
 ```
 
-`cuda` selects GPU 0; `cuda:INDEX` selects another device. CUDA is opt-in and
-does not change the default backend selection.
+### 2. Speech Transcription & Translation (`transcribe`)
 
-Download size is not RAM usage. The native defaults are a 16,384-token context
-and up to 8,192 output tokens. For a smaller memory budget, add
-`--context-size 2048 --max-new-tokens 256`.
-
-See the [getting-started guide](docs/getting-started.md) for environment setup,
-authentication, pinned revisions, offline use, and troubleshooting.
-
-### Python Installation
-
-The installed `kidi` command and `python -m kidi` expose the same CLI. The `hf`
-extra enables Hugging Face downloads. Replace `python3.12` with your installed
-Python 3.12+ executable as needed. These shell examples use bash/zsh syntax.
-
-If you have a compatible prebuilt wheel, install it without a compiler:
+Whisper models load directly from Hugging Face (16 kHz mono/multichannel WAV input) and cache a native INT8 layout on first load:
 
 ```bash
-python -m pip install '/path/to/kidi.whl[hf]'
-```
-
-Use the actual wheel filename for your OS and architecture; availability depends
-on the build you received. Wheels still require compatible OS libraries. The
-standalone executable needs no Python but accepts local model paths only.
-For checkout installation and building your own wheel, see the
-[developer guide](README-dev.md#python-package).
-
-### Interactive Chat
-
-Type a message and replies stream as they are generated. The model stays loaded
-between turns. Each completed reply reports tokens, speed, latency, and memory.
-Native CPU chat on Linux, macOS, and Android prepares a fixed execution shape on
-first use and stores reusable FFN layouts under `.kidi-cache/` in the model directory
-(override with `KIDI_FFN_CACHE=/path` or `KIDI_FFN_CACHE=0`).
-Later startups memory-map this cache. It rebuilds when the checkpoint or cache
-format changes; delete the directory to reclaim its model-dependent space.
-
-| Action | Command |
-|---|---|
-| Clear conversation | `/clear` |
-| Set a system instruction | `/system Be concise.` |
-| Enter multiple lines | `/multiline`, then `/send` |
-| Cancel a reply | Ctrl-C |
-| Help / exit | `/help` / `/exit` |
-
-Conversation history and the requested reply must fit within the context.
-Use `/clear` or lower the output budget when it fills up; history is not silently
-truncated. See the [chat guide](docs/getting-started.md#2-start-chat) for more.
-
-### Desktop App
-
-The native desktop app combines Kidi's C++ inference runtime with an embedded
-HTML/CSS/JavaScript interface through the vendored LiteApp framework. Unlike the
-WebAssembly build, model weights remain in the native process and the UI talks
-only to a capability-protected loopback server.
-
-```bash
-make app
-build-release/kidi-app examples/kidi-app.yaml
-```
-
-The app opens in the system browser on macOS and Linux and uses an embedded
-WebView on supported Windows builds. The command-line
-[`examples/kidi-app.yaml`](examples/kidi-app.yaml) is the single source for chat,
-ASR, and TTS model directories and the reader's literary-translation prompt,
-accelerators, generation limits, cache sizes, languages, and voice settings;
-relative model paths resolve from the YAML file. The example uses the models
-under `models/`, enables Gemma 4 and Whisper, and leaves OmniVoice disabled until
-a converted package is added. The process validates and loads this configuration
-before opening the UI; model paths and runtime settings cannot be changed from
-the browser and remain fixed until the application restarts. A read-only
-configuration panel shows the active models, limits, and system prompt. TTS
-language, diffusion steps, and voice attributes are user preferences and may be
-overridden there for future Read aloud requests. Conversations and TTS
-preferences stay in browser-local storage; prompts are sent only to the local
-native process.
-
-Host-specific configuration is a deep override under `runtime.<host>` using the
-same root keys. The base configuration targets native desktop; for example,
-`runtime.wasm.models.chat.model_id` replaces only the browser chat model while
-inheriting prompts and generation settings. Kidi removes the `native`/`wasm`
-override blocks after resolving the active host.
-The executable embeds its frontend assets and does not need a separate web
-server or installed Node.js runtime. Chat tokens, live microphone PCM and
-partial transcripts, and TTS PCM chunks share one authenticated WebSocket; see
-the [desktop streaming protocol](desktop/README.md). The waveform control runs
-continuous voice turns—VAD-finalized ASR, streamed chat, TTS playback, then
-automatic listening—using the same visible conversation history. Assistant replies render
-sanitized GitHub-flavored Markdown with safe links, tables, block quotes, and
-syntax-highlighted code blocks. During generation, completed lines render as
-Markdown immediately while only the unfinished final line remains plain text.
-Open fenced-code blocks stream as unhighlighted code until their closing fence
-arrives.
-
-The Reader imports EPUB books into browser-local storage. Selecting a translation
-language displays the source and translated text side by side and translates
-paragraphs incrementally with the configured local chat model. Translations are
-cached incrementally by book, chapter, language, source content, and model/prompt
-identity, so partially translated pages survive close, reload, and native-app
-restarts. A compact progress bar reports done, cached, and remaining segments,
-supports immediate pause/resume, and provides a retranslate action that clears
-only the current chapter/language entry. Source and target
-paragraphs remain vertically aligned in the shared scrolling surface. Read
-chapter can begin after the first translated paragraph and continues as later
-paragraphs arrive. Clicking a source paragraph switches narration, language,
-seeking, and highlighting to the original text; clicking a completed target
-paragraph switches them back to the translation. Reader translation requests do
-not enter conversation history. Background translation stops after the visible
-range plus three paragraphs, performs no inference while paused, and resumes
-when the reader scrolls or target-language narration approaches untranslated
-text. Desktop translation stays strictly sequential while its independent TTS
-stream reads completed text. Oversized paragraphs split first at sentence
-boundaries and then at punctuation under hard character and token limits. A
-three-state page-view control shows Source, Both, or Translation, and reader
-pages use dedicated light/dark palettes and speech-highlight colors rather than
-chat-bubble styling. Semantic block breaks are preserved for narration, so
-titles and headings remain separate speech segments with a short audible pause
-before the following paragraph.
-
-### WebAssembly
-
-The self-hosted browser app runs Gemma E2B locally, with streaming replies, saved
-chats, Markdown, code highlighting, diagrams, and Whisper microphone dictation.
-In a hosted instance, open Model settings and download the chat model; speech
-dictation has a separate model download. Models are cached in your browser.
-Once the complete model is cached, it loads automatically on later visits.
-The browser Reader uses the same local translation, caching, and translated
-read-aloud workflow as the desktop app.
-
-Microphone access requires permission and a secure browser context (HTTPS or
-localhost). Clearing site data removes downloaded models and saved browser data.
-To run your own instance, follow the [browser build instructions](README-dev.md#browser).
-
-Use a current Chrome, Edge, Firefox, or Safari with ample memory. The Wasm heap is limited to **4 GiB**; a
-2,000-token chat peaks near 2.3 GiB on CPU or 0.8 GiB with WebGPU, plus about 1.1 GiB of browser memory for
-per-layer embeddings. WebGPU is used when the browser supports it. The browser
-defaults to 1,024 output tokens, allows up to 8,192, and shares a 9,216-token
-context between the conversation and reply. Its cache is separate from the CLI's.
-
-See the [browser guide](web/README.md) for getting started and browser requirements.
-
-### Android
-
-The Android app packages the same responsive LiteApp web interface as desktop
-and Wasm while executing chat, reader translation, vision, Whisper, and
-OmniVoice through the native JNI runtime. It supports streaming chat, searchable
-history, camera/photo questions, dictation, read aloud and continuous voice,
-plus EPUB reading and translation. It needs an **ARM64 phone running Android 10
-or later**, a current Android System WebView, enough RAM for the selected model,
-and several GB of free storage.
-
-Use an APK or Google Play testing invitation supplied by the maintainer. A Play
-test requires joining with the invited Google account; do not assume the beta
-is available through public store search.
-
-1. Open **Set up models** and download the default chat model (about **2.49 GB**).
-2. Start a chat, or attach a photo from the camera or image picker.
-3. Optionally download speech and allow microphone access to dictate. The current
-  Whisper Small Q8 download is about **267 MB**, with a separate **249 MB** prepared
-  cache. Existing Tiny/Base selections are not automatically replaced.
-4. Use Chat or Reader; tap the logo to find earlier conversations. After setup,
-  installed models and the bundled UI reopen offline.
-
-Downloads require confirmation; model weights are not bundled in the APK. Keep
-the app open during initial downloads. Chats and copied photos are stored
-locally. Uninstalling or clearing app data removes local conversations and model
-downloads. A differently signed APK may require uninstalling an existing build,
-so check with the maintainer before replacing one.
-
-For more about the app, see the [Android guide](android/README.md). Building APKs
-and publishing Play test releases are covered in [README-dev.md](README-dev.md#android).
-
-### Whisper Transcription
-
-Whisper Tiny, Base, Small, Large-v3, and Large-v3-Turbo load from their original Hugging Face directories.
-Source files are not changed and no `model.yaml` is required. FP16/BF16 checkpoints, including
-`openai/whisper-large-v3-turbo`, prepare a reusable native INT8 cache on first load to reduce CPU memory use.
-Input must be a mono or multichannel 16 kHz PCM WAV. Channels are averaged to mono.
-
-```bash
-python -m kidi transcribe \
-  --model @openai/whisper-small \
-  --in speech.wav \
-  --language auto
-```
-
-Use an ISO language code such as `en`, `es`, `de`, `ja`, or `hi` to bypass detection. `--task translate` translates
-supported speech into English; the default task transcribes in the detected or selected language. Whisper is currently
-CPU-only, so use `--backend ynnpack` rather than Metal. Hub downloads handle the
-required files for you. Advanced local-checkpoint import is documented in
-[README-dev.md](README-dev.md#ggml-and-gguf-import).
-
-For a long recording with the faster Large-v3-Turbo:
-
-```bash
+# Transcribe speech (use --language en/es/de/ja/hi or auto; add --task translate for English output)
 python -m kidi transcribe \
   --model @openai/whisper-large-v3-turbo \
   --in recording-16k.wav \
   --language auto \
-  --max-new-tokens 444 \
-  --out transcript.txt \
-  --profile
+  --out transcript.txt
 ```
 
-The original Large-v3-Turbo download is about **1.62 GB**, plus the derived INT8 cache.
-The CLI reads bounded windows, keeps the model loaded, and flushes one transcript line per window.
-`--chunk-seconds` defaults to 30 and accepts 1-30; smaller windows can help dense speech.
-Windows do not overlap or share text context, so words at a boundary may be affected; this is not
-Whisper's timestamp-based long-form decoder. Timestamps and speaker diarization are not emitted.
-Text-only decoding can also stop early after pauses within a window. For completeness-sensitive
-recordings, use Whisper's timestamp-aware long-form decoding instead of this native windowed path.
-If a long-file window reaches its token limit, the command fails explicitly rather than
-silently skipping the rest; already completed lines remain in the output.
+### 3. Text-to-Speech Synthesis (`synthesize`)
 
-### OmniVoice Text-to-Speech
-
-OmniVoice support is an experimental native CPU/Metal/Vulkan implementation. Convert
-the original checkpoint once; the export retains the Qwen3 generator and
-waveform decoder, omits voice-cloning encoders, and stores every retained
-learned parameter as signed INT8 with separate FP32 quantization scales.
-Conversion fuses Q/K/V and gate/up weights into the shared Kidi transformer
-layer layout.
+Synthesize natural speech using **OmniVoice** (multilingual with voice design attributes) or **Kokoro-82M** (compact US English):
 
 ```bash
+# OmniVoice: convert once to INT8 (~618 MB), then synthesize on CPU, Metal (--backend mps), or Vulkan
 python -m pip install '.[convert,hf]'
 SOURCE="$(hf download k2-fsa/OmniVoice)"
 python -m kidi.converters.omnivoice "$SOURCE" .cache/omnivoice-int8
@@ -307,173 +127,103 @@ build-release/kidi synthesize \
   --model .cache/omnivoice-int8 \
   --text 'Hello from Kidi.' \
   --language English \
-  --voice gender=female \
-  --voice 'age=young adult' \
-  --voice pitch=high \
-  --voice accent=british \
-  --duration 1.0 \
+  --voice gender=female --voice 'age=young adult' --voice accent=british \
   --out hello.wav
 ```
 
-CPU is the portable default. Android builds also accept `--backend vulkan`;
-Vulkan accelerates compatible INT8 generator projections while unsupported
-operators and the waveform decoder use the CPU. Applications embedding the C++
-library can select the same behavior with `tensor::Device::vulkan()`.
-Apple builds use Metal with `--backend mps` (and select it for `--backend auto`);
-the INT8 checkpoint is expanded once into a reusable FP16 projection cache for
-native Metal GEMM. The Higgs/DAC waveform decoder also runs on Metal using INT8
-projections and dedicated Snake/convolution layout kernels.
-
-The current converted package is about **618 MB**, including a **607 MB** INT8
-Safetensors file and tokenizer. `--duration auto` is the default and uses
-OmniVoice's Unicode script-weighted rule estimator; pass a positive number such
-as `--duration 1.5` to request exact seconds. Use `--steps 32` for the upstream
-quality-first decoding schedule; smaller values trade iterative refinement for
-lower latency.
-Voice design uses the repeatable, model-independent `--voice KEY=VALUE` option.
-For example, repeat the same option as `--voice gender=female --voice
-age=young-adult --voice style=whisper`. OmniVoice currently recognizes
-`gender`, `age`, `pitch`, `style`, `accent`, and `dialect`; another TTS model
-can interpret a different set through the same task-level map. Encoding an
-external reference WAV remains excluded from this decoder-only package.
-
-Long text is split at linguistic sentence boundaries before synthesis. Wrapped
-source lines remain in one paragraph, blank lines force paragraph boundaries,
-and Unicode punctuation, closing quotes, initials, decimals, acronyms, and
-language-specific non-breaking prefixes are handled before each sentence is
-synthesized. Prefix rules are package data in `sentence-prefixes.tsv`, not
-hard-coded model logic. OmniVoice first generates the shortest sentence whose
-estimated duration is at least three seconds, then reuses that sentence's text and audio
-tokens as a fixed speaker prompt for every other sentence. The output remains
-in source order, but all chunks inherit one narrator instead of independently
-choosing voices.
-
-For CPU long-form reading, `--steps 25` is the lower-latency profile on an
-8-core Apple M5; retain `--steps 32` when maximum iterative-decoding quality is
-more important than latency. On the 195-word `tmp2.txt` fixture, consistent-voice
-25-step synthesis produced 64.04 seconds of audio in 76.54 seconds (RTF 1.195).
-Kidi automatically
-uses two-row batched classifier-free guidance for longer sentences to reduce
-masked attention work; short sentences retain the lower-overhead packed layout.
-
-Embedded applications may retain the generated `VoicePrompt` from one fixed
-reference utterance and supply it to later requests. The desktop app does this
-per voice-attribute profile so separate messages and sentence chunks keep one
-narrator. Setting the language to `auto`, `none`, or an empty value omits
-explicit language conditioning and lets OmniVoice infer it from the text; its
-script-aware duration and voice-instruction paths continue to distinguish Han
-text automatically. Embedded clients may also set `duration_scale`: values
-above `1` allocate more acoustic frames for a slower, calmer delivery without
-resampling the waveform or lowering its pitch. Because OmniVoice's baseline is
-deliberate, Kidi linearly spaces its reading-oriented presets across the
-model-supported range: Briskyest (`0.50`), Briskier (`0.62`), Brisk (`0.74`),
-Natural (`0.86`), Relaxed (`0.98`), and Mellow (`1.10`).
-
-Metal is the preferred Apple backend: on the same 195-word fixture, quality-first
-consistent-voice 32-step synthesis produced 64.04 seconds of audio in 36.91
-seconds (RTF 0.576, 1.74x real time). The measured expanded-weight cache is
-about 898 MB, peak device allocation is 5.82 GB, and peak process footprint is
-10.72 GB. Reference conditioning intentionally trades memory and latency for a
-stable narrator.
-
-| OmniVoice key | Accepted values |
-|---|---|
-| `gender` | `male`, `female` |
-| `age` | `child`, `teenager`, `young adult`, `middle-aged`, `elderly` |
-| `pitch` | `very low`, `low`, `moderate`, `high`, `very high` |
-| `style` | `whisper` |
-| `accent` | `american`, `british`, `australian`, `chinese`, `canadian`, `indian`, `korean`, `portuguese`, `russian`, `japanese` |
-| `dialect` | The twelve Chinese dialect labels supported by the upstream checkpoint |
-
-Use `auto` as a value to omit an attribute. English accent and Chinese dialect
-cannot be combined.
-
-The upstream code is Apache-2.0, but the pretrained OmniVoice weights are
-**CC-BY-NC**. Review that non-commercial license before redistributing a
-converted checkpoint or using it in a product. The bundled Higgs Audio 2
-decoder is additionally governed by the Boson Higgs Audio 2 Community License,
-the Meta Llama 3 Community License, and its Acceptable Use Policy. Converted
-packages include all of these texts and the required attribution in `NOTICE`;
-review their commercial-user and redistribution terms independently.
-
-### Kokoro-82M Text-to-Speech
-
-Kokoro uses the same `synthesize` task and generic `--voice KEY=VALUE` map, but
-its model adapter recognizes different keys:
-
 ```bash
-SOURCE="$(hf download hexgrad/Kokoro-82M \
-  config.json kokoro-v1_0.pth voices/af_heart.pt README.md VOICES.md)"
-python -m kidi.converters.kokoro \
-  "$SOURCE" \
-  .cache/kokoro-int8 \
-  --voices af_heart
+# Kokoro-82M: convert with selected voice pack(s) and synthesize
+SOURCE="$(hf download hexgrad/Kokoro-82M config.json kokoro-v1_0.pth voices/af_heart.pt README.md VOICES.md)"
+python -m kidi.converters.kokoro "$SOURCE" .cache/kokoro-int8 --voices af_heart
 
 build-release/kidi synthesize \
   --model .cache/kokoro-int8 \
   --text 'Hello world.' \
   --language English \
-  --voice name=af_heart \
-  --voice speed=1.0 \
+  --voice name=af_heart --voice speed=1.0 \
   --out kokoro.wav
 ```
 
-The package stores every learned model and voice value as signed INT8. Matrices
-use eight-value quantization groups and vectors use per-element scales to avoid
-Kokoro's known AdaIN/Snake instability. Parameters are lazily dequantized for
-FP32 CPU compute because correctness is the current priority. The package also
-contains an offline Misaki-derived US-English pronunciation lexicon.
+> **Note on model licenses:** Kokoro-82M and Misaki are Apache-2.0. Pretrained OmniVoice weights are **CC-BY-NC** (non-commercial) and bundle the Higgs Audio 2 decoder; review the generated `NOTICE` file before redistributing converted checkpoints.
 
-Kokoro supports `name=<embedded voice>` and `speed=<positive factor>`. It
-predicts its own duration, so `--duration auto` is required. This first package
-supports US English and reports an explicit error for out-of-lexicon words.
-The model and reference implementation are Apache-2.0 licensed.
-Converted packages include separate Kokoro and Misaki Apache-2.0 license copies
-plus an attribution `NOTICE`.
+### 4. 500-Language Machine Translation (`translate`)
 
-The browser settings accept Hugging Face model IDs rather than file URLs. Loading resolves the repository's current
-`main` revision to an immutable commit before downloading. The speech model field offers `openai/whisper-tiny`,
-`openai/whisper-base`, and `openai/whisper-small` (default); weights download as whisper.cpp Q8_0 files (264 MB for
-Small) and run as INT8. Larger models trade more download, memory, and latency for accuracy. During recording, the composer shows replaceable draft text and runs a final refinement after stop.
-
-### RTG Model Package
-
-The public [RTG 500 model](https://huggingface.co/thammegowda/rtg-500eng-v1)
-translates from 500 languages into English. With the `hf` extra installed,
-translate Moses-tokenized text, one sentence per line:
+Translate text from 500 languages into English using the public [RTG 500 model](https://huggingface.co/thammegowda/rtg-500eng-v1):
 
 ```bash
 kidi translate -m @thammegowda/rtg-500eng-v1 -i input.txt -o output.txt --beam-size 1
 ```
 
-The first run downloads the model; later runs reuse the cache. No Hugging Face
-login or manual conversion is required. Use `-m /path/to/rtg-model` for an
-existing local package. Text normalization and detokenization remain separate
-steps; see the [translation guide](docs/getting-started.md#rtg-translation-from-hugging-face).
+---
 
-### Gemma 4 Generation
+## Applications
 
-For scripts, `generate` reads chat requests as JSONL and returns one JSON response
-per input line, in order:
+Kidi shares a unified responsive UI across Desktop, Browser, and Android:
+
+### 1. Native Desktop App ([`desktop/README.md`](desktop/README.md))
+
+Combines the native C++ inference process with an embedded [`liteapp`](https://github.com/thammegowda/liteapp) interface over a capability-protected local loopback server (no Node.js required):
 
 ```bash
-printf '%s\n' '{"messages":[{"role":"user","content":"What is binary search?"}],"max_tokens":128}' | \
-  kidi generate -m @google/gemma-4-E2B-it-qat-mobile-transformers
+make app
+build-release/kidi-app examples/kidi-app.yaml
 ```
 
-Use `-i requests.jsonl -o responses.jsonl` for files. Responses include the
-assistant message and token IDs. `generate` is for chat models; use `translate`
-for RTG. Run either command with `--help` for decoding and batching options.
+- **Streaming Chat & Continuous Voice Turns:** Live Markdown rendering, syntax-highlighted code blocks, VAD-triggered Whisper dictation, and automatic TTS read-aloud replies.
+- **Bilingual EPUB Reader & Narrator:** Import EPUB books, translate chapters side-by-side in the background with persistent paragraph-level caching, and listen to synchronized read-aloud narration in either the source or target language.
 
-## For Developers
+### 2. WebAssembly & WebGPU Browser App ([`web/README.md`](web/README.md))
 
-Build instructions, C++ architecture, checkpoint formats, tests, benchmarks,
-and release workflows are in [README-dev.md](README-dev.md).
+Runs Gemma 4 E2B and Whisper dictation **100% inside the browser** (Chrome, Edge, Firefox, Safari) with WebGPU acceleration and persistent browser-cached weights (`make wasm`). Includes the full chat interface, microphone dictation, and bilingual EPUB Reader.
 
-## AI Notice
+### 3. Android App ([`android/README.md`](android/README.md))
 
-Kidi is experimental. AI-generated responses, photo interpretations, and speech
-transcriptions can be wrong. Double-check important information against reliable
-sources; do not rely on Kidi for professional advice or emergencies.
+Packages the [`liteapp`](https://github.com/thammegowda/liteapp) interface with Kidi's ARM64 JNI runtime for Android 10+ phones:
+- Supports offline streaming chat, **camera & photo Q&A** (Gemma 4 vision), Whisper dictation, OmniVoice read-aloud, and the bilingual EPUB Reader.
 
-[Android Privacy Policy](android/PRIVACY.md) | [Android Terms of Use](android/TERMS.md)
+---
+
+## Companion Projects & Publications
+
+Kidi is built atop modular, open-source C++ libraries and quantization research:
+
+| Project / Publication | Description |
+|---|---|
+| **[`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev)** | Custom fork of YNNPACK with low-bit LLM operators, ARM64 NEON/DOTPROD/SME2, x86 AVX2/AVX-512, WebAssembly SIMD128, and CUDA kernels |
+| **[`tokenizerspp`](https://github.com/thammegowda/tokenizerspp)** | Fast, standalone C++ Hugging Face `tokenizer.json` implementation (BPE, Unigram, WordPiece, pre-tokenizers, and chat templates) |
+| **[`tahoma-vision`](https://github.com/thammegowda/tahoma-vision)** | Lightweight SIMD-accelerated C++ vision library for JPEG (`libjpeg-turbo`), PNG ([`pigzpp`](https://github.com/thammegowda/pigzpp) + `zlib-ng`), PPM, and image preprocessing |
+| **[`pigzpp`](https://github.com/thammegowda/pigzpp)** | Modern C++ parallel gzip/deflate compression and decompression library built on `zlib-ng` |
+| **[`liteapp`](https://github.com/thammegowda/liteapp)** | Zero-Node.js C++23 cross-platform application framework with an embedded HTTP/WebSocket server, ZIP/EPUB virtual filesystem, and web/Android transport bridge |
+| **[WMT 2026 Paper](https://aclanthology.org/2026.wmt-main.136/)** | *Quantize, Qualify, Rerank: A Recipe for Compressing LLMs Without Losing Quality* (Thamme Gowda, WMT 2026, pp. 1991–1998) |
+| **[Technical Blog Post](https://gowda.ai/posts/2026/08/llm-fast-inference/)** | Deep dive into Kidi's blockwise INT4 quantization, 11-step MSE outlier clipping, and ARM64 CPU roofline optimizations |
+
+### Citation
+
+If you use the asymmetric quantization with MSE outlier clipping recipe in your work, please cite our [WMT 2026 paper](https://aclanthology.org/2026.wmt-main.136/):
+
+```bibtex
+@inproceedings{gowda-2026-quantize,
+    title = "Quantize, Qualify, Rerank: A Recipe for Compressing {LLM}s Without Losing Quality",
+    author = "Gowda, Thamme",
+    booktitle = "Proceedings of the Eleventh Conference on Machine Translation",
+    month = oct,
+    year = "2026",
+    address = "Budapest, Hungary",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2026.wmt-main.136/",
+    doi = "10.18653/2026.wmt-main.136",
+    pages = "1991--1998"
+}
+```
+
+---
+
+## Documentation & Links
+
+- **[Getting Started Guide](docs/getting-started.md):** Detailed setup, offline caching, and CLI walkthroughs.
+- **[Arm CPU Benchmark Suite](benchmarks/gemma4/arm/README.md):** Gemma 4 E2B comparisons against Arm ExecuTorch + KleidiAI, ONNX Runtime, `llama.cpp`, and Google LiteRT-LM.
+- **[Benchmarks Overview](benchmarks/README.md):** Native CPU and NVIDIA CUDA vs. vLLM benchmarks.
+- **[Developer Guide](README-dev.md):** CMake presets, C++ architecture, checkpoint converters, WebAssembly/Android builds, and test suites.
+- **[Android Privacy Policy](android/PRIVACY.md) | [Android Terms of Use](android/TERMS.md)**
+
+> **AI Notice:** Kidi is experimental software. AI-generated responses, photo interpretations, translations, and speech transcriptions can contain errors — always verify important information independently.
