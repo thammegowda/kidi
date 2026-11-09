@@ -96,8 +96,12 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
     const auto weight_bits = settings.value("weight_bits", 0);
     const auto group_size = settings.value("group_size", 128);
     const auto started = Clock::now();
-    auto generator =
-        require(kidi::inference::Generator::load(directory, gemma_device(), weight_bits, group_size, packed_prefill));
+    auto generator = require(kidi::inference::Generator::load(
+        directory, kidi::inference::ModelLoadOptions{.device = gemma_device(),
+                                                     .weight_bits = weight_bits,
+                                                     .group_size = group_size,
+                                                     .packed_prefill = packed_prefill,
+                                                     .dense_lm_head = settings.value("dense_lm_head", false)}));
     require(generator.configure_serving({.maximum_active = 1,
                                          .maximum_requests = 1,
                                          .cache_token_budget = context,

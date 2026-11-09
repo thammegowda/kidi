@@ -1,4 +1,5 @@
 #include "kidi/core/hnsw.h"
+#include "kidi/layers/linear.h"
 #include "kidi/ops/context.h"
 #include "kidi/runtime/ynn/graph.h"
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -293,6 +295,206 @@ auto import_checks(const std::filesystem::path& root, bool bfloat) -> void {
     save(source_path, std::span(source).first(90));
     check(!core::HnswIndex::from_hnswlib(source_path, vectors, 3, 8), "import accepted a truncated source index");
 }
+
+auto quantized_linear_checks(const std::filesystem::path& root) -> void {
+    using namespace kidi;
+    constexpr std::size_t rows = 16, width = 128;
+    std::vector<float> values(rows * width, 0.F);
+    for (std::size_t r = 0; r < rows; ++r) values[r * width + r * 4] = 8.F;
+    const auto vectors = require(tensor::Tensor::from_host({rows, width}, std::span<const float>(values)));
+    auto index = require(
+        core::HnswIndex::build(vectors, {.m = 4, .ef_construction = 16, .seed = 42, .candidates = 4, .ef_search = 16}));
+    const auto path = root / "quantized-linear.hnsw";
+    require(index.save(path));
+
+    ops::Context context(tensor::Device::cpu());
+    for (const std::int32_t bits : {8, 4, 2}) {
+        const std::int32_t group_size = bits == 4 ? 32 : static_cast<std::int32_t>(width);
+        const std::size_t B = width / static_cast<std::size_t>(group_size);
+        const std::size_t row_bytes = width / (8 / static_cast<std::size_t>(bits));
+        std::vector<std::uint8_t> packed(rows * row_bytes, 0);
+        for (std::size_t r = 0; r < rows; ++r) {
+            const std::size_t col = r * 4;
+            if (bits == 8) {
+                packed[r * row_bytes + col] = static_cast<std::uint8_t>(64);
+            } else if (bits == 4) {
+                packed[r * row_bytes + col / 2] = static_cast<std::uint8_t>(6);
+            } else {
+                packed[r * row_bytes + col / 4] = static_cast<std::uint8_t>(1);
+            }
+        }
+        std::vector<float> scales(rows * B, 1.F);
+        const ModuleScope host(tensor::Device::cpu());
+        layers::Linear linear(width, rows, true, false, bits, false, group_size);
+        StateDict state;
+        state.emplace("weight",
+                      require(tensor::Tensor::from_bytes({rows, static_cast<std::int64_t>(row_bytes)},
+                                                         tensor::DType::U8, std::as_bytes(std::span(packed)))));
+        state.emplace("weight_scale", require(tensor::Tensor::from_host({rows, static_cast<std::int64_t>(B)},
+                                                                        std::span<const float>(scales))));
+        const float zero_f = 0.F;
+        state.emplace("input_activation_scale",
+                      require(tensor::Tensor::from_host({}, std::span<const float>(&zero_f, 1))));
+        state.emplace("output_activation_scale",
+                      require(tensor::Tensor::from_host({}, std::span<const float>(&zero_f, 1))));
+        require(linear->load_state_dict(state));
+        require(linear->bind_hnsw(path));
+        check(linear->has_hnsw(), "LinearImpl::bind_hnsw did not enable HNSW");
+        std::vector<float> q(width, 0.F);
+        q[7 * 4] = 4.F;
+        const auto q_tensor = require(tensor::Tensor::from_host({1, 1, width}, std::span<const float>(q)));
+        const auto selected = linear->select(context, q_tensor);
+        check(require(selected.data<std::int32_t>())[0] == 7, "quantized LinearImpl::select returned wrong token");
+        q.resize(2 * width, 0.F);
+        q[width + 3 * 4] = 4.F;
+        const auto batch = require(tensor::Tensor::from_host({1, 2, width}, std::span<const float>(q)));
+        const auto chosen = linear->select(context, batch);
+        const auto ids = require(chosen.data<std::int32_t>());
+        check(ids.size() == 2 && ids[0] == 7 && ids[1] == 3, "batched HNSW selection mixed query workspaces");
+        linear->release_workspaces();
+        check(require(linear->select(context, q_tensor).data<std::int32_t>())[0] == 7,
+              "HNSW workspaces did not rebuild after release");
+        bool rejected = false;
+        try {
+            linear->select(context, require(tensor::Tensor::zeros({1, width / 2}, tensor::DType::F32)));
+        } catch (const ops::Failure&) {
+            rejected = true;
+        }
+        check(rejected, "HNSW linear accepted a query with the wrong width");
+    }
+}
+
+auto quantized_distance_checks(const std::filesystem::path& root, std::int32_t bits, std::size_t group,
+                               std::size_t width, bool affine, bool half) -> void {
+    using namespace kidi;
+    constexpr std::size_t rows = 32;
+    const auto blocks = width / group;
+    const auto values_per_byte = static_cast<std::size_t>(8 / bits);
+    std::mt19937 random(17);
+    std::vector<std::uint8_t> packed(rows * width / values_per_byte);
+    std::vector<float> decoded(rows * width), scales(rows * blocks), zeros(rows * blocks);
+    std::vector<std::uint16_t> half_scales(rows * blocks), half_zeros(rows * blocks);
+    const std::array<float, 4> scale_values{0.125F, 0.25F, 0.5F, 1.F};
+    const std::array<std::uint16_t, 4> encoded_scales{0x3000, 0x3400, 0x3800, 0x3c00};
+    const std::array<float, 4> zero_values{-0.5F, 0.F, 0.25F, 0.5F};
+    const std::array<std::uint16_t, 4> encoded_zeros{0xb800, 0, 0x3400, 0x3800};
+    for (std::size_t i = 0; i < scales.size(); ++i) {
+        scales[i] = scale_values[i % 4];
+        half_scales[i] = encoded_scales[i % 4];
+        zeros[i] = affine ? zero_values[(i / 4) % 4] : 0.F;
+        half_zeros[i] = encoded_zeros[(i / 4) % 4];
+    }
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t column = 0; column < width; ++column) {
+            const auto encoded = random() % (1U << bits);
+            const auto value = static_cast<std::int32_t>(encoded) - (encoded >= (1U << (bits - 1)) ? (1 << bits) : 0);
+            packed[row * width / values_per_byte + column / values_per_byte] |=
+                static_cast<std::uint8_t>(encoded << (bits * (column % values_per_byte)));
+            decoded[row * width + column] =
+                value * scales[row * blocks + column / group] + zeros[row * blocks + column / group];
+        }
+    }
+    const auto vectors =
+        require(tensor::Tensor::from_host({rows, static_cast<std::int64_t>(width)}, std::span<const float>(decoded)));
+    auto topology = require(core::HnswIndex::build(
+        vectors, {.m = 32, .ef_construction = 64, .seed = 42, .candidates = rows, .ef_search = rows}));
+    const auto path = root / ("packed-" + std::to_string(bits) + "-" + std::to_string(group) + "-" +
+                              std::to_string(width) + "-" + std::to_string(affine) + "-" + std::to_string(half));
+    require(topology.save(path));
+    const auto weights = require(tensor::Tensor::from_bytes({rows, static_cast<std::int64_t>(width / values_per_byte)},
+                                                            tensor::DType::U8, std::as_bytes(std::span(packed))));
+    const auto metadata = [&](const std::vector<float>& values, const std::vector<std::uint16_t>& encoded) {
+        const std::vector<std::int64_t> shape{rows, static_cast<std::int64_t>(blocks)};
+        return half ? require(tensor::Tensor::from_bytes(shape, tensor::DType::F16, std::as_bytes(std::span(encoded))))
+                    : require(tensor::Tensor::from_host(shape, std::span<const float>(values)));
+    };
+    const auto act_scale = bits == 2 ? 0.125F : 0.F;
+    auto index = require(core::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales),
+                                                         affine ? metadata(zeros, half_zeros) : tensor::Tensor{}, bits,
+                                                         static_cast<std::int32_t>(group), act_scale));
+    if (bits == 8 && !half) {
+        for (const auto invalid_scale : {-1.F, std::numeric_limits<float>::quiet_NaN()})
+            check(!core::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales), {}, bits,
+                                                   static_cast<std::int32_t>(group), invalid_scale),
+                  "packed HNSW accepted an invalid activation scale");
+        check(!core::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales),
+                                               metadata(zeros, half_zeros), bits, static_cast<std::int32_t>(group)),
+              "INT8 HNSW silently ignored affine offsets");
+    }
+    core::HnswWorkspace workspace;
+    std::vector<float> query(width), rounded(width);
+    for (std::size_t attempt = 0; attempt < 5; ++attempt) {
+        for (auto& value : query) value = (static_cast<float>(random() % 101) - 50.F) / 16.F;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            float maximum = 0.F;
+            for (std::size_t c = 0; c < group; ++c) maximum = std::max(maximum, std::abs(query[b * group + c]));
+            const auto scale = act_scale > 0.F ? act_scale : maximum / 127.F;
+            const auto inverse = act_scale > 0.F ? 1.F / act_scale : 127.F / maximum;
+            for (std::size_t c = 0; c < group; ++c)
+                rounded[b * group + c] = std::clamp(std::nearbyint(query[b * group + c] * inverse),
+                                                    act_scale > 0.F ? -128.F : -127.F, 127.F) *
+                                         scale;
+        }
+        const auto found = require(index.search(query, workspace));
+        check(found.size() == rows, "exhaustive packed search did not return every row");
+        for (const auto& neighbor : found) {
+            double dot = 0.;
+            for (std::size_t c = 0; c < width; ++c)
+                dot += static_cast<double>(rounded[c]) * decoded[neighbor.id * width + c];
+            const auto expected = 1.F - static_cast<float>(dot);
+            check(std::abs(neighbor.distance - expected) < 0.00005F * (1.F + std::abs(expected)),
+                  "packed search differs from scalar reference scores");
+        }
+    }
+}
+
+#if !defined(_WIN32)
+auto search_settings_checks(const std::filesystem::path& root) -> void {
+    using namespace kidi;
+    struct Environment {
+        std::optional<std::string> ef;
+        Environment() {
+            if (const auto* value = std::getenv("KIDI_HNSW_EF")) ef = value;
+            unsetenv("KIDI_HNSW_EF");
+        }
+        ~Environment() {
+            if (ef)
+                setenv("KIDI_HNSW_EF", ef->c_str(), 1);
+            else
+                unsetenv("KIDI_HNSW_EF");
+        }
+    } restore;
+    std::vector<float> values;
+    const auto vectors = vector_table(16, 64, false, values);
+    auto topology =
+        require(core::HnswIndex::build(vectors, {.m = 4, .ef_construction = 16, .candidates = 4, .ef_search = 16}));
+    const auto path = root / "search-settings.hnsw";
+    require(topology.save(path));
+    const ModuleScope host(tensor::DType::F32, false, tensor::Device::cpu());
+    layers::Linear linear(64, 16, true, false);
+    require(linear->set_state({{"weight", vectors}}));
+    require(linear->bind_hnsw(path));
+    ops::Context context(tensor::Device::cpu());
+    std::vector<float> query(64, 1.F);
+    const auto input = require(tensor::Tensor::from_host({1, 64}, std::span<const float>(query)));
+    const auto expected = require(linear->select(context, input).data<std::int32_t>())[0];
+    for (const auto* value : {"", "0", "-1", "abc", "8junk", "17", "18446744073709551616"}) {
+        setenv("KIDI_HNSW_EF", value, 1);
+        const auto bound = linear->bind_hnsw(path);
+        check(!bound && bound.error().code == ErrorCode::INVALID_ARGUMENT,
+              "invalid HNSW setting was silently accepted");
+        check(require(linear->select(context, input).data<std::int32_t>())[0] == expected,
+              "failed HNSW binding changed the previous search configuration");
+    }
+    setenv("KIDI_HNSW_EF", "3", 1);
+    check(!linear->bind_hnsw(path), "search effort smaller than candidate count was accepted");
+    setenv("KIDI_HNSW_EF", "16", 1);
+    require(linear->bind_hnsw(path));
+    setenv("KIDI_HNSW_EF", "invalid-after-binding", 1);
+    check(require(linear->select(context, input).data<std::int32_t>())[0] == expected,
+          "HNSW hot path reread its environment settings");
+}
+#endif
 } // namespace
 
 auto main() -> int {
@@ -340,6 +542,21 @@ auto main() -> int {
         for (bool bfloat : {false, true})
             for (const std::size_t width : {64, 67}) brute_force_checks(root, bfloat, width);
         for (bool bfloat : {false, true}) import_checks(root, bfloat);
+        quantized_linear_checks(root);
+        for (const bool half : {false, true}) {
+            quantized_distance_checks(root, 8, 1536, 1536, false, half);
+            quantized_distance_checks(root, 2, 1536, 1536, false, half);
+            quantized_distance_checks(root, 2, 32, 128, false, half);
+            for (const bool affine : {false, true}) {
+                quantized_distance_checks(root, 4, 32, 384, affine, half);
+                quantized_distance_checks(root, 4, 128, 1536, affine, half);
+                quantized_distance_checks(root, 4, 32, 96, affine, half);
+                quantized_distance_checks(root, 4, 64, 384, affine, half);
+            }
+        }
+#if !defined(_WIN32)
+        search_settings_checks(root);
+#endif
         const std::array<float, 32> zeros{};
         const auto tied_vectors = require(tensor::Tensor::from_host({8, 4}, std::span<const float>(zeros)));
         auto tied = require(core::HnswIndex::build(tied_vectors, options));

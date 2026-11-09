@@ -20,6 +20,10 @@
 #include <immintrin.h>
 #define KIDI_HNSW_AVX512 1
 #endif
+#if defined(__ARM_NEON) && (defined(__aarch64__) || defined(__arm64__))
+#include <arm_neon.h>
+#define KIDI_HNSW_NEON 1
+#endif
 
 namespace kidi::core {
 namespace {
@@ -377,6 +381,74 @@ __attribute__((target("avx512f,avx512bw,fma"))) auto dot_rows_avx512(const std::
     return _mm512_reduce_add_ps(sum) + tail;
 }
 #endif
+#if defined(KIDI_HNSW_NEON)
+template <bool bfloat>
+auto dot_neon(const float* query, const std::byte* row, std::size_t width) -> float {
+    float32x4_t s0 = vdupq_n_f32(0.F), s1 = vdupq_n_f32(0.F);
+    float32x4_t s2 = vdupq_n_f32(0.F), s3 = vdupq_n_f32(0.F);
+    std::size_t column = 0;
+    for (; column + 16 <= width; column += 16) {
+        const float32x4_t q0 = vld1q_f32(query + column);
+        const float32x4_t q1 = vld1q_f32(query + column + 4);
+        const float32x4_t q2 = vld1q_f32(query + column + 8);
+        const float32x4_t q3 = vld1q_f32(query + column + 12);
+        if constexpr (bfloat) {
+            const auto* w_u16 = reinterpret_cast<const std::uint16_t*>(row) + column;
+            const uint16x8_t lo = vld1q_u16(w_u16);
+            const uint16x8_t hi = vld1q_u16(w_u16 + 8);
+            const float32x4_t w0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(lo), 16));
+            const float32x4_t w1 = vreinterpretq_f32_u32(vshll_high_n_u16(lo, 16));
+            const float32x4_t w2 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(hi), 16));
+            const float32x4_t w3 = vreinterpretq_f32_u32(vshll_high_n_u16(hi, 16));
+            s0 = vfmaq_f32(s0, q0, w0);
+            s1 = vfmaq_f32(s1, q1, w1);
+            s2 = vfmaq_f32(s2, q2, w2);
+            s3 = vfmaq_f32(s3, q3, w3);
+        } else {
+            const auto* w_f32 = reinterpret_cast<const float*>(row) + column;
+            s0 = vfmaq_f32(s0, q0, vld1q_f32(w_f32));
+            s1 = vfmaq_f32(s1, q1, vld1q_f32(w_f32 + 4));
+            s2 = vfmaq_f32(s2, q2, vld1q_f32(w_f32 + 8));
+            s3 = vfmaq_f32(s3, q3, vld1q_f32(w_f32 + 12));
+        }
+    }
+    float sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
+    for (; column < width; ++column) sum = std::fma(query[column], weight<bfloat>(row, column), sum);
+    return sum;
+}
+template <bool bfloat>
+auto dot_rows_neon(const std::byte* left, const std::byte* right, std::size_t width) -> float {
+    float32x4_t s0 = vdupq_n_f32(0.F), s1 = vdupq_n_f32(0.F);
+    float32x4_t s2 = vdupq_n_f32(0.F), s3 = vdupq_n_f32(0.F);
+    std::size_t column = 0;
+    for (; column + 16 <= width; column += 16) {
+        if constexpr (bfloat) {
+            const auto* l_u16 = reinterpret_cast<const std::uint16_t*>(left) + column;
+            const auto* r_u16 = reinterpret_cast<const std::uint16_t*>(right) + column;
+            const uint16x8_t l_lo = vld1q_u16(l_u16), l_hi = vld1q_u16(l_u16 + 8);
+            const uint16x8_t r_lo = vld1q_u16(r_u16), r_hi = vld1q_u16(r_u16 + 8);
+            s0 = vfmaq_f32(s0, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(l_lo), 16)),
+                           vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(r_lo), 16)));
+            s1 = vfmaq_f32(s1, vreinterpretq_f32_u32(vshll_high_n_u16(l_lo, 16)),
+                           vreinterpretq_f32_u32(vshll_high_n_u16(r_lo, 16)));
+            s2 = vfmaq_f32(s2, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(l_hi), 16)),
+                           vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(r_hi), 16)));
+            s3 = vfmaq_f32(s3, vreinterpretq_f32_u32(vshll_high_n_u16(l_hi, 16)),
+                           vreinterpretq_f32_u32(vshll_high_n_u16(r_hi, 16)));
+        } else {
+            const auto* l_f32 = reinterpret_cast<const float*>(left) + column;
+            const auto* r_f32 = reinterpret_cast<const float*>(right) + column;
+            s0 = vfmaq_f32(s0, vld1q_f32(l_f32), vld1q_f32(r_f32));
+            s1 = vfmaq_f32(s1, vld1q_f32(l_f32 + 4), vld1q_f32(r_f32 + 4));
+            s2 = vfmaq_f32(s2, vld1q_f32(l_f32 + 8), vld1q_f32(r_f32 + 8));
+            s3 = vfmaq_f32(s3, vld1q_f32(l_f32 + 12), vld1q_f32(r_f32 + 12));
+        }
+    }
+    float sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
+    for (; column < width; ++column) sum = std::fma(weight<bfloat>(left, column), weight<bfloat>(right, column), sum);
+    return sum;
+}
+#endif
 
 struct ByDistance {
     auto operator()(const std::pair<float, std::uint32_t>& left, const std::pair<float, std::uint32_t>& right) const
@@ -426,22 +498,71 @@ auto dot_kernels(tensor::DType dtype) -> std::pair<Dot, RowDot> {
         dot = dtype == tensor::DType::BF16 ? dot_avx512<true> : dot_avx512<false>;
         row_dot = dtype == tensor::DType::BF16 ? dot_rows_avx512<true> : dot_rows_avx512<false>;
     }
+#elif defined(KIDI_HNSW_NEON)
+    dot = dtype == tensor::DType::BF16 ? dot_neon<true> : dot_neon<false>;
+    row_dot = dtype == tensor::DType::BF16 ? dot_rows_neon<true> : dot_rows_neon<false>;
 #endif
     return {dot, row_dot};
 }
+
+auto read_meta(const std::byte* base, bool f16, std::size_t idx) noexcept -> float {
+#if defined(KIDI_HNSW_NEON)
+    if (f16) return static_cast<float>(reinterpret_cast<const __fp16*>(base)[idx]);
+#else
+    if (f16) {
+        const auto h = reinterpret_cast<const std::uint16_t*>(base)[idx];
+        const std::uint32_t sign = (h & 0x8000U) << 16;
+        const std::uint32_t exp = (h >> 10) & 0x1FU;
+        const std::uint32_t mant = h & 0x03FFU;
+        if (exp == 0) return std::copysign(static_cast<float>(mant) * (1.F / 16777216.F), std::bit_cast<float>(sign));
+        if (exp == 31) return std::bit_cast<float>(sign | 0x7F800000U | (mant << 13));
+        return std::bit_cast<float>(sign | ((exp + 112U) << 23) | (mant << 13));
+    }
+#endif
+    return reinterpret_cast<const float*>(base)[idx];
+}
+
 } // namespace
 
 struct HnswIndex::State {
     Graph graph;
     tensor::Tensor vectors;
     std::span<const std::byte> bytes;
+    tensor::Tensor scales, zeros;
+    std::span<const std::byte> scale_bytes, zero_bytes;
+    std::int32_t bits = 0, group_size = 0;
+    float input_scale = 0.F;
+    bool scale_f16 = false, zero_f16 = false, has_zero = false;
+    std::size_t row_bytes = 0;
     Dot dot;
     RowDot row_dot;
 
     State(Graph topology, tensor::Tensor table)
-        : graph(std::move(topology)), vectors(std::move(table)), bytes(require(std::as_const(vectors).host_bytes())) {
+        : graph(std::move(topology)),
+          vectors(std::move(table)),
+          bytes(require(std::as_const(vectors).host_bytes())),
+          row_bytes(graph.width * tensor::element_size(vectors.dtype())) {
         std::tie(dot, row_dot) = dot_kernels(vectors.dtype());
     }
+
+    State(Graph topology, tensor::Tensor weight_table, tensor::Tensor scale_table, tensor::Tensor zero_table,
+          std::int32_t weight_bits, std::int32_t group, float act_scale)
+        : graph(std::move(topology)),
+          vectors(std::move(weight_table)),
+          bytes(require(std::as_const(vectors).host_bytes())),
+          scales(std::move(scale_table)),
+          zeros(std::move(zero_table)),
+          scale_bytes(require(std::as_const(scales).host_bytes())),
+          zero_bytes(zeros.defined() ? require(std::as_const(zeros).host_bytes()) : std::span<const std::byte>{}),
+          bits(weight_bits),
+          group_size(group),
+          input_scale(act_scale),
+          scale_f16(scales.dtype() == tensor::DType::F16),
+          zero_f16(zeros.defined() && zeros.dtype() == tensor::DType::F16),
+          has_zero(zeros.defined()),
+          row_bytes(graph.width / (8 / static_cast<std::size_t>(weight_bits))),
+          dot(nullptr),
+          row_dot(nullptr) {}
 };
 
 HnswIndex::HnswIndex(std::unique_ptr<State> state) : state_(std::move(state)) {}
@@ -468,6 +589,32 @@ auto HnswIndex::load(const std::filesystem::path& path, tensor::Tensor vectors) 
         if (hnsw_crc32(require(std::as_const(vectors).host_bytes())) != graph.weights_crc32)
             throw Failure({ErrorCode::INVALID_ARGUMENT, "HNSW vector-table checksum mismatch"});
         return HnswIndex(std::make_unique<State>(std::move(graph), std::move(vectors)));
+    } catch (const Failure& error) {
+        return std::unexpected(error.error());
+    }
+}
+auto HnswIndex::load_quantized(const std::filesystem::path& path, tensor::Tensor weights, tensor::Tensor scales,
+                               tensor::Tensor zeros, std::int32_t bits, std::int32_t group_size, float input_scale)
+    -> Result<HnswIndex> {
+    auto bytes = read_file(path);
+    if (!bytes) return std::unexpected(std::move(bytes.error()));
+    try {
+        auto graph = decode(*bytes);
+        if ((bits != 2 && bits != 4 && bits != 8) || !std::isfinite(input_scale) || input_scale < 0 ||
+            group_size <= 0 || graph.width % group_size != 0 || group_size % 32 != 0 || !weights.defined() ||
+            !weights.is_host_accessible() || !weights.is_contiguous() || weights.dtype() != tensor::DType::U8 ||
+            weights.dimensions() != 2 || weights.size(0) != graph.labels.size() ||
+            weights.size(1) != graph.width / (8 / bits) || !scales.defined() || !scales.is_host_accessible() ||
+            !scales.is_contiguous() || scales.dimensions() != 2 || scales.size(0) != graph.labels.size() ||
+            scales.size(1) != graph.width / group_size ||
+            (scales.dtype() != tensor::DType::F32 && scales.dtype() != tensor::DType::F16) ||
+            (zeros.defined() &&
+             (bits != 4 || !zeros.is_host_accessible() || !zeros.is_contiguous() || zeros.dimensions() != 2 ||
+              zeros.size(0) != scales.size(0) || zeros.size(1) != scales.size(1) ||
+              (zeros.dtype() != tensor::DType::F32 && zeros.dtype() != tensor::DType::F16))))
+            throw Failure({ErrorCode::INVALID_ARGUMENT, "HNSW index does not match quantized vector table"});
+        return HnswIndex(std::make_unique<State>(std::move(graph), std::move(weights), std::move(scales),
+                                                 std::move(zeros), bits, group_size, input_scale));
     } catch (const Failure& error) {
         return std::unexpected(error.error());
     }
@@ -609,14 +756,247 @@ auto HnswIndex::save(const std::filesystem::path& path) const -> Result<void> {
         return std::unexpected(Error{ErrorCode::IO, "cannot save HNSW index: " + std::string(error.what())});
     }
 }
-auto HnswIndex::query_distance(std::span<const float> query, std::uint32_t node) const -> float {
+auto HnswIndex::prefetch_node(std::uint32_t node) const noexcept -> void {
     const auto& state = *state_;
-    const auto row = static_cast<std::size_t>(state.graph.labels[node]) * state.graph.width *
-                     tensor::element_size(state.vectors.dtype());
-    const auto result = 1.F - state.dot(query.data(), state.bytes.data() + row, state.graph.width);
+    const auto label = static_cast<std::size_t>(state.graph.labels[node]);
+    const auto* ptr = state.bytes.data() + label * state.row_bytes;
+    const std::size_t limit = std::min<std::size_t>(state.row_bytes, 1024);
+#if defined(__GNUC__) || defined(__clang__)
+    for (std::size_t off = 0; off < limit; off += 128) __builtin_prefetch(ptr + off, 0, 1);
+    if (state.bits) {
+        const auto B = static_cast<std::size_t>(state.graph.width / state.group_size);
+        const auto s_elem = state.scale_f16 ? 2U : 4U;
+        __builtin_prefetch(state.scale_bytes.data() + label * B * s_elem, 0, 1);
+        if (state.has_zero) {
+            const auto z_elem = state.zero_f16 ? 2U : 4U;
+            __builtin_prefetch(state.zero_bytes.data() + label * B * z_elem, 0, 1);
+        }
+    }
+#else
+    (void)ptr;
+    (void)limit;
+#endif
+}
+
+auto HnswIndex::prepare_query(std::span<const float> query, HnswWorkspace& workspace) const -> void {
+    const auto& state = *state_;
+    if (!state.bits) return;
+    const auto width = static_cast<std::size_t>(state.graph.width);
+    const auto G = static_cast<std::size_t>(state.group_size);
+    const auto B = width / G;
+    workspace.q_i8.resize(width);
+    workspace.q_scale.resize(B);
+    workspace.q_bsum.resize(B);
+    for (std::size_t b = 0; b < B; ++b) {
+        const float* x = query.data() + b * G;
+        float scale = state.input_scale;
+        float inv_scale = 0.F;
+        if (scale > 0.F) {
+            inv_scale = 1.F / scale;
+        } else {
+            float max_abs = 0.F;
+            for (std::size_t i = 0; i < G; ++i) max_abs = std::max(max_abs, std::abs(x[i]));
+            scale = max_abs > 0.F ? max_abs / 127.F : 0.F;
+            inv_scale = max_abs > 0.F ? 127.F / max_abs : 0.F;
+        }
+        workspace.q_scale[b] = scale;
+        const float min_q = state.input_scale > 0.F ? -128.F : -127.F;
+        if (state.bits == 8) {
+            auto* dst = workspace.q_i8.data() + b * G;
+            for (std::size_t i = 0; i < G; ++i)
+                dst[i] = static_cast<std::int8_t>(std::clamp(std::nearbyint(x[i] * inv_scale), min_q, 127.F));
+        } else if (state.bits == 4) {
+            const auto chunks = G / 32;
+            std::int32_t bsum = 0;
+            for (std::size_t c = 0; c < chunks; ++c) {
+                const float* xc = x + c * 32;
+                auto* dst = workspace.q_i8.data() + (b * chunks + c) * 32;
+                for (std::size_t i = 0; i < 16; ++i) {
+                    const auto qe =
+                        static_cast<std::int8_t>(std::clamp(std::nearbyint(xc[2 * i] * inv_scale), min_q, 127.F));
+                    const auto qo =
+                        static_cast<std::int8_t>(std::clamp(std::nearbyint(xc[2 * i + 1] * inv_scale), min_q, 127.F));
+                    dst[i] = qe;
+                    dst[16 + i] = qo;
+                    bsum += static_cast<std::int32_t>(qe) + static_cast<std::int32_t>(qo);
+                }
+            }
+            workspace.q_bsum[b] = static_cast<float>(bsum) * scale;
+        } else if (state.bits == 2) {
+            const auto quarter = G / 4;
+            auto* dst = workspace.q_i8.data() + b * G;
+            for (std::size_t i = 0; i < quarter; ++i) {
+                dst[0 * quarter + i] =
+                    static_cast<std::int8_t>(std::clamp(std::nearbyint(x[4 * i + 0] * inv_scale), min_q, 127.F));
+                dst[1 * quarter + i] =
+                    static_cast<std::int8_t>(std::clamp(std::nearbyint(x[4 * i + 1] * inv_scale), min_q, 127.F));
+                dst[2 * quarter + i] =
+                    static_cast<std::int8_t>(std::clamp(std::nearbyint(x[4 * i + 2] * inv_scale), min_q, 127.F));
+                dst[3 * quarter + i] =
+                    static_cast<std::int8_t>(std::clamp(std::nearbyint(x[4 * i + 3] * inv_scale), min_q, 127.F));
+            }
+        }
+    }
+}
+
+auto HnswIndex::query_distance(std::span<const float> query, const HnswWorkspace& workspace, std::uint32_t node) const
+    -> float {
+    const auto& state = *state_;
+    const auto label = static_cast<std::size_t>(state.graph.labels[node]);
+    if (!state.bits) {
+        const auto row = label * state.row_bytes;
+        const auto result = 1.F - state.dot(query.data(), state.bytes.data() + row, state.graph.width);
+        if (!std::isfinite(result)) throw Failure({ErrorCode::RUNTIME, "nonfinite HNSW query distance"});
+        return result;
+    }
+    const auto width = static_cast<std::size_t>(state.graph.width);
+    const auto G = static_cast<std::size_t>(state.group_size);
+    const auto B = width / G;
+    const auto* w_row = reinterpret_cast<const std::uint8_t*>(state.bytes.data()) + label * state.row_bytes;
+    float score = 0.F;
+    if (state.bits == 8) {
+        for (std::size_t b = 0; b < B; ++b) {
+            const auto* q_ptr = workspace.q_i8.data() + b * G;
+            const auto* w_ptr = reinterpret_cast<const std::int8_t*>(w_row + b * G);
+            std::int32_t dot_i32 = 0;
+#if defined(KIDI_HNSW_NEON) && defined(__ARM_FEATURE_DOTPROD)
+            int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
+            int32x4_t acc2 = vdupq_n_s32(0), acc3 = vdupq_n_s32(0);
+            std::size_t c = 0;
+            for (; c + 64 <= G; c += 64) {
+                acc0 = vdotq_s32(acc0, vld1q_s8(q_ptr + c), vld1q_s8(w_ptr + c));
+                acc1 = vdotq_s32(acc1, vld1q_s8(q_ptr + c + 16), vld1q_s8(w_ptr + c + 16));
+                acc2 = vdotq_s32(acc2, vld1q_s8(q_ptr + c + 32), vld1q_s8(w_ptr + c + 32));
+                acc3 = vdotq_s32(acc3, vld1q_s8(q_ptr + c + 48), vld1q_s8(w_ptr + c + 48));
+            }
+            dot_i32 = vaddvq_s32(vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3)));
+            for (; c < G; ++c) dot_i32 += static_cast<std::int32_t>(q_ptr[c]) * static_cast<std::int32_t>(w_ptr[c]);
+#else
+            for (std::size_t c = 0; c < G; ++c)
+                dot_i32 += static_cast<std::int32_t>(q_ptr[c]) * static_cast<std::int32_t>(w_ptr[c]);
+#endif
+            const float w_s = read_meta(state.scale_bytes.data(), state.scale_f16, label * B + b);
+            score += static_cast<float>(dot_i32) * (workspace.q_scale[b] * w_s);
+        }
+    } else if (state.bits == 4) {
+        const auto chunks = G / 32;
+#if defined(KIDI_HNSW_NEON) && defined(__ARM_FEATURE_DOTPROD)
+        if (B % 4 == 0) {
+            float32x4_t f_acc = vdupq_n_f32(0.F);
+            const auto* s_f16 =
+                state.scale_f16 ? reinterpret_cast<const __fp16*>(state.scale_bytes.data()) + label * B : nullptr;
+            const auto* s_f32 =
+                state.scale_f16 ? nullptr : reinterpret_cast<const float*>(state.scale_bytes.data()) + label * B;
+            const auto* z_f16 = (state.has_zero && state.zero_f16)
+                                    ? reinterpret_cast<const __fp16*>(state.zero_bytes.data()) + label * B
+                                    : nullptr;
+            const auto* z_f32 = (state.has_zero && !state.zero_f16)
+                                    ? reinterpret_cast<const float*>(state.zero_bytes.data()) + label * B
+                                    : nullptr;
+            for (std::size_t b = 0; b < B; b += 4) {
+                int32x4_t d[4]{vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0)};
+                for (std::size_t r = 0; r < 4; ++r) {
+                    const auto blk = b + r;
+                    for (std::size_t c = 0; c < chunks; ++c) {
+                        const uint8x16_t raw = vld1q_u8(w_row + (blk * chunks + c) * 16);
+                        const int8x16_t we = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw, 4)), 4);
+                        const int8x16_t wo = vshrq_n_s8(vreinterpretq_s8_u8(raw), 4);
+                        const auto* qp = workspace.q_i8.data() + (blk * chunks + c) * 32;
+                        d[r] = vdotq_s32(vdotq_s32(d[r], we, vld1q_s8(qp)), wo, vld1q_s8(qp + 16));
+                    }
+                }
+                const int32x4_t dots = vpaddq_s32(vpaddq_s32(d[0], d[1]), vpaddq_s32(d[2], d[3]));
+                const float32x4_t ws = s_f16 ? vcvt_f32_f16(vld1_f16(s_f16 + b)) : vld1q_f32(s_f32 + b);
+                const float32x4_t qs = vld1q_f32(workspace.q_scale.data() + b);
+                f_acc = vfmaq_f32(f_acc, vcvtq_f32_s32(dots), vmulq_f32(ws, qs));
+                if (state.has_zero) {
+                    const float32x4_t wz = z_f16 ? vcvt_f32_f16(vld1_f16(z_f16 + b)) : vld1q_f32(z_f32 + b);
+                    const float32x4_t qz = vld1q_f32(workspace.q_bsum.data() + b);
+                    f_acc = vfmaq_f32(f_acc, wz, qz);
+                }
+            }
+            score = vaddvq_f32(f_acc);
+        } else
+#endif
+        {
+            for (std::size_t b = 0; b < B; ++b) {
+                std::int32_t dot_i32 = 0;
+#if defined(KIDI_HNSW_NEON) && defined(__ARM_FEATURE_DOTPROD)
+                int32x4_t acc = vdupq_n_s32(0);
+                for (std::size_t c = 0; c < chunks; ++c) {
+                    const uint8x16_t raw = vld1q_u8(w_row + (b * chunks + c) * 16);
+                    const int8x16_t we = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw, 4)), 4);
+                    const int8x16_t wo = vshrq_n_s8(vreinterpretq_s8_u8(raw), 4);
+                    const auto* qp = workspace.q_i8.data() + (b * chunks + c) * 32;
+                    acc = vdotq_s32(vdotq_s32(acc, we, vld1q_s8(qp)), wo, vld1q_s8(qp + 16));
+                }
+                dot_i32 = vaddvq_s32(acc);
+#else
+                for (std::size_t c = 0; c < chunks; ++c) {
+                    const auto* wp = w_row + (b * chunks + c) * 16;
+                    const auto* qp = workspace.q_i8.data() + (b * chunks + c) * 32;
+                    for (std::size_t i = 0; i < 16; ++i) {
+                        const auto byte = wp[i];
+                        const auto we = static_cast<std::int8_t>(static_cast<std::int8_t>(byte << 4) >> 4);
+                        const auto wo = static_cast<std::int8_t>(static_cast<std::int8_t>(byte) >> 4);
+                        dot_i32 += static_cast<std::int32_t>(we) * qp[i] + static_cast<std::int32_t>(wo) * qp[16 + i];
+                    }
+                }
+#endif
+                const float w_s = read_meta(state.scale_bytes.data(), state.scale_f16, label * B + b);
+                score += static_cast<float>(dot_i32) * (workspace.q_scale[b] * w_s);
+                if (state.has_zero) {
+                    const float w_z = read_meta(state.zero_bytes.data(), state.zero_f16, label * B + b);
+                    score += workspace.q_bsum[b] * w_z;
+                }
+            }
+        }
+    } else if (state.bits == 2) {
+        const auto quarter = G / 4;
+        for (std::size_t b = 0; b < B; ++b) {
+            const auto* wp = w_row + b * quarter;
+            const auto* qp = workspace.q_i8.data() + b * G;
+            std::int32_t dot_i32 = 0;
+#if defined(KIDI_HNSW_NEON) && defined(__ARM_FEATURE_DOTPROD)
+            int32x4_t acc = vdupq_n_s32(0);
+            std::size_t c = 0;
+            for (; c + 16 <= quarter; c += 16) {
+                const int8x16_t raw = vreinterpretq_s8_u8(vld1q_u8(wp + c));
+                const int8x16_t w0 = vshrq_n_s8(vshlq_n_s8(raw, 6), 6);
+                const int8x16_t w1 = vshrq_n_s8(vshlq_n_s8(raw, 4), 6);
+                const int8x16_t w2 = vshrq_n_s8(vshlq_n_s8(raw, 2), 6);
+                const int8x16_t w3 = vshrq_n_s8(raw, 6);
+                acc = vdotq_s32(acc, w0, vld1q_s8(qp + 0 * quarter + c));
+                acc = vdotq_s32(acc, w1, vld1q_s8(qp + 1 * quarter + c));
+                acc = vdotq_s32(acc, w2, vld1q_s8(qp + 2 * quarter + c));
+                acc = vdotq_s32(acc, w3, vld1q_s8(qp + 3 * quarter + c));
+            }
+            dot_i32 = vaddvq_s32(acc);
+            for (; c < quarter; ++c) {
+                const auto raw = static_cast<std::int8_t>(wp[c]);
+                dot_i32 += static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 6) >> 6) * qp[0 * quarter + c] +
+                           static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 4) >> 6) * qp[1 * quarter + c] +
+                           static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 2) >> 6) * qp[2 * quarter + c] +
+                           static_cast<std::int32_t>(raw >> 6) * qp[3 * quarter + c];
+            }
+#else
+            for (std::size_t c = 0; c < quarter; ++c) {
+                const auto raw = static_cast<std::int8_t>(wp[c]);
+                dot_i32 += static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 6) >> 6) * qp[0 * quarter + c] +
+                           static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 4) >> 6) * qp[1 * quarter + c] +
+                           static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 2) >> 6) * qp[2 * quarter + c] +
+                           static_cast<std::int32_t>(raw >> 6) * qp[3 * quarter + c];
+            }
+#endif
+            const float w_s = read_meta(state.scale_bytes.data(), state.scale_f16, label * B + b);
+            score += static_cast<float>(dot_i32) * (workspace.q_scale[b] * w_s);
+        }
+    }
+    const auto result = 1.F - score;
     if (!std::isfinite(result)) throw Failure({ErrorCode::RUNTIME, "nonfinite HNSW query distance"});
     return result;
 }
+
 auto HnswIndex::node_distance(std::uint32_t left, std::uint32_t right) const -> float {
     const auto& state = *state_;
     const auto stride = state.graph.width * tensor::element_size(state.vectors.dtype());
@@ -846,13 +1226,15 @@ auto HnswIndex::search(std::span<const float> query, HnswWorkspace& workspace, s
         if (query.size() != graph.width || !candidates || candidates > graph.labels.size() || ef < candidates ||
             std::ranges::any_of(query, [](float value) { return !std::isfinite(value); }))
             throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid HNSW query or search parameters"});
+        prepare_query(query, workspace);
         const auto nodes = graph.labels.size();
+        ef = std::min(ef, nodes);
         if (workspace.visited.size() != nodes) {
             workspace.visited.assign(nodes, 0);
-            workspace.frontier.reserve(ef + 1);
-            workspace.nearest.reserve(ef + 1);
             workspace.epoch = 0;
         }
+        workspace.frontier.reserve(ef + 1);
+        workspace.nearest.reserve(ef + 1);
         if (++workspace.epoch == 0) {
             std::ranges::fill(workspace.visited, 0);
             workspace.epoch = 1;
@@ -860,16 +1242,18 @@ auto HnswIndex::search(std::span<const float> query, HnswWorkspace& workspace, s
         workspace.frontier.clear();
         workspace.nearest.clear();
         workspace.result.clear();
-        ef = std::min(ef, nodes);
         workspace.result.reserve(candidates);
         auto entry = graph.entry;
-        auto best = query_distance(query, entry);
+        auto best = query_distance(query, workspace, entry);
         for (std::size_t level = graph.upper.size(); level; --level) {
             bool changed = true;
             while (changed) {
                 changed = false;
-                for (auto neighbor : graph.neighbors(entry, level)) {
-                    const auto value = query_distance(query, neighbor);
+                const auto neighbors = graph.neighbors(entry, level);
+                for (std::size_t idx = 0; idx < neighbors.size(); ++idx) {
+                    if (idx + 2 < neighbors.size()) prefetch_node(neighbors[idx + 2]);
+                    const auto neighbor = neighbors[idx];
+                    const auto value = query_distance(query, workspace, neighbor);
                     if (value < best) {
                         best = value;
                         entry = neighbor;
@@ -884,10 +1268,14 @@ auto HnswIndex::search(std::span<const float> query, HnswWorkspace& workspace, s
         while (!workspace.frontier.empty()) {
             if (-workspace.frontier.front().first > best) break;
             const auto current = pop(workspace.frontier).second;
-            for (auto neighbor : graph.neighbors(current, 0)) {
+            const auto neighbors = graph.neighbors(current, 0);
+            for (std::size_t idx = 0; idx < neighbors.size(); ++idx) {
+                if (idx + 2 < neighbors.size() && workspace.visited[neighbors[idx + 2]] != workspace.epoch)
+                    prefetch_node(neighbors[idx + 2]);
+                const auto neighbor = neighbors[idx];
                 if (workspace.visited[neighbor] == workspace.epoch) continue;
                 workspace.visited[neighbor] = workspace.epoch;
-                const auto value = query_distance(query, neighbor);
+                const auto value = query_distance(query, workspace, neighbor);
                 if (workspace.nearest.size() < ef || value < best) {
                     push(workspace.frontier, -value, neighbor);
                     push(workspace.nearest, value, neighbor);
@@ -898,14 +1286,16 @@ auto HnswIndex::search(std::span<const float> query, HnswWorkspace& workspace, s
         }
         if (workspace.nearest.size() < candidates)
             throw Failure({ErrorCode::RUNTIME, "HNSW search returned too few candidates"});
-        while (workspace.nearest.size() > candidates) pop(workspace.nearest);
-        while (!workspace.nearest.empty()) {
-            const auto [distance, node] = pop(workspace.nearest);
+        std::partial_sort(
+            workspace.nearest.begin(), workspace.nearest.begin() + candidates, workspace.nearest.end(),
+            [&](const auto& left, const auto& right) {
+                return left.first < right.first ||
+                       (left.first == right.first && graph.labels[left.second] < graph.labels[right.second]);
+            });
+        for (std::size_t rank = 0; rank < candidates; ++rank) {
+            const auto [distance, node] = workspace.nearest[rank];
             workspace.result.push_back({distance, graph.labels[node]});
         }
-        std::ranges::sort(workspace.result, [](const HnswNeighbor& left, const HnswNeighbor& right) {
-            return left.distance < right.distance || (left.distance == right.distance && left.id < right.id);
-        });
         return std::span<const HnswNeighbor>(workspace.result);
     } catch (const Failure& error) {
         return std::unexpected(error.error());

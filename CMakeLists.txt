@@ -110,6 +110,7 @@ add_library(kidi
     src/kidi/layers/audio.cpp
     src/kidi/layers/gemma4.cpp
     src/kidi/layers/higgs_audio.cpp
+    src/kidi/layers/linear.cpp
     src/kidi/layers/qwen3.cpp
     src/kidi/layers/transformer.cpp
     src/kidi/layers/whisper.cpp

@@ -139,19 +139,9 @@ struct Gemma4Impl::State {
     layers::Linear per_layer_projection, lm_head;
     layers::RmsNorm per_layer_norm, norm;
     Tensor projection_scale, combination_scale, logit_scale, inverse_logit_scale;
+    Tensor lm_head_zero;
     std::vector<Tensor> step_inputs;
     std::string npu_prefill_key, npu_decode_key;
-    std::optional<core::HnswIndex> hnsw;
-    Tensor indexed_weight;
-    std::vector<core::HnswWorkspace> search_workspaces;
-    struct HeadSlot {
-        Tensor weights, selected;
-        std::vector<std::byte> weight_bytes;
-        std::vector<std::vector<std::uint32_t>> candidates;
-        std::vector<std::int32_t> union_ids;
-        std::vector<std::optional<Error>> errors;
-    };
-    std::map<std::size_t, HeadSlot> head_slots;
 
     explicit State(const YAML::Node& config)
         : context(module_device, false, std::nullopt, config["quantization_config"] ? DType::F32 : module_dtype),
@@ -513,6 +503,7 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
         impl_->context = ops::Context(device(), packed_prefill, std::nullopt, impl_->parameter_dtype);
         impl_->weight_bits = weight_bits;
         impl_->packed_prefill = packed_prefill;
+        impl_->lm_head_zero = Tensor{};
         if (!zeros_state.empty()) {
             const auto bound = state_dict();
             for (auto& [zero_name, zero_tensor] : zeros_state) {
@@ -521,8 +512,11 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
                     emb ? std::string_view(".embedding_zero").size() : std::string_view(".weight_zero").size();
                 const auto scale_name =
                     zero_name.substr(0, zero_name.size() - suffix_len) + (emb ? ".embedding_scale" : ".weight_scale");
+                auto dev_zero = require(zero_tensor.to(device()));
+                if (zero_name == "embed_tokens.embedding_zero" || zero_name == "lm_head.weight_zero")
+                    impl_->lm_head_zero = dev_zero;
                 if (const auto found = bound.find(scale_name); found != bound.end())
-                    impl_->context.bind_packed_zero(found->second, require(zero_tensor.to(device())));
+                    impl_->context.bind_packed_zero(found->second, std::move(dev_zero));
             }
         }
         if (weight_bits) {
@@ -551,34 +545,16 @@ auto Gemma4Impl::set_kv_cache_precision(core::KVCachePrecision precision) noexce
 }
 auto Gemma4Impl::configure_lm_head(const std::filesystem::path& path) -> Result<void> {
     try {
-        if (path.empty() || impl_->qat || !device().capabilities().compute.host() ||
-            !impl_->context.accelerator().empty() ||
-            (impl_->parameter_dtype != DType::F32 && impl_->parameter_dtype != DType::BF16))
+        if (path.empty() || !device().capabilities().compute.host() || !impl_->context.accelerator().empty())
             throw ops::Failure(
-                {ErrorCode::UNSUPPORTED, "HNSW head requires CPU inference with original FP32/BF16 weights"});
-        auto index = require(core::HnswIndex::load(path, impl_->lm_head->weight()));
-        if (index.candidates() > std::min<std::size_t>(1024, impl_->vocabulary))
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "HNSW LM-head candidate count exceeds 1024"});
-        require(runtime::ynn::reserve_thread_pool(runtime::ynn::thread_count()));
+                {ErrorCode::UNSUPPORTED, "HNSW head requires CPU inference without an external accelerator"});
+        require(impl_->lm_head->bind_hnsw(path, impl_->lm_head_zero));
         impl_->context.synchronize();
         impl_->context.clear_replays();
-        impl_->head_slots.clear();
-        impl_->search_workspaces.clear();
-        impl_->hnsw = std::move(index);
-        impl_->indexed_weight = impl_->lm_head->weight();
         return {};
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
-}
-auto Gemma4Impl::check_head_binding() const -> void {
-    if (!impl_->hnsw) return;
-    const auto& weight = impl_->lm_head->weight();
-    if (weight.storage_identity() != impl_->indexed_weight.storage_identity() ||
-        weight.storage_offset() != impl_->indexed_weight.storage_offset() ||
-        weight.dtype() != impl_->indexed_weight.dtype() ||
-        !std::ranges::equal(weight.shape(), impl_->indexed_weight.shape()))
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "output weights changed; reload the matching HNSW graph"});
 }
 auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
     try {
@@ -838,83 +814,11 @@ auto Gemma4Impl::per_layer_input(const Tensor& per_layer, int layer, std::int64_
 auto Gemma4Impl::head(const Tensor& hidden, bool select, ops::TokenOutput output) -> Tensor {
     auto& context = impl_->context;
     const auto query = impl_->norm->forward(context, hidden);
-    if (select && impl_->hnsw) return select_head(query);
+    if (select) return impl_->lm_head->select(context, query, output);
     auto logits = impl_->lm_head->forward(context, query);
-    if (select) return context.greedy_token(logits, output);
     if (logits.dtype() != DType::F32) logits = context.cast(logits, DType::F32);
     logits = context.multiply(context.tanh(context.multiply(logits, impl_->inverse_logit_scale)), impl_->logit_scale);
     return logits;
-}
-
-auto Gemma4Impl::select_head(const Tensor& query) -> Tensor {
-    auto& context = impl_->context;
-    check_head_binding();
-    context.synchronize();
-    context.profile_phase("lm_head");
-    const auto rows = query.numel() / query.size(-1);
-    const auto& index = *impl_->hnsw;
-    const auto width = static_cast<std::size_t>(impl_->hidden), candidates = index.candidates();
-    const auto capacity = rows * candidates, row_bytes = width * tensor::element_size(index.vectors().dtype());
-    auto& slot = impl_->head_slots[rows];
-    if (!slot.weights.defined()) {
-        slot.weights = require(
-            Tensor::empty({static_cast<std::int64_t>(capacity), impl_->hidden}, index.vectors().dtype(), device()));
-        slot.selected = require(Tensor::empty({static_cast<std::int64_t>(rows)}, DType::I32));
-        slot.weight_bytes.resize(capacity * row_bytes);
-        slot.candidates.resize(rows);
-        slot.errors.resize(rows);
-        slot.union_ids.reserve(capacity);
-        for (auto& list : slot.candidates) list.reserve(candidates);
-    }
-    if (impl_->search_workspaces.size() < rows) impl_->search_workspaces.resize(rows);
-    const auto activation = index.vectors().dtype() == DType::BF16 ? context.cast(query, DType::BF16) : query;
-    const auto floating = context.cast(activation, DType::F32);
-    context.synchronize();
-    const auto queries = require(floating.data<float>());
-    std::ranges::fill(slot.errors, std::nullopt);
-    require(runtime::ynn::parallel_for(rows, [&](std::size_t row) {
-        auto found = index.search(queries.subspan(row * width, width), impl_->search_workspaces[row]);
-        if (!found) {
-            slot.errors[row] = std::move(found.error());
-            return;
-        }
-        auto& list = slot.candidates[row];
-        list.clear();
-        for (const auto& neighbor : *found) list.push_back(neighbor.id);
-    }));
-    slot.union_ids.clear();
-    for (std::size_t row = 0; row < rows; ++row) {
-        if (slot.errors[row]) throw ops::Failure(std::move(*slot.errors[row]));
-        for (auto token : slot.candidates[row]) slot.union_ids.push_back(static_cast<std::int32_t>(token));
-    }
-    std::ranges::sort(slot.union_ids);
-    slot.union_ids.erase(std::unique(slot.union_ids.begin(), slot.union_ids.end()), slot.union_ids.end());
-    require(tensor::gather_rows(index.vectors(), slot.union_ids,
-                                std::span(slot.weight_bytes).first(slot.union_ids.size() * row_bytes)));
-    for (std::size_t row = slot.union_ids.size(); row < capacity; ++row)
-        std::copy_n(slot.weight_bytes.begin(), row_bytes, slot.weight_bytes.begin() + row * row_bytes);
-    require(slot.weights.copy_from_host(slot.weight_bytes));
-    const auto scores = context.cast(context.matmul(activation, slot.weights, true), DType::F32);
-    context.synchronize();
-    const auto score_values = require(scores.data<float>());
-    auto selected = require(slot.selected.data<std::int32_t>());
-    for (std::size_t row = 0; row < rows; ++row) {
-        float best = -std::numeric_limits<float>::infinity();
-        selected[row] = -1;
-        for (auto token : slot.candidates[row]) {
-            const auto found = std::ranges::lower_bound(slot.union_ids, static_cast<std::int32_t>(token));
-            if (found == slot.union_ids.end() || *found != static_cast<std::int32_t>(token))
-                throw ops::Failure({ErrorCode::RUNTIME, "candidate is absent from the projection union"});
-            const auto score = score_values[row * capacity + static_cast<std::size_t>(found - slot.union_ids.begin())];
-            if (!std::isfinite(score)) throw ops::Failure({ErrorCode::RUNTIME, "nonfinite HNSW candidate score"});
-            if (score > best || (score == best && static_cast<std::int32_t>(token) < selected[row])) {
-                best = score;
-                selected[row] = static_cast<std::int32_t>(token);
-            }
-        }
-        if (selected[row] < 0) throw ops::Failure({ErrorCode::RUNTIME, "HNSW head selected no candidate"});
-    }
-    return slot.selected;
 }
 
 auto Gemma4Impl::can_decode_step(const Gemma4State& state) const -> bool {
@@ -931,7 +835,7 @@ auto Gemma4Impl::decode_step(const Tensor& token, Gemma4State& state, bool selec
 
 auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4StepInputs& inputs, bool prefill,
                                bool select, ops::TokenOutput output) -> Tensor {
-    check_head_binding();
+    impl_->lm_head->check_hnsw_binding();
     auto& context = impl_->context;
     const auto device = context.device();
     const auto staging_device = device.capabilities().memory.requires_staging() ? tensor::Device::cpu() : device;
@@ -994,7 +898,7 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
                      (prefill  ? ""
                       : select ? ":token"
                                : ":logits");
-    const auto split_head = select && impl_->hnsw;
+    const auto split_head = select && impl_->lm_head->has_hnsw();
     const auto replay_key =
         key + (select && output == ops::TokenOutput::DEVICE ? ":device" : "") + (split_head ? ":query" : "");
     if (context.accelerator() == "qnn-htp") {
@@ -1046,7 +950,7 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
         return std::vector{head(hidden, select, output)};
     });
     if (prefill) return {};
-    return split_head ? select_head(outputs[0]) : outputs[0];
+    return split_head ? impl_->lm_head->select(context, outputs[0], output) : outputs[0];
 }
 
 auto Gemma4Impl::prefill(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void> {
@@ -1112,7 +1016,7 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
                          std::span<Gemma4State*> batch_states) -> Result<Tensor> {
     const ops::DecodeScope decode_scope(!batch_states.empty());
     try {
-        check_head_binding();
+        impl_->lm_head->check_hnsw_binding();
         const std::size_t token_count = tokens.size();
         const std::size_t step_count = batch_states.empty() ? token_count : 1;
         if (!token_count || state.position > state.capacity || step_count > state.capacity - state.position ||
@@ -1201,15 +1105,13 @@ auto Gemma4Impl::configure_cache(const std::filesystem::path& directory, const s
 }
 auto Gemma4Impl::release_workspaces() -> void {
     impl_->context.release_workspaces();
-    impl_->head_slots.clear();
-    impl_->search_workspaces.clear();
+    impl_->lm_head->release_workspaces();
 }
 auto Gemma4Impl::trim_workspaces() -> void {
     impl_->context.synchronize();
     impl_->context.clear_replays();
     impl_->context.trim_workspaces();
-    impl_->head_slots.clear();
-    impl_->search_workspaces.clear();
+    impl_->lm_head->release_workspaces();
 }
 auto Gemma4Impl::accelerator() const -> std::string_view { return impl_->context.accelerator(); }
 auto Gemma4Impl::prefill_chunk_size(std::size_t requested) const -> std::size_t {

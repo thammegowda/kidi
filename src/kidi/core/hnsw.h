@@ -30,6 +30,8 @@ struct HnswWorkspace {
     std::uint32_t epoch = 0;
     std::vector<std::pair<float, std::uint32_t>> frontier, nearest;
     std::vector<HnswNeighbor> result;
+    std::vector<std::int8_t> q_i8;
+    std::vector<float> q_scale, q_bsum;
 };
 
 using HnswProgress = std::function<void(std::size_t completed, std::size_t total)>;
@@ -48,6 +50,9 @@ public:
     static auto build(tensor::Tensor vectors, HnswBuildOptions options = {}, HnswProgress progress = {},
                       HnswParallelFor parallel_for = {}) -> Result<HnswIndex>;
     static auto load(const std::filesystem::path& path, tensor::Tensor vectors) -> Result<HnswIndex>;
+    static auto load_quantized(const std::filesystem::path& path, tensor::Tensor weights, tensor::Tensor scales,
+                               tensor::Tensor zeros, std::int32_t bits, std::int32_t group_size,
+                               float input_scale = 0.F) -> Result<HnswIndex>;
     /// Imports an original 64-bit hnswlib FP32 export, checking every vector against the supplied table.
     static auto from_hnswlib(const std::filesystem::path& path, tensor::Tensor vectors, std::size_t candidates = 8,
                              std::size_t ef_search = 800) -> Result<HnswIndex>;
@@ -67,7 +72,10 @@ public:
 private:
     struct State;
     explicit HnswIndex(std::unique_ptr<State> state);
-    auto query_distance(std::span<const float> query, std::uint32_t node) const -> float;
+    auto prepare_query(std::span<const float> query, HnswWorkspace& workspace) const -> void;
+    auto query_distance(std::span<const float> query, const HnswWorkspace& workspace, std::uint32_t node) const
+        -> float;
+    auto prefetch_node(std::uint32_t node) const noexcept -> void;
     auto node_distance(std::uint32_t left, std::uint32_t right) const -> float;
 
     std::unique_ptr<State> state_;

@@ -82,8 +82,6 @@ private:
     auto per_layer_input(const tensor::Tensor& per_layer, int layer, std::int64_t length) -> tensor::Tensor;
     auto head(const tensor::Tensor& hidden, bool select, ops::TokenOutput output = ops::TokenOutput::HOST)
         -> tensor::Tensor;
-    auto select_head(const tensor::Tensor& query) -> tensor::Tensor;
-    auto check_head_binding() const -> void;
     /// Decodes one token as a captured step: host values are written into `state.step`, caches by index.
     auto decode_step(const tensor::Tensor& token, Gemma4State& state, bool select,
                      ops::TokenOutput output = ops::TokenOutput::HOST) -> tensor::Tensor;

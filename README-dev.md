@@ -390,7 +390,7 @@ pool for distance calculations. `--threads` controls parallelism (default: 1);
 one- and multi-threaded builds produce the same graph with a fixed seed on the
 same hardware. More threads are not always faster for small graph expansions:
 on the Xeon test host, 2,048 E4B rows took 7.36/16.80/28.30 seconds with 1/4/14
-threads, respectively. CPU distance kernels use AVX-512/FMA where supported.
+threads, respectively. CPU distance kernels use AVX-512/FMA or ARM64 NEON where supported.
 Progress includes row counts, percentage, elapsed time, rate and an interval-based
 ETA. A full vocabulary can still take substantial offline time.
 
@@ -424,16 +424,42 @@ produced identical dense/HNSW tokens and chrF **76.13394**. This validates that
 specific index and sample; it is not an exact-search guarantee or evidence for
 every native CPU-built graph.
 
-CPU generation automatically loads `lm_head.hnsw`, verifies its dimensions and
-vector-table checksum, retrieves the stored candidate count/search effort, then
-scores only those original output rows. Add `--dense-lm-head` to disable it for
-a paired control. CUDA and attached accelerators ignore automatic HNSW discovery
-and retain their device-native dense head.
+CPU generation automatically loads `lm_head.hnsw` and uses its stored candidate
+count/search effort. Add `--dense-lm-head` to disable it for a paired control.
+CUDA and attached accelerators ignore automatic HNSW discovery and retain their
+device-native dense head.
+
+[`Linear`](src/kidi/layers/linear.h) owns the high-level API: `bind_hnsw` attaches
+an index to a transposed, bias-free CPU projection; `select` returns I32 `[rows]`
+token IDs for an input shaped `[..., input_size]`. `forward` still returns full
+dense logits. Workspaces are reused after warmup. Floating-point candidates are
+reprojected using the original weights, gathering directly into the projection
+buffer rather than copying through a second staging buffer.
+
+Packed 2/4/8-bit heads search the original signed packed rows and FP16/FP32
+scales (plus offsets for asymmetric INT4) without expanding or copying the
+vocabulary table. Search scores one visited row at a time with the existing
+per-vector SIMD kernels. A single query runs directly on its caller, while
+independent batch rows can use the worker pool.
+
+The graph file's payload checksum is always checked. FP32/BF16 bindings also
+require an exact vector-table checksum; packed bindings reuse the original
+graph topology and validate dimensions/layout, **not** an exact checksum match
+to the unquantized vectors. Only reuse a topology for quantized versions of the
+same model with the same vocabulary order. This remains approximate selection:
+retrieval can miss the dense winner, and packed search scores need not exactly
+match the dense backend's activation rounding. Matching one 64-token prompt is
+not proof of unchanged generation quality.
+
+`KIDI_HNSW_EF` optionally overrides search effort when the layer binds its index.
+It must be at least the candidate count stored in the graph; invalid values
+fail explicitly. Without an override, defaults remain those stored in the index.
+Check held-out generation quality, dense agreement and memory as well as speed.
+The [CPU harness](benchmarks/cpu/README.md#hnsw-lm-head-comparisons) provides
+dense/indexed controls and records the graph hash.
 
 `HnswIndex` exposes typed metadata without exposing its graph buffers or disk
-format. It has no dependency on `ops::Context`. LM-head search binds the model's
-actual output weights and retains reference candidate re-projection; approximate
-search distances are not substituted for the model's scores.
+format. It has no dependency on `ops::Context`.
 
 ## GGML and GGUF Import
 
