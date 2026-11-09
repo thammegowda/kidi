@@ -177,18 +177,6 @@ private:
         const auto width = logits.size(-1), rows = logits.numel() / width;
         const auto values = require(logits.data<float>());
         auto tokens = require(output.data<std::int32_t>());
-#if defined(__APPLE__)
-        for (std::size_t row = 0; row < rows; ++row) {
-            const float* row_values = values.data() + row * width;
-            float best = -std::numeric_limits<float>::infinity();
-            vDSP_Length best_index = 0;
-            vDSP_maxvi(row_values, 1, &best, &best_index, width);
-            bool invalid = std::isnan(best) || best == std::numeric_limits<float>::infinity();
-            for (std::size_t column = 0; !invalid && column < width; ++column) invalid = std::isnan(row_values[column]);
-            tokens[row] =
-                invalid || best == -std::numeric_limits<float>::infinity() ? -1 : static_cast<std::int32_t>(best_index);
-        }
-#else
         for (std::size_t row = 0; row < rows; ++row) {
             float best = -std::numeric_limits<float>::infinity();
             std::int32_t token = -1;
@@ -203,7 +191,6 @@ private:
             }
             tokens[row] = invalid ? -1 : token;
         }
-#endif
     }
 
     OutputPool pool_;
@@ -1122,8 +1109,8 @@ public:
         const auto block_size = spec.attributes[1];
         const auto valid_meta = [](DType dt) { return dt == DType::F32 || dt == DType::F16; };
         return bits == 4 && block_size >= 32 && (block_size % 32 == 0) &&
-               (inputs.size() == 4 || block_size < inputs[0].size(-1)) && inputs[0].dtype() == DType::F32 &&
-               inputs[1].dtype() == DType::U8 && valid_meta(inputs[2].dtype()) &&
+               (inputs.size() == 4 || (block_size < inputs[0].size(-1) && inputs[1].size(0) >= 256)) &&
+               inputs[0].dtype() == DType::F32 && inputs[1].dtype() == DType::U8 && valid_meta(inputs[2].dtype()) &&
                (inputs.size() == 3 || valid_meta(inputs[3].dtype())) && spec.epsilon <= 0.F;
     }
 
@@ -1605,8 +1592,8 @@ public:
             if (!cached_sz) {
                 cached_sz = BlockwiseInt4Linear::pack_scales_and_zeros(inputs[2], has_zero ? inputs[3] : Tensor{});
                 if (inputs[1].size(0) < 65536) {
-                    inputs[2].release_pages(true);
-                    if (has_zero) inputs[3].release_pages(true);
+                    inputs[2].release_pages();
+                    if (has_zero) inputs[3].release_pages();
                 }
             }
             return std::make_unique<BlockwiseInt4Linear>(spec, inputs[0], inputs[1], cached_sz, has_zero, arena_);
