@@ -50,6 +50,7 @@ def main(argv=None):
 
     if mode == "eval":
         prompts = protocol["prompts"]
+        item_ids = protocol.get("item_ids", list(range(len(prompts))))
         max_outputs = int(protocol["max_output_tokens"])
         with engine:
             for _ in range(warmups):
@@ -65,7 +66,8 @@ def main(argv=None):
             total_prompt_tokens = 0
             total_output_tokens = 0
             eval_started = time.perf_counter()
-            for raw_prompt in prompts:
+            for item_id, raw_prompt in zip(item_ids, prompts):
+                item_started = time.perf_counter()
                 native_prompt = raw_prompt.removeprefix("<bos>")
                 with engine.create_session(
                     apply_prompt_template=False,
@@ -77,8 +79,18 @@ def main(argv=None):
                     info = session.get_benchmark_info()
                     text = response.texts[0]
                     gen = list(engine.tokenize(text))
-                    total_prompt_tokens += int(info.last_prefill_token_count)
+                    item_seconds = time.perf_counter() - item_started
+                    p_tok = int(info.last_prefill_token_count)
+                    total_prompt_tokens += p_tok
                     total_output_tokens += len(gen)
+                    emit({
+                        "stage": "eval_item",
+                        "id": int(item_id),
+                        "seconds": item_seconds,
+                        "prompt_tokens": p_tok,
+                        "output_tokens": len(gen),
+                        "token_ids": gen,
+                    })
                     all_token_ids.append(gen)
                     outputs.append(text)
             emit({

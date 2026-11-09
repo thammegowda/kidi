@@ -59,6 +59,12 @@ auto quant_group_size(const YAML::Node& config, const std::string& name) -> std:
         }
     return group_size;
 }
+auto embedding_groups(const YAML::Node& config, std::int32_t width) -> std::int32_t {
+    const auto quantization = config["quantization_config"];
+    if (!quantization || !quantization["embedding_group_size"]) return 1;
+    const auto group_size = quantization["embedding_group_size"].as<std::int32_t>(0);
+    return group_size > 0 && width % group_size == 0 ? width / group_size : 1;
+}
 auto embedding(std::int32_t vocabulary, std::int32_t width, float scale, std::int32_t bits = 0, std::int32_t groups = 1)
     -> layers::TokenEmbedding {
     const ModuleScope storage(tensor::Device::cpu());
@@ -151,7 +157,8 @@ struct Gemma4Impl::State {
           vocabulary(config["vocab_size"].as<int>()),
           per_layer_vocabulary(config["vocab_size_per_layer_input"].as<int>()),
           tokens(embedding(config["vocab_size"].as<int>(), hidden, std::sqrt(static_cast<float>(hidden)),
-                           quant_bits(config, "model.language_model.embed_tokens"))),
+                           quant_bits(config, "model.language_model.embed_tokens"),
+                           embedding_groups(config, hidden))),
           per_layer_tokens(embedding(config["vocab_size_per_layer_input"].as<int>(), layer_count * per_layer_width,
                                      std::sqrt(static_cast<float>(per_layer_width)),
                                      quant_bits(config, "model.language_model.embed_tokens_per_layer"), layer_count)),
@@ -345,7 +352,7 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
             constexpr std::string_view PREFIX = "model.language_model.";
             if (!key.starts_with(PREFIX) && !(impl_->qat && key.starts_with("lm_head."))) continue;
             const auto name = key.starts_with(PREFIX) ? key.substr(PREFIX.size()) : key;
-            if (name.ends_with(".weight_zero")) {
+            if (name.ends_with(".weight_zero") || name.ends_with(".embedding_zero")) {
                 zeros_state.emplace(name, value);
                 continue;
             }
@@ -401,7 +408,7 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
                                                 name.ends_with("input_activation_scale") ||
                                                 name.ends_with("output_activation_scale") ||
                                                 name.ends_with("k_cache_scale") || name.ends_with("v_cache_scale");
-                if (impl_->qat && quantization_scale) {
+                if (impl_->qat && quantization_scale && value.dtype() == DType::F32) {
                     const bool calibration_scale = name.ends_with("input_activation_scale") ||
                                                    name.ends_with("output_activation_scale") ||
                                                    name.ends_with("k_cache_scale") || name.ends_with("v_cache_scale");
@@ -464,6 +471,17 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
             fuse_pair(layer_prefix + ".mlp.", "gate_proj", "up_proj", "gate_up_proj");
             if (layer < impl_->shared_begin) fuse_pair(layer_prefix + ".self_attn.", "k_proj", "v_proj", "kv_proj");
         }
+        if (impl_->qat && !state.contains("lm_head.weight") && state.contains("embed_tokens.embedding_quantized")) {
+            state.emplace("lm_head.weight", state.at("embed_tokens.embedding_quantized"));
+            state.emplace("lm_head.weight_scale", state.at("embed_tokens.embedding_scale"));
+            const float zero = 0.F;
+            if (!state.contains("lm_head.input_activation_scale"))
+                state.emplace("lm_head.input_activation_scale",
+                              require(Tensor::from_host({}, std::span<const float>(&zero, 1))));
+            if (!state.contains("lm_head.output_activation_scale"))
+                state.emplace("lm_head.output_activation_scale",
+                              require(Tensor::from_host({}, std::span<const float>(&zero, 1))));
+        }
         if (weight_bits)
             for (const auto& [name, value] : state)
                 if (value.dimensions() == 2 && name != "embed_tokens.weight" &&
@@ -484,8 +502,11 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
         if (!zeros_state.empty()) {
             const auto bound = state_dict();
             for (auto& [zero_name, zero_tensor] : zeros_state) {
+                const bool emb = zero_name.ends_with(".embedding_zero");
+                const auto suffix_len =
+                    emb ? std::string_view(".embedding_zero").size() : std::string_view(".weight_zero").size();
                 const auto scale_name =
-                    zero_name.substr(0, zero_name.size() - std::string_view(".weight_zero").size()) + ".weight_scale";
+                    zero_name.substr(0, zero_name.size() - suffix_len) + (emb ? ".embedding_scale" : ".weight_scale");
                 if (const auto found = bound.find(scale_name); found != bound.end())
                     impl_->context.bind_packed_zero(found->second, require(zero_tensor.to(device())));
             }

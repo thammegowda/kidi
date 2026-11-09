@@ -314,12 +314,14 @@ def build_eval_protocol(work: Path, tokenizer, num_lines: int, langs: str = "ja,
                 interleaved.append(by_lang[lang][idx])
     rng = random.Random(seed)
     rng.shuffle(interleaved)
-    selected = interleaved[:num_lines]
     prompts = []
     input_token_ids_list = []
+    selected = []
     input_jsonl_lines = []
     ref_jsonl_lines = []
-    for idx, row in enumerate(selected):
+    for row in interleaved:
+        if len(selected) >= num_lines:
+            break
         lang_name = LANG_NAMES.get(row["lang"], row["lang"])
         user_prompt = (
             f"Translate the following {lang_name} text fully into English. "
@@ -328,6 +330,10 @@ def build_eval_protocol(work: Path, tokenizer, num_lines: int, langs: str = "ja,
         )
         serialized = "<bos><|turn>user\n" + user_prompt + "<turn|>\n<|turn>model\n"
         ids = tokenizer.encode(serialized, add_special_tokens=False).ids
+        if len(ids) + max_output_tokens > context_tokens:
+            continue
+        idx = len(selected)
+        selected.append(row)
         prompts.append(serialized)
         input_token_ids_list.append(ids)
         input_jsonl_lines.append(json.dumps({
@@ -544,10 +550,19 @@ def prepare(model_path, work, source, profile_name="int4-g128"):
     }
     if group_size:
         quantization_config["group_size"] = group_size
+        quantization_config["embedding_group_size"] = group_size
     config_document["quantization_config"] = quantization_config
     config_document["text_config"].update(dtype="float32", packed_weights_signed=True)
     save(canonical / "config.json", config_document)
     consolidate_weights(canonical, files)
+    merged = load_file(str(canonical / "model.safetensors"))
+    if "lm_head.weight" in merged:
+        merged["model.language_model.embed_tokens.embedding_quantized"] = merged.pop("lm_head.weight")
+        merged["model.language_model.embed_tokens.embedding_scale"] = merged.pop("lm_head.weight_scale")
+        merged.pop("lm_head.input_activation_scale", None)
+        merged.pop("lm_head.output_activation_scale", None)
+        save_file(merged, str(canonical / "model.safetensors"))
+    del merged
     shutil.copyfile(model_path / "tokenizer.json", canonical / "tokenizer.json")
 
     inputs = torch.ones((1, 32), dtype=torch.int64)
@@ -593,30 +608,57 @@ def prepare(model_path, work, source, profile_name="int4-g128"):
     save(work / "manifest.json", manifest)
 
 
-def prepare_asym_clip(model_path: Path, work: Path, group_size: int = 128) -> Path:
+def prepare_asym_clip(model_path: Path, work: Path, group_size: int = 128,
+                      subdir: str = "shared-asym-clip") -> Path:
     import torch
     from safetensors import safe_open
     from safetensors.torch import load_file, save_file
 
-    target_dir = work / "shared-asym-clip"
+    target_dir = work / subdir
     if (target_dir / "model.safetensors").exists() and (target_dir / "config.json").exists():
-        return target_dir
+        cfg = json.loads((target_dir / "config.json").read_text())
+        qcfg = cfg.get("quantization_config", {})
+        if qcfg.get("group_size") == group_size and qcfg.get("embedding_group_size") == group_size:
+            with safe_open(str(target_dir / "model.safetensors"), framework="pt", device="cpu") as existing:
+                emb_dt = existing.get_slice("model.language_model.embed_tokens.embedding_scale").get_dtype()
+                kc_dt = existing.get_slice("model.language_model.layers.0.self_attn.k_cache_scale").get_dtype()
+                if emb_dt != "F16" or kc_dt != "F32":
+                    upgraded = {}
+                    for k in existing.keys():
+                        t = existing.get_tensor(k)
+                        if k.endswith((".weight_scale", ".embedding_scale", ".weight_zero", ".embedding_zero")):
+                            upgraded[k] = t.half()
+                        elif k.endswith(("_cache_scale", "activation_scale")):
+                            upgraded[k] = t.float()
+                        else:
+                            upgraded[k] = t
+                    save_file(upgraded, str(target_dir / "model.safetensors"))
+                    del upgraded
+            return target_dir
     if target_dir.exists():
         shutil.rmtree(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(4)
     checkpoint = model_path / "model.safetensors"
     state = load_file(str(work / "shared/model.safetensors"))
+    state.pop("lm_head.weight", None)
+    state.pop("lm_head.weight_scale", None)
+    state.pop("lm_head.weight_zero", None)
+    state.pop("lm_head.input_activation_scale", None)
+    state.pop("lm_head.output_activation_scale", None)
     with safe_open(str(checkpoint), framework="pt", device="cpu") as original:
         emb_w = original.get_tensor("model.language_model.embed_tokens.weight")
-        emb_p, emb_s = pack_int4_asym_clip(emb_w, group_size=0, chunk_rows=2048, asymmetric=False)
+        emb_p, emb_s, emb_z = pack_int4_asym_clip(emb_w, group_size=group_size, chunk_rows=2048, asymmetric=True)
         state["model.language_model.embed_tokens.embedding_quantized"] = emb_p
-        state["model.language_model.embed_tokens.embedding_scale"] = emb_s
-        lm_p, lm_s, lm_z = pack_int4_asym_clip(emb_w, group_size=group_size, chunk_rows=2048, asymmetric=True)
-        state["lm_head.weight"] = lm_p
-        state["lm_head.weight_scale"] = lm_s
-        state["lm_head.weight_zero"] = lm_z
-        del emb_w, emb_p, emb_s, lm_p, lm_s, lm_z
+        state["model.language_model.embed_tokens.embedding_scale"] = emb_s.half()
+        state["model.language_model.embed_tokens.embedding_zero"] = emb_z.half()
+        del emb_w, emb_p, emb_s, emb_z
+        ple_w = original.get_tensor("model.language_model.embed_tokens_per_layer.weight")
+        ple_p, ple_s, ple_z = pack_int4_asym_clip(ple_w, group_size=256, chunk_rows=1024, asymmetric=True)
+        state["model.language_model.embed_tokens_per_layer.embedding_quantized"] = ple_p
+        state["model.language_model.embed_tokens_per_layer.embedding_scale"] = ple_s.half()
+        state["model.language_model.embed_tokens_per_layer.embedding_zero"] = ple_z.half()
+        del ple_w, ple_p, ple_s, ple_z
         for source_name in sorted(original.keys()):
             if not source_name.startswith(("model.language_model.layers.", "model.language_model.per_layer")):
                 continue
@@ -630,13 +672,16 @@ def prepare_asym_clip(model_path: Path, work: Path, group_size: int = 128) -> Pa
                 weight, group_size=group_size, chunk_rows=2048, asymmetric=True
             )
             state[prefix + ".weight"] = packed
-            state[prefix + ".weight_scale"] = scales
-            state[prefix + ".weight_zero"] = zeros
+            state[prefix + ".weight_scale"] = scales.half()
+            state[prefix + ".weight_zero"] = zeros.half()
             del packed, scales, zeros, weight
             gc.collect()
     save_file(state, str(target_dir / "model.safetensors"))
     del state
-    shutil.copyfile(work / "shared/config.json", target_dir / "config.json")
+    config_document = json.loads((work / "shared/config.json").read_text())
+    config_document["quantization_config"]["group_size"] = group_size
+    config_document["quantization_config"]["embedding_group_size"] = group_size
+    save(target_dir / "config.json", config_document)
     shutil.copyfile(work / "shared/tokenizer.json", target_dir / "tokenizer.json")
     return target_dir
 
@@ -674,18 +719,209 @@ def measure(command, work, name, protocol, timeout):
     return {"command": command, "records": records, "summary": summarize(records, protocol), "cached": False}
 
 
-def measure_eval(command, work, name, eval_protocol, tokenizer, timeout):
+def load_partial_eval_items(work: Path, name: str, eval_protocol: dict, tokenizer=None) -> dict[int, dict]:
+    results_dir = work / "results"
+    jsonl_path = results_dir / f"{name}_eval.output.jsonl"
+    json_path = results_dir / f"{name}_eval.json"
+    legacy_tokens = {}
+    legacy_avg_sec = 0.05
+    if json_path.exists():
+        try:
+            doc = json.loads(json_path.read_text(encoding="utf-8"))
+            ev_rows = [r for r in doc.get("records", []) if r.get("stage") == "eval"]
+            if ev_rows:
+                t_list = ev_rows[0].get("token_ids", [])
+                if t_list:
+                    legacy_avg_sec = max(float(ev_rows[0].get("eval_seconds", 0.1)) / len(t_list), 1e-4)
+                for idx, tids in enumerate(t_list):
+                    legacy_tokens[idx] = tids
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    completed = {}
+    if jsonl_path.exists():
+        try:
+            for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                idx = int(row["id"])
+                if not (0 <= idx < eval_protocol["items"]):
+                    continue
+                if row.get("source") != eval_protocol["sources"][idx]:
+                    continue
+                tids = row.get("token_ids", legacy_tokens.get(idx))
+                if not isinstance(tids, list):
+                    continue
+                clean = list(tids)
+                for stop_id in (1, 106):
+                    if stop_id in clean:
+                        clean = clean[:clean.index(stop_id)]
+                sec = float(row.get("seconds", legacy_avg_sec))
+                if not math.isfinite(sec) or sec <= 0:
+                    sec = legacy_avg_sec
+                out_text = row.get("output")
+                if out_text is None and tokenizer is not None:
+                    out_text = clean_translation_text(tokenizer.decode(clean, skip_special_tokens=True))
+                completed[idx] = {
+                    "id": idx,
+                    "lang": eval_protocol["item_langs"][idx],
+                    "source": eval_protocol["sources"][idx],
+                    "reference": eval_protocol["references"][idx],
+                    "output": out_text or "",
+                    "token_ids": clean,
+                    "prompt_tokens": int(row.get("prompt_tokens", len(eval_protocol["input_token_ids_list"][idx]))),
+                    "output_tokens": len(clean),
+                    "seconds": sec,
+                }
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return completed
+
+
+def write_eval_output_jsonl(work: Path, name: str, items_by_id: dict[int, dict]) -> None:
+    results_dir = work / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    out_path = results_dir / f"{name}_eval.output.jsonl"
+    lines = [json.dumps(items_by_id[idx], ensure_ascii=False) for idx in sorted(items_by_id)]
+    out_path.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+
+
+def measure_eval(command, work, name, eval_protocol, tokenizer, timeout, force=False):
+    completed_by_id = {} if force else load_partial_eval_items(work, name, eval_protocol, tokenizer)
+    missing_ids = [idx for idx in range(eval_protocol["items"]) if idx not in completed_by_id]
+    if not missing_ids:
+        ordered = [completed_by_id[idx] for idx in range(eval_protocol["items"])]
+        records = [{
+            "stage": "eval",
+            "items": len(ordered),
+            "eval_seconds": sum(item["seconds"] for item in ordered),
+            "prompt_tokens": sum(item["prompt_tokens"] for item in ordered),
+            "output_tokens": sum(item["output_tokens"] for item in ordered),
+            "token_ids": [item["token_ids"] for item in ordered],
+        }]
+        return {
+            "command": command,
+            "records": records,
+            "summary": summarize_eval(records, eval_protocol, tokenizer),
+            "cached": True,
+        }
+
+    write_eval_output_jsonl(work, name, completed_by_id)
+    total_items = eval_protocol["items"]
+    print(
+        f"[eval] {name}: {len(completed_by_id)}/{total_items} cached, running {len(missing_ids)} remaining...",
+        file=sys.stderr, flush=True,
+    )
+    pending_protocol = {
+        **eval_protocol,
+        "items": len(missing_ids),
+        "item_ids": missing_ids,
+        "prompts": [eval_protocol["prompts"][idx] for idx in missing_ids],
+        "input_token_ids_list": [eval_protocol["input_token_ids_list"][idx] for idx in missing_ids],
+        "sources": [eval_protocol["sources"][idx] for idx in missing_ids],
+        "references": [eval_protocol["references"][idx] for idx in missing_ids],
+        "item_langs": [eval_protocol["item_langs"][idx] for idx in missing_ids],
+    }
+    pending_path = work / f"eval_pending_{name}.json"
+    save(pending_path, pending_protocol)
+    orig_protocol_str = str(work / "eval_protocol.json")
+    pending_cmd = [
+        arg.replace(orig_protocol_str, str(pending_path))
+        for arg in command
+    ]
+
     environment = {key: value for key, value in os.environ.items() if not key.startswith("KIDI_")}
     environment["KIDI_ACCELERATOR"] = "cpu"
-    try:
-        completed = subprocess.run(command, cwd=ROOT, env=environment, text=True, capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError(f"{name} eval timed out after {timeout}s") from error
-    (work / f"{name}_eval.stdout.jsonl").write_text(completed.stdout)
-    (work / f"{name}_eval.stderr.log").write_text(completed.stderr)
-    if completed.returncode:
-        raise RuntimeError(f"{name} eval exited {completed.returncode}: {completed.stderr[-3000:]}")
-    records = records_from(completed.stdout)
+    results_dir = work / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = results_dir / f"{name}_eval.output.jsonl"
+    stderr_log_path = work / f"{name}_eval.stderr.log"
+    stdout_lines = []
+    started = time.monotonic() if hasattr(time := __import__("time"), "monotonic") else 0.0
+    with stderr_log_path.open("w", encoding="utf-8") as stderr_file, subprocess.Popen(
+        pending_cmd, cwd=ROOT, env=environment, text=True,
+        stdout=subprocess.PIPE, stderr=stderr_file, bufsize=1,
+    ) as proc, jsonl_path.open("a", encoding="utf-8") as stream:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            stdout_lines.append(line)
+            if timeout and (time.monotonic() - started) > timeout:
+                proc.kill()
+                raise RuntimeError(f"{name} eval timed out after {timeout}s")
+            stripped = line.strip()
+            if not stripped.startswith("{"):
+                continue
+            try:
+                rec = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("stage") == "eval_item":
+                idx = int(rec["id"])
+                clean = list(rec["token_ids"])
+                for stop_id in (1, 106):
+                    if stop_id in clean:
+                        clean = clean[:clean.index(stop_id)]
+                hyp = ""
+                if tokenizer is not None:
+                    hyp = clean_translation_text(tokenizer.decode(clean, skip_special_tokens=True))
+                entry = {
+                    "id": idx,
+                    "lang": eval_protocol["item_langs"][idx],
+                    "source": eval_protocol["sources"][idx],
+                    "reference": eval_protocol["references"][idx],
+                    "output": hyp,
+                    "token_ids": clean,
+                    "prompt_tokens": int(rec.get("prompt_tokens", len(eval_protocol["input_token_ids_list"][idx]))),
+                    "output_tokens": len(clean),
+                    "seconds": max(float(rec.get("seconds", 1e-4)), 1e-4),
+                }
+                completed_by_id[idx] = entry
+                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                stream.flush()
+                if len(completed_by_id) % 25 == 0 or len(completed_by_id) == total_items:
+                    print(
+                        f"[eval] {name}: {len(completed_by_id)}/{total_items} completed",
+                        file=sys.stderr, flush=True,
+                    )
+        returncode = proc.wait()
+    pending_path.unlink(missing_ok=True)
+    stdout_text = "".join(stdout_lines)
+    stderr_text = stderr_log_path.read_text(encoding="utf-8", errors="replace")
+    (work / f"{name}_eval.stdout.jsonl").write_text(stdout_text, encoding="utf-8")
+    if returncode:
+        raise RuntimeError(f"{name} eval exited {returncode}: {stderr_text[-3000:]}")
+    if len(completed_by_id) < eval_protocol["items"]:
+        raw_records = records_from(stdout_text)
+        ev_rows = [r for r in raw_records if r.get("stage") == "eval"]
+        if ev_rows and len(ev_rows[0].get("token_ids", [])) == len(missing_ids):
+            avg_sec = max(float(ev_rows[0]["eval_seconds"]) / max(len(missing_ids), 1), 1e-4)
+            for idx, tids in zip(missing_ids, ev_rows[0]["token_ids"]):
+                clean = list(tids)
+                for stop_id in (1, 106):
+                    if stop_id in clean:
+                        clean = clean[:clean.index(stop_id)]
+                hyp = clean_translation_text(tokenizer.decode(clean, skip_special_tokens=True)) if tokenizer else ""
+                completed_by_id[idx] = {
+                    "id": idx,
+                    "lang": eval_protocol["item_langs"][idx],
+                    "source": eval_protocol["sources"][idx],
+                    "reference": eval_protocol["references"][idx],
+                    "output": hyp,
+                    "token_ids": clean,
+                    "prompt_tokens": len(eval_protocol["input_token_ids_list"][idx]),
+                    "output_tokens": len(clean),
+                    "seconds": avg_sec,
+                }
+    write_eval_output_jsonl(work, name, completed_by_id)
+    ordered = [completed_by_id[idx] for idx in range(eval_protocol["items"])]
+    records = [{
+        "stage": "eval",
+        "items": len(ordered),
+        "eval_seconds": sum(item["seconds"] for item in ordered),
+        "prompt_tokens": sum(item["prompt_tokens"] for item in ordered),
+        "output_tokens": sum(item["output_tokens"] for item in ordered),
+        "token_ids": [item["token_ids"] for item in ordered],
+    }]
     return {
         "command": command,
         "records": records,
@@ -706,17 +942,32 @@ def save_cached_eval(work, name, eval_run, eval_protocol):
         "summary": eval_run["summary"],
     }
     save(results_dir / f"{name}_eval.json", payload)
+    ev_rows = [r for r in eval_run.get("records", []) if r.get("stage") == "eval"]
+    raw_tids = ev_rows[0].get("token_ids", []) if ev_rows else []
+    avg_sec = max(float(eval_run["summary"].get("eval_seconds", 0.1)) / max(len(raw_tids), 1), 1e-4)
+    existing = load_partial_eval_items(work, name, eval_protocol)
     hypotheses = eval_run["summary"].get("hypotheses", [])
-    out_lines = []
+    items_by_id = {}
     for idx, hyp in enumerate(hypotheses):
-        out_lines.append(json.dumps({
-            "id": idx,
-            "lang": eval_protocol["item_langs"][idx],
-            "source": eval_protocol["sources"][idx],
-            "reference": eval_protocol["references"][idx],
-            "output": hyp,
-        }, ensure_ascii=False))
-    (results_dir / f"{name}_eval.output.jsonl").write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        if idx in existing:
+            items_by_id[idx] = {**existing[idx], "output": hyp}
+        else:
+            tids = list(raw_tids[idx]) if idx < len(raw_tids) else []
+            for stop_id in (1, 106):
+                if stop_id in tids:
+                    tids = tids[:tids.index(stop_id)]
+            items_by_id[idx] = {
+                "id": idx,
+                "lang": eval_protocol["item_langs"][idx],
+                "source": eval_protocol["sources"][idx],
+                "reference": eval_protocol["references"][idx],
+                "output": hyp,
+                "token_ids": tids,
+                "prompt_tokens": len(eval_protocol["input_token_ids_list"][idx]),
+                "output_tokens": len(tids),
+                "seconds": avg_sec,
+            }
+    write_eval_output_jsonl(work, name, items_by_id)
 
 
 def load_cached_eval(work, name, command, binary_sha256, eval_protocol, tokenizer):
@@ -877,6 +1128,75 @@ def load_cached_run(work, name, command, binary_sha256, protocol, tokenizer=None
     return None
 
 
+TABLE_SPECS = (
+    ("bf16_int8", "### 1. Reference BF16 & 8-Bit (`int8`) Inference"),
+    ("int4_g128", "### 2. 4-Bit Inference — Group Size 128 (`int4-g128`)"),
+    ("int4_g32", "### 3. 4-Bit Inference — Group Size 32 (`int4-g32`)"),
+    ("qat_mixed", "### 4. 4-Bit Quantization-Aware Trained (QAT / Mixed Precision)"),
+)
+
+
+BINARY_TABLE_ROWS = (
+    ("llama.cpp (`llamacpp`)", "`llamacpp_gemma4_bench` + `libllama.0.dylib` + `libggml*.dylib`", "4.48", "5.10",
+     "C++ probe + GGML CPU/KleidiAI shared libraries (reads GGUF vocabulary)"),
+    ("KIDI (`kidi` / `kidi_bf16` / `kidi_qat`)", "`kidi_android_baseline` (single static binary)", "7.62", "9.39",
+     "Zero external non-OS dylibs (**6.29 MiB** with `-Wl,-dead_strip`); includes built-in C++ Hugging Face tokenizer (~1.35 MiB); core Gemma 4 + YNNPACK runtime is **~3.3 MiB**"),
+    ("Arm ExecuTorch v1.5.1 (`arm`)", "`arm_gemma4_bench` (single static binary)", "7.87", "10.28",
+     "Zero external non-OS dylibs (**6.22 MiB** with `-Wl,-dead_strip`); ExecuTorch runtime + XNNPACK + KleidiAI (excludes tokenizer)"),
+    ("ONNX Runtime v1.31.1 (`onnx`)", "`libonnxruntime.1.31.1.dylib`", "20.10", "31.51",
+     "Standalone native ONNX Runtime C/C++ shared library (excludes Python interpreter)"),
+    ("Google LiteRT-LM v0.17.1 (`litert`)", "`liblitert-lm.dylib`", "52.18", "66.01",
+     "Standalone native Google LiteRT-LM C++ shared library (excludes Python interpreter)"),
+)
+
+
+def load_results_tsv(tsv_path: Path = HERE / "results.tsv") -> list[dict[str, str]]:
+    lines = [line.rstrip("\r\n") for line in tsv_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not lines:
+        return []
+    headers = lines[0].split("\t")
+    rows = []
+    for line in lines[1:]:
+        cols = line.split("\t")
+        if len(cols) != len(headers):
+            raise ValueError(f"expected {len(headers)} TSV columns, got {len(cols)}: {line}")
+        rows.append(dict(zip(headers, cols)))
+    return rows
+
+
+def render_markdown_tables(tsv_path: Path = HERE / "results.tsv") -> str:
+    rows = load_results_tsv(tsv_path)
+    sections = []
+    header = (
+        "| Runtime | Engine / Backend | Weight Format | Model (GiB) | Prefill (tok/s) | "
+        "Decode (tok/s) | TTFT (ms) | Peak RSS (GiB) | chrF (ref) | chrF (bf16) | Eval Time (s) |\n"
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+    )
+    for group_key, title in TABLE_SPECS:
+        group_rows = [r for r in rows if r["table_group"] == group_key]
+        if not group_rows:
+            continue
+        lines = [title, "", header]
+        for r in group_rows:
+            lines.append(
+                f"| **{r['runtime']}** | {r['backend']} | {r['weight_format']} | "
+                f"{r['model_gib']} | {r['prefill_tps']} | {r['decode_tps']} | "
+                f"{r['ttft_ms']} | {r['peak_rss_gib']} | "
+                f"{r['chrf_ref']} | {r['chrf_bf16']} | {r['wmt23_eval_s']} |"
+            )
+        sections.append("\n".join(lines))
+    bin_lines = [
+        "### 5. Self-Contained Runtime Binary Size Comparison",
+        "",
+        "| Runtime | Artifacts Measured | Stripped (MiB) | Unstripped (MiB) | Notes |",
+        "|---|---|---:|---:|---|",
+    ]
+    for rt, artifacts, stripped, unstripped, notes in BINARY_TABLE_ROWS:
+        bin_lines.append(f"| **{rt}** | {artifacts} | **{stripped}** | {unstripped} | {notes} |")
+    sections.append("\n".join(bin_lines))
+    return "\n\n".join(sections)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=ROOT / "tmp.models/gemma-4-E2B-it")
@@ -897,12 +1217,20 @@ def main(argv=None):
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--render-tables", action="store_true",
+                        help="render the four Markdown benchmark tables from results.tsv and exit")
+    parser.add_argument("--tsv", type=Path, default=HERE / "results.tsv",
+                        help="path to results.tsv used by --render-tables")
     parser.add_argument("--force", action="store_true", help="ignore cached per-runtime JSON results and rerun all")
     parser.add_argument("--rerun", action="append", default=[], help="force rerunning specific runtime(s) by name")
+    parser.add_argument("--skip", action="append", default=[], help="skip specific runtime(s) by name")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=900)
     arguments = parser.parse_args(argv)
+    if arguments.render_tables:
+        print(render_markdown_tables(arguments.tsv.expanduser().resolve()))
+        return 0
     if (arguments.jobs < 1 or not 1 <= arguments.threads <= (os.cpu_count() or 1) or not math.isfinite(arguments.timeout) or
             arguments.timeout <= 0):
         parser.error("expected positive jobs, threads and timeout")
@@ -948,12 +1276,6 @@ def main(argv=None):
         commands = {}
         bf16_model_dir = arguments.model.expanduser().resolve()
         if not arguments.no_bf16 and (bf16_model_dir / "model.safetensors").exists():
-            commands["hf_bf16"] = [
-                str(arguments.litert_python.expanduser().absolute()),
-                str(HERE / "hf_bench.py"),
-                str(bf16_model_dir),
-                str(work / "protocol.json"),
-            ]
             commands["kidi_bf16"] = [
                 str(work / "build-kidi/kidi_android_baseline"), "gemma",
                 str(bf16_model_dir),
@@ -964,10 +1286,18 @@ def main(argv=None):
             str(arguments.threads), "3", json.dumps(settings),
         ]
         asym_clip_dir = None
+        asym_g32_dir = None
         if arguments.profile == "int4-g128" and (bf16_model_dir / "model.safetensors").exists():
-            asym_clip_dir = prepare_asym_clip(bf16_model_dir, work, profile["group_size"] or 128)
+            asym_clip_dir = prepare_asym_clip(
+                bf16_model_dir, work, profile["group_size"] or 128, "shared-asym-clip"
+            )
             commands["kidi_asym_clip"] = [
                 str(work / "build-kidi/kidi_android_baseline"), "gemma", str(asym_clip_dir),
+                str(arguments.threads), "3", json.dumps(settings),
+            ]
+            asym_g32_dir = prepare_asym_clip(bf16_model_dir, work, 32, "shared-asym-g32")
+            commands["kidi_asym_g32"] = [
+                str(work / "build-kidi/kidi_android_baseline"), "gemma", str(asym_g32_dir),
                 str(arguments.threads), "3", json.dumps(settings),
             ]
         commands["arm"] = [
@@ -1036,6 +1366,11 @@ def main(argv=None):
                     str(work / "build-kidi/kidi_android_baseline"), "gemma", str(asym_clip_dir),
                     str(arguments.threads), "1", json.dumps(eval_settings),
                 ]
+            if asym_g32_dir is not None:
+                eval_commands["kidi_asym_g32"] = [
+                    str(work / "build-kidi/kidi_android_baseline"), "gemma", str(asym_g32_dir),
+                    str(arguments.threads), "1", json.dumps(eval_settings),
+                ]
             if arguments.include_onnx:
                 eval_commands["onnx"] = [
                     str(arguments.onnx_python.expanduser().absolute()), str(HERE / "onnx_bench.py"),
@@ -1060,13 +1395,6 @@ def main(argv=None):
                     str(arguments.kidi_qat_model.expanduser().resolve()),
                     str(arguments.threads), "1", json.dumps(eval_settings),
                 ]
-            if "hf_bf16" in commands:
-                eval_commands["hf_bf16"] = [
-                    str(arguments.litert_python.expanduser().absolute()),
-                    str(HERE / "hf_bench.py"),
-                    str(bf16_model_dir),
-                    str(eval_protocol_path),
-                ]
             if "kidi_bf16" in commands:
                 eval_commands["kidi_bf16"] = [
                     str(work / "build-kidi/kidi_android_baseline"), "gemma",
@@ -1081,7 +1409,7 @@ def main(argv=None):
                     "diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=ROOT)).hexdigest(),
                     "benchmark_files": {name: digest(HERE / name) for name in
                                         ("run.py", "executorch_bench.cpp", "llamacpp_bench.cpp",
-                                         "litert_bench.py", "onnx_bench.py", "hf_bench.py",
+                                         "litert_bench.py", "onnx_bench.py",
                                          "CMakeLists.txt", "requirements.txt")}},
         )
         if eval_protocol is not None:
@@ -1093,6 +1421,10 @@ def main(argv=None):
                 ["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
             report["host"]["ram_bytes"] = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True))
         rerun_set = set(arguments.rerun)
+        skip_set = set(arguments.skip)
+        for skipped in skip_set:
+            commands.pop(skipped, None)
+            eval_commands.pop(skipped, None)
         for name, command in commands.items():
             checksum = digest(Path(command[0]))
             cached = None
@@ -1115,10 +1447,13 @@ def main(argv=None):
             if eval_protocol is not None and name in eval_commands:
                 eval_cmd = eval_commands[name]
                 eval_cached = None
-                if not arguments.force and not arguments.prepare and name not in rerun_set:
+                force_eval = arguments.force or arguments.prepare or name in rerun_set
+                if not force_eval:
                     eval_cached = load_cached_eval(work, name, eval_cmd, checksum, eval_protocol, tokenizer)
                 if eval_cached is None:
-                    eval_cached = measure_eval(eval_cmd, work, name, eval_protocol, tokenizer, arguments.timeout)
+                    eval_cached = measure_eval(
+                        eval_cmd, work, name, eval_protocol, tokenizer, arguments.timeout, force=force_eval
+                    )
                     eval_cached["binary_sha256"] = checksum
                     save_cached_eval(work, name, eval_cached, eval_protocol)
                 report["runs"][name]["eval"] = eval_cached["summary"]
@@ -1136,18 +1471,35 @@ def main(argv=None):
         if digest(work / manifest["pte"]) != manifest["pte_sha256"]:
             raise ValueError("ExecuTorch PTE changed during measurement")
         summaries = {name: run["summary"] for name, run in report["runs"].items()}
+        if eval_protocol is not None:
+            from sacrebleu.metrics import CHRF
+            bf16_hyps = None
+            if "kidi_bf16" in report["runs"] and "eval" in report["runs"]["kidi_bf16"]:
+                bf16_hyps = report["runs"]["kidi_bf16"]["eval"].get("hypotheses")
+            if not bf16_hyps:
+                partial_bf16 = load_partial_eval_items(work, "kidi_bf16", eval_protocol, tokenizer)
+                if len(partial_bf16) == eval_protocol["items"]:
+                    bf16_hyps = [partial_bf16[idx]["output"] for idx in range(eval_protocol["items"])]
+            if bf16_hyps and len(bf16_hyps) == eval_protocol["items"]:
+                for name, run in report["runs"].items():
+                    if "eval" in run and len(run["eval"].get("hypotheses", [])) == len(bf16_hyps):
+                        score_bf16 = (100.0 if name == "kidi_bf16" else
+                                      float(CHRF().corpus_score(run["eval"]["hypotheses"], [bf16_hyps]).score))
+                        run["eval"]["chrf_bf16"] = score_bf16
+                        run["summary"]["chrf_bf16"] = score_bf16
         comparison = compare(summaries)
         report["kidi_speedup"] = comparison["speedup"]
         report["output_comparison"] = comparison["outputs"]
         report.update(status="completed", completed=datetime.now(timezone.utc).isoformat())
         save(work / "benchmark.json", report)
         if eval_protocol is not None:
-            print("runtime       prefill tok/s   decode tok/s   TTFT ms   peak GiB   bin MiB     chrF   eval s   source")
+            print("runtime       prefill tok/s   decode tok/s   TTFT ms   peak GiB   chrF(ref)   chrF(bf16)   eval s   source")
             for name, row in summaries.items():
                 source_tag = "cached" if (report["runs"][name].get("cached") and report["runs"][name].get("eval_cached", True)) else "measured"
                 print(f'{name:12} {row["prefill_tps"]:13.2f} {row["decode_tps"]:14.2f}'
-                      f' {row["ttft_ms"]:9.2f} {row["peak_rss_gib"]:10.2f} {row["binary_size_mib"]:9.2f}'
-                      f' {row.get("chrf", 0.0):8.2f} {row.get("eval_seconds", 0.0):8.2f}   {source_tag}')
+                      f' {row["ttft_ms"]:9.2f} {row["peak_rss_gib"]:10.2f}'
+                      f' {row.get("chrf", 0.0):11.2f} {row.get("chrf_bf16", 0.0):12.2f}'
+                      f' {row.get("eval_seconds", 0.0):8.2f}   {source_tag}')
         else:
             print("runtime       prefill tok/s   decode tok/s   TTFT ms   peak GiB   bin MiB   source")
             for name, row in summaries.items():

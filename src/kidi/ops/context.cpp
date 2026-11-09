@@ -202,7 +202,8 @@ struct Context::Impl {
             invalid(input.dtype() != tensor::DType::F32 || input.dimensions() < 2 || !input.size(-1) ||
                         input.size(-1) % group || group % (8 / bits) || inputs[1].dtype() != tensor::DType::U8 ||
                         inputs[1].dimensions() != 2 || !inputs[1].size(0) ||
-                        inputs[1].size(1) != input.size(-1) / (8 / bits) || inputs[2].dtype() != tensor::DType::F32 ||
+                        inputs[1].size(1) != input.size(-1) / (8 / bits) ||
+                        (inputs[2].dtype() != tensor::DType::F32 && inputs[2].dtype() != tensor::DType::F16) ||
                         inputs[2].dimensions() != 2 || inputs[2].size(0) != inputs[1].size(0) ||
                         inputs[2].size(1) != input.size(-1) / group,
                     "packed linear shape or dtype mismatch");
@@ -600,7 +601,12 @@ auto Context::embedding(const Tensor& indices, const Tensor& weight, const Tenso
     const std::array<std::int64_t, 4> attributes{width, bits, bits ? static_cast<std::int64_t>(scales.size(1)) : 1,
                                                  unsigned_packed ? 1 : 0};
     const OperatorSpec spec{Operation::EMBEDDING, attributes, impl_->activation_dtype, multiplier};
-    if (bits) return impl_->run(spec, {&indices, &weight, &scales});
+    if (bits) {
+        if (const auto found = impl_->packed_zeros.find(scales.storage_identity());
+            found != impl_->packed_zeros.end() && found->second.defined())
+            return impl_->run(spec, {&indices, &weight, &scales, &found->second});
+        return impl_->run(spec, {&indices, &weight, &scales});
+    }
     return impl_->run(spec, {&indices, &weight});
 }
 auto Context::add_(Tensor& left, const Tensor& right) -> Tensor& {

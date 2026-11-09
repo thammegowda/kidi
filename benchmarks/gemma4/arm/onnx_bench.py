@@ -161,8 +161,12 @@ def build_onnx_model(shared_dir: Path, onnx_path: Path):
                 ])
 
         def add_linear(prefix: str, tag: str, inp: str, out: str, dyn_q=None):
-            q_weight = reader.get_tensor(f"{prefix}.weight")
-            scales = reader.get_tensor(f"{prefix}.weight_scale").astype(np.float32)
+            if prefix == "lm_head" and "lm_head.weight" not in reader.keys():
+                q_weight = reader.get_tensor("model.language_model.embed_tokens.embedding_quantized")
+                scales = reader.get_tensor("model.language_model.embed_tokens.embedding_scale").astype(np.float32)
+            else:
+                q_weight = reader.get_tensor(f"{prefix}.weight")
+                scales = reader.get_tensor(f"{prefix}.weight_scale").astype(np.float32)
             N = q_weight.shape[0]
             K = q_weight.shape[1] * (2 if bits == 4 else 1)
             w_name = f"{tag}_w"
@@ -500,6 +504,7 @@ def main(argv=None):
 
     if mode == "eval":
         inputs_list = protocol["input_token_ids_list"]
+        item_ids = protocol.get("item_ids", list(range(len(inputs_list))))
         max_outputs = int(protocol["max_output_tokens"])
 
         def run_seq(prompt_ids, limit):
@@ -521,10 +526,20 @@ def main(argv=None):
         total_prompt_tokens = 0
         total_output_tokens = 0
         eval_started = time.perf_counter()
-        for prompt_ids in inputs_list:
+        for item_id, prompt_ids in zip(item_ids, inputs_list):
+            item_started = time.perf_counter()
             total_prompt_tokens += len(prompt_ids)
             gen = run_seq(prompt_ids, max_outputs)
+            item_seconds = time.perf_counter() - item_started
             total_output_tokens += len(gen)
+            emit({
+                "stage": "eval_item",
+                "id": int(item_id),
+                "seconds": item_seconds,
+                "prompt_tokens": len(prompt_ids),
+                "output_tokens": len(gen),
+                "token_ids": gen,
+            })
             all_token_ids.append(gen)
         emit({
             "stage": "eval",

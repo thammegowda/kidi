@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <utility>
@@ -119,8 +120,14 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
         if (!eval_stream) throw std::runtime_error("cannot open Gemma eval protocol");
         const auto eval_protocol = nlohmann::json::parse(eval_stream);
         const auto prompts = eval_protocol.at("prompts").get<std::vector<std::string>>();
+        std::vector<std::size_t> item_ids(prompts.size());
+        if (eval_protocol.contains("item_ids"))
+            item_ids = eval_protocol.at("item_ids").get<std::vector<std::size_t>>();
+        else
+            std::iota(item_ids.begin(), item_ids.end(), std::size_t{0});
         const auto max_outputs = eval_protocol.value("max_output_tokens", output_tokens);
-        if (prompts.empty()) throw std::invalid_argument("Gemma eval requires at least one prompt");
+        if (prompts.empty() || item_ids.size() != prompts.size())
+            throw std::invalid_argument("Gemma eval requires matching non-empty prompts and item_ids");
         auto run_one = [&](const std::string& raw_prompt, std::size_t max_new) -> kidi::inference::TextGeneration {
             kidi::inference::GenerationOptions options;
             options.maximum_new_tokens = max_new;
@@ -151,12 +158,21 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
         outputs.reserve(prompts.size());
         std::size_t total_prompt_tokens = 0, total_output_tokens = 0;
         const auto eval_started = Clock::now();
-        for (const auto& user_prompt : prompts) {
-            auto res = run_one(user_prompt, max_outputs);
+        for (std::size_t idx = 0; idx < prompts.size(); ++idx) {
+            const auto item_started = Clock::now();
+            auto res = run_one(prompts[idx], max_outputs);
+            const auto item_seconds = std::chrono::duration<double>(Clock::now() - item_started).count();
             total_prompt_tokens += res.stats.prompt_tokens;
             auto ids = std::move(res.generation.token_ids);
             while (!ids.empty() && (ids.back() == 1 || ids.back() == 106)) ids.pop_back();
             total_output_tokens += ids.size();
+            emit({{"stage", "eval_item"},
+                  {"id", item_ids[idx]},
+                  {"seconds", item_seconds},
+                  {"prompt_tokens", res.stats.prompt_tokens},
+                  {"output_tokens", ids.size()},
+                  {"token_ids", ids}},
+                 threads);
             all_token_ids.push_back(std::move(ids));
             outputs.push_back(std::move(res.text));
         }

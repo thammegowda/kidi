@@ -193,6 +193,16 @@ class ArmGemmaBenchmarkTest(unittest.TestCase):
             self.assertTrue(loaded["cached"])
             self.assertAlmostEqual(loaded["summary"]["chrf"], 100.0, places=3)
 
+    def test_results_tsv_and_readme_tables(self):
+        rows = BENCHMARK.load_results_tsv()
+        self.assertGreaterEqual(len(rows), 13)
+        groups = {r["table_group"] for r in rows}
+        self.assertEqual(groups, {"bf16_int8", "int4_g128", "int4_g32", "qat_mixed"})
+        rendered = BENCHMARK.render_markdown_tables()
+        readme = (BENCHMARK.HERE / "README.md").read_text(encoding="utf-8")
+        for block in rendered.split("\n\n"):
+            self.assertIn(block, readme)
+
 
 if __name__ == "__main__":
     unittest.main()

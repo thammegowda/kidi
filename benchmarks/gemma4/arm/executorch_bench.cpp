@@ -94,8 +94,14 @@ auto main(int argc, char** argv) -> int {
 
         if (mode == "eval") {
             const auto inputs_list = protocol.at("input_token_ids_list").get<std::vector<std::vector<std::int64_t>>>();
+            std::vector<std::size_t> item_ids(inputs_list.size());
+            if (protocol.contains("item_ids"))
+                item_ids = protocol.at("item_ids").get<std::vector<std::size_t>>();
+            else
+                std::iota(item_ids.begin(), item_ids.end(), std::size_t{0});
             const auto max_outputs = protocol.at("max_output_tokens").get<std::size_t>();
-            if (inputs_list.empty() || !max_outputs) throw std::invalid_argument("invalid Gemma eval protocol");
+            if (inputs_list.empty() || !max_outputs || item_ids.size() != inputs_list.size())
+                throw std::invalid_argument("invalid Gemma eval protocol");
             auto run_seq = [&](const std::vector<std::int64_t>& prompt_ids, std::size_t limit) {
                 auto ids = prompt_ids;
                 std::vector<std::int64_t> positions(ids.size());
@@ -118,10 +124,19 @@ auto main(int argc, char** argv) -> int {
             all_token_ids.reserve(inputs_list.size());
             std::size_t total_prompt_tokens = 0, total_output_tokens = 0;
             const auto eval_started = Clock::now();
-            for (const auto& prompt_ids : inputs_list) {
+            for (std::size_t idx = 0; idx < inputs_list.size(); ++idx) {
+                const auto& prompt_ids = inputs_list[idx];
+                const auto item_started = Clock::now();
                 total_prompt_tokens += prompt_ids.size();
                 auto gen = run_seq(prompt_ids, max_outputs);
+                const auto item_seconds = seconds(item_started, Clock::now());
                 total_output_tokens += gen.size();
+                emit({{"stage", "eval_item"},
+                      {"id", item_ids[idx]},
+                      {"seconds", item_seconds},
+                      {"prompt_tokens", prompt_ids.size()},
+                      {"output_tokens", gen.size()},
+                      {"token_ids", gen}});
                 all_token_ids.push_back(std::move(gen));
             }
             emit({{"stage", "eval"},
