@@ -1,9 +1,9 @@
 #include "kidi/cli/index.h"
 #include "kidi/checkpoint/config.h"
 #include "kidi/checkpoint/weights.h"
-#include "kidi/core/hnsw.h"
 #include "kidi/model/gemma4.h"
 #include "kidi/runtime/ynn/graph.h"
+#include "kidi/search/hnsw.h"
 #if defined(KIDI_HAS_CUDA)
 #include "kidi/ops/context.h"
 #include "kidi/tensor/backend.h"
@@ -98,8 +98,8 @@ auto cuda_index_available() -> Result<bool> {
     return (*backend)->is_available(tensor::Device::cuda());
 }
 
-auto build_cuda_index(const tensor::Tensor& vectors, core::HnswBuildOptions options, std::size_t threads)
-    -> Result<core::HnswIndex> {
+auto build_cuda_index(const tensor::Tensor& vectors, search::HnswBuildOptions options, std::size_t threads)
+    -> Result<search::HnswIndex> {
     try {
         if (!vectors.defined() || !vectors.is_host_accessible() || !vectors.is_contiguous() ||
             vectors.dimensions() != 2 || !vectors.size(0) || vectors.size(0) > (1U << 24) ||
@@ -138,7 +138,7 @@ auto build_cuda_index(const tensor::Tensor& vectors, core::HnswBuildOptions opti
                         std::to_string(vectors.size(0)), std::to_string(vectors.size(1)), std::to_string(options.m),
                         std::to_string(options.ef_construction), std::to_string(threads)}));
         std::cerr << "Validating every exported vector and packing ordered 24-bit graph references\n";
-        return core::HnswIndex::from_hnswlib(temporary.output(), vectors, options.candidates, options.ef_search);
+        return search::HnswIndex::from_hnswlib(temporary.output(), vectors, options.candidates, options.ef_search);
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     } catch (const std::filesystem::filesystem_error& error) {
@@ -148,7 +148,7 @@ auto build_cuda_index(const tensor::Tensor& vectors, core::HnswBuildOptions opti
 #else
 auto cuda_index_available() -> Result<bool> { return false; }
 
-auto build_cuda_index(const tensor::Tensor&, core::HnswBuildOptions, std::size_t) -> Result<core::HnswIndex> {
+auto build_cuda_index(const tensor::Tensor&, search::HnswBuildOptions, std::size_t) -> Result<search::HnswIndex> {
     return std::unexpected(Error{ErrorCode::UNSUPPORTED, "CUDA index construction is disabled in this build"});
 }
 #endif
@@ -211,7 +211,7 @@ auto index_command(const Namespace& arguments, const std::filesystem::path& dire
         return 2;
     }
     runtime::ynn::set_thread_count(threads);
-    core::HnswParallelFor parallel_for;
+    search::HnswParallelFor parallel_for;
     if (threads > 1) {
         const auto reserved = runtime::ynn::reserve_thread_pool(threads);
         if (!reserved) {
@@ -259,7 +259,7 @@ auto index_command(const Namespace& arguments, const std::filesystem::path& dire
         spdlog::error("HNSW M exceeds uint32 bounds");
         return 2;
     }
-    const core::HnswBuildOptions options{
+    const search::HnswBuildOptions options{
         .m = static_cast<std::uint32_t>(m),
         .ef_construction = arguments.get<std::size_t>("ef_construction"),
         .seed = arguments.get<std::uint64_t>("seed"),
@@ -287,9 +287,9 @@ auto index_command(const Namespace& arguments, const std::filesystem::path& dire
         last = now;
         last_completed = completed;
     };
-    auto index = [&]() -> Result<core::HnswIndex> {
+    auto index = [&]() -> Result<search::HnswIndex> {
         if (use_cuda) return build_cuda_index(*vectors, options, threads);
-        return core::HnswIndex::build(*vectors, options, progress, std::move(parallel_for));
+        return search::HnswIndex::build(*vectors, options, progress, std::move(parallel_for));
     }();
     if (!index) {
         spdlog::error("{}", index.error().message);

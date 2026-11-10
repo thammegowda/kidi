@@ -1,4 +1,4 @@
-#include "kidi/core/hnsw.h"
+#include "kidi/search/hnsw.h"
 #include "kidi/layers/linear.h"
 #include "kidi/ops/context.h"
 #include "kidi/runtime/ynn/graph.h"
@@ -72,7 +72,7 @@ auto malformed_indexes(const std::filesystem::path& root, const std::filesystem:
     const auto path = root / "malformed.hnsw";
     const auto reject = [&](std::span<const std::byte> data) {
         save(path, data);
-        const auto loaded = kidi::core::HnswIndex::load(path, vectors);
+        const auto loaded = kidi::search::HnswIndex::load(path, vectors);
         check(!loaded && loaded.error().code == kidi::ErrorCode::INVALID_MANIFEST,
               "malformed index was not rejected as an invalid manifest");
     };
@@ -115,7 +115,7 @@ auto malformed_indexes(const std::filesystem::path& root, const std::filesystem:
     }
 }
 
-auto saving(const std::filesystem::path& root, const kidi::core::HnswIndex& index) -> void {
+auto saving(const std::filesystem::path& root, const kidi::search::HnswIndex& index) -> void {
     const auto path = root / "saved.hnsw";
     require(index.save(path));
     const auto original = bytes(path);
@@ -164,7 +164,7 @@ auto brute_force_checks(const std::filesystem::path& root, bool bfloat, std::siz
     constexpr std::size_t rows = 256, candidates = 8;
     std::vector<float> values;
     const auto vectors = vector_table(rows, width, bfloat, values);
-    auto index = require(core::HnswIndex::build(
+    auto index = require(search::HnswIndex::build(
         vectors, {.m = 16, .ef_construction = 128, .seed = 42, .candidates = candidates, .ef_search = rows}));
     check(index.size() == rows && index.width() == width && index.candidates() == candidates &&
               index.ef_search() == rows && index.runtime_bytes() > rows * sizeof(float),
@@ -174,7 +174,7 @@ auto brute_force_checks(const std::filesystem::path& root, bool bfloat, std::siz
     runtime::ynn::set_thread_count(4);
     require(runtime::ynn::reserve_thread_pool(4));
     std::size_t parallel_calls = 0;
-    auto threaded = require(core::HnswIndex::build(
+    auto threaded = require(search::HnswIndex::build(
         vectors, {.m = 16, .ef_construction = 128, .seed = 42, .candidates = candidates, .ef_search = rows}, {},
         [&](std::size_t count, std::function<void(std::size_t)> body) {
             ++parallel_calls;
@@ -184,7 +184,7 @@ auto brute_force_checks(const std::filesystem::path& root, bool bfloat, std::siz
     require(threaded.save(parallel_path));
     check(parallel_calls > 0 && bytes(parallel_path) == bytes(path),
           "threaded construction changed graph order or values");
-    const auto failed_executor = core::HnswIndex::build(
+    const auto failed_executor = search::HnswIndex::build(
         vectors, {.m = 16, .ef_construction = 128, .seed = 42, .candidates = candidates, .ef_search = rows}, {},
         [](std::size_t, std::function<void(std::size_t)>) -> Result<void> {
             return std::unexpected(Error{ErrorCode::RUNTIME, "test executor failure"});
@@ -194,9 +194,9 @@ auto brute_force_checks(const std::filesystem::path& root, bool bfloat, std::siz
     const auto readonly =
         require(tensor::Tensor::from_blob({rows, static_cast<std::int64_t>(width)}, vectors.dtype(),
                                           require(vectors.host_bytes()), std::make_shared<tensor::Tensor>(vectors)));
-    auto loaded = require(core::HnswIndex::load(path, readonly));
+    auto loaded = require(search::HnswIndex::load(path, readonly));
     auto moved = std::move(loaded);
-    core::HnswWorkspace workspace;
+    search::HnswWorkspace workspace;
     std::mt19937 random(23);
     std::vector<float> query(width);
     for (std::size_t attempt = 0; attempt < 20; ++attempt) {
@@ -271,7 +271,7 @@ auto import_checks(const std::filesystem::path& root, bool bfloat) -> void {
     }
     const auto source_path = root / (bfloat ? "import-bf16.bin" : "import-fp32.bin");
     save(source_path, source);
-    auto imported = require(core::HnswIndex::from_hnswlib(source_path, vectors, 3, 8));
+    auto imported = require(search::HnswIndex::from_hnswlib(source_path, vectors, 3, 8));
     const auto packed_path = source_path.string() + ".hnsw";
     require(imported.save(packed_path));
     const auto packed = bytes(packed_path);
@@ -283,7 +283,7 @@ auto import_checks(const std::filesystem::path& root, bool bfloat) -> void {
                   integer(packed, edges + 6 * node + 3, 3) == (node + 2) % rows,
               "import changed ordered live neighbors");
     }
-    core::HnswWorkspace workspace;
+    search::HnswWorkspace workspace;
     const std::array<float, 4> query{1, 0, 0, 0};
     auto best = std::uint32_t{0};
     for (std::size_t row = 1; row < rows; ++row)
@@ -291,9 +291,9 @@ auto import_checks(const std::filesystem::path& root, bool bfloat) -> void {
     check(require(imported.search(query, workspace)).front().id == best, "import changed raw inner-product ranking");
     integer(source, 96 + 20, 4, std::bit_cast<std::uint32_t>(std::numeric_limits<float>::quiet_NaN()));
     save(source_path, source);
-    check(!core::HnswIndex::from_hnswlib(source_path, vectors, 3, 8), "import accepted altered vectors");
+    check(!search::HnswIndex::from_hnswlib(source_path, vectors, 3, 8), "import accepted altered vectors");
     save(source_path, std::span(source).first(90));
-    check(!core::HnswIndex::from_hnswlib(source_path, vectors, 3, 8), "import accepted a truncated source index");
+    check(!search::HnswIndex::from_hnswlib(source_path, vectors, 3, 8), "import accepted a truncated source index");
 }
 
 auto quantized_linear_checks(const std::filesystem::path& root) -> void {
@@ -302,8 +302,8 @@ auto quantized_linear_checks(const std::filesystem::path& root) -> void {
     std::vector<float> values(rows * width, 0.F);
     for (std::size_t r = 0; r < rows; ++r) values[r * width + r * 4] = 8.F;
     const auto vectors = require(tensor::Tensor::from_host({rows, width}, std::span<const float>(values)));
-    auto index = require(
-        core::HnswIndex::build(vectors, {.m = 4, .ef_construction = 16, .seed = 42, .candidates = 4, .ef_search = 16}));
+    auto index = require(search::HnswIndex::build(
+        vectors, {.m = 4, .ef_construction = 16, .seed = 42, .candidates = 4, .ef_search = 16}));
     const auto path = root / "quantized-linear.hnsw";
     require(index.save(path));
 
@@ -396,7 +396,7 @@ auto quantized_distance_checks(const std::filesystem::path& root, std::int32_t b
     }
     const auto vectors =
         require(tensor::Tensor::from_host({rows, static_cast<std::int64_t>(width)}, std::span<const float>(decoded)));
-    auto topology = require(core::HnswIndex::build(
+    auto topology = require(search::HnswIndex::build(
         vectors, {.m = 32, .ef_construction = 64, .seed = 42, .candidates = rows, .ef_search = rows}));
     const auto path = root / ("packed-" + std::to_string(bits) + "-" + std::to_string(group) + "-" +
                               std::to_string(width) + "-" + std::to_string(affine) + "-" + std::to_string(half));
@@ -409,19 +409,19 @@ auto quantized_distance_checks(const std::filesystem::path& root, std::int32_t b
                     : require(tensor::Tensor::from_host(shape, std::span<const float>(values)));
     };
     const auto act_scale = bits == 2 ? 0.125F : 0.F;
-    auto index = require(core::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales),
-                                                         affine ? metadata(zeros, half_zeros) : tensor::Tensor{}, bits,
-                                                         static_cast<std::int32_t>(group), act_scale));
+    auto index = require(search::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales),
+                                                           affine ? metadata(zeros, half_zeros) : tensor::Tensor{},
+                                                           bits, static_cast<std::int32_t>(group), act_scale));
     if (bits == 8 && !half) {
         for (const auto invalid_scale : {-1.F, std::numeric_limits<float>::quiet_NaN()})
-            check(!core::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales), {}, bits,
-                                                   static_cast<std::int32_t>(group), invalid_scale),
+            check(!search::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales), {}, bits,
+                                                     static_cast<std::int32_t>(group), invalid_scale),
                   "packed HNSW accepted an invalid activation scale");
-        check(!core::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales),
-                                               metadata(zeros, half_zeros), bits, static_cast<std::int32_t>(group)),
+        check(!search::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales),
+                                                 metadata(zeros, half_zeros), bits, static_cast<std::int32_t>(group)),
               "INT8 HNSW silently ignored affine offsets");
     }
-    core::HnswWorkspace workspace;
+    search::HnswWorkspace workspace;
     std::vector<float> query(width), rounded(width);
     for (std::size_t attempt = 0; attempt < 5; ++attempt) {
         for (auto& value : query) value = (static_cast<float>(random() % 101) - 50.F) / 16.F;
@@ -467,7 +467,7 @@ auto search_settings_checks(const std::filesystem::path& root) -> void {
     std::vector<float> values;
     const auto vectors = vector_table(16, 64, false, values);
     auto topology =
-        require(core::HnswIndex::build(vectors, {.m = 4, .ef_construction = 16, .candidates = 4, .ef_search = 16}));
+        require(search::HnswIndex::build(vectors, {.m = 4, .ef_construction = 16, .candidates = 4, .ef_search = 16}));
     const auto path = root / "search-settings.hnsw";
     require(topology.save(path));
     const ModuleScope host(tensor::DType::F32, false, tensor::Device::cpu());
@@ -510,20 +510,21 @@ auto main() -> int {
         };
         const auto vectors = require(tensor::Tensor::from_host({8, 4}, std::span<const float>(values)));
         std::size_t progress = 0;
-        const core::HnswBuildOptions options{.m = 2, .ef_construction = 8, .seed = 42, .candidates = 3, .ef_search = 8};
-        auto first = require(core::HnswIndex::build(vectors, options, [&](std::size_t completed, std::size_t total) {
+        const search::HnswBuildOptions options{
+            .m = 2, .ef_construction = 8, .seed = 42, .candidates = 3, .ef_search = 8};
+        auto first = require(search::HnswIndex::build(vectors, options, [&](std::size_t completed, std::size_t total) {
             if (completed > total || completed <= progress) throw std::runtime_error("invalid HNSW progress");
             progress = completed;
         }));
-        auto second = require(core::HnswIndex::build(vectors, options));
+        auto second = require(search::HnswIndex::build(vectors, options));
         check(progress == vectors.size(0), "HNSW build progress is incomplete");
         require(first.save(first_path));
         require(second.save(second_path));
         if (bytes(first_path) != bytes(second_path)) throw std::runtime_error("deterministic HNSW files differ");
-        auto loaded = require(core::HnswIndex::load(first_path, vectors));
+        auto loaded = require(search::HnswIndex::load(first_path, vectors));
         require(loaded.save(root / "roundtrip.hnsw"));
         check(bytes(root / "roundtrip.hnsw") == bytes(first_path), "graph order changed during round trip");
-        core::HnswWorkspace workspace;
+        search::HnswWorkspace workspace;
         const std::array<float, 4> query{1, 0, 0, 0};
         const auto found = require(loaded.search(query, workspace));
         if (found.size() != 3 || found[0].id != 1 || found[0].distance != -9.F)
@@ -535,9 +536,10 @@ auto main() -> int {
         auto corrupt = bytes(first_path);
         corrupt.back() ^= std::byte{1};
         save(second_path, corrupt);
-        if (core::HnswIndex::load(second_path, vectors)) throw std::runtime_error("corrupt HNSW index was accepted");
+        if (search::HnswIndex::load(second_path, vectors)) throw std::runtime_error("corrupt HNSW index was accepted");
         const auto wrong = require(tensor::Tensor::zeros({8, 4}, tensor::DType::F32));
-        if (core::HnswIndex::load(first_path, wrong)) throw std::runtime_error("mismatched HNSW vectors were accepted");
+        if (search::HnswIndex::load(first_path, wrong))
+            throw std::runtime_error("mismatched HNSW vectors were accepted");
         saving(root, first);
         for (bool bfloat : {false, true})
             for (const std::size_t width : {64, 67}) brute_force_checks(root, bfloat, width);
@@ -559,7 +561,7 @@ auto main() -> int {
 #endif
         const std::array<float, 32> zeros{};
         const auto tied_vectors = require(tensor::Tensor::from_host({8, 4}, std::span<const float>(zeros)));
-        auto tied = require(core::HnswIndex::build(tied_vectors, options));
+        auto tied = require(search::HnswIndex::build(tied_vectors, options));
         for (const auto& neighbor : require(tied.search(query, workspace)))
             check(neighbor.distance == 1.F, "tied distances changed");
         std::filesystem::remove_all(root);

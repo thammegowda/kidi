@@ -1,6 +1,6 @@
 #include "kidi/layers/linear.h"
-#include "kidi/core/hnsw.h"
 #include "kidi/runtime/ynn/graph.h"
+#include "kidi/search/hnsw.h"
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -14,10 +14,10 @@ using ops::require;
 using tensor::DType;
 
 struct LinearImpl::HnswState {
-    core::HnswIndex index;
+    search::HnswIndex index;
     Tensor indexed_weight;
     std::size_t ef_search;
-    std::vector<core::HnswWorkspace> search_workspaces;
+    std::vector<search::HnswWorkspace> search_workspaces;
     struct Slot {
         Tensor weights, selected;
         std::vector<std::vector<std::uint32_t>> candidates;
@@ -26,7 +26,7 @@ struct LinearImpl::HnswState {
     };
     std::map<std::size_t, Slot> slots;
 
-    HnswState(core::HnswIndex idx, Tensor bound, std::size_t ef)
+    HnswState(search::HnswIndex idx, Tensor bound, std::size_t ef)
         : index(std::move(idx)), indexed_weight(std::move(bound)), ef_search(ef) {}
 };
 
@@ -151,18 +151,18 @@ auto LinearImpl::bind_hnsw(const std::filesystem::path& path, const Tensor& pack
     try {
         if (path.empty() || !transpose_ || has_bias_ || qstate_ || !device().capabilities().compute.host())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "HNSW linear requires a transposed bias-free CPU projection"});
-        auto index = [&]() -> core::HnswIndex {
+        auto index = [&]() -> search::HnswIndex {
             if (packed_bits_) {
                 if (!input_scale_.defined() || input_scale_.numel() != 1)
                     throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "HNSW linear activation scale is not bound"});
                 const float in_scale = require(std::as_const(input_scale_).data<float>())[0];
-                return require(core::HnswIndex::load_quantized(path, weight_, packed_scale_, packed_zero, packed_bits_,
-                                                               group_size_, in_scale));
+                return require(search::HnswIndex::load_quantized(path, weight_, packed_scale_, packed_zero,
+                                                                 packed_bits_, group_size_, in_scale));
             }
             if (weight_.dtype() != DType::F32 && weight_.dtype() != DType::BF16)
                 throw ops::Failure(
                     {ErrorCode::UNSUPPORTED, "HNSW head requires FP32, BF16, or packed quantized weights"});
-            return require(core::HnswIndex::load(path, weight_));
+            return require(search::HnswIndex::load(path, weight_));
         }();
         const auto vocabulary = static_cast<std::size_t>(weight_.size(0));
         const auto ef = search_setting("KIDI_HNSW_EF", index.ef_search(), vocabulary);

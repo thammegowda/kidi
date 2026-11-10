@@ -368,7 +368,7 @@ support for arbitrary Hugging Face architectures.
 
 ### CPU HNSW indexes
 
-`kidi::core::HnswIndex` provides deterministic HNSW learning, versioned
+`kidi::search::HnswIndex` provides deterministic HNSW learning, versioned
 serialization, loading and inner-product search over an external FP32/BF16
 tensor table. The index stores graph topology and row labels, not a duplicate
 vector table, so other Kidi search features can reuse it.

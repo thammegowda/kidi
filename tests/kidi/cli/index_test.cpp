@@ -1,7 +1,7 @@
 #include "kidi/cli/main.h"
-#include "kidi/core/hnsw.h"
 #include "kidi/inference/generator.h"
 #include "kidi/ops/context.h"
+#include "kidi/search/hnsw.h"
 #include <algorithm>
 #include <chrono>
 #include <fstream>

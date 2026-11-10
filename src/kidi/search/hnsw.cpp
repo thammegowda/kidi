@@ -1,50 +1,22 @@
-#include "kidi/core/hnsw.h"
+#include "kidi/search/hnsw.h"
+#include "kidi/search/search.h"
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
-#include <fstream>
-#include <iostream>
 #include <limits>
 #include <mutex>
 #include <numeric>
 #include <optional>
-#include <queue>
 #include <random>
 #include <tuple>
-#include <type_traits>
-#include <zlib.h>
 
-#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
-#include <immintrin.h>
-#define KIDI_HNSW_AVX512 1
-#endif
-#if defined(__ARM_NEON) && (defined(__aarch64__) || defined(__arm64__))
-#include <arm_neon.h>
-#define KIDI_HNSW_NEON 1
-#endif
-
-namespace kidi::core {
+namespace kidi::search {
 namespace {
 constexpr std::size_t HEADER_BYTES = 128, HEADER_CRC_OFFSET = 52;
 constexpr std::uint32_t MAX_NODES = 1U << 24;
 constexpr std::uint32_t FORMAT_VERSION = 2;
-
-class Failure {
-public:
-    explicit Failure(Error error) : error_(std::move(error)) {}
-    auto error() const -> const Error& { return error_; }
-
-private:
-    Error error_;
-};
-
-template <typename T>
-auto require(Result<T> result) -> T {
-    if (!result) throw Failure(std::move(result.error()));
-    if constexpr (!std::is_void_v<T>) return std::move(*result);
-}
 
 struct Layer {
     std::vector<std::uint32_t> nodes, offsets, edges;
@@ -61,81 +33,6 @@ struct Graph {
     auto neighbors(std::uint32_t node, std::size_t level) const -> std::span<const std::uint32_t>;
     auto runtime_bytes() const noexcept -> std::size_t;
 };
-
-auto hnsw_crc32(std::span<const std::byte> bytes) -> std::uint32_t {
-    return static_cast<std::uint32_t>(crc32_z(0, reinterpret_cast<const Bytef*>(bytes.data()), bytes.size()));
-}
-
-auto invalid(bool condition, const char* message) -> void {
-    if (condition) throw Failure({ErrorCode::INVALID_MANIFEST, message});
-}
-
-class Reader {
-public:
-    explicit Reader(std::span<const std::byte> bytes) : bytes_(bytes) {}
-    auto take(std::size_t count) -> std::span<const std::byte> {
-        invalid(count > bytes_.size() - position_, "truncated HNSW index");
-        const auto result = bytes_.subspan(position_, count);
-        position_ += count;
-        return result;
-    }
-    auto integer(std::size_t count) -> std::uint64_t {
-        std::uint64_t value = 0;
-        const auto bytes = take(count);
-        for (std::size_t index = 0; index < count; ++index)
-            value |= std::to_integer<std::uint64_t>(bytes[index]) << (8 * index);
-        return value;
-    }
-    auto position() const -> std::size_t { return position_; }
-    auto remaining() const -> std::size_t { return bytes_.size() - position_; }
-
-private:
-    std::span<const std::byte> bytes_;
-    std::size_t position_ = 0;
-};
-
-auto append(std::vector<std::byte>& bytes, std::uint64_t value, std::size_t count) -> void {
-    for (std::size_t index = 0; index < count; ++index)
-        bytes.push_back(static_cast<std::byte>((value >> (8 * index)) & 255U));
-}
-auto write(std::span<std::byte> bytes, std::size_t offset, std::uint64_t value, std::size_t count) -> void {
-    for (std::size_t index = 0; index < count; ++index)
-        bytes[offset + index] = static_cast<std::byte>((value >> (8 * index)) & 255U);
-}
-
-class StagingFile {
-public:
-    std::filesystem::path directory;
-    auto file() const -> std::filesystem::path { return directory / "index"; }
-    auto cleanup() -> Result<void> {
-        if (directory.empty()) return {};
-        std::error_code error;
-        std::filesystem::remove(file(), error);
-        if (!error) std::filesystem::remove(directory, error);
-        if (error)
-            return std::unexpected(Error{ErrorCode::IO, "cannot clean HNSW staging directory: " + error.message()});
-        directory.clear();
-        return {};
-    }
-    ~StagingFile() {
-        const auto result = cleanup();
-        if (!result) std::cerr << "kidi_hnsw_save|cleanup_error=" << result.error().message << '\n';
-    }
-};
-
-auto read_file(const std::filesystem::path& path) -> Result<std::vector<std::byte>> {
-    std::ifstream stream(path, std::ios::binary | std::ios::ate);
-    if (!stream) return std::unexpected(Error{ErrorCode::IO, "cannot open HNSW index: " + path.string()});
-    const auto size = stream.tellg();
-    if (size < 0 || static_cast<std::uint64_t>(size) > std::numeric_limits<std::size_t>::max() ||
-        static_cast<std::uint64_t>(size) > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
-        return std::unexpected(Error{ErrorCode::IO, "cannot determine HNSW index size"});
-    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
-    stream.seekg(0);
-    if (!stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size())))
-        return std::unexpected(Error{ErrorCode::IO, "failed reading HNSW index"});
-    return bytes;
-}
 
 auto validate_graph(const Graph& graph) -> void {
     const auto nodes = graph.labels.size();
@@ -187,7 +84,8 @@ auto decode(std::span<const std::byte> bytes) -> Graph {
     std::fill_n(header.begin() + HEADER_CRC_OFFSET, 4, std::byte{0});
     Reader reader(bytes);
     reader.take(8);
-    const auto version = reader.integer(4), header_bytes = reader.integer(4), nodes = reader.integer(4);
+    const auto version = reader.integer(4), header_bytes = reader.integer(4);
+    const auto nodes = reader.integer(4);
     Graph graph;
     graph.width = static_cast<std::uint32_t>(reader.integer(4));
     reader.integer(4);
@@ -300,175 +198,10 @@ auto encode(const Graph& graph) -> std::vector<std::byte> {
     return result;
 }
 
-template <bool bfloat>
-auto weight(const std::byte* row, std::size_t column) -> float {
-    if constexpr (bfloat)
-        return std::bit_cast<float>(static_cast<std::uint32_t>(reinterpret_cast<const std::uint16_t*>(row)[column])
-                                    << 16);
-    else
-        return reinterpret_cast<const float*>(row)[column];
-}
-template <bool bfloat>
-auto dot_portable(const float* query, const std::byte* row, std::size_t width) -> float {
-    std::array<float, 16> lanes{};
-    std::size_t column = 0;
-    for (; column + 16 <= width; column += 16)
-        for (std::size_t lane = 0; lane < 16; ++lane)
-            lanes[lane] = std::fma(query[column + lane], weight<bfloat>(row, column + lane), lanes[lane]);
-    for (std::size_t offset = 8; offset; offset /= 2)
-        for (std::size_t lane = 0; lane < offset; ++lane) lanes[lane] += lanes[lane + offset];
-    float tail = 0;
-    for (; column < width; ++column) tail = std::fma(query[column], weight<bfloat>(row, column), tail);
-    return lanes[0] + tail;
-}
-template <bool bfloat>
-auto dot_rows_portable(const std::byte* left, const std::byte* right, std::size_t width) -> float {
-    std::array<float, 16> lanes{};
-    std::size_t column = 0;
-    for (; column + 16 <= width; column += 16)
-        for (std::size_t lane = 0; lane < 16; ++lane)
-            lanes[lane] =
-                std::fma(weight<bfloat>(left, column + lane), weight<bfloat>(right, column + lane), lanes[lane]);
-    for (std::size_t offset = 8; offset; offset /= 2)
-        for (std::size_t lane = 0; lane < offset; ++lane) lanes[lane] += lanes[lane + offset];
-    float tail = 0;
-    for (; column < width; ++column) tail = std::fma(weight<bfloat>(left, column), weight<bfloat>(right, column), tail);
-    return lanes[0] + tail;
-}
-#if defined(KIDI_HNSW_AVX512)
-template <bool bfloat>
-__attribute__((target("avx512f,avx512bw,fma"))) auto dot_avx512(const float* query, const std::byte* row,
-                                                                std::size_t width) -> float {
-    auto sum = _mm512_setzero_ps();
-    std::size_t column = 0;
-    for (; column + 16 <= width; column += 16) {
-        __m512 values;
-        if constexpr (bfloat) {
-            const auto packed =
-                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + column * sizeof(std::uint16_t)));
-            values = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(packed), 16));
-        } else {
-            values = _mm512_loadu_ps(reinterpret_cast<const float*>(row) + column);
-        }
-        sum = _mm512_fmadd_ps(_mm512_loadu_ps(query + column), values, sum);
-    }
-    float tail = 0;
-    for (; column < width; ++column) tail = std::fma(query[column], weight<bfloat>(row, column), tail);
-    return _mm512_reduce_add_ps(sum) + tail;
-}
-template <bool bfloat>
-__attribute__((target("avx512f,avx512bw,fma"))) auto dot_rows_avx512(const std::byte* left, const std::byte* right,
-                                                                     std::size_t width) -> float {
-    auto sum = _mm512_setzero_ps();
-    std::size_t column = 0;
-    for (; column + 16 <= width; column += 16) {
-        __m512 first, second;
-        if constexpr (bfloat) {
-            const auto left_values =
-                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(left + column * sizeof(std::uint16_t)));
-            const auto right_values =
-                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(right + column * sizeof(std::uint16_t)));
-            first = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(left_values), 16));
-            second = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(right_values), 16));
-        } else {
-            first = _mm512_loadu_ps(reinterpret_cast<const float*>(left) + column);
-            second = _mm512_loadu_ps(reinterpret_cast<const float*>(right) + column);
-        }
-        sum = _mm512_fmadd_ps(first, second, sum);
-    }
-    float tail = 0;
-    for (; column < width; ++column) tail = std::fma(weight<bfloat>(left, column), weight<bfloat>(right, column), tail);
-    return _mm512_reduce_add_ps(sum) + tail;
-}
-#endif
-#if defined(KIDI_HNSW_NEON)
-template <bool bfloat>
-auto dot_neon(const float* query, const std::byte* row, std::size_t width) -> float {
-    float32x4_t s0 = vdupq_n_f32(0.F), s1 = vdupq_n_f32(0.F);
-    float32x4_t s2 = vdupq_n_f32(0.F), s3 = vdupq_n_f32(0.F);
-    std::size_t column = 0;
-    for (; column + 16 <= width; column += 16) {
-        const float32x4_t q0 = vld1q_f32(query + column);
-        const float32x4_t q1 = vld1q_f32(query + column + 4);
-        const float32x4_t q2 = vld1q_f32(query + column + 8);
-        const float32x4_t q3 = vld1q_f32(query + column + 12);
-        if constexpr (bfloat) {
-            const auto* w_u16 = reinterpret_cast<const std::uint16_t*>(row) + column;
-            const uint16x8_t lo = vld1q_u16(w_u16);
-            const uint16x8_t hi = vld1q_u16(w_u16 + 8);
-            const float32x4_t w0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(lo), 16));
-            const float32x4_t w1 = vreinterpretq_f32_u32(vshll_high_n_u16(lo, 16));
-            const float32x4_t w2 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(hi), 16));
-            const float32x4_t w3 = vreinterpretq_f32_u32(vshll_high_n_u16(hi, 16));
-            s0 = vfmaq_f32(s0, q0, w0);
-            s1 = vfmaq_f32(s1, q1, w1);
-            s2 = vfmaq_f32(s2, q2, w2);
-            s3 = vfmaq_f32(s3, q3, w3);
-        } else {
-            const auto* w_f32 = reinterpret_cast<const float*>(row) + column;
-            s0 = vfmaq_f32(s0, q0, vld1q_f32(w_f32));
-            s1 = vfmaq_f32(s1, q1, vld1q_f32(w_f32 + 4));
-            s2 = vfmaq_f32(s2, q2, vld1q_f32(w_f32 + 8));
-            s3 = vfmaq_f32(s3, q3, vld1q_f32(w_f32 + 12));
-        }
-    }
-    float sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
-    for (; column < width; ++column) sum = std::fma(query[column], weight<bfloat>(row, column), sum);
-    return sum;
-}
-template <bool bfloat>
-auto dot_rows_neon(const std::byte* left, const std::byte* right, std::size_t width) -> float {
-    float32x4_t s0 = vdupq_n_f32(0.F), s1 = vdupq_n_f32(0.F);
-    float32x4_t s2 = vdupq_n_f32(0.F), s3 = vdupq_n_f32(0.F);
-    std::size_t column = 0;
-    for (; column + 16 <= width; column += 16) {
-        if constexpr (bfloat) {
-            const auto* l_u16 = reinterpret_cast<const std::uint16_t*>(left) + column;
-            const auto* r_u16 = reinterpret_cast<const std::uint16_t*>(right) + column;
-            const uint16x8_t l_lo = vld1q_u16(l_u16), l_hi = vld1q_u16(l_u16 + 8);
-            const uint16x8_t r_lo = vld1q_u16(r_u16), r_hi = vld1q_u16(r_u16 + 8);
-            s0 = vfmaq_f32(s0, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(l_lo), 16)),
-                           vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(r_lo), 16)));
-            s1 = vfmaq_f32(s1, vreinterpretq_f32_u32(vshll_high_n_u16(l_lo, 16)),
-                           vreinterpretq_f32_u32(vshll_high_n_u16(r_lo, 16)));
-            s2 = vfmaq_f32(s2, vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(l_hi), 16)),
-                           vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(r_hi), 16)));
-            s3 = vfmaq_f32(s3, vreinterpretq_f32_u32(vshll_high_n_u16(l_hi, 16)),
-                           vreinterpretq_f32_u32(vshll_high_n_u16(r_hi, 16)));
-        } else {
-            const auto* l_f32 = reinterpret_cast<const float*>(left) + column;
-            const auto* r_f32 = reinterpret_cast<const float*>(right) + column;
-            s0 = vfmaq_f32(s0, vld1q_f32(l_f32), vld1q_f32(r_f32));
-            s1 = vfmaq_f32(s1, vld1q_f32(l_f32 + 4), vld1q_f32(r_f32 + 4));
-            s2 = vfmaq_f32(s2, vld1q_f32(l_f32 + 8), vld1q_f32(r_f32 + 8));
-            s3 = vfmaq_f32(s3, vld1q_f32(l_f32 + 12), vld1q_f32(r_f32 + 12));
-        }
-    }
-    float sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
-    for (; column < width; ++column) sum = std::fma(weight<bfloat>(left, column), weight<bfloat>(right, column), sum);
-    return sum;
-}
-#endif
-
-struct ByDistance {
-    auto operator()(const std::pair<float, std::uint32_t>& left, const std::pair<float, std::uint32_t>& right) const
-        -> bool {
-        return left.first < right.first;
-    }
-};
-auto push(std::vector<std::pair<float, std::uint32_t>>& heap, float distance, std::uint32_t node) -> void {
-    heap.emplace_back(distance, node);
-    std::push_heap(heap.begin(), heap.end(), ByDistance{});
-}
-auto pop(std::vector<std::pair<float, std::uint32_t>>& heap) -> std::pair<float, std::uint32_t> {
-    std::pop_heap(heap.begin(), heap.end(), ByDistance{});
-    const auto result = heap.back();
-    heap.pop_back();
-    return result;
-}
 struct BuildNode {
     std::vector<std::vector<std::uint32_t>> links;
 };
+
 auto Graph::neighbors(std::uint32_t node, std::size_t level) const -> std::span<const std::uint32_t> {
     if (node >= labels.size() || level > upper.size())
         throw Failure({ErrorCode::INVALID_ARGUMENT, "HNSW node or level is out of bounds"});
@@ -480,46 +213,12 @@ auto Graph::neighbors(std::uint32_t node, std::size_t level) const -> std::span<
     const auto index = static_cast<std::size_t>(found - layer.nodes.begin());
     return std::span(layer.edges).subspan(layer.offsets[index], layer.offsets[index + 1] - layer.offsets[index]);
 }
+
 auto Graph::runtime_bytes() const noexcept -> std::size_t {
     auto bytes = (labels.size() + base_offsets.size() + base_edges.size()) * sizeof(std::uint32_t) + levels.size();
     for (const auto& layer : upper)
         bytes += (layer.nodes.size() + layer.offsets.size() + layer.edges.size()) * sizeof(std::uint32_t);
     return bytes;
-}
-
-using Dot = float (*)(const float*, const std::byte*, std::size_t);
-using RowDot = float (*)(const std::byte*, const std::byte*, std::size_t);
-
-auto dot_kernels(tensor::DType dtype) -> std::pair<Dot, RowDot> {
-    Dot dot = dtype == tensor::DType::BF16 ? dot_portable<true> : dot_portable<false>;
-    RowDot row_dot = dtype == tensor::DType::BF16 ? dot_rows_portable<true> : dot_rows_portable<false>;
-#if defined(KIDI_HNSW_AVX512)
-    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("fma")) {
-        dot = dtype == tensor::DType::BF16 ? dot_avx512<true> : dot_avx512<false>;
-        row_dot = dtype == tensor::DType::BF16 ? dot_rows_avx512<true> : dot_rows_avx512<false>;
-    }
-#elif defined(KIDI_HNSW_NEON)
-    dot = dtype == tensor::DType::BF16 ? dot_neon<true> : dot_neon<false>;
-    row_dot = dtype == tensor::DType::BF16 ? dot_rows_neon<true> : dot_rows_neon<false>;
-#endif
-    return {dot, row_dot};
-}
-
-auto read_meta(const std::byte* base, bool f16, std::size_t idx) noexcept -> float {
-#if defined(KIDI_HNSW_NEON)
-    if (f16) return static_cast<float>(reinterpret_cast<const __fp16*>(base)[idx]);
-#else
-    if (f16) {
-        const auto h = reinterpret_cast<const std::uint16_t*>(base)[idx];
-        const std::uint32_t sign = (h & 0x8000U) << 16;
-        const std::uint32_t exp = (h >> 10) & 0x1FU;
-        const std::uint32_t mant = h & 0x03FFU;
-        if (exp == 0) return std::copysign(static_cast<float>(mant) * (1.F / 16777216.F), std::bit_cast<float>(sign));
-        if (exp == 31) return std::bit_cast<float>(sign | 0x7F800000U | (mant << 13));
-        return std::bit_cast<float>(sign | ((exp + 112U) << 23) | (mant << 13));
-    }
-#endif
-    return reinterpret_cast<const float*>(base)[idx];
 }
 
 } // namespace
@@ -593,6 +292,7 @@ auto HnswIndex::load(const std::filesystem::path& path, tensor::Tensor vectors) 
         return std::unexpected(error.error());
     }
 }
+
 auto HnswIndex::load_quantized(const std::filesystem::path& path, tensor::Tensor weights, tensor::Tensor scales,
                                tensor::Tensor zeros, std::int32_t bits, std::int32_t group_size, float input_scale)
     -> Result<HnswIndex> {
@@ -619,6 +319,7 @@ auto HnswIndex::load_quantized(const std::filesystem::path& path, tensor::Tensor
         return std::unexpected(error.error());
     }
 }
+
 auto HnswIndex::from_hnswlib(const std::filesystem::path& path, tensor::Tensor vectors, std::size_t candidates,
                              std::size_t ef_search) -> Result<HnswIndex> {
     try {
@@ -656,6 +357,7 @@ auto HnswIndex::from_hnswlib(const std::filesystem::path& path, tensor::Tensor v
         graph.base_offsets.reserve(nodes + 1);
         graph.base_offsets.push_back(0);
         const auto row_bytes = vectors.size(1) * tensor::element_size(vectors.dtype());
+        const bool bfloat = vectors.dtype() == tensor::DType::BF16;
         for (std::size_t node = 0; node < nodes; ++node) {
             const auto record = source.take(record_bytes);
             Reader labels(record.subspan(label_offset));
@@ -674,8 +376,7 @@ auto HnswIndex::from_hnswlib(const std::filesystem::path& path, tensor::Tensor v
             const auto* row = table.data() + label * row_bytes;
             for (std::size_t column = 0; column < vectors.size(1); ++column) {
                 const auto actual = static_cast<std::uint32_t>(values.integer(4));
-                const auto expected =
-                    vectors.dtype() == tensor::DType::BF16 ? weight<true>(row, column) : weight<false>(row, column);
+                const auto expected = weight_element(row, column, bfloat);
                 invalid(!std::isfinite(expected) || actual != std::bit_cast<std::uint32_t>(expected),
                         "hnswlib vectors differ from the original unnormalized table");
             }
@@ -710,133 +411,31 @@ auto HnswIndex::from_hnswlib(const std::filesystem::path& path, tensor::Tensor v
         return std::unexpected(error.error());
     }
 }
+
 auto HnswIndex::save(const std::filesystem::path& path) const -> Result<void> {
     try {
-        if (path.empty())
-            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "HNSW output path must not be empty"});
-        const auto destination = std::filesystem::absolute(path);
-        std::error_code error;
-        const auto status = std::filesystem::symlink_status(destination, error);
-        if (error && error != std::errc::no_such_file_or_directory)
-            return std::unexpected(Error{ErrorCode::IO, "cannot inspect HNSW output: " + error.message()});
-        if (status.type() != std::filesystem::file_type::not_found)
-            return std::unexpected(Error{ErrorCode::IO, "HNSW output already exists: " + destination.string()});
         const auto bytes = encode(state_->graph);
-        if (bytes.size() > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max()))
-            return std::unexpected(Error{ErrorCode::IO, "HNSW output exceeds stream size limits"});
-        StagingFile staging;
-        std::random_device random;
-        for (int attempt = 0; attempt < 16 && staging.directory.empty(); ++attempt) {
-            const auto directory = destination.parent_path() / (".kidi-hnsw-" + std::to_string(random()));
-            error.clear();
-            if (std::filesystem::create_directory(directory, error)) {
-                staging.directory = directory;
-            } else if (error && error != std::errc::file_exists) {
-                return std::unexpected(
-                    Error{ErrorCode::IO, "cannot create HNSW staging directory: " + error.message()});
-            }
-        }
-        if (staging.directory.empty())
-            return std::unexpected(Error{ErrorCode::IO, "cannot allocate a unique HNSW staging directory"});
-        std::ofstream output(staging.file(), std::ios::binary | std::ios::trunc);
-        if (!output) return std::unexpected(Error{ErrorCode::IO, "cannot create staged HNSW index"});
-        output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        output.flush();
-        if (!output) return std::unexpected(Error{ErrorCode::IO, "failed writing HNSW index"});
-        output.close();
-        if (!output) return std::unexpected(Error{ErrorCode::IO, "failed closing HNSW index"});
-        std::filesystem::create_hard_link(staging.file(), destination, error);
-        if (error) return std::unexpected(Error{ErrorCode::IO, "cannot publish HNSW index: " + error.message()});
-        const auto cleaned = staging.cleanup();
-        if (!cleaned) return cleaned;
-        return {};
+        return save_atomic_file(path, bytes);
     } catch (const Failure& error) {
         return std::unexpected(error.error());
     } catch (const std::system_error& error) {
         return std::unexpected(Error{ErrorCode::IO, "cannot save HNSW index: " + std::string(error.what())});
     }
 }
+
 auto HnswIndex::prefetch_node(std::uint32_t node) const noexcept -> void {
     const auto& state = *state_;
     const auto label = static_cast<std::size_t>(state.graph.labels[node]);
     const auto* ptr = state.bytes.data() + label * state.row_bytes;
-    const std::size_t limit = std::min<std::size_t>(state.row_bytes, 1024);
-#if defined(__GNUC__) || defined(__clang__)
-    for (std::size_t off = 0; off < limit; off += 128) __builtin_prefetch(ptr + off, 0, 1);
-    if (state.bits) {
-        const auto B = static_cast<std::size_t>(state.graph.width / state.group_size);
-        const auto s_elem = state.scale_f16 ? 2U : 4U;
-        __builtin_prefetch(state.scale_bytes.data() + label * B * s_elem, 0, 1);
-        if (state.has_zero) {
-            const auto z_elem = state.zero_f16 ? 2U : 4U;
-            __builtin_prefetch(state.zero_bytes.data() + label * B * z_elem, 0, 1);
-        }
-    }
-#else
-    (void)ptr;
-    (void)limit;
-#endif
+    const auto groups = state.bits ? static_cast<std::size_t>(state.graph.width / state.group_size) : 0;
+    prefetch_row(ptr, state.row_bytes, state.bits, label, groups, state.scale_bytes, state.scale_f16, state.zero_bytes,
+                 state.zero_f16, state.has_zero);
 }
 
 auto HnswIndex::prepare_query(std::span<const float> query, HnswWorkspace& workspace) const -> void {
     const auto& state = *state_;
-    if (!state.bits) return;
-    const auto width = static_cast<std::size_t>(state.graph.width);
-    const auto G = static_cast<std::size_t>(state.group_size);
-    const auto B = width / G;
-    workspace.q_i8.resize(width);
-    workspace.q_scale.resize(B);
-    workspace.q_bsum.resize(B);
-    for (std::size_t b = 0; b < B; ++b) {
-        const float* x = query.data() + b * G;
-        float scale = state.input_scale;
-        float inv_scale = 0.F;
-        if (scale > 0.F) {
-            inv_scale = 1.F / scale;
-        } else {
-            float max_abs = 0.F;
-            for (std::size_t i = 0; i < G; ++i) max_abs = std::max(max_abs, std::abs(x[i]));
-            scale = max_abs > 0.F ? max_abs / 127.F : 0.F;
-            inv_scale = max_abs > 0.F ? 127.F / max_abs : 0.F;
-        }
-        workspace.q_scale[b] = scale;
-        const float min_q = state.input_scale > 0.F ? -128.F : -127.F;
-        if (state.bits == 8) {
-            auto* dst = workspace.q_i8.data() + b * G;
-            for (std::size_t i = 0; i < G; ++i)
-                dst[i] = static_cast<std::int8_t>(std::clamp(std::nearbyint(x[i] * inv_scale), min_q, 127.F));
-        } else if (state.bits == 4) {
-            const auto chunks = G / 32;
-            std::int32_t bsum = 0;
-            for (std::size_t c = 0; c < chunks; ++c) {
-                const float* xc = x + c * 32;
-                auto* dst = workspace.q_i8.data() + (b * chunks + c) * 32;
-                for (std::size_t i = 0; i < 16; ++i) {
-                    const auto qe =
-                        static_cast<std::int8_t>(std::clamp(std::nearbyint(xc[2 * i] * inv_scale), min_q, 127.F));
-                    const auto qo =
-                        static_cast<std::int8_t>(std::clamp(std::nearbyint(xc[2 * i + 1] * inv_scale), min_q, 127.F));
-                    dst[i] = qe;
-                    dst[16 + i] = qo;
-                    bsum += static_cast<std::int32_t>(qe) + static_cast<std::int32_t>(qo);
-                }
-            }
-            workspace.q_bsum[b] = static_cast<float>(bsum) * scale;
-        } else if (state.bits == 2) {
-            const auto quarter = G / 4;
-            auto* dst = workspace.q_i8.data() + b * G;
-            for (std::size_t i = 0; i < quarter; ++i) {
-                dst[0 * quarter + i] =
-                    static_cast<std::int8_t>(std::clamp(std::nearbyint(x[4 * i + 0] * inv_scale), min_q, 127.F));
-                dst[1 * quarter + i] =
-                    static_cast<std::int8_t>(std::clamp(std::nearbyint(x[4 * i + 1] * inv_scale), min_q, 127.F));
-                dst[2 * quarter + i] =
-                    static_cast<std::int8_t>(std::clamp(std::nearbyint(x[4 * i + 2] * inv_scale), min_q, 127.F));
-                dst[3 * quarter + i] =
-                    static_cast<std::int8_t>(std::clamp(std::nearbyint(x[4 * i + 3] * inv_scale), min_q, 127.F));
-            }
-        }
-    }
+    prepare_quantized_query(query, state.graph.width, state.bits, state.group_size, state.input_scale, workspace.q_i8,
+                            workspace.q_scale, workspace.q_bsum);
 }
 
 auto HnswIndex::query_distance(std::span<const float> query, const HnswWorkspace& workspace, std::uint32_t node) const
@@ -849,149 +448,10 @@ auto HnswIndex::query_distance(std::span<const float> query, const HnswWorkspace
         if (!std::isfinite(result)) throw Failure({ErrorCode::RUNTIME, "nonfinite HNSW query distance"});
         return result;
     }
-    const auto width = static_cast<std::size_t>(state.graph.width);
-    const auto G = static_cast<std::size_t>(state.group_size);
-    const auto B = width / G;
     const auto* w_row = reinterpret_cast<const std::uint8_t*>(state.bytes.data()) + label * state.row_bytes;
-    float score = 0.F;
-    if (state.bits == 8) {
-        for (std::size_t b = 0; b < B; ++b) {
-            const auto* q_ptr = workspace.q_i8.data() + b * G;
-            const auto* w_ptr = reinterpret_cast<const std::int8_t*>(w_row + b * G);
-            std::int32_t dot_i32 = 0;
-#if defined(KIDI_HNSW_NEON) && defined(__ARM_FEATURE_DOTPROD)
-            int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
-            int32x4_t acc2 = vdupq_n_s32(0), acc3 = vdupq_n_s32(0);
-            std::size_t c = 0;
-            for (; c + 64 <= G; c += 64) {
-                acc0 = vdotq_s32(acc0, vld1q_s8(q_ptr + c), vld1q_s8(w_ptr + c));
-                acc1 = vdotq_s32(acc1, vld1q_s8(q_ptr + c + 16), vld1q_s8(w_ptr + c + 16));
-                acc2 = vdotq_s32(acc2, vld1q_s8(q_ptr + c + 32), vld1q_s8(w_ptr + c + 32));
-                acc3 = vdotq_s32(acc3, vld1q_s8(q_ptr + c + 48), vld1q_s8(w_ptr + c + 48));
-            }
-            dot_i32 = vaddvq_s32(vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3)));
-            for (; c < G; ++c) dot_i32 += static_cast<std::int32_t>(q_ptr[c]) * static_cast<std::int32_t>(w_ptr[c]);
-#else
-            for (std::size_t c = 0; c < G; ++c)
-                dot_i32 += static_cast<std::int32_t>(q_ptr[c]) * static_cast<std::int32_t>(w_ptr[c]);
-#endif
-            const float w_s = read_meta(state.scale_bytes.data(), state.scale_f16, label * B + b);
-            score += static_cast<float>(dot_i32) * (workspace.q_scale[b] * w_s);
-        }
-    } else if (state.bits == 4) {
-        const auto chunks = G / 32;
-#if defined(KIDI_HNSW_NEON) && defined(__ARM_FEATURE_DOTPROD)
-        if (B % 4 == 0) {
-            float32x4_t f_acc = vdupq_n_f32(0.F);
-            const auto* s_f16 =
-                state.scale_f16 ? reinterpret_cast<const __fp16*>(state.scale_bytes.data()) + label * B : nullptr;
-            const auto* s_f32 =
-                state.scale_f16 ? nullptr : reinterpret_cast<const float*>(state.scale_bytes.data()) + label * B;
-            const auto* z_f16 = (state.has_zero && state.zero_f16)
-                                    ? reinterpret_cast<const __fp16*>(state.zero_bytes.data()) + label * B
-                                    : nullptr;
-            const auto* z_f32 = (state.has_zero && !state.zero_f16)
-                                    ? reinterpret_cast<const float*>(state.zero_bytes.data()) + label * B
-                                    : nullptr;
-            for (std::size_t b = 0; b < B; b += 4) {
-                int32x4_t d[4]{vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0)};
-                for (std::size_t r = 0; r < 4; ++r) {
-                    const auto blk = b + r;
-                    for (std::size_t c = 0; c < chunks; ++c) {
-                        const uint8x16_t raw = vld1q_u8(w_row + (blk * chunks + c) * 16);
-                        const int8x16_t we = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw, 4)), 4);
-                        const int8x16_t wo = vshrq_n_s8(vreinterpretq_s8_u8(raw), 4);
-                        const auto* qp = workspace.q_i8.data() + (blk * chunks + c) * 32;
-                        d[r] = vdotq_s32(vdotq_s32(d[r], we, vld1q_s8(qp)), wo, vld1q_s8(qp + 16));
-                    }
-                }
-                const int32x4_t dots = vpaddq_s32(vpaddq_s32(d[0], d[1]), vpaddq_s32(d[2], d[3]));
-                const float32x4_t ws = s_f16 ? vcvt_f32_f16(vld1_f16(s_f16 + b)) : vld1q_f32(s_f32 + b);
-                const float32x4_t qs = vld1q_f32(workspace.q_scale.data() + b);
-                f_acc = vfmaq_f32(f_acc, vcvtq_f32_s32(dots), vmulq_f32(ws, qs));
-                if (state.has_zero) {
-                    const float32x4_t wz = z_f16 ? vcvt_f32_f16(vld1_f16(z_f16 + b)) : vld1q_f32(z_f32 + b);
-                    const float32x4_t qz = vld1q_f32(workspace.q_bsum.data() + b);
-                    f_acc = vfmaq_f32(f_acc, wz, qz);
-                }
-            }
-            score = vaddvq_f32(f_acc);
-        } else
-#endif
-        {
-            for (std::size_t b = 0; b < B; ++b) {
-                std::int32_t dot_i32 = 0;
-#if defined(KIDI_HNSW_NEON) && defined(__ARM_FEATURE_DOTPROD)
-                int32x4_t acc = vdupq_n_s32(0);
-                for (std::size_t c = 0; c < chunks; ++c) {
-                    const uint8x16_t raw = vld1q_u8(w_row + (b * chunks + c) * 16);
-                    const int8x16_t we = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw, 4)), 4);
-                    const int8x16_t wo = vshrq_n_s8(vreinterpretq_s8_u8(raw), 4);
-                    const auto* qp = workspace.q_i8.data() + (b * chunks + c) * 32;
-                    acc = vdotq_s32(vdotq_s32(acc, we, vld1q_s8(qp)), wo, vld1q_s8(qp + 16));
-                }
-                dot_i32 = vaddvq_s32(acc);
-#else
-                for (std::size_t c = 0; c < chunks; ++c) {
-                    const auto* wp = w_row + (b * chunks + c) * 16;
-                    const auto* qp = workspace.q_i8.data() + (b * chunks + c) * 32;
-                    for (std::size_t i = 0; i < 16; ++i) {
-                        const auto byte = wp[i];
-                        const auto we = static_cast<std::int8_t>(static_cast<std::int8_t>(byte << 4) >> 4);
-                        const auto wo = static_cast<std::int8_t>(static_cast<std::int8_t>(byte) >> 4);
-                        dot_i32 += static_cast<std::int32_t>(we) * qp[i] + static_cast<std::int32_t>(wo) * qp[16 + i];
-                    }
-                }
-#endif
-                const float w_s = read_meta(state.scale_bytes.data(), state.scale_f16, label * B + b);
-                score += static_cast<float>(dot_i32) * (workspace.q_scale[b] * w_s);
-                if (state.has_zero) {
-                    const float w_z = read_meta(state.zero_bytes.data(), state.zero_f16, label * B + b);
-                    score += workspace.q_bsum[b] * w_z;
-                }
-            }
-        }
-    } else if (state.bits == 2) {
-        const auto quarter = G / 4;
-        for (std::size_t b = 0; b < B; ++b) {
-            const auto* wp = w_row + b * quarter;
-            const auto* qp = workspace.q_i8.data() + b * G;
-            std::int32_t dot_i32 = 0;
-#if defined(KIDI_HNSW_NEON) && defined(__ARM_FEATURE_DOTPROD)
-            int32x4_t acc = vdupq_n_s32(0);
-            std::size_t c = 0;
-            for (; c + 16 <= quarter; c += 16) {
-                const int8x16_t raw = vreinterpretq_s8_u8(vld1q_u8(wp + c));
-                const int8x16_t w0 = vshrq_n_s8(vshlq_n_s8(raw, 6), 6);
-                const int8x16_t w1 = vshrq_n_s8(vshlq_n_s8(raw, 4), 6);
-                const int8x16_t w2 = vshrq_n_s8(vshlq_n_s8(raw, 2), 6);
-                const int8x16_t w3 = vshrq_n_s8(raw, 6);
-                acc = vdotq_s32(acc, w0, vld1q_s8(qp + 0 * quarter + c));
-                acc = vdotq_s32(acc, w1, vld1q_s8(qp + 1 * quarter + c));
-                acc = vdotq_s32(acc, w2, vld1q_s8(qp + 2 * quarter + c));
-                acc = vdotq_s32(acc, w3, vld1q_s8(qp + 3 * quarter + c));
-            }
-            dot_i32 = vaddvq_s32(acc);
-            for (; c < quarter; ++c) {
-                const auto raw = static_cast<std::int8_t>(wp[c]);
-                dot_i32 += static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 6) >> 6) * qp[0 * quarter + c] +
-                           static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 4) >> 6) * qp[1 * quarter + c] +
-                           static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 2) >> 6) * qp[2 * quarter + c] +
-                           static_cast<std::int32_t>(raw >> 6) * qp[3 * quarter + c];
-            }
-#else
-            for (std::size_t c = 0; c < quarter; ++c) {
-                const auto raw = static_cast<std::int8_t>(wp[c]);
-                dot_i32 += static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 6) >> 6) * qp[0 * quarter + c] +
-                           static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 4) >> 6) * qp[1 * quarter + c] +
-                           static_cast<std::int32_t>(static_cast<std::int8_t>(raw << 2) >> 6) * qp[2 * quarter + c] +
-                           static_cast<std::int32_t>(raw >> 6) * qp[3 * quarter + c];
-            }
-#endif
-            const float w_s = read_meta(state.scale_bytes.data(), state.scale_f16, label * B + b);
-            score += static_cast<float>(dot_i32) * (workspace.q_scale[b] * w_s);
-        }
-    }
+    const float score = quantized_row_dot(w_row, label, state.graph.width, state.bits, state.group_size,
+                                          state.scale_bytes, state.scale_f16, state.zero_bytes, state.zero_f16,
+                                          state.has_zero, workspace.q_i8, workspace.q_scale, workspace.q_bsum);
     const auto result = 1.F - score;
     if (!std::isfinite(result)) throw Failure({ErrorCode::RUNTIME, "nonfinite HNSW query distance"});
     return result;
@@ -999,7 +459,7 @@ auto HnswIndex::query_distance(std::span<const float> query, const HnswWorkspace
 
 auto HnswIndex::node_distance(std::uint32_t left, std::uint32_t right) const -> float {
     const auto& state = *state_;
-    const auto stride = state.graph.width * tensor::element_size(state.vectors.dtype());
+    const auto stride = state.row_bytes;
     const auto left_row = static_cast<std::size_t>(state.graph.labels[left]) * stride;
     const auto right_row = static_cast<std::size_t>(state.graph.labels[right]) * stride;
     const auto result =
@@ -1030,26 +490,6 @@ auto HnswIndex::build(tensor::Tensor vectors, HnswBuildOptions options, HnswProg
         std::iota(graph.labels.begin(), graph.labels.end(), 0);
         graph.levels.resize(vectors.size(0));
         HnswIndex index(std::make_unique<State>(graph, std::move(vectors)));
-        const auto distances = [&](std::uint32_t query, std::span<const std::uint32_t> neighbors) {
-            std::vector<float> result(neighbors.size());
-            if (!parallel_for || neighbors.size() < 8) {
-                for (std::size_t item = 0; item < neighbors.size(); ++item)
-                    result[item] = index.node_distance(query, neighbors[item]);
-                return result;
-            }
-            std::mutex mutex;
-            std::optional<Error> failure;
-            require(parallel_for(neighbors.size(), [&](std::size_t item) {
-                try {
-                    result[item] = index.node_distance(query, neighbors[item]);
-                } catch (const Failure& error) {
-                    std::scoped_lock lock(mutex);
-                    if (!failure) failure = error.error();
-                }
-            }));
-            if (failure) throw Failure(std::move(*failure));
-            return result;
-        };
         const auto nodes = graph.labels.size();
         std::vector<BuildNode> build(nodes);
         std::mt19937_64 random(options.seed);
@@ -1063,81 +503,162 @@ auto HnswIndex::build(tensor::Tensor vectors, HnswBuildOptions options, HnswProg
         graph.entry = 0;
         auto maximum_level = static_cast<std::size_t>(graph.levels[0]);
         if (progress) progress(1, nodes);
-        std::vector<std::uint32_t> visited(nodes);
+        std::vector<std::uint32_t> visited(nodes), unseen;
+        std::vector<float> unseen_distances;
         std::uint32_t epoch = 0;
-        const auto search_layer = [&](std::uint32_t query, std::uint32_t entry, std::size_t ef, std::size_t level) {
+        using Pair = std::pair<float, std::uint32_t>;
+        std::vector<Pair> nearest, candidates;
+        constexpr std::size_t wave_pops = 32, dirty_slack = 512;
+        nearest.reserve(options.ef_construction + wave_pops * 2 * static_cast<std::size_t>(options.m) + dirty_slack);
+        candidates.reserve(options.ef_construction * 2);
+        unseen.reserve(wave_pops * 2 * static_cast<std::size_t>(options.m) + 1);
+        unseen_distances.reserve(wave_pops * 2 * static_cast<std::size_t>(options.m) + 1);
+        const auto compact_nearest = [&](std::size_t ef) -> float {
+            std::nth_element(nearest.begin(), nearest.begin() + static_cast<std::ptrdiff_t>(ef - 1), nearest.end());
+            nearest.resize(ef);
+            return nearest[ef - 1].first;
+        };
+        const auto search_layer = [&](std::uint32_t query, std::uint32_t entry, std::size_t ef,
+                                      std::size_t level) -> std::span<const Pair> {
             if (++epoch == 0) {
                 std::ranges::fill(visited, 0);
                 epoch = 1;
             }
-            using Pair = std::pair<float, std::uint32_t>;
-            std::priority_queue<Pair> nearest;
-            std::priority_queue<Pair, std::vector<Pair>, std::greater<>> candidates;
+            nearest.clear();
+            candidates.clear();
             const auto initial = index.node_distance(query, entry);
-            nearest.emplace(initial, entry);
-            candidates.emplace(initial, entry);
+            nearest.emplace_back(initial, entry);
+            candidates.emplace_back(initial, entry);
             visited[entry] = epoch;
+            float upper_bound = nearest.size() == ef ? initial : std::numeric_limits<float>::infinity();
+            const std::size_t max_pops = !level && ef >= 256 ? wave_pops : 1;
             while (!candidates.empty()) {
-                const auto [distance, current] = candidates.top();
-                if (nearest.size() == ef && distance > nearest.top().first) break;
-                candidates.pop();
-                std::vector<std::uint32_t> unseen;
-                for (auto neighbor : build[current].links[level]) {
-                    if (visited[neighbor] == epoch) continue;
-                    visited[neighbor] = epoch;
-                    unseen.push_back(neighbor);
-                }
-                const auto values = distances(query, unseen);
-                for (std::size_t item = 0; item < unseen.size(); ++item) {
-                    const auto neighbor = unseen[item];
-                    const auto value = values[item];
-                    if (nearest.size() < ef || value < nearest.top().first) {
-                        candidates.emplace(value, neighbor);
-                        nearest.emplace(value, neighbor);
-                        if (nearest.size() > ef) nearest.pop();
+                unseen.clear();
+                for (std::size_t pop_index = 0; pop_index < max_pops && !candidates.empty(); ++pop_index) {
+                    if (candidates.front().first > upper_bound) break;
+                    std::pop_heap(candidates.begin(), candidates.end(), std::greater<>{});
+                    const auto current = candidates.back().second;
+                    candidates.pop_back();
+                    for (auto neighbor : build[current].links[level]) {
+                        if (visited[neighbor] == epoch) continue;
+                        visited[neighbor] = epoch;
+                        unseen.push_back(neighbor);
                     }
                 }
+                if (unseen.empty()) break;
+                unseen_distances.resize(unseen.size());
+                if (parallel_for && unseen.size() >= 64) {
+                    std::mutex mutex;
+                    std::optional<Error> failure;
+                    require(parallel_for(unseen.size(), [&](std::size_t item) {
+                        try {
+                            unseen_distances[item] = index.node_distance(query, unseen[item]);
+                        } catch (const Failure& error) {
+                            std::scoped_lock lock(mutex);
+                            if (!failure) failure = error.error();
+                        }
+                    }));
+                    if (failure) throw Failure(std::move(*failure));
+                } else {
+                    for (std::size_t item = 0; item < unseen.size(); ++item) {
+                        if (item + 2 < unseen.size()) index.prefetch_node(unseen[item + 2]);
+                        unseen_distances[item] = index.node_distance(query, unseen[item]);
+                    }
+                }
+                for (std::size_t item = 0; item < unseen.size(); ++item) {
+                    const auto value = unseen_distances[item];
+                    if (value < upper_bound) nearest.emplace_back(value, unseen[item]);
+                }
+                const bool compacted =
+                    (!std::isfinite(upper_bound) && nearest.size() >= ef) || nearest.size() >= ef + dirty_slack;
+                if (compacted) {
+                    upper_bound = compact_nearest(ef);
+                    std::erase_if(candidates, [&](const Pair& item) { return item.first > upper_bound; });
+                }
+                const bool rebuild_candidates = compacted || unseen.size() >= candidates.size() / 4;
+                for (std::size_t item = 0; item < unseen.size(); ++item) {
+                    const auto value = unseen_distances[item];
+                    if (value < upper_bound) {
+                        candidates.emplace_back(value, unseen[item]);
+                        if (!rebuild_candidates) std::push_heap(candidates.begin(), candidates.end(), std::greater<>{});
+                    }
+                }
+                if (rebuild_candidates) std::make_heap(candidates.begin(), candidates.end(), std::greater<>{});
             }
-            std::vector<Pair> result;
-            result.reserve(nearest.size());
-            while (!nearest.empty()) {
-                result.push_back(nearest.top());
-                nearest.pop();
-            }
-            std::ranges::sort(result, [](const Pair& left, const Pair& right) {
-                return left.first < right.first || (left.first == right.first && left.second < right.second);
-            });
-            return result;
+            if (nearest.size() > ef) compact_nearest(ef);
+            const auto sorted_prefix = std::min<std::size_t>(nearest.size(), std::max<std::size_t>(2 * options.m, 66));
+            std::partial_sort(nearest.begin(), nearest.begin() + static_cast<std::ptrdiff_t>(sorted_prefix),
+                              nearest.end());
+            return nearest;
         };
-        const auto select = [&](std::uint32_t query, std::vector<std::pair<float, std::uint32_t>> candidates,
-                                std::size_t maximum) {
-            std::ranges::sort(candidates, [](const auto& left, const auto& right) {
-                return left.first < right.first || (left.first == right.first && left.second < right.second);
-            });
-            candidates.erase(
-                std::unique(candidates.begin(), candidates.end(),
-                            [](const auto& left, const auto& right) { return left.second == right.second; }),
-                candidates.end());
+        const auto select_sorted = [&](std::span<const Pair> pool, std::size_t maximum) {
+            const auto prefix_limit = std::max<std::size_t>(maximum, 66);
+            const auto front = pool.first(std::min(pool.size(), prefix_limit));
             std::vector<std::uint32_t> selected, rejected;
             selected.reserve(maximum);
-            for (const auto [distance, candidate] : candidates) {
-                if (candidate == query) continue;
-                bool diverse;
-                if (parallel_for && selected.size() >= 8) {
-                    const auto values = distances(candidate, selected);
-                    diverse = std::ranges::all_of(values, [&](auto value) { return value >= distance; });
-                } else {
-                    diverse = std::ranges::all_of(
-                        selected, [&](auto other) { return index.node_distance(candidate, other) >= distance; });
-                }
+            for (std::size_t item = 0; item < front.size(); ++item) {
+                if (item + 2 < front.size()) index.prefetch_node(front[item + 2].second);
+                const auto [distance, candidate] = front[item];
+                const bool diverse = std::ranges::all_of(
+                    selected, [&](auto other) { return index.node_distance(candidate, other) >= distance; });
                 (diverse ? selected : rejected).push_back(candidate);
-                if (selected.size() == maximum) break;
+                if (selected.size() == maximum) return selected;
+            }
+            if (front.size() < pool.size()) {
+                const auto tail = pool.subspan(prefix_limit);
+                std::vector<Pair> survivors;
+                if (parallel_for && tail.size() >= 64) {
+                    std::vector<std::uint8_t> keep(tail.size(), 0);
+                    std::mutex mutex;
+                    std::optional<Error> failure;
+                    require(parallel_for(tail.size(), [&](std::size_t item) {
+                        try {
+                            const auto [distance, candidate] = tail[item];
+                            keep[item] = std::ranges::all_of(selected, [&](auto other) {
+                                return index.node_distance(candidate, other) >= distance;
+                            });
+                        } catch (const Failure& error) {
+                            std::scoped_lock lock(mutex);
+                            if (!failure) failure = error.error();
+                        }
+                    }));
+                    if (failure) throw Failure(std::move(*failure));
+                    for (std::size_t item = 0; item < tail.size(); ++item)
+                        if (keep[item]) survivors.push_back(tail[item]);
+                } else {
+                    for (std::size_t item = 0; item < tail.size(); ++item) {
+                        if (item + 2 < tail.size()) index.prefetch_node(tail[item + 2].second);
+                        const auto [distance, candidate] = tail[item];
+                        if (std::ranges::all_of(selected, [&](auto other) {
+                                return index.node_distance(candidate, other) >= distance;
+                            }))
+                            survivors.push_back(tail[item]);
+                    }
+                }
+                std::ranges::sort(survivors);
+                const auto seed_count = selected.size();
+                for (const auto [distance, candidate] : survivors) {
+                    if (std::ranges::all_of(std::span(selected).subspan(seed_count), [&](auto other) {
+                            return index.node_distance(candidate, other) >= distance;
+                        })) {
+                        selected.push_back(candidate);
+                        if (selected.size() == maximum) return selected;
+                    }
+                }
             }
             for (auto candidate : rejected) {
                 if (selected.size() == maximum) break;
                 selected.push_back(candidate);
             }
             return selected;
+        };
+        const auto select = [&](std::uint32_t query, std::vector<Pair> pool, std::size_t maximum) {
+            std::ranges::sort(pool);
+            pool.erase(std::unique(pool.begin(), pool.end(),
+                                   [](const auto& left, const auto& right) { return left.second == right.second; }),
+                       pool.end());
+            std::erase_if(pool, [&](const auto& candidate) { return candidate.second == query; });
+            return select_sorted(pool, maximum);
         };
         for (std::uint32_t node = 1; node < nodes; ++node) {
             auto entry = graph.entry;
@@ -1148,10 +669,10 @@ auto HnswIndex::build(tensor::Tensor vectors, HnswBuildOptions options, HnswProg
                 while (changed) {
                     changed = false;
                     const auto& neighbors = build[entry].links[current_level];
-                    const auto values = distances(node, neighbors);
                     for (std::size_t item = 0; item < neighbors.size(); ++item) {
+                        if (item + 2 < neighbors.size()) index.prefetch_node(neighbors[item + 2]);
                         const auto neighbor = neighbors[item];
-                        const auto distance = values[item];
+                        const auto distance = index.node_distance(node, neighbor);
                         if (distance < best) {
                             best = distance;
                             entry = neighbor;
@@ -1163,23 +684,51 @@ auto HnswIndex::build(tensor::Tensor vectors, HnswBuildOptions options, HnswProg
             const auto connected_level = std::min(level, maximum_level);
             for (std::size_t offset = 0; offset <= connected_level; ++offset) {
                 const auto current_level = connected_level - offset;
-                auto candidates = search_layer(node, entry, options.ef_construction, current_level);
+                const auto layer_candidates = search_layer(node, entry, options.ef_construction, current_level);
+                const auto next_entry = layer_candidates.empty() ? entry : layer_candidates.front().second;
                 const auto maximum = current_level ? options.m : 2 * options.m;
-                auto selected = select(node, candidates, maximum);
+                auto selected = select_sorted(layer_candidates, maximum);
                 build[node].links[current_level] = selected;
+                std::vector<std::uint32_t> overflow;
                 for (auto neighbor : selected) {
                     auto& links = build[neighbor].links[current_level];
                     if (!std::ranges::contains(links, node)) links.push_back(node);
                     if (links.size() > maximum) {
-                        std::vector<std::pair<float, std::uint32_t>> alternatives;
+                        if (parallel_for) {
+                            overflow.push_back(neighbor);
+                            continue;
+                        }
+                        std::vector<Pair> alternatives;
                         alternatives.reserve(links.size());
-                        const auto values = distances(neighbor, links);
-                        for (std::size_t item = 0; item < links.size(); ++item)
-                            alternatives.emplace_back(values[item], links[item]);
+                        for (std::size_t idx = 0; idx < links.size(); ++idx) {
+                            if (idx + 2 < links.size()) index.prefetch_node(links[idx + 2]);
+                            alternatives.emplace_back(index.node_distance(neighbor, links[idx]), links[idx]);
+                        }
                         links = select(neighbor, std::move(alternatives), maximum);
                     }
                 }
-                if (!candidates.empty()) entry = candidates.front().second;
+                if (!overflow.empty()) {
+                    std::mutex mutex;
+                    std::optional<Error> failure;
+                    require(parallel_for(overflow.size(), [&](std::size_t item) {
+                        try {
+                            const auto neighbor = overflow[item];
+                            auto& links = build[neighbor].links[current_level];
+                            std::vector<Pair> alternatives;
+                            alternatives.reserve(links.size());
+                            for (std::size_t idx = 0; idx < links.size(); ++idx) {
+                                if (idx + 2 < links.size()) index.prefetch_node(links[idx + 2]);
+                                alternatives.emplace_back(index.node_distance(neighbor, links[idx]), links[idx]);
+                            }
+                            links = select(neighbor, std::move(alternatives), maximum);
+                        } catch (const Failure& error) {
+                            std::scoped_lock lock(mutex);
+                            if (!failure) failure = error.error();
+                        }
+                    }));
+                    if (failure) throw Failure(std::move(*failure));
+                }
+                entry = next_entry;
             }
             if (level > maximum_level) {
                 graph.entry = node;
@@ -1301,4 +850,5 @@ auto HnswIndex::search(std::span<const float> query, HnswWorkspace& workspace, s
         return std::unexpected(error.error());
     }
 }
-} // namespace kidi::core
+
+} // namespace kidi::search

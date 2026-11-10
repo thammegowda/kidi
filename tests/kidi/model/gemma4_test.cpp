@@ -1,9 +1,9 @@
-#include "kidi/core/hnsw.h"
 #include "kidi/graph/compiler.h"
 #include "kidi/model/gemma4.h"
 #include "kidi/checkpoint/safetensors/mapped.h"
 #include "kidi/inference/generator.h"
 #include "kidi/runtime/operator.h"
+#include "kidi/search/hnsw.h"
 #include "kidi/tensor/backend.h"
 #include "kidi/tensor/external.h"
 
@@ -553,11 +553,11 @@ auto check_hnsw_head(kidi::model::Gemma4& network, const kidi::tensor::Tensor& w
         ("kidi-hnsw-model-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
     try {
         auto index =
-            require(core::HnswIndex::build(weights, {.m = 2,
-                                                     .ef_construction = std::max<std::size_t>(4, weights.size(0)),
-                                                     .seed = 42,
-                                                     .candidates = weights.size(0),
-                                                     .ef_search = weights.size(0)}));
+            require(search::HnswIndex::build(weights, {.m = 2,
+                                                       .ef_construction = std::max<std::size_t>(4, weights.size(0)),
+                                                       .seed = 42,
+                                                       .candidates = weights.size(0),
+                                                       .ef_search = weights.size(0)}));
         require(index.save(path));
         if (!network->device().capabilities().compute.host()) {
             if (network->configure_lm_head(path))
@@ -590,11 +590,11 @@ auto check_hnsw_head(kidi::model::Gemma4& network, const kidi::tensor::Tensor& w
         if (run() != dense) throw std::runtime_error("head workspaces did not rebuild correctly");
         std::filesystem::remove(path);
         auto subset =
-            require(core::HnswIndex::build(weights, {.m = 4,
-                                                     .ef_construction = std::max<std::size_t>(4, weights.size(0)),
-                                                     .seed = 42,
-                                                     .candidates = 4,
-                                                     .ef_search = weights.size(0)}));
+            require(search::HnswIndex::build(weights, {.m = 4,
+                                                       .ef_construction = std::max<std::size_t>(4, weights.size(0)),
+                                                       .seed = 42,
+                                                       .candidates = 4,
+                                                       .ef_search = weights.size(0)}));
         require(subset.save(path));
         require(network->configure_lm_head(path));
         if (run() != dense) throw std::runtime_error("candidate-subset HNSW head differs from dense fixture selection");

@@ -1,6 +1,5 @@
 #include "kidi/graph/compiler.h"
 #include "kidi/model/gemma4.h"
-#include "kidi/core/hnsw.h"
 #include "kidi/runtime/operator.h"
 #include "kidi/runtime/ynn/graph.h"
 
@@ -161,8 +160,7 @@ struct Gemma4Impl::State {
           vocabulary(config["vocab_size"].as<int>()),
           per_layer_vocabulary(config["vocab_size_per_layer_input"].as<int>()),
           tokens(embedding(config["vocab_size"].as<int>(), hidden, std::sqrt(static_cast<float>(hidden)),
-                           quant_bits(config, "model.language_model.embed_tokens"),
-                           embedding_groups(config, hidden))),
+                           quant_bits(config, "model.language_model.embed_tokens"), embedding_groups(config, hidden))),
           per_layer_tokens(embedding(config["vocab_size_per_layer_input"].as<int>(), layer_count * per_layer_width,
                                      std::sqrt(static_cast<float>(per_layer_width)),
                                      quant_bits(config, "model.language_model.embed_tokens_per_layer"), layer_count)),
@@ -464,8 +462,7 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
             const auto second_zero = zeros_state.find(std::string(prefix) + std::string(second_stem) + ".weight_zero");
             if (first_zero != zeros_state.end() && second_zero != zeros_state.end()) {
                 const auto fused_zero = std::string(prefix) + std::string(fused_stem) + ".weight_zero";
-                zeros_state.emplace(fused_zero,
-                                    concatenate_projection_rows(first_zero->second, second_zero->second));
+                zeros_state.emplace(fused_zero, concatenate_projection_rows(first_zero->second, second_zero->second));
                 zeros_state.erase(first_zero);
                 zeros_state.erase(second_zero);
             }

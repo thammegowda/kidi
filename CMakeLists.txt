@@ -93,7 +93,6 @@ add_library(kidi
     src/kidi/checkpoint/package.cpp
     src/kidi/checkpoint/prepare.cpp
     src/kidi/checkpoint/weights.cpp
-    src/kidi/core/hnsw.cpp
     src/kidi/core/memory.cpp
     src/kidi/core/module.cpp
     src/kidi/core/version.cpp
@@ -131,6 +130,8 @@ add_library(kidi
     src/kidi/runtime/ynn/graph.cpp
     src/kidi/runtime/ynn/numa.cpp
     src/kidi/runtime/ynn/worker_pool.cpp
+    src/kidi/search/hnsw.cpp
+    src/kidi/search/search.cpp
     src/kidi/tensor/backend.cpp
     src/kidi/tensor/cpu_backend.cpp
     src/kidi/tensor/external.cpp

@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace kidi::core {
+namespace kidi::search {
 
 struct HnswBuildOptions {
     std::uint32_t m = 32;
@@ -81,4 +81,4 @@ private:
     std::unique_ptr<State> state_;
 };
 
-} // namespace kidi::core
+} // namespace kidi::search
