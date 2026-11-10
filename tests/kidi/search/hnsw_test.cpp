@@ -159,33 +159,72 @@ auto vector_table(std::size_t rows, std::size_t width, bool bfloat, std::vector<
                                                     kidi::tensor::DType::BF16, std::as_bytes(std::span(encoded))));
 }
 
+auto check_ground_truth_graph(std::span<const std::byte> data) -> void {
+    check(integer(data, 16, 4) == 8 && integer(data, 20, 4) == 4 && integer(data, 24, 4) == 4 &&
+              integer(data, 28, 4) == 2 && integer(data, 32, 4) == 3 && integer(data, 36, 4) == 5 &&
+              integer(data, 44, 4) == 1332379836U && integer(data, 48, 4) == 2773177997U &&
+              integer(data, 52, 4) == 2032867032U,
+          "8x4 ground-truth HNSW header metadata or checksums changed");
+    const auto base = static_cast<std::size_t>(integer(data, 64, 8));
+    const auto upper = static_cast<std::size_t>(integer(data, 72, 8));
+    for (std::size_t node = 0; node <= 8; ++node)
+        check(integer(data, base + 4 * node, 4) == 4 * node, "8x4 ground-truth base offsets changed");
+    const std::array<std::uint32_t, 32> expected_base{
+        1, 5, 6, 4, 4, 0, 3, 5, 7, 5, 6, 3, 1, 7, 5, 6, 1, 3, 0, 2, 0, 2, 3, 6, 0, 2, 3, 5, 2, 3, 5, 6,
+    };
+    const auto edges = base + 4 * 9;
+    for (std::size_t idx = 0; idx < expected_base.size(); ++idx)
+        check(integer(data, edges + 3 * idx, 3) == expected_base[idx], "8x4 ground-truth base edges changed");
+    const std::array<std::uint8_t, 66> expected_upper{
+        3, 0, 0, 0, 3, 0, 0, 2, 0, 5, 0, 0, 7, 0, 0, 5, 0, 0, 2, 0, 3, 0, 0, 7, 0, 0, 7, 0, 0, 2, 0, 3, 0,
+        0, 5, 0, 0, 2, 0, 0, 0, 3, 0, 0, 1, 0, 5, 0, 0, 5, 0, 0, 1, 0, 3, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0,
+    };
+    check(data.size() - upper == expected_upper.size(), "8x4 ground-truth upper-layer byte length changed");
+    for (std::size_t idx = 0; idx < expected_upper.size(); ++idx)
+        check(std::to_integer<std::uint8_t>(data[upper + idx]) == expected_upper[idx],
+              "8x4 ground-truth upper-layer topology changed");
+}
+
 auto brute_force_checks(const std::filesystem::path& root, bool bfloat, std::size_t width) -> void {
     using namespace kidi;
-    constexpr std::size_t rows = 256, candidates = 8;
+    constexpr std::size_t rows = 320, candidates = 8;
     std::vector<float> values;
     const auto vectors = vector_table(rows, width, bfloat, values);
     auto index = require(search::HnswIndex::build(
-        vectors, {.m = 16, .ef_construction = 128, .seed = 42, .candidates = candidates, .ef_search = rows}));
+        vectors, {.m = 16, .ef_construction = 256, .seed = 42, .candidates = candidates, .ef_search = rows}));
     check(index.size() == rows && index.width() == width && index.candidates() == candidates &&
               index.ef_search() == rows && index.runtime_bytes() > rows * sizeof(float),
           "incorrect index metadata");
     const auto path = root / (std::string(bfloat ? "bf16-" : "fp32-") + std::to_string(width) + ".hnsw");
     require(index.save(path));
+    const auto serialized = bytes(path);
+    const auto expected_crc = width == 64 ? 0x3F9D6C25U : 0xCEAEE420U;
+    check(serialized.size() == 34041 && integer(serialized, 24, 4) == 32 && integer(serialized, 32, 4) == 2 &&
+              integer(serialized, 36, 4) == 183 && integer(serialized, 48, 4) == expected_crc,
+          "320-row ground-truth HNSW topology or payload checksum changed");
+    const auto base = static_cast<std::size_t>(integer(serialized, 64, 8));
+    const auto edges = base + 4 * (rows + 1);
+    const std::array<std::uint32_t, 8> expected_first8 =
+        width == 64 ? std::array<std::uint32_t, 8>{129, 248, 173, 313, 277, 79, 111, 213}
+                    : std::array<std::uint32_t, 8>{229, 319, 89, 179, 225, 255, 254, 149};
+    for (std::size_t idx = 0; idx < expected_first8.size(); ++idx)
+        check(integer(serialized, edges + 3 * idx, 3) == expected_first8[idx],
+              "320-row ground-truth node-0 neighbor list changed");
     runtime::ynn::set_thread_count(4);
     require(runtime::ynn::reserve_thread_pool(4));
     std::size_t parallel_calls = 0;
     auto threaded = require(search::HnswIndex::build(
-        vectors, {.m = 16, .ef_construction = 128, .seed = 42, .candidates = candidates, .ef_search = rows}, {},
+        vectors, {.m = 16, .ef_construction = 256, .seed = 42, .candidates = candidates, .ef_search = rows}, {},
         [&](std::size_t count, std::function<void(std::size_t)> body) {
             ++parallel_calls;
             return runtime::ynn::parallel_for(count, std::move(body));
         }));
     const auto parallel_path = path.string() + ".parallel";
     require(threaded.save(parallel_path));
-    check(parallel_calls > 0 && bytes(parallel_path) == bytes(path),
+    check(parallel_calls > 0 && bytes(parallel_path) == serialized,
           "threaded construction changed graph order or values");
     const auto failed_executor = search::HnswIndex::build(
-        vectors, {.m = 16, .ef_construction = 128, .seed = 42, .candidates = candidates, .ef_search = rows}, {},
+        vectors, {.m = 16, .ef_construction = 256, .seed = 42, .candidates = candidates, .ef_search = rows}, {},
         [](std::size_t, std::function<void(std::size_t)>) -> Result<void> {
             return std::unexpected(Error{ErrorCode::RUNTIME, "test executor failure"});
         });
@@ -521,6 +560,7 @@ auto main() -> int {
         require(first.save(first_path));
         require(second.save(second_path));
         if (bytes(first_path) != bytes(second_path)) throw std::runtime_error("deterministic HNSW files differ");
+        check_ground_truth_graph(bytes(first_path));
         auto loaded = require(search::HnswIndex::load(first_path, vectors));
         require(loaded.save(root / "roundtrip.hnsw"));
         check(bytes(root / "roundtrip.hnsw") == bytes(first_path), "graph order changed during round trip");

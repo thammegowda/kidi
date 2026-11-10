@@ -508,16 +508,11 @@ auto HnswIndex::build(tensor::Tensor vectors, HnswBuildOptions options, HnswProg
         std::uint32_t epoch = 0;
         using Pair = std::pair<float, std::uint32_t>;
         std::vector<Pair> nearest, candidates;
-        constexpr std::size_t wave_pops = 32, dirty_slack = 512;
-        nearest.reserve(options.ef_construction + wave_pops * 2 * static_cast<std::size_t>(options.m) + dirty_slack);
+        constexpr std::size_t wave_pops = 32;
+        nearest.reserve(options.ef_construction + 1);
         candidates.reserve(options.ef_construction * 2);
         unseen.reserve(wave_pops * 2 * static_cast<std::size_t>(options.m) + 1);
         unseen_distances.reserve(wave_pops * 2 * static_cast<std::size_t>(options.m) + 1);
-        const auto compact_nearest = [&](std::size_t ef) -> float {
-            std::nth_element(nearest.begin(), nearest.begin() + static_cast<std::ptrdiff_t>(ef - 1), nearest.end());
-            nearest.resize(ef);
-            return nearest[ef - 1].first;
-        };
         const auto search_layer = [&](std::uint32_t query, std::uint32_t entry, std::size_t ef,
                                       std::size_t level) -> std::span<const Pair> {
             if (++epoch == 0) {
@@ -530,12 +525,13 @@ auto HnswIndex::build(tensor::Tensor vectors, HnswBuildOptions options, HnswProg
             nearest.emplace_back(initial, entry);
             candidates.emplace_back(initial, entry);
             visited[entry] = epoch;
-            float upper_bound = nearest.size() == ef ? initial : std::numeric_limits<float>::infinity();
+            bool nearest_heap = ef == 1;
             const std::size_t max_pops = !level && ef >= 256 ? wave_pops : 1;
             while (!candidates.empty()) {
+                if (nearest_heap && candidates.front().first > nearest.front().first) break;
                 unseen.clear();
                 for (std::size_t pop_index = 0; pop_index < max_pops && !candidates.empty(); ++pop_index) {
-                    if (candidates.front().first > upper_bound) break;
+                    if (nearest_heap && candidates.front().first > nearest.front().first) break;
                     std::pop_heap(candidates.begin(), candidates.end(), std::greater<>{});
                     const auto current = candidates.back().second;
                     candidates.pop_back();
@@ -545,7 +541,7 @@ auto HnswIndex::build(tensor::Tensor vectors, HnswBuildOptions options, HnswProg
                         unseen.push_back(neighbor);
                     }
                 }
-                if (unseen.empty()) break;
+                if (unseen.empty()) continue;
                 unseen_distances.resize(unseen.size());
                 if (parallel_for && unseen.size() >= 64) {
                     std::mutex mutex;
@@ -565,27 +561,35 @@ auto HnswIndex::build(tensor::Tensor vectors, HnswBuildOptions options, HnswProg
                         unseen_distances[item] = index.node_distance(query, unseen[item]);
                     }
                 }
+                bool rebuild_candidates = unseen.size() >= candidates.size() / 4 && unseen.size() >= 8;
                 for (std::size_t item = 0; item < unseen.size(); ++item) {
                     const auto value = unseen_distances[item];
-                    if (value < upper_bound) nearest.emplace_back(value, unseen[item]);
-                }
-                const bool compacted =
-                    (!std::isfinite(upper_bound) && nearest.size() >= ef) || nearest.size() >= ef + dirty_slack;
-                if (compacted) {
-                    upper_bound = compact_nearest(ef);
-                    std::erase_if(candidates, [&](const Pair& item) { return item.first > upper_bound; });
-                }
-                const bool rebuild_candidates = compacted || unseen.size() >= candidates.size() / 4;
-                for (std::size_t item = 0; item < unseen.size(); ++item) {
-                    const auto value = unseen_distances[item];
-                    if (value < upper_bound) {
-                        candidates.emplace_back(value, unseen[item]);
+                    const auto neighbor = unseen[item];
+                    if (!nearest_heap) {
+                        nearest.emplace_back(value, neighbor);
+                        if (nearest.size() == ef) {
+                            std::make_heap(nearest.begin(), nearest.end());
+                            nearest_heap = true;
+                            rebuild_candidates = true;
+                        }
+                        candidates.emplace_back(value, neighbor);
+                        if (!rebuild_candidates) std::push_heap(candidates.begin(), candidates.end(), std::greater<>{});
+                    } else if (value < nearest.front().first) {
+                        std::pop_heap(nearest.begin(), nearest.end());
+                        nearest.back() = {value, neighbor};
+                        std::push_heap(nearest.begin(), nearest.end());
+                        candidates.emplace_back(value, neighbor);
                         if (!rebuild_candidates) std::push_heap(candidates.begin(), candidates.end(), std::greater<>{});
                     }
                 }
-                if (rebuild_candidates) std::make_heap(candidates.begin(), candidates.end(), std::greater<>{});
+                if (rebuild_candidates) {
+                    if (nearest_heap) {
+                        const float bound = nearest.front().first;
+                        std::erase_if(candidates, [bound](const Pair& item) { return item.first > bound; });
+                    }
+                    std::make_heap(candidates.begin(), candidates.end(), std::greater<>{});
+                }
             }
-            if (nearest.size() > ef) compact_nearest(ef);
             const auto sorted_prefix = std::min<std::size_t>(nearest.size(), std::max<std::size_t>(2 * options.m, 66));
             std::partial_sort(nearest.begin(), nearest.begin() + static_cast<std::ptrdiff_t>(sorted_prefix),
                               nearest.end());
