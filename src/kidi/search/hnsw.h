@@ -26,8 +26,10 @@ struct HnswNeighbor {
 };
 
 struct HnswWorkspace {
-    std::vector<std::uint32_t> visited;
+    std::vector<std::uint64_t> visited;
     std::uint32_t epoch = 0;
+    std::vector<std::uint32_t> unseen;
+    std::vector<float> unseen_distances;
     std::vector<std::pair<float, std::uint32_t>> frontier, nearest;
     std::vector<HnswNeighbor> result;
     std::vector<std::int8_t> q_i8;
@@ -59,8 +61,8 @@ public:
     /// Atomically publishes a complete graph-only file; existing paths are never overwritten.
     auto save(const std::filesystem::path& path) const -> Result<void>;
     /// The result borrows workspace storage until its next search; concurrent queries need separate workspaces.
-    auto search(std::span<const float> query, HnswWorkspace& workspace, std::size_t candidates = 0,
-                std::size_t ef = 0) const -> Result<std::span<const HnswNeighbor>>;
+    auto search(std::span<const float> query, HnswWorkspace& workspace, std::size_t candidates = 0, std::size_t ef = 0,
+                HnswParallelFor parallel_for = {}) const -> Result<std::span<const HnswNeighbor>>;
 
     auto size() const noexcept -> std::size_t;
     auto width() const noexcept -> std::size_t;

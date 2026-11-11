@@ -223,8 +223,10 @@ auto LinearImpl::select(ops::Context& context, const Tensor& query, ops::TokenOu
     auto selected = require(slot.selected.data<std::int32_t>());
     std::ranges::fill(slot.errors, std::nullopt);
     const auto search = [&](std::size_t row) {
+        search::HnswParallelFor inner_parallel;
+        if (rows == 1 && runtime::ynn::thread_count() > 1) inner_parallel = runtime::ynn::parallel_for;
         auto found = index.search(queries.subspan(row * width, width), hnsw_->search_workspaces[row], candidates,
-                                  hnsw_->ef_search);
+                                  hnsw_->ef_search, std::move(inner_parallel));
         if (!found) {
             slot.errors[row] = std::move(found.error());
             return;

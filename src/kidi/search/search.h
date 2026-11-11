@@ -3,6 +3,7 @@
 #include "kidi/core/error.h"
 #include "kidi/tensor/dtype.h"
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -86,23 +87,30 @@ inline auto pop(std::vector<std::pair<float, std::uint32_t>>& heap) -> std::pair
 }
 
 using Dot = float (*)(const float*, const std::byte*, std::size_t);
+using Dot4 = std::array<float, 4> (*)(const float*, const std::byte*, const std::byte*, const std::byte*,
+                                      const std::byte*, std::size_t);
 using RowDot = float (*)(const std::byte*, const std::byte*, std::size_t);
 
 auto hnsw_crc32(std::span<const std::byte> bytes) -> std::uint32_t;
 auto read_file(const std::filesystem::path& path) -> Result<std::vector<std::byte>>;
 auto save_atomic_file(const std::filesystem::path& path, std::span<const std::byte> bytes) -> Result<void>;
-auto dot_kernels(tensor::DType dtype) -> std::pair<Dot, RowDot>;
+auto dot_kernels(tensor::DType dtype) -> std::tuple<Dot, Dot4, RowDot>;
 auto weight_element(const std::byte* row, std::size_t column, bool bfloat) noexcept -> float;
-auto prefetch_row(const std::byte* row_ptr, std::size_t row_bytes, std::int32_t bits, std::size_t label,
-                  std::size_t groups, std::span<const std::byte> scale_bytes, bool scale_f16,
-                  std::span<const std::byte> zero_bytes, bool zero_f16, bool has_zero) noexcept -> void;
+auto prefetch_slice(const std::byte* slice_ptr, std::size_t slice_bytes) noexcept -> void;
+auto quantized_slice_bytes(std::size_t width, std::int32_t bits, std::int32_t group_size, bool scale_f16, bool zero_f16,
+                           bool has_zero) noexcept -> std::size_t;
+auto pack_quantized_slice(std::byte* dst, const std::byte* w_row, const std::byte* s_row, const std::byte* z_row,
+                          std::size_t width, std::int32_t bits, std::int32_t group_size, bool scale_f16, bool zero_f16,
+                          bool has_zero) noexcept -> void;
 auto prepare_quantized_query(std::span<const float> query, std::size_t width, std::int32_t bits,
                              std::int32_t group_size, float input_scale, std::vector<std::int8_t>& q_i8,
                              std::vector<float>& q_scale, std::vector<float>& q_bsum) -> void;
-auto quantized_row_dot(const std::uint8_t* w_row, std::size_t label, std::size_t width, std::int32_t bits,
-                       std::int32_t group_size, std::span<const std::byte> scale_bytes, bool scale_f16,
-                       std::span<const std::byte> zero_bytes, bool zero_f16, bool has_zero,
-                       const std::vector<std::int8_t>& q_i8, const std::vector<float>& q_scale,
-                       const std::vector<float>& q_bsum) -> float;
+auto quantized_slice_dot(const std::byte* slice_ptr, std::size_t width, std::int32_t bits, std::int32_t group_size,
+                         bool scale_f16, bool zero_f16, bool has_zero, const std::vector<std::int8_t>& q_i8,
+                         const std::vector<float>& q_scale, const std::vector<float>& q_bsum) -> float;
+auto quantized_slices4_dot(const std::byte* s0, const std::byte* s1, const std::byte* s2, const std::byte* s3,
+                           std::size_t width, std::int32_t bits, std::int32_t group_size, bool scale_f16, bool zero_f16,
+                           bool has_zero, const std::vector<std::int8_t>& q_i8, const std::vector<float>& q_scale,
+                           const std::vector<float>& q_bsum) -> std::array<float, 4>;
 
 } // namespace kidi::search

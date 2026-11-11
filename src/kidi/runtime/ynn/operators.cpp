@@ -4,7 +4,6 @@
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/ops/context.h"
 #include "ynnpack/composites/composites.h"
-#include "ynnpack/kernels/unary/unary.h"
 #include <array>
 #include <compare>
 #include <functional>
@@ -16,10 +15,6 @@
 #include <algorithm>
 #include <limits>
 #include <cstdlib>
-
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
 
 #if defined(__APPLE__)
 #define ACCELERATE_NEW_LAPACK
@@ -66,21 +61,10 @@ auto transpose_packed_tile(const Tensor& input, std::int32_t bits, std::size_t r
     if (input.dtype() != DType::U8 || input.dimensions() != 2 || row_start + row_count > input.size(0) ||
         column_start + column_count > logical_columns || row_count % values_per_byte)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed feed-forward tile"});
-    const auto& source_tensor = input;
-    const auto source = require(source_tensor.data<std::uint8_t>());
-    const auto destination_row_bytes = row_count / values_per_byte;
-    std::vector<std::uint8_t> destination(column_count * destination_row_bytes);
-    const auto mask = static_cast<std::uint8_t>((1 << bits) - 1);
-    for (std::size_t row = 0; row < row_count; ++row)
-        for (std::size_t column = 0; column < column_count; ++column) {
-            const auto source_column = column_start + column;
-            const auto value = static_cast<std::uint8_t>(
-                (source[(row_start + row) * input.size(1) + source_column / values_per_byte] >>
-                 ((source_column % values_per_byte) * bits)) &
-                mask);
-            destination[column * destination_row_bytes + row / values_per_byte] |=
-                static_cast<std::uint8_t>(value << ((row % values_per_byte) * bits));
-        }
+    const auto source = require(input.data<std::uint8_t>());
+    std::vector<std::uint8_t> destination(column_count * (row_count / values_per_byte));
+    ::ynn::transpose_packed_subbyte_tile(bits, source.data(), static_cast<std::size_t>(input.size(1)), row_start,
+                                         row_count, column_start, column_count, destination.data());
     return destination;
 }
 auto hash_tensor(const Tensor& tensor, std::uint64_t hash = 0x9E3779B97F4A7C15ULL) -> std::uint64_t {
@@ -175,22 +159,8 @@ public:
 private:
     static auto select(const Tensor& logits, Tensor& output) -> void {
         const auto width = logits.size(-1), rows = logits.numel() / width;
-        const auto values = require(logits.data<float>());
-        auto tokens = require(output.data<std::int32_t>());
-        for (std::size_t row = 0; row < rows; ++row) {
-            float best = -std::numeric_limits<float>::infinity();
-            std::int32_t token = -1;
-            bool invalid = false;
-            for (std::size_t column = 0; column < width; ++column) {
-                const auto value = values[row * width + column];
-                invalid |= std::isnan(value) || value == std::numeric_limits<float>::infinity();
-                if (value > best) {
-                    best = value;
-                    token = column;
-                }
-            }
-            tokens[row] = invalid ? -1 : token;
-        }
+        ::ynn::argmax_rows_f32(rows, width, require(logits.data<float>()).data(),
+                               require(output.data<std::int32_t>()).data());
     }
 
     OutputPool pool_;
@@ -212,17 +182,13 @@ public:
 private:
     auto quantize(const Tensor& input, Tensor& output) const -> void {
         const auto source = require(input.data<float>());
-        auto destination = require(output.data<std::int8_t>());
-        for (std::size_t index = 0; index < source.size(); ++index) {
-            const auto rounded = std::nearbyint(source[index] / scale_);
-            destination[index] = static_cast<std::int8_t>(std::clamp(rounded, -128.F, 127.F));
-        }
+        ::ynn::quantize_symmetric_int8_f32(source.size(), scale_, source.data(),
+                                           require(output.data<std::int8_t>()).data());
     }
 
     float scale_;
     OutputPool pool_;
 };
-/// Token rows gathered from FP32/BF16 tables, or signed 2/4/8-bit tables with per-row group scales, times a multiplier.
 /// Splits `rows` across the thread pool in contiguous blocks; small problems run on the calling thread.
 auto for_rows(std::size_t rows, std::size_t row_work, const std::function<void(std::size_t, std::size_t)>& body)
     -> void {
@@ -235,14 +201,10 @@ auto for_rows(std::size_t rows, std::size_t row_work, const std::function<void(s
     }));
 }
 
-class SiluGate final : public Operator {
+class GatedActivationOp final : public Operator {
 public:
-    SiluGate(const Tensor& input, tensor::Arena& arena)
-        : rows_(input.numel() / input.size(-1)),
-          width_(input.size(-1) / 2),
-          tasks_(rows_ * input.size(-1) < 32768 ? 1 : std::min(ynn::thread_count(), rows_)),
-          scratch_(tasks_ * width_),
-          pool_(&arena) {
+    GatedActivationOp(const Tensor& input, bool silu, tensor::Arena& arena)
+        : rows_(input.numel() / input.size(-1)), width_(input.size(-1) / 2), silu_(silu), pool_(&arena) {
         shape_.assign(input.shape().begin(), input.shape().end());
         shape_.back() = static_cast<std::int64_t>(width_);
     }
@@ -257,140 +219,24 @@ public:
         apply(inputs[0], output);
         return output;
     }
-
     auto run_(TensorInputs, Tensor&) -> Tensor override {
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "SiLU gate is not an in-place operation"});
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "gated activation is not an in-place operation"});
     }
-
     auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs[0]); }
-
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
-    auto apply(const Tensor& input, Tensor& output) -> void {
+    auto apply(const Tensor& input, Tensor& output) const -> void {
         const auto* source = require(input.data<float>()).data();
         auto* target = require(output.data<float>()).data();
-        const auto rows_per_task = (rows_ + tasks_ - 1) / tasks_;
-        require(ynn::parallel_for(tasks_, [&](std::size_t task) {
-            const auto begin = task * rows_per_task, end = std::min(rows_, begin + rows_per_task);
-#if defined(__APPLE__)
-            auto* temporary = scratch_.data() + task * width_;
-            const auto count = static_cast<int>(width_);
-            const float one = 1.F;
-#else
-            static const auto sigmoid =
-                ::ynn::get_unary_kernel(ynn_unary_sigmoid, ynn_type_fp32, ynn_type_fp32);
-            static const auto sigmoid_params = ::ynn::get_unary_params(ynn_unary_sigmoid);
-            if (!sigmoid) throw ops::Failure({ErrorCode::UNSUPPORTED, "FP32 sigmoid kernel is unavailable"});
-#endif
-            for (auto row = begin; row < end; ++row) {
-                const auto* gate = source + row * 2 * width_;
-                const auto* up = gate + width_;
-                auto* hidden = target + row * width_;
-#if defined(__APPLE__)
-                vDSP_vneg(gate, 1, temporary, 1, width_);
-                vvexpf(hidden, temporary, &count);
-                vDSP_vsadd(hidden, 1, &one, hidden, 1, width_);
-                vDSP_vdiv(hidden, 1, gate, 1, temporary, 1, width_);
-                vDSP_vmul(temporary, 1, up, 1, hidden, 1, width_);
-#else
-                sigmoid(1, width_, width_ * sizeof(float), gate, width_ * sizeof(float), hidden, &sigmoid_params);
-                std::size_t channel = 0;
-#if defined(__ARM_NEON)
-                for (; channel + 8 <= width_; channel += 8) {
-                    const auto first = vmulq_f32(vld1q_f32(hidden + channel), vld1q_f32(gate + channel));
-                    const auto second = vmulq_f32(vld1q_f32(hidden + channel + 4), vld1q_f32(gate + channel + 4));
-                    vst1q_f32(hidden + channel, vmulq_f32(first, vld1q_f32(up + channel)));
-                    vst1q_f32(hidden + channel + 4, vmulq_f32(second, vld1q_f32(up + channel + 4)));
-                }
-#endif
-                for (; channel < width_; ++channel) hidden[channel] *= gate[channel] * up[channel];
-#endif
-            }
-        }));
+        for_rows(rows_, 2 * width_, [&](std::size_t begin, std::size_t end) {
+            check(silu_ ? ::ynn::silu_gate_f32(rows_, width_, source, target, begin, end)
+                        : ::ynn::gelu_gate_f32(rows_, width_, source, target, begin, end));
+        });
     }
 
-    std::size_t rows_, width_, tasks_;
-    std::vector<float> scratch_;
-    std::vector<std::int64_t> shape_;
-    OutputPool pool_;
-};
-
-class GeluGate final : public Operator {
-public:
-    GeluGate(const Tensor& input, tensor::Arena& arena)
-        : rows_(input.numel() / input.size(-1)),
-          width_(input.size(-1) / 2),
-          tasks_(rows_ * input.size(-1) < 32768 ? 1 : std::min(ynn::thread_count(), rows_)),
-          pool_(&arena) {
-        shape_.assign(input.shape().begin(), input.shape().end());
-        shape_.back() = static_cast<std::int64_t>(width_);
-    }
-
-    static auto supports(TensorInputs inputs) -> bool {
-        return inputs.size() == 1 && inputs[0].dtype() == DType::F32 && inputs[0].dimensions() > 0 &&
-               inputs[0].is_contiguous() && inputs[0].size(-1) > 0 && inputs[0].size(-1) % 2 == 0;
-    }
-
-    auto run(TensorInputs inputs) -> Tensor override {
-        auto output = pool_.acquire(shape_, DType::F32, tensor::Device::cpu());
-        apply(inputs[0], output);
-        return output;
-    }
-
-    auto run_(TensorInputs, Tensor&) -> Tensor override {
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "GELU gate is not an in-place operation"});
-    }
-
-    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs[0]); }
-
-    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
-
-private:
-    auto apply(const Tensor& input, Tensor& output) -> void {
-        const auto* source = require(input.data<float>()).data();
-        auto* target = require(output.data<float>()).data();
-        static const auto tanh_kernel = ::ynn::get_unary_kernel(ynn_unary_tanh, ynn_type_fp32, ynn_type_fp32);
-        static const auto tanh_params = ::ynn::get_unary_params(ynn_unary_tanh);
-        if (!tanh_kernel) throw ops::Failure({ErrorCode::UNSUPPORTED, "FP32 tanh kernel is unavailable"});
-        const auto rows_per_task = (rows_ + tasks_ - 1) / tasks_;
-        const auto run_task = [&](std::size_t task) {
-            const auto begin = task * rows_per_task, end = std::min(rows_, begin + rows_per_task);
-            constexpr float SCALE = 0.79788456080286535588F; // sqrt(2 / pi)
-            for (auto row = begin; row < end; ++row) {
-                const auto* gate = source + row * 2 * width_;
-                const auto* up = gate + width_;
-                auto* hidden = target + row * width_;
-                constexpr std::size_t CHUNK = 1024;
-                for (std::size_t offset = 0; offset < width_; offset += CHUNK) {
-                    const auto count = std::min(CHUNK, width_ - offset);
-                    {
-#pragma clang fp contract(off)
-                        for (std::size_t i = 0; i < count; ++i) {
-                            const auto g = gate[offset + i];
-                            hidden[offset + i] = (g + (g * g * g) * 0.044715F) * SCALE;
-                        }
-                    }
-                    tanh_kernel(1, count, count * sizeof(float), hidden + offset, count * sizeof(float),
-                                hidden + offset, &tanh_params);
-                    {
-#pragma clang fp contract(off)
-                        for (std::size_t i = 0; i < count; ++i) {
-                            hidden[offset + i] =
-                                ((gate[offset + i] * 0.5F) * (1.F + hidden[offset + i])) * up[offset + i];
-                        }
-                    }
-                }
-            }
-        };
-        if (tasks_ <= 1) {
-            run_task(0);
-            return;
-        }
-        require(ynn::parallel_for(tasks_, run_task));
-    }
-
-    std::size_t rows_, width_, tasks_;
+    std::size_t rows_, width_;
+    bool silu_;
     std::vector<std::int64_t> shape_;
     OutputPool pool_;
 };
@@ -423,29 +269,14 @@ public:
 private:
     static auto apply(TensorInputs inputs, Tensor& output) -> void {
         const auto &input = inputs[0], &cosine = inputs[1];
-        const auto rows = input.size(1), heads = input.size(2), width = input.size(3), half = width / 2;
+        const auto rows = input.size(1), heads = input.size(2), width = input.size(3);
         const auto shared_angles = cosine.size(0) == 1;
         const auto* source = require(input.data<float>()).data();
         const auto* cosines = require(cosine.data<float>()).data();
         const auto* sines = require(inputs[2].data<float>()).data();
         auto* target = require(output.data<float>()).data();
         for_rows(input.size(0) * rows, heads * width, [&](std::size_t begin, std::size_t end) {
-        // Matches the separate multiply, subtract, and add of the graph path: no fused multiply-add.
-#pragma clang fp contract(off)
-            for (auto row = begin; row < end; ++row) {
-                const auto angle = (shared_angles ? row % rows : row) * half;
-                const auto* c = cosines + angle;
-                const auto* s = sines + angle;
-                for (std::size_t head = 0; head < heads; ++head) {
-                    const auto* x = source + (row * heads + head) * width;
-                    auto* y = target + (row * heads + head) * width;
-                    for (std::size_t index = 0; index < half; ++index) {
-                        const auto first = x[index], second = x[index + half];
-                        y[index] = first * c[index] - second * s[index];
-                        y[index + half] = second * c[index] + first * s[index];
-                    }
-                }
-            }
+            ::ynn::rotary_f32(rows, heads, width, shared_angles, source, cosines, sines, target, begin, end);
         });
     }
     OutputPool pool_;
@@ -567,31 +398,25 @@ private:
         const auto scale = residual_ && inputs.size() == 4 ? require(inputs[3].data<float>())[0] : 1.F;
         const bool scaled = residual_ && inputs.size() == 4;
         auto* target = require(output.data<float>()).data();
-        const auto reciprocal = 1.F / static_cast<float>(width);
         for_rows(rows, width, [&](std::size_t begin, std::size_t end) {
+#if defined(__clang__)
 #pragma clang fp contract(off)
+#endif
+            if (!pytorch_parity_) {
+                ::ynn::rms_norm_f32(rows, width, epsilon_, source, weight, residual, scaled, scale, target, begin, end);
+                return;
+            }
             for (auto row = begin; row < end; ++row) {
                 const auto* x = source + row * width;
                 auto* y = target + row * width;
-                std::size_t index = 0;
-                auto sum = 0.F;
-                if (pytorch_parity_) {
-                    sum = parity::sum_squares(std::span(x, width));
-                } else {
-                    std::array<float, 8> partial{};
-                    for (; index + 8 <= width; index += 8)
-                        for (std::size_t lane = 0; lane < 8; ++lane) partial[lane] += x[index + lane] * x[index + lane];
-                    for (; index < width; ++index) sum += x[index] * x[index];
-                    for (const auto value : partial) sum += value;
-                }
-                const auto mean = pytorch_parity_ ? sum / static_cast<float>(width) : sum * reciprocal;
-                const auto inverse = 1.F / std::sqrt(mean + epsilon_);
+                const auto sum = parity::sum_squares(std::span(x, width));
+                const auto inverse = 1.F / std::sqrt(sum / static_cast<float>(width) + epsilon_);
                 if (!residual_) {
-                    for (index = 0; index < width; ++index) y[index] = x[index] * inverse * weight[index];
+                    for (std::size_t index = 0; index < width; ++index) y[index] = x[index] * inverse * weight[index];
                     continue;
                 }
                 const auto* r = residual + row * width;
-                for (index = 0; index < width; ++index) {
+                for (std::size_t index = 0; index < width; ++index) {
                     const auto value = r[index] + x[index] * inverse * weight[index];
                     y[index] = scaled ? value * scale : value;
                 }
@@ -642,14 +467,11 @@ public:
         apply(inputs, output);
         return output;
     }
-
     auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
         apply(inputs, destination);
         return destination;
     }
-
     auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
-
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
@@ -658,44 +480,16 @@ private:
         const auto rows = sliced_ ? sequence_length_ : input.size(1);
         const auto heads = sliced_ ? heads_ : input.size(2);
         const auto width = sliced_ ? width_ : input.size(3);
-        const auto half = width / 2;
         const auto vectors = input.size(0) * rows * heads;
         const auto* source = require(input.data<float>()).data();
         const auto* weight = require(inputs[1].data<float>()).data();
         const auto* cosines = require(cosine.data<float>()).data();
         const auto* sines = require(inputs[3].data<float>()).data();
         auto* target = require(output.data<float>()).data();
-        const auto shared_angles = cosine.size(0) == 1;
-        const auto reciprocal = 1.F / static_cast<float>(width);
         for_rows(vectors, width, [&](std::size_t begin, std::size_t end) {
-#pragma clang fp contract(off)
-            for (auto vector = begin; vector < end; ++vector) {
-                const auto sample = vector / (rows * heads);
-                const auto position = vector / heads % rows;
-                const auto head = vector % heads;
-                const auto* x = sliced_
-                                    ? source + (sample * input.size(1) + sequence_offset_ + position) * input.size(2) +
-                                          channel_offset_ + head * width
-                                    : source + vector * width;
-                auto* y = target + vector * width;
-                std::array<float, 8> partial{};
-                std::size_t index = 0;
-                for (; index + 8 <= width; index += 8)
-                    for (std::size_t lane = 0; lane < 8; ++lane) partial[lane] += x[index + lane] * x[index + lane];
-                auto sum = 0.F;
-                for (; index < width; ++index) sum += x[index] * x[index];
-                for (const auto value : partial) sum += value;
-                const auto inverse = 1.F / std::sqrt(sum * reciprocal + epsilon_);
-                const auto angle = (shared_angles ? position : sample * rows + position) * half;
-                const auto* c = cosines + angle;
-                const auto* s = sines + angle;
-                for (index = 0; index < half; ++index) {
-                    const auto first = x[index] * inverse * weight[index];
-                    const auto second = x[index + half] * inverse * weight[index + half];
-                    y[index] = first * c[index] - second * s[index];
-                    y[index + half] = second * c[index] + first * s[index];
-                }
-            }
+            ::ynn::rms_rotary_f32(rows, heads, width, sliced_, input.size(1), input.size(2), sequence_offset_,
+                                  channel_offset_, epsilon_, cosine.size(0) == 1, source, weight, cosines, sines,
+                                  target, begin, end);
         });
     }
 
@@ -719,13 +513,14 @@ public:
         const auto stored = packed ? width_ / (8 / bits_) : width_;
         const auto valid_scale_dtype = [](DType dt) { return dt == DType::F32 || dt == DType::F16; };
         if (weight.size(1) != stored || (packed && width_ % (8 / bits_)) ||
-            (packed ? (weight.dtype() != DType::U8 && !(bits_ == 8 && weight.dtype() == DType::I8)) ||
-                          (inputs.size() != 3 && inputs.size() != 4) || !valid_scale_dtype(inputs[2].dtype()) ||
-                          inputs[2].dimensions() != 2 || inputs[2].size(0) != weight.size(0) ||
-                          inputs[2].size(1) != groups_ || !groups_ || width_ % groups_ ||
-                          (inputs.size() == 4 && (!valid_scale_dtype(inputs[3].dtype()) || inputs[3].dimensions() != 2 ||
-                                                  inputs[3].size(0) != weight.size(0) || inputs[3].size(1) != groups_))
-                    : weight.dtype() != DType::F32 && weight.dtype() != DType::BF16))
+            (packed
+                 ? (weight.dtype() != DType::U8 && !(bits_ == 8 && weight.dtype() == DType::I8)) ||
+                       (inputs.size() != 3 && inputs.size() != 4) || !valid_scale_dtype(inputs[2].dtype()) ||
+                       inputs[2].dimensions() != 2 || inputs[2].size(0) != weight.size(0) ||
+                       inputs[2].size(1) != groups_ || !groups_ || width_ % groups_ ||
+                       (inputs.size() == 4 && (!valid_scale_dtype(inputs[3].dtype()) || inputs[3].dimensions() != 2 ||
+                                               inputs[3].size(0) != weight.size(0) || inputs[3].size(1) != groups_))
+                 : weight.dtype() != DType::F32 && weight.dtype() != DType::BF16))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid embedding table layout"});
     }
     auto run(TensorInputs inputs) -> Tensor override {
@@ -745,63 +540,20 @@ private:
     auto lookup(TensorInputs inputs, Tensor& output) const -> void {
         const auto tokens = require(inputs[0].data<std::int32_t>());
         const auto& weight = inputs[1];
-        const auto bytes = require(weight.host_bytes());
-        auto values = require(output.data<float>());
         for (const auto token : tokens)
             if (token < 0 || static_cast<std::size_t>(token) >= weight.size(0))
                 throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "embedding token outside vocabulary"});
-        if (bits_) {
-            const auto s_bytes = require(inputs[2].host_bytes());
-            const auto z_bytes = inputs.size() == 4 ? require(inputs[3].host_bytes()) : std::span<const std::byte>{};
-            const bool s_f16 = inputs[2].dtype() == DType::F16;
-            const bool z_f16 = inputs.size() == 4 && inputs[3].dtype() == DType::F16;
-            const auto* s_f32 = s_f16 ? nullptr : reinterpret_cast<const float*>(s_bytes.data());
-            const auto* z_f32 = (inputs.size() == 4 && !z_f16) ? reinterpret_cast<const float*>(z_bytes.data()) : nullptr;
-            const auto read_val = [](const std::byte* base, bool is_f16, const float* f32_ptr,
-                                     std::size_t idx) -> float {
-                if (!is_f16) return f32_ptr[idx];
-#if defined(__aarch64__) || defined(__arm64__)
-                return static_cast<float>(reinterpret_cast<const __fp16*>(base)[idx]);
-#else
-                std::uint16_t h = reinterpret_cast<const std::uint16_t*>(base)[idx];
-                std::uint32_t sign = (h & 0x8000U) << 16;
-                std::uint32_t exp = (h >> 10) & 0x1FU;
-                std::uint32_t mant = h & 0x03FFU;
-                std::uint32_t bits = exp == 0 ? sign : (exp == 31 ? (sign | 0x7F800000U | (mant << 13))
-                                                                  : (sign | ((exp + 112) << 23) | (mant << 13)));
-                return std::bit_cast<float>(bits);
-#endif
-            };
-            const bool has_zeros = inputs.size() == 4;
-            const auto group_width = width_ / groups_, per_byte = static_cast<std::size_t>(8 / bits_);
-            const auto data = reinterpret_cast<const std::uint8_t*>(bytes.data());
-            const auto sign = 1 << (bits_ - 1);
-            const std::uint8_t sign_mask = unsigned_packed_ ? (bits_ == 2 ? 0xaaU : bits_ == 4 ? 0x88U : 0U) : 0U;
-            for (std::size_t row = 0; row < tokens.size(); ++row)
-                for (std::size_t channel = 0; channel < width_; ++channel) {
-                    const auto offset = static_cast<std::size_t>(tokens[row]) * width_ + channel;
-                    const auto byte = static_cast<std::uint8_t>(data[offset / per_byte] ^ sign_mask);
-                    const auto raw = (byte >> ((offset % per_byte) * bits_)) & ((1 << bits_) - 1);
-                    const auto integer = (raw ^ sign) - sign;
-                    const auto group_index = static_cast<std::size_t>(tokens[row]) * groups_ + channel / group_width;
-                    const auto sc = read_val(s_bytes.data(), s_f16, s_f32, group_index);
-                    const auto zr = has_zeros ? read_val(z_bytes.data(), z_f16, z_f32, group_index) : 0.F;
-                    const auto dequantized = integer * sc + zr;
-                    values[row * width_ + channel] = dequantized * multiplier_;
-                }
-            return;
-        }
-        for (std::size_t row = 0; row < tokens.size(); ++row)
-            for (std::size_t channel = 0; channel < width_; ++channel) {
-                const auto offset = static_cast<std::size_t>(tokens[row]) * width_ + channel;
-                const auto value =
-                    weight.dtype() == DType::BF16
-                        ? std::bit_cast<float>(
-                              static_cast<std::uint32_t>(reinterpret_cast<const std::uint16_t*>(bytes.data())[offset])
-                              << 16)
-                        : reinterpret_cast<const float*>(bytes.data())[offset];
-                values[row * width_ + channel] = value * multiplier_;
-            }
+        const auto* w_bytes = require(weight.host_bytes()).data();
+        const void* s_bytes = bits_ ? require(inputs[2].host_bytes()).data() : nullptr;
+        const void* z_bytes = (bits_ && inputs.size() == 4) ? require(inputs[3].host_bytes()).data() : nullptr;
+        const bool s_f16 = bits_ && inputs[2].dtype() == DType::F16;
+        const bool z_f16 = bits_ && inputs.size() == 4 && inputs[3].dtype() == DType::F16;
+        auto* out = require(output.data<float>()).data();
+        for_rows(tokens.size(), width_, [&](std::size_t begin, std::size_t end) {
+            ::ynn::dequantize_embedding_f32(tokens.data(), tokens.size(), w_bytes, weight.dtype() == DType::BF16, bits_,
+                                            unsigned_packed_, width_, groups_, s_bytes, s_f16, z_bytes, z_f16,
+                                            multiplier_, out, begin, end);
+        });
     }
 
     std::size_t width_;
@@ -951,27 +703,13 @@ public:
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
-    static auto dot(const float* left, const float* right, std::size_t count) -> float {
-        // Independent lanes let the compiler use vector multiply-adds.
-        std::array<float, 8> lanes{};
-        std::size_t index = 0;
-        for (; index + lanes.size() <= count; index += lanes.size())
-            for (std::size_t lane = 0; lane < lanes.size(); ++lane)
-                lanes[lane] += left[index + lane] * right[index + lane];
-        float sum = 0;
-        for (const auto lane : lanes) sum += lane;
-        for (; index < count; ++index) sum += left[index] * right[index];
-        return sum;
-    }
     auto attend(TensorInputs inputs, Tensor& output) -> void {
         const auto& query = inputs[0];
         const auto batch = static_cast<std::size_t>(query.size(0)), rows = static_cast<std::size_t>(query.size(1));
         const auto width = static_cast<std::size_t>(query.size(2)), head_width = width / heads_;
         const auto kv_width = key_heads_ * head_width;
-        const auto group_size = heads_ / key_heads_;
         const auto total_keys = static_cast<std::size_t>(inputs[1].size(1));
         const auto keys = key_length_ ? key_length_ : total_keys;
-        const auto key_batch_stride = inputs[1].size(0) == 1 ? 0 : total_keys * kv_width;
         std::array<std::size_t, 4> mask_strides{};
         const float* mask = nullptr;
         if (inputs.size() == 4) {
@@ -982,108 +720,38 @@ private:
                 stride *= inputs[3].size(axis);
             }
         }
+        const ::ynn::attention_f32_params params{
+            batch,
+            rows,
+            heads_,
+            key_heads_,
+            key_start_,
+            key_length_,
+            total_keys,
+            head_width,
+            inputs[1].size(0) == 1 ? 0 : total_keys * kv_width,
+            mask_strides[0],
+            mask_strides[1],
+            mask_strides[2],
+            mask_strides[3],
+            explicit_scale_ ? scale_ : static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_width))),
+        };
+        const auto items = ::ynn::attention_f32_work_items(params);
+        if (!items) return;
         const auto* query_data = require(query.data<float>()).data();
         const auto* key_data = require(inputs[1].data<float>()).data();
         const auto* value_data = require(inputs[2].data<float>()).data();
         auto* output_data = require(output.data<float>()).data();
-        const auto scale =
-            explicit_scale_ ? scale_ : static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_width)));
-        const auto items = batch * heads_ * rows;
-        if (!items) return;
-        if (batch == 1 && rows == 1 && key_heads_ == 1 && heads_ == 8 && mask_strides[1] == 0) {
-            const auto* k_base = key_data + key_start_ * head_width;
-            const auto* v_base = value_data + key_start_ * head_width;
-            const auto* bias = mask;
-            std::size_t active_keys = keys;
-            if (bias) {
-                while (active_keys > 0 && bias[(active_keys - 1) * mask_strides[3]] <= -1e8F) --active_keys;
-            }
-            if (!active_keys) {
-                std::fill_n(output_data, width, 0.F);
-                return;
-            }
-            scratch_.resize(8 * active_keys);
-            std::array<float, 8> largest;
-            largest.fill(-std::numeric_limits<float>::infinity());
-            for (std::size_t key = 0; key < active_keys; ++key) {
-                const auto b = bias ? bias[key * mask_strides[3]] : 0.F;
-                if (b <= -1e8F) {
-                    for (std::size_t h = 0; h < 8; ++h)
-                        scratch_[h * active_keys + key] = -std::numeric_limits<float>::infinity();
-                    continue;
-                }
-                const auto* k_row = k_base + key * head_width;
-                for (std::size_t h = 0; h < 8; ++h) {
-                    const auto s = dot(query_data + h * head_width, k_row, head_width) * scale + b;
-                    scratch_[h * active_keys + key] = s;
-                    largest[h] = std::max(largest[h], s);
-                }
-            }
-            std::array<float, 8> inv_total{};
-            for (std::size_t h = 0; h < 8; ++h) {
-                float total = 0;
-                auto* scores = scratch_.data() + h * active_keys;
-                for (std::size_t key = 0; key < active_keys; ++key) {
-                    scores[key] = scores[key] == -std::numeric_limits<float>::infinity()
-                                      ? 0.F
-                                      : std::exp(scores[key] - largest[h]);
-                    total += scores[key];
-                }
-                inv_total[h] = 1.F / total;
-            }
-            std::fill_n(output_data, width, 0.F);
-            for (std::size_t key = 0; key < active_keys; ++key) {
-                const auto b = bias ? bias[key * mask_strides[3]] : 0.F;
-                if (b <= -1e8F) continue;
-                const auto* v_row = v_base + key * head_width;
-                for (std::size_t h = 0; h < 8; ++h) {
-                    const float w = scratch_[h * active_keys + key] * inv_total[h];
-                    auto* out_h = output_data + h * head_width;
-                    for (std::size_t index = 0; index < head_width; ++index) out_h[index] += w * v_row[index];
-                }
-            }
-            return;
-        }
-        const auto tasks = items * keys * head_width <= 524288 ? std::size_t{1} : std::min(ynn::thread_count(), items);
-        scratch_.resize(tasks * keys);
+        const auto tasks =
+            (items == 1 || items * keys * head_width <= 524288) ? std::size_t{1} : std::min(ynn::thread_count(), items);
+        const auto scratch_per_task = ::ynn::attention_f32_scratch_size(params);
+        scratch_.resize(tasks * scratch_per_task);
         const auto per_task = (items + tasks - 1) / tasks;
         const auto run_task = [&](std::size_t task) {
-            auto* scores = scratch_.data() + task * keys;
-            for (auto item = task * per_task; item < std::min(items, (task + 1) * per_task); ++item) {
-                const auto row = item % rows, head = item / rows % heads_, sample = item / rows / heads_;
-                const auto kv_head = head / group_size;
-                const auto* q = query_data + (sample * rows + row) * width + head * head_width;
-                const auto* k = key_data + sample * key_batch_stride + (key_start_ * key_heads_ + kv_head) * head_width;
-                const auto* v =
-                    value_data + sample * key_batch_stride + (key_start_ * key_heads_ + kv_head) * head_width;
-                const auto* bias =
-                    mask ? mask + sample * mask_strides[0] + head * mask_strides[1] + row * mask_strides[2] : nullptr;
-                auto largest = -std::numeric_limits<float>::infinity();
-                for (std::size_t key = 0; key < keys; ++key) {
-                    const auto b = bias ? bias[key * mask_strides[3]] : 0.F;
-                    if (b <= -1e8F) {
-                        scores[key] = -std::numeric_limits<float>::infinity();
-                        continue;
-                    }
-                    scores[key] = dot(q, k + key * kv_width, head_width) * scale + b;
-                    largest = std::max(largest, scores[key]);
-                }
-                float total = 0;
-                for (std::size_t key = 0; key < keys; ++key) {
-                    scores[key] =
-                        scores[key] == -std::numeric_limits<float>::infinity() ? 0.F : std::exp(scores[key] - largest);
-                    total += scores[key];
-                }
-                const auto inv_total = 1.F / total;
-                auto* out = output_data + (sample * rows + row) * width + head * head_width;
-                std::fill_n(out, head_width, 0.F);
-                for (std::size_t key = 0; key < keys; ++key) {
-                    if (scores[key] == 0.F) continue;
-                    const auto weight = scores[key] * inv_total;
-                    const auto* source = v + key * kv_width;
-                    for (std::size_t index = 0; index < head_width; ++index) out[index] += weight * source[index];
-                }
-            }
+            const auto begin = task * per_task, end = std::min(items, begin + per_task);
+            if (begin >= end) return;
+            ::ynn::attention_f32(params, query_data, key_data, value_data, mask, output_data, begin, end,
+                                 scratch_.data() + task * scratch_per_task);
         };
         if (tasks <= 1) {
             run_task(0);
@@ -1098,371 +766,151 @@ private:
     std::vector<float> scratch_;
     OutputPool pool_;
 };
-#if defined(__ARM_NEON) && (defined(__aarch64__) || defined(__arm64__))
-class BlockwiseInt4Linear final : public Operator {
+
+struct PackedTileKey {
+    const void* weight_id = nullptr;
+    std::int64_t weight_offset = 0;
+    const void* scale_id = nullptr;
+    std::int64_t scale_offset = 0;
+    const void* zero_id = nullptr;
+    std::int64_t zero_offset = 0;
+    std::size_t block_size = 0;
+    std::int32_t bits = 0;
+    auto operator<=>(const PackedTileKey&) const = default;
+};
+
+class BlockwiseLinear final : public Operator {
 public:
     static auto supports(const OperatorSpec& spec, TensorInputs inputs) noexcept -> bool {
         if (spec.operation != Operation::PACKED_LINEAR || (inputs.size() != 3 && inputs.size() != 4) ||
-            spec.attributes.size() < 3)
+            spec.attributes.size() < 3 || spec.epsilon > 0.F)
             return false;
-        const auto bits = spec.attributes[0];
-        const auto block_size = spec.attributes[1];
+        const auto bits = static_cast<std::int32_t>(spec.attributes[0]);
+        if (!::ynn::is_blockwise_linear_supported(bits)) return false;
+        const auto block_size = static_cast<std::size_t>(spec.attributes[1]);
+        if (block_size < 32 || (inputs[0].size(-1) % block_size != 0)) return false;
         const auto valid_meta = [](DType dt) { return dt == DType::F32 || dt == DType::F16; };
-        return bits == 4 && block_size >= 32 && (block_size % 32 == 0) &&
-               (inputs.size() == 4 || (block_size < inputs[0].size(-1) && inputs[1].size(0) >= 256)) &&
-               inputs[0].dtype() == DType::F32 && inputs[1].dtype() == DType::U8 && valid_meta(inputs[2].dtype()) &&
-               (inputs.size() == 3 || valid_meta(inputs[3].dtype())) && spec.epsilon <= 0.F;
+        if (inputs[0].dtype() != DType::F32 || !valid_meta(inputs[2].dtype())) return false;
+        if (bits == 4) {
+            return (block_size % 32 == 0) && inputs[1].dtype() == DType::U8 &&
+                   (inputs.size() == 4 ||
+                    (block_size < static_cast<std::size_t>(inputs[0].size(-1)) && inputs[1].size(0) >= 256)) &&
+                   (inputs.size() == 3 || valid_meta(inputs[3].dtype()));
+        }
+        if (bits == 8) {
+            return (block_size % 16 == 0) && inputs.size() == 3 && inputs[1].size(0) >= 64 &&
+                   (inputs[1].dtype() == DType::I8 || inputs[1].dtype() == DType::U8);
+        }
+        return false;
     }
 
-    static auto pack_scales_and_zeros(const Tensor& scales, const Tensor& zeros)
-        -> std::shared_ptr<const std::vector<__fp16>> {
-        const auto N = static_cast<std::size_t>(scales.size(0));
-        const auto B = static_cast<std::size_t>(scales.size(1));
-        const auto tiles_4 = (N + 3) / 4;
+    static auto pack_tiles(std::int32_t bits, const Tensor& weight, const Tensor& scales, const Tensor& zeros,
+                           std::size_t block_size) -> Tensor {
+        const auto N = static_cast<std::size_t>(weight.size(0));
+        const auto K = static_cast<std::size_t>(weight.size(1)) * (bits == 4 ? 2U : 1U);
         const bool has_zero = zeros.defined();
-        const std::size_t stride = has_zero ? 8 : 4;
-        const auto s_bytes = require(std::as_const(scales).host_bytes());
+        const auto total_bytes = ::ynn::packed_blockwise_linear_size(bits, N, K, block_size, has_zero);
+        auto packed = require(Tensor::empty({static_cast<std::int64_t>(total_bytes)}, DType::U8));
+        const auto* w_bytes = require(std::as_const(weight).host_bytes()).data();
+        const auto* s_bytes = require(std::as_const(scales).host_bytes()).data();
         const bool s_f16 = scales.dtype() == DType::F16;
-        const auto* s_f32 = s_f16 ? nullptr : reinterpret_cast<const float*>(s_bytes.data());
-        const auto* s_h16 = s_f16 ? reinterpret_cast<const __fp16*>(s_bytes.data()) : nullptr;
-        const auto z_bytes = has_zero ? require(std::as_const(zeros).host_bytes()) : std::span<const std::byte>{};
+        const void* z_bytes = has_zero ? require(std::as_const(zeros).host_bytes()).data() : nullptr;
         const bool z_f16 = has_zero && zeros.dtype() == DType::F16;
-        const auto* z_f32 = (has_zero && !z_f16) ? reinterpret_cast<const float*>(z_bytes.data()) : nullptr;
-        const auto* z_h16 = (has_zero && z_f16) ? reinterpret_cast<const __fp16*>(z_bytes.data()) : nullptr;
-        auto packed = std::make_shared<std::vector<__fp16>>(tiles_4 * B * stride);
-        for (std::size_t tile = 0; tile < tiles_4; ++tile) {
-            const auto n0 = tile * 4;
-            for (std::size_t b = 0; b < B; ++b) {
-                auto* dst = packed->data() + (tile * B + b) * stride;
-                for (std::size_t r = 0; r < 4; ++r) {
-                    const auto n = n0 + r;
-                    const auto idx = n * B + b;
-                    dst[r] = n < N ? (s_f16 ? s_h16[idx] : static_cast<__fp16>(s_f32[idx])) : static_cast<__fp16>(0.0F);
-                    if (has_zero)
-                        dst[4 + r] =
-                            n < N ? (z_f16 ? z_h16[idx] : static_cast<__fp16>(z_f32[idx])) : static_cast<__fp16>(0.0F);
-                }
-            }
+        auto* dst = require(packed.host_bytes()).data();
+        const auto tiles_32 = ::ynn::blockwise_linear_tile_count(N);
+        const auto workers = std::min(ynn::thread_count(), tiles_32);
+        if (workers > 1 && tiles_32 >= 8) {
+            const auto per_worker = (tiles_32 + workers - 1) / workers;
+            require(ynn::parallel_for(workers, [&](std::size_t task) {
+                const auto t_begin = task * per_worker, t_end = std::min(tiles_32, t_begin + per_worker);
+                if (t_begin < t_end)
+                    ::ynn::pack_blockwise_linear_tiles(bits, N, K, block_size, w_bytes, s_bytes, s_f16, z_bytes, z_f16,
+                                                       t_begin, t_end, dst);
+            }));
+        } else {
+            ::ynn::pack_blockwise_linear_tiles(bits, N, K, block_size, w_bytes, s_bytes, s_f16, z_bytes, z_f16, 0,
+                                               tiles_32, dst);
         }
         return packed;
     }
 
-    BlockwiseInt4Linear(const OperatorSpec& spec, const Tensor& input, const Tensor& weight,
-                        std::shared_ptr<const std::vector<__fp16>> scale_zero_f16, bool has_zero, tensor::Arena& arena)
-        : weight_(weight),
-          weight_ptr_(reinterpret_cast<const std::uint8_t*>(require(std::as_const(weight_).host_bytes()).data())),
-          scale_zero_f16_(std::move(scale_zero_f16)),
+    BlockwiseLinear(const OperatorSpec& spec, const Tensor& sample_input, const Tensor& weight, Tensor packed_tiles,
+                    bool has_zero, tensor::Arena& arena)
+        : packed_(std::move(packed_tiles)),
+          packed_ptr_(require(std::as_const(packed_).host_bytes()).data()),
+          bits_(static_cast<std::int32_t>(spec.attributes[0])),
           N_(static_cast<std::size_t>(weight.size(0))),
-          K_(static_cast<std::size_t>(input.size(-1))),
+          K_(static_cast<std::size_t>(sample_input.size(-1))),
           block_size_(static_cast<std::size_t>(spec.attributes[1])),
           B_(K_ / block_size_),
           has_zero_(has_zero),
           output_scale_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]))),
-          shape_(input.shape().begin(), input.shape().end()),
-          pool_(&arena) {
-        shape_.back() = static_cast<std::int64_t>(N_);
-    }
+          pool_(&arena) {}
 
     auto run(TensorInputs inputs) -> Tensor override {
         std::vector<std::int64_t> out_shape(inputs[0].shape().begin(), inputs[0].shape().end());
         out_shape.back() = static_cast<std::int64_t>(N_);
         auto output = pool_.acquire(out_shape, DType::F32, tensor::Device::cpu());
-        compute(inputs[0], output);
+        apply(inputs[0], output);
         return output;
     }
     auto run_(TensorInputs, Tensor&) -> Tensor override {
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "blockwise int4 linear is not in-place"});
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "blockwise linear cannot run in place"});
     }
-    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { compute(inputs[0], outputs.back()); }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs.back()); }
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
-    template <std::size_t CHUNKS, std::size_t MR, bool HAS_ZERO>
-    static void eval_tile_4xM(std::size_t B, const std::uint8_t* w0, const std::uint8_t* w1, const std::uint8_t* w2,
-                              const std::uint8_t* w3, const __fp16* sz_ptr, const std::int8_t* q_base,
-                              const float* a_scale_base, const float* a_bsum_base, float* y_base, std::size_t N,
-                              std::size_t n_valid, float output_scale) noexcept {
-        constexpr std::size_t G = CHUNKS * 32;
-        constexpr std::size_t W_STEP = CHUNKS * 16;
-        float32x4_t acc[MR];
-        for (std::size_t r = 0; r < MR; ++r) acc[r] = vdupq_n_f32(0.0F);
-        float32x4_t acc_zero_m1 = vdupq_n_f32(0.0F);
-
-        for (std::size_t b = 0; b < B; ++b) {
-            float32x4_t s4, z4;
-            if constexpr (HAS_ZERO) {
-                const float16x8_t sz = vld1q_f16(sz_ptr + b * 8);
-                s4 = vcvt_f32_f16(vget_low_f16(sz));
-                z4 = vcvt_f32_f16(vget_high_f16(sz));
-            } else {
-                s4 = vcvt_f32_f16(vld1_f16(sz_ptr + b * 4));
-                z4 = vdupq_n_f32(0.0F);
-            }
-
-            if constexpr (CHUNKS == 1) {
-                const uint8x16_t raw0 = vld1q_u8(w0 + b * 16);
-                const uint8x16_t raw1 = vld1q_u8(w1 + b * 16);
-                const uint8x16_t raw2 = vld1q_u8(w2 + b * 16);
-                const uint8x16_t raw3 = vld1q_u8(w3 + b * 16);
-
-                const int8x16_t w0_e = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw0, 4)), 4);
-                const int8x16_t w0_o = vshrq_n_s8(vreinterpretq_s8_u8(raw0), 4);
-                const int8x16_t w1_e = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw1, 4)), 4);
-                const int8x16_t w1_o = vshrq_n_s8(vreinterpretq_s8_u8(raw1), 4);
-                const int8x16_t w2_e = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw2, 4)), 4);
-                const int8x16_t w2_o = vshrq_n_s8(vreinterpretq_s8_u8(raw2), 4);
-                const int8x16_t w3_e = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw3, 4)), 4);
-                const int8x16_t w3_o = vshrq_n_s8(vreinterpretq_s8_u8(raw3), 4);
-
-                for (std::size_t r = 0; r < MR; ++r) {
-                    const std::int8_t* qp = q_base + (r * B + b) * 32;
-                    const int8x16_t qe = vld1q_s8(qp + 0);
-                    const int8x16_t qo = vld1q_s8(qp + 16);
-                    const int32x4_t d0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w0_e, qe), w0_o, qo);
-                    const int32x4_t d1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w1_e, qe), w1_o, qo);
-                    const int32x4_t d2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w2_e, qe), w2_o, qo);
-                    const int32x4_t d3 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w3_e, qe), w3_o, qo);
-                    const int32x4_t dots = vpaddq_s32(vpaddq_s32(d0, d1), vpaddq_s32(d2, d3));
-                    const float32x4_t fdots = vcvtq_f32_s32(dots);
-                    const float a_s = a_scale_base[r * B + b];
-                    acc[r] = vfmaq_f32(acc[r], fdots, vmulq_n_f32(s4, a_s));
-                    if constexpr (HAS_ZERO) {
-                        const float a_z = a_bsum_base[r * B + b];
-                        if constexpr (MR == 1) {
-                            acc_zero_m1 = vfmaq_n_f32(acc_zero_m1, z4, a_z);
-                        } else {
-                            acc[r] = vfmaq_n_f32(acc[r], z4, a_z);
-                        }
-                    }
-                }
-            } else {
-                int32x4_t d0[MR], d1[MR], d2[MR], d3[MR];
-                for (std::size_t r = 0; r < MR; ++r) {
-                    d0[r] = vdupq_n_s32(0);
-                    d1[r] = vdupq_n_s32(0);
-                    d2[r] = vdupq_n_s32(0);
-                    d3[r] = vdupq_n_s32(0);
-                }
-
-                for (std::size_t c = 0; c < CHUNKS; ++c) {
-                    const uint8x16_t raw0 = vld1q_u8(w0 + b * W_STEP + c * 16);
-                    const uint8x16_t raw1 = vld1q_u8(w1 + b * W_STEP + c * 16);
-                    const uint8x16_t raw2 = vld1q_u8(w2 + b * W_STEP + c * 16);
-                    const uint8x16_t raw3 = vld1q_u8(w3 + b * W_STEP + c * 16);
-
-                    const int8x16_t w0_e = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw0, 4)), 4);
-                    const int8x16_t w0_o = vshrq_n_s8(vreinterpretq_s8_u8(raw0), 4);
-                    const int8x16_t w1_e = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw1, 4)), 4);
-                    const int8x16_t w1_o = vshrq_n_s8(vreinterpretq_s8_u8(raw1), 4);
-                    const int8x16_t w2_e = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw2, 4)), 4);
-                    const int8x16_t w2_o = vshrq_n_s8(vreinterpretq_s8_u8(raw2), 4);
-                    const int8x16_t w3_e = vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(raw3, 4)), 4);
-                    const int8x16_t w3_o = vshrq_n_s8(vreinterpretq_s8_u8(raw3), 4);
-
-                    for (std::size_t r = 0; r < MR; ++r) {
-                        const std::int8_t* qp = q_base + (r * B + b) * G + c * 32;
-                        const int8x16_t qe = vld1q_s8(qp + 0);
-                        const int8x16_t qo = vld1q_s8(qp + 16);
-                        d0[r] = vdotq_s32(vdotq_s32(d0[r], w0_e, qe), w0_o, qo);
-                        d1[r] = vdotq_s32(vdotq_s32(d1[r], w1_e, qe), w1_o, qo);
-                        d2[r] = vdotq_s32(vdotq_s32(d2[r], w2_e, qe), w2_o, qo);
-                        d3[r] = vdotq_s32(vdotq_s32(d3[r], w3_e, qe), w3_o, qo);
-                    }
-                }
-
-                for (std::size_t r = 0; r < MR; ++r) {
-                    const int32x4_t dots = vpaddq_s32(vpaddq_s32(d0[r], d1[r]), vpaddq_s32(d2[r], d3[r]));
-                    const float32x4_t fdots = vcvtq_f32_s32(dots);
-                    const float a_s = a_scale_base[r * B + b];
-                    acc[r] = vfmaq_f32(acc[r], fdots, vmulq_n_f32(s4, a_s));
-                    if constexpr (HAS_ZERO) {
-                        const float a_z = a_bsum_base[r * B + b];
-                        if constexpr (MR == 1) {
-                            acc_zero_m1 = vfmaq_n_f32(acc_zero_m1, z4, a_z);
-                        } else {
-                            acc[r] = vfmaq_n_f32(acc[r], z4, a_z);
-                        }
-                    }
-                }
-            }
-        }
-
-        if constexpr (HAS_ZERO && MR == 1) acc[0] = vaddq_f32(acc[0], acc_zero_m1);
-        for (std::size_t r = 0; r < MR; ++r) {
-            float32x4_t res = acc[r];
-            if (output_scale > 0.0F) {
-                const float32x4_t vinv = vdupq_n_f32(1.0F / output_scale);
-                const float32x4_t vscale = vdupq_n_f32(output_scale);
-                res = vmulq_f32(vminq_f32(vmaxq_f32(vrndnq_f32(vmulq_f32(res, vinv)), vdupq_n_f32(-128.0F)),
-                                          vdupq_n_f32(127.0F)),
-                                vscale);
-            }
-            if (n_valid == 4) {
-                vst1q_f32(y_base + r * N, res);
-            } else {
-                alignas(16) float tmp[4];
-                vst1q_f32(tmp, res);
-                for (std::size_t i = 0; i < n_valid; ++i) y_base[r * N + i] = tmp[i];
-            }
-        }
-    }
-
-    template <std::size_t CHUNKS, bool HAS_ZERO>
-    void dispatch_tiles(std::size_t t_begin, std::size_t t_end, std::size_t M, float* y) const noexcept {
-        const auto row_bytes = K_ / 2;
-        const auto* sz_all = scale_zero_f16_->data();
-        constexpr std::size_t SZ_STRIDE = HAS_ZERO ? 8 : 4;
-        for (std::size_t tile = t_begin; tile < t_end; ++tile) {
-            const auto n0 = tile * 4;
-            const auto n_valid = std::min<std::size_t>(4, N_ - n0);
-            const auto* w0 = weight_ptr_ + n0 * row_bytes;
-            const auto* w1 = n_valid > 1 ? w0 + row_bytes : w0;
-            const auto* w2 = n_valid > 2 ? w0 + 2 * row_bytes : w0;
-            const auto* w3 = n_valid > 3 ? w0 + 3 * row_bytes : w0;
-            const auto* sz_ptr = sz_all + tile * B_ * SZ_STRIDE;
-
-            std::size_t m = 0;
-            if constexpr (CHUNKS == 1) {
-                for (; m + 8 <= M; m += 8) {
-                    eval_tile_4xM<CHUNKS, 8, HAS_ZERO>(B_, w0, w1, w2, w3, sz_ptr, act_q_.data() + m * K_,
-                                                       act_scale_.data() + m * B_, act_bsum_.data() + m * B_,
-                                                       y + m * N_ + n0, N_, n_valid, output_scale_);
-                }
-            }
-            for (; m + 4 <= M; m += 4) {
-                eval_tile_4xM<CHUNKS, 4, HAS_ZERO>(B_, w0, w1, w2, w3, sz_ptr, act_q_.data() + m * K_,
-                                                   act_scale_.data() + m * B_, act_bsum_.data() + m * B_,
-                                                   y + m * N_ + n0, N_, n_valid, output_scale_);
-            }
-            if (m + 3 <= M) {
-                eval_tile_4xM<CHUNKS, 3, HAS_ZERO>(B_, w0, w1, w2, w3, sz_ptr, act_q_.data() + m * K_,
-                                                   act_scale_.data() + m * B_, act_bsum_.data() + m * B_,
-                                                   y + m * N_ + n0, N_, n_valid, output_scale_);
-                m += 3;
-            }
-            if (m + 2 <= M) {
-                eval_tile_4xM<CHUNKS, 2, HAS_ZERO>(B_, w0, w1, w2, w3, sz_ptr, act_q_.data() + m * K_,
-                                                   act_scale_.data() + m * B_, act_bsum_.data() + m * B_,
-                                                   y + m * N_ + n0, N_, n_valid, output_scale_);
-                m += 2;
-            }
-            if (m < M) {
-                eval_tile_4xM<CHUNKS, 1, HAS_ZERO>(B_, w0, w1, w2, w3, sz_ptr, act_q_.data() + m * K_,
-                                                   act_scale_.data() + m * B_, act_bsum_.data() + m * B_,
-                                                   y + m * N_ + n0, N_, n_valid, output_scale_);
-            }
-        }
-    }
-
-    auto compute(const Tensor& input, Tensor& output) -> void {
+    auto apply(const Tensor& input, Tensor& output) -> void {
+        const auto M = input.numel() / K_;
         const auto* x = require(input.data<float>()).data();
         auto* y = require(output.data<float>()).data();
-        const auto M = input.numel() / K_;
         act_q_.resize(M * K_);
         act_scale_.resize(M * B_);
         if (has_zero_) act_bsum_.resize(M * B_);
+        float* bsum_ptr = has_zero_ ? act_bsum_.data() : nullptr;
 
-        const auto chunks_per_block = block_size_ / 32;
-        for (std::size_t m = 0; m < M; ++m) {
-            for (std::size_t b = 0; b < B_; ++b) {
-                const float* x_block = x + (m * B_ + b) * block_size_;
-                float32x4_t vsum0 = vdupq_n_f32(0.0F), vsum1 = vdupq_n_f32(0.0F);
-                float32x4_t vmax0 = vdupq_n_f32(0.0F), vmax1 = vdupq_n_f32(0.0F);
-                for (std::size_t c = 0; c < chunks_per_block; ++c) {
-                    const float* xp = x_block + c * 32;
-                    const float32x4_t x0 = vld1q_f32(xp + 0), x1 = vld1q_f32(xp + 4);
-                    const float32x4_t x2 = vld1q_f32(xp + 8), x3 = vld1q_f32(xp + 12);
-                    const float32x4_t x4 = vld1q_f32(xp + 16), x5 = vld1q_f32(xp + 20);
-                    const float32x4_t x6 = vld1q_f32(xp + 24), x7 = vld1q_f32(xp + 28);
-                    if (has_zero_) {
-                        vsum0 = vaddq_f32(vsum0, vaddq_f32(vaddq_f32(x0, x1), vaddq_f32(x2, x3)));
-                        vsum1 = vaddq_f32(vsum1, vaddq_f32(vaddq_f32(x4, x5), vaddq_f32(x6, x7)));
-                    }
-                    vmax0 = vmaxq_f32(vmax0, vmaxq_f32(vmaxq_f32(vabsq_f32(x0), vabsq_f32(x1)),
-                                                       vmaxq_f32(vabsq_f32(x2), vabsq_f32(x3))));
-                    vmax1 = vmaxq_f32(vmax1, vmaxq_f32(vmaxq_f32(vabsq_f32(x4), vabsq_f32(x5)),
-                                                       vmaxq_f32(vabsq_f32(x6), vabsq_f32(x7))));
-                }
-                const float amax = vmaxvq_f32(vmaxq_f32(vmax0, vmax1));
-                const float scale = amax / 127.0F;
-                const float inv_scale = amax > 0.0F ? 127.0F / amax : 0.0F;
-                act_scale_[m * B_ + b] = scale;
-                if (has_zero_) act_bsum_[m * B_ + b] = vaddvq_f32(vaddq_f32(vsum0, vsum1));
-
-                const float32x4_t vinv = vdupq_n_f32(inv_scale);
-                for (std::size_t c = 0; c < chunks_per_block; ++c) {
-                    const float* xp = x_block + c * 32;
-                    const int32x4_t i0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 0), vinv));
-                    const int32x4_t i1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 4), vinv));
-                    const int32x4_t i2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 8), vinv));
-                    const int32x4_t i3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 12), vinv));
-                    const int32x4_t i4 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 16), vinv));
-                    const int32x4_t i5 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 20), vinv));
-                    const int32x4_t i6 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 24), vinv));
-                    const int32x4_t i7 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp + 28), vinv));
-                    const int16x8_t s0 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
-                    const int16x8_t s1 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
-                    const int16x8_t s2 = vcombine_s16(vqmovn_s32(i4), vqmovn_s32(i5));
-                    const int16x8_t s3 = vcombine_s16(vqmovn_s32(i6), vqmovn_s32(i7));
-                    const int8x16_t q0 = vcombine_s8(vqmovn_s16(s0), vqmovn_s16(s1));
-                    const int8x16_t q1 = vcombine_s8(vqmovn_s16(s2), vqmovn_s16(s3));
-                    std::int8_t* qp = act_q_.data() + (m * B_ + b) * block_size_ + c * 32;
-                    vst1q_s8(qp + 0, vuzp1q_s8(q0, q1));
-                    vst1q_s8(qp + 16, vuzp2q_s8(q0, q1));
-                }
-            }
+        const auto q_workers = (M >= 8 && M * K_ >= 65536) ? std::min(ynn::thread_count(), M) : std::size_t{1};
+        if (q_workers > 1) {
+            const auto per_worker = (M + q_workers - 1) / q_workers;
+            require(ynn::parallel_for(q_workers, [&](std::size_t task) {
+                const auto m_begin = task * per_worker, m_end = std::min(M, m_begin + per_worker);
+                if (m_begin < m_end)
+                    ::ynn::quantize_blockwise_activations_f32(bits_, M, K_, block_size_, has_zero_, x, act_q_.data(),
+                                                              act_scale_.data(), bsum_ptr, m_begin, m_end);
+            }));
+        } else {
+            ::ynn::quantize_blockwise_activations_f32(bits_, M, K_, block_size_, has_zero_, x, act_q_.data(),
+                                                      act_scale_.data(), bsum_ptr, 0, M);
         }
 
-        const auto tiles_4 = (N_ + 3) / 4;
-        const auto tasks = (M == 1 && K_ * N_ <= 384 * 1024) ? std::size_t{1} : std::min(ynn::thread_count(), tiles_4);
-        const auto tiles_per_task = (tiles_4 + tasks - 1) / tasks;
-        const auto run_task = [&](std::size_t task) {
-            const auto t_begin = task * tiles_per_task;
-            const auto t_end = std::min(tiles_4, t_begin + tiles_per_task);
-            if (t_begin >= t_end) return;
-            if (has_zero_) {
-                if (chunks_per_block == 1) {
-                    dispatch_tiles<1, true>(t_begin, t_end, M, y);
-                } else if (chunks_per_block == 2) {
-                    dispatch_tiles<2, true>(t_begin, t_end, M, y);
-                } else if (chunks_per_block == 4) {
-                    dispatch_tiles<4, true>(t_begin, t_end, M, y);
-                } else {
-                    dispatch_tiles<8, true>(t_begin, t_end, M, y);
-                }
-            } else {
-                if (chunks_per_block == 1) {
-                    dispatch_tiles<1, false>(t_begin, t_end, M, y);
-                } else if (chunks_per_block == 2) {
-                    dispatch_tiles<2, false>(t_begin, t_end, M, y);
-                } else if (chunks_per_block == 4) {
-                    dispatch_tiles<4, false>(t_begin, t_end, M, y);
-                } else {
-                    dispatch_tiles<8, false>(t_begin, t_end, M, y);
-                }
-            }
+        const auto tiles = ::ynn::blockwise_linear_tile_count(N_);
+        const auto tasks = (M == 1 && K_ * N_ <= 64 * 1024) ? std::size_t{1} : std::min(ynn::thread_count(), tiles);
+        const auto per_task = (tiles + tasks - 1) / tasks;
+        const auto run_tiles = [&](std::size_t task) {
+            const auto t_begin = task * per_task, t_end = std::min(tiles, t_begin + per_task);
+            if (t_begin < t_end)
+                ::ynn::blockwise_linear_f32(bits_, M, N_, K_, block_size_, has_zero_, output_scale_, packed_ptr_,
+                                            act_q_.data(), act_scale_.data(), bsum_ptr, y, t_begin, t_end);
         };
         if (tasks <= 1) {
-            run_task(0);
+            run_tiles(0);
             return;
         }
-        require(ynn::parallel_for(tasks, run_task));
+        require(ynn::parallel_for(tasks, run_tiles));
     }
 
-    Tensor weight_;
-    const std::uint8_t* weight_ptr_;
-    std::shared_ptr<const std::vector<__fp16>> scale_zero_f16_;
+    Tensor packed_;
+    const void* packed_ptr_;
+    std::int32_t bits_;
     std::size_t N_, K_, block_size_, B_;
     bool has_zero_;
     float output_scale_;
-    std::vector<std::int64_t> shape_;
     OutputPool pool_;
     std::vector<std::int8_t> act_q_;
     std::vector<float> act_scale_;
     std::vector<float> act_bsum_;
 };
-#endif
-
 class CpuOperator final : public Operator {
 public:
     CpuOperator(ynn::Executable executable, std::size_t count, std::size_t dynamic_count, DType dtype,
@@ -1572,10 +1020,9 @@ public:
         if (spec.operation == Operation::SCATTER) return std::make_unique<Scatter>(arena_);
         if (spec.operation == Operation::GREEDY_TOKEN) return std::make_unique<GreedyToken>(arena_);
         if (spec.operation == Operation::EMBEDDING) return std::make_unique<Embedding>(spec, inputs, arena_);
-        if (spec.operation == Operation::SILU_GATE && SiluGate::supports(inputs))
-            return std::make_unique<SiluGate>(inputs[0], arena_);
-        if (spec.operation == Operation::GELU_GATE && GeluGate::supports(inputs))
-            return std::make_unique<GeluGate>(inputs[0], arena_);
+        if ((spec.operation == Operation::SILU_GATE || spec.operation == Operation::GELU_GATE) &&
+            GatedActivationOp::supports(inputs))
+            return std::make_unique<GatedActivationOp>(inputs[0], spec.operation == Operation::SILU_GATE, arena_);
         if (spec.operation == Operation::ROTARY && Rotary::supports(inputs)) return std::make_unique<Rotary>(arena_);
         if ((spec.operation == Operation::RMS_NORM || spec.operation == Operation::RMS_NORM_RESIDUAL) &&
             RmsNorm::supports(spec, inputs))
@@ -1584,21 +1031,30 @@ public:
             return std::make_unique<RmsRotary>(spec, arena_);
         if (spec.operation == Operation::CAST && spec.dtype == DType::I8 && spec.epsilon > 0)
             return std::make_unique<QuantizeInt8>(spec.epsilon, arena_);
-#if defined(__ARM_NEON) && (defined(__aarch64__) || defined(__arm64__))
-        if (BlockwiseInt4Linear::supports(spec, inputs)) {
+        if (BlockwiseLinear::supports(spec, inputs)) {
+            const auto bits = static_cast<std::int32_t>(spec.attributes[0]);
             const bool has_zero = inputs.size() == 4;
-            const std::pair<const void*, std::size_t> sz_key{inputs[2].storage_identity(), inputs[2].storage_offset()};
-            auto& cached_sz = scale_zero_cache_[sz_key];
-            if (!cached_sz) {
-                cached_sz = BlockwiseInt4Linear::pack_scales_and_zeros(inputs[2], has_zero ? inputs[3] : Tensor{});
+            const auto block_size = static_cast<std::size_t>(spec.attributes[1]);
+            const PackedTileKey key{inputs[1].storage_identity(),
+                                    inputs[1].storage_offset(),
+                                    inputs[2].storage_identity(),
+                                    inputs[2].storage_offset(),
+                                    has_zero ? inputs[3].storage_identity() : nullptr,
+                                    has_zero ? inputs[3].storage_offset() : 0,
+                                    block_size,
+                                    bits};
+            auto& cached_tiles = packed_tile_cache_[key];
+            if (!cached_tiles.defined()) {
+                cached_tiles = BlockwiseLinear::pack_tiles(bits, inputs[1], inputs[2], has_zero ? inputs[3] : Tensor{},
+                                                           block_size);
                 if (inputs[1].size(0) < 65536) {
+                    inputs[1].release_pages();
                     inputs[2].release_pages();
                     if (has_zero) inputs[3].release_pages();
                 }
             }
-            return std::make_unique<BlockwiseInt4Linear>(spec, inputs[0], inputs[1], cached_sz, has_zero, arena_);
+            return std::make_unique<BlockwiseLinear>(spec, inputs[0], inputs[1], cached_tiles, has_zero, arena_);
         }
-#endif
         if (spec.operation == Operation::ATTENTION) {
 #if defined(__APPLE__)
             if (PytorchParityAttention::supports(spec, inputs))
@@ -2095,11 +1551,10 @@ public:
         auto executable = require(std::move(graph).compile(operator_threads));
         require(executable.reshape());
         auto shape = require(executable.shape(output_id));
-        auto op = std::make_unique<CpuOperator>(
-            std::move(executable), graph_input_count, dynamic_count, dtype,
-            std::vector<std::int64_t>(shape.begin(), shape.end()), arena_, std::move(constant_owners),
-            has_packed_zero ? inputs[3] : Tensor{},
-            has_packed_zero ? static_cast<std::size_t>(spec.attributes[1]) : 0);
+        auto op = std::make_unique<CpuOperator>(std::move(executable), graph_input_count, dynamic_count, dtype,
+                                                std::vector<std::int64_t>(shape.begin(), shape.end()), arena_,
+                                                std::move(constant_owners), has_packed_zero ? inputs[3] : Tensor{},
+                                                has_packed_zero ? static_cast<std::size_t>(spec.attributes[1]) : 0);
         if (constant) {
             if (inputs[1].size(0) < 65536) {
                 for (std::size_t index = dynamic_count; index < inputs.size(); ++index) inputs[index].release_pages();
@@ -2114,9 +1569,7 @@ public:
 private:
     tensor::Arena arena_;
     ynn::FeedForwardCache feed_forward_cache_;
-#if defined(__ARM_NEON) && (defined(__aarch64__) || defined(__arm64__))
-    std::map<std::pair<const void*, std::size_t>, std::shared_ptr<const std::vector<__fp16>>> scale_zero_cache_;
-#endif
+    std::map<PackedTileKey, Tensor> packed_tile_cache_;
 };
 } // namespace
 auto cpu_operators() -> std::unique_ptr<OperatorBackend> { return std::make_unique<CpuBackend>(); }
