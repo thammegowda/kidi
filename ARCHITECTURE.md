@@ -946,6 +946,19 @@ the prompt, EOS, and PAD; limits count generated tokens. Optional unfinished-sco
 length preserves historical RTG truncation normalization. Translation preserves
 bounded length-sorted batching and restores original input order.
 
+`GreedyState::accept_speculative`, `GreedyState::step_speculative`, and
+`Decoder::generate_speculative` (`inference/decoder.h`) provide Kidi's
+model-agnostic speculative decoding framework alongside `Decoder::generate`.
+`accept_speculative` verifies a proposed token block against one target-score row
+per draft plus a final bonus row, accepting the matching prefix and a target
+correction or bonus while respecting EOS, stop-ID, scoring, and output-limit
+rules. `step_speculative` and `generate_speculative` drive the draft-budget
+clamping, stop-token halting, verification, rewind callback, and timing/acceptance
+accounting through lightweight callbacks (`DraftFunction`, `VerifyFunction`,
+`CommitFunction`), supporting both standalone draft causal LMs (such as Qwen
+draft-target pairs) and feature-conditioned MTP/EAGLE assistants without extra
+session hierarchies.
+
 `model::Gemma4` implements dense Gemma 4 text decoding using RMSNorm, gated
 tanh-GELU MLPs, grouped-query attention, local/global masks, proportional RoPE,
 shared K/V, per-layer embeddings, and logit softcapping. `inference::Generator`
@@ -958,6 +971,55 @@ the execution device. An external per-layer embedding table is gathered on the
 host; captured steps receive those rows as a step input because a replay would
 skip host code. Gate/up projections stored back to back are viewed as the fused
 matrix without a copy. Other projections execute on the selected backend.
+
+`forward`, `forward_token`, and `select_token` accept an optional `Tensor* hidden`
+out-parameter to capture normalized final-layer activations alongside target
+logits or greedy selections in the same replayable step. `rewind` discards a
+rejected suffix by moving the dense KV cache's logical position; accepted history
+is not copied, and future rows remain masked until overwritten.
+
+`model::Gemma4Assistant` reuses `layers::Gemma4Block` (with `per_layer_width = 0`)
+and `layers::Linear`'s candidate shortlist selector to load the official assistant
+Safetensors checkpoint, borrow the target's token embedding and last KV donor of
+each attention type, and run its query-only decoder blocks. All drafts in a round
+share a fixed RoPE position and committed target history. The assistant's trained
+bidirectional sliding mask includes the preceding window plus one token. E2B's
+clustered head scores only the tokens in the selected centroids, preserving
+canonical token IDs. Independent Transformers fixtures check projected states and
+draft tokens for both clustered and dense heads.
+
+Assistants are target-variant-specific. The loader never chooses or shares one
+globally: callers provide the assistant checkpoint for each target instance.
+Validation requires matching target hidden width, key/value heads, local/global
+head dimensions, vocabulary, and rotary configuration, so an E2B assistant is
+rejected for E4B or other incompatible Gemma 4 variants.
+
+`ModelLoadOptions::assistant_model` opts into CPU greedy speculative decoding, with
+`draft_tokens` in 1..16. For Gemma 4 MTP, FP32 target activations
+are consumed directly; regular BF16 target hidden states and KV donors are
+converted to FP32 at the assistant boundary while target verification remains BF16.
+Calibrated QAT targets retain the ordinary AUTO/INT8 KV path; explicit FP32 is
+also supported. Regular BF16 targets retain BF16 KV through the target and are
+converted only for assistant attention; FP8 KV storage is rejected. Serving admits one active request, without deferred tokens or
+decode-ahead. Serial prefix caching, batched generation, and image input are
+explicitly unsupported in this mode. The normal generation path is unchanged
+when no assistant is supplied.
+
+CPU speculative decoding can use a checkpoint `lm_head.hnsw`. On Gemma 4, the
+replayed target body returns normalized hidden rows, then the existing multi-row
+HNSW selector searches and reranks each verification row. This remains approximate
+target selection: benchmarks must compare indexed outputs with both indexed
+speculative-off and dense controls, and report any token divergence rather than
+treating HNSW as lossless.
+
+Each round drafts candidates, verifies them together, accepts the matching prefix
+plus a correction or bonus, rewinds the rejected cache suffix via `commit`, and
+emits ordinary streaming events for the committed outputs. `GenerationStats`
+records draft and verification time, proposed/accepted draft counts, and
+verification calls. CPU verification uses decode attention arithmetic for small
+grouped-query blocks; prefill retains its existing kernels. Regression tests cover
+standalone-draft and feature-conditioned sessions, stops, output limits, streamed
+text, repeated requests, and parity with ordinary greedy generation.
 
 Gemma 4 generation supports greedy text requests, including packed independent
 decode rows through `forward_batch` and `forward_batch_tokens`. Projection and

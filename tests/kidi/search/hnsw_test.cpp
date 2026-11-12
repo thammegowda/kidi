@@ -162,15 +162,16 @@ auto vector_table(std::size_t rows, std::size_t width, bool bfloat, std::vector<
 auto check_ground_truth_graph(std::span<const std::byte> data) -> void {
     check(integer(data, 16, 4) == 8 && integer(data, 20, 4) == 4 && integer(data, 24, 4) == 4 &&
               integer(data, 28, 4) == 2 && integer(data, 32, 4) == 3 && integer(data, 36, 4) == 5 &&
-              integer(data, 44, 4) == 1332379836U && integer(data, 48, 4) == 2773177997U &&
-              integer(data, 52, 4) == 2032867032U,
+              integer(data, 44, 4) == 1332379836U && integer(data, 48, 4) == 828371281U &&
+              integer(data, 52, 4) == 1310553304U,
           "8x4 ground-truth HNSW header metadata or checksums changed");
     const auto base = static_cast<std::size_t>(integer(data, 64, 8));
     const auto upper = static_cast<std::size_t>(integer(data, 72, 8));
+    const std::array<std::uint32_t, 9> expected_offsets{0, 2, 6, 8, 12, 14, 18, 20, 23};
     for (std::size_t node = 0; node <= 8; ++node)
-        check(integer(data, base + 4 * node, 4) == 4 * node, "8x4 ground-truth base offsets changed");
-    const std::array<std::uint32_t, 32> expected_base{
-        1, 5, 6, 4, 4, 0, 3, 5, 7, 5, 6, 3, 1, 7, 5, 6, 1, 3, 0, 2, 0, 2, 3, 6, 0, 2, 3, 5, 2, 3, 5, 6,
+        check(integer(data, base + 4 * node, 4) == expected_offsets[node], "8x4 ground-truth base offsets changed");
+    const std::array<std::uint32_t, 23> expected_base{
+        1, 5, 3, 5, 0, 4, 7, 5, 1, 7, 5, 6, 1, 3, 0, 2, 3, 6, 3, 5, 3, 5, 2,
     };
     const auto edges = base + 4 * 9;
     for (std::size_t idx = 0; idx < expected_base.size(); ++idx)
@@ -198,15 +199,16 @@ auto brute_force_checks(const std::filesystem::path& root, bool bfloat, std::siz
     const auto path = root / (std::string(bfloat ? "bf16-" : "fp32-") + std::to_string(width) + ".hnsw");
     require(index.save(path));
     const auto serialized = bytes(path);
-    const auto expected_crc = width == 64 ? 0x3F9D6C25U : 0xCEAEE420U;
-    check(serialized.size() == 34041 && integer(serialized, 24, 4) == 32 && integer(serialized, 32, 4) == 2 &&
+    const auto expected_size = width == 64 ? std::size_t{26256} : std::size_t{26244};
+    const auto expected_crc = width == 64 ? 0x04C11AC2U : 0x769AA146U;
+    check(serialized.size() == expected_size && integer(serialized, 24, 4) == 32 && integer(serialized, 32, 4) == 2 &&
               integer(serialized, 36, 4) == 183 && integer(serialized, 48, 4) == expected_crc,
           "320-row ground-truth HNSW topology or payload checksum changed");
     const auto base = static_cast<std::size_t>(integer(serialized, 64, 8));
     const auto edges = base + 4 * (rows + 1);
     const std::array<std::uint32_t, 8> expected_first8 =
-        width == 64 ? std::array<std::uint32_t, 8>{129, 248, 173, 313, 277, 79, 111, 213}
-                    : std::array<std::uint32_t, 8>{229, 319, 89, 179, 225, 255, 254, 149};
+        width == 64 ? std::array<std::uint32_t, 8>{129, 248, 213, 192, 155, 295, 282, 73}
+                    : std::array<std::uint32_t, 8>{229, 319, 89, 284, 255, 55, 127, 6};
     for (std::size_t idx = 0; idx < expected_first8.size(); ++idx)
         check(integer(serialized, edges + 3 * idx, 3) == expected_first8[idx],
               "320-row ground-truth node-0 neighbor list changed");

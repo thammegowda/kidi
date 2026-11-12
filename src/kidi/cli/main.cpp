@@ -282,14 +282,16 @@ auto load_chat_session(const kidi::cli::Namespace& arguments, const std::filesys
     if (!kv_cache_precision)
         return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, "invalid KV-cache precision"});
     const auto started = std::chrono::steady_clock::now();
-    auto loaded =
-        kidi::inference::Generator::load(directory, {.device = device,
-                                                     .precision = *precision,
-                                                     .kv_cache_precision = *kv_cache_precision,
-                                                     .weight_bits = arguments.get<std::int32_t>("weight_bits"),
-                                                     .group_size = arguments.get<std::int32_t>("group_size"),
-                                                     .packed_prefill = arguments.get<bool>("packed_prefill"),
-                                                     .dense_lm_head = arguments.get<bool>("dense_lm_head")});
+    auto loaded = kidi::inference::Generator::load(
+        directory, {.device = device,
+                    .precision = *precision,
+                    .kv_cache_precision = *kv_cache_precision,
+                    .weight_bits = arguments.get<std::int32_t>("weight_bits"),
+                    .group_size = arguments.get<std::int32_t>("group_size"),
+                    .packed_prefill = arguments.get<bool>("packed_prefill"),
+                    .dense_lm_head = arguments.get<bool>("dense_lm_head"),
+                    .assistant_model = arguments.get<std::filesystem::path>("assistant_model"),
+                    .draft_tokens = arguments.get<std::size_t>("draft_tokens")});
     if (!loaded) return std::unexpected(std::move(loaded.error()));
     const auto load_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
@@ -389,6 +391,12 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
                     record["prompt_tokens"] = generation.stats.prompt_tokens;
                     record["prefill_ns"] = generation.stats.prefill_ns;
                     record["decode_tokens"] = generation.stats.decode_tokens;
+                    record["speculative"] = generation.stats.speculative;
+                    record["draft_tokens"] = generation.stats.draft_tokens;
+                    record["accepted_draft_tokens"] = generation.stats.accepted_draft_tokens;
+                    record["verification_steps"] = generation.stats.verification_steps;
+                    record["draft_ns"] = generation.stats.draft_ns;
+                    record["verify_ns"] = generation.stats.verify_ns;
                     if (limits.maximum_active == 1) {
                         record["decode_ns"] = generation.stats.decode_ns;
                         record["preparation_ns"] = generation.stats.preparation_ns;
@@ -920,6 +928,14 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             .dest("dense_lm_head")
             .action(kidi::cli::Action::STORE_TRUE)
             .help("disable checkpoint lm_head.hnsw discovery and use the exact dense head");
+        command_parser->add_argument("--assistant-model")
+            .dest("assistant_model")
+            .default_value(std::filesystem::path{})
+            .help("local draft or MTP assistant model for speculative decoding (CPU, requires --max-active 1)");
+        command_parser->add_argument("--draft-tokens")
+            .dest("draft_tokens")
+            .default_value<std::size_t>(3)
+            .help("maximum speculative draft length (1 to 16); requires --assistant-model");
     }
 
     auto& inspect_parser = commands.add_parser("inspect", "inspect a model package");

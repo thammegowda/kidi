@@ -479,6 +479,35 @@ auto main() -> int {
                 if (std::abs(attention_values[head * 2] - probability) > 1e-5F ||
                     std::abs(attention_values[head * 2 + 1] - (1.F - probability)) > 1e-5F)
                     return 1;
+            for (const std::int64_t heads : {2, 8}) {
+                const ops::DecodeScope decoding(true);
+                constexpr std::int64_t ROWS = 3;
+                const auto width = heads * 2;
+                std::vector<float> queries(ROWS * width);
+                for (std::size_t index = 0; index < queries.size(); ++index)
+                    queries[index] = (static_cast<int>(index % 11) - 5) * 0.25F;
+                const std::array<float, 6> masks{0.F, -1e9F, 0.F, 0.F, -1e9F, 0.F};
+                const auto batch_query =
+                    ops::require(tensor::Tensor::from_host({1, ROWS, width}, std::span<const float>(queries), device));
+                const auto batch_mask =
+                    ops::require(tensor::Tensor::from_host({1, 1, ROWS, 2}, std::span<const float>(masks), device));
+                const auto batch_result =
+                    context.grouped_query_attention(batch_query, memory, memory, heads, 1, batch_mask);
+                context.synchronize();
+                const auto batch_values = ops::require(batch_result.data<float>());
+                const std::vector<float> expected(batch_values.begin(), batch_values.end());
+                for (std::int64_t row = 0; row < ROWS; ++row) {
+                    const auto row_query = ops::require(tensor::Tensor::from_host(
+                        {1, 1, width}, std::span<const float>(queries).subspan(row * width, width), device));
+                    const auto row_mask = ops::require(tensor::Tensor::from_host(
+                        {1, 1, 1, 2}, std::span<const float>(masks).subspan(row * 2, 2), device));
+                    const auto actual = context.grouped_query_attention(row_query, memory, memory, heads, 1, row_mask);
+                    context.synchronize();
+                    const auto actual_values = ops::require(actual.data<float>());
+                    for (std::int64_t column = 0; column < width; ++column)
+                        if (std::abs(actual_values[column] - expected[row * width + column]) > 1e-5F) return 1;
+                }
+            }
             if (device.capabilities().attention.int8_cache_tokens) {
                 constexpr std::int64_t HEADS = 4, KEY_HEADS = 2, WIDTH = 40, QUERIES = 3, KEYS = 259, START = 5;
                 constexpr float KEY_SCALE = 0.05F, VALUE_SCALE = 0.02F;
@@ -517,6 +546,30 @@ auto main() -> int {
                 const auto actual_values = ops::require(actual.data<float>());
                 for (std::size_t index = 0; index < expected_values.size(); ++index)
                     if (std::abs(actual_values[index] - expected_values[index]) > 1e-4F) return 1;
+                if (device == tensor::Device::cpu()) {
+                    const ops::DecodeScope decoding(true);
+                    const auto batched =
+                        context.grouped_query_attention(test_query, byte_key, byte_value, HEADS, KEY_HEADS, test_mask,
+                                                        1.F, START, key_quantization, value_quantization);
+                    context.synchronize();
+                    const auto batched_values = ops::require(batched.data<float>());
+                    for (std::int64_t row = 0; row < QUERIES; ++row) {
+                        const auto query_row = ops::require(tensor::Tensor::from_host(
+                            {1, 1, HEADS * WIDTH},
+                            std::span<const float>(query_values).subspan(row * HEADS * WIDTH, HEADS * WIDTH), device));
+                        const auto mask_row = ops::require(tensor::Tensor::from_host(
+                            {1, 1, 1, KEYS - START},
+                            std::span<const float>(mask_values).subspan(row * (KEYS - START), KEYS - START), device));
+                        const auto serial =
+                            context.grouped_query_attention(query_row, byte_key, byte_value, HEADS, KEY_HEADS, mask_row,
+                                                            1.F, START, key_quantization, value_quantization);
+                        context.synchronize();
+                        const auto serial_values = ops::require(serial.data<float>());
+                        if (!std::ranges::equal(serial_values,
+                                                batched_values.subspan(row * HEADS * WIDTH, HEADS * WIDTH)))
+                            return 1;
+                    }
+                }
                 if (device == tensor::Device::cpu()) context.set_precision(core::InferencePrecision::CHECKPOINT);
             }
             auto saved = result;

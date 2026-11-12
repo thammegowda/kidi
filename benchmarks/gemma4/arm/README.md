@@ -52,6 +52,89 @@ comparison.
 `.litertlm` bundle uses a different mixed INT2/INT4 checkpoint rather than a
 directly comparable Q8 or Q4 export.
 
+### Experimental MTP off/on comparison
+
+The existing tables below remain the original runtime comparison. To measure
+Kidi's experimental MTP separately, build `kidi_android_baseline` with
+`KIDI_BUILD_BENCHMARKS=ON`, download the official assistant matching the target,
+and run:
+
+```bash
+python3 benchmarks/gemma4/arm/mtp.py \
+  --runner build-mtp/kidi_android_baseline \
+  --model /path/to/INT4-g128-checkpoint \
+  --assistant /path/to/gemma-4-E2B-it-assistant \
+  --draft-tokens 1 2 3 \
+  --kv-cache-precision fp32 \
+  --output benchmarks/gemma4/arm/mtp-int4-g128-results.json
+```
+
+The paired runs use the same prompt, CPU threads, target weights, dense LM head,
+the requested KV storage, context, warmups, and output budget. It measures 64
+output tokens with one excluded warmup and three measured repetitions per mode.
+Every warmup and measured output must match the non-MTP baseline token-for-token.
+The JSON report includes emitted-token throughput, speedup, acceptance, draft and
+verification time, peak RSS, raw records, and the runner hash. Assistant weights
+are loaded from BF16 storage and currently computed in FP32.
+
+On the Apple M5 protocol above, the fastest tested configuration starts from
+the **regular `google/gemma-4-E2B-it` model** (not QAT), quantizes that target to
+symmetric INT4-g128, and pairs it with its matching
+`google/gemma-4-E2B-it-assistant`:
+
+| Target / cache | MTP drafts | Decode (tok/s) | Matched speedup | Peak RSS (GiB) |
+|---|---:|---:|---:|---:|
+| INT4-g128 / FP32 KV | Off | 60.72 | 1.000x | 1.51 |
+| INT4-g128 / FP32 KV | 1 | 80.89 | 1.332x | 2.06 |
+| **INT4-g128 / FP32 KV** | **2** | **82.33** | **1.356x** | **2.07** |
+| INT4-g128 / FP32 KV | 3 | 73.52 | 1.211x | 2.14 |
+
+The regular BF16 and INT8 targets confirm that the base E2B assistant remains
+well aligned through INT8, while INT4 changes its draft behavior:
+
+| Regular E2B target | Drafts | Decode (tok/s) | Speedup | Draft acceptance |
+|---|---:|---:|---:|---:|
+| BF16 | Off | 16.75 | 1.000x | — |
+| BF16 | 1 | 23.93 | 1.429x | 70.3% |
+| BF16 | 2 | 27.02 | 1.613x | 49.2% |
+| **BF16** | **4** | **27.65** | **1.650x** | **34.3%** |
+| INT8 weights | Off | 32.36 | 1.000x | — |
+| INT8 weights | 1 | 43.60 | 1.347x | 65.8% |
+| INT8 weights | 2 | 47.88 | 1.480x | 55.9% |
+| **INT8 weights** | **4** | **47.97** | **1.482x** | **34.3%** |
+
+BF16 uses five measured repetitions; INT8 uses three. Every output matches its
+own non-MTP baseline token-for-token. BF16 and INT8 both accept 34.3% at
+look-ahead four and require 27 target verification rounds, whereas INT4 accepts
+20.9% and needs 35 rounds. Quantizing or otherwise adapting the assistant for the
+INT4 target is therefore a separate experiment, not an assumed optimization.
+
+This reaches **1.20x the published 68.56 tok/s Kidi QAT result**. INT8 KV is
+not valid for this target because its 15 producer-layer cache scales are zero.
+Increasing fixed look-ahead does not improve this freeform workload. A separate
+matched sweep measured draft lengths 2, 4, and 8 at 79.29, 54.07, and 32.77
+tok/s respectively (59.49 tok/s off). Acceptance fell from 36.1% to 20.9% and
+10.6%, so longer rejected suffixes added drafting and verification work without
+reducing the 35 target rounds. Kidi accepts look-ahead values through 16 for
+workloads with higher predictability, but two is the measured optimum here.
+On the calibrated mobile-QAT target, use
+`google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant` and
+`--kv-cache-precision int8 --context-tokens 512`. That path is correct but slower
+for this freeform prompt: 66.92 tok/s off versus a best 49.60 tok/s on. The
+QAT-matched assistant accepts too few drafts to amortize target verification.
+
+Assistant checkpoints are variant-specific and must not be shared across Gemma
+4 sizes. For example, E2B uses `google/gemma-4-E2B-it-assistant`, while E4B must
+use `google/gemma-4-E4B-it-assistant`. Kidi requires an explicit assistant path
+for each loaded target and validates the target hidden width, attention geometry,
+vocabulary, and rotary configuration before accepting it.
+
+Native CLI users can opt in with `--assistant-model LOCAL_DIRECTORY
+--draft-tokens 3 --backend ynnpack --max-active 1 --dense-lm-head`. MTP preserves
+AUTO/INT8 KV on calibrated QAT checkpoints and is currently limited to one active
+greedy text request. Enabling it does not imply a speedup: report both modes,
+including regressions.
+
 <p align="center">
   <img src="../../../docs/gemma4-arm-pareto.svg" alt="Gemma 4 E2B Arm CPU speed and quality comparison" width="100%">
 </p>

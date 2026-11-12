@@ -95,13 +95,20 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
         throw std::invalid_argument("Gemma benchmark prompt must not be empty");
     const auto weight_bits = settings.value("weight_bits", 0);
     const auto group_size = settings.value("group_size", 128);
+    const auto cache_precision =
+        kidi::core::parse_kv_cache_precision(settings.value("kv_cache_precision", std::string("auto")));
+    if (!cache_precision) throw std::invalid_argument("invalid benchmark KV-cache precision");
     const auto started = Clock::now();
     auto generator = require(kidi::inference::Generator::load(
-        directory, kidi::inference::ModelLoadOptions{.device = gemma_device(),
-                                                     .weight_bits = weight_bits,
-                                                     .group_size = group_size,
-                                                     .packed_prefill = packed_prefill,
-                                                     .dense_lm_head = settings.value("dense_lm_head", false)}));
+        directory,
+        kidi::inference::ModelLoadOptions{.device = gemma_device(),
+                                          .kv_cache_precision = *cache_precision,
+                                          .weight_bits = weight_bits,
+                                          .group_size = group_size,
+                                          .packed_prefill = packed_prefill,
+                                          .dense_lm_head = settings.value("dense_lm_head", false),
+                                          .assistant_model = settings.value("assistant_model", std::string{}),
+                                          .draft_tokens = settings.value("draft_tokens", std::size_t{3})}));
     require(generator.configure_serving({.maximum_active = 1,
                                          .maximum_requests = 1,
                                          .cache_token_budget = context,
@@ -116,6 +123,7 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
           {"execution", generator.execution()},
           {"model", "gemma"},
           {"ms", rounded(elapsed_ms(started))},
+          {"speculative", generator.speculative()},
           {"native_qat", generator.native_qat()}},
          threads);
 
@@ -273,6 +281,12 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
                           {"decode_tokens", stats.decode_tokens},
                           {"decode_submitted_tokens", stats.decode_submitted_tokens},
                           {"decode_queue_peak", stats.decode_queue_peak},
+                          {"speculative", stats.speculative},
+                          {"draft_tokens", stats.draft_tokens},
+                          {"accepted_draft_tokens", stats.accepted_draft_tokens},
+                          {"verification_steps", stats.verification_steps},
+                          {"draft_ms", rounded(stats.draft_ns / 1e6)},
+                          {"verify_ms", rounded(stats.verify_ns / 1e6)},
                           {"decode_tps", rounded(stats.decode_tokens * 1e9 / stats.decode_ns)},
                           {"first_token_ms", rounded(stats.time_to_first_token_ns / 1e6)},
                           {"generation_ms", rounded(stats.generation_ns / 1e6)},

@@ -114,6 +114,7 @@ add_library(kidi
     src/kidi/layers/transformer.cpp
     src/kidi/layers/whisper.cpp
     src/kidi/model/gemma4.cpp
+    src/kidi/model/gemma4_assistant.cpp
     src/kidi/model/gemma4_vision.cpp
     src/kidi/model/kokoro.cpp
     src/kidi/model/omnivoice.cpp
@@ -131,7 +132,6 @@ add_library(kidi
     src/kidi/runtime/ynn/numa.cpp
     src/kidi/runtime/ynn/worker_pool.cpp
     src/kidi/search/hnsw.cpp
-    src/kidi/search/search.cpp
     src/kidi/tensor/backend.cpp
     src/kidi/tensor/cpu_backend.cpp
     src/kidi/tensor/external.cpp
