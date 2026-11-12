@@ -106,9 +106,10 @@ def benchmark_environment(replay, profile_ops, warmups, hnsw_ef=None):
 
 
 def main(argv=None):
+    available_threads = max(1, os.cpu_count() or 1)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--threads", type=int, nargs="+", default=[8])
+    parser.add_argument("--threads", type=int, nargs="+", default=[min(8, available_threads)])
     parser.add_argument("--tokens", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
@@ -132,7 +133,7 @@ def main(argv=None):
     if (not 1 <= arguments.repeats <= 20 or not 1 <= arguments.warmups <= 20 or
             not 2 <= arguments.tokens < arguments.context_tokens or arguments.prefill_chunk < 1 or
             arguments.jobs < 1 or not math.isfinite(arguments.timeout) or arguments.timeout <= 0 or
-            any(threads < 1 or threads > (os.cpu_count() or 1) for threads in arguments.threads) or
+            any(threads < 1 or threads > available_threads for threads in arguments.threads) or
             len(set(arguments.threads)) != len(arguments.threads) or not arguments.prompt.strip()):
         parser.error("expected positive thread/job counts, 1-20 repeats/warmups, and 2 <= tokens < context")
     if arguments.hnsw_ef is not None and arguments.hnsw_ef < 1:

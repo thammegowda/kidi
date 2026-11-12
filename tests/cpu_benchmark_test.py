@@ -96,7 +96,8 @@ class CpuBenchmarkTest(unittest.TestCase):
             self.assertEqual(error.exception.code, 2)
 
     def test_hnsw_settings_reject_a_missing_index(self):
-        with tempfile.TemporaryDirectory() as temporary, patch("sys.stderr"), patch("sys.stdout"):
+        with tempfile.TemporaryDirectory() as temporary, patch("sys.stderr"), patch("sys.stdout"), \
+                patch.object(BENCHMARK.os, "cpu_count", side_effect=(8, 1)):
             output = Path(temporary) / "report.json"
             status = BENCHMARK.main(["--model", temporary, "--hnsw-ef", "256", "--output", str(output)])
             self.assertEqual(status, 1)
