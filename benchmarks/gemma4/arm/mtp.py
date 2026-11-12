@@ -25,14 +25,17 @@ def measure(arguments, drafts, reference):
         "prefill_chunk_tokens": arguments.context_tokens,
         "packed_prefill": True,
         "warmups": arguments.warmups,
-        "dense_lm_head": True,
+        "dense_lm_head": not arguments.hnsw,
         "kv_cache_precision": arguments.kv_cache_precision,
     }
     if drafts:
         settings.update(assistant_model=str(arguments.assistant), draft_tokens=drafts)
     command = [str(arguments.runner), "gemma", str(arguments.model), str(arguments.threads),
                str(arguments.repeats), json.dumps(settings)]
-    process = subprocess.run(command, cwd=ROOT, env={**os.environ, "KIDI_ACCELERATOR": "cpu"},
+    environment = {**os.environ, "KIDI_ACCELERATOR": "cpu"}
+    if arguments.hnsw_ef is not None:
+        environment["KIDI_HNSW_EF"] = str(arguments.hnsw_ef)
+    process = subprocess.run(command, cwd=ROOT, env=environment,
                              capture_output=True, text=True)
     if process.returncode:
         raise RuntimeError(f"MTP draft length {drafts} failed:\n{process.stderr}\n{process.stdout}")
@@ -90,12 +93,15 @@ def main():
     parser.add_argument("--context-tokens", type=int, default=1024)
     parser.add_argument("--draft-tokens", type=int, nargs="+", default=[1, 2, 3])
     parser.add_argument("--kv-cache-precision", choices=["auto", "fp32", "int8"], default="int8")
+    parser.add_argument("--hnsw", action="store_true", help="use MODEL/lm_head.hnsw instead of the dense target head")
+    parser.add_argument("--hnsw-ef", type=int, help="override HNSW search effort")
     parser.add_argument("--prompt", default=PROMPT)
     parser.add_argument("--output", type=Path, default=ROOT / ".cache/benchmarks/mtp-e2b-int8.json")
     arguments = parser.parse_args()
     if (arguments.threads < 1 or arguments.repeats < 1 or arguments.warmups < 1
             or arguments.output_tokens < 3 or arguments.context_tokens <= arguments.output_tokens
-            or not arguments.draft_tokens or any(value < 1 or value > 16 for value in arguments.draft_tokens)):
+            or not arguments.draft_tokens or any(value < 1 or value > 16 for value in arguments.draft_tokens)
+            or (arguments.hnsw_ef is not None and arguments.hnsw_ef < 1)):
         parser.error("Counts must be positive, the context must fit the output, and draft lengths must be 1 to 16")
     for name in ("runner", "model", "assistant", "output"):
         setattr(arguments, name, getattr(arguments, name).expanduser().absolute())
@@ -112,6 +118,7 @@ def main():
         "assistant_model": str(arguments.assistant),
         "assistant_compute_precision": "fp32",
         "kv_cache_precision": arguments.kv_cache_precision,
+        "lm_head": "hnsw" if arguments.hnsw else "dense",
         "runner_sha256": hashlib.sha256(arguments.runner.read_bytes()).hexdigest(),
         "runs": [],
     }
@@ -120,6 +127,12 @@ def main():
         document = target_config.read_bytes()
         report["target_config_sha256"] = hashlib.sha256(document).hexdigest()
         report["target_weight_bits"] = json.loads(document).get("quantization_config", {}).get("num_bits")
+    if arguments.hnsw:
+        index = arguments.model / "lm_head.hnsw"
+        if not index.is_file():
+            parser.error("--hnsw requires MODEL/lm_head.hnsw")
+        report["hnsw_index_sha256"] = hashlib.sha256(index.read_bytes()).hexdigest()
+        report["hnsw_ef"] = arguments.hnsw_ef
     reference = None
     for drafts in [0, *dict.fromkeys(arguments.draft_tokens)]:
         result, reference = measure(arguments, drafts, reference)

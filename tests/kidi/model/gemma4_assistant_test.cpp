@@ -1,4 +1,5 @@
 #include "kidi/inference/generator.h"
+#include "kidi/search/hnsw.h"
 
 #include <algorithm>
 #include <array>
@@ -186,7 +187,33 @@ auto check_generation(const std::filesystem::path& fixture, const std::filesyste
         !completed->stats.verification_steps || !completed->stats.draft_tokens)
         return false;
     require(speculative.release_workspaces());
-    return !speculative.generate_batch(std::array<std::string, 1>{"alpha"});
+    if (speculative.generate_batch(std::array<std::string, 1>{"alpha"})) return false;
+    if (!qat) {
+        const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
+        auto target = require(model::Gemma4Impl::create(config["model"]));
+        require(target->set_checkpoint(require(checkpoint::Weights::load(directory / "model.safetensors"))));
+        const auto weights = target->state_dict().at("embed_tokens.weight");
+        auto index = require(search::HnswIndex::build(weights, {.m = 4,
+                                                                .ef_construction = weights.size(0),
+                                                                .seed = 42,
+                                                                .candidates = weights.size(0),
+                                                                .ef_search = weights.size(0)}));
+        require(index.save(directory / "lm_head.hnsw"));
+        auto dense = require(inference::Generator::load(directory, {.dense_lm_head = true}));
+        auto indexed =
+            require(inference::Generator::load(directory, {.assistant_model = assistant, .draft_tokens = 3}));
+        const inference::GenerationOptions options{.maximum_new_tokens = 10,
+                                                   .context_size = 16,
+                                                   .prefill_chunk_size = 4,
+                                                   .raw_prompt = true,
+                                                   .ignore_eos = true};
+        const auto expected = require(dense.generate("alpha beta gamma", options));
+        const auto actual = require(indexed.generate("alpha beta gamma", options));
+        if (actual.generation.token_ids != expected.generation.token_ids || actual.text != expected.text ||
+            !actual.stats.speculative)
+            return false;
+    }
+    return true;
 }
 } // namespace
 

@@ -176,8 +176,8 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
 #endif
         model->set_precision(options.precision);
         model->set_kv_cache_precision(options.kv_cache_precision);
-        if (!options.assistant_model.empty() && (!lm_head_index.empty() || !model->accelerator().empty()))
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "Gemma MTP requires a CPU target with a dense LM head"});
+        if (!options.assistant_model.empty() && !model->accelerator().empty())
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "Gemma MTP requires a native CPU target"});
         if (!lm_head_index.empty() && options.weight_bits)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "HNSW head does not support load-time weight packing"});
         if (!lm_head_index.empty()) require(model->configure_lm_head(lm_head_index));

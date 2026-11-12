@@ -989,7 +989,7 @@ head dimensions, vocabulary, and rotary configuration, so an E2B assistant is
 rejected for E4B or other incompatible Gemma 4 variants.
 
 `ModelLoadOptions::assistant_model` opts into CPU greedy text MTP, with
-`draft_tokens` in 1..16. It requires a dense target head. FP32 target activations
+`draft_tokens` in 1..16. FP32 target activations
 are consumed directly; regular BF16 target hidden states and KV donors are
 converted to FP32 at the assistant boundary while target verification remains BF16.
 Calibrated QAT targets retain the ordinary AUTO/INT8 KV path; explicit FP32 is
@@ -998,6 +998,12 @@ converted only for assistant attention; FP8 KV storage is rejected. Serving admi
 decode-ahead. Serial prefix caching, batched generation, and image input are
 explicitly unsupported in this mode. The normal generation path is unchanged
 when no assistant is supplied.
+
+CPU MTP can use a checkpoint `lm_head.hnsw`. The replayed target body returns
+normalized hidden rows, then the existing multi-row HNSW selector searches and
+reranks each verification row. This remains approximate target selection:
+benchmarks must compare indexed outputs with both indexed MTP-off and dense
+controls, and report any token divergence rather than treating HNSW as lossless.
 
 Each round drafts candidates, verifies them together, accepts the matching prefix
 plus a correction or bonus, rewinds the rejected cache suffix, and emits ordinary
