@@ -293,6 +293,64 @@ class HubCliTest(unittest.TestCase):
                     resolve("owner/kokoro", root)
 
 
+    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
+    def test_gemma4_assistant_resolution_and_cli_speculative(self):
+        import shutil
+        import yaml
+        from kidi.hub import resolve
+
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as root:
+            cache = Path(root).resolve()
+            assistant_snap = cache / "models--google--gemma-4-E2B-it-assistant" / "snapshots" / ("f" * 40)
+            assistant_snap.mkdir(parents=True)
+            shutil.copy2(repo_root / "tests/data/gemma4-assistant/config.json", assistant_snap / "config.json")
+            shutil.copy2(repo_root / "tests/data/gemma4-assistant/model.safetensors",
+                         assistant_snap / "model.safetensors")
+            with patch("huggingface_hub.snapshot_download", return_value=str(assistant_snap)) as download:
+                self.assertEqual(resolve("google/gemma-4-E2B-it-assistant", cache), assistant_snap)
+                self.assertFalse((assistant_snap / "model.yaml").exists())
+                self.assertEqual(set(download.call_args.kwargs["allow_patterns"]),
+                                 {"config.json", "model.safetensors", "model.yaml"})
+
+            target_dir = cache / "target"
+            target_dir.mkdir()
+            shutil.copy2(repo_root / "tests/data/gemma4/model.safetensors", target_dir / "model.safetensors")
+            doc = yaml.safe_load((repo_root / "tests/data/gemma4/model.yaml").read_text())
+            doc.update({"format_version": 1, "weights_file": "model.safetensors", "tokenizer_file": "tokenizer.json",
+                        "decode": {"context_size": 16, "maximum_new_tokens": 6}})
+            (target_dir / "model.yaml").write_text(yaml.safe_dump(doc))
+            (target_dir / "tokenizer.json").write_text(json.dumps({
+                "version": "1.0", "pre_tokenizer": {"type": "WhitespaceSplit"},
+                "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": False},
+                "model": {"type": "WordLevel", "unk_token": "<unk>", "vocab": {
+                    "<pad>": 0, "<eos>": 1, "<bos>": 2, "<turn|>": 3, "<|turn>": 4, "<unk>": 5,
+                    "alpha": 6, "beta": 7, "gamma": 8, "delta": 9, "theta": 10, "zeta": 11,
+                    "eta": 12, "iota": 13, "kappa": 14, "lambda": 15}},
+            }))
+            (target_dir / "tokenizer_config.json").write_text("{}")
+            (target_dir / "chat_template.jinja").write_text(
+                "<bos>{% for m in messages %}<|turn>{{ m.role }}\n{{ m.content }}<turn|>\n{% endfor %}<|turn>model\n"
+            )
+            req_file = cache / "req.jsonl"
+            out_file = cache / "out.jsonl"
+            req_file.write_text('{"messages":[{"role":"user","content":"alpha beta"}],"max_tokens":4}\n')
+
+            for assistant_arg in ("@google/gemma-4-E2B-it-assistant", "google/gemma-4-E2B-it-assistant"):
+                out_file.unlink(missing_ok=True)
+                with patch("kidi.hub.resolve", return_value=assistant_snap) as mocked_resolve:
+                    code = kidi.main([
+                        "generate", "-m", str(target_dir), "-c", str(cache),
+                        "--assistant-model", assistant_arg, "--draft-tokens", "2",
+                        "--ignore-eos", "-i", str(req_file), "-o", str(out_file), "--profile",
+                    ])
+                    self.assertEqual(code, 0)
+                    mocked_resolve.assert_called_once_with("google/gemma-4-E2B-it-assistant", str(cache))
+                    row = json.loads(out_file.read_text().strip())
+                    self.assertTrue(row["speculative"])
+                    self.assertGreater(row["verification_steps"], 0)
+
+
 class PythonCliTest(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("KIDI_WHISPER_MODEL") and os.environ.get("KIDI_WHISPER_WAV"),
                          "set KIDI_WHISPER_MODEL and KIDI_WHISPER_WAV to an English PCM16 mono 16 kHz fixture")

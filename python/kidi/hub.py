@@ -88,6 +88,14 @@ def resolve(reference: str, cache: str | Path = DEFAULT_CACHE) -> Path:
                 raise ValueError("Only native Gemma mobile QAT or original floating-point checkpoints are supported")
             files = ["config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"]
             gemma = True
+        elif (original.get("model_type") == "gemma4_assistant"
+              and isinstance(text, dict) and text
+              and not original.get("quantization_config")
+              and not text.get("quantization_config")
+              and not text.get("enable_moe_block")):
+            files = ["config.json", "model.safetensors"]
+            gemma = False
+            direct = True
         elif (original.get("model_type") == "whisper"
               and original.get("architectures") == ["WhisperForConditionalGeneration"]
               and (original.get("d_model"), original.get("encoder_layers"), original.get("decoder_layers"),
@@ -106,8 +114,8 @@ def resolve(reference: str, cache: str | Path = DEFAULT_CACHE) -> Path:
             direct = True
         else:
             raise ValueError(
-                "Automatic setup supports dense Gemma 4, Whisper conditional-generation checkpoints, "
-                "or ready-made Kidi packages only"
+                "Automatic setup supports dense Gemma 4, Gemma 4 MTP assistants, "
+                "Whisper conditional-generation checkpoints, or ready-made Kidi packages only"
             )
 
     optional = []
