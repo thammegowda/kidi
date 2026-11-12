@@ -589,6 +589,11 @@ auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
                                                   impl_->key_heads * impl_->head_width[impl_->kind[index]]};
             result.layers.push_back({require(Tensor::zeros(shape, cache_dtype, device())),
                                      require(Tensor::zeros(shape, cache_dtype, device()))});
+            if (byte_cache) {
+                auto quantization = impl_->layers->at(index)->cache_quantization();
+                result.layers.back().key_quantization = std::move(quantization[0]);
+                result.layers.back().value_quantization = std::move(quantization[1]);
+            }
         }
         return result;
     } catch (const ops::Failure& error) {
@@ -597,6 +602,48 @@ auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
 }
 auto Gemma4Impl::forward(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits) -> Result<Tensor> {
     return project(tokens, state, all_logits, false);
+}
+auto Gemma4Impl::forward_features(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits)
+    -> Result<Gemma4Output> {
+    Tensor hidden;
+    auto logits = project(tokens, state, all_logits, false, {}, &hidden);
+    if (!logits) return std::unexpected(logits.error());
+    return Gemma4Output{std::move(hidden), std::move(*logits)};
+}
+auto Gemma4Impl::select_features(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_tokens)
+    -> Result<Gemma4Selection> {
+    Tensor hidden;
+    auto selected = project(tokens, state, all_tokens, true, {}, &hidden);
+    if (!selected) return std::unexpected(selected.error());
+    return Gemma4Selection{std::move(hidden), std::move(*selected)};
+}
+auto Gemma4Impl::assistant_embedding(ops::Context& context, std::int32_t token) const -> Tensor {
+    return impl_->tokens->forward(context, std::span(&token, 1));
+}
+auto Gemma4Impl::assistant_cache(Gemma4State& state, int type) const -> layers::KeyValue& {
+    if (type < 0 || type > 1 || !state.position || state.position > state.capacity ||
+        state.layers.size() != static_cast<std::size_t>(impl_->shared_begin))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid target state for Gemma MTP"});
+    for (auto layer = impl_->shared_begin; layer-- > 0;)
+        if (impl_->kind[layer] == type) return state.layers[layer];
+    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Gemma MTP requires a target KV donor for each attention type"});
+}
+auto Gemma4Impl::assistant_positions(int type, std::size_t position) -> std::array<Tensor, 2> {
+    return impl_->positions(type, position, 1);
+}
+auto Gemma4Impl::rewind(Gemma4State& state, std::size_t position) -> Result<void> {
+    try {
+        if (!state.capacity || state.capacity > static_cast<std::size_t>(impl_->maximum_position) ||
+            state.position > state.capacity || position > state.position ||
+            state.layers.size() != static_cast<std::size_t>(impl_->shared_begin))
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 cache rewind"});
+        impl_->context.synchronize();
+        state.position = position;
+        state.prefilling = position == 0;
+        return {};
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    }
 }
 auto Gemma4Impl::fork_state(const Gemma4State& source, std::size_t prefix_length, std::size_t capacity)
     -> Result<Gemma4State> {
@@ -808,9 +855,10 @@ auto Gemma4Impl::per_layer_input(const Tensor& per_layer, int layer, std::int64_
     return context.reshape(context.slice(per_layer, 2, layer, 1), {1, length, impl_->per_layer_width});
 }
 
-auto Gemma4Impl::head(const Tensor& hidden, bool select, ops::TokenOutput output) -> Tensor {
+auto Gemma4Impl::head(const Tensor& hidden, bool select, ops::TokenOutput output, Tensor* output_hidden) -> Tensor {
     auto& context = impl_->context;
     const auto query = impl_->norm->forward(context, hidden);
+    if (output_hidden) *output_hidden = query;
     if (select) return impl_->lm_head->select(context, query, output);
     auto logits = impl_->lm_head->forward(context, query);
     if (logits.dtype() != DType::F32) logits = context.cast(logits, DType::F32);
@@ -831,7 +879,7 @@ auto Gemma4Impl::decode_step(const Tensor& token, Gemma4State& state, bool selec
 }
 
 auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4StepInputs& inputs, bool prefill,
-                               bool select, ops::TokenOutput output) -> Tensor {
+                               bool select, ops::TokenOutput output, Tensor* output_hidden) -> Tensor {
     impl_->lm_head->check_hnsw_binding();
     auto& context = impl_->context;
     const auto device = context.device();
@@ -896,8 +944,9 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
                       : select ? ":token"
                                : ":logits");
     const auto split_head = select && impl_->lm_head->has_hnsw();
-    const auto replay_key =
-        key + (select && output == ops::TokenOutput::DEVICE ? ":device" : "") + (split_head ? ":query" : "");
+    const auto replay_key = key + (select && output == ops::TokenOutput::DEVICE ? ":device" : "") +
+                            (split_head ? ":query" : "") +
+                            (output_hidden ? (state.prefilling ? ":features:prefill" : ":features:decode") : "");
     if (context.accelerator() == "qnn-htp") {
         // Bound NPU prefill and decode shape caches to one executable each so attention buckets do not accumulate
         // duplicate HTP weights.
@@ -944,9 +993,15 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
         }
         if (prefill) return std::vector<Tensor>{};
         if (split_head) return std::vector{impl_->norm->forward(context, hidden)};
+        if (output_hidden) {
+            Tensor normalized;
+            auto logits = head(hidden, select, output, &normalized);
+            return std::vector{std::move(logits), std::move(normalized)};
+        }
         return std::vector{head(hidden, select, output)};
     });
     if (prefill) return {};
+    if (output_hidden) *output_hidden = outputs[split_head ? 0 : 1];
     return split_head ? impl_->lm_head->select(context, outputs[0], output) : outputs[0];
 }
 
@@ -1010,8 +1065,9 @@ auto Gemma4Impl::prefill_impl(std::span<const std::int32_t> tokens, Gemma4State&
 }
 
 auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits, bool select,
-                         std::span<Gemma4State*> batch_states) -> Result<Tensor> {
-    const ops::DecodeScope decode_scope(!batch_states.empty());
+                         std::span<Gemma4State*> batch_states, Tensor* output_hidden) -> Result<Tensor> {
+    const auto verification = output_hidden && !state.prefilling;
+    const ops::DecodeScope decode_scope(!batch_states.empty() || verification, !batch_states.empty());
     try {
         impl_->lm_head->check_hnsw_binding();
         const std::size_t token_count = tokens.size();
@@ -1024,22 +1080,25 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
                 if (token < 0 || token >= impl_->vocabulary || token >= impl_->per_layer_vocabulary)
                     throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "embedding token outside vocabulary"});
             require(prefill_impl(tokens.first(token_count - 1), state));
-            return project(tokens.last(1), state, false, select);
+            return project(tokens.last(1), state, false, select, {}, output_hidden);
         }
         auto& context = impl_->context;
         if (!state.profile_started) {
             context.profile_phase("gemma4_request");
             state.profile_started = true;
         }
-        if (token_count == 1 && batch_states.empty() && can_decode_step(state)) {
+        if (batch_states.empty() &&
+            ((token_count == 1 && can_decode_step(state)) || (output_hidden && all_logits && state.images.empty()))) {
             context.profile_phase(state.prefilling ? "prefill_body" : "decode_body");
             auto& token =
-                step_input(state.step.token, {1}, DType::I32,
+                step_input(state.step.token, {static_cast<std::int64_t>(token_count)}, DType::I32,
                            device().capabilities().memory.requires_staging() ? tensor::Device::cpu() : device());
-            require(token.data<std::int32_t>())[0] = tokens[0];
-            auto output = decode_step(token, state, select);
+            std::ranges::copy(tokens, require(token.data<std::int32_t>()).begin());
+            auto output = output_hidden ? captured_step(token, state, state.step, false, select, ops::TokenOutput::HOST,
+                                                        output_hidden)
+                                        : decode_step(token, state, select);
             context.synchronize();
-            ++state.position;
+            state.position += token_count;
             state.prefilling = false;
             return output;
         }
@@ -1084,7 +1143,7 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
         }
         context.profile_phase(state.prefilling ? "prefill_head" : "decode_head");
         if (!all_logits) hidden = context.slice(hidden, 1, active_length - 1, 1);
-        auto logits = head(hidden, select);
+        auto logits = head(hidden, select, ops::TokenOutput::HOST, output_hidden);
         context.synchronize();
         for (std::size_t row = 0; row < requests; ++row) {
             auto& request = batch_states.empty() ? state : *batch_states[row];

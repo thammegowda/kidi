@@ -18,12 +18,13 @@ enum class TokenOutput { HOST, DEVICE };
 class DecodeScope {
 public:
     explicit DecodeScope(bool enabled);
+    DecodeScope(bool attention, bool projections);
     ~DecodeScope();
     DecodeScope(const DecodeScope&) = delete;
     auto operator=(const DecodeScope&) -> DecodeScope& = delete;
 
 private:
-    bool previous_;
+    bool previous_attention_, previous_projections_;
 };
 /// Attaches `compiler` to CPU contexts constructed on this thread while the scope is alive, so their captured
 /// steps run on an accelerator. Scopes nest and restore the previous compiler.

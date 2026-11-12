@@ -100,6 +100,45 @@ auto GreedyState::accept(TokenScores scores) -> Result<void> {
     return {};
 }
 
+auto GreedyState::accept_speculative(std::span<const std::int32_t> drafts, TokenScores scores)
+    -> Result<SpeculativeAcceptance> {
+    const auto valid_token = [&](std::int32_t token) {
+        return token >= 0 && static_cast<std::size_t>(token) < options_.vocabulary_size;
+    };
+    if (finished_ || drafts.size() == std::numeric_limits<std::size_t>::max() || scores.greedy_token ||
+        !std::ranges::all_of(drafts, valid_token))
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid speculative verification request"});
+    const auto rows = drafts.size() + 1;
+    const bool selected = !scores.greedy_tokens.empty();
+    if (selected ? options_.compute_score || !scores.values.empty() || scores.greedy_tokens.size() != rows ||
+                       !std::ranges::all_of(scores.greedy_tokens, valid_token)
+                 : rows > std::numeric_limits<std::size_t>::max() / options_.vocabulary_size ||
+                       scores.values.size() != rows * options_.vocabulary_size)
+        return std::unexpected(Error{ErrorCode::RUNTIME, "invalid speculative target-score shape or selected tokens"});
+    if (!selected)
+        for (std::size_t row = 0; row < rows; ++row) {
+            const auto values = scores.values.subspan(row * options_.vocabulary_size, options_.vocabulary_size);
+            if (std::ranges::any_of(
+                    values,
+                    [](float value) { return std::isnan(value) || value == std::numeric_limits<float>::infinity(); }) ||
+                !std::isfinite(*std::ranges::max_element(values)))
+                return std::unexpected(Error{ErrorCode::RUNTIME, "invalid speculative target scores"});
+        }
+    SpeculativeAcceptance result;
+    for (std::size_t row = 0; row < rows && !finished_; ++row) {
+        const auto accepted =
+            selected
+                ? accept(TokenScores{{}, scores.kind, scores.greedy_tokens[row]})
+                : accept(TokenScores{scores.values.subspan(row * options_.vocabulary_size, options_.vocabulary_size),
+                                     scores.kind});
+        if (!accepted) return std::unexpected(accepted.error());
+        ++result.committed_inputs;
+        if (row == drafts.size() || token_ != drafts[row]) break;
+        ++result.accepted_drafts;
+    }
+    return result;
+}
+
 auto Decoder::generate(std::span<const std::int32_t> prompt, const SearchOptions& options, const ScoreFunction& score,
                        InferenceStats* stats) -> Result<Generation> {
     const auto valid_token = [&](auto token) {

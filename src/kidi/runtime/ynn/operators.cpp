@@ -582,6 +582,7 @@ public:
           query_length_(inputs[0].size(1)),
           head_dim_(inputs[0].size(2) / heads_),
           key_batch_stride_(inputs[1].size(0) == 1 ? 0 : inputs[1].size(1) * inputs[1].size(2)),
+          decode_rows_(spec.vector_projection),
           pool_(&arena) {
         const auto& mask = inputs[3];
         std::array<std::size_t, 4> strides{};
@@ -595,8 +596,16 @@ public:
         mask_head_stride_ = strides[1];
         mask_query_stride_ = strides[2];
         mask_key_stride_ = strides[3];
-        const auto params = parameters();
-        work_items_ = ::ynn::quantized_attention_f32_work_items(params);
+        auto params = parameters();
+        if (decode_rows_) {
+            params.batch_size = 1;
+            params.query_length = 1;
+            params.key_batch_stride = 0;
+            params.mask_batch_stride = 0;
+            params.mask_query_stride = 0;
+        }
+        work_items_ =
+            decode_rows_ ? batch_size_ * query_length_ * heads_ : ::ynn::quantized_attention_f32_work_items(params);
         tasks_ = std::min(ynn::thread_count(), work_items_);
         task_scratch_bytes_ = ::ynn::quantized_attention_f32_scratch_size(params);
         scratch_.resize(tasks_ * task_scratch_bytes_);
@@ -625,9 +634,31 @@ private:
         require(ynn::parallel_for(tasks_, [&](std::size_t task) {
             const auto row_start = task * rows_per_task;
             const auto row_end = std::min(row_start + rows_per_task, work_items_);
-            ::ynn::quantized_attention_f32(params, query_data.data(), key_data.data(), value_data.data(),
-                                           mask_data.data(), output_data.data(), row_start, row_end,
-                                           scratch_.data() + task * task_scratch_bytes_);
+            auto* scratch = scratch_.data() + task * task_scratch_bytes_;
+            if (!decode_rows_ || query_length_ == 1) {
+                ::ynn::quantized_attention_f32(params, query_data.data(), key_data.data(), value_data.data(),
+                                               mask_data.data(), output_data.data(), row_start, row_end, scratch);
+                return;
+            }
+            auto decode = params;
+            decode.batch_size = 1;
+            decode.query_length = 1;
+            decode.key_batch_stride = 0;
+            decode.mask_batch_stride = 0;
+            decode.mask_query_stride = 0;
+            const auto query_stride = heads_ * head_dim_;
+            for (auto work = row_start; work < row_end; ++work) {
+                const auto query_row = work / heads_;
+                const auto query_head = work % heads_;
+                const auto batch = query_row / query_length_;
+                const auto query_index = query_row % query_length_;
+                const auto key_offset = key_batch_stride_ ? batch * key_batch_stride_ : 0;
+                const auto mask_offset = batch * mask_batch_stride_ + query_index * mask_query_stride_;
+                ::ynn::quantized_attention_f32(
+                    decode, query_data.data() + query_row * query_stride, key_data.data() + key_offset,
+                    value_data.data() + key_offset, mask_data.data() + mask_offset,
+                    output_data.data() + query_row * query_stride, query_head, query_head + 1, scratch);
+            }
         }));
     }
     auto parameters() const -> ::ynn::quantized_attention_f32_params {
@@ -655,6 +686,7 @@ private:
     std::size_t mask_batch_stride_, mask_head_stride_, mask_query_stride_, mask_key_stride_;
     std::size_t batch_size_, query_length_, head_dim_, key_batch_stride_;
     float scale_;
+    bool decode_rows_;
     std::vector<float> key_scales_, value_scales_;
     std::vector<std::int32_t> key_zero_points_, value_zero_points_;
     std::size_t key_block_size_, value_block_size_;
@@ -666,12 +698,13 @@ private:
 /// value into head-major order on each call, which dominates a one-token step over a long encoder memory.
 class FewQueryAttention final : public Operator {
 public:
-    static constexpr std::int64_t MAXIMUM_QUERIES = 8;
+    static constexpr std::int64_t MAXIMUM_QUERIES = 17;
     static auto supports(const OperatorSpec& spec, TensorInputs inputs) -> bool {
         if (spec.attributes.size() == 1) {
             if (inputs[0].size(1) > MAXIMUM_QUERIES) return false;
         } else if (spec.attributes.size() == 4) {
-            if (inputs[0].size(1) != 1) return false;
+            if (inputs[0].size(1) != 1 && (!spec.vector_projection || inputs[0].size(1) > MAXIMUM_QUERIES))
+                return false;
         } else {
             return false;
         }

@@ -48,6 +48,10 @@ struct Generation {
     bool truncated = false;
 };
 
+struct SpeculativeAcceptance {
+    std::size_t accepted_drafts = 0, committed_inputs = 0;
+};
+
 struct GreedyRequest {
     std::span<const std::int32_t> tokens;
     std::size_t generated_steps;
@@ -60,6 +64,9 @@ class GreedyState {
 public:
     static auto create(SearchOptions options) -> Result<GreedyState>;
     auto accept(TokenScores scores) -> Result<void>;
+    /// Verifies `drafts.size() + 1` target-score rows, accepting the matching prefix and one correction or bonus
+    /// token. `committed_inputs` excludes the rejected verification suffix, including when a stop ends the round.
+    auto accept_speculative(std::span<const std::int32_t> drafts, TokenScores scores) -> Result<SpeculativeAcceptance>;
     auto finished() const -> bool { return finished_; }
     auto token() const -> std::int32_t { return token_; }
     auto result() const& -> const Generation& { return result_; }

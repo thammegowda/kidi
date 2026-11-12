@@ -114,6 +114,7 @@ add_library(kidi
     src/kidi/layers/transformer.cpp
     src/kidi/layers/whisper.cpp
     src/kidi/model/gemma4.cpp
+    src/kidi/model/gemma4_assistant.cpp
     src/kidi/model/gemma4_vision.cpp
     src/kidi/model/kokoro.cpp
     src/kidi/model/omnivoice.cpp

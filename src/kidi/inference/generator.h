@@ -3,6 +3,7 @@
 #include "kidi/core/precision.h"
 #include "kidi/inference/decoder.h"
 #include "kidi/model/gemma4.h"
+#include "kidi/model/gemma4_assistant.h"
 #include "kidi/model/gemma4_vision.h"
 #include "kidi/text/tokenizer.h"
 #include <chrono>
@@ -23,11 +24,14 @@ struct GenerationStats {
     bool device_selection = false;
     bool last_token_prefill = false;
     bool shared_prefill_tail = false;
+    bool speculative = false;
     std::uint64_t tokenize_ns = 0, prefill_ns = 0, decode_ns = 0, preparation_ns = 0, time_to_first_token_ns = 0;
     std::uint64_t generation_ns = 0;
     std::size_t prompt_tokens = 0, decode_tokens = 0;
     std::size_t reused_prompt_tokens = 0, prefix_cache_bytes = 0, prefix_reserved_bytes = 0;
     std::size_t decode_submitted_tokens = 0, decode_queue_peak = 0;
+    std::uint64_t draft_ns = 0, verify_ns = 0;
+    std::size_t draft_tokens = 0, accepted_draft_tokens = 0, verification_steps = 0;
 };
 struct TextGeneration {
     std::string text;
@@ -82,6 +86,8 @@ struct ModelLoadOptions {
     std::int32_t group_size = 128;
     bool packed_prefill = false;
     bool dense_lm_head = false;
+    std::filesystem::path assistant_model;
+    std::size_t draft_tokens = 3;
 };
 
 class Generator {
@@ -109,6 +115,7 @@ public:
     auto precision() const noexcept -> core::InferencePrecision { return precision_; }
     auto kv_cache_precision() const noexcept -> core::KVCachePrecision { return kv_cache_precision_; }
     auto native_qat() const -> bool { return static_cast<bool>(config_["model"]["quantization_config"]); }
+    auto speculative() const noexcept -> bool { return static_cast<bool>(assistant_); }
     auto vision_supported() const -> bool { return static_cast<bool>(config_["vision"]); }
     auto memory() const -> GeneratorMemory;
     /// Prepares reusable request shapes and weights before the first request.
@@ -124,6 +131,8 @@ private:
     YAML::Node config_;
     text::Tokenizer tokenizer_;
     model::Gemma4 model_;
+    model::Gemma4Assistant assistant_{nullptr};
+    std::size_t draft_tokens_ = 0;
     model::Gemma4Vision vision_{nullptr};
     struct CachedImage {
         std::string encoded;
@@ -170,6 +179,8 @@ private:
         std::string image_key;
         std::optional<DeviceDecode> decode;
         bool completion_emitted = false;
+        tensor::Tensor mtp_hidden;
+        std::vector<std::int32_t> mtp_inputs, mtp_drafts;
     };
     auto retain_serving_prefix(QueuedGeneration& request) -> void;
     auto reap_retired() -> void;

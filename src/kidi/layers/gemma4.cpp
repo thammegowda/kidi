@@ -260,6 +260,13 @@ auto Gemma4AttentionImpl::has_cache_scales() const -> bool {
     const auto key_scale = key_scale_.data<float>(), value_scale = value_scale_.data<float>();
     return key_scale && value_scale && (*key_scale)[0] > 0 && (*value_scale)[0] > 0;
 }
+auto Gemma4AttentionImpl::cache_quantization() const -> std::array<ops::BlockwiseQuantization, 2> {
+    if (!has_cache_scales())
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Gemma attention has no positive cache calibration scales"});
+    const auto width = static_cast<std::size_t>(head_width_);
+    return {ops::BlockwiseQuantization{{require(key_scale_.data<float>())[0]}, {0}, width},
+            ops::BlockwiseQuantization{{require(value_scale_.data<float>())[0]}, {0}, width}};
+}
 auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& input,
                                            std::span<const Gemma4AttentionSegment> segments, const Tensor& cosine,
                                            const Tensor& sine, bool cache_only) const -> Tensor {
