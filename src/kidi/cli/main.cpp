@@ -931,11 +931,11 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         command_parser->add_argument("--assistant-model")
             .dest("assistant_model")
             .default_value(std::filesystem::path{})
-            .help("local Gemma 4 MTP assistant; CPU only, requires --max-active 1 and a dense LM head");
+            .help("local draft or MTP assistant model for speculative decoding (CPU, requires --max-active 1)");
         command_parser->add_argument("--draft-tokens")
             .dest("draft_tokens")
             .default_value<std::size_t>(3)
-            .help("maximum MTP draft length (1 to 16); requires --assistant-model");
+            .help("maximum speculative draft length (1 to 16); requires --assistant-model");
     }
 
     auto& inspect_parser = commands.add_parser("inspect", "inspect a model package");

@@ -1,4 +1,5 @@
 #include "kidi/inference/generator.h"
+#include "kidi/model/gemma4_assistant.h"
 #include "kidi/search/hnsw.h"
 
 #include <algorithm>
@@ -38,8 +39,9 @@ auto check_reference(const std::filesystem::path& target_directory, const std::f
     auto target = require(model::Gemma4Impl::create(config));
     require(target->set_checkpoint(require(checkpoint::Weights::load(target_directory / "model.safetensors"))));
     auto state = require(target->create_state(16));
-    const auto features = require(target->forward_features(input, state));
-    if (!close(features.hidden, require(reference.tensor("target_hidden")))) return false;
+    tensor::Tensor target_hidden;
+    require(target->forward(input, state, true, &target_hidden));
+    if (!close(target_hidden, require(reference.tensor("target_hidden")))) return false;
     std::vector<std::vector<std::byte>> caches;
     for (const auto& layer : state.layers) {
         caches.push_back(require(layer.key.copy_to_host()));
@@ -63,7 +65,7 @@ auto check_reference(const std::filesystem::path& target_directory, const std::f
         const auto expected_hidden = require(reference.tensor("draft_hidden" + suffix));
         const auto first = require(reference.tensor("first_token"));
         auto token = require(first.data<std::int32_t>())[0];
-        auto hidden = row(features.hidden, input.size() - 1);
+        auto hidden = row(target_hidden, input.size() - 1);
         for (std::size_t step = 0; step < expected_tokens.size(); ++step) {
             auto output = require(current->forward(*target, hidden, token, state));
             if (output.token != expected_tokens[step]) {
@@ -87,8 +89,8 @@ auto check_reference(const std::filesystem::path& target_directory, const std::f
     invalid["backbone_hidden_size"] = 9;
     if (model::Gemma4AssistantImpl::create(invalid, config)) return false;
     auto empty = require(target->create_state(16));
-    return !assistant->forward(*target, row(features.hidden, 0), 2, empty) &&
-           !assistant->forward(*target, row(features.hidden, 0), 16, state);
+    return !assistant->forward(*target, row(target_hidden, 0), 2, empty) &&
+           !assistant->forward(*target, row(target_hidden, 0), 16, state);
 }
 auto check_generation(const std::filesystem::path& fixture, const std::filesystem::path& assistant) -> bool {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -157,8 +159,8 @@ auto check_generation(const std::filesystem::path& fixture, const std::filesyste
     if (inference::Generator::load(directory, {.kv_cache_precision = core::KVCachePrecision::E4M3,
                                                .dense_lm_head = true,
                                                .assistant_model = assistant}) ||
-        inference::Generator::load(
-            directory, {.dense_lm_head = true, .assistant_model = assistant, .draft_tokens = 17}))
+        inference::Generator::load(directory,
+                                   {.dense_lm_head = true, .assistant_model = assistant, .draft_tokens = 17}))
         return false;
     auto speculative = require(inference::Generator::load(
         directory, {.dense_lm_head = true, .assistant_model = assistant, .draft_tokens = 3}));

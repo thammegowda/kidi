@@ -41,32 +41,39 @@ auto check_rounds(model::Gemma4Impl& model, std::span<const std::int32_t> prompt
     const auto& expected = reference.result().token_ids;
     for (int mode = 0; mode < 3; ++mode) {
         auto state = require(model.create_state(16));
-        auto search = require(inference::GreedyState::create(options));
-        const auto first = require(model.forward_features(prompt, state, false));
-        require(search.accept({require(first.logits.data<float>())}));
-        while (!search.finished()) {
-            const auto generated = search.result().decoder_steps;
-            const auto count = std::min<std::size_t>(3, MAXIMUM - generated - 1);
-            std::vector<std::int32_t> drafts;
-            for (std::size_t index = 0; index < count; ++index) {
-                const auto token = expected[generated + index];
-                drafts.push_back(mode == 0 || (mode == 2 && index == 0)
-                                     ? token
-                                     : static_cast<std::int32_t>((token + 1) % vocabulary));
-            }
-            std::vector<std::int32_t> inputs{search.token()};
-            inputs.insert(inputs.end(), drafts.begin(), drafts.end());
-            const auto position = state.position;
-            const auto verification = require(model.forward_features(inputs, state));
-            const auto accepted =
-                require(search.accept_speculative(drafts, {require(verification.logits.data<float>())}));
-            const auto matching = mode == 0 ? count : mode == 1 ? 0 : std::min<std::size_t>(1, count);
-            if (accepted.accepted_drafts != matching || !accepted.committed_inputs ||
-                accepted.committed_inputs > inputs.size())
-                return false;
-            require(model.rewind(state, position + accepted.committed_inputs));
-        }
-        if (search.result().token_ids != expected) return false;
+        tensor::Tensor hidden, verified_logits;
+        const auto first_logits = require(model.forward(prompt, state, false, &hidden));
+        std::size_t verify_position = 0;
+        inference::SpeculativeStats stats;
+        std::size_t generated = 1;
+        const auto generation = require(inference::Decoder::generate_speculative(
+            {require(first_logits.data<float>())}, options, 3,
+            [&](std::int32_t, std::size_t limit, const inference::GreedyState::StopPredicate&,
+                std::vector<std::int32_t>& drafts) -> Result<void> {
+                for (std::size_t index = 0; index < limit; ++index) {
+                    const auto token = expected[generated + index];
+                    drafts.push_back(mode == 0 || (mode == 2 && index == 0)
+                                         ? token
+                                         : static_cast<std::int32_t>((token + 1) % vocabulary));
+                }
+                return {};
+            },
+            [&](std::span<const std::int32_t> inputs) -> Result<inference::TokenScores> {
+                verify_position = state.position;
+                auto logits = model.forward(inputs, state, true, &hidden);
+                if (!logits) return std::unexpected(logits.error());
+                verified_logits = std::move(*logits);
+                return inference::TokenScores{require(verified_logits.data<float>())};
+            },
+            [&](std::size_t committed_inputs) -> Result<void> {
+                generated += committed_inputs;
+                return model.rewind(state, verify_position + committed_inputs);
+            },
+            &stats));
+        if (generation.token_ids != expected || !stats.verification_steps ||
+            (mode == 0 && stats.accepted_draft_tokens != stats.draft_tokens) ||
+            (mode == 1 && stats.accepted_draft_tokens != 0))
+            return false;
     }
     return true;
 }
@@ -83,10 +90,11 @@ auto check(const std::filesystem::path& directory) -> bool {
             (layer.key_quantization.scales.size() != 1 || layer.value_quantization.scales.size() != 1 ||
              layer.key_quantization.scales[0] <= 0 || layer.value_quantization.scales[0] <= 0))
             return false;
-    const auto features = require(model->forward_features(prompt, prefix));
-    const auto feature_logits = snapshot(features.logits);
-    if (features.hidden.dimensions() != 3 || features.hidden.size(1) != prompt.size() ||
-        features.hidden.size(2) != config["hidden_size"].as<int>() || features.logits.size(1) != prompt.size() ||
+    tensor::Tensor features_hidden;
+    const auto features_logits = require(model->forward(prompt, prefix, true, &features_hidden));
+    const auto feature_logits = snapshot(features_logits);
+    if (features_hidden.dimensions() != 3 || features_hidden.size(1) != prompt.size() ||
+        features_hidden.size(2) != config["hidden_size"].as<int>() || features_logits.size(1) != prompt.size() ||
         prefix.position != prompt.size())
         return false;
     auto oracle = require(model->create_state(16));
@@ -96,8 +104,9 @@ auto check(const std::filesystem::path& directory) -> bool {
     for (std::size_t committed = 1; committed <= proposed.size(); ++committed) {
         auto speculative = require(model->fork_state(prefix, prompt.size(), 16));
         auto serial = require(model->fork_state(prefix, prompt.size(), 16));
-        const auto verification = require(model->forward_features(proposed, speculative));
-        if (verification.hidden.size(1) != proposed.size() || verification.logits.size(1) != proposed.size() ||
+        tensor::Tensor verification_hidden;
+        const auto verification_logits = require(model->forward(proposed, speculative, true, &verification_hidden));
+        if (verification_hidden.size(1) != proposed.size() || verification_logits.size(1) != proposed.size() ||
             speculative.position != prompt.size() + proposed.size())
             return false;
         require(model->rewind(speculative, prompt.size() + committed));
@@ -110,15 +119,16 @@ auto check(const std::filesystem::path& directory) -> bool {
     const auto position = prefix.position;
     if (model->rewind(prefix, position + 1) || prefix.position != position) return false;
     require(model->rewind(prefix, 0));
-    const auto replayed = require(model->forward_features(prompt, prefix, false));
-    const auto replayed_logits = snapshot(replayed.logits);
+    tensor::Tensor replayed_hidden;
+    const auto replayed_logits = snapshot(require(model->forward(prompt, prefix, false, &replayed_hidden)));
     auto fresh = require(model->create_state(16));
     const auto expected = require(model->forward(prompt, fresh));
-    if (replayed.hidden.size(1) != 1 || !close(replayed_logits, expected)) return false;
-    const auto one = require(model->forward_features(correction, prefix));
-    if (!one.hidden.defined() || one.hidden.size(1) != 1 || one.logits.size(1) != 1) return false;
+    if (replayed_hidden.size(1) != 1 || !close(replayed_logits, expected)) return false;
+    tensor::Tensor one_hidden;
+    const auto one_logits = require(model->forward(correction, prefix, true, &one_hidden));
+    if (!one_hidden.defined() || one_hidden.size(1) != 1 || one_logits.size(1) != 1) return false;
     model::Gemma4State invalid;
-    return !model->rewind(invalid, 0) && !model->forward_features({}, prefix) &&
+    return !model->rewind(invalid, 0) && !model->forward({}, prefix, true, &one_hidden) &&
            check_rounds(*model, prompt, config["vocab_size"].as<std::size_t>());
 }
 } // namespace

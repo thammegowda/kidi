@@ -11,43 +11,6 @@ using ops::require;
 using tensor::DType;
 using tensor::Tensor;
 namespace {
-KIDI_MODULE(AssistantBlock);
-class AssistantBlockImpl : public Module {
-public:
-    AssistantBlockImpl(const YAML::Node& config, int type)
-        : attention_(config["hidden_size"].as<int>(), config["num_attention_heads"].as<int>(),
-                     config["num_key_value_heads"].as<int>(), config[type ? "global_head_dim" : "head_dim"].as<int>(),
-                     config["rms_norm_eps"].as<float>(), true),
-          feed_forward_(config["hidden_size"].as<int>(), config["intermediate_size"].as<int>()),
-          input_norm_(config["hidden_size"].as<int>(), config["rms_norm_eps"].as<float>()),
-          attention_norm_(config["hidden_size"].as<int>(), config["rms_norm_eps"].as<float>()),
-          pre_feed_forward_norm_(config["hidden_size"].as<int>(), config["rms_norm_eps"].as<float>()),
-          post_feed_forward_norm_(config["hidden_size"].as<int>(), config["rms_norm_eps"].as<float>()) {
-        register_module("self_attn", attention_);
-        register_module("mlp", feed_forward_);
-        register_module("input_layernorm", input_norm_);
-        register_module("post_attention_layernorm", attention_norm_);
-        register_module("pre_feedforward_layernorm", pre_feed_forward_norm_);
-        register_module("post_feedforward_layernorm", post_feed_forward_norm_);
-        register_parameter("layer_scalar", scalar_, {1}, DType::F32);
-    }
-    auto forward(ops::Context& context, const Tensor& input, layers::KeyValue& cache, std::size_t position,
-                 const Tensor& mask, const std::array<Tensor, 2>& angles, std::size_t key_start) -> Tensor {
-        const auto attended = attention_->forward(context, input_norm_->forward(context, input), cache, position, mask,
-                                                  angles[0], angles[1], key_start);
-        const auto hidden = attention_norm_->forward_residual(context, attended, input);
-        return post_feed_forward_norm_->forward_residual(
-            context, feed_forward_->forward(context, pre_feed_forward_norm_->forward(context, hidden)), hidden,
-            scalar_);
-    }
-
-private:
-    layers::Gemma4Attention attention_;
-    layers::GatedFeedForward feed_forward_;
-    layers::RmsNorm input_norm_, attention_norm_, pre_feed_forward_norm_, post_feed_forward_norm_;
-    Tensor scalar_;
-};
-
 KIDI_MODULE(AssistantVocabulary);
 class AssistantVocabularyImpl : public Module {
 public:
@@ -61,7 +24,7 @@ public:
         clusters_.resize(centroids);
         candidates_.reserve(static_cast<std::size_t>(top_k) * (vocabulary / centroids));
     }
-    auto select(ops::Context& context, const Tensor& hidden, const Tensor& weight) -> std::int32_t {
+    auto select(ops::Context& context, const Tensor& hidden, const layers::Linear& lm_head) -> std::int32_t {
         const auto logits = centroids_->forward(context, hidden);
         const auto values = require(logits.data<float>());
         if (std::ranges::any_of(values, [](float value) { return !std::isfinite(value); }))
@@ -76,23 +39,7 @@ public:
         for (int cluster = 0; cluster < top_k_; ++cluster)
             for (int row = 0; row < per_cluster; ++row)
                 candidates_.push_back(static_cast<std::int32_t>(ordering[clusters_[cluster] * per_cluster + row]));
-        const auto indices = require(Tensor::from_host({static_cast<std::int64_t>(candidates_.size())},
-                                                       std::span<const std::int32_t>(candidates_)));
-        const auto selected = context.gather(weight, indices);
-        const auto scores = context.matmul(hidden, selected, true);
-        const auto score_values = require(scores.data<float>());
-        auto best = -std::numeric_limits<float>::infinity();
-        std::int32_t token = -1;
-        for (std::size_t index = 0; index < score_values.size(); ++index) {
-            const auto value = score_values[index];
-            if (!std::isfinite(value))
-                throw ops::Failure({ErrorCode::RUNTIME, "nonfinite Gemma MTP vocabulary scores"});
-            if (value > best || (value == best && candidates_[index] < token)) {
-                best = value;
-                token = candidates_[index];
-            }
-        }
-        return token;
+        return lm_head->select(context, hidden, candidates_);
     }
 
 private:
@@ -108,7 +55,7 @@ struct Gemma4AssistantImpl::State {
     int hidden, backbone, vocabulary, window, maximum_position;
     layers::Linear pre_projection, post_projection, lm_head;
     layers::RmsNorm norm;
-    ModuleList<AssistantBlockImpl> layers;
+    ModuleList<layers::Gemma4BlockImpl> layers;
     AssistantVocabulary masked_embedding{nullptr};
     std::vector<int> kind;
     std::array<layers::KeyValue, 2> caches;
@@ -128,10 +75,14 @@ struct Gemma4AssistantImpl::State {
           post_projection(hidden, backbone, true, false),
           lm_head(hidden, vocabulary, true, false),
           norm(hidden, config["text_config"]["rms_norm_eps"].as<float>()) {
-        for (const auto& layer : config["text_config"]["layer_types"]) {
+        const auto text = config["text_config"];
+        for (const auto& layer : text["layer_types"]) {
             const int type = layer.as<std::string>() == "full_attention" ? 1 : 0;
             kind.push_back(type);
-            layers->push_back(AssistantBlock(config["text_config"], type));
+            layers->push_back(layers::Gemma4Block(
+                hidden, text["intermediate_size"].as<int>(), text["num_attention_heads"].as<int>(),
+                text["num_key_value_heads"].as<int>(), text[type ? "global_head_dim" : "head_dim"].as<int>(), 0,
+                text["rms_norm_eps"].as<float>(), true));
         }
         if (config["use_ordered_embeddings"].as<bool>(false))
             masked_embedding = AssistantVocabulary(hidden, vocabulary, config["num_centroids"].as<int>(),
@@ -300,8 +251,8 @@ auto Gemma4AssistantImpl::forward(Gemma4Impl& target, const Tensor& hidden, std:
                 impl_->angles[type] = target.assistant_positions(type, state.position);
                 const auto& source = target.assistant_cache(state, type);
                 if (source.key.dtype() == DType::BF16) {
-                    const auto shape = std::vector<std::int64_t>{
-                        1, static_cast<std::int64_t>(extent), static_cast<std::int64_t>(source.key.size(2))};
+                    const auto shape = std::vector<std::int64_t>{1, static_cast<std::int64_t>(extent),
+                                                                 static_cast<std::int64_t>(source.key.size(2))};
                     const auto bytes = extent * source.key.size(2) * tensor::element_size(DType::BF16);
                     auto key = require(Tensor::from_bytes(shape, DType::BF16,
                                                           require(source.key.host_bytes()).first(bytes), device()));
@@ -321,14 +272,15 @@ auto Gemma4AssistantImpl::forward(Gemma4Impl& target, const Tensor& hidden, std:
         // All drafts in a round share the target history and the same RoPE position, as trained by Gemma MTP.
         for (std::size_t layer = 0; layer < impl_->layers->size(); ++layer) {
             const auto type = impl_->kind[layer];
-            value = impl_->layers->at(layer)->forward(context, value, impl_->caches[type], state.position - 1,
-                                                      impl_->masks[type], impl_->angles[type], impl_->key_starts[type]);
+            value = impl_->layers->at(layer)->forward(context, value, {}, impl_->caches[type], state.position - 1,
+                                                      impl_->masks[type], impl_->angles[type][0],
+                                                      impl_->angles[type][1], impl_->key_starts[type]);
         }
         value = impl_->norm->forward(context, value);
         const auto projected = impl_->post_projection->forward(context, value);
         std::int32_t selected;
         if (impl_->masked_embedding)
-            selected = impl_->masked_embedding->select(context, value, impl_->lm_head->weight());
+            selected = impl_->masked_embedding->select(context, value, impl_->lm_head);
         else {
             const auto output = impl_->lm_head->select(context, value);
             selected = require(output.data<std::int32_t>())[0];
@@ -340,6 +292,21 @@ auto Gemma4AssistantImpl::forward(Gemma4Impl& target, const Tensor& hidden, std:
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
+}
+auto Gemma4AssistantImpl::draft(Gemma4Impl& target, const Tensor& hidden, std::int32_t last_token, Gemma4State& state,
+                                std::size_t max_drafts, const inference::GreedyState::StopPredicate& is_stop,
+                                std::vector<std::int32_t>& drafts) -> Result<void> {
+    auto current_hidden = hidden;
+    auto token = last_token;
+    for (std::size_t index = 0; index < max_drafts; ++index) {
+        auto output = forward(target, current_hidden, token, state);
+        if (!output) return std::unexpected(output.error());
+        current_hidden = std::move(output->hidden);
+        token = output->token;
+        drafts.push_back(token);
+        if (is_stop && is_stop(token)) break;
+    }
+    return {};
 }
 auto Gemma4AssistantImpl::preparation_ns() const -> std::uint64_t { return impl_->context.preparation_ns(); }
 auto Gemma4AssistantImpl::release_workspaces() -> void {

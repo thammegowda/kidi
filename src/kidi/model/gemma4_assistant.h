@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kidi/inference/decoder.h"
 #include "kidi/model/gemma4.h"
 
 namespace kidi::model {
@@ -19,6 +20,9 @@ public:
     auto set_checkpoint(const checkpoint::Weights& weights) -> Result<void>;
     auto forward(Gemma4Impl& target, const tensor::Tensor& hidden, std::int32_t token, Gemma4State& state)
         -> Result<Gemma4Draft>;
+    auto draft(Gemma4Impl& target, const tensor::Tensor& hidden, std::int32_t last_token, Gemma4State& state,
+               std::size_t max_drafts, const inference::GreedyState::StopPredicate& is_stop,
+               std::vector<std::int32_t>& drafts) -> Result<void>;
     auto preparation_ns() const -> std::uint64_t;
     auto release_workspaces() -> void;
 

@@ -117,8 +117,8 @@ public:
 private:
     Gemma4Attention attention_;
     GatedFeedForward feed_forward_;
-    RmsNorm input_norm_, attention_norm_, pre_feed_forward_norm_, post_feed_forward_norm_, per_layer_norm_;
-    Linear per_layer_gate_, per_layer_projection_;
+    RmsNorm input_norm_, attention_norm_, pre_feed_forward_norm_, post_feed_forward_norm_, per_layer_norm_{nullptr};
+    Linear per_layer_gate_{nullptr}, per_layer_projection_{nullptr};
     Tensor scalar_;
 };
 } // namespace kidi::layers

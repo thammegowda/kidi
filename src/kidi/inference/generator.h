@@ -3,12 +3,12 @@
 #include "kidi/core/precision.h"
 #include "kidi/inference/decoder.h"
 #include "kidi/model/gemma4.h"
-#include "kidi/model/gemma4_assistant.h"
 #include "kidi/model/gemma4_vision.h"
 #include "kidi/text/tokenizer.h"
 #include <chrono>
 #include <deque>
 #include <functional>
+#include <memory>
 
 namespace kidi::inference {
 struct GenerationOptions {
@@ -92,6 +92,10 @@ struct ModelLoadOptions {
 
 class Generator {
 public:
+    Generator(Generator&&) noexcept;
+    auto operator=(Generator&&) noexcept -> Generator&;
+    ~Generator();
+
     static auto load(const std::filesystem::path& directory, ModelLoadOptions options,
                      const ExternalTensorSource& external = {}) -> Result<Generator>;
     /// Loads Gemma 4 on `device`; the Qualcomm NPU device keeps the model on the CPU and compiles captured
@@ -115,7 +119,7 @@ public:
     auto precision() const noexcept -> core::InferencePrecision { return precision_; }
     auto kv_cache_precision() const noexcept -> core::KVCachePrecision { return kv_cache_precision_; }
     auto native_qat() const -> bool { return static_cast<bool>(config_["model"]["quantization_config"]); }
-    auto speculative() const noexcept -> bool { return static_cast<bool>(assistant_); }
+    auto speculative() const noexcept -> bool { return static_cast<bool>(drafter_); }
     auto vision_supported() const -> bool { return static_cast<bool>(config_["vision"]); }
     auto memory() const -> GeneratorMemory;
     /// Prepares reusable request shapes and weights before the first request.
@@ -128,10 +132,11 @@ public:
 private:
     Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model, std::array<std::int32_t, 3> special,
               core::InferencePrecision precision, core::KVCachePrecision kv_cache_precision);
+    struct DraftBackend;
     YAML::Node config_;
     text::Tokenizer tokenizer_;
     model::Gemma4 model_;
-    model::Gemma4Assistant assistant_{nullptr};
+    std::unique_ptr<DraftBackend> drafter_;
     std::size_t draft_tokens_ = 0;
     model::Gemma4Vision vision_{nullptr};
     struct CachedImage {
@@ -179,8 +184,7 @@ private:
         std::string image_key;
         std::optional<DeviceDecode> decode;
         bool completion_emitted = false;
-        tensor::Tensor mtp_hidden;
-        std::vector<std::int32_t> mtp_inputs, mtp_drafts;
+        tensor::Tensor draft_hidden;
     };
     auto retain_serving_prefix(QueuedGeneration& request) -> void;
     auto reap_retired() -> void;

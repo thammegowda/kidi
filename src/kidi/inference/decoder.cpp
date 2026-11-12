@@ -100,8 +100,12 @@ auto GreedyState::accept(TokenScores scores) -> Result<void> {
     return {};
 }
 
-auto GreedyState::accept_speculative(std::span<const std::int32_t> drafts, TokenScores scores)
-    -> Result<SpeculativeAcceptance> {
+auto GreedyState::is_stop_token(std::int32_t token) const noexcept -> bool {
+    return options_.stop_on_eos && (token == options_.end_id || std::ranges::find(stop_ids_, token) != stop_ids_.end());
+}
+
+auto GreedyState::accept_speculative(std::span<const std::int32_t> drafts, TokenScores scores,
+                                     std::vector<std::int32_t>* committed_tokens) -> Result<SpeculativeAcceptance> {
     const auto valid_token = [&](std::int32_t token) {
         return token >= 0 && static_cast<std::size_t>(token) < options_.vocabulary_size;
     };
@@ -124,6 +128,7 @@ auto GreedyState::accept_speculative(std::span<const std::int32_t> drafts, Token
                 !std::isfinite(*std::ranges::max_element(values)))
                 return std::unexpected(Error{ErrorCode::RUNTIME, "invalid speculative target scores"});
         }
+    if (committed_tokens) committed_tokens->clear();
     SpeculativeAcceptance result;
     for (std::size_t row = 0; row < rows && !finished_; ++row) {
         const auto accepted =
@@ -133,10 +138,71 @@ auto GreedyState::accept_speculative(std::span<const std::int32_t> drafts, Token
                                      scores.kind});
         if (!accepted) return std::unexpected(accepted.error());
         ++result.committed_inputs;
+        if (committed_tokens) committed_tokens->push_back(token_);
         if (row == drafts.size() || token_ != drafts[row]) break;
         ++result.accepted_drafts;
     }
     return result;
+}
+
+auto GreedyState::step_speculative(std::size_t max_drafts, const DraftFunction& draft, const VerifyFunction& verify,
+                                   const CommitFunction& commit, SpeculativeStats* stats) -> Result<SpeculativeStep> {
+    if (finished_ || !max_drafts || max_drafts > MAX_DRAFT_TOKENS || !draft || !verify)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid speculative step request"});
+    const auto remaining = remaining_steps();
+    const auto draft_limit = std::min(max_drafts, remaining > 0 ? remaining - 1 : 0);
+    std::vector<std::int32_t> drafts, inputs{token_};
+    drafts.reserve(draft_limit);
+    inputs.reserve(draft_limit + 1);
+    std::uint64_t draft_ns = 0;
+    if (draft_limit > 0) {
+        const auto started = Clock::now();
+        if (const auto proposed = draft(
+                token_, draft_limit, [this](std::int32_t id) { return is_stop_token(id); }, drafts);
+            !proposed)
+            return std::unexpected(proposed.error());
+        draft_ns = elapsed(started);
+        if (drafts.size() > draft_limit)
+            return std::unexpected(Error{ErrorCode::RUNTIME, "speculative drafter exceeded requested draft budget"});
+        inputs.insert(inputs.end(), drafts.begin(), drafts.end());
+    }
+    const auto verify_started = Clock::now();
+    auto scores = verify(inputs);
+    if (!scores) return std::unexpected(scores.error());
+    const auto verify_ns = elapsed(verify_started);
+    SpeculativeStep step;
+    step.draft_tokens = drafts.size();
+    step.tokens.reserve(inputs.size());
+    const auto accepted = accept_speculative(drafts, *scores, &step.tokens);
+    if (!accepted) return std::unexpected(accepted.error());
+    step.acceptance = *accepted;
+    if (commit)
+        if (const auto committed = commit(step.acceptance.committed_inputs); !committed)
+            return std::unexpected(committed.error());
+    if (stats) {
+        stats->draft_ns += draft_ns;
+        stats->verify_ns += verify_ns;
+        stats->draft_tokens += step.draft_tokens;
+        stats->accepted_draft_tokens += step.acceptance.accepted_drafts;
+        ++stats->verification_steps;
+    }
+    return step;
+}
+
+auto Decoder::generate_speculative(TokenScores initial_scores, const SearchOptions& options, std::size_t max_drafts,
+                                   const GreedyState::DraftFunction& draft, const GreedyState::VerifyFunction& verify,
+                                   const GreedyState::CommitFunction& commit, SpeculativeStats* stats)
+    -> Result<Generation> {
+    if (!max_drafts || max_drafts > MAX_DRAFT_TOKENS || !draft || !verify)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid speculative generation request"});
+    auto search = GreedyState::create(options);
+    if (!search) return std::unexpected(search.error());
+    if (const auto accepted = search->accept(initial_scores); !accepted) return std::unexpected(accepted.error());
+    while (!search->finished()) {
+        const auto step = search->step_speculative(max_drafts, draft, verify, commit, stats);
+        if (!step) return std::unexpected(step.error());
+    }
+    return std::move(*search).result();
 }
 
 auto Decoder::generate(std::span<const std::int32_t> prompt, const SearchOptions& options, const ScoreFunction& score,

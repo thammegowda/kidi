@@ -98,8 +98,8 @@ if(KIDI_BUILD_INTEGRATION_TESTS)
     set_tests_properties(kidi_python_test PROPERTIES LABELS python WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
 
     add_test(NAME kidi_browser_test COMMAND "${KIDI_TEST_NODE}" --test
-        "${PROJECT_SOURCE_DIR}/tests/web/model_cache_test.mjs"
-        "${PROJECT_SOURCE_DIR}/tests/web/speech_test.mjs")
+        "${PROJECT_SOURCE_DIR}/tests/browser/model_cache_test.mjs"
+        "${PROJECT_SOURCE_DIR}/tests/browser/speech_test.mjs")
     set_tests_properties(kidi_browser_test PROPERTIES LABELS browser WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
 
     add_test(NAME kidi_rtg_regression_test COMMAND "${KIDI_TEST_PYTHON}"

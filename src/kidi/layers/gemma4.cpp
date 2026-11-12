@@ -373,19 +373,22 @@ Gemma4BlockImpl::Gemma4BlockImpl(std::int32_t hidden, std::int32_t intermediate,
       input_norm_(hidden, epsilon),
       attention_norm_(hidden, epsilon),
       pre_feed_forward_norm_(hidden, epsilon),
-      post_feed_forward_norm_(hidden, epsilon),
-      per_layer_norm_(hidden, epsilon),
-      per_layer_gate_(hidden, per_layer_width, true, false, per_layer_bits, false, per_layer_group_size),
-      per_layer_projection_(per_layer_width, hidden, true, false, per_layer_bits, false, per_layer_group_size) {
+      post_feed_forward_norm_(hidden, epsilon) {
     register_module("self_attn", attention_);
     register_module("mlp", feed_forward_);
     register_module("input_layernorm", input_norm_);
     register_module("post_attention_layernorm", attention_norm_);
     register_module("pre_feedforward_layernorm", pre_feed_forward_norm_);
     register_module("post_feedforward_layernorm", post_feed_forward_norm_);
-    register_module("post_per_layer_input_norm", per_layer_norm_);
-    register_module("per_layer_input_gate", per_layer_gate_);
-    register_module("per_layer_projection", per_layer_projection_);
+    if (per_layer_width > 0) {
+        per_layer_norm_ = RmsNorm(hidden, epsilon);
+        per_layer_gate_ = Linear(hidden, per_layer_width, true, false, per_layer_bits, false, per_layer_group_size);
+        per_layer_projection_ =
+            Linear(per_layer_width, hidden, true, false, per_layer_bits, false, per_layer_group_size);
+        register_module("post_per_layer_input_norm", per_layer_norm_);
+        register_module("per_layer_input_gate", per_layer_gate_);
+        register_module("per_layer_projection", per_layer_projection_);
+    }
     register_parameter("layer_scalar", scalar_, {1}, tensor::DType::F32);
     if (scalar_.defined()) scalar_ = require(Tensor::from_host({1}, std::span<const float>(std::array{1.F}), device()));
 }
@@ -402,6 +405,10 @@ auto Gemma4BlockImpl::forward_segments(ops::Context& context, const Tensor& inpu
         attention_->forward_segments(context, input_norm_->forward(context, input), segments, cosine, sine, cache_only);
     if (cache_only) return {};
     auto hidden = attention_norm_->forward_residual(context, attended, input);
+    if (!per_layer_projection_)
+        return post_feed_forward_norm_->forward_residual(
+            context, feed_forward_->forward(context, pre_feed_forward_norm_->forward(context, hidden)), hidden,
+            scalar_);
     hidden = post_feed_forward_norm_->forward_residual(
         context, feed_forward_->forward(context, pre_feed_forward_norm_->forward(context, hidden)), hidden);
     auto gate = per_layer_gate_->forward(context, hidden);

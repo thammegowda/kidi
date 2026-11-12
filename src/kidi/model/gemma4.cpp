@@ -600,22 +600,9 @@ auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
         return std::unexpected(error.error());
     }
 }
-auto Gemma4Impl::forward(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits) -> Result<Tensor> {
-    return project(tokens, state, all_logits, false);
-}
-auto Gemma4Impl::forward_features(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits)
-    -> Result<Gemma4Output> {
-    Tensor hidden;
-    auto logits = project(tokens, state, all_logits, false, {}, &hidden);
-    if (!logits) return std::unexpected(logits.error());
-    return Gemma4Output{std::move(hidden), std::move(*logits)};
-}
-auto Gemma4Impl::select_features(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_tokens)
-    -> Result<Gemma4Selection> {
-    Tensor hidden;
-    auto selected = project(tokens, state, all_tokens, true, {}, &hidden);
-    if (!selected) return std::unexpected(selected.error());
-    return Gemma4Selection{std::move(hidden), std::move(*selected)};
+auto Gemma4Impl::forward(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits, Tensor* hidden)
+    -> Result<Tensor> {
+    return project(tokens, state, all_logits, false, {}, hidden);
 }
 auto Gemma4Impl::assistant_embedding(ops::Context& context, std::int32_t token) const -> Tensor {
     return impl_->tokens->forward(context, std::span(&token, 1));
@@ -681,11 +668,13 @@ auto Gemma4Impl::fork_state(const Gemma4State& source, std::size_t prefix_length
         return std::unexpected(error.error());
     }
 }
-auto Gemma4Impl::forward_token(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<std::int32_t> {
-    return selected_token(project(tokens, state, false, true));
+auto Gemma4Impl::forward_token(std::span<const std::int32_t> tokens, Gemma4State& state, Tensor* hidden)
+    -> Result<std::int32_t> {
+    return selected_token(project(tokens, state, false, true, {}, hidden));
 }
-auto Gemma4Impl::select_token(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<Tensor> {
-    return project(tokens, state, false, true);
+auto Gemma4Impl::select_token(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_tokens, Tensor* hidden)
+    -> Result<Tensor> {
+    return project(tokens, state, all_tokens, true, {}, hidden);
 }
 auto Gemma4Impl::select_batch_tokens(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states)
     -> Result<Tensor> {
@@ -872,10 +861,11 @@ auto Gemma4Impl::can_decode_step(const Gemma4State& state) const -> bool {
     });
 }
 
-auto Gemma4Impl::decode_step(const Tensor& token, Gemma4State& state, bool select, ops::TokenOutput output) -> Tensor {
+auto Gemma4Impl::decode_step(const Tensor& token, Gemma4State& state, bool select, ops::TokenOutput output,
+                             Tensor* output_hidden) -> Tensor {
     if (state.prefilling && state.images.empty() && !impl_->context.accelerator().empty())
         impl_->context.clear_replays("gemma4_prefill:");
-    return captured_step(token, state, state.step, false, select, output);
+    return captured_step(token, state, state.step, false, select, output, output_hidden);
 }
 
 auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4StepInputs& inputs, bool prefill,
@@ -1094,9 +1084,7 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
                 step_input(state.step.token, {static_cast<std::int64_t>(token_count)}, DType::I32,
                            device().capabilities().memory.requires_staging() ? tensor::Device::cpu() : device());
             std::ranges::copy(tokens, require(token.data<std::int32_t>()).begin());
-            auto output = output_hidden ? captured_step(token, state, state.step, false, select, ops::TokenOutput::HOST,
-                                                        output_hidden)
-                                        : decode_step(token, state, select);
+            auto output = decode_step(token, state, select, ops::TokenOutput::HOST, output_hidden);
             context.synchronize();
             state.position += token_count;
             state.prefilling = false;

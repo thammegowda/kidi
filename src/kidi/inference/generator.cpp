@@ -2,6 +2,7 @@
 #include "kidi/inference/generator.h"
 #include <cstring>
 #include "kidi/core/memory.h"
+#include "kidi/model/gemma4_assistant.h"
 #include "kidi/runtime/operator.h"
 #include "kidi/tensor/backend.h"
 #include "kidi/checkpoint/config.h"
@@ -41,6 +42,66 @@ auto should_capture_prefill(std::string_view accelerator, std::size_t prompt_tok
 }
 } // namespace
 
+struct Generator::DraftBackend {
+    model::Gemma4Assistant gemma4{nullptr};
+
+    static auto load(const std::filesystem::path& directory, const YAML::Node& target_config, tensor::Device device)
+        -> Result<std::unique_ptr<DraftBackend>> {
+        try {
+            const auto assistant_config =
+                require(checkpoint::load_config(directory, model::Gemma4AssistantImpl::checkpoint_config()));
+            const ModuleScope scope(tensor::DType::F32, false, device);
+            auto assistant = require(model::Gemma4AssistantImpl::create(assistant_config["model"], target_config));
+            const auto weights = require(checkpoint::Weights::load(assistant_config["weights_file"].as<std::string>()));
+            require(assistant->set_checkpoint(weights));
+            auto backend = std::make_unique<DraftBackend>();
+            backend->gemma4 = std::move(assistant);
+            return backend;
+        } catch (const ops::Failure& error) {
+            return std::unexpected(error.error());
+        }
+    }
+
+    auto step(model::Gemma4Impl& target, model::Gemma4State& state, tensor::Tensor& hidden, GreedyState& search,
+              std::size_t max_drafts, SpeculativeStats* stats) -> Result<SpeculativeStep> {
+        tensor::Tensor verified_hidden, verified_tokens;
+        std::size_t verify_position = 0;
+        return search.step_speculative(
+            max_drafts,
+            [&](std::int32_t last_token, std::size_t limit, const GreedyState::StopPredicate& is_stop,
+                std::vector<std::int32_t>& drafts) {
+                return gemma4->draft(target, hidden, last_token, state, limit, is_stop, drafts);
+            },
+            [&](std::span<const std::int32_t> inputs) -> Result<TokenScores> {
+                verify_position = state.position;
+                auto tokens = target.select_token(inputs, state, true, &verified_hidden);
+                if (!tokens) return std::unexpected(tokens.error());
+                verified_tokens = std::move(*tokens);
+                const auto selected = std::as_const(verified_tokens).data<std::int32_t>();
+                if (!selected) return std::unexpected(selected.error());
+                return TokenScores{{}, ScoreKind::LOGITS, {}, *selected};
+            },
+            [&](std::size_t committed_inputs) -> Result<void> {
+                if (const auto rewound = target.rewind(state, verify_position + committed_inputs); !rewound)
+                    return rewound;
+                const auto rows = verified_hidden.select(0, 0);
+                if (!rows) return std::unexpected(rows.error());
+                const auto row = rows->select(0, committed_inputs - 1);
+                if (!row) return std::unexpected(row.error());
+                auto reshaped = row->reshape({1, 1, static_cast<std::int64_t>(row->size(0))});
+                if (!reshaped) return std::unexpected(reshaped.error());
+                hidden = std::move(*reshaped);
+                return {};
+            },
+            stats);
+    }
+
+    auto preparation_ns() const -> std::uint64_t { return gemma4 ? gemma4->preparation_ns() : 0; }
+    auto release_workspaces() -> void {
+        if (gemma4) gemma4->release_workspaces();
+    }
+};
+
 Generator::Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model,
                      std::array<std::int32_t, 3> special, core::InferencePrecision precision,
                      core::KVCachePrecision kv_cache_precision)
@@ -50,6 +111,9 @@ Generator::Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4
       special_(special),
       precision_(precision),
       kv_cache_precision_(kv_cache_precision) {}
+Generator::Generator(Generator&&) noexcept = default;
+auto Generator::operator=(Generator&&) noexcept -> Generator& = default;
+Generator::~Generator() = default;
 auto Generator::load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits,
                      std::int32_t group_size, bool packed_prefill, const ExternalTensorSource& external)
     -> Result<Generator> {
@@ -71,11 +135,14 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
         require(model::Gemma4Impl::validate_config(config["model"]));
         const bool qat = static_cast<bool>(config["model"]["quantization_config"]);
         if (!options.assistant_model.empty() && !options.device.capabilities().compute.host())
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "Gemma MTP currently requires CPU target execution"});
-        if ((!options.assistant_model.empty() && (!options.draft_tokens || options.draft_tokens > 16)) ||
-            (options.assistant_model.empty() && options.draft_tokens != 3))
             throw ops::Failure(
-                {ErrorCode::INVALID_ARGUMENT, "Gemma MTP needs an assistant model and 1 to 16 draft tokens"});
+                {ErrorCode::UNSUPPORTED, "speculative decoding currently requires CPU target execution"});
+        if (!options.assistant_model.empty() && (!options.draft_tokens || options.draft_tokens > MAX_DRAFT_TOKENS))
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
+                                "speculative decoding requires an assistant model and 1 to 16 draft tokens"});
+        if (options.assistant_model.empty() && options.draft_tokens != 3)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
+                                "speculative decoding requires an assistant model and 1 to 16 draft tokens"});
         std::filesystem::path lm_head_index;
         if (!options.dense_lm_head && options.device.capabilities().compute.host()) {
             const auto checkpoint_directory =
@@ -177,24 +244,17 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
         model->set_precision(options.precision);
         model->set_kv_cache_precision(options.kv_cache_precision);
         if (!options.assistant_model.empty() && !model->accelerator().empty())
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "Gemma MTP requires a native CPU target"});
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding requires a native CPU target"});
         if (!lm_head_index.empty() && options.weight_bits)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "HNSW head does not support load-time weight packing"});
         if (!lm_head_index.empty()) require(model->configure_lm_head(lm_head_index));
-        model::Gemma4Assistant assistant{nullptr};
-        if (!options.assistant_model.empty()) {
-            const auto assistant_config = require(
-                checkpoint::load_config(options.assistant_model, model::Gemma4AssistantImpl::checkpoint_config()));
-            const ModuleScope assistant_scope(tensor::DType::F32, false, device);
-            assistant = require(model::Gemma4AssistantImpl::create(assistant_config["model"], config["model"]));
-            const auto assistant_weights =
-                require(checkpoint::Weights::load(assistant_config["weights_file"].as<std::string>()));
-            require(assistant->set_checkpoint(assistant_weights));
-        }
+        std::unique_ptr<DraftBackend> drafter;
+        if (!options.assistant_model.empty())
+            drafter = require(DraftBackend::load(options.assistant_model, config["model"], device));
         Generator result(std::move(config), std::move(tokenizer), std::move(model), special, options.precision,
                          options.kv_cache_precision);
-        result.assistant_ = std::move(assistant);
-        result.draft_tokens_ = result.assistant_ ? options.draft_tokens : 0;
+        result.drafter_ = std::move(drafter);
+        result.draft_tokens_ = result.drafter_ ? options.draft_tokens : 0;
         return result;
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
@@ -290,7 +350,7 @@ auto Generator::release_workspaces() -> Result<void> {
         if (pending_requests())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "drain generation requests before releasing workspaces"});
         model_->release_workspaces();
-        if (assistant_) assistant_->release_workspaces();
+        if (drafter_) drafter_->release_workspaces();
         retired_.clear();
         reserved_cache_tokens_ = 0;
         if (vision_) vision_->release_workspaces();
@@ -306,7 +366,7 @@ auto Generator::trim_workspaces() -> Result<void> {
         if (pending_requests())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "drain generation requests before trimming workspaces"});
         model_->trim_workspaces();
-        if (assistant_) assistant_->release_workspaces();
+        if (drafter_) drafter_->release_workspaces();
         if (vision_) vision_->release_workspaces();
         return {};
     } catch (const ops::Failure& error) {
@@ -343,12 +403,12 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
                                 "drain serving requests before serial generation; reload after a serving failure"});
         serving_prefix_.reset();
-        if (assistant_ && options.prefix_cache_bytes)
+        if (drafter_ && options.prefix_cache_bytes)
             throw ops::Failure(
-                {ErrorCode::UNSUPPORTED, "serial MTP prefix caching is not implemented; use the serving API"});
+                {ErrorCode::UNSUPPORTED, "serial speculative prefix caching is not implemented; use the serving API"});
         const auto decode_ahead =
             serving_ ? serving_->decode_ahead_tokens : model_->device().policy().transformer.decode_ahead_tokens;
-        if (assistant_ || (decode_ahead > 1 && !options.prefix_cache_bytes && model_->supports_device_tokens())) {
+        if (drafter_ || (decode_ahead > 1 && !options.prefix_cache_bytes && model_->supports_device_tokens())) {
             struct Restore {
                 std::optional<ServingOptions>& target;
                 std::optional<ServingOptions> previous;
@@ -483,8 +543,9 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
 }
 auto Generator::generate_batch(std::span<const std::string> prompts, GenerationOptions options)
     -> Result<GenerationBatch> {
-    if (assistant_)
-        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "Gemma MTP currently supports one active request"});
+    if (drafter_)
+        return std::unexpected(
+            Error{ErrorCode::UNSUPPORTED, "speculative decoding currently supports one active request"});
     try {
         require_immediate_tokens();
         options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
@@ -588,9 +649,10 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
         reap_retired();
         if (!options.decode_ahead_tokens)
             options.decode_ahead_tokens = model_->device().policy().transformer.decode_ahead_tokens;
-        if (assistant_ && (options.maximum_active != 1 || options.deferred_tokens || options.decode_ahead_tokens > 1))
+        if (drafter_ && (options.maximum_active != 1 || options.deferred_tokens || options.decode_ahead_tokens > 1))
             throw ops::Failure(
-                {ErrorCode::UNSUPPORTED, "Gemma MTP needs one active request without deferred or decode-ahead tokens"});
+                {ErrorCode::UNSUPPORTED,
+                 "speculative decoding requires one active request without deferred or decode-ahead tokens"});
         options.prefill_tokens_per_step = model_->prefill_chunk_size(options.prefill_tokens_per_step);
         if (!options.deferred_tokens) require_immediate_tokens();
         if (pending_requests() || !retired_.empty() || serving_failed_ || !options.maximum_active ||
@@ -612,8 +674,8 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
 auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options)
     -> Result<std::uint64_t> {
     try {
-        if (assistant_ && std::ranges::any_of(messages, [](const auto& message) { return !message.images.empty(); }))
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "Gemma MTP currently supports text-only requests"});
+        if (drafter_ && std::ranges::any_of(messages, [](const auto& message) { return !message.images.empty(); }))
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding currently supports text-only requests"});
         if (options.image_max_pixels < image::MIN_RESIZED_PIXELS ||
             options.image_max_pixels > image::MAX_RESIZED_PIXELS)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "image resize limit must be 161280 to 3000000 pixels"});
@@ -768,7 +830,7 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         stats.device_selection = model_->device().capabilities().sampling.supports(tensor::TokenSelection::DEVICE);
         stats.last_token_prefill = model_->last_token_prefill();
         stats.shared_prefill_tail = model_->shared_prefill_tail();
-        stats.speculative = static_cast<bool>(assistant_);
+        stats.speculative = static_cast<bool>(drafter_);
         waiting_.push_back(
             {next_request_id_, std::move(tokens), capacity, options, std::move(search), {}, stats, started, {}});
         return next_request_id_++;
@@ -839,7 +901,7 @@ auto Generator::step() -> Result<GenerationStep> {
         reap_retired();
         GenerationStep result;
         result.events.reserve(serving_->maximum_active + 1);
-        const auto preparation = model_->preparation_ns() + (assistant_ ? assistant_->preparation_ns() : 0);
+        const auto preparation = model_->preparation_ns() + (drafter_ ? drafter_->preparation_ns() : 0);
         const auto admit = [&] {
             while (!waiting_.empty() && running_.size() < serving_->maximum_active &&
                    waiting_.front().capacity <= serving_->cache_token_budget - reserved_cache_tokens_) {
@@ -862,10 +924,6 @@ auto Generator::step() -> Result<GenerationStep> {
                 request.state->crop_local_attention = !request.options.full_attention_cache;
                 request.state->capture_prefill =
                     !request.images.empty() || should_capture_prefill(model_->accelerator(), request.prompt.size());
-                if (assistant_) {
-                    request.mtp_inputs.reserve(draft_tokens_ + 1);
-                    request.mtp_drafts.reserve(draft_tokens_);
-                }
                 running_.push_back(std::move(request));
                 reserved_cache_tokens_ += running_.back().capacity;
                 waiting_.pop_front();
@@ -957,60 +1015,33 @@ auto Generator::step() -> Result<GenerationStep> {
         for (std::size_t row = 0; row < running_.size() && !prefill_selects; ++row) {
             auto& request = running_[row];
             if (!request.search.result().decoder_steps || request.completion_emitted) continue;
-            if (assistant_) {
+            if (drafter_) {
                 const auto started = Clock::now();
-                const auto prepared = model_->preparation_ns() + assistant_->preparation_ns();
-                const auto maximum = request.options.maximum_new_tokens
-                                         ? request.options.maximum_new_tokens
-                                         : config_["decode"]["maximum_new_tokens"].as<std::size_t>();
-                const auto remaining = maximum - request.search.result().decoder_steps;
-                const auto draft_count = std::min(draft_tokens_, remaining - 1);
-                auto& inputs = request.mtp_inputs;
-                auto& drafts = request.mtp_drafts;
-                inputs.clear();
-                drafts.clear();
-                auto token = request.search.token();
-                inputs.push_back(token);
-                auto hidden = request.mtp_hidden;
-                const auto draft_started = Clock::now();
-                for (std::size_t index = 0; index < draft_count; ++index) {
-                    auto output = require(assistant_->forward(*model_, hidden, token, *request.state));
-                    hidden = std::move(output.hidden);
-                    token = output.token;
-                    drafts.push_back(token);
-                    inputs.push_back(token);
-                    if (!request.options.ignore_eos && (token == special_[0] || token == special_[1])) break;
-                }
-                request.stats.draft_ns += elapsed(draft_started);
-                const auto position = request.state->position;
-                const auto verify_started = Clock::now();
-                const auto output = require(model_->select_features(inputs, *request.state));
-                request.stats.verify_ns += elapsed(verify_started);
-                const auto selected = require(output.tokens.data<std::int32_t>());
+                const auto prepared = model_->preparation_ns() + drafter_->preparation_ns();
                 const auto previous = request.search.result().token_ids.size();
-                const auto acceptance = require(
-                    request.search.accept_speculative(drafts, TokenScores{{}, ScoreKind::LOGITS, {}, selected}));
-                require(model_->rewind(*request.state, position + acceptance.committed_inputs));
-                const auto hidden_rows = require(output.hidden.select(0, 0));
-                const auto hidden_row = require(hidden_rows.select(0, acceptance.committed_inputs - 1));
-                request.mtp_hidden = require(hidden_row.reshape({1, 1, static_cast<std::int64_t>(hidden_row.size(0))}));
-                request.stats.draft_tokens += drafts.size();
-                request.stats.accepted_draft_tokens += acceptance.accepted_drafts;
-                ++request.stats.verification_steps;
+                SpeculativeStats step_stats;
+                const auto step_result = require(drafter_->step(*model_, *request.state, request.draft_hidden,
+                                                                request.search, draft_tokens_, &step_stats));
+                request.stats.draft_ns += step_stats.draft_ns;
+                request.stats.verify_ns += step_stats.verify_ns;
+                request.stats.draft_tokens += step_stats.draft_tokens;
+                request.stats.accepted_draft_tokens += step_stats.accepted_draft_tokens;
+                request.stats.verification_steps += step_stats.verification_steps;
                 const auto decode_ns = elapsed(started);
                 request.stats.decode_ns += decode_ns;
-                request.stats.preparation_ns += model_->preparation_ns() + assistant_->preparation_ns() - prepared;
+                request.stats.preparation_ns += model_->preparation_ns() + drafter_->preparation_ns() - prepared;
                 result.decode_ns += decode_ns;
                 const auto history = std::span(request.search.result().token_ids);
                 auto visible = previous;
-                for (std::size_t index = 0; index < acceptance.committed_inputs; ++index) {
+                for (std::size_t index = 0; index < step_result.tokens.size(); ++index) {
+                    const auto chosen = step_result.tokens[index];
                     std::optional<std::int32_t> emitted;
-                    if (visible < history.size() && history[visible] == selected[index]) {
-                        emitted = selected[index];
+                    if (visible < history.size() && history[visible] == chosen) {
+                        emitted = chosen;
                         ++visible;
                     }
                     emit_token(request, emitted, history.first(visible),
-                               request.search.finished() && index + 1 == acceptance.committed_inputs);
+                               request.search.finished() && index + 1 == step_result.tokens.size());
                 }
                 continue;
             }
@@ -1109,17 +1140,13 @@ auto Generator::step() -> Result<GenerationStep> {
             const auto started = Clock::now();
             const auto prepared = model_->preparation_ns();
             std::optional<std::int32_t> selected;
-            tensor::Tensor mtp_selected;
             const bool deferred = final_chunk && serving_->deferred_tokens;
             if (deferred)
                 pending_tokens_.push_back(
                     {request.id, require(model_->select_token(input, *request.state)), 0, started, true});
-            else if (final_chunk && assistant_) {
-                auto output = require(model_->select_features(input, *request.state, false));
-                request.mtp_hidden = std::move(output.hidden);
-                mtp_selected = std::move(output.tokens);
-            } else if (final_chunk)
-                selected = require(model_->forward_token(input, *request.state));
+            else if (final_chunk)
+                selected =
+                    require(model_->forward_token(input, *request.state, drafter_ ? &request.draft_hidden : nullptr));
             else if (uses_padded_prefill(model_)) {
                 const auto maximum = prefill_bucket(
                     model_, std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
@@ -1134,17 +1161,13 @@ auto Generator::step() -> Result<GenerationStep> {
             result.prefill_ns = elapsed(started);
             if (!deferred) request.stats.prefill_ns += result.prefill_ns;
             request.stats.preparation_ns += model_->preparation_ns() - prepared;
-            if (mtp_selected.defined())
-                accept(request, require(std::as_const(mtp_selected).data<std::int32_t>())[0]);
-            else if (selected)
-                accept(request, *selected);
+            if (selected) accept(request, *selected);
         }
         retire();
         result.active_requests = running_.size();
         result.waiting_requests = waiting_.size();
         result.reserved_cache_tokens = reserved_cache_tokens_;
-        result.preparation_ns =
-            model_->preparation_ns() + (assistant_ ? assistant_->preparation_ns() : 0) - preparation;
+        result.preparation_ns = model_->preparation_ns() + (drafter_ ? drafter_->preparation_ns() : 0) - preparation;
         return result;
     } catch (const ops::Failure& error) {
         serving_failed_ = true;
