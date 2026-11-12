@@ -47,14 +47,20 @@ runtime memory must be measured separately from artifact size.
 
 ### CUDA
 
-The optional NVIDIA backend requires the CUDA 13+ toolkit and a compatible GPU.
-From an initialized checkout, enable it for the standalone CLI:
+The optional NVIDIA backend requires Linux, the CUDA 13+ toolkit, a cuVS SDK
+with its C API and shared-library dependencies, DLPack headers, and a compatible
+GPU. `KIDI_ENABLE_CUDA=ON` enables both CUDA inference and GPU HNSW index
+construction. From an initialized checkout, enable it for the standalone CLI:
 
 ```bash
 cmake --preset release -DKIDI_ENABLE_CUDA=ON
 cmake --build --preset release --target kidi_cli
 build-release/kidi chat --model /path/to/gemma-model --backend cuda:0
 ```
+
+For a nonstandard SDK installation, add `-DKIDI_CUVS_ROOT=/path/to/cuvs` and,
+if needed, `-DKIDI_DLPACK_INCLUDE_DIR=/path/to/include` to the configure command.
+CUDA configuration fails if these required dependencies cannot be found.
 
 For the Python launcher, build and install a CUDA-enabled package separately:
 
@@ -359,6 +365,101 @@ support for arbitrary Hugging Face architectures.
 - [CODING_GUIDELINES.md](CODING_GUIDELINES.md): APIs, naming, formatting and testing rules.
 - [Manual model setup](docs/getting-started.md#optional-manual-setup): configuration and converter entry points.
 - [Benchmarks](benchmarks/README.md): build options, CPU/CUDA/Metal runners, precision, and validation.
+
+### CPU HNSW indexes
+
+`kidi::search::HnswIndex` provides deterministic HNSW learning, versioned
+serialization, loading and inner-product search over an external FP32/BF16
+tensor table. The index stores graph topology and row labels, not a duplicate
+vector table, so other Kidi search features can reuse it.
+
+Build a Gemma output-head index natively:
+
+```bash
+build-release/kidi index --model /path/to/gemma-4 \
+  --m 32 --ef-construction 200 --candidates 8 --ef-search 800 --threads 4
+```
+
+Both the core `save` API and the command refuse to overwrite any existing
+path. Each save uses its own staging directory, checks write/flush/close errors,
+and atomically publishes a complete graph-only file. The command installs
+`MODEL/lm_head.hnsw`. It supports original dense Gemma FP32/BF16 checkpoints;
+native QAT and load-time packed weights are intentionally excluded. Index
+learning keeps insertions and pruning ordered, and can use the existing CPU worker
+pool for distance calculations. `--threads` controls parallelism (default: 1);
+one- and multi-threaded builds produce the same graph with a fixed seed on the
+same hardware. More threads are not always faster for small graph expansions:
+on the Xeon test host, 2,048 E4B rows took 7.36/16.80/28.30 seconds with 1/4/14
+threads, respectively. CPU distance kernels use AVX-512/FMA or ARM64 NEON where supported.
+Progress includes row counts, percentage, elapsed time, rate and an interval-based
+ETA. A full vocabulary can still take substantial offline time.
+
+CUDA-enabled builds also include native cuVS offline construction, which builds
+the graph on CUDA and exports it for CPU search. The existing
+`KIDI_ENABLE_CUDA=ON` setting enables inference and indexing together; there is
+no separate vector-search feature switch. See the [CUDA requirements](#cuda).
+`--builder auto` selects this backend when compiled and a CUDA device is present;
+`--builder cpu` forces the deterministic builder. For example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 build-release/kidi index --model /path/to/gemma-4 --builder cuda --threads 4
+```
+
+The native `kidi-index-cuda` helper runs in a separate process, so a cuVS SDK
+built against another CUDA major version cannot interfere with inference's
+CUDA libraries. Keep the helper beside `kidi` or on `PATH`. No Python runtime is
+used. The command has only three source files: `cli/index.h`, `cli/index.cpp`,
+and `cli/index.cu`. The existing `KIDI_HAS_CUDA` macro selects CUDA dispatch or
+unavailable-backend stubs; only the CUDA-only `index.cu` target links the cuVS SDK.
+GPU construction uses raw FP32 representations of the original weights,
+then verifies every exported vector, label and ordered live edge before packing
+the graph. cuVS does not expose per-node progress or a seeded construction API;
+its stage heartbeats explicitly report progress/ETA as unavailable rather than
+inventing a percentage, and GPU builds do not claim seed determinism.
+
+On the RTX A6000 test host, native cuVS construction, export validation and packing
+of all 262,144 E4B rows completed in **37.95 seconds**, producing a **53,115,573-byte**
+graph-only file. A fresh CPU batch-1 control on four frozen multilingual sentences
+produced identical dense/HNSW tokens and chrF **76.13394**. This validates that
+specific index and sample; it is not an exact-search guarantee or evidence for
+every native CPU-built graph.
+
+CPU generation automatically loads `lm_head.hnsw` and uses its stored candidate
+count/search effort. Add `--dense-lm-head` to disable it for a paired control.
+CUDA and attached accelerators ignore automatic HNSW discovery and retain their
+device-native dense head.
+
+[`Linear`](src/kidi/layers/linear.h) owns the high-level API: `bind_hnsw` attaches
+an index to a transposed, bias-free CPU projection; `select` returns I32 `[rows]`
+token IDs for an input shaped `[..., input_size]`. `forward` still returns full
+dense logits. Workspaces are reused after warmup. Floating-point candidates are
+reprojected using the original weights, gathering directly into the projection
+buffer rather than copying through a second staging buffer.
+
+Packed 2/4/8-bit heads search the original signed packed rows and FP16/FP32
+scales (plus offsets for asymmetric INT4) without expanding or copying the
+vocabulary table. Search scores one visited row at a time with the existing
+per-vector SIMD kernels. A single query runs directly on its caller, while
+independent batch rows can use the worker pool.
+
+The graph file's payload checksum is always checked. FP32/BF16 bindings also
+require an exact vector-table checksum; packed bindings reuse the original
+graph topology and validate dimensions/layout, **not** an exact checksum match
+to the unquantized vectors. Only reuse a topology for quantized versions of the
+same model with the same vocabulary order. This remains approximate selection:
+retrieval can miss the dense winner, and packed search scores need not exactly
+match the dense backend's activation rounding. Matching one 64-token prompt is
+not proof of unchanged generation quality.
+
+`KIDI_HNSW_EF` optionally overrides search effort when the layer binds its index.
+It must be at least the candidate count stored in the graph; invalid values
+fail explicitly. Without an override, defaults remain those stored in the index.
+Check held-out generation quality, dense agreement and memory as well as speed.
+The [CPU harness](benchmarks/cpu/README.md#hnsw-lm-head-comparisons) provides
+dense/indexed controls and records the graph hash.
+
+`HnswIndex` exposes typed metadata without exposing its graph buffers or disk
+format. It has no dependency on `ops::Context`.
 
 ## GGML and GGUF Import
 

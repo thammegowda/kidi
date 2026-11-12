@@ -41,6 +41,7 @@ public:
     auto configure_cache(const std::filesystem::path& directory, const std::filesystem::path& source) -> void;
     auto set_precision(core::InferencePrecision precision) noexcept -> void;
     auto set_kv_cache_precision(core::KVCachePrecision precision) noexcept -> void;
+    auto configure_lm_head(const std::filesystem::path& index) -> Result<void>;
     auto create_state(std::size_t capacity) -> Result<Gemma4State>;
     auto fork_state(const Gemma4State& source, std::size_t prefix_length, std::size_t capacity) -> Result<Gemma4State>;
     auto prefill(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void>;

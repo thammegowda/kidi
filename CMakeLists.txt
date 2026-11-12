@@ -12,7 +12,8 @@ option(KIDI_BUILD_TESTS "Build kidi tests" ON)
 option(KIDI_BUILD_INTEGRATION_TESTS "Register Python, browser, and model regression tests" OFF)
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
-option(KIDI_ENABLE_CUDA "Build the NVIDIA CUDA backend" OFF)
+option(KIDI_ENABLE_CUDA "Build NVIDIA CUDA inference and GPU HNSW indexing" OFF)
+set(KIDI_CUVS_ROOT "" CACHE PATH "cuVS SDK root for CUDA HNSW construction")
 set(YNNPACK_ENABLE_CUDA ${KIDI_ENABLE_CUDA} CACHE BOOL "Build YNNPACK CUDA" FORCE)
 set(KIDI_DESKTOP_APP_DEFAULT ON)
 if(ANDROID OR EMSCRIPTEN)
@@ -108,6 +109,7 @@ add_library(kidi
     src/kidi/layers/audio.cpp
     src/kidi/layers/gemma4.cpp
     src/kidi/layers/higgs_audio.cpp
+    src/kidi/layers/linear.cpp
     src/kidi/layers/qwen3.cpp
     src/kidi/layers/transformer.cpp
     src/kidi/layers/whisper.cpp
@@ -128,6 +130,8 @@ add_library(kidi
     src/kidi/runtime/ynn/graph.cpp
     src/kidi/runtime/ynn/numa.cpp
     src/kidi/runtime/ynn/worker_pool.cpp
+    src/kidi/search/hnsw.cpp
+    src/kidi/search/search.cpp
     src/kidi/tensor/backend.cpp
     src/kidi/tensor/cpu_backend.cpp
     src/kidi/tensor/external.cpp
@@ -359,8 +363,27 @@ if(APPLE)
     endif()
 endif()
 
-add_library(kidi_cli_main STATIC src/kidi/cli/main.cpp src/kidi/cli/interactive.cpp)
+add_library(kidi_cli_main STATIC src/kidi/cli/index.cpp src/kidi/cli/interactive.cpp src/kidi/cli/main.cpp)
 target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi spdlog::spdlog nlohmann_json::nlohmann_json)
+if(KIDI_ENABLE_CUDA)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "CUDA builds currently require Linux for cuVS HNSW construction")
+    endif()
+    find_package(CUDAToolkit REQUIRED)
+    find_package(Threads REQUIRED)
+    find_path(KIDI_CUVS_INCLUDE_DIR cuvs/neighbors/hnsw.h HINTS "${KIDI_CUVS_ROOT}/include" REQUIRED)
+    find_path(KIDI_DLPACK_INCLUDE_DIR dlpack/dlpack.h REQUIRED)
+    find_library(KIDI_CUVS_C_LIBRARY cuvs_c HINTS "${KIDI_CUVS_ROOT}/lib64" "${KIDI_CUVS_ROOT}/lib" REQUIRED)
+    # cuVS exposes a host API; avoid linking a second CUDA runtime into this adapter.
+    set_source_files_properties(src/kidi/cli/index.cu PROPERTIES LANGUAGE CXX)
+    add_executable(kidi_index_cuda_helper src/kidi/cli/index.cu)
+    set_target_properties(kidi_index_cuda_helper PROPERTIES OUTPUT_NAME kidi-index-cuda)
+    target_include_directories(kidi_index_cuda_helper PRIVATE
+        "${KIDI_CUVS_INCLUDE_DIR}" "${KIDI_DLPACK_INCLUDE_DIR}" ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(kidi_index_cuda_helper PRIVATE "${KIDI_CUVS_C_LIBRARY}" Threads::Threads)
+    install(TARGETS kidi_index_cuda_helper RUNTIME DESTINATION bin)
+    add_dependencies(kidi_cli_main kidi_index_cuda_helper)
+endif()
 
 add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)
 set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)

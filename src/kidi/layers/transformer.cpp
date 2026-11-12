@@ -11,11 +11,6 @@ auto check_precision(tensor::DType precision) -> void {
     if (precision != tensor::DType::F32 && precision != tensor::DType::BF16 && precision != tensor::DType::I8)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "unsupported parameter precision"});
 }
-auto parameter_device(bool packed) -> tensor::Device {
-    const auto kind =
-        module_dtype == tensor::DType::I8 || packed ? tensor::ParameterKind::QUANTIZED : tensor::ParameterKind::FLOAT;
-    return module_device.parameter_device(tensor::ParameterRole::PROJECTION, kind);
-}
 auto split_qkv(ops::Context& context, const Tensor& projected) -> std::array<Tensor, 3> {
     auto width = static_cast<std::int64_t>(projected.size(-1) / 3);
     return {context.slice(projected, 2, 0, width), context.slice(projected, 2, width, width),
@@ -23,89 +18,6 @@ auto split_qkv(ops::Context& context, const Tensor& projected) -> std::array<Ten
 }
 } // namespace
 
-auto QuantizedState::decode_vector(const Tensor& values, std::string_view name, tensor::Device target) const
-    -> const Tensor& {
-    if (decoded.defined()) return decoded;
-    if (values.dtype() != tensor::DType::I8 || values.dimensions() != 1 || scale.dtype() != tensor::DType::F32 ||
-        scale.numel() != 1)
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid quantized vector: " + std::string(name)});
-    const auto scale_bytes = require(scale.copy_to_host());
-    const auto multiplier = *reinterpret_cast<const float*>(scale_bytes.data());
-    if (!std::isfinite(multiplier) || multiplier <= 0)
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid quantized scale: " + std::string(name)});
-    const auto source = require(values.copy_to_host());
-    const auto integers = std::span(reinterpret_cast<const std::int8_t*>(source.data()), values.numel());
-    std::vector<float> output(integers.size());
-    for (std::size_t index = 0; index < integers.size(); ++index) output[index] = integers[index] * multiplier;
-    decoded =
-        require(Tensor::from_host({static_cast<std::int64_t>(output.size())}, std::span<const float>(output), target));
-    return decoded;
-}
-
-LinearImpl::LinearImpl(std::int32_t input_size, std::int32_t output_size, bool transpose, bool bias,
-                       std::int32_t packed_bits, bool quantized_bias, std::int32_t group_size)
-    : packed_bits_(packed_bits),
-      input_size_(input_size),
-      group_size_(group_size ? group_size : input_size),
-      transpose_(transpose),
-      has_bias_(bias) {
-    const auto storage = parameter_device(packed_bits != 0);
-    if (packed_bits) {
-        if ((packed_bits != 2 && packed_bits != 4 && packed_bits != 8) || !transpose || bias || group_size_ <= 0 ||
-            group_size_ % (8 / packed_bits) || input_size % group_size_)
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed linear construction"});
-        register_parameter("weight", weight_, {output_size, input_size / (8 / packed_bits)}, tensor::DType::U8,
-                           allocate_parameters, storage);
-        register_parameter("weight_scale", packed_scale_, {output_size, input_size / group_size_}, tensor::DType::F32,
-                           allocate_parameters, storage);
-        register_parameter("input_activation_scale", input_scale_, {}, tensor::DType::F32, allocate_parameters,
-                           tensor::Device::cpu());
-        register_parameter("output_activation_scale", output_scale_, {}, tensor::DType::F32, allocate_parameters,
-                           tensor::Device::cpu());
-        return;
-    }
-    check_precision(module_dtype);
-    register_parameter("weight", weight_,
-                       transpose ? std::vector<std::int64_t>{output_size, input_size}
-                                 : std::vector<std::int64_t>{input_size, output_size},
-                       module_dtype, allocate_parameters, storage);
-    if (quantized_bias && (!bias || module_dtype != tensor::DType::I8))
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "quantized linear bias requires INT8 weights and a bias"});
-    if (bias && quantized_bias) {
-        bias_qstate_.emplace();
-        const auto vector_storage =
-            module_device.parameter_device(tensor::ParameterRole::PROJECTION, tensor::ParameterKind::PREPARED_VECTOR);
-        register_parameter("bias", bias_, {output_size}, tensor::DType::I8, allocate_parameters, vector_storage);
-        register_parameter("bias_scale", bias_qstate_->scale, {1}, tensor::DType::F32, allocate_parameters,
-                           vector_storage);
-    } else if (bias) {
-        register_parameter("bias", bias_, {output_size}, tensor::DType::F32, allocate_parameters, storage);
-    } else if (module_dtype == tensor::DType::I8)
-        bias_ = require(Tensor::zeros({output_size}, tensor::DType::F32, storage));
-    if (module_dtype == tensor::DType::I8) {
-        qstate_.emplace();
-        register_parameter("scale", qstate_->scale, {output_size, 1}, tensor::DType::F32, allocate_parameters, storage);
-        if (allocate_parameters) {
-            const std::vector<float> ones(output_size, 1.F);
-            const auto bytes = std::as_bytes(std::span(ones));
-            require(qstate_->scale.copy_from_host(bytes));
-            if (bias_qstate_) require(bias_qstate_->scale.copy_from_host(bytes.first(sizeof(float))));
-        }
-    }
-}
-auto LinearImpl::bias() const -> const Tensor& {
-    return bias_qstate_ ? bias_qstate_->decode_vector(bias_, "linear bias") : bias_;
-}
-auto LinearImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    if (!weight_.defined() || (has_bias_ && !bias_.defined()))
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "linear state has not been initialized"});
-    if (packed_bits_) {
-        return context.packed_linear(input, weight_, packed_scale_, packed_bits_, group_size_,
-                                     require(input_scale_.data<float>())[0], require(output_scale_.data<float>())[0]);
-    }
-    if (qstate_) return context.quantized_linear(input, weight_, qstate_->scale, bias(), transpose_);
-    return context.linear(input, weight_, bias(), transpose_);
-}
 LayerNormImpl::LayerNormImpl(std::int32_t hidden_size, float epsilon) : epsilon_(epsilon) {
     if (!std::isfinite(epsilon) || epsilon <= 0)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid normalization epsilon"});

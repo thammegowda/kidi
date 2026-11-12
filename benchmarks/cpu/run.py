@@ -91,21 +91,25 @@ def operator_summary(text):
     return sorted(groups.values(), key=lambda row: row["run_ns"], reverse=True)
 
 
-def benchmark_environment(replay, profile_ops, warmups):
+def benchmark_environment(replay, profile_ops, warmups, hnsw_ef=None):
     environment = dict(os.environ, KIDI_ACCELERATOR="cpu")
-    for name in ("KIDI_REPLAY", "KIDI_PROFILE_OPS", "KIDI_PROFILE_OPS_SKIP", "KIDI_CUDA_PROFILE"):
+    for name in ("KIDI_REPLAY", "KIDI_PROFILE_OPS", "KIDI_PROFILE_OPS_SKIP", "KIDI_CUDA_PROFILE",
+                 "KIDI_HNSW_EF"):
         environment.pop(name, None)
     if replay != "default":
         environment["KIDI_REPLAY"] = "1" if replay == "on" else "0"
     if profile_ops:
         environment.update(KIDI_PROFILE_OPS="host", KIDI_PROFILE_OPS_SKIP=str(warmups))
+    if hnsw_ef is not None:
+        environment["KIDI_HNSW_EF"] = str(hnsw_ef)
     return environment
 
 
 def main(argv=None):
+    available_threads = max(1, os.cpu_count() or 1)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--threads", type=int, nargs="+", default=[8])
+    parser.add_argument("--threads", type=int, nargs="+", default=[min(8, available_threads)])
     parser.add_argument("--tokens", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
@@ -116,6 +120,8 @@ def main(argv=None):
     parser.add_argument("--prompt", default="Explain how binary search works in detail.")
     parser.add_argument("--replay", choices=("default", "on", "off"), default="default")
     parser.add_argument("--profile-ops", action="store_true")
+    parser.add_argument("--dense-lm-head", action="store_true", help="bypass the checkpoint HNSW index")
+    parser.add_argument("--hnsw-ef", type=int, help="override HNSW search effort (otherwise use the index default)")
     parser.add_argument("--build", action="store_true", help="incrementally build the native benchmark first")
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build-release")
     parser.add_argument("--binary", type=Path)
@@ -127,18 +133,26 @@ def main(argv=None):
     if (not 1 <= arguments.repeats <= 20 or not 1 <= arguments.warmups <= 20 or
             not 2 <= arguments.tokens < arguments.context_tokens or arguments.prefill_chunk < 1 or
             arguments.jobs < 1 or not math.isfinite(arguments.timeout) or arguments.timeout <= 0 or
-            any(threads < 1 or threads > (os.cpu_count() or 1) for threads in arguments.threads) or
+            any(threads < 1 or threads > available_threads for threads in arguments.threads) or
             len(set(arguments.threads)) != len(arguments.threads) or not arguments.prompt.strip()):
         parser.error("expected positive thread/job counts, 1-20 repeats/warmups, and 2 <= tokens < context")
+    if arguments.hnsw_ef is not None and arguments.hnsw_ef < 1:
+        parser.error("expected positive HNSW search effort")
+    if arguments.dense_lm_head and arguments.hnsw_ef is not None:
+        parser.error("--dense-lm-head cannot be combined with --hnsw-ef")
     output = arguments.output.expanduser().resolve()
     if arguments.baseline and arguments.baseline.expanduser().resolve() == output:
         parser.error("baseline and output must be different files")
     settings = {"output_tokens": arguments.tokens, "context_tokens": arguments.context_tokens,
                 "prefill_chunk_tokens": arguments.prefill_chunk, "packed_prefill": arguments.packed_prefill,
                 "warmups": arguments.warmups, "workload": arguments.workload, "prompt": arguments.prompt}
+    if arguments.dense_lm_head:
+        settings["dense_lm_head"] = True
     report = {"version": 1, "started": datetime.now(timezone.utc).isoformat(), "status": "running",
               "protocol": {"settings": settings, "replay": arguments.replay, "operator_profiling": arguments.profile_ops},
               "runs": {}}
+    if arguments.hnsw_ef is not None:
+        report["protocol"]["hnsw"] = {"ef": arguments.hnsw_ef}
     output.parent.mkdir(parents=True, exist_ok=True)
 
     def save():
@@ -152,6 +166,9 @@ def main(argv=None):
             model = Path(arguments.model).expanduser().resolve()
         if not model.is_dir():
             raise ValueError(f"not a model directory: {model}")
+        index_path = model / "lm_head.hnsw"
+        if "hnsw" in report["protocol"] and not index_path.is_file():
+            raise ValueError("HNSW settings require MODEL/lm_head.hnsw; refusing to measure a dense fallback")
         report["model"] = str(model)
         reference = json.loads(arguments.baseline.expanduser().read_text()) if arguments.baseline else None
         if reference and (reference.get("status") != "completed" or reference["protocol"] != report["protocol"] or
@@ -177,6 +194,12 @@ def main(argv=None):
             "diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"], cwd=ROOT)).hexdigest(),
             "binary": str(binary), "binary_sha256": digest(binary), "harness_sha256": digest(Path(__file__)),
         }
+        if index_path.is_file() and not arguments.dense_lm_head:
+            report["source"]["hnsw_index_sha256"] = digest(index_path)
+            report["source"]["hnsw_index_bytes"] = index_path.stat().st_size
+        if (reference and reference.get("source", {}).get("hnsw_index_sha256") !=
+                report["source"].get("hnsw_index_sha256")):
+            raise ValueError("baseline HNSW index differs; compare identical topology and search settings")
         cache = binary.parent / "CMakeCache.txt"
         if cache.is_file():
             names = {"CMAKE_BUILD_TYPE", "CMAKE_CXX_COMPILER", "CMAKE_CXX_FLAGS", "CMAKE_CXX_FLAGS_RELEASE",
@@ -187,7 +210,8 @@ def main(argv=None):
                 name = declaration.partition(":")[0]
                 if separator and name in names:
                     report["source"]["cmake"][name] = value
-        environment = benchmark_environment(arguments.replay, arguments.profile_ops, arguments.warmups)
+        environment = benchmark_environment(arguments.replay, arguments.profile_ops, arguments.warmups,
+                                            arguments.hnsw_ef)
         report["environment"] = {key: value for key, value in environment.items() if key.startswith("KIDI_")}
         save()
         print("threads workload   decode tok/s (min..max)    warm TTFT ms   peak GiB   baseline", flush=True)
@@ -231,6 +255,9 @@ def main(argv=None):
             save()
         if digest(binary) != report["source"]["binary_sha256"]:
             raise RuntimeError("benchmark binary changed during measurement")
+        if ("hnsw_index_sha256" in report["source"] and
+                digest(index_path) != report["source"]["hnsw_index_sha256"]):
+            raise RuntimeError("HNSW index changed during measurement")
         report.update(status="completed", completed=datetime.now(timezone.utc).isoformat())
         save()
         print(f"Report: {output}")

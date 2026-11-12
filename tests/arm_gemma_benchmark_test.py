@@ -33,6 +33,9 @@ class ArmGemmaBenchmarkTest(unittest.TestCase):
         self.assertEqual(summary["decode_range"], [10, 30])
         self.assertEqual(summary["ttft_ms"], 10)
         self.assertEqual(summary["peak_rss_gib"], 1)
+        self.assertEqual(BENCHMARK.format_progress_time(0), "00:00")
+        self.assertEqual(BENCHMARK.format_progress_time(65), "01:05")
+        self.assertEqual(BENCHMARK.format_progress_time(3661), "1:01:01")
 
     def test_rejects_invalid_or_unmatched_measurements(self):
         for change in ("device", "threads", "missing", "warmup", "prompt", "count", "tokens", "reuse", "nan", "rate"):
@@ -144,6 +147,10 @@ class ArmGemmaBenchmarkTest(unittest.TestCase):
             self.assertIsNone(BENCHMARK.load_cached_run(work, "kidi", ["bench", "model"], "abc123", changed_protocol))
 
     def test_eval_cleaning_and_cache_jsonl(self):
+        prompt = BENCHMARK.serialize_translation_prompt("uk", "Тест")
+        self.assertTrue(prompt.startswith("<bos><|turn>system\nYou are a professional translator."))
+        self.assertIn("<turn|>\n<|turn>user\nTranslate the following Ukrainian text fully into English.", prompt)
+        self.assertTrue(prompt.endswith("Тест<turn|>\n<|turn>model\n"))
         self.assertEqual(
             BENCHMARK.clean_translation_text("<|channel>thought\n thinking <channel|>\nHello world\n<turn|>"),
             "Hello world",
@@ -192,17 +199,25 @@ class ArmGemmaBenchmarkTest(unittest.TestCase):
             self.assertIsNotNone(loaded)
             self.assertTrue(loaded["cached"])
             self.assertAlmostEqual(loaded["summary"]["chrf"], 100.0, places=3)
+            changed_prompt = copy.deepcopy(eval_protocol)
+            changed_prompt["input_token_ids_list"][0] = [99]
+            self.assertEqual(BENCHMARK.load_partial_eval_items(work, "kidi", changed_prompt, FakeTokenizer()), {})
 
     def test_results_tsv_and_readme_tables(self):
         rows = BENCHMARK.load_results_tsv()
-        self.assertGreaterEqual(len(rows), 13)
-        groups = {r["table_group"] for r in rows}
-        self.assertEqual(groups, {"bf16_int8", "int4_g128", "int4_g32", "qat_mixed"})
+        self.assertEqual(len(rows), 14)
+        self.assertEqual({r["tier"] for r in rows}, {"reference", "q8", "q4", "reference_only"})
+        for row in rows:
+            for key in ("model_gib", "prefill_tps", "decode_tps", "ttft_ms", "peak_rss_gib", "chrf_ref"):
+                self.assertGreater(float(row[key]), 0)
         rendered = BENCHMARK.render_markdown_tables()
         readme = (BENCHMARK.HERE / "README.md").read_text(encoding="utf-8")
-        for block in rendered.split("\n\n"):
-            self.assertIn(block, readme)
+        self.assertIn(rendered, readme)
         svg = BENCHMARK.render_pareto_svg()
+        self.assertEqual(svg.count(">Kidi Q8+HNSW</text>"), 1)
+        self.assertEqual(svg.count(">Kidi Q4_g32+HNSW</text>"), 1)
+        self.assertEqual(svg.count(">Kidi Q4 (g=128)+HNSW</text>"), 1)
+        self.assertNotIn("LiteRT", svg)
         svg_path = ROOT / "docs/gemma4-arm-pareto.svg"
         self.assertEqual(svg, svg_path.read_text(encoding="utf-8"))
 

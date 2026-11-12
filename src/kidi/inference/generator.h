@@ -81,6 +81,7 @@ struct ModelLoadOptions {
     std::int32_t weight_bits = 0;
     std::int32_t group_size = 128;
     bool packed_prefill = false;
+    bool dense_lm_head = false;
 };
 
 class Generator {

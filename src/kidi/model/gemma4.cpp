@@ -1,11 +1,13 @@
 #include "kidi/graph/compiler.h"
 #include "kidi/model/gemma4.h"
 #include "kidi/runtime/operator.h"
+#include "kidi/runtime/ynn/graph.h"
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
+#include <map>
 #include <numeric>
 #include <regex>
 
@@ -136,6 +138,7 @@ struct Gemma4Impl::State {
     layers::Linear per_layer_projection, lm_head;
     layers::RmsNorm per_layer_norm, norm;
     Tensor projection_scale, combination_scale, logit_scale, inverse_logit_scale;
+    Tensor lm_head_zero;
     std::vector<Tensor> step_inputs;
     std::string npu_prefill_key, npu_decode_key;
 
@@ -157,8 +160,7 @@ struct Gemma4Impl::State {
           vocabulary(config["vocab_size"].as<int>()),
           per_layer_vocabulary(config["vocab_size_per_layer_input"].as<int>()),
           tokens(embedding(config["vocab_size"].as<int>(), hidden, std::sqrt(static_cast<float>(hidden)),
-                           quant_bits(config, "model.language_model.embed_tokens"),
-                           embedding_groups(config, hidden))),
+                           quant_bits(config, "model.language_model.embed_tokens"), embedding_groups(config, hidden))),
           per_layer_tokens(embedding(config["vocab_size_per_layer_input"].as<int>(), layer_count * per_layer_width,
                                      std::sqrt(static_cast<float>(per_layer_width)),
                                      quant_bits(config, "model.language_model.embed_tokens_per_layer"), layer_count)),
@@ -460,8 +462,7 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
             const auto second_zero = zeros_state.find(std::string(prefix) + std::string(second_stem) + ".weight_zero");
             if (first_zero != zeros_state.end() && second_zero != zeros_state.end()) {
                 const auto fused_zero = std::string(prefix) + std::string(fused_stem) + ".weight_zero";
-                zeros_state.emplace(fused_zero,
-                                    concatenate_projection_rows(first_zero->second, second_zero->second));
+                zeros_state.emplace(fused_zero, concatenate_projection_rows(first_zero->second, second_zero->second));
                 zeros_state.erase(first_zero);
                 zeros_state.erase(second_zero);
             }
@@ -499,6 +500,7 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
         impl_->context = ops::Context(device(), packed_prefill, std::nullopt, impl_->parameter_dtype);
         impl_->weight_bits = weight_bits;
         impl_->packed_prefill = packed_prefill;
+        impl_->lm_head_zero = Tensor{};
         if (!zeros_state.empty()) {
             const auto bound = state_dict();
             for (auto& [zero_name, zero_tensor] : zeros_state) {
@@ -507,8 +509,11 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
                     emb ? std::string_view(".embedding_zero").size() : std::string_view(".weight_zero").size();
                 const auto scale_name =
                     zero_name.substr(0, zero_name.size() - suffix_len) + (emb ? ".embedding_scale" : ".weight_scale");
+                auto dev_zero = require(zero_tensor.to(device()));
+                if (zero_name == "embed_tokens.embedding_zero" || zero_name == "lm_head.weight_zero")
+                    impl_->lm_head_zero = dev_zero;
                 if (const auto found = bound.find(scale_name); found != bound.end())
-                    impl_->context.bind_packed_zero(found->second, require(zero_tensor.to(device())));
+                    impl_->context.bind_packed_zero(found->second, std::move(dev_zero));
             }
         }
         if (weight_bits) {
@@ -534,6 +539,19 @@ auto Gemma4Impl::set_precision(core::InferencePrecision precision) noexcept -> v
 }
 auto Gemma4Impl::set_kv_cache_precision(core::KVCachePrecision precision) noexcept -> void {
     impl_->kv_cache_precision = precision;
+}
+auto Gemma4Impl::configure_lm_head(const std::filesystem::path& path) -> Result<void> {
+    try {
+        if (path.empty() || !device().capabilities().compute.host() || !impl_->context.accelerator().empty())
+            throw ops::Failure(
+                {ErrorCode::UNSUPPORTED, "HNSW head requires CPU inference without an external accelerator"});
+        require(impl_->lm_head->bind_hnsw(path, impl_->lm_head_zero));
+        impl_->context.synchronize();
+        impl_->context.clear_replays();
+        return {};
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    }
 }
 auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
     try {
@@ -792,8 +810,9 @@ auto Gemma4Impl::per_layer_input(const Tensor& per_layer, int layer, std::int64_
 
 auto Gemma4Impl::head(const Tensor& hidden, bool select, ops::TokenOutput output) -> Tensor {
     auto& context = impl_->context;
-    auto logits = impl_->lm_head->forward(context, impl_->norm->forward(context, hidden));
-    if (select) return context.greedy_token(logits, output);
+    const auto query = impl_->norm->forward(context, hidden);
+    if (select) return impl_->lm_head->select(context, query, output);
+    auto logits = impl_->lm_head->forward(context, query);
     if (logits.dtype() != DType::F32) logits = context.cast(logits, DType::F32);
     logits = context.multiply(context.tanh(context.multiply(logits, impl_->inverse_logit_scale)), impl_->logit_scale);
     return logits;
@@ -813,6 +832,7 @@ auto Gemma4Impl::decode_step(const Tensor& token, Gemma4State& state, bool selec
 
 auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4StepInputs& inputs, bool prefill,
                                bool select, ops::TokenOutput output) -> Tensor {
+    impl_->lm_head->check_hnsw_binding();
     auto& context = impl_->context;
     const auto device = context.device();
     const auto staging_device = device.capabilities().memory.requires_staging() ? tensor::Device::cpu() : device;
@@ -875,7 +895,9 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
                      (prefill  ? ""
                       : select ? ":token"
                                : ":logits");
-    const auto replay_key = key + (select && output == ops::TokenOutput::DEVICE ? ":device" : "");
+    const auto split_head = select && impl_->lm_head->has_hnsw();
+    const auto replay_key =
+        key + (select && output == ops::TokenOutput::DEVICE ? ":device" : "") + (split_head ? ":query" : "");
     if (context.accelerator() == "qnn-htp") {
         // Bound NPU prefill and decode shape caches to one executable each so attention buckets do not accumulate
         // duplicate HTP weights.
@@ -921,9 +943,11 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
             state.layers[producer].value_quantization = caches[producer].value_quantization;
         }
         if (prefill) return std::vector<Tensor>{};
+        if (split_head) return std::vector{impl_->norm->forward(context, hidden)};
         return std::vector{head(hidden, select, output)};
     });
-    return prefill ? Tensor{} : outputs[0];
+    if (prefill) return {};
+    return split_head ? impl_->lm_head->select(context, outputs[0], output) : outputs[0];
 }
 
 auto Gemma4Impl::prefill(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void> {
@@ -989,6 +1013,7 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
                          std::span<Gemma4State*> batch_states) -> Result<Tensor> {
     const ops::DecodeScope decode_scope(!batch_states.empty());
     try {
+        impl_->lm_head->check_hnsw_binding();
         const std::size_t token_count = tokens.size();
         const std::size_t step_count = batch_states.empty() ? token_count : 1;
         if (!token_count || state.position > state.capacity || step_count > state.capacity - state.position ||
@@ -1075,11 +1100,15 @@ auto Gemma4Impl::preparation_ns() const -> std::uint64_t { return impl_->context
 auto Gemma4Impl::configure_cache(const std::filesystem::path& directory, const std::filesystem::path& source) -> void {
     impl_->context.configure_cache(directory, source);
 }
-auto Gemma4Impl::release_workspaces() -> void { impl_->context.release_workspaces(); }
+auto Gemma4Impl::release_workspaces() -> void {
+    impl_->context.release_workspaces();
+    impl_->lm_head->release_workspaces();
+}
 auto Gemma4Impl::trim_workspaces() -> void {
     impl_->context.synchronize();
     impl_->context.clear_replays();
     impl_->context.trim_workspaces();
+    impl_->lm_head->release_workspaces();
 }
 auto Gemma4Impl::accelerator() const -> std::string_view { return impl_->context.accelerator(); }
 auto Gemma4Impl::prefill_chunk_size(std::size_t requested) const -> std::size_t {

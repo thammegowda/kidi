@@ -19,15 +19,18 @@
 #include "kidi/cli/main.h"
 #include "kidi/audio/wav.h"
 #include "kidi/cli/interactive.h"
+#include "kidi/cli/index.h"
 #include "kidi/core/version.h"
 #include "kidi/checkpoint/package.h"
 #include "kidi/checkpoint/config.h"
+#include "kidi/checkpoint/weights.h"
 #include "kidi/inference/translator.h"
 #include "kidi/inference/generator.h"
 #include "kidi/inference/synthesizer.h"
 #include "kidi/inference/transcriber.h"
 #include "kidi/model/omnivoice.h"
 #include "kidi/model/kokoro.h"
+#include "kidi/model/gemma4.h"
 #include "kidi/model/registry.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/runtime/ynn/numa.h"
@@ -285,7 +288,8 @@ auto load_chat_session(const kidi::cli::Namespace& arguments, const std::filesys
                                                      .kv_cache_precision = *kv_cache_precision,
                                                      .weight_bits = arguments.get<std::int32_t>("weight_bits"),
                                                      .group_size = arguments.get<std::int32_t>("group_size"),
-                                                     .packed_prefill = arguments.get<bool>("packed_prefill")});
+                                                     .packed_prefill = arguments.get<bool>("packed_prefill"),
+                                                     .dense_lm_head = arguments.get<bool>("dense_lm_head")});
     if (!loaded) return std::unexpected(std::move(loaded.error()));
     const auto load_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
@@ -787,6 +791,8 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
     kidi::cli::ArgumentParser parser("kidi", "Run translation, transcription, text generation and TTS models.");
     parser.version("kidi " + std::string(kidi::version()));
     auto& commands = parser.add_subparsers().required();
+    auto& index_parser = commands.add_parser("index", "build a reusable CPU HNSW index for a model");
+    kidi::cli::configure_index_parser(index_parser);
     auto& translate_parser = commands.add_parser("translate", "translate one Moses-tokenized line per input line");
     translate_parser.description("Translate with an RTG model. Output preserves input order.");
     auto& generate_parser = commands.add_parser("generate", "generate one reply per JSONL chat request");
@@ -910,6 +916,10 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             .dest("packed_prefill")
             .action(kidi::cli::Action::STORE_TRUE)
             .help("use packed GEMM for prefill; default may cache FP16 matrices for native QAT");
+        command_parser->add_argument("--dense-lm-head")
+            .dest("dense_lm_head")
+            .action(kidi::cli::Action::STORE_TRUE)
+            .help("disable checkpoint lm_head.hnsw discovery and use the exact dense head");
     }
 
     auto& inspect_parser = commands.add_parser("inspect", "inspect a model package");
@@ -982,6 +992,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             }
             directory = std::move(*resolved);
         }
+        if (command == "index") return kidi::cli::index_command(arguments, directory);
         if (command == "inspect") return inspect(directory);
         if (command == "translate") return translate_command(arguments, directory);
         if (command == "generate") return generate_command(arguments, directory);

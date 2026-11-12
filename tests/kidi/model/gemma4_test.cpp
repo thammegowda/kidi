@@ -3,9 +3,11 @@
 #include "kidi/checkpoint/safetensors/mapped.h"
 #include "kidi/inference/generator.h"
 #include "kidi/runtime/operator.h"
+#include "kidi/search/hnsw.h"
 #include "kidi/tensor/backend.h"
 #include "kidi/tensor/external.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -542,6 +544,75 @@ auto check_async_serving(const YAML::Node& config) -> void {
     std::filesystem::remove_all(directory);
 }
 
+auto check_hnsw_head(kidi::model::Gemma4& network, const kidi::tensor::Tensor& weights,
+                     std::span<const std::int32_t> tokens) -> bool {
+    using namespace kidi;
+    using ops::require;
+    const auto path =
+        std::filesystem::temp_directory_path() /
+        ("kidi-hnsw-model-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+    try {
+        auto index =
+            require(search::HnswIndex::build(weights, {.m = 2,
+                                                       .ef_construction = std::max<std::size_t>(4, weights.size(0)),
+                                                       .seed = 42,
+                                                       .candidates = weights.size(0),
+                                                       .ef_search = weights.size(0)}));
+        require(index.save(path));
+        if (!network->device().capabilities().compute.host()) {
+            if (network->configure_lm_head(path))
+                throw std::runtime_error("non-CPU inference accepted a host-synchronized HNSW head");
+            std::filesystem::remove(path);
+            return true;
+        }
+        const auto run = [&] {
+            std::vector<std::int32_t> output;
+            auto serial = require(network->create_state(8));
+            std::array<model::Gemma4State, 2> batched;
+            for (std::size_t row = 0; row < batched.size(); ++row) {
+                batched[row] = require(network->create_state(8));
+                require(network->prefill(tokens.first(row + 1), batched[row]));
+            }
+            require(network->prefill(tokens.first(1), serial));
+            for (std::size_t step = 0; step < 3; ++step) {
+                const std::array input{tokens[step], tokens[step + 1]};
+                output.push_back(require(network->forward_token(std::span(input).first(1), serial)));
+                std::array states{&batched[0], &batched[1]};
+                const auto selected = require(network->forward_batch_tokens(input, states));
+                output.insert(output.end(), selected.begin(), selected.end());
+            }
+            return output;
+        };
+        const auto dense = run();
+        require(network->configure_lm_head(path));
+        if (run() != dense) throw std::runtime_error("all-candidate HNSW head differs from dense token selection");
+        network->release_workspaces();
+        if (run() != dense) throw std::runtime_error("head workspaces did not rebuild correctly");
+        std::filesystem::remove(path);
+        auto subset =
+            require(search::HnswIndex::build(weights, {.m = 4,
+                                                       .ef_construction = std::max<std::size_t>(4, weights.size(0)),
+                                                       .seed = 42,
+                                                       .candidates = 4,
+                                                       .ef_search = weights.size(0)}));
+        require(subset.save(path));
+        require(network->configure_lm_head(path));
+        if (run() != dense) throw std::runtime_error("candidate-subset HNSW head differs from dense fixture selection");
+        require(network->load_state_dict(network->state_dict()));
+        auto stale = require(network->create_state(8));
+        if (network->forward_token(tokens.first(1), stale) || stale.position)
+            throw std::runtime_error("stale index binding was accepted after replacing output weights");
+        std::filesystem::remove(path);
+        return true;
+    } catch (const std::exception& error) {
+        std::cerr << "HNSW head on " << tensor::to_string(network->device()) << ": " << error.what() << '\n';
+        std::error_code cleanup;
+        std::filesystem::remove(path, cleanup);
+        if (cleanup) std::cerr << "HNSW fixture cleanup: " << cleanup.message() << '\n';
+        return false;
+    }
+}
+
 auto check_bfloat_model(const YAML::Node& config, const kidi::checkpoint::Weights& checkpoint,
                         std::span<const std::int32_t> tokens) -> bool {
     using namespace kidi;
@@ -568,6 +639,7 @@ auto check_bfloat_model(const YAML::Node& config, const kidi::checkpoint::Weight
         actual = require(model::Gemma4Impl::create(config));
         require(actual->set_state(state));
     }
+    if (!check_hnsw_head(actual, state.at("embed_tokens.weight"), tokens)) return false;
     auto reference_state = require(reference->create_state(8));
     auto actual_state = require(actual->create_state(8));
     if (actual_state.layers.front().key.dtype() != tensor::DType::BF16) return false;
@@ -693,6 +765,24 @@ auto main() -> int {
                 const ModuleScope construction(tensor::DType::F32, false, device);
                 auto model = ops::require(model::Gemma4Impl::create(config));
                 ops::require(model->set_checkpoint(checkpoint));
+                if (fixture == std::string_view("gemma4") && device == tensor::Device::cpu()) {
+                    auto hnsw_model = ops::require(model::Gemma4Impl::create(config));
+                    ops::require(hnsw_model->set_checkpoint(checkpoint));
+                    if (!check_hnsw_head(hnsw_model,
+                                         ops::require(checkpoint.tensor("model.language_model.embed_tokens.weight")),
+                                         tokens))
+                        return failed(__LINE__);
+                    StateDict bfloat;
+                    ops::Context context(tensor::Device::cpu());
+                    for (const auto& [name, value] : model->state_dict())
+                        bfloat.emplace(name,
+                                       value.dimensions() == 2 ? context.cast(value, tensor::DType::BF16) : value);
+                    const ModuleScope bfloat_scope(tensor::DType::BF16, false, tensor::Device::cpu());
+                    auto bfloat_model = ops::require(model::Gemma4Impl::create(config));
+                    ops::require(bfloat_model->set_state(bfloat));
+                    if (!check_hnsw_head(bfloat_model, bfloat.at("embed_tokens.weight"), tokens))
+                        return failed(__LINE__);
+                }
                 const auto parameters = model->state_dict();
                 for (const auto& [name, parameter] : parameters)
                     if (name.find(".mlp.gate_proj.") != std::string::npos ||

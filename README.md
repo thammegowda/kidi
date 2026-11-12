@@ -17,7 +17,7 @@ Kidi (*"spark"* in Kannada) runs modern generative AI models locally on your har
   - **Audio & Speech:** WAV PCM I/O, Whisper log-Mel spectrogram frontend, and neural vocoders (Higgs Audio 2 / Kokoro)
   - **Checkpoints & Formats:** Zero-copy `mmap` Safetensors, GGUF/GGML, YAML (`yaml-cpp`), JSON (`nlohmann/json`), and parallel gzip ([`pigzpp`](https://github.com/thammegowda/pigzpp) / `zlib-ng`)
   - **Desktop Server & UI ([`liteapp`](https://github.com/thammegowda/liteapp)):** Embedded C++ HTTP + WebSocket loopback server, EPUB/ZIP virtual filesystem, and bundled web/Android UI bridge (`kidi-app`)
-- **State-of-the-Art Edge CPU & GPU Speed:** Custom ARM64 SME2 and fused zero-copy NEON `sdot` kernels (`BlockwiseInt4Linear`), graph capture/replay, and `mmap`-backed weight streaming deliver faster prefill, faster decode, and lower RAM usage than ExecuTorch, ONNX Runtime, `llama.cpp`, and LiteRT-LM.
+- **State-of-the-Art Edge CPU & GPU Speed:** Custom ARM64 SME2 and fused zero-copy NEON `sdot` kernels (`BlockwiseInt4Linear`), graph capture/replay, and `mmap`-backed weight streaming deliver faster prefill, faster decode, and lower RAM usage than ExecuTorch, ONNX Runtime, and `llama.cpp`.
 - **High-Fidelity Low-Bit Quantization:** Built on findings from our [**WMT 2026 LLM compression paper**](https://aclanthology.org/2026.wmt-main.136/) (*Quantize, Qualify, Rerank: A Recipe for Compressing LLMs Without Losing Quality*) and [**engineering blog post**](https://gowda.ai/posts/2026/08/llm-fast-inference/). Supports native mixed 2/4/8-bit QAT checkpoints, blockwise symmetric INT4/INT8, and **blockwise asymmetric INT4 (`g=128` and `g=32`) with 11-step MSE outlier clipping** that recovers near-BF16 translation quality at 4-bit memory footprints.
 - **One Engine, Every Surface:** Use the CLI and Python package for scripting, or launch the **Desktop App**, **Android App**, or **WebAssembly / WebGPU Browser App** for streaming chat, continuous voice conversations, camera/photo Q&A, and side-by-side bilingual EPUB book reading with read-aloud narration.
 
@@ -27,17 +27,21 @@ Kidi (*"spark"* in Kannada) runs modern generative AI models locally on your har
 
 ### Gemma 4 E2B (`google/gemma-4-E2B-it`) on Arm CPU (Apple M5, 4 Threads, Batch 1)
 
-Measured against **Arm ExecuTorch v1.5.1** (`XNNPACK + KleidiAI`), **ONNX Runtime v1.31.1** (`MLAS + KleidiAI`), **`llama.cpp`** (`GGML + KleidiAI`), and **Google LiteRT-LM v0.17.1** (`XNNPACK`) across both throughput (`tokens/s`) and 150-sentence WMT23 (`ja, uk, de -> en`) translation quality (`chrF` vs. human reference translations). Full methodology and 4-table breakdown in [`benchmarks/gemma4/arm/README.md`](benchmarks/gemma4/arm/README.md):
+Measured against **Arm ExecuTorch**, **ONNX Runtime**, and **`llama.cpp`** with
+4 CPU threads. Translation quality uses 150 WMT23
+sentences with the WMT26 translate-only system prompt. See the concise
+[Arm CPU benchmark](benchmarks/gemma4/arm/README.md) for methodology and
+reproduction commands.
 
 <p align="center">
   <img src="docs/gemma4-arm-pareto.svg" alt="Gemma 4 E2B on Arm CPU: Speed vs. Translation Quality Pareto Frontier" width="100%">
 </p>
 
-- **Dominates the 4-bit & 8-bit Pareto frontier on both Prefill and Decode:**
-  - **4-bit QAT (`2.29 GiB`):** Kidi reaches **844.8 tok/s prefill** (**5.29x faster** than Google LiteRT-LM at `159.7 tok/s`) and **68.6 tok/s decode** (**1.44x faster** than LiteRT-LM at `47.5 tok/s`).
-  - **4-bit `g=128` (`2.27 GiB`):** On matched weights, Kidi runs **2.32x faster on prefill** (`544.1` vs. `234.1 tok/s`) and **1.34x faster on decode** (`58.2` vs. `43.5 tok/s`) than Arm ExecuTorch in **1.44 GiB RAM**, and **1.37x faster on prefill** (`544.1` vs. `396.3 tok/s`) and **1.15x faster on decode** (`58.2` vs. `50.7 tok/s`) than ONNX Runtime.
-  - **4-bit `g=32` (`2.47 GiB`):** Kidi's asymmetric INT4 + MSE outlier clipping reaches **`56.27` `chrF (ref)` / `87.79` `chrF (bf16)`** at **432.0 tok/s prefill** (**2.96x faster** than `llama.cpp` `Q4_0`) and **48.5 tok/s decode** while using **2.30x less RAM** (`1.69 GiB` vs. `3.88 GiB`).
-  - **8-bit (`4.37 GiB`):** Kidi reaches **583.1 tok/s prefill** (**1.33x faster** than Arm ExecuTorch, **1.88x faster** than ONNX Runtime, and **3.16x faster** than `llama.cpp` `Q8_0`) at near-lossless BF16 quality (`57.16` `chrF`).
+- **Q8:** Kidi reaches **490.7 tok/s prefill**, **34.1 tok/s decode**, and
+  **57.48 chrF**. The optional HNSW output head raises decode to **39.0 tok/s**.
+- **Q4:** Kidi Q4_g128 reaches **558.7 tok/s prefill** and **60.3 tok/s
+  decode**; Q4_g32 reaches **56.46 chrF** and **52.2 tok/s decode**, compared
+  with llama.cpp Q4_0 at **56.04 chrF** and **48.2 tok/s**.
 - **CUDA Graph Pipelining:** On an NVIDIA RTX A4000 (2,322-token prompt, BF16), Kidi reaches **11,285.9 tok/s prefill** (**1.40x faster** than compiled `vLLM` at `8,062.7 tok/s`) and **64.4 tok/s decode** (see [`benchmarks/README.md`](benchmarks/README.md)).
 
 ---
@@ -221,7 +225,7 @@ If you use the asymmetric quantization with MSE outlier clipping recipe in your 
 ## Documentation & Links
 
 - **[Getting Started Guide](docs/getting-started.md):** Detailed setup, offline caching, and CLI walkthroughs.
-- **[Arm CPU Benchmark Suite](benchmarks/gemma4/arm/README.md):** Gemma 4 E2B comparisons against Arm ExecuTorch + KleidiAI, ONNX Runtime, `llama.cpp`, and Google LiteRT-LM.
+- **[Arm CPU Benchmark Suite](benchmarks/gemma4/arm/README.md):** Gemma 4 E2B comparisons against Arm ExecuTorch + KleidiAI, ONNX Runtime, and `llama.cpp`.
 - **[Benchmarks Overview](benchmarks/README.md):** Native CPU and NVIDIA CUDA vs. vLLM benchmarks.
 - **[Developer Guide](README-dev.md):** CMake presets, C++ architecture, checkpoint converters, WebAssembly/Android builds, and test suites.
 - **[Android Privacy Policy](android/PRIVACY.md) | [Android Terms of Use](android/TERMS.md)**

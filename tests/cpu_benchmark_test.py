@@ -74,15 +74,34 @@ class CpuBenchmarkTest(unittest.TestCase):
 
     def test_environment_forces_cpu_and_explicit_profiling(self):
         with patch.dict(os.environ, {"KIDI_ACCELERATOR": "cuda:0", "KIDI_REPLAY": "0",
-                                     "KIDI_PROFILE_OPS": "sync", "KIDI_CUDA_PROFILE": "1"}):
+                                     "KIDI_PROFILE_OPS": "sync", "KIDI_CUDA_PROFILE": "1",
+                                     "KIDI_HNSW_EF": "10"}):
             environment = BENCHMARK.benchmark_environment("default", False, 1)
             self.assertEqual(environment["KIDI_ACCELERATOR"], "cpu")
             self.assertNotIn("KIDI_REPLAY", environment)
             self.assertNotIn("KIDI_PROFILE_OPS", environment)
             self.assertNotIn("KIDI_CUDA_PROFILE", environment)
+            self.assertNotIn("KIDI_HNSW_EF", environment)
             environment = BENCHMARK.benchmark_environment("on", True, 2)
             self.assertEqual(environment["KIDI_REPLAY"], "1")
             self.assertEqual(environment["KIDI_PROFILE_OPS_SKIP"], "2")
+            environment = BENCHMARK.benchmark_environment("default", False, 1, 256)
+            self.assertEqual(environment["KIDI_HNSW_EF"], "256")
+
+    def test_rejects_invalid_hnsw_options(self):
+        for options in (["--hnsw-ef", "0"], ["--hnsw-ef", "-1"],
+                        ["--dense-lm-head", "--hnsw-ef", "256"]):
+            with self.subTest(options=options), patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                BENCHMARK.main(options)
+            self.assertEqual(error.exception.code, 2)
+
+    def test_hnsw_settings_reject_a_missing_index(self):
+        with tempfile.TemporaryDirectory() as temporary, patch("sys.stderr"), patch("sys.stdout"), \
+                patch.object(BENCHMARK.os, "cpu_count", side_effect=(8, 1)):
+            output = Path(temporary) / "report.json"
+            status = BENCHMARK.main(["--model", temporary, "--hnsw-ef", "256", "--output", str(output)])
+            self.assertEqual(status, 1)
+            self.assertIn("refusing to measure a dense fallback", json.loads(output.read_text())["error"])
 
     def test_operator_summary_groups_shapes_without_counting_other_output(self):
         text = "\n".join((
