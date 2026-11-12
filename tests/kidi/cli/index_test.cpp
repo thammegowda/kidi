@@ -8,6 +8,7 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <sstream>
+#include <thread>
 
 namespace {
 using kidi::ops::require;
@@ -70,16 +71,18 @@ auto main() -> int {
         prepare(root);
         auto dense = require(inference::Generator::load(
             root, inference::ModelLoadOptions{.device = tensor::Device::cpu(), .dense_lm_head = true}));
+        const auto threads = std::min<std::size_t>(4, std::max(1U, std::thread::hardware_concurrency()));
         std::vector<std::string> command{
             "kidi",         "index", "--model",     root.string(), "--m",       "4",   "--ef-construction", "32",
-            "--candidates", "4",     "--ef-search", "16",          "--builder", "cpu", "--threads",         "4",
+            "--candidates", "4",     "--ef-search", "16",          "--builder", "cpu", "--threads",
+            std::to_string(threads),
         };
         std::string progress;
         const auto [status, output] = run(command, &progress);
         check(status == 0, "native CLI failed to build a complete index");
         const auto report = nlohmann::json::parse(output);
         const auto path = root / "lm_head.hnsw";
-        check(report["nodes"] == 16 && report["candidates"] == 4 && report["threads"] == 4 &&
+        check(report["nodes"] == 16 && report["candidates"] == 4 && report["threads"] == threads &&
                   report["bytes"] == std::filesystem::file_size(path),
               "index CLI did not report the requested construction parameters");
         check(progress.find("100.00%") != std::string::npos && progress.find("ETA") != std::string::npos,
