@@ -867,8 +867,9 @@ private:
         auto* y = require(output.data<float>()).data();
         act_q_.resize(M * K_);
         act_scale_.resize(M * B_);
-        if (has_zero_) act_bsum_.resize(M * B_);
-        float* bsum_ptr = has_zero_ ? act_bsum_.data() : nullptr;
+        const bool use_bsum = has_zero_ || bits_ == 8;
+        if (use_bsum) act_bsum_.resize(M * B_);
+        float* bsum_ptr = use_bsum ? act_bsum_.data() : nullptr;
 
         const auto q_workers = (M >= 8 && M * K_ >= 65536) ? std::min(ynn::thread_count(), M) : std::size_t{1};
         if (q_workers > 1) {
@@ -876,11 +877,11 @@ private:
             require(ynn::parallel_for(q_workers, [&](std::size_t task) {
                 const auto m_begin = task * per_worker, m_end = std::min(M, m_begin + per_worker);
                 if (m_begin < m_end)
-                    ::ynn::quantize_blockwise_activations_f32(bits_, M, K_, block_size_, has_zero_, x, act_q_.data(),
+                    ::ynn::quantize_blockwise_activations_f32(bits_, M, K_, block_size_, use_bsum, x, act_q_.data(),
                                                               act_scale_.data(), bsum_ptr, m_begin, m_end);
             }));
         } else {
-            ::ynn::quantize_blockwise_activations_f32(bits_, M, K_, block_size_, has_zero_, x, act_q_.data(),
+            ::ynn::quantize_blockwise_activations_f32(bits_, M, K_, block_size_, use_bsum, x, act_q_.data(),
                                                       act_scale_.data(), bsum_ptr, 0, M);
         }
 

@@ -465,6 +465,29 @@ auto quantized_distance_checks(const std::filesystem::path& root, std::int32_t b
     for (std::size_t attempt = 0; attempt < 5; ++attempt) {
         for (auto& value : query) value = (static_cast<float>(random() % 101) - 50.F) / 16.F;
         for (std::size_t b = 0; b < blocks; ++b) {
+            if (bits == 8 && act_scale <= 0.F) {
+                float rmin = 0.F, rmax = 0.F;
+                for (std::size_t c = 0; c < group; ++c) {
+                    rmin = std::min(rmin, query[b * group + c]);
+                    rmax = std::max(rmax, query[b * group + c]);
+                }
+                const float rdiff = rmax - rmin;
+                const float inverse = rdiff > 0.F ? 255.F / rdiff : 0.F;
+                const float scale = rdiff > 0.F ? rdiff / 255.F : 1.F;
+                const float min_error = -128.F + rmin * inverse;
+                const float max_error = 127.F + rmax * inverse;
+                const float fzp =
+                    min_error + max_error > 0.F ? -128.F - rmin * inverse : 127.F - rmax * inverse;
+                const auto zp = rdiff > 0.F
+                                    ? static_cast<std::int32_t>(std::rint(std::clamp(fzp, -128.F, 127.F)))
+                                    : -128;
+                for (std::size_t c = 0; c < group; ++c) {
+                    const auto q = std::clamp<std::int32_t>(
+                        static_cast<std::int32_t>(std::round(query[b * group + c] * inverse)) + zp, -128, 127);
+                    rounded[b * group + c] = static_cast<float>(q - zp) * scale;
+                }
+                continue;
+            }
             float maximum = 0.F;
             for (std::size_t c = 0; c < group; ++c) maximum = std::max(maximum, std::abs(query[b * group + c]));
             const auto scale = act_scale > 0.F ? act_scale : maximum / 127.F;

@@ -512,7 +512,8 @@ auto quantized_slice_bytes(std::size_t width, std::int32_t bits, std::int32_t gr
     const auto B = width / static_cast<std::size_t>(group_size);
     const auto scale_row_bytes = B * (scale_f16 ? 2U : 4U);
     const auto zero_row_bytes = has_zero ? B * (zero_f16 ? 2U : 4U) : 0U;
-    const auto raw = row_bytes + scale_row_bytes + zero_row_bytes;
+    const auto wsum_row_bytes = bits == 8 ? B * sizeof(std::int32_t) : 0U;
+    const auto raw = row_bytes + scale_row_bytes + zero_row_bytes + wsum_row_bytes;
     return raw >= 64 ? ((raw + 63U) & ~std::size_t{63}) : ((raw + 15U) & ~std::size_t{15});
 }
 
@@ -551,6 +552,15 @@ auto pack_quantized_slice(std::byte* dst, const std::byte* w_row, const std::byt
     std::memcpy(dst, w_row, row_bytes);
     std::memcpy(dst + row_bytes, s_row, scale_row_bytes);
     if (has_zero) std::memcpy(dst + row_bytes + scale_row_bytes, z_row, zero_row_bytes);
+    if (bits == 8) {
+        const auto* w_i8 = reinterpret_cast<const std::int8_t*>(w_row);
+        auto* wsum_dst = dst + row_bytes + scale_row_bytes + zero_row_bytes;
+        for (std::size_t b = 0; b < B; ++b) {
+            std::int32_t wsum = 0;
+            for (std::size_t c = 0; c < G; ++c) wsum += static_cast<std::int32_t>(w_i8[b * G + c]);
+            std::memcpy(wsum_dst + b * sizeof(std::int32_t), &wsum, sizeof(std::int32_t));
+        }
+    }
 }
 
 auto prepare_quantized_query(std::span<const float> query, std::size_t width, std::int32_t bits,
@@ -564,6 +574,34 @@ auto prepare_quantized_query(std::span<const float> query, std::size_t width, st
     q_bsum.resize(B);
     for (std::size_t b = 0; b < B; ++b) {
         const float* x = query.data() + b * G;
+        if (bits == 8 && input_scale <= 0.F) {
+            float rmin = 0.F, rmax = 0.F;
+            for (std::size_t i = 0; i < G; ++i) {
+                rmin = std::min(rmin, x[i]);
+                rmax = std::max(rmax, x[i]);
+            }
+            const float rdiff = rmax - rmin;
+            float scale = 1.F;
+            float inv_scale = 0.F;
+            std::int32_t zp = -128;
+            if (rdiff > 0.F) {
+                inv_scale = 255.F / rdiff;
+                scale = rdiff / 255.F;
+                const float min_error = -128.F + rmin * inv_scale;
+                const float max_error = 127.F + rmax * inv_scale;
+                const float fzp =
+                    min_error + max_error > 0.F ? -128.F - rmin * inv_scale : 127.F - rmax * inv_scale;
+                zp = static_cast<std::int32_t>(std::rint(std::clamp(fzp, -128.F, 127.F)));
+            }
+            q_scale[b] = scale;
+            q_bsum[b] = static_cast<float>(zp);
+            auto* dst = q_i8.data() + b * G;
+            for (std::size_t i = 0; i < G; ++i) {
+                const auto q = static_cast<std::int32_t>(std::round(x[i] * inv_scale)) + zp;
+                dst[i] = static_cast<std::int8_t>(std::clamp<std::int32_t>(q, -128, 127));
+            }
+            continue;
+        }
         float scale = input_scale;
         float inv_scale = 0.F;
         if (scale > 0.F) {
@@ -650,6 +688,8 @@ auto quantized_slice_dot(const std::byte* slice_ptr, std::size_t width, std::int
     const auto* zero_ptr = scale_ptr + scale_row_bytes;
     float score = 0.F;
     if (bits == 8) {
+        const auto zero_row_bytes = has_zero ? B * (zero_f16 ? 2U : 4U) : 0U;
+        const auto* wsum_ptr = zero_ptr + zero_row_bytes;
         for (std::size_t b = 0; b < B; ++b) {
             const auto* q_ptr = q_i8.data() + b * G;
             const auto* w_ptr = reinterpret_cast<const std::int8_t*>(w_row + b * G);
@@ -670,6 +710,12 @@ auto quantized_slice_dot(const std::byte* slice_ptr, std::size_t width, std::int
             for (std::size_t c = 0; c < G; ++c)
                 dot_i32 += static_cast<std::int32_t>(q_ptr[c]) * static_cast<std::int32_t>(w_ptr[c]);
 #endif
+            const auto zp = static_cast<std::int32_t>(q_bsum[b]);
+            if (zp != 0) {
+                std::int32_t wsum = 0;
+                std::memcpy(&wsum, wsum_ptr + b * sizeof(std::int32_t), sizeof(std::int32_t));
+                dot_i32 -= zp * wsum;
+            }
             const float w_s = read_meta(scale_ptr, scale_f16, b);
             score += static_cast<float>(dot_i32) * (q_scale[b] * w_s);
         }
@@ -807,6 +853,8 @@ auto quantized_slices4_dot(const std::byte* s0, const std::byte* s1, const std::
         const auto* sc1 = s1 + row_bytes;
         const auto* sc2 = s2 + row_bytes;
         const auto* sc3 = s3 + row_bytes;
+        const auto wsum_off =
+            row_bytes + B * (scale_f16 ? 2U : 4U) + (has_zero ? B * (zero_f16 ? 2U : 4U) : 0U);
         std::array<float, 4> scores{0.F, 0.F, 0.F, 0.F};
         for (std::size_t b = 0; b < B; ++b) {
             const auto* q_ptr = q_i8.data() + b * G;
@@ -828,6 +876,18 @@ auto quantized_slices4_dot(const std::byte* s0, const std::byte* s1, const std::
                 d[1] += qv * w1[b * G + c];
                 d[2] += qv * w2[b * G + c];
                 d[3] += qv * w3[b * G + c];
+            }
+            const auto zp = static_cast<std::int32_t>(q_bsum[b]);
+            if (zp != 0) {
+                std::int32_t ws0 = 0, ws1 = 0, ws2 = 0, ws3 = 0;
+                std::memcpy(&ws0, s0 + wsum_off + b * sizeof(std::int32_t), sizeof(std::int32_t));
+                std::memcpy(&ws1, s1 + wsum_off + b * sizeof(std::int32_t), sizeof(std::int32_t));
+                std::memcpy(&ws2, s2 + wsum_off + b * sizeof(std::int32_t), sizeof(std::int32_t));
+                std::memcpy(&ws3, s3 + wsum_off + b * sizeof(std::int32_t), sizeof(std::int32_t));
+                d[0] -= zp * ws0;
+                d[1] -= zp * ws1;
+                d[2] -= zp * ws2;
+                d[3] -= zp * ws3;
             }
             scores[0] += static_cast<float>(d[0]) * (q_scale[b] * read_meta(sc0, scale_f16, b));
             scores[1] += static_cast<float>(d[1]) * (q_scale[b] * read_meta(sc1, scale_f16, b));

@@ -17,6 +17,7 @@ from statistics import median
 import subprocess
 import sys
 import tempfile
+import time
 from unittest.mock import patch
 
 
@@ -261,6 +262,8 @@ def summarize(records, protocol):
 
 
 def compare(summaries):
+    if "kidi" not in summaries or "arm" not in summaries:
+        return {"speedup": {}, "outputs": {}}
     kidi_ids, arm_ids = summaries["kidi"]["token_ids"], summaries["arm"]["token_ids"]
     if len(kidi_ids) != len(arm_ids):
         raise ValueError("runtime output token budgets differ")
@@ -276,6 +279,28 @@ def compare(summaries):
 
 
 LANG_NAMES = {"ja": "Japanese", "uk": "Ukrainian", "de": "German"}
+TRANSLATION_SYSTEM_PROMPT = (
+    "You are a professional translator. Translate the user's text into the requested target language. "
+    "Output only the final translation — no preamble, explanations, alternatives, transliterations, notes, or "
+    "commentary, and do not restate the request. Preserve the meaning, tone, and any structure or markup "
+    "(e.g. JSON keys, HTML tags, placeholders) present in the source."
+)
+
+
+def serialize_translation_prompt(lang: str, source: str) -> str:
+    lang_name = LANG_NAMES.get(lang, lang)
+    user_prompt = (
+        f"Translate the following {lang_name} text fully into English. "
+        "Output only the translation, with no explanations, alternatives, notes, labels, or extra details.\n\n"
+        f"{source}"
+    )
+    return (
+        "<bos><|turn>system\n"
+        + TRANSLATION_SYSTEM_PROMPT
+        + "<turn|>\n<|turn>user\n"
+        + user_prompt
+        + "<turn|>\n<|turn>model\n"
+    )
 
 
 def clean_translation_text(text: str) -> str:
@@ -322,13 +347,7 @@ def build_eval_protocol(work: Path, tokenizer, num_lines: int, langs: str = "ja,
     for row in interleaved:
         if len(selected) >= num_lines:
             break
-        lang_name = LANG_NAMES.get(row["lang"], row["lang"])
-        user_prompt = (
-            f"Translate the following {lang_name} text fully into English. "
-            "Output only the translation, with no explanations, alternatives, notes, labels, or extra details.\n\n"
-            f"{row['source']}"
-        )
-        serialized = "<bos><|turn>user\n" + user_prompt + "<turn|>\n<|turn>model\n"
+        serialized = serialize_translation_prompt(row["lang"], row["source"])
         ids = tokenizer.encode(serialized, add_special_tokens=False).ids
         if len(ids) + max_output_tokens > context_tokens:
             continue
@@ -701,9 +720,26 @@ def build(work, source, jobs):
                     "--parallel", str(jobs)], check=True)
 
 
-def measure(command, work, name, protocol, timeout):
+def prepare_hnsw_view(base_dir: Path, hnsw_index: Path, target_dir: Path) -> Path:
+    index_resolved = hnsw_index.expanduser().resolve()
+    if not index_resolved.is_file():
+        raise FileNotFoundError(f"HNSW index not found: {index_resolved}")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for child in list(target_dir.iterdir()):
+        if child.is_symlink() or child.is_file():
+            child.unlink()
+    for source in base_dir.iterdir():
+        if source.name != "lm_head.hnsw":
+            (target_dir / source.name).symlink_to(source.resolve())
+    (target_dir / "lm_head.hnsw").symlink_to(index_resolved)
+    return target_dir
+
+
+def measure(command, work, name, protocol, timeout, extra_env=None):
     environment = {key: value for key, value in os.environ.items() if not key.startswith("KIDI_")}
     environment["KIDI_ACCELERATOR"] = "cpu"
+    if extra_env:
+        environment.update(extra_env)
     try:
         completed = subprocess.run(command, cwd=ROOT, env=environment, text=True, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired as error:
@@ -723,11 +759,19 @@ def load_partial_eval_items(work: Path, name: str, eval_protocol: dict, tokenize
     results_dir = work / "results"
     jsonl_path = results_dir / f"{name}_eval.output.jsonl"
     json_path = results_dir / f"{name}_eval.json"
+    protocol_path = results_dir / f"{name}_eval.protocol.json"
     legacy_tokens = {}
     legacy_avg_sec = 0.05
+    protocol_matches = False
+    if protocol_path.exists():
+        try:
+            protocol_matches = json.loads(protocol_path.read_text(encoding="utf-8")) == eval_protocol
+        except (OSError, ValueError, TypeError):
+            pass
     if json_path.exists():
         try:
             doc = json.loads(json_path.read_text(encoding="utf-8"))
+            protocol_matches = protocol_matches or doc.get("eval_protocol") == eval_protocol
             ev_rows = [r for r in doc.get("records", []) if r.get("stage") == "eval"]
             if ev_rows:
                 t_list = ev_rows[0].get("token_ids", [])
@@ -737,6 +781,8 @@ def load_partial_eval_items(work: Path, name: str, eval_protocol: dict, tokenize
                     legacy_tokens[idx] = tids
         except (OSError, ValueError, KeyError, TypeError):
             pass
+    if not protocol_matches:
+        return {}
     completed = {}
     if jsonl_path.exists():
         try:
@@ -786,8 +832,16 @@ def write_eval_output_jsonl(work: Path, name: str, items_by_id: dict[int, dict])
     out_path.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
 
 
-def measure_eval(command, work, name, eval_protocol, tokenizer, timeout, force=False):
+def format_progress_time(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def measure_eval(command, work, name, eval_protocol, tokenizer, timeout, force=False, extra_env=None):
     completed_by_id = {} if force else load_partial_eval_items(work, name, eval_protocol, tokenizer)
+    cached_count = len(completed_by_id)
     missing_ids = [idx for idx in range(eval_protocol["items"]) if idx not in completed_by_id]
     if not missing_ids:
         ordered = [completed_by_id[idx] for idx in range(eval_protocol["items"])]
@@ -806,6 +860,9 @@ def measure_eval(command, work, name, eval_protocol, tokenizer, timeout, force=F
             "cached": True,
         }
 
+    results_dir = work / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    save(results_dir / f"{name}_eval.protocol.json", eval_protocol)
     write_eval_output_jsonl(work, name, completed_by_id)
     total_items = eval_protocol["items"]
     print(
@@ -832,12 +889,14 @@ def measure_eval(command, work, name, eval_protocol, tokenizer, timeout, force=F
 
     environment = {key: value for key, value in os.environ.items() if not key.startswith("KIDI_")}
     environment["KIDI_ACCELERATOR"] = "cpu"
+    if extra_env:
+        environment.update(extra_env)
     results_dir = work / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = results_dir / f"{name}_eval.output.jsonl"
     stderr_log_path = work / f"{name}_eval.stderr.log"
     stdout_lines = []
-    started = time.monotonic() if hasattr(time := __import__("time"), "monotonic") else 0.0
+    started = time.monotonic()
     with stderr_log_path.open("w", encoding="utf-8") as stderr_file, subprocess.Popen(
         pending_cmd, cwd=ROOT, env=environment, text=True,
         stdout=subprocess.PIPE, stderr=stderr_file, bufsize=1,
@@ -878,9 +937,16 @@ def measure_eval(command, work, name, eval_protocol, tokenizer, timeout, force=F
                 completed_by_id[idx] = entry
                 stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 stream.flush()
-                if len(completed_by_id) % 25 == 0 or len(completed_by_id) == total_items:
+                run_completed = len(completed_by_id) - cached_count
+                if run_completed % 10 == 0 or run_completed == len(missing_ids):
+                    elapsed = time.monotonic() - started
+                    speed = run_completed / elapsed if elapsed > 0 else 0.0
+                    remaining = len(missing_ids) - run_completed
+                    eta = remaining / speed if speed > 0 else 0.0
                     print(
-                        f"[eval] {name}: {len(completed_by_id)}/{total_items} completed",
+                        f"[eval] {name}: {len(completed_by_id)}/{total_items} | "
+                        f"{speed:.2f} items/s | elapsed {format_progress_time(elapsed)} | "
+                        f"ETA {format_progress_time(eta)}",
                         file=sys.stderr, flush=True,
                     )
         returncode = proc.wait()
@@ -942,6 +1008,7 @@ def save_cached_eval(work, name, eval_run, eval_protocol):
         "summary": eval_run["summary"],
     }
     save(results_dir / f"{name}_eval.json", payload)
+    save(results_dir / f"{name}_eval.protocol.json", eval_protocol)
     ev_rows = [r for r in eval_run.get("records", []) if r.get("stage") == "eval"]
     raw_tids = ev_rows[0].get("token_ids", []) if ev_rows else []
     avg_sec = max(float(eval_run["summary"].get("eval_seconds", 0.1)) / max(len(raw_tids), 1), 1e-4)
@@ -1128,28 +1195,6 @@ def load_cached_run(work, name, command, binary_sha256, protocol, tokenizer=None
     return None
 
 
-TABLE_SPECS = (
-    ("bf16_int8", "### 1. Reference BF16 & 8-Bit (`int8`) Inference"),
-    ("int4_g128", "### 2. 4-Bit Inference — Group Size 128 (`int4-g128`)"),
-    ("int4_g32", "### 3. 4-Bit Inference — Group Size 32 (`int4-g32`)"),
-    ("qat_mixed", "### 4. 4-Bit Quantization-Aware Trained (QAT / Mixed Precision)"),
-)
-
-
-BINARY_TABLE_ROWS = (
-    ("llama.cpp (`llamacpp`)", "`llamacpp_gemma4_bench` + `libllama.0.dylib` + `libggml*.dylib`", "4.48", "5.10",
-     "C++ probe + GGML CPU/KleidiAI shared libraries (reads GGUF vocabulary)"),
-    ("Kidi (`kidi` / `kidi_bf16` / `kidi_qat`)", "`kidi_android_baseline` (single static binary)", "7.62", "9.39",
-     "Zero external non-OS dylibs (**6.29 MiB** with `-Wl,-dead_strip`). Includes C++ HF tokenizer ([`tokenizerspp`](https://github.com/thammegowda/tokenizerspp) + `uni-algo` + `RE2`), vision codecs ([`tahoma-vision`](https://github.com/thammegowda/tahoma-vision) + `libjpeg-turbo` + PNG/[`pigzpp`](https://github.com/thammegowda/pigzpp)/`zlib-ng`), WAV/Mel audio, Safetensors/GGUF/YAML/JSON parsers, and 6 model families; core Gemma 4 + [`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) is **~3.3 MiB**"),
-    ("Arm ExecuTorch v1.5.1 (`arm`)", "`arm_gemma4_bench` (single static binary)", "7.87", "10.28",
-     "Zero external non-OS dylibs (**6.22 MiB** with `-Wl,-dead_strip`); ExecuTorch runtime + XNNPACK + KleidiAI (excludes tokenizer, vision/audio codecs, and checkpoint parsers)"),
-    ("ONNX Runtime v1.31.1 (`onnx`)", "`libonnxruntime.1.31.1.dylib`", "20.10", "31.51",
-     "Standalone native ONNX Runtime C/C++ shared library (excludes Python interpreter and tokenizer)"),
-    ("Google LiteRT-LM v0.17.1 (`litert`)", "`liblitert-lm.dylib`", "52.18", "66.01",
-     "Standalone native Google LiteRT-LM C++ shared library (excludes Python interpreter)"),
-)
-
-
 def load_results_tsv(tsv_path: Path = HERE / "results.tsv") -> list[dict[str, str]]:
     lines = [line.rstrip("\r\n") for line in tsv_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if not lines:
@@ -1166,35 +1211,19 @@ def load_results_tsv(tsv_path: Path = HERE / "results.tsv") -> list[dict[str, st
 
 def render_markdown_tables(tsv_path: Path = HERE / "results.tsv") -> str:
     rows = load_results_tsv(tsv_path)
-    sections = []
     header = (
-        "| Runtime | Engine / Backend | Weight Format | Model (GiB) | Prefill (tok/s) | "
-        "Decode (tok/s) | TTFT (ms) | Peak RSS (GiB) | chrF (ref) | chrF (bf16) | Eval Time (s) |\n"
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "| Runtime | Precision | Model (GiB) | Prefill (tok/s) | Decode (tok/s) | "
+        "TTFT (ms) | Peak RSS (GiB) | chrF ↑ |\n"
+        "|---|---|---:|---:|---:|---:|---:|---:|"
     )
-    for group_key, title in TABLE_SPECS:
-        group_rows = [r for r in rows if r["table_group"] == group_key]
-        if not group_rows:
-            continue
-        lines = [title, "", header]
-        for r in group_rows:
-            lines.append(
-                f"| **{r['runtime']}** | {r['backend']} | {r['weight_format']} | "
-                f"{r['model_gib']} | {r['prefill_tps']} | {r['decode_tps']} | "
-                f"{r['ttft_ms']} | {r['peak_rss_gib']} | "
-                f"{r['chrf_ref']} | {r['chrf_bf16']} | {r['wmt23_eval_s']} |"
-            )
-        sections.append("\n".join(lines))
-    bin_lines = [
-        "### 5. Self-Contained Runtime Binary Size Comparison",
-        "",
-        "| Runtime | Artifacts Measured | Stripped (MiB) | Unstripped (MiB) | Notes |",
-        "|---|---|---:|---:|---|",
-    ]
-    for rt, artifacts, stripped, unstripped, notes in BINARY_TABLE_ROWS:
-        bin_lines.append(f"| **{rt}** | {artifacts} | **{stripped}** | {unstripped} | {notes} |")
-    sections.append("\n".join(bin_lines))
-    return "\n\n".join(sections)
+    lines = ["## Results", "", header]
+    for r in rows:
+        lines.append(
+            f"| **{r['runtime']}** | {r['precision']} | {r['model_gib']} | "
+            f"{r['prefill_tps']} | {r['decode_tps']} | {r['ttft_ms']} | "
+            f"{r['peak_rss_gib']} | {r['chrf_ref']} |"
+        )
+    return "\n".join(lines)
 
 
 def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
@@ -1212,69 +1241,66 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
     #   Arm ExecuTorch:   Blue (#0173B2)
     #   ONNX Runtime:     Bluish Green (#029E73)
     #   llama.cpp:        Reddish Purple (#CC78BC)
-    #   Google LiteRT-LM: Orange (#DE8F05)
     #   BF16 Reference:   Deep Slate (#0f172a)
     #
     # Shapes by precision family:
     #   "star"     -> BF16 reference
     #   "solid"    -> 8-bit (Q8)
     #   "hollow"   -> 4-bit (Q4, g=32 / g=128)
-    #   "triangle" -> MixedQ (QAT mixed 2/4/8-bit)
     meta = {
-        "kidi_bf16":      ("#0f172a", "star",     "Kidi BF16"),
-        "kidi_int8":      ("#D55E00", "solid",    "Kidi Q8"),
-        "arm_int8":       ("#0173B2", "solid",    "Arm ET Q8"),
-        "onnx_int8":      ("#029E73", "solid",    "ONNX Q8"),
-        "llamacpp_int8":  ("#CC78BC", "solid",    "llama.cpp Q8"),
-        "kidi_asym_g32":  ("#D55E00", "hollow",   "Kidi Q4 Asym (g=32)"),
-        "llamacpp_q4_0":  ("#CC78BC", "hollow",   "llama.cpp Q4 (g=32)"),
-        "litert":         ("#DE8F05", "triangle", "LiteRT-LM MixedQ"),
-        "kidi_qat":       ("#D55E00", "triangle", "Kidi MixedQ"),
-        "kidi_asym_clip": ("#D55E00", "hollow",   "Kidi Q4 Asym (g=128)"),
-        "kidi_int4_g128": ("#D55E00", "hollow",   "Kidi Q4 Sym (g=128)"),
-        "onnx_int4_g128": ("#029E73", "hollow",   "ONNX Q4 (g=128)"),
-        "arm_int4_g128":  ("#0173B2", "hollow",   "Arm ET Q4 (g=128)"),
+        "kidi_bf16":           ("#0f172a", "star",     "Kidi BF16"),
+        "kidi_int8":           ("#D55E00", "solid",    "Kidi Q8"),
+        "kidi_int8_hnsw":      ("#D55E00", "diamond",  "Kidi Q8+HNSW"),
+        "arm_int8":            ("#0173B2", "solid",    "Arm ET Q8"),
+        "onnx_int8":           ("#029E73", "solid",    "ONNX Q8"),
+        "llamacpp_int8":       ("#CC78BC", "solid",    "llama.cpp Q8"),
+        "kidi_asym_g32":       ("#D55E00", "hollow",   "Kidi Q4_g32"),
+        "kidi_asym_g32_hnsw":  ("#D55E00", "diamond",  "Kidi Q4_g32+HNSW"),
+        "llamacpp_q4_0":       ("#CC78BC", "hollow",   "llama.cpp Q4_0"),
+        "kidi_asym_clip":      ("#D55E00", "hollow",   "Kidi Q4 (g=128)"),
+        "kidi_asym_clip_hnsw": ("#D55E00", "diamond",  "Kidi Q4 (g=128)+HNSW"),
+        "onnx_int4_g128":      ("#029E73", "hollow",   "ONNX Q4 (g=128)"),
+        "arm_int4_g128":       ("#0173B2", "hollow",   "Arm ET Q4 (g=128)"),
     }
 
     # Label offsets (dx, dy, text_anchor) with leader lines so zero labels collide
     prefill_labels = {
-        "kidi_bf16":      ( 14,  18, "start"),
-        "llamacpp_int8":  ( -4,  21, "middle"),
-        "onnx_int8":      ( -8, -16, "end"),
-        "arm_int8":       (  8, -15, "start"),
-        "kidi_int8":      ( 15, -13, "start"),
-        "llamacpp_q4_0":  ( 14, -14, "start"),
-        "litert":         ( 12,  19, "start"),
-        "kidi_asym_g32":  ( 15, -14, "start"),
-        "kidi_asym_clip": (-16,  -4, "end"),
-        "kidi_int4_g128": ( 16,  17, "start"),
-        "kidi_qat":       ( -6, -17, "end"),
-        "onnx_int4_g128": ( 14,  15, "start"),
-        "arm_int4_g128":  (  0, -15, "middle"),
+        "kidi_bf16":           (-12, -14, "end"),
+        "llamacpp_int8":       ( -4,  24, "start"),
+        "onnx_int8":           ( 12,  18, "start"),
+        "arm_int8":            (-10, -14, "end"),
+        "kidi_int8":           (  6,  20, "middle"),
+        "kidi_int8_hnsw":      ( 14, -12, "start"),
+        "llamacpp_q4_0":       ( 14, -14, "start"),
+        "kidi_asym_g32":       ( 16, -15, "start"),
+        "kidi_asym_g32_hnsw":  ( 18,   2, "start"),
+        "kidi_asym_clip_hnsw": ( 20,  44, "start"),
+        "kidi_asym_clip":      ( 14,  20, "start"),
+        "onnx_int4_g128":      ( 14,  15, "start"),
+        "arm_int4_g128":       (  0, -16, "middle"),
     }
 
     decode_labels = {
-        "kidi_bf16":      ( 14,  20, "start"),
-        "arm_int8":       (-15,  -8, "end"),
-        "onnx_int8":      ( -4, -18, "middle"),
-        "kidi_int8":      ( 16, -12, "start"),
-        "llamacpp_int8":  ( 16,  15, "start"),
-        "kidi_asym_g32":  ( 16, -15, "start"),
-        "llamacpp_q4_0":  (-16, -13, "end"),
-        "litert":         (-16,   5, "end"),
-        "kidi_asym_clip": (-16,  -5, "end"),
-        "kidi_int4_g128": ( 14,  16, "start"),
-        "kidi_qat":       (  0, -17, "middle"),
-        "onnx_int4_g128": ( 14,  15, "start"),
-        "arm_int4_g128":  (-14,  14, "end"),
+        "kidi_bf16":           ( 12,  16, "start"),
+        "arm_int8":            (-14, -12, "end"),
+        "onnx_int8":           (  2, -18, "middle"),
+        "llamacpp_int8":       (-14,  24, "end"),
+        "kidi_int8":           (  8,  22, "start"),
+        "kidi_int8_hnsw":      ( 14, -12, "start"),
+        "llamacpp_q4_0":       (-15, -14, "end"),
+        "kidi_asym_g32":       (-10, -28, "middle"),
+        "kidi_asym_g32_hnsw":  (  8, -16, "middle"),
+        "kidi_asym_clip":      (-10,  18, "end"),
+        "kidi_asym_clip_hnsw": ( -6, -14, "middle"),
+        "onnx_int4_g128":      ( 14,  15, "start"),
+        "arm_int4_g128":       (-14,  14, "end"),
     }
 
     # Comparable precision & group-size tiers connected within each subplot
     comparable_groups = [
-        ("q8",       ["llamacpp_int8", "onnx_int8", "arm_int8", "kidi_int8"],              "none"),
-        ("q4_g32",   ["llamacpp_q4_0", "kidi_asym_g32"],                                   "7,4"),
-        ("q4_g128",  ["arm_int4_g128", "onnx_int4_g128", "kidi_asym_clip", "kidi_int4_g128"], "3,3"),
-        ("mixedq",   ["litert", "kidi_qat"],                                               "7,3,2,3"),
+        ("q8",       ["llamacpp_int8", "onnx_int8", "arm_int8", "kidi_int8", "kidi_int8_hnsw"], "none"),
+        ("q4_g32",   ["llamacpp_q4_0", "kidi_asym_g32", "kidi_asym_g32_hnsw"],                  "7,4"),
+        ("q4_g128",  ["arm_int4_g128", "onnx_int4_g128", "kidi_asym_clip", "kidi_asym_clip_hnsw"], "3,3"),
     ]
 
     def star_points(cx: float, cy: float, r_outer: float = 8.8, r_inner: float = 3.8) -> str:
@@ -1285,8 +1311,8 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
             pts.append(f"{cx + r * math.cos(angle):.1f},{cy + r * math.sin(angle):.1f}")
         return " ".join(pts)
 
-    def triangle_points(cx: float, cy: float, r: float = 7.2) -> str:
-        return f"{cx:.1f},{cy - r:.1f} {cx - r * 0.92:.1f},{cy + r * 0.72:.1f} {cx + r * 0.92:.1f},{cy + r * 0.72:.1f}"
+    def diamond_points(cx: float, cy: float, r: float = 6.8) -> str:
+        return f"{cx:.1f},{cy - r:.1f} {cx + r:.1f},{cy:.1f} {cx:.1f},{cy + r:.1f} {cx - r:.1f},{cy:.1f}"
 
     svg = [
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="100%" height="100%" '
@@ -1318,8 +1344,8 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
          "Prefill Speed (tokens / sec) →",
          prefill_labels),
         ("B. Decode Throughput vs. Translation Quality",
-         "decode_tps", 648.0, 1136.0, 12.0, 73.0,
-         [15, 25, 35, 45, 55, 65],
+         "decode_tps", 648.0, 1136.0, 12.0, 80.0,
+         [20, 30, 40, 50, 60, 70, 80],
          "Autoregressive Decode Speed (tokens / sec) →",
          decode_labels),
     ]
@@ -1333,6 +1359,12 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
     for title, x_key, x0, x1, xmin, xmax, xticks, xlabel, lbl_map in panels:
         def sx(val: float) -> float:
             return x0 + (val - xmin) / (xmax - xmin) * (x1 - x0)
+
+        panel_meta = {
+            rid: value
+            for rid, value in meta.items()
+            if x_key != "prefill_tps" or not rid.endswith("_hnsw")
+        }
 
         # Panel card
         svg.append(f'  <rect x="{x0}" y="{y0}" width="{x1 - x0}" height="{y1 - y0}" rx="6" fill="#ffffff" '
@@ -1372,11 +1404,12 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
         py_bf16 = sy(bf16_y)
         svg.append(f'  <line x1="{x0}" y1="{py_bf16:.1f}" x2="{x1}" y2="{py_bf16:.1f}" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="3,4"/>')
         svg.append(f'  <text x="{x1 - 8}" y="{py_bf16 + 13:.1f}" text-anchor="end" font-size="9.5" font-weight="600" '
-                   f'font-style="italic" fill="#64748b">BF16 baseline (57.05)</text>')
+                   f'font-style="italic" fill="#64748b">BF16 baseline ({bf16_y:.2f})</text>')
 
         # Connect comparable quantization & group-size variants (ordered left-to-right along X)
         for _, grp_ids, dash in comparable_groups:
-            ordered = sorted(grp_ids, key=lambda k: float(by_id[k][x_key]))
+            ordered = sorted((rid for rid in grp_ids if rid in panel_meta),
+                             key=lambda k: float(by_id[k][x_key]))
             pts = " ".join(f"{sx(float(by_id[k][x_key])):.1f},{sy(float(by_id[k]['chrf_ref'])):.1f}" for k in ordered)
             dash_attr = f' stroke-dasharray="{dash}"' if dash != "none" else ""
             svg.append(f'  <polyline points="{pts}" fill="none" stroke="#e2e8f0" stroke-width="6.0" '
@@ -1385,7 +1418,7 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
                        f'stroke-linecap="round" stroke-linejoin="round"{dash_attr}/>')
 
         # Leader lines first (underneath markers)
-        for rid, (color, shape, short_label) in meta.items():
+        for rid, (color, shape, short_label) in panel_meta.items():
             r = by_id[rid]
             px = sx(float(r[x_key]))
             py = sy(float(r["chrf_ref"]))
@@ -1396,7 +1429,7 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
             svg.append(f'  <line x1="{px:.1f}" y1="{py:.1f}" x2="{lx:.1f}" y2="{ly:.1f}" stroke="{lcol}" stroke-width="1.1"/>')
 
         # Markers & labels (with white halo paint-order on text for crisp legibility)
-        for rid, (color, shape, short_label) in meta.items():
+        for rid, (color, shape, short_label) in panel_meta.items():
             r = by_id[rid]
             px = sx(float(r[x_key]))
             py = sy(float(r["chrf_ref"]))
@@ -1406,8 +1439,8 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
                 svg.append(f'  <circle cx="{px:.1f}" cy="{py:.1f}" r="10.0" fill="{color}" opacity="0.12"/>')
             if shape == "star":
                 svg.append(f'  <polygon points="{star_points(px, py)}" fill="{color}" stroke="#ffffff" stroke-width="1.2"/>')
-            elif shape == "triangle":
-                svg.append(f'  <polygon points="{triangle_points(px, py)}" fill="{color}" stroke="#ffffff" stroke-width="1.4"/>')
+            elif shape == "diamond":
+                svg.append(f'  <polygon points="{diamond_points(px, py)}" fill="{color}" stroke="#ffffff" stroke-width="1.5"/>')
             elif shape == "solid":
                 svg.append(f'  <circle cx="{px:.1f}" cy="{py:.1f}" r="6.0" fill="{color}" stroke="#ffffff" stroke-width="1.6"/>')
             else:
@@ -1425,7 +1458,6 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
         ("#0173B2", "Arm ExecuTorch v1.5.1"),
         ("#029E73", "ONNX Runtime v1.31.1"),
         ("#CC78BC", "llama.cpp"),
-        ("#DE8F05", "Google LiteRT-LM v0.17.1"),
     ]
     lx_cur = 212.0
     svg.append(f'  <text x="90" y="{leg_y1}" font-size="11" font-weight="700" fill="#475569">Runtimes:</text>')
@@ -1437,16 +1469,16 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
 
     leg_y2 = 530.0
     shape_entries = [
-        ("star",     "none",     "BF16 Reference"),
+        ("star",     "none",     "BF16 Ref"),
         ("solid",    "none",     "Q8 (8-bit)"),
-        ("hollow",   "7,4",      "Q4 (4-bit, g=32)"),
-        ("hollow",   "3,3",      "Q4 (4-bit, g=128)"),
-        ("triangle", "7,3,2,3",  "MixedQ (2/4/8-bit QAT)"),
+        ("hollow",   "7,4",      "Q4 (g=32)"),
+        ("hollow",   "3,3",      "Q4 (g=128)"),
+        ("diamond",  "none",     "HNSW Head (ef=400)"),
     ]
     lx_cur = 212.0
     svg.append(f'  <text x="90" y="{leg_y2}" font-size="11" font-weight="700" fill="#475569">Comparable Tiers:</text>')
     for shape, dash, text in shape_entries:
-        if shape != "star":
+        if shape not in ("star", "diamond"):
             dash_attr = f' stroke-dasharray="{dash}"' if dash != "none" else ""
             svg.append(f'  <line x1="{lx_cur - 6}" y1="{leg_y2 - 4}" x2="{lx_cur + 22}" y2="{leg_y2 - 4}" '
                        f'stroke="#64748b" stroke-width="2.1"{dash_attr}/>')
@@ -1456,10 +1488,10 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
             svg.append(f'  <circle cx="{lx_cur + 8}" cy="{leg_y2 - 4}" r="4.8" fill="#334155" stroke="#ffffff" stroke-width="1.2"/>')
         elif shape == "hollow":
             svg.append(f'  <circle cx="{lx_cur + 8}" cy="{leg_y2 - 4}" r="4.6" fill="#ffffff" stroke="#334155" stroke-width="2.3"/>')
-        elif shape == "triangle":
-            svg.append(f'  <polygon points="{triangle_points(lx_cur + 8, leg_y2 - 3.5, 6.0)}" fill="#334155" stroke="#ffffff" stroke-width="1.0"/>')
-        svg.append(f'  <text x="{lx_cur + 28}" y="{leg_y2}" font-size="11" font-weight="600" fill="#0f172a">{text}</text>')
-        lx_cur += len(text) * 5.9 + 52
+        elif shape == "diamond":
+            svg.append(f'  <polygon points="{diamond_points(lx_cur + 8, leg_y2 - 4, 5.8)}" fill="#D55E00" stroke="#ffffff" stroke-width="1.1"/>')
+        svg.append(f'  <text x="{lx_cur + 26}" y="{leg_y2}" font-size="10.8" font-weight="600" fill="#0f172a">{text}</text>')
+        lx_cur += len(text) * 5.8 + 44
 
     svg.append('</svg>')
     return "\n".join(svg) + "\n"
@@ -1476,7 +1508,10 @@ def main(argv=None):
     parser.add_argument("--llamacpp-model", type=Path)
     parser.add_argument("--litert-model", type=Path)
     parser.add_argument("--litert-python", type=Path, default=ROOT / ".cache/gemma-venv/bin/python")
-    parser.add_argument("--kidi-qat-model", type=Path)
+    parser.add_argument("--hnsw-index", type=Path,
+                        help="optional lm_head.hnsw path to also benchmark HNSW ef variants")
+    parser.add_argument("--hnsw-ef", type=int, default=400,
+                        help="HNSW ef_search value when --hnsw-index is provided (default: 400)")
     parser.add_argument("--no-bf16", action="store_true", help="skip unquantized BF16 reference model")
     parser.add_argument("--eval-lines", type=int, default=5,
                         help="number of WMT23 translation sentences for chrF quality evaluation (0 to skip)")
@@ -1486,7 +1521,7 @@ def main(argv=None):
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--render-tables", action="store_true",
-                        help="render the four Markdown benchmark tables from results.tsv and exit")
+                        help="render the compact Markdown results table from results.tsv and exit")
     parser.add_argument("--render-svg", type=Path,
                         help="render the Pareto frontier and throughput SVG chart to the given path and exit")
     parser.add_argument("--tsv", type=Path, default=HERE / "results.tsv",
@@ -1550,6 +1585,7 @@ def main(argv=None):
         settings = {"prompt": PROMPT, "workload": "short", "output_tokens": 64, "context_tokens": 1024,
                     "prefill_chunk_tokens": 1024, "packed_prefill": True, "warmups": 1}
         commands = {}
+        extra_envs = {}
         bf16_model_dir = arguments.model.expanduser().resolve()
         if not arguments.no_bf16 and (bf16_model_dir / "model.safetensors").exists():
             commands["kidi_bf16"] = [
@@ -1561,6 +1597,16 @@ def main(argv=None):
             str(work / "build-kidi/kidi_android_baseline"), "gemma", str(work / "shared"),
             str(arguments.threads), "3", json.dumps(settings),
         ]
+        hnsw_shared_dir = None
+        hnsw_asym_clip_dir = None
+        hnsw_asym_g32_dir = None
+        if arguments.hnsw_index and arguments.profile == "int8":
+            hnsw_shared_dir = prepare_hnsw_view(work / "shared", arguments.hnsw_index, work / "shared-hnsw")
+            commands["kidi_hnsw"] = [
+                str(work / "build-kidi/kidi_android_baseline"), "gemma", str(hnsw_shared_dir),
+                str(arguments.threads), "3", json.dumps(settings),
+            ]
+            extra_envs["kidi_hnsw"] = {"KIDI_HNSW_EF": str(arguments.hnsw_ef)}
         asym_clip_dir = None
         asym_g32_dir = None
         if arguments.profile == "int4-g128" and (bf16_model_dir / "model.safetensors").exists():
@@ -1571,11 +1617,25 @@ def main(argv=None):
                 str(work / "build-kidi/kidi_android_baseline"), "gemma", str(asym_clip_dir),
                 str(arguments.threads), "3", json.dumps(settings),
             ]
+            if arguments.hnsw_index:
+                hnsw_asym_clip_dir = prepare_hnsw_view(asym_clip_dir, arguments.hnsw_index, work / "shared-asym-clip-hnsw")
+                commands["kidi_asym_clip_hnsw"] = [
+                    str(work / "build-kidi/kidi_android_baseline"), "gemma", str(hnsw_asym_clip_dir),
+                    str(arguments.threads), "3", json.dumps(settings),
+                ]
+                extra_envs["kidi_asym_clip_hnsw"] = {"KIDI_HNSW_EF": str(arguments.hnsw_ef)}
             asym_g32_dir = prepare_asym_clip(bf16_model_dir, work, 32, "shared-asym-g32")
             commands["kidi_asym_g32"] = [
                 str(work / "build-kidi/kidi_android_baseline"), "gemma", str(asym_g32_dir),
                 str(arguments.threads), "3", json.dumps(settings),
             ]
+            if arguments.hnsw_index:
+                hnsw_asym_g32_dir = prepare_hnsw_view(asym_g32_dir, arguments.hnsw_index, work / "shared-asym-g32-hnsw")
+                commands["kidi_asym_g32_hnsw"] = [
+                    str(work / "build-kidi/kidi_android_baseline"), "gemma", str(hnsw_asym_g32_dir),
+                    str(arguments.threads), "3", json.dumps(settings),
+                ]
+                extra_envs["kidi_asym_g32_hnsw"] = {"KIDI_HNSW_EF": str(arguments.hnsw_ef)}
         commands["arm"] = [
             str(work / "build-arm/arm_gemma4_bench"), str(work / manifest["pte"]),
             str(work / "protocol.json"),
@@ -1597,12 +1657,6 @@ def main(argv=None):
                 str(work / "build-arm/llamacpp_gemma4_bench"),
                 str(arguments.llamacpp_model.expanduser().resolve()),
                 str(work / "protocol.json"),
-            ]
-        if arguments.kidi_qat_model:
-            commands["kidi_qat"] = [
-                str(work / "build-kidi/kidi_android_baseline"), "gemma",
-                str(arguments.kidi_qat_model.expanduser().resolve()),
-                str(arguments.threads), "3", json.dumps(settings),
             ]
         if arguments.litert_model:
             commands["litert"] = [
@@ -1637,14 +1691,29 @@ def main(argv=None):
                 str(work / "build-kidi/kidi_android_baseline"), "gemma", str(work / "shared"),
                 str(arguments.threads), "1", json.dumps(eval_settings),
             ]
+            if hnsw_shared_dir is not None:
+                eval_commands["kidi_hnsw"] = [
+                    str(work / "build-kidi/kidi_android_baseline"), "gemma", str(hnsw_shared_dir),
+                    str(arguments.threads), "1", json.dumps(eval_settings),
+                ]
             if asym_clip_dir is not None:
                 eval_commands["kidi_asym_clip"] = [
                     str(work / "build-kidi/kidi_android_baseline"), "gemma", str(asym_clip_dir),
                     str(arguments.threads), "1", json.dumps(eval_settings),
                 ]
+            if hnsw_asym_clip_dir is not None:
+                eval_commands["kidi_asym_clip_hnsw"] = [
+                    str(work / "build-kidi/kidi_android_baseline"), "gemma", str(hnsw_asym_clip_dir),
+                    str(arguments.threads), "1", json.dumps(eval_settings),
+                ]
             if asym_g32_dir is not None:
                 eval_commands["kidi_asym_g32"] = [
                     str(work / "build-kidi/kidi_android_baseline"), "gemma", str(asym_g32_dir),
+                    str(arguments.threads), "1", json.dumps(eval_settings),
+                ]
+            if hnsw_asym_g32_dir is not None:
+                eval_commands["kidi_asym_g32_hnsw"] = [
+                    str(work / "build-kidi/kidi_android_baseline"), "gemma", str(hnsw_asym_g32_dir),
                     str(arguments.threads), "1", json.dumps(eval_settings),
                 ]
             if arguments.include_onnx:
@@ -1664,12 +1733,6 @@ def main(argv=None):
                     str(HERE / "litert_bench.py"),
                     str(arguments.litert_model.expanduser().resolve()),
                     str(eval_protocol_path),
-                ]
-            if arguments.kidi_qat_model:
-                eval_commands["kidi_qat"] = [
-                    str(work / "build-kidi/kidi_android_baseline"), "gemma",
-                    str(arguments.kidi_qat_model.expanduser().resolve()),
-                    str(arguments.threads), "1", json.dumps(eval_settings),
                 ]
             if "kidi_bf16" in commands:
                 eval_commands["kidi_bf16"] = [
@@ -1709,7 +1772,7 @@ def main(argv=None):
             if cached is not None:
                 report["runs"][name] = cached
             else:
-                report["runs"][name] = measure(command, work, name, protocol, arguments.timeout)
+                report["runs"][name] = measure(command, work, name, protocol, arguments.timeout, extra_envs.get(name))
                 report["runs"][name]["binary_sha256"] = checksum
                 report["runs"][name]["summary"]["text"] = tokenizer.decode(
                     report["runs"][name]["summary"]["token_ids"], skip_special_tokens=False)
@@ -1728,7 +1791,8 @@ def main(argv=None):
                     eval_cached = load_cached_eval(work, name, eval_cmd, checksum, eval_protocol, tokenizer)
                 if eval_cached is None:
                     eval_cached = measure_eval(
-                        eval_cmd, work, name, eval_protocol, tokenizer, arguments.timeout, force=force_eval
+                        eval_cmd, work, name, eval_protocol, tokenizer, arguments.timeout,
+                        force=force_eval, extra_env=extra_envs.get(name),
                     )
                     eval_cached["binary_sha256"] = checksum
                     save_cached_eval(work, name, eval_cached, eval_protocol)
