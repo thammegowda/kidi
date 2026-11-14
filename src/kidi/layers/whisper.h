@@ -31,16 +31,28 @@ private:
     Tensor weight_;
 };
 
-KIDI_MODULE(WhisperAttention);
-class WhisperAttentionImpl : public Module {
+KIDI_MODULE(WhisperSelfAttention);
+class WhisperSelfAttentionImpl : public Module {
 public:
-    WhisperAttentionImpl(std::int32_t hidden, std::int32_t heads);
-    auto project_memory(ops::Context& context, const Tensor& input) const -> KeyValue;
-    auto forward(ops::Context& context, const Tensor& input, const KeyValue* memory = nullptr, const Tensor& mask = {},
-                 KeyValue* cache = nullptr, const Tensor& cache_index = {}) const -> Tensor;
+    WhisperSelfAttentionImpl(std::int32_t hidden, std::int32_t heads);
+    auto forward(ops::Context& context, const Tensor& input, const Tensor& mask = {}, KeyValue* cache = nullptr,
+                 const Tensor& cache_index = {}) const -> Tensor;
 
 private:
-    Linear key_, value_, query_, output_;
+    Linear qkv_, output_;
+    std::int32_t heads_;
+};
+
+KIDI_MODULE(WhisperCrossAttention);
+class WhisperCrossAttentionImpl : public Module {
+public:
+    WhisperCrossAttentionImpl(std::int32_t hidden, std::int32_t heads);
+    auto project_memory(ops::Context& context, const Tensor& input) const -> KeyValue;
+    auto forward(ops::Context& context, const Tensor& input, const KeyValue& memory, const Tensor& mask = {}) const
+        -> Tensor;
+
+private:
+    Linear query_, key_value_, output_;
     std::int32_t heads_;
 };
 
@@ -51,7 +63,7 @@ public:
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
 
 private:
-    WhisperAttention self_attention_;
+    WhisperSelfAttention self_attention_;
     LayerNorm self_norm_, final_norm_;
     Linear first_, second_;
 };
@@ -65,7 +77,8 @@ public:
                  KeyValue& cache, const Tensor& cache_index) const -> Tensor;
 
 private:
-    WhisperAttention self_attention_, cross_attention_;
+    WhisperSelfAttention self_attention_;
+    WhisperCrossAttention cross_attention_;
     LayerNorm self_norm_, cross_norm_, final_norm_;
     Linear first_, second_;
 };

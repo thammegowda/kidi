@@ -1,5 +1,6 @@
-#include <iostream>
 #include <cmath>
+#include <filesystem>
+#include <iostream>
 
 #include "kidi/model/whisper.h"
 #include "kidi/ops/quantization.h"
@@ -22,9 +23,60 @@ auto main() -> int {
     }
     const auto state = (*model)->state_dict();
     for (const auto* name :
-         {"encoder.conv1.weight", "encoder.layers.3.self_attn.k_proj.weight", "decoder.embed_tokens.weight",
-          "decoder.layers.0.encoder_attn.q_proj.bias", "proj_out.weight"})
+         {"encoder.conv1.weight", "encoder.layers.3.self_attn.qkv_proj.weight", "decoder.embed_tokens.weight",
+          "decoder.layers.0.self_attn.qkv_proj.bias", "decoder.layers.0.encoder_attn.q_proj.bias",
+          "decoder.layers.0.encoder_attn.kv_proj.weight", "proj_out.weight"})
         if (!state.contains(name)) return 1;
+    for (const auto* name : {"encoder.layers.0.self_attn.k_proj.weight", "decoder.layers.0.self_attn.q_proj.weight",
+                             "decoder.layers.0.encoder_attn.k_proj.weight"})
+        if (state.contains(name)) return 1;
+    {
+        using kidi::ops::require;
+        using kidi::tensor::Tensor;
+        const auto path = std::filesystem::temp_directory_path() / "kidi-whisper-mapping-test.safetensors";
+        std::filesystem::remove(path);
+        const auto matrix = [](float fill) {
+            const std::array<float, 16> values{fill, fill, fill, fill, fill, fill, fill, fill,
+                                               fill, fill, fill, fill, fill, fill, fill, fill};
+            return require(Tensor::from_host({4, 4}, std::span<const float>(values)));
+        };
+        const auto vector = [](float fill) {
+            const std::array<float, 4> values{fill, fill, fill, fill};
+            return require(Tensor::from_host({4}, std::span<const float>(values)));
+        };
+        kidi::StateDict unfused{
+            {"model.decoder.embed_tokens.weight", matrix(1.F)},
+            {"model.proj_out.weight", matrix(1.F)},
+            {"model.encoder.layers.0.self_attn.q_proj.weight", matrix(0.25F)},
+            {"model.encoder.layers.0.self_attn.k_proj.weight", matrix(0.5F)},
+            {"model.encoder.layers.0.self_attn.v_proj.weight", matrix(0.75F)},
+            {"model.encoder.layers.0.self_attn.q_proj.bias", vector(0.125F)},
+            {"model.encoder.layers.0.self_attn.v_proj.bias", vector(-0.25F)},
+            {"model.decoder.layers.0.encoder_attn.k_proj.weight", matrix(1.5F)},
+            {"model.decoder.layers.0.encoder_attn.v_proj.weight", matrix(2.5F)},
+            {"model.decoder.layers.0.encoder_attn.v_proj.bias", vector(-0.5F)},
+        };
+        require(kidi::checkpoint::Weights::save(path, unfused));
+        const auto loaded_weights = require(kidi::checkpoint::Weights::load(path));
+        std::filesystem::remove(path);
+        const auto mapped = require((*model)->map_checkpoint(loaded_weights));
+        if (mapped.contains("proj_out.weight") || mapped.contains("encoder.layers.0.self_attn.q_proj.weight") ||
+            mapped.contains("decoder.layers.0.encoder_attn.v_proj.bias"))
+            return 1;
+        const auto qkv_weight_tensor = require(mapped.tensor("encoder.layers.0.self_attn.qkv_proj.weight"));
+        const auto qkv_bias_tensor = require(mapped.tensor("encoder.layers.0.self_attn.qkv_proj.bias"));
+        const auto kv_weight_tensor = require(mapped.tensor("decoder.layers.0.encoder_attn.kv_proj.weight"));
+        const auto kv_bias_tensor = require(mapped.tensor("decoder.layers.0.encoder_attn.kv_proj.bias"));
+        const auto qkv_weight = require(qkv_weight_tensor.data<float>());
+        const auto qkv_bias = require(qkv_bias_tensor.data<float>());
+        const auto kv_weight = require(kv_weight_tensor.data<float>());
+        const auto kv_bias = require(kv_bias_tensor.data<float>());
+        if (qkv_weight.size() != 48 || qkv_weight[0] != 0.25F || qkv_weight[16] != 0.5F || qkv_weight[32] != 0.75F ||
+            qkv_bias.size() != 12 || qkv_bias[0] != 0.125F || qkv_bias[4] != 0.F || qkv_bias[8] != -0.25F ||
+            kv_weight.size() != 32 || kv_weight[0] != 1.5F || kv_weight[16] != 2.5F || kv_bias.size() != 8 ||
+            kv_bias[0] != 0.F || kv_bias[4] != -0.5F)
+            return 1;
+    }
     config["d_model"] = 512;
     config["encoder_layers"] = 6;
     config["decoder_layers"] = 6;
@@ -55,7 +107,7 @@ auto main() -> int {
     if (!kidi::model::WhisperImpl::validate_config(config)) return 1;
     config["decoder_layers"] = 3;
     if (kidi::model::WhisperImpl::validate_config(config)) return 1;
-    if ((*model)->encode({std::vector<float>(128 * 3000), 128, 3000})) return 1;
+    if ((*model)->encode_audio({std::vector<float>(128 * 3000), 128, 3000})) return 1;
     {
         using kidi::ops::require;
         using kidi::tensor::Tensor;
@@ -106,6 +158,12 @@ auto main() -> int {
         if (!std::ranges::equal(require(packed_fp16.values.host_bytes()), require(packed_fp32.values.host_bytes())) ||
             !std::ranges::equal(require(packed_fp16.scales.data<float>()), require(packed_fp32.scales.data<float>())))
             return 1;
+        const kidi::ModuleScope allocated(kidi::tensor::DType::F32, true, kidi::tensor::Device::cpu());
+        kidi::layers::WhisperSelfAttention chunked_attention(4, 2);
+        const auto chunked_input = require(Tensor::zeros({1, 129, 4}, kidi::tensor::DType::F32));
+        const auto chunked_mask = require(Tensor::zeros({1, 1, 129, 129}, kidi::tensor::DType::F32));
+        const auto chunked_output = chunked_attention->forward(context, chunked_input, chunked_mask);
+        if (chunked_output.dimensions() != 3 || chunked_output.size(1) != 129 || chunked_output.size(2) != 4) return 1;
     }
     return 0;
 }

@@ -110,6 +110,27 @@ auto Qwen3Impl::create(const YAML::Node& config) -> Result<Qwen3> {
     }
 }
 
+auto Qwen3Impl::state_mapping_specs() const -> std::vector<checkpoint::StateMappingSpec> {
+    using checkpoint::StateMappingOp;
+    using checkpoint::StateMappingSpec;
+    return {
+        {.sources = {R"(^model\.(.+)$)"}, .destination = "$1"},
+        {.sources = {R"(^layers\.(\d+)\.self_attn\.q_proj\.(weight|scale|weight_scale|bias)$)",
+                     "layers.$1.self_attn.k_proj.$2", "layers.$1.self_attn.v_proj.$2"},
+         .destination = "layers.$1.self_attn.qkv_proj.$2"},
+        {.sources = {R"(^layers\.(\d+)\.self_attn\.q_proj\.(input_activation_scale|output_activation_scale)$)",
+                     "layers.$1.self_attn.k_proj.$2", "layers.$1.self_attn.v_proj.$2"},
+         .destination = "layers.$1.self_attn.qkv_proj.$2",
+         .op = StateMappingOp::IDENTICAL},
+        {.sources = {R"(^layers\.(\d+)\.mlp\.gate_proj\.(weight|scale|weight_scale)$)", "layers.$1.mlp.up_proj.$2"},
+         .destination = "layers.$1.mlp.gate_up_proj.$2"},
+        {.sources = {R"(^layers\.(\d+)\.mlp\.gate_proj\.(input_activation_scale|output_activation_scale)$)",
+                     "layers.$1.mlp.up_proj.$2"},
+         .destination = "layers.$1.mlp.gate_up_proj.$2",
+         .op = StateMappingOp::IDENTICAL},
+    };
+}
+
 auto Qwen3Impl::embed(ops::Context& context, std::span<const std::int32_t> tokens) const -> tensor::Tensor {
     return tokens_->forward(context, tokens);
 }

@@ -9,7 +9,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include "kidi/audio/whisper.h"
-#include "kidi/model/whisper.h"
+#include "kidi/model/model.h"
 #include "kidi/text/tokenizer.h"
 #include "kidi/inference/coroutine.h"
 
@@ -63,13 +63,14 @@ private:
     auto transcription_session_(std::vector<float> waveform, std::uint32_t sample_rate,
                                  TranscriptionOptions options) -> Session;
     Transcriber(YAML::Node config, YAML::Node generation, audio::WhisperFeatureExtractor extractor,
-                text::Tokenizer tokenizer, model::Whisper model, std::map<std::string, std::int32_t> languages,
-                std::vector<std::int32_t> suppress, std::vector<std::int32_t> begin_suppress);
+                text::Tokenizer tokenizer, std::shared_ptr<model::SpeechRecognitionModel> model,
+                std::map<std::string, std::int32_t> languages, std::vector<std::int32_t> suppress,
+                std::vector<std::int32_t> begin_suppress);
 
     YAML::Node config_, generation_;
     audio::WhisperFeatureExtractor extractor_;
     text::Tokenizer tokenizer_;
-    model::Whisper model_;
+    std::shared_ptr<model::SpeechRecognitionModel> model_;
     std::map<std::string, std::int32_t> languages_;
     std::vector<std::int32_t> suppress_, begin_suppress_;
 };

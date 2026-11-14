@@ -7,6 +7,8 @@
 
 #include "kidi/checkpoint/config.h"
 #include "kidi/checkpoint/prepare.h"
+#include "kidi/model/registry.h"
+#include "kidi/model/whisper.h"
 
 namespace kidi::inference {
 using ops::require;
@@ -32,8 +34,9 @@ auto token_list(const YAML::Node& node) -> std::vector<std::int32_t> {
 } // namespace
 
 Transcriber::Transcriber(YAML::Node config, YAML::Node generation, audio::WhisperFeatureExtractor extractor,
-                         text::Tokenizer tokenizer, model::Whisper model, std::map<std::string, std::int32_t> languages,
-                         std::vector<std::int32_t> suppress, std::vector<std::int32_t> begin_suppress)
+                         text::Tokenizer tokenizer, std::shared_ptr<model::SpeechRecognitionModel> model,
+                         std::map<std::string, std::int32_t> languages, std::vector<std::int32_t> suppress,
+                         std::vector<std::int32_t> begin_suppress)
     : config_(std::move(config)),
       generation_(std::move(generation)),
       extractor_(std::move(extractor)),
@@ -90,15 +93,15 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
             weights.emplace(require(checkpoint::Weights::load(config["weights_file"].as<std::string>())));
         }
         const auto parameter = require(weights->tensor("model.encoder.layers.0.fc1.weight"));
-        const ModuleScope construction(parameter.dtype(), false, device);
-        auto whisper = require(model::WhisperImpl::create(config["model"]));
-        require(whisper->set_checkpoint(*weights));
+        auto model = require(model::create_model_as<model::SpeechRecognitionModel>(
+            config["model"], {.device = device, .parameter_dtype = parameter.dtype()}));
+        require(model->set_checkpoint(*weights));
         auto suppress = token_list(generation["suppress_tokens"]);
         auto begin_suppress = token_list(generation["begin_suppress_tokens"]);
         if (!std::ranges::all_of(suppress, valid_token) || !std::ranges::all_of(begin_suppress, valid_token))
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Whisper suppression token is outside vocabulary"});
         return Transcriber(std::move(config), std::move(generation), std::move(extractor), std::move(tokenizer),
-                           std::move(whisper), std::move(languages), std::move(suppress), std::move(begin_suppress));
+                           std::move(model), std::move(languages), std::move(suppress), std::move(begin_suppress));
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     } catch (const YAML::Exception& error) {
@@ -194,14 +197,14 @@ auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint3
             emitted.clear();
             const auto preparation = model_->preparation_ns();
             const auto encode_start = Clock::now();
-            auto source = require(model_->encode(features, frames, options.cancelled));
+            auto source = require(model_->encode_audio(features, frames, options.cancelled));
             if (gpu) co_yield std::monostate{};
             result.stats.encode_ns = elapsed(encode_start);
             check_cancelled();
-            auto state = require(model_->create_state(options.maximum_tokens + 4));
+            auto state = require(model_->create_decoder_state(source, 1, options.maximum_tokens + 4));
             const auto decode_start = Clock::now();
             const auto start_token = generation_["decoder_start_token_id"].as<std::int32_t>();
-            auto logits = require(model_->forward(source, std::span(&start_token, 1), state));
+            auto logits = require(model_->forward(std::span(&start_token, 1), *state));
             std::span<float> scores;
             std::int32_t language_token = -1;
             if (detect_language) {
@@ -234,9 +237,9 @@ auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint3
                 language_token = found->second;
             }
             const std::array prefix{language_token, task.as<std::int32_t>()};
-            require(model_->prefill(source, prefix, state));
+            require(model_->prefill(prefix, *state));
             const auto no_timestamps = generation_["no_timestamps_token_id"].as<std::int32_t>();
-            logits = require(model_->forward(source, std::span(&no_timestamps, 1), state));
+            logits = require(model_->forward(std::span(&no_timestamps, 1), *state));
 
             const auto vocabulary = config_["model"]["vocab_size"].as<std::size_t>();
             const auto end = generation_["eos_token_id"].as<std::int32_t>();
@@ -270,7 +273,7 @@ auto Transcriber::transcription_session_(std::vector<float> waveform, std::uint3
                     if (!delta.empty()) options.on_partial(emitted, result.language);
                 }
                 if (step + 1 < options.maximum_tokens)
-                    logits = require(model_->forward(source, std::span(&selected, 1), state));
+                    logits = require(model_->forward(std::span(&selected, 1), *state));
             }
             result.stats.decode_ns = elapsed(decode_start);
             result.stats.preparation_ns = model_->preparation_ns() - preparation;

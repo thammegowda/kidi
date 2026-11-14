@@ -378,7 +378,7 @@ auto quantized_linear_checks(const std::filesystem::path& root) -> void {
                       require(tensor::Tensor::from_host({}, std::span<const float>(&zero_f, 1))));
         state.emplace("output_activation_scale",
                       require(tensor::Tensor::from_host({}, std::span<const float>(&zero_f, 1))));
-        require(linear->load_state_dict(state));
+        require(linear->set_state(state, true, true));
         require(linear->bind_hnsw(path));
         check(linear->has_hnsw(), "LinearImpl::bind_hnsw did not enable HNSW");
         std::vector<float> q(width, 0.F);

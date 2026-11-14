@@ -1,20 +1,24 @@
 #pragma once
 
 #include <map>
+#include <span>
 
 #include <yaml-cpp/yaml.h>
 
 #include "kidi/layers/gemma4.h"
 #include "kidi/layers/qwen3.h"
+#include "kidi/model/model.h"
 
 namespace kidi::model {
 
 KIDI_MODULE(Qwen3);
-class Qwen3Impl : public Module {
+class Qwen3Impl : public Model {
 public:
     explicit Qwen3Impl(const YAML::Node& config);
     static auto validate_config(const YAML::Node& config) -> Result<void>;
     static auto create(const YAML::Node& config) -> Result<Qwen3>;
+    auto kind() const noexcept -> ModelKind override { return ModelKind::CAUSAL_LM; }
+    auto state_mapping_specs() const -> std::vector<checkpoint::StateMappingSpec> override;
 
     auto embed(ops::Context& context, std::span<const std::int32_t> tokens) const -> tensor::Tensor;
     auto forward(ops::Context& context, const tensor::Tensor& embeddings) const -> tensor::Tensor;

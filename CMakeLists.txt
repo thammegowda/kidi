@@ -117,6 +117,7 @@ add_library(kidi
     src/kidi/model/gemma4_assistant.cpp
     src/kidi/model/gemma4_vision.cpp
     src/kidi/model/kokoro.cpp
+    src/kidi/model/model.cpp
     src/kidi/model/omnivoice.cpp
     src/kidi/model/qwen3.cpp
     src/kidi/model/registry.cpp

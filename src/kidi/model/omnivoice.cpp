@@ -404,17 +404,21 @@ auto OmniVoiceImpl::voice_instruction(const inference::VoiceAttributes& attribut
     return result;
 }
 
+auto OmniVoiceImpl::state_mapping_specs() const -> std::vector<checkpoint::StateMappingSpec> {
+    return checkpoint::prefix_state_mappings("llm.", "llm.", impl_->llm->state_mapping_specs());
+}
+
 auto OmniVoiceImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
-    for (const auto& name : weights.names()) {
-        auto value = weights.tensor(name);
-        if (!value) return std::unexpected(std::move(value.error()));
-        const auto scale = name.ends_with(".scale") || name.ends_with("_scale");
-        if ((!scale && value->dtype() != tensor::DType::I8 && value->dtype() != tensor::DType::U8) ||
-            (scale && value->dtype() != tensor::DType::F32))
+    auto state = prepare_checkpoint(weights);
+    if (!state) return std::unexpected(std::move(state.error()));
+    for (const auto& [name, value] : *state) {
+        const bool scale = name.ends_with(".scale") || name.ends_with("_scale");
+        if ((!scale && value.dtype() != tensor::DType::I8 && value.dtype() != tensor::DType::U8) ||
+            (scale && value.dtype() != tensor::DType::F32))
             return std::unexpected(
                 Error{ErrorCode::INVALID_ARGUMENT, "OmniVoice checkpoint is not fully INT8: " + name});
     }
-    return set_state(weights);
+    return set_state(*state);
 }
 
 auto OmniVoiceImpl::decode(const tensor::Tensor& tokens, bool normalize) -> Result<std::vector<float>> {
@@ -797,7 +801,11 @@ auto OmniVoiceImpl::synthesis_session_(std::string text, inference::SynthesisOpt
     }
 }
 
+auto OmniVoiceImpl::sample_rate() const noexcept -> std::uint32_t { return impl_->sample_rate; }
 auto OmniVoiceImpl::execution() const -> std::string { return impl_->context.execution(); }
+auto OmniVoiceImpl::preparation_ns() const noexcept -> std::uint64_t {
+    return impl_->context.preparation_ns() + impl_->decoder_context.preparation_ns();
+}
 auto OmniVoiceImpl::release_workspaces() -> void {
     if (impl_->context.device().policy().replay.region_layers)
         impl_->context.trim_workspaces();

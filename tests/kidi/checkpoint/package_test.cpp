@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "kidi/checkpoint/package.h"
+#include "kidi/model/registry.h"
 #include "kidi/model/transformer.h"
 #include "kidi/inference/translator.h"
 
@@ -119,6 +120,15 @@ auto main() -> int {
     invalid = YAML::Clone(model_config);
     invalid["layer_norm_epsilon"] = std::numeric_limits<float>::quiet_NaN();
     if (kidi::model::TransformerImpl::validate_config(invalid)) return 1;
+    const auto malformed_type = kidi::model::validate_model_config(YAML::Load("{type: {nested: value}}"));
+    if (malformed_type || malformed_type.error().code != kidi::ErrorCode::INVALID_MANIFEST) return 1;
+    auto encoder_memory = (*scratch)->encode_text(std::array{std::vector<std::int32_t>{1, 2}});
+    if (!encoder_memory) return 1;
+    auto batched_state = (*scratch)->create_decoder_state(*encoder_memory, 2, 8);
+    if (!batched_state) return 1;
+    const std::array<std::int32_t, 2> batched_tokens{1, 2};
+    const auto single_forward = (*scratch)->forward(batched_tokens, **batched_state);
+    if (single_forward || single_forward.error().code != kidi::ErrorCode::INVALID_ARGUMENT) return 1;
 
     auto invalid_decode = YAML::Load(std::string(MANIFEST_JSON));
     invalid_decode["decode"]["beam_size"] = 0;

@@ -1,5 +1,4 @@
 #include "kidi/checkpoint/package.h"
-#include "kidi/model/transformer.h"
 
 #include <array>
 #include <set>
@@ -57,8 +56,7 @@ auto Package::load(const std::filesystem::path& model_directory) -> Result<Packa
         if (!config) {
             return std::unexpected(std::move(config.error()));
         }
-        auto weights = checkpoint::Weights::load((*config)["weights_file"].as<std::string>(),
-                                                 model::TransformerImpl::state_mapping_specs());
+        auto weights = checkpoint::Weights::load((*config)["weights_file"].as<std::string>());
         if (!weights) {
             return std::unexpected(std::move(weights.error()));
         }

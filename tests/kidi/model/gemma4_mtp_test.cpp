@@ -32,17 +32,17 @@ auto check_rounds(model::Gemma4Impl& model, std::span<const std::int32_t> prompt
     auto reference_state = require(model.create_state(16));
     auto reference = require(inference::GreedyState::create(options));
     require(
-        reference.accept({{}, inference::ScoreKind::LOGITS, require(model.forward_token(prompt, reference_state))}));
+        reference.accept({{}, inference::ScoreKind::LOGITS, require(model.forward_token(prompt, *reference_state))}));
     while (!reference.finished()) {
         const auto token = reference.token();
         require(reference.accept(
-            {{}, inference::ScoreKind::LOGITS, require(model.forward_token(std::span(&token, 1), reference_state))}));
+            {{}, inference::ScoreKind::LOGITS, require(model.forward_token(std::span(&token, 1), *reference_state))}));
     }
     const auto& expected = reference.result().token_ids;
     for (int mode = 0; mode < 3; ++mode) {
         auto state = require(model.create_state(16));
         tensor::Tensor hidden, verified_logits;
-        const auto first_logits = require(model.forward(prompt, state, false, &hidden));
+        const auto first_logits = require(model.forward(prompt, *state, false, &hidden));
         std::size_t verify_position = 0;
         inference::SpeculativeStats stats;
         std::size_t generated = 1;
@@ -59,15 +59,15 @@ auto check_rounds(model::Gemma4Impl& model, std::span<const std::int32_t> prompt
                 return {};
             },
             [&](std::span<const std::int32_t> inputs) -> Result<inference::TokenScores> {
-                verify_position = state.position;
-                auto logits = model.forward(inputs, state, true, &hidden);
+                verify_position = state->sequence_position();
+                auto logits = model.forward(inputs, *state, true, &hidden);
                 if (!logits) return std::unexpected(logits.error());
                 verified_logits = std::move(*logits);
                 return inference::TokenScores{require(verified_logits.data<float>())};
             },
             [&](std::size_t committed_inputs) -> Result<void> {
                 generated += committed_inputs;
-                return model.rewind(state, verify_position + committed_inputs);
+                return model.rewind(*state, verify_position + committed_inputs);
             },
             &stats));
         if (generation.token_ids != expected || !stats.verification_steps ||
@@ -84,7 +84,8 @@ auto check(const std::filesystem::path& directory) -> bool {
     auto model = require(model::Gemma4Impl::create(config));
     require(model->set_checkpoint(checkpoint));
     const std::array<std::int32_t, 3> prompt{2, 5, 7};
-    auto prefix = require(model->create_state(16));
+    auto prefix_ptr = require(model->create_state(16));
+    auto& prefix = static_cast<model::Gemma4State&>(*prefix_ptr);
     for (const auto& layer : prefix.layers)
         if (layer.key.dtype() == tensor::DType::I8 &&
             (layer.key_quantization.scales.size() != 1 || layer.value_quantization.scales.size() != 1 ||
@@ -98,23 +99,25 @@ auto check(const std::filesystem::path& directory) -> bool {
         prefix.position != prompt.size())
         return false;
     auto oracle = require(model->create_state(16));
-    if (!close(feature_logits, require(model->forward(prompt, oracle, true)))) return false;
+    if (!close(feature_logits, require(model->forward(prompt, *oracle, true)))) return false;
     const std::array<std::int32_t, 4> proposed{3, 8, 6, 9};
     const std::array<std::int32_t, 1> correction{11};
     for (std::size_t committed = 1; committed <= proposed.size(); ++committed) {
-        auto speculative = require(model->fork_state(prefix, prompt.size(), 16));
-        auto serial = require(model->fork_state(prefix, prompt.size(), 16));
+        auto speculative_ptr = require(model->fork_state(prefix, prompt.size(), 16));
+        auto serial_ptr = require(model->fork_state(prefix, prompt.size(), 16));
+        auto& speculative = *speculative_ptr;
+        auto& serial = *serial_ptr;
         tensor::Tensor verification_hidden;
         const auto verification_logits = require(model->forward(proposed, speculative, true, &verification_hidden));
         if (verification_hidden.size(1) != proposed.size() || verification_logits.size(1) != proposed.size() ||
-            speculative.position != prompt.size() + proposed.size())
+            speculative.sequence_position() != prompt.size() + proposed.size())
             return false;
         require(model->rewind(speculative, prompt.size() + committed));
         for (const auto token : std::span(proposed).first(committed))
             require(model->forward(std::span(&token, 1), serial));
         const auto actual = snapshot(require(model->forward(correction, speculative)));
         const auto expected = require(model->forward(correction, serial));
-        if (!close(actual, expected) || speculative.position != serial.position) return false;
+        if (!close(actual, expected) || speculative.sequence_position() != serial.sequence_position()) return false;
     }
     const auto position = prefix.position;
     if (model->rewind(prefix, position + 1) || prefix.position != position) return false;
@@ -122,7 +125,7 @@ auto check(const std::filesystem::path& directory) -> bool {
     tensor::Tensor replayed_hidden;
     const auto replayed_logits = snapshot(require(model->forward(prompt, prefix, false, &replayed_hidden)));
     auto fresh = require(model->create_state(16));
-    const auto expected = require(model->forward(prompt, fresh));
+    const auto expected = require(model->forward(prompt, *fresh));
     if (replayed_hidden.size(1) != 1 || !close(replayed_logits, expected)) return false;
     tensor::Tensor one_hidden;
     const auto one_logits = require(model->forward(correction, prefix, true, &one_hidden));

@@ -9,6 +9,7 @@
 #include "kidi/checkpoint/weights.h"
 #include "kidi/inference/coroutine.h"
 #include "kidi/inference/synthesizer.h"
+#include "kidi/model/model.h"
 
 namespace kidi::model {
 
@@ -18,10 +19,10 @@ struct KokoroOutput {
 };
 
 KIDI_MODULE(Kokoro);
-class KokoroImpl : public Module, public inference::SynthesizerModel {
+class KokoroImpl : public SpeechSynthesisModel {
 public:
     KokoroImpl(YAML::Node config, checkpoint::Weights weights);
-    ~KokoroImpl();
+    ~KokoroImpl() override;
 
     static auto validate_config(const YAML::Node& config) -> Result<void>;
     static auto load(YAML::Node config, checkpoint::Weights weights) -> Result<Kokoro>;
@@ -33,8 +34,8 @@ public:
         -> Result<std::unique_ptr<inference::SynthesisSession>> override;
     auto execution() const -> std::string override { return "cpu"; }
     auto release_workspaces() -> void override;
-    auto sample_rate() const noexcept -> std::uint32_t;
-    auto preparation_ns() const noexcept -> std::uint64_t;
+    auto sample_rate() const noexcept -> std::uint32_t override;
+    auto preparation_ns() const noexcept -> std::uint64_t override;
 
 private:
     using Session = inference::CoroutineSession<inference::Synthesis, inference::SynthesisSession>;

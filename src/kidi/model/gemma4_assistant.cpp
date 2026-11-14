@@ -161,55 +161,42 @@ auto Gemma4AssistantImpl::create(const YAML::Node& config, const YAML::Node& tar
         return std::unexpected(error.error());
     }
 }
+auto Gemma4AssistantImpl::state_mapping_specs() const -> std::vector<checkpoint::StateMappingSpec> {
+    using checkpoint::StateMappingOp;
+    using checkpoint::StateMappingSpec;
+    return {
+        {.sources = {R"(^model\.(.+)$)"}, .destination = "$1"},
+        {.sources = {R"(^embed_tokens\.weight$)", "lm_head.weight"},
+         .destination = "lm_head.weight",
+         .op = StateMappingOp::IDENTICAL},
+        {.sources = {R"(^embed_tokens\.weight$)"}, .destination = "lm_head.weight"},
+        {.sources = {R"(^layers\.(\d+)\.mlp\.gate_proj\.weight$)", "layers.$1.mlp.up_proj.weight"},
+         .destination = "layers.$1.mlp.gate_up_proj.weight"},
+    };
+}
 auto Gemma4AssistantImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
-    try {
-        StateDict state;
-        const auto checkpoint = require(weights.state_dict());
-        for (const auto& [key, tensor] : checkpoint) {
-            auto name = key.starts_with("model.") ? key.substr(6) : key;
-            if (name == "embed_tokens.weight") name = "lm_head.weight";
-            auto value = tensor;
-            if (value.dtype() != DType::I64) {
-                if (value.dtype() != DType::F32 && value.dtype() != DType::BF16 && value.dtype() != DType::F16)
-                    throw ops::Failure({ErrorCode::UNSUPPORTED, "Gemma MTP requires floating-point assistant weights"});
-                if (value.dtype() != DType::F32) value = impl_->context.cast(value, DType::F32);
-            }
-            if (const auto existing = state.find(name); existing != state.end()) {
-                if (!std::ranges::equal(require(existing->second.host_bytes()), require(value.host_bytes())))
-                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "conflicting tied Gemma MTP head weights"});
-            } else
-                state.emplace(std::move(name), std::move(value));
+    auto state = prepare_checkpoint(weights);
+    if (!state) return std::unexpected(std::move(state.error()));
+    if (impl_->masked_embedding) {
+        const auto ordering = state->find("masked_embedding.token_ordering");
+        if (ordering == state->end() || ordering->second.dtype() != DType::I64 ||
+            ordering->second.numel() != static_cast<std::size_t>(impl_->vocabulary))
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Gemma MTP token ordering"});
+        std::vector<bool> seen(impl_->vocabulary);
+        const auto ids = std::as_const(ordering->second).data<std::int64_t>();
+        if (!ids) return std::unexpected(ids.error());
+        for (const auto token : *ids) {
+            if (token < 0 || token >= impl_->vocabulary || seen[token])
+                return std::unexpected(
+                    Error{ErrorCode::INVALID_ARGUMENT, "Gemma MTP token ordering is not a permutation"});
+            seen[token] = true;
         }
-        for (std::size_t layer = 0; layer < impl_->layers->size(); ++layer) {
-            const auto prefix = "layers." + std::to_string(layer) + ".mlp.";
-            const auto gate = state.find(prefix + "gate_proj.weight"), up = state.find(prefix + "up_proj.weight");
-            if (gate == state.end() || up == state.end())
-                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "missing Gemma MTP feed-forward weights"});
-            const std::array pieces{gate->second, up->second};
-            state.emplace(prefix + "gate_up_proj.weight", impl_->context.concat(pieces, 0));
-            state.erase(gate);
-            state.erase(up);
-        }
-        if (impl_->masked_embedding) {
-            const auto ordering = state.find("masked_embedding.token_ordering");
-            if (ordering == state.end() || ordering->second.dtype() != DType::I64 ||
-                ordering->second.numel() != static_cast<std::size_t>(impl_->vocabulary))
-                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma MTP token ordering"});
-            std::vector<bool> seen(impl_->vocabulary);
-            for (const auto token : require(std::as_const(ordering->second).data<std::int64_t>())) {
-                if (token < 0 || token >= impl_->vocabulary || seen[token])
-                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Gemma MTP token ordering is not a permutation"});
-                seen[token] = true;
-            }
-        }
-        impl_->context.synchronize();
-        require(set_state(state));
-        impl_->context = ops::Context(device());
-        impl_->prefix = 0;
-        return {};
-    } catch (const ops::Failure& error) {
-        return std::unexpected(error.error());
     }
+    impl_->context.synchronize();
+    if (auto ok = set_state(*state); !ok) return ok;
+    impl_->context = ops::Context(device());
+    impl_->prefix = 0;
+    return {};
 }
 auto Gemma4AssistantImpl::forward(Gemma4Impl& target, const Tensor& hidden, std::int32_t token, Gemma4State& state)
     -> Result<Gemma4Draft> {
@@ -279,13 +266,18 @@ auto Gemma4AssistantImpl::forward(Gemma4Impl& target, const Tensor& hidden, std:
         return std::unexpected(error.error());
     }
 }
-auto Gemma4AssistantImpl::draft(Gemma4Impl& target, const Tensor& hidden, std::int32_t last_token, Gemma4State& state,
-                                std::size_t max_drafts, const inference::GreedyState::StopPredicate& is_stop,
-                                std::vector<std::int32_t>& drafts) -> Result<void> {
+auto Gemma4AssistantImpl::draft(LanguageModel& target, const Tensor& hidden, std::int32_t last_token,
+                                LanguageModelState& state, std::size_t max_drafts,
+                                const std::function<bool(std::int32_t)>& is_stop, std::vector<std::int32_t>& drafts)
+    -> Result<void> {
+    auto* gemma_target = dynamic_cast<Gemma4Impl*>(&target);
+    auto* gemma_state = dynamic_cast<Gemma4State*>(&state);
+    if (!gemma_target || !gemma_state)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "Gemma MTP requires a Gemma4 target and state"});
     auto current_hidden = hidden;
     auto token = last_token;
     for (std::size_t index = 0; index < max_drafts; ++index) {
-        auto output = forward(target, current_hidden, token, state);
+        auto output = forward(*gemma_target, current_hidden, token, *gemma_state);
         if (!output) return std::unexpected(output.error());
         current_hidden = std::move(output->hidden);
         token = output->token;
@@ -294,7 +286,7 @@ auto Gemma4AssistantImpl::draft(Gemma4Impl& target, const Tensor& hidden, std::i
     }
     return {};
 }
-auto Gemma4AssistantImpl::preparation_ns() const -> std::uint64_t { return impl_->context.preparation_ns(); }
+auto Gemma4AssistantImpl::preparation_ns() const noexcept -> std::uint64_t { return impl_->context.preparation_ns(); }
 auto Gemma4AssistantImpl::release_workspaces() -> void {
     impl_->context.release_workspaces();
     impl_->prefix = 0;

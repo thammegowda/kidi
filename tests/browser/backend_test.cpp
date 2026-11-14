@@ -390,12 +390,12 @@ rope_parameters: {rope_theta: 10000}
             auto model = ops::require(model::Gemma4Impl::create(config));
             ops::require(model->set_checkpoint(weights));
             auto state = ops::require(model->create_state(8));
-            compare(expected, ops::require(model->forward(tokens, state, true)), 2e-4F);
+            compare(expected, ops::require(model->forward(tokens, *state, true)), 2e-4F);
             auto incremental = ops::require(model->create_state(8));
             const auto reference_values = ops::require(expected.data<float>());
             const auto vocabulary = expected.size(-1);
             for (std::size_t position = 0; position < tokens.size(); ++position) {
-                const auto selected = ops::require(model->forward_token(tokens.subspan(position, 1), incremental));
+                const auto selected = ops::require(model->forward_token(tokens.subspan(position, 1), *incremental));
                 const auto row = reference_values.subspan(position * vocabulary, vocabulary);
                 if (selected != std::ranges::max_element(row) - row.begin())
                     throw std::runtime_error("Gemma selected token mismatch");
@@ -570,12 +570,14 @@ extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_diagnose() -> int {
         auto host_ff = cpu.rms_norm(host_after, state.at(first + "pre_feedforward_layernorm.weight"), epsilon);
         auto gpu_ff = gpu.rms_norm(gpu_after, state.at(first + "pre_feedforward_layernorm.weight"), epsilon);
         compare("mlp_norm", host_ff, gpu_ff);
-        auto host_gate = linear(cpu, host_ff, "mlp.gate_proj", 4), gpu_gate = linear(gpu, gpu_ff, "mlp.gate_proj", 4);
-        auto host_up = linear(cpu, host_ff, "mlp.up_proj", 4), gpu_up = linear(gpu, gpu_ff, "mlp.up_proj", 4);
-        compare("mlp_gate", host_gate, gpu_gate);
-        compare("mlp_up", host_up, gpu_up);
-        auto host_activation = cpu.gelu_multiply(host_gate, host_up),
-             gpu_activation = gpu.gelu_multiply(gpu_gate, gpu_up);
+        auto host_gate_up = linear(cpu, host_ff, "mlp.gate_up_proj", 4),
+             gpu_gate_up = linear(gpu, gpu_ff, "mlp.gate_up_proj", 4);
+        compare("mlp_gate_up", host_gate_up, gpu_gate_up);
+        const auto mlp_width = static_cast<std::int64_t>(host_gate_up.size(-1) / 2);
+        auto host_activation = cpu.gelu_multiply(cpu.slice(host_gate_up, -1, 0, mlp_width),
+                                                 cpu.slice(host_gate_up, -1, mlp_width, mlp_width)),
+             gpu_activation = gpu.gelu_multiply(gpu.slice(gpu_gate_up, -1, 0, mlp_width),
+                                                gpu.slice(gpu_gate_up, -1, mlp_width, mlp_width));
         compare("mlp_activation", host_activation, gpu_activation);
         compare("mlp_down", linear(cpu, host_activation, "mlp.down_proj", 4),
                 linear(gpu, gpu_activation, "mlp.down_proj", 4));

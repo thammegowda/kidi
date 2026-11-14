@@ -1,10 +1,11 @@
 #pragma once
 
 #include "kidi/core/precision.h"
+#include "kidi/image/gemma4.h"
 #include "kidi/inference/decoder.h"
-#include "kidi/model/gemma4.h"
-#include "kidi/model/gemma4_vision.h"
+#include "kidi/model/model.h"
 #include "kidi/text/tokenizer.h"
+#include <yaml-cpp/yaml.h>
 #include <chrono>
 #include <deque>
 #include <functional>
@@ -130,15 +131,16 @@ public:
     auto trim_workspaces() -> Result<void>;
 
 private:
-    Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model, std::array<std::int32_t, 3> special,
-              core::InferencePrecision precision, core::KVCachePrecision kv_cache_precision);
+    Generator(YAML::Node config, text::Tokenizer tokenizer, std::shared_ptr<model::CausalLanguageModel> model,
+              std::array<std::int32_t, 3> special, core::InferencePrecision precision,
+              core::KVCachePrecision kv_cache_precision);
     struct DraftBackend;
     YAML::Node config_;
     text::Tokenizer tokenizer_;
-    model::Gemma4 model_;
+    std::shared_ptr<model::CausalLanguageModel> model_;
     std::unique_ptr<DraftBackend> drafter_;
     std::size_t draft_tokens_ = 0;
-    model::Gemma4Vision vision_{nullptr};
+    std::shared_ptr<model::VisionModel> vision_;
     struct CachedImage {
         std::string encoded;
         tensor::Tensor embeddings;
@@ -152,7 +154,7 @@ private:
     bool prefill_warmed_ = false;
     struct PrefixEntry {
         std::vector<std::int32_t> tokens;
-        model::Gemma4State state;
+        std::unique_ptr<model::LanguageModelState> state;
         std::size_t bytes = 0, chunk_size = 0;
         bool crop_local_attention = true;
         std::string image_key;
@@ -176,11 +178,11 @@ private:
         std::size_t capacity;
         GenerationOptions options;
         GreedyState search;
-        std::optional<model::Gemma4State> state;
+        std::unique_ptr<model::LanguageModelState> state;
         GenerationStats stats;
         std::chrono::steady_clock::time_point enqueued;
         std::string streamed_text;
-        std::vector<model::Gemma4ImageTokens> images;
+        std::vector<model::EmbeddingSpan> images;
         std::string image_key;
         std::optional<DeviceDecode> decode;
         bool completion_emitted = false;

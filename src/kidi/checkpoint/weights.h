@@ -17,11 +17,21 @@ namespace kidi::checkpoint {
 
 using DataType = tensor::DType;
 
+enum class StateMappingOp {
+    CONCAT,
+    IDENTICAL,
+    IGNORE,
+};
+
 struct StateMappingSpec {
     std::vector<std::string> sources;
     std::string destination;
     std::int64_t concat_axis = 0;
+    StateMappingOp op = StateMappingOp::CONCAT;
 };
+
+auto prefix_state_mappings(std::string_view source_prefix, std::string_view destination_prefix,
+                           std::span<const StateMappingSpec> mappings) -> std::vector<StateMappingSpec>;
 
 class Weights {
 public:
@@ -35,6 +45,10 @@ public:
     static auto load(const std::filesystem::path& path, std::span<const StateMappingSpec> mappings = {})
         -> Result<Weights>;
     static auto save(const std::filesystem::path& path, const StateDict& state) -> Result<void>;
+
+    /// Returns a view with declarative model state mappings (renaming, projection fusion, scalar checks, ignores)
+    /// applied without copying untouched tensors.
+    auto mapped(std::span<const StateMappingSpec> mappings) const -> Result<Weights>;
 
     /// Adds a tensor supplied by the embedder rather than the file, such as a table kept outside linear memory.
     auto add(std::string name, tensor::Tensor value) -> Result<void>;

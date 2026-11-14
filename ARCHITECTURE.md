@@ -158,10 +158,10 @@ precision, allocation, and device are scoped construction settings. State is
 assigned separately after registration:
 
 ```cpp
-const auto embedding = ops::require(package.weights().tensor("target_embedding.weight"));
-ModuleScope construction(embedding.dtype(), false);
+const auto dtype = ops::require(model::TransformerImpl::checkpoint_dtype(package.weights()));
+ModuleScope construction(dtype, false);
 auto model = ops::require(model::TransformerImpl::create(package.config()["model"]));
-ops::require(model->set_state(package.weights()));
+ops::require(model->set_checkpoint(package.weights()));
 ```
 
 The model validates its own supported architecture and caches runtime dimensions
@@ -533,7 +533,7 @@ dynamic bindings, allowing one shape-specialized executable to serve many layers
 without recompiling their weights. Queued bindings retain their tensor owners;
 host-constant fallback and CPU packed projections still use identity-keyed entries.
 Do not mutate their storage after first use; replace registered parameters with
-`load_state_dict`, or create a new context/model. Activations, masks, and token indices are dynamic bindings and
+`set_state(..., copy=true)`, or create a new context/model. Activations, masks, and token indices are dynamic bindings and
 may change between completed calls without recompilation. This is an inference
 API, not an autograd or optimizer framework.
 
@@ -792,7 +792,7 @@ execution engine.
 ```cpp
 ModuleScope construction(tensor::DType::BF16, false, tensor::Device::cpu());
 layers::Linear projection(768, 2048);
-ops::require(projection->set_state(weights));
+ops::require(projection->set_state(ops::require(weights.state_dict())));
 ops::Context context(projection->device());
 auto output = projection->forward(context, input);
 const auto& implementation = *projection;
@@ -883,12 +883,13 @@ necessarily the original imported RTG checkpoint names. `TransformerImpl::state_
 adapts RTG names once when loading the package; layer constructors never receive
 checkpoint paths or prefixes.
 
-`set_state(weights)` and `set_state(StateDict)` bind tensors after construction.
-On the same storage device they retain incoming storage, including read-only mapped weights;
+`Model::set_checkpoint(weights)` maps and normalizes external checkpoints before
+binding. `Module::set_state(StateDict, strict=true, copy=false)` binds already-mapped
+tensors after construction. On the same storage device (`copy=false`) it retains incoming storage, including read-only mapped weights;
 cross-device tensors are transferred to each parameter's registered storage device,
 normally the module's captured device. Caller-retained
 state shares same-device storage, so it must not be mutated during inference.
-`load_state_dict(state, strict=true)` instead copies into fresh storage. Both validate all
+Setting `copy=true` instead copies into fresh storage. Both validate all
 keys, shapes, and dtypes before changes; strict mode requires exact keys, while
 non-strict mode loads matching entries and ignores missing/unexpected ones.
 All required transfers/copies finish before committing replacements. Copying loads

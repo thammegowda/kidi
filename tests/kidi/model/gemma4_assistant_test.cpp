@@ -38,7 +38,8 @@ auto check_reference(const std::filesystem::path& target_directory, const std::f
     const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
     auto target = require(model::Gemma4Impl::create(config));
     require(target->set_checkpoint(require(checkpoint::Weights::load(target_directory / "model.safetensors"))));
-    auto state = require(target->create_state(16));
+    auto state_ptr = require(target->create_state(16));
+    auto& state = static_cast<model::Gemma4State&>(*state_ptr);
     tensor::Tensor target_hidden;
     require(target->forward(input, state, true, &target_hidden));
     if (!close(target_hidden, require(reference.tensor("target_hidden")))) return false;
@@ -88,7 +89,8 @@ auto check_reference(const std::filesystem::path& target_directory, const std::f
     invalid = YAML::Clone(assistant_config);
     invalid["backbone_hidden_size"] = 9;
     if (model::Gemma4AssistantImpl::create(invalid, config)) return false;
-    auto empty = require(target->create_state(16));
+    auto empty_ptr = require(target->create_state(16));
+    auto& empty = static_cast<model::Gemma4State&>(*empty_ptr);
     return !assistant->forward(*target, row(target_hidden, 0), 2, empty) &&
            !assistant->forward(*target, row(target_hidden, 0), 16, state);
 }

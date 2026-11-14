@@ -1,5 +1,7 @@
 #include "kidi/inference/translator.h"
 #include "kidi/inference/decoder.h"
+#include "kidi/model/registry.h"
+#include "kidi/model/transformer.h"
 
 #include <algorithm>
 #include <array>
@@ -69,7 +71,7 @@ auto resolve_options(const YAML::Node& config, const DecodeOptions& options) -> 
 
 } // namespace
 
-Translator::Translator(checkpoint::Package package, model::Transformer model) noexcept
+Translator::Translator(checkpoint::Package package, std::shared_ptr<model::Seq2SeqModel> model) noexcept
     : package_(std::move(package)), model_(std::move(model)) {}
 
 auto Translator::load(const std::filesystem::path& model_directory, tensor::Device device, InferenceStats* stats,
@@ -84,14 +86,12 @@ auto Translator::load(const std::filesystem::path& model_directory, tensor::Devi
     if (!package) return std::unexpected(std::move(package.error()));
     auto defaults = resolve_options(package->config()["decode"], {});
     if (!defaults) return std::unexpected(std::move(defaults.error()));
-    auto embedding = package->weights().tensor("target_embedding.weight");
-    if (!embedding) return std::unexpected(std::move(embedding.error()));
-    auto model = [&] {
-        const ModuleScope construction(embedding->dtype(), false, device);
-        return model::TransformerImpl::create(package->config()["model"]);
-    }();
+    auto dtype = model::TransformerImpl::checkpoint_dtype(package->weights());
+    if (!dtype) return std::unexpected(std::move(dtype.error()));
+    auto model = model::create_model_as<model::Seq2SeqModel>(package->config()["model"],
+                                                             {.device = device, .parameter_dtype = *dtype});
     if (!model) return std::unexpected(std::move(model.error()));
-    auto loaded = (*model)->set_state(package->weights());
+    auto loaded = (*model)->set_checkpoint(package->weights());
     if (!loaded) return std::unexpected(std::move(loaded.error()));
     Translator translator(std::move(*package), std::move(*model));
     translator.batch_size_ = batch_size;
@@ -111,14 +111,14 @@ auto Translator::translate(std::string_view source, DecodeOptions options, Infer
         source_ids->push_back(config["source_end_id"].as<std::int32_t>());
     }
     const auto maximum_steps = source_ids->size() + (*decode)["maximum_extra_tokens"].as<std::size_t>();
-    auto projected_source = model_->encode(std::array{*source_ids}, stats);
+    auto projected_source = model_->encode_text(std::array{*source_ids}, stats);
     if (!projected_source) return std::unexpected(std::move(projected_source.error()));
 
     const auto beam_size = (*decode)["beam_size"].as<std::size_t>();
     const auto vocabulary_size = config["vocabulary_size"].as<std::size_t>();
-    std::optional<model::DecoderState> self_cache;
+    std::unique_ptr<model::LanguageModelState> self_cache;
     if (beam_size == 1) {
-        auto cache = model_->create_state(1, maximum_steps);
+        auto cache = model_->create_decoder_state(*projected_source, 1, maximum_steps);
         if (!cache) return std::unexpected(std::move(cache.error()));
         self_cache = std::move(*cache);
     }
@@ -135,8 +135,9 @@ auto Translator::translate(std::string_view source, DecodeOptions options, Infer
     auto generated = inference::Decoder::generate(
         std::array{config["begin_id"].as<std::int32_t>()}, search,
         [&](const inference::DecodeRequest& request) -> Result<inference::TokenScores> {
-            auto scores = model_->forward(*projected_source, self_cache ? request.prefixes.last(1) : request.prefixes,
-                                          request.beam_indices.size(), self_cache ? &*self_cache : nullptr, stats);
+            auto scores =
+                model_->decode_step(**projected_source, self_cache ? request.prefixes.last(1) : request.prefixes,
+                                    request.beam_indices.size(), self_cache.get(), stats);
             if (!scores) return std::unexpected(std::move(scores.error()));
             score_storage = std::move(*scores);
             auto values = score_storage.data<float>();
@@ -196,9 +197,9 @@ auto Translator::translate_batch(std::span<const std::string> sources, DecodeOpt
             batch_ids.push_back(std::move(ids[order[begin + offset]]));
             batch_limits.push_back(limits[order[begin + offset]]);
         }
-        auto source = model_->encode(batch_ids, stats);
+        auto source = model_->encode_text(batch_ids, stats);
         if (!source) return std::unexpected(std::move(source.error()));
-        auto state = model_->create_state(count, *std::ranges::max_element(batch_limits));
+        auto state = model_->create_decoder_state(*source, count, *std::ranges::max_element(batch_limits));
         if (!state) return std::unexpected(std::move(state.error()));
         std::vector<SearchOptions> settings;
         for (auto limit : batch_limits)
@@ -214,7 +215,7 @@ auto Translator::translate_batch(std::span<const std::string> sources, DecodeOpt
         auto batch = Decoder::generate_batch(
             initial, settings,
             [&](const GreedyRequest& request) -> Result<TokenScores> {
-                auto logits = model_->forward(*source, request.tokens, count, &*state, stats);
+                auto logits = model_->decode_step(**source, request.tokens, count, state->get(), stats);
                 if (!logits) return std::unexpected(std::move(logits.error()));
                 score_storage = std::move(*logits);
                 auto values = score_storage.data<float>();

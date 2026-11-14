@@ -77,13 +77,12 @@ auto inspect(const std::filesystem::path& directory) -> int {
         spdlog::error("{}", document.error().message);
         return 1;
     }
+    if (auto validation = kidi::model::validate_model_config((*document)["model"]); !validation) {
+        spdlog::error("{}", validation.error().message);
+        return 1;
+    }
     const auto type = (*document)["model"]["type"].as<std::string>();
     if (type == "whisper") {
-        auto validation = kidi::model::WhisperImpl::validate_config((*document)["model"]);
-        if (!validation) {
-            spdlog::error("{}", validation.error().message);
-            return 1;
-        }
         auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
         if (!weights) {
             spdlog::error("{}", weights.error().message);
@@ -106,11 +105,6 @@ auto inspect(const std::filesystem::path& directory) -> int {
         return 0;
     }
     if (type == "gemma4_text") {
-        auto validation = kidi::model::Gemma4Impl::validate_config((*document)["model"]);
-        if (!validation) {
-            spdlog::error("{}", validation.error().message);
-            return 1;
-        }
         auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
         if (!weights) {
             spdlog::error("{}", weights.error().message);
@@ -134,12 +128,7 @@ auto inspect(const std::filesystem::path& directory) -> int {
                   << "default device: " << kidi::tensor::to_string(kidi::module_device) << '\n';
         return 0;
     }
-    if ((*document)["model"]["type"].as<std::string>() == "omnivoice") {
-        auto validation = kidi::model::OmniVoiceImpl::validate_config((*document)["model"]);
-        if (!validation) {
-            spdlog::error("{}", validation.error().message);
-            return 1;
-        }
+    if (type == "omnivoice") {
         auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
         if (!weights) {
             spdlog::error("{}", weights.error().message);
@@ -164,12 +153,7 @@ auto inspect(const std::filesystem::path& directory) -> int {
                   << "execution device: cpu\n";
         return 0;
     }
-    if ((*document)["model"]["type"].as<std::string>() == "kokoro") {
-        auto validation = kidi::model::KokoroImpl::validate_config((*document)["model"]);
-        if (!validation) {
-            spdlog::error("{}", validation.error().message);
-            return 1;
-        }
+    if (type == "kokoro") {
         auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
         if (!weights) {
             spdlog::error("{}", weights.error().message);
@@ -198,11 +182,6 @@ auto inspect(const std::filesystem::path& directory) -> int {
         return 1;
     }
     const auto& config = package->config();
-    auto validation = kidi::model::TransformerImpl::validate_config(config["model"]);
-    if (!validation) {
-        spdlog::error("{}", validation.error().message);
-        return 1;
-    }
     std::cout << "format: " << config["format_version"].as<int>() << '\n'
               << "model: " << config["model"]["type"].as<std::string>() << '\n'
               << "weights: " << config["weights_file"].as<std::string>() << '\n'
