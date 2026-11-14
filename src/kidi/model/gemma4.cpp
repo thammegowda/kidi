@@ -335,6 +335,7 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t
                 if (name.starts_with("layers.") &&
                     (name.find(".self_attn.k_proj.") != std::string::npos ||
                      name.find(".self_attn.v_proj.") != std::string::npos ||
+                     name.find(".self_attn.kv_proj.") != std::string::npos ||
                      name.find(".self_attn.k_norm.") != std::string::npos || name.ends_with(".k_cache_scale") ||
                      name.ends_with(".v_cache_scale")))
                     continue;

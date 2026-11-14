@@ -143,19 +143,28 @@ test('WebGPU layout sends decoder projections to fused GPU buffers and keeps the
     const header = {
         'model.language_model.layers.0.mlp.gate_proj.weight': tensor('U8', [4, 2], 0, 8),
         'model.language_model.layers.0.mlp.up_proj.weight': tensor('U8', [4, 2], 8, 16),
-        'model.language_model.layers.0.self_attn.q_proj.weight': tensor('U8', [4, 2], 16, 24),
-        'model.language_model.layers.0.mlp.gate_proj.weight_scale': tensor('F32', [4, 1], 24, 40),
-        'model.language_model.embed_tokens.embedding_quantized': tensor('U8', [4, 2], 40, 48),
+        'model.language_model.layers.0.self_attn.k_proj.weight': tensor('U8', [2, 2], 16, 20),
+        'model.language_model.layers.0.self_attn.v_proj.weight': tensor('U8', [2, 2], 20, 24),
+        'model.language_model.layers.0.self_attn.q_proj.weight': tensor('U8', [4, 2], 24, 32),
+        'model.language_model.layers.0.mlp.gate_proj.weight_scale': tensor('F32', [4, 1], 32, 48),
+        'model.language_model.layers.2.self_attn.k_proj.weight': tensor('U8', [2, 2], 48, 52),
+        'model.language_model.layers.2.self_attn.v_proj.weight': tensor('U8', [2, 2], 52, 56),
+        'model.language_model.layers.2.self_attn.k_proj.weight_scale': tensor('F32', [2, 1], 56, 64),
+        'model.language_model.layers.2.self_attn.k_cache_scale': tensor('F32', [], 64, 68),
+        'model.language_model.layers.2.self_attn.q_proj.weight': tensor('U8', [4, 2], 68, 76),
+        'model.language_model.embed_tokens.embedding_quantized': tensor('U8', [4, 2], 76, 84),
     };
     const ranges = Object.entries(header).map(([name, info]) => ({name, start: info.data_offsets[0],
-        end: info.data_offsets[1], mask: 0, bits: name.endsWith('weight_scale') ? 0 : 4}));
-    const layout = weightLayout(header, ranges, true, true);
+        end: info.data_offsets[1], mask: 0, bits: name.endsWith('scale') ? 0 : 4}));
+    const layout = weightLayout(header, ranges, true, true, 2);
     assert.deepEqual(layout.device.map(entry => [entry.name, entry.shape, entry.bytes, entry.bits]), [
         ['model.language_model.layers.0.mlp.gate_up_proj.weight', [8, 2], 16, 4],
-        ['model.language_model.layers.0.self_attn.q_proj.weight', [4, 2], 8, 4]]);
+        ['model.language_model.layers.0.self_attn.kv_proj.weight', [4, 2], 8, 4],
+        ['model.language_model.layers.0.self_attn.q_proj.weight', [4, 2], 8, 4],
+        ['model.language_model.layers.2.self_attn.q_proj.weight', [4, 2], 8, 4]]);
     assert.deepEqual(Object.keys(layout.header).sort(), ['model.language_model.embed_tokens.embedding_quantized',
         'model.language_model.layers.0.mlp.gate_proj.weight_scale']);
-    assert.equal(weightLayout(header, ranges.map(range => ({...range})), true).device.length, 0);
+    assert.equal(weightLayout(header, ranges.map(range => ({...range})), true, false, 2).device.length, 0);
 });
 
 test('model IDs resolve latest Hub revisions and retain an offline pinned mapping', async () => {

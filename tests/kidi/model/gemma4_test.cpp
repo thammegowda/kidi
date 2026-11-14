@@ -702,6 +702,9 @@ auto main() -> int {
                     }
                 }
                 auto sentinel_checkpoint = ops::require(checkpoint::Weights::load(sentinel_path));
+                ops::require(sentinel_checkpoint.add(
+                    "model.language_model.layers.2.self_attn.kv_proj.weight",
+                    ops::require(sentinel_checkpoint.tensor("model.language_model.layers.0.self_attn.k_proj.weight"))));
                 const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
                 auto sentinel_model = ops::require(model::Gemma4Impl::create(config));
                 ops::require(sentinel_model->set_checkpoint(sentinel_checkpoint));

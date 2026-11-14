@@ -349,8 +349,15 @@ const alignUp = (value, alignment) => Math.ceil(value / alignment) * alignment;
 const EXTERNAL_TENSORS = new Set(['model.language_model.embed_tokens_per_layer.embedding_quantized']);
 // With WebGPU, decoder projections are only read by GPU kernels, so they go straight to GPU buffers.
 const DEVICE_TENSOR = /^model\.language_model\.layers\.\d+\..+\.weight$/;
-const placement = (range, gemma, gpu) => !gemma ? 'heap'
-    : /^model\.(audio_tower|embed_audio)\./.test(range.name) ? 'skip'
+const SHARED_KV_TENSOR =
+    /^model\.language_model\.layers\.(\d+)\.self_attn\.(?:k_proj\.|v_proj\.|kv_proj\.|k_norm\.|k_cache_scale$|v_cache_scale$)/;
+function isUnusedSharedKv(name, sharedBegin) {
+    if (!Number.isFinite(sharedBegin)) return false;
+    const match = SHARED_KV_TENSOR.exec(name);
+    return Boolean(match && Number(match[1]) >= sharedBegin);
+}
+const placement = (range, gemma, gpu, sharedBegin = Infinity) => !gemma ? 'heap'
+    : /^model\.(audio_tower|embed_audio)\./.test(range.name) || isUnusedSharedKv(range.name, sharedBegin) ? 'skip'
     : EXTERNAL_TENSORS.has(range.name) ? 'external'
     : gpu && range.bits && DEVICE_TENSOR.test(range.name) ? 'gpu' : 'heap';
 
@@ -396,14 +403,14 @@ function applyMask(bytes, mask) {
 /// Compacted heap layout: excluded tensors removed, 64-byte aligned starts, and each gate projection followed directly by
 /// its up projection so the runtime can view the pair as one fused matrix without copying. With `gpu`, decoder
 /// projections are staged for GPU buffers instead, gate and up fused into one `gate_up_proj` buffer.
-export function weightLayout(header, ranges, gemma, gpu = false) {
+export function weightLayout(header, ranges, gemma, gpu = false, sharedBegin = Infinity) {
     const byName = new Map(ranges.map(range => [range.name, range]));
     const metadata = header.__metadata__;
     const layout = {header: metadata ? {__metadata__: metadata} : {}, tensors: [], external: [], device: [],
         dataBytes: 0};
     let cursor = 0;
     const place = (range, adjacent) => {
-        range.target = placement(range, gemma, gpu);
+        range.target = placement(range, gemma, gpu, sharedBegin);
         if (range.target === 'skip') return;
         const info = header[range.name];
         if (range.target === 'gpu') {
@@ -678,7 +685,11 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
     const size = first.total;
     plan ??= planFor(new Uint8Array(first.bytes), size);
     const {headerBytes, header, ranges} = plan;
-    const layout = weightLayout(header, ranges, true, Boolean(gpu));
+    const hiddenLayers = Number(config.text_config?.num_hidden_layers);
+    const sharedLayers = Number(config.text_config?.num_kv_shared_layers || 0);
+    const sharedBegin = Number.isInteger(hiddenLayers) && Number.isInteger(sharedLayers) && sharedLayers > 0
+        ? hiddenLayers - sharedLayers : Infinity;
+    const layout = weightLayout(header, ranges, true, Boolean(gpu), sharedBegin);
     metrics.totalBytes = size + configData.bytes.byteLength;
     metrics.loadedBytes = configData.bytes.byteLength;
     const pointer = allocateWeights(module, layout.totalBytes + ALIGNMENT);
