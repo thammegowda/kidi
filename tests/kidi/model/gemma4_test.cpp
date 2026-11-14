@@ -189,21 +189,17 @@ auto check_external_rows(const std::filesystem::path& fixture, const YAML::Node&
     reduced.erase(table_name);
     require(kidi::checkpoint::Weights::save(directory / "internal" / "model.safetensors", state));
     require(kidi::checkpoint::Weights::save(directory / "external" / "model.safetensors", reduced));
-    YAML::Node manifest;
-    manifest["format_version"] = 1;
-    manifest["weights_file"] = "model.safetensors";
-    manifest["tokenizer_file"] = "tokenizer.json";
-    manifest["model"] = YAML::Clone(config);
+    auto manifest = YAML::Clone(config);
     manifest["decode"]["maximum_new_tokens"] = 4;
     manifest["decode"]["context_size"] = 16;
-    std::ofstream(directory / "internal" / "model.yaml") << manifest;
+    std::ofstream(directory / "internal" / "config.json") << manifest;
     const auto& table = state.at(table_name);
     YAML::Node declared;
     declared["name"] = table_name;
     declared["dtype"] = std::string(kidi::tensor::to_string(table.dtype()));
     declared["shape"] = std::vector<std::int64_t>(table.shape().begin(), table.shape().end());
     manifest["external_tensors"].push_back(declared);
-    std::ofstream(directory / "external" / "model.yaml") << manifest;
+    std::ofstream(directory / "external" / "config.json") << manifest;
     for (const auto* name : {"internal", "external"}) write_tokenizer(directory / name / "tokenizer.json");
     if (kidi::inference::Generator::load(directory / "external", device))
         throw std::runtime_error("declared external tensors loaded without a source");
@@ -237,14 +233,10 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     std::filesystem::remove_all(directory);
     std::filesystem::create_directories(directory);
     std::filesystem::copy_file(fixture / "model.safetensors", directory / "model.safetensors");
-    YAML::Node manifest;
-    manifest["format_version"] = 1;
-    manifest["weights_file"] = "model.safetensors";
-    manifest["tokenizer_file"] = "tokenizer.json";
-    manifest["model"] = YAML::Clone(config);
+    auto manifest = YAML::Clone(config);
     manifest["decode"]["maximum_new_tokens"] = 3;
     manifest["decode"]["context_size"] = 16;
-    std::ofstream(directory / "model.yaml") << manifest;
+    std::ofstream(directory / "config.json") << manifest;
     write_tokenizer(directory / "tokenizer.json");
     auto cached = require(kidi::inference::Generator::load(directory, device));
     auto plain = require(kidi::inference::Generator::load(directory, device));
@@ -364,8 +356,8 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
                                                 run(plain, prompts[index], uncached).generation.token_ids)
                 throw std::runtime_error("deferred token serving changed generated tokens");
     }
-    manifest["model"]["max_position_embeddings"] = 1024;
-    std::ofstream(directory / "model.yaml") << manifest;
+    manifest["max_position_embeddings"] = 1024;
+    std::ofstream(directory / "config.json") << manifest;
     auto compact = require(kidi::inference::Generator::load(directory, device));
     auto full = require(kidi::inference::Generator::load(directory, device));
     require(compact.configure_serving({1, 1, 1024, 2, true}));
@@ -468,14 +460,10 @@ auto check_async_serving(const YAML::Node& config) -> void {
         if (!embedding || !gate || !projection) throw std::runtime_error("async EOS fixture lacks transition weights");
     }
     require(checkpoint::Weights::save(directory / "model.safetensors", state));
-    YAML::Node manifest;
-    manifest["format_version"] = 1;
-    manifest["weights_file"] = "model.safetensors";
-    manifest["tokenizer_file"] = "tokenizer.json";
-    manifest["model"] = model_config;
+    auto manifest = YAML::Clone(model_config);
     manifest["decode"]["maximum_new_tokens"] = 12;
     manifest["decode"]["context_size"] = 64;
-    std::ofstream(directory / "model.yaml") << manifest;
+    std::ofstream(directory / "config.json") << manifest;
     write_tokenizer(directory / "tokenizer.json");
     auto pipelined = require(inference::Generator::load(directory, device));
     auto serial = require(inference::Generator::load(directory, device));
@@ -684,7 +672,7 @@ auto main() -> int {
             current_fixture = fixture;
             current_device = "cpu";
             const auto directory = fixture_directory(fixture);
-            const auto config = YAML::LoadFile((directory / "model.yaml").string())["model"];
+            const auto config = YAML::LoadFile((directory / "config.json").string());
             auto checkpoint = ops::require(checkpoint::Weights::load(directory / "model.safetensors"));
             auto reference = ops::require(checkpoint::Weights::load(directory / "reference.safetensors"));
             if (fixture == std::string_view("gemma4-qat")) {

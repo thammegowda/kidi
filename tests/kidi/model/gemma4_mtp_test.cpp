@@ -78,7 +78,7 @@ auto check_rounds(model::Gemma4Impl& model, std::span<const std::int32_t> prompt
     return true;
 }
 auto check(const std::filesystem::path& directory) -> bool {
-    const auto config = YAML::LoadFile((directory / "model.yaml").string())["model"];
+    const auto config = YAML::LoadFile((directory / "config.json").string());
     const auto checkpoint = require(checkpoint::Weights::load(directory / "model.safetensors"));
     const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
     auto model = require(model::Gemma4Impl::create(config));

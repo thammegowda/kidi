@@ -34,7 +34,6 @@ public:
     explicit Gemma4Impl(const YAML::Node& config);
     ~Gemma4Impl();
     static auto validate_config(const YAML::Node& config) -> Result<void>;
-    static auto checkpoint_config() -> checkpoint::ConfigAdapter;
     static auto create(const YAML::Node& config) -> Result<Gemma4>;
     auto set_checkpoint(const checkpoint::Weights& weights, std::int32_t weight_bits = 0, std::int32_t group_size = 128,
                         bool packed_prefill = false) -> Result<void>;

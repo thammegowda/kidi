@@ -21,7 +21,6 @@ struct Preparation {
 
 using PreparationHook = auto (*)(const YAML::Node&) -> Result<Preparation>;
 
-auto prepare(const std::filesystem::path& path, const ConfigAdapter& config, PreparationHook customize)
-    -> Result<std::filesystem::path>;
+auto prepare(const std::filesystem::path& path, PreparationHook customize) -> Result<std::filesystem::path>;
 
 } // namespace kidi::checkpoint

@@ -1,27 +1,20 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {mkdir, mkdtemp, realpath, rm, symlink, writeFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, realpath, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 
 import {createModelCacheServer} from '../../web/tools/serve-model-cache.mjs';
 
-test('loopback model bridge exposes only cached Hub revisions with byte ranges', async t => {
+test('loopback model bridge exposes only cached Hub directories with byte ranges', async t => {
   const root = await mkdtemp(join(tmpdir(), 'kidi-model-bridge-test-'));
-  const repository = join(root, 'models--owner--model');
+  const repository = join(root, 'owner/model');
   const revision = 'a'.repeat(40);
-  const snapshot = join(repository, 'snapshots', revision);
-  const localMetadata = join(repository, 'snapshots/local/.cache/huggingface/download');
-  const blob = join(root, 'blobs', 'weights');
-  await mkdir(join(repository, 'refs'), {recursive: true});
-  await mkdir(snapshot, {recursive: true});
+  const localMetadata = join(repository, '.cache/huggingface/download');
   await mkdir(localMetadata, {recursive: true});
-  await mkdir(join(root, 'blobs'), {recursive: true});
-  await writeFile(join(repository, 'refs/main'), 'local\n');
   await writeFile(join(localMetadata, 'config.json.metadata'), `${revision}\nlocal-etag\n0\n`);
-  await writeFile(join(snapshot, 'config.json'), '{"model_type":"gemma4"}');
-  await writeFile(blob, Uint8Array.from({length: 32}, (_, index) => index));
-  await symlink('../../../blobs/weights', join(snapshot, 'model.safetensors'));
+  await writeFile(join(repository, 'config.json'), '{"model_type":"gemma4"}');
+  await writeFile(join(repository, 'model.safetensors'), Uint8Array.from({length: 32}, (_, index) => index));
   const bridge = await createModelCacheServer({root});
   t.after(async () => {
     await bridge.close();
@@ -46,15 +39,12 @@ test('loopback model bridge exposes only cached Hub revisions with byte ranges',
   assert.equal((await fetch(`${bridge.url}/owner/model/resolve/${revision}/..%2Fsecret`)).status, 400);
   assert.equal((await fetch(`${bridge.url}/api/models/owner/model/revision/dev`)).status, 404);
 
-  const localRepository = join(root, 'models--owner--local-model');
-  const localSnapshot = join(localRepository, 'snapshots/local');
-  await mkdir(join(localRepository, 'refs'), {recursive: true});
-  await mkdir(localSnapshot, {recursive: true});
-  await writeFile(join(localRepository, 'refs/main'), 'local\n');
-  await writeFile(join(localSnapshot, 'config.json'), '{"model_type":"kidi_omnivoice"}');
+  const localRepository = join(root, 'owner/local-model');
+  await mkdir(localRepository, {recursive: true});
+  await writeFile(join(localRepository, 'config.json'), '{"model_type":"omnivoice"}');
   const localRevision = await (await fetch(`${bridge.url}/api/models/owner/local-model/revision/main`)).json();
   assert.match(localRevision.sha, /^[a-f0-9]{40}$/u);
   assert.equal(await (await fetch(
     `${bridge.url}/owner/local-model/resolve/${localRevision.sha}/config.json`)).text(),
-  '{"model_type":"kidi_omnivoice"}');
+  '{"model_type":"omnivoice"}');
 });

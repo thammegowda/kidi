@@ -73,7 +73,7 @@ struct GeneratorMemory {
     std::size_t image_bytes = 0; // reusable image embeddings
 };
 
-/// Creates a tensor that model.yaml lists under `external_tensors`: checkpoint data the embedder keeps outside
+/// Creates a tensor that config.json lists under `external_tensors`: checkpoint data the embedder keeps outside
 /// linear memory, such as browser-held lookup tables.
 using ExternalTensorSource = std::function<Result<tensor::Tensor>(std::string_view name, tensor::DType dtype,
                                                                   std::span<const std::int64_t> shape)>;

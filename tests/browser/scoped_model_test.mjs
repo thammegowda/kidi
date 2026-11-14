@@ -15,12 +15,12 @@ test('model loader namespaces and host allocations belong to their session', () 
     };
     const first = scopedModel(module, '/models/chat-1');
     const second = scopedModel(module, '/models/tts-2');
-    first.FS.writeFile('/model/model.yaml', 'chat');
-    second.FS.writeFile('/model/model.yaml', 'speech');
+    first.FS.writeFile('/model/config.json', 'chat');
+    second.FS.writeFile('/model/config.json', 'speech');
     first.FS.writeFile('/model-other/unchanged', 'unchanged');
     assert.deepEqual(calls.slice(2), [
-        ['writeFile', '/models/chat-1/model.yaml', 'chat'],
-        ['writeFile', '/models/tts-2/model.yaml', 'speech'],
+        ['writeFile', '/models/chat-1/config.json', 'chat'],
+        ['writeFile', '/models/tts-2/config.json', 'speech'],
         ['writeFile', '/model-other/unchanged', 'unchanged'],
     ]);
     module.HEAPU8 = new Uint8Array(16);

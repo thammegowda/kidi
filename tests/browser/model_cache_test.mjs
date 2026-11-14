@@ -196,7 +196,7 @@ test('Kidi OmniVoice Hub package streams one safetensors file by ranges', async 
     const config = {name: 'OmniVoice-q8', model_type: 'kidi_omnivoice',
         architectures: ['KidiOmniVoiceForTextToSpeech'], kidi_format_version: 1,
         quantization_config: {format: 'signed-int8'}};
-    const metadata = ['model.yaml', 'tokenizer.json.gz', 'sentence-prefixes.tsv',
+    const metadata = ['tokenizer.json.gz', 'sentence-prefixes.tsv',
         'synthesis_template.jinja', 'NOTICE', 'licenses/OMNIVOICE-CC-BY-NC-4.0.txt',
         'licenses/META-LLAMA-3-LICENSE.txt', 'licenses/META-LLAMA-3-USE-POLICY.md',
         'licenses/HIGGS-AUDIO-2-LICENSE.txt'];
@@ -232,7 +232,7 @@ test('Kidi OmniVoice Hub package streams one safetensors file by ranges', async 
         assert.equal(loaded.precision, 'signed-int8');
         assert.equal(loaded.heapWeightBytes, weights.length);
         assert.deepEqual([...nodes.get('/model/model.safetensors').contents], [...weights]);
-        assert.ok(files.has('/model/model.yaml'));
+        assert.ok(files.has('/model/config.json'));
         assert.ok(files.has('/model/licenses/HIGGS-AUDIO-2-LICENSE.txt'));
         assert.equal(await isModelCached(source), true);
     } finally {
@@ -363,11 +363,11 @@ test('Hub ranges are cached sign-flipped once and reload into owned memory witho
         assert.deepEqual([...first.HEAPU8.subarray(destination, destination + 8)], Array(8).fill(0x12 ^ 0x88));
         assert.throws(() => first.kidiExternal.gather('model.language_model.embed_tokens_per_layer.embedding_quantized',
             rows, 3, destination, 4), /outside/);
-        const descriptor = JSON.parse(first.files.get('/model/model.yaml'));
+        const descriptor = JSON.parse(new TextDecoder().decode(first.files.get('/model/config.json')));
         assert.deepEqual(descriptor.external_tensors, [{name: 'model.language_model.embed_tokens_per_layer.embedding_quantized',
             dtype: 'u8', shape: [2, 4]}]);
-        assert.deepEqual(JSON.parse(new TextDecoder().decode(first.files.get('/model/config.json'))), config);
-        assert.equal(descriptor.model.packed_weights_signed, true);
+        assert.equal(descriptor.model_type, config.model_type);
+        assert.equal(descriptor.packed_weights_signed, true);
         assert.deepEqual(descriptor.decode, {maximum_new_tokens: 1024, context_size: 9216});
         const rangeKey = [...cache.keys()].find(key => key.endsWith('kidi_range=0-8388607'));
         const cachedFirst = new Uint8Array(await cache.get(rangeKey).clone().arrayBuffer());

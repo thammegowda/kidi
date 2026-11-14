@@ -13,14 +13,13 @@
 namespace kidi::checkpoint {
 using ops::require;
 
-auto prepare(const std::filesystem::path& path, const ConfigAdapter& adapter,
-             PreparationHook customize) -> Result<std::filesystem::path> {
+auto prepare(const std::filesystem::path& path, PreparationHook customize) -> Result<std::filesystem::path> {
     static std::mutex conversion_mutex;
     std::scoped_lock lock(conversion_mutex);
     std::filesystem::path temporary;
     try {
         if (!customize) throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "missing checkpoint preparation hook"});
-        const auto config = require(load_config(path, adapter));
+        const auto config = require(load_config(path));
         const auto policy = require(customize(config));
         const auto cache_name = std::filesystem::path(policy.cache_directory);
         if (cache_name.empty() || cache_name.has_parent_path() || cache_name == "." || cache_name == ".." ||
@@ -31,11 +30,13 @@ auto prepare(const std::filesystem::path& path, const ConfigAdapter& adapter,
         const auto source_time = std::filesystem::last_write_time(source_path).time_since_epoch().count();
         const auto root = source_path.parent_path();
         const auto destination = root / cache_name;
-        const ConfigSource source{root, {}, {}};
         for (const auto& name : policy.files) {
-            if (std::filesystem::path(name).has_parent_path())
+            const auto sidecar = std::filesystem::path(name);
+            if (sidecar.empty() || sidecar.has_parent_path() || sidecar == "." || sidecar == "..")
                 throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "checkpoint sidecars must be filenames"});
-            require(source.file(name));
+            if (!std::filesystem::is_regular_file(root / sidecar))
+                throw ops::Failure(
+                    {ErrorCode::INVALID_MANIFEST, "package file does not exist: " + (root / sidecar).string()});
         }
         if (std::filesystem::exists(destination)) {
             const auto valid = [&] {

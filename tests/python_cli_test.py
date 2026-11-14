@@ -4,6 +4,7 @@ import os
 import importlib.util
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -55,61 +56,126 @@ class HubCliTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "expected 3"):
                 _activation_quantization(path, 3, "p99.99")
 
-    def test_resolution_only_after_valid_arguments(self):
-        with patch("kidi.hub.resolve") as resolve:
-            self.assertEqual(kidi.main(["chat", "--help", "-m", "@google/example"]), 0)
-            self.assertEqual(kidi.main(["chat", "-m", "@google/example", "--not-an-option"]), 2)
-            self.assertEqual(kidi.main(["inspect", "-m", "/nonexistent-kidi-test"]), 1)
-            resolve.assert_not_called()
-        for args, cache in [(["-m", "@google/example"], "~/.cache/kidi/model-hub"),
-                            (["--model=@google/example", "-c", "custom cache"], "custom cache"),
-                            (["-m=@google/example", "--cache=other"], "other")]:
-            with self.subTest(args=args), patch("kidi.hub.resolve", return_value=Path("/nonexistent-kidi-test")) as resolve:
-                self.assertEqual(kidi.main(["inspect", *args]), 1)
-                resolve.assert_called_once_with("google/example", cache)
+    def _install_mock_hf(self, root: Path, repo_root: Path, log_path: Path) -> str:
+        bin_dir = root / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        script = bin_dir / "hf"
+        script.write_text(
+            f"#!{sys.executable}\n"
+            "import json, shutil, sys\n"
+            "from pathlib import Path\n"
+            f"repo_root = Path({str(repo_root)!r})\n"
+            f"log_path = Path({str(log_path)!r})\n"
+            "args = sys.argv[1:]\n"
+            "with log_path.open('a', encoding='utf-8') as f:\n"
+            "    f.write(json.dumps(args) + '\\n')\n"
+            "assert args[0] == 'download', args\n"
+            "repo_id = args[1]\n"
+            "local_dir = Path(args[args.index('--local-dir') + 1])\n"
+            "local_dir.mkdir(parents=True, exist_ok=True)\n"
+            "src = repo_root / repo_id\n"
+            "if not src.is_dir():\n"
+            "    sys.exit(1)\n"
+            "if 'config.json' in args and '--include' not in args:\n"
+            "    cfg = src / 'config.json'\n"
+            "    if not cfg.is_file():\n"
+            "        sys.exit(1)\n"
+            "    shutil.copy2(cfg, local_dir / 'config.json')\n"
+            "else:\n"
+            "    includes = [args[i + 1] for i, a in enumerate(args) if a == '--include']\n"
+            "    for rel in includes:\n"
+            "        candidate = src / rel\n"
+            "        if candidate.is_file():\n"
+            "            dst = local_dir / rel\n"
+            "            dst.parent.mkdir(parents=True, exist_ok=True)\n"
+            "            shutil.copy2(candidate, dst)\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return str(bin_dir)
 
-    def test_missing_extra(self):
-        from kidi.hub import resolve
+    def test_resolution_only_after_valid_arguments_and_missing_hf(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            repos = base / "repos"
+            log_path = base / "hf.log"
+            bin_dir = self._install_mock_hf(base, repos, log_path)
+            with patch.dict(os.environ, {"PATH": bin_dir}):
+                self.assertEqual(kidi.main(["chat", "--help", "-m", "@google/example"]), 0)
+                self.assertEqual(kidi.main(["chat", "-m", "@google/example", "--not-an-option"]), 2)
+                self.assertEqual(kidi.main(["inspect", "-m", "/nonexistent-kidi-test"]), 1)
+                self.assertFalse(log_path.exists())
+                for args, cache_name in [
+                    (["--model=@google/example", "-c", str(base / "custom cache")], base / "custom cache"),
+                    (["-m=@google/example", f"--cache={base / 'other'}"], base / "other"),
+                ]:
+                    log_path.unlink(missing_ok=True)
+                    self.assertEqual(kidi.main(["inspect", *args]), 1)
+                    calls = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+                    self.assertEqual(len(calls), 1)
+                    self.assertIn(str(cache_name / "google" / "example"), calls[0])
+            with patch.dict(os.environ, {"PATH": ""}):
+                self.assertEqual(kidi.main(["inspect", "-m", "@google/example", "-c", str(base / "empty")]), 1)
 
-        with patch.dict(sys.modules, {"huggingface_hub": None}):
-            with self.assertRaisesRegex(RuntimeError, r"kidi\[hf\]"):
-                resolve("google/example")
-
-    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
     def test_whisper_checkpoint_stays_unchanged(self):
-        from kidi.hub import resolve
-
         for model, hidden, layers, heads, ffn, bins, vocabulary in [
             ("whisper-tiny", 384, 4, 6, 1536, 80, 51865),
             ("whisper-large-v3", 1280, 32, 20, 5120, 128, 51866),
             ("whisper-large-v3-turbo", 1280, 32, 20, 5120, 128, 51866),
         ]:
             with self.subTest(model=model), tempfile.TemporaryDirectory() as root:
-                cache = Path(root).resolve()
-                snapshot = cache / f"models--openai--{model}" / "snapshots" / ("c" * 40)
-                snapshot.mkdir(parents=True)
-                config = {"model_type": "whisper", "architectures": ["WhisperForConditionalGeneration"],
-                          "d_model": hidden, "encoder_layers": layers,
-                          "decoder_layers": 4 if model.endswith("-turbo") else layers,
-                          "encoder_attention_heads": heads, "decoder_attention_heads": heads,
-                          "encoder_ffn_dim": ffn, "decoder_ffn_dim": ffn,
-                          "num_mel_bins": bins, "vocab_size": vocabulary}
-                (snapshot / "config.json").write_text(json.dumps(config))
+                base = Path(root).resolve()
+                repos = base / "repos"
+                cache = base / "cache"
+                log_path = base / "hf.log"
+                bin_dir = self._install_mock_hf(base, repos, log_path)
+                repo_dir = repos / "openai" / model
+                repo_dir.mkdir(parents=True)
+                config = {
+                    "model_type": "whisper",
+                    "architectures": ["WhisperForConditionalGeneration"],
+                    "activation_function": "gelu",
+                    "scale_embedding": False,
+                    "is_encoder_decoder": True,
+                    "use_cache": True,
+                    "activation_dropout": 0.0,
+                    "attention_dropout": 0.0,
+                    "decoder_layerdrop": 0.0,
+                    "dropout": 0.0,
+                    "encoder_layerdrop": 0.0,
+                    "max_source_positions": 1500,
+                    "max_target_positions": 448,
+                    "d_model": hidden,
+                    "encoder_layers": layers,
+                    "decoder_layers": 4 if model.endswith("-turbo") else layers,
+                    "encoder_attention_heads": heads,
+                    "decoder_attention_heads": heads,
+                    "encoder_ffn_dim": ffn,
+                    "decoder_ffn_dim": ffn,
+                    "num_mel_bins": bins,
+                    "vocab_size": vocabulary,
+                }
+                (repo_dir / "config.json").write_text(json.dumps(config))
                 for name in ("model.safetensors", "tokenizer.json", "preprocessor_config.json", "generation_config.json"):
-                    (snapshot / name).write_text("{}")
-                with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
-                    self.assertEqual(resolve(f"openai/{model}", cache), snapshot)
-                    self.assertFalse((snapshot / "model.yaml").exists())
-                    patterns = download.call_args.kwargs["allow_patterns"]
-                    self.assertIn("preprocessor_config.json", patterns)
-                    self.assertIn("generation_config.json", patterns)
+                    (repo_dir / name).write_text("{}")
+                with patch.dict(os.environ, {"PATH": bin_dir}):
+                    # inspect downloads into <cache>/openai/<model> cleanly (then fails reading empty safetensors)
+                    self.assertEqual(kidi.main(["inspect", "-m", f"@openai/{model}", "-c", str(cache)]), 1)
+                    local_dir = cache / "openai" / model
+                    self.assertTrue((local_dir / "config.json").is_file())
+                    self.assertTrue((local_dir / "preprocessor_config.json").is_file())
+                    self.assertTrue((local_dir / "generation_config.json").is_file())
+                    self.assertFalse((local_dir / "model.yaml").exists())
                 if model == "whisper-large-v3":
+                    log_path.unlink(missing_ok=True)
+                    shutil.rmtree(cache)
                     config["num_mel_bins"] = 80
-                    (snapshot / "config.json").write_text(json.dumps(config))
-                    with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
-                        with self.assertRaisesRegex(ValueError, "Automatic setup supports"):
-                            resolve(f"openai/{model}", cache)
-                        self.assertEqual(download.call_count, 1)
+                    (repo_dir / "config.json").write_text(json.dumps(config))
+                    with patch.dict(os.environ, {"PATH": bin_dir}):
+                        self.assertEqual(kidi.main(["inspect", "-m", f"@openai/{model}", "-c", str(cache)]), 1)
+                        # Fails after pass 1 config.json check without downloading weights
+                        calls = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+                        self.assertEqual(len(calls), 1)
 
     def test_whisper_window_validation(self):
         import wave
@@ -134,192 +200,87 @@ class HubCliTest(unittest.TestCase):
                     self.assertEqual(kidi.main([*base, "--out", str(alias)]), 2)
                 self.assertEqual(path.read_bytes(), original)
 
-    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
-    def test_cached_setup_and_validation(self):
-        import yaml
-        from kidi.hub import resolve
-        from kidi.converters.gemma4 import configure
-
+    def test_cached_setup_and_package_validation(self):
         with tempfile.TemporaryDirectory() as root:
-            cache = Path(root).resolve()
-            snapshot = cache / "models--google--example" / "snapshots" / ("a" * 40)
-            snapshot.mkdir(parents=True)
-            original = {"model_type": "gemma4", "text_config": {"hidden_size": 4},
-                        "quantization_config": {"quant_method": "gemma"}}
-            (snapshot / "config.json").write_text(json.dumps(original))
-            with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
-                with self.assertRaisesRegex(ValueError, "Missing model.safetensors"):
-                    resolve("google/example", cache)
-                self.assertFalse((snapshot / "model.yaml").exists())
-                (snapshot / "model.safetensors").write_bytes(b"test weights")
-                (snapshot / "tokenizer.json").write_text("{}")
-                (snapshot / "tokenizer_config.json").write_text("{}")
-                with self.assertRaisesRegex(ValueError, "chat_template"):
-                    resolve("google/example", cache)
-                self.assertFalse((snapshot / "model.yaml").exists())
-                (snapshot / "chat_template.jinja").write_text("{{ messages }}")
-                self.assertEqual(resolve("google/example@revision", cache), snapshot)
-                self.assertEqual(download.call_args.kwargs["revision"], snapshot.name)
-                self.assertEqual(download.call_args.kwargs["cache_dir"], cache)
-                config = snapshot / "model.yaml"
-                self.assertEqual(yaml.safe_load(config.read_text())["model"]["quantization_config"],
-                                 original["quantization_config"])
-                self.assertEqual(yaml.safe_load(config.read_text())["decode"],
-                                 {"maximum_new_tokens": 8192, "context_size": 16384})
-                saved = config.read_bytes()
-                self.assertEqual(resolve("google/example", cache), snapshot)
-                self.assertEqual(config.read_bytes(), saved)
-                with self.assertRaises(FileExistsError):
-                    configure(snapshot)
-                self.assertEqual(config.read_bytes(), saved)
-                self.assertFalse(list(snapshot.glob(".model.yaml.*")))
-                self.assertEqual((snapshot / "model.safetensors").read_bytes(), b"test weights")
-                legacy = yaml.safe_load(saved)
-                legacy["decode"] = {"maximum_new_tokens": 256, "context_size": 2048}
-                config.write_text(yaml.safe_dump(legacy))
-                resolve("google/example", cache)
-                self.assertEqual(config.read_bytes(), saved)
-                customized = yaml.safe_load(saved)
-                customized["decode"]["maximum_new_tokens"] = 512
-                config.write_text(yaml.safe_dump(customized))
-                custom_bytes = config.read_bytes()
-                resolve("google/example", cache)
-                self.assertEqual(config.read_bytes(), custom_bytes)
-                (snapshot / "model.safetensors").unlink()
-                with self.assertRaisesRegex(ValueError, "Missing model.safetensors"):
-                    resolve("google/example", cache)
-                config.unlink()
-                original["model_type"] = "unsupported"
-                (snapshot / "config.json").write_text(json.dumps(original))
-                download.reset_mock()
-                with self.assertRaisesRegex(ValueError, "Automatic setup supports"):
-                    resolve("google/example", cache)
-                self.assertEqual(download.call_count, 1)
+            base = Path(root).resolve()
+            repos = base / "repos"
+            cache = base / "cache"
+            log_path = base / "hf.log"
+            bin_dir = self._install_mock_hf(base, repos, log_path)
 
-    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
-    def test_preconfigured_package_paths(self):
-        import yaml
-        from kidi.hub import resolve
+            gemma_repo = repos / "google" / "example"
+            gemma_repo.mkdir(parents=True)
+            original = {
+                "model_type": "gemma4",
+                "text_config": {"hidden_size": 4},
+                "quantization_config": {"quant_method": "gemma"},
+            }
+            (gemma_repo / "config.json").write_text(json.dumps(original))
+            with patch.dict(os.environ, {"PATH": bin_dir}):
+                # Missing model.safetensors
+                self.assertEqual(kidi.main(["inspect", "-m", "@google/example", "-c", str(cache)]), 1)
+                (gemma_repo / "model.safetensors").write_bytes(b"invalid safetensors")
+                (gemma_repo / "tokenizer.json").write_text("{}")
+                (gemma_repo / "tokenizer_config.json").write_text("{}")
+                # Missing chat_template
+                self.assertEqual(kidi.main(["inspect", "-m", "@google/example", "-c", str(cache)]), 1)
+                (gemma_repo / "chat_template.jinja").write_text("{{ messages }}")
+                log_path.unlink(missing_ok=True)
+                self.assertEqual(kidi.main(["inspect", "-m", "@google/example@rev1", "-c", str(cache)]), 1)
+                calls = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(calls), 2)
+                self.assertIn("rev1", calls[0])
+                self.assertFalse((cache / "google" / "example" / "model.yaml").exists())
 
-        with tempfile.TemporaryDirectory() as root:
-            snapshot = Path(root).resolve() / ("b" * 40)
-            snapshot.mkdir()
-            document = {"format_version": 1, "model": {"type": "rtg_transformer_nmt"}, "decode": {},
-                        "weights_file": "weights.safetensors",
-                        "tokenizers": {"source": "src.json.gz", "target": "tgt.json.gz"}}
-            config = snapshot / "model.yaml"
-            config.write_text(yaml.safe_dump(document))
+                # Cached <cache>/google/example resolves without invoking hf at all (even with empty PATH).
+                log_path.unlink(missing_ok=True)
+            with patch.dict(os.environ, {"PATH": ""}):
+                self.assertEqual(kidi.main(["inspect", "-m", "@google/example", "-c", str(cache)]), 1)
+                self.assertFalse(log_path.exists())
+
+            # RTG, OmniVoice, and Kokoro config.json path validation
+            rtg_repo = repos / "owner" / "rtg"
+            rtg_repo.mkdir(parents=True)
+            rtg_doc = {
+                "model_type": "rtg_transformer_nmt",
+                "decode": {"beam_size": 4},
+                "io": {"input_format": "moses_tokenized", "output_format": "moses_tokenized"},
+                "weights_file": "weights.safetensors",
+                "tokenizers": {"source": "src.json.gz", "target": "tgt.json.gz"},
+            }
             for name in ("weights.safetensors", "src.json.gz", "tgt.json.gz"):
-                (snapshot / name).write_bytes(b"fixture")
-            saved = config.read_bytes()
-            with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
-                self.assertEqual(resolve("owner/rtg", root), snapshot)
-                self.assertEqual(config.read_bytes(), saved)
-                self.assertIn("src.json.gz", download.call_args.kwargs["allow_patterns"])
+                (rtg_repo / name).write_bytes(b"fixture")
+            with patch.dict(os.environ, {"PATH": bin_dir}):
                 for unsafe in ("../outside", "/absolute", "*.safetensors", "C:\\weights"):
-                    document["weights_file"] = unsafe
-                    config.write_text(yaml.safe_dump(document))
-                    with self.assertRaisesRegex(ValueError, "Invalid package file path"):
-                        resolve("owner/rtg", root)
+                    shutil.rmtree(cache, ignore_errors=True)
+                    log_path.unlink(missing_ok=True)
+                    rtg_doc["weights_file"] = unsafe
+                    (rtg_repo / "config.json").write_text(json.dumps(rtg_doc))
+                    self.assertEqual(kidi.main(["inspect", "-m", "@owner/rtg", "-c", str(cache)]), 1)
+                    calls = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+                    self.assertEqual(len(calls), 1)
 
-    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
-    def test_preconfigured_omnivoice_package(self):
-        import yaml
-        from kidi.hub import resolve
-
-        with tempfile.TemporaryDirectory() as root:
-            snapshot = Path(root).resolve() / ("d" * 40)
-            snapshot.mkdir()
-            document = {
-                "format_version": 1,
-                "task": "tts",
-                "model": {"type": "omnivoice"},
-                "synthesis": {},
-                "license_files": ["NOTICE"],
-                "weights_file": "model.safetensors",
-                "tokenizer_file": "tokenizer.json",
-                "template_file": "synthesis_template.jinja",
-                "sentence_prefixes_file": "sentence-prefixes.tsv",
-            }
-            config = snapshot / "model.yaml"
-            config.write_text(yaml.safe_dump(document))
-            for name in (
-                "model.safetensors",
-                "tokenizer.json",
-                "synthesis_template.jinja",
-                "sentence-prefixes.tsv",
-                "NOTICE",
-            ):
-                (snapshot / name).write_bytes(b"fixture")
-            with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
-                self.assertEqual(resolve("owner/omnivoice", root), snapshot)
-                patterns = download.call_args.kwargs["allow_patterns"]
-                self.assertIn("model.safetensors", patterns)
-                self.assertIn("tokenizer.json", patterns)
-                document.pop("task")
-                config.write_text(yaml.safe_dump(document))
-                with self.assertRaisesRegex(ValueError, "task: tts"):
-                    resolve("owner/omnivoice", root)
-
-    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
-    def test_preconfigured_kokoro_package(self):
-        import yaml
-        from kidi.hub import resolve
-
-        with tempfile.TemporaryDirectory() as root:
-            snapshot = Path(root).resolve() / ("e" * 40)
-            snapshot.mkdir()
-            document = {
-                "format_version": 1,
-                "task": "tts",
-                "model": {"type": "kokoro"},
-                "synthesis": {"default_voice": "af_heart"},
-                "license_files": ["NOTICE"],
-                "weights_file": "model.safetensors",
-                "lexicon_file": "lexicon-us.tsv",
-                "sentence_prefixes_file": "sentence-prefixes.tsv",
-            }
-            config = snapshot / "model.yaml"
-            config.write_text(yaml.safe_dump(document))
-            for name in ("model.safetensors", "lexicon-us.tsv", "sentence-prefixes.tsv", "NOTICE"):
-                (snapshot / name).write_bytes(b"fixture")
-            with patch("huggingface_hub.snapshot_download", return_value=str(snapshot)) as download:
-                self.assertEqual(resolve("owner/kokoro", root), snapshot)
-                patterns = download.call_args.kwargs["allow_patterns"]
-                self.assertIn("model.safetensors", patterns)
-                self.assertIn("lexicon-us.tsv", patterns)
-                (snapshot / "NOTICE").unlink()
-                with self.assertRaisesRegex(ValueError, "Missing NOTICE"):
-                    resolve("owner/kokoro", root)
-
-
-    @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "requires kidi[hf]")
     def test_gemma4_assistant_resolution_and_cli_speculative(self):
-        import shutil
-        import yaml
-        from kidi.hub import resolve
-
         repo_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as root:
-            cache = Path(root).resolve()
-            assistant_snap = cache / "models--google--gemma-4-E2B-it-assistant" / "snapshots" / ("f" * 40)
-            assistant_snap.mkdir(parents=True)
-            shutil.copy2(repo_root / "tests/data/gemma4-assistant/config.json", assistant_snap / "config.json")
-            shutil.copy2(repo_root / "tests/data/gemma4-assistant/model.safetensors",
-                         assistant_snap / "model.safetensors")
-            with patch("huggingface_hub.snapshot_download", return_value=str(assistant_snap)) as download:
-                self.assertEqual(resolve("google/gemma-4-E2B-it-assistant", cache), assistant_snap)
-                self.assertFalse((assistant_snap / "model.yaml").exists())
-                self.assertEqual(set(download.call_args.kwargs["allow_patterns"]),
-                                 {"config.json", "model.safetensors", "model.yaml"})
+            base = Path(root).resolve()
+            repos = base / "repos"
+            cache = base / "cache"
+            log_path = base / "hf.log"
+            bin_dir = self._install_mock_hf(base, repos, log_path)
 
-            target_dir = cache / "target"
+            assistant_repo = repos / "google" / "gemma-4-E2B-it-assistant"
+            assistant_repo.mkdir(parents=True)
+            shutil.copy2(repo_root / "tests/data/gemma4-assistant/config.json", assistant_repo / "config.json")
+            shutil.copy2(repo_root / "tests/data/gemma4-assistant/model.safetensors",
+                         assistant_repo / "model.safetensors")
+
+            target_dir = base / "target"
             target_dir.mkdir()
             shutil.copy2(repo_root / "tests/data/gemma4/model.safetensors", target_dir / "model.safetensors")
-            doc = yaml.safe_load((repo_root / "tests/data/gemma4/model.yaml").read_text())
-            doc.update({"format_version": 1, "weights_file": "model.safetensors", "tokenizer_file": "tokenizer.json",
-                        "decode": {"context_size": 16, "maximum_new_tokens": 6}})
-            (target_dir / "model.yaml").write_text(yaml.safe_dump(doc))
+            doc = json.loads((repo_root / "tests/data/gemma4/config.json").read_text())
+            doc["decode"] = {"context_size": 16, "maximum_new_tokens": 6}
+            (target_dir / "config.json").write_text(json.dumps(doc))
             (target_dir / "tokenizer.json").write_text(json.dumps({
                 "version": "1.0", "pre_tokenizer": {"type": "WhitespaceSplit"},
                 "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": False},
@@ -332,20 +293,22 @@ class HubCliTest(unittest.TestCase):
             (target_dir / "chat_template.jinja").write_text(
                 "<bos>{% for m in messages %}<|turn>{{ m.role }}\n{{ m.content }}<turn|>\n{% endfor %}<|turn>model\n"
             )
-            req_file = cache / "req.jsonl"
-            out_file = cache / "out.jsonl"
+            req_file = base / "req.jsonl"
+            out_file = base / "out.jsonl"
             req_file.write_text('{"messages":[{"role":"user","content":"alpha beta"}],"max_tokens":4}\n')
 
             for assistant_arg in ("@google/gemma-4-E2B-it-assistant", "google/gemma-4-E2B-it-assistant"):
                 out_file.unlink(missing_ok=True)
-                with patch("kidi.hub.resolve", return_value=assistant_snap) as mocked_resolve:
+                shutil.rmtree(cache, ignore_errors=True)
+                with patch.dict(os.environ, {"PATH": bin_dir}):
                     code = kidi.main([
                         "generate", "-m", str(target_dir), "-c", str(cache),
                         "--assistant-model", assistant_arg, "--draft-tokens", "2",
                         "--ignore-eos", "-i", str(req_file), "-o", str(out_file), "--profile",
                     ])
                     self.assertEqual(code, 0)
-                    mocked_resolve.assert_called_once_with("google/gemma-4-E2B-it-assistant", str(cache))
+                    self.assertTrue((cache / "google" / "gemma-4-E2B-it-assistant" / "config.json").is_file())
+                    self.assertFalse((cache / "google" / "gemma-4-E2B-it-assistant" / "model.yaml").exists())
                     row = json.loads(out_file.read_text().strip())
                     self.assertTrue(row["speculative"])
                     self.assertGreater(row["verification_steps"], 0)

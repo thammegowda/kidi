@@ -380,7 +380,7 @@ rope_parameters: {rope_theta: 10000}
         std::cout << "FP32 and QAT vision encoder CPU/WebGPU feature parity passed\n";
         for (const auto* fixture : {"gemma4", "gemma4-qat"}) {
             const auto directory = std::filesystem::path("/fixtures") / fixture;
-            const auto config = YAML::LoadFile((directory / "model.yaml").string())["model"];
+            const auto config = YAML::LoadFile((directory / "config.json").string());
             auto weights = ops::require(checkpoint::Weights::load(directory / "model.safetensors"));
             auto reference = ops::require(checkpoint::Weights::load(directory / "reference.safetensors"));
             const auto token_storage = ops::require(reference.tensor("tokens"));
@@ -413,7 +413,7 @@ rope_parameters: {rope_theta: 10000}
 extern "C" EMSCRIPTEN_KEEPALIVE auto kidi_gpu_diagnose() -> int {
     try {
         using namespace kidi;
-        const auto config = ops::require(checkpoint::load_config("/model/model.yaml"));
+        const auto config = ops::require(checkpoint::load_config("/model"));
         auto weights = ops::require(checkpoint::Weights::load("/model/model.safetensors"));
         auto tokenizer = ops::require(text::Tokenizer::load("/model/tokenizer.json"));
         const std::array messages{text::ChatMessage{"user", "Name three practical uses of binary search."}};

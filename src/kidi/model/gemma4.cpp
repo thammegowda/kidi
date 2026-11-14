@@ -224,40 +224,6 @@ struct Gemma4Impl::State {
     }
 };
 
-auto Gemma4Impl::checkpoint_config() -> checkpoint::ConfigAdapter {
-    return {"config.json", [](const checkpoint::ConfigSource& source) -> Result<YAML::Node> {
-                const auto& document = source.document;
-                const auto type = document["model_type"].as<std::string>("");
-                if (type != "gemma4" && type != "gemma4_text")
-                    return std::unexpected(Error{ErrorCode::UNSUPPORTED, "checkpoint is not a Gemma 4 model"});
-                YAML::Node config;
-                config["format_version"] = 1;
-                const auto text = document["text_config"];
-                config["model"] = YAML::Clone(text && text.IsMap() ? text : document);
-                config["model"]["type"] = "gemma4_text";
-                const auto quantization = document["quantization_config"];
-                if (quantization && quantization.IsMap())
-                    config["model"]["quantization_config"] = YAML::Clone(quantization);
-                if (config["model"]["quantization_config"].IsNull()) config["model"].remove("quantization_config");
-                if (!config["model"]["tie_word_embeddings"] && document["tie_word_embeddings"])
-                    config["model"]["tie_word_embeddings"] = document["tie_word_embeddings"];
-                constexpr std::array<std::string_view, 1> candidates{"model.safetensors"};
-                const auto weights = require(source.weights(candidates));
-                if (weights["format"].as<std::string>() != "safetensors")
-                    return std::unexpected(Error{ErrorCode::UNSUPPORTED, "Gemma 4 requires safetensors weights"});
-                config["weights_file"] = weights["path"];
-                config["tokenizer_file"] = require(source.file("tokenizer.json")).string();
-                config["decode"]["context_size"] =
-                    std::min<std::size_t>(config["model"]["max_position_embeddings"].as<std::size_t>(16384), 16384);
-                config["decode"]["maximum_new_tokens"] = 8192;
-                if (document["vision_config"]) {
-                    config["vision"] = YAML::Clone(document["vision_config"]);
-                    config["image_token_id"] = document["image_token_id"];
-                }
-                return config;
-            }};
-}
-
 auto Gemma4Impl::validate_config(const YAML::Node& config) -> Result<void> {
     try {
         if (config["quantization_config"] &&

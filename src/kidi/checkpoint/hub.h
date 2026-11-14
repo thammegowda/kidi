@@ -12,10 +12,10 @@ class Hub {
 public:
     Hub(std::string remote, std::filesystem::path local);
 
-    auto resolve(std::string_view model_id, std::string_view revision = "main") const
-        -> Result<std::filesystem::path>;
+    auto resolve(std::string_view model_id, std::string_view revision = "main") const -> Result<std::filesystem::path>;
     auto get_file(std::string_view model_id, std::string_view file, std::string_view revision = "main") const
         -> Result<std::filesystem::path>;
+    auto download(std::string_view reference) const -> Result<std::filesystem::path>;
 
     auto remote() const noexcept -> const std::string& { return remote_; }
     auto local() const noexcept -> const std::filesystem::path& { return local_; }

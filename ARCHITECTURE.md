@@ -111,24 +111,23 @@ than a particular format reader. There are no compatibility aliases in `model`.
 ## Configuration
 
 Configuration stays in `YAML::Node`; there are no model-specific configuration
-structs or mirrored manifest types. `checkpoint::load_config` reads `model.yaml`,
-checks package structure and file paths, and resolves file paths relative to
-the package. The `load_config(path, ConfigAdapter)` overload reads the adapter's
-metadata filename and invokes its model-supplied configuration callback.
-`ConfigSource` supplies the parsed YAML/JSON document and checked file/weight
-resolution; it does not encode a model's required files or dimensions.
-`WhisperImpl::checkpoint_config()` supplies the Hugging Face layout and GGML
-header compatibility rules without writing a manifest. `Package::config()`
-exposes RTG package documents.
+structs or mirrored manifest types. Every model directory (both upstream Hugging
+Face checkpoints and converted Kidi packages) uses a single `config.json`
+manifest keyed by `model_type`. `checkpoint::load_config` reads `config.json`,
+validates relative file paths against path traversal, checks Whisper GGML header
+compatibility when applicable, and returns a normalized package document with
+resolved paths (`weights_file`, `tokenizer_file`, and task-specific sidecars).
+`checkpoint::hub_files` shares the same `model_type` rules to determine which
+repository files a Hub download needs. `Package::config()` exposes RTG package
+documents.
 
-`Gemma4Impl::checkpoint_config()` adapts an ordinary Gemma 4 checkpoint directory
-when no `model.yaml` is present. It reads the wrapper's `text_config`, or a direct
-text-model config, and keeps the architecture and quantization metadata intact.
-Generation and inspection accept either representation. Dense E2B/E4B topology
-comes from dimensions and layer metadata; there is no model-size/name switch.
-Actual tensor headers select the construction dtype, while registration checks
-the checkpoint shapes and encoding. Native QAT calibration is not silently
-replaced with BF16 arithmetic.
+For Gemma 4 (`model_type` `"gemma4"` or `"gemma4_text"`), `checkpoint::load_config`
+reads the wrapper's `text_config` (or a direct text-model config) and keeps the
+architecture, vision, and quantization metadata intact without generating a
+secondary manifest file. Dense E2B/E4B topology comes from dimensions and layer
+metadata; there is no model-size/name switch. Actual tensor headers select the
+construction dtype, while registration checks the checkpoint shapes and
+encoding. Native QAT calibration is not silently replaced with BF16 arithmetic.
 
 An eager backend resolves activation dtype from the model's parameter dtype.
 Gemma passes this captured construction setting when creating/recreating its
@@ -138,7 +137,7 @@ FP32 weight expansion. QAT retains its existing FP32/calibrated INT8 path. Other
 backends keep their existing arithmetic policy. Public score tensors remain FP32;
 dtype alignment does not imply bit-identical results across different kernels.
 
-`checkpoint::prepare` takes a config adapter and model-owned preparation hook.
+`checkpoint::prepare` takes a model-owned preparation hook.
 The returned `Preparation` describes the source, cache directory/version,
 sidecars, metadata labels and conversion callback. These are persistence
 descriptors, not copies of model architecture fields. No registry or new model
@@ -190,7 +189,7 @@ The old flat manifest layout is not supported or automatically migrated.
 TTS manifests declare every redistributed legal artifact in `license_files`;
 configuration loading and Hub resolution require and path-check the complete
 list alongside weights and tokenizer/frontend data.
-`model.yaml` may list `external_tensors` (name, dtype, shape) that the embedder
+`config.json` may list `external_tensors` (name, dtype, shape) that the embedder
 supplies through `Generator::load`'s `ExternalTensorSource`; `Weights::add`
 registers them beside the file's tensors. The browser uses this for the Gemma
 per-layer embedding table: `tensor::external_tensor` wraps a `RowSource` whose rows
@@ -355,27 +354,22 @@ CLI diagnostics use spdlog on stderr. Translation results and inspection output
 remain on stdout; machine-readable metric/profile records retain their unadorned
 format on stderr. `SPDLOG_LEVEL` controls the human-readable logger.
 
-The Python launcher optionally resolves `--model @owner/repo[@revision]` through
-Hugging Face Hub. Native parsing and help run first; only a validated Hub reference
-invokes the injected `ModelResolver`. `-c/--cache` defaults to
-`~/.cache/kidi/model-hub` and is expanded by Python. Local model paths bypass the
-resolver. The standalone executable has no Python/download dependency and reports
-that Hub references require the Python launcher.
+Both the native `kidi` binary and the Python `python -m kidi` launcher share the
+same C++ CLI and resolve `--model @owner/repo[@revision]` (and `--assistant-model`)
+through `checkpoint::Hub`. Native argument parsing and `--help` run first. `-c/--cache`
+defaults to `~/.cache/kidi/model-hub`, storing each repository as plain regular files
+in `<cache>/<owner>/<repo>/` rather than a symlinked Git-LFS blob/snapshot tree.
+Local model paths bypass `Hub` completely.
 
-The `hf` extra supplies Hub, PyYAML and filelock. The resolver reads model metadata
-first, then downloads required files at the same resolved commit using Hub's normal
-snapshot/blob cache. Ready-made Kidi manifests retain their declared relative file
-paths; unsupported or escaping paths are rejected. Dense Gemma 4 snapshots without
-Kidi YAML use `kidi.converters.gemma4.configure`, under a per-snapshot lock, with an
-atomic no-overwrite config install. A local generated config exactly matching the
-old 256-output/2048-context defaults is atomically upgraded to 8192/16384 under
-that lock; customized configs and downloaded manifests are left alone. Whisper conditional-generation snapshots
-download their original config, Safetensors, tokenizer, preprocessor, and generation metadata without modification. Original
-weights and tokenizer files remain unchanged. Incomplete
-caches fail rather than being marked ready; `HF_HUB_OFFLINE=1` requires cached
-files. No downloaded Python code or pickled checkpoints execute during resolution.
-Explicit trusted RTG conversion is separate in `kidi.converters.rtg` with the
-`convert` extra; its NLCodec helper is bundled in wheels.
+When a `@owner/repo` model is not yet cached locally, `checkpoint::Hub::download`
+delegates to the `hf` CLI in `PATH` (`hf download ... --local-dir <cache>/<owner>/<repo>`),
+fetching `config.json` first to validate `model_type` and build the exact `--include`
+allow-list before downloading weights and sidecars. Original checkpoints remain
+completely unmodified on disk. If `hf` is absent from `PATH` or fails, Kidi exits
+cleanly with instructions to activate an environment providing `hf` (`kidi[hf]`) or
+pass a pre-downloaded local model directory. Offline export scripts (`rtg.py`,
+`kokoro.py`, `omnivoice.py`) live outside the runtime wheel under `tools/converters/`
+and emit self-contained `config.json` + `model.safetensors` packages.
 
 Each model family has its own command rather than one command that branches on
 `model.type`. `translate` serves RTG and reads Moses-tokenized text lines;

@@ -206,7 +206,7 @@ Synthesizer::~Synthesizer() = default;
 
 auto Synthesizer::load(const std::filesystem::path& directory, tensor::Device device) -> Result<Synthesizer> {
     try {
-        auto config = require(checkpoint::load_config(directory / "model.yaml"));
+        auto config = require(checkpoint::load_config(directory));
         const auto type = config["model"]["type"].as<std::string>();
         if (!model::supports_task(type, model::Task::TTS))
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, type + " does not support the TTS task"});

@@ -26,31 +26,31 @@ constexpr std::string_view TOKENIZER_JSON = R"({
   }
 })";
 
-constexpr std::string_view MANIFEST_YAML = R"(format_version: 1
-weights_file: model.safetensors
-tokenizers: {source: tokenizer.src.json, target: tokenizer.tgt.json}
-io: {input_format: moses_tokenized, output_format: moses_tokenized}
-model:
-  type: rtg_transformer_nmt
-  source_tokens: 8
-  encoder_layers: 1
-  decoder_layers: 1
-  hidden_size: 4
-  feed_forward_size: 8
-  attention_heads: 2
-  source_vocabulary_size: 5
-  target_vocabulary_size: 5
-  activation: gelu
-  attention_bias: true
-  tied_embeddings: one-way
-  layer_norm_epsilon: 1.0e-5
-  position_encoding: sinusoidal
-  maximum_position: 32
-decode:
-  beam_size: 2
-  maximum_extra_tokens: 4
-  length_penalty: 0.6
-)";
+constexpr std::string_view MANIFEST_JSON = R"({
+  "model_type": "rtg_transformer_nmt",
+  "weights_file": "model.safetensors",
+  "tokenizers": {"source": "tokenizer.src.json", "target": "tokenizer.tgt.json"},
+  "io": {"input_format": "moses_tokenized", "output_format": "moses_tokenized"},
+  "source_tokens": 8,
+  "encoder_layers": 1,
+  "decoder_layers": 1,
+  "hidden_size": 4,
+  "feed_forward_size": 8,
+  "attention_heads": 2,
+  "source_vocabulary_size": 5,
+  "target_vocabulary_size": 5,
+  "activation": "gelu",
+  "attention_bias": true,
+  "tied_embeddings": "one-way",
+  "layer_norm_epsilon": 1.0e-5,
+  "position_encoding": "sinusoidal",
+  "maximum_position": 32,
+  "decode": {
+    "beam_size": 2,
+    "maximum_extra_tokens": 4,
+    "length_penalty": 0.6
+  }
+})";
 
 auto write(const std::filesystem::path& path, std::string_view contents = {}) -> void {
     std::ofstream(path, std::ios::binary) << contents;
@@ -76,7 +76,7 @@ auto main() -> int {
     write_empty_safetensors(directory / "model.safetensors");
     write(directory / "tokenizer.src.json", TOKENIZER_JSON);
     write(directory / "tokenizer.tgt.json", TOKENIZER_JSON);
-    write(directory / "model.yaml", MANIFEST_YAML);
+    write(directory / "config.json", MANIFEST_JSON);
 
     auto package = kidi::checkpoint::Package::load(directory);
     if (!package || package->source_tokenizer().token_id("<s>") != 2 ||
@@ -87,7 +87,7 @@ auto main() -> int {
         std::cerr << "valid RTG package was rejected\n";
         return 1;
     }
-    if (kidi::checkpoint::Package::load(directory / "model.yaml")) {
+    if (kidi::checkpoint::Package::load(directory / "config.json")) {
         std::cerr << "manifest path was accepted as a model directory\n";
         return 1;
     }
@@ -120,18 +120,18 @@ auto main() -> int {
     invalid["layer_norm_epsilon"] = std::numeric_limits<float>::quiet_NaN();
     if (kidi::model::TransformerImpl::validate_config(invalid)) return 1;
 
-    auto invalid_decode = YAML::Load(std::string(MANIFEST_YAML));
+    auto invalid_decode = YAML::Load(std::string(MANIFEST_JSON));
     invalid_decode["decode"]["beam_size"] = 0;
-    write(directory / "model.yaml", YAML::Dump(invalid_decode));
+    write(directory / "config.json", YAML::Dump(invalid_decode));
     auto translator = kidi::inference::Translator::load(directory, kidi::module_device);
     if (translator || translator.error().code != kidi::ErrorCode::INVALID_ARGUMENT) return 1;
     invalid_decode["decode"]["beam_size"] = 1;
     invalid_decode["decode"]["length_penalty"] = std::numeric_limits<float>::quiet_NaN();
-    write(directory / "model.yaml", YAML::Dump(invalid_decode));
+    write(directory / "config.json", YAML::Dump(invalid_decode));
     translator = kidi::inference::Translator::load(directory, kidi::module_device);
     if (translator || translator.error().code != kidi::ErrorCode::INVALID_ARGUMENT) return 1;
 
-    write(directory / "model.yaml", MANIFEST_YAML);
+    write(directory / "config.json", MANIFEST_JSON);
     const std::string original(TOKENIZER_JSON);
     auto reordered = original;
     const std::string vocabulary = R"("<pad>": 0, "<unk>": 1, "<s>": 2, "</s>": 3, "hi": 4)";

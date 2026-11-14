@@ -47,8 +47,7 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
     try {
         if (!device.capabilities().supports_audio_transformer())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "device lacks the operations required for Whisper inference"});
-        const auto adapter = model::WhisperImpl::checkpoint_config();
-        auto config = require(checkpoint::load_config(directory, adapter));
+        auto config = require(checkpoint::load_config(directory));
         require(model::WhisperImpl::validate_config(config["model"]));
         auto extractor =
             require(audio::WhisperFeatureExtractor::load(config["preprocessor_config_file"].as<std::string>()));
@@ -81,14 +80,14 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
                 throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Whisper special token is outside vocabulary"});
         std::optional<checkpoint::Weights> weights;
         if (config["weights_format"].as<std::string>("") != "whisper_ggml") {
-            weights.emplace(require(checkpoint::Weights::load(config["model_file"].as<std::string>())));
+            weights.emplace(require(checkpoint::Weights::load(config["weights_file"].as<std::string>())));
             const auto precision = require(weights->tensor("model.encoder.layers.0.fc1.weight")).dtype();
             if (precision == tensor::DType::F16 || precision == tensor::DType::BF16) weights.reset();
         }
         if (!weights) {
-            config = require(checkpoint::load_config(
-                require(checkpoint::prepare(directory, adapter, model::WhisperImpl::int8_preparation)), adapter));
-            weights.emplace(require(checkpoint::Weights::load(config["model_file"].as<std::string>())));
+            config = require(
+                checkpoint::load_config(require(checkpoint::prepare(directory, model::WhisperImpl::int8_preparation))));
+            weights.emplace(require(checkpoint::Weights::load(config["weights_file"].as<std::string>())));
         }
         const auto parameter = require(weights->tensor("model.encoder.layers.0.fc1.weight"));
         const ModuleScope construction(parameter.dtype(), false, device);

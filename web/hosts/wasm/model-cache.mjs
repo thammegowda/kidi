@@ -9,8 +9,8 @@ const WHISPER_GGML_REVISION = '5359861c739e955e79d9a303bcbc70fb988958b1';
 const WHISPER_SIZES = {384: 'tiny', 512: 'base', 768: 'small'};
 const isWhisper = config => config.model_type === 'whisper' &&
     config.architectures?.includes('WhisperForConditionalGeneration');
-const isKidiOmniVoice = config => config.model_type === 'kidi_omnivoice' &&
-    config.architectures?.includes('KidiOmniVoiceForTextToSpeech') && config.kidi_format_version === 1;
+const isKidiOmniVoice = config => (config.model_type === 'omnivoice' || config.model_type === 'kidi_omnivoice') &&
+    config.architectures?.includes('KidiOmniVoiceForTextToSpeech');
 // After the first load the cache keeps the INT8 checkpoint the runtime converted from the GGML weights, so reloads skip
 // the conversion. The name changes with the GGML source and the conversion format.
 const convertedSpeech = configUrl => new URL(`kidi-int8-v1-${WHISPER_GGML_REVISION.slice(0, 12)}.safetensors`, configUrl);
@@ -245,8 +245,7 @@ export async function isModelCached(source) {
             const response = await cache.match(url.href);
             const config = await response.json();
             const required = isKidiOmniVoice(config)
-                ? ['model.yaml', 'tokenizer.json.gz', 'sentence-prefixes.tsv',
-                    'synthesis_template.jinja', 'NOTICE']
+                ? ['tokenizer.json.gz', 'sentence-prefixes.tsv', 'synthesis_template.jinja', 'NOTICE']
                 : isWhisper(config)
                 ? ['tokenizer.json', 'preprocessor_config.json', 'generation_config.json']
                 : ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
@@ -270,7 +269,7 @@ export async function isModelCached(source) {
         }
         const manifest = await (await cache.match(url.href)).json();
         if (manifest.version !== 1 || !Array.isArray(manifest.files) || !/^[a-f0-9]{64}$/.test(manifest.id)) return false;
-        for (const name of ['model.yaml', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json'])
+        for (const name of ['config.json', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json'])
             if (!manifest.files.some(file => file.name === name)) return false;
         return manifest.files.every(file => Array.isArray(file.chunks) && file.chunks.length &&
             file.chunks.every(chunk => keys.has(new URL(`./__kidi_chunks__/${chunk.sha256}`, url).href)));
@@ -584,7 +583,7 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
         module.FS.mkdir('/model');
         metrics.totalBytes += configData.bytes.byteLength;
         metrics.loadedBytes += configData.bytes.byteLength;
-        await writeMetadata(['model.yaml', 'tokenizer.json.gz', 'sentence-prefixes.tsv',
+        await writeMetadata(['tokenizer.json.gz', 'sentence-prefixes.tsv',
             'synthesis_template.jinja', 'NOTICE',
             'licenses/OMNIVOICE-CC-BY-NC-4.0.txt', 'licenses/META-LLAMA-3-LICENSE.txt',
             'licenses/META-LLAMA-3-USE-POLICY.md', 'licenses/HIGGS-AUDIO-2-LICENSE.txt']);
@@ -738,13 +737,11 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
     if (layout.device.some(entry => !entry.handle)) throw new Error('Incomplete GPU weight upload');
     module.kidiExternal = externalTables(module, layout.external, layout.device);
     await writeMetadata(['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja']);
-    module.FS.writeFile('/model/model.yaml', JSON.stringify({format_version: 1,
-        weights_file: 'model.safetensors', tokenizer_file: 'tokenizer.json',
-        model: {...config.text_config, type: 'gemma4_text', packed_weights_signed: true,
-            quantization_config: config.quantization_config},
+    module.FS.writeFile('/model/config.json', new TextEncoder().encode(JSON.stringify({
+        ...config, packed_weights_signed: true,
         external_tensors: [...layout.external, ...layout.device].map(table => ({name: table.name,
             dtype: table.dtype.toLowerCase(), shape: table.shape})),
-        decode: {maximum_new_tokens: 1024, context_size: 9216}}));
+        decode: {maximum_new_tokens: 1024, context_size: 9216}})));
     return {...metrics, warning, model: 'Gemma 4 E2B IT', precision: 'QAT mixed 2/4/8-bit', id: configUrl.href,
         heapWeightBytes: layout.totalBytes, externalWeightBytes: module.kidiExternal.bytes,
         gpuWeightBytes: module.kidiExternal.deviceBytes};
@@ -776,7 +773,7 @@ export async function loadModel(module, manifestUrl, progress, {cacheOnly = fals
         throw new Error('Invalid model manifest');
     const names = new Set();
     const allowed = new Set([
-        'model.yaml', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja',
+        'config.json', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja',
         'sentence-prefixes.tsv', 'synthesis_template.jinja', 'NOTICE',
         'licenses/OMNIVOICE-CC-BY-NC-4.0.txt', 'licenses/META-LLAMA-3-LICENSE.txt',
         'licenses/META-LLAMA-3-USE-POLICY.md', 'licenses/HIGGS-AUDIO-2-LICENSE.txt',
@@ -793,7 +790,7 @@ export async function loadModel(module, manifestUrl, progress, {cacheOnly = fals
                 throw new Error('Invalid model chunk');
         }
     }
-    for (const name of ['model.yaml', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json'])
+    for (const name of ['config.json', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json'])
         if (!names.has(name)) throw new Error(`Missing ${name}`);
     module.FS.mkdir('/model');
     const metrics = {totalBytes: manifest.files.reduce((sum, file) => sum + file.size, 0), loadedBytes: 0, cachedBytes: 0, downloadedBytes: 0};

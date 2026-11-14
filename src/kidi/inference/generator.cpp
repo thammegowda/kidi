@@ -48,8 +48,7 @@ struct Generator::DraftBackend {
     static auto load(const std::filesystem::path& directory, const YAML::Node& target_config, tensor::Device device)
         -> Result<std::unique_ptr<DraftBackend>> {
         try {
-            const auto assistant_config =
-                require(checkpoint::load_config(directory, model::Gemma4AssistantImpl::checkpoint_config()));
+            const auto assistant_config = require(checkpoint::load_config(directory));
             const ModuleScope scope(tensor::DType::F32, false, device);
             auto assistant = require(model::Gemma4AssistantImpl::create(assistant_config["model"], target_config));
             const auto weights = require(checkpoint::Weights::load(assistant_config["weights_file"].as<std::string>()));
@@ -129,9 +128,7 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
 auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions options,
                      const ExternalTensorSource& external) -> Result<Generator> {
     try {
-        auto config = require(std::filesystem::is_regular_file(directory / "model.yaml")
-                                  ? checkpoint::load_config(directory / "model.yaml")
-                                  : checkpoint::load_config(directory, model::Gemma4Impl::checkpoint_config()));
+        auto config = require(checkpoint::load_config(directory));
         require(model::Gemma4Impl::validate_config(config["model"]));
         const bool qat = static_cast<bool>(config["model"]["quantization_config"]);
         if (!options.assistant_model.empty() && !options.device.capabilities().compute.host())
@@ -208,15 +205,6 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
                 throw ops::Failure({ErrorCode::INVALID_MANIFEST, "unknown external tensor dtype: " + dtype_name});
             const auto shape = declared["shape"].as<std::vector<std::int64_t>>();
             require(weights.add(name, require(external(name, *dtype, shape))));
-        }
-        if (std::filesystem::is_regular_file(directory / "config.json") &&
-            weights.contains("model.vision_tower.patch_embedder.input_proj.weight") &&
-            weights.contains("model.embed_vision.embedding_projection.weight")) {
-            const auto upstream = YAML::LoadFile((directory / "config.json").string());
-            if (upstream["vision_config"] && !config["model"]["use_bidirectional_attention"].IsScalar()) {
-                config["vision"] = upstream["vision_config"];
-                config["image_token_id"] = upstream["image_token_id"];
-            }
         }
         const auto parameter = require(weights.tensor(config["model"]["quantization_config"]
                                                           ? "model.language_model.norm.weight"

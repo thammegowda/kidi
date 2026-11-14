@@ -110,43 +110,10 @@ auto WhisperImpl::create(const YAML::Node& config) -> Result<Whisper> {
     }
 }
 
-auto WhisperImpl::checkpoint_config() -> checkpoint::ConfigAdapter {
-    return {
-        "config.json", [](const checkpoint::ConfigSource& source) -> Result<YAML::Node> {
-            const auto& model = source.document;
-            if (!model.IsMap() || model["model_type"].as<std::string>() != "whisper")
-                return std::unexpected(Error{ErrorCode::UNSUPPORTED, "checkpoint is not a Hugging Face Whisper model"});
-            YAML::Node config;
-            config["model"] = YAML::Clone(model);
-            config["model"]["type"] = "whisper";
-            constexpr std::array<std::string_view, 2> candidates{"model.safetensors", "ggml-model.bin"};
-            const auto weights = require(source.weights(candidates));
-            config["model_file"] = weights["path"];
-            if (weights["format"].as<std::string>() == "ggml") {
-                constexpr std::array keys{
-                    "vocab_size",     "max_source_positions", "d_model", "encoder_attention_heads",
-                    "encoder_layers", "max_target_positions", "d_model", "decoder_attention_heads",
-                    "decoder_layers", "num_mel_bins"};
-                for (std::size_t index = 0; index < keys.size(); ++index)
-                    if (model[keys[index]].as<std::int32_t>() != weights["ggml_header"][index].as<std::int32_t>())
-                        return std::unexpected(
-                            Error{ErrorCode::INVALID_MANIFEST,
-                                  "Whisper GGML header disagrees with config: " + std::string(keys[index])});
-                config["weights_format"] = "whisper_ggml";
-            } else if (weights["format"].as<std::string>() == "gguf") {
-                return std::unexpected(Error{ErrorCode::UNSUPPORTED,
-                                             "Whisper GGUF model mapping is not supported; use legacy Whisper GGML"});
-            }
-            for (const auto* name : {"tokenizer.json", "preprocessor_config.json", "generation_config.json"})
-                config[std::filesystem::path(name).stem().string() + "_file"] = require(source.file(name)).string();
-            return config;
-        }};
-}
-
 auto WhisperImpl::int8_preparation(const YAML::Node& config) -> Result<checkpoint::Preparation> {
     auto valid = validate_config(config["model"]);
     if (!valid) return std::unexpected(valid.error());
-    const auto source = std::filesystem::path(config["model_file"].as<std::string>());
+    const auto source = std::filesystem::path(config["weights_file"].as<std::string>());
     const bool imported = config["weights_format"].as<std::string>("") == "whisper_ggml";
     return checkpoint::Preparation{
         .source = source,

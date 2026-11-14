@@ -14,7 +14,6 @@ class Gemma4AssistantImpl : public Module {
 public:
     Gemma4AssistantImpl(const YAML::Node& config, const YAML::Node& target_config);
     ~Gemma4AssistantImpl();
-    static auto checkpoint_config() -> checkpoint::ConfigAdapter;
     static auto validate_config(const YAML::Node& config, const YAML::Node& target_config) -> Result<void>;
     static auto create(const YAML::Node& config, const YAML::Node& target_config) -> Result<Gemma4Assistant>;
     auto set_checkpoint(const checkpoint::Weights& weights) -> Result<void>;

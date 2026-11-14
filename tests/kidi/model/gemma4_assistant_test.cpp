@@ -30,7 +30,7 @@ auto row(const tensor::Tensor& value, std::size_t index) -> tensor::Tensor {
     return require(selected.reshape({1, 1, static_cast<std::int64_t>(selected.size(0))}));
 }
 auto check_reference(const std::filesystem::path& target_directory, const std::filesystem::path& directory) -> bool {
-    const auto config = YAML::LoadFile((target_directory / "model.yaml").string())["model"];
+    const auto config = YAML::LoadFile((target_directory / "config.json").string());
     const auto assistant_config = YAML::LoadFile((directory / "config.json").string());
     const auto reference = require(checkpoint::Weights::load(directory / "reference.safetensors"));
     const auto tokens = require(reference.tensor("tokens"));
@@ -105,13 +105,10 @@ auto check_generation(const std::filesystem::path& fixture, const std::filesyste
         }
     } cleanup{directory};
     std::filesystem::copy_file(fixture / "model.safetensors", directory / "model.safetensors");
-    auto config = YAML::LoadFile((fixture / "model.yaml").string());
-    config["format_version"] = 1;
-    config["weights_file"] = "model.safetensors";
-    config["tokenizer_file"] = "tokenizer.json";
+    auto config = YAML::LoadFile((fixture / "config.json").string());
     config["decode"]["context_size"] = 16;
     config["decode"]["maximum_new_tokens"] = 10;
-    std::ofstream(directory / "model.yaml") << config;
+    std::ofstream(directory / "config.json") << config;
     std::ofstream(directory / "tokenizer.json") << R"({
       "version":"1.0", "pre_tokenizer":{"type":"WhitespaceSplit"},
       "decoder":{"type":"WordPiece","prefix":"##","cleanup":false},
@@ -119,7 +116,7 @@ auto check_generation(const std::filesystem::path& fixture, const std::filesyste
         "<pad>":0,"<eos>":1,"<bos>":2,"<turn|>":3,"<|turn>":4,"<unk>":5,
         "alpha":6,"beta":7,"gamma":8,"delta":9,"theta":10,"zeta":11,"eta":12,"iota":13,"kappa":14,"lambda":15}}
     })";
-    const auto qat = static_cast<bool>(config["model"]["quantization_config"]);
+    const auto qat = static_cast<bool>(config["quantization_config"]);
     for (const auto cache_precision : qat ? std::array{core::KVCachePrecision::FP32, core::KVCachePrecision::INT8}
                                           : std::array{core::KVCachePrecision::FP32, core::KVCachePrecision::FP32}) {
         auto baseline = require(
@@ -192,7 +189,7 @@ auto check_generation(const std::filesystem::path& fixture, const std::filesyste
     if (speculative.generate_batch(std::array<std::string, 1>{"alpha"})) return false;
     if (!qat) {
         const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
-        auto target = require(model::Gemma4Impl::create(config["model"]));
+        auto target = require(model::Gemma4Impl::create(config));
         require(target->set_checkpoint(require(checkpoint::Weights::load(directory / "model.safetensors"))));
         const auto weights = target->state_dict().at("embed_tokens.weight");
         auto index = require(search::HnswIndex::build(weights, {.m = 4,

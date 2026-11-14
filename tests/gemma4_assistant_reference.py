@@ -18,7 +18,7 @@ from transformers import (
 
 def generate(target_directory: Path, destination: Path):
     torch.set_num_threads(1)
-    document = yaml.safe_load((target_directory / "model.yaml").read_text())["model"]
+    document = json.loads((target_directory / "config.json").read_text())
     target_config = Gemma4TextConfig(**document, attn_implementation="eager")
     target = Gemma4ForCausalLM(target_config).float().eval()
     state = {

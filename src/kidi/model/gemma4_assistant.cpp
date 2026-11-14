@@ -90,20 +90,6 @@ struct Gemma4AssistantImpl::State {
     }
 };
 
-auto Gemma4AssistantImpl::checkpoint_config() -> checkpoint::ConfigAdapter {
-    return {"config.json", [](const checkpoint::ConfigSource& source) -> Result<YAML::Node> {
-                if (source.document["model_type"].as<std::string>("") != "gemma4_assistant")
-                    return std::unexpected(Error{ErrorCode::UNSUPPORTED, "checkpoint is not a Gemma 4 assistant"});
-                constexpr std::array<std::string_view, 1> candidates{"model.safetensors"};
-                const auto weights = require(source.weights(candidates));
-                if (weights["format"].as<std::string>() != "safetensors")
-                    return std::unexpected(Error{ErrorCode::UNSUPPORTED, "Gemma MTP requires safetensors weights"});
-                YAML::Node result;
-                result["model"] = YAML::Clone(source.document);
-                result["weights_file"] = weights["path"];
-                return result;
-            }};
-}
 auto Gemma4AssistantImpl::validate_config(const YAML::Node& config, const YAML::Node& target) -> Result<void> {
     try {
         const auto text = config["text_config"];

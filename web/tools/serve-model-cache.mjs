@@ -57,20 +57,15 @@ async function snapshotRevision(snapshot) {
 }
 
 async function mainRevision(repository) {
-  const reference = (await readFile(join(repository, 'refs/main'), 'utf8')).trim();
-  if (REVISION.test(reference))
-    return {revision: reference, snapshot: join(repository, 'snapshots', reference)};
-  if (!SAFE_NAME.test(reference)) throw new Error('Invalid local model reference');
-  const local = join(repository, 'snapshots', reference);
+  if (!(await stat(repository)).isDirectory()) throw Object.assign(new Error('Missing repository'), {code: 'ENOENT'});
   try {
-    const metadata = await readFile(join(local, '.cache/huggingface/download/config.json.metadata'), 'utf8');
+    const metadata = await readFile(join(repository, '.cache/huggingface/download/config.json.metadata'), 'utf8');
     const revision = metadata.split(/\r?\n/u)[0].trim();
-    if (REVISION.test(revision))
-      return {revision, snapshot: join(repository, 'snapshots', revision)};
+    if (REVISION.test(revision)) return {revision, snapshot: repository};
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
-  return {revision: await snapshotRevision(local), snapshot: local};
+  return {revision: await snapshotRevision(repository), snapshot: repository};
 }
 
 export async function createModelCacheServer({
@@ -93,7 +88,7 @@ export async function createModelCacheServer({
       let repository, path;
       if (parts.length === 6 && parts[0] === 'api' && parts[1] === 'models' &&
           parts[4] === 'revision' && parts[5] === 'main') {
-        repository = join(cache, `models--${parts[2]}--${parts[3]}`);
+        repository = join(cache, parts[2], parts[3]);
         const {revision} = await mainRevision(repository);
         const body = JSON.stringify({sha: revision});
         return send(response, 200, request.method === 'HEAD' ? '' : body, {
@@ -102,17 +97,10 @@ export async function createModelCacheServer({
       }
       if (parts.length < 5 || parts[2] !== 'resolve' || !REVISION.test(parts[3]))
         return send(response, 404);
-      repository = join(cache, `models--${parts[0]}--${parts[1]}`);
-      let snapshot = join(repository, 'snapshots', parts[3]);
-      try {
-        if (!(await stat(snapshot)).isDirectory()) return send(response, 404);
-      } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
-        const resolved = await mainRevision(repository);
-        if (resolved.revision !== parts[3]) return send(response, 404);
-        snapshot = resolved.snapshot;
-      }
-      path = join(snapshot, ...parts.slice(4));
+      repository = join(cache, parts[0], parts[1]);
+      const resolved = await mainRevision(repository);
+      if (resolved.revision !== parts[3]) return send(response, 404);
+      path = join(resolved.snapshot, ...parts.slice(4));
       const file = await inside(cache, path);
       if (!file) return send(response, 403);
       const details = await stat(file);

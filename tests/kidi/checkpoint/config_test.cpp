@@ -14,24 +14,12 @@ auto write(const std::filesystem::path& path, std::string_view content = {}) -> 
 struct FixtureModel {
     inline static int conversions = 0;
 
-    static auto checkpoint_config() -> kidi::checkpoint::ConfigAdapter {
-        return {"fixture.json", [](const kidi::checkpoint::ConfigSource& source) -> kidi::Result<YAML::Node> {
-                    constexpr std::array<std::string_view, 1> candidates{"source.safetensors"};
-                    auto weights = source.weights(candidates);
-                    if (!weights) return std::unexpected(weights.error());
-                    YAML::Node config;
-                    config["model"] = source.document;
-                    config["source"] = (*weights)["path"];
-                    return config;
-                }};
-    }
-
     static auto preparation(const YAML::Node& config) -> kidi::Result<kidi::checkpoint::Preparation> {
         return kidi::checkpoint::Preparation{
-            .source = config["source"].as<std::string>(),
+            .source = config["weights_file"].as<std::string>(),
             .cache_directory = config["model"]["cache"].as<std::string>(),
             .format = "fixture-v1",
-            .files = {"fixture.json"},
+            .files = {"config.json", "tokenizer.json", "preprocessor_config.json", "generation_config.json"},
             .metadata = {{"kind", "fixture"}},
             .convert = [](const YAML::Node& model,
                           const kidi::checkpoint::Weights& weights) -> kidi::Result<kidi::StateDict> {
@@ -51,17 +39,18 @@ auto main() -> int {
     write(directory / "model.safetensors");
     write(directory / "src.json");
     write(directory / "tgt.json.gz");
-    const auto config = YAML::Load(R"(
-format_version: 1
-weights_file: model.safetensors
-tokenizers: {source: src.json, target: tgt.json.gz}
-io: {input_format: moses_tokenized, output_format: moses_tokenized}
-model: {type: rtg_transformer_nmt, hidden_size: 768}
-decode: {beam_size: 4}
-)");
-    write(directory / "model.yaml", YAML::Dump(config));
-    auto loaded = kidi::checkpoint::load_config(directory / "model.yaml");
+    const auto config = YAML::Load(R"({
+      "model_type": "rtg_transformer_nmt",
+      "weights_file": "model.safetensors",
+      "tokenizers": {"source": "src.json", "target": "tgt.json.gz"},
+      "io": {"input_format": "moses_tokenized", "output_format": "moses_tokenized"},
+      "hidden_size": 768,
+      "decode": {"beam_size": 4}
+    })");
+    write(directory / "config.json", YAML::Dump(config));
+    auto loaded = kidi::checkpoint::load_config(directory);
     if (!loaded || (*loaded)["model"]["hidden_size"].as<int>() != 768 ||
+        (*loaded)["model"]["type"].as<std::string>() != "rtg_transformer_nmt" ||
         (*loaded)["weights_file"].as<std::string>() != (directory / "model.safetensors").string() ||
         (*loaded)["tokenizers"]["target"].as<std::string>() != (directory / "tgt.json.gz").string())
         return 1;
@@ -72,62 +61,58 @@ decode: {beam_size: 4}
                 invalid[field] = bad_path;
             else
                 invalid["tokenizers"][field] = bad_path;
-            write(directory / "invalid.yaml", YAML::Dump(invalid));
-            auto result = kidi::checkpoint::load_config(directory / "invalid.yaml");
+            write(directory / "invalid.json", YAML::Dump(invalid));
+            auto result = kidi::checkpoint::load_config(directory / "invalid.json");
             if (result || result.error().code != kidi::ErrorCode::INVALID_MANIFEST) return 1;
         }
     }
-    auto old_format = YAML::Clone(config);
-    auto gemma = YAML::Clone(config);
-    gemma["model"]["type"] = "gemma4_text";
-    gemma.remove("io");
-    gemma.remove("tokenizers");
+    YAML::Node gemma;
+    gemma["model_type"] = "gemma4_text";
+    gemma["weights_file"] = "model.safetensors";
     gemma["tokenizer_file"] = "src.json";
-    write(directory / "gemma.yaml", YAML::Dump(gemma));
-    auto gemma_config = kidi::checkpoint::load_config(directory / "gemma.yaml");
+    gemma["hidden_size"] = 768;
+    gemma["decode"]["beam_size"] = 1;
+    write(directory / "gemma.json", YAML::Dump(gemma));
+    auto gemma_config = kidi::checkpoint::load_config(directory / "gemma.json");
     if (!gemma_config || (*gemma_config)["tokenizer_file"].as<std::string>() != (directory / "src.json").string())
         return 1;
     gemma["tokenizer_file"] = "../outside";
-    write(directory / "invalid-gemma.yaml", YAML::Dump(gemma));
-    if (kidi::checkpoint::load_config(directory / "invalid-gemma.yaml")) return 1;
-    auto omnivoice = YAML::Clone(gemma);
-    omnivoice["model"]["type"] = "omnivoice";
+    write(directory / "invalid-gemma.json", YAML::Dump(gemma));
+    if (kidi::checkpoint::load_config(directory / "invalid-gemma.json")) return 1;
+    YAML::Node omnivoice;
+    omnivoice["model_type"] = "omnivoice";
+    omnivoice["weights_file"] = "model.safetensors";
     omnivoice["tokenizer_file"] = "src.json";
-    omnivoice.remove("decode");
-    omnivoice["task"] = "tts";
     omnivoice["synthesis"]["steps"] = 32;
     omnivoice["license_files"].push_back("src.json");
     omnivoice["template_file"] = "src.json";
     omnivoice["sentence_prefixes_file"] = "src.json";
-    write(directory / "omnivoice.yaml", YAML::Dump(omnivoice));
-    auto omnivoice_config = kidi::checkpoint::load_config(directory / "omnivoice.yaml");
+    write(directory / "omnivoice.json", YAML::Dump(omnivoice));
+    auto omnivoice_config = kidi::checkpoint::load_config(directory / "omnivoice.json");
     if (!omnivoice_config ||
         (*omnivoice_config)["tokenizer_file"].as<std::string>() != (directory / "src.json").string())
         return 1;
     auto unlicensed_omnivoice = YAML::Clone(omnivoice);
     unlicensed_omnivoice.remove("license_files");
-    write(directory / "unlicensed-omnivoice.yaml", YAML::Dump(unlicensed_omnivoice));
-    if (kidi::checkpoint::load_config(directory / "unlicensed-omnivoice.yaml")) return 1;
+    write(directory / "unlicensed-omnivoice.json", YAML::Dump(unlicensed_omnivoice));
+    if (kidi::checkpoint::load_config(directory / "unlicensed-omnivoice.json")) return 1;
     omnivoice.remove("synthesis");
-    write(directory / "invalid-omnivoice.yaml", YAML::Dump(omnivoice));
-    if (kidi::checkpoint::load_config(directory / "invalid-omnivoice.yaml")) return 1;
-    auto kokoro = YAML::Clone(gemma);
-    kokoro["model"]["type"] = "kokoro";
-    kokoro.remove("decode");
-    kokoro.remove("tokenizer_file");
-    kokoro["task"] = "tts";
+    write(directory / "invalid-omnivoice.json", YAML::Dump(omnivoice));
+    if (kidi::checkpoint::load_config(directory / "invalid-omnivoice.json")) return 1;
+    YAML::Node kokoro;
+    kokoro["model_type"] = "kokoro";
+    kokoro["weights_file"] = "model.safetensors";
     kokoro["synthesis"]["default_voice"] = "af_heart";
     kokoro["lexicon_file"] = "src.json";
     kokoro["sentence_prefixes_file"] = "src.json";
     kokoro["license_files"].push_back("src.json");
-    write(directory / "kokoro.yaml", YAML::Dump(kokoro));
-    auto kokoro_config = kidi::checkpoint::load_config(directory / "kokoro.yaml");
+    write(directory / "kokoro.json", YAML::Dump(kokoro));
+    auto kokoro_config = kidi::checkpoint::load_config(directory / "kokoro.json");
     if (!kokoro_config || (*kokoro_config)["lexicon_file"].as<std::string>() != (directory / "src.json").string())
         return 1;
     kokoro["lexicon_file"] = "../outside";
-    write(directory / "invalid-kokoro.yaml", YAML::Dump(kokoro));
-    if (kidi::checkpoint::load_config(directory / "invalid-kokoro.yaml")) return 1;
-    write(directory / "config.json", R"({"model_type":"whisper","d_model":384})");
+    write(directory / "invalid-kokoro.json", YAML::Dump(kokoro));
+    if (kidi::checkpoint::load_config(directory / "invalid-kokoro.json")) return 1;
     write(directory / "tokenizer.json");
     write(directory / "preprocessor_config.json");
     write(directory / "generation_config.json");
@@ -145,8 +130,7 @@ decode: {beam_size: 4}
             } else
                 document["quantization_config"] = YAML::Null;
             write(directory / "config.json", YAML::Dump(document));
-            const auto imported =
-                kidi::checkpoint::load_config(directory, kidi::model::Gemma4Impl::checkpoint_config());
+            const auto imported = kidi::checkpoint::load_config(directory);
             if (!imported || (*imported)["model"]["type"].as<std::string>() != "gemma4_text" ||
                 (*imported)["model"]["hidden_size"].as<int>() != hidden ||
                 !(*imported)["model"]["tie_word_embeddings"].as<bool>() ||
@@ -159,7 +143,7 @@ decode: {beam_size: 4}
         }
     write(directory / "config.json",
           R"({"model_type":"gemma4_text","hidden_size":2048,"tie_word_embeddings":true,"quantization_config":null})");
-    const auto text_only = kidi::checkpoint::load_config(directory, kidi::model::Gemma4Impl::checkpoint_config());
+    const auto text_only = kidi::checkpoint::load_config(directory);
     if (!text_only || (*text_only)["model"]["hidden_size"].as<int>() != 2048 ||
         (*text_only)["model"]["quantization_config"]) {
         std::cerr << "Gemma text config import failed: "
@@ -167,38 +151,35 @@ decode: {beam_size: 4}
         return 1;
     }
     write(directory / "config.json", R"({"model_type":"whisper","d_model":384})");
-    const auto adapter = kidi::model::WhisperImpl::checkpoint_config();
-    auto whisper = kidi::checkpoint::load_config(directory, adapter);
+    auto whisper = kidi::checkpoint::load_config(directory);
     if (!whisper || (*whisper)["model"]["type"].as<std::string>() != "whisper" ||
         (*whisper)["model"]["d_model"].as<int>() != 384 ||
-        (*whisper)["model_file"].as<std::string>() != (directory / "model.safetensors").string() ||
+        (*whisper)["weights_file"].as<std::string>() != (directory / "model.safetensors").string() ||
         (*whisper)["tokenizer_file"].as<std::string>() != (directory / "tokenizer.json").string())
         return 1;
     std::filesystem::remove(directory / "generation_config.json");
-    if (kidi::checkpoint::load_config(directory, adapter)) return 1;
-    old_format.remove("model");
-    old_format["architecture"]["hidden_size"] = 768;
-    write(directory / "old.yaml", YAML::Dump(old_format));
-    if (kidi::checkpoint::load_config(directory / "old.yaml")) return 1;
-    write(directory / "malformed.yaml", "model: [");
-    if (kidi::checkpoint::load_config(directory / "malformed.yaml")) return 1;
+    if (kidi::checkpoint::load_config(directory)) return 1;
+    write(directory / "missing-type.json", R"({"hidden_size": 768})");
+    if (kidi::checkpoint::load_config(directory / "missing-type.json")) return 1;
+    write(directory / "malformed.json", "{\"model_type\": [");
+    if (kidi::checkpoint::load_config(directory / "malformed.json")) return 1;
 
+    write(directory / "generation_config.json");
     auto tensor = kidi::tensor::Tensor::zeros({1}, kidi::tensor::DType::F32, kidi::tensor::Device::cpu());
-    const auto source = directory / "source.safetensors";
+    const auto source = directory / "model.safetensors";
+    std::filesystem::remove(source);
     if (!tensor || !kidi::checkpoint::Weights::save(source, {{"weight", *tensor}})) return 1;
-    write(directory / "fixture.json", R"({"cache":"prepared-fixture"})");
-    const auto prepare_fixture = [&] {
-        return kidi::checkpoint::prepare(directory, FixtureModel::checkpoint_config(), FixtureModel::preparation);
-    };
+    write(directory / "config.json", R"({"model_type":"whisper","cache":"prepared-fixture"})");
+    const auto prepare_fixture = [&] { return kidi::checkpoint::prepare(directory, FixtureModel::preparation); };
     auto prepared = prepare_fixture();
     if (!prepared || *prepared != directory / "prepared-fixture" || FixtureModel::conversions != 1 ||
         !kidi::checkpoint::Weights::load(*prepared / "model.safetensors") ||
-        !std::filesystem::is_regular_file(*prepared / "fixture.json"))
+        !std::filesystem::is_regular_file(*prepared / "config.json"))
         return 1;
     if (!prepare_fixture() || FixtureModel::conversions != 1) return 1;
     std::filesystem::last_write_time(source, std::filesystem::last_write_time(source) + std::chrono::seconds(1));
     if (!prepare_fixture() || FixtureModel::conversions != 2) return 1;
-    write(directory / "fixture.json", R"({"cache":"failed-fixture","fail":true})");
+    write(directory / "config.json", R"({"model_type":"whisper","cache":"failed-fixture","fail":true})");
     if (prepare_fixture() || std::filesystem::exists(directory / "failed-fixture") || FixtureModel::conversions != 3)
         return 1;
     for (const auto& entry : std::filesystem::directory_iterator(directory))

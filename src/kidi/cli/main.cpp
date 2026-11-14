@@ -23,6 +23,7 @@
 #include "kidi/core/version.h"
 #include "kidi/checkpoint/package.h"
 #include "kidi/checkpoint/config.h"
+#include "kidi/checkpoint/hub.h"
 #include "kidi/checkpoint/weights.h"
 #include "kidi/inference/translator.h"
 #include "kidi/inference/generator.h"
@@ -71,21 +72,19 @@ auto configure_cpu_threads(const kidi::cli::Namespace& arguments, std::int32_t t
 }
 
 auto inspect(const std::filesystem::path& directory) -> int {
-    const auto manifest = std::filesystem::is_regular_file(directory / "model.yaml");
-    auto document = manifest ? kidi::checkpoint::load_config(directory / "model.yaml")
-                             : kidi::checkpoint::load_config(directory, kidi::model::Gemma4Impl::checkpoint_config());
-    if (!manifest && !document && document.error().code == kidi::ErrorCode::UNSUPPORTED) {
-        auto config = kidi::checkpoint::load_config(directory, kidi::model::WhisperImpl::checkpoint_config());
-        if (!config) {
-            spdlog::error("{}", config.error().message);
-            return 1;
-        }
-        auto validation = kidi::model::WhisperImpl::validate_config((*config)["model"]);
+    auto document = kidi::checkpoint::load_config(directory);
+    if (!document) {
+        spdlog::error("{}", document.error().message);
+        return 1;
+    }
+    const auto type = (*document)["model"]["type"].as<std::string>();
+    if (type == "whisper") {
+        auto validation = kidi::model::WhisperImpl::validate_config((*document)["model"]);
         if (!validation) {
             spdlog::error("{}", validation.error().message);
             return 1;
         }
-        auto weights = kidi::checkpoint::Weights::load((*config)["model_file"].as<std::string>());
+        auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
         if (!weights) {
             spdlog::error("{}", weights.error().message);
             return 1;
@@ -97,20 +96,16 @@ auto inspect(const std::filesystem::path& directory) -> int {
         }
         std::cout << "format: huggingface\n"
                   << "model: whisper\n"
-                  << "weights: " << (*config)["model_file"].as<std::string>() << '\n'
+                  << "weights: " << (*document)["weights_file"].as<std::string>() << '\n'
                   << "weight tensors: " << weights->size() << '\n'
                   << "weight dtype: " << kidi::tensor::to_string(parameter->dtype()) << '\n'
-                  << "encoder layers: " << (*config)["model"]["encoder_layers"].as<int>() << '\n'
-                  << "decoder layers: " << (*config)["model"]["decoder_layers"].as<int>() << '\n'
-                  << "vocabulary: " << (*config)["model"]["vocab_size"].as<int>() << '\n'
+                  << "encoder layers: " << (*document)["model"]["encoder_layers"].as<int>() << '\n'
+                  << "decoder layers: " << (*document)["model"]["decoder_layers"].as<int>() << '\n'
+                  << "vocabulary: " << (*document)["model"]["vocab_size"].as<int>() << '\n'
                   << "execution device: cpu\n";
         return 0;
     }
-    if (!document) {
-        spdlog::error("{}", document.error().message);
-        return 1;
-    }
-    if ((*document)["model"]["type"].as<std::string>() == "gemma4_text") {
+    if (type == "gemma4_text") {
         auto validation = kidi::model::Gemma4Impl::validate_config((*document)["model"]);
         if (!validation) {
             spdlog::error("{}", validation.error().message);
@@ -548,10 +543,7 @@ auto prepare_command(const kidi::cli::Namespace& arguments, const std::filesyste
         return 2;
     }
     configure_cpu_threads(arguments, threads);
-    auto config =
-        task == kidi::model::Task::TEXT_GENERATION && !std::filesystem::is_regular_file(directory / "model.yaml")
-            ? kidi::checkpoint::load_config(directory, kidi::model::Gemma4Impl::checkpoint_config())
-            : kidi::checkpoint::load_config(directory / "model.yaml");
+    auto config = kidi::checkpoint::load_config(directory);
     if (!config) {
         spdlog::error("{}", config.error().message);
         return 1;
@@ -613,8 +605,7 @@ auto is_bare_repo_id(std::string_view value) -> bool {
            value.find('/', slash + 1) == std::string_view::npos;
 }
 
-auto resolve_hub_argument(const std::filesystem::path& path, const std::filesystem::path& cache,
-                          const kidi::cli::ModelResolver& resolve_model, bool allow_bare_id,
+auto resolve_hub_argument(const std::filesystem::path& path, const std::filesystem::path& cache, bool allow_bare_id,
                           std::filesystem::path& resolved_out) -> int {
     if (path.empty()) {
         resolved_out.clear();
@@ -623,45 +614,45 @@ auto resolve_hub_argument(const std::filesystem::path& path, const std::filesyst
     const auto text = path.string();
     const bool explicit_hub = text.starts_with('@');
     std::error_code fs_error;
-    const bool bare_hub = allow_bare_id && !explicit_hub && static_cast<bool>(resolve_model) &&
-                          !std::filesystem::exists(path, fs_error) && is_bare_repo_id(text);
+    const bool bare_hub =
+        allow_bare_id && !explicit_hub && !std::filesystem::exists(path, fs_error) && is_bare_repo_id(text);
     if (!explicit_hub && !bare_hub) {
         resolved_out = path;
         return 0;
     }
-    if (!resolve_model) {
-        spdlog::error("Hub models require the Python launcher: install 'kidi[hf]' and use python -m kidi");
-        return 2;
-    }
-    auto resolved = resolve_model(explicit_hub ? std::string_view(text).substr(1) : std::string_view(text), cache);
-    if (!resolved) {
-        spdlog::error("{}", resolved.error().message);
+    try {
+        const kidi::checkpoint::Hub hub{"https://huggingface.co", cache};
+        auto resolved = hub.download(explicit_hub ? std::string_view(text).substr(1) : std::string_view(text));
+        if (!resolved) {
+            spdlog::error("{}", resolved.error().message);
+            return 1;
+        }
+        resolved_out = std::move(*resolved);
+        return 0;
+    } catch (const std::exception& error) {
+        spdlog::error("{}", error.what());
         return 1;
     }
-    resolved_out = std::move(*resolved);
-    return 0;
 }
 
-auto generate_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory,
-                      const kidi::cli::ModelResolver& resolve_model) -> int {
+auto generate_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
     if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TEXT_GENERATION)) return status;
     std::filesystem::path assistant_directory;
-    if (const auto status = resolve_hub_argument(arguments.get<std::filesystem::path>("assistant_model"),
-                                                 arguments.get<std::filesystem::path>("cache"), resolve_model, true,
-                                                 assistant_directory))
+    if (const auto status =
+            resolve_hub_argument(arguments.get<std::filesystem::path>("assistant_model"),
+                                 arguments.get<std::filesystem::path>("cache"), true, assistant_directory))
         return status;
     return run_with_streams(arguments, [&](std::istream& input, std::ostream& output) {
         return generate_chat(arguments, directory, assistant_directory, input, output);
     });
 }
 
-auto chat_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory,
-                  const kidi::cli::ModelResolver& resolve_model) -> int {
+auto chat_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
     if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TEXT_GENERATION)) return status;
     std::filesystem::path assistant_directory;
-    if (const auto status = resolve_hub_argument(arguments.get<std::filesystem::path>("assistant_model"),
-                                                 arguments.get<std::filesystem::path>("cache"), resolve_model, true,
-                                                 assistant_directory))
+    if (const auto status =
+            resolve_hub_argument(arguments.get<std::filesystem::path>("assistant_model"),
+                                 arguments.get<std::filesystem::path>("cache"), true, assistant_directory))
         return status;
     auto session = load_chat_session(arguments, directory, assistant_directory);
     if (!session) {
@@ -850,7 +841,7 @@ auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesy
 
 } // namespace
 
-auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& resolve_model) -> int {
+auto kidi::cli::main(int argc, const char* const argv[]) -> int {
     auto logger = spdlog::get("kidi");
     if (!logger) logger = spdlog::stderr_color_mt("kidi");
     spdlog::set_default_logger(std::move(logger));
@@ -891,7 +882,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
             .type<std::filesystem::path>()
             .required()
             .metavar("MODEL")
-            .help("local directory or @owner/model (Python launcher with kidi[hf])");
+            .help("local directory or @owner/model");
         command_parser->add_argument("-c", "--cache")
             .type<std::filesystem::path>()
             .default_value(std::filesystem::path("~/.cache/kidi/model-hub"))
@@ -1010,7 +1001,7 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         .type<std::filesystem::path>()
         .required()
         .metavar("MODEL")
-        .help("local directory or @owner/model (Python launcher with kidi[hf])");
+        .help("local directory or @owner/model");
     inspect_parser.add_argument("-c", "--cache")
         .type<std::filesystem::path>()
         .default_value(std::filesystem::path("~/.cache/kidi/model-hub"))
@@ -1062,14 +1053,14 @@ auto kidi::cli::main(int argc, const char* const argv[], const ModelResolver& re
         std::filesystem::path directory;
         const auto cache = arguments.contains("cache") ? arguments.get<std::filesystem::path>("cache")
                                                        : std::filesystem::path("~/.cache/kidi/model-hub");
-        if (const auto status = resolve_hub_argument(arguments.get<std::filesystem::path>("model"), cache,
-                                                     resolve_model, false, directory))
+        if (const auto status =
+                resolve_hub_argument(arguments.get<std::filesystem::path>("model"), cache, false, directory))
             return status;
         if (command == "index") return kidi::cli::index_command(arguments, directory);
         if (command == "inspect") return inspect(directory);
         if (command == "translate") return translate_command(arguments, directory);
-        if (command == "generate") return generate_command(arguments, directory, resolve_model);
-        if (command == "chat") return chat_command(arguments, directory, resolve_model);
+        if (command == "generate") return generate_command(arguments, directory);
+        if (command == "chat") return chat_command(arguments, directory);
         if (command == "transcribe") return transcribe_command(arguments, directory);
         if (command == "synthesize") return synthesize_command(arguments, directory);
         throw std::logic_error("unhandled command: " + command);

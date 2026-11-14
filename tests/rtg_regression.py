@@ -13,8 +13,12 @@ from pathlib import Path
 
 
 MODEL_ID = "thammegowda/rtg-500eng-v1"
-MODEL_REVISION = "8581803b79d7ab3f46697140788272e3417bb238"
-PAYLOAD = ("model.yaml", "model.safetensors", "tokenizer.src.json.gz", "tokenizer.tgt.json.gz")
+CHECKSUMS = {
+    "model.safetensors": "3a5a876292e8877004afc40588603ea09c1d9d85aa6726dbf90aa89ef0c3b5b7",
+    "tokenizer.src.json.gz": "6ca4f081c20b5b1dbc6aac0b7a1a64c09a644f8d578b3494427bce0bbdb96bcf",
+    "tokenizer.tgt.json.gz": "72722e53c66e440ad98a13d6a503d6cd76dd9f6c3d7f12efbfc880cb54b8b16b",
+}
+PAYLOAD = ("config.json", *CHECKSUMS)
 DATA = Path(__file__).resolve().parent / "data"
 INPUT = DATA / "sample.input.txt"
 LANGUAGES = DATA / "sample.input.lang.txt"
@@ -24,21 +28,18 @@ OUTPUT = DATA / "sample.eng.rtg-500eng-v1.out.txt"
 
 def model_directory() -> Path:
     hub = Path(os.environ.get("KIDI_HUB", "~/.cache/kidi/model-hub")).expanduser()
-    return hub.resolve() / "rtg-500eng-v1"
+    return hub.resolve() / MODEL_ID
 
 
 def verify_model(directory: Path) -> None:
-    checksums = directory / "SHA256SUMS"
-    if not checksums.is_file():
-        raise ValueError(f"Model not installed at {directory}; run make setup-test first")
-    entries = [line.split() for line in checksums.read_text(encoding="utf-8").splitlines()]
-    if len(entries) != len(PAYLOAD) or any(len(entry) != 2 for entry in entries):
-        raise ValueError("Invalid model checksum manifest")
-    if {entry[1] for entry in entries} != set(PAYLOAD):
-        raise ValueError("Unexpected model payload files")
-    for expected, filename in entries:
+    if not (directory / "config.json").is_file() or not (directory / "config.json").stat().st_size:
+        raise ValueError(f"Model config.json not installed at {directory}; run make setup-test first")
+    for filename, expected in CHECKSUMS.items():
+        path = directory / filename
+        if not path.is_file():
+            raise ValueError(f"Model file {filename} missing at {directory}; run make setup-test first")
         digest = hashlib.sha256()
-        with (directory / filename).open("rb") as stream:
+        with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
                 digest.update(chunk)
         if digest.hexdigest() != expected:
@@ -48,25 +49,18 @@ def verify_model(directory: Path) -> None:
 def setup() -> None:
     directory = model_directory()
     flag = directory / "._OK"
-    if (
-        flag.is_file()
-        and flag.read_text(encoding="utf-8").strip() == MODEL_REVISION
-        and all((directory / name).is_file() for name in (*PAYLOAD, "SHA256SUMS"))
-    ):
+    if flag.is_file() and all((directory / name).is_file() for name in PAYLOAD):
         print(f"Skipping RTG model setup: {flag}")
         return
     flag.unlink(missing_ok=True)
-    from huggingface_hub import snapshot_download
-
-    snapshot_download(
-        repo_id=MODEL_ID,
-        revision=MODEL_REVISION,
-        local_dir=directory,
-        allow_patterns=[*PAYLOAD, "SHA256SUMS"],
-    )
+    hf = Path(sys.executable).with_name("hf")
+    cmd = [str(hf) if hf.is_file() else "hf", "download", MODEL_ID, "--local-dir", str(directory)]
+    for name in PAYLOAD:
+        cmd.extend(["--include", name])
+    subprocess.run(cmd, check=True)
     verify_model(directory)
-    flag.write_text(MODEL_REVISION + "\n", encoding="utf-8")
-    print(f"Verified {MODEL_ID}@{MODEL_REVISION} at {directory}")
+    flag.write_text("ok\n", encoding="utf-8")
+    print(f"Verified {MODEL_ID} at {directory}")
 
 
 def read_lines(filename: Path) -> list[str]:

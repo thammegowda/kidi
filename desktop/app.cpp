@@ -367,7 +367,7 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
         }
         if (result.tts.enabled) {
             for (const auto* file :
-                 {"model.yaml", "model.safetensors", "sentence-prefixes.tsv", "synthesis_template.jinja", "NOTICE"}) {
+                 {"config.json", "model.safetensors", "sentence-prefixes.tsv", "synthesis_template.jinja", "NOTICE"}) {
                 if (!std::filesystem::is_regular_file(result.tts.directory / file, error))
                     return invalid_config("TTS package is missing required file: " + std::string(file));
             }
