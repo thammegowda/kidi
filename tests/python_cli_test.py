@@ -17,9 +17,9 @@ import kidi
 
 
 class HubCliTest(unittest.TestCase):
-    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires kidi[convert]")
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires torch")
     def test_omnivoice_activation_calibration(self):
-        from kidi.converters.omnivoice import _activation_quantization
+        from tools.converters.omnivoice import _activation_quantization
 
         edges = (
             "attention_norm",

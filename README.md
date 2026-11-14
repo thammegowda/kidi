@@ -130,13 +130,9 @@ python -m kidi transcribe \
 Synthesize natural speech using **OmniVoice** (multilingual with voice design attributes) or **Kokoro-82M** (compact US English):
 
 ```bash
-# OmniVoice: convert once to INT8 (~618 MB), then synthesize on CPU, Metal (--backend mps), or Vulkan
-python -m pip install '.[convert,hf]'
-SOURCE="$(hf download k2-fsa/OmniVoice)"
-python -m kidi.converters.omnivoice "$SOURCE" .cache/omnivoice-int8
-
+# OmniVoice: use a published INT8 package directly, or export offline with tools/converters/omnivoice.py
 build-release/kidi synthesize \
-  --model .cache/omnivoice-int8 \
+  --model @thammegowda/OmniVoice-q8 \
   --text 'Hello from Kidi.' \
   --language English \
   --voice gender=female --voice 'age=young adult' --voice accent=british \
@@ -144,9 +140,9 @@ build-release/kidi synthesize \
 ```
 
 ```bash
-# Kokoro-82M: convert with selected voice pack(s) and synthesize
+# Kokoro-82M: convert offline with selected voice pack(s) and synthesize
 SOURCE="$(hf download hexgrad/Kokoro-82M config.json kokoro-v1_0.pth voices/af_heart.pt README.md VOICES.md)"
-python -m kidi.converters.kokoro "$SOURCE" .cache/kokoro-int8 --voices af_heart
+python tools/converters/kokoro.py "$SOURCE" .cache/kokoro-int8 --voices af_heart
 
 build-release/kidi synthesize \
   --model .cache/kokoro-int8 \

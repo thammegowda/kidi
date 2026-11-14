@@ -103,9 +103,8 @@ OmniVoice conversion reads public Safetensors only and writes a decoder-only,
 all-parameter INT8 package:
 
 ```bash
-python -m pip install '.[convert,hf]'
 SOURCE="$(hf download k2-fsa/OmniVoice)"
-python -m kidi.converters.omnivoice "$SOURCE" .cache/omnivoice-int8
+python tools/converters/omnivoice.py "$SOURCE" .cache/omnivoice-int8
 build-release/kidi inspect --model .cache/omnivoice-int8
 ```
 
@@ -129,7 +128,7 @@ checkpoint's weight-normalization tensors, packs the Misaki US-English
 pronunciation dictionaries, and embeds requested voice tables:
 
 ```bash
-python -m kidi.converters.kokoro /path/to/Kokoro-82M .cache/kokoro-int8 \
+python tools/converters/kokoro.py /path/to/Kokoro-82M .cache/kokoro-int8 \
   --voices af_heart
 ```
 

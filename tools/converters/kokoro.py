@@ -11,10 +11,12 @@ import math
 from pathlib import Path
 
 import torch
-import yaml
 from safetensors.torch import save_file
 
-from ._licenses import write_license_bundle
+try:
+    from ._licenses import write_license_bundle
+except ImportError:
+    from _licenses import write_license_bundle
 
 
 TRANSPOSED_CONVOLUTIONS = {
@@ -147,19 +149,16 @@ def _write_lexicon(destination: Path, british: bool) -> int:
 
 def _model_document(config: dict, voices: list[str], license_files: list[str] | None = None) -> dict:
     return {
-        "format_version": 1,
-        "task": "tts",
+        "model_type": "kokoro",
+        "architectures": ["KokoroForTextToSpeech"],
         "license_files": license_files or [],
         "weights_file": "model.safetensors",
         "lexicon_file": "lexicon-us.tsv",
         "sentence_prefixes_file": "sentence-prefixes.tsv",
-        "model": {
-            "type": "kokoro",
-            "config": config,
-            "sample_rate": 24000,
-            "voices": voices,
-            "weight_group_size": GROUP_SIZE,
-        },
+        "config": config,
+        "sample_rate": 24000,
+        "voices": voices,
+        "weight_group_size": GROUP_SIZE,
         "synthesis": {
             "default_voice": voices[0],
             "voice_attributes": {
@@ -244,9 +243,7 @@ Sources:
         notice,
     )
     document = _model_document(config, voices, license_files)
-    (destination / "model.yaml").write_text(
-        yaml.safe_dump(document, sort_keys=False, allow_unicode=True), encoding="utf-8"
-    )
+    (destination / "config.json").write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     lexicon_entries = _write_lexicon(destination / "lexicon-us.tsv", british=False)
     shutil.copy2(Path(__file__).with_name("sentence-prefixes.tsv"), destination / "sentence-prefixes.tsv")
     for name in ("README.md", "VOICES.md"):

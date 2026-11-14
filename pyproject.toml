@@ -11,13 +11,6 @@ requires-python = ">=3.12"
 
 [project.optional-dependencies]
 hf = ["huggingface-hub[cli]>=1.0,<3"]
-convert = [
-    "torch>=2",
-    "numpy>=2",
-    "ruamel.yaml>=0.17",
-    "safetensors>=0.4,<1",
-    "misaki[en]>=0.9.4,<1",
-]
 
 [project.urls]
 Repository = "https://github.com/thammegowda/kidi"
