@@ -744,9 +744,10 @@ auto Context::scaled_dot_product_attention(const Tensor& query, const Tensor& ke
 auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight) -> Tensor {
     if (transpose_weight && !bias.defined() && !impl_->packed_weights.empty()) {
         const auto found = impl_->packed_weights.find(require(weight.host_bytes()).data());
+        const bool single_row = input.dimensions() > 0 && input.numel() == input.size(-1);
         if (found != impl_->packed_weights.end() && found->second.source.dtype() == weight.dtype() &&
             std::ranges::equal(found->second.source.shape(), weight.shape()) &&
-            (found->second.packed_prefill || (input.dimensions() > 0 && input.numel() == input.size(-1)))) {
+            (found->second.packed_prefill || decode_attention || decode_projections || single_row)) {
             auto& binding = found->second;
             if (!binding.packed.values.defined()) {
                 const auto started = Clock::now();
@@ -761,8 +762,9 @@ auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bi
             auto output = packed_linear(input, binding.packed.values, binding.packed.scales, binding.packed.bits,
                                         binding.packed.group_size, 0.F, 0.F, binding.packed.zeros);
             if (!binding.released && device().kind == tensor::DeviceKind::CPU &&
-                impl_->precision == core::InferencePrecision::CHECKPOINT && input.dimensions() > 0 &&
-                input.numel() == input.size(-1) && binding.packed.values.nbytes() >= (std::size_t{1} << 20) &&
+                impl_->precision == core::InferencePrecision::CHECKPOINT && single_row &&
+                binding.packed.group_size < input.size(-1) &&
+                binding.packed.values.nbytes() >= (std::size_t{1} << 20) &&
                 binding.packed.values.size(0) % (8 / binding.packed.bits) == 0) {
                 binding.packed.values.release_pages(true);
                 binding.released = true;

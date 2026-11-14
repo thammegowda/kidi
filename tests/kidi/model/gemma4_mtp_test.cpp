@@ -128,8 +128,15 @@ auto check(const std::filesystem::path& directory) -> bool {
     const auto one_logits = require(model->forward(correction, prefix, true, &one_hidden));
     if (!one_hidden.defined() || one_hidden.size(1) != 1 || one_logits.size(1) != 1) return false;
     model::Gemma4State invalid;
-    return !model->rewind(invalid, 0) && !model->forward({}, prefix, true, &one_hidden) &&
-           check_rounds(*model, prompt, config["vocab_size"].as<std::size_t>());
+    if (!(!model->rewind(invalid, 0) && !model->forward({}, prefix, true, &one_hidden) &&
+          check_rounds(*model, prompt, config["vocab_size"].as<std::size_t>())))
+        return false;
+    if (!config["quantization_config"]) {
+        auto packed = require(model::Gemma4Impl::create(config));
+        require(packed->set_checkpoint(checkpoint, 4, 4, false));
+        if (!check_rounds(*packed, prompt, config["vocab_size"].as<std::size_t>())) return false;
+    }
+    return true;
 }
 } // namespace
 
