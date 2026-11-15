@@ -29,6 +29,7 @@ using runtime::OperatorSpec;
 using runtime::TensorInputs;
 namespace {
 thread_local bool decode_projections = false;
+thread_local bool decode_attention = false;
 thread_local std::shared_ptr<graph::Compiler> default_compiler;
 
 class InplaceScope {
@@ -52,8 +53,14 @@ struct OperatorProfile {
     std::uint64_t allocations = 0, allocated_bytes = 0, output_bytes = 0;
 };
 } // namespace
-DecodeScope::DecodeScope(bool enabled) : previous_(std::exchange(decode_projections, enabled)) {}
-DecodeScope::~DecodeScope() { decode_projections = previous_; }
+DecodeScope::DecodeScope(bool enabled) : DecodeScope(enabled, enabled) {}
+DecodeScope::DecodeScope(bool attention, bool projections)
+    : previous_attention_(std::exchange(decode_attention, attention)),
+      previous_projections_(std::exchange(decode_projections, projections)) {}
+DecodeScope::~DecodeScope() {
+    decode_attention = previous_attention_;
+    decode_projections = previous_projections_;
+}
 StepCompilerScope::StepCompilerScope(std::shared_ptr<graph::Compiler> compiler)
     : previous_(std::exchange(default_compiler, std::move(compiler))) {}
 StepCompilerScope::~StepCompilerScope() { default_compiler = std::move(previous_); }
@@ -130,10 +137,11 @@ struct Context::Impl {
         const auto& capabilities = device.capabilities();
         const auto& dispatch = device.policy().dispatch;
         spec.packed_prefill = packed_prefill;
-        spec.vector_projection = decode_projections && spec.operation == Operation::PACKED_LINEAR &&
-                                 dispatch.projection == tensor::ProjectionDispatch::VECTOR_DECODE &&
-                                 inputs[0].dimensions() > 0 && inputs[0].size(-1) &&
-                                 inputs[0].numel() / inputs[0].size(-1) >= 4;
+        spec.vector_projection =
+            (decode_projections && spec.operation == Operation::PACKED_LINEAR &&
+             dispatch.projection == tensor::ProjectionDispatch::VECTOR_DECODE && inputs[0].dimensions() > 0 &&
+             inputs[0].size(-1) && inputs[0].numel() / inputs[0].size(-1) >= 4) ||
+            (decode_attention && spec.operation == Operation::ATTENTION && device.capabilities().compute.host());
         if (is_inplace && destination->is_host_accessible()) require(destination->host_bytes());
         const auto entered = profiling ? Clock::now() : Clock::time_point{};
         const auto preparation_before = preparation;
@@ -736,9 +744,10 @@ auto Context::scaled_dot_product_attention(const Tensor& query, const Tensor& ke
 auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight) -> Tensor {
     if (transpose_weight && !bias.defined() && !impl_->packed_weights.empty()) {
         const auto found = impl_->packed_weights.find(require(weight.host_bytes()).data());
+        const bool single_row = input.dimensions() > 0 && input.numel() == input.size(-1);
         if (found != impl_->packed_weights.end() && found->second.source.dtype() == weight.dtype() &&
             std::ranges::equal(found->second.source.shape(), weight.shape()) &&
-            (found->second.packed_prefill || (input.dimensions() > 0 && input.numel() == input.size(-1)))) {
+            (found->second.packed_prefill || decode_attention || decode_projections || single_row)) {
             auto& binding = found->second;
             if (!binding.packed.values.defined()) {
                 const auto started = Clock::now();
@@ -753,8 +762,9 @@ auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bi
             auto output = packed_linear(input, binding.packed.values, binding.packed.scales, binding.packed.bits,
                                         binding.packed.group_size, 0.F, 0.F, binding.packed.zeros);
             if (!binding.released && device().kind == tensor::DeviceKind::CPU &&
-                impl_->precision == core::InferencePrecision::CHECKPOINT && input.dimensions() > 0 &&
-                input.numel() == input.size(-1) && binding.packed.values.nbytes() >= (std::size_t{1} << 20) &&
+                impl_->precision == core::InferencePrecision::CHECKPOINT && single_row &&
+                binding.packed.group_size < input.size(-1) &&
+                binding.packed.values.nbytes() >= (std::size_t{1} << 20) &&
                 binding.packed.values.size(0) % (8 / binding.packed.bits) == 0) {
                 binding.packed.values.release_pages(true);
                 binding.released = true;

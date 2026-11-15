@@ -114,8 +114,10 @@ add_library(kidi
     src/kidi/layers/transformer.cpp
     src/kidi/layers/whisper.cpp
     src/kidi/model/gemma4.cpp
+    src/kidi/model/gemma4_assistant.cpp
     src/kidi/model/gemma4_vision.cpp
     src/kidi/model/kokoro.cpp
+    src/kidi/model/model.cpp
     src/kidi/model/omnivoice.cpp
     src/kidi/model/qwen3.cpp
     src/kidi/model/registry.cpp
@@ -131,7 +133,6 @@ add_library(kidi
     src/kidi/runtime/ynn/numa.cpp
     src/kidi/runtime/ynn/worker_pool.cpp
     src/kidi/search/hnsw.cpp
-    src/kidi/search/search.cpp
     src/kidi/tensor/backend.cpp
     src/kidi/tensor/cpu_backend.cpp
     src/kidi/tensor/external.cpp
@@ -260,10 +261,27 @@ if(KIDI_BUILD_BENCHMARKS)
     endif()
 endif()
 
+function(kidi_embed_text input output symbol)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input}")
+    file(READ "${input}" KIDI_EMBEDDED_TEXT)
+    set(KIDI_EMBEDDED_SYMBOL "${symbol}")
+    configure_file(cmake/embed_text.h.in "${output}" @ONLY)
+endfunction()
+
+set(KIDI_CHECKPOINT_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated/checkpoint")
+file(MAKE_DIRECTORY "${KIDI_CHECKPOINT_GENERATED}")
+kidi_embed_text(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/checkpoint/packages.jsonl"
+    "${KIDI_CHECKPOINT_GENERATED}/packages_jsonl.h"
+    KIDI_PACKAGE_SPECS_JSONL
+)
+
 target_include_directories(kidi
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
         $<INSTALL_INTERFACE:include>
+    PRIVATE
+        "${KIDI_CHECKPOINT_GENERATED}"
 )
 
 target_compile_features(kidi PUBLIC cxx_std_23)
@@ -289,12 +307,6 @@ if(APPLE)
     find_library(KIDI_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
     set(KIDI_MPS_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated/mps")
     file(MAKE_DIRECTORY "${KIDI_MPS_GENERATED}")
-    function(kidi_embed_text input output symbol)
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input}")
-        file(READ "${input}" KIDI_EMBEDDED_TEXT)
-        set(KIDI_EMBEDDED_SYMBOL "${symbol}")
-        configure_file(cmake/embed_text.h.in "${output}" @ONLY)
-    endfunction()
     set(KIDI_MPS_METAL_SOURCES
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/command_batch.metal"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/eager_kernels.metal"
@@ -484,8 +496,6 @@ if(KIDI_BUILD_PYTHON)
     nanobind_add_module(_native STABLE_ABI python/bindings.cpp)
     target_link_libraries(_native PRIVATE kidi_cli_main)
     install(TARGETS _native LIBRARY DESTINATION kidi COMPONENT python)
-    install(FILES "${KIDI_THIRD_PARTY_DIR}/tokenizerspp/tools/nlcodec_to_tokenizer_json.py"
-        DESTINATION kidi/converters COMPONENT python)
     execute_process(
         COMMAND "${Python_EXECUTABLE}" -c
             "from importlib.metadata import distribution; package = distribution('nanobind'); print(next(package.locate_file(file) for file in package.files if file.name == 'LICENSE' and '.dist-info' in str(file)))"

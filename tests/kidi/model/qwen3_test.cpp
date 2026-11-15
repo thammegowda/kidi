@@ -1,6 +1,7 @@
 #include "kidi/model/qwen3.h"
 
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 
 int main() {
@@ -106,6 +107,38 @@ int main() {
     for (std::size_t index = 0; index < batch_values.size(); ++index)
         if (std::abs(expected[index % expected.size()] - batch_values[index]) > 1e-5F)
             return fail("Qwen3 batched guidance differs");
+
+    {
+        const auto path = std::filesystem::temp_directory_path() / "kidi-qwen3-mapping-test.safetensors";
+        std::filesystem::remove(path);
+        kidi::StateDict unfused;
+        for (const auto& [name, tensor] : state) {
+            const auto key = "model." + name;
+            if (const auto pos = key.find(".self_attn.qkv_proj."); pos != std::string::npos) {
+                const auto prefix = key.substr(0, pos) + ".self_attn.";
+                const auto suffix = key.substr(pos + std::string_view(".self_attn.qkv_proj.").size());
+                unfused.emplace(prefix + "q_proj." + suffix, kidi::ops::require(tensor.narrow(0, 0, 4)));
+                unfused.emplace(prefix + "k_proj." + suffix, kidi::ops::require(tensor.narrow(0, 4, 2)));
+                unfused.emplace(prefix + "v_proj." + suffix, kidi::ops::require(tensor.narrow(0, 6, 2)));
+            } else if (const auto pos = key.find(".mlp.gate_up_proj."); pos != std::string::npos) {
+                const auto prefix = key.substr(0, pos) + ".mlp.";
+                const auto suffix = key.substr(pos + std::string_view(".mlp.gate_up_proj.").size());
+                unfused.emplace(prefix + "gate_proj." + suffix, kidi::ops::require(tensor.narrow(0, 0, 6)));
+                unfused.emplace(prefix + "up_proj." + suffix, kidi::ops::require(tensor.narrow(0, 6, 6)));
+            } else {
+                unfused.emplace(key, tensor);
+            }
+        }
+        kidi::ops::require(kidi::checkpoint::Weights::save(path, unfused));
+        const auto loaded = kidi::ops::require(kidi::checkpoint::Weights::load(path));
+        std::filesystem::remove(path);
+        kidi::model::Qwen3 from_unfused(config);
+        kidi::ops::require(from_unfused->set_checkpoint(loaded));
+        const auto fused_output = from_unfused->forward(context, from_unfused->embed(context, tokens));
+        context.synchronize();
+        if (!std::ranges::equal(expected, kidi::ops::require(fused_output.data<float>())))
+            return fail("Qwen3 unfused checkpoint fusion changed output");
+    }
 
 #if defined(__APPLE__)
     const std::array<std::int32_t, 4> metal_tokens{1, 2, 1, 2};

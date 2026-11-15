@@ -409,7 +409,7 @@ auto run_gemma_teacher_forced(const std::filesystem::path& directory, int copies
     constexpr std::size_t CONTEXT = 9216;
     constexpr std::size_t STEPS = 64;
     const auto chunk = std::getenv("KIDI_DIAG_CHUNK") ? std::strtoull(std::getenv("KIDI_DIAG_CHUNK"), nullptr, 10) : 32;
-    const auto full_config = require(kidi::checkpoint::load_config(directory / "model.yaml"));
+    const auto full_config = require(kidi::checkpoint::load_config(directory));
     const auto config = full_config["model"];
     auto tokenizer = require(kidi::text::Tokenizer::load(full_config["tokenizer_file"].as<std::string>()));
     auto weights = require(kidi::checkpoint::Weights::load(full_config["weights_file"].as<std::string>()));

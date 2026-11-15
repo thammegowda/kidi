@@ -160,7 +160,7 @@ auto configure_index_parser(ArgumentParser& parser) -> void {
         .type<std::filesystem::path>()
         .required()
         .metavar("MODEL")
-        .help("local directory or @owner/model (Python launcher with kidi[hf])");
+        .help("local directory or @owner/model");
     parser.add_argument("-c", "--cache")
         .type<std::filesystem::path>()
         .default_value(std::filesystem::path("~/.cache/kidi/model-hub"))
@@ -220,9 +220,7 @@ auto index_command(const Namespace& arguments, const std::filesystem::path& dire
         }
         parallel_for = runtime::ynn::parallel_for;
     }
-    auto config = std::filesystem::is_regular_file(directory / "model.yaml")
-                      ? checkpoint::load_config(directory / "model.yaml")
-                      : checkpoint::load_config(directory, model::Gemma4Impl::checkpoint_config());
+    auto config = checkpoint::load_config(directory);
     if (!config) {
         spdlog::error("{}", config.error().message);
         return 1;

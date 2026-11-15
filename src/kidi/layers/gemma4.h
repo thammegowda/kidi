@@ -86,6 +86,7 @@ public:
     auto forward_segments(ops::Context& context, const Tensor& input, std::span<const Gemma4AttentionSegment> segments,
                           const Tensor& cosine, const Tensor& sine, bool cache_only = false) const -> Tensor;
     auto has_cache_scales() const -> bool;
+    auto cache_quantization() const -> std::array<ops::BlockwiseQuantization, 2>;
 
 private:
     Linear query_, key_value_{nullptr}, output_;
@@ -109,12 +110,15 @@ public:
                           std::span<const Gemma4AttentionSegment> segments, const Tensor& cosine, const Tensor& sine,
                           bool cache_only = false) const -> Tensor;
     auto has_cache_scales() const -> bool { return attention_->has_cache_scales(); }
+    auto cache_quantization() const -> std::array<ops::BlockwiseQuantization, 2> {
+        return attention_->cache_quantization();
+    }
 
 private:
     Gemma4Attention attention_;
     GatedFeedForward feed_forward_;
-    RmsNorm input_norm_, attention_norm_, pre_feed_forward_norm_, post_feed_forward_norm_, per_layer_norm_;
-    Linear per_layer_gate_, per_layer_projection_;
+    RmsNorm input_norm_, attention_norm_, pre_feed_forward_norm_, post_feed_forward_norm_, per_layer_norm_{nullptr};
+    Linear per_layer_gate_{nullptr}, per_layer_projection_{nullptr};
     Tensor scalar_;
 };
 } // namespace kidi::layers

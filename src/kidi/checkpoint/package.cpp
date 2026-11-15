@@ -1,5 +1,4 @@
 #include "kidi/checkpoint/package.h"
-#include "kidi/model/transformer.h"
 
 #include <array>
 #include <set>
@@ -9,8 +8,6 @@
 
 namespace kidi::checkpoint {
 namespace {
-
-constexpr std::string_view MANIFEST_FILENAME = "model.yaml";
 
 auto tokenizer_tokens(const text::Tokenizer& tokenizer, std::int32_t expected_size, std::string_view label)
     -> Result<YAML::Node> {
@@ -55,12 +52,11 @@ auto Package::load(const std::filesystem::path& model_directory) -> Result<Packa
         if (!std::filesystem::is_directory(model_directory)) {
             return std::unexpected(Error{ErrorCode::IO, "not a model directory: " + model_directory.string()});
         }
-        auto config = load_config(model_directory / MANIFEST_FILENAME);
+        auto config = load_config(model_directory);
         if (!config) {
             return std::unexpected(std::move(config.error()));
         }
-        auto weights =
-            checkpoint::Weights::load((*config)["weights_file"].as<std::string>(), model::TransformerImpl::state_mapping_specs());
+        auto weights = checkpoint::Weights::load((*config)["weights_file"].as<std::string>());
         if (!weights) {
             return std::unexpected(std::move(weights.error()));
         }

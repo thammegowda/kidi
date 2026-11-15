@@ -47,8 +47,12 @@ export async function loadAppConfig(source = globalThis.KIDI_APP_CONFIG ||
     const models = object(root.models, 'models');
     for (const name of ['chat', 'asr', 'tts']) {
         const model = object(models[name], `models.${name}`);
-        if (model.enabled !== false && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(model.model_id || ''))
-            throw new Error(`models.${name}.model_id must be a Hugging Face model ID`);
+        if (model.enabled !== false) {
+            const id = typeof model.model_id === 'string' ? model.model_id.trim() : '';
+            if (!id) throw new Error(`models.${name}.model_id must be a @owner/model Hub ID or local path`);
+            if (id.startsWith('@') && !/^@[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(id))
+                throw new Error(`models.${name}.model_id must be a valid @owner/model Hugging Face ID`);
+        }
     }
     const chat = models.chat;
     if ('system_prompt' in chat || 'translation_prompt' in chat || chat.editor?.prompts !== undefined)

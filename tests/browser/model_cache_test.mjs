@@ -143,19 +143,28 @@ test('WebGPU layout sends decoder projections to fused GPU buffers and keeps the
     const header = {
         'model.language_model.layers.0.mlp.gate_proj.weight': tensor('U8', [4, 2], 0, 8),
         'model.language_model.layers.0.mlp.up_proj.weight': tensor('U8', [4, 2], 8, 16),
-        'model.language_model.layers.0.self_attn.q_proj.weight': tensor('U8', [4, 2], 16, 24),
-        'model.language_model.layers.0.mlp.gate_proj.weight_scale': tensor('F32', [4, 1], 24, 40),
-        'model.language_model.embed_tokens.embedding_quantized': tensor('U8', [4, 2], 40, 48),
+        'model.language_model.layers.0.self_attn.k_proj.weight': tensor('U8', [2, 2], 16, 20),
+        'model.language_model.layers.0.self_attn.v_proj.weight': tensor('U8', [2, 2], 20, 24),
+        'model.language_model.layers.0.self_attn.q_proj.weight': tensor('U8', [4, 2], 24, 32),
+        'model.language_model.layers.0.mlp.gate_proj.weight_scale': tensor('F32', [4, 1], 32, 48),
+        'model.language_model.layers.2.self_attn.k_proj.weight': tensor('U8', [2, 2], 48, 52),
+        'model.language_model.layers.2.self_attn.v_proj.weight': tensor('U8', [2, 2], 52, 56),
+        'model.language_model.layers.2.self_attn.k_proj.weight_scale': tensor('F32', [2, 1], 56, 64),
+        'model.language_model.layers.2.self_attn.k_cache_scale': tensor('F32', [], 64, 68),
+        'model.language_model.layers.2.self_attn.q_proj.weight': tensor('U8', [4, 2], 68, 76),
+        'model.language_model.embed_tokens.embedding_quantized': tensor('U8', [4, 2], 76, 84),
     };
     const ranges = Object.entries(header).map(([name, info]) => ({name, start: info.data_offsets[0],
-        end: info.data_offsets[1], mask: 0, bits: name.endsWith('weight_scale') ? 0 : 4}));
-    const layout = weightLayout(header, ranges, true, true);
+        end: info.data_offsets[1], mask: 0, bits: name.endsWith('scale') ? 0 : 4}));
+    const layout = weightLayout(header, ranges, true, true, 2);
     assert.deepEqual(layout.device.map(entry => [entry.name, entry.shape, entry.bytes, entry.bits]), [
         ['model.language_model.layers.0.mlp.gate_up_proj.weight', [8, 2], 16, 4],
-        ['model.language_model.layers.0.self_attn.q_proj.weight', [4, 2], 8, 4]]);
+        ['model.language_model.layers.0.self_attn.kv_proj.weight', [4, 2], 8, 4],
+        ['model.language_model.layers.0.self_attn.q_proj.weight', [4, 2], 8, 4],
+        ['model.language_model.layers.2.self_attn.q_proj.weight', [4, 2], 8, 4]]);
     assert.deepEqual(Object.keys(layout.header).sort(), ['model.language_model.embed_tokens.embedding_quantized',
         'model.language_model.layers.0.mlp.gate_proj.weight_scale']);
-    assert.equal(weightLayout(header, ranges.map(range => ({...range})), true).device.length, 0);
+    assert.equal(weightLayout(header, ranges.map(range => ({...range})), true, false, 2).device.length, 0);
 });
 
 test('model IDs resolve latest Hub revisions and retain an offline pinned mapping', async () => {
@@ -173,16 +182,17 @@ test('model IDs resolve latest Hub revisions and retain an offline pinned mappin
         return new Response(JSON.stringify({sha: revision}));
     };
     try {
-        assert.equal(await resolveModelSource('google/test'),
+        assert.equal(await resolveModelSource('@google/test'),
             `https://huggingface.co/google/test/resolve/${revision}/config.json`);
         revision = 'b'.repeat(40);
-        assert.equal(await resolveModelSource('google/test'),
+        assert.equal(await resolveModelSource('@google/test'),
             `https://huggingface.co/google/test/resolve/${revision}/config.json`);
         globalThis.fetch = async () => { throw new Error('offline'); };
-        assert.equal(await resolveModelSource('google/test', {cacheOnly: true}),
+        assert.equal(await resolveModelSource('@google/test', {cacheOnly: true}),
             `https://huggingface.co/google/test/resolve/${revision}/config.json`);
         assert.equal(requests, 2);
-        await assert.rejects(resolveModelSource('missing/model', {cacheOnly: true}), /no resolved revision/);
+        assert.equal(await resolveModelSource('google/test'), 'http://localhost/google/test');
+        await assert.rejects(resolveModelSource('@missing/model', {cacheOnly: true}), /no resolved revision/);
     } finally {
         globalThis.fetch = originalFetch;
         if (originalCaches === undefined) delete globalThis.caches;
@@ -196,10 +206,7 @@ test('Kidi OmniVoice Hub package streams one safetensors file by ranges', async 
     const config = {name: 'OmniVoice-q8', model_type: 'kidi_omnivoice',
         architectures: ['KidiOmniVoiceForTextToSpeech'], kidi_format_version: 1,
         quantization_config: {format: 'signed-int8'}};
-    const metadata = ['model.yaml', 'tokenizer.json.gz', 'sentence-prefixes.tsv',
-        'synthesis_template.jinja', 'NOTICE', 'licenses/OMNIVOICE-CC-BY-NC-4.0.txt',
-        'licenses/META-LLAMA-3-LICENSE.txt', 'licenses/META-LLAMA-3-USE-POLICY.md',
-        'licenses/HIGGS-AUDIO-2-LICENSE.txt'];
+    const metadata = ['model.yaml', 'tokenizer.json.gz', 'sentence-prefixes.tsv', 'synthesis_template.jinja'];
     const weights = Uint8Array.from({length: 32}, (_, index) => index);
     const cache = new Map(), files = new Map(), nodes = new Map();
     const originalFetch = globalThis.fetch, originalCaches = globalThis.caches;
@@ -232,9 +239,45 @@ test('Kidi OmniVoice Hub package streams one safetensors file by ranges', async 
         assert.equal(loaded.precision, 'signed-int8');
         assert.equal(loaded.heapWeightBytes, weights.length);
         assert.deepEqual([...nodes.get('/model/model.safetensors').contents], [...weights]);
+        assert.ok(files.has('/model/config.json'));
         assert.ok(files.has('/model/model.yaml'));
-        assert.ok(files.has('/model/licenses/HIGGS-AUDIO-2-LICENSE.txt'));
+        assert.ok(files.has('/model/tokenizer.json.gz'));
         assert.equal(await isModelCached(source), true);
+
+        const unifiedSource = `https://huggingface.co/kidi/OmniVoice-unified/resolve/${revision}/config.json`;
+        const unifiedConfig = {
+            model_type: 'omnivoice',
+            architectures: ['KidiOmniVoiceForTextToSpeech'],
+            tokenizer_file: 'tokenizer.json',
+            sentence_prefixes_file: 'sentence-prefixes.tsv',
+            template_file: 'synthesis_template.jinja',
+            synthesis: {steps: 32},
+            quantization: {format: 'signed-int8'},
+        };
+        const unifiedMeta = ['tokenizer.json', 'sentence-prefixes.tsv', 'synthesis_template.jinja'];
+        const unifiedFiles = new Map(), unifiedNodes = new Map();
+        globalThis.fetch = async url => {
+            const value = String(url);
+            const path = new URL(value).pathname;
+            if (value === unifiedSource) return new Response(JSON.stringify(unifiedConfig));
+            if (path.endsWith('/model.safetensors')) return new Response(weights, {
+                status: 206, headers: {'Content-Range': `bytes 0-${weights.length - 1}/${weights.length}`},
+            });
+            if (unifiedMeta.some(name => path.endsWith(`/${name}`))) return new Response(`data:${path.split('/').at(-1)}`);
+            throw new Error(`Unexpected request: ${value}`);
+        };
+        const unifiedModule = {HEAPU8: new Uint8Array(4096), _malloc: () => 64, FS: {
+            mkdir() {},
+            mkdirTree() {},
+            writeFile: (name, data) => unifiedFiles.set(name, data),
+            createDataFile: (directory, name) => unifiedNodes.set(`${directory}/${name}`, {stream_ops: {}}),
+            lookupPath: name => ({node: unifiedNodes.get(name)}),
+        }};
+        const unifiedLoaded = await loadModel(unifiedModule, unifiedSource, () => {});
+        assert.equal(unifiedLoaded.precision, 'signed-int8');
+        assert.ok(unifiedFiles.has('/model/tokenizer.json'));
+        assert.ok(!unifiedFiles.has('/model/model.yaml'));
+        assert.equal(await isModelCached(unifiedSource), true);
     } finally {
         globalThis.fetch = originalFetch;
         if (originalCaches === undefined) delete globalThis.caches;
@@ -363,11 +406,11 @@ test('Hub ranges are cached sign-flipped once and reload into owned memory witho
         assert.deepEqual([...first.HEAPU8.subarray(destination, destination + 8)], Array(8).fill(0x12 ^ 0x88));
         assert.throws(() => first.kidiExternal.gather('model.language_model.embed_tokens_per_layer.embedding_quantized',
             rows, 3, destination, 4), /outside/);
-        const descriptor = JSON.parse(first.files.get('/model/model.yaml'));
+        const descriptor = JSON.parse(new TextDecoder().decode(first.files.get('/model/config.json')));
         assert.deepEqual(descriptor.external_tensors, [{name: 'model.language_model.embed_tokens_per_layer.embedding_quantized',
             dtype: 'u8', shape: [2, 4]}]);
-        assert.deepEqual(JSON.parse(new TextDecoder().decode(first.files.get('/model/config.json'))), config);
-        assert.equal(descriptor.model.packed_weights_signed, true);
+        assert.equal(descriptor.model_type, config.model_type);
+        assert.equal(descriptor.packed_weights_signed, true);
         assert.deepEqual(descriptor.decode, {maximum_new_tokens: 1024, context_size: 9216});
         const rangeKey = [...cache.keys()].find(key => key.endsWith('kidi_range=0-8388607'));
         const cachedFirst = new Uint8Array(await cache.get(rangeKey).clone().arrayBuffer());

@@ -81,7 +81,7 @@ auto synthesis_elapsed_ns(std::chrono::steady_clock::time_point start) -> std::u
 }
 
 struct Synthesizer::Impl {
-    std::shared_ptr<SynthesizerModel> model;
+    std::shared_ptr<model::SpeechSynthesisModel> model;
     text::SentenceSegmenter sentences;
     tensor::Device device;
 };
@@ -89,7 +89,7 @@ struct Synthesizer::Impl {
 namespace {
 class SegmentedSynthesisSession final : public SynthesisSession {
 public:
-    SegmentedSynthesisSession(std::shared_ptr<SynthesizerModel> model, std::vector<std::string> chunks,
+    SegmentedSynthesisSession(std::shared_ptr<model::SpeechSynthesisModel> model, std::vector<std::string> chunks,
                               SynthesisOptions options, std::optional<std::size_t> selected_reference,
                               bool notify_single_chunk)
         : model_(std::move(model)),
@@ -181,7 +181,7 @@ private:
         }
     }
 
-    std::shared_ptr<SynthesizerModel> model_;
+    std::shared_ptr<model::SpeechSynthesisModel> model_;
     std::vector<std::string> chunks_;
     SynthesisOptions options_;
     std::optional<std::size_t> selected_reference_;
@@ -195,7 +195,7 @@ private:
 };
 } // namespace
 
-Synthesizer::Synthesizer(std::shared_ptr<SynthesizerModel> model, text::SentenceSegmenter sentences,
+Synthesizer::Synthesizer(std::shared_ptr<model::SpeechSynthesisModel> model, text::SentenceSegmenter sentences,
                          tensor::Device device)
     : impl_(std::make_unique<Impl>(std::move(model), std::move(sentences), device)) {
     if (!impl_->model) throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "a synthesizer requires a model"});
@@ -206,7 +206,7 @@ Synthesizer::~Synthesizer() = default;
 
 auto Synthesizer::load(const std::filesystem::path& directory, tensor::Device device) -> Result<Synthesizer> {
     try {
-        auto config = require(checkpoint::load_config(directory / "model.yaml"));
+        auto config = require(checkpoint::load_config(directory));
         const auto type = config["model"]["type"].as<std::string>();
         if (!model::supports_task(type, model::Task::TTS))
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, type + " does not support the TTS task"});
@@ -219,7 +219,7 @@ auto Synthesizer::load(const std::filesystem::path& directory, tensor::Device de
         }
         require(runtime::ynn::reserve_thread_pool(runtime::ynn::thread_count()));
         auto sentences = require(text::SentenceSegmenter::load(config["sentence_prefixes_file"].as<std::string>()));
-        std::shared_ptr<SynthesizerModel> model;
+        std::shared_ptr<model::SpeechSynthesisModel> model;
         if (type == "omnivoice")
             model = require(model::OmniVoiceImpl::load(std::move(config), device)).ptr();
         else if (type == "kokoro")

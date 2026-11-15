@@ -98,7 +98,7 @@ def generate(destination: Path, qat: bool = False):
                 "per_layer_projection$": {"num_bits": 8},
             },
         }
-    (destination / "model.yaml").write_text(yaml.safe_dump({"model": document}, sort_keys=False))
+    (destination / "config.json").write_text(json.dumps(document, indent=2) + "\n")
     print(f"Saved {len(weights)} parameters and {logits.numel()} reference logits in {destination}")
 
 

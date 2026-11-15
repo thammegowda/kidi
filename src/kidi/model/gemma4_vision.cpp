@@ -53,27 +53,28 @@ auto project_rows(ops::Context& context, const layers::Linear& layer, const Tens
     return output;
 }
 
-auto concatenate_rows(const Tensor& first, const Tensor& second, std::string_view name) -> Tensor {
-    if (first.dtype() != second.dtype() || first.dimensions() != 2 || second.dimensions() != 2 ||
-        first.size(1) != second.size(1))
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "cannot combine gate/up parameter: " + std::string(name)});
-    const auto first_bytes = require(std::as_const(first).host_bytes());
-    const auto second_bytes = require(std::as_const(second).host_bytes());
-    std::vector<std::byte> bytes(first_bytes.size() + second_bytes.size());
-    std::ranges::copy(first_bytes, bytes.begin());
-    std::ranges::copy(second_bytes, bytes.begin() + static_cast<std::ptrdiff_t>(first_bytes.size()));
-    return require(Tensor::from_bytes(
-        {static_cast<std::int64_t>(first.size(0) + second.size(0)), static_cast<std::int64_t>(first.size(1))},
-        first.dtype(), bytes));
-}
-
-auto require_same_scalar(const Tensor& first, const Tensor& second, std::string_view name) -> Tensor {
-    const auto first_bytes = require(std::as_const(first).host_bytes());
-    const auto second_bytes = require(std::as_const(second).host_bytes());
-    if (first.dtype() != second.dtype() || first.numel() != 1 || second.numel() != 1 ||
-        !std::ranges::equal(first_bytes, second_bytes))
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "gate/up calibration differs: " + std::string(name)});
-    return first;
+auto project_pair_rows(ops::Context& context, const layers::Linear& layer, const Tensor& input)
+    -> std::pair<Tensor, Tensor> {
+    const auto length = static_cast<std::int64_t>(input.size(1));
+    const auto rows = slice_rows(context, false);
+    if (length <= rows) {
+        const auto projected = layer->forward(context, input);
+        const auto width = static_cast<std::int64_t>(projected.size(2) / 2);
+        return {context.slice(projected, 2, 0, width), context.slice(projected, 2, width, width)};
+    }
+    Tensor first, second;
+    for (std::int64_t start = 0; start < length; start += rows) {
+        const auto count = std::min(rows, length - start);
+        const auto part = layer->forward(context, context.slice(input, 1, start, count));
+        const auto width = static_cast<std::int64_t>(part.size(2) / 2);
+        if (!first.defined()) {
+            first = require(Tensor::empty({1, length, width}, part.dtype(), context.device()));
+            second = require(Tensor::empty({1, length, width}, part.dtype(), context.device()));
+        }
+        context.copy_slice_(first, context.slice(part, 2, 0, width), 1, start);
+        context.copy_slice_(second, context.slice(part, 2, width, width), 1, start);
+    }
+    return {std::move(first), std::move(second)};
 }
 
 KIDI_MODULE(VisionAttention);
@@ -83,15 +84,13 @@ public:
         : width_(config["head_dim"].as<int>()),
           heads_(config["num_attention_heads"].as<int>()),
           query_(config["hidden_size"].as<int>(), heads_ * width_, true, false, quantized ? 8 : 0),
-          key_(config["hidden_size"].as<int>(), heads_ * width_, true, false, quantized ? 8 : 0),
-          value_(config["hidden_size"].as<int>(), heads_ * width_, true, false, quantized ? 8 : 0),
+          key_value_(config["hidden_size"].as<int>(), 2 * heads_ * width_, true, false, quantized ? 8 : 0),
           output_(heads_ * width_, config["hidden_size"].as<int>(), true, false, quantized ? 8 : 0),
           query_norm_(width_, config["rms_norm_eps"].as<float>()),
           key_norm_(width_, config["rms_norm_eps"].as<float>()),
           value_norm_(width_, config["rms_norm_eps"].as<float>(), false) {
         register_module("q_proj", query_);
-        register_module("k_proj", key_);
-        register_module("v_proj", value_);
+        register_module("kv_proj", key_value_);
         register_module("o_proj", output_);
         register_module("q_norm", query_norm_);
         register_module("k_norm", key_norm_);
@@ -119,10 +118,9 @@ public:
         const auto query_projected = project_rows(context, query_, input);
         if (observer) observer("q_proj", query_projected);
         const auto query = rotary(query_projected, query_norm_, "q_norm", "q_rope");
-        const auto key_projected = project_rows(context, key_, input);
+        const auto [key_projected, value_projected] = project_pair_rows(context, key_value_, input);
         if (observer) observer("k_proj", key_projected);
         const auto key = rotary(key_projected, key_norm_, "k_norm", "k_rope");
-        const auto value_projected = project_rows(context, value_, input);
         if (observer) observer("v_proj", value_projected);
         const auto value_normalized =
             value_norm_->forward(context, context.reshape(value_projected, {1, length, heads_, width_}));
@@ -149,7 +147,7 @@ public:
 
 private:
     std::int32_t width_, heads_;
-    layers::Linear query_, key_, value_, output_;
+    layers::Linear query_, key_value_, output_;
     layers::RmsNorm query_norm_, key_norm_, value_norm_;
 };
 
@@ -295,13 +293,14 @@ public:
 
 struct Gemma4VisionImpl::State {
     ops::Context context{module_device, true};
-    int hidden, heads, head_width, positions;
+    int hidden, text_width, heads, head_width, positions;
     float theta;
     core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
     VisionTower tower;
     VisionProjection projection;
-    State(const YAML::Node& config, int text_width, bool quantized)
+    State(const YAML::Node& config, int output_width, bool quantized)
         : hidden(config["hidden_size"].as<int>()),
+          text_width(output_width),
           heads(config["num_attention_heads"].as<int>()),
           head_width(config["head_dim"].as<int>()),
           positions(config["position_embedding_size"].as<int>()),
@@ -325,6 +324,7 @@ Gemma4VisionImpl::Gemma4VisionImpl(const YAML::Node& config, std::int32_t text_w
     register_module("embed_vision", impl_->projection);
 }
 Gemma4VisionImpl::~Gemma4VisionImpl() = default;
+auto Gemma4VisionImpl::output_dim() const noexcept -> std::int32_t { return impl_->text_width; }
 auto Gemma4VisionImpl::set_precision(core::InferencePrecision precision) noexcept -> void {
     impl_->precision = precision;
     impl_->context.set_precision(precision);
@@ -335,82 +335,32 @@ auto Gemma4VisionImpl::release_workspaces() -> void {
     else impl_->context.release_workspaces();
 }
 
-auto Gemma4VisionImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
-    try {
-        const auto checkpoint_key = [&](std::string_view name) {
-            auto key = "model." + std::string(name);
-            if (!weights.contains(key)) {
-                for (const auto suffix :
-                     {".weight", ".weight_scale", ".input_activation_scale", ".output_activation_scale"}) {
-                    if (key.ends_with(suffix)) {
-                        key.insert(key.size() - std::string_view(suffix).size(), ".linear");
-                        break;
-                    }
-                }
-            }
-            return key;
-        };
-        const auto normalize_host = [&](Tensor value) {
-            if (value.dtype() == DType::I8) {
-                const auto bytes = require(std::as_const(value).host_bytes());
-                return require(Tensor::from_bytes({value.shape().begin(), value.shape().end()}, DType::U8, bytes));
-            }
-            if (value.dtype() == DType::BF16) {
-                const auto bytes = require(std::as_const(value).host_bytes());
-                const auto source = reinterpret_cast<const std::uint16_t*>(bytes.data());
-                std::vector<float> values(value.numel());
-                for (std::size_t index = 0; index < values.size(); ++index)
-                    values[index] = std::bit_cast<float>(static_cast<std::uint32_t>(source[index]) << 16);
-                return require(
-                    Tensor::from_host({value.shape().begin(), value.shape().end()}, std::span<const float>(values)));
-            }
-            if (value.dtype() != DType::F32 && value.dtype() != DType::U8)
-                throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported vision checkpoint parameter dtype"});
-            return value;
-        };
-        const auto normalize = [&](std::string_view name, Tensor value) {
-            if (value.dtype() == DType::I8) return require(normalize_host(std::move(value)).to(device()));
-            if (value.dtype() == DType::BF16 && name.ends_with("position_embedding_table"))
-                return normalize_host(std::move(value));
-            if (value.dtype() != DType::F32 && value.dtype() != DType::U8)
-                return impl_->context.cast(require(value.to(device())), DType::F32);
-            return value;
-        };
-        const auto load = [&](std::string_view name) {
-            return normalize(name, require(weights.tensor(checkpoint_key(name))));
-        };
-        const auto load_host = [&](std::string_view name) {
-            return normalize_host(require(weights.tensor(checkpoint_key(name))));
-        };
-        StateDict state;
-        for (const auto& parameter : state_dict()) {
-            const auto& name = parameter.first;
-            constexpr std::string_view GATE_UP = ".mlp.gate_up_proj.";
-            if (const auto position = name.find(GATE_UP); position != std::string::npos) {
-                const auto combined_key = checkpoint_key(name);
-                if (weights.contains(combined_key)) {
-                    state.emplace(name, normalize(name, require(weights.tensor(combined_key))));
-                    continue;
-                }
-                auto gate_name = name;
-                gate_name.replace(position, GATE_UP.size(), ".mlp.gate_proj.");
-                auto up_name = name;
-                up_name.replace(position, GATE_UP.size(), ".mlp.up_proj.");
-                auto gate = load_host(gate_name);
-                auto up = load_host(up_name);
-                const bool scalar =
-                    name.ends_with("input_activation_scale") || name.ends_with("output_activation_scale");
-                auto combined = scalar ? require_same_scalar(gate, up, name) : concatenate_rows(gate, up, name);
-                if (!scalar) combined = require(combined.to(device()));
-                state.emplace(name, std::move(combined));
-                continue;
-            }
-            state.emplace(name, load(name));
-        }
-        return set_state(state);
-    } catch (const ops::Failure& error) {
-        return std::unexpected(error.error());
-    }
+auto Gemma4VisionImpl::state_mapping_specs() const -> std::vector<checkpoint::StateMappingSpec> {
+    using checkpoint::StateMappingOp;
+    using checkpoint::StateMappingSpec;
+    return {
+        {.sources = {R"(^(?!(?:model\.)?(?:vision_tower|embed_vision)\.).*)"}, .op = StateMappingOp::IGNORE},
+        {.sources =
+             {R"(^model\.((?:vision_tower|embed_vision)\..+?)(?:\.linear)?\.(weight|weight_scale|input_activation_scale|output_activation_scale|bias)$)"},
+         .destination = "$1.$2"},
+        {.sources = {R"(^model\.((?:vision_tower|embed_vision)\..+)$)"}, .destination = "$1"},
+        {.sources = {R"(^vision_tower\.encoder\.layers\.(\d+)\.mlp\.gate_proj\.(weight|weight_scale)$)",
+                     "vision_tower.encoder.layers.$1.mlp.up_proj.$2"},
+         .destination = "vision_tower.encoder.layers.$1.mlp.gate_up_proj.$2"},
+        {.sources =
+             {R"(^vision_tower\.encoder\.layers\.(\d+)\.mlp\.gate_proj\.(input_activation_scale|output_activation_scale)$)",
+              "vision_tower.encoder.layers.$1.mlp.up_proj.$2"},
+         .destination = "vision_tower.encoder.layers.$1.mlp.gate_up_proj.$2",
+         .op = StateMappingOp::IDENTICAL},
+        {.sources = {R"(^vision_tower\.encoder\.layers\.(\d+)\.self_attn\.k_proj\.(weight|weight_scale)$)",
+                     "vision_tower.encoder.layers.$1.self_attn.v_proj.$2"},
+         .destination = "vision_tower.encoder.layers.$1.self_attn.kv_proj.$2"},
+        {.sources =
+             {R"(^vision_tower\.encoder\.layers\.(\d+)\.self_attn\.k_proj\.(input_activation_scale|output_activation_scale)$)",
+              "vision_tower.encoder.layers.$1.self_attn.v_proj.$2"},
+         .destination = "vision_tower.encoder.layers.$1.self_attn.kv_proj.$2",
+         .op = StateMappingOp::IDENTICAL},
+    };
 }
 
 auto Gemma4VisionImpl::forward(const image::Gemma4Image& image) -> Result<Tensor> {

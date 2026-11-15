@@ -83,7 +83,7 @@ auto main() -> int {
         ModuleMap<> modules;
         modules->insert("qkv", qkv);
         modules->insert("attention", attention);
-        ops::require(modules->set_state(weights));
+        ops::require(modules->set_state(ops::require(weights.state_dict())));
         const std::array input_values{1.F, 2.F, 3.F, 4.F, 0.5F, -1.F, 2.F, -0.5F, 3.F, 0.25F, -2.F, 1.F};
         const std::array mask_values{0.F, -1e9F, -1e9F, 0.F, 0.F, -1e9F, 0.F, 0.F, 0.F};
         const std::array expected{0.514999986F, 0.700000048F,  1.379999995F, 0.089999951F, 0.243209749F, 0.126859829F,

@@ -73,7 +73,7 @@ auto main() -> int {
         auto missing_scale = require(weights.state_dict());
         missing_scale.erase("linear.scale");
         if (modules->set_state(missing_scale)) return 1;
-        require(modules->set_state(weights));
+        require(modules->set_state(require(weights.state_dict())));
         const std::array input_values{-1.F, 0.F, 1.F, 2.F, -2.F, -1.F, 1.F, 2.F};
         const std::array expected{0.6F, 2.55F, 1.675F, 0.35F, 3.05F, 1.3F};
         std::vector devices{tensor::Device::cpu()};

@@ -9,14 +9,66 @@ const WHISPER_GGML_REVISION = '5359861c739e955e79d9a303bcbc70fb988958b1';
 const WHISPER_SIZES = {384: 'tiny', 512: 'base', 768: 'small'};
 const isWhisper = config => config.model_type === 'whisper' &&
     config.architectures?.includes('WhisperForConditionalGeneration');
-const isKidiOmniVoice = config => config.model_type === 'kidi_omnivoice' &&
-    config.architectures?.includes('KidiOmniVoiceForTextToSpeech') && config.kidi_format_version === 1;
+const isKidiOmniVoice = config => (config.model_type === 'omnivoice' || config.model_type === 'kidi_omnivoice') &&
+    config.architectures?.includes('KidiOmniVoiceForTextToSpeech');
+const safeRelativePath = value => typeof value === 'string' && value.length > 0 && !value.startsWith('/') &&
+    !/[:\\]|(^|\/)\.\.(\/|$)/.test(value);
+const isWeightFile = name => name.endsWith('.safetensors') || name.endsWith('.bin');
+const TASK_KIND = {tts: 'TTS', asr: 'Speech', chat: 'Chat', translation: 'Translation'};
+
+let packageSpecsPromise;
+async function loadPackageSpecs() {
+    packageSpecsPromise ??= (async () => {
+        let text;
+        if (typeof process !== 'undefined' && process.versions?.node) {
+            const {readFile} = await import('node:fs/promises');
+            const {dirname, join} = await import('node:path');
+            const {fileURLToPath} = await import('node:url');
+            try {
+                text = await readFile(new URL('./packages.jsonl', import.meta.url), 'utf8');
+            } catch {
+                text = await readFile(
+                    join(dirname(fileURLToPath(import.meta.url)), '../../../src/kidi/checkpoint/packages.jsonl'), 'utf8');
+            }
+        } else {
+            const response = await fetch(new URL('./packages.jsonl', import.meta.url));
+            if (!response.ok) throw new Error(`Unable to load packages.jsonl (HTTP ${response.status})`);
+            text = await response.text();
+        }
+        const specs = new Map();
+        for (const line of text.split(/\r?\n/)) {
+            if (!line.trim()) continue;
+            const spec = JSON.parse(line);
+            specs.set(spec.model_type, spec);
+        }
+        return specs;
+    })();
+    return packageSpecsPromise;
+}
+
+function packageFiles(config, specs) {
+    const spec = specs.get(config?.model_type);
+    const files = spec ? [...spec.files, ...(spec.sidecars || [])] :
+        ['model.safetensors', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
+    const weights = safeRelativePath(config?.weights_file) ? config.weights_file : (files.find(isWeightFile) || 'model.safetensors');
+    let metadata = files.filter(name => !isWeightFile(name) && name !== weights);
+    if (config?.model_type === 'kidi_omnivoice' && config?.synthesis)
+        metadata = metadata.filter(name => name !== 'model.yaml');
+    for (const key of ['tokenizer_file', 'template_file', 'sentence_prefixes_file', 'lexicon_file']) {
+        const value = config?.[key];
+        if (safeRelativePath(value) && !metadata.includes(value)) metadata.push(value);
+    }
+    if (config?.model_type === 'kidi_omnivoice' && config?.synthesis && !config?.tokenizer_file)
+        metadata = metadata.map(name => name === 'tokenizer.json.gz' ? 'tokenizer.json' : name);
+    return {spec, weights, metadata};
+}
 // After the first load the cache keeps the INT8 checkpoint the runtime converted from the GGML weights, so reloads skip
 // the conversion. The name changes with the GGML source and the conversion format.
 const convertedSpeech = configUrl => new URL(`kidi-int8-v1-${WHISPER_GGML_REVISION.slice(0, 12)}.safetensors`, configUrl);
 // Gemma weight chunks are cached with packed values already sign-flipped (see normalizationPlan), marked by this layout.
 const SIGNED_WEIGHTS = 'gemma-signed-v1';
-const MODEL_ID = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const REPO_ID = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const HUB_MODEL_ID = /^@([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/;
 const hex = bytes => Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
 
 export function configureModelHub(remote) {
@@ -33,14 +85,17 @@ const configUrl = (modelId, revision) => `${MODEL_HUB_REMOTE}/${modelId}/resolve
 
 async function resolveReference(source, cache, cacheOnly) {
     const value = String(source).trim();
-    if (!MODEL_ID.test(value))
+    if (!value.startsWith('@'))
         return new URL(value, globalThis.location?.href || 'http://localhost/').href;
-    const key = referenceKey(value);
+    const match = HUB_MODEL_ID.exec(value);
+    if (!match) throw new Error(`Invalid Hugging Face model ID: ${value}`);
+    const modelId = match[1];
+    const key = referenceKey(modelId);
     const cached = cache && await cache.match(key);
     const cachedUrl = async () => {
         if (!cached) return null;
         const metadata = await cached.json();
-        const expected = configUrl(value, metadata.revision);
+        const expected = configUrl(modelId, metadata.revision);
         return /^[a-f0-9]{40}$/.test(metadata.revision) && metadata.url === expected ? expected : null;
     };
     if (cacheOnly) {
@@ -49,14 +104,14 @@ async function resolveReference(source, cache, cacheOnly) {
         return resolved;
     }
     try {
-        const path = value.split('/').map(encodeURIComponent).join('/');
+        const path = modelId.split('/').map(encodeURIComponent).join('/');
         const response = await fetch(`${MODEL_HUB_REMOTE}/api/models/${path}/revision/main`,
             {mode: 'cors', credentials: 'omit', cache: 'no-cache', signal: AbortSignal.timeout(30000)});
         if (!response.ok) throw new Error(`Hugging Face model lookup HTTP ${response.status}`);
         const metadata = await response.json();
         if (!/^[a-f0-9]{40}$/.test(metadata.sha || '')) throw new Error('Hugging Face returned an invalid revision');
-        const url = configUrl(value, metadata.sha);
-        if (cache) await cache.put(key, new Response(JSON.stringify({modelId: value, revision: metadata.sha, url}),
+        const url = configUrl(modelId, metadata.sha);
+        if (cache) await cache.put(key, new Response(JSON.stringify({modelId, revision: metadata.sha, url}),
             {headers: {'Content-Type': 'application/json'}}));
         return url;
     } catch (error) {
@@ -101,7 +156,7 @@ async function cacheInventory() {
         if (url.origin === 'https://kidi.invalid' && url.pathname.startsWith('/__model_refs__/')) {
             try {
                 const metadata = await (await cache.match(request)).json();
-                if (MODEL_ID.test(metadata.modelId) && /^[a-f0-9]{40}$/.test(metadata.revision) &&
+                if (REPO_ID.test(metadata.modelId) && /^[a-f0-9]{40}$/.test(metadata.revision) &&
                     metadata.url === configUrl(metadata.modelId, metadata.revision))
                     references.set(metadata.url, {modelId: metadata.modelId, key: request.url});
             } catch {}
@@ -128,14 +183,13 @@ async function cacheInventory() {
             }
         }
     }
+    const specs = await loadPackageSpecs();
     const models = [];
     for (const model of hubs.values()) {
         const reference = references.get(model.source);
         if (reference) model.cacheKeys.add(reference.key);
         const files = [...model.files.values()].sort((left, right) => right.bytes - left.bytes);
-        const kind = model.config?.model_type === 'kidi_omnivoice' ? 'TTS' :
-            model.config?.model_type === 'whisper' ? 'Speech' :
-            model.config?.model_type === 'gemma4' ? 'Chat' : 'Model';
+        const kind = TASK_KIND[specs.get(model.config?.model_type)?.task] || 'Model';
         models.push({...model, name: reference?.modelId || model.modelId, kind, files,
             bytes: files.reduce((sum, file) => sum + file.bytes, 0), complete: await isModelCached(model.source)});
     }
@@ -244,12 +298,8 @@ export async function isModelCached(source) {
                 !/^\/[^/]+\/[^/]+\/resolve\/[a-f0-9]{40}\/config\.json$/.test(url.pathname)) return false;
             const response = await cache.match(url.href);
             const config = await response.json();
-            const required = isKidiOmniVoice(config)
-                ? ['model.yaml', 'tokenizer.json.gz', 'sentence-prefixes.tsv',
-                    'synthesis_template.jinja', 'NOTICE']
-                : isWhisper(config)
-                ? ['tokenizer.json', 'preprocessor_config.json', 'generation_config.json']
-                : ['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'];
+            const specs = await loadPackageSpecs();
+            const {weights: weightsName, metadata: required} = packageFiles(config, specs);
             for (const name of required)
                 if (!keys.has(new URL(name, url).href)) return false;
             const complete = async file => {
@@ -265,12 +315,12 @@ export async function isModelCached(source) {
                 }
                 return true;
             };
-            if (!isWhisper(config)) return complete(new URL('model.safetensors', url));
+            if (!isWhisper(config)) return complete(new URL(weightsName, url));
             return await complete(convertedSpeech(url)) || complete(new URL('ggml-model.bin', url));
         }
         const manifest = await (await cache.match(url.href)).json();
         if (manifest.version !== 1 || !Array.isArray(manifest.files) || !/^[a-f0-9]{64}$/.test(manifest.id)) return false;
-        for (const name of ['model.yaml', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json'])
+        for (const name of ['config.json', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json'])
             if (!manifest.files.some(file => file.name === name)) return false;
         return manifest.files.every(file => Array.isArray(file.chunks) && file.chunks.length &&
             file.chunks.every(chunk => keys.has(new URL(`./__kidi_chunks__/${chunk.sha256}`, url).href)));
@@ -350,8 +400,15 @@ const alignUp = (value, alignment) => Math.ceil(value / alignment) * alignment;
 const EXTERNAL_TENSORS = new Set(['model.language_model.embed_tokens_per_layer.embedding_quantized']);
 // With WebGPU, decoder projections are only read by GPU kernels, so they go straight to GPU buffers.
 const DEVICE_TENSOR = /^model\.language_model\.layers\.\d+\..+\.weight$/;
-const placement = (range, gemma, gpu) => !gemma ? 'heap'
-    : /^model\.(audio_tower|embed_audio)\./.test(range.name) ? 'skip'
+const SHARED_KV_TENSOR =
+    /^model\.language_model\.layers\.(\d+)\.self_attn\.(?:k_proj\.|v_proj\.|kv_proj\.|k_norm\.|k_cache_scale$|v_cache_scale$)/;
+function isUnusedSharedKv(name, sharedBegin) {
+    if (!Number.isFinite(sharedBegin)) return false;
+    const match = SHARED_KV_TENSOR.exec(name);
+    return Boolean(match && Number(match[1]) >= sharedBegin);
+}
+const placement = (range, gemma, gpu, sharedBegin = Infinity) => !gemma ? 'heap'
+    : /^model\.(audio_tower|embed_audio)\./.test(range.name) || isUnusedSharedKv(range.name, sharedBegin) ? 'skip'
     : EXTERNAL_TENSORS.has(range.name) ? 'external'
     : gpu && range.bits && DEVICE_TENSOR.test(range.name) ? 'gpu' : 'heap';
 
@@ -397,14 +454,14 @@ function applyMask(bytes, mask) {
 /// Compacted heap layout: excluded tensors removed, 64-byte aligned starts, and each gate projection followed directly by
 /// its up projection so the runtime can view the pair as one fused matrix without copying. With `gpu`, decoder
 /// projections are staged for GPU buffers instead, gate and up fused into one `gate_up_proj` buffer.
-export function weightLayout(header, ranges, gemma, gpu = false) {
+export function weightLayout(header, ranges, gemma, gpu = false, sharedBegin = Infinity) {
     const byName = new Map(ranges.map(range => [range.name, range]));
     const metadata = header.__metadata__;
     const layout = {header: metadata ? {__metadata__: metadata} : {}, tensors: [], external: [], device: [],
         dataBytes: 0};
     let cursor = 0;
     const place = (range, adjacent) => {
-        range.target = placement(range, gemma, gpu);
+        range.target = placement(range, gemma, gpu, sharedBegin);
         if (range.target === 'skip') return;
         const info = header[range.name];
         if (range.target === 'gpu') {
@@ -565,8 +622,10 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
         }
         return true;
     };
+    const specs = await loadPackageSpecs();
     const configData = await get(configUrl);
     const config = JSON.parse(new TextDecoder().decode(configData.bytes));
+    const {weights: packageWeights, metadata: packageMetadata} = packageFiles(config, specs);
     const writeMetadata = async names => {
         module.FS.writeFile('/model/config.json', new Uint8Array(configData.bytes));
         for (const name of names) {
@@ -584,11 +643,8 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
         module.FS.mkdir('/model');
         metrics.totalBytes += configData.bytes.byteLength;
         metrics.loadedBytes += configData.bytes.byteLength;
-        await writeMetadata(['model.yaml', 'tokenizer.json.gz', 'sentence-prefixes.tsv',
-            'synthesis_template.jinja', 'NOTICE',
-            'licenses/OMNIVOICE-CC-BY-NC-4.0.txt', 'licenses/META-LLAMA-3-LICENSE.txt',
-            'licenses/META-LLAMA-3-USE-POLICY.md', 'licenses/HIGGS-AUDIO-2-LICENSE.txt']);
-        const weightsUrl = new URL('model.safetensors', configUrl);
+        await writeMetadata(packageMetadata);
+        const weightsUrl = new URL(packageWeights, configUrl);
         let pointer = 0;
         let total = 0;
         await readRanges(weightsUrl, (bytes, start, size) => {
@@ -599,18 +655,18 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
             }
             module.HEAPU8.set(bytes, pointer + start);
             metrics.loadedBytes += bytes.length;
-            report('model.safetensors');
+            report(packageWeights);
         });
         mountWeights(module, pointer, total);
         return {...metrics, warning, model: config.name || 'OmniVoice-q8',
-            precision: config.quantization_config?.format || 'signed INT8', id: configUrl.href,
-            heapWeightBytes: total, externalWeightBytes: 0};
+            precision: config.quantization_config?.format || config.quantization?.format || 'signed INT8',
+            id: configUrl.href, heapWeightBytes: total, externalWeightBytes: 0};
     }
     if (isWhisper(config)) {
         const size = WHISPER_SIZES[config.d_model];
         if (!size || config.vocab_size !== 51865) throw new Error('Expected multilingual Whisper Tiny, Base, or Small');
         module.FS.mkdir('/model');
-        await writeMetadata(['tokenizer.json', 'preprocessor_config.json', 'generation_config.json']);
+        await writeMetadata(packageMetadata);
         const modelName = config._name_or_path?.split('/').at(-1) || `whisper-${size}`;
         const precision = 'INT8 from GGML Q8_0';
         // Earlier versions cached the FP32 Safetensors checkpoint, which is no longer read.
@@ -655,7 +711,7 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
         return {...metrics, warning, model: modelName, precision, id: configUrl.href, heapWeightBytes: 0,
             externalWeightBytes: weights.length, convertedUrl: converted.href};
     }
-    const weightsUrl = new URL('model.safetensors', configUrl);
+    const weightsUrl = new URL(packageWeights, configUrl);
     let plan;
     const planFor = (bytes, total) => {
         const headerBytes = Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, true));
@@ -679,7 +735,11 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
     const size = first.total;
     plan ??= planFor(new Uint8Array(first.bytes), size);
     const {headerBytes, header, ranges} = plan;
-    const layout = weightLayout(header, ranges, true, Boolean(gpu));
+    const hiddenLayers = Number(config.text_config?.num_hidden_layers);
+    const sharedLayers = Number(config.text_config?.num_kv_shared_layers || 0);
+    const sharedBegin = Number.isInteger(hiddenLayers) && Number.isInteger(sharedLayers) && sharedLayers > 0
+        ? hiddenLayers - sharedLayers : Infinity;
+    const layout = weightLayout(header, ranges, true, Boolean(gpu), sharedBegin);
     metrics.totalBytes = size + configData.bytes.byteLength;
     metrics.loadedBytes = configData.bytes.byteLength;
     const pointer = allocateWeights(module, layout.totalBytes + ALIGNMENT);
@@ -737,14 +797,12 @@ async function loadHubModel(module, source, progress, cache, warning, cacheOnly,
     mountWeights(module, base, layout.totalBytes);
     if (layout.device.some(entry => !entry.handle)) throw new Error('Incomplete GPU weight upload');
     module.kidiExternal = externalTables(module, layout.external, layout.device);
-    await writeMetadata(['tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja']);
-    module.FS.writeFile('/model/model.yaml', JSON.stringify({format_version: 1,
-        weights_file: 'model.safetensors', tokenizer_file: 'tokenizer.json',
-        model: {...config.text_config, type: 'gemma4_text', packed_weights_signed: true,
-            quantization_config: config.quantization_config},
+    await writeMetadata(packageMetadata);
+    module.FS.writeFile('/model/config.json', new TextEncoder().encode(JSON.stringify({
+        ...config, packed_weights_signed: true,
         external_tensors: [...layout.external, ...layout.device].map(table => ({name: table.name,
             dtype: table.dtype.toLowerCase(), shape: table.shape})),
-        decode: {maximum_new_tokens: 1024, context_size: 9216}}));
+        decode: {maximum_new_tokens: 1024, context_size: 9216}})));
     return {...metrics, warning, model: 'Gemma 4 E2B IT', precision: 'QAT mixed 2/4/8-bit', id: configUrl.href,
         heapWeightBytes: layout.totalBytes, externalWeightBytes: module.kidiExternal.bytes,
         gpuWeightBytes: module.kidiExternal.deviceBytes};
@@ -776,7 +834,7 @@ export async function loadModel(module, manifestUrl, progress, {cacheOnly = fals
         throw new Error('Invalid model manifest');
     const names = new Set();
     const allowed = new Set([
-        'model.yaml', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja',
+        'config.json', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja',
         'sentence-prefixes.tsv', 'synthesis_template.jinja', 'NOTICE',
         'licenses/OMNIVOICE-CC-BY-NC-4.0.txt', 'licenses/META-LLAMA-3-LICENSE.txt',
         'licenses/META-LLAMA-3-USE-POLICY.md', 'licenses/HIGGS-AUDIO-2-LICENSE.txt',
@@ -793,7 +851,7 @@ export async function loadModel(module, manifestUrl, progress, {cacheOnly = fals
                 throw new Error('Invalid model chunk');
         }
     }
-    for (const name of ['model.yaml', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json'])
+    for (const name of ['config.json', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json'])
         if (!names.has(name)) throw new Error(`Missing ${name}`);
     module.FS.mkdir('/model');
     const metrics = {totalBytes: manifest.files.reduce((sum, file) => sum + file.size, 0), loadedBytes: 0, cachedBytes: 0, downloadedBytes: 0};

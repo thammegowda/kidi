@@ -15,7 +15,7 @@ auto elapsed(Clock::time_point start) -> std::uint64_t {
 } // namespace
 struct TransformerImpl::State {
     ops::Context context;
-    std::int32_t hidden_size, maximum_position, source_tokens, pad;
+    std::int32_t hidden_size, source_vocabulary, target_vocabulary, maximum_position, source_tokens, pad;
     layers::Embedding source_embedding{nullptr}, target_embedding{nullptr};
     ModuleList<layers::EncoderBlockImpl> encoder;
     ModuleList<layers::DecoderBlockImpl> decoder;
@@ -24,14 +24,14 @@ struct TransformerImpl::State {
     explicit State(const YAML::Node& config)
         : context(module_device),
           hidden_size(config["hidden_size"].as<std::int32_t>()),
+          source_vocabulary(config["source_vocabulary_size"].as<std::int32_t>()),
+          target_vocabulary(config["target_vocabulary_size"].as<std::int32_t>()),
           maximum_position(config["maximum_position"].as<std::int32_t>()),
           source_tokens(config["source_tokens"].as<std::int32_t>()),
           pad(config["source_pad_id"].as<std::int32_t>()) {
         const auto epsilon = config["layer_norm_epsilon"].as<float>();
-        source_embedding =
-            layers::Embedding(config["source_vocabulary_size"].as<std::int32_t>(), hidden_size, maximum_position);
-        target_embedding =
-            layers::Embedding(config["target_vocabulary_size"].as<std::int32_t>(), hidden_size, maximum_position);
+        source_embedding = layers::Embedding(source_vocabulary, hidden_size, maximum_position);
+        target_embedding = layers::Embedding(target_vocabulary, hidden_size, maximum_position);
         encoder_norm = layers::LayerNorm(hidden_size, epsilon);
         decoder_norm = layers::LayerNorm(hidden_size, epsilon);
         const bool tied = module_dtype != DType::I8;
@@ -96,26 +96,59 @@ auto TransformerImpl::create(const YAML::Node& config) -> Result<Transformer> {
         return std::unexpected(error.error());
     }
 }
-auto TransformerImpl::state_mapping_specs() -> std::span<const checkpoint::StateMappingSpec> {
+auto TransformerImpl::checkpoint_dtype(const checkpoint::Weights& weights) -> Result<tensor::DType> {
+    for (const auto* key : {"target_embedding.weight", "tgt_embed.0.lut.weight"}) {
+        if (weights.contains(key)) {
+            const auto embedding = weights.tensor(key);
+            if (!embedding) return std::unexpected(embedding.error());
+            return embedding->dtype();
+        }
+    }
+    return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "weight tensor not found: target_embedding.weight"});
+}
+auto TransformerImpl::state_mapping_specs() const -> std::vector<checkpoint::StateMappingSpec> {
     static const auto specs = [] {
         std::vector<checkpoint::StateMappingSpec> result;
+        const auto suffixes = std::array{std::pair{R"(\.weight)", ".weight"}, std::pair{R"(\.bias)", ".bias"},
+                                         std::pair{R"(\.weight\.scale)", ".scale"}, std::pair{R"(\.scale)", ".scale"}};
         const auto add = [&](std::string source, std::string target) {
-            for (const auto& [suffix, destination] :
-                 std::array{std::pair{R"(\.weight)", ".weight"}, std::pair{R"(\.bias)", ".bias"},
-                            std::pair{R"(\.weight\.scale)", ".scale"}})
-                result.push_back({{source + suffix}, target + destination});
+            for (const auto& [suffix, destination] : suffixes)
+                result.push_back({{"^" + source + suffix + "$"}, target + destination});
+        };
+        const auto fuse = [&](std::span<const std::string_view> sources, std::string target) {
+            for (const auto& [suffix, destination] : suffixes) {
+                std::vector<std::string> pattern;
+                pattern.reserve(sources.size());
+                pattern.push_back("^" + std::string(sources.front()) + suffix + "$");
+                for (std::size_t index = 1; index < sources.size(); ++index)
+                    pattern.push_back(std::string(sources[index]) + (suffix == std::string_view(R"(\.weight\.scale)")
+                                                                         ? ".weight.scale"
+                                                                         : destination));
+                result.push_back({std::move(pattern), target + destination});
+            }
         };
         add(R"(src_embed\.0\.lut)", "source_embedding");
         add(R"(tgt_embed\.0\.lut)", "target_embedding");
         add(R"(generator\.proj)", "generator");
         add(R"((encoder|decoder)\.norm)", "$1_norm");
         add(R"(encoder\.layers\.(\d+)\.self_attn\.qkv)", "encoder.$1.qkv");
-        add(R"(encoder\.layers\.(\d+)\.self_attn\.out)", "encoder.$1.attention.output");
+        fuse(std::array<std::string_view, 3>{R"(encoder\.layers\.(\d+)\.self_attn\.linears\.0)",
+                                             "encoder.layers.$1.self_attn.linears.1",
+                                             "encoder.layers.$1.self_attn.linears.2"},
+             "encoder.$1.qkv");
+        add(R"(encoder\.layers\.(\d+)\.self_attn\.(?:out|linears\.3))", "encoder.$1.attention.output");
         add(R"(decoder\.layers\.(\d+)\.self_attn\.qkv)", "decoder.$1.qkv");
-        add(R"(decoder\.layers\.(\d+)\.self_attn\.out)", "decoder.$1.self_attention.output");
-        add(R"(decoder\.layers\.(\d+)\.src_attn\.q)", "decoder.$1.query");
+        fuse(std::array<std::string_view, 3>{R"(decoder\.layers\.(\d+)\.self_attn\.linears\.0)",
+                                             "decoder.layers.$1.self_attn.linears.1",
+                                             "decoder.layers.$1.self_attn.linears.2"},
+             "decoder.$1.qkv");
+        add(R"(decoder\.layers\.(\d+)\.self_attn\.(?:out|linears\.3))", "decoder.$1.self_attention.output");
+        add(R"(decoder\.layers\.(\d+)\.src_attn\.(?:q|linears\.0))", "decoder.$1.query");
         add(R"(decoder\.layers\.(\d+)\.src_attn\.kv)", "decoder.$1.source");
-        add(R"(decoder\.layers\.(\d+)\.src_attn\.out)", "decoder.$1.cross_attention.output");
+        fuse(std::array<std::string_view, 2>{R"(decoder\.layers\.(\d+)\.src_attn\.linears\.1)",
+                                             "decoder.layers.$1.src_attn.linears.2"},
+             "decoder.$1.source");
+        add(R"(decoder\.layers\.(\d+)\.src_attn\.(?:out|linears\.3))", "decoder.$1.cross_attention.output");
         add(R"((encoder|decoder)\.layers\.(\d+)\.feed_forward\.w_1)", "$1.$2.feed_forward.first");
         add(R"((encoder|decoder)\.layers\.(\d+)\.feed_forward\.w_2)", "$1.$2.feed_forward.second");
         add(R"(encoder\.layers\.(\d+)\.sublayer\.0\.norm)", "encoder.$1.attention_norm");
@@ -127,8 +160,17 @@ auto TransformerImpl::state_mapping_specs() -> std::span<const checkpoint::State
     }();
     return specs;
 }
-auto TransformerImpl::encode(std::span<const std::vector<std::int32_t>> sources, inference::InferenceStats* stats)
-    -> Result<EncoderState> {
+auto TransformerImpl::hidden_size() const noexcept -> std::int32_t { return impl_->hidden_size; }
+auto TransformerImpl::source_vocabulary_size() const noexcept -> std::int32_t { return impl_->source_vocabulary; }
+auto TransformerImpl::vocabulary_size() const noexcept -> std::int32_t { return impl_->target_vocabulary; }
+auto TransformerImpl::max_positions() const noexcept -> std::size_t {
+    return static_cast<std::size_t>(impl_->maximum_position);
+}
+auto TransformerImpl::preparation_ns() const noexcept -> std::uint64_t { return impl_->context.preparation_ns(); }
+auto TransformerImpl::release_workspaces() -> void { impl_->context.release_workspaces(); }
+
+auto TransformerImpl::encode_text(std::span<const std::vector<std::int32_t>> sources, inference::InferenceStats* stats)
+    -> Result<std::shared_ptr<EncoderMemory>> {
     try {
         auto& context = impl_->context;
         const auto prep = context.preparation_ns();
@@ -146,74 +188,81 @@ auto TransformerImpl::encode(std::span<const std::vector<std::int32_t>> sources,
             std::copy(sources[row].begin(), sources[row].end(), tokens.begin() + row * length);
             std::fill_n(mask.begin() + row * length, sources[row].size(), 0.F);
         }
-        EncoderState result;
-        result.mask = require(
+        auto result = std::make_shared<EncoderState>();
+        result->mask = require(
             Tensor::from_host({static_cast<std::int64_t>(sources.size()), 1, 1, static_cast<std::int64_t>(length)},
                               std::span<const float>(mask), context.device()));
         auto hidden = impl_->source_embedding->forward(context, tokens, sources.size());
         if (stats) stats->source_embedding_ns += elapsed(started);
         context.profile_phase("encoder");
-        for (const auto& layer : *impl_->encoder) hidden = layer->forward(context, hidden, result.mask);
+        for (const auto& layer : *impl_->encoder) hidden = layer->forward(context, hidden, result->mask);
         hidden = impl_->encoder_norm->forward(context, hidden);
         context.synchronize();
         if (stats) stats->encoder_ns += elapsed(started);
         started = Clock::now();
         context.profile_phase("source_projection");
-        for (const auto& layer : *impl_->decoder) result.layers.push_back(layer->project_source(context, hidden));
+        for (const auto& layer : *impl_->decoder) result->layers.push_back(layer->project_source(context, hidden));
         context.synchronize();
         if (stats) {
             stats->source_projection_ns += elapsed(started);
             stats->graph_compile_ns += context.preparation_ns() - prep;
         }
-        return result;
+        return std::shared_ptr<EncoderMemory>(std::move(result));
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
 }
-auto TransformerImpl::create_state(std::size_t batch, std::size_t capacity) -> Result<DecoderState> {
+auto TransformerImpl::create_decoder_state(std::shared_ptr<const EncoderMemory> memory, std::size_t batch,
+                                           std::size_t capacity) -> Result<std::unique_ptr<LanguageModelState>> {
     try {
         if (!batch || !capacity || capacity > static_cast<std::size_t>(impl_->maximum_position))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid decoder cache capacity"});
-        DecoderState result;
-        result.capacity = capacity;
-        result.mask =
+        auto result = std::make_unique<DecoderState>();
+        result->memory = std::move(memory);
+        result->batch = batch;
+        result->capacity = capacity;
+        result->mask =
             require(Tensor::empty({1, 1, 1, static_cast<std::int64_t>(capacity)}, DType::F32, impl_->context.device()));
-        auto mask = require(result.mask.data<float>());
+        auto mask = require(result->mask.data<float>());
         std::fill(mask.begin(), mask.end(), -1e9F);
-        result.index = require(Tensor::empty({1}, DType::I32, impl_->context.device()));
-        result.embedding = require(Tensor::empty({static_cast<std::int64_t>(batch), 1, impl_->hidden_size}, DType::F32,
-                                                 impl_->context.device()));
+        result->index = require(Tensor::empty({1}, DType::I32, impl_->context.device()));
+        result->embedding = require(Tensor::empty({static_cast<std::int64_t>(batch), 1, impl_->hidden_size}, DType::F32,
+                                                  impl_->context.device()));
         const std::vector<std::int64_t> shape{static_cast<std::int64_t>(batch), static_cast<std::int64_t>(capacity),
                                               impl_->hidden_size};
         for (std::size_t index = 0; index < impl_->decoder->size(); ++index)
-            result.layers.push_back({require(Tensor::zeros(shape, DType::F32, impl_->context.device())),
-                                     require(Tensor::zeros(shape, DType::F32, impl_->context.device()))});
-        return result;
+            result->layers.push_back({require(Tensor::zeros(shape, DType::F32, impl_->context.device())),
+                                      require(Tensor::zeros(shape, DType::F32, impl_->context.device()))});
+        return std::unique_ptr<LanguageModelState>(std::move(result));
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
 }
-auto TransformerImpl::forward(const EncoderState& source, std::span<const std::int32_t> tokens, std::size_t batch,
-                              DecoderState* state, inference::InferenceStats* stats) -> Result<Tensor> {
+auto TransformerImpl::decode_step(const EncoderMemory& memory, std::span<const std::int32_t> tokens, std::size_t batch,
+                                  LanguageModelState* state, inference::InferenceStats* stats) -> Result<Tensor> {
     try {
-        if (!batch || tokens.empty() || tokens.size() % batch || source.layers.size() != impl_->decoder->size() ||
-            (state && (state->position >= state->capacity || tokens.size() != batch ||
-                       state->layers.size() != impl_->decoder->size())))
+        const auto* source = dynamic_cast<const EncoderState*>(&memory);
+        auto* decoder = state ? dynamic_cast<DecoderState*>(state) : nullptr;
+        if (!source || (state && !decoder))
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "incompatible Transformer encoder or decoder state"});
+        if (!batch || tokens.empty() || tokens.size() % batch || source->layers.size() != impl_->decoder->size() ||
+            (decoder && (decoder->position >= decoder->capacity || tokens.size() != batch ||
+                         decoder->layers.size() != impl_->decoder->size())))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid decoder inputs/state"});
         auto& context = impl_->context;
         auto prep = context.preparation_ns();
         auto started = Clock::now();
-        auto hidden = state
-                          ? impl_->target_embedding->forward_(context, state->embedding, tokens, batch, state->position)
-                          : impl_->target_embedding->forward(context, tokens, batch);
+        auto hidden =
+            decoder ? impl_->target_embedding->forward_(context, decoder->embedding, tokens, batch, decoder->position)
+                    : impl_->target_embedding->forward(context, tokens, batch);
         if (stats) stats->target_embedding_ns += elapsed(started);
         const auto length = tokens.size() / batch;
         Tensor mask, index;
-        if (state) {
-            require(state->mask.data<float>())[state->position] = 0.F;
-            require(state->index.data<std::int32_t>())[0] = static_cast<std::int32_t>(state->position);
-            mask = state->mask;
-            index = state->index;
+        if (decoder) {
+            require(decoder->mask.data<float>())[decoder->position] = 0.F;
+            require(decoder->index.data<std::int32_t>())[0] = static_cast<std::int32_t>(decoder->position);
+            mask = decoder->mask;
+            index = decoder->index;
         } else {
             std::vector<float> values(length * length, -1.0e9F);
             for (std::size_t row = 0; row < length; ++row) std::fill_n(values.begin() + row * length, row + 1, 0.F);
@@ -223,14 +272,14 @@ auto TransformerImpl::forward(const EncoderState& source, std::span<const std::i
         }
         context.profile_phase("decoder");
         for (std::size_t layer = 0; layer < impl_->decoder->size(); ++layer)
-            hidden = impl_->decoder->at(layer)->forward(context, hidden, source.layers[layer], source.mask, mask,
-                                                        state ? &state->layers[layer] : nullptr, index);
+            hidden = impl_->decoder->at(layer)->forward(context, hidden, source->layers[layer], source->mask, mask,
+                                                        decoder ? &decoder->layers[layer] : nullptr, index);
         hidden = impl_->decoder_norm->forward(context, hidden);
-        if (!state) hidden = context.slice(hidden, 1, length - 1, 1);
+        if (!decoder) hidden = context.slice(hidden, 1, length - 1, 1);
         context.profile_phase("generator");
         auto logits = impl_->generator->forward(context, hidden);
         context.synchronize();
-        if (state) ++state->position;
+        if (decoder) ++decoder->position;
         if (stats) stats->graph_compile_ns += context.preparation_ns() - prep;
         return logits;
     } catch (const ops::Failure& error) {

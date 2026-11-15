@@ -133,7 +133,7 @@ auto main() -> int {
                                {"bias", ops::require(tensor::Tensor::zeros({3}, tensor::DType::F32))}};
         ops::require(scoped->set_state(scoped_state));
         if (scoped->state_dict().at("weight").device() != default_device) return 1;
-        ops::require(scoped->load_state_dict(scoped_state));
+        ops::require(scoped->set_state(scoped_state, true, true));
         if (scoped->state_dict().at("weight").device() != default_device) return 1;
         {
             const ModuleScope selected(default_device);
@@ -189,7 +189,7 @@ auto main() -> int {
         if (ops::require(bound.at("0.weight").host_bytes()).data() !=
             ops::require(initial.at("0.weight").host_bytes()).data())
             return 1;
-        ops::require(deferred->load_state_dict(initial));
+        ops::require(deferred->set_state(initial, true, true));
         const auto copied = deferred->state_dict();
         if (ops::require(copied.at("0.weight").host_bytes()).data() !=
                 ops::require(copied.at("0.tied").host_bytes()).data() ||
@@ -211,7 +211,7 @@ auto main() -> int {
         const std::array mappings{checkpoint::StateMappingSpec{{R"(ff\.w_1\.(weight|bias))"}, "projections.0.$1"},
                                   checkpoint::StateMappingSpec{{R"(ff\.w_2\.(weight|bias))"}, "projections.1.$1"}};
         auto mapped = ops::require(checkpoint::Weights::load(path, mappings));
-        ops::require(modules->set_state(mapped));
+        ops::require(modules->set_state(ops::require(mapped.state_dict())));
         const auto snapshot = modules->state_dict();
         if (snapshot.size() != 6 || !snapshot.contains("projections.0.weight") || !snapshot.contains("norm.bias"))
             return 1;
@@ -261,13 +261,13 @@ auto main() -> int {
             replacement["projections.0.weight"] = ops::require(tensor::Tensor::zeros({4, 3}, tensor::DType::F32));
             auto invalid = replacement;
             invalid["projections.1.bias"] = ops::require(tensor::Tensor::zeros({1}, tensor::DType::F32));
-            if (modules->load_state_dict(invalid)) return 1;
+            if (modules->set_state(invalid, true, true)) return 1;
             auto unchanged = first->forward(context, normalized);
             context.synchronize();
             auto original_values = ops::require(unchanged.data<float>());
             for (std::size_t index = 0; index < original_values.size(); ++index)
                 if (!near(original_values[index], linear_expected[index])) return 1;
-            ops::require(modules->load_state_dict(replacement));
+            ops::require(modules->set_state(replacement, true, true));
             auto external_weight = ops::require(replacement.at("projections.0.weight").data<float>());
             std::fill(external_weight.begin(), external_weight.end(), 7.F);
             auto changed = projections->at(0)->forward(context, normalized);
@@ -276,7 +276,7 @@ auto main() -> int {
             const std::array bias{0.2F, -0.1F, 0.3F};
             for (std::size_t index = 0; index < changed_values.size(); ++index)
                 if (!near(changed_values[index], bias[index % 3])) return 1;
-            ops::require(modules->load_state_dict(snapshot));
+            ops::require(modules->set_state(snapshot, true, true));
             auto restored = first_impl.forward(context, normalized);
             context.synchronize();
             auto restored_values = ops::require(restored.data<float>());
@@ -285,11 +285,11 @@ auto main() -> int {
         }
         auto missing = snapshot;
         missing.erase("norm.bias");
-        if (modules->load_state_dict(missing)) return 1;
-        ops::require(modules->load_state_dict(missing, false));
+        if (modules->set_state(missing, true, true)) return 1;
+        ops::require(modules->set_state(missing, false, true));
         auto extra = snapshot;
         extra.emplace("unknown", snapshot.begin()->second);
-        if (modules->load_state_dict(extra)) return 1;
+        if (modules->set_state(extra, true, true)) return 1;
         bool cycle_rejected = false;
         try {
             modules->insert("cycle", modules);

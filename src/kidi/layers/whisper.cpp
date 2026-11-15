@@ -101,36 +101,85 @@ auto WhisperPositionEmbeddingImpl::gather(ops::Context& context, const Tensor& p
                                                                 static_cast<std::int64_t>(weight_.size(1))});
 }
 
-WhisperAttentionImpl::WhisperAttentionImpl(std::int32_t hidden, std::int32_t heads)
-    : key_(hidden, hidden, true, false),
-      value_(hidden, hidden, true),
-      query_(hidden, hidden, true),
-      output_(hidden, hidden, true),
-      heads_(heads) {
+WhisperSelfAttentionImpl::WhisperSelfAttentionImpl(std::int32_t hidden, std::int32_t heads)
+    : qkv_(hidden, 3 * hidden, true), output_(hidden, hidden, true), heads_(heads) {
     if (heads <= 0 || hidden % heads)
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Whisper attention dimensions"});
-    register_module("k_proj", key_);
-    register_module("v_proj", value_);
-    register_module("q_proj", query_);
+    register_module("qkv_proj", qkv_);
     register_module("out_proj", output_);
 }
 
-auto WhisperAttentionImpl::project_memory(ops::Context& context, const Tensor& input) const -> KeyValue {
-    return {by_rows(context, input, [&](const Tensor& rows, std::int64_t) { return key_->forward(context, rows); }),
-            by_rows(context, input, [&](const Tensor& rows, std::int64_t) { return value_->forward(context, rows); })};
+auto WhisperSelfAttentionImpl::forward(ops::Context& context, const Tensor& input, const Tensor& mask, KeyValue* cache,
+                                       const Tensor& cache_index) const -> Tensor {
+    const auto length = static_cast<std::int64_t>(input.size(1));
+    const auto width = static_cast<std::int64_t>(input.size(2));
+    if (cache || !context.device().capabilities().compute.host() || length <= ENCODER_ROWS) {
+        const auto projected = qkv_->forward(context, input);
+        const auto query = context.slice(projected, 2, 0, width);
+        KeyValue memory{context.slice(projected, 2, width, width), context.slice(projected, 2, 2 * width, width)};
+        if (cache) {
+            context.scatter_(cache->key, memory.key, cache_index);
+            context.scatter_(cache->value, memory.value, cache_index);
+            memory = *cache;
+        }
+        return output_->forward(context,
+                                context.scaled_dot_product_attention(query, memory.key, memory.value, heads_, mask));
+    }
+    Tensor queries, keys, values;
+    for (std::int64_t first = 0; first < length; first += ENCODER_ROWS) {
+        const auto count = std::min(ENCODER_ROWS, length - first);
+        const auto projected = qkv_->forward(context, context.slice(input, 1, first, count));
+        if (!queries.defined()) {
+            queries = require(Tensor::empty({1, length, width}, projected.dtype(), context.device()));
+            keys = require(Tensor::empty({1, length, width}, projected.dtype(), context.device()));
+            values = require(Tensor::empty({1, length, width}, projected.dtype(), context.device()));
+        }
+        context.copy_slice_(queries, context.slice(projected, 2, 0, width), 1, first);
+        context.copy_slice_(keys, context.slice(projected, 2, width, width), 1, first);
+        context.copy_slice_(values, context.slice(projected, 2, 2 * width, width), 1, first);
+    }
+    return by_rows(context, queries, [&](const Tensor& rows, std::int64_t start) {
+        Tensor slice_mask = mask;
+        if (mask.defined() && mask.dimensions() >= 3 && mask.size(2) > 1)
+            slice_mask = context.slice(mask, 2, start, static_cast<std::int64_t>(rows.size(1)));
+        return output_->forward(context, context.scaled_dot_product_attention(rows, keys, values, heads_, slice_mask));
+    });
 }
 
-auto WhisperAttentionImpl::forward(ops::Context& context, const Tensor& input, const KeyValue* memory,
-                                   const Tensor& mask, KeyValue* cache, const Tensor& cache_index) const -> Tensor {
-    auto projected = memory ? *memory : project_memory(context, input);
-    if (cache) {
-        context.scatter_(cache->key, projected.key, cache_index);
-        context.scatter_(cache->value, projected.value, cache_index);
-        projected = *cache;
+WhisperCrossAttentionImpl::WhisperCrossAttentionImpl(std::int32_t hidden, std::int32_t heads)
+    : query_(hidden, hidden, true), key_value_(hidden, 2 * hidden, true), output_(hidden, hidden, true), heads_(heads) {
+    if (heads <= 0 || hidden % heads)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Whisper attention dimensions"});
+    register_module("q_proj", query_);
+    register_module("kv_proj", key_value_);
+    register_module("out_proj", output_);
+}
+
+auto WhisperCrossAttentionImpl::project_memory(ops::Context& context, const Tensor& input) const -> KeyValue {
+    const auto length = static_cast<std::int64_t>(input.size(1));
+    const auto width = static_cast<std::int64_t>(input.size(2));
+    if (!context.device().capabilities().compute.host() || length <= ENCODER_ROWS) {
+        const auto projected = key_value_->forward(context, input);
+        return {context.slice(projected, 2, 0, width), context.slice(projected, 2, width, width)};
     }
-    return output_->forward(
-        context, context.scaled_dot_product_attention(query_->forward(context, input), projected.key, projected.value,
-                                                      heads_, mask));
+    Tensor keys, values;
+    for (std::int64_t first = 0; first < length; first += ENCODER_ROWS) {
+        const auto count = std::min(ENCODER_ROWS, length - first);
+        const auto projected = key_value_->forward(context, context.slice(input, 1, first, count));
+        if (!keys.defined()) {
+            keys = require(Tensor::empty({1, length, width}, projected.dtype(), context.device()));
+            values = require(Tensor::empty({1, length, width}, projected.dtype(), context.device()));
+        }
+        context.copy_slice_(keys, context.slice(projected, 2, 0, width), 1, first);
+        context.copy_slice_(values, context.slice(projected, 2, width, width), 1, first);
+    }
+    return {std::move(keys), std::move(values)};
+}
+
+auto WhisperCrossAttentionImpl::forward(ops::Context& context, const Tensor& input, const KeyValue& memory,
+                                        const Tensor& mask) const -> Tensor {
+    return output_->forward(context, context.scaled_dot_product_attention(query_->forward(context, input), memory.key,
+                                                                          memory.value, heads_, mask));
 }
 
 WhisperEncoderBlockImpl::WhisperEncoderBlockImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t heads,
@@ -150,10 +199,10 @@ WhisperEncoderBlockImpl::WhisperEncoderBlockImpl(std::int32_t hidden, std::int32
 auto WhisperEncoderBlockImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
     const auto normalized =
         by_rows(context, input, [&](const Tensor& rows, std::int64_t) { return self_norm_->forward(context, rows); });
-    const auto memory = self_attention_->project_memory(context, normalized);
+    const auto attended = self_attention_->forward(context, normalized);
     return by_rows(context, input, [&](const Tensor& rows, std::int64_t start) {
-        const auto queries = context.slice(normalized, 1, start, static_cast<std::int64_t>(rows.size(1)));
-        auto hidden = context.add(rows, self_attention_->forward(context, queries, &memory));
+        const auto count = static_cast<std::int64_t>(rows.size(1));
+        auto hidden = context.add(rows, context.slice(attended, 1, start, count));
         return context.add(
             hidden,
             second_->forward(context, context.gelu(first_->forward(context, final_norm_->forward(context, hidden)))));
@@ -185,9 +234,9 @@ auto WhisperDecoderBlockImpl::project_source(ops::Context& context, const Tensor
 auto WhisperDecoderBlockImpl::forward(ops::Context& context, const Tensor& input, const KeyValue& source,
                                       const Tensor& self_mask, KeyValue& cache,
                                       const Tensor& cache_index) const -> Tensor {
-    auto hidden = context.add(input, self_attention_->forward(context, self_norm_->forward(context, input), nullptr,
-                                                              self_mask, &cache, cache_index));
-    hidden = context.add(hidden, cross_attention_->forward(context, cross_norm_->forward(context, hidden), &source));
+    auto hidden = context.add(
+        input, self_attention_->forward(context, self_norm_->forward(context, input), self_mask, &cache, cache_index));
+    hidden = context.add(hidden, cross_attention_->forward(context, cross_norm_->forward(context, hidden), source));
     return context.add(
         hidden,
         second_->forward(context, context.gelu(first_->forward(context, final_norm_->forward(context, hidden)))));

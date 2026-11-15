@@ -45,21 +45,105 @@ auto parse_data_type(std::string_view value) -> std::optional<DataType> {
 
 auto data_type_size(DataType data_type) -> std::size_t { return tensor::element_size(data_type); }
 
-struct OwnedTensor {
-    DataType data_type;
+struct FileStorage {
+    explicit FileStorage(const std::filesystem::path& path) {
+        std::ifstream stream(path, std::ios::binary);
+        std::uint32_t magic = 0;
+        stream.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        if (magic == ggml::GGUF_MAGIC || magic == ggml::GGML_MAGIC)
+            imported = std::make_unique<ggml::GgmlFile>(ops::require(ggml::GgmlFile::open(path)));
+        else
+            checkpoint = std::make_unique<safetensors::MappedCheckpoint>(path.string());
+    }
+
+    std::unique_ptr<safetensors::MappedCheckpoint> checkpoint;
+    std::unique_ptr<ggml::GgmlFile> imported;
+};
+
+struct Entry {
+    enum class Kind { VIEW, GGML, TENSOR } kind = Kind::VIEW;
+    std::optional<DataType> dtype;
+    std::string raw_dtype;
     std::vector<std::int64_t> shape;
-    std::vector<std::byte> bytes;
+    std::span<const std::byte> bytes;
+    std::string ggml_name;
+    tensor::Tensor tensor;
+    std::shared_ptr<const void> owner;
 };
 
 struct RawTensorView {
     DataType data_type;
-    std::span<const std::int64_t> shape;
+    std::vector<std::int64_t> shape;
     std::span<const std::byte> bytes;
+    bool mapped_view = false;
+    std::shared_ptr<const void> owner;
 
     auto element_size() const noexcept -> std::size_t { return tensor::element_size(data_type); }
 };
 
+auto escape_regex(std::string_view text) -> std::string {
+    std::string escaped;
+    escaped.reserve(text.size() * 2);
+    for (const char ch : text) {
+        switch (ch) {
+            case '.':
+            case '^':
+            case '$':
+            case '|':
+            case '(':
+            case ')':
+            case '[':
+            case ']':
+            case '{':
+            case '}':
+            case '+':
+            case '*':
+            case '?':
+            case '\\':
+                escaped.push_back('\\');
+                break;
+            default:
+                break;
+        }
+        escaped.push_back(ch);
+    }
+    return escaped;
+}
+
+auto is_zero_reference(std::string_view source) noexcept -> bool { return source.starts_with("0:"); }
+
+auto find_anchor_index(std::span<const std::string> sources) -> std::size_t {
+    for (std::size_t index = 0; index < sources.size(); ++index) {
+        if (!is_zero_reference(sources[index])) return index;
+    }
+    throw std::invalid_argument("weight mapping requires at least one concrete source pattern");
+}
+
 } // namespace
+
+auto prefix_state_mappings(std::string_view source_prefix, std::string_view destination_prefix,
+                           std::span<const StateMappingSpec> mappings) -> std::vector<StateMappingSpec> {
+    const auto escaped_prefix = escape_regex(source_prefix);
+    std::vector<StateMappingSpec> prefixed;
+    prefixed.reserve(mappings.size());
+    for (auto spec : mappings) {
+        const auto anchor_index = find_anchor_index(spec.sources);
+        for (std::size_t index = 0; index < spec.sources.size(); ++index) {
+            auto& source = spec.sources[index];
+            if (index == anchor_index) {
+                source = "^" + escaped_prefix + (source.starts_with('^') ? source.substr(1) : source);
+            } else if (is_zero_reference(source)) {
+                source = "0:" + std::string(source_prefix) + source.substr(2);
+            } else {
+                source = std::string(source_prefix) + source;
+            }
+        }
+        if (spec.op != StateMappingOp::IGNORE && !spec.destination.empty())
+            spec.destination = std::string(destination_prefix) + spec.destination;
+        prefixed.push_back(std::move(spec));
+    }
+    return prefixed;
+}
 
 auto Weights::save(const std::filesystem::path& path, const StateDict& state) -> Result<void> {
     if (std::endian::native != std::endian::little || state.empty())
@@ -114,22 +198,29 @@ auto Weights::save(const std::filesystem::path& path, const StateDict& state) ->
 }
 
 struct Weights::Impl {
-    explicit Impl(const std::filesystem::path& path) {
-        std::ifstream stream(path, std::ios::binary);
-        std::uint32_t magic = 0;
-        stream.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-        if (magic == ggml::GGUF_MAGIC || magic == ggml::GGML_MAGIC)
-            imported = std::make_unique<ggml::GgmlFile>(ops::require(ggml::GgmlFile::open(path)));
-        else
-            checkpoint = std::make_unique<safetensors::MappedCheckpoint>(path.string());
+    explicit Impl(const std::filesystem::path& path) : storage(std::make_shared<const FileStorage>(path)) {
+        if (storage->imported) {
+            for (const auto& [name, unused] : storage->imported->tensors())
+                entries.emplace(name, Entry{.kind = Entry::Kind::GGML, .ggml_name = name});
+        } else {
+            for (const auto& [name, tensor] : storage->checkpoint->tensors()) {
+                entries.emplace(name, Entry{
+                                          .kind = Entry::Kind::VIEW,
+                                          .dtype = parse_data_type(tensor.dtype),
+                                          .raw_dtype = tensor.dtype,
+                                          .shape = tensor.shape,
+                                          .bytes = tensor.bytes(),
+                                          .owner = storage,
+                                      });
+            }
+        }
     }
 
-    std::unique_ptr<safetensors::MappedCheckpoint> checkpoint;
-    std::unique_ptr<ggml::GgmlFile> imported;
-    std::unordered_map<std::string, OwnedTensor> transformed;
-    std::unordered_map<std::string, std::string> aliases;
-    std::unordered_set<std::string> hidden;
-    std::unordered_map<std::string, tensor::Tensor> provided;
+    Impl(std::shared_ptr<const FileStorage> shared_storage, std::unordered_map<std::string, Entry> copied_entries)
+        : storage(std::move(shared_storage)), entries(std::move(copied_entries)) {}
+
+    std::shared_ptr<const FileStorage> storage;
+    std::unordered_map<std::string, Entry> entries;
 };
 
 namespace {
@@ -153,54 +244,44 @@ auto render_template(std::string_view value, const std::smatch& match) -> std::s
     return result;
 }
 
-auto mapped_tensor_view(const safetensors::MappedTensor& tensor) -> RawTensorView {
-    const auto data_type = parse_data_type(tensor.dtype);
-    if (!data_type) throw std::invalid_argument("unsupported mapped tensor dtype: " + tensor.dtype);
-    return RawTensorView{.data_type = *data_type, .shape = tensor.shape, .bytes = tensor.bytes()};
-}
-
-template <typename Storage>
-auto tensor_view(const Storage& impl, std::string_view name) -> RawTensorView {
-    if (const auto transformed = impl.transformed.find(std::string(name)); transformed != impl.transformed.end()) {
-        return RawTensorView{
-            .data_type = transformed->second.data_type,
-            .shape = transformed->second.shape,
-            .bytes = transformed->second.bytes,
-        };
+auto materialize_view(const FileStorage& storage, const Entry& entry, std::vector<tensor::Tensor>& scratch)
+    -> RawTensorView {
+    switch (entry.kind) {
+        case Entry::Kind::VIEW:
+            if (!entry.dtype) throw std::invalid_argument("unsupported mapped tensor dtype: " + entry.raw_dtype);
+            return RawTensorView{
+                .data_type = *entry.dtype,
+                .shape = entry.shape,
+                .bytes = entry.bytes,
+                .mapped_view = true,
+                .owner = entry.owner,
+            };
+        case Entry::Kind::GGML:
+            scratch.push_back(ops::require(storage.imported->tensor(entry.ggml_name)));
+            return RawTensorView{
+                .data_type = scratch.back().dtype(),
+                .shape = {scratch.back().shape().begin(), scratch.back().shape().end()},
+                .bytes = ops::require(scratch.back().host_bytes()),
+            };
+        case Entry::Kind::TENSOR:
+            return RawTensorView{
+                .data_type = entry.tensor.dtype(),
+                .shape = {entry.tensor.shape().begin(), entry.tensor.shape().end()},
+                .bytes = ops::require(entry.tensor.host_bytes()),
+            };
     }
-    if (const auto alias = impl.aliases.find(std::string(name)); alias != impl.aliases.end()) {
-        return mapped_tensor_view(impl.checkpoint->at(alias->second));
-    }
-    return mapped_tensor_view(impl.checkpoint->at(std::string(name)));
+    throw std::invalid_argument("invalid weight entry");
 }
 
-template <typename Storage>
-auto contains_tensor(const Storage& impl, std::string_view name) -> bool {
-    return impl.provided.contains(std::string(name)) || impl.transformed.contains(std::string(name)) ||
-           impl.aliases.contains(std::string(name)) ||
-           (!impl.hidden.contains(std::string(name)) &&
-            (impl.imported ? impl.imported->tensors().contains(std::string(name))
-                           : impl.checkpoint->contains(std::string(name))));
-}
-
-template <typename Storage>
-auto base_names(const Storage& impl) -> std::vector<std::string> {
-    std::vector<std::string> keys;
-    if (impl.imported) {
-        for (const auto& [name, unused] : impl.imported->tensors()) keys.push_back(name);
-    } else {
-        for (const auto& [name, unused] : impl.checkpoint->tensors()) keys.push_back(name);
-    }
-    return keys;
-}
-
-auto concatenate_tensors(const std::vector<RawTensorView>& inputs, std::int64_t axis) -> OwnedTensor {
+auto concatenate_entries(const std::vector<RawTensorView>& inputs, std::int64_t axis) -> Entry {
     if (inputs.empty()) throw std::invalid_argument("weight mapping has no inputs");
     const auto rank = static_cast<std::int64_t>(inputs.front().shape.size());
     if (axis < 0) axis += rank;
     if (axis < 0 || axis >= rank) throw std::invalid_argument("weight mapping axis is out of range");
 
     std::vector<std::int64_t> shape(inputs.front().shape.begin(), inputs.front().shape.end());
+    bool contiguous_views = axis == 0 && inputs.front().mapped_view && inputs.front().owner != nullptr;
+    std::size_t total_bytes = inputs.front().bytes.size();
     for (std::size_t input = 1; input < inputs.size(); ++input) {
         if (inputs[input].data_type != inputs.front().data_type ||
             inputs[input].shape.size() != static_cast<std::size_t>(rank)) {
@@ -213,6 +294,20 @@ auto concatenate_tensors(const std::vector<RawTensorView>& inputs, std::int64_t 
             }
         }
         shape[static_cast<std::size_t>(axis)] += inputs[input].shape[static_cast<std::size_t>(axis)];
+        contiguous_views =
+            contiguous_views && inputs[input].mapped_view && inputs[input].owner == inputs.front().owner &&
+            inputs[input - 1].bytes.data() + inputs[input - 1].bytes.size() == inputs[input].bytes.data();
+        total_bytes += inputs[input].bytes.size();
+    }
+
+    if (contiguous_views) {
+        return Entry{
+            .kind = Entry::Kind::VIEW,
+            .dtype = inputs.front().data_type,
+            .shape = std::move(shape),
+            .bytes = {inputs.front().bytes.data(), total_bytes},
+            .owner = inputs.front().owner,
+        };
     }
 
     const auto product = [](std::span<const std::int64_t> dimensions) {
@@ -221,68 +316,123 @@ auto concatenate_tensors(const std::vector<RawTensorView>& inputs, std::int64_t 
     const auto inner = product(std::span<const std::int64_t>(shape).subspan(static_cast<std::size_t>(axis + 1)));
     const auto outer = product(std::span<const std::int64_t>(shape).first(static_cast<std::size_t>(axis)));
     const auto element_size = inputs.front().element_size();
-    std::vector<std::byte> bytes(product(shape) * element_size);
+    auto output = ops::require(tensor::Tensor::empty(shape, inputs.front().data_type));
+    auto* destination = ops::require(output.host_bytes()).data();
     for (std::size_t row = 0; row < outer; ++row) {
         std::size_t axis_offset = 0;
         for (const auto& input : inputs) {
             const auto count = static_cast<std::size_t>(input.shape[static_cast<std::size_t>(axis)]) * inner;
             std::memcpy(
-                bytes.data() + (row * static_cast<std::size_t>(shape[static_cast<std::size_t>(axis)]) + axis_offset) *
-                                   element_size,
+                destination + (row * static_cast<std::size_t>(shape[static_cast<std::size_t>(axis)]) + axis_offset) *
+                                  element_size,
                 input.bytes.data() + row * count * element_size, count * element_size);
             axis_offset += count;
         }
     }
-    return OwnedTensor{
-        .data_type = inputs.front().data_type,
+    for (const auto& input : inputs) {
+        if (input.mapped_view) (void)safetensors::MappedFile::release_any_pages(input.bytes.data(), input.bytes.size());
+    }
+    return Entry{
+        .kind = Entry::Kind::TENSOR,
+        .dtype = output.dtype(),
         .shape = std::move(shape),
-        .bytes = std::move(bytes),
+        .tensor = std::move(output),
     };
 }
 
+auto current_keys(const std::unordered_map<std::string, Entry>& entries) -> std::vector<std::string> {
+    std::vector<std::string> keys;
+    keys.reserve(entries.size());
+    for (const auto& [name, unused] : entries) keys.push_back(name);
+    std::ranges::sort(keys);
+    return keys;
+}
+
 template <typename Storage>
-auto apply_state_mappings(Storage& impl, const std::vector<StateMappingSpec>& specs) -> void {
+auto apply_state_mappings(Storage& impl, std::span<const StateMappingSpec> specs) -> void {
     for (const auto& spec : specs) {
-        const std::regex anchor(spec.sources.front());
-        const auto keys = base_names(impl);
+        const auto anchor_index = find_anchor_index(spec.sources);
+        const std::regex anchor(spec.sources[anchor_index]);
+        const auto keys = current_keys(impl.entries);
         for (const auto& key : keys) {
+            if (!impl.entries.contains(key)) continue;
             std::smatch match;
             if (!std::regex_match(key, match, anchor)) continue;
-            const auto destination = render_template(spec.destination, match);
-            if (contains_tensor(impl, destination)) continue;
 
             std::vector<std::string> sources;
             sources.reserve(spec.sources.size());
-            sources.push_back(key);
             bool complete = true;
-            for (std::size_t index = 1; index < spec.sources.size(); ++index) {
-                auto source = render_template(spec.sources[index], match);
-                complete = complete && contains_tensor(impl, source);
+            for (std::size_t index = 0; index < spec.sources.size(); ++index) {
+                auto source = index == anchor_index ? key : render_template(spec.sources[index], match);
+                const auto lookup =
+                    is_zero_reference(source) ? std::string_view(source).substr(2) : std::string_view(source);
+                complete = complete && impl.entries.contains(std::string(lookup));
                 sources.push_back(std::move(source));
             }
             if (!complete) continue;
-            if (sources.size() == 1) {
-                impl.aliases.emplace(destination, sources.front());
-                impl.hidden.insert(sources.front());
+
+            if (spec.op == StateMappingOp::IGNORE || spec.destination.empty()) {
+                for (const auto& source : sources) {
+                    if (!is_zero_reference(source)) impl.entries.erase(source);
+                }
                 continue;
             }
 
+            const auto destination = render_template(spec.destination, match);
+            const bool destination_in_sources = std::ranges::find(sources, destination) != sources.end();
+            if (!destination_in_sources && impl.entries.contains(destination)) continue;
+
+            if (spec.op == StateMappingOp::IDENTICAL) {
+                std::vector<tensor::Tensor> scratch;
+                scratch.reserve(sources.size());
+                std::vector<RawTensorView> views;
+                views.reserve(sources.size());
+                for (const auto& source : sources)
+                    views.push_back(materialize_view(*impl.storage, impl.entries.at(source), scratch));
+                for (std::size_t index = 1; index < views.size(); ++index) {
+                    if (views[index].data_type != views.front().data_type ||
+                        !std::ranges::equal(views[index].shape, views.front().shape) ||
+                        !std::ranges::equal(views[index].bytes, views.front().bytes))
+                        throw ops::Failure({ErrorCode::UNSUPPORTED,
+                                            "paired parameters must match for fused projection: " + destination});
+                }
+                auto retained = std::move(impl.entries.at(sources.front()));
+                for (const auto& source : sources) impl.entries.erase(source);
+                impl.entries.emplace(destination, std::move(retained));
+                continue;
+            }
+
+            if (sources.size() == 1 && !is_zero_reference(sources.front())) {
+                auto moved = std::move(impl.entries.at(sources.front()));
+                impl.entries.erase(sources.front());
+                impl.entries.emplace(destination, std::move(moved));
+                continue;
+            }
+
+            std::vector<tensor::Tensor> scratch;
+            scratch.reserve(sources.size() * 2);
+            std::vector<std::vector<std::byte>> zero_buffers;
+            zero_buffers.reserve(sources.size());
             std::vector<RawTensorView> tensors;
             tensors.reserve(sources.size());
-            std::vector<tensor::Tensor> imported;
-            imported.reserve(sources.size());
             for (const auto& source : sources) {
-                if (impl.imported && !impl.transformed.contains(source)) {
-                    const auto alias = impl.aliases.find(source);
-                    imported.push_back(
-                        ops::require(impl.imported->tensor(alias == impl.aliases.end() ? source : alias->second)));
-                    const auto& value = imported.back();
-                    tensors.push_back({value.dtype(), value.shape(), ops::require(value.host_bytes())});
-                } else
-                    tensors.push_back(tensor_view(impl, source));
+                if (is_zero_reference(source)) {
+                    const auto reference = materialize_view(*impl.storage, impl.entries.at(source.substr(2)), scratch);
+                    zero_buffers.emplace_back(reference.bytes.size(), std::byte{0});
+                    tensors.push_back(RawTensorView{
+                        .data_type = reference.data_type,
+                        .shape = reference.shape,
+                        .bytes = zero_buffers.back(),
+                    });
+                } else {
+                    tensors.push_back(materialize_view(*impl.storage, impl.entries.at(source), scratch));
+                }
             }
-            impl.transformed.emplace(destination, concatenate_tensors(tensors, spec.concat_axis));
-            impl.hidden.insert(sources.begin(), sources.end());
+            auto combined = concatenate_entries(tensors, spec.concat_axis);
+            for (const auto& source : sources) {
+                if (!is_zero_reference(source)) impl.entries.erase(source);
+            }
+            impl.entries.emplace(destination, std::move(combined));
         }
     }
 }
@@ -297,7 +447,7 @@ Weights::~Weights() = default;
 auto Weights::load(const std::filesystem::path& path, std::span<const StateMappingSpec> mappings) -> Result<Weights> {
     try {
         auto impl = std::make_shared<Impl>(path);
-        apply_state_mappings(*impl, std::vector<StateMappingSpec>(mappings.begin(), mappings.end()));
+        apply_state_mappings(*impl, mappings);
         return Weights(std::move(impl));
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
@@ -312,7 +462,19 @@ auto Weights::load(const std::filesystem::path& path, std::span<const StateMappi
     }
 }
 
-auto Weights::contains(std::string_view name) const -> bool { return contains_tensor(*impl_, name); }
+auto Weights::mapped(std::span<const StateMappingSpec> mappings) const -> Result<Weights> {
+    try {
+        auto impl = std::make_shared<Impl>(impl_->storage, impl_->entries);
+        apply_state_mappings(*impl, mappings);
+        return Weights(std::move(impl));
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, std::string("cannot map weights: ") + error.what()});
+    }
+}
+
+auto Weights::contains(std::string_view name) const -> bool { return impl_->entries.contains(std::string(name)); }
 
 auto Weights::state_dict() const -> Result<StateDict> {
     StateDict result;
@@ -324,48 +486,46 @@ auto Weights::state_dict() const -> Result<StateDict> {
     return result;
 }
 
-auto Weights::names() const -> std::vector<std::string> {
-    auto result = base_names(*impl_);
-    std::erase_if(result, [&](const auto& name) {
-        return impl_->hidden.contains(name) || impl_->transformed.contains(name) || impl_->aliases.contains(name);
-    });
-    for (const auto& [name, unused] : impl_->aliases) result.push_back(name);
-    for (const auto& [name, unused] : impl_->transformed) result.push_back(name);
-    for (const auto& [name, unused] : impl_->provided) result.push_back(name);
-    std::ranges::sort(result);
-    return result;
-}
+auto Weights::names() const -> std::vector<std::string> { return current_keys(impl_->entries); }
 
-auto Weights::size() const noexcept -> std::size_t {
-    return (impl_->imported ? impl_->imported->tensors().size() : impl_->checkpoint->tensors().size()) -
-           impl_->hidden.size() + impl_->transformed.size() + impl_->aliases.size() + impl_->provided.size();
-}
+auto Weights::size() const noexcept -> std::size_t { return impl_->entries.size(); }
 
 auto Weights::add(std::string name, tensor::Tensor value) -> Result<void> {
     if (!value.defined() || contains(name))
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "duplicate or undefined weight tensor: " + name});
-    impl_->provided.emplace(std::move(name), std::move(value));
+    std::vector<std::int64_t> shape(value.shape().begin(), value.shape().end());
+    impl_->entries.emplace(std::move(name), Entry{
+                                                .kind = Entry::Kind::TENSOR,
+                                                .dtype = value.dtype(),
+                                                .shape = std::move(shape),
+                                                .tensor = std::move(value),
+                                            });
     return {};
 }
 
 auto Weights::tensor(std::string_view name) const -> Result<tensor::Tensor> {
-    if (!contains(name)) {
+    const auto found = impl_->entries.find(std::string(name));
+    if (found == impl_->entries.end()) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "weight tensor not found: " + std::string(name)});
     }
-    if (const auto found = impl_->provided.find(std::string(name)); found != impl_->provided.end())
-        return found->second;
-    if (impl_->imported && !impl_->transformed.contains(std::string(name))) {
-        const auto alias = impl_->aliases.find(std::string(name));
-        return impl_->imported->tensor(alias == impl_->aliases.end() ? name : std::string_view(alias->second));
+    const auto& entry = found->second;
+    switch (entry.kind) {
+        case Entry::Kind::TENSOR:
+            return entry.tensor;
+        case Entry::Kind::GGML:
+            return impl_->storage->imported->tensor(entry.ggml_name);
+        case Entry::Kind::VIEW: {
+            if (!entry.dtype)
+                return std::unexpected(
+                    Error{ErrorCode::INVALID_ARGUMENT, "unsupported mapped tensor dtype: " + entry.raw_dtype});
+            if (reinterpret_cast<std::uintptr_t>(entry.bytes.data()) % data_type_size(*entry.dtype) != 0) {
+                return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "weight tensor " + std::string(name) +
+                                                                              " is not aligned for zero-copy access"});
+            }
+            return tensor::Tensor::from_blob(entry.shape, *entry.dtype, entry.bytes, entry.owner);
+        }
     }
-    const auto raw = tensor_view(*impl_, name);
-    if (reinterpret_cast<std::uintptr_t>(raw.bytes.data()) % data_type_size(raw.data_type) != 0) {
-        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT,
-                                     "weight tensor " + std::string(name) + " is not aligned for zero-copy access"});
-    }
-    std::shared_ptr<const void> owner = impl_;
-    return tensor::Tensor::from_blob(std::vector<std::int64_t>(raw.shape.begin(), raw.shape.end()), raw.data_type,
-                                     raw.bytes, std::move(owner));
+    return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid weight tensor: " + std::string(name)});
 }
 
 auto Weights::float32_tensor(std::string_view name) const -> Result<tensor::Tensor> {

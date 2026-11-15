@@ -69,11 +69,11 @@ export async function runGpuRuntimeIntegration({speech, chat = true} = {}) {
             voice: {gender: 'female', age: 'middle-aged', pitch: 'moderate'}}});
     try {
         results.ttsLoad = await tts.request(ttsLoad, ready);
-        await asr.request({type: 'load', source: 'openai/whisper-tiny', backend: 'webgpu', threads: 1, cacheOnly: true}, ready);
+        await asr.request({type: 'load', source: '@openai/whisper-tiny', backend: 'webgpu', threads: 1, cacheOnly: true}, ready);
         let llm;
         if (chat) {
             llm = create('chat');
-            await llm.request({type: 'load', manifest: 'google/gemma-4-E2B-it-qat-mobile-transformers',
+            await llm.request({type: 'load', manifest: '@google/gemma-4-E2B-it-qat-mobile-transformers',
                 backend: 'webgpu', threads: 1, cacheOnly: true}, ready);
         }
         const operations = [

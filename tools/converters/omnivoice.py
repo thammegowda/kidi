@@ -11,11 +11,13 @@ import tempfile
 from pathlib import Path
 
 import torch
-import yaml
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from ._licenses import write_license_bundle
+try:
+    from ._licenses import write_license_bundle
+except ImportError:
+    from _licenses import write_license_bundle
 
 
 def _row_quantize(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -266,29 +268,26 @@ def _model_document(source: Path, license_files: list[str] | None = None) -> dic
     sample_rate = codec["sample_rate"]
     frame_rate = sample_rate // math.prod(ratios)
     return {
-        "format_version": 1,
-        "task": "tts",
+        "model_type": "omnivoice",
+        "architectures": ["KidiOmniVoiceForTextToSpeech"],
         "license_files": license_files or [],
         "weights_file": "model.safetensors",
         "tokenizer_file": "tokenizer.json",
         "template_file": "synthesis_template.jinja",
         "sentence_prefixes_file": "sentence-prefixes.tsv",
-        "model": {
-            "type": "omnivoice",
-            "audio_vocab_size": config["audio_vocab_size"],
-            "audio_mask_id": config["audio_mask_id"],
-            "num_audio_codebook": config["num_audio_codebook"],
-            "llm_config": config["llm_config"],
-            "codec_config": {
-                "codebook_size": codec["codebook_size"],
-                "codebook_dim": codec["codebook_dim"],
-                "hidden_size": latent_width,
-                "acoustic_hidden_size": acoustic["hidden_size"],
-                "decoder_hidden_size": acoustic["decoder_hidden_size"],
-                "upsampling_ratios": ratios,
-                "sample_rate": sample_rate,
-                "frame_rate": frame_rate,
-            },
+        "audio_vocab_size": config["audio_vocab_size"],
+        "audio_mask_id": config["audio_mask_id"],
+        "num_audio_codebook": config["num_audio_codebook"],
+        "llm_config": config["llm_config"],
+        "codec_config": {
+            "codebook_size": codec["codebook_size"],
+            "codebook_dim": codec["codebook_dim"],
+            "hidden_size": latent_width,
+            "acoustic_hidden_size": acoustic["hidden_size"],
+            "decoder_hidden_size": acoustic["decoder_hidden_size"],
+            "upsampling_ratios": ratios,
+            "sample_rate": sample_rate,
+            "frame_rate": frame_rate,
         },
         "synthesis": {
             "steps": 32,
@@ -399,16 +398,16 @@ Sources:
         activation_calibration = activation_calibration.expanduser().resolve()
         if not activation_calibration.is_file():
             raise ValueError(f"Activation calibration does not exist: {activation_calibration}")
-        layers = document["model"]["llm_config"]["num_hidden_layers"]
+        layers = document["llm_config"]["num_hidden_layers"]
         activation_quantization = _activation_quantization(
             activation_calibration,
             layers,
             activation_percentile,
         )
-        document["model"]["llm_config"]["activation_quantization"] = activation_quantization
+        document["llm_config"]["activation_quantization"] = activation_quantization
     tensors: dict[str, torch.Tensor] = {}
     _convert_generator(source, tensors, activation_quantization)
-    _convert_audio_decoder(source, tensors, document["model"]["num_audio_codebook"])
+    _convert_audio_decoder(source, tensors, document["num_audio_codebook"])
     for name, value in tensors.items():
         if name.endswith(".scale") or name.endswith("_scale"):
             if value.dtype != torch.float32:
@@ -428,8 +427,8 @@ Sources:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
 
-    (destination / "model.yaml").write_text(
-        yaml.safe_dump(document, sort_keys=False, allow_unicode=True),
+    (destination / "config.json").write_text(
+        json.dumps(document, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     (destination / "synthesis_template.jinja").write_text(

@@ -279,6 +279,50 @@ auto main(int argc, char** argv) -> int {
         std::cerr << "state mapping fusion is incorrect\n";
         return 1;
     }
+    const auto zero_copy_mapped = weights->mapped(mappings);
+    auto zero_copy_fused = zero_copy_mapped
+                               ? zero_copy_mapped->tensor("fused")
+                               : kidi::Result<kidi::tensor::Tensor>{std::unexpected(zero_copy_mapped.error())};
+    if (!zero_copy_fused || zero_copy_fused->data<float>().has_value() ||
+        std::as_const(*zero_copy_fused).host_bytes()->data() != std::as_const(*tensor).host_bytes()->data()) {
+        std::cerr << "adjacent state mapping fusion was not zero-copy\n";
+        return 1;
+    }
+    {
+        using kidi::checkpoint::StateMappingOp;
+        using kidi::checkpoint::StateMappingSpec;
+        const std::array rules = {
+            StateMappingSpec{.sources = {R"(^e[45]m.*$)"}, .op = StateMappingOp::IGNORE},
+            StateMappingSpec{
+                .sources = {R"(^weight$)", "weight"}, .destination = "same_scale", .op = StateMappingOp::IDENTICAL},
+            StateMappingSpec{.sources = {"0:weight2", R"(^weight2$)"}, .destination = "zero_prefixed"},
+        };
+        const auto view = weights->mapped(rules);
+        const auto zero_prefixed =
+            view ? view->tensor("zero_prefixed") : kidi::Result<kidi::tensor::Tensor>{std::unexpected(view.error())};
+        const auto zp_values = zero_prefixed
+                                   ? std::as_const(*zero_prefixed).data<float>()
+                                   : kidi::Result<std::span<const float>>{std::unexpected(zero_prefixed.error())};
+        if (!view || view->contains("e4m3") || view->contains("e5m2") || !view->contains("same_scale") || !zp_values ||
+            zp_values->size() != 4 || (*zp_values)[0] != 0.F || (*zp_values)[1] != 0.F || (*zp_values)[2] != 3.0F ||
+            (*zp_values)[3] != 4.0F) {
+            std::cerr << "mapped IGNORE/IDENTICAL/zero-reference rules failed\n";
+            return 1;
+        }
+        const std::array mismatch = {StateMappingSpec{
+            .sources = {R"(^weight$)", "weight2"}, .destination = "bad_scale", .op = StateMappingOp::IDENTICAL}};
+        if (weights->mapped(mismatch)) {
+            std::cerr << "mismatched IDENTICAL parameters were accepted\n";
+            return 1;
+        }
+        const auto prefixed =
+            kidi::checkpoint::prefix_state_mappings("llm.", "llm.", std::span<const StateMappingSpec>(mappings));
+        if (prefixed.size() != 1 || prefixed[0].sources[0] != R"(^llm\.weight$)" ||
+            prefixed[0].sources[1] != "llm.weight2" || prefixed[0].destination != "llm.fused") {
+            std::cerr << "prefix_state_mappings rewrote patterns incorrectly\n";
+            return 1;
+        }
+    }
 
     const auto saved_path = std::filesystem::temp_directory_path() / "kidi-weights-roundtrip.safetensors";
     const auto state = weights->state_dict();

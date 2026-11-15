@@ -14,10 +14,10 @@ test('model packaging splits weights at 256 MiB and retains small support files'
         const weights = await open(join(source, 'model.safetensors'), 'w');
         try { await weights.truncate(256 * 1024 * 1024 + 17); }
         finally { await weights.close(); }
-        const config = await open(join(source, 'model.yaml'), 'w');
-        try { await config.writeFile('model: omnivoice\n'); }
+        const config = await open(join(source, 'config.json'), 'w');
+        try { await config.writeFile('{"model_type":"omnivoice"}\n'); }
         finally { await config.close(); }
-        const manifest = await packageModel(source, destination, ['model.safetensors', 'model.yaml']);
+        const manifest = await packageModel(source, destination, ['model.safetensors', 'config.json']);
         assert.deepEqual(manifest.files[0].chunks.map(chunk => chunk.size), [256 * 1024 * 1024, 17]);
         assert.equal(manifest.files[1].chunks.length, 1);
         for (const file of manifest.files)

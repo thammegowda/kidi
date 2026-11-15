@@ -94,7 +94,7 @@ struct OperatorSpec {
     float epsilon = 0;
     bool dynamic_parameters = false;
     bool packed_prefill = false;
-    bool vector_projection = false;
+    bool vector_projection = false; // Preserve per-row decode arithmetic in projections and CPU attention.
     std::array<BlockwiseQuantizationSpec, 2> quantization;
 };
 

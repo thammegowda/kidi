@@ -34,6 +34,11 @@ kidi_add_test(kidi_model_registry_test tests/kidi/model/registry_test.cpp)
 target_compile_definitions(kidi_gemma4_test PRIVATE KIDI_GEMMA4_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/gemma4")
 kidi_add_test(kidi_whisper_test tests/kidi/model/whisper_test.cpp)
 kidi_add_test(kidi_decoder_test tests/kidi/inference/decoder_test.cpp)
+kidi_add_test(kidi_speculative_test tests/kidi/inference/speculative_test.cpp)
+kidi_add_test(kidi_gemma4_mtp_test tests/kidi/model/gemma4_mtp_test.cpp)
+target_compile_definitions(kidi_gemma4_mtp_test PRIVATE KIDI_GEMMA4_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/gemma4")
+kidi_add_test(kidi_gemma4_assistant_test tests/kidi/model/gemma4_assistant_test.cpp)
+target_compile_definitions(kidi_gemma4_assistant_test PRIVATE KIDI_GEMMA4_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/gemma4")
 kidi_add_test(kidi_voice_test tests/kidi/inference/voice_test.cpp)
 kidi_add_test(kidi_weights_test tests/kidi/checkpoint/weights_test.cpp)
 kidi_add_test(kidi_tensor_test tests/kidi/tensor/tensor_test.cpp)
@@ -93,8 +98,8 @@ if(KIDI_BUILD_INTEGRATION_TESTS)
     set_tests_properties(kidi_python_test PROPERTIES LABELS python WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
 
     add_test(NAME kidi_browser_test COMMAND "${KIDI_TEST_NODE}" --test
-        "${PROJECT_SOURCE_DIR}/tests/web/model_cache_test.mjs"
-        "${PROJECT_SOURCE_DIR}/tests/web/speech_test.mjs")
+        "${PROJECT_SOURCE_DIR}/tests/browser/model_cache_test.mjs"
+        "${PROJECT_SOURCE_DIR}/tests/browser/speech_test.mjs")
     set_tests_properties(kidi_browser_test PROPERTIES LABELS browser WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
 
     add_test(NAME kidi_rtg_regression_test COMMAND "${KIDI_TEST_PYTHON}"

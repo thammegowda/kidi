@@ -288,15 +288,22 @@ auto interactive_chat(inference::Generator& generator, inference::GenerationOpti
             const auto decode_speed = stats.decode_tokens && stats.decode_ns
                                           ? fmt::format("{:.1f}tok/s", stats.decode_tokens * 1e9 / stats.decode_ns)
                                           : std::string("n/a tok/s");
+            const auto draft_summary =
+                stats.speculative ? fmt::format(" | draft {}/{}", stats.accepted_draft_tokens, stats.draft_tokens)
+                                  : std::string{};
             const auto first_ns = elapsed_ns(entered, first_text.value_or(*finished));
             const auto last_ns = elapsed_ns(entered, *finished);
-            label(fmt::format("[{}tok @ {} | 1st {:.2f}s last {:.2f}s | {}]\n", completed->generation.token_ids.size(),
-                              decode_speed, first_ns / 1e9, last_ns / 1e9, memory_summary()),
-                  "\033[2m");
+            label(
+                fmt::format("[{}tok @ {}{} | 1st {:.2f}s last {:.2f}s | {}]\n", completed->generation.token_ids.size(),
+                            decode_speed, draft_summary, first_ns / 1e9, last_ns / 1e9, memory_summary()),
+                "\033[2m");
             if (arguments.get<bool>("profile"))
                 std::cerr << "kidi_chat|request_id=" << *queued << "|prompt_tokens=" << completed->stats.prompt_tokens
                           << "|generated_tokens=" << completed->generation.token_ids.size()
                           << "|decode_tokens=" << stats.decode_tokens << "|decode_ns=" << stats.decode_ns
+                          << "|speculative=" << stats.speculative << "|draft_tokens=" << stats.draft_tokens
+                          << "|accepted_draft_tokens=" << stats.accepted_draft_tokens
+                          << "|verification_steps=" << stats.verification_steps
                           << "|ttft_ns=" << completed->stats.time_to_first_token_ns
                           << "|generation_ns=" << completed->stats.generation_ns << "|user_ttft_ns=" << first_ns
                           << "|user_total_ns=" << last_ns << "|enqueue_ns=" << elapsed_ns(entered, enqueued)

@@ -57,19 +57,19 @@ auto check_captured_prefill(const YAML::Node& config, const kidi::checkpoint::We
     auto captured_state = require((*captured)->create_state(128));
     auto eager_state = require(eager->create_state(128));
     for (std::size_t offset = 0; offset < 64; offset += 16) {
-        require((*captured)->prefill(std::span(sequence).subspan(offset, 16), captured_state));
-        require(eager->prefill(std::span(sequence).subspan(offset, 16), eager_state));
+        require((*captured)->prefill(std::span(sequence).subspan(offset, 16), *captured_state));
+        require(eager->prefill(std::span(sequence).subspan(offset, 16), *eager_state));
     }
-    require((*captured)->prefill(std::span(sequence).subspan(64, 7), captured_state));
-    require(eager->prefill(std::span(sequence).subspan(64, 7), eager_state));
-    if (captured_state.position != 71 || eager_state.position != 71) {
+    require((*captured)->prefill(std::span(sequence).subspan(64, 7), *captured_state));
+    require(eager->prefill(std::span(sequence).subspan(64, 7), *eager_state));
+    if (captured_state->sequence_position() != 71 || eager_state->sequence_position() != 71) {
         std::cerr << "padded prefill advanced by its padded length\n";
         return false;
     }
     for (std::size_t position = 71; position < sequence.size(); ++position) {
         const auto token = std::span(sequence).subspan(position, 1);
-        const auto actual = require((*captured)->forward(token, captured_state));
-        const auto expected = require(eager->forward(token, eager_state));
+        const auto actual = require((*captured)->forward(token, *captured_state));
+        const auto expected = require(eager->forward(token, *eager_state));
         if (!std::ranges::equal(require(actual.data<float>()), require(expected.data<float>()))) {
             std::cerr << "captured prefill or decode differs from eager at " << position << '\n';
             return false;
@@ -112,13 +112,16 @@ auto check_image_prefill_rebinding(const YAML::Node& config, const kidi::checkpo
     for (std::size_t index = 0; index < sequence.size(); ++index) sequence[index] = tokens[index % tokens.size()];
     const auto run = [&](kidi::model::Gemma4& model, float offset) {
         auto state = require(model->create_state(128));
-        state.images.push_back({3, embeddings(offset)});
-        require(model->prefill(sequence, state));
+        require(state->attach_embeddings({{3, embeddings(offset)}}));
+        require(model->prefill(sequence, *state));
         return state;
     };
-    const auto first = run(*captured, 0.25F);
-    const auto rebound = run(*captured, 3.5F);
-    const auto expected = run(eager, 3.5F);
+    const auto first_ptr = run(*captured, 0.25F);
+    const auto rebound_ptr = run(*captured, 3.5F);
+    const auto expected_ptr = run(eager, 3.5F);
+    const auto& first = static_cast<const kidi::model::Gemma4State&>(*first_ptr);
+    const auto& rebound = static_cast<const kidi::model::Gemma4State&>(*rebound_ptr);
+    const auto& expected = static_cast<const kidi::model::Gemma4State&>(*expected_ptr);
     bool distinct = false;
     for (std::size_t layer = 0; layer < rebound.layers.size(); ++layer) {
         for (const auto pair : {std::pair{&first.layers[layer].key, &rebound.layers[layer].key},
@@ -189,21 +192,17 @@ auto check_external_rows(const std::filesystem::path& fixture, const YAML::Node&
     reduced.erase(table_name);
     require(kidi::checkpoint::Weights::save(directory / "internal" / "model.safetensors", state));
     require(kidi::checkpoint::Weights::save(directory / "external" / "model.safetensors", reduced));
-    YAML::Node manifest;
-    manifest["format_version"] = 1;
-    manifest["weights_file"] = "model.safetensors";
-    manifest["tokenizer_file"] = "tokenizer.json";
-    manifest["model"] = YAML::Clone(config);
+    auto manifest = YAML::Clone(config);
     manifest["decode"]["maximum_new_tokens"] = 4;
     manifest["decode"]["context_size"] = 16;
-    std::ofstream(directory / "internal" / "model.yaml") << manifest;
+    std::ofstream(directory / "internal" / "config.json") << manifest;
     const auto& table = state.at(table_name);
     YAML::Node declared;
     declared["name"] = table_name;
     declared["dtype"] = std::string(kidi::tensor::to_string(table.dtype()));
     declared["shape"] = std::vector<std::int64_t>(table.shape().begin(), table.shape().end());
     manifest["external_tensors"].push_back(declared);
-    std::ofstream(directory / "external" / "model.yaml") << manifest;
+    std::ofstream(directory / "external" / "config.json") << manifest;
     for (const auto* name : {"internal", "external"}) write_tokenizer(directory / name / "tokenizer.json");
     if (kidi::inference::Generator::load(directory / "external", device))
         throw std::runtime_error("declared external tensors loaded without a source");
@@ -237,14 +236,10 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     std::filesystem::remove_all(directory);
     std::filesystem::create_directories(directory);
     std::filesystem::copy_file(fixture / "model.safetensors", directory / "model.safetensors");
-    YAML::Node manifest;
-    manifest["format_version"] = 1;
-    manifest["weights_file"] = "model.safetensors";
-    manifest["tokenizer_file"] = "tokenizer.json";
-    manifest["model"] = YAML::Clone(config);
+    auto manifest = YAML::Clone(config);
     manifest["decode"]["maximum_new_tokens"] = 3;
     manifest["decode"]["context_size"] = 16;
-    std::ofstream(directory / "model.yaml") << manifest;
+    std::ofstream(directory / "config.json") << manifest;
     write_tokenizer(directory / "tokenizer.json");
     auto cached = require(kidi::inference::Generator::load(directory, device));
     auto plain = require(kidi::inference::Generator::load(directory, device));
@@ -364,8 +359,8 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
                                                 run(plain, prompts[index], uncached).generation.token_ids)
                 throw std::runtime_error("deferred token serving changed generated tokens");
     }
-    manifest["model"]["max_position_embeddings"] = 1024;
-    std::ofstream(directory / "model.yaml") << manifest;
+    manifest["max_position_embeddings"] = 1024;
+    std::ofstream(directory / "config.json") << manifest;
     auto compact = require(kidi::inference::Generator::load(directory, device));
     auto full = require(kidi::inference::Generator::load(directory, device));
     require(compact.configure_serving({1, 1, 1024, 2, true}));
@@ -448,34 +443,15 @@ auto check_async_serving(const YAML::Node& config) -> void {
                                                            std::span<const float>(values)));
             if (parameter.dimensions() == 2) value = context.cast(value, tensor::DType::BF16);
             if (name == "lm_head.weight") continue;
-            constexpr std::string_view GATE_UP = "gate_up_proj.weight";
-            constexpr std::string_view KV = "kv_proj.weight";
-            const auto key = "model.language_model." + name;
-            if (name.ends_with(GATE_UP)) {
-                const auto prefix = key.substr(0, key.size() - GATE_UP.size());
-                const auto middle = static_cast<std::int64_t>(value.size(0) / 2);
-                state.emplace(prefix + "gate_proj.weight", require(value.narrow(0, 0, middle)));
-                state.emplace(prefix + "up_proj.weight", require(value.narrow(0, middle, middle)));
-            } else if (name.ends_with(KV)) {
-                const auto prefix = key.substr(0, key.size() - KV.size());
-                const auto middle = static_cast<std::int64_t>(value.size(0) / 2);
-                state.emplace(prefix + "k_proj.weight", require(value.narrow(0, 0, middle)));
-                state.emplace(prefix + "v_proj.weight", require(value.narrow(0, middle, middle)));
-            } else {
-                state.emplace(key, std::move(value));
-            }
+            state.emplace("model.language_model." + name, std::move(value));
         }
         if (!embedding || !gate || !projection) throw std::runtime_error("async EOS fixture lacks transition weights");
     }
     require(checkpoint::Weights::save(directory / "model.safetensors", state));
-    YAML::Node manifest;
-    manifest["format_version"] = 1;
-    manifest["weights_file"] = "model.safetensors";
-    manifest["tokenizer_file"] = "tokenizer.json";
-    manifest["model"] = model_config;
+    auto manifest = YAML::Clone(model_config);
     manifest["decode"]["maximum_new_tokens"] = 12;
     manifest["decode"]["context_size"] = 64;
-    std::ofstream(directory / "model.yaml") << manifest;
+    std::ofstream(directory / "config.json") << manifest;
     write_tokenizer(directory / "tokenizer.json");
     auto pipelined = require(inference::Generator::load(directory, device));
     auto serial = require(inference::Generator::load(directory, device));
@@ -568,16 +544,16 @@ auto check_hnsw_head(kidi::model::Gemma4& network, const kidi::tensor::Tensor& w
         const auto run = [&] {
             std::vector<std::int32_t> output;
             auto serial = require(network->create_state(8));
-            std::array<model::Gemma4State, 2> batched;
+            std::array<std::unique_ptr<model::LanguageModelState>, 2> batched;
             for (std::size_t row = 0; row < batched.size(); ++row) {
                 batched[row] = require(network->create_state(8));
-                require(network->prefill(tokens.first(row + 1), batched[row]));
+                require(network->prefill(tokens.first(row + 1), *batched[row]));
             }
-            require(network->prefill(tokens.first(1), serial));
+            require(network->prefill(tokens.first(1), *serial));
             for (std::size_t step = 0; step < 3; ++step) {
                 const std::array input{tokens[step], tokens[step + 1]};
-                output.push_back(require(network->forward_token(std::span(input).first(1), serial)));
-                std::array states{&batched[0], &batched[1]};
+                output.push_back(require(network->forward_token(std::span(input).first(1), *serial)));
+                std::array<model::LanguageModelState*, 2> states{batched[0].get(), batched[1].get()};
                 const auto selected = require(network->forward_batch_tokens(input, states));
                 output.insert(output.end(), selected.begin(), selected.end());
             }
@@ -598,9 +574,9 @@ auto check_hnsw_head(kidi::model::Gemma4& network, const kidi::tensor::Tensor& w
         require(subset.save(path));
         require(network->configure_lm_head(path));
         if (run() != dense) throw std::runtime_error("candidate-subset HNSW head differs from dense fixture selection");
-        require(network->load_state_dict(network->state_dict()));
+        require(network->set_state(network->state_dict(), true, true));
         auto stale = require(network->create_state(8));
-        if (network->forward_token(tokens.first(1), stale) || stale.position)
+        if (network->forward_token(tokens.first(1), *stale) || stale->sequence_position())
             throw std::runtime_error("stale index binding was accepted after replacing output weights");
         std::filesystem::remove(path);
         return true;
@@ -642,9 +618,10 @@ auto check_bfloat_model(const YAML::Node& config, const kidi::checkpoint::Weight
     if (!check_hnsw_head(actual, state.at("embed_tokens.weight"), tokens)) return false;
     auto reference_state = require(reference->create_state(8));
     auto actual_state = require(actual->create_state(8));
-    if (actual_state.layers.front().key.dtype() != tensor::DType::BF16) return false;
-    const auto expected = require(reference->forward(tokens, reference_state, true));
-    const auto output = require(require(actual->forward(tokens, actual_state, true)).to(tensor::Device::cpu()));
+    if (static_cast<const model::Gemma4State&>(*actual_state).layers.front().key.dtype() != tensor::DType::BF16)
+        return false;
+    const auto expected = require(reference->forward(tokens, *reference_state, true));
+    const auto output = require(require(actual->forward(tokens, *actual_state, true)).to(tensor::Device::cpu()));
     if (output.dtype() != tensor::DType::F32 || !std::ranges::equal(output.shape(), expected.shape())) return false;
     const auto expected_values = require(expected.data<float>()), actual_values = require(output.data<float>());
     for (std::size_t index = 0; index < actual_values.size(); ++index)
@@ -662,14 +639,14 @@ auto check_bfloat_model(const YAML::Node& config, const kidi::checkpoint::Weight
     std::vector<std::int32_t> sequence(258);
     for (std::size_t index = 0; index < sequence.size(); ++index) sequence[index] = tokens[index % tokens.size()];
     auto cropped = require(extended->create_state(384)), uncropped = require(extended->create_state(384));
-    uncropped.crop_local_attention = false;
-    require(extended->prefill(sequence, cropped));
-    require(extended->prefill(sequence, uncropped));
+    extended->configure_state(*uncropped, true, true);
+    require(extended->prefill(sequence, *cropped));
+    require(extended->prefill(sequence, *uncropped));
     for (int iteration = 0; iteration < 4; ++iteration) {
         const auto token = tokens[iteration % tokens.size()];
         const std::array input{token};
-        const auto first = require(extended->forward(input, cropped));
-        const auto second = require(extended->forward(input, uncropped));
+        const auto first = require(extended->forward(input, *cropped));
+        const auto second = require(extended->forward(input, *uncropped));
         const auto first_values = require(require(first.to(tensor::Device::cpu())).copy_to_host());
         const auto second_values = require(require(second.to(tensor::Device::cpu())).copy_to_host());
         if (first_values != second_values) return false;
@@ -684,7 +661,7 @@ auto main() -> int {
             current_fixture = fixture;
             current_device = "cpu";
             const auto directory = fixture_directory(fixture);
-            const auto config = YAML::LoadFile((directory / "model.yaml").string())["model"];
+            const auto config = YAML::LoadFile((directory / "config.json").string());
             auto checkpoint = ops::require(checkpoint::Weights::load(directory / "model.safetensors"));
             auto reference = ops::require(checkpoint::Weights::load(directory / "reference.safetensors"));
             if (fixture == std::string_view("gemma4-qat")) {
@@ -714,17 +691,21 @@ auto main() -> int {
                     }
                 }
                 auto sentinel_checkpoint = ops::require(checkpoint::Weights::load(sentinel_path));
+                ops::require(sentinel_checkpoint.add(
+                    "model.language_model.layers.2.self_attn.kv_proj.weight",
+                    ops::require(sentinel_checkpoint.tensor("model.language_model.layers.0.self_attn.k_proj.weight"))));
                 const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
                 auto sentinel_model = ops::require(model::Gemma4Impl::create(config));
                 ops::require(sentinel_model->set_checkpoint(sentinel_checkpoint));
-                auto state =
+                auto state_ptr =
                     ops::require(sentinel_model->create_state(config["max_position_embeddings"].as<std::size_t>()));
+                const auto& state = static_cast<const model::Gemma4State&>(*state_ptr);
                 if (std::ranges::any_of(state.layers, [](const auto& layer) {
                         return layer.key.dtype() != tensor::DType::F32 || layer.value.dtype() != tensor::DType::F32;
                     }))
                     return failed(__LINE__);
                 const std::array<std::int32_t, 2> uncalibrated_tokens{2, 6};
-                const auto uncalibrated_logits = ops::require(sentinel_model->forward(uncalibrated_tokens, state));
+                const auto uncalibrated_logits = ops::require(sentinel_model->forward(uncalibrated_tokens, *state_ptr));
                 if (std::ranges::any_of(ops::require(uncalibrated_logits.data<float>()),
                                         [](float value) { return !std::isfinite(value); }))
                     return failed(__LINE__);
@@ -817,17 +798,17 @@ auto main() -> int {
                             8 <= capabilities.attention.int8_cache_tokens
                         ? tensor::DType::I8
                         : tensor::DType::F32;
-                for (const auto& cache : full.layers)
+                for (const auto& cache : static_cast<const model::Gemma4State&>(*full).layers)
                     if (cache.key.dtype() != cache_dtype || cache.value.dtype() != cache_dtype) return failed(__LINE__);
                 model->set_kv_cache_precision(core::KVCachePrecision::FP32);
                 const auto fp32_cache = ops::require(model->create_state(8));
-                for (const auto& cache : fp32_cache.layers)
+                for (const auto& cache : static_cast<const model::Gemma4State&>(*fp32_cache).layers)
                     if (cache.key.dtype() != tensor::DType::F32 || cache.value.dtype() != tensor::DType::F32)
                         return failed(__LINE__);
                 if (cache_dtype == tensor::DType::I8) {
                     model->set_kv_cache_precision(core::KVCachePrecision::INT8);
                     const auto int8_cache = ops::require(model->create_state(8));
-                    for (const auto& cache : int8_cache.layers)
+                    for (const auto& cache : static_cast<const model::Gemma4State&>(*int8_cache).layers)
                         if (cache.key.dtype() != tensor::DType::I8 || cache.value.dtype() != tensor::DType::I8)
                             return failed(__LINE__);
                 }
@@ -843,9 +824,9 @@ auto main() -> int {
                         ops::require(quantized->set_checkpoint(checkpoint, bits, 2));
                         if (!quantized->last_token_prefill()) return failed(__LINE__);
                         auto quantized_state = ops::require(quantized->create_state(8));
-                        const auto first = ops::require(quantized->forward_token(tokens.first(2), quantized_state));
+                        const auto first = ops::require(quantized->forward_token(tokens.first(2), *quantized_state));
                         const std::array next_input{first};
-                        const auto second = ops::require(quantized->forward_token(next_input, quantized_state));
+                        const auto second = ops::require(quantized->forward_token(next_input, *quantized_state));
                         if (first < 0 || second < 0) return failed(__LINE__);
                     }
                 }
@@ -864,13 +845,13 @@ auto main() -> int {
                     for (const auto precision : precisions) {
                         model->set_precision(precision);
                         auto precision_state = ops::require(model->create_state(8));
-                        const auto precision_output = ops::require(model->forward(tokens, precision_state, true));
+                        const auto precision_output = ops::require(model->forward(tokens, *precision_state, true));
                         for (const auto value : ops::require(precision_output.data<float>()))
                             if (!std::isfinite(value)) return failed(__LINE__);
                     }
                     model->set_precision(core::InferencePrecision::CHECKPOINT);
                 }
-                auto prefill = ops::require(model->forward(tokens, full, true));
+                auto prefill = ops::require(model->forward(tokens, *full, true));
                 const auto prefill_values = ops::require(prefill.data<float>());
                 if (prefill_values.size() != values.size()) return failed(__LINE__);
                 for (std::size_t index = 0; index < values.size(); ++index)
@@ -883,10 +864,10 @@ auto main() -> int {
                 auto incremental = ops::require(model->create_state(8));
                 auto selected_state = ops::require(model->create_state(8));
                 for (std::size_t position = 0; position < tokens.size(); ++position) {
-                    auto output = ops::require(model->forward(std::span(tokens).subspan(position, 1), incremental));
+                    auto output = ops::require(model->forward(std::span(tokens).subspan(position, 1), *incremental));
                     const auto actual = ops::require(output.data<float>());
                     const auto selected =
-                        ops::require(model->forward_token(std::span(tokens).subspan(position, 1), selected_state));
+                        ops::require(model->forward_token(std::span(tokens).subspan(position, 1), *selected_state));
                     if (selected != std::ranges::max_element(actual) - actual.begin()) return failed(__LINE__);
                     for (std::size_t token = 0; token < actual.size(); ++token)
                         if (!std::isfinite(actual[token]) ||
@@ -895,7 +876,8 @@ auto main() -> int {
                             return failed(__LINE__);
                         }
                 }
-                if (incremental.position != tokens.size() || full.position != tokens.size()) return failed(__LINE__);
+                if (incremental->sequence_position() != tokens.size() || full->sequence_position() != tokens.size())
+                    return failed(__LINE__);
                 {
                     // Replayed decode steps match eagerly executed steps bit for bit.
                     setenv("KIDI_REPLAY", "0", 1);
@@ -906,8 +888,8 @@ auto main() -> int {
                     auto eager = ops::require(eager_model->create_state(8));
                     for (std::size_t position = 0; position < tokens.size(); ++position) {
                         const auto token = std::span(tokens).subspan(position, 1);
-                        const auto actual = ops::require(model->forward(token, replayed));
-                        const auto expected = ops::require(eager_model->forward(token, eager));
+                        const auto actual = ops::require(model->forward(token, *replayed));
+                        const auto expected = ops::require(eager_model->forward(token, *eager));
                         if (!std::ranges::equal(ops::require(actual.data<float>()),
                                                 ops::require(expected.data<float>()))) {
                             std::cerr << "replayed Gemma decode differs from eager at " << position << '\n';
@@ -919,17 +901,17 @@ auto main() -> int {
                     auto integer = ops::require(model->create_state(8));
                     auto token = ops::require(tensor::Tensor::from_host({1}, tokens.first(1), device));
                     auto next = tokens[0];
-                    for (std::size_t step = 0; step + 1 < fed.capacity; ++step) {
-                        const auto selected = ops::require(model->forward_token(token, fed));
-                        next = ops::require(model->forward_token(std::span(&next, 1), integer));
+                    for (std::size_t step = 0; step + 1 < fed->sequence_capacity(); ++step) {
+                        const auto selected = ops::require(model->forward_device_token(token, *fed));
+                        next = ops::require(model->forward_token(std::span(&next, 1), *integer));
                         if (selected.device() != device || ops::require(selected.data<std::int32_t>())[0] != next) {
                             std::cerr << "Gemma token tensor feedback differs at step " << step << '\n';
                             return failed(__LINE__);
                         }
                         token = selected;
                     }
-                    if (model->forward_token(ops::require(tensor::Tensor::from_host({2}, tokens.first(2), device)),
-                                             fed))
+                    if (model->forward_device_token(
+                            ops::require(tensor::Tensor::from_host({2}, tokens.first(2), device)), *fed))
                         return failed(__LINE__);
                     if (device == tensor::Device::cpu()) {
                         if (!check_captured_prefill(config, checkpoint, tokens) ||
@@ -938,29 +920,30 @@ auto main() -> int {
                     }
                 }
                 for (const std::size_t batch_size : {2, 4}) {
-                    std::vector<model::Gemma4State> batch, serial;
+                    std::vector<std::unique_ptr<model::LanguageModelState>> batch, serial;
                     std::vector<std::size_t> order;
                     for (std::size_t row = 0; row < batch_size; ++row) {
                         auto source = ops::require(model->create_state(8));
-                        ops::require(model->prefill(tokens.first(row + 1), source));
-                        batch.push_back(ops::require(model->fork_state(source, row + 1, 8)));
-                        serial.push_back(ops::require(model->fork_state(source, row + 1, 8)));
+                        ops::require(model->prefill(tokens.first(row + 1), *source));
+                        batch.push_back(ops::require(model->fork_state(*source, row + 1, 8)));
+                        serial.push_back(ops::require(model->fork_state(*source, row + 1, 8)));
                         order.push_back(row);
                     }
-                    std::array duplicate{&batch[0], &batch[0]};
-                    if (model->forward_batch(std::array{tokens[0], tokens[1]}, duplicate) || batch[0].position != 1)
+                    std::array<model::LanguageModelState*, 2> duplicate{batch[0].get(), batch[0].get()};
+                    if (model->forward_batch(std::array{tokens[0], tokens[1]}, duplicate) ||
+                        batch[0]->sequence_position() != 1)
                         return failed(__LINE__);
                     for (std::size_t step = 0; step < 3; ++step) {
                         if (step == 1) std::ranges::reverse(order);
                         if (step == 2) order.pop_back();
-                        std::vector<model::Gemma4State*> states;
+                        std::vector<model::LanguageModelState*> states;
                         std::vector<std::int32_t> input_ids;
                         std::vector<float> expected;
                         for (auto row : order) {
-                            states.push_back(&batch[row]);
+                            states.push_back(batch[row].get());
                             input_ids.push_back(tokens[(row + step) % tokens.size()]);
                             const auto output = ops::require(
-                                model->forward(std::span<const std::int32_t>(&input_ids.back(), 1), serial[row]));
+                                model->forward(std::span<const std::int32_t>(&input_ids.back(), 1), *serial[row]));
                             const auto row_values = ops::require(output.data<float>());
                             expected.insert(expected.end(), row_values.begin(), row_values.end());
                         }
@@ -974,31 +957,36 @@ auto main() -> int {
                                 return failed(__LINE__);
                             }
                         for (auto row : order)
-                            if (batch[row].position != serial[row].position) return failed(__LINE__);
+                            if (batch[row]->sequence_position() != serial[row]->sequence_position())
+                                return failed(__LINE__);
                     }
                 }
                 auto chunked = ops::require(model->create_state(8));
-                ops::require(model->prefill(tokens.first(3), chunked));
+                ops::require(model->prefill(tokens.first(3), *chunked));
                 auto complete_prefix = ops::require(model->create_state(8));
-                ops::require(model->forward(tokens.first(3), complete_prefix, true));
-                if (chunked.position != complete_prefix.position) return failed(__LINE__);
-                for (std::size_t producer = 0; producer < chunked.layers.size(); ++producer)
-                    if (ops::require(chunked.layers[producer].key.copy_to_host()) !=
-                            ops::require(complete_prefix.layers[producer].key.copy_to_host()) ||
-                        ops::require(chunked.layers[producer].value.copy_to_host()) !=
-                            ops::require(complete_prefix.layers[producer].value.copy_to_host())) {
+                ops::require(model->forward(tokens.first(3), *complete_prefix, true));
+                if (chunked->sequence_position() != complete_prefix->sequence_position()) return failed(__LINE__);
+                const auto& chunked_gemma = static_cast<const model::Gemma4State&>(*chunked);
+                const auto& prefix_gemma = static_cast<const model::Gemma4State&>(*complete_prefix);
+                for (std::size_t producer = 0; producer < chunked_gemma.layers.size(); ++producer)
+                    if (ops::require(chunked_gemma.layers[producer].key.copy_to_host()) !=
+                            ops::require(prefix_gemma.layers[producer].key.copy_to_host()) ||
+                        ops::require(chunked_gemma.layers[producer].value.copy_to_host()) !=
+                            ops::require(prefix_gemma.layers[producer].value.copy_to_host())) {
                         std::cerr << "cache-only prefill differs from full evaluation at producer " << producer << '\n';
                         return failed(__LINE__);
                     }
-                auto snapshot = ops::require(model->fork_state(chunked, 3, 3));
-                const auto saved_key = ops::require(snapshot.layers[0].key.copy_to_host());
-                auto resumed = ops::require(model->fork_state(snapshot, 3, 8));
-                const auto resumed_output = ops::require(model->forward(tokens.subspan(3), resumed, true));
-                const auto tail = ops::require(model->forward(tokens.subspan(3), chunked, true));
+                auto snapshot = ops::require(model->fork_state(*chunked, 3, 3));
+                const auto saved_key =
+                    ops::require(static_cast<const model::Gemma4State&>(*snapshot).layers[0].key.copy_to_host());
+                auto resumed = ops::require(model->fork_state(*snapshot, 3, 8));
+                const auto resumed_output = ops::require(model->forward(tokens.subspan(3), *resumed, true));
+                const auto tail = ops::require(model->forward(tokens.subspan(3), *chunked, true));
                 const auto tail_values = ops::require(tail.data<float>());
                 if (!std::ranges::equal(ops::require(resumed_output.data<float>()), tail_values) ||
-                    saved_key != ops::require(snapshot.layers[0].key.copy_to_host()) ||
-                    model->fork_state(snapshot, 4, 8) || model->fork_state(snapshot, 3, 2))
+                    saved_key !=
+                        ops::require(static_cast<const model::Gemma4State&>(*snapshot).layers[0].key.copy_to_host()) ||
+                    model->fork_state(*snapshot, 4, 8) || model->fork_state(*snapshot, 3, 2))
                     return failed(__LINE__);
                 const auto reference_tail = values.last(tail_values.size());
                 for (std::size_t index = 0; index < tail_values.size(); ++index)
@@ -1006,7 +994,7 @@ auto main() -> int {
                         std::abs(tail_values[index] - reference_tail[index]) > 2e-4F)
                         return failed(__LINE__);
                 const std::array<std::int32_t, 1> invalid{-1};
-                if (model->forward(invalid, incremental) || incremental.position != tokens.size())
+                if (model->forward(invalid, *incremental) || incremental->sequence_position() != tokens.size())
                     return failed(__LINE__);
                 if (model->set_checkpoint(checkpoint, 4, 3)) return failed(__LINE__);
                 ops::require(model->set_checkpoint(checkpoint));
@@ -1014,7 +1002,7 @@ auto main() -> int {
                     if (model->set_checkpoint(checkpoint, 8, 4)) return failed(__LINE__);
                     ops::require(model->set_checkpoint(checkpoint, 0, 128, true));
                     auto packed_state = ops::require(model->create_state(8));
-                    const auto packed_output = ops::require(model->forward(tokens, packed_state, true));
+                    const auto packed_output = ops::require(model->forward(tokens, *packed_state, true));
                     const auto packed_values = ops::require(packed_output.data<float>());
                     for (std::size_t index = 0; index < values.size(); ++index)
                         if (!std::isfinite(packed_values[index]) ||
@@ -1023,7 +1011,7 @@ auto main() -> int {
                 } else {
                     ops::require(model->set_checkpoint(checkpoint, 8, 4));
                     auto quantized_state = ops::require(model->create_state(8));
-                    const auto quantized = ops::require(model->forward(tokens.first(1), quantized_state));
+                    const auto quantized = ops::require(model->forward(tokens.first(1), *quantized_state));
                     const auto quantized_values = ops::require(quantized.data<float>());
                     for (std::size_t index = 0; index < quantized_values.size(); ++index)
                         if (!std::isfinite(quantized_values[index]) ||
@@ -1031,7 +1019,7 @@ auto main() -> int {
                             return failed(__LINE__);
                     ops::require(model->set_checkpoint(checkpoint));
                     auto restored_state = ops::require(model->create_state(8));
-                    const auto restored = ops::require(model->forward(tokens.first(1), restored_state));
+                    const auto restored = ops::require(model->forward(tokens.first(1), *restored_state));
                     const auto restored_values = ops::require(restored.data<float>());
                     for (std::size_t index = 0; index < restored_values.size(); ++index)
                         if (!std::isfinite(restored_values[index]) ||
@@ -1056,12 +1044,12 @@ auto main() -> int {
                                 capacity <= capabilities.attention.int8_cache_tokens
                             ? tensor::DType::I8
                             : tensor::DType::F32;
-                    for (const auto& cache : prefix_state.layers)
+                    for (const auto& cache : static_cast<const model::Gemma4State&>(*prefix_state).layers)
                         if (cache.key.dtype() != extended_cache_dtype || cache.value.dtype() != extended_cache_dtype)
                             return failed(__LINE__);
-                    const auto prefix = ops::require(extended->forward(sequence, prefix_state));
+                    const auto prefix = ops::require(extended->forward(sequence, *prefix_state));
                     auto oracle_state = ops::require(extended->create_state(capacity));
-                    const auto all_logits = ops::require(extended->forward(sequence, oracle_state, true));
+                    const auto all_logits = ops::require(extended->forward(sequence, *oracle_state, true));
                     const auto last_values = ops::require(prefix.data<float>());
                     const auto oracle_values = ops::require(all_logits.data<float>()).last(last_values.size());
                     if (const auto [gap, at] = difference(last_values, oracle_values); gap > 2e-4F) {
@@ -1070,21 +1058,21 @@ auto main() -> int {
                         return failed(__LINE__);
                     }
                     auto history_state = ops::require(extended->create_state(capacity));
-                    history_state.crop_local_attention = false;
-                    ops::require(extended->prefill(std::span(sequence).first(length - 1), history_state));
-                    const auto history = ops::require(extended->forward(std::span(sequence).last(1), history_state));
+                    extended->configure_state(*history_state, true, true);
+                    ops::require(extended->prefill(std::span(sequence).first(length - 1), *history_state));
+                    const auto history = ops::require(extended->forward(std::span(sequence).last(1), *history_state));
                     const auto history_values = ops::require(history.data<float>());
                     auto bucket_state = ops::require(extended->create_state(capacity));
-                    ops::require(extended->prefill(std::span(sequence).first(128), bucket_state));
-                    ops::require(extended->prefill(std::span(sequence).subspan(128, length - 129), bucket_state));
-                    const auto bucket = ops::require(extended->forward(std::span(sequence).last(1), bucket_state));
+                    ops::require(extended->prefill(std::span(sequence).first(128), *bucket_state));
+                    ops::require(extended->prefill(std::span(sequence).subspan(128, length - 129), *bucket_state));
+                    const auto bucket = ops::require(extended->forward(std::span(sequence).last(1), *bucket_state));
                     const auto prefix_values = ops::require(prefix.data<float>()),
                                bucket_values = ops::require(bucket.data<float>());
                     auto larger_state = ops::require(extended->create_state(capacity));
                     const std::size_t chunk = length == 259 ? 256 : 512;
                     for (std::size_t offset = 0; offset < length - 3; offset += chunk)
-                        ops::require(extended->prefill(std::span(sequence).subspan(offset, chunk), larger_state));
-                    const auto larger = ops::require(extended->forward(std::span(sequence).last(3), larger_state));
+                        ops::require(extended->prefill(std::span(sequence).subspan(offset, chunk), *larger_state));
+                    const auto larger = ops::require(extended->forward(std::span(sequence).last(3), *larger_state));
                     const auto larger_values = ops::require(larger.data<float>());
                     // CPU prefill is batch-invariant, so every chunking yields the same logits. Metal's QAT prefill
                     // multiplies FP16-expanded weights, which can move a calibrated activation by one int8 step from
@@ -1101,7 +1089,7 @@ auto main() -> int {
                     }
                     // Greedy tokens after the prompt: the argmax of its last logits, then three decoded tokens. These
                     // run last because decoding may reuse the buffers holding earlier logits.
-                    const auto continuation = [&](std::span<const float> logits, model::Gemma4State& state) {
+                    const auto continuation = [&](std::span<const float> logits, model::LanguageModelState& state) {
                         std::vector<std::int32_t> generated{
                             static_cast<std::int32_t>(std::ranges::max_element(logits) - logits.begin())};
                         for (int step = 0; step < 3; ++step) {
@@ -1112,8 +1100,8 @@ auto main() -> int {
                         return generated;
                     };
                     const std::array generated{
-                        continuation(bucket_values, bucket_state), continuation(prefix_values, prefix_state),
-                        continuation(history_values, history_state), continuation(larger_values, larger_state)};
+                        continuation(bucket_values, *bucket_state), continuation(prefix_values, *prefix_state),
+                        continuation(history_values, *history_state), continuation(larger_values, *larger_state)};
                     for (std::size_t index = 1; index < generated.size(); ++index)
                         if (generated[index] != generated[0]) {
                             std::cerr << "length " << length << ": chunking " << index

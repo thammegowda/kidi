@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import json
 import os
 import shutil
 import subprocess
@@ -242,7 +243,7 @@ def find_tokenizer_converter(explicit: Path | None) -> Path:
     candidates = []
     if explicit is not None:
         candidates.append(explicit)
-    repository = Path(__file__).resolve().parents[3]
+    repository = Path(__file__).resolve().parents[2]
     candidates.extend(
         [
             Path(__file__).with_name("nlcodec_to_tokenizer_json.py"),
@@ -280,27 +281,25 @@ def write_manifest(
     checkpoint: Mapping[str, object],
 ) -> None:
     document = {
-        "format_version": 1,
+        "model_type": "rtg_transformer_nmt",
+        "architectures": ["RtgTransformerForConditionalGeneration"],
         "weights_file": "model.safetensors",
         "tokenizers": {"source": source_tokenizer, "target": target_tokenizer},
         "io": {"input_format": "moses_tokenized", "output_format": "moses_tokenized"},
-        "model": {
-            "type": "rtg_transformer_nmt",
-            "encoder_layers": int(model_args["enc_layers"]),
-            "decoder_layers": int(model_args["dec_layers"]),
-            "hidden_size": int(model_args["hid_size"]),
-            "feed_forward_size": int(model_args["ff_size"]),
-            "attention_heads": int(model_args["n_heads"]),
-            "source_vocabulary_size": int(model_args["src_vocab"]),
-            "target_vocabulary_size": int(model_args["tgt_vocab"]),
-            "activation": str(model_args["activation"]),
-            "attention_bias": True,
-            "tied_embeddings": "one-way",
-            "layer_norm_epsilon": 1.0e-5,
-            "position_encoding": "sinusoidal",
-            "maximum_position": 5000,
-            "source_tokens": 160,
-        },
+        "encoder_layers": int(model_args["enc_layers"]),
+        "decoder_layers": int(model_args["dec_layers"]),
+        "hidden_size": int(model_args["hid_size"]),
+        "feed_forward_size": int(model_args["ff_size"]),
+        "attention_heads": int(model_args["n_heads"]),
+        "source_vocabulary_size": int(model_args["src_vocab"]),
+        "target_vocabulary_size": int(model_args["tgt_vocab"]),
+        "activation": str(model_args["activation"]),
+        "attention_bias": True,
+        "tied_embeddings": "one-way",
+        "layer_norm_epsilon": 1.0e-5,
+        "position_encoding": "sinusoidal",
+        "maximum_position": 5000,
+        "source_tokens": 160,
         "decode": {
             "beam_size": 4,
             "maximum_extra_tokens": 50,
@@ -312,10 +311,7 @@ def write_manifest(
             "averaged_checkpoints": int(checkpoint.get("num_checkpts", 1)),
         },
     }
-    yaml = YAML()
-    yaml.default_flow_style = False
-    with path.open("w", encoding="utf-8") as output:
-        yaml.dump(document, output)
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
 
 def convert(args: argparse.Namespace) -> Path:
@@ -363,7 +359,7 @@ def convert(args: argparse.Namespace) -> Path:
             target_tokenizer = gzip_deterministic(target_tokenizer)
 
         write_manifest(
-            staging / "model.yaml",
+            staging / "config.json",
             model_args,
             source_tokenizer.name,
             target_tokenizer.name,

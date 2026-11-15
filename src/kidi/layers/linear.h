@@ -35,11 +35,12 @@ public:
     auto forward(ops::Context&, const Tensor&) const -> Tensor;
     /// Returns I32 [rows] token IDs; an indexed head is approximate and does not materialize vocabulary logits.
     auto select(ops::Context&, const Tensor&, ops::TokenOutput output = ops::TokenOutput::HOST) const -> Tensor;
+    /// Scores `candidates` rows of a transposed unquantized weight table and returns the greedy winner.
+    auto select(ops::Context&, const Tensor&, std::span<const std::int32_t> candidates) const -> std::int32_t;
     auto bind_hnsw(const std::filesystem::path& path, const Tensor& packed_zero = {}) -> Result<void>;
     auto has_hnsw() const noexcept -> bool;
     auto check_hnsw_binding() const -> void;
     auto release_workspaces() const -> void;
-    auto weight() const -> const Tensor& { return weight_; }
 
 private:
     friend class GatedFeedForwardImpl;

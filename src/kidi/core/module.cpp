@@ -1,5 +1,4 @@
 #include "kidi/core/module.h"
-#include "kidi/checkpoint/weights.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -75,18 +74,15 @@ auto Module::state_dict() const -> StateDict {
     for (const auto& [name, parameter] : slots) result.emplace(name, *parameter.value);
     return result;
 }
-auto Module::set_state(const StateDict& state, bool strict) -> Result<void> {
-    return assign_state(state, strict, false);
+auto Module::parameter_specs() const -> ParameterSpecMap {
+    Slots slots;
+    collect(slots, "");
+    ParameterSpecMap result;
+    for (const auto& [name, parameter] : slots)
+        result.emplace(name, ParameterSpec{parameter.shape, parameter.dtype, parameter.device, parameter.alias});
+    return result;
 }
-auto Module::set_state(const checkpoint::Weights& weights, bool strict) -> Result<void> {
-    auto state = weights.state_dict();
-    if (!state) return std::unexpected(std::move(state.error()));
-    return set_state(*state, strict);
-}
-auto Module::load_state_dict(const StateDict& state, bool strict) -> Result<void> {
-    return assign_state(state, strict, true);
-}
-auto Module::assign_state(const StateDict& state, bool strict, bool copy) -> Result<void> {
+auto Module::set_state(const StateDict& state, bool strict, bool copy) -> Result<void> {
     Slots slots;
     collect(slots, "");
     if (strict) {

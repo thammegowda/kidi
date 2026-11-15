@@ -48,11 +48,11 @@ runtime:
   wasm:
     models:
       chat:
-        model_id: google/gemma-4-E2B-it-qat-mobile-transformers
+        model_id: "@google/gemma-4-E2B-it-qat-mobile-transformers"
 
 models:
   chat:
-    model_id: google/gemma-4-E4B-it-qat-mobile-transformers
+    model_id: "@google/gemma-4-E4B-it-qat-mobile-transformers"
     revision: main
 ```
 

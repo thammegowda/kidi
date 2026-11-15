@@ -45,14 +45,10 @@ auto prepare(const std::filesystem::path& directory) -> void {
     const std::filesystem::path fixture(KIDI_GEMMA4_FIXTURE);
     check(std::filesystem::create_directory(directory), "cannot create index CLI fixture");
     std::filesystem::copy_file(fixture / "model.safetensors", directory / "model.safetensors");
-    YAML::Node manifest;
-    manifest["format_version"] = 1;
-    manifest["weights_file"] = "model.safetensors";
-    manifest["tokenizer_file"] = "tokenizer.json";
-    manifest["model"] = YAML::LoadFile((fixture / "model.yaml").string())["model"];
+    auto manifest = YAML::LoadFile((fixture / "config.json").string());
     manifest["decode"]["maximum_new_tokens"] = 4;
     manifest["decode"]["context_size"] = 16;
-    std::ofstream(directory / "model.yaml") << manifest;
+    std::ofstream(directory / "config.json") << manifest;
     std::ofstream(directory / "tokenizer.json") << R"({
       "version":"1.0", "pre_tokenizer":{"type":"WhitespaceSplit"},
       "decoder":{"type":"WordPiece","prefix":"##","cleanup":false},
@@ -73,9 +69,10 @@ auto main() -> int {
             root, inference::ModelLoadOptions{.device = tensor::Device::cpu(), .dense_lm_head = true}));
         const auto threads = std::min<std::size_t>(4, std::max(1U, std::thread::hardware_concurrency()));
         std::vector<std::string> command{
-            "kidi",         "index", "--model",     root.string(), "--m",       "4",   "--ef-construction", "32",
-            "--candidates", "4",     "--ef-search", "16",          "--builder", "cpu", "--threads",
-            std::to_string(threads),
+            "kidi",         "index", "--model",           root.string(),
+            "--m",          "4",     "--ef-construction", "32",
+            "--candidates", "4",     "--ef-search",       "16",
+            "--builder",    "cpu",   "--threads",         std::to_string(threads),
         };
         std::string progress;
         const auto [status, output] = run(command, &progress);

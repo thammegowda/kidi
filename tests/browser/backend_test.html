@@ -59,7 +59,7 @@
                 }
                 for(const fixture of ['gemma4','gemma4-qat']) {
                     module.FS.mkdir('/fixtures/'+fixture);
-                    for(const file of ['model.yaml','model.safetensors','reference.safetensors']) {
+                    for(const file of ['config.json','model.safetensors','reference.safetensors']) {
                         const response=await fetch('../data/'+fixture+'/'+file);
                         if(!response.ok)throw new Error(`Fixture HTTP ${response.status}: ${fixture}/${file}`);
                         module.FS.writeFile('/fixtures/'+fixture+'/'+file,new Uint8Array(await response.arrayBuffer()));

@@ -103,9 +103,8 @@ OmniVoice conversion reads public Safetensors only and writes a decoder-only,
 all-parameter INT8 package:
 
 ```bash
-python -m pip install '.[convert,hf]'
 SOURCE="$(hf download k2-fsa/OmniVoice)"
-python -m kidi.converters.omnivoice "$SOURCE" .cache/omnivoice-int8
+python tools/converters/omnivoice.py "$SOURCE" .cache/omnivoice-int8
 build-release/kidi inspect --model .cache/omnivoice-int8
 ```
 
@@ -129,7 +128,7 @@ checkpoint's weight-normalization tensors, packs the Misaki US-English
 pronunciation dictionaries, and embeds requested voice tables:
 
 ```bash
-python -m kidi.converters.kokoro /path/to/Kokoro-82M .cache/kokoro-int8 \
+python tools/converters/kokoro.py /path/to/Kokoro-82M .cache/kokoro-int8 \
   --voices af_heart
 ```
 
@@ -368,10 +367,11 @@ support for arbitrary Hugging Face architectures.
 
 ### CPU HNSW indexes
 
-`kidi::search::HnswIndex` provides deterministic HNSW learning, versioned
-serialization, loading and inner-product search over an external FP32/BF16
-tensor table. The index stores graph topology and row labels, not a duplicate
-vector table, so other Kidi search features can reuse it.
+`kidi::search::HnswIndex` wraps YNNPACK's `ynnpack/composites/hnsw.h` engine and
+microkernels with versioned `.hnsw` serialization, tensor validation and loading
+over an external FP32/BF16 or quantized tensor table. The index stores graph
+topology and row labels, not a duplicate vector table, so other Kidi search
+features can reuse it.
 
 Build a Gemma output-head index natively:
 
@@ -384,15 +384,17 @@ Both the core `save` API and the command refuse to overwrite any existing
 path. Each save uses its own staging directory, checks write/flush/close errors,
 and atomically publishes a complete graph-only file. The command installs
 `MODEL/lm_head.hnsw`. It supports original dense Gemma FP32/BF16 checkpoints;
-native QAT and load-time packed weights are intentionally excluded. Index
-learning keeps insertions and pruning ordered, and can use the existing CPU worker
-pool for distance calculations. `--threads` controls parallelism (default: 1);
-one- and multi-threaded builds produce the same graph with a fixed seed on the
-same hardware. More threads are not always faster for small graph expansions:
-on the Xeon test host, 2,048 E4B rows took 7.36/16.80/28.30 seconds with 1/4/14
-threads, respectively. CPU distance kernels use AVX-512/FMA or ARM64 NEON where supported.
-Progress includes row counts, percentage, elapsed time, rate and an interval-based
-ETA. A full vocabulary can still take substantial offline time.
+native QAT and load-time packed weights are intentionally excluded. CPU index
+learning inserts nodes in deterministic two-phase prefix-doubling batches
+(parallel read-only snapshot search followed by bucketed reverse-link merging
+with 20% prune headroom) and scores neighbors four at a time via AVX-512/FMA or
+ARM64 NEON/BF16 dot kernels. `--threads` controls parallelism (default: 1);
+one- and multi-threaded builds produce byte-identical graphs with a fixed seed
+on the same hardware. On Apple M5 (`arm64`), building all 262,144 E2B rows
+(`1,536`-wide BF16) completes in **117.6 seconds** (`--threads 4`) or **89.7
+seconds** (`--threads 10`), producing a **39,927,380-byte** graph-only file.
+Progress includes row counts, percentage, elapsed time, rate and an
+interval-based ETA.
 
 CUDA-enabled builds also include native cuVS offline construction, which builds
 the graph on CUDA and exports it for CPU search. The existing

@@ -3,8 +3,6 @@ import {readFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 
-import {load} from '../libs/js-yaml/js-yaml.mjs';
-
 const binary = resolve(process.argv[2] || 'build-extension/chromium/single/kidi.mjs');
 const {default: create} = await import(pathToFileURL(binary));
 const module = await create();
@@ -13,16 +11,13 @@ const call = (name, types = [], values = []) => {
   assert.equal(result.error, undefined, `${name}: ${result.error}`);
   return result;
 };
-const config = load(await readFile(new URL('../../tests/data/gemma4/model.yaml', import.meta.url), 'utf8'));
-config.model.max_position_embeddings = 9216;
+const config = JSON.parse(await readFile(new URL('../../tests/data/gemma4/config.json', import.meta.url), 'utf8'));
+config.max_position_embeddings = 9216;
+config.decode = {maximum_new_tokens: 8, context_size: 9216};
 module.FS.mkdir('/fixture');
 module.FS.writeFile('/fixture/model.safetensors',
   new Uint8Array(await readFile(new URL('../../tests/data/gemma4/model.safetensors', import.meta.url))));
-module.FS.writeFile('/fixture/model.yaml', JSON.stringify({
-  format_version: 1, model: config.model,
-  weights_file: 'model.safetensors', tokenizer_file: 'tokenizer.json',
-  decode: {maximum_new_tokens: 8, context_size: 9216},
-}));
+module.FS.writeFile('/fixture/config.json', JSON.stringify(config));
 const tokens = ['<pad>', '<eos>', '<bos>', '<turn|>', '<|turn>', '<unk>',
   'alpha', 'beta', 'gamma', 'delta', 'theta', 'zeta', 'eta', 'iota', 'kappa', 'lambda'];
 module.FS.writeFile('/fixture/tokenizer.json', JSON.stringify({

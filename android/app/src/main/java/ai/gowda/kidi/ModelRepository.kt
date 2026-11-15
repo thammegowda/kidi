@@ -40,7 +40,7 @@ internal class ModelRepository(context: Context, rootName: String = "models") {
     private val prepareMutex = Mutex()
     private val downloader = ModelDownloader()
 
-    fun installed(): InstalledModel? = installed(CURRENT_FILE, CHAT_FILES + "model.yaml")
+    fun installed(): InstalledModel? = installed(CURRENT_FILE, CHAT_FILES)
 
     fun installedSpeech(): InstalledModel? = installed(SPEECH_CURRENT_FILE, SPEECH_FILES)
 
@@ -71,7 +71,7 @@ internal class ModelRepository(context: Context, rootName: String = "models") {
     }
 
     suspend fun prepare(modelId: String, progress: (ModelDownloadProgress) -> Unit): InstalledModel =
-        prepareModel(modelId, CHAT_FILES, CURRENT_FILE, ::createManifest, progress)
+        prepareModel(modelId, CHAT_FILES, CURRENT_FILE, ::validateChatModel, progress)
 
     suspend fun prepareSpeech(modelId: String, progress: (ModelDownloadProgress) -> Unit): InstalledModel =
         prepareModel(modelId, SPEECH_FILES, SPEECH_CURRENT_FILE, ::validateSpeechModel, progress, ::resolveSpeech)
@@ -144,7 +144,7 @@ internal class ModelRepository(context: Context, rootName: String = "models") {
         }
 
     fun removeInstalled() {
-        removeInstalled(CURRENT_FILE, CHAT_FILES + "model.yaml")
+        removeInstalled(CURRENT_FILE, CHAT_FILES)
     }
 
     fun removeInstalledSpeech() {
@@ -188,10 +188,10 @@ internal class ModelRepository(context: Context, rootName: String = "models") {
         return Revision(modelId, revision, files)
     }
 
-    private fun createManifest(directory: File) {
+    private fun validateChatModel(directory: File) {
         val config = JSONObject(File(directory, "config.json").readText())
-        val model = JSONObject(config.getJSONObject("text_config").toString())
-        require(config.optString("model_type") == "gemma4" && !model.optBoolean("enable_moe_block")) {
+        val model = config.optJSONObject("text_config")
+        require(config.optString("model_type") == "gemma4" && model != null && !model.optBoolean("enable_moe_block")) {
             "Expected a dense Gemma 4 checkpoint"
         }
         val quantization = config.optJSONObject("quantization_config")
@@ -202,15 +202,6 @@ internal class ModelRepository(context: Context, rootName: String = "models") {
         require(tokenizerConfig.optString("chat_template").isNotBlank() || File(directory, "chat_template.jinja").isFile) {
             "Model has no chat template"
         }
-        model.put("type", "gemma4_text")
-        if (quantization != null) model.put("quantization_config", quantization)
-        val manifest = JSONObject()
-            .put("format_version", 1)
-            .put("weights_file", "model.safetensors")
-            .put("tokenizer_file", "tokenizer.json")
-            .put("model", model)
-            .put("decode", JSONObject().put("maximum_new_tokens", 8192).put("context_size", 16384))
-        writeAtomically(File(directory, "model.yaml"), manifest.toString())
     }
 
     private fun validateSpeechModel(directory: File) {
@@ -324,7 +315,7 @@ internal class ModelRepository(context: Context, rootName: String = "models") {
         )
         val SPEECH_FILES = SPEECH_METADATA_FILES + "model.safetensors"
         val TTS_BASE_FILES = listOf(
-            "model.yaml",
+            "config.json",
             "model.safetensors",
             "sentence-prefixes.tsv",
             "synthesis_template.jinja",

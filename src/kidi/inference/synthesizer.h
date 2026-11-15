@@ -15,6 +15,10 @@
 #include "kidi/tensor/tensor.h"
 #include "kidi/text/sentence.h"
 
+namespace kidi::model {
+class SpeechSynthesisModel;
+}
+
 namespace kidi::inference {
 
 using VoiceAttributes = std::map<std::string, std::string, std::less<>>;
@@ -74,20 +78,6 @@ public:
     virtual auto step() -> Result<std::optional<Synthesis>> = 0;
 };
 
-class SynthesizerModel {
-public:
-    virtual ~SynthesizerModel() = default;
-    virtual auto voice_reference_chunk(std::span<const std::string>, const SynthesisOptions&) const
-        -> Result<std::optional<std::size_t>> {
-        return std::optional<std::size_t>{};
-    }
-    virtual auto supports_voice_prompt() const noexcept -> bool { return false; }
-    virtual auto start_synthesis(std::string_view, const SynthesisOptions&)
-        -> Result<std::unique_ptr<SynthesisSession>> = 0;
-    virtual auto execution() const -> std::string = 0;
-    virtual auto release_workspaces() -> void {}
-};
-
 class Synthesizer {
 public:
     Synthesizer(Synthesizer&&) noexcept;
@@ -108,7 +98,8 @@ public:
 
 private:
     struct Impl;
-    Synthesizer(std::shared_ptr<SynthesizerModel> model, text::SentenceSegmenter sentences, tensor::Device device);
+    Synthesizer(std::shared_ptr<model::SpeechSynthesisModel> model, text::SentenceSegmenter sentences,
+                tensor::Device device);
     auto create_session(std::string_view text, const SynthesisOptions& options, bool stepped) const
         -> Result<std::unique_ptr<SynthesisSession>>;
 

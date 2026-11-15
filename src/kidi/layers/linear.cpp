@@ -279,4 +279,29 @@ auto LinearImpl::select(ops::Context& context, const Tensor& query, ops::TokenOu
     return slot.selected;
 }
 
+auto LinearImpl::select(ops::Context& context, const Tensor& query, std::span<const std::int32_t> candidates) const
+    -> std::int32_t {
+    if (!weight_.defined() || !transpose_ || has_bias_ || packed_bits_ || qstate_ || candidates.empty())
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid candidate shortlist selection"});
+    const auto indices =
+        require(Tensor::from_host({static_cast<std::int64_t>(candidates.size())}, candidates, query.device()));
+    const auto selected = context.gather(weight_, indices);
+    const auto scores = context.cast(context.matmul(query, selected, true), DType::F32);
+    const auto values = require(scores.data<float>());
+    if (values.size() != candidates.size())
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "candidate shortlist selection expects a single query row"});
+    float best = -std::numeric_limits<float>::infinity();
+    std::int32_t winner = -1;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        const auto value = values[index];
+        if (!std::isfinite(value)) throw ops::Failure({ErrorCode::RUNTIME, "nonfinite shortlist candidate score"});
+        if (value > best || (value == best && candidates[index] < winner)) {
+            best = value;
+            winner = candidates[index];
+        }
+    }
+    if (winner < 0) throw ops::Failure({ErrorCode::RUNTIME, "shortlist head selected no candidate"});
+    return winner;
+}
+
 } // namespace kidi::layers

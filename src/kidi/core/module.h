@@ -17,13 +17,17 @@
     class NAME##Impl;     \
     using NAME = ::kidi::core::ModuleHolder<NAME##Impl>
 
-namespace kidi::checkpoint {
-class Weights;
-}
-
 namespace kidi::core {
 
 using StateDict = std::map<std::string, tensor::Tensor, std::less<>>;
+
+struct ParameterSpec {
+    std::vector<std::int64_t> shape;
+    tensor::DType dtype;
+    tensor::Device device;
+    std::string alias;
+};
+using ParameterSpecMap = std::map<std::string, ParameterSpec, std::less<>>;
 
 template <typename Implementation>
 class ModuleHolder {
@@ -85,9 +89,8 @@ public:
     auto device() const noexcept -> tensor::Device { return device_; }
 
     auto state_dict() const -> StateDict;
-    auto set_state(const StateDict& state, bool strict = true) -> Result<void>;
-    auto set_state(const checkpoint::Weights& weights, bool strict = true) -> Result<void>;
-    auto load_state_dict(const StateDict& state, bool strict = true) -> Result<void>;
+    auto parameter_specs() const -> ParameterSpecMap;
+    auto set_state(const StateDict& state, bool strict = true, bool copy = false) -> Result<void>;
 
 protected:
     auto register_parameter(std::string name, tensor::Tensor& parameter) -> void;
@@ -110,7 +113,6 @@ private:
         std::string alias;
     };
     using Slots = std::map<std::string, Parameter, std::less<>>;
-    auto assign_state(const StateDict& state, bool strict, bool copy) -> Result<void>;
     auto collect(Slots& result, const std::string& prefix) const -> void;
     auto contains(const Module* module) const -> bool;
     auto check_name(std::string_view name) const -> void;

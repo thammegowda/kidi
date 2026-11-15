@@ -42,7 +42,7 @@ to kidi-owned C++ code. Code under `third_party/` follows its upstream project.
 - Register parameter members and child modules during construction. Use typed
   `ModuleList<Impl>` / `ModuleMap<Impl>` for registered containers. Module objects
   are nonmovable so registered tensor-member addresses remain valid. Use
-  `load_state_dict`, not in-place weight mutation, to replace prepared parameters.
+  `set_state(..., /*copy=*/true)`, not in-place weight mutation, to replace prepared parameters.
 - Constructors take dimensions/structure, not checkpoint objects or name prefixes.
   Registered module paths define state keys. Use scoped `ModuleScope` for thread-local
   dtype, allocation and device defaults; do not thread those arguments through every

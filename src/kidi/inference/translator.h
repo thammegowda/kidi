@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "kidi/core/error.h"
-#include "kidi/model/transformer.h"
+#include "kidi/model/model.h"
 #include "kidi/checkpoint/package.h"
 #include "kidi/inference/profile.h"
 
@@ -43,10 +43,10 @@ public:
                          InferenceStats* stats = nullptr) -> Result<std::vector<Translation>>;
 
 private:
-    Translator(checkpoint::Package package, model::Transformer model) noexcept;
+    Translator(checkpoint::Package package, std::shared_ptr<model::Seq2SeqModel> model) noexcept;
 
     checkpoint::Package package_;
-    model::Transformer model_;
+    std::shared_ptr<model::Seq2SeqModel> model_;
     std::size_t batch_size_ = 1;
 };
 

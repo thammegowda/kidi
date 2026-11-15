@@ -258,11 +258,15 @@ auto yaml_string(const YAML::Node& node, std::string_view key, std::string fallb
     return value ? value.as<std::string>() : std::move(fallback);
 }
 
-auto resolve_model_path(const std::filesystem::path& config, const YAML::Node& node) -> std::filesystem::path {
-    auto path = std::filesystem::path(yaml_string(node, "directory"));
-    if (path.empty()) return {};
+auto resolve_local_path(const std::filesystem::path& config, std::string_view raw) -> std::filesystem::path {
+    if (raw.empty()) return {};
+    auto path = kidi::checkpoint::Hub::expand_home(std::filesystem::path(raw));
     if (path.is_relative()) path = config.parent_path() / path;
     return path.lexically_normal();
+}
+
+auto resolve_model_path(const std::filesystem::path& config, const YAML::Node& node) -> std::filesystem::path {
+    return resolve_local_path(config, yaml_string(node, "directory"));
 }
 
 auto positive_size(const YAML::Node& node, std::string_view key, std::size_t fallback, std::size_t maximum)
@@ -348,26 +352,41 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
         result.chat = model_config(source, models["chat"], true);
         result.asr = model_config(source, models["asr"], false);
         result.tts = model_config(source, models["tts"], false);
-        for (auto* model : {&result.chat, &result.asr, &result.tts}) {
-            if (!model->enabled || !model->directory.empty()) continue;
-            auto resolved = model_hub.resolve(model->model_id, model->revision);
-            if (!resolved) return invalid_config(resolved.error().message);
-            model->directory = std::move(*resolved);
-        }
         if (!result.chat.enabled) return invalid_config("models.chat must be enabled");
-        if (result.chat.directory.empty()) return invalid_config("Chat model is not present in model_hub.local");
-        for (const auto* model : {&result.chat, &result.asr, &result.tts}) {
-            if (model->enabled && model->directory.empty())
-                return invalid_config("Enabled model is not present in model_hub.local: " + model->model_id);
+        for (auto* model : {&result.chat, &result.asr, &result.tts}) {
+            if (!model->enabled) continue;
             if (model->accelerator != "auto" && model->accelerator != "cpu" && model->accelerator != "gpu" &&
                 model->accelerator != "npu" && !kidi::tensor::parse_cuda_device(model->accelerator))
                 return invalid_config("Model accelerator must be auto, cpu, gpu, npu, or cuda[:INDEX]");
-            if (model->enabled && !std::filesystem::is_directory(model->directory, error))
+            if (!model->directory.empty()) {
+                if (!std::filesystem::is_directory(model->directory, error))
+                    return invalid_config("Enabled model directory does not exist: " + model->directory.string());
+                continue;
+            }
+            if (!model->model_id.starts_with('@')) {
+                model->directory = resolve_local_path(source, model->model_id);
+                if (model->directory.empty())
+                    return invalid_config("Enabled model path is not configured: " + model->model_id);
+                if (!std::filesystem::is_directory(model->directory, error))
+                    return invalid_config("Enabled model directory does not exist: " + model->directory.string());
+            }
+        }
+        for (auto* model : {&result.chat, &result.asr, &result.tts}) {
+            if (!model->enabled || !model->directory.empty()) continue;
+            const auto repo_id = std::string_view(model->model_id).substr(1);
+            const auto reference = model->revision.empty() || model->revision == "main"
+                                       ? std::string(repo_id)
+                                       : std::string(repo_id) + "@" + model->revision;
+            auto resolved = model_hub.download(reference);
+            if (!resolved) return invalid_config(resolved.error().message);
+            model->directory = std::move(*resolved);
+            if (!std::filesystem::is_directory(model->directory, error))
                 return invalid_config("Enabled model directory does not exist: " + model->directory.string());
         }
+        if (result.chat.directory.empty()) return invalid_config("Chat model path is not configured");
         if (result.tts.enabled) {
             for (const auto* file :
-                 {"model.yaml", "model.safetensors", "sentence-prefixes.tsv", "synthesis_template.jinja", "NOTICE"}) {
+                 {"config.json", "model.safetensors", "sentence-prefixes.tsv", "synthesis_template.jinja"}) {
                 if (!std::filesystem::is_regular_file(result.tts.directory / file, error))
                     return invalid_config("TTS package is missing required file: " + std::string(file));
             }
@@ -444,6 +463,8 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
         return result;
     } catch (const YAML::Exception& error) {
         return invalid_config(std::string{"Invalid YAML configuration: "} + error.what());
+    } catch (const std::invalid_argument& error) {
+        return invalid_config(error.what());
     }
 }
 

@@ -16,13 +16,6 @@ using ops::require;
 using tensor::DType;
 using tensor::Tensor;
 namespace {
-auto selected_token(Result<Tensor> output) -> Result<std::int32_t> {
-    if (!output) return std::unexpected(std::move(output.error()));
-    auto selected = output->data<std::int32_t>();
-    if (!selected) return std::unexpected(std::move(selected.error()));
-    if ((*selected)[0] < 0) return std::unexpected(Error{ErrorCode::RUNTIME, "Gemma 4 returned invalid token scores"});
-    return (*selected)[0];
-}
 auto scalar(float value, tensor::Device device) -> Tensor {
     return require(Tensor::from_host({}, std::span<const float>(&value, 1), device));
 }
@@ -77,43 +70,16 @@ auto output_projection(std::int32_t hidden, std::int32_t vocabulary, std::int32_
     const ModuleScope host(tensor::Device::cpu());
     return layers::Linear(hidden, vocabulary, true, false, bits, false, group_size);
 }
-auto float_parameter(const Tensor& input) -> Tensor {
-    if (input.dtype() == DType::F32) return input;
-    if (input.dtype() != DType::BF16)
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "Gemma 4 parameters must be BF16 or FP32"});
-    auto output = require(Tensor::empty({input.shape().begin(), input.shape().end()}, DType::F32));
-    const auto bytes = require(input.host_bytes());
-    const auto source = reinterpret_cast<const std::uint16_t*>(bytes.data());
-    auto values = require(output.data<float>());
-    for (std::size_t index = 0; index < values.size(); ++index)
-        values[index] = std::bit_cast<float>(static_cast<std::uint32_t>(source[index]) << 16);
-    input.release_pages(false);
-    return output;
-}
-auto concatenate_projection_rows(const Tensor& first, const Tensor& second) -> Tensor {
-    if (first.dimensions() != 2 || second.dimensions() != 2 || first.dtype() != second.dtype() ||
-        !std::ranges::equal(first.shape(), second.shape()))
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "gate/up projection shape or dtype mismatch"});
-    auto shape = std::vector<std::int64_t>(first.shape().begin(), first.shape().end());
-    shape[0] *= 2;
-    if (first.is_host_accessible() && second.is_host_accessible()) {
-        const auto first_view = first.host_bytes(), second_view = second.host_bytes();
-        // Checkpoints laid out with each up projection directly after its gate projection need no copy.
-        if (first_view && second_view && first_view->data() + first_view->size() == second_view->data())
-            return require(Tensor::from_blob(shape, first.dtype(), {first_view->data(), first_view->size() * 2},
-                                             std::make_shared<std::array<Tensor, 2>>(std::array{first, second})));
-    }
-    auto output = require(Tensor::empty(shape, first.dtype()));
-    auto destination = require(output.host_bytes());
-    const auto first_host = require(first.to(tensor::Device::cpu()));
-    const auto second_host = require(second.to(tensor::Device::cpu()));
-    const auto first_bytes = require(first_host.host_bytes());
-    const auto second_bytes = require(second_host.host_bytes());
-    std::ranges::copy(first_bytes, destination.begin());
-    std::ranges::copy(second_bytes, destination.begin() + first_bytes.size());
-    first.release_pages(false);
-    second.release_pages(false);
-    return output;
+auto parameter_quant_bits(const YAML::Node& config, std::string_view name) -> std::int32_t {
+    const auto suffix =
+        name.ends_with(".embedding_quantized") ? std::string_view(".embedding_quantized") : std::string_view(".weight");
+    auto module = std::string(name.substr(0, name.size() - suffix.size()));
+    if (const auto pos = module.find(".mlp.gate_up_proj"); pos != std::string::npos)
+        module.replace(pos, std::string_view(".mlp.gate_up_proj").size(), ".mlp.gate_proj");
+    if (const auto pos = module.find(".self_attn.kv_proj"); pos != std::string::npos)
+        module.replace(pos, std::string_view(".self_attn.kv_proj").size(), ".self_attn.k_proj");
+    if (module != "lm_head") module.insert(0, "model.language_model.");
+    return quant_bits(config, module);
 }
 } // namespace
 
@@ -224,45 +190,11 @@ struct Gemma4Impl::State {
     }
 };
 
-auto Gemma4Impl::checkpoint_config() -> checkpoint::ConfigAdapter {
-    return {"config.json", [](const checkpoint::ConfigSource& source) -> Result<YAML::Node> {
-                const auto& document = source.document;
-                const auto type = document["model_type"].as<std::string>("");
-                if (type != "gemma4" && type != "gemma4_text")
-                    return std::unexpected(Error{ErrorCode::UNSUPPORTED, "checkpoint is not a Gemma 4 model"});
-                YAML::Node config;
-                config["format_version"] = 1;
-                const auto text = document["text_config"];
-                config["model"] = YAML::Clone(text && text.IsMap() ? text : document);
-                config["model"]["type"] = "gemma4_text";
-                const auto quantization = document["quantization_config"];
-                if (quantization && quantization.IsMap())
-                    config["model"]["quantization_config"] = YAML::Clone(quantization);
-                if (config["model"]["quantization_config"].IsNull()) config["model"].remove("quantization_config");
-                if (!config["model"]["tie_word_embeddings"] && document["tie_word_embeddings"])
-                    config["model"]["tie_word_embeddings"] = document["tie_word_embeddings"];
-                constexpr std::array<std::string_view, 1> candidates{"model.safetensors"};
-                const auto weights = require(source.weights(candidates));
-                if (weights["format"].as<std::string>() != "safetensors")
-                    return std::unexpected(Error{ErrorCode::UNSUPPORTED, "Gemma 4 requires safetensors weights"});
-                config["weights_file"] = weights["path"];
-                config["tokenizer_file"] = require(source.file("tokenizer.json")).string();
-                config["decode"]["context_size"] =
-                    std::min<std::size_t>(config["model"]["max_position_embeddings"].as<std::size_t>(16384), 16384);
-                config["decode"]["maximum_new_tokens"] = 8192;
-                if (document["vision_config"]) {
-                    config["vision"] = YAML::Clone(document["vision_config"]);
-                    config["image_token_id"] = document["image_token_id"];
-                }
-                return config;
-            }};
-}
-
 auto Gemma4Impl::validate_config(const YAML::Node& config) -> Result<void> {
     try {
-        if (config["quantization_config"] &&
-            (config["quantization_config"]["quant_method"].as<std::string>() != "gemma" ||
-             !config["quantization_config"]["quantize_embeddings"].as<bool>()))
+        if (const auto q = config["quantization_config"];
+            q && !q.IsNull() &&
+            (!q.IsMap() || q["quant_method"].as<std::string>() != "gemma" || !q["quantize_embeddings"].as<bool>()))
             return std::unexpected(Error{ErrorCode::UNSUPPORTED, "unsupported QAT checkpoint format"});
         if (config["type"].as<std::string>() != "gemma4_text" || config["enable_moe_block"].as<bool>() ||
             config["attention_bias"].as<bool>() || config["attention_k_eq_v"].as<bool>() ||
@@ -338,162 +270,146 @@ auto Gemma4Impl::create(const YAML::Node& config) -> Result<Gemma4> {
         return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
     }
 }
-auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, std::int32_t weight_bits, std::int32_t group_size,
-                                bool packed_prefill) -> Result<void> {
+auto Gemma4State::cache_bytes() const noexcept -> std::size_t {
+    std::size_t bytes = 0;
+    for (const auto& layer : layers) bytes += layer.key.nbytes() + layer.value.nbytes();
+    return bytes;
+}
+
+auto Gemma4State::attach_embeddings(std::vector<EmbeddingSpan> spans) -> Result<void> {
+    images.clear();
+    images.reserve(spans.size());
+    for (auto& span : spans) images.push_back({span.position, std::move(span.embeddings)});
+    return {};
+}
+
+auto Gemma4Impl::hidden_size() const noexcept -> std::int32_t { return impl_->hidden; }
+auto Gemma4Impl::vocabulary_size() const noexcept -> std::int32_t { return impl_->vocabulary; }
+auto Gemma4Impl::max_positions() const noexcept -> std::size_t {
+    return static_cast<std::size_t>(impl_->maximum_position);
+}
+
+auto Gemma4Impl::state_mapping_specs() const -> std::vector<checkpoint::StateMappingSpec> {
+    using checkpoint::StateMappingOp;
+    using checkpoint::StateMappingSpec;
+    std::vector<StateMappingSpec> specs = {
+        {.sources = {R"(^model\.(?!language_model\.).*)"}, .op = StateMappingOp::IGNORE},
+        {.sources = {R"(^(?!model\.language_model\.|layers\.|embed_tokens|per_layer_|norm\.|lm_head\.).*)"},
+         .op = StateMappingOp::IGNORE},
+    };
+    if (!impl_->qat) specs.push_back({.sources = {R"(^lm_head\..*)"}, .op = StateMappingOp::IGNORE});
+    specs.push_back({.sources = {R"(^model\.language_model\.(.+)$)"}, .destination = "$1"});
+    for (std::int32_t layer = impl_->shared_begin; layer < impl_->layer_count; ++layer) {
+        specs.push_back(
+            {.sources = {"^layers\\." + std::to_string(layer) +
+                         R"(\.self_attn\.(?:k_proj|v_proj|kv_proj|k_norm|k_cache_scale|v_cache_scale)(?:\..+)?$)"},
+             .op = StateMappingOp::IGNORE});
+    }
+    specs.push_back({.sources = {R"(^layers\.(\d+)\.mlp\.gate_proj\.(weight|weight_scale|weight_zero)$)",
+                                 "layers.$1.mlp.up_proj.$2"},
+                     .destination = "layers.$1.mlp.gate_up_proj.$2"});
+    specs.push_back({.sources = {R"(^layers\.(\d+)\.mlp\.gate_proj\.(input_activation_scale|output_activation_scale)$)",
+                                 "layers.$1.mlp.up_proj.$2"},
+                     .destination = "layers.$1.mlp.gate_up_proj.$2",
+                     .op = StateMappingOp::IDENTICAL});
+    specs.push_back({.sources = {R"(^layers\.(\d+)\.self_attn\.k_proj\.(weight|weight_scale|weight_zero)$)",
+                                 "layers.$1.self_attn.v_proj.$2"},
+                     .destination = "layers.$1.self_attn.kv_proj.$2"});
+    specs.push_back(
+        {.sources = {R"(^layers\.(\d+)\.self_attn\.k_proj\.(input_activation_scale|output_activation_scale)$)",
+                     "layers.$1.self_attn.v_proj.$2"},
+         .destination = "layers.$1.self_attn.kv_proj.$2",
+         .op = StateMappingOp::IDENTICAL});
+    return specs;
+}
+auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
+    return set_checkpoint(weights, RuntimeQuantization{});
+}
+auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, RuntimeQuantization quantization) -> Result<void> {
     try {
+        const auto weight_bits = quantization.weight_bits;
+        const auto group_size = quantization.group_size;
+        const auto packed_prefill = quantization.packed_prefill;
         if ((weight_bits != 0 && weight_bits != 4 && weight_bits != 8) || group_size <= 0)
             throw ops::Failure(
                 {ErrorCode::INVALID_ARGUMENT, "weight bits must be 0, 4 or 8 and group size must be positive"});
         if (impl_->qat && weight_bits)
             throw ops::Failure(
                 {ErrorCode::INVALID_ARGUMENT, "QAT checkpoint precision is trained; do not override weight bits"});
-        const auto checkpoint = require(weights.state_dict());
-        const auto declared = state_dict();
-        StateDict state, zeros_state;
-        for (const auto& [key, value] : checkpoint) {
-            constexpr std::string_view PREFIX = "model.language_model.";
-            if (!key.starts_with(PREFIX) && !(impl_->qat && key.starts_with("lm_head."))) continue;
-            const auto name = key.starts_with(PREFIX) ? key.substr(PREFIX.size()) : key;
-            if (name.ends_with(".weight_zero") || name.ends_with(".embedding_zero")) {
-                zeros_state.emplace(name, value);
-                continue;
-            }
-            auto declaration = name;
-            for (const auto marker : {std::string_view(".mlp.gate_proj."), std::string_view(".mlp.up_proj.")})
-                if (const auto position = name.find(marker); position != std::string::npos)
-                    declaration.replace(position, marker.size(), ".mlp.gate_up_proj.");
-            for (const auto marker : {std::string_view(".self_attn.k_proj."), std::string_view(".self_attn.v_proj.")})
-                if (const auto position = name.find(marker); position != std::string::npos)
-                    declaration.replace(position, marker.size(), ".self_attn.kv_proj.");
-            if (!declared.contains(declaration)) {
-                if (name.starts_with("layers.") &&
-                    (name.find(".self_attn.k_proj.") != std::string::npos ||
-                     name.find(".self_attn.v_proj.") != std::string::npos ||
-                     name.find(".self_attn.k_norm.") != std::string::npos || name.ends_with(".k_cache_scale") ||
-                     name.ends_with(".v_cache_scale")))
-                    continue;
+
+        StateDict extras;
+        auto state = require(prepare_checkpoint(weights, &extras));
+        StateDict zeros_state;
+        for (auto& [name, value] : extras) {
+            if (!name.ends_with(".weight_zero") && !name.ends_with(".embedding_zero"))
                 return std::unexpected(
                     Error{ErrorCode::INVALID_ARGUMENT, "unknown Gemma 4 checkpoint parameter: " + name});
-            }
-            if (impl_->qat && (value.dtype() == DType::U8 || value.dtype() == DType::I8)) {
-                const auto suffix = name.ends_with(".embedding_quantized") ? std::string(".embedding_quantized")
-                                                                           : std::string(".weight");
-                const auto bits = quant_bits(impl_->construction_config, key.substr(0, key.size() - suffix.size()));
-                if (impl_->construction_config["packed_weights_signed"].as<bool>(false)) {
-                    if (!bits || value.dtype() != DType::U8)
-                        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "signed packed weights must use U8 storage"});
-                    state.emplace(name, value);
+            zeros_state.emplace(name, std::move(value));
+        }
+
+        const bool signed_packed = impl_->construction_config["packed_weights_signed"].as<bool>(false);
+        if (impl_->qat) {
+            for (auto& [name, value] : state) {
+                if (value.dtype() == DType::U8) {
+                    const auto bits = parameter_quant_bits(impl_->construction_config, name);
+                    if (!bits)
+                        throw ops::Failure(
+                            {ErrorCode::INVALID_ARGUMENT, "QAT weight storage does not match configured precision"});
+                    if (!signed_packed && bits < 8 &&
+                        !(name.ends_with(".embedding_quantized") && device().kind == tensor::DeviceKind::CPU)) {
+                        const auto source = require(std::as_const(value).host_bytes());
+                        const std::uint8_t sign_mask = bits == 2 ? 0xaa : 0x88;
+                        auto converted =
+                            require(Tensor::empty({value.shape().begin(), value.shape().end()}, DType::U8));
+                        auto destination = require(converted.data<std::uint8_t>());
+                        for (std::size_t offset = 0; offset < destination.size(); ++offset)
+                            destination[offset] = std::to_integer<std::uint8_t>(source[offset]) ^ sign_mask;
+                        value.release_pages(false);
+                        value = std::move(converted);
+                    }
                     continue;
                 }
-                if (!bits || (bits < 8 && value.dtype() != DType::U8) || (bits == 8 && value.dtype() != DType::I8))
-                    throw ops::Failure(
-                        {ErrorCode::INVALID_ARGUMENT, "QAT weight storage does not match configured precision"});
-                const auto source = require(value.host_bytes());
-                if (bits == 8) {
-                    state.emplace(name, require(Tensor::from_blob({value.shape().begin(), value.shape().end()},
-                                                                  DType::U8, source, std::make_shared<Tensor>(value))));
-                    continue;
-                }
-                if (name.ends_with(".embedding_quantized") && device().kind == tensor::DeviceKind::CPU) {
-                    state.emplace(name, value);
-                    continue;
-                }
-                auto converted = require(Tensor::empty({value.shape().begin(), value.shape().end()}, DType::U8));
-                auto destination = require(converted.data<std::uint8_t>());
-                const std::uint8_t sign_mask = bits == 2 ? 0xaa : bits == 4 ? 0x88 : 0;
-                for (std::size_t offset = 0; offset < destination.size(); ++offset)
-                    destination[offset] = std::to_integer<std::uint8_t>(source[offset]) ^ sign_mask;
-                value.release_pages(false);
-                state.emplace(name, std::move(converted));
-            } else {
                 const bool quantization_scale = name.ends_with("weight_scale") || name.ends_with("embedding_scale") ||
                                                 name.ends_with("input_activation_scale") ||
                                                 name.ends_with("output_activation_scale") ||
                                                 name.ends_with("k_cache_scale") || name.ends_with("v_cache_scale");
-                if (impl_->qat && quantization_scale && value.dtype() == DType::F32) {
+                if (quantization_scale && value.dtype() == DType::F32) {
                     const bool calibration_scale = name.ends_with("input_activation_scale") ||
                                                    name.ends_with("output_activation_scale") ||
                                                    name.ends_with("k_cache_scale") || name.ends_with("v_cache_scale");
-                    const auto scales = require(value.data<float>());
+                    const auto scales = require(std::as_const(value).data<float>());
                     if (std::ranges::any_of(scales, [&](float scale) {
                             return !std::isfinite(scale) || scale < 0 || (!calibration_scale && scale == 0);
                         }))
                         throw ops::Failure(
                             {ErrorCode::INVALID_ARGUMENT, "invalid trained quantization scale: " + name});
                 }
-                state.emplace(name, name.ends_with("norm.weight") || name.ends_with("layer_scalar")
-                                        ? float_parameter(value)
-                                        : value);
+            }
+            if (!state.contains("lm_head.weight") && state.contains("embed_tokens.embedding_quantized")) {
+                state.emplace("lm_head.weight", state.at("embed_tokens.embedding_quantized"));
+                state.emplace("lm_head.weight_scale", state.at("embed_tokens.embedding_scale"));
+                const float zero = 0.F;
+                if (!state.contains("lm_head.input_activation_scale"))
+                    state.emplace("lm_head.input_activation_scale",
+                                  require(Tensor::from_host({}, std::span<const float>(&zero, 1))));
+                if (!state.contains("lm_head.output_activation_scale"))
+                    state.emplace("lm_head.output_activation_scale",
+                                  require(Tensor::from_host({}, std::span<const float>(&zero, 1))));
             }
         }
-        const auto fuse_pair = [&](std::string_view prefix, std::string_view first_stem, std::string_view second_stem,
-                                   std::string_view fused_stem) {
-            for (const auto suffix :
-                 {std::string_view("weight"), std::string_view("weight_scale"),
-                  std::string_view("input_activation_scale"), std::string_view("output_activation_scale")}) {
-                if (!impl_->qat && suffix != "weight") continue;
-                // Loaders that place weights on a device may supply the pair already fused.
-                const auto fused_name = std::string(prefix) + std::string(fused_stem) + "." + std::string(suffix);
-                if (state.contains(fused_name)) continue;
-                const auto first_name = std::string(prefix) + std::string(first_stem) + "." + std::string(suffix);
-                const auto second_name = std::string(prefix) + std::string(second_stem) + "." + std::string(suffix);
-                const auto first = state.find(first_name), second = state.find(second_name);
-                if (first == state.end() || second == state.end())
-                    throw ops::Failure(
-                        {ErrorCode::INVALID_ARGUMENT, "missing paired checkpoint parameter: " + std::string(prefix)});
-                Tensor combined;
-                if (suffix.ends_with("activation_scale")) {
-                    const auto& first_scale = first->second;
-                    const auto& second_scale = second->second;
-                    if (first_scale.numel() != 1 || second_scale.numel() != 1 ||
-                        require(first_scale.data<float>())[0] != require(second_scale.data<float>())[0])
-                        throw ops::Failure(
-                            {ErrorCode::UNSUPPORTED,
-                             "paired activation scales must match for a fused linear: " + std::string(prefix)});
-                    combined = first->second;
-                } else {
-                    combined = concatenate_projection_rows(first->second, second->second);
-                }
-                state.emplace(fused_name, std::move(combined));
-                state.erase(first);
-                state.erase(second);
-            }
-            const auto first_zero = zeros_state.find(std::string(prefix) + std::string(first_stem) + ".weight_zero");
-            const auto second_zero = zeros_state.find(std::string(prefix) + std::string(second_stem) + ".weight_zero");
-            if (first_zero != zeros_state.end() && second_zero != zeros_state.end()) {
-                const auto fused_zero = std::string(prefix) + std::string(fused_stem) + ".weight_zero";
-                zeros_state.emplace(fused_zero, concatenate_projection_rows(first_zero->second, second_zero->second));
-                zeros_state.erase(first_zero);
-                zeros_state.erase(second_zero);
-            }
-        };
-        for (std::int32_t layer = 0; layer < impl_->layer_count; ++layer) {
-            const auto layer_prefix = "layers." + std::to_string(layer);
-            fuse_pair(layer_prefix + ".mlp.", "gate_proj", "up_proj", "gate_up_proj");
-            if (layer < impl_->shared_begin) fuse_pair(layer_prefix + ".self_attn.", "k_proj", "v_proj", "kv_proj");
-        }
-        if (impl_->qat && !state.contains("lm_head.weight") && state.contains("embed_tokens.embedding_quantized")) {
-            state.emplace("lm_head.weight", state.at("embed_tokens.embedding_quantized"));
-            state.emplace("lm_head.weight_scale", state.at("embed_tokens.embedding_scale"));
-            const float zero = 0.F;
-            if (!state.contains("lm_head.input_activation_scale"))
-                state.emplace("lm_head.input_activation_scale",
-                              require(Tensor::from_host({}, std::span<const float>(&zero, 1))));
-            if (!state.contains("lm_head.output_activation_scale"))
-                state.emplace("lm_head.output_activation_scale",
-                              require(Tensor::from_host({}, std::span<const float>(&zero, 1))));
-        }
-        if (weight_bits)
+        if (weight_bits) {
             for (const auto& [name, value] : state)
                 if (value.dimensions() == 2 && name != "embed_tokens.weight" &&
                     name != "embed_tokens_per_layer.weight" && weight_bits == 4 &&
                     name.find(".mlp.") != std::string::npos && (group_size % 2 || value.size(1) % group_size))
                     throw ops::Failure(
                         {ErrorCode::INVALID_ARGUMENT, "quantization group must divide projection width"});
+        }
+
         impl_->context.synchronize();
         require(set_state(state));
-        const bool unsigned_embeddings = impl_->qat && device().kind == tensor::DeviceKind::CPU &&
-                                         !impl_->construction_config["packed_weights_signed"].as<bool>(false);
+
+        const bool unsigned_embeddings = impl_->qat && device().kind == tensor::DeviceKind::CPU && !signed_packed;
         impl_->tokens->set_unsigned_packed(unsigned_embeddings);
         impl_->per_layer_tokens->set_unsigned_packed(unsigned_embeddings);
         const ops::StepCompilerScope compiler(impl_->context.step_compiler());
@@ -553,12 +469,12 @@ auto Gemma4Impl::configure_lm_head(const std::filesystem::path& path) -> Result<
         return std::unexpected(error.error());
     }
 }
-auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
+auto Gemma4Impl::create_state(std::size_t capacity) -> Result<std::unique_ptr<LanguageModelState>> {
     try {
         if (!capacity || capacity > static_cast<std::size_t>(impl_->maximum_position))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 cache capacity"});
-        Gemma4State result;
-        result.capacity = capacity;
+        auto result = std::make_unique<Gemma4State>();
+        result->capacity = capacity;
         if ((impl_->kv_cache_precision == core::KVCachePrecision::BF16 &&
              impl_->context.activation_dtype() != DType::BF16) ||
             impl_->kv_cache_precision == core::KVCachePrecision::E4M3 ||
@@ -587,110 +503,150 @@ auto Gemma4Impl::create_state(std::size_t capacity) -> Result<Gemma4State> {
         for (int index = 0; index < impl_->shared_begin; ++index) {
             const std::vector<std::int64_t> shape{1, static_cast<std::int64_t>(capacity),
                                                   impl_->key_heads * impl_->head_width[impl_->kind[index]]};
-            result.layers.push_back({require(Tensor::zeros(shape, cache_dtype, device())),
-                                     require(Tensor::zeros(shape, cache_dtype, device()))});
+            result->layers.push_back({require(Tensor::zeros(shape, cache_dtype, device())),
+                                      require(Tensor::zeros(shape, cache_dtype, device()))});
+            if (byte_cache) {
+                auto quantization = impl_->layers->at(index)->cache_quantization();
+                result->layers.back().key_quantization = std::move(quantization[0]);
+                result->layers.back().value_quantization = std::move(quantization[1]);
+            }
         }
-        return result;
+        return std::unique_ptr<LanguageModelState>(std::move(result));
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
 }
-auto Gemma4Impl::forward(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits) -> Result<Tensor> {
-    return project(tokens, state, all_logits, false);
+auto Gemma4Impl::forward(std::span<const std::int32_t> tokens, LanguageModelState& state, bool all_logits,
+                         Tensor* hidden) -> Result<Tensor> {
+    auto* gemma_state = dynamic_cast<Gemma4State*>(&state);
+    if (!gemma_state) return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 state"});
+    return project(tokens, *gemma_state, all_logits, false, {}, hidden);
 }
-auto Gemma4Impl::fork_state(const Gemma4State& source, std::size_t prefix_length, std::size_t capacity)
-    -> Result<Gemma4State> {
+auto Gemma4Impl::assistant_embedding(ops::Context& context, std::int32_t token) const -> Tensor {
+    return impl_->tokens->forward(context, std::span(&token, 1));
+}
+auto Gemma4Impl::assistant_cache(Gemma4State& state, int type) const -> layers::KeyValue& {
+    if (type < 0 || type > 1 || !state.position || state.position > state.capacity ||
+        state.layers.size() != static_cast<std::size_t>(impl_->shared_begin))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid target state for Gemma MTP"});
+    for (auto layer = impl_->shared_begin; layer-- > 0;)
+        if (impl_->kind[layer] == type) return state.layers[layer];
+    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Gemma MTP requires a target KV donor for each attention type"});
+}
+auto Gemma4Impl::assistant_positions(int type, std::size_t position) -> std::array<Tensor, 2> {
+    return impl_->positions(type, position, 1);
+}
+auto Gemma4Impl::configure_state(LanguageModelState& state, bool full_attention_cache, bool capture_prefill) -> void {
+    if (auto* gemma_state = dynamic_cast<Gemma4State*>(&state)) {
+        gemma_state->crop_local_attention = !full_attention_cache;
+        gemma_state->capture_prefill = capture_prefill;
+    }
+}
+auto Gemma4Impl::rewind(LanguageModelState& state, std::size_t position) -> Result<void> {
     try {
-        if (prefix_length > source.position || source.position > source.capacity || prefix_length > capacity ||
-            source.layers.size() != static_cast<std::size_t>(impl_->shared_begin))
+        auto* gemma_state = dynamic_cast<Gemma4State*>(&state);
+        if (!gemma_state || !gemma_state->capacity ||
+            gemma_state->capacity > static_cast<std::size_t>(impl_->maximum_position) ||
+            gemma_state->position > gemma_state->capacity || position > gemma_state->position ||
+            gemma_state->layers.size() != static_cast<std::size_t>(impl_->shared_begin))
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 cache rewind"});
+        impl_->context.synchronize();
+        gemma_state->position = position;
+        if (position == 0) gemma_state->prefilling = true;
+        return {};
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    }
+}
+auto Gemma4Impl::fork_state(const LanguageModelState& source, std::size_t prefix_length, std::size_t capacity)
+    -> Result<std::unique_ptr<LanguageModelState>> {
+    try {
+        const auto* gemma_source = dynamic_cast<const Gemma4State*>(&source);
+        if (!gemma_source || prefix_length > gemma_source->position ||
+            gemma_source->position > gemma_source->capacity || prefix_length > capacity ||
+            gemma_source->layers.size() != static_cast<std::size_t>(impl_->shared_begin))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 prefix snapshot"});
-        for (std::size_t layer = 0; layer < source.layers.size(); ++layer)
-            for (const auto* tensor : {&source.layers[layer].key, &source.layers[layer].value})
+        for (std::size_t layer = 0; layer < gemma_source->layers.size(); ++layer)
+            for (const auto* tensor : {&gemma_source->layers[layer].key, &gemma_source->layers[layer].value})
                 if (!tensor->defined() || tensor->device() != device() ||
                     (tensor->dtype() != DType::F32 && tensor->dtype() != DType::I8 && tensor->dtype() != DType::BF16) ||
-                    tensor->dimensions() != 3 || tensor->size(0) != 1 || tensor->size(1) != source.capacity ||
+                    tensor->dimensions() != 3 || tensor->size(0) != 1 || tensor->size(1) != gemma_source->capacity ||
                     tensor->size(2) != impl_->key_heads * impl_->head_width[impl_->kind[layer]])
                     throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 snapshot cache geometry"});
-        auto result = require(create_state(capacity));
-        for (std::size_t layer = 0; layer < source.layers.size(); ++layer) {
-            result.layers[layer].key_quantization = source.layers[layer].key_quantization;
-            result.layers[layer].value_quantization = source.layers[layer].value_quantization;
+        auto created = require(create_state(capacity));
+        auto& result = static_cast<Gemma4State&>(*created);
+        for (std::size_t layer = 0; layer < gemma_source->layers.size(); ++layer) {
+            result.layers[layer].key_quantization = gemma_source->layers[layer].key_quantization;
+            result.layers[layer].value_quantization = gemma_source->layers[layer].value_quantization;
         }
         impl_->context.synchronize();
         if (prefix_length) {
-            for (std::size_t layer = 0; layer < source.layers.size(); ++layer) {
-                const auto key = impl_->context.slice(source.layers[layer].key, 1, 0, prefix_length);
-                const auto value = impl_->context.slice(source.layers[layer].value, 1, 0, prefix_length);
+            for (std::size_t layer = 0; layer < gemma_source->layers.size(); ++layer) {
+                const auto key = impl_->context.slice(gemma_source->layers[layer].key, 1, 0, prefix_length);
+                const auto value = impl_->context.slice(gemma_source->layers[layer].value, 1, 0, prefix_length);
                 impl_->context.copy_slice_(result.layers[layer].key, key, 1, 0);
                 impl_->context.copy_slice_(result.layers[layer].value, value, 1, 0);
             }
             impl_->context.synchronize();
         }
         result.position = prefix_length;
-        result.images = source.images;
-        result.crop_local_attention = source.crop_local_attention;
-        return result;
+        result.images = gemma_source->images;
+        result.crop_local_attention = gemma_source->crop_local_attention;
+        return created;
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
 }
-auto Gemma4Impl::forward_token(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<std::int32_t> {
-    return selected_token(project(tokens, state, false, true));
+auto Gemma4Impl::select_token(std::span<const std::int32_t> tokens, LanguageModelState& state, bool all_tokens,
+                              Tensor* hidden) -> Result<Tensor> {
+    auto* gemma_state = dynamic_cast<Gemma4State*>(&state);
+    if (!gemma_state) return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 state"});
+    return project(tokens, *gemma_state, all_tokens, true, {}, hidden);
 }
-auto Gemma4Impl::select_token(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<Tensor> {
-    return project(tokens, state, false, true);
-}
-auto Gemma4Impl::select_batch_tokens(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states)
+auto Gemma4Impl::select_batch_tokens(std::span<const std::int32_t> tokens, std::span<LanguageModelState* const> states)
     -> Result<Tensor> {
     return run_batch(tokens, states, true);
 }
-auto Gemma4Impl::forward_token(const Tensor& token, Gemma4State& state) -> Result<Tensor> {
+auto Gemma4Impl::forward_device_token(const Tensor& token, LanguageModelState& state) -> Result<Tensor> {
     try {
-        if (token.dtype() != DType::I32 || token.dimensions() != 1 || token.size(0) != 1 ||
-            token.device() != device() || state.position >= state.capacity ||
-            state.layers.size() != static_cast<std::size_t>(impl_->shared_begin))
+        auto* gemma_state = dynamic_cast<Gemma4State*>(&state);
+        if (!gemma_state || token.dtype() != DType::I32 || token.dimensions() != 1 || token.size(0) != 1 ||
+            token.device() != device() || gemma_state->position >= gemma_state->capacity ||
+            gemma_state->layers.size() != static_cast<std::size_t>(impl_->shared_begin))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 token tensor or cache state"});
-        if (!can_decode_step(state))
+        if (!can_decode_step(*gemma_state))
             throw ops::Failure({ErrorCode::UNSUPPORTED, "token tensor decoding needs host-writable step inputs"});
         const bool chained = supports_device_tokens();
         if (!chained && device().capabilities().memory.deferred())
             throw ops::Failure(
                 {ErrorCode::UNSUPPORTED, "this backend cannot chain token tensors without a host await"});
         auto& context = impl_->context;
-        if (!state.profile_started) {
+        if (!gemma_state->profile_started) {
             context.profile_phase("gemma4_request");
-            state.profile_started = true;
+            gemma_state->profile_started = true;
         }
         context.profile_phase("decode_body");
-        auto output = decode_step(token, state, true, chained ? ops::TokenOutput::DEVICE : ops::TokenOutput::HOST);
+        auto output =
+            decode_step(token, *gemma_state, true, chained ? ops::TokenOutput::DEVICE : ops::TokenOutput::HOST);
         if (!chained) context.synchronize();
-        ++state.position;
-        state.prefilling = false;
+        ++gemma_state->position;
+        gemma_state->prefilling = false;
         return require(require(output.to(device())).reshape({1}));
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
 }
-auto Gemma4Impl::forward_batch(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states) -> Result<Tensor> {
+auto Gemma4Impl::forward_batch(std::span<const std::int32_t> tokens, std::span<LanguageModelState* const> states)
+    -> Result<Tensor> {
     return run_batch(tokens, states, false);
 }
-auto Gemma4Impl::forward_batch_tokens(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states)
-    -> Result<std::vector<std::int32_t>> {
-    auto output = run_batch(tokens, states, true);
-    if (!output) return std::unexpected(std::move(output.error()));
-    auto selected = output->data<std::int32_t>();
-    if (!selected) return std::unexpected(std::move(selected.error()));
-    if (std::ranges::any_of(*selected, [](auto token) { return token < 0; }))
-        return std::unexpected(Error{ErrorCode::RUNTIME, "batched Gemma 4 returned invalid token scores"});
-    return std::vector<std::int32_t>(selected->begin(), selected->end());
-}
-auto Gemma4Impl::run_batch(std::span<const std::int32_t> tokens, std::span<Gemma4State*> states, bool select)
-    -> Result<Tensor> {
+auto Gemma4Impl::run_batch(std::span<const std::int32_t> tokens, std::span<LanguageModelState* const> states,
+                           bool select) -> Result<Tensor> {
     try {
         if (tokens.empty() || tokens.size() != states.size())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "batched decode requires one token per state"});
         for (std::size_t row = 0; row < states.size(); ++row) {
-            const auto* state = states[row];
+            const auto* state = dynamic_cast<const Gemma4State*>(states[row]);
             if (!state || state->position >= state->capacity ||
                 state->layers.size() != static_cast<std::size_t>(impl_->shared_begin))
                 throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid batched decode state"});
@@ -701,16 +657,18 @@ auto Gemma4Impl::run_batch(std::span<const std::int32_t> tokens, std::span<Gemma
                         tensor->size(0) != 1 || tensor->size(1) != state->capacity ||
                         tensor->size(2) != impl_->key_heads * impl_->head_width[impl_->kind[producer]])
                         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid batched cache geometry"});
-                for (std::size_t previous = 0; previous < row; ++previous)
+                for (std::size_t previous = 0; previous < row; ++previous) {
+                    const auto* prior = static_cast<const Gemma4State*>(states[previous]);
                     if (state->layers[producer].key.storage_identity() ==
-                            states[previous]->layers[producer].key.storage_identity() ||
+                            prior->layers[producer].key.storage_identity() ||
                         state->layers[producer].value.storage_identity() ==
-                            states[previous]->layers[producer].value.storage_identity())
+                            prior->layers[producer].value.storage_identity())
                         throw ops::Failure(
                             {ErrorCode::INVALID_ARGUMENT, "batched requests must not alias mutable caches"});
+                }
             }
         }
-        return project(tokens, *states.front(), true, select, states);
+        return project(tokens, static_cast<Gemma4State&>(*states.front()), true, select, states);
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
@@ -757,15 +715,15 @@ auto Gemma4Impl::embed(std::span<const std::int32_t> tokens, std::span<const Gem
     return {std::move(hidden), std::move(per_layer)};
 }
 
-auto Gemma4Impl::attention_inputs(Gemma4State& state, std::span<Gemma4State*> batch_states, std::size_t step_count)
-    -> Attention {
+auto Gemma4Impl::attention_inputs(Gemma4State& state, std::span<LanguageModelState* const> batch_states,
+                                  std::size_t step_count) -> Attention {
     const auto requests = batch_states.empty() ? 1 : batch_states.size();
     Attention result;
     result.masks.resize(requests);
     result.key_starts.resize(requests);
     std::vector<std::array<std::array<Tensor, 2>, 2>> row_angles(requests);
     for (std::size_t row = 0; row < requests; ++row) {
-        const auto& request = batch_states.empty() ? state : *batch_states[row];
+        const auto& request = batch_states.empty() ? state : static_cast<const Gemma4State&>(*batch_states[row]);
         const auto extent = std::min(request.capacity, ((request.position + step_count + 127) / 128) * 128);
         const auto crop_device = device().policy().transformer.crop_history;
         result.key_starts[row] = {request.crop_local_attention && crop_device &&
@@ -808,9 +766,10 @@ auto Gemma4Impl::per_layer_input(const Tensor& per_layer, int layer, std::int64_
     return context.reshape(context.slice(per_layer, 2, layer, 1), {1, length, impl_->per_layer_width});
 }
 
-auto Gemma4Impl::head(const Tensor& hidden, bool select, ops::TokenOutput output) -> Tensor {
+auto Gemma4Impl::head(const Tensor& hidden, bool select, ops::TokenOutput output, Tensor* output_hidden) -> Tensor {
     auto& context = impl_->context;
     const auto query = impl_->norm->forward(context, hidden);
+    if (output_hidden) *output_hidden = query;
     if (select) return impl_->lm_head->select(context, query, output);
     auto logits = impl_->lm_head->forward(context, query);
     if (logits.dtype() != DType::F32) logits = context.cast(logits, DType::F32);
@@ -824,14 +783,15 @@ auto Gemma4Impl::can_decode_step(const Gemma4State& state) const -> bool {
     });
 }
 
-auto Gemma4Impl::decode_step(const Tensor& token, Gemma4State& state, bool select, ops::TokenOutput output) -> Tensor {
+auto Gemma4Impl::decode_step(const Tensor& token, Gemma4State& state, bool select, ops::TokenOutput output,
+                             Tensor* output_hidden) -> Tensor {
     if (state.prefilling && state.images.empty() && !impl_->context.accelerator().empty())
         impl_->context.clear_replays("gemma4_prefill:");
-    return captured_step(token, state, state.step, false, select, output);
+    return captured_step(token, state, state.step, false, select, output, output_hidden);
 }
 
 auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4StepInputs& inputs, bool prefill,
-                               bool select, ops::TokenOutput output) -> Tensor {
+                               bool select, ops::TokenOutput output, Tensor* output_hidden) -> Tensor {
     impl_->lm_head->check_hnsw_binding();
     auto& context = impl_->context;
     const auto device = context.device();
@@ -896,8 +856,9 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
                       : select ? ":token"
                                : ":logits");
     const auto split_head = select && impl_->lm_head->has_hnsw();
-    const auto replay_key =
-        key + (select && output == ops::TokenOutput::DEVICE ? ":device" : "") + (split_head ? ":query" : "");
+    const auto replay_key = key + (select && output == ops::TokenOutput::DEVICE ? ":device" : "") +
+                            (split_head ? ":query" : "") +
+                            (output_hidden ? (state.prefilling ? ":features:prefill" : ":features:decode") : "");
     if (context.accelerator() == "qnn-htp") {
         // Bound NPU prefill and decode shape caches to one executable each so attention buckets do not accumulate
         // duplicate HTP weights.
@@ -944,14 +905,22 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
         }
         if (prefill) return std::vector<Tensor>{};
         if (split_head) return std::vector{impl_->norm->forward(context, hidden)};
+        if (output_hidden) {
+            Tensor normalized;
+            auto logits = head(hidden, select, output, &normalized);
+            return std::vector{std::move(logits), std::move(normalized)};
+        }
         return std::vector{head(hidden, select, output)};
     });
     if (prefill) return {};
+    if (output_hidden) *output_hidden = outputs[split_head ? 0 : 1];
     return split_head ? impl_->lm_head->select(context, outputs[0], output) : outputs[0];
 }
 
-auto Gemma4Impl::prefill(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void> {
-    return prefill_impl(tokens, state);
+auto Gemma4Impl::prefill(std::span<const std::int32_t> tokens, LanguageModelState& state) -> Result<void> {
+    auto* gemma_state = dynamic_cast<Gemma4State*>(&state);
+    if (!gemma_state) return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 state"});
+    return prefill_impl(tokens, *gemma_state);
 }
 auto Gemma4Impl::prefill_impl(std::span<const std::int32_t> tokens, Gemma4State& state) -> Result<void> {
     try {
@@ -1010,8 +979,9 @@ auto Gemma4Impl::prefill_impl(std::span<const std::int32_t> tokens, Gemma4State&
 }
 
 auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& state, bool all_logits, bool select,
-                         std::span<Gemma4State*> batch_states) -> Result<Tensor> {
-    const ops::DecodeScope decode_scope(!batch_states.empty());
+                         std::span<LanguageModelState* const> batch_states, Tensor* output_hidden) -> Result<Tensor> {
+    const auto verification = output_hidden && !state.prefilling;
+    const ops::DecodeScope decode_scope(!batch_states.empty() || verification, !batch_states.empty());
     try {
         impl_->lm_head->check_hnsw_binding();
         const std::size_t token_count = tokens.size();
@@ -1024,22 +994,23 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
                 if (token < 0 || token >= impl_->vocabulary || token >= impl_->per_layer_vocabulary)
                     throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "embedding token outside vocabulary"});
             require(prefill_impl(tokens.first(token_count - 1), state));
-            return project(tokens.last(1), state, false, select);
+            return project(tokens.last(1), state, false, select, {}, output_hidden);
         }
         auto& context = impl_->context;
         if (!state.profile_started) {
             context.profile_phase("gemma4_request");
             state.profile_started = true;
         }
-        if (token_count == 1 && batch_states.empty() && can_decode_step(state)) {
+        if (batch_states.empty() &&
+            ((token_count == 1 && can_decode_step(state)) || (output_hidden && all_logits && state.images.empty()))) {
             context.profile_phase(state.prefilling ? "prefill_body" : "decode_body");
             auto& token =
-                step_input(state.step.token, {1}, DType::I32,
+                step_input(state.step.token, {static_cast<std::int64_t>(token_count)}, DType::I32,
                            device().capabilities().memory.requires_staging() ? tensor::Device::cpu() : device());
-            require(token.data<std::int32_t>())[0] = tokens[0];
-            auto output = decode_step(token, state, select);
+            std::ranges::copy(tokens, require(token.data<std::int32_t>()).begin());
+            auto output = decode_step(token, state, select, ops::TokenOutput::HOST, output_hidden);
             context.synchronize();
-            ++state.position;
+            state.position += token_count;
             state.prefilling = false;
             return output;
         }
@@ -1073,7 +1044,7 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
             const auto input = per_layer_input(per_layer, layer, active_length);
             const auto type = impl_->kind[layer];
             for (std::size_t row = 0; row < requests; ++row) {
-                auto& request = batch_states.empty() ? state : *batch_states[row];
+                auto& request = batch_states.empty() ? state : static_cast<Gemma4State&>(*batch_states[row]);
                 segments[row] = {&request.layers[impl_->cache_layer[layer]], request.position + query_offset,
                                  batch_states.empty() ? static_cast<std::size_t>(active_length) : step_count,
                                  &attention.masks[row][type],
@@ -1084,10 +1055,10 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
         }
         context.profile_phase(state.prefilling ? "prefill_head" : "decode_head");
         if (!all_logits) hidden = context.slice(hidden, 1, active_length - 1, 1);
-        auto logits = head(hidden, select);
+        auto logits = head(hidden, select, ops::TokenOutput::HOST, output_hidden);
         context.synchronize();
         for (std::size_t row = 0; row < requests; ++row) {
-            auto& request = batch_states.empty() ? state : *batch_states[row];
+            auto& request = batch_states.empty() ? state : static_cast<Gemma4State&>(*batch_states[row]);
             request.position += step_count;
             request.prefilling = false;
         }
@@ -1096,7 +1067,7 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
         return std::unexpected(error.error());
     }
 }
-auto Gemma4Impl::preparation_ns() const -> std::uint64_t { return impl_->context.preparation_ns(); }
+auto Gemma4Impl::preparation_ns() const noexcept -> std::uint64_t { return impl_->context.preparation_ns(); }
 auto Gemma4Impl::configure_cache(const std::filesystem::path& directory, const std::filesystem::path& source) -> void {
     impl_->context.configure_cache(directory, source);
 }

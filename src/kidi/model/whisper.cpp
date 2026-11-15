@@ -110,44 +110,27 @@ auto WhisperImpl::create(const YAML::Node& config) -> Result<Whisper> {
     }
 }
 
-auto WhisperImpl::checkpoint_config() -> checkpoint::ConfigAdapter {
-    return {
-        "config.json", [](const checkpoint::ConfigSource& source) -> Result<YAML::Node> {
-            const auto& model = source.document;
-            if (!model.IsMap() || model["model_type"].as<std::string>() != "whisper")
-                return std::unexpected(Error{ErrorCode::UNSUPPORTED, "checkpoint is not a Hugging Face Whisper model"});
-            YAML::Node config;
-            config["model"] = YAML::Clone(model);
-            config["model"]["type"] = "whisper";
-            constexpr std::array<std::string_view, 2> candidates{"model.safetensors", "ggml-model.bin"};
-            const auto weights = require(source.weights(candidates));
-            config["model_file"] = weights["path"];
-            if (weights["format"].as<std::string>() == "ggml") {
-                constexpr std::array keys{
-                    "vocab_size",     "max_source_positions", "d_model", "encoder_attention_heads",
-                    "encoder_layers", "max_target_positions", "d_model", "decoder_attention_heads",
-                    "decoder_layers", "num_mel_bins"};
-                for (std::size_t index = 0; index < keys.size(); ++index)
-                    if (model[keys[index]].as<std::int32_t>() != weights["ggml_header"][index].as<std::int32_t>())
-                        return std::unexpected(
-                            Error{ErrorCode::INVALID_MANIFEST,
-                                  "Whisper GGML header disagrees with config: " + std::string(keys[index])});
-                config["weights_format"] = "whisper_ggml";
-            } else if (weights["format"].as<std::string>() == "gguf") {
-                return std::unexpected(Error{ErrorCode::UNSUPPORTED,
-                                             "Whisper GGUF model mapping is not supported; use legacy Whisper GGML"});
-            }
-            for (const auto* name : {"tokenizer.json", "preprocessor_config.json", "generation_config.json"})
-                config[std::filesystem::path(name).stem().string() + "_file"] = require(source.file(name)).string();
-            return config;
-        }};
-}
-
 auto WhisperImpl::int8_preparation(const YAML::Node& config) -> Result<checkpoint::Preparation> {
     auto valid = validate_config(config["model"]);
     if (!valid) return std::unexpected(valid.error());
-    const auto source = std::filesystem::path(config["model_file"].as<std::string>());
-    const bool imported = config["weights_format"].as<std::string>("") == "whisper_ggml";
+    const auto format = config["weights_format"].as<std::string>("");
+    if (format == "gguf")
+        return std::unexpected(
+            Error{ErrorCode::UNSUPPORTED, "Whisper GGUF model mapping is not supported; use legacy Whisper GGML"});
+    const bool imported = format == "ggml";
+    if (imported) {
+        constexpr std::array keys{"vocab_size",     "max_source_positions", "d_model", "encoder_attention_heads",
+                                  "encoder_layers", "max_target_positions", "d_model", "decoder_attention_heads",
+                                  "decoder_layers", "num_mel_bins"};
+        const auto header = config["ggml_header"];
+        if (!header || !header.IsSequence() || header.size() != keys.size())
+            return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "missing Whisper GGML header"});
+        for (std::size_t index = 0; index < keys.size(); ++index)
+            if (config["model"][keys[index]].as<std::int32_t>() != header[index].as<std::int32_t>())
+                return std::unexpected(Error{ErrorCode::INVALID_MANIFEST,
+                                             "Whisper GGML header disagrees with config: " + std::string(keys[index])});
+    }
+    const auto source = std::filesystem::path(config["weights_file"].as<std::string>());
     return checkpoint::Preparation{
         .source = source,
         .cache_directory = imported ? source.filename().string() + ".kidi-int8-v1" : "kidi-int8-v2",
@@ -173,56 +156,85 @@ auto WhisperImpl::int8_checkpoint(const YAML::Node& config, const checkpoint::We
     }
 }
 
+auto WhisperImpl::state_mapping_specs() const -> std::vector<checkpoint::StateMappingSpec> {
+    using checkpoint::StateMappingOp;
+    using checkpoint::StateMappingSpec;
+    return {
+        {.sources = {R"(^model\.(.+)$)"}, .destination = "$1"},
+        {.sources = {R"(^proj_out\.(weight|scale)$)", "decoder.embed_tokens.$1"},
+         .destination = "decoder.embed_tokens.$1",
+         .op = StateMappingOp::IDENTICAL},
+        {.sources = {R"(^(encoder|decoder)\.layers\.(\d+)\.self_attn\.q_proj\.(weight|scale)$)",
+                     "$1.layers.$2.self_attn.k_proj.$3", "$1.layers.$2.self_attn.v_proj.$3"},
+         .destination = "$1.layers.$2.self_attn.qkv_proj.$3"},
+        {.sources = {R"(^(encoder|decoder)\.layers\.(\d+)\.self_attn\.q_proj\.bias$)",
+                     "$1.layers.$2.self_attn.k_proj.bias", "$1.layers.$2.self_attn.v_proj.bias"},
+         .destination = "$1.layers.$2.self_attn.qkv_proj.bias"},
+        {.sources = {R"(^(encoder|decoder)\.layers\.(\d+)\.self_attn\.q_proj\.bias$)",
+                     "0:$1.layers.$2.self_attn.q_proj.bias", "$1.layers.$2.self_attn.v_proj.bias"},
+         .destination = "$1.layers.$2.self_attn.qkv_proj.bias"},
+        {.sources = {R"(^decoder\.layers\.(\d+)\.encoder_attn\.k_proj\.(weight|scale)$)",
+                     "decoder.layers.$1.encoder_attn.v_proj.$2"},
+         .destination = "decoder.layers.$1.encoder_attn.kv_proj.$2"},
+        {.sources = {R"(^decoder\.layers\.(\d+)\.encoder_attn\.k_proj\.bias$)",
+                     "decoder.layers.$1.encoder_attn.v_proj.bias"},
+         .destination = "decoder.layers.$1.encoder_attn.kv_proj.bias"},
+        {.sources = {"0:decoder.layers.$1.encoder_attn.v_proj.bias",
+                     R"(^decoder\.layers\.(\d+)\.encoder_attn\.v_proj\.bias$)"},
+         .destination = "decoder.layers.$1.encoder_attn.kv_proj.bias"},
+    };
+}
+
+auto WhisperImpl::hidden_size() const noexcept -> std::int32_t { return impl_->hidden; }
+auto WhisperImpl::vocabulary_size() const noexcept -> std::int32_t { return impl_->vocabulary; }
+auto WhisperImpl::max_positions() const noexcept -> std::size_t {
+    return static_cast<std::size_t>(impl_->maximum_target);
+}
+auto WhisperImpl::mel_bins() const noexcept -> std::int32_t { return impl_->mel_bins; }
+auto WhisperImpl::preparation_ns() const noexcept -> std::uint64_t { return impl_->context.preparation_ns(); }
+auto WhisperImpl::release_workspaces() -> void { impl_->context.release_workspaces(); }
+
 auto WhisperImpl::set_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
-    try {
-        StateDict state;
-        for (const auto& key : weights.names()) {
-            constexpr std::string_view PREFIX = "model.";
-            if (!key.starts_with(PREFIX))
-                return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "unknown Whisper parameter: " + key});
-            const auto name = key.substr(PREFIX.size());
-            const bool projection =
-                name.ends_with(".weight") &&
-                (name.starts_with("encoder.conv2") || name.ends_with("_proj.weight") || name.ends_with(".fc1.weight") ||
-                 name.ends_with(".fc2.weight") || name == "decoder.embed_tokens.weight");
-            auto value = require(weights.tensor(key));
-            if (impl_->precision == DType::I8 && projection && value.dtype() != DType::I8) {
+    auto state = prepare_checkpoint(weights);
+    if (!state) return std::unexpected(std::move(state.error()));
+    if (impl_->precision == DType::I8) {
+        try {
+            const auto slots = parameter_specs();
+            StateDict scales;
+            for (auto& [name, value] : *state) {
+                const auto slot = slots.find(name);
+                if (slot == slots.end() || slot->second.dtype != DType::I8 || value.dtype() == DType::I8) continue;
                 const auto rows = static_cast<std::int64_t>(value.size(0));
                 const auto width = static_cast<std::int64_t>(value.numel() / value.size(0));
                 const auto matrix = require(value.reshape({rows, width}));
                 const auto packed = require(ops::pack_weight(matrix, 8, static_cast<std::int32_t>(width)));
                 const auto bytes = require(packed.values.host_bytes());
-                auto quantized = require(
+                value = require(
                     Tensor::from_host(std::vector<std::int64_t>(value.shape().begin(), value.shape().end()),
                                       std::span(reinterpret_cast<const std::int8_t*>(bytes.data()), bytes.size()),
                                       tensor::Device::cpu()));
-                state.emplace(name, std::move(quantized));
-                state.emplace(name.substr(0, name.size() - 7) + ".scale", packed.scales);
-            } else {
-                if (value.dtype() == DType::F16 || value.dtype() == DType::BF16)
-                    value = require(weights.float32_tensor(key));
-                state.emplace(name, std::move(value));
+                scales.emplace(name.substr(0, name.size() - 7) + ".scale", packed.scales);
             }
-        }
-        for (const auto& [name, value] : state) {
-            if (impl_->precision == DType::I8 && name.ends_with(".scale")) {
+            for (auto& [name, scale] : scales) state->emplace(name, std::move(scale));
+            for (const auto& [name, value] : *state) {
+                if (!name.ends_with(".scale")) continue;
                 if (value.dtype() != DType::F32)
-                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Whisper INT8 scale must be FP32: " + name});
-                for (const auto scale : require(value.data<float>()))
+                    return std::unexpected(
+                        Error{ErrorCode::INVALID_ARGUMENT, "Whisper INT8 scale must be FP32: " + name});
+                for (const auto scale : require(std::as_const(value).data<float>()))
                     if (!std::isfinite(scale) || scale <= 0)
-                        throw ops::Failure(
-                            {ErrorCode::INVALID_ARGUMENT, "Whisper INT8 scale must be positive and finite: " + name});
+                        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT,
+                                                     "Whisper INT8 scale must be positive and finite: " + name});
             }
+        } catch (const ops::Failure& error) {
+            return std::unexpected(error.error());
         }
-        require(set_state(state));
-        return {};
-    } catch (const ops::Failure& error) {
-        return std::unexpected(error.error());
     }
+    return set_state(*state);
 }
 
-auto WhisperImpl::encode(const audio::WhisperFeatures& features, std::size_t frames,
-                         const std::function<bool()>& cancelled) -> Result<WhisperEncoderState> {
+auto WhisperImpl::encode_audio(const audio::WhisperFeatures& features, std::size_t frames,
+                               const std::function<bool()>& cancelled) -> Result<std::shared_ptr<EncoderMemory>> {
     try {
         if (!frames) frames = features.frames;
         if (!device().capabilities().supports_audio_transformer() ||
@@ -237,6 +249,7 @@ auto WhisperImpl::encode(const audio::WhisperFeatures& features, std::size_t fra
         const auto input =
             require(Tensor::from_host({1, static_cast<std::int64_t>(frames), static_cast<std::int64_t>(features.bins)},
                                       std::span<const float>(values), device()));
+        auto result = std::make_shared<WhisperEncoderState>();
         if (device().policy().replay.region_layers) {
             const auto outputs = impl_->context.replay(
                 "whisper_encoder:" + std::to_string(frames), std::array{input},
@@ -244,61 +257,71 @@ auto WhisperImpl::encode(const audio::WhisperFeatures& features, std::size_t fra
                     const auto convolution = impl_->encoder->convolve(impl_->context, inputs[0]);
                     const auto hidden = impl_->encoder->encode(impl_->context, convolution, cancelled);
                     const auto memory = impl_->decoder->project_source(impl_->context, hidden);
-                    std::vector<Tensor> result{convolution, hidden};
-                    for (const auto& layer : memory) result.insert(result.end(), {layer.key, layer.value});
-                    return result;
+                    std::vector<Tensor> replay_outputs{convolution, hidden};
+                    for (const auto& layer : memory)
+                        replay_outputs.insert(replay_outputs.end(), {layer.key, layer.value});
+                    return replay_outputs;
                 },
                 false);
-            WhisperEncoderState result{outputs[0], outputs[1], {}};
+            result->convolution = outputs[0];
+            result->hidden = outputs[1];
             for (std::size_t layer = 0; layer < static_cast<std::size_t>(impl_->decoder_layers); ++layer)
-                result.layers.push_back({outputs[2 + 2 * layer], outputs[3 + 2 * layer]});
+                result->layers.push_back({outputs[2 + 2 * layer], outputs[3 + 2 * layer]});
             impl_->context.synchronize();
-            return result;
+            return std::shared_ptr<EncoderMemory>(std::move(result));
         }
-        auto convolution = impl_->encoder->convolve(impl_->context, input);
-        auto hidden = impl_->encoder->encode(impl_->context, convolution, cancelled);
-        WhisperEncoderState result{convolution, hidden, impl_->decoder->project_source(impl_->context, hidden)};
+        result->convolution = impl_->encoder->convolve(impl_->context, input);
+        result->hidden = impl_->encoder->encode(impl_->context, result->convolution, cancelled);
+        result->layers = impl_->decoder->project_source(impl_->context, result->hidden);
         impl_->context.synchronize();
-        return result;
+        return std::shared_ptr<EncoderMemory>(std::move(result));
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
 }
 
-auto WhisperImpl::create_state(std::size_t capacity) -> Result<WhisperDecoderState> {
+auto WhisperImpl::create_decoder_state(std::shared_ptr<const EncoderMemory> memory, std::size_t batch,
+                                       std::size_t capacity) -> Result<std::unique_ptr<LanguageModelState>> {
     try {
-        if (!capacity || capacity > static_cast<std::size_t>(impl_->maximum_target))
+        if (batch != 1 || !capacity || capacity > static_cast<std::size_t>(impl_->maximum_target))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Whisper decoder capacity"});
-        WhisperDecoderState result;
-        result.capacity = capacity;
+        auto result = std::make_unique<WhisperDecoderState>();
+        result->memory = std::move(memory);
+        result->batch = batch;
+        result->capacity = capacity;
         const std::vector<float> mask(capacity, -1e9F);
-        result.mask = require(
+        result->mask = require(
             Tensor::from_host({1, 1, 1, static_cast<std::int64_t>(capacity)}, std::span<const float>(mask), device()));
-        result.index = require(Tensor::empty({1}, DType::I32, device()));
-        result.tokens = require(Tensor::empty({1}, DType::I32, device()));
+        result->index = require(Tensor::empty({1}, DType::I32, device()));
+        result->tokens = require(Tensor::empty({1}, DType::I32, device()));
         const std::vector<std::int64_t> shape{1, static_cast<std::int64_t>(capacity), impl_->hidden};
         for (std::int32_t layer = 0; layer < impl_->decoder_layers; ++layer)
-            result.layers.push_back({require(Tensor::zeros(shape, DType::F32, device())),
-                                     require(Tensor::zeros(shape, DType::F32, device()))});
-        return result;
+            result->layers.push_back({require(Tensor::zeros(shape, DType::F32, device())),
+                                      require(Tensor::zeros(shape, DType::F32, device()))});
+        return std::unique_ptr<LanguageModelState>(std::move(result));
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
 }
 
-auto WhisperImpl::forward(const WhisperEncoderState& source, std::span<const std::int32_t> tokens,
-                          WhisperDecoderState& state) -> Result<Tensor> {
-    if (tokens.size() != 1)
-        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "Whisper forward expects one token"});
-    return decode(source, tokens.front(), state, true);
+auto WhisperImpl::decode_step(const EncoderMemory& memory, std::span<const std::int32_t> tokens, std::size_t batch,
+                              LanguageModelState* state, inference::InferenceStats*) -> Result<Tensor> {
+    const auto* source = dynamic_cast<const WhisperEncoderState*>(&memory);
+    auto* decoder = dynamic_cast<WhisperDecoderState*>(state);
+    if (!source || !decoder || batch != 1 || tokens.size() != 1)
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT, "Whisper decode requires one token and decoder state"});
+    return decode(*source, tokens.front(), *decoder, true);
 }
 
-auto WhisperImpl::prefill(const WhisperEncoderState& source, std::span<const std::int32_t> tokens,
-                          WhisperDecoderState& state) -> Result<void> {
-    if (tokens.empty() || state.position > state.capacity || tokens.size() > state.capacity - state.position)
+auto WhisperImpl::prefill(std::span<const std::int32_t> tokens, LanguageModelState& state) -> Result<void> {
+    auto* decoder = dynamic_cast<WhisperDecoderState*>(&state);
+    const auto* source = decoder ? dynamic_cast<const WhisperEncoderState*>(decoder->memory.get()) : nullptr;
+    if (!decoder || !source || tokens.empty() || decoder->position > decoder->capacity ||
+        tokens.size() > decoder->capacity - decoder->position)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Whisper prefix length"});
     for (const auto token : tokens) {
-        auto hidden = decode(source, token, state, false);
+        auto hidden = decode(*source, token, *decoder, false);
         if (!hidden) return std::unexpected(hidden.error());
     }
     return {};
@@ -348,21 +371,12 @@ auto WhisperImpl::decode(const WhisperEncoderState& source, std::int32_t token, 
     }
 }
 
-auto WhisperImpl::preparation_ns() const -> std::uint64_t { return impl_->context.preparation_ns(); }
-
 auto WhisperImpl::select_token(const Tensor& logits, const Tensor& mask) -> Tensor {
-    auto selected = impl_->context.greedy_token(impl_->context.add(logits, mask));
-    impl_->context.synchronize();
-    return selected;
+    return select_masked_token(impl_->context, logits, mask);
 }
 
 auto WhisperImpl::select_language(const Tensor& logits, const Tensor& language_ids) -> Tensor {
-    const auto rows = impl_->context.reshape(logits, {impl_->vocabulary});
-    const auto allowed = impl_->context.gather(rows, language_ids);
-    auto selected = impl_->context.greedy_token(
-        impl_->context.reshape(allowed, {1, static_cast<std::int64_t>(language_ids.numel())}));
-    impl_->context.synchronize();
-    return selected;
+    return select_allowed_token(impl_->context, logits, language_ids);
 }
 
 } // namespace kidi::model

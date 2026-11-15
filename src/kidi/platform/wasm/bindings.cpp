@@ -503,8 +503,7 @@ EMSCRIPTEN_KEEPALIVE auto kidi_tts_set_voice_prompt(const char* text, const std:
         if (!state.synthesizer || !state.synthesizer->supports_voice_prompt())
             throw std::runtime_error("The loaded TTS model does not support voice prompts");
         if (!text || !*text || !tokens || !count || count > 80000) throw std::runtime_error("Invalid TTS voice prompt");
-        const auto package =
-            kidi::ops::require(kidi::checkpoint::load_config(std::filesystem::path(state.directory) / "model.yaml"));
+        const auto package = kidi::ops::require(kidi::checkpoint::load_config(std::filesystem::path(state.directory)));
         const auto model = package["model"];
         const auto codebooks = model["num_audio_codebook"].as<std::size_t>();
         const auto vocabulary = model["audio_vocab_size"].as<std::int32_t>();
@@ -542,8 +541,7 @@ EMSCRIPTEN_KEEPALIVE auto kidi_tts_decode_reference(const std::int32_t* tokens, 
     return answer([&]() -> nlohmann::json {
         if (!tokens || !count || count > 80000 || session().directory.empty())
             throw std::runtime_error("Invalid reference codec input");
-        auto package = kidi::ops::require(
-            kidi::checkpoint::load_config(std::filesystem::path(session().directory) / "model.yaml"));
+        auto package = kidi::ops::require(kidi::checkpoint::load_config(std::filesystem::path(session().directory)));
         auto model =
             kidi::ops::require(kidi::model::OmniVoiceImpl::load(std::move(package), kidi::tensor::Device::cpu()));
         auto waveform = kidi::ops::require(model->decode_reference({tokens, count}));

@@ -2,6 +2,10 @@
 #include "kidi/inference/generator.h"
 #include <cstring>
 #include "kidi/core/memory.h"
+#include "kidi/image/gemma4.h"
+#include "kidi/model/gemma4_assistant.h"
+#include "kidi/model/gemma4_vision.h"
+#include "kidi/model/registry.h"
 #include "kidi/runtime/operator.h"
 #include "kidi/tensor/backend.h"
 #include "kidi/checkpoint/config.h"
@@ -21,7 +25,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t QNN_PREFILL_CAPTURE_TOKENS = 2048;
 constexpr std::size_t CPU_PREFILL_BUCKET = 128;
-auto uses_padded_prefill(const model::Gemma4& model) -> bool {
+auto uses_padded_prefill(const std::shared_ptr<model::CausalLanguageModel>& model) -> bool {
 #if defined(__EMSCRIPTEN__)
     (void)model;
     return false;
@@ -29,7 +33,7 @@ auto uses_padded_prefill(const model::Gemma4& model) -> bool {
     return model->device() == tensor::Device::cpu() && model->accelerator().empty();
 #endif
 }
-auto prefill_bucket(const model::Gemma4& model, std::size_t requested) -> std::size_t {
+auto prefill_bucket(const std::shared_ptr<model::CausalLanguageModel>& model, std::size_t requested) -> std::size_t {
     return uses_padded_prefill(model) ? std::min(requested, CPU_PREFILL_BUCKET) : requested;
 }
 
@@ -41,7 +45,66 @@ auto should_capture_prefill(std::string_view accelerator, std::size_t prompt_tok
 }
 } // namespace
 
-Generator::Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4 model,
+struct Generator::DraftBackend {
+    std::shared_ptr<model::DraftLanguageModel> drafter;
+
+    static auto load(const std::filesystem::path& directory, const YAML::Node& target_config, tensor::Device device)
+        -> Result<std::unique_ptr<DraftBackend>> {
+        try {
+            const auto assistant_config = require(checkpoint::load_config(directory));
+            const ModuleScope scope(tensor::DType::F32, false, device);
+            auto assistant = require(model::Gemma4AssistantImpl::create(assistant_config["model"], target_config));
+            const auto weights = require(checkpoint::Weights::load(assistant_config["weights_file"].as<std::string>()));
+            require(assistant->set_checkpoint(weights));
+            auto backend = std::make_unique<DraftBackend>();
+            backend->drafter = assistant.ptr();
+            return backend;
+        } catch (const ops::Failure& error) {
+            return std::unexpected(error.error());
+        }
+    }
+
+    auto step(model::LanguageModel& target, model::LanguageModelState& state, tensor::Tensor& hidden,
+              GreedyState& search, std::size_t max_drafts, SpeculativeStats* stats) -> Result<SpeculativeStep> {
+        tensor::Tensor verified_hidden, verified_tokens;
+        std::size_t verify_position = 0;
+        return search.step_speculative(
+            max_drafts,
+            [&](std::int32_t last_token, std::size_t limit, const GreedyState::StopPredicate& is_stop,
+                std::vector<std::int32_t>& drafts) {
+                return drafter->draft(target, hidden, last_token, state, limit, is_stop, drafts);
+            },
+            [&](std::span<const std::int32_t> inputs) -> Result<TokenScores> {
+                verify_position = state.sequence_position();
+                auto tokens = target.select_token(inputs, state, true, &verified_hidden);
+                if (!tokens) return std::unexpected(tokens.error());
+                verified_tokens = std::move(*tokens);
+                const auto selected = std::as_const(verified_tokens).data<std::int32_t>();
+                if (!selected) return std::unexpected(selected.error());
+                return TokenScores{{}, ScoreKind::LOGITS, {}, *selected};
+            },
+            [&](std::size_t committed_inputs) -> Result<void> {
+                if (const auto rewound = target.rewind(state, verify_position + committed_inputs); !rewound)
+                    return rewound;
+                const auto rows = verified_hidden.select(0, 0);
+                if (!rows) return std::unexpected(rows.error());
+                const auto row = rows->select(0, committed_inputs - 1);
+                if (!row) return std::unexpected(row.error());
+                auto reshaped = row->reshape({1, 1, static_cast<std::int64_t>(row->size(0))});
+                if (!reshaped) return std::unexpected(reshaped.error());
+                hidden = std::move(*reshaped);
+                return {};
+            },
+            stats);
+    }
+
+    auto preparation_ns() const -> std::uint64_t { return drafter ? drafter->preparation_ns() : 0; }
+    auto release_workspaces() -> void {
+        if (drafter) drafter->release_workspaces();
+    }
+};
+
+Generator::Generator(YAML::Node config, text::Tokenizer tokenizer, std::shared_ptr<model::CausalLanguageModel> model,
                      std::array<std::int32_t, 3> special, core::InferencePrecision precision,
                      core::KVCachePrecision kv_cache_precision)
     : config_(std::move(config)),
@@ -50,6 +113,9 @@ Generator::Generator(YAML::Node config, text::Tokenizer tokenizer, model::Gemma4
       special_(special),
       precision_(precision),
       kv_cache_precision_(kv_cache_precision) {}
+Generator::Generator(Generator&&) noexcept = default;
+auto Generator::operator=(Generator&&) noexcept -> Generator& = default;
+Generator::~Generator() = default;
 auto Generator::load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits,
                      std::int32_t group_size, bool packed_prefill, const ExternalTensorSource& external)
     -> Result<Generator> {
@@ -65,11 +131,23 @@ auto Generator::load(const std::filesystem::path& directory, tensor::Device devi
 auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions options,
                      const ExternalTensorSource& external) -> Result<Generator> {
     try {
-        auto config = require(std::filesystem::is_regular_file(directory / "model.yaml")
-                                  ? checkpoint::load_config(directory / "model.yaml")
-                                  : checkpoint::load_config(directory, model::Gemma4Impl::checkpoint_config()));
-        require(model::Gemma4Impl::validate_config(config["model"]));
+        auto config = require(checkpoint::load_config(directory));
+        require(model::validate_model_config(config["model"]));
+        if (!config["decode"] || !config["decode"].IsMap()) {
+            config["decode"]["context_size"] =
+                std::min<std::size_t>(config["model"]["max_position_embeddings"].as<std::size_t>(16384), 16384);
+            config["decode"]["maximum_new_tokens"] = 8192;
+        }
         const bool qat = static_cast<bool>(config["model"]["quantization_config"]);
+        if (!options.assistant_model.empty() && !options.device.capabilities().compute.host())
+            throw ops::Failure(
+                {ErrorCode::UNSUPPORTED, "speculative decoding currently requires CPU target execution"});
+        if (!options.assistant_model.empty() && (!options.draft_tokens || options.draft_tokens > MAX_DRAFT_TOKENS))
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
+                                "speculative decoding requires an assistant model and 1 to 16 draft tokens"});
+        if (options.assistant_model.empty() && options.draft_tokens != 3)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
+                                "speculative decoding requires an assistant model and 1 to 16 draft tokens"});
         std::filesystem::path lm_head_index;
         if (!options.dense_lm_head && options.device.capabilities().compute.host()) {
             const auto checkpoint_directory =
@@ -136,15 +214,6 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             const auto shape = declared["shape"].as<std::vector<std::int64_t>>();
             require(weights.add(name, require(external(name, *dtype, shape))));
         }
-        if (std::filesystem::is_regular_file(directory / "config.json") &&
-            weights.contains("model.vision_tower.patch_embedder.input_proj.weight") &&
-            weights.contains("model.embed_vision.embedding_projection.weight")) {
-            const auto upstream = YAML::LoadFile((directory / "config.json").string());
-            if (upstream["vision_config"] && !config["model"]["use_bidirectional_attention"].IsScalar()) {
-                config["vision"] = upstream["vision_config"];
-                config["image_token_id"] = upstream["image_token_id"];
-            }
-        }
         const auto parameter = require(weights.tensor(config["model"]["quantization_config"]
                                                           ? "model.language_model.norm.weight"
                                                           : "model.language_model.embed_tokens.weight"));
@@ -156,11 +225,13 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             accelerator.emplace(require(runtime::npu_step_compiler()));
             device = tensor::Device::cpu();
         }
-        const ModuleScope construction(parameter.dtype(), false, device);
-        auto model = require(model::Gemma4Impl::create(config["model"]));
+        auto model = require(model::create_model_as<model::CausalLanguageModel>(
+            config["model"], {.device = device, .parameter_dtype = parameter.dtype()}));
         {
             const core::MemoryScope memory("load:bind_weights");
-            require(model->set_checkpoint(weights, options.weight_bits, options.group_size, options.packed_prefill));
+            require(model->set_checkpoint(weights, {.weight_bits = options.weight_bits,
+                                                    .group_size = options.group_size,
+                                                    .packed_prefill = options.packed_prefill}));
         }
 #if !defined(__EMSCRIPTEN__)
         if (uses_padded_prefill(model)) {
@@ -170,11 +241,19 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
 #endif
         model->set_precision(options.precision);
         model->set_kv_cache_precision(options.kv_cache_precision);
+        if (!options.assistant_model.empty() && !model->accelerator().empty())
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding requires a native CPU target"});
         if (!lm_head_index.empty() && options.weight_bits)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "HNSW head does not support load-time weight packing"});
         if (!lm_head_index.empty()) require(model->configure_lm_head(lm_head_index));
-        return Generator(std::move(config), std::move(tokenizer), std::move(model), special, options.precision,
+        std::unique_ptr<DraftBackend> drafter;
+        if (!options.assistant_model.empty())
+            drafter = require(DraftBackend::load(options.assistant_model, config["model"], device));
+        Generator result(std::move(config), std::move(tokenizer), std::move(model), special, options.precision,
                          options.kv_cache_precision);
+        result.drafter_ = std::move(drafter);
+        result.draft_tokens_ = result.drafter_ ? options.draft_tokens : 0;
+        return result;
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     } catch (const std::exception& error) {
@@ -240,12 +319,12 @@ auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size
             {
                 auto state = require(model_->create_state(std::max(capacity, maximum)));
                 const std::vector prefill_tokens(maximum, token);
-                require(model_->prefill(prefill_tokens, state));
+                require(model_->prefill(prefill_tokens, *state));
             }
             {
                 auto state = require(model_->create_state(capacity));
                 const std::array decode_token{token};
-                require(model_->select_token(decode_token, state));
+                require(model_->select_token(decode_token, *state));
             }
             model_->trim_workspaces();
             prefill_warmed_ = true;
@@ -253,7 +332,7 @@ auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size
             auto state = require(model_->create_state(capacity));
             const std::array tokens{token};
             // The selected token is never read, so devices that finish asynchronously need no wait here.
-            require(model_->select_token(tokens, state));
+            require(model_->select_token(tokens, *state));
             if (model_->accelerator().empty() && !model_->device().capabilities().memory.deferred())
                 model_->trim_workspaces();
         }
@@ -269,6 +348,7 @@ auto Generator::release_workspaces() -> Result<void> {
         if (pending_requests())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "drain generation requests before releasing workspaces"});
         model_->release_workspaces();
+        if (drafter_) drafter_->release_workspaces();
         retired_.clear();
         reserved_cache_tokens_ = 0;
         if (vision_) vision_->release_workspaces();
@@ -284,6 +364,7 @@ auto Generator::trim_workspaces() -> Result<void> {
         if (pending_requests())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "drain generation requests before trimming workspaces"});
         model_->trim_workspaces();
+        if (drafter_) drafter_->release_workspaces();
         if (vision_) vision_->release_workspaces();
         return {};
     } catch (const ops::Failure& error) {
@@ -294,15 +375,12 @@ auto Generator::trim_workspaces() -> Result<void> {
 }
 auto Generator::memory() const -> GeneratorMemory {
     GeneratorMemory result;
-    const auto add_state = [&](const model::Gemma4State& state) {
-        for (const auto& layer : state.layers) result.cache_bytes += layer.key.nbytes() + layer.value.nbytes();
-    };
     for (const auto& request : running_)
-        if (request.state) add_state(*request.state);
+        if (request.state) result.cache_bytes += request.state->cache_bytes();
     for (const auto& request : retired_)
-        if (request.state) add_state(*request.state);
-    if (prefix_) add_state(prefix_->state);
-    if (serving_prefix_) add_state(serving_prefix_->state);
+        if (request.state) result.cache_bytes += request.state->cache_bytes();
+    if (prefix_ && prefix_->state) result.cache_bytes += prefix_->state->cache_bytes();
+    if (serving_prefix_ && serving_prefix_->state) result.cache_bytes += serving_prefix_->state->cache_bytes();
     for (const auto& image : images_) result.image_bytes += image.embeddings.nbytes();
     return result;
 }
@@ -320,9 +398,12 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
                                 "drain serving requests before serial generation; reload after a serving failure"});
         serving_prefix_.reset();
+        if (drafter_ && options.prefix_cache_bytes)
+            throw ops::Failure(
+                {ErrorCode::UNSUPPORTED, "serial speculative prefix caching is not implemented; use the serving API"});
         const auto decode_ahead =
             serving_ ? serving_->decode_ahead_tokens : model_->device().policy().transformer.decode_ahead_tokens;
-        if (decode_ahead > 1 && !options.prefix_cache_bytes && model_->supports_device_tokens()) {
+        if (drafter_ || (decode_ahead > 1 && !options.prefix_cache_bytes && model_->supports_device_tokens())) {
             struct Restore {
                 std::optional<ServingOptions>& target;
                 std::optional<ServingOptions> previous;
@@ -373,16 +454,16 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
             result.stats.reused_prompt_tokens = (common / options.prefill_chunk_size) * options.prefill_chunk_size;
         }
         auto state = result.stats.reused_prompt_tokens
-                         ? require(model_->fork_state(prefix_->state, result.stats.reused_prompt_tokens, capacity))
+                         ? require(model_->fork_state(*prefix_->state, result.stats.reused_prompt_tokens, capacity))
                          : require(model_->create_state(capacity));
-        state.crop_local_attention = !options.full_attention_cache;
-        state.capture_prefill = should_capture_prefill(model_->accelerator(), tokens.size());
-        std::size_t bytes_per_token = 0;
-        for (const auto& layer : state.layers)
-            bytes_per_token += (layer.key.nbytes() + layer.value.nbytes()) / capacity;
-        const auto cached_length = std::min((tokens.size() - 1) / options.prefill_chunk_size,
-                                            options.prefix_cache_bytes / bytes_per_token / options.prefill_chunk_size) *
-                                   options.prefill_chunk_size;
+        model_->configure_state(*state, options.full_attention_cache,
+                                should_capture_prefill(model_->accelerator(), tokens.size()));
+        const auto bytes_per_token = state->cache_bytes() / capacity;
+        const auto cached_length =
+            bytes_per_token ? std::min((tokens.size() - 1) / options.prefill_chunk_size,
+                                       options.prefix_cache_bytes / bytes_per_token / options.prefill_chunk_size) *
+                                  options.prefill_chunk_size
+                            : 0;
         const std::array extra_stops{special_[1]};
         const SearchOptions search{.vocabulary_size = tokenizer_.vocabulary_size(),
                                    .end_id = special_[0],
@@ -397,11 +478,11 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
             model_->device().capabilities().sampling.supports(tensor::TokenSelection::DEVICE);
         const auto project = [&](std::span<const std::int32_t> input) -> Result<void> {
             if (result.stats.device_selection) {
-                auto token = model_->forward_token(input, state);
+                auto token = model_->forward_token(input, *state);
                 if (!token) return std::unexpected(std::move(token.error()));
                 selected = *token;
             } else {
-                auto logits = model_->forward(input, state);
+                auto logits = model_->forward(input, *state);
                 if (!logits) return std::unexpected(std::move(logits.error()));
                 storage = std::move(*logits);
             }
@@ -415,17 +496,17 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
                     std::size_t offset = result.stats.reused_prompt_tokens;
                     while (tokens.size() - offset > options.prefill_chunk_size) {
                         auto status =
-                            model_->prefill(std::span(tokens).subspan(offset, options.prefill_chunk_size), state);
+                            model_->prefill(std::span(tokens).subspan(offset, options.prefill_chunk_size), *state);
                         if (!status) return std::unexpected(std::move(status.error()));
                         offset += options.prefill_chunk_size;
                         if (offset == cached_length && offset > result.stats.reused_prompt_tokens) {
                             prefix_.reset();
-                            auto snapshot = require(model_->fork_state(state, cached_length, cached_length));
+                            auto snapshot = require(model_->fork_state(*state, cached_length, cached_length));
                             prefix_ = PrefixEntry{{tokens.begin(), tokens.begin() + cached_length},
                                                   std::move(snapshot),
                                                   cached_length * bytes_per_token,
                                                   options.prefill_chunk_size,
-                                                  state.crop_local_attention};
+                                                  !options.full_attention_cache};
                         }
                     }
                     auto status = project(std::span(tokens).subspan(offset));
@@ -457,6 +538,9 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
 }
 auto Generator::generate_batch(std::span<const std::string> prompts, GenerationOptions options)
     -> Result<GenerationBatch> {
+    if (drafter_)
+        return std::unexpected(
+            Error{ErrorCode::UNSUPPORTED, "speculative decoding currently supports one active request"});
     try {
         require_immediate_tokens();
         options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
@@ -483,7 +567,7 @@ auto Generator::generate_batch(std::span<const std::string> prompts, GenerationO
                                    .stop_on_eos = !options.ignore_eos};
         GenerationBatch result;
         result.rows.resize(prompts.size());
-        std::vector<model::Gemma4State> states;
+        std::vector<std::unique_ptr<model::LanguageModelState>> states;
         states.reserve(prompts.size());
         std::vector<std::int32_t> chosen(prompts.size()), seeds(prompts.size());
         for (std::size_t row = 0; row < prompts.size(); ++row) {
@@ -503,16 +587,16 @@ auto Generator::generate_batch(std::span<const std::string> prompts, GenerationO
                     {ErrorCode::INVALID_ARGUMENT, "every batch prompt and generation must fit the context"});
             seeds[row] = tokens.back();
             states.push_back(require(model_->create_state(capacity)));
-            states.back().crop_local_attention = !options.full_attention_cache;
-            states.back().capture_prefill = should_capture_prefill(model_->accelerator(), tokens.size());
+            model_->configure_state(*states.back(), options.full_attention_cache,
+                                    should_capture_prefill(model_->accelerator(), tokens.size()));
             const auto preparation = model_->preparation_ns();
             const auto prefill_start = Clock::now();
             std::size_t offset = 0;
             while (tokens.size() - offset > options.prefill_chunk_size) {
-                require(model_->prefill(std::span(tokens).subspan(offset, options.prefill_chunk_size), states.back()));
+                require(model_->prefill(std::span(tokens).subspan(offset, options.prefill_chunk_size), *states.back()));
                 offset += options.prefill_chunk_size;
             }
-            chosen[row] = require(model_->forward_token(std::span(tokens).subspan(offset), states.back()));
+            chosen[row] = require(model_->forward_token(std::span(tokens).subspan(offset), *states.back()));
             stats.prefill_ns = elapsed(prefill_start);
             stats.preparation_ns = model_->preparation_ns() - preparation;
             stats.time_to_first_token_ns = elapsed(started);
@@ -520,7 +604,7 @@ auto Generator::generate_batch(std::span<const std::string> prompts, GenerationO
         }
         std::vector<SearchOptions> policies(prompts.size(), search);
         std::vector<std::int32_t> inputs;
-        std::vector<model::Gemma4State*> active_states;
+        std::vector<model::LanguageModelState*> active_states;
         inputs.reserve(prompts.size());
         active_states.reserve(prompts.size());
         auto generated =
@@ -530,7 +614,7 @@ auto Generator::generate_batch(std::span<const std::string> prompts, GenerationO
                     active_states.clear();
                     for (auto row : request.active_rows) {
                         inputs.push_back(request.tokens[row]);
-                        active_states.push_back(&states[row]);
+                        active_states.push_back(states[row].get());
                     }
                     const auto decode_start = Clock::now();
                     auto output = model_->forward_batch_tokens(inputs, active_states);
@@ -560,6 +644,10 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
         reap_retired();
         if (!options.decode_ahead_tokens)
             options.decode_ahead_tokens = model_->device().policy().transformer.decode_ahead_tokens;
+        if (drafter_ && (options.maximum_active != 1 || options.deferred_tokens || options.decode_ahead_tokens > 1))
+            throw ops::Failure(
+                {ErrorCode::UNSUPPORTED,
+                 "speculative decoding requires one active request without deferred or decode-ahead tokens"});
         options.prefill_tokens_per_step = model_->prefill_chunk_size(options.prefill_tokens_per_step);
         if (!options.deferred_tokens) require_immediate_tokens();
         if (pending_requests() || !retired_.empty() || serving_failed_ || !options.maximum_active ||
@@ -581,6 +669,8 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
 auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options)
     -> Result<std::uint64_t> {
     try {
+        if (drafter_ && std::ranges::any_of(messages, [](const auto& message) { return !message.images.empty(); }))
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding currently supports text-only requests"});
         if (options.image_max_pixels < image::MIN_RESIZED_PIXELS ||
             options.image_max_pixels > image::MAX_RESIZED_PIXELS)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "image resize limit must be 161280 to 3000000 pixels"});
@@ -622,15 +712,14 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, Genera
                         if (options.on_image_progress) options.on_image_progress("Preparing image model");
                         const core::MemoryScope memory("load:vision");
                         const ModuleScope construction(tensor::DType::F32, false, model_->device());
-                        auto vision = model::Gemma4Vision(config_["vision"], config_["model"]["hidden_size"].as<int>(),
-                                                          native_qat());
+                        auto vision = model::Gemma4Vision(config_["vision"], model_->hidden_size(), native_qat());
                         auto weights = require(checkpoint::Weights::load(config_["weights_file"].as<std::string>()));
                         require(vision->set_checkpoint(weights));
                         vision->set_precision(precision_);
-                        vision_ = std::move(vision);
+                        vision_ = vision.ptr();
                     }
                     if (options.on_image_progress) options.on_image_progress("Encoding images");
-                    auto features = vision_->forward(pixels);
+                    auto features = vision_->encode_image(pixels);
                     if (vision_->device().capabilities().compute.host()) vision_->release_workspaces();
                     embeddings = require(require(std::move(features)).to(model_->device()));
                     if (options.on_image_progress) options.on_image_progress("Image encoded");
@@ -647,7 +736,7 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, Genera
             message.content = placeholders + message.content;
         }
         const auto prompt = require(tokenizer_.format_chat(expanded));
-        std::vector<model::Gemma4ImageTokens> positions;
+        std::vector<model::EmbeddingSpan> positions;
         if (!current.empty()) {
             const auto ids = require(tokenizer_.encode(prompt));
             const auto image_token = config_["image_token_id"].as<std::int32_t>();
@@ -735,6 +824,7 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         stats.device_selection = model_->device().capabilities().sampling.supports(tensor::TokenSelection::DEVICE);
         stats.last_token_prefill = model_->last_token_prefill();
         stats.shared_prefill_tail = model_->shared_prefill_tail();
+        stats.speculative = static_cast<bool>(drafter_);
         waiting_.push_back(
             {next_request_id_, std::move(tokens), capacity, options, std::move(search), {}, stats, started, {}});
         return next_request_id_++;
@@ -746,11 +836,10 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
 }
 auto Generator::retain_serving_prefix(QueuedGeneration& request) -> void {
     serving_prefix_.reset();
-    if (!request.options.prefix_cache_bytes || !request.state || !request.state->position) return;
-    std::size_t bytes = 0;
-    for (const auto& layer : request.state->layers) bytes += layer.key.nbytes() + layer.value.nbytes();
+    if (!request.options.prefix_cache_bytes || !request.state || !request.state->sequence_position()) return;
+    const auto bytes = request.state->cache_bytes();
     if (bytes > request.options.prefix_cache_bytes) return;
-    const auto position = request.state->position;
+    const auto position = request.state->sequence_position();
     const auto& generated = request.search.result().token_ids;
     if (position > request.prompt.size() + generated.size()) return;
     auto tokens = std::move(request.prompt);
@@ -763,7 +852,7 @@ auto Generator::retain_serving_prefix(QueuedGeneration& request) -> void {
     request.stats.prefix_cache_bytes = bytes / request.capacity * position;
     request.stats.prefix_reserved_bytes = bytes;
     const auto chunk = std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step);
-    serving_prefix_.emplace(PrefixEntry{std::move(tokens), std::move(*request.state), bytes, chunk,
+    serving_prefix_.emplace(PrefixEntry{std::move(tokens), std::move(request.state), bytes, chunk,
                                         !request.options.full_attention_cache, std::move(request.image_key)});
     request.state.reset();
 }
@@ -805,7 +894,7 @@ auto Generator::step() -> Result<GenerationStep> {
         reap_retired();
         GenerationStep result;
         result.events.reserve(serving_->maximum_active + 1);
-        const auto preparation = model_->preparation_ns();
+        const auto preparation = model_->preparation_ns() + (drafter_ ? drafter_->preparation_ns() : 0);
         const auto admit = [&] {
             while (!waiting_.empty() && running_.size() < serving_->maximum_active &&
                    waiting_.front().capacity <= serving_->cache_token_budget - reserved_cache_tokens_) {
@@ -813,21 +902,22 @@ auto Generator::step() -> Result<GenerationStep> {
                 const auto chunk = std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step);
                 if (serving_prefix_ && request.options.prefix_cache_bytes >= serving_prefix_->bytes &&
                     request.image_key == serving_prefix_->image_key &&
-                    request.capacity == serving_prefix_->state.capacity && chunk == serving_prefix_->chunk_size &&
+                    request.capacity == serving_prefix_->state->sequence_capacity() &&
+                    chunk == serving_prefix_->chunk_size &&
                     serving_prefix_->crop_local_attention == !request.options.full_attention_cache) {
                     const auto limit = std::min(serving_prefix_->tokens.size(), request.prompt.size() - 1);
                     std::size_t common = 0;
                     while (common < limit && serving_prefix_->tokens[common] == request.prompt[common]) ++common;
                     request.stats.reused_prompt_tokens = common;
-                    request.state.emplace(std::move(serving_prefix_->state));
-                    request.state->position = common;
+                    request.state = std::move(serving_prefix_->state);
+                    require(model_->rewind(*request.state, common));
                 }
                 serving_prefix_.reset();
                 if (!request.state) request.state = require(model_->create_state(request.capacity));
-                request.state->images = request.images;
-                request.state->crop_local_attention = !request.options.full_attention_cache;
-                request.state->capture_prefill =
-                    !request.images.empty() || should_capture_prefill(model_->accelerator(), request.prompt.size());
+                if (!request.images.empty()) require(request.state->attach_embeddings(request.images));
+                model_->configure_state(
+                    *request.state, request.options.full_attention_cache,
+                    !request.images.empty() || should_capture_prefill(model_->accelerator(), request.prompt.size()));
                 running_.push_back(std::move(request));
                 reserved_cache_tokens_ += running_.back().capacity;
                 waiting_.pop_front();
@@ -841,7 +931,8 @@ auto Generator::step() -> Result<GenerationStep> {
             });
         };
         const auto complete = [&](QueuedGeneration& request) {
-            if (request.decode && request.state) request.state->position = request.decode->logical_position;
+            if (request.decode && request.state)
+                require(model_->rewind(*request.state, request.decode->logical_position));
             retain_serving_prefix(request);
             TextGeneration completed;
             completed.generation = std::move(request.search).result();
@@ -852,19 +943,28 @@ auto Generator::step() -> Result<GenerationStep> {
             request.completion_emitted = true;
             return completed;
         };
-        const auto accept = [&](QueuedGeneration& request, std::int32_t token) {
-            const auto previous = request.search.result().token_ids.size();
-            require(request.search.accept(TokenScores{{}, ScoreKind::LOGITS, token}));
+        const auto emit_token = [&](QueuedGeneration& request, std::optional<std::int32_t> token,
+                                    std::span<const std::int32_t> history, bool finished) {
             if (request.search.result().decoder_steps == 1)
                 request.stats.time_to_first_token_ns = elapsed(request.enqueued);
             GenerationEvent event{request.id, {}, {}};
-            if (request.search.result().token_ids.size() > previous) event.token = token;
+            event.token = token;
             if (request.options.stream_text)
-                event.text = require(tokenizer_.decode_delta(request.search.result().token_ids, request.streamed_text,
-                                                             request.search.finished()));
-            if (request.search.finished() && (!request.decode || request.decode->pending.empty()))
-                event.completed = complete(request);
+                event.text = require(tokenizer_.decode_delta(history, request.streamed_text, finished));
+            if (finished && (!request.decode || request.decode->pending.empty())) event.completed = complete(request);
             result.events.push_back(std::move(event));
+        };
+        const auto accept_scores = [&](QueuedGeneration& request, TokenScores scores) {
+            const auto previous = request.search.result().token_ids.size();
+            require(request.search.accept(scores));
+            emit_token(request,
+                       request.search.result().token_ids.size() > previous
+                           ? std::optional<std::int32_t>(request.search.token())
+                           : std::nullopt,
+                       request.search.result().token_ids, request.search.finished());
+        };
+        const auto accept = [&](QueuedGeneration& request, std::int32_t token) {
+            accept_scores(request, TokenScores{{}, ScoreKind::LOGITS, token});
         };
         admit();
         // Deferred tokens selected by the previous call are complete once the caller has awaited the device.
@@ -891,7 +991,7 @@ auto Generator::step() -> Result<GenerationStep> {
             return prefill;
         };
         const auto chunk_length = [&](const QueuedGeneration& request) {
-            const auto remaining = request.prompt.size() - request.state->position;
+            const auto remaining = request.prompt.size() - request.state->sequence_position();
             const auto maximum =
                 prefill_bucket(model_, std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
             if (!prefill_warmed_ || !uses_padded_prefill(model_)) return std::min(remaining, maximum);
@@ -901,15 +1001,46 @@ auto Generator::step() -> Result<GenerationStep> {
         // Captured steps reuse their output buffers, and deferred selections are read only on the next call, so a
         // deferred step submits one selection: a final prefill chunk takes the step and decoding resumes next call.
         const auto upcoming = next_prefill();
-        const bool prefill_selects = serving_->deferred_tokens && upcoming != running_.end() &&
-                                     upcoming->state->position + chunk_length(*upcoming) == upcoming->prompt.size();
+        const bool prefill_selects =
+            serving_->deferred_tokens && upcoming != running_.end() &&
+            upcoming->state->sequence_position() + chunk_length(*upcoming) == upcoming->prompt.size();
         std::array<std::int32_t, 16> tokens{};
-        std::array<model::Gemma4State*, 16> states{};
+        std::array<model::LanguageModelState*, 16> states{};
         std::array<std::size_t, 16> rows{};
         std::size_t count = 0;
         for (std::size_t row = 0; row < running_.size() && !prefill_selects; ++row) {
             auto& request = running_[row];
             if (!request.search.result().decoder_steps || request.completion_emitted) continue;
+            if (drafter_) {
+                const auto started = Clock::now();
+                const auto prepared = model_->preparation_ns() + drafter_->preparation_ns();
+                const auto previous = request.search.result().token_ids.size();
+                SpeculativeStats step_stats;
+                const auto step_result = require(drafter_->step(*model_, *request.state, request.draft_hidden,
+                                                                request.search, draft_tokens_, &step_stats));
+                request.stats.draft_ns += step_stats.draft_ns;
+                request.stats.verify_ns += step_stats.verify_ns;
+                request.stats.draft_tokens += step_stats.draft_tokens;
+                request.stats.accepted_draft_tokens += step_stats.accepted_draft_tokens;
+                request.stats.verification_steps += step_stats.verification_steps;
+                const auto decode_ns = elapsed(started);
+                request.stats.decode_ns += decode_ns;
+                request.stats.preparation_ns += model_->preparation_ns() + drafter_->preparation_ns() - prepared;
+                result.decode_ns += decode_ns;
+                const auto history = std::span(request.search.result().token_ids);
+                auto visible = previous;
+                for (std::size_t index = 0; index < step_result.tokens.size(); ++index) {
+                    const auto chosen = step_result.tokens[index];
+                    std::optional<std::int32_t> emitted;
+                    if (visible < history.size() && history[visible] == chosen) {
+                        emitted = chosen;
+                        ++visible;
+                    }
+                    emit_token(request, emitted, history.first(visible),
+                               request.search.finished() && index + 1 == step_result.tokens.size());
+                }
+                continue;
+            }
             if (serving_->maximum_active == 1 && !serving_->deferred_tokens && serving_->decode_ahead_tokens > 1 &&
                 model_->supports_device_tokens()) {
                 const auto started = Clock::now();
@@ -920,7 +1051,7 @@ auto Generator::step() -> Result<GenerationStep> {
                     request.decode->token = require(
                         tensor::Tensor::from_host({1}, std::span<const std::int32_t>(initial), model_->device()));
                     request.decode->submitted = request.search.result().decoder_steps;
-                    request.decode->logical_position = request.state->position;
+                    request.decode->logical_position = request.state->sequence_position();
                     request.decode->started = started;
                 }
                 auto& decode = *request.decode;
@@ -950,8 +1081,8 @@ auto Generator::step() -> Result<GenerationStep> {
                                          : config_["decode"]["maximum_new_tokens"].as<std::size_t>();
                 while (!request.search.finished() && decode.pending.size() < serving_->decode_ahead_tokens &&
                        decode.submitted < maximum) {
-                    decode.token = require(model_->forward_token(decode.token, *request.state));
-                    decode.pending.push_back({require(decode.token.readback()), request.state->position});
+                    decode.token = require(model_->forward_device_token(decode.token, *request.state));
+                    decode.pending.push_back({require(decode.token.readback()), request.state->sequence_position()});
                     ++decode.submitted;
                     ++request.stats.decode_submitted_tokens;
                     request.stats.decode_queue_peak = std::max(request.stats.decode_queue_peak, decode.pending.size());
@@ -961,7 +1092,7 @@ auto Generator::step() -> Result<GenerationStep> {
                 continue;
             }
             tokens[count] = request.search.token();
-            states[count] = &*request.state;
+            states[count] = request.state.get();
             rows[count++] = row;
         }
         if (count && serving_->deferred_tokens) {
@@ -994,14 +1125,16 @@ auto Generator::step() -> Result<GenerationStep> {
         retire();
         admit();
         const auto prefill = next_prefill();
-        const bool second_selection = serving_->deferred_tokens && count && prefill != running_.end() &&
-                                      prefill->state->position + chunk_length(*prefill) == prefill->prompt.size();
+        const bool second_selection =
+            serving_->deferred_tokens && count && prefill != running_.end() &&
+            prefill->state->sequence_position() + chunk_length(*prefill) == prefill->prompt.size();
         if (prefill != running_.end() && !second_selection) {
             auto& request = *prefill;
             prefill_after_ = request.id;
             const auto length = chunk_length(request);
-            const auto input = std::span(request.prompt).subspan(request.state->position, length);
-            const bool final_chunk = request.state->position + length == request.prompt.size();
+            const auto start_position = request.state->sequence_position();
+            const auto input = std::span(request.prompt).subspan(start_position, length);
+            const bool final_chunk = start_position + length == request.prompt.size();
             const auto started = Clock::now();
             const auto prepared = model_->preparation_ns();
             std::optional<std::int32_t> selected;
@@ -1010,16 +1143,17 @@ auto Generator::step() -> Result<GenerationStep> {
                 pending_tokens_.push_back(
                     {request.id, require(model_->select_token(input, *request.state)), 0, started, true});
             else if (final_chunk)
-                selected = require(model_->forward_token(input, *request.state));
+                selected =
+                    require(model_->forward_token(input, *request.state, drafter_ ? &request.draft_hidden : nullptr));
             else if (uses_padded_prefill(model_)) {
                 const auto maximum = prefill_bucket(
                     model_, std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
-                const auto available = request.state->capacity - request.state->position;
+                const auto available = request.state->sequence_capacity() - start_position;
                 const auto execution_length = maximum <= available ? maximum : length;
                 std::vector<std::int32_t> padded(execution_length, special_[2]);
                 std::ranges::copy(input, padded.begin());
                 require(model_->prefill(padded, *request.state));
-                request.state->position -= execution_length - length;
+                if (execution_length > length) require(model_->rewind(*request.state, start_position + length));
             } else
                 require(model_->prefill(input, *request.state));
             result.prefill_ns = elapsed(started);
@@ -1031,7 +1165,7 @@ auto Generator::step() -> Result<GenerationStep> {
         result.active_requests = running_.size();
         result.waiting_requests = waiting_.size();
         result.reserved_cache_tokens = reserved_cache_tokens_;
-        result.preparation_ns = model_->preparation_ns() - preparation;
+        result.preparation_ns = model_->preparation_ns() + (drafter_ ? drafter_->preparation_ns() : 0) - preparation;
         return result;
     } catch (const ops::Failure& error) {
         serving_failed_ = true;
