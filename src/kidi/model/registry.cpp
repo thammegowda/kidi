@@ -4,6 +4,7 @@
 #include <array>
 
 #include "kidi/model/gemma4.h"
+#include "kidi/model/gemma4_assistant.h"
 #include "kidi/model/kokoro.h"
 #include "kidi/model/omnivoice.h"
 #include "kidi/model/transformer.h"
@@ -16,6 +17,7 @@ constexpr std::array TRANSLATION_TASKS{Task::TRANSLATION};
 constexpr std::array GENERATION_TASKS{Task::TEXT_GENERATION};
 constexpr std::array RECOGNITION_TASKS{Task::SPEECH_RECOGNITION};
 constexpr std::array TTS_TASKS{Task::TTS};
+constexpr std::span<const Task> NO_TASKS{};
 
 template <typename Holder, auto Factory>
 auto construct_model(const YAML::Node& config) -> Result<std::shared_ptr<Model>> {
@@ -29,6 +31,8 @@ const std::array MODELS{
                construct_model<Transformer, TransformerImpl::create>},
     Descriptor{"gemma4_text", GENERATION_TASKS, ModelKind::CAUSAL_LM, Gemma4Impl::validate_config,
                construct_model<Gemma4, Gemma4Impl::create>},
+    Descriptor{"gemma4_assistant", NO_TASKS, ModelKind::DRAFT_LM,
+               static_cast<Result<void> (*)(const YAML::Node&)>(Gemma4AssistantImpl::validate_config), nullptr},
     Descriptor{"whisper", RECOGNITION_TASKS, ModelKind::SPEECH_RECOGNITION_LM, WhisperImpl::validate_config,
                construct_model<Whisper, WhisperImpl::create>},
     Descriptor{"omnivoice", TTS_TASKS, ModelKind::SPEECH_SYNTHESIS, OmniVoiceImpl::validate_config, nullptr},

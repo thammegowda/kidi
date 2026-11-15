@@ -32,6 +32,7 @@ export async function packageSite(destination, runtimes = {
         (await readFile(join(root, 'web/hosts/wasm/app-config.mjs'), 'utf8'))
             .replace('../../libs/js-yaml/', './libs/js-yaml/'));
     await copyFile(join(root, 'examples/kidi-app.yaml'), join(destination, 'app-config.yaml'));
+    await copyFile(join(root, 'src/kidi/checkpoint/packages.jsonl'), join(destination, 'packages.jsonl'));
     await writeFile(join(destination, 'model-residency.mjs'),
         (await readFile(join(root, 'web/hosts/wasm/model-residency.mjs'), 'utf8'))
             .replace('../../ui/speech-controller.js', './speech-controller.js'));

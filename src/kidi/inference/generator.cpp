@@ -132,7 +132,12 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
                      const ExternalTensorSource& external) -> Result<Generator> {
     try {
         auto config = require(checkpoint::load_config(directory));
-        require(model::Gemma4Impl::validate_config(config["model"]));
+        require(model::validate_model_config(config["model"]));
+        if (!config["decode"] || !config["decode"].IsMap()) {
+            config["decode"]["context_size"] =
+                std::min<std::size_t>(config["model"]["max_position_embeddings"].as<std::size_t>(16384), 16384);
+            config["decode"]["maximum_new_tokens"] = 8192;
+        }
         const bool qat = static_cast<bool>(config["model"]["quantization_config"]);
         if (!options.assistant_model.empty() && !options.device.capabilities().compute.host())
             throw ops::Failure(

@@ -261,10 +261,27 @@ if(KIDI_BUILD_BENCHMARKS)
     endif()
 endif()
 
+function(kidi_embed_text input output symbol)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input}")
+    file(READ "${input}" KIDI_EMBEDDED_TEXT)
+    set(KIDI_EMBEDDED_SYMBOL "${symbol}")
+    configure_file(cmake/embed_text.h.in "${output}" @ONLY)
+endfunction()
+
+set(KIDI_CHECKPOINT_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated/checkpoint")
+file(MAKE_DIRECTORY "${KIDI_CHECKPOINT_GENERATED}")
+kidi_embed_text(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/checkpoint/packages.jsonl"
+    "${KIDI_CHECKPOINT_GENERATED}/packages_jsonl.h"
+    KIDI_PACKAGE_SPECS_JSONL
+)
+
 target_include_directories(kidi
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
         $<INSTALL_INTERFACE:include>
+    PRIVATE
+        "${KIDI_CHECKPOINT_GENERATED}"
 )
 
 target_compile_features(kidi PUBLIC cxx_std_23)
@@ -290,12 +307,6 @@ if(APPLE)
     find_library(KIDI_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
     set(KIDI_MPS_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated/mps")
     file(MAKE_DIRECTORY "${KIDI_MPS_GENERATED}")
-    function(kidi_embed_text input output symbol)
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input}")
-        file(READ "${input}" KIDI_EMBEDDED_TEXT)
-        set(KIDI_EMBEDDED_SYMBOL "${symbol}")
-        configure_file(cmake/embed_text.h.in "${output}" @ONLY)
-    endfunction()
     set(KIDI_MPS_METAL_SOURCES
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/command_batch.metal"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/eager_kernels.metal"

@@ -1,0 +1,8 @@
+{"model_type": "gemma4", "type": "gemma4_text", "task": "chat", "model_key": "text_config", "copy": ["decode"], "files": ["model.safetensors", "tokenizer.json"], "sidecars": ["tokenizer_config.json", "chat_template.jinja"]}
+{"model_type": "gemma4_text", "task": "chat", "copy": ["decode"], "files": ["model.safetensors", "tokenizer.json"], "sidecars": ["tokenizer_config.json", "chat_template.jinja"]}
+{"model_type": "gemma4_assistant", "files": ["model.safetensors"]}
+{"model_type": "whisper", "task": "asr", "files": ["model.safetensors", "ggml-model.bin", "tokenizer.json", "preprocessor_config.json", "generation_config.json"]}
+{"model_type": "rtg_transformer_nmt", "task": "translation", "requires": ["decode", "io", "tokenizers"], "copy": ["io", "decode"], "files": ["model.safetensors"]}
+{"model_type": "omnivoice", "task": "tts", "requires": ["synthesis", "license_files"], "copy": ["synthesis"], "files": ["model.safetensors", "tokenizer.json", "synthesis_template.jinja", "sentence-prefixes.tsv"]}
+{"model_type": "kidi_omnivoice", "type": "omnivoice", "task": "tts", "fallback": "model.yaml", "requires": ["synthesis", "license_files"], "copy": ["synthesis"], "files": ["model.safetensors", "model.yaml", "tokenizer.json.gz", "synthesis_template.jinja", "sentence-prefixes.tsv"]}
+{"model_type": "kokoro", "task": "tts", "requires": ["synthesis", "license_files"], "copy": ["synthesis"], "files": ["model.safetensors", "lexicon-us.tsv", "sentence-prefixes.tsv"]}

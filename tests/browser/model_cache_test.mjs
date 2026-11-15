@@ -205,10 +205,7 @@ test('Kidi OmniVoice Hub package streams one safetensors file by ranges', async 
     const config = {name: 'OmniVoice-q8', model_type: 'kidi_omnivoice',
         architectures: ['KidiOmniVoiceForTextToSpeech'], kidi_format_version: 1,
         quantization_config: {format: 'signed-int8'}};
-    const metadata = ['tokenizer.json.gz', 'sentence-prefixes.tsv',
-        'synthesis_template.jinja', 'NOTICE', 'licenses/OMNIVOICE-CC-BY-NC-4.0.txt',
-        'licenses/META-LLAMA-3-LICENSE.txt', 'licenses/META-LLAMA-3-USE-POLICY.md',
-        'licenses/HIGGS-AUDIO-2-LICENSE.txt'];
+    const metadata = ['model.yaml', 'tokenizer.json.gz', 'sentence-prefixes.tsv', 'synthesis_template.jinja'];
     const weights = Uint8Array.from({length: 32}, (_, index) => index);
     const cache = new Map(), files = new Map(), nodes = new Map();
     const originalFetch = globalThis.fetch, originalCaches = globalThis.caches;
@@ -242,8 +239,44 @@ test('Kidi OmniVoice Hub package streams one safetensors file by ranges', async 
         assert.equal(loaded.heapWeightBytes, weights.length);
         assert.deepEqual([...nodes.get('/model/model.safetensors').contents], [...weights]);
         assert.ok(files.has('/model/config.json'));
-        assert.ok(files.has('/model/licenses/HIGGS-AUDIO-2-LICENSE.txt'));
+        assert.ok(files.has('/model/model.yaml'));
+        assert.ok(files.has('/model/tokenizer.json.gz'));
         assert.equal(await isModelCached(source), true);
+
+        const unifiedSource = `https://huggingface.co/kidi/OmniVoice-unified/resolve/${revision}/config.json`;
+        const unifiedConfig = {
+            model_type: 'omnivoice',
+            architectures: ['KidiOmniVoiceForTextToSpeech'],
+            tokenizer_file: 'tokenizer.json',
+            sentence_prefixes_file: 'sentence-prefixes.tsv',
+            template_file: 'synthesis_template.jinja',
+            synthesis: {steps: 32},
+            quantization: {format: 'signed-int8'},
+        };
+        const unifiedMeta = ['tokenizer.json', 'sentence-prefixes.tsv', 'synthesis_template.jinja'];
+        const unifiedFiles = new Map(), unifiedNodes = new Map();
+        globalThis.fetch = async url => {
+            const value = String(url);
+            const path = new URL(value).pathname;
+            if (value === unifiedSource) return new Response(JSON.stringify(unifiedConfig));
+            if (path.endsWith('/model.safetensors')) return new Response(weights, {
+                status: 206, headers: {'Content-Range': `bytes 0-${weights.length - 1}/${weights.length}`},
+            });
+            if (unifiedMeta.some(name => path.endsWith(`/${name}`))) return new Response(`data:${path.split('/').at(-1)}`);
+            throw new Error(`Unexpected request: ${value}`);
+        };
+        const unifiedModule = {HEAPU8: new Uint8Array(4096), _malloc: () => 64, FS: {
+            mkdir() {},
+            mkdirTree() {},
+            writeFile: (name, data) => unifiedFiles.set(name, data),
+            createDataFile: (directory, name) => unifiedNodes.set(`${directory}/${name}`, {stream_ops: {}}),
+            lookupPath: name => ({node: unifiedNodes.get(name)}),
+        }};
+        const unifiedLoaded = await loadModel(unifiedModule, unifiedSource, () => {});
+        assert.equal(unifiedLoaded.precision, 'signed-int8');
+        assert.ok(unifiedFiles.has('/model/tokenizer.json'));
+        assert.ok(!unifiedFiles.has('/model/model.yaml'));
+        assert.equal(await isModelCached(unifiedSource), true);
     } finally {
         globalThis.fetch = originalFetch;
         if (originalCaches === undefined) delete globalThis.caches;

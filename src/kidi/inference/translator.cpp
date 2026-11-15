@@ -84,6 +84,13 @@ auto Translator::load(const std::filesystem::path& model_directory, tensor::Devi
     auto package =
         measure(stats ? &stats->package_load_ns : nullptr, [&] { return checkpoint::Package::load(model_directory); });
     if (!package) return std::unexpected(std::move(package.error()));
+    const auto io = package->config()["io"];
+    const auto moses_format = [](const YAML::Node& parent, const char* key) {
+        const auto value = parent[key];
+        return value && value.IsScalar() && value.as<std::string>() == "moses_tokenized";
+    };
+    if (!io || !io.IsMap() || !moses_format(io, "input_format") || !moses_format(io, "output_format"))
+        return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "input and output must be moses_tokenized"});
     auto defaults = resolve_options(package->config()["decode"], {});
     if (!defaults) return std::unexpected(std::move(defaults.error()));
     auto dtype = model::TransformerImpl::checkpoint_dtype(package->weights());

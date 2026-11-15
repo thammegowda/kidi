@@ -98,7 +98,42 @@ auto main() -> int {
     if (kidi::checkpoint::load_config(directory / "unlicensed-omnivoice.json")) return 1;
     omnivoice.remove("synthesis");
     write(directory / "invalid-omnivoice.json", YAML::Dump(omnivoice));
-    if (kidi::checkpoint::load_config(directory / "invalid-omnivoice.json")) return 1;
+    auto missing_synthesis = kidi::checkpoint::load_config(directory / "invalid-omnivoice.json");
+    if (missing_synthesis || missing_synthesis.error().code != kidi::ErrorCode::INVALID_MANIFEST ||
+        missing_synthesis.error().message.find("invalid node") != std::string::npos)
+        return 1;
+    const auto legacy_dir = directory / "legacy-omnivoice";
+    std::filesystem::create_directories(legacy_dir / "licenses");
+    write(legacy_dir / "model.safetensors");
+    write(legacy_dir / "tokenizer.json.gz");
+    write(legacy_dir / "sentence-prefixes.tsv");
+    write(legacy_dir / "synthesis_template.jinja");
+    write(legacy_dir / "NOTICE");
+    write(legacy_dir / "licenses/OMNIVOICE-CC-BY-NC-4.0.txt");
+    write(legacy_dir / "licenses/META-LLAMA-3-LICENSE.txt");
+    write(legacy_dir / "licenses/META-LLAMA-3-USE-POLICY.md");
+    write(legacy_dir / "licenses/HIGGS-AUDIO-2-LICENSE.txt");
+    write(legacy_dir / "config.json", R"({
+      "name": "OmniVoice-q8",
+      "model_type": "kidi_omnivoice",
+      "architectures": ["KidiOmniVoiceForTextToSpeech"]
+    })");
+    YAML::Node legacy_manifest;
+    legacy_manifest["weights_file"] = "model.safetensors";
+    legacy_manifest["tokenizer_file"] = "tokenizer.json.gz";
+    legacy_manifest["template_file"] = "synthesis_template.jinja";
+    legacy_manifest["sentence_prefixes_file"] = "sentence-prefixes.tsv";
+    legacy_manifest["license_files"].push_back("NOTICE");
+    legacy_manifest["model"]["type"] = "omnivoice";
+    legacy_manifest["synthesis"]["steps"] = 32;
+    write(legacy_dir / "model.yaml", YAML::Dump(legacy_manifest));
+    const auto legacy_hub = kidi::checkpoint::hub_files(YAML::LoadFile((legacy_dir / "config.json").string()));
+    if (!legacy_hub || !std::ranges::contains(*legacy_hub, "model.yaml")) return 1;
+    const auto legacy_config = kidi::checkpoint::load_config(legacy_dir);
+    if (!legacy_config || (*legacy_config)["model"]["type"].as<std::string>() != "omnivoice" ||
+        (*legacy_config)["tokenizer_file"].as<std::string>() != (legacy_dir / "tokenizer.json.gz").string() ||
+        (*legacy_config)["synthesis"]["steps"].as<int>() != 32)
+        return 1;
     YAML::Node kokoro;
     kokoro["model_type"] = "kokoro";
     kokoro["weights_file"] = "model.safetensors";

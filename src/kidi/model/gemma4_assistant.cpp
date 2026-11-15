@@ -90,14 +90,17 @@ struct Gemma4AssistantImpl::State {
     }
 };
 
-auto Gemma4AssistantImpl::validate_config(const YAML::Node& config, const YAML::Node& target) -> Result<void> {
+auto Gemma4AssistantImpl::validate_config(const YAML::Node& config) -> Result<void> {
     try {
         const auto text = config["text_config"];
-        if (config["model_type"].as<std::string>() != "gemma4_assistant" || config["quantization_config"] ||
-            text["quantization_config"] || text["enable_moe_block"].as<bool>(false) ||
-            text["attention_bias"].as<bool>(false) || text["attention_k_eq_v"].as<bool>(false) ||
-            text["use_double_wide_mlp"].as<bool>(false) || text["hidden_size_per_layer_input"].as<int>(0) != 0 ||
-            text["vocab_size_per_layer_input"].as<int>(0) != 0 ||
+        const auto type =
+            config["type"] ? config["type"].as<std::string>("") : config["model_type"].as<std::string>("");
+        if (!text || !text.IsMap() || type != "gemma4_assistant" ||
+            (config["quantization_config"] && !config["quantization_config"].IsNull()) ||
+            (text["quantization_config"] && !text["quantization_config"].IsNull()) ||
+            text["enable_moe_block"].as<bool>(false) || text["attention_bias"].as<bool>(false) ||
+            text["attention_k_eq_v"].as<bool>(false) || text["use_double_wide_mlp"].as<bool>(false) ||
+            text["hidden_size_per_layer_input"].as<int>(0) != 0 || text["vocab_size_per_layer_input"].as<int>(0) != 0 ||
             text["hidden_activation"].as<std::string>() != "gelu_pytorch_tanh")
             return std::unexpected(Error{ErrorCode::UNSUPPORTED, "unsupported Gemma MTP assistant architecture"});
         for (const auto* name :
@@ -106,35 +109,51 @@ auto Gemma4AssistantImpl::validate_config(const YAML::Node& config, const YAML::
             if (text[name].as<int>() <= 0)
                 return std::unexpected(
                     Error{ErrorCode::INVALID_MANIFEST, "invalid Gemma MTP dimension: " + std::string(name)});
-        if (config["backbone_hidden_size"].as<int>() != target["hidden_size"].as<int>() ||
+        if (config["backbone_hidden_size"].as<int>() <= 0 ||
             text["num_kv_shared_layers"].as<int>() != text["num_hidden_layers"].as<int>() ||
             text["num_attention_heads"].as<int>() % text["num_key_value_heads"].as<int>() ||
             text["layer_types"].size() != text["num_hidden_layers"].as<std::size_t>())
             return std::unexpected(
                 Error{ErrorCode::INVALID_MANIFEST, "invalid Gemma MTP sharing or backbone dimensions"});
-        for (const auto* name : {"num_key_value_heads", "head_dim", "global_head_dim", "vocab_size"})
-            if (text[name].as<int>() != target[name].as<int>())
-                return std::unexpected(
-                    Error{ErrorCode::INVALID_MANIFEST, "Gemma MTP target mismatch: " + std::string(name)});
         const auto epsilon = text["rms_norm_eps"].as<float>();
         if (!std::isfinite(epsilon) || epsilon <= 0)
             return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "invalid Gemma MTP normalization epsilon"});
         for (const auto& layer : text["layer_types"]) {
-            const auto type = layer.as<std::string>();
-            if (type != "sliding_attention" && type != "full_attention")
+            const auto layer_type = layer.as<std::string>();
+            if (layer_type != "sliding_attention" && layer_type != "full_attention")
                 return std::unexpected(Error{ErrorCode::UNSUPPORTED, "unknown Gemma MTP attention type"});
-            const auto rope = text["rope_parameters"][type], reference = target["rope_parameters"][type];
-            if (rope["rope_theta"].as<float>() != reference["rope_theta"].as<float>() ||
-                rope["partial_rotary_factor"].as<float>(1.F) != reference["partial_rotary_factor"].as<float>(1.F) ||
-                rope["rope_type"].as<std::string>() != reference["rope_type"].as<std::string>())
-                return std::unexpected(
-                    Error{ErrorCode::UNSUPPORTED, "Gemma MTP rotary configuration differs from target"});
         }
         if (config["use_ordered_embeddings"].as<bool>(false)) {
             const auto clusters = config["num_centroids"].as<int>(),
                        top_k = config["centroid_intermediate_top_k"].as<int>();
             if (clusters <= 0 || text["vocab_size"].as<int>() % clusters || top_k <= 0 || top_k > clusters)
                 return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "invalid Gemma MTP vocabulary clusters"});
+        }
+        return {};
+    } catch (const YAML::Exception& error) {
+        return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, error.what()});
+    }
+}
+
+auto Gemma4AssistantImpl::validate_config(const YAML::Node& config, const YAML::Node& target) -> Result<void> {
+    if (auto valid = validate_config(config); !valid) return valid;
+    try {
+        const auto text = config["text_config"];
+        if (config["backbone_hidden_size"].as<int>() != target["hidden_size"].as<int>())
+            return std::unexpected(
+                Error{ErrorCode::INVALID_MANIFEST, "invalid Gemma MTP sharing or backbone dimensions"});
+        for (const auto* name : {"num_key_value_heads", "head_dim", "global_head_dim", "vocab_size"})
+            if (text[name].as<int>() != target[name].as<int>())
+                return std::unexpected(
+                    Error{ErrorCode::INVALID_MANIFEST, "Gemma MTP target mismatch: " + std::string(name)});
+        for (const auto& layer : text["layer_types"]) {
+            const auto type = layer.as<std::string>();
+            const auto rope = text["rope_parameters"][type], reference = target["rope_parameters"][type];
+            if (rope["rope_theta"].as<float>() != reference["rope_theta"].as<float>() ||
+                rope["partial_rotary_factor"].as<float>(1.F) != reference["partial_rotary_factor"].as<float>(1.F) ||
+                rope["rope_type"].as<std::string>() != reference["rope_type"].as<std::string>())
+                return std::unexpected(
+                    Error{ErrorCode::UNSUPPORTED, "Gemma MTP rotary configuration differs from target"});
         }
         return {};
     } catch (const YAML::Exception& error) {

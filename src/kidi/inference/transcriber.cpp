@@ -82,7 +82,11 @@ auto Transcriber::load(const std::filesystem::path& directory, tensor::Device de
             if (!valid_token(generation[name].as<std::int32_t>()))
                 throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Whisper special token is outside vocabulary"});
         std::optional<checkpoint::Weights> weights;
-        if (config["weights_format"].as<std::string>("") != "whisper_ggml") {
+        const auto weights_format = config["weights_format"].as<std::string>("");
+        if (weights_format == "gguf")
+            throw ops::Failure(
+                {ErrorCode::UNSUPPORTED, "Whisper GGUF model mapping is not supported; use legacy Whisper GGML"});
+        if (weights_format != "ggml") {
             weights.emplace(require(checkpoint::Weights::load(config["weights_file"].as<std::string>())));
             const auto precision = require(weights->tensor("model.encoder.layers.0.fc1.weight")).dtype();
             if (precision == tensor::DType::F16 || precision == tensor::DType::BF16) weights.reset();

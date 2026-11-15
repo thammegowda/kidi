@@ -14,6 +14,7 @@ class Gemma4AssistantImpl : public DraftLanguageModel {
 public:
     Gemma4AssistantImpl(const YAML::Node& config, const YAML::Node& target_config);
     ~Gemma4AssistantImpl() override;
+    static auto validate_config(const YAML::Node& config) -> Result<void>;
     static auto validate_config(const YAML::Node& config, const YAML::Node& target_config) -> Result<void>;
     static auto create(const YAML::Node& config, const YAML::Node& target_config) -> Result<Gemma4Assistant>;
     auto state_mapping_specs() const -> std::vector<checkpoint::StateMappingSpec> override;

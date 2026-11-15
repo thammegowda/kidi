@@ -113,8 +113,24 @@ auto WhisperImpl::create(const YAML::Node& config) -> Result<Whisper> {
 auto WhisperImpl::int8_preparation(const YAML::Node& config) -> Result<checkpoint::Preparation> {
     auto valid = validate_config(config["model"]);
     if (!valid) return std::unexpected(valid.error());
+    const auto format = config["weights_format"].as<std::string>("");
+    if (format == "gguf")
+        return std::unexpected(
+            Error{ErrorCode::UNSUPPORTED, "Whisper GGUF model mapping is not supported; use legacy Whisper GGML"});
+    const bool imported = format == "ggml";
+    if (imported) {
+        constexpr std::array keys{"vocab_size",     "max_source_positions", "d_model", "encoder_attention_heads",
+                                  "encoder_layers", "max_target_positions", "d_model", "decoder_attention_heads",
+                                  "decoder_layers", "num_mel_bins"};
+        const auto header = config["ggml_header"];
+        if (!header || !header.IsSequence() || header.size() != keys.size())
+            return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "missing Whisper GGML header"});
+        for (std::size_t index = 0; index < keys.size(); ++index)
+            if (config["model"][keys[index]].as<std::int32_t>() != header[index].as<std::int32_t>())
+                return std::unexpected(Error{ErrorCode::INVALID_MANIFEST,
+                                             "Whisper GGML header disagrees with config: " + std::string(keys[index])});
+    }
     const auto source = std::filesystem::path(config["weights_file"].as<std::string>());
-    const bool imported = config["weights_format"].as<std::string>("") == "whisper_ggml";
     return checkpoint::Preparation{
         .source = source,
         .cache_directory = imported ? source.filename().string() + ".kidi-int8-v1" : "kidi-int8-v2",

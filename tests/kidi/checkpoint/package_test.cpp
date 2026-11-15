@@ -131,9 +131,14 @@ auto main() -> int {
     if (single_forward || single_forward.error().code != kidi::ErrorCode::INVALID_ARGUMENT) return 1;
 
     auto invalid_decode = YAML::Load(std::string(MANIFEST_JSON));
-    invalid_decode["decode"]["beam_size"] = 0;
+    invalid_decode["io"]["input_format"] = "plain";
     write(directory / "config.json", YAML::Dump(invalid_decode));
     auto translator = kidi::inference::Translator::load(directory, kidi::module_device);
+    if (translator || translator.error().code != kidi::ErrorCode::INVALID_MANIFEST) return 1;
+    invalid_decode["io"]["input_format"] = "moses_tokenized";
+    invalid_decode["decode"]["beam_size"] = 0;
+    write(directory / "config.json", YAML::Dump(invalid_decode));
+    translator = kidi::inference::Translator::load(directory, kidi::module_device);
     if (translator || translator.error().code != kidi::ErrorCode::INVALID_ARGUMENT) return 1;
     invalid_decode["decode"]["beam_size"] = 1;
     invalid_decode["decode"]["length_penalty"] = std::numeric_limits<float>::quiet_NaN();

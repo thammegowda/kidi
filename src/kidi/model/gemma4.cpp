@@ -192,9 +192,9 @@ struct Gemma4Impl::State {
 
 auto Gemma4Impl::validate_config(const YAML::Node& config) -> Result<void> {
     try {
-        if (config["quantization_config"] &&
-            (config["quantization_config"]["quant_method"].as<std::string>() != "gemma" ||
-             !config["quantization_config"]["quantize_embeddings"].as<bool>()))
+        if (const auto q = config["quantization_config"];
+            q && !q.IsNull() &&
+            (!q.IsMap() || q["quant_method"].as<std::string>() != "gemma" || !q["quantize_embeddings"].as<bool>()))
             return std::unexpected(Error{ErrorCode::UNSUPPORTED, "unsupported QAT checkpoint format"});
         if (config["type"].as<std::string>() != "gemma4_text" || config["enable_moe_block"].as<bool>() ||
             config["attention_bias"].as<bool>() || config["attention_k_eq_v"].as<bool>() ||
