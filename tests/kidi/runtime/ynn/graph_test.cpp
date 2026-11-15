@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 
 #include <ynnpack.h>
 
+#include "kidi/core/precision.h"
 #include "kidi/ops/context.h"
 #include "kidi/runtime/ynn/feed_forward_cache.h"
 #include "kidi/runtime/ynn/graph.h"
@@ -130,6 +132,72 @@ auto main() -> int {
     const auto cached_values = kidi::ops::require(cached_ffn.data<float>());
     if (!std::ranges::equal(expected_values, populated_values) || !std::ranges::equal(expected_values, cached_values))
         return 1;
+
+    // Verify fused GATED_FEED_FORWARD matches composed PACKED_LINEAR + GELU/SILU_MULTIPLY + PACKED_LINEAR across
+    // bits = 2, 4, 8 and both M = 1 (decode) and M = 17 (odd multi-row prefill) with 4 worker threads.
+    kidi::runtime::ynn::set_thread_count(4);
+    for (const std::int32_t bits : {2, 4, 8}) {
+        const std::size_t vals_per_byte = static_cast<std::size_t>(8 / bits);
+        for (const std::int32_t m_rows : {1, 17}) {
+            std::vector<float> x_vals(m_rows * INPUT_SIZE);
+            for (std::size_t i = 0; i < x_vals.size(); ++i)
+                x_vals[i] = static_cast<float>(static_cast<int>((i * 5) % 19) - 9) * 0.0625F;
+            std::vector<std::uint8_t> gu_b(2 * INTERMEDIATE * (INPUT_SIZE / vals_per_byte));
+            for (std::size_t i = 0; i < gu_b.size(); ++i) gu_b[i] = static_cast<std::uint8_t>((i * 11 + 7) & 0xFFU);
+            std::vector<std::uint8_t> dn_b(INPUT_SIZE * (INTERMEDIATE / vals_per_byte));
+            for (std::size_t i = 0; i < dn_b.size(); ++i) dn_b[i] = static_cast<std::uint8_t>((i * 17 + 3) & 0xFFU);
+            const auto x_t = kidi::ops::require(
+                kidi::tensor::Tensor::from_host({1, m_rows, INPUT_SIZE}, std::span<const float>(x_vals)));
+            const auto gu_t = kidi::ops::require(kidi::tensor::Tensor::from_host(
+                {2 * INTERMEDIATE, static_cast<std::int64_t>(INPUT_SIZE / vals_per_byte)},
+                std::span<const std::uint8_t>(gu_b)));
+            const auto dn_t = kidi::ops::require(
+                kidi::tensor::Tensor::from_host({INPUT_SIZE, static_cast<std::int64_t>(INTERMEDIATE / vals_per_byte)},
+                                                std::span<const std::uint8_t>(dn_b)));
+
+            for (const bool silu : {false, true}) {
+                kidi::ops::Context ctx(kidi::tensor::Device::cpu());
+                const auto fused =
+                    ctx.gated_feed_forward(x_t, gu_t, gate_up_scale_tensor, dn_t, down_scale_tensor, bits, INPUT_SIZE,
+                                           INTERMEDIATE, 0.125F, 0.0625F, 0.03125F, 0.125F, silu);
+                const auto proj = ctx.packed_linear(x_t, gu_t, gate_up_scale_tensor, bits, INPUT_SIZE, 0.125F, 0.0625F);
+                const auto g_slice = ctx.slice(proj, -1, 0, INTERMEDIATE);
+                const auto u_slice = ctx.slice(proj, -1, INTERMEDIATE, INTERMEDIATE);
+                const auto hid = silu ? ctx.silu_multiply(g_slice, u_slice) : ctx.gelu_multiply(g_slice, u_slice);
+                const auto composed =
+                    ctx.packed_linear(hid, dn_t, down_scale_tensor, bits, INTERMEDIATE, 0.03125F, 0.125F);
+                const auto f_span = kidi::ops::require(fused.data<float>());
+                const auto c_span = kidi::ops::require(composed.data<float>());
+                for (std::size_t i = 0; i < f_span.size(); ++i) {
+                    if (std::abs(f_span[i] - c_span[i]) > 1e-5F) {
+                        std::cerr << "FFN mismatch bits=" << bits << " rows=" << m_rows << " silu=" << silu
+                                  << " idx=" << i << " fused=" << f_span[i] << " composed=" << c_span[i] << '\n';
+                        return 1;
+                    }
+                }
+            }
+#if defined(__APPLE__)
+            // Cross-check calibrated SymmetricPackedLinear (bits = 2, 4, 8, including K = 2056 non-multiple of 32)
+            // against Apple Accelerate LOWBIT_PARITY reference math.
+            kidi::ops::Context fast_ctx(kidi::tensor::Device::cpu());
+            kidi::ops::Context parity_ctx(kidi::tensor::Device::cpu());
+            parity_ctx.set_precision(kidi::core::InferencePrecision::LOWBIT_PARITY);
+            const auto fast_out =
+                fast_ctx.packed_linear(x_t, gu_t, gate_up_scale_tensor, bits, INPUT_SIZE, 0.125F, 0.0625F);
+            const auto ref_out =
+                parity_ctx.packed_linear(x_t, gu_t, gate_up_scale_tensor, bits, INPUT_SIZE, 0.125F, 0.0625F);
+            const auto fast_span = kidi::ops::require(fast_out.data<float>());
+            const auto ref_span = kidi::ops::require(ref_out.data<float>());
+            for (std::size_t i = 0; i < fast_span.size(); ++i) {
+                if (std::abs(fast_span[i] - ref_span[i]) > 1e-5F) {
+                    std::cerr << "Calibrated packed_linear parity mismatch bits=" << bits << " rows=" << m_rows
+                              << " idx=" << i << " fast=" << fast_span[i] << " ref=" << ref_span[i] << '\n';
+                    return 1;
+                }
+            }
+#endif
+        }
+    }
     std::filesystem::remove_all(cache_root);
 #endif
 

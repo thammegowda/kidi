@@ -2,23 +2,25 @@
 
 #include <algorithm>
 #include <cassert>
+#include <mutex>
+#include <new>
 #include <utility>
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
 #endif
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 namespace kidi::runtime::ynn {
 namespace {
 
-// Idle threads and the thread joining a loop poll in two phases: `pause` first, so a loop forked right after the
-// previous one starts within a microsecond, then `yield`, so an oversubscribed machine still lets other runnable
-// threads make progress. Past the budget a thread blocks.
-constexpr int IDLE_PAUSES = 256;
-constexpr int IDLE_YIELDS = 1000;
-constexpr int JOIN_PAUSES = 2048;
-constexpr int JOIN_YIELDS = 1000;
 constexpr int LOCK_PAUSES = 128;
+constexpr int BARRIER_PAUSES = 4096;
+constexpr std::uint64_t SPIN_MICROSECONDS = 180;
+constexpr int X86_SPIN_PAUSES = 4096;
+constexpr int GENERIC_SPIN_YIELDS = 64;
 
 inline auto cpu_relax() noexcept -> void {
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
@@ -30,23 +32,108 @@ inline auto cpu_relax() noexcept -> void {
 #endif
 }
 
-/// Polls `ready` until it holds or the budget is spent. Returns whether it held.
+#if (defined(__aarch64__) || defined(__arm64__)) && (defined(__GNUC__) || defined(__clang__))
+inline auto arm_counter_ticks() noexcept -> std::uint64_t {
+    std::uint64_t ticks = 0;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(ticks));
+    return ticks;
+}
+
+inline auto arm_spin_budget_ticks(std::uint64_t microseconds) noexcept -> std::uint64_t {
+    static const std::uint64_t freq = [] {
+        std::uint64_t f = 0;
+        __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(f));
+        return f ? f : std::uint64_t{24'000'000};
+    }();
+    return std::max<std::uint64_t>(1, (freq * microseconds) / 1'000'000);
+}
+#endif
+
+/// Polls `ready` in user space (`yield` gated by `cntvct_el0` every 16 iterations on ARM64, `_mm_pause` on x86)
+/// without pipeline-flushing `isb` instructions or premature kernel `sched_yield` syscalls.
 template <typename Ready>
-auto spin_until(Ready&& ready, int pauses, int yields) -> bool {
-    for (int i = 0; i < pauses; ++i) {
+auto spin_until_ready(Ready&& ready) noexcept -> bool {
+    if (ready()) return true;
+#if (defined(__aarch64__) || defined(__arm64__)) && (defined(__GNUC__) || defined(__clang__))
+    const auto budget = arm_spin_budget_ticks(SPIN_MICROSECONDS);
+    const auto start = arm_counter_ticks();
+    do {
+        for (int i = 0; i < 16; ++i) {
+            if (ready()) return true;
+            cpu_relax();
+        }
+    } while (arm_counter_ticks() - start < budget);
+#elif defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    for (int i = 0; i < X86_SPIN_PAUSES; ++i) {
         if (ready()) return true;
-        cpu_relax();
+        _mm_pause();
     }
-    for (int i = 0; i < yields; ++i) {
+#else
+    for (int i = 0; i < GENERIC_SPIN_YIELDS; ++i) {
         if (ready()) return true;
         std::this_thread::yield();
     }
+#endif
     return ready();
 }
 
-/// Loops this thread is executing, innermost last. A thread never joins a loop it is already inside of, which would
-/// run the loop's iterations recursively on its own stack.
-thread_local std::vector<const WorkerPool::Loop*> running_loops;
+thread_local const WorkerPool* active_team_pool = nullptr;
+
+class ActiveTeamScope {
+public:
+    explicit ActiveTeamScope(const WorkerPool* pool) noexcept : previous_(std::exchange(active_team_pool, pool)) {}
+    ~ActiveTeamScope() { active_team_pool = previous_; }
+    ActiveTeamScope(const ActiveTeamScope&) = delete;
+    auto operator=(const ActiveTeamScope&) -> ActiveTeamScope& = delete;
+
+private:
+    const WorkerPool* previous_;
+};
+
+struct InlineScratchStack {
+    std::vector<std::unique_ptr<std::byte[], void (*)(std::byte*)>> slots;
+    std::vector<std::size_t> capacities;
+    std::size_t depth = 0;
+};
+
+thread_local InlineScratchStack tls_inline_scratch;
+
+class InlineScratchScope {
+public:
+    explicit InlineScratchScope(std::size_t required_bytes) {
+        if (required_bytes == 0) return;
+        auto& stack = tls_inline_scratch;
+        index_ = stack.depth++;
+        active_ = true;
+        if (index_ >= stack.slots.size()) {
+            stack.slots.emplace_back(nullptr, [](std::byte* ptr) {
+                if (ptr != nullptr) ::operator delete(ptr, std::align_val_t{CACHE_LINE_BYTES});
+            });
+            stack.capacities.push_back(0);
+        }
+        if (stack.capacities[index_] < required_bytes) {
+            const auto alloc_bytes = std::max(required_bytes, stack.capacities[index_] * 2);
+            auto* fresh = static_cast<std::byte*>(::operator new(alloc_bytes, std::align_val_t{CACHE_LINE_BYTES}));
+            stack.slots[index_].reset(fresh);
+            stack.capacities[index_] = alloc_bytes;
+        }
+        data_ = stack.slots[index_].get();
+    }
+
+    ~InlineScratchScope() {
+        if (active_) --tls_inline_scratch.depth;
+    }
+
+    InlineScratchScope(const InlineScratchScope&) = delete;
+    auto operator=(const InlineScratchScope&) -> InlineScratchScope& = delete;
+
+    auto data() const noexcept -> std::byte* { return data_; }
+
+private:
+    std::byte* data_ = nullptr;
+    std::size_t index_ = 0;
+    bool active_ = false;
+};
 
 } // namespace
 
@@ -70,153 +157,360 @@ auto SpinLock::try_lock() noexcept -> bool {
 
 auto SpinLock::unlock() noexcept -> void { locked_.store(false, std::memory_order_release); }
 
-WorkerPool::WorkerPool(int workers) : workers_(workers) {
-    threads_.reserve(static_cast<std::size_t>(std::max(workers, 0)));
-    for (int i = 0; i < workers; ++i) threads_.emplace_back([this] { worker_main(); });
+PhaseBarrier::PhaseBarrier(std::size_t participants) noexcept
+    : participants_(std::max<std::size_t>(1, participants)), remaining_(participants_) {}
+
+auto PhaseBarrier::reset(std::size_t participants) noexcept -> void {
+    participants_ = std::max<std::size_t>(1, participants);
+    aborted_.store(false, std::memory_order_relaxed);
+    remaining_.store(participants_, std::memory_order_relaxed);
+    phase_.store(0, std::memory_order_relaxed);
+}
+
+auto PhaseBarrier::abort() noexcept -> void {
+    aborted_.store(true, std::memory_order_release);
+    phase_.fetch_add(1, std::memory_order_release);
+}
+
+auto PhaseBarrier::arrive_and_wait() noexcept -> bool {
+    if (aborted_.load(std::memory_order_acquire)) return false;
+    if (participants_ <= 1) return true;
+    const auto observed = phase_.load(std::memory_order_acquire);
+    if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        remaining_.store(participants_, std::memory_order_relaxed);
+        phase_.fetch_add(1, std::memory_order_release);
+        return !aborted_.load(std::memory_order_acquire);
+    }
+    int spins = 0;
+    while (phase_.load(std::memory_order_acquire) == observed && !aborted_.load(std::memory_order_acquire)) {
+        if (spins < BARRIER_PAUSES) {
+            ++spins;
+            cpu_relax();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    return !aborted_.load(std::memory_order_acquire);
+}
+
+WorkerPool::ScratchBuffer::~ScratchBuffer() {
+    if (data != nullptr) ::operator delete(data, std::align_val_t{CACHE_LINE_BYTES});
+}
+
+WorkerPool::ScratchBuffer::ScratchBuffer(ScratchBuffer&& other) noexcept
+    : data(std::exchange(other.data, nullptr)), capacity(std::exchange(other.capacity, 0)) {}
+
+auto WorkerPool::ScratchBuffer::operator=(ScratchBuffer&& other) noexcept -> ScratchBuffer& {
+    if (this != &other) {
+        if (data != nullptr) ::operator delete(data, std::align_val_t{CACHE_LINE_BYTES});
+        data = std::exchange(other.data, nullptr);
+        capacity = std::exchange(other.capacity, 0);
+    }
+    return *this;
+}
+
+auto WorkerPool::ScratchBuffer::ensure(std::size_t required_bytes) -> void {
+    if (required_bytes <= capacity) return;
+    const auto alloc_bytes = std::max(required_bytes, capacity * 2);
+    auto* fresh = static_cast<std::byte*>(::operator new(alloc_bytes, std::align_val_t{CACHE_LINE_BYTES}));
+    if (data != nullptr) ::operator delete(data, std::align_val_t{CACHE_LINE_BYTES});
+    data = fresh;
+    capacity = alloc_bytes;
+}
+
+WorkerPool::WorkerPool(int workers) : workers_(std::max(workers, 0)) {
+    const auto total = total_threads();
+    scratches_.resize(total);
+    range_slots_ = std::make_unique<RangeSlot[]>(total);
+    threads_.reserve(static_cast<std::size_t>(workers_));
+    for (int i = 0; i < workers_; ++i) {
+        const auto tid = static_cast<std::size_t>(i + 1);
+        threads_.emplace_back([this, tid] { worker_main(tid); });
+    }
 }
 
 WorkerPool::~WorkerPool() {
-    update([this] { stop_.store(true, std::memory_order_relaxed); }, Notify::EVERYONE);
+    stop_.store(true, std::memory_order_release);
+    event_seq_.fetch_add(1, std::memory_order_seq_cst);
+    event_seq_.notify_all();
     for (auto& thread : threads_) thread.join();
 }
 
-auto WorkerPool::enqueue(std::size_t n, task_body body, int max_workers) -> slinky::ref_count<task> {
-    assert(n > 0);
-    constexpr int MAX_SHARDS = 8;
-    // A bounded worker count asks for an ordered loop, whose iterations must start in order from one shared counter.
-    const bool ordered = max_workers < std::numeric_limits<int>::max();
-    max_workers = static_cast<int>(std::min<std::size_t>(n, static_cast<std::size_t>(max_workers)));
-    const int shards = ordered ? 1 : std::min(MAX_SHARDS, max_workers);
-    auto loop = Loop::make(static_cast<std::size_t>(shards), n, std::move(body), max_workers);
-    update([&] { queue_.push_back(loop); }, max_workers == 1 ? Notify::ONE : Notify::EVERYONE);
-    return loop;
-}
-
-auto WorkerPool::wait_for(task* t) -> void {
-    auto* loop = static_cast<Loop*>(t);
-    if (run(*loop, -1)) loop_completed();
-    if (loop->done()) return;
-    // The remaining iterations are running on other threads: poll for their completion without the lock, then help
-    // with other queued loops while waiting.
-    if (spin_until([&] { return loop->done(); }, JOIN_PAUSES, JOIN_YIELDS)) return;
-    wait_for([&] { return loop->done(); });
-}
-
-auto WorkerPool::wait_for(predicate_ref condition) -> void {
-    // Count before the first check, so a loop completing from here on is announced to this thread. The count, the
-    // completing thread's load of it, and `Loop::done()` are all sequentially consistent: either the completing
-    // thread sees this registration or the condition sees the completion.
-    waiting_helpers_.fetch_add(1);
-    std::unique_lock lock(lock_);
-    while (!condition()) {
-        const auto seen = epoch_.load(std::memory_order_relaxed);
-        int worker = -1;
-        if (auto loop = dequeue(worker)) {
-            lock.unlock();
-            const bool completed = run(*loop, worker);
-            loop = nullptr;
-            if (completed) loop_completed();
-            lock.lock();
-        } else {
-            idle(lock, seen, helper_waiters_);
-        }
+auto WorkerPool::record_exception(std::exception_ptr error) noexcept -> void {
+    {
+        std::scoped_lock lock(error_lock_);
+        if (!team_error_) team_error_ = std::move(error);
     }
-    lock.unlock();
-    waiting_helpers_.fetch_sub(1);
+    team_barrier_.abort();
 }
 
-auto WorkerPool::atomic_call(slinky::function_ref<void()> t) -> void { update(t, Notify::EVERYONE); }
-
-auto WorkerPool::worker_main() -> void {
-    std::unique_lock lock(lock_);
-    while (!stop_.load(std::memory_order_relaxed)) {
-        const auto seen = epoch_.load(std::memory_order_relaxed);
-        int worker = -1;
-        if (auto loop = dequeue(worker)) {
-            lock.unlock();
-            const bool completed = run(*loop, worker);
-            loop = nullptr;
-            if (completed) loop_completed();
-            lock.lock();
-        } else {
-            idle(lock, seen, worker_waiters_);
-        }
+auto WorkerPool::execute_team_member(std::size_t tid) noexcept -> void {
+    const ActiveTeamScope scope(this);
+    const WorkerContext worker{
+        .tid = tid,
+        .thread_count = active_team_size_,
+        .scratch = team_scratch_bytes_ > 0 ? scratches_[tid].data : nullptr,
+        .scratch_size = team_scratch_bytes_,
+    };
+    try {
+        team_fn_(team_ctx_, worker, team_barrier_);
+    } catch (...) {
+        record_exception(std::current_exception());
     }
 }
 
-auto WorkerPool::dequeue(int& worker) -> slinky::ref_count<Loop> {
-    for (auto i = queue_.begin(); i != queue_.end();) {
-        slinky::ref_count<Loop>& loop = *i;
-        if (loop->all_work_started()) {
-            // No more threads can start working on this loop.
-            i = queue_.erase(i);
-        } else if (std::ranges::find(running_loops, &*loop) != running_loops.end()) {
-            ++i;
-        } else {
-            worker = loop->allocate_worker();
-            if (worker < 0) {
-                i = queue_.erase(i);
-            } else if (worker == 0) {
-                // This is the last worker the loop admits.
-                auto result = std::move(loop);
-                queue_.erase(i);
-                return result;
-            } else {
-                return loop;
+auto WorkerPool::run_team(std::size_t max_threads, std::size_t scratch_bytes, void* context, TeamFn fn) -> void {
+    if (max_threads == 0) return;
+    const auto team_size = std::min(max_threads, total_threads());
+
+    // Serial or re-entrant nested execution runs inline on the current thread without touching worker synchronization.
+    if (team_size <= 1 || active_team_pool == this) {
+        const InlineScratchScope inline_scratch(scratch_bytes);
+        PhaseBarrier single_barrier(1);
+        const WorkerContext worker{
+            .tid = 0,
+            .thread_count = 1,
+            .scratch = inline_scratch.data(),
+            .scratch_size = scratch_bytes,
+        };
+        fn(context, worker, single_barrier);
+        return;
+    }
+
+    std::scoped_lock caller_guard(caller_lock_);
+    while (async_active_.load(std::memory_order_acquire) != 0 || async_nonempty_.load(std::memory_order_acquire)) {
+        if (!run_one_async()) cpu_relax();
+    }
+
+    if (scratch_bytes > 0) {
+        for (std::size_t t = 0; t < team_size; ++t) scratches_[t].ensure(scratch_bytes);
+    }
+
+    active_team_size_ = team_size;
+    team_fn_ = fn;
+    team_ctx_ = context;
+    team_scratch_bytes_ = scratch_bytes;
+    team_error_ = nullptr;
+    team_barrier_.reset(team_size);
+    team_remaining_.store(team_size - 1, std::memory_order_relaxed);
+
+    const auto token = ((++team_seq_) << 16) | static_cast<std::uint64_t>(team_size);
+    team_id_.store(token, std::memory_order_release);
+    event_seq_.fetch_add(1, std::memory_order_seq_cst);
+    if (sleeping_.load(std::memory_order_seq_cst) > 0) {
+        event_seq_.notify_all();
+    }
+
+    execute_team_member(0);
+
+    if (team_remaining_.load(std::memory_order_acquire) != 0) {
+        while (!spin_until_ready([&] { return team_remaining_.load(std::memory_order_acquire) == 0; })) {
+            std::this_thread::yield();
+        }
+    }
+
+    auto error = std::move(team_error_);
+    if (error) std::rethrow_exception(error);
+}
+
+auto WorkerPool::run_ranges(std::size_t items, std::size_t min_grain, std::size_t scratch_bytes, void* context,
+                            RangeFn fn) -> void {
+    if (items == 0) return;
+    min_grain = std::max<std::size_t>(1, min_grain);
+    const auto max_by_grain = (items + min_grain - 1) / min_grain;
+    const auto team_size = std::min(max_by_grain, total_threads());
+
+    if (team_size <= 1 || active_team_pool == this) {
+        const InlineScratchScope inline_scratch(scratch_bytes);
+        const WorkerContext worker{
+            .tid = 0,
+            .thread_count = 1,
+            .scratch = inline_scratch.data(),
+            .scratch_size = scratch_bytes,
+        };
+        fn(context, worker, 0, items);
+        return;
+    }
+
+    std::scoped_lock caller_guard(caller_lock_);
+    while (async_active_.load(std::memory_order_acquire) != 0 || async_nonempty_.load(std::memory_order_acquire)) {
+        if (!run_one_async()) cpu_relax();
+    }
+
+    if (scratch_bytes > 0) {
+        for (std::size_t t = 0; t < team_size; ++t) scratches_[t].ensure(scratch_bytes);
+    }
+
+    // Partition `[0, items)` into cache-line-isolated per-worker home ranges aligned to `min_grain`.
+    const auto total_units = (items + min_grain - 1) / min_grain;
+    const auto base_units = total_units / team_size;
+    const auto rem_units = total_units % team_size;
+    std::size_t cursor = 0;
+    for (std::size_t t = 0; t < team_size; ++t) {
+        const auto units = base_units + (t < rem_units ? 1 : 0);
+        const auto end = std::min(items, cursor + units * min_grain);
+        const auto len = end - cursor;
+        // Claim ~4 home sub-chunks locally to leave stealable work for faster P-cores when heterogeneous.
+        const auto home_units = std::max<std::size_t>(1, (units + 3) / 4);
+        range_slots_[t].next.store(cursor, std::memory_order_relaxed);
+        range_slots_[t].end = end;
+        range_slots_[t].home_grain = std::max(min_grain, std::min(len, home_units * min_grain));
+        range_slots_[t].steal_grain = min_grain;
+        cursor = end;
+    }
+
+    struct RangePayload {
+        RangeSlot* slots;
+        void* user_ctx;
+        RangeFn user_fn;
+    } payload{range_slots_.get(), context, fn};
+
+    const TeamFn runner = [](void* raw, const WorkerContext& worker, PhaseBarrier& barrier) {
+        const auto p = *static_cast<const RangePayload*>(raw);
+        auto& home = p.slots[worker.tid];
+        for (;;) {
+            if (barrier.aborted()) return;
+            const auto cur = home.next.fetch_add(home.home_grain, std::memory_order_relaxed);
+            if (cur >= home.end) break;
+            p.user_fn(p.user_ctx, worker, cur, std::min(home.end, cur + home.home_grain));
+        }
+        for (std::size_t offset = 1; offset < worker.thread_count; ++offset) {
+            if (barrier.aborted()) return;
+            auto& victim = p.slots[(worker.tid + offset) % worker.thread_count];
+            if (victim.next.load(std::memory_order_relaxed) >= victim.end) continue;
+            for (;;) {
+                if (barrier.aborted()) return;
+                const auto cur = victim.next.fetch_add(victim.steal_grain, std::memory_order_relaxed);
+                if (cur >= victim.end) break;
+                p.user_fn(p.user_ctx, worker, cur, std::min(victim.end, cur + victim.steal_grain));
             }
         }
+    };
+
+    active_team_size_ = team_size;
+    team_fn_ = runner;
+    team_ctx_ = &payload;
+    team_scratch_bytes_ = scratch_bytes;
+    team_error_ = nullptr;
+    team_barrier_.reset(team_size);
+    team_remaining_.store(team_size - 1, std::memory_order_relaxed);
+
+    const auto token = ((++team_seq_) << 16) | static_cast<std::uint64_t>(team_size);
+    team_id_.store(token, std::memory_order_release);
+    event_seq_.fetch_add(1, std::memory_order_seq_cst);
+    if (sleeping_.load(std::memory_order_seq_cst) > 0) {
+        event_seq_.notify_all();
     }
-    return nullptr;
+
+    execute_team_member(0);
+
+    if (team_remaining_.load(std::memory_order_acquire) != 0) {
+        while (!spin_until_ready([&] { return team_remaining_.load(std::memory_order_acquire) == 0; })) {
+            std::this_thread::yield();
+        }
+    }
+
+    auto error = std::move(team_error_);
+    if (error) std::rethrow_exception(error);
 }
 
-auto WorkerPool::run(Loop& loop, int worker) -> bool {
-    running_loops.push_back(&loop);
-    const bool completed = worker >= 0 ? loop.work(static_cast<std::size_t>(worker)) : loop.work();
-    running_loops.pop_back();
-    return completed;
+auto WorkerPool::run_tasks(std::size_t n, void* context, TaskFn fn) -> void {
+    if (n == 0) return;
+    struct Payload {
+        void* ctx;
+        TaskFn fn;
+    } payload{context, fn};
+    run_ranges(n, 1, 0, &payload, [](void* raw, const WorkerContext&, std::size_t begin, std::size_t end) {
+        const auto p = *static_cast<const Payload*>(raw);
+        for (std::size_t i = begin; i < end; ++i) p.fn(p.ctx, i);
+    });
 }
 
-auto WorkerPool::idle(std::unique_lock<SpinLock>& lock, std::uint64_t seen, Waiters& waiters) -> void {
-    lock.unlock();
-    const bool moved =
-        spin_until([&] { return epoch_.load(std::memory_order_acquire) != seen; }, IDLE_PAUSES, IDLE_YIELDS);
-    lock.lock();
-    if (moved) return;
-    ++waiters.sleeping;
-    waiters.parked.wait(lock, [&] { return epoch_.load(std::memory_order_relaxed) != seen; });
-    --waiters.sleeping;
+auto WorkerPool::parallel_for(std::size_t n, const std::function<void(std::size_t)>& body) -> void {
+    if (n == 0) return;
+    run_ranges(n, 1, 0, const_cast<std::function<void(std::size_t)>*>(&body),
+               [](void* raw, const WorkerContext&, std::size_t begin, std::size_t end) {
+                   const auto& fn = *static_cast<const std::function<void(std::size_t)>*>(raw);
+                   for (std::size_t i = begin; i < end; ++i) fn(i);
+               });
 }
 
-auto WorkerPool::update(slinky::function_ref<void()> change, Notify notify) -> void {
-    bool wake_workers = false;
-    bool wake_helpers = false;
+auto WorkerPool::schedule_async(void* task_context, AsyncFn task) -> void {
+    if (workers_ <= 0) {
+        const ActiveTeamScope scope(this);
+        task(task_context);
+        return;
+    }
+    async_active_.fetch_add(1, std::memory_order_relaxed);
     {
-        std::scoped_lock lock(lock_);
-        change();
-        epoch_.fetch_add(1, std::memory_order_release);
-        wake_workers = notify != Notify::HELPERS && worker_waiters_.sleeping > 0;
-        wake_helpers = helper_waiters_.sleeping > 0;
+        std::scoped_lock lock(async_lock_);
+        async_queue_.push_back({task_context, task});
+        async_nonempty_.store(true, std::memory_order_release);
     }
-    if (wake_workers) {
-        if (notify == Notify::ONE) {
-            worker_waiters_.parked.notify_one();
-        } else {
-            worker_waiters_.parked.notify_all();
-        }
-    }
-    if (wake_helpers) {
-        if (notify == Notify::ONE) {
-            helper_waiters_.parked.notify_one();
-        } else {
-            helper_waiters_.parked.notify_all();
-        }
+    event_seq_.fetch_add(1, std::memory_order_seq_cst);
+    if (sleeping_.load(std::memory_order_seq_cst) > 0) {
+        event_seq_.notify_all();
     }
 }
 
-auto WorkerPool::loop_completed() -> void {
-    // Only a thread inside `wait_for(predicate)` can be waiting for a completion, and it registers before it checks.
-    if (waiting_helpers_.load() == 0) return;
-    update([] {}, Notify::HELPERS);
+auto WorkerPool::run_one_async() -> bool {
+    AsyncItem item{};
+    {
+        std::scoped_lock lock(async_lock_);
+        if (async_queue_.empty()) {
+            async_nonempty_.store(false, std::memory_order_relaxed);
+            return false;
+        }
+        item = async_queue_.front();
+        async_queue_.pop_front();
+        if (async_queue_.empty()) async_nonempty_.store(false, std::memory_order_relaxed);
+    }
+    {
+        const ActiveTeamScope scope(this);
+        item.fn(item.context);
+    }
+    async_active_.fetch_sub(1, std::memory_order_release);
+    return true;
+}
+
+auto WorkerPool::worker_main(std::size_t tid) -> void {
+#if defined(__APPLE__)
+    if (::pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) != 0)
+        (void)::pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+    std::uint64_t last_team_seq = 0;
+    for (;;) {
+        const auto seen = event_seq_.load(std::memory_order_acquire);
+        if (stop_.load(std::memory_order_acquire)) break;
+
+        const auto cur_token = team_id_.load(std::memory_order_acquire);
+        const auto cur_seq = cur_token >> 16;
+        if (cur_seq != last_team_seq) {
+            last_team_seq = cur_seq;
+            const auto tok_team_size = static_cast<std::size_t>(cur_token & 0xFFFFu);
+            if (tid < tok_team_size) {
+                execute_team_member(tid);
+                team_remaining_.fetch_sub(1, std::memory_order_acq_rel);
+                if (async_nonempty_.load(std::memory_order_acquire)) (void)run_one_async();
+                continue;
+            }
+        }
+
+        if (async_nonempty_.load(std::memory_order_acquire)) {
+            if (run_one_async()) continue;
+        }
+
+        idle_worker(seen);
+    }
+}
+
+auto WorkerPool::idle_worker(std::uint64_t seen) -> void {
+    if (spin_until_ready([&] { return event_seq_.load(std::memory_order_acquire) != seen; })) return;
+    sleeping_.fetch_add(1, std::memory_order_seq_cst);
+    if (event_seq_.load(std::memory_order_seq_cst) == seen && !stop_.load(std::memory_order_acquire)) {
+        event_seq_.wait(seen, std::memory_order_acquire);
+    }
+    sleeping_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 } // namespace kidi::runtime::ynn

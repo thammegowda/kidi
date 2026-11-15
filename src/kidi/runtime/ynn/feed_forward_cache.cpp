@@ -18,7 +18,7 @@
 
 namespace kidi::runtime::ynn {
 namespace {
-constexpr std::array<char, 8> MAGIC{'K', 'I', 'D', 'I', 'G', 'F', 'F', '1'};
+constexpr std::array<char, 8> MAGIC{'K', 'I', 'D', 'I', 'G', 'F', 'F', '2'};
 constexpr std::uint32_t FORMAT_VERSION = 1;
 constexpr std::size_t PAYLOAD_OFFSET = 4096;
 

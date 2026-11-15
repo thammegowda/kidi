@@ -87,6 +87,37 @@ auto test_confine() -> bool {
 auto test_confine() -> bool { return expect(!kidi::runtime::ynn::confine_to_numa_node(1), "unsupported platform"); }
 #endif
 
+auto test_choose_performance_cpus() -> bool {
+    using kidi::runtime::ynn::choose_performance_cpus;
+    using kidi::runtime::ynn::count_performance_cpus;
+    using kidi::runtime::ynn::CpuCapacity;
+    const std::array<CpuCapacity, 8> hybrid = {
+        CpuCapacity{0, 448},  CpuCapacity{1, 448},  CpuCapacity{2, 448},  CpuCapacity{3, 448},
+        CpuCapacity{4, 1024}, CpuCapacity{5, 1024}, CpuCapacity{6, 1024}, CpuCapacity{7, 1024},
+    };
+    const std::array<CpuCapacity, 8> tri_cluster = {
+        CpuCapacity{0, 320}, CpuCapacity{1, 320}, CpuCapacity{2, 320}, CpuCapacity{3, 320},
+        CpuCapacity{4, 768}, CpuCapacity{5, 768}, CpuCapacity{6, 768}, CpuCapacity{7, 1024},
+    };
+    const std::array<CpuCapacity, 4> uniform = {
+        CpuCapacity{0, 1024},
+        CpuCapacity{1, 1024},
+        CpuCapacity{2, 1024},
+        CpuCapacity{3, 1024},
+    };
+    return expect(choose_performance_cpus(hybrid, 4) == std::vector<int>{4, 5, 6, 7}, "picks P-cores when 4 fit") &&
+           expect(choose_performance_cpus(hybrid, 2) == std::vector<int>{4, 5, 6, 7}, "keeps full P-core cluster") &&
+           expect(choose_performance_cpus(tri_cluster, 4) == std::vector<int>{4, 5, 6, 7},
+                  "tri-cluster picks Prime + Perf cores") &&
+           expect(choose_performance_cpus(hybrid, 8).empty(), "all cores requested needs no narrowing") &&
+           expect(choose_performance_cpus(uniform, 2).empty(), "uniform topology needs no P-core narrowing") &&
+           expect(choose_performance_cpus(hybrid, 0).empty(), "zero threads needs no narrowing") &&
+           expect(count_performance_cpus(hybrid) == 4, "2-tier auto count picks 4 P-cores") &&
+           expect(count_performance_cpus(tri_cluster) == 4, "3-tier auto count picks Prime + Perf cores") &&
+           expect(count_performance_cpus(uniform) == 4, "uniform auto count keeps all cores") &&
+           expect(count_performance_cpus({}) == 0, "empty topology returns 0");
+}
+
 } // namespace
 
-auto main() -> int { return test_parse() && test_choose() && test_confine() ? 0 : 1; }
+auto main() -> int { return test_parse() && test_choose() && test_choose_performance_cpus() && test_confine() ? 0 : 1; }

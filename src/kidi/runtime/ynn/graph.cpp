@@ -9,10 +9,26 @@
 #include <unordered_map>
 #include <utility>
 
+#include "kidi/runtime/ynn/numa.h"
 #include "kidi/runtime/ynn/worker_pool.h"
 #include "ynnpack/base/arch.h"
 
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
+
 namespace kidi::runtime::ynn {
+namespace {
+
+constexpr ynn_scheduler YNN_SCHEDULER{
+    .num_threads = [](void* context) -> int { return static_cast<WorkerPool*>(context)->thread_count(); },
+    .schedule = [](void* context, void* task_context, void (*task)(void*)) -> void {
+        static_cast<WorkerPool*>(context)->schedule_async(task_context, task);
+    },
+};
+
+} // namespace
+
 class ThreadPool {
 public:
     static auto create(std::size_t total_threads) -> Result<std::shared_ptr<ThreadPool>> {
@@ -21,79 +37,185 @@ public:
     }
 
     ~ThreadPool() {
-        if (handle_ != nullptr) ynn_delete_threadpool(handle_);
+        if (ynn_handle_ != nullptr) ynn_delete_threadpool(ynn_handle_);
     }
 
-    auto get() const noexcept -> ynn_threadpool_t { return handle_; }
-    auto parallel_for(std::size_t size, std::function<void(std::size_t)> body) -> void {
-        reinterpret_cast<slinky::thread_pool*>(handle_)->parallel_for(size, std::move(body));
+    auto ynn_handle() -> Result<ynn_threadpool_t> {
+        std::scoped_lock lock(adapter_mutex_);
+        if (ynn_handle_ != nullptr) return ynn_handle_;
+        if (pool_->thread_count() <= 0) return nullptr;
+        ynn_threadpool_t created = nullptr;
+        if (auto status = check_status(ynn_create_threadpool(&YNN_SCHEDULER, pool_.get(), 0, &created),
+                                       "create YNNPACK threadpool adapter");
+            !status) {
+            return std::unexpected(std::move(status.error()));
+        }
+        ynn_handle_ = created;
+        return ynn_handle_;
+    }
+
+    auto worker_pool() const noexcept -> WorkerPool* { return pool_.get(); }
+    auto parallel_for(std::size_t size, const std::function<void(std::size_t)>& body) -> void {
+        pool_->parallel_for(size, body);
+    }
+    auto run_tasks(std::size_t size, void* context, void (*body)(void*, std::size_t)) -> void {
+        pool_->run_tasks(size, context, body);
+    }
+    auto run_ranges(std::size_t items, std::size_t min_grain, std::size_t scratch_bytes, void* context,
+                    void (*body)(void*, const WorkerContext&, std::size_t, std::size_t)) -> void {
+        pool_->run_ranges(items, min_grain, scratch_bytes, context, body);
+    }
+    auto run_team(std::size_t max_threads, std::size_t scratch_bytes, void* context,
+                  void (*body)(void*, const WorkerContext&, PhaseBarrier&)) -> void {
+        pool_->run_team(max_threads, scratch_bytes, context, body);
     }
 
 private:
-    explicit ThreadPool(int worker_count) : handle_(reinterpret_cast<ynn_threadpool_t>(new WorkerPool(worker_count))) {}
+    explicit ThreadPool(int worker_count) : pool_(std::make_unique<WorkerPool>(worker_count)) {}
 
-    ynn_threadpool_t handle_ = nullptr;
+    std::unique_ptr<WorkerPool> pool_;
+    std::mutex adapter_mutex_;
+    ynn_threadpool_t ynn_handle_ = nullptr;
 };
 
 namespace {
 
 std::atomic<std::size_t> configured_thread_count = 0;
 
-auto default_thread_pool(std::size_t total_threads) -> Result<std::shared_ptr<ThreadPool>> {
+struct CachedPool {
+    std::size_t threads = 0;
+    std::shared_ptr<ThreadPool> pool;
+};
+
+auto ensure_interactive_qos() noexcept -> void {
+#if defined(__APPLE__)
+    thread_local bool configured = false;
+    if (!configured) {
+        if (::pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) != 0)
+            (void)::pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+        configured = true;
+    }
+#endif
+}
+
+auto borrow_thread_pool(std::size_t total_threads) -> Result<ThreadPool*> {
     struct PoolCache {
         std::mutex mutex;
-        std::unordered_map<std::size_t, std::weak_ptr<ThreadPool>> pools;
+        std::unordered_map<std::size_t, std::shared_ptr<ThreadPool>> pools;
     };
     static PoolCache cache;
 
     if (total_threads == 0) total_threads = thread_count();
-    if (total_threads > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    if (total_threads == 0 || total_threads > static_cast<std::size_t>(std::numeric_limits<int>::max()))
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "CPU thread count exceeds supported range"});
-    struct LocalPool {
-        std::size_t threads = 0;
-        std::shared_ptr<ThreadPool> pool;
-    };
-    thread_local LocalPool local;
-    if (local.pool && local.threads == total_threads) return local.pool;
+
+    ensure_interactive_qos();
+    thread_local CachedPool local;
+    if (local.pool && local.threads == total_threads) return local.pool.get();
+
     std::scoped_lock lock(cache.mutex);
-    if (auto existing = cache.pools[total_threads].lock()) {
-        local = {total_threads, existing};
-        return existing;
+    if (auto found = cache.pools.find(total_threads); found != cache.pools.end()) {
+        if (total_threads > 1 || !local.pool) local = {total_threads, found->second};
+        return found->second.get();
     }
     auto created = ThreadPool::create(total_threads);
     if (!created) return std::unexpected(std::move(created.error()));
-    cache.pools[total_threads] = *created;
-    local = {total_threads, *created};
-    return *created;
+    auto* raw = created->get();
+    cache.pools.emplace(total_threads, *created);
+    if (total_threads > 1 || !local.pool) local = {total_threads, std::move(*created)};
+    return raw;
+}
+
+auto default_thread_pool(std::size_t total_threads) -> Result<std::shared_ptr<ThreadPool>> {
+    if (total_threads == 0) total_threads = thread_count();
+    if (total_threads == 0 || total_threads > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "CPU thread count exceeds supported range"});
+    if (total_threads == 1) return std::shared_ptr<ThreadPool>{};
+    auto borrowed = borrow_thread_pool(total_threads);
+    if (!borrowed) return std::unexpected(std::move(borrowed.error()));
+    // PoolCache retains strong ownership for the lifetime of the process; wrap with a no-op deleter when needed,
+    // or return a non-owning shared_ptr alias so Executable never destroys global worker threads.
+    return std::shared_ptr<ThreadPool>(std::shared_ptr<ThreadPool>{}, *borrowed);
 }
 
 } // namespace
 
 auto set_thread_count(std::size_t total_threads) noexcept -> void {
+    ensure_interactive_qos();
     configured_thread_count.store(total_threads, std::memory_order_relaxed);
 }
 
 auto thread_count() noexcept -> std::size_t {
     const auto configured = configured_thread_count.load(std::memory_order_relaxed);
-    return configured == 0 ? std::max(1U, std::thread::hardware_concurrency()) : configured;
+    return configured == 0 ? default_thread_count() : configured;
 }
 
 auto reserve_thread_pool(std::size_t total_threads) -> Result<void> {
-    static std::mutex mutex;
-    static std::unordered_map<std::size_t, std::shared_ptr<ThreadPool>> reservations;
     if (total_threads == 0) total_threads = thread_count();
-    std::scoped_lock lock(mutex);
-    if (reservations.contains(total_threads)) return {};
-    auto pool = default_thread_pool(total_threads);
+    if (total_threads <= 1) return {};
+    auto pool = borrow_thread_pool(total_threads);
     if (!pool) return std::unexpected(std::move(pool.error()));
-    reservations.emplace(total_threads, std::move(*pool));
     return {};
 }
 
 auto parallel_for(std::size_t size, std::function<void(std::size_t)> body) -> Result<void> {
-    auto pool = default_thread_pool(0);
+    if (size == 0) return {};
+    const auto threads = thread_count();
+    if (size == 1 || threads <= 1) {
+        for (std::size_t index = 0; index < size; ++index) body(index);
+        return {};
+    }
+    auto pool = borrow_thread_pool(threads);
     if (!pool) return std::unexpected(std::move(pool.error()));
-    (*pool)->parallel_for(size, std::move(body));
+    (*pool)->parallel_for(size, body);
+    return {};
+}
+
+auto parallel_tasks(std::size_t tasks, void* context, void (*body)(void*, std::size_t)) -> Result<void> {
+    if (tasks == 0) return {};
+    const auto threads = thread_count();
+    if (tasks == 1 || threads <= 1) {
+        for (std::size_t index = 0; index < tasks; ++index) body(context, index);
+        return {};
+    }
+    auto pool = borrow_thread_pool(threads);
+    if (!pool) return std::unexpected(std::move(pool.error()));
+    (*pool)->run_tasks(tasks, context, body);
+    return {};
+}
+
+auto parallel_ranges(std::size_t items, std::size_t min_grain, void* context,
+                     void (*body)(void*, std::size_t, std::size_t)) -> Result<void> {
+    struct Payload {
+        void* ctx;
+        void (*fn)(void*, std::size_t, std::size_t);
+    } payload{context, body};
+    return parallel_ranges_with_worker(items, min_grain, 0, &payload,
+                                       [](void* raw, const WorkerContext&, std::size_t begin, std::size_t end) {
+                                           const auto p = *static_cast<const Payload*>(raw);
+                                           p.fn(p.ctx, begin, end);
+                                       });
+}
+
+auto parallel_ranges_with_worker(std::size_t items, std::size_t min_grain, std::size_t scratch_bytes, void* context,
+                                 void (*body)(void*, const WorkerContext&, std::size_t, std::size_t)) -> Result<void> {
+    if (items == 0) return {};
+    min_grain = std::max<std::size_t>(1, min_grain);
+    const auto threads = thread_count();
+    auto pool = borrow_thread_pool(threads);
+    if (!pool) return std::unexpected(std::move(pool.error()));
+    (*pool)->run_ranges(items, min_grain, scratch_bytes, context, body);
+    return {};
+}
+
+auto parallel_team(std::size_t max_threads, std::size_t scratch_bytes, void* context,
+                   void (*body)(void*, const WorkerContext&, PhaseBarrier&)) -> Result<void> {
+    if (max_threads == 0) return {};
+    const auto threads = thread_count();
+    const auto team = std::min(max_threads, threads);
+    auto pool = borrow_thread_pool(threads);
+    if (!pool) return std::unexpected(std::move(pool.error()));
+    (*pool)->run_team(team, scratch_bytes, context, body);
     return {};
 }
 
@@ -169,13 +291,17 @@ auto Graph::release() noexcept -> ynn_subgraph_t { return std::exchange(graph_, 
 auto Graph::compile(std::size_t total_threads) && -> Result<Executable> {
     auto thread_pool = default_thread_pool(total_threads);
     if (!thread_pool) return std::unexpected(std::move(thread_pool.error()));
-    if (auto status = check_status(ynn_optimize_subgraph(graph_, (*thread_pool)->get(), 0), "optimize graph");
-        !status) {
+    ynn_threadpool_t handle = nullptr;
+    if (*thread_pool) {
+        auto resolved = (*thread_pool)->ynn_handle();
+        if (!resolved) return std::unexpected(std::move(resolved.error()));
+        handle = *resolved;
+    }
+    if (auto status = check_status(ynn_optimize_subgraph(graph_, handle, 0), "optimize graph"); !status) {
         return std::unexpected(std::move(status.error()));
     }
     ynn_runtime_t runtime = nullptr;
-    if (auto status = check_status(ynn_create_runtime(graph_, (*thread_pool)->get(), 0, &runtime), "create runtime");
-        !status) {
+    if (auto status = check_status(ynn_create_runtime(graph_, handle, 0, &runtime), "create runtime"); !status) {
         return std::unexpected(std::move(status.error()));
     }
     return Executable(release(), runtime, std::move(*thread_pool));

@@ -67,8 +67,12 @@ auto backend_label(kidi::tensor::Device device) -> std::string_view {
 auto configure_cpu_threads(const kidi::cli::Namespace& arguments, std::int32_t threads) -> void {
     kidi::runtime::ynn::set_thread_count(threads);
     const auto& backend = arguments.get<std::string>("backend");
-    if (backend == "auto" || backend == "ynnpack")
-        kidi::runtime::ynn::confine_to_numa_node(static_cast<std::size_t>(threads));
+    if (backend == "auto" || backend == "ynnpack") {
+        const auto resolved = kidi::runtime::ynn::thread_count();
+        kidi::runtime::ynn::confine_to_numa_node(resolved);
+        kidi::runtime::ynn::confine_to_performance_cpus(resolved);
+        (void)kidi::runtime::ynn::reserve_thread_pool(resolved);
+    }
 }
 
 auto inspect(const std::filesystem::path& directory) -> int {

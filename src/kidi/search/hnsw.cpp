@@ -1,4 +1,5 @@
 #include "kidi/search/hnsw.h"
+#include "kidi/runtime/ynn/graph.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -555,6 +556,35 @@ auto HnswIndex::search(std::span<const float> query, HnswWorkspace& workspace, s
     if (status != ynn_status_success)
         return std::unexpected(
             status_error(status, failure, "invalid HNSW query or search parameters", "nonfinite HNSW query distance"));
+    return std::span<const HnswNeighbor>(neighbors, count);
+}
+
+auto HnswIndex::search_parallel(std::span<const float> query, HnswWorkspace& workspace, std::size_t candidates,
+                                std::size_t ef) const -> Result<std::span<const HnswNeighbor>> {
+    const auto& state = *state_;
+    if (!candidates) candidates = state.graph.candidates;
+    if (!ef) ef = state.graph.ef_search;
+    const HnswNeighbor* neighbors = nullptr;
+    std::size_t count = 0;
+    const bool use_parallel = runtime::ynn::thread_count() > 1;
+    std::optional<Error> parallel_error;
+    const ynn::hnsw_task_runner_fn runner =
+        use_parallel ? [](void* exec_ctx, std::size_t tasks, void* body_ctx, void (*body)(void*, std::size_t)) {
+            auto status = runtime::ynn::parallel_tasks(tasks, body_ctx, body);
+            if (!status) {
+                auto* err = static_cast<std::optional<Error>*>(exec_ctx);
+                if (!*err) *err = std::move(status.error());
+            }
+        }
+                     : nullptr;
+    const auto status = ynn::search_hnsw(state.search_index, query.data(), query.size(), candidates, ef, &workspace,
+                                         &neighbors, &count, &parallel_error, runner);
+    if (parallel_error) return std::unexpected(std::move(*parallel_error));
+    if (status != ynn_status_success) {
+        std::optional<Error> none;
+        return std::unexpected(
+            status_error(status, none, "invalid HNSW query or search parameters", "nonfinite HNSW query distance"));
+    }
     return std::span<const HnswNeighbor>(neighbors, count);
 }
 

@@ -4,6 +4,7 @@
 #include "kidi/checkpoint/prepare.h"
 #include "kidi/image/gemma4.h"
 #include "kidi/inference/transcriber.h"
+#include "kidi/model/whisper.h"
 #include "kidi/model/gemma4_vision.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/runtime/ynn/numa.h"
@@ -114,10 +115,7 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
                                          .cache_token_budget = context,
                                          .prefill_tokens_per_step = chunk,
                                          .decode_ahead_tokens = decode_ahead}));
-    const auto config =
-        require(std::filesystem::is_regular_file(directory / "model.yaml")
-                    ? kidi::checkpoint::load_config(directory / "model.yaml")
-                    : kidi::checkpoint::load_config(directory, kidi::model::Gemma4Impl::checkpoint_config()));
+    const auto config = require(kidi::checkpoint::load_config(directory));
     auto tokenizer = require(kidi::text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
     emit({{"stage", "load"},
           {"execution", generator.execution()},
@@ -653,8 +651,7 @@ auto benchmark_dictation(const std::filesystem::path& directory, const std::file
     if (waveform.sample_rate != 16000 || waveform.samples.size() < 32000 || waveform.samples.size() > 480000)
         throw std::runtime_error("benchmark WAV must be 2-30 seconds at 16 kHz");
     const auto started = Clock::now();
-    const auto prepared = require(kidi::checkpoint::prepare(directory, kidi::model::WhisperImpl::checkpoint_config(),
-                                                            kidi::model::WhisperImpl::int8_preparation));
+    const auto prepared = require(kidi::checkpoint::prepare(directory, kidi::model::WhisperImpl::int8_preparation));
     auto transcriber = require(kidi::inference::Transcriber::load(prepared));
     emit({{"stage", "load"}, {"model", "whisper-int8"}, {"ms", rounded(elapsed_ms(started))}}, threads);
     // Defaults match the app: fitted audio and a warm-up at load. Set either variable to 0 to compare.
@@ -710,6 +707,7 @@ auto main(int argc, char** argv) -> int {
             throw std::runtime_error("invalid mode, thread count, repeat count, or WAV argument");
         kidi::runtime::ynn::set_thread_count(threads);
         const auto numa_node = kidi::runtime::ynn::confine_to_numa_node(static_cast<std::size_t>(threads));
+        kidi::runtime::ynn::confine_to_performance_cpus(static_cast<std::size_t>(threads));
         require(kidi::runtime::ynn::reserve_thread_pool(threads));
         emit({{"stage", "runtime"},
               {"arch", kidi::runtime::ynn::supported_arch_names()},

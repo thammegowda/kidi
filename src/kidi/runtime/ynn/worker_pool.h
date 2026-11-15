@@ -1,24 +1,20 @@
 #pragma once
 
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <limits>
-#include <mutex>
+#include <exception>
+#include <functional>
+#include <memory>
 #include <thread>
 #include <vector>
 
-#include "slinky/base/function_ref.h"
-#include "slinky/base/ref_count.h"
-#include "slinky/base/thread_pool.h"
-#include "slinky/base/thread_pool_impl.h"
-
 namespace kidi::runtime::ynn {
 
-/// Lock for the pool's few-instruction critical sections. Waiters poll a plain load instead of hammering the lock word,
-/// and yield once the holder is slow to release it, for example because it was preempted on an oversubscribed machine.
+inline constexpr std::size_t CACHE_LINE_BYTES = 64;
+
+/// Lock for few-instruction critical sections (cold async fallback and exception capture).
 class SpinLock {
 public:
     auto lock() noexcept -> void;
@@ -29,64 +25,128 @@ private:
     std::atomic<bool> locked_ = false;
 };
 
-/// The thread pool behind YNNPACK's slinky runtime.
-///
-/// It keeps the `slinky::thread_pool` contract and loop scheduling of `slinky::thread_pool_impl` (shared work-stealing
-/// loops, nested loops, `wait_for` helping, `atomic_call`), but changes how threads idle and wake. A decoding step
-/// forks hundreds of short loops, so dispatch latency is a large part of its runtime. Idle threads poll an epoch
-/// counter without taking the queue lock, so the enqueuing thread never competes with them for it, and only block on a
-/// condition variable after a bounded spin. Completions only touch the lock when some thread is waiting for one.
-class WorkerPool final : public slinky::thread_pool {
-public:
-    using Loop = slinky::thread_pool_impl::task_impl;
+/// Per-worker execution context passed into parallel range and multi-phase team callbacks.
+struct WorkerContext {
+    std::size_t tid = 0;          // [0, thread_count); 0 is the calling thread
+    std::size_t thread_count = 1; // active team size for this dispatch
+    std::byte* scratch = nullptr; // cache-line-aligned persistent per-worker scratchpad
+    std::size_t scratch_size = 0;
+};
 
-    /// Starts `workers` background threads, which inherit the calling thread's CPU affinity. The thread that runs a
-    /// loop participates in it, so a pool with `workers` threads runs loops on `workers + 1` threads.
+/// Sense-reversing user-space barrier synchronizing all participants of a `WorkerPool::run_team` launch.
+class PhaseBarrier {
+public:
+    explicit PhaseBarrier(std::size_t participants = 1) noexcept;
+
+    auto reset(std::size_t participants) noexcept -> void;
+    auto abort() noexcept -> void;
+    auto aborted() const noexcept -> bool { return aborted_.load(std::memory_order_acquire); }
+    auto arrive_and_wait() noexcept -> bool;
+
+private:
+    std::size_t participants_ = 1;
+    std::atomic<bool> aborted_ = false;
+    alignas(CACHE_LINE_BYTES) std::atomic<std::size_t> remaining_ = 1;
+    alignas(CACHE_LINE_BYTES) std::atomic<std::uint64_t> phase_ = 0;
+};
+
+/// Slinky-free CPU execution core for Kidi and YNNPACK composites.
+///
+/// Provides:
+/// - Explicit `WorkerContext` (`tid`, `thread_count`, and persistent cache-aligned per-worker scratchpads).
+/// - Deterministic per-worker home-range slots with contention-free ring stealing (`run_ranges`).
+/// - Single-dispatch multi-phase team execution (`run_team` + `PhaseBarrier`) so multi-stage ops synchronize in L1/L2
+///   without re-entering the thread pool.
+/// - Hardware-timed `yield` spinning + C++20 `std::atomic::wait` (`ulock`/`futex`) parking with zero mutex wakeups.
+class WorkerPool final {
+public:
+    using TeamFn = void (*)(void* context, const WorkerContext& worker, PhaseBarrier& barrier);
+    using RangeFn = void (*)(void* context, const WorkerContext& worker, std::size_t begin, std::size_t end);
+    using TaskFn = void (*)(void* context, std::size_t task);
+    using AsyncFn = void (*)(void* task_context);
+
+    /// Starts `workers` background threads (`tid = 1 .. workers`); the calling thread participates as `tid = 0`.
     explicit WorkerPool(int workers);
-    ~WorkerPool() override;
+    ~WorkerPool();
 
     WorkerPool(const WorkerPool&) = delete;
     auto operator=(const WorkerPool&) -> WorkerPool& = delete;
 
     /// Number of background worker threads.
-    auto thread_count() const -> int override { return workers_; }
-    auto enqueue(std::size_t n, task_body body, int max_workers = std::numeric_limits<int>::max())
-        -> slinky::ref_count<task> override;
-    using thread_pool::enqueue;
-    auto wait_for(task* t) -> void override;
-    auto wait_for(predicate_ref condition) -> void override;
-    auto atomic_call(slinky::function_ref<void()> t) -> void override;
+    auto thread_count() const noexcept -> int { return workers_; }
+    /// Total execution threads including the calling thread (`workers + 1`).
+    auto total_threads() const noexcept -> std::size_t {
+        return static_cast<std::size_t>(workers_ > 0 ? workers_ + 1 : 1);
+    }
+
+    auto run_team(std::size_t max_threads, std::size_t scratch_bytes, void* context, TeamFn fn) -> void;
+    auto run_ranges(std::size_t items, std::size_t min_grain, std::size_t scratch_bytes, void* context, RangeFn fn)
+        -> void;
+    auto run_tasks(std::size_t n, void* context, TaskFn fn) -> void;
+    auto parallel_for(std::size_t n, const std::function<void(std::size_t)>& body) -> void;
+
+    /// Asynchronous fire-and-forget scheduling hook used only by the legacy `ynn_scheduler` adapter.
+    auto schedule_async(void* task_context, AsyncFn task) -> void;
 
 private:
-    /// Threads that found nothing to run and wait for the epoch to move.
-    struct Waiters {
-        std::condition_variable_any parked;
-        int sleeping = 0;
-    };
-    /// Which blocked threads an epoch change wakes. Spinning threads always notice it.
-    enum class Notify { EVERYONE, ONE, HELPERS };
+    struct ScratchBuffer {
+        std::byte* data = nullptr;
+        std::size_t capacity = 0;
 
-    auto worker_main() -> void;
-    auto dequeue(int& worker) -> slinky::ref_count<Loop>;
-    static auto run(Loop& loop, int worker) -> bool;
-    auto idle(std::unique_lock<SpinLock>& lock, std::uint64_t seen, Waiters& waiters) -> void;
-    auto update(slinky::function_ref<void()> change, Notify notify) -> void;
-    auto loop_completed() -> void;
+        ScratchBuffer() = default;
+        ~ScratchBuffer();
+        ScratchBuffer(ScratchBuffer&& other) noexcept;
+        auto operator=(ScratchBuffer&& other) noexcept -> ScratchBuffer&;
+        ScratchBuffer(const ScratchBuffer&) = delete;
+        auto operator=(const ScratchBuffer&) -> ScratchBuffer& = delete;
+
+        auto ensure(std::size_t required_bytes) -> void;
+    };
+
+    struct alignas(CACHE_LINE_BYTES) RangeSlot {
+        std::atomic<std::size_t> next = 0;
+        std::size_t end = 0;
+        std::size_t home_grain = 1;
+        std::size_t steal_grain = 1;
+    };
+
+    struct AsyncItem {
+        void* context = nullptr;
+        AsyncFn fn = nullptr;
+    };
+
+    auto execute_team_member(std::size_t tid) noexcept -> void;
+    auto record_exception(std::exception_ptr error) noexcept -> void;
+    auto run_one_async() -> bool;
+    auto worker_main(std::size_t tid) -> void;
+    auto idle_worker(std::uint64_t seen) -> void;
 
     int workers_;
     std::vector<std::thread> threads_;
+    std::vector<ScratchBuffer> scratches_;
+    std::unique_ptr<RangeSlot[]> range_slots_;
     std::atomic<bool> stop_ = false;
 
-    alignas(slinky::cache_line_size) SpinLock lock_;
-    std::deque<slinky::ref_count<Loop>> queue_;
-    Waiters worker_waiters_;
-    Waiters helper_waiters_;
+    alignas(CACHE_LINE_BYTES) SpinLock caller_lock_;
+    std::uint64_t team_seq_ = 0;
+    std::size_t active_team_size_ = 0;
+    TeamFn team_fn_ = nullptr;
+    void* team_ctx_ = nullptr;
+    std::size_t team_scratch_bytes_ = 0;
+    SpinLock error_lock_;
+    std::exception_ptr team_error_;
+    PhaseBarrier team_barrier_;
 
-    /// Moves, under `lock_`, whenever a waiting thread may have something new to do: a loop was queued, an atomic call
-    /// ran, or a loop completed while a thread waited for one.
-    alignas(slinky::cache_line_size) std::atomic<std::uint64_t> epoch_ = 0;
-    /// Threads inside `wait_for(predicate)`. Loop completions are only announced while this is non-zero.
-    alignas(slinky::cache_line_size) std::atomic<int> waiting_helpers_ = 0;
+    alignas(CACHE_LINE_BYTES) std::atomic<std::uint64_t> team_id_ = 0;
+    alignas(CACHE_LINE_BYTES) std::atomic<std::size_t> team_remaining_ = 0;
+
+    alignas(CACHE_LINE_BYTES) SpinLock async_lock_;
+    std::deque<AsyncItem> async_queue_;
+    std::atomic<bool> async_nonempty_ = false;
+    std::atomic<std::size_t> async_active_ = 0;
+
+    alignas(CACHE_LINE_BYTES) std::atomic<std::uint64_t> event_seq_ = 0;
+    alignas(CACHE_LINE_BYTES) std::atomic<int> sleeping_ = 0;
 };
 
 } // namespace kidi::runtime::ynn

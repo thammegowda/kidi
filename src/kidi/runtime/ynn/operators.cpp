@@ -4,6 +4,7 @@
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/ops/context.h"
 #include "ynnpack/composites/composites.h"
+#include <atomic>
 #include <array>
 #include <compare>
 #include <functional>
@@ -158,9 +159,47 @@ public:
 
 private:
     static auto select(const Tensor& logits, Tensor& output) -> void {
-        const auto width = logits.size(-1), rows = logits.numel() / width;
-        ::ynn::argmax_rows_f32(rows, width, require(logits.data<float>()).data(),
-                               require(output.data<std::int32_t>()).data());
+        const auto width = static_cast<std::size_t>(logits.size(-1));
+        const auto rows = logits.numel() / width;
+        const auto* data = require(logits.data<float>()).data();
+        auto* tokens = require(output.data<std::int32_t>()).data();
+        const auto threads = ynn::thread_count();
+        if (threads <= 1 || rows * width < 65536) {
+            ::ynn::argmax_rows_f32(rows, width, data, tokens);
+            return;
+        }
+        if (rows == 1) {
+            constexpr std::size_t MAX_CHUNKS = 32;
+            const auto chunks = std::min({threads * 2, MAX_CHUNKS, (width + 8191) / 8192});
+            if (chunks <= 1) {
+                ::ynn::argmax_rows_f32(1, width, data, tokens);
+                return;
+            }
+            const auto step = (width + chunks - 1) / chunks;
+            std::array<float, MAX_CHUNKS> best_vals{};
+            std::array<std::int32_t, MAX_CHUNKS> best_ids{};
+            std::array<bool, MAX_CHUNKS> invalid_flags{};
+            require(ynn::parallel_tasks(chunks, [&](std::size_t c) {
+                const auto begin = c * step;
+                const auto count = begin < width ? std::min(step, width - begin) : 0;
+                ::ynn::argmax_chunk_f32(count, data + begin, begin, &best_vals[c], &best_ids[c], &invalid_flags[c]);
+            }));
+            float best = -std::numeric_limits<float>::infinity();
+            std::int32_t winner = -1;
+            bool invalid = false;
+            for (std::size_t c = 0; c < chunks; ++c) {
+                invalid |= invalid_flags[c];
+                if (best_vals[c] > best) {
+                    best = best_vals[c];
+                    winner = best_ids[c];
+                }
+            }
+            tokens[0] = invalid ? -1 : winner;
+            return;
+        }
+        require(ynn::parallel_ranges(rows, 1, [&](std::size_t r_begin, std::size_t r_end) {
+            ::ynn::argmax_rows_f32(r_end - r_begin, width, data + r_begin * width, tokens + r_begin);
+        }));
     }
 
     OutputPool pool_;
@@ -182,23 +221,29 @@ public:
 private:
     auto quantize(const Tensor& input, Tensor& output) const -> void {
         const auto source = require(input.data<float>());
-        ::ynn::quantize_symmetric_int8_f32(source.size(), scale_, source.data(),
-                                           require(output.data<std::int8_t>()).data());
+        auto* dst = require(output.data<std::int8_t>()).data();
+        const auto count = source.size();
+        if (count < 32768 || ynn::thread_count() <= 1) {
+            ::ynn::quantize_symmetric_int8_f32(count, scale_, source.data(), dst);
+            return;
+        }
+        require(ynn::parallel_ranges(count, 4096, [&](std::size_t begin, std::size_t end) {
+            ::ynn::quantize_symmetric_int8_f32(end - begin, scale_, source.data() + begin, dst + begin);
+        }));
     }
 
     float scale_;
     OutputPool pool_;
 };
-/// Splits `rows` across the thread pool in contiguous blocks; small problems run on the calling thread.
-auto for_rows(std::size_t rows, std::size_t row_work, const std::function<void(std::size_t, std::size_t)>& body)
-    -> void {
-    const auto tasks = rows * row_work < 32768 ? std::size_t{1} : std::min(ynn::thread_count(), rows);
-    if (tasks <= 1) return body(0, rows);
-    const auto block = (rows + tasks - 1) / tasks;
-    require(ynn::parallel_for(tasks, [&](std::size_t task) {
-        const auto begin = task * block;
-        if (begin < rows) body(begin, std::min(rows, begin + block));
-    }));
+/// Splits `rows` across the thread pool using dynamic ranges; small problems run on the calling thread.
+template <typename Body>
+auto for_rows(std::size_t rows, std::size_t row_work, Body&& body) -> void {
+    if (rows == 0) return;
+    if (rows == 1 || rows * row_work < 32768 || ynn::thread_count() <= 1) {
+        body(0, rows);
+        return;
+    }
+    require(ynn::parallel_ranges(rows, 1, std::forward<Body>(body)));
 }
 
 class GatedActivationOp final : public Operator {
@@ -229,14 +274,196 @@ private:
     auto apply(const Tensor& input, Tensor& output) const -> void {
         const auto* source = require(input.data<float>()).data();
         auto* target = require(output.data<float>()).data();
-        for_rows(rows_, 2 * width_, [&](std::size_t begin, std::size_t end) {
-            check(silu_ ? ::ynn::silu_gate_f32(rows_, width_, source, target, begin, end)
-                        : ::ynn::gelu_gate_f32(rows_, width_, source, target, begin, end));
-        });
+        const auto tiles = ::ynn::gated_activation_tile_count(rows_, width_);
+        if (tiles <= 1 || rows_ * 2 * width_ < 8192 || ynn::thread_count() <= 1) {
+            check(silu_ ? ::ynn::silu_gate_tiles_f32(rows_, width_, source, target, 0, tiles)
+                        : ::ynn::gelu_gate_tiles_f32(rows_, width_, source, target, 0, tiles));
+            return;
+        }
+        require(ynn::parallel_ranges(tiles, 1, [&](std::size_t begin, std::size_t end) {
+            check(silu_ ? ::ynn::silu_gate_tiles_f32(rows_, width_, source, target, begin, end)
+                        : ::ynn::gelu_gate_tiles_f32(rows_, width_, source, target, begin, end));
+        }));
     }
 
     std::size_t rows_, width_;
     bool silu_;
+    std::vector<std::int64_t> shape_;
+    OutputPool pool_;
+};
+
+class GatedMultiplyOp final : public Operator {
+public:
+    GatedMultiplyOp(const Tensor& gate, bool silu, tensor::Arena& arena)
+        : elements_(gate.numel()), silu_(silu), shape_(gate.shape().begin(), gate.shape().end()), pool_(&arena) {}
+
+    static auto supports(TensorInputs inputs) noexcept -> bool {
+        return inputs.size() == 2 && inputs[0].dtype() == DType::F32 && inputs[1].dtype() == DType::F32 &&
+               inputs[0].is_contiguous() && inputs[1].is_contiguous() &&
+               std::ranges::equal(inputs[0].shape(), inputs[1].shape());
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, DType::F32, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
+        apply(inputs, destination);
+        return destination;
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(TensorInputs inputs, Tensor& output) const -> void {
+        const auto* gate = require(inputs[0].data<float>()).data();
+        const auto* up = require(inputs[1].data<float>()).data();
+        auto* target = require(output.data<float>()).data();
+        const auto tiles = ::ynn::gated_multiply_tile_count(elements_);
+        if (tiles <= 1 || elements_ < 4096 || ynn::thread_count() <= 1) {
+            check(silu_ ? ::ynn::silu_multiply_tiles_f32(elements_, gate, up, target, 0, tiles)
+                        : ::ynn::gelu_multiply_tiles_f32(elements_, gate, up, target, 0, tiles));
+            return;
+        }
+        require(ynn::parallel_ranges(tiles, 1, [&](std::size_t begin, std::size_t end) {
+            check(silu_ ? ::ynn::silu_multiply_tiles_f32(elements_, gate, up, target, begin, end)
+                        : ::ynn::gelu_multiply_tiles_f32(elements_, gate, up, target, begin, end));
+        }));
+    }
+
+    std::size_t elements_;
+    bool silu_;
+    std::vector<std::int64_t> shape_;
+    OutputPool pool_;
+};
+
+class ElementwiseBinaryF32 final : public Operator {
+public:
+    ElementwiseBinaryF32(TensorInputs inputs, bool is_multiply, tensor::Arena& arena)
+        : is_multiply_(is_multiply), pool_(&arena) {
+        swap_operands_ = inputs[0].numel() == 1 && inputs[1].numel() > 1;
+        const auto& primary = swap_operands_ ? inputs[1] : inputs[0];
+        const auto& secondary = swap_operands_ ? inputs[0] : inputs[1];
+        shape_.assign(primary.shape().begin(), primary.shape().end());
+        elements_ = primary.numel();
+        rhs_stride_ = secondary.numel() == 1 ? 0 : secondary.numel();
+    }
+
+    static auto supports(TensorInputs inputs) noexcept -> bool {
+        if (inputs.size() != 2 || inputs[0].dtype() != DType::F32 || inputs[1].dtype() != DType::F32 ||
+            !inputs[0].is_contiguous() || !inputs[1].is_contiguous())
+            return false;
+        if (std::ranges::equal(inputs[0].shape(), inputs[1].shape())) return true;
+        if (inputs[1].numel() == 1 && inputs[0].dimensions() >= inputs[1].dimensions()) return true;
+        if (inputs[0].numel() == 1 && inputs[1].dimensions() >= inputs[0].dimensions()) return true;
+        if (inputs[1].dimensions() == 1 && inputs[0].dimensions() >= 1 && inputs[0].size(-1) == inputs[1].size(0))
+            return true;
+        return false;
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, DType::F32, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
+        if (destination.dtype() != DType::F32 || !std::ranges::equal(destination.shape(), shape_))
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "in-place operation cannot change shape or dtype"});
+        apply(inputs, destination);
+        return destination;
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(TensorInputs inputs, Tensor& output) const -> void {
+        if (elements_ == 0) return;
+        const auto* lhs = require(inputs[swap_operands_ ? 1 : 0].data<float>()).data();
+        const auto* rhs = require(inputs[swap_operands_ ? 0 : 1].data<float>()).data();
+        auto* dst = require(output.data<float>()).data();
+        if (elements_ < 32768 || ynn::thread_count() <= 1) {
+            ::ynn::elementwise_binary_f32(is_multiply_, elements_, rhs_stride_, lhs, rhs, dst, 0, elements_);
+            return;
+        }
+        require(ynn::parallel_ranges(elements_, 8192, [&](std::size_t begin, std::size_t end) {
+            ::ynn::elementwise_binary_f32(is_multiply_, elements_, rhs_stride_, lhs, rhs, dst, begin, end);
+        }));
+    }
+
+    bool is_multiply_;
+    bool swap_operands_ = false;
+    std::size_t elements_ = 0;
+    std::size_t rhs_stride_ = 0;
+    std::vector<std::int64_t> shape_;
+    OutputPool pool_;
+};
+
+class SliceOp final : public Operator {
+public:
+    SliceOp(const OperatorSpec& spec, const Tensor& input, tensor::Arena& arena)
+        : dtype_(input.dtype()), pool_(&arena) {
+        const auto rank = input.dimensions();
+        const auto raw_axis = spec.attributes[0];
+        const auto axis =
+            static_cast<std::size_t>(raw_axis < 0 ? raw_axis + static_cast<std::int64_t>(rank) : raw_axis);
+        const auto start = static_cast<std::size_t>(spec.attributes[1]);
+        const auto length = static_cast<std::size_t>(spec.attributes[2]);
+        shape_.assign(input.shape().begin(), input.shape().end());
+        shape_[axis] = static_cast<std::int64_t>(length);
+        outer_ = 1;
+        for (std::size_t d = 0; d < axis; ++d) outer_ *= static_cast<std::size_t>(input.shape()[d]);
+        std::size_t inner = 1;
+        for (std::size_t d = axis + 1; d < rank; ++d) inner *= static_cast<std::size_t>(input.shape()[d]);
+        const auto elem_bytes = tensor::element_size(dtype_);
+        src_stride_bytes_ = static_cast<std::size_t>(input.shape()[axis]) * inner * elem_bytes;
+        dst_stride_bytes_ = length * inner * elem_bytes;
+        offset_bytes_ = start * inner * elem_bytes;
+    }
+
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) noexcept -> bool {
+        if (spec.operation != Operation::SLICE || inputs.size() != 1 || spec.attributes.size() < 3 ||
+            !inputs[0].is_contiguous() || inputs[0].dimensions() == 0)
+            return false;
+        const auto rank = static_cast<std::int64_t>(inputs[0].dimensions());
+        const auto axis = spec.attributes[0] < 0 ? spec.attributes[0] + rank : spec.attributes[0];
+        if (axis < 0 || axis >= rank) return false;
+        const auto start = spec.attributes[1], length = spec.attributes[2];
+        const auto extent = static_cast<std::int64_t>(inputs[0].size(axis));
+        return start >= 0 && length >= 0 && start <= extent && length <= extent - start;
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, dtype_, tensor::Device::cpu());
+        apply(inputs[0], output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "slice cannot run in place"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(const Tensor& input, Tensor& output) const -> void {
+        if (outer_ == 0 || dst_stride_bytes_ == 0) return;
+        const auto* src = require(input.host_bytes()).data();
+        auto* dst = require(output.host_bytes()).data();
+        const auto copy_blocks = [&](std::size_t begin, std::size_t end) {
+            for (auto b = begin; b < end; ++b) {
+                std::memcpy(dst + b * dst_stride_bytes_, src + b * src_stride_bytes_ + offset_bytes_,
+                            dst_stride_bytes_);
+            }
+        };
+        if (outer_ <= 1 || outer_ * dst_stride_bytes_ < 65536 || ynn::thread_count() <= 1) {
+            copy_blocks(0, outer_);
+            return;
+        }
+        require(ynn::parallel_ranges(outer_, 1, copy_blocks));
+    }
+
+    DType dtype_;
+    std::size_t outer_ = 0, src_stride_bytes_ = 0, dst_stride_bytes_ = 0, offset_bytes_ = 0;
     std::vector<std::int64_t> shape_;
     OutputPool pool_;
 };
@@ -608,7 +835,6 @@ public:
             decode_rows_ ? batch_size_ * query_length_ * heads_ : ::ynn::quantized_attention_f32_work_items(params);
         tasks_ = std::min(ynn::thread_count(), work_items_);
         task_scratch_bytes_ = ::ynn::quantized_attention_f32_scratch_size(params);
-        scratch_.resize(tasks_ * task_scratch_bytes_);
     }
     auto run(TensorInputs inputs) -> Tensor override {
         auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
@@ -630,24 +856,22 @@ private:
         const auto value_data = require(inputs[2].data<std::int8_t>());
         const auto mask_data = require(inputs[3].data<float>());
         auto output_data = require(output.data<float>());
-        const auto rows_per_task = (work_items_ + tasks_ - 1) / tasks_;
-        require(ynn::parallel_for(tasks_, [&](std::size_t task) {
-            const auto row_start = task * rows_per_task;
-            const auto row_end = std::min(row_start + rows_per_task, work_items_);
-            auto* scratch = scratch_.data() + task * task_scratch_bytes_;
+        const auto active_threads =
+            (work_items_ <= 1 || work_items_ * key_length_ * head_dim_ <= 16384) ? std::size_t{1} : tasks_;
+        auto decode = params;
+        decode.batch_size = 1;
+        decode.query_length = 1;
+        decode.key_batch_stride = 0;
+        decode.mask_batch_stride = 0;
+        decode.mask_query_stride = 0;
+        const auto query_stride = heads_ * head_dim_;
+        const auto run_range = [&](void* scratch, std::size_t begin, std::size_t end) {
             if (!decode_rows_ || query_length_ == 1) {
                 ::ynn::quantized_attention_f32(params, query_data.data(), key_data.data(), value_data.data(),
-                                               mask_data.data(), output_data.data(), row_start, row_end, scratch);
+                                               mask_data.data(), output_data.data(), begin, end, scratch);
                 return;
             }
-            auto decode = params;
-            decode.batch_size = 1;
-            decode.query_length = 1;
-            decode.key_batch_stride = 0;
-            decode.mask_batch_stride = 0;
-            decode.mask_query_stride = 0;
-            const auto query_stride = heads_ * head_dim_;
-            for (auto work = row_start; work < row_end; ++work) {
+            for (auto work = begin; work < end; ++work) {
                 const auto query_row = work / heads_;
                 const auto query_head = work % heads_;
                 const auto batch = query_row / query_length_;
@@ -659,7 +883,15 @@ private:
                     value_data.data() + key_offset, mask_data.data() + mask_offset,
                     output_data.data() + query_row * query_stride, query_head, query_head + 1, scratch);
             }
-        }));
+        };
+        if (active_threads <= 1) {
+            if (fallback_scratch_.size() < task_scratch_bytes_) fallback_scratch_.resize(task_scratch_bytes_);
+            run_range(fallback_scratch_.data(), 0, work_items_);
+            return;
+        }
+        require(ynn::parallel_ranges_with_worker(work_items_, 1, task_scratch_bytes_,
+                                                 [&](const ynn::WorkerContext& worker, std::size_t begin,
+                                                     std::size_t end) { run_range(worker.scratch, begin, end); }));
     }
     auto parameters() const -> ::ynn::quantized_attention_f32_params {
         return {
@@ -691,7 +923,7 @@ private:
     std::vector<std::int32_t> key_zero_points_, value_zero_points_;
     std::size_t key_block_size_, value_block_size_;
     std::size_t work_items_, tasks_, task_scratch_bytes_;
-    std::vector<std::byte> scratch_;
+    std::vector<std::byte> fallback_scratch_;
     OutputPool pool_;
 };
 /// Attention for a few FP32 query rows, as in an autoregressive decoding step. The generic graph copies every key and
@@ -775,28 +1007,26 @@ private:
         const auto* key_data = require(inputs[1].data<float>()).data();
         const auto* value_data = require(inputs[2].data<float>()).data();
         auto* output_data = require(output.data<float>()).data();
-        const auto tasks =
-            (items == 1 || items * keys * head_width <= 524288) ? std::size_t{1} : std::min(ynn::thread_count(), items);
-        const auto scratch_per_task = ::ynn::attention_f32_scratch_size(params);
-        scratch_.resize(tasks * scratch_per_task);
-        const auto per_task = (items + tasks - 1) / tasks;
-        const auto run_task = [&](std::size_t task) {
-            const auto begin = task * per_task, end = std::min(items, begin + per_task);
-            if (begin >= end) return;
-            ::ynn::attention_f32(params, query_data, key_data, value_data, mask, output_data, begin, end,
-                                 scratch_.data() + task * scratch_per_task);
-        };
-        if (tasks <= 1) {
-            run_task(0);
+        const auto total_q_heads = batch * rows * heads_;
+        const auto scratch_floats = ::ynn::attention_f32_scratch_size(params);
+        const auto scratch_bytes = scratch_floats * sizeof(float);
+        if (items == 1 || total_q_heads * keys * head_width <= 32768 || ynn::thread_count() <= 1) {
+            if (fallback_scratch_.size() < scratch_floats) fallback_scratch_.resize(scratch_floats);
+            ::ynn::attention_f32(params, query_data, key_data, value_data, mask, output_data, 0, items,
+                                 fallback_scratch_.data());
             return;
         }
-        require(ynn::parallel_for(tasks, run_task));
+        require(ynn::parallel_ranges_with_worker(
+            items, 1, scratch_bytes, [&](const ynn::WorkerContext& worker, std::size_t begin, std::size_t end) {
+                ::ynn::attention_f32(params, query_data, key_data, value_data, mask, output_data, begin, end,
+                                     reinterpret_cast<float*>(worker.scratch));
+            }));
     }
 
     std::size_t heads_, key_heads_, key_start_, key_length_;
     bool explicit_scale_;
     float scale_;
-    std::vector<float> scratch_;
+    std::vector<float> fallback_scratch_;
     OutputPool pool_;
 };
 
@@ -809,14 +1039,58 @@ struct PackedTileKey {
     std::int64_t zero_offset = 0;
     std::size_t block_size = 0;
     std::int32_t bits = 0;
+    bool fp32_symmetric = false;
     auto operator<=>(const PackedTileKey&) const = default;
 };
+
+struct alignas(64) ParallelRangeSlot {
+    std::atomic<std::size_t> next = 0;
+    std::size_t end = 0;
+};
+
+class ParallelRangeSlots {
+public:
+    static constexpr std::size_t INLINE_CAP = 32;
+
+    ParallelRangeSlots(std::size_t items, std::size_t workers) : count_(workers) {
+        if (workers > INLINE_CAP) heap_ = std::make_unique<ParallelRangeSlot[]>(workers);
+        auto* s = data();
+        for (std::size_t w = 0; w < workers; ++w) {
+            s[w].next.store((items * w) / workers, std::memory_order_relaxed);
+            s[w].end = (items * (w + 1)) / workers;
+        }
+    }
+
+    auto data() noexcept -> ParallelRangeSlot* { return heap_ ? heap_.get() : inline_.data(); }
+    auto size() const noexcept -> std::size_t { return count_; }
+
+private:
+    std::size_t count_ = 0;
+    std::array<ParallelRangeSlot, INLINE_CAP> inline_{};
+    std::unique_ptr<ParallelRangeSlot[]> heap_;
+};
+
+template <typename Fn>
+auto drain_range_slots(ParallelRangeSlots& slots, std::size_t tid, std::size_t grain, Fn&& fn) -> void {
+    const auto count = slots.size();
+    auto* arr = slots.data();
+    for (std::size_t offset = 0; offset < count; ++offset) {
+        auto& slot = arr[(tid + offset) % count];
+        const auto limit = slot.end;
+        for (;;) {
+            auto cur = slot.next.load(std::memory_order_relaxed);
+            if (cur >= limit) break;
+            const auto next = std::min(limit, cur + grain);
+            if (slot.next.compare_exchange_weak(cur, next, std::memory_order_relaxed)) fn(cur, next);
+        }
+    }
+}
 
 class BlockwiseLinear final : public Operator {
 public:
     static auto supports(const OperatorSpec& spec, TensorInputs inputs) noexcept -> bool {
-        if (spec.operation != Operation::PACKED_LINEAR || (inputs.size() != 3 && inputs.size() != 4) ||
-            spec.attributes.size() < 3 || spec.epsilon > 0.F)
+        if (spec.operation != Operation::PACKED_LINEAR || spec.dynamic_parameters ||
+            (inputs.size() != 3 && inputs.size() != 4) || spec.attributes.size() < 3 || spec.epsilon > 0.F)
             return false;
         const auto bits = static_cast<std::int32_t>(spec.attributes[0]);
         if (!::ynn::is_blockwise_linear_supported(bits)) return false;
@@ -854,7 +1128,7 @@ public:
         const auto workers = std::min(ynn::thread_count(), tiles_32);
         if (workers > 1 && tiles_32 >= 8) {
             const auto per_worker = (tiles_32 + workers - 1) / workers;
-            require(ynn::parallel_for(workers, [&](std::size_t task) {
+            require(ynn::parallel_tasks(workers, [&](std::size_t task) {
                 const auto t_begin = task * per_worker, t_end = std::min(tiles_32, t_begin + per_worker);
                 if (t_begin < t_end)
                     ::ynn::pack_blockwise_linear_tiles(bits, N, K, block_size, w_bytes, s_bytes, s_f16, z_bytes, z_f16,
@@ -898,40 +1172,53 @@ private:
         const auto M = input.numel() / K_;
         const auto* x = require(input.data<float>()).data();
         auto* y = require(output.data<float>()).data();
-        act_q_.resize(M * K_);
-        act_scale_.resize(M * B_);
+        if (act_q_.size() < M * K_) act_q_.resize(M * K_);
+        if (act_scale_.size() < M * B_) act_scale_.resize(M * B_);
         const bool use_bsum = has_zero_ || bits_ == 8;
-        if (use_bsum) act_bsum_.resize(M * B_);
+        if (use_bsum && act_bsum_.size() < M * B_) act_bsum_.resize(M * B_);
         float* bsum_ptr = use_bsum ? act_bsum_.data() : nullptr;
 
-        const auto q_workers = (M >= 8 && M * K_ >= 65536) ? std::min(ynn::thread_count(), M) : std::size_t{1};
-        if (q_workers > 1) {
-            const auto per_worker = (M + q_workers - 1) / q_workers;
-            require(ynn::parallel_for(q_workers, [&](std::size_t task) {
-                const auto m_begin = task * per_worker, m_end = std::min(M, m_begin + per_worker);
-                if (m_begin < m_end)
-                    ::ynn::quantize_blockwise_activations_f32(bits_, M, K_, block_size_, use_bsum, x, act_q_.data(),
-                                                              act_scale_.data(), bsum_ptr, m_begin, m_end);
-            }));
-        } else {
-            ::ynn::quantize_blockwise_activations_f32(bits_, M, K_, block_size_, use_bsum, x, act_q_.data(),
-                                                      act_scale_.data(), bsum_ptr, 0, M);
-        }
-
+        const auto total_blocks = M * B_;
         const auto tiles = ::ynn::blockwise_linear_tile_count(N_);
-        const auto tasks = (M == 1 && K_ * N_ <= 64 * 1024) ? std::size_t{1} : std::min(ynn::thread_count(), tiles);
-        const auto per_task = (tiles + tasks - 1) / tasks;
-        const auto run_tiles = [&](std::size_t task) {
-            const auto t_begin = task * per_task, t_end = std::min(tiles, t_begin + per_task);
-            if (t_begin < t_end)
-                ::ynn::blockwise_linear_f32(bits_, M, N_, K_, block_size_, has_zero_, output_scale_, packed_ptr_,
-                                            act_q_.data(), act_scale_.data(), bsum_ptr, y, t_begin, t_end);
-        };
-        if (tasks <= 1) {
-            run_tiles(0);
+        const auto threads = ynn::thread_count();
+        if (threads <= 1 || tiles <= 1 || (M == 1 && K_ * N_ <= 64 * 1024)) {
+            ::ynn::quantize_blockwise_blocks_f32(bits_, M, K_, block_size_, use_bsum, x, act_q_.data(),
+                                                 act_scale_.data(), bsum_ptr, 0, total_blocks);
+            ::ynn::blockwise_linear_f32(bits_, M, N_, K_, block_size_, has_zero_, output_scale_, packed_ptr_,
+                                        act_q_.data(), act_scale_.data(), bsum_ptr, y, 0, tiles);
             return;
         }
-        require(ynn::parallel_for(tasks, run_tiles));
+
+        const auto min_tile_grain = tiles >= threads * 8 ? std::size_t{2} : std::size_t{1};
+        if (M * K_ < 8192 || total_blocks < 4) {
+            ::ynn::quantize_blockwise_blocks_f32(bits_, M, K_, block_size_, use_bsum, x, act_q_.data(),
+                                                 act_scale_.data(), bsum_ptr, 0, total_blocks);
+            require(ynn::parallel_ranges(tiles, min_tile_grain, [&](std::size_t t_begin, std::size_t t_end) {
+                ::ynn::blockwise_linear_f32(bits_, M, N_, K_, block_size_, has_zero_, output_scale_, packed_ptr_,
+                                            act_q_.data(), act_scale_.data(), bsum_ptr, y, t_begin, t_end);
+            }));
+            return;
+        }
+
+        // Single-launch team execution with PhaseBarrier and cache-aligned home slots + stealing:
+        // Phase 1: each worker quantizes its deterministic block range, then steals stragglers.
+        // Barrier: single sense-reversing PhaseBarrier (no second thread-pool dispatch).
+        // Phase 2: each worker computes its home output-tile range (preserving L2 weight affinity), then steals.
+        const auto workers = std::min(threads, tiles);
+        const auto q_grain = std::max<std::size_t>(1, total_blocks / (workers * 4));
+        const auto t_grain = std::max<std::size_t>(min_tile_grain, tiles / (workers * 8));
+        ParallelRangeSlots q_slots(total_blocks, workers), t_slots(tiles, workers);
+        require(ynn::parallel_team(workers, 0, [&](const ynn::WorkerContext& worker, ynn::PhaseBarrier& barrier) {
+            drain_range_slots(q_slots, worker.tid, q_grain, [&](std::size_t b_begin, std::size_t b_end) {
+                ::ynn::quantize_blockwise_blocks_f32(bits_, M, K_, block_size_, use_bsum, x, act_q_.data(),
+                                                     act_scale_.data(), bsum_ptr, b_begin, b_end);
+            });
+            if (!barrier.arrive_and_wait()) return;
+            drain_range_slots(t_slots, worker.tid, t_grain, [&](std::size_t t_begin, std::size_t t_end) {
+                ::ynn::blockwise_linear_f32(bits_, M, N_, K_, block_size_, has_zero_, output_scale_, packed_ptr_,
+                                            act_q_.data(), act_scale_.data(), bsum_ptr, y, t_begin, t_end);
+            });
+        }));
     }
 
     Tensor packed_;
@@ -944,6 +1231,342 @@ private:
     std::vector<std::int8_t> act_q_;
     std::vector<float> act_scale_;
     std::vector<float> act_bsum_;
+};
+
+class SymmetricPackedLinear final : public Operator {
+public:
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) noexcept -> bool {
+        if (spec.operation != Operation::PACKED_LINEAR || spec.dynamic_parameters || inputs.size() != 3 ||
+            spec.attributes.size() < 3 || spec.epsilon <= 0.F)
+            return false;
+        const auto bits = static_cast<std::int32_t>(spec.attributes[0]);
+        if (!::ynn::is_symmetric_linear_supported(bits)) return false;
+        const auto block_size = static_cast<std::size_t>(spec.attributes[1]);
+        const auto values_per_byte = static_cast<std::size_t>(8 / bits);
+        const auto in_features = static_cast<std::size_t>(inputs[0].size(-1));
+        if (block_size == 0 || in_features == 0 || (in_features % block_size != 0) ||
+            (block_size % values_per_byte != 0))
+            return false;
+        if (inputs[0].dtype() != DType::F32 || !inputs[0].is_contiguous() || !inputs[1].is_contiguous() ||
+            !inputs[2].is_contiguous())
+            return false;
+        if (inputs[1].dimensions() != 2 || inputs[1].size(1) * values_per_byte != in_features) return false;
+        const bool valid_weight = inputs[1].dtype() == DType::U8 || (bits == 8 && inputs[1].dtype() == DType::I8);
+        const bool valid_scale = inputs[2].dtype() == DType::F32 || inputs[2].dtype() == DType::F16;
+        return valid_weight && valid_scale && inputs[2].numel() == inputs[1].size(0) * (in_features / block_size);
+    }
+
+    static auto pack_tiles(std::int32_t bits, const Tensor& weight, const Tensor& scales, std::size_t block_size)
+        -> Tensor {
+        const auto values_per_byte = static_cast<std::size_t>(8 / bits);
+        const auto out_features = static_cast<std::size_t>(weight.size(0));
+        const auto in_features = static_cast<std::size_t>(weight.size(1)) * values_per_byte;
+        const auto total_bytes = ::ynn::packed_symmetric_linear_size(bits, out_features, in_features, block_size);
+        auto packed = require(Tensor::empty({static_cast<std::int64_t>(total_bytes)}, DType::U8));
+        const auto* w_bytes = require(std::as_const(weight).host_bytes()).data();
+        const auto* s_bytes = require(std::as_const(scales).host_bytes()).data();
+        const bool s_f16 = scales.dtype() == DType::F16;
+        auto* dst = require(packed.host_bytes()).data();
+        const auto tiles = ::ynn::blockwise_linear_tile_count(out_features);
+        const auto workers = std::min(ynn::thread_count(), tiles);
+        if (workers > 1 && tiles >= 8) {
+            const auto per_worker = (tiles + workers - 1) / workers;
+            require(ynn::parallel_tasks(workers, [&](std::size_t task) {
+                const auto t_begin = task * per_worker, t_end = std::min(tiles, t_begin + per_worker);
+                if (t_begin < t_end)
+                    ::ynn::pack_symmetric_linear_tiles(bits, out_features, in_features, 0, block_size, w_bytes, s_bytes,
+                                                       s_f16, t_begin, t_end, dst);
+            }));
+        } else {
+            ::ynn::pack_symmetric_linear_tiles(bits, out_features, in_features, 0, block_size, w_bytes, s_bytes, s_f16,
+                                               0, tiles, dst);
+        }
+        return packed;
+    }
+
+    SymmetricPackedLinear(const OperatorSpec& spec, const Tensor& sample_input, const Tensor& weight,
+                          Tensor packed_tiles, tensor::Arena& arena)
+        : packed_(std::move(packed_tiles)),
+          packed_ptr_(require(std::as_const(packed_).host_bytes()).data()),
+          bits_(static_cast<std::int32_t>(spec.attributes[0])),
+          out_features_(static_cast<std::size_t>(weight.size(0))),
+          in_features_(static_cast<std::size_t>(sample_input.size(-1))),
+          block_size_(static_cast<std::size_t>(spec.attributes[1])),
+          blocks_(in_features_ / block_size_),
+          padded_block_(::ynn::symmetric_linear_padded_block(block_size_)),
+          input_scale_(spec.epsilon > 0.F ? spec.epsilon : 0.F),
+          output_scale_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]))),
+          pool_(&arena) {}
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        std::vector<std::int64_t> out_shape(inputs[0].shape().begin(), inputs[0].shape().end());
+        out_shape.back() = static_cast<std::int64_t>(out_features_);
+        auto output = pool_.acquire(out_shape, DType::F32, tensor::Device::cpu());
+        apply(inputs[0], output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "packed linear cannot run in place"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs.back()); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(const Tensor& input, Tensor& output) -> void {
+        const auto rows = input.numel() / in_features_;
+        if (rows == 0) return;
+        const auto* x = require(input.data<float>()).data();
+        auto* y = require(output.data<float>()).data();
+        const auto total_blocks = rows * blocks_;
+        if (act_q_.size() < total_blocks * padded_block_) act_q_.resize(total_blocks * padded_block_);
+        if (act_scale_.size() < total_blocks) act_scale_.resize(total_blocks);
+
+        const auto tiles = ::ynn::blockwise_linear_tile_count(out_features_);
+        const auto threads = ynn::thread_count();
+        if (threads <= 1 || tiles <= 1 || (rows == 1 && in_features_ * out_features_ <= 64 * 1024)) {
+            ::ynn::quantize_symmetric_blocks_f32(bits_, rows, in_features_, block_size_, input_scale_, x, act_q_.data(),
+                                                 act_scale_.data(), 0, total_blocks);
+            ::ynn::symmetric_linear_f32(bits_, rows, out_features_, in_features_, block_size_, output_scale_,
+                                        packed_ptr_, act_q_.data(), act_scale_.data(), y, out_features_, 0, tiles);
+            return;
+        }
+
+        const auto min_tile_grain = tiles >= threads * 8 ? std::size_t{2} : std::size_t{1};
+        if (rows * in_features_ < 8192 || total_blocks < 4) {
+            ::ynn::quantize_symmetric_blocks_f32(bits_, rows, in_features_, block_size_, input_scale_, x, act_q_.data(),
+                                                 act_scale_.data(), 0, total_blocks);
+            require(ynn::parallel_ranges(tiles, min_tile_grain, [&](std::size_t t_begin, std::size_t t_end) {
+                ::ynn::symmetric_linear_f32(bits_, rows, out_features_, in_features_, block_size_, output_scale_,
+                                            packed_ptr_, act_q_.data(), act_scale_.data(), y, out_features_, t_begin,
+                                            t_end);
+            }));
+            return;
+        }
+
+        const auto workers = std::min(threads, tiles);
+        const auto q_grain = std::max<std::size_t>(1, total_blocks / (workers * 4));
+        const auto t_grain = std::max<std::size_t>(min_tile_grain, tiles / (workers * 8));
+        ParallelRangeSlots q_slots(total_blocks, workers), t_slots(tiles, workers);
+        require(ynn::parallel_team(workers, 0, [&](const ynn::WorkerContext& worker, ynn::PhaseBarrier& barrier) {
+            drain_range_slots(q_slots, worker.tid, q_grain, [&](std::size_t b_begin, std::size_t b_end) {
+                ::ynn::quantize_symmetric_blocks_f32(bits_, rows, in_features_, block_size_, input_scale_, x,
+                                                     act_q_.data(), act_scale_.data(), b_begin, b_end);
+            });
+            if (!barrier.arrive_and_wait()) return;
+            drain_range_slots(t_slots, worker.tid, t_grain, [&](std::size_t t_begin, std::size_t t_end) {
+                ::ynn::symmetric_linear_f32(bits_, rows, out_features_, in_features_, block_size_, output_scale_,
+                                            packed_ptr_, act_q_.data(), act_scale_.data(), y, out_features_, t_begin,
+                                            t_end);
+            });
+        }));
+    }
+
+    Tensor packed_;
+    const void* packed_ptr_;
+    std::int32_t bits_;
+    std::size_t out_features_, in_features_, block_size_, blocks_, padded_block_;
+    float input_scale_, output_scale_;
+    OutputPool pool_;
+    std::vector<std::int8_t> act_q_;
+    std::vector<float> act_scale_;
+};
+
+class PackedFeedForward final : public Operator {
+public:
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) noexcept -> bool {
+        if (spec.operation != Operation::GATED_FEED_FORWARD || spec.dynamic_parameters || inputs.size() != 5 ||
+            spec.attributes.size() < 6 || spec.epsilon <= 0.F)
+            return false;
+        const auto bits = static_cast<std::int32_t>(spec.attributes[0]);
+        if (!::ynn::is_symmetric_linear_supported(bits)) return false;
+        const auto input_size = static_cast<std::size_t>(spec.attributes[1]);
+        const auto intermediate = static_cast<std::size_t>(spec.attributes[2]);
+        const auto values_per_byte = static_cast<std::size_t>(8 / bits);
+        return input_size > 0 && intermediate > 0 && (input_size % values_per_byte == 0) &&
+               (intermediate % values_per_byte == 0) && inputs[0].dtype() == DType::F32 && inputs[0].is_contiguous() &&
+               inputs[1].is_contiguous() && inputs[2].is_contiguous() && inputs[3].is_contiguous() &&
+               inputs[4].is_contiguous() && inputs[2].dtype() == DType::F32 && inputs[4].dtype() == DType::F32;
+    }
+
+    PackedFeedForward(const OperatorSpec& spec, TensorInputs inputs, ynn::FeedForwardCache& cache, tensor::Arena& arena)
+        : bits_(static_cast<std::int32_t>(spec.attributes[0])),
+          input_size_(static_cast<std::size_t>(spec.attributes[1])),
+          intermediate_(static_cast<std::size_t>(spec.attributes[2])),
+          in_padded_(::ynn::symmetric_linear_padded_block(input_size_)),
+          mid_padded_(::ynn::symmetric_linear_padded_block(intermediate_)),
+          gate_input_scale_(spec.epsilon),
+          gate_output_scale_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[3]))),
+          down_input_scale_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[4]))),
+          down_output_scale_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[5]))),
+          silu_(spec.attributes.size() >= 7 && spec.attributes[6] != 0),
+          pool_(&arena) {
+        const auto gate_bytes = ::ynn::packed_symmetric_linear_size(bits_, intermediate_, input_size_, input_size_);
+        const auto up_bytes = gate_bytes;
+        const auto down_bytes = ::ynn::packed_symmetric_linear_size(bits_, input_size_, intermediate_, intermediate_);
+        const auto payload_size = gate_bytes + up_bytes + down_bytes;
+        const bool lookup_cache = cache.enabled();
+        const auto source_hash = lookup_cache ? hash_tensor(inputs[3], hash_tensor(inputs[1])) : 0;
+        const ynn::FeedForwardCacheSpec cache_spec{.bits = static_cast<std::uint32_t>(bits_),
+                                                   .input_size = input_size_,
+                                                   .intermediate_size = intermediate_,
+                                                   .source_hash = source_hash};
+        if (lookup_cache) {
+            if (auto cached = cache.load(cache_spec, payload_size)) {
+                owner_ = std::move(cached.owner);
+                gate_ptr_ = cached.bytes.data();
+                up_ptr_ = gate_ptr_ + gate_bytes;
+                down_ptr_ = up_ptr_ + up_bytes;
+                return;
+            }
+        }
+        packed_storage_ = require(Tensor::empty({static_cast<std::int64_t>(payload_size)}, DType::U8));
+        auto* base = reinterpret_cast<std::uint8_t*>(require(packed_storage_.host_bytes()).data());
+        auto* gate_dst = base;
+        auto* up_dst = gate_dst + gate_bytes;
+        auto* down_dst = up_dst + up_bytes;
+        const auto* gu_w = require(inputs[1].host_bytes()).data();
+        const auto* gu_s = require(inputs[2].host_bytes()).data();
+        const auto* d_w = require(inputs[3].host_bytes()).data();
+        const auto* d_s = require(inputs[4].host_bytes()).data();
+        const auto mid_tiles = ::ynn::blockwise_linear_tile_count(intermediate_);
+        const auto out_tiles = ::ynn::blockwise_linear_tile_count(input_size_);
+        const auto workers = std::min(ynn::thread_count(), std::max(mid_tiles, out_tiles));
+        if (workers > 1 && (mid_tiles + out_tiles) >= 8) {
+            require(ynn::parallel_tasks(workers, [&](std::size_t task) {
+                const auto m_begin = (mid_tiles * task) / workers;
+                const auto m_end = (mid_tiles * (task + 1)) / workers;
+                if (m_begin < m_end) {
+                    ::ynn::pack_symmetric_linear_tiles(bits_, intermediate_, input_size_, 0, input_size_, gu_w, gu_s,
+                                                       false, m_begin, m_end, gate_dst);
+                    ::ynn::pack_symmetric_linear_tiles(bits_, intermediate_, input_size_, intermediate_, input_size_,
+                                                       gu_w, gu_s, false, m_begin, m_end, up_dst);
+                }
+                const auto o_begin = (out_tiles * task) / workers;
+                const auto o_end = (out_tiles * (task + 1)) / workers;
+                if (o_begin < o_end) {
+                    ::ynn::pack_symmetric_linear_tiles(bits_, input_size_, intermediate_, 0, intermediate_, d_w, d_s,
+                                                       false, o_begin, o_end, down_dst);
+                }
+            }));
+        } else {
+            ::ynn::pack_symmetric_linear_tiles(bits_, intermediate_, input_size_, 0, input_size_, gu_w, gu_s, false, 0,
+                                               mid_tiles, gate_dst);
+            ::ynn::pack_symmetric_linear_tiles(bits_, intermediate_, input_size_, intermediate_, input_size_, gu_w,
+                                               gu_s, false, 0, mid_tiles, up_dst);
+            ::ynn::pack_symmetric_linear_tiles(bits_, input_size_, intermediate_, 0, intermediate_, d_w, d_s, false, 0,
+                                               out_tiles, down_dst);
+        }
+        if (cache.writable()) cache.store(cache_spec, {base, payload_size});
+        gate_ptr_ = gate_dst;
+        up_ptr_ = up_dst;
+        down_ptr_ = down_dst;
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
+        apply(inputs[0], output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "gated feed-forward cannot run in place"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs.back()); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(const Tensor& input, Tensor& output) -> void {
+        const auto rows = input.numel() / input_size_;
+        if (rows == 0) return;
+        const auto* x = require(input.data<float>()).data();
+        auto* y = require(output.data<float>()).data();
+        if (in_q_.size() < rows * in_padded_) in_q_.resize(rows * in_padded_);
+        if (in_scale_.size() < rows) in_scale_.resize(rows, gate_input_scale_);
+        std::ranges::fill_n(in_scale_.begin(), rows, gate_input_scale_);
+        if (mid_q_.size() < rows * mid_padded_) mid_q_.resize(rows * mid_padded_);
+        if (mid_scale_.size() < rows) mid_scale_.resize(rows, down_input_scale_);
+        std::ranges::fill_n(mid_scale_.begin(), rows, down_input_scale_);
+
+        const auto mid_tiles = ::ynn::blockwise_linear_tile_count(intermediate_);
+        const auto out_tiles = ::ynn::blockwise_linear_tile_count(input_size_);
+        const auto threads = ynn::thread_count();
+        if (threads <= 1 || (mid_tiles <= 1 && out_tiles <= 1)) {
+            ::ynn::quantize_symmetric_blocks_f32(bits_, rows, input_size_, input_size_, gate_input_scale_, x,
+                                                 in_q_.data(), in_scale_.data(), 0, rows);
+            check(::ynn::packed_ffn_mid_tiles_f32(bits_, rows, input_size_, intermediate_, gate_output_scale_,
+                                                  down_input_scale_, silu_, gate_ptr_, up_ptr_, in_q_.data(),
+                                                  in_scale_.data(), mid_q_.data(), 0, mid_tiles));
+            ::ynn::symmetric_linear_f32(bits_, rows, input_size_, intermediate_, intermediate_, down_output_scale_,
+                                        down_ptr_, mid_q_.data(), mid_scale_.data(), y, input_size_, 0, out_tiles);
+            return;
+        }
+
+        const auto workers = std::min(threads, std::max(mid_tiles, out_tiles));
+        const auto m_grain = std::max<std::size_t>(1, mid_tiles / (workers * 8));
+        const auto o_grain = std::max<std::size_t>(1, out_tiles / (workers * 8));
+        ParallelRangeSlots m_slots(mid_tiles, workers), o_slots(out_tiles, workers);
+        std::atomic<ynn_status> ffn_status = ynn_status_success;
+
+        if (rows * input_size_ < 8192 || rows < 2) {
+            // Single-token decode / small input: quantize inline on the calling thread so the team pays only a single
+            // PhaseBarrier between intermediate tiles and down-projection tiles.
+            ::ynn::quantize_symmetric_blocks_f32(bits_, rows, input_size_, input_size_, gate_input_scale_, x,
+                                                 in_q_.data(), in_scale_.data(), 0, rows);
+            require(ynn::parallel_team(workers, 0, [&](const ynn::WorkerContext& worker, ynn::PhaseBarrier& barrier) {
+                drain_range_slots(m_slots, worker.tid, m_grain, [&](std::size_t t_begin, std::size_t t_end) {
+                    const auto st = ::ynn::packed_ffn_mid_tiles_f32(
+                        bits_, rows, input_size_, intermediate_, gate_output_scale_, down_input_scale_, silu_,
+                        gate_ptr_, up_ptr_, in_q_.data(), in_scale_.data(), mid_q_.data(), t_begin, t_end);
+                    if (st != ynn_status_success) ffn_status.store(st, std::memory_order_relaxed);
+                });
+                if (!barrier.arrive_and_wait()) return;
+                if (ffn_status.load(std::memory_order_relaxed) != ynn_status_success) return;
+                drain_range_slots(o_slots, worker.tid, o_grain, [&](std::size_t t_begin, std::size_t t_end) {
+                    ::ynn::symmetric_linear_f32(bits_, rows, input_size_, intermediate_, intermediate_,
+                                                down_output_scale_, down_ptr_, mid_q_.data(), mid_scale_.data(), y,
+                                                input_size_, t_begin, t_end);
+                });
+            }));
+            check(ffn_status.load(std::memory_order_relaxed));
+            return;
+        }
+
+        const auto q_grain = std::max<std::size_t>(1, rows / (workers * 4));
+        ParallelRangeSlots q_slots(rows, workers);
+        require(ynn::parallel_team(workers, 0, [&](const ynn::WorkerContext& worker, ynn::PhaseBarrier& barrier) {
+            drain_range_slots(q_slots, worker.tid, q_grain, [&](std::size_t r_begin, std::size_t r_end) {
+                ::ynn::quantize_symmetric_blocks_f32(bits_, rows, input_size_, input_size_, gate_input_scale_, x,
+                                                     in_q_.data(), in_scale_.data(), r_begin, r_end);
+            });
+            if (!barrier.arrive_and_wait()) return;
+            drain_range_slots(m_slots, worker.tid, m_grain, [&](std::size_t t_begin, std::size_t t_end) {
+                const auto st = ::ynn::packed_ffn_mid_tiles_f32(
+                    bits_, rows, input_size_, intermediate_, gate_output_scale_, down_input_scale_, silu_, gate_ptr_,
+                    up_ptr_, in_q_.data(), in_scale_.data(), mid_q_.data(), t_begin, t_end);
+                if (st != ynn_status_success) ffn_status.store(st, std::memory_order_relaxed);
+            });
+            if (!barrier.arrive_and_wait()) return;
+            if (ffn_status.load(std::memory_order_relaxed) != ynn_status_success) return;
+            drain_range_slots(o_slots, worker.tid, o_grain, [&](std::size_t t_begin, std::size_t t_end) {
+                ::ynn::symmetric_linear_f32(bits_, rows, input_size_, intermediate_, intermediate_, down_output_scale_,
+                                            down_ptr_, mid_q_.data(), mid_scale_.data(), y, input_size_, t_begin,
+                                            t_end);
+            });
+        }));
+        check(ffn_status.load(std::memory_order_relaxed));
+    }
+
+    Tensor packed_storage_;
+    std::shared_ptr<const void> owner_;
+    const std::uint8_t* gate_ptr_ = nullptr;
+    const std::uint8_t* up_ptr_ = nullptr;
+    const std::uint8_t* down_ptr_ = nullptr;
+    std::int32_t bits_;
+    std::size_t input_size_, intermediate_, in_padded_, mid_padded_;
+    float gate_input_scale_, gate_output_scale_, down_input_scale_, down_output_scale_;
+    bool silu_;
+    OutputPool pool_;
+    std::vector<std::int8_t> in_q_, mid_q_;
+    std::vector<float> in_scale_, mid_scale_;
 };
 class CpuOperator final : public Operator {
 public:
@@ -1054,9 +1677,16 @@ public:
         if (spec.operation == Operation::SCATTER) return std::make_unique<Scatter>(arena_);
         if (spec.operation == Operation::GREEDY_TOKEN) return std::make_unique<GreedyToken>(arena_);
         if (spec.operation == Operation::EMBEDDING) return std::make_unique<Embedding>(spec, inputs, arena_);
+        if (SliceOp::supports(spec, inputs)) return std::make_unique<SliceOp>(spec, inputs[0], arena_);
+        if ((spec.operation == Operation::ADD || spec.operation == Operation::MULTIPLY) &&
+            ElementwiseBinaryF32::supports(inputs))
+            return std::make_unique<ElementwiseBinaryF32>(inputs, spec.operation == Operation::MULTIPLY, arena_);
         if ((spec.operation == Operation::SILU_GATE || spec.operation == Operation::GELU_GATE) &&
             GatedActivationOp::supports(inputs))
             return std::make_unique<GatedActivationOp>(inputs[0], spec.operation == Operation::SILU_GATE, arena_);
+        if ((spec.operation == Operation::SILU_MULTIPLY || spec.operation == Operation::GELU_MULTIPLY) &&
+            GatedMultiplyOp::supports(inputs))
+            return std::make_unique<GatedMultiplyOp>(inputs[0], spec.operation == Operation::SILU_MULTIPLY, arena_);
         if (spec.operation == Operation::ROTARY && Rotary::supports(inputs)) return std::make_unique<Rotary>(arena_);
         if ((spec.operation == Operation::RMS_NORM || spec.operation == Operation::RMS_NORM_RESIDUAL) &&
             RmsNorm::supports(spec, inputs))
@@ -1076,7 +1706,8 @@ public:
                                     has_zero ? inputs[3].storage_identity() : nullptr,
                                     has_zero ? inputs[3].storage_offset() : 0,
                                     block_size,
-                                    bits};
+                                    bits,
+                                    false};
             auto& cached_tiles = packed_tile_cache_[key];
             if (!cached_tiles.defined()) {
                 cached_tiles = BlockwiseLinear::pack_tiles(bits, inputs[1], inputs[2], has_zero ? inputs[3] : Tensor{},
@@ -1089,6 +1720,30 @@ public:
             }
             return std::make_unique<BlockwiseLinear>(spec, inputs[0], inputs[1], cached_tiles, has_zero, arena_);
         }
+        if (SymmetricPackedLinear::supports(spec, inputs)) {
+            const auto bits = static_cast<std::int32_t>(spec.attributes[0]);
+            const auto block_size = static_cast<std::size_t>(spec.attributes[1]);
+            const PackedTileKey key{inputs[1].storage_identity(),
+                                    inputs[1].storage_offset(),
+                                    inputs[2].storage_identity(),
+                                    inputs[2].storage_offset(),
+                                    nullptr,
+                                    0,
+                                    block_size,
+                                    bits,
+                                    true};
+            auto& cached_tiles = packed_tile_cache_[key];
+            if (!cached_tiles.defined()) {
+                cached_tiles = SymmetricPackedLinear::pack_tiles(bits, inputs[1], inputs[2], block_size);
+                if (inputs[1].size(0) < 65536) {
+                    inputs[1].release_pages();
+                    inputs[2].release_pages();
+                }
+            }
+            return std::make_unique<SymmetricPackedLinear>(spec, inputs[0], inputs[1], cached_tiles, arena_);
+        }
+        if (PackedFeedForward::supports(spec, inputs))
+            return std::make_unique<PackedFeedForward>(spec, inputs, feed_forward_cache_, arena_);
         if (spec.operation == Operation::ATTENTION) {
 #if defined(__APPLE__)
             if (PytorchParityAttention::supports(spec, inputs))

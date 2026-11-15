@@ -223,10 +223,11 @@ auto LinearImpl::select(ops::Context& context, const Tensor& query, ops::TokenOu
     auto selected = require(slot.selected.data<std::int32_t>());
     std::ranges::fill(slot.errors, std::nullopt);
     const auto search = [&](std::size_t row) {
-        search::HnswParallelFor inner_parallel;
-        if (rows == 1 && runtime::ynn::thread_count() > 1) inner_parallel = runtime::ynn::parallel_for;
-        auto found = index.search(queries.subspan(row * width, width), hnsw_->search_workspaces[row], candidates,
-                                  hnsw_->ef_search, std::move(inner_parallel));
+        auto found = (rows == 1 && runtime::ynn::thread_count() > 1)
+                         ? index.search_parallel(queries.subspan(row * width, width), hnsw_->search_workspaces[row],
+                                                 candidates, hnsw_->ef_search)
+                         : index.search(queries.subspan(row * width, width), hnsw_->search_workspaces[row], candidates,
+                                        hnsw_->ef_search);
         if (!found) {
             slot.errors[row] = std::move(found.error());
             return;
@@ -242,7 +243,7 @@ auto LinearImpl::select(ops::Context& context, const Tensor& query, ops::TokenOu
     if (rows == 1)
         search(0);
     else
-        require(runtime::ynn::parallel_for(rows, search));
+        require(runtime::ynn::parallel_tasks(rows, search));
     for (std::size_t row = 0; row < rows; ++row)
         if (slot.errors[row]) throw ops::Failure(std::move(*slot.errors[row]));
     if (packed_bits_) return slot.selected;
