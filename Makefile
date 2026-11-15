@@ -13,7 +13,7 @@ TEST_DIST := .cache/test-dist
 
 export KIDI_HUB PYTHON
 
-.PHONY: setup-test build-test build-python-test prepare-test native-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
+.PHONY: setup-test build-test build-python-test prepare-test native-test ynnpack-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
 
 setup-test:
 	bash tests/setup.sh
@@ -26,6 +26,9 @@ native-test:
 	cmake --preset debug -DKIDI_BUILD_INTEGRATION_TESTS=OFF
 	cmake --build --preset debug
 	ctest --preset debug -L native
+
+ynnpack-test:
+	$(MAKE) -C third_party/ynnpack-dev test
 
 build-python-test: setup-test
 	rm -rf "$(TEST_DIST)"
