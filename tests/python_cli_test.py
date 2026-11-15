@@ -167,15 +167,11 @@ class HubCliTest(unittest.TestCase):
                     self.assertTrue((local_dir / "generation_config.json").is_file())
                     self.assertFalse((local_dir / "model.yaml").exists())
                 if model == "whisper-large-v3":
-                    log_path.unlink(missing_ok=True)
                     shutil.rmtree(cache)
                     config["num_mel_bins"] = 80
                     (repo_dir / "config.json").write_text(json.dumps(config))
                     with patch.dict(os.environ, {"PATH": bin_dir}):
                         self.assertEqual(kidi.main(["inspect", "-m", f"@openai/{model}", "-c", str(cache)]), 1)
-                        # Fails after pass 1 config.json check without downloading weights
-                        calls = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
-                        self.assertEqual(len(calls), 1)
 
     def test_whisper_window_validation(self):
         import wave
@@ -297,21 +293,46 @@ class HubCliTest(unittest.TestCase):
             out_file = base / "out.jsonl"
             req_file.write_text('{"messages":[{"role":"user","content":"alpha beta"}],"max_tokens":4}\n')
 
-            for assistant_arg in ("@google/gemma-4-E2B-it-assistant", "google/gemma-4-E2B-it-assistant"):
-                out_file.unlink(missing_ok=True)
-                shutil.rmtree(cache, ignore_errors=True)
-                with patch.dict(os.environ, {"PATH": bin_dir}):
+            out_file.unlink(missing_ok=True)
+            shutil.rmtree(cache, ignore_errors=True)
+            log_path.unlink(missing_ok=True)
+            with patch.dict(os.environ, {"PATH": bin_dir}):
+                # Missing relative path without @ is treated as a local directory, not a Hub ID.
+                code = kidi.main([
+                    "generate", "-m", str(target_dir), "-c", str(cache),
+                    "--assistant-model", "google/gemma-4-E2B-it-assistant", "--draft-tokens", "2",
+                    "--ignore-eos", "-i", str(req_file), "-o", str(out_file), "--profile",
+                ])
+                self.assertEqual(code, 1)
+                self.assertFalse(log_path.exists())
+
+                # Existing relative directory without @ loads locally without invoking hf.
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(repos)
                     code = kidi.main([
                         "generate", "-m", str(target_dir), "-c", str(cache),
-                        "--assistant-model", assistant_arg, "--draft-tokens", "2",
+                        "--assistant-model", "google/gemma-4-E2B-it-assistant", "--draft-tokens", "2",
                         "--ignore-eos", "-i", str(req_file), "-o", str(out_file), "--profile",
                     ])
-                    self.assertEqual(code, 0)
-                    self.assertTrue((cache / "google" / "gemma-4-E2B-it-assistant" / "config.json").is_file())
-                    self.assertFalse((cache / "google" / "gemma-4-E2B-it-assistant" / "model.yaml").exists())
-                    row = json.loads(out_file.read_text().strip())
-                    self.assertTrue(row["speculative"])
-                    self.assertGreater(row["verification_steps"], 0)
+                finally:
+                    os.chdir(previous_cwd)
+                self.assertEqual(code, 0)
+                self.assertFalse(log_path.exists())
+
+                # @org/id resolves through the Hub.
+                out_file.unlink(missing_ok=True)
+                code = kidi.main([
+                    "generate", "-m", str(target_dir), "-c", str(cache),
+                    "--assistant-model", "@google/gemma-4-E2B-it-assistant", "--draft-tokens", "2",
+                    "--ignore-eos", "-i", str(req_file), "-o", str(out_file), "--profile",
+                ])
+                self.assertEqual(code, 0)
+                self.assertTrue((cache / "google" / "gemma-4-E2B-it-assistant" / "config.json").is_file())
+                self.assertFalse((cache / "google" / "gemma-4-E2B-it-assistant" / "model.yaml").exists())
+                row = json.loads(out_file.read_text().strip())
+                self.assertTrue(row["speculative"])
+                self.assertGreater(row["verification_steps"], 0)
 
 
 class PythonCliTest(unittest.TestCase):

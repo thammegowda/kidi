@@ -11,12 +11,12 @@ async function backendSource() {
         polish:'Polish configured text.',page_summarize:'Summarize configured page.',
         page_translate:'Translate configured page into {target_language}.'
       },models:{
-        chat:{enabled:true,model_id:'google/test',accelerator:'auto',precision:'checkpoint',
+        chat:{enabled:true,model_id:'@google/test',accelerator:'auto',precision:'checkpoint',
           kv_cache_precision:'auto',
           generation:{max_tokens:128,context_tokens:1024,prefix_cache_mb:0}},
-        asr:{enabled:true,model_id:'openai/whisper-small',language:'auto',max_tokens:128,
+        asr:{enabled:true,model_id:'@openai/whisper-small',language:'auto',max_tokens:128,
           vad:{threshold:.012,minimum_speech_ms:250,silence_ms:800}},
-        tts:{enabled:true,model_id:'test/tts',language:'auto',steps:10,realtime_steps:6,pace:1.15,
+        tts:{enabled:true,model_id:'@test/tts',language:'auto',steps:10,realtime_steps:6,pace:1.15,
           reference_language:'English',reference_text:'Hello.',voice:{}}
       }});`);
   source = source.replace(
@@ -103,7 +103,7 @@ test('chat, reader, editor and documents use unified prompts and preserve explic
     const {backend} = await import(`data:text/javascript,${encodeURIComponent(isolated)}#translation`);
     const events = [];
     backend.connect({onEvent: event => events.push(event)});
-    backend.send('runtime.load', 'load', {model: 'google/test', backend: 'cpu', threads: 2});
+    backend.send('runtime.load', 'load', {model: '@google/test', backend: 'cpu', threads: 2});
     workers[0].onmessage({data: {type: 'ready', backend: 'cpu'}});
     backend.send('reader.translate', 'translate', {
       text: 'The old house.', previous: 'A storm ended.', next: 'The garden bloomed.',

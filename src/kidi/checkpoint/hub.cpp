@@ -65,33 +65,26 @@ auto validate_downloaded_package(const std::filesystem::path& directory, std::st
     if (!expected) return std::unexpected(expected.error());
     auto config = load_config(directory);
     if (!config) return std::unexpected(config.error());
-    const bool gemma = (*config)["model"]["type"].as<std::string>("") == "gemma4_text";
     for (const auto& name : *expected) {
-        if (gemma && std::filesystem::path(name).filename() == "chat_template.jinja") continue;
+        if (std::filesystem::path(name).filename() == "chat_template.jinja" && !non_empty_file(directory / name)) {
+            const auto tok_cfg_path = (directory / name).parent_path() / "tokenizer_config.json";
+            if (non_empty_file(tok_cfg_path)) {
+                try {
+                    const auto tok_cfg = YAML::LoadFile(tok_cfg_path.string());
+                    if (tok_cfg.IsMap() && tok_cfg["chat_template"] && tok_cfg["chat_template"].IsScalar() &&
+                        !tok_cfg["chat_template"].as<std::string>("").empty())
+                        continue;
+                } catch (const YAML::Exception& error) {
+                    return std::unexpected(Error{ErrorCode::INVALID_MANIFEST,
+                                                 "invalid tokenizer_config.json: " + std::string(error.what())});
+                }
+            }
+        }
         if (!non_empty_file(directory / name))
             return std::unexpected(
                 Error{ErrorCode::IO, "Missing " + name + " in @" + std::string(reference) +
                                          "; retry online to complete the download. Sharded and non-Safetensors "
                                          "checkpoints are not supported."});
-    }
-    if (gemma) {
-        const auto tokenizer_dir = std::filesystem::path((*config)["tokenizer_file"].as<std::string>()).parent_path();
-        const auto tok_cfg_path = tokenizer_dir / "tokenizer_config.json";
-        if (!non_empty_file(tok_cfg_path))
-            return std::unexpected(Error{ErrorCode::INVALID_MANIFEST, "Missing tokenizer_config.json"});
-        try {
-            const auto tok_cfg = YAML::LoadFile(tok_cfg_path.string());
-            const auto inline_template =
-                tok_cfg.IsMap() && tok_cfg["chat_template"] && tok_cfg["chat_template"].IsScalar()
-                    ? tok_cfg["chat_template"].as<std::string>("")
-                    : std::string{};
-            if (inline_template.empty() && !non_empty_file(tokenizer_dir / "chat_template.jinja"))
-                return std::unexpected(Error{ErrorCode::INVALID_MANIFEST,
-                                             "Missing chat_template.jinja or chat_template in tokenizer_config.json"});
-        } catch (const YAML::Exception& error) {
-            return std::unexpected(
-                Error{ErrorCode::INVALID_MANIFEST, "invalid tokenizer_config.json: " + std::string(error.what())});
-        }
     }
     return {};
 }

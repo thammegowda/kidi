@@ -104,11 +104,11 @@ printf '%s\n' '{"messages":[{"role":"user","content":"Explain binary search in t
   kidi generate -m @google/gemma-4-E2B-it-qat-mobile-transformers
 ```
 
-Add `--assistant-model` (with `@owner/model`, `owner/model`, or a local directory) to enable CPU speculative decoding in `chat` or `generate`:
+Add `--assistant-model` (with `@owner/model` or a local directory) to enable CPU speculative decoding in `chat` or `generate`:
 
 ```bash
 kidi chat -m @google/gemma-4-E2B-it \
-  --assistant-model google/gemma-4-E2B-it-assistant \
+  --assistant-model @google/gemma-4-E2B-it-assistant \
   --weight-bits 8 --draft-tokens 4
 ```
 
