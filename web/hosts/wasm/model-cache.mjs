@@ -67,7 +67,8 @@ function packageFiles(config, specs) {
 const convertedSpeech = configUrl => new URL(`kidi-int8-v1-${WHISPER_GGML_REVISION.slice(0, 12)}.safetensors`, configUrl);
 // Gemma weight chunks are cached with packed values already sign-flipped (see normalizationPlan), marked by this layout.
 const SIGNED_WEIGHTS = 'gemma-signed-v1';
-const MODEL_ID = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const REPO_ID = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const HUB_MODEL_ID = /^@([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/;
 const hex = bytes => Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join('');
 
 export function configureModelHub(remote) {
@@ -84,14 +85,17 @@ const configUrl = (modelId, revision) => `${MODEL_HUB_REMOTE}/${modelId}/resolve
 
 async function resolveReference(source, cache, cacheOnly) {
     const value = String(source).trim();
-    if (!MODEL_ID.test(value))
+    if (!value.startsWith('@'))
         return new URL(value, globalThis.location?.href || 'http://localhost/').href;
-    const key = referenceKey(value);
+    const match = HUB_MODEL_ID.exec(value);
+    if (!match) throw new Error(`Invalid Hugging Face model ID: ${value}`);
+    const modelId = match[1];
+    const key = referenceKey(modelId);
     const cached = cache && await cache.match(key);
     const cachedUrl = async () => {
         if (!cached) return null;
         const metadata = await cached.json();
-        const expected = configUrl(value, metadata.revision);
+        const expected = configUrl(modelId, metadata.revision);
         return /^[a-f0-9]{40}$/.test(metadata.revision) && metadata.url === expected ? expected : null;
     };
     if (cacheOnly) {
@@ -100,14 +104,14 @@ async function resolveReference(source, cache, cacheOnly) {
         return resolved;
     }
     try {
-        const path = value.split('/').map(encodeURIComponent).join('/');
+        const path = modelId.split('/').map(encodeURIComponent).join('/');
         const response = await fetch(`${MODEL_HUB_REMOTE}/api/models/${path}/revision/main`,
             {mode: 'cors', credentials: 'omit', cache: 'no-cache', signal: AbortSignal.timeout(30000)});
         if (!response.ok) throw new Error(`Hugging Face model lookup HTTP ${response.status}`);
         const metadata = await response.json();
         if (!/^[a-f0-9]{40}$/.test(metadata.sha || '')) throw new Error('Hugging Face returned an invalid revision');
-        const url = configUrl(value, metadata.sha);
-        if (cache) await cache.put(key, new Response(JSON.stringify({modelId: value, revision: metadata.sha, url}),
+        const url = configUrl(modelId, metadata.sha);
+        if (cache) await cache.put(key, new Response(JSON.stringify({modelId, revision: metadata.sha, url}),
             {headers: {'Content-Type': 'application/json'}}));
         return url;
     } catch (error) {
@@ -152,7 +156,7 @@ async function cacheInventory() {
         if (url.origin === 'https://kidi.invalid' && url.pathname.startsWith('/__model_refs__/')) {
             try {
                 const metadata = await (await cache.match(request)).json();
-                if (MODEL_ID.test(metadata.modelId) && /^[a-f0-9]{40}$/.test(metadata.revision) &&
+                if (REPO_ID.test(metadata.modelId) && /^[a-f0-9]{40}$/.test(metadata.revision) &&
                     metadata.url === configUrl(metadata.modelId, metadata.revision))
                     references.set(metadata.url, {modelId: metadata.modelId, key: request.url});
             } catch {}

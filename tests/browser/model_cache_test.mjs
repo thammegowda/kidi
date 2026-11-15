@@ -182,16 +182,17 @@ test('model IDs resolve latest Hub revisions and retain an offline pinned mappin
         return new Response(JSON.stringify({sha: revision}));
     };
     try {
-        assert.equal(await resolveModelSource('google/test'),
+        assert.equal(await resolveModelSource('@google/test'),
             `https://huggingface.co/google/test/resolve/${revision}/config.json`);
         revision = 'b'.repeat(40);
-        assert.equal(await resolveModelSource('google/test'),
+        assert.equal(await resolveModelSource('@google/test'),
             `https://huggingface.co/google/test/resolve/${revision}/config.json`);
         globalThis.fetch = async () => { throw new Error('offline'); };
-        assert.equal(await resolveModelSource('google/test', {cacheOnly: true}),
+        assert.equal(await resolveModelSource('@google/test', {cacheOnly: true}),
             `https://huggingface.co/google/test/resolve/${revision}/config.json`);
         assert.equal(requests, 2);
-        await assert.rejects(resolveModelSource('missing/model', {cacheOnly: true}), /no resolved revision/);
+        assert.equal(await resolveModelSource('google/test'), 'http://localhost/google/test');
+        await assert.rejects(resolveModelSource('@missing/model', {cacheOnly: true}), /no resolved revision/);
     } finally {
         globalThis.fetch = originalFetch;
         if (originalCaches === undefined) delete globalThis.caches;

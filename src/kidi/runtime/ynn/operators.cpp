@@ -1539,13 +1539,9 @@ public:
             case Operation::CONCAT:
                 check(ynn_define_concatenate(native, spec.attributes[0], operands.size(), operands.data(), &result, 0));
                 break;
-            case Operation::SCATTER:
-            case Operation::GREEDY_TOKEN:
-            case Operation::RMS_ROTARY:
-            case Operation::EMBEDDING:
-            case Operation::SNAKE_CONV1D:
-            case Operation::SNAKE_QUANTIZED_LINEAR:
-                break;
+            default:
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "CPU backend does not support operation: " +
+                                                                std::string(operation_name(spec.operation))});
         }
         auto output_id = static_cast<std::uint32_t>(graph_input_count);
         if (pad_columns) {

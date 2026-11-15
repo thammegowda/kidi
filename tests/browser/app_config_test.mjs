@@ -7,14 +7,14 @@ import {loadAppConfig, resolveRuntimeConfig} from '../../web/hosts/wasm/app-conf
 test('browser consumes the canonical desktop YAML configuration', async () => {
   const source = await readFile(new URL('../../examples/kidi-app.yaml', import.meta.url), 'utf8');
   const document = load(source);
-  assert.equal(document.models.chat.model_id, 'google/gemma-4-E4B-it-qat-mobile-transformers');
+  assert.equal(document.models.chat.model_id, '@google/gemma-4-E4B-it-qat-mobile-transformers');
   const config = await loadAppConfig(document);
   assert.equal(config.model_hub.remote, 'https://huggingface.co');
   assert.equal(config.model_hub.local, '~/.cache/kidi/model-hub');
-  assert.equal(config.models.chat.model_id, 'google/gemma-4-E2B-it-qat-mobile-transformers');
+  assert.equal(config.models.chat.model_id, '@google/gemma-4-E2B-it-qat-mobile-transformers');
   assert.equal(config.runtime.wasm, undefined);
-  assert.equal(config.models.asr.model_id, 'openai/whisper-small');
-  assert.equal(config.models.tts.model_id, 'thammegowda/OmniVoice-q8');
+  assert.equal(config.models.asr.model_id, '@openai/whisper-small');
+  assert.equal(config.models.tts.model_id, '@thammegowda/OmniVoice-q8');
   assert.equal(config.prompts.system.includes('preserve natural code switching'), true);
   assert.match(config.prompts.system, /untrusted reference material/);
   assert.match(config.prompts.translate, /\{target_language\}/);
@@ -76,6 +76,13 @@ test('browser consumes the canonical desktop YAML configuration', async () => {
 test('browser rejects incomplete shared model configuration', async () => {
   await assert.rejects(loadAppConfig({version: 1, model_hub: {remote: 'http://example.com'}, models: {}}),
     /runtime|model_hub.remote|models/);
+  const base = load(await readFile(new URL('../../examples/kidi-app.yaml', import.meta.url), 'utf8'));
+  const localPath = structuredClone(base);
+  localPath.runtime.wasm.models.chat.model_id = './local/gemma4';
+  assert.equal((await loadAppConfig(localPath)).models.chat.model_id, './local/gemma4');
+  const badHub = structuredClone(base);
+  badHub.runtime.wasm.models.chat.model_id = '@invalid';
+  await assert.rejects(loadAppConfig(badHub), /valid @owner\/model/);
 });
 
 test('browser validates unified prompts and rejects model-local definitions', async () => {

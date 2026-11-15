@@ -12,6 +12,8 @@ class Hub {
 public:
     Hub(std::string remote, std::filesystem::path local);
 
+    static auto expand_home(std::filesystem::path path) -> std::filesystem::path;
+
     auto resolve(std::string_view model_id, std::string_view revision = "main") const -> Result<std::filesystem::path>;
     auto get_file(std::string_view model_id, std::string_view file, std::string_view revision = "main") const
         -> Result<std::filesystem::path>;

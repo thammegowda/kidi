@@ -104,7 +104,7 @@ runtime:
   wasm:
     models:
       chat:
-        model_id: google/gemma-4-E2B-it-qat-mobile-transformers
+        model_id: "@google/gemma-4-E2B-it-qat-mobile-transformers"
 
 transport:
   max_text_frame_bytes: 1048576
@@ -114,7 +114,7 @@ transport:
 models:
   chat:
     enabled: true
-    model_id: google/gemma-4-E4B-it-qat-mobile-transformers
+    model_id: "@google/gemma-4-E4B-it-qat-mobile-transformers"
     revision: main
     accelerator: auto
     precision: checkpoint
@@ -133,7 +133,7 @@ models:
 
   asr:
     enabled: true
-    model_id: openai/whisper-small
+    model_id: "@openai/whisper-small"
     revision: main
     accelerator: cpu
     language: auto
@@ -148,7 +148,7 @@ models:
 
   tts:
     enabled: true
-    model_id: thammegowda/OmniVoice-q8
+    model_id: "@thammegowda/OmniVoice-q8"
     revision: main
     accelerator: auto
     metal_prefill_cache_mb: 1024

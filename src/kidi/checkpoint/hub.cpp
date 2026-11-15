@@ -28,23 +28,6 @@ extern "C" char** environ;
 namespace kidi::checkpoint {
 namespace {
 
-auto expand_home(std::filesystem::path path) -> std::filesystem::path {
-    const auto value = path.string();
-    if (value.empty() || value.front() != '~') return path;
-    const auto* home = std::getenv(
-#if defined(_WIN32)
-        "USERPROFILE"
-#else
-        "HOME"
-#endif
-    );
-    if (!home || !*home) throw std::invalid_argument("cannot expand Hub cache without a home directory");
-    if (value == "~") return home;
-    if (value.size() < 2 || (value[1] != '/' && value[1] != '\\'))
-        throw std::invalid_argument("Hub cache uses an invalid home-relative path");
-    return std::filesystem::path(home) / value.substr(2);
-}
-
 auto safe_segment(std::string_view part) -> bool {
     return !part.empty() && part != "." && part != ".." && std::ranges::all_of(part, [](unsigned char byte) {
         return std::isalnum(byte) || byte == '_' || byte == '.' || byte == '-';
@@ -218,6 +201,23 @@ auto run_hf(std::vector<std::string> arguments, std::string_view reference) -> R
 }
 
 } // namespace
+
+auto Hub::expand_home(std::filesystem::path path) -> std::filesystem::path {
+    const auto value = path.string();
+    if (value.empty() || value.front() != '~') return path;
+    const auto* home = std::getenv(
+#if defined(_WIN32)
+        "USERPROFILE"
+#else
+        "HOME"
+#endif
+    );
+    if (!home || !*home) throw std::invalid_argument("cannot expand home path without a home directory");
+    if (value == "~") return home;
+    if (value.size() < 2 || (value[1] != '/' && value[1] != '\\'))
+        throw std::invalid_argument("invalid home-relative path: " + value);
+    return std::filesystem::path(home) / value.substr(2);
+}
 
 Hub::Hub(std::string remote, std::filesystem::path local)
     : remote_(std::move(remote)), local_(expand_home(std::move(local)).lexically_normal()) {

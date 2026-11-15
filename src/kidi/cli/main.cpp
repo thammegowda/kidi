@@ -576,32 +576,20 @@ auto translate_command(const kidi::cli::Namespace& arguments, const std::filesys
     });
 }
 
-auto is_bare_repo_id(std::string_view value) -> bool {
-    if (value.empty() || value.front() == '.' || value.front() == '/' || value.find('\\') != std::string_view::npos)
-        return false;
-    const auto slash = value.find('/');
-    return slash != std::string_view::npos && slash > 0 && slash + 1 < value.size() &&
-           value.find('/', slash + 1) == std::string_view::npos;
-}
-
-auto resolve_hub_argument(const std::filesystem::path& path, const std::filesystem::path& cache, bool allow_bare_id,
+auto resolve_hub_argument(const std::filesystem::path& path, const std::filesystem::path& cache,
                           std::filesystem::path& resolved_out) -> int {
     if (path.empty()) {
         resolved_out.clear();
         return 0;
     }
     const auto text = path.string();
-    const bool explicit_hub = text.starts_with('@');
-    std::error_code fs_error;
-    const bool bare_hub =
-        allow_bare_id && !explicit_hub && !std::filesystem::exists(path, fs_error) && is_bare_repo_id(text);
-    if (!explicit_hub && !bare_hub) {
+    if (!text.starts_with('@')) {
         resolved_out = path;
         return 0;
     }
     try {
         const kidi::checkpoint::Hub hub{"https://huggingface.co", cache};
-        auto resolved = hub.download(explicit_hub ? std::string_view(text).substr(1) : std::string_view(text));
+        auto resolved = hub.download(std::string_view(text).substr(1));
         if (!resolved) {
             spdlog::error("{}", resolved.error().message);
             return 1;
@@ -617,9 +605,8 @@ auto resolve_hub_argument(const std::filesystem::path& path, const std::filesyst
 auto generate_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
     if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TEXT_GENERATION)) return status;
     std::filesystem::path assistant_directory;
-    if (const auto status =
-            resolve_hub_argument(arguments.get<std::filesystem::path>("assistant_model"),
-                                 arguments.get<std::filesystem::path>("cache"), true, assistant_directory))
+    if (const auto status = resolve_hub_argument(arguments.get<std::filesystem::path>("assistant_model"),
+                                                 arguments.get<std::filesystem::path>("cache"), assistant_directory))
         return status;
     return run_with_streams(arguments, [&](std::istream& input, std::ostream& output) {
         return generate_chat(arguments, directory, assistant_directory, input, output);
@@ -629,9 +616,8 @@ auto generate_command(const kidi::cli::Namespace& arguments, const std::filesyst
 auto chat_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
     if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TEXT_GENERATION)) return status;
     std::filesystem::path assistant_directory;
-    if (const auto status =
-            resolve_hub_argument(arguments.get<std::filesystem::path>("assistant_model"),
-                                 arguments.get<std::filesystem::path>("cache"), true, assistant_directory))
+    if (const auto status = resolve_hub_argument(arguments.get<std::filesystem::path>("assistant_model"),
+                                                 arguments.get<std::filesystem::path>("cache"), assistant_directory))
         return status;
     auto session = load_chat_session(arguments, directory, assistant_directory);
     if (!session) {
@@ -966,7 +952,7 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
             .dest("assistant_model")
             .default_value(std::filesystem::path{})
             .metavar("MODEL")
-            .help("local directory or [@]owner/model assistant for speculative decoding");
+            .help("local directory or @owner/model assistant for speculative decoding");
         command_parser->add_argument("--draft-tokens")
             .dest("draft_tokens")
             .type<std::size_t>()
@@ -1032,8 +1018,7 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         std::filesystem::path directory;
         const auto cache = arguments.contains("cache") ? arguments.get<std::filesystem::path>("cache")
                                                        : std::filesystem::path("~/.cache/kidi/model-hub");
-        if (const auto status =
-                resolve_hub_argument(arguments.get<std::filesystem::path>("model"), cache, false, directory))
+        if (const auto status = resolve_hub_argument(arguments.get<std::filesystem::path>("model"), cache, directory))
             return status;
         if (command == "index") return kidi::cli::index_command(arguments, directory);
         if (command == "inspect") return inspect(directory);
