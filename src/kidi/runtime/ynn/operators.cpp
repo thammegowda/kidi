@@ -28,33 +28,7 @@ namespace {
 using ops::require;
 using tensor::DType;
 using tensor::Tensor;
-auto type(DType dtype) -> ynn_type {
-    switch (dtype) {
-        case DType::F32:
-            return ynn_type_fp32;
-        case DType::BF16:
-            return ynn_type_bf16;
-        case DType::I8:
-            return ynn_type_int8;
-        case DType::I32:
-            return ynn_type_int32;
-        case DType::E4M3:
-            return ynn_type_fp8_e4m3;
-        case DType::E5M2:
-            return ynn_type_fp8_e5m2;
-        default:
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported eager CPU dtype"});
-    }
-}
 auto check(ynn_status status) -> void { require(ynn::check_status(status, "eager CPU operator")); }
-#if defined(__EMSCRIPTEN__) || defined(__x86_64__)
-// Single-row calibrated projections use the same INT8 dot as multi-row ones, so YNNPACK's constant cache shares one
-// packed copy of each weight between prefill and decode. WebAssembly decode measured no slower this way, and x86
-// decode measured faster.
-constexpr bool SHARED_DECODE_PACKING = true;
-#else
-constexpr bool SHARED_DECODE_PACKING = false;
-#endif
 auto transpose_packed_tile(const Tensor& input, std::int32_t bits, std::size_t row_start, std::size_t row_count,
                            std::size_t column_start, std::size_t column_count) -> std::vector<std::uint8_t> {
     const auto values_per_byte = static_cast<std::size_t>(8 / bits);
@@ -134,10 +108,8 @@ private:
             indices = saved_indices;
         }
         const auto row_bytes = update.size(2) * tensor::element_size(update.dtype());
-        for (std::size_t batch = 0; batch < destination.size(0); ++batch)
-            for (std::size_t index = 0; index < indices.size(); ++index)
-                std::memcpy(target.data() + (batch * destination.size(1) + indices[index]) * row_bytes,
-                            source.data() + (batch * indices.size() + index) * row_bytes, row_bytes);
+        ::ynn::scatter_rows(destination.size(0), destination.size(1), indices.size(), row_bytes, indices.data(),
+                            source.data(), target.data());
     }
 
     OutputPool pool_;
@@ -449,17 +421,13 @@ private:
         if (outer_ == 0 || dst_stride_bytes_ == 0) return;
         const auto* src = require(input.host_bytes()).data();
         auto* dst = require(output.host_bytes()).data();
-        const auto copy_blocks = [&](std::size_t begin, std::size_t end) {
-            for (auto b = begin; b < end; ++b) {
-                std::memcpy(dst + b * dst_stride_bytes_, src + b * src_stride_bytes_ + offset_bytes_,
-                            dst_stride_bytes_);
-            }
-        };
         if (outer_ <= 1 || outer_ * dst_stride_bytes_ < 65536 || ynn::thread_count() <= 1) {
-            copy_blocks(0, outer_);
+            ::ynn::slice_blocks(outer_, src_stride_bytes_, dst_stride_bytes_, offset_bytes_, src, dst, 0, outer_);
             return;
         }
-        require(ynn::parallel_ranges(outer_, 1, copy_blocks));
+        require(ynn::parallel_ranges(outer_, 1, [&](std::size_t begin, std::size_t end) {
+            ::ynn::slice_blocks(outer_, src_stride_bytes_, dst_stride_bytes_, offset_bytes_, src, dst, begin, end);
+        }));
     }
 
     DType dtype_;
@@ -926,38 +894,34 @@ private:
     std::vector<std::byte> fallback_scratch_;
     OutputPool pool_;
 };
-/// Attention for a few FP32 query rows, as in an autoregressive decoding step. The generic graph copies every key and
-/// value into head-major order on each call, which dominates a one-token step over a long encoder memory.
-class FewQueryAttention final : public Operator {
+/// Direct FP32/BF16 attention over `[batch, queries, heads * head_dim]` and `[batch_or_1, total_keys, kv_heads *
+/// head_dim]`, supporting MHA and GQA with optional slice `[key_start, key_length)` and broadcast mask.
+class DirectAttentionOp final : public Operator {
 public:
-    static constexpr std::int64_t MAXIMUM_QUERIES = 17;
     static auto supports(const OperatorSpec& spec, TensorInputs inputs) -> bool {
-        if (spec.attributes.size() == 1) {
-            if (inputs[0].size(1) > MAXIMUM_QUERIES) return false;
-        } else if (spec.attributes.size() == 4) {
-            if (inputs[0].size(1) != 1 && (!spec.vector_projection || inputs[0].size(1) > MAXIMUM_QUERIES))
-                return false;
-        } else {
-            return false;
-        }
+        if (spec.operation != Operation::ATTENTION || (inputs.size() != 3 && inputs.size() != 4)) return false;
+        if (spec.attributes.size() != 1 && spec.attributes.size() < 2) return false;
         if (!spec.quantization[0].scales.empty() || !spec.quantization[1].scales.empty()) return false;
         const auto heads = static_cast<std::size_t>(spec.attributes[0]);
         const auto key_heads = spec.attributes.size() >= 2 ? static_cast<std::size_t>(spec.attributes[1]) : heads;
         if (!heads || !key_heads || heads % key_heads != 0) return false;
-        for (std::size_t index = 0; index < inputs.size(); ++index)
-            if (inputs[index].dtype() != DType::F32 || !inputs[index].is_contiguous()) return false;
+        for (std::size_t index = 0; index < inputs.size(); ++index) {
+            const auto dt = inputs[index].dtype();
+            if ((dt != DType::F32 && dt != DType::BF16) || !inputs[index].is_contiguous()) return false;
+        }
         return true;
     }
-    FewQueryAttention(const OperatorSpec& spec, tensor::Arena& arena)
+    DirectAttentionOp(const OperatorSpec& spec, tensor::Arena& arena)
         : heads_(static_cast<std::size_t>(spec.attributes[0])),
           key_heads_(spec.attributes.size() >= 2 ? static_cast<std::size_t>(spec.attributes[1]) : heads_),
           key_start_(spec.attributes.size() >= 4 ? static_cast<std::size_t>(spec.attributes[2]) : 0),
           key_length_(spec.attributes.size() >= 4 ? static_cast<std::size_t>(spec.attributes[3]) : 0),
           explicit_scale_(spec.attributes.size() >= 2),
           scale_(spec.epsilon),
+          out_dtype_(spec.dtype == DType::BF16 ? DType::BF16 : DType::F32),
           pool_(&arena) {}
     auto run(TensorInputs inputs) -> Tensor override {
-        auto output = pool_.acquire(inputs[0].shape(), DType::F32, tensor::Device::cpu());
+        auto output = pool_.acquire(inputs[0].shape(), out_dtype_, tensor::Device::cpu());
         attend(inputs, output);
         return output;
     }
@@ -968,6 +932,16 @@ public:
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
+    static auto ensure_f32(const Tensor& tensor, std::vector<float>& scratch) -> const float* {
+        if (tensor.dtype() == DType::F32) return require(tensor.data<float>()).data();
+        const auto count = tensor.numel();
+        if (scratch.size() < count) scratch.resize(count);
+        const auto raw = require(tensor.host_bytes());
+        ::ynn::convert_bf16_to_f32_rows(1, count, reinterpret_cast<const std::uint16_t*>(raw.data()), count,
+                                        scratch.data(), count, 0, 1);
+        return scratch.data();
+    }
+
     auto attend(TensorInputs inputs, Tensor& output) -> void {
         const auto& query = inputs[0];
         const auto batch = static_cast<std::size_t>(query.size(0)), rows = static_cast<std::size_t>(query.size(1));
@@ -978,7 +952,7 @@ private:
         std::array<std::size_t, 4> mask_strides{};
         const float* mask = nullptr;
         if (inputs.size() == 4) {
-            mask = require(inputs[3].data<float>()).data();
+            mask = ensure_f32(inputs[3], mask_f32_);
             std::size_t stride = 1;
             for (std::size_t axis = inputs[3].dimensions(); axis-- > 0;) {
                 mask_strides[4 - inputs[3].dimensions() + axis] = inputs[3].size(axis) == 1 ? 0 : stride;
@@ -1003,30 +977,46 @@ private:
         };
         const auto items = ::ynn::attention_f32_work_items(params);
         if (!items) return;
-        const auto* query_data = require(query.data<float>()).data();
-        const auto* key_data = require(inputs[1].data<float>()).data();
-        const auto* value_data = require(inputs[2].data<float>()).data();
-        auto* output_data = require(output.data<float>()).data();
-        const auto total_q_heads = batch * rows * heads_;
-        const auto scratch_floats = ::ynn::attention_f32_scratch_size(params);
-        const auto scratch_bytes = scratch_floats * sizeof(float);
-        if (items == 1 || total_q_heads * keys * head_width <= 32768 || ynn::thread_count() <= 1) {
-            if (fallback_scratch_.size() < scratch_floats) fallback_scratch_.resize(scratch_floats);
-            ::ynn::attention_f32(params, query_data, key_data, value_data, mask, output_data, 0, items,
-                                 fallback_scratch_.data());
-            return;
+        const auto* query_data = ensure_f32(query, q_f32_);
+        const auto* key_data = ensure_f32(inputs[1], k_f32_);
+        const auto* value_data = ensure_f32(inputs[2], v_f32_);
+        float* output_data = nullptr;
+        if (out_dtype_ == DType::F32) {
+            output_data = require(output.data<float>()).data();
+        } else {
+            if (out_f32_.size() < query.numel()) out_f32_.resize(query.numel());
+            output_data = out_f32_.data();
         }
-        require(ynn::parallel_ranges_with_worker(
-            items, 1, scratch_bytes, [&](const ynn::WorkerContext& worker, std::size_t begin, std::size_t end) {
-                ::ynn::attention_f32(params, query_data, key_data, value_data, mask, output_data, begin, end,
-                                     reinterpret_cast<float*>(worker.scratch));
-            }));
+        const auto total_q_heads = batch * rows * heads_;
+        if (rows > 17 && keys >= 8) {
+            ::ynn::attention_prefill_f32(params, query_data, key_data, value_data, mask, output_data);
+        } else {
+            const auto scratch_floats = ::ynn::attention_f32_scratch_size(params);
+            const auto scratch_bytes = scratch_floats * sizeof(float);
+            if (items == 1 || total_q_heads * keys * head_width <= 32768 || ynn::thread_count() <= 1) {
+                if (fallback_scratch_.size() < scratch_floats) fallback_scratch_.resize(scratch_floats);
+                ::ynn::attention_f32(params, query_data, key_data, value_data, mask, output_data, 0, items,
+                                     fallback_scratch_.data());
+            } else {
+                require(ynn::parallel_ranges_with_worker(
+                    items, 1, scratch_bytes, [&](const ynn::WorkerContext& worker, std::size_t begin, std::size_t end) {
+                        ::ynn::attention_f32(params, query_data, key_data, value_data, mask, output_data, begin, end,
+                                             reinterpret_cast<float*>(worker.scratch));
+                    }));
+            }
+        }
+        if (out_dtype_ == DType::BF16) {
+            auto raw = require(output.host_bytes());
+            ::ynn::convert_f32_to_bf16_rows(1, query.numel(), output_data, query.numel(),
+                                            reinterpret_cast<std::uint16_t*>(raw.data()), query.numel(), 0, 1);
+        }
     }
 
     std::size_t heads_, key_heads_, key_start_, key_length_;
     bool explicit_scale_;
     float scale_;
-    std::vector<float> fallback_scratch_;
+    DType out_dtype_;
+    std::vector<float> q_f32_, k_f32_, v_f32_, mask_f32_, out_f32_, fallback_scratch_;
     OutputPool pool_;
 };
 
@@ -1042,49 +1032,6 @@ struct PackedTileKey {
     bool fp32_symmetric = false;
     auto operator<=>(const PackedTileKey&) const = default;
 };
-
-struct alignas(64) ParallelRangeSlot {
-    std::atomic<std::size_t> next = 0;
-    std::size_t end = 0;
-};
-
-class ParallelRangeSlots {
-public:
-    static constexpr std::size_t INLINE_CAP = 32;
-
-    ParallelRangeSlots(std::size_t items, std::size_t workers) : count_(workers) {
-        if (workers > INLINE_CAP) heap_ = std::make_unique<ParallelRangeSlot[]>(workers);
-        auto* s = data();
-        for (std::size_t w = 0; w < workers; ++w) {
-            s[w].next.store((items * w) / workers, std::memory_order_relaxed);
-            s[w].end = (items * (w + 1)) / workers;
-        }
-    }
-
-    auto data() noexcept -> ParallelRangeSlot* { return heap_ ? heap_.get() : inline_.data(); }
-    auto size() const noexcept -> std::size_t { return count_; }
-
-private:
-    std::size_t count_ = 0;
-    std::array<ParallelRangeSlot, INLINE_CAP> inline_{};
-    std::unique_ptr<ParallelRangeSlot[]> heap_;
-};
-
-template <typename Fn>
-auto drain_range_slots(ParallelRangeSlots& slots, std::size_t tid, std::size_t grain, Fn&& fn) -> void {
-    const auto count = slots.size();
-    auto* arr = slots.data();
-    for (std::size_t offset = 0; offset < count; ++offset) {
-        auto& slot = arr[(tid + offset) % count];
-        const auto limit = slot.end;
-        for (;;) {
-            auto cur = slot.next.load(std::memory_order_relaxed);
-            if (cur >= limit) break;
-            const auto next = std::min(limit, cur + grain);
-            if (slot.next.compare_exchange_weak(cur, next, std::memory_order_relaxed)) fn(cur, next);
-        }
-    }
-}
 
 class BlockwiseLinear final : public Operator {
 public:
@@ -1207,7 +1154,7 @@ private:
         const auto workers = std::min(threads, tiles);
         const auto q_grain = std::max<std::size_t>(1, total_blocks / (workers * 4));
         const auto t_grain = std::max<std::size_t>(min_tile_grain, tiles / (workers * 8));
-        ParallelRangeSlots q_slots(total_blocks, workers), t_slots(tiles, workers);
+        ynn::ParallelRangeSlots q_slots(total_blocks, workers), t_slots(tiles, workers);
         require(ynn::parallel_team(workers, 0, [&](const ynn::WorkerContext& worker, ynn::PhaseBarrier& barrier) {
             drain_range_slots(q_slots, worker.tid, q_grain, [&](std::size_t b_begin, std::size_t b_end) {
                 ::ynn::quantize_blockwise_blocks_f32(bits_, M, K_, block_size_, use_bsum, x, act_q_.data(),
@@ -1346,7 +1293,7 @@ private:
         const auto workers = std::min(threads, tiles);
         const auto q_grain = std::max<std::size_t>(1, total_blocks / (workers * 4));
         const auto t_grain = std::max<std::size_t>(min_tile_grain, tiles / (workers * 8));
-        ParallelRangeSlots q_slots(total_blocks, workers), t_slots(tiles, workers);
+        ynn::ParallelRangeSlots q_slots(total_blocks, workers), t_slots(tiles, workers);
         require(ynn::parallel_team(workers, 0, [&](const ynn::WorkerContext& worker, ynn::PhaseBarrier& barrier) {
             drain_range_slots(q_slots, worker.tid, q_grain, [&](std::size_t b_begin, std::size_t b_end) {
                 ::ynn::quantize_symmetric_blocks_f32(bits_, rows, in_features_, block_size_, input_scale_, x,
@@ -1503,7 +1450,7 @@ private:
         const auto workers = std::min(threads, std::max(mid_tiles, out_tiles));
         const auto m_grain = std::max<std::size_t>(1, mid_tiles / (workers * 8));
         const auto o_grain = std::max<std::size_t>(1, out_tiles / (workers * 8));
-        ParallelRangeSlots m_slots(mid_tiles, workers), o_slots(out_tiles, workers);
+        ynn::ParallelRangeSlots m_slots(mid_tiles, workers), o_slots(out_tiles, workers);
         std::atomic<ynn_status> ffn_status = ynn_status_success;
 
         if (rows * input_size_ < 8192 || rows < 2) {
@@ -1531,7 +1478,7 @@ private:
         }
 
         const auto q_grain = std::max<std::size_t>(1, rows / (workers * 4));
-        ParallelRangeSlots q_slots(rows, workers);
+        ynn::ParallelRangeSlots q_slots(rows, workers);
         require(ynn::parallel_team(workers, 0, [&](const ynn::WorkerContext& worker, ynn::PhaseBarrier& barrier) {
             drain_range_slots(q_slots, worker.tid, q_grain, [&](std::size_t r_begin, std::size_t r_end) {
                 ::ynn::quantize_symmetric_blocks_f32(bits_, rows, input_size_, input_size_, gate_input_scale_, x,
@@ -1568,87 +1515,1202 @@ private:
     std::vector<std::int8_t> in_q_, mid_q_;
     std::vector<float> in_scale_, mid_scale_;
 };
-class CpuOperator final : public Operator {
+struct DenseTileKey {
+    const void* weight_id = nullptr;
+    std::int64_t weight_offset = 0;
+    std::size_t n = 0;
+    std::size_t k = 0;
+    bool transpose_b = false;
+    DType b_dtype = DType::F32;
+    bool quantized_i8 = false;
+    auto operator<=>(const DenseTileKey&) const = default;
+};
+
+struct PackedDenseEntry {
+    ::ynn::dense_linear_plan plan;
+    Tensor packed;
+    Tensor col_sums;
+};
+
+class DenseLinearOp final : public Operator {
 public:
-    CpuOperator(ynn::Executable executable, std::size_t count, std::size_t dynamic_count, DType dtype,
-                std::vector<std::int64_t> shape, tensor::Arena& arena,
-                std::vector<std::shared_ptr<const void>> constant_owners = {}, const Tensor& block_zeros = {},
-                std::size_t block_size = 0)
-        : executable_(std::move(executable)),
-          count_(count),
-          dynamic_count_(dynamic_count),
-          dtype_(dtype),
-          shape_(std::move(shape)),
-          pool_(&arena),
-          constant_owners_(std::move(constant_owners)),
-          block_zeros_(block_zeros),
-          block_size_(block_size) {}
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) noexcept -> bool {
+        if ((spec.operation != Operation::LINEAR && spec.operation != Operation::MATMUL) ||
+            (inputs.size() != 2 && inputs.size() != 3) || spec.attributes.empty())
+            return false;
+        if (spec.operation == Operation::MATMUL && inputs.size() != 2) return false;
+        if (spec.dtype != DType::F32 && spec.dtype != DType::BF16) return false;
+        const auto& a = inputs[0];
+        const auto& b = inputs[1];
+        if ((a.dtype() != DType::F32 && a.dtype() != DType::BF16) ||
+            (b.dtype() != DType::F32 && b.dtype() != DType::BF16))
+            return false;
+        if (!a.is_contiguous() || !b.is_contiguous() || a.dimensions() < 2 || b.dimensions() < 2) return false;
+        const bool transpose_b = spec.attributes[0] != 0;
+        const auto k = static_cast<std::size_t>(a.size(-1));
+        const auto b_k = static_cast<std::size_t>(transpose_b ? b.size(-1) : b.size(-2));
+        const auto n = static_cast<std::size_t>(transpose_b ? b.size(-2) : b.size(-1));
+        if (k == 0 || n == 0 || k != b_k) return false;
+        const auto a_batch_dims = a.dimensions() - 2;
+        const auto b_batch_dims = b.dimensions() - 2;
+        const auto min_batch = std::min(a_batch_dims, b_batch_dims);
+        for (std::size_t i = 0; i < min_batch; ++i) {
+            const auto ad = a.shape()[a_batch_dims - 1 - i];
+            const auto bd = b.shape()[b_batch_dims - 1 - i];
+            if (ad != bd && ad != 1 && bd != 1) return false;
+        }
+        if (inputs.size() == 3) {
+            const auto& bias = inputs[2];
+            if ((bias.dtype() != DType::F32 && bias.dtype() != DType::BF16) || !bias.is_contiguous() ||
+                (bias.numel() != n && bias.numel() != 1))
+                return false;
+        }
+        return true;
+    }
+
+    static auto pack_static_b(const Tensor& b, bool transpose_b, const ::ynn::dense_linear_plan& plan) -> Tensor {
+        auto packed = require(Tensor::empty({static_cast<std::int64_t>(plan.total_bytes)}, DType::U8));
+        const auto* b_bytes = require(std::as_const(b).host_bytes()).data();
+        auto* dst = require(packed.host_bytes()).data();
+        const std::size_t elem_bytes = tensor::element_size(b.dtype());
+        const std::size_t b_row_stride = (transpose_b ? plan.k : plan.n) * elem_bytes;
+        const auto workers = std::min(ynn::thread_count(), plan.blocks_n);
+        if (workers > 1 && plan.blocks_n >= 4) {
+            const auto per_worker = (plan.blocks_n + workers - 1) / workers;
+            require(ynn::parallel_tasks(workers, [&](std::size_t task) {
+                const auto t_begin = task * per_worker;
+                const auto t_end = std::min(plan.blocks_n, t_begin + per_worker);
+                if (t_begin < t_end)
+                    ::ynn::pack_dense_linear_tiles(plan, transpose_b, b_bytes, b_row_stride, t_begin, t_end, dst);
+            }));
+        } else {
+            ::ynn::pack_dense_linear_tiles(plan, transpose_b, b_bytes, b_row_stride, 0, plan.blocks_n, dst);
+        }
+        return packed;
+    }
+
+    DenseLinearOp(const OperatorSpec& spec, TensorInputs inputs, PackedDenseEntry static_b, tensor::Arena& arena)
+        : out_dtype_(spec.dtype),
+          b_dtype_(inputs[1].dtype()),
+          transpose_b_(spec.attributes[0] != 0),
+          static_b_(static_b.packed.defined()),
+          plan_(static_b.plan),
+          packed_b_(std::move(static_b.packed)),
+          pool_(&arena) {
+        const auto& a = inputs[0];
+        const auto& b = inputs[1];
+        k_ = static_cast<std::size_t>(a.size(-1));
+        n_ = static_cast<std::size_t>(transpose_b_ ? b.size(-2) : b.size(-1));
+        m_ = static_cast<std::size_t>(a.size(-2));
+        if (!static_b_) {
+            const auto ynn_bt = b_dtype_ == DType::BF16 ? ynn_type_bf16 : ynn_type_fp32;
+            check(::ynn::make_dense_linear_plan(ynn_bt, ynn_bt, ynn_type_fp32, n_, k_, &plan_));
+        }
+
+        const auto a_batch_dims = a.dimensions() - 2;
+        const auto b_batch_dims = b.dimensions() - 2;
+        const auto batch_dims = std::max(a_batch_dims, b_batch_dims);
+        out_shape_.reserve(batch_dims + 2);
+        a_batch_shape_.assign(batch_dims, 1);
+        b_batch_shape_.assign(batch_dims, 1);
+        for (std::size_t i = 0; i < batch_dims; ++i) {
+            const auto ad = i >= batch_dims - a_batch_dims ? a.shape()[i - (batch_dims - a_batch_dims)] : 1;
+            const auto bd = i >= batch_dims - b_batch_dims ? b.shape()[i - (batch_dims - b_batch_dims)] : 1;
+            a_batch_shape_[i] = static_cast<std::size_t>(ad);
+            b_batch_shape_[i] = static_cast<std::size_t>(bd);
+            out_shape_.push_back(std::max(ad, bd));
+            total_batches_ *= static_cast<std::size_t>(std::max(ad, bd));
+        }
+        out_shape_.push_back(a.size(-2));
+        out_shape_.push_back(static_cast<std::int64_t>(n_));
+
+        if (b_batch_dims == 0 || b.numel() == static_cast<std::int64_t>(k_ * n_)) {
+            b_is_single_matrix_ = true;
+            eff_m_ = total_batches_ * m_;
+            total_batches_ = 1;
+        } else {
+            eff_m_ = m_;
+            a_batch_strides_.assign(batch_dims, 0);
+            b_batch_strides_.assign(batch_dims, 0);
+            std::size_t a_stride = m_ * k_ * tensor::element_size(a.dtype());
+            std::size_t b_stride = k_ * n_ * tensor::element_size(b.dtype());
+            for (std::size_t i = batch_dims; i-- > 0;) {
+                a_batch_strides_[i] = a_batch_shape_[i] > 1 ? a_stride : 0;
+                b_batch_strides_[i] = b_batch_shape_[i] > 1 ? b_stride : 0;
+                a_stride *= a_batch_shape_[i];
+                b_stride *= b_batch_shape_[i];
+            }
+        }
+
+        if (inputs.size() == 3 && !spec.dynamic_parameters) {
+            prepare_bias(inputs[2], bias_f32_);
+        }
+    }
+
     auto run(TensorInputs inputs) -> Tensor override {
-        for (std::size_t index = 0; index < dynamic_count_; ++index) require(executable_.bind(index, inputs[index]));
-        auto output = pool_.acquire(shape_, dtype_, tensor::Device::cpu());
-        require(executable_.bind(count_, output));
-        require(executable_.invoke());
-        if (block_zeros_.defined() && block_size_ > 0) apply_block_zeros(inputs[0], output);
+        auto output = pool_.acquire(out_shape_, out_dtype_, tensor::Device::cpu());
+        apply(inputs, output);
         return output;
     }
-    auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
-        if (destination.dtype() != dtype_ || !std::ranges::equal(destination.shape(), shape_))
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "in-place operation cannot change shape or dtype"});
-        auto target = require(destination.host_bytes());
-        const auto output = run(inputs);
-        const auto source = require(output.host_bytes());
-        std::memcpy(target.data(), source.data(), source.size());
-        return destination;
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "dense linear cannot run in place"});
     }
-    auto run_pair(TensorInputs inputs) -> std::array<Tensor, 2> override {
-        auto residual = pool_.acquire(shape_, dtype_, tensor::Device::cpu());
-        require(executable_.bind(count_ + 1, residual));
-        auto normalized = run(inputs);
-        return {std::move(residual), std::move(normalized)};
-    }
-    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override {
-        for (std::size_t index = 0; index < dynamic_count_; ++index) require(executable_.bind(index, inputs[index]));
-        require(executable_.bind(count_, outputs.back()));
-        if (outputs.size() == 2) require(executable_.bind(count_ + 1, outputs.front()));
-        require(executable_.invoke());
-        if (block_zeros_.defined() && block_size_ > 0) apply_block_zeros(inputs[0], outputs.back());
-    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs.back()); }
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
-    auto apply_block_zeros(const Tensor& input, Tensor& output) const -> void {
-        const auto* x = require(input.data<float>()).data();
-        auto* y = require(output.data<float>()).data();
-        const auto* z = require(std::as_const(block_zeros_).data<float>()).data();
-        const auto N = static_cast<std::size_t>(block_zeros_.size(0));
-        const auto B = static_cast<std::size_t>(block_zeros_.size(1));
-        const auto K = B * block_size_;
-        const auto M = input.numel() / K;
-        std::vector<float> sums(B);
-        for (std::size_t m = 0; m < M; ++m) {
-            for (std::size_t b = 0; b < B; ++b) {
-                const auto* xb = x + (m * B + b) * block_size_;
-                float s = 0.F;
-                for (std::size_t k = 0; k < block_size_; ++k) s += xb[k];
-                sums[b] = s;
-            }
-            for (std::size_t n = 0; n < N; ++n) {
-                float corr = 0.F;
-                for (std::size_t b = 0; b < B; ++b) corr += sums[b] * z[n * B + b];
-                y[m * N + n] += corr;
+    auto prepare_bias(const Tensor& bias, std::vector<float>& dst) const -> void {
+        dst.resize(n_);
+        if (bias.dtype() == DType::F32) {
+            const auto src = require(std::as_const(bias).data<float>());
+            if (src.size() == 1)
+                std::ranges::fill(dst, src[0]);
+            else
+                std::ranges::copy(src, dst.begin());
+        } else {
+            const auto raw = require(std::as_const(bias).host_bytes());
+            const auto* src = reinterpret_cast<const std::uint16_t*>(raw.data());
+            if (bias.numel() == 1) {
+                float val = 0.F;
+                ::ynn::convert_bf16_to_f32_rows(1, 1, src, 1, &val, 1, 0, 1);
+                std::ranges::fill(dst, val);
+            } else {
+                ::ynn::convert_bf16_to_f32_rows(1, n_, src, n_, dst.data(), n_, 0, 1);
             }
         }
     }
 
-    ynn::Executable executable_;
-    std::size_t count_, dynamic_count_;
-    DType dtype_;
+    auto run_one_matrix(const void* a_ptr, DType a_dtype, const void* packed_b, const float* bias_ptr, float* out_f32)
+        -> void {
+        const std::size_t a_elem_bytes = tensor::element_size(b_dtype_);
+        const void* eff_a = a_ptr;
+        if (a_dtype != b_dtype_) {
+            if (b_dtype_ == DType::BF16) {
+                if (a_conv_.size() < eff_m_ * k_ * sizeof(std::uint16_t))
+                    a_conv_.resize(eff_m_ * k_ * sizeof(std::uint16_t));
+                ::ynn::convert_f32_to_bf16_rows(eff_m_, k_, static_cast<const float*>(a_ptr), k_,
+                                                reinterpret_cast<std::uint16_t*>(a_conv_.data()), k_, 0, eff_m_);
+            } else {
+                if (a_conv_.size() < eff_m_ * k_ * sizeof(float)) a_conv_.resize(eff_m_ * k_ * sizeof(float));
+                ::ynn::convert_bf16_to_f32_rows(eff_m_, k_, static_cast<const std::uint16_t*>(a_ptr), k_,
+                                                reinterpret_cast<float*>(a_conv_.data()), k_, 0, eff_m_);
+            }
+            eff_a = a_conv_.data();
+        }
+
+        bool transposed_a = false;
+        std::size_t tile_m = 1;
+        std::size_t a_packed_bytes = 0;
+        if (!::ynn::dense_linear_select_kernel(plan_, eff_m_, &transposed_a, &tile_m, &a_packed_bytes))
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "no matching YNNPACK dense dot kernel"});
+
+        if (transposed_a) {
+            if (a_packed_.size() < a_packed_bytes) a_packed_.resize(a_packed_bytes);
+            ::ynn::dense_linear_pack_a(plan_, eff_m_, tile_m, eff_a, k_ * a_elem_bytes, a_packed_.data());
+            eff_a = a_packed_.data();
+        }
+
+        const auto threads = ynn::thread_count();
+        if (threads <= 1 || plan_.blocks_n <= 1 || (eff_m_ == 1 && k_ * n_ <= 64 * 1024)) {
+            ::ynn::dense_linear_run_tiles(plan_, eff_m_, transposed_a, tile_m, eff_a, k_ * a_elem_bytes, packed_b,
+                                          bias_ptr, out_f32, n_, 0, plan_.blocks_n);
+            return;
+        }
+        require(ynn::parallel_ranges(plan_.blocks_n, 1, [&](std::size_t t_begin, std::size_t t_end) {
+            ::ynn::dense_linear_run_tiles(plan_, eff_m_, transposed_a, tile_m, eff_a, k_ * a_elem_bytes, packed_b,
+                                          bias_ptr, out_f32, n_, t_begin, t_end);
+        }));
+    }
+
+    auto apply(TensorInputs inputs, Tensor& output) -> void {
+        if (eff_m_ == 0 || n_ == 0 || k_ == 0) return;
+        const auto* a_base = require(inputs[0].host_bytes()).data();
+        auto* out_raw = require(output.host_bytes()).data();
+        const float* bias_ptr = nullptr;
+        if (inputs.size() == 3) {
+            if (bias_f32_.empty()) prepare_bias(inputs[2], dynamic_bias_f32_);
+            bias_ptr = bias_f32_.empty() ? dynamic_bias_f32_.data() : bias_f32_.data();
+        }
+
+        if (b_is_single_matrix_) {
+            const void* packed_ptr = nullptr;
+            if (static_b_) {
+                packed_ptr = require(std::as_const(packed_b_).host_bytes()).data();
+            } else {
+                if (dynamic_b_.size() < plan_.total_bytes) dynamic_b_.resize(plan_.total_bytes);
+                const auto* b_bytes = require(inputs[1].host_bytes()).data();
+                const std::size_t b_row_stride = (transpose_b_ ? k_ : n_) * tensor::element_size(b_dtype_);
+                if (ynn::thread_count() > 1 && plan_.blocks_n >= 4) {
+                    require(ynn::parallel_ranges(plan_.blocks_n, 1, [&](std::size_t t_begin, std::size_t t_end) {
+                        ::ynn::pack_dense_linear_tiles(plan_, transpose_b_, b_bytes, b_row_stride, t_begin, t_end,
+                                                       dynamic_b_.data());
+                    }));
+                } else {
+                    ::ynn::pack_dense_linear_tiles(plan_, transpose_b_, b_bytes, b_row_stride, 0, plan_.blocks_n,
+                                                   dynamic_b_.data());
+                }
+                packed_ptr = dynamic_b_.data();
+            }
+
+            float* out_f32 = nullptr;
+            if (out_dtype_ == DType::F32) {
+                out_f32 = reinterpret_cast<float*>(out_raw);
+            } else {
+                if (out_f32_.size() < eff_m_ * n_) out_f32_.resize(eff_m_ * n_);
+                out_f32 = out_f32_.data();
+            }
+            run_one_matrix(a_base, inputs[0].dtype(), packed_ptr, bias_ptr, out_f32);
+            if (out_dtype_ == DType::BF16) {
+                ::ynn::convert_f32_to_bf16_rows(eff_m_, n_, out_f32, n_, reinterpret_cast<std::uint16_t*>(out_raw), n_,
+                                                0, eff_m_);
+            }
+            return;
+        }
+
+        const auto* b_base = require(inputs[1].host_bytes()).data();
+        const std::size_t b_row_stride = (transpose_b_ ? k_ : n_) * tensor::element_size(b_dtype_);
+        if (dynamic_b_.size() < plan_.total_bytes) dynamic_b_.resize(plan_.total_bytes);
+        if (out_dtype_ == DType::BF16 && out_f32_.size() < m_ * n_) out_f32_.resize(m_ * n_);
+        const std::size_t c_matrix_bytes = m_ * n_ * tensor::element_size(out_dtype_);
+
+        for (std::size_t batch = 0; batch < total_batches_; ++batch) {
+            std::size_t rem = batch;
+            std::size_t a_off = 0;
+            std::size_t b_off = 0;
+            for (std::size_t d = a_batch_strides_.size(); d-- > 0;) {
+                const std::size_t dim = std::max(a_batch_shape_[d], b_batch_shape_[d]);
+                const std::size_t idx = rem % dim;
+                rem /= dim;
+                a_off += idx * a_batch_strides_[d];
+                b_off += idx * b_batch_strides_[d];
+            }
+            ::ynn::pack_dense_linear_tiles(plan_, transpose_b_, b_base + b_off, b_row_stride, 0, plan_.blocks_n,
+                                           dynamic_b_.data());
+            float* out_f32 =
+                out_dtype_ == DType::F32 ? reinterpret_cast<float*>(out_raw + batch * c_matrix_bytes) : out_f32_.data();
+            run_one_matrix(a_base + a_off, inputs[0].dtype(), dynamic_b_.data(), bias_ptr, out_f32);
+            if (out_dtype_ == DType::BF16) {
+                ::ynn::convert_f32_to_bf16_rows(
+                    m_, n_, out_f32, n_, reinterpret_cast<std::uint16_t*>(out_raw + batch * c_matrix_bytes), n_, 0, m_);
+            }
+        }
+    }
+
+    DType out_dtype_, b_dtype_;
+    bool transpose_b_;
+    bool static_b_;
+    bool b_is_single_matrix_ = false;
+    std::size_t m_ = 0, eff_m_ = 0, n_ = 0, k_ = 0, total_batches_ = 1;
+    ::ynn::dense_linear_plan plan_{};
+    Tensor packed_b_;
+    std::vector<std::int64_t> out_shape_;
+    std::vector<std::size_t> a_batch_shape_, b_batch_shape_, a_batch_strides_, b_batch_strides_;
+    std::vector<float> bias_f32_, dynamic_bias_f32_, out_f32_;
+    std::vector<std::byte> a_conv_, a_packed_, dynamic_b_;
+    OutputPool pool_;
+};
+
+class QuantizedLinearOp final : public Operator {
+public:
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) noexcept -> bool {
+        if (spec.operation != Operation::QUANTIZED_LINEAR || (inputs.size() != 3 && inputs.size() != 4) ||
+            spec.attributes.empty() || spec.dtype != DType::F32)
+            return false;
+        const auto& a = inputs[0];
+        const auto& b = inputs[1];
+        const auto& scale = inputs[2];
+        if (a.dtype() != DType::F32 || b.dtype() != DType::I8 || scale.dtype() != DType::F32 || !a.is_contiguous() ||
+            !b.is_contiguous() || !scale.is_contiguous() || a.dimensions() < 2 || b.dimensions() != 2)
+            return false;
+        const bool transpose_b = spec.attributes[0] != 0;
+        const auto k = static_cast<std::size_t>(a.size(-1));
+        const auto b_k = static_cast<std::size_t>(transpose_b ? b.size(1) : b.size(0));
+        const auto n = static_cast<std::size_t>(transpose_b ? b.size(0) : b.size(1));
+        if (k == 0 || n == 0 || k != b_k || (scale.numel() != 1 && scale.numel() != n)) return false;
+        if (inputs.size() == 4) {
+            const auto& bias = inputs[3];
+            if ((bias.dtype() != DType::F32 && bias.dtype() != DType::BF16) || !bias.is_contiguous() ||
+                (bias.numel() != n && bias.numel() != 1))
+                return false;
+        }
+        return true;
+    }
+
+    static auto pack_static_b(const Tensor& b, bool transpose_b, const ::ynn::dense_linear_plan& plan)
+        -> std::pair<Tensor, Tensor> {
+        auto packed = require(Tensor::empty({static_cast<std::int64_t>(plan.total_bytes)}, DType::U8));
+        auto col_sums = require(Tensor::empty({static_cast<std::int64_t>(plan.n)}, DType::I32));
+        const auto* b_bytes = require(std::as_const(b).host_bytes()).data();
+        auto* dst = require(packed.host_bytes()).data();
+        auto* sums = require(col_sums.data<std::int32_t>()).data();
+        const std::size_t b_row_stride = transpose_b ? plan.k : plan.n;
+        const auto workers = std::min(ynn::thread_count(), plan.blocks_n);
+        if (workers > 1 && plan.blocks_n >= 4) {
+            const auto per_worker = (plan.blocks_n + workers - 1) / workers;
+            require(ynn::parallel_tasks(workers, [&](std::size_t task) {
+                const auto t_begin = task * per_worker;
+                const auto t_end = std::min(plan.blocks_n, t_begin + per_worker);
+                if (t_begin < t_end)
+                    ::ynn::pack_dense_linear_tiles(plan, transpose_b, b_bytes, b_row_stride, t_begin, t_end, dst, sums);
+            }));
+        } else {
+            ::ynn::pack_dense_linear_tiles(plan, transpose_b, b_bytes, b_row_stride, 0, plan.blocks_n, dst, sums);
+        }
+        return {std::move(packed), std::move(col_sums)};
+    }
+
+    QuantizedLinearOp(const OperatorSpec& spec, TensorInputs inputs, PackedDenseEntry static_b, tensor::Arena& arena)
+        : transpose_b_(spec.attributes[0] != 0),
+          static_b_(static_b.packed.defined()),
+          plan_(static_b.plan),
+          packed_b_(std::move(static_b.packed)),
+          col_sums_(std::move(static_b.col_sums)),
+          pool_(&arena) {
+        const auto& a = inputs[0];
+        const auto& b = inputs[1];
+        k_ = static_cast<std::size_t>(a.size(-1));
+        n_ = static_cast<std::size_t>(transpose_b_ ? b.size(0) : b.size(1));
+        rows_ = static_cast<std::size_t>(a.numel() / k_);
+        out_shape_.assign(a.shape().begin(), a.shape().end());
+        out_shape_.back() = static_cast<std::int64_t>(n_);
+        if (!static_b_)
+            check(::ynn::make_dense_linear_plan(ynn_type_int8, ynn_type_int8, ynn_type_int32, n_, k_, &plan_));
+        if (!spec.dynamic_parameters) {
+            prepare_scales(inputs[2], w_scales_);
+            if (inputs.size() == 4) prepare_bias(inputs[3], bias_f32_);
+        }
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(out_shape_, DType::F32, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "quantized linear cannot run in place"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs.back()); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto prepare_scales(const Tensor& scale, std::vector<float>& dst) const -> void {
+        dst.resize(n_);
+        const auto src = require(std::as_const(scale).data<float>());
+        if (src.size() == 1)
+            std::ranges::fill(dst, src[0]);
+        else
+            std::ranges::copy(src, dst.begin());
+    }
+
+    auto prepare_bias(const Tensor& bias, std::vector<float>& dst) const -> void {
+        dst.resize(n_);
+        if (bias.dtype() == DType::F32) {
+            const auto src = require(std::as_const(bias).data<float>());
+            if (src.size() == 1)
+                std::ranges::fill(dst, src[0]);
+            else
+                std::ranges::copy(src, dst.begin());
+        } else {
+            const auto raw = require(std::as_const(bias).host_bytes());
+            const auto* src = reinterpret_cast<const std::uint16_t*>(raw.data());
+            if (bias.numel() == 1) {
+                float val = 0.F;
+                ::ynn::convert_bf16_to_f32_rows(1, 1, src, 1, &val, 1, 0, 1);
+                std::ranges::fill(dst, val);
+            } else {
+                ::ynn::convert_bf16_to_f32_rows(1, n_, src, n_, dst.data(), n_, 0, 1);
+            }
+        }
+    }
+
+    auto apply(TensorInputs inputs, Tensor& output) -> void {
+        if (rows_ == 0) return;
+        const auto* a_f32 = require(inputs[0].data<float>()).data();
+        auto* y = require(output.data<float>()).data();
+
+        const void* packed_ptr = nullptr;
+        const std::int32_t* sum_ptr = nullptr;
+        if (static_b_) {
+            packed_ptr = require(std::as_const(packed_b_).host_bytes()).data();
+            sum_ptr = require(std::as_const(col_sums_).data<std::int32_t>()).data();
+        } else {
+            if (dynamic_b_.size() < plan_.total_bytes) dynamic_b_.resize(plan_.total_bytes);
+            if (dynamic_sums_.size() < n_) dynamic_sums_.resize(n_);
+            const auto* b_bytes = require(inputs[1].host_bytes()).data();
+            ::ynn::pack_dense_linear_tiles(plan_, transpose_b_, b_bytes, transpose_b_ ? k_ : n_, 0, plan_.blocks_n,
+                                           dynamic_b_.data(), dynamic_sums_.data());
+            packed_ptr = dynamic_b_.data();
+            sum_ptr = dynamic_sums_.data();
+        }
+
+        const float* scale_ptr = nullptr;
+        if (w_scales_.empty()) {
+            prepare_scales(inputs[2], dynamic_scales_);
+            scale_ptr = dynamic_scales_.data();
+        } else {
+            scale_ptr = w_scales_.data();
+        }
+
+        const float* bias_ptr = nullptr;
+        if (inputs.size() == 4) {
+            if (bias_f32_.empty()) prepare_bias(inputs[3], dynamic_bias_f32_);
+            bias_ptr = bias_f32_.empty() ? dynamic_bias_f32_.data() : bias_f32_.data();
+        }
+
+        if (q_a_.size() < rows_ * k_) q_a_.resize(rows_ * k_);
+        if (a_scales_.size() < rows_) a_scales_.resize(rows_);
+        if (a_zps_.size() < rows_) a_zps_.resize(rows_);
+
+        const auto threads = ynn::thread_count();
+        if (threads <= 1 || rows_ * k_ < 8192) {
+            ::ynn::quantize_dynamic_int8_rows_f32(rows_, k_, a_f32, q_a_.data(), a_scales_.data(), a_zps_.data(), 0,
+                                                  rows_);
+        } else {
+            require(ynn::parallel_ranges(rows_, 1, [&](std::size_t r_begin, std::size_t r_end) {
+                ::ynn::quantize_dynamic_int8_rows_f32(rows_, k_, a_f32, q_a_.data(), a_scales_.data(), a_zps_.data(),
+                                                      r_begin, r_end);
+            }));
+        }
+
+        bool transposed_a = false;
+        std::size_t tile_m = 1;
+        std::size_t a_packed_bytes = 0;
+        if (!::ynn::dense_linear_select_kernel(plan_, rows_, &transposed_a, &tile_m, &a_packed_bytes))
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "no matching YNNPACK quantized dot kernel"});
+
+        const void* eff_a = q_a_.data();
+        if (transposed_a) {
+            if (a_packed_.size() < a_packed_bytes) a_packed_.resize(a_packed_bytes);
+            ::ynn::dense_linear_pack_a(plan_, rows_, tile_m, q_a_.data(), k_, a_packed_.data());
+            eff_a = a_packed_.data();
+        }
+
+        const std::size_t scratch_bytes = ::ynn::quantized_linear_scratch_bytes(plan_, rows_, tile_m);
+        if (threads <= 1 || plan_.blocks_n <= 1 || (rows_ == 1 && k_ * n_ <= 64 * 1024)) {
+            if (fallback_scratch_.size() < scratch_bytes / sizeof(std::int32_t))
+                fallback_scratch_.resize(scratch_bytes / sizeof(std::int32_t));
+            ::ynn::quantized_linear_run_tiles(plan_, rows_, transposed_a, tile_m, eff_a, k_, packed_ptr, sum_ptr,
+                                              a_scales_.data(), a_zps_.data(), scale_ptr, bias_ptr, y, n_,
+                                              fallback_scratch_.data(), 0, plan_.blocks_n);
+            return;
+        }
+        require(ynn::parallel_ranges_with_worker(
+            plan_.blocks_n, 1, scratch_bytes,
+            [&](const ynn::WorkerContext& worker, std::size_t t_begin, std::size_t t_end) {
+                ::ynn::quantized_linear_run_tiles(plan_, rows_, transposed_a, tile_m, eff_a, k_, packed_ptr, sum_ptr,
+                                                  a_scales_.data(), a_zps_.data(), scale_ptr, bias_ptr, y, n_,
+                                                  reinterpret_cast<std::int32_t*>(worker.scratch), t_begin, t_end);
+            }));
+    }
+
+    bool transpose_b_;
+    bool static_b_;
+    std::size_t rows_ = 0, n_ = 0, k_ = 0;
+    ::ynn::dense_linear_plan plan_{};
+    Tensor packed_b_, col_sums_;
+    std::vector<std::int64_t> out_shape_;
+    std::vector<float> w_scales_, dynamic_scales_, bias_f32_, dynamic_bias_f32_, a_scales_;
+    std::vector<std::int32_t> a_zps_, dynamic_sums_, fallback_scratch_;
+    std::vector<std::int8_t> q_a_;
+    std::vector<std::byte> a_packed_, dynamic_b_;
+    OutputPool pool_;
+};
+
+auto cast_ynn_type(DType dtype) -> ynn_type {
+    switch (dtype) {
+        case DType::F32:
+            return ynn_type_fp32;
+        case DType::BF16:
+            return ynn_type_bf16;
+        case DType::F16:
+            return ynn_type_fp16;
+        case DType::E4M3:
+            return ynn_type_fp8_e4m3;
+        case DType::E5M2:
+            return ynn_type_fp8_e5m2;
+        case DType::I32:
+            return ynn_type_int32;
+        case DType::I8:
+            return ynn_type_int8;
+        case DType::U8:
+            return ynn_type_uint8;
+        default:
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported CPU cast dtype"});
+    }
+}
+
+class BroadcastBinaryOp final : public Operator {
+public:
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) noexcept -> bool {
+        if ((spec.operation != Operation::ADD && spec.operation != Operation::MULTIPLY) || inputs.size() != 2 ||
+            !inputs[0].is_contiguous() || !inputs[1].is_contiguous())
+            return false;
+        const auto a_dt = inputs[0].dtype(), b_dt = inputs[1].dtype();
+        const bool is_float =
+            (a_dt == DType::F32 || a_dt == DType::BF16) && (b_dt == DType::F32 || b_dt == DType::BF16);
+        const bool is_int = (a_dt == DType::I32 || a_dt == DType::I64) && a_dt == b_dt && spec.dtype == a_dt;
+        if (!is_float && !is_int) return false;
+        const auto ra = inputs[0].dimensions(), rb = inputs[1].dimensions();
+        const auto rank = std::max(ra, rb);
+        for (std::size_t i = 0; i < rank; ++i) {
+            const auto ad = i >= rank - ra ? inputs[0].shape()[i - (rank - ra)] : 1;
+            const auto bd = i >= rank - rb ? inputs[1].shape()[i - (rank - rb)] : 1;
+            if (ad != bd && ad != 1 && bd != 1) return false;
+        }
+        return true;
+    }
+
+    BroadcastBinaryOp(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
+        : is_multiply_(spec.operation == Operation::MULTIPLY), out_dtype_(spec.dtype), pool_(&arena) {
+        const auto ra = inputs[0].dimensions(), rb = inputs[1].dimensions();
+        const auto rank = std::max(ra, rb);
+        shape_.resize(rank);
+        out_shape_.resize(rank);
+        a_strides_.assign(rank, 0);
+        b_strides_.assign(rank, 0);
+        std::size_t a_stride = 1, b_stride = 1;
+        out_elements_ = 1;
+        for (std::size_t i = rank; i-- > 0;) {
+            const auto ad = i >= rank - ra ? static_cast<std::size_t>(inputs[0].shape()[i - (rank - ra)]) : 1;
+            const auto bd = i >= rank - rb ? static_cast<std::size_t>(inputs[1].shape()[i - (rank - rb)]) : 1;
+            const auto od = std::max(ad, bd);
+            shape_[i] = static_cast<std::int64_t>(od);
+            out_shape_[i] = od;
+            out_elements_ *= od;
+            a_strides_[i] = ad > 1 ? a_stride : 0;
+            b_strides_[i] = bd > 1 ? b_stride : 0;
+            a_stride *= ad;
+            b_stride *= bd;
+        }
+        if (rank == 0) {
+            out_shape_.push_back(1);
+            a_strides_.push_back(0);
+            b_strides_.push_back(0);
+        }
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, out_dtype_, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
+        if (destination.dtype() != out_dtype_ || !std::ranges::equal(destination.shape(), shape_))
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "in-place operation cannot change shape or dtype"});
+        apply(inputs, destination);
+        return destination;
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    static auto ensure_f32(const Tensor& tensor, std::vector<float>& scratch) -> const float* {
+        if (tensor.dtype() == DType::F32) return require(tensor.data<float>()).data();
+        const auto count = tensor.numel();
+        if (scratch.size() < count) scratch.resize(count);
+        const auto raw = require(tensor.host_bytes());
+        ::ynn::convert_bf16_to_f32_rows(1, count, reinterpret_cast<const std::uint16_t*>(raw.data()), count,
+                                        scratch.data(), count, 0, 1);
+        return scratch.data();
+    }
+
+    auto apply(TensorInputs inputs, Tensor& output) -> void {
+        if (out_elements_ == 0) return;
+        const auto rank = out_shape_.size();
+        if (out_dtype_ == DType::I32) {
+            ::ynn::broadcast_binary_i32(is_multiply_, rank, out_shape_.data(), a_strides_.data(), b_strides_.data(),
+                                        out_elements_, require(inputs[0].data<std::int32_t>()).data(),
+                                        require(inputs[1].data<std::int32_t>()).data(),
+                                        require(output.data<std::int32_t>()).data());
+            return;
+        }
+        if (out_dtype_ == DType::I64) {
+            ::ynn::broadcast_binary_i64(is_multiply_, rank, out_shape_.data(), a_strides_.data(), b_strides_.data(),
+                                        out_elements_, require(inputs[0].data<std::int64_t>()).data(),
+                                        require(inputs[1].data<std::int64_t>()).data(),
+                                        require(output.data<std::int64_t>()).data());
+            return;
+        }
+        const auto* a = ensure_f32(inputs[0], a_f32_);
+        const auto* b = ensure_f32(inputs[1], b_f32_);
+        float* dst = nullptr;
+        if (out_dtype_ == DType::F32) {
+            dst = require(output.data<float>()).data();
+        } else {
+            if (out_f32_.size() < out_elements_) out_f32_.resize(out_elements_);
+            dst = out_f32_.data();
+        }
+        if (out_elements_ < 32768 || ynn::thread_count() <= 1) {
+            ::ynn::broadcast_binary_f32(is_multiply_, rank, out_shape_.data(), a_strides_.data(), b_strides_.data(),
+                                        out_elements_, a, b, dst, 0, out_elements_);
+        } else {
+            require(ynn::parallel_ranges(out_elements_, 8192, [&](std::size_t begin, std::size_t end) {
+                ::ynn::broadcast_binary_f32(is_multiply_, rank, out_shape_.data(), a_strides_.data(), b_strides_.data(),
+                                            out_elements_, a, b, dst, begin, end);
+            }));
+        }
+        if (out_dtype_ == DType::BF16) {
+            auto raw = require(output.host_bytes());
+            ::ynn::convert_f32_to_bf16_rows(1, out_elements_, dst, out_elements_,
+                                            reinterpret_cast<std::uint16_t*>(raw.data()), out_elements_, 0, 1);
+        }
+    }
+
+    bool is_multiply_;
+    DType out_dtype_;
+    std::size_t out_elements_ = 0;
+    std::vector<std::int64_t> shape_;
+    std::vector<std::size_t> out_shape_, a_strides_, b_strides_;
+    std::vector<float> a_f32_, b_f32_, out_f32_;
+    OutputPool pool_;
+};
+
+class CastOp final : public Operator {
+public:
+    CastOp(const OperatorSpec& spec, const Tensor& input, tensor::Arena& arena)
+        : src_type_(cast_ynn_type(input.dtype())),
+          dst_type_(cast_ynn_type(spec.dtype)),
+          out_dtype_(spec.dtype),
+          count_(input.numel()),
+          shape_(input.shape().begin(), input.shape().end()),
+          pool_(&arena) {}
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, out_dtype_, tensor::Device::cpu());
+        apply(inputs[0], output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "cast cannot run in place"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(const Tensor& input, Tensor& output) const -> void {
+        if (count_ == 0) return;
+        const auto* src = require(input.host_bytes()).data();
+        auto* dst = require(output.host_bytes()).data();
+        if (count_ < 32768 || ynn::thread_count() <= 1) {
+            ::ynn::cast_elements(src_type_, dst_type_, count_, src, dst, 0, count_);
+            return;
+        }
+        require(ynn::parallel_ranges(count_, 8192, [&](std::size_t begin, std::size_t end) {
+            ::ynn::cast_elements(src_type_, dst_type_, count_, src, dst, begin, end);
+        }));
+    }
+
+    ynn_type src_type_, dst_type_;
+    DType out_dtype_;
+    std::size_t count_;
     std::vector<std::int64_t> shape_;
     OutputPool pool_;
-    std::vector<std::shared_ptr<const void>> constant_owners_;
-    Tensor block_zeros_;
-    std::size_t block_size_ = 0;
 };
+
+class LayerNormOp final : public Operator {
+public:
+    static auto supports(const OperatorSpec& spec, TensorInputs inputs) noexcept -> bool {
+        const bool paired = spec.operation == Operation::RESIDUAL_NORM;
+        if ((spec.operation != Operation::LAYER_NORM && !paired) || inputs.size() != (paired ? 4U : 3U)) return false;
+        const auto& x = inputs[0];
+        if ((x.dtype() != DType::F32 && x.dtype() != DType::BF16) || !x.is_contiguous() || x.dimensions() == 0 ||
+            x.size(-1) == 0)
+            return false;
+        if (paired && (inputs[1].dtype() != x.dtype() || !inputs[1].is_contiguous() ||
+                       !std::ranges::equal(inputs[1].shape(), x.shape())))
+            return false;
+        const auto w_idx = paired ? 2U : 1U;
+        for (std::size_t i = w_idx; i < inputs.size(); ++i) {
+            if ((inputs[i].dtype() != DType::F32 && inputs[i].dtype() != DType::BF16) || !inputs[i].is_contiguous() ||
+                inputs[i].numel() != x.size(-1))
+                return false;
+        }
+        return true;
+    }
+
+    LayerNormOp(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
+        : paired_(spec.operation == Operation::RESIDUAL_NORM),
+          epsilon_(spec.epsilon),
+          width_(static_cast<std::size_t>(inputs[0].size(-1))),
+          rows_(inputs[0].numel() / width_),
+          shape_(inputs[0].shape().begin(), inputs[0].shape().end()),
+          pool_(&arena) {
+        const auto w_idx = paired_ ? 2U : 1U;
+        if (!spec.dynamic_parameters) {
+            load_f32(inputs[w_idx], weight_f32_);
+            load_f32(inputs[w_idx + 1], bias_f32_);
+        }
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto norm = pool_.acquire(shape_, DType::F32, tensor::Device::cpu());
+        apply(inputs, norm, nullptr);
+        return norm;
+    }
+    auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
+        apply(inputs, destination, nullptr);
+        return destination;
+    }
+    auto run_pair(TensorInputs inputs) -> std::array<Tensor, 2> override {
+        auto residual = pool_.acquire(shape_, DType::F32, tensor::Device::cpu());
+        auto norm = pool_.acquire(shape_, DType::F32, tensor::Device::cpu());
+        apply(inputs, norm, &residual);
+        return {std::move(residual), std::move(norm)};
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override {
+        apply(inputs, outputs.back(), outputs.size() == 2 ? &outputs.front() : nullptr);
+    }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    static auto load_f32(const Tensor& tensor, std::vector<float>& dst) -> const float* {
+        if (tensor.dtype() == DType::F32) {
+            const auto src = require(std::as_const(tensor).data<float>());
+            dst.assign(src.begin(), src.end());
+            return dst.data();
+        }
+        const auto count = tensor.numel();
+        dst.resize(count);
+        const auto raw = require(std::as_const(tensor).host_bytes());
+        ::ynn::convert_bf16_to_f32_rows(1, count, reinterpret_cast<const std::uint16_t*>(raw.data()), count, dst.data(),
+                                        count, 0, 1);
+        return dst.data();
+    }
+
+    auto apply(TensorInputs inputs, Tensor& out_norm, Tensor* out_residual) -> void {
+        if (rows_ == 0) return;
+        const float* x =
+            inputs[0].dtype() == DType::F32 ? require(inputs[0].data<float>()).data() : load_f32(inputs[0], x_f32_);
+        const float* res = nullptr;
+        if (paired_) {
+            res = inputs[1].dtype() == DType::F32 ? require(inputs[1].data<float>()).data()
+                                                  : load_f32(inputs[1], res_f32_);
+        }
+        const auto w_idx = paired_ ? 2U : 1U;
+        const float* w = weight_f32_.empty()
+                             ? (inputs[w_idx].dtype() == DType::F32 ? require(inputs[w_idx].data<float>()).data()
+                                                                    : load_f32(inputs[w_idx], dyn_w_))
+                             : weight_f32_.data();
+        const float* b = bias_f32_.empty() ? (inputs[w_idx + 1].dtype() == DType::F32
+                                                  ? require(inputs[w_idx + 1].data<float>()).data()
+                                                  : load_f32(inputs[w_idx + 1], dyn_b_))
+                                           : bias_f32_.data();
+        auto* yn = require(out_norm.data<float>()).data();
+        auto* yr = out_residual ? require(out_residual->data<float>()).data() : nullptr;
+        for_rows(rows_, width_, [&](std::size_t begin, std::size_t end) {
+            ::ynn::layer_norm_f32(rows_, width_, epsilon_, x, res, w, b, yn, yr, begin, end);
+        });
+    }
+
+    bool paired_;
+    float epsilon_;
+    std::size_t width_, rows_;
+    std::vector<std::int64_t> shape_;
+    std::vector<float> weight_f32_, bias_f32_, dyn_w_, dyn_b_, x_f32_, res_f32_;
+    OutputPool pool_;
+};
+
+class SoftmaxOp final : public Operator {
+public:
+    SoftmaxOp(const OperatorSpec& spec, const Tensor& input, tensor::Arena& arena)
+        : logarithmic_(spec.operation == Operation::LOG_SOFTMAX),
+          width_(static_cast<std::size_t>(input.size(-1))),
+          rows_(input.numel() / width_),
+          out_dtype_(spec.dtype),
+          shape_(input.shape().begin(), input.shape().end()),
+          pool_(&arena) {}
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, out_dtype_, tensor::Device::cpu());
+        apply(inputs[0], output);
+        return output;
+    }
+    auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
+        apply(inputs[0], destination);
+        return destination;
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(const Tensor& input, Tensor& output) -> void {
+        if (rows_ == 0) return;
+        const float* src = nullptr;
+        if (input.dtype() == DType::F32) {
+            src = require(input.data<float>()).data();
+        } else {
+            if (x_f32_.size() < rows_ * width_) x_f32_.resize(rows_ * width_);
+            const auto raw = require(input.host_bytes());
+            ::ynn::convert_bf16_to_f32_rows(rows_, width_, reinterpret_cast<const std::uint16_t*>(raw.data()), width_,
+                                            x_f32_.data(), width_, 0, rows_);
+            src = x_f32_.data();
+        }
+        float* dst = nullptr;
+        if (out_dtype_ == DType::F32) {
+            dst = require(output.data<float>()).data();
+        } else {
+            if (out_f32_.size() < rows_ * width_) out_f32_.resize(rows_ * width_);
+            dst = out_f32_.data();
+        }
+        for_rows(rows_, width_, [&](std::size_t begin, std::size_t end) {
+            ::ynn::softmax_f32(rows_, width_, logarithmic_, src, dst, begin, end);
+        });
+        if (out_dtype_ == DType::BF16) {
+            auto raw = require(output.host_bytes());
+            ::ynn::convert_f32_to_bf16_rows(rows_, width_, dst, width_, reinterpret_cast<std::uint16_t*>(raw.data()),
+                                            width_, 0, rows_);
+        }
+    }
+
+    bool logarithmic_;
+    std::size_t width_, rows_;
+    DType out_dtype_;
+    std::vector<std::int64_t> shape_;
+    std::vector<float> x_f32_, out_f32_;
+    OutputPool pool_;
+};
+
+class UnaryElementwiseOp final : public Operator {
+public:
+    UnaryElementwiseOp(const OperatorSpec& spec, const Tensor& input, tensor::Arena& arena)
+        : op_(spec.operation),
+          approximate_(!spec.attributes.empty() && spec.attributes[0] != 0),
+          scale_(spec.epsilon),
+          count_(input.numel()),
+          out_dtype_(spec.dtype),
+          shape_(input.shape().begin(), input.shape().end()),
+          pool_(&arena) {}
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, out_dtype_, tensor::Device::cpu());
+        apply(inputs[0], output);
+        return output;
+    }
+    auto run_(TensorInputs inputs, Tensor& destination) -> Tensor override {
+        apply(inputs[0], destination);
+        return destination;
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(const Tensor& input, Tensor& output) -> void {
+        if (count_ == 0) return;
+        const float* src = nullptr;
+        if (input.dtype() == DType::F32) {
+            src = require(input.data<float>()).data();
+        } else {
+            if (x_f32_.size() < count_) x_f32_.resize(count_);
+            const auto raw = require(input.host_bytes());
+            ::ynn::convert_bf16_to_f32_rows(1, count_, reinterpret_cast<const std::uint16_t*>(raw.data()), count_,
+                                            x_f32_.data(), count_, 0, 1);
+            src = x_f32_.data();
+        }
+        float* dst = nullptr;
+        if (out_dtype_ == DType::F32) {
+            dst = require(output.data<float>()).data();
+        } else {
+            if (out_f32_.size() < count_) out_f32_.resize(count_);
+            dst = out_f32_.data();
+        }
+        const auto run_chunk = [&](std::size_t begin, std::size_t end) {
+            if (op_ == Operation::GELU)
+                ::ynn::gelu_f32(count_, approximate_, src, dst, begin, end);
+            else if (op_ == Operation::TANH)
+                ::ynn::tanh_f32(count_, src, dst, begin, end);
+            else
+                ::ynn::static_round_f32(count_, scale_, src, dst, begin, end);
+        };
+        if (count_ < 16384 || ynn::thread_count() <= 1) {
+            run_chunk(0, count_);
+        } else {
+            require(ynn::parallel_ranges(count_, 4096, run_chunk));
+        }
+        if (out_dtype_ == DType::BF16) {
+            auto raw = require(output.host_bytes());
+            ::ynn::convert_f32_to_bf16_rows(1, count_, dst, count_, reinterpret_cast<std::uint16_t*>(raw.data()),
+                                            count_, 0, 1);
+        }
+    }
+
+    Operation op_;
+    bool approximate_;
+    float scale_;
+    std::size_t count_;
+    DType out_dtype_;
+    std::vector<std::int64_t> shape_;
+    std::vector<float> x_f32_, out_f32_;
+    OutputPool pool_;
+};
+
+class TransposeOp final : public Operator {
+public:
+    TransposeOp(const OperatorSpec& spec, const Tensor& input, tensor::Arena& arena)
+        : dtype_(input.dtype()), elem_bytes_(tensor::element_size(dtype_)), pool_(&arena) {
+        const auto rank = input.dimensions();
+        in_shape_.resize(rank);
+        out_shape_.resize(rank);
+        std::vector<std::size_t> out_axis_stride(rank, 1);
+        for (std::size_t d = 0; d < rank; ++d) {
+            in_shape_[d] = static_cast<std::size_t>(input.shape()[d]);
+            const auto src_axis = static_cast<std::size_t>(spec.attributes[d]);
+            out_shape_[d] = input.shape()[src_axis];
+        }
+        std::size_t stride = 1;
+        for (std::size_t d = rank; d-- > 0;) {
+            out_axis_stride[d] = stride;
+            stride *= static_cast<std::size_t>(out_shape_[d]);
+        }
+        out_strides_.resize(rank, 0);
+        for (std::size_t d = 0; d < rank; ++d)
+            out_strides_[static_cast<std::size_t>(spec.attributes[d])] = out_axis_stride[d];
+        outer_ = 1;
+        for (std::size_t d = 0; d + 1 < rank; ++d) outer_ *= in_shape_[d];
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(out_shape_, dtype_, tensor::Device::cpu());
+        apply(inputs[0], output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "transpose cannot run in place"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs[0], outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(const Tensor& input, Tensor& output) const -> void {
+        if (input.numel() == 0) return;
+        const auto* src = require(input.host_bytes()).data();
+        auto* dst = require(output.host_bytes()).data();
+        const auto* s_bytes = reinterpret_cast<const std::uint8_t*>(src);
+        auto* d_bytes = reinterpret_cast<std::uint8_t*>(dst);
+        if (outer_ <= 1 || input.numel() < 16384 || ynn::thread_count() <= 1) {
+            ::ynn::transpose_elements(elem_bytes_, in_shape_.size(), in_shape_.data(), out_strides_.data(), s_bytes,
+                                      d_bytes, 0, outer_);
+            return;
+        }
+        require(ynn::parallel_ranges(outer_, 1, [&](std::size_t begin, std::size_t end) {
+            ::ynn::transpose_elements(elem_bytes_, in_shape_.size(), in_shape_.data(), out_strides_.data(), s_bytes,
+                                      d_bytes, begin, end);
+        }));
+    }
+
+    DType dtype_;
+    std::size_t elem_bytes_, outer_ = 1;
+    std::vector<std::int64_t> out_shape_;
+    std::vector<std::size_t> in_shape_, out_strides_;
+    OutputPool pool_;
+};
+
+class GatherOp final : public Operator {
+public:
+    GatherOp(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
+        : dtype_(inputs[0].dtype()),
+          idx_dtype_(inputs[1].dtype()),
+          elem_bytes_(tensor::element_size(dtype_)),
+          pool_(&arena) {
+        const auto rank = static_cast<std::int64_t>(inputs[0].dimensions());
+        auto axis = spec.attributes[0];
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "gather axis outside tensor rank"});
+        const auto u_axis = static_cast<std::size_t>(axis);
+        axis_len_ = static_cast<std::size_t>(inputs[0].size(u_axis));
+        index_count_ = inputs[1].numel();
+        outer_ = 1;
+        for (std::size_t d = 0; d < u_axis; ++d) outer_ *= static_cast<std::size_t>(inputs[0].shape()[d]);
+        inner_ = 1;
+        for (std::size_t d = u_axis + 1; d < static_cast<std::size_t>(rank); ++d)
+            inner_ *= static_cast<std::size_t>(inputs[0].shape()[d]);
+
+        out_shape_.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+        if (inputs[1].dimensions() == 1) {
+            out_shape_[u_axis] = static_cast<std::int64_t>(index_count_);
+        } else {
+            out_shape_.erase(out_shape_.begin() + static_cast<std::ptrdiff_t>(u_axis));
+            out_shape_.insert(out_shape_.begin() + static_cast<std::ptrdiff_t>(u_axis), inputs[1].shape().begin(),
+                              inputs[1].shape().end());
+        }
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(out_shape_, dtype_, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "gather cannot run in place"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(TensorInputs inputs, Tensor& output) const -> void {
+        if (outer_ == 0 || index_count_ == 0 || inner_ == 0) return;
+        const auto* src = require(inputs[0].host_bytes()).data();
+        auto* dst = require(output.host_bytes()).data();
+        const auto* idx_bytes = require(inputs[1].host_bytes()).data();
+        const bool idx_is_i64 = idx_dtype_ == DType::I64;
+        for (std::size_t j = 0; j < index_count_; ++j) {
+            const auto raw = idx_is_i64
+                                 ? reinterpret_cast<const std::int64_t*>(idx_bytes)[j]
+                                 : static_cast<std::int64_t>(reinterpret_cast<const std::int32_t*>(idx_bytes)[j]);
+            if (raw < 0 || static_cast<std::size_t>(raw) >= axis_len_)
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "gather index out of range"});
+        }
+        const auto total_copies = outer_ * index_count_;
+        if (total_copies * inner_ * elem_bytes_ < 65536 || ynn::thread_count() <= 1) {
+            ::ynn::gather_elements(elem_bytes_, axis_len_, inner_, index_count_, idx_is_i64, src, idx_bytes, dst, 0,
+                                   total_copies);
+            return;
+        }
+        require(ynn::parallel_ranges(total_copies, 1, [&](std::size_t begin, std::size_t end) {
+            ::ynn::gather_elements(elem_bytes_, axis_len_, inner_, index_count_, idx_is_i64, src, idx_bytes, dst, begin,
+                                   end);
+        }));
+    }
+
+    DType dtype_, idx_dtype_;
+    std::size_t elem_bytes_, outer_ = 1, axis_len_ = 0, inner_ = 1, index_count_ = 0;
+    std::vector<std::int64_t> out_shape_;
+    OutputPool pool_;
+};
+
+class ConcatOp final : public Operator {
+public:
+    ConcatOp(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
+        : dtype_(inputs[0].dtype()), pool_(&arena) {
+        const auto rank = static_cast<std::int64_t>(inputs[0].dimensions());
+        auto axis = spec.attributes[0];
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "concat axis outside tensor rank"});
+        const auto u_axis = static_cast<std::size_t>(axis);
+        out_shape_.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+        out_shape_[u_axis] = 0;
+        for (std::size_t idx = 0; idx < inputs.size(); ++idx) out_shape_[u_axis] += inputs[idx].size(u_axis);
+        outer_ = 1;
+        for (std::size_t d = 0; d < u_axis; ++d) outer_ *= static_cast<std::size_t>(inputs[0].shape()[d]);
+        std::size_t inner = 1;
+        for (std::size_t d = u_axis + 1; d < static_cast<std::size_t>(rank); ++d)
+            inner *= static_cast<std::size_t>(inputs[0].shape()[d]);
+        inner_bytes_ = inner * tensor::element_size(dtype_);
+        dst_stride_bytes_ = static_cast<std::size_t>(out_shape_[u_axis]) * inner_bytes_;
+        axis_ = u_axis;
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(out_shape_, dtype_, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "concat cannot run in place"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(TensorInputs inputs, Tensor& output) const -> void {
+        if (outer_ == 0 || dst_stride_bytes_ == 0) return;
+        auto* dst = require(output.host_bytes()).data();
+        std::size_t dst_off = 0;
+        for (std::size_t idx = 0; idx < inputs.size(); ++idx) {
+            const auto& t = inputs[idx];
+            const auto src_stride = static_cast<std::size_t>(t.size(axis_)) * inner_bytes_;
+            if (src_stride == 0) continue;
+            const auto* src = require(t.host_bytes()).data();
+            for (std::size_t o = 0; o < outer_; ++o) {
+                std::memcpy(dst + o * dst_stride_bytes_ + dst_off, src + o * src_stride, src_stride);
+            }
+            dst_off += src_stride;
+        }
+    }
+
+    DType dtype_;
+    std::size_t axis_ = 0, outer_ = 1, inner_bytes_ = 0, dst_stride_bytes_ = 0;
+    std::vector<std::int64_t> out_shape_;
+    OutputPool pool_;
+};
+
+class PortablePackedLinearOp final : public Operator {
+public:
+    PortablePackedLinearOp(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
+        : bits_(static_cast<std::int32_t>(spec.attributes[0])),
+          block_size_(static_cast<std::size_t>(spec.attributes[1])),
+          input_scale_(spec.epsilon),
+          output_scale_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]))),
+          n_(static_cast<std::size_t>(inputs[1].size(0))),
+          k_(static_cast<std::size_t>(inputs[0].size(-1))),
+          blocks_(k_ / block_size_),
+          has_zero_(inputs.size() == 4),
+          pool_(&arena) {
+        if (!spec.dynamic_parameters) {
+            unpack_params(inputs);
+            cached_ = true;
+        }
+    }
+
+    auto run(TensorInputs inputs) -> Tensor override {
+        std::vector<std::int64_t> shape(inputs[0].shape().begin(), inputs[0].shape().end());
+        shape.back() = static_cast<std::int64_t>(n_);
+        auto output = pool_.acquire(shape, DType::F32, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "packed linear cannot run in place"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs.back()); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto unpack_params(TensorInputs inputs) -> void {
+        w_.resize(n_ * k_);
+        ::ynn::portable_packed_linear_unpack_weights(
+            bits_, reinterpret_cast<const std::uint8_t*>(require(std::as_const(inputs[1]).host_bytes()).data()), n_, k_,
+            static_cast<std::size_t>(inputs[1].size(1)), w_.data());
+        scales_.resize(inputs[2].numel());
+        ::ynn::portable_packed_linear_decode_meta(require(std::as_const(inputs[2]).host_bytes()).data(),
+                                                  inputs[2].dtype() == DType::F16, scales_.size(), scales_.data());
+        if (has_zero_) {
+            zeros_.resize(inputs[3].numel());
+            ::ynn::portable_packed_linear_decode_meta(require(std::as_const(inputs[3]).host_bytes()).data(),
+                                                      inputs[3].dtype() == DType::F16, zeros_.size(), zeros_.data());
+        }
+    }
+
+    auto apply(TensorInputs inputs, Tensor& output) -> void {
+        if (!cached_) unpack_params(inputs);
+        const auto rows = inputs[0].numel() / k_;
+        if (rows == 0) return;
+        const auto* x = require(inputs[0].data<float>()).data();
+        auto* y = require(output.data<float>()).data();
+        if (rows <= 1 || ynn::thread_count() <= 1 || rows * n_ * k_ < 32768) {
+            ::ynn::portable_packed_linear_f32(rows, n_, k_, block_size_, input_scale_, output_scale_, has_zero_, x,
+                                              w_.data(), scales_.data(), has_zero_ ? zeros_.data() : nullptr, y, 0,
+                                              rows);
+            return;
+        }
+        require(ynn::parallel_ranges(rows, 1, [&](std::size_t begin, std::size_t end) {
+            ::ynn::portable_packed_linear_f32(rows, n_, k_, block_size_, input_scale_, output_scale_, has_zero_, x,
+                                              w_.data(), scales_.data(), has_zero_ ? zeros_.data() : nullptr, y, begin,
+                                              end);
+        }));
+    }
+
+    std::int32_t bits_;
+    std::size_t block_size_;
+    float input_scale_, output_scale_;
+    std::size_t n_, k_, blocks_;
+    bool has_zero_, cached_ = false;
+    std::vector<std::int8_t> w_;
+    std::vector<float> scales_, zeros_;
+    OutputPool pool_;
+};
+
 class CpuBackend final : public OperatorBackend {
 public:
     CpuBackend() { require(arena_.reserve(8 * 1024 * 1024)); }
@@ -1744,517 +2806,106 @@ public:
         }
         if (PackedFeedForward::supports(spec, inputs))
             return std::make_unique<PackedFeedForward>(spec, inputs, feed_forward_cache_, arena_);
+        if (DenseLinearOp::supports(spec, inputs)) {
+            PackedDenseEntry entry;
+            if (!spec.dynamic_parameters && spec.operation == Operation::LINEAR && inputs[1].dimensions() == 2) {
+                const bool transpose_b = spec.attributes[0] != 0;
+                const auto k = static_cast<std::size_t>(inputs[0].size(-1));
+                const auto n = static_cast<std::size_t>(transpose_b ? inputs[1].size(0) : inputs[1].size(1));
+                const DenseTileKey key{inputs[1].storage_identity(),
+                                       inputs[1].storage_offset(),
+                                       n,
+                                       k,
+                                       transpose_b,
+                                       inputs[1].dtype(),
+                                       false};
+                auto found = dense_tile_cache_.find(key);
+                if (found == dense_tile_cache_.end()) {
+                    const auto ynn_bt = inputs[1].dtype() == DType::BF16 ? ynn_type_bf16 : ynn_type_fp32;
+                    ::ynn::dense_linear_plan plan{};
+                    check(::ynn::make_dense_linear_plan(ynn_bt, ynn_bt, ynn_type_fp32, n, k, &plan));
+                    auto packed = DenseLinearOp::pack_static_b(inputs[1], transpose_b, plan);
+                    found = dense_tile_cache_.emplace(key, PackedDenseEntry{plan, std::move(packed), {}}).first;
+                    if (inputs[1].size(0) < 65536) inputs[1].release_pages();
+#if defined(__APPLE__)
+                    if (inputs[1].nbytes() >= (std::size_t{8} << 20)) ::malloc_zone_pressure_relief(nullptr, 0);
+#endif
+                }
+                entry = found->second;
+            }
+            return std::make_unique<DenseLinearOp>(spec, inputs, std::move(entry), arena_);
+        }
+        if (QuantizedLinearOp::supports(spec, inputs)) {
+            PackedDenseEntry entry;
+            if (!spec.dynamic_parameters) {
+                const bool transpose_b = spec.attributes[0] != 0;
+                const auto k = static_cast<std::size_t>(inputs[0].size(-1));
+                const auto n = static_cast<std::size_t>(transpose_b ? inputs[1].size(0) : inputs[1].size(1));
+                const DenseTileKey key{inputs[1].storage_identity(),
+                                       inputs[1].storage_offset(),
+                                       n,
+                                       k,
+                                       transpose_b,
+                                       inputs[1].dtype(),
+                                       true};
+                auto found = dense_tile_cache_.find(key);
+                if (found == dense_tile_cache_.end()) {
+                    ::ynn::dense_linear_plan plan{};
+                    check(::ynn::make_dense_linear_plan(ynn_type_int8, ynn_type_int8, ynn_type_int32, n, k, &plan));
+                    auto [packed, sums] = QuantizedLinearOp::pack_static_b(inputs[1], transpose_b, plan);
+                    found = dense_tile_cache_.emplace(key, PackedDenseEntry{plan, std::move(packed), std::move(sums)})
+                                .first;
+                    if (inputs[1].size(0) < 65536) inputs[1].release_pages();
+#if defined(__APPLE__)
+                    if (inputs[1].nbytes() >= (std::size_t{8} << 20)) ::malloc_zone_pressure_relief(nullptr, 0);
+#endif
+                }
+                entry = found->second;
+            }
+            return std::make_unique<QuantizedLinearOp>(spec, inputs, std::move(entry), arena_);
+        }
         if (spec.operation == Operation::ATTENTION) {
 #if defined(__APPLE__)
             if (PytorchParityAttention::supports(spec, inputs))
                 return std::make_unique<PytorchParityAttention>(spec, arena_);
 #endif
-            if (FewQueryAttention::supports(spec, inputs)) return std::make_unique<FewQueryAttention>(spec, arena_);
+            if (DirectAttentionOp::supports(spec, inputs)) return std::make_unique<DirectAttentionOp>(spec, arena_);
             const bool byte_cache = inputs[1].dtype() == DType::I8 && !spec.quantization[0].scales.empty() &&
                                     !spec.quantization[1].scales.empty();
             if (byte_cache && inputs[0].dtype() == DType::F32 && inputs[2].dtype() == inputs[1].dtype())
                 return std::make_unique<QuantizedAttention>(spec, inputs, arena_);
         }
-        const auto flags = inputs[0].dtype() == DType::BF16 ? YNN_FLAG_NO_EXCESS_PRECISION : 0;
-        const bool paired = spec.operation == Operation::RESIDUAL_NORM;
-        const bool has_packed_zero = spec.operation == Operation::PACKED_LINEAR && inputs.size() == 4;
-        const auto graph_input_count = has_packed_zero ? 3U : inputs.size();
-        auto graph = require(ynn::Graph::create(graph_input_count + (paired ? 2 : 1), flags));
-        auto native = graph.get();
-        const auto constant =
-            !spec.dynamic_parameters &&
-            (spec.operation == Operation::LINEAR || spec.operation == Operation::QUANTIZED_LINEAR ||
-             spec.operation == Operation::LAYER_NORM || spec.operation == Operation::RMS_NORM ||
-             spec.operation == Operation::PACKED_LINEAR || spec.operation == Operation::GATED_FEED_FORWARD || paired);
-        const std::size_t dynamic_count = constant ? (paired ? 2 : 1) : graph_input_count;
-        const std::size_t column_alignment = spec.operation == Operation::PACKED_LINEAR ? 8 / spec.attributes[0] : 1;
-        const auto padded_columns =
-            spec.operation == Operation::PACKED_LINEAR
-                ? ((inputs[1].size(0) + column_alignment - 1) / column_alignment) * column_alignment
-                : 0;
-        const bool pad_columns = spec.operation == Operation::PACKED_LINEAR && padded_columns != inputs[1].size(0);
-        std::vector<std::uint32_t> operands;
-        for (std::size_t index = 0; index < graph_input_count; ++index) {
-            auto id = static_cast<std::uint32_t>(index);
-            std::vector<std::size_t> shape(inputs[index].shape().begin(), inputs[index].shape().end());
-            const bool parameter = index >= dynamic_count;
-            if (parameter) id = YNN_INVALID_VALUE_ID;
-            const bool packed = (spec.operation == Operation::PACKED_LINEAR && index == 1) ||
-                                (spec.operation == Operation::GATED_FEED_FORWARD && (index == 1 || index == 3));
-            if (packed) shape[1] *= 8 / spec.attributes[0];
-            const auto dtype = packed ? (spec.attributes[0] == 2   ? ynn_type_int2
-                                         : spec.attributes[0] == 4 ? ynn_type_int4
-                                                                   : ynn_type_int8)
-                                      : type(inputs[index].dtype());
-            std::vector<std::byte> padded;
-            const auto* data = parameter ? require(inputs[index].host_bytes()).data() : nullptr;
-            if (pad_columns && index > 0) {
-                shape[0] = padded_columns;
-                const auto bytes = require(inputs[index].host_bytes());
-                padded.assign(bytes.begin(), bytes.end());
-                padded.resize(bytes.size() / inputs[index].size(0) * padded_columns, std::byte{});
-                data = padded.data();
-            }
-            check(ynn_define_tensor(
-                native, dtype, shape.size(), shape.data(), data,
-                parameter ? (padded.empty() ? 0 : YNN_VALUE_FLAG_COPY_DATA) : YNN_VALUE_FLAG_EXTERNAL_INPUT, &id));
-            operands.push_back(id);
-        }
-        const auto scalar = [&](float value) {
-            auto id = YNN_INVALID_VALUE_ID;
-            check(ynn_define_tensor(native, ynn_type_fp32, 0, nullptr, &value, YNN_VALUE_FLAG_COPY_DATA, &id));
-            return id;
-        };
-        const auto unary = [&](ynn_unary_operator operation, std::uint32_t input) {
-            auto id = YNN_INVALID_VALUE_ID;
-            check(ynn_define_unary(native, operation, input, &id, 0));
-            return id;
-        };
-        const auto binary = [&](ynn_binary_operator operation, std::uint32_t left, std::uint32_t right) {
-            auto id = YNN_INVALID_VALUE_ID;
-            check(ynn_define_binary(native, operation, left, right, &id, 0));
-            return id;
-        };
-        const std::int32_t last_axis = -1;
-        const auto reduce = [&](ynn_reduce_operator operation, std::uint32_t input) {
-            auto id = YNN_INVALID_VALUE_ID;
-            check(ynn_define_reduce(native, operation, 1, &last_axis, input, YNN_INVALID_VALUE_ID, &id,
-                                    YNN_NODE_FLAG_KEEP_DIMS));
-            return id;
-        };
-        auto result = YNN_INVALID_VALUE_ID;
-        auto residual = YNN_INVALID_VALUE_ID;
-        auto dtype = spec.dtype;
-        std::vector<std::shared_ptr<const void>> constant_owners;
-        switch (spec.operation) {
-            case Operation::ADD:
-                result = binary(ynn_binary_add, operands[0], operands[1]);
-                break;
-            case Operation::MULTIPLY:
-                result = binary(ynn_binary_multiply, operands[0], operands[1]);
-                break;
-            case Operation::ATTENTION: {
-                const auto heads = static_cast<std::size_t>(spec.attributes[0]);
-                const auto head_width = inputs[0].size(2) / heads;
-                if (spec.attributes.size() >= 2) {
-                    const auto key_heads = static_cast<std::size_t>(spec.attributes[1]);
-                    const auto reshape = [&](std::uint32_t input, std::span<const std::size_t> shape) {
-                        auto output = YNN_INVALID_VALUE_ID;
-                        check(ynn_define_static_reshape(native, shape.size(), shape.data(), input, &output, 0));
-                        return output;
-                    };
-                    const auto transpose = [&](std::uint32_t input, std::array<std::int32_t, 5> axes) {
-                        auto output = YNN_INVALID_VALUE_ID;
-                        check(ynn_define_static_transpose(native, axes.size(), axes.data(), input, &output, 0));
-                        return output;
-                    };
-                    const auto split = [&](std::size_t index, bool key) {
-                        auto operand = operands[index];
-                        auto length = inputs[index].size(1);
-                        if (index != 0 && spec.attributes.size() >= 4) {
-                            length = spec.attributes[3];
-                            if (spec.attributes[2] || length != inputs[index].size(1)) {
-                                const std::int32_t axis = 1;
-                                const std::int64_t start = spec.attributes[2], end = start + length, stride = 1;
-                                operand = YNN_INVALID_VALUE_ID;
-                                check(ynn_define_static_slice(native, 1, &axis, &start, &end, &stride, operands[index],
-                                                              &operand, 0));
-                            }
-                        }
-                        const std::array shape{inputs[index].size(0), length, key_heads,
-                                               index == 0 ? heads / key_heads : std::size_t{1}, head_width};
-                        return transpose(reshape(operand, shape), key ? std::array<std::int32_t, 5>{0, 2, 3, 4, 1}
-                                                                      : std::array<std::int32_t, 5>{0, 2, 3, 1, 4});
-                    };
-                    auto scores = YNN_INVALID_VALUE_ID, probability = YNN_INVALID_VALUE_ID,
-                         hidden = YNN_INVALID_VALUE_ID;
-                    check(ynn_define_dot(native, 1, split(0, false), split(1, true), YNN_INVALID_VALUE_ID, &scores, 0));
-                    scores = binary(ynn_binary_multiply, scores, scalar(spec.epsilon));
-                    std::vector<std::size_t> mask_shape(5 - inputs[3].dimensions(), 1);
-                    mask_shape.insert(mask_shape.end(), inputs[3].shape().begin(), inputs[3].shape().end());
-                    if (inputs[3].dimensions() == 4) {
-                        mask_shape[0] = inputs[3].size(0);
-                        mask_shape[1] = 1;
-                    }
-                    scores = binary(ynn_binary_add, scores, reshape(operands[3], mask_shape));
-                    check(::ynn::define_softmax(native, scores, 1.F, probability));
-                    check(ynn_define_dot(native, 1, probability, split(2, false), YNN_INVALID_VALUE_ID, &hidden, 0));
-                    const std::array shape{inputs[0].size(0), inputs[0].size(1), inputs[0].size(2)};
-                    result = reshape(transpose(hidden, {0, 3, 1, 2, 4}), shape);
-                    break;
-                }
-                const auto reshape = [&](std::uint32_t input, std::span<const std::size_t> shape) {
-                    auto output = YNN_INVALID_VALUE_ID;
-                    check(ynn_define_static_reshape(native, shape.size(), shape.data(), input, &output, 0));
-                    return output;
-                };
-                const auto transpose = [&](std::uint32_t input, std::array<std::int32_t, 4> axes) {
-                    auto output = YNN_INVALID_VALUE_ID;
-                    check(ynn_define_static_transpose(native, axes.size(), axes.data(), input, &output, 0));
-                    return output;
-                };
-                const auto split = [&](std::size_t index) {
-                    const std::array shape{inputs[index].size(0), inputs[index].size(1), heads, head_width};
-                    return transpose(reshape(operands[index], shape), {0, 2, 1, 3});
-                };
-                auto query = split(0), key = transpose(split(1), {0, 1, 3, 2}), value = split(2);
-                auto scores = YNN_INVALID_VALUE_ID;
-                check(ynn_define_dot(native, 1, query, key, YNN_INVALID_VALUE_ID, &scores, 0));
-                scores = binary(ynn_binary_multiply, scores,
-                                scalar(static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_width)))));
-                if (inputs.size() == 4) scores = binary(ynn_binary_add, scores, operands[3]);
-                auto probability = YNN_INVALID_VALUE_ID, hidden = YNN_INVALID_VALUE_ID;
-                check(::ynn::define_softmax(native, scores, 1.F, probability));
-                check(ynn_define_dot(native, 1, probability, value, YNN_INVALID_VALUE_ID, &hidden, 0));
-                const std::array shape{inputs[0].size(0), inputs[0].size(1), inputs[0].size(2)};
-                result = reshape(transpose(hidden, {0, 2, 1, 3}), shape);
-                break;
-            }
-            case Operation::CAST:
-                check(ynn_define_convert(native, operands[0], type(dtype), &result, YNN_NODE_FLAG_NO_EXCESS_PRECISION));
-                break;
-            case Operation::MATMUL:
-            case Operation::LINEAR: {
-                auto right = operands[1];
-                if (spec.attributes[0]) {
-                    std::vector<std::int32_t> axes(inputs[1].dimensions());
-                    std::iota(axes.begin(), axes.end(), 0);
-                    std::swap(axes[axes.size() - 1], axes[axes.size() - 2]);
-                    right = YNN_INVALID_VALUE_ID;
-                    check(ynn_define_static_transpose(native, axes.size(), axes.data(), operands[1], &right, 0));
-                }
-                check(ynn_define_dot(native, 1, operands[0], right, YNN_INVALID_VALUE_ID, &result, 0));
-                if (spec.operation == Operation::LINEAR && operands.size() == 3)
-                    result = binary(ynn_binary_add, result, operands[2]);
-                break;
-            }
-            case Operation::PACKED_LINEAR:
-            case Operation::QUANTIZED_LINEAR: {
-                const bool packed = spec.operation == Operation::PACKED_LINEAR;
-                const auto block_size = packed ? static_cast<std::size_t>(spec.attributes[1]) : inputs[0].size(-1);
-                const bool transposed = packed || (!spec.attributes.empty() && spec.attributes[0]);
-                auto zero = YNN_INVALID_VALUE_ID, scale = YNN_INVALID_VALUE_ID, quantized = YNN_INVALID_VALUE_ID;
-                if (packed && spec.epsilon > 0) {
-                    const std::int32_t origin = 0;
-                    check(ynn_define_tensor(native, ynn_type_int32, 0, nullptr, &origin, YNN_VALUE_FLAG_COPY_DATA,
-                                            &zero));
-                    scale = scalar(spec.epsilon);
-                } else {
-                    const auto range = reduce(ynn_reduce_min_max, operands[0]);
-                    check(ynn_define_dynamic_quantization(native, range, ynn_type_int8, &zero, &scale, 0));
-                }
-                check(ynn_define_quantize(native, operands[0], ynn_type_int8, zero, scale, &quantized, 0));
-                auto weight = operands[1];
-                if (transposed) {
-                    const std::array<std::int32_t, 2> axes{1, 0};
-                    weight = YNN_INVALID_VALUE_ID;
-                    check(ynn_define_static_transpose(native, 2, axes.data(), operands[1], &weight, 0));
-                }
-                if (packed && spec.epsilon > 0 && block_size == inputs[0].size(-1) &&
-                    (SHARED_DECODE_PACKING || inputs[0].numel() > inputs[0].size(-1))) {
-                    const std::size_t columns = padded_columns;
-                    auto channel_scale = YNN_INVALID_VALUE_ID;
-                    check(ynn_define_static_reshape(native, 1, &columns, operands[2], &channel_scale, 0));
-                    check(ynn_define_dot(native, 1, quantized, weight, YNN_INVALID_VALUE_ID, &result, 0));
-                    result = binary(ynn_binary_multiply, binary(ynn_binary_multiply, result, channel_scale), scale);
-                } else
-                    check(::ynn::define_blockwise_dot(
-                        native, quantized, zero, scale, weight, YNN_INVALID_VALUE_ID, operands[2], block_size,
-                        packed ? YNN_INVALID_VALUE_ID : operands[3], ynn_type_fp32, result, 0));
-                if (packed) {
-                    const auto output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]));
-                    if (output_scale > 0) {
-                        result = unary(ynn_unary_round, binary(ynn_binary_divide, result, scalar(output_scale)));
-                        result = binary(
-                            ynn_binary_multiply,
-                            binary(ynn_binary_min, binary(ynn_binary_max, result, scalar(-128.F)), scalar(127.F)),
-                            scalar(output_scale));
-                    }
-                }
-                break;
-            }
-            case Operation::GATED_FEED_FORWARD: {
-                const auto bits = static_cast<std::int32_t>(spec.attributes[0]);
-                const auto input_size = static_cast<std::size_t>(spec.attributes[1]);
-                const auto intermediate = static_cast<std::size_t>(spec.attributes[2]);
-                const auto gate_output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[3]));
-                const auto down_input_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[4]));
-                const auto down_output_scale = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[5]));
-                constexpr std::size_t TILE_SIZE = 2048;
-                const auto tiles = (intermediate + TILE_SIZE - 1) / TILE_SIZE;
-                const bool lookup_cache = feed_forward_cache_.enabled();
-                const auto source_hash = lookup_cache ? hash_tensor(inputs[3], hash_tensor(inputs[1])) : 0;
-                ynn::FeedForwardCacheSpec cache_spec{.bits = static_cast<std::uint32_t>(bits),
-                                                     .input_size = input_size,
-                                                     .intermediate_size = intermediate,
-                                                     .source_hash = source_hash};
-                const auto payload_size = 3 * input_size * intermediate / (8 / bits);
-                auto cached =
-                    lookup_cache ? feed_forward_cache_.load(cache_spec, payload_size) : ynn::FeedForwardCacheEntry{};
-                const bool store_cache = !cached && feed_forward_cache_.writable();
-                if (cached) constant_owners.push_back(cached.owner);
-                std::vector<std::uint8_t> payload;
-                if (store_cache) payload.reserve(payload_size);
-                std::size_t payload_offset = 0;
-                std::vector<std::uint32_t> gate_weight_ids(tiles), gate_scale_ids(tiles), up_weight_ids(tiles),
-                    up_scale_ids(tiles), down_weight_ids(tiles);
-                const auto define_weight = [&](const Tensor& weight, std::size_t row_start, std::size_t row_count,
-                                               std::size_t column_start, std::size_t column_count) {
-                    const auto size = column_count * row_count / (8 / bits);
-                    std::vector<std::uint8_t> generated;
-                    std::span<const std::uint8_t> bytes;
-                    if (cached) {
-                        if (payload_offset > cached.bytes.size() || size > cached.bytes.size() - payload_offset)
-                            throw ops::Failure({ErrorCode::RUNTIME, "invalid cached feed-forward payload"});
-                        bytes = cached.bytes.subspan(payload_offset, size);
-                    } else {
-                        generated =
-                            transpose_packed_tile(weight, bits, row_start, row_count, column_start, column_count);
-                        bytes = generated;
-                        if (store_cache) payload.insert(payload.end(), bytes.begin(), bytes.end());
-                    }
-                    payload_offset += size;
-                    const std::array<std::size_t, 2> shape{column_count, row_count};
-                    auto id = YNN_INVALID_VALUE_ID;
-                    const auto dtype = bits == 2 ? ynn_type_int2 : bits == 4 ? ynn_type_int4 : ynn_type_int8;
-                    check(ynn_define_tensor(native, dtype, shape.size(), shape.data(), bytes.data(),
-                                            cached ? 0 : YNN_VALUE_FLAG_COPY_DATA, &id));
-                    return id;
-                };
-                const auto& scales_tensor = inputs[2];
-                const auto scales = require(scales_tensor.data<float>());
-                const auto define_scales = [&](std::size_t start, std::size_t length) {
-                    const std::array<std::size_t, 2> shape{length, 1};
-                    auto id = YNN_INVALID_VALUE_ID;
-                    check(ynn_define_tensor(native, ynn_type_fp32, shape.size(), shape.data(), scales.data() + start,
-                                            YNN_VALUE_FLAG_COPY_DATA, &id));
-                    return id;
-                };
-                for (std::size_t tile = 0; tile < tiles; ++tile) {
-                    const auto begin = tile * TILE_SIZE;
-                    const auto length = std::min(TILE_SIZE, intermediate - begin);
-                    gate_weight_ids[tile] = define_weight(inputs[1], begin, length, 0, input_size);
-                    gate_scale_ids[tile] = define_scales(begin, length);
-                    up_weight_ids[tile] = define_weight(inputs[1], intermediate + begin, length, 0, input_size);
-                    up_scale_ids[tile] = define_scales(intermediate + begin, length);
-                    down_weight_ids[tile] = define_weight(inputs[3], 0, input_size, begin, length);
-                }
-                if (store_cache) feed_forward_cache_.store(cache_spec, payload);
-                check(::ynn::define_packed_feed_forward(
-                    native, operands[0], scalar(spec.epsilon), gate_weight_ids.data(), gate_scale_ids.data(),
-                    up_weight_ids.data(), up_scale_ids.data(), scalar(gate_output_scale), down_weight_ids.data(),
-                    operands[4], scalar(down_input_scale), scalar(down_output_scale), input_size, intermediate,
-                    TILE_SIZE, true, result));
-                break;
-            }
-            case Operation::GELU_MULTIPLY:
-            case Operation::GELU: {
-                if (spec.operation == Operation::GELU_MULTIPLY || spec.attributes[0]) {
-                    auto square = binary(ynn_binary_multiply, operands[0], operands[0]);
-                    auto cubic = binary(ynn_binary_multiply, square, operands[0]);
-                    auto inner =
-                        binary(ynn_binary_add, operands[0], binary(ynn_binary_multiply, cubic, scalar(0.044715F)));
-                    auto probability = binary(
-                        ynn_binary_add, scalar(1.F),
-                        unary(ynn_unary_tanh,
-                              binary(ynn_binary_multiply, inner, scalar(std::sqrt(2.F / 3.14159265358979323846F)))));
-                    result = binary(ynn_binary_multiply, binary(ynn_binary_multiply, operands[0], scalar(0.5F)),
-                                    probability);
-                    if (spec.operation == Operation::GELU_MULTIPLY)
-                        result = binary(ynn_binary_multiply, result, operands[1]);
-                    break;
-                }
-                auto normalized = binary(ynn_binary_multiply, operands[0], scalar(std::sqrt(2.0F) / 2.0F));
-                auto probability =
-                    binary(ynn_binary_add, binary(ynn_binary_multiply, unary(ynn_unary_erf, normalized), scalar(0.5F)),
-                           scalar(0.5F));
-                result = binary(ynn_binary_multiply, operands[0], probability);
-                break;
-            }
-            case Operation::SILU_MULTIPLY:
-                result = binary(ynn_binary_multiply,
-                                binary(ynn_binary_multiply, operands[0], unary(ynn_unary_sigmoid, operands[0])),
-                                operands[1]);
-                break;
-            case Operation::GELU_GATE:
-            case Operation::SILU_GATE: {
-                const std::int32_t axis = static_cast<std::int32_t>(inputs[0].dimensions() - 1);
-                const std::int64_t begin = 0, middle = inputs[0].size(-1) / 2, end = inputs[0].size(-1), stride = 1;
-                auto gate = YNN_INVALID_VALUE_ID, up = YNN_INVALID_VALUE_ID;
-                check(ynn_define_static_slice(native, 1, &axis, &begin, &middle, &stride, operands[0], &gate, 0));
-                check(ynn_define_static_slice(native, 1, &axis, &middle, &end, &stride, operands[0], &up, 0));
-                if (spec.operation == Operation::GELU_GATE) {
-                    auto square = binary(ynn_binary_multiply, gate, gate);
-                    auto cubic = binary(ynn_binary_multiply, square, gate);
-                    auto inner = binary(ynn_binary_add, gate, binary(ynn_binary_multiply, cubic, scalar(0.044715F)));
-                    auto probability = binary(
-                        ynn_binary_add, scalar(1.F),
-                        unary(ynn_unary_tanh,
-                              binary(ynn_binary_multiply, inner, scalar(std::sqrt(2.F / 3.14159265358979323846F)))));
-                    result = binary(
-                        ynn_binary_multiply,
-                        binary(ynn_binary_multiply, binary(ynn_binary_multiply, gate, scalar(0.5F)), probability), up);
-                    break;
-                }
-                result =
-                    binary(ynn_binary_multiply, binary(ynn_binary_multiply, gate, unary(ynn_unary_sigmoid, gate)), up);
-                break;
-            }
-            case Operation::ROTARY: {
-                const std::int32_t axis = 3;
-                const std::int64_t begin = 0, middle = inputs[0].size(3) / 2, end = inputs[0].size(3), stride = 1;
-                auto first = YNN_INVALID_VALUE_ID, second = YNN_INVALID_VALUE_ID;
-                check(ynn_define_static_slice(native, 1, &axis, &begin, &middle, &stride, operands[0], &first, 0));
-                check(ynn_define_static_slice(native, 1, &axis, &middle, &end, &stride, operands[0], &second, 0));
-                const std::array parts{binary(ynn_binary_subtract, binary(ynn_binary_multiply, first, operands[1]),
-                                              binary(ynn_binary_multiply, second, operands[2])),
-                                       binary(ynn_binary_add, binary(ynn_binary_multiply, second, operands[1]),
-                                              binary(ynn_binary_multiply, first, operands[2]))};
-                check(ynn_define_concatenate(native, axis, parts.size(), parts.data(), &result, 0));
-                break;
-            }
-            case Operation::TANH:
-                result = unary(ynn_unary_tanh, operands[0]);
-                break;
-            case Operation::STATIC_ROUND:
-                result = unary(ynn_unary_round, binary(ynn_binary_divide, operands[0], scalar(spec.epsilon)));
-                result = binary(ynn_binary_multiply,
-                                binary(ynn_binary_min, binary(ynn_binary_max, result, scalar(-128.F)), scalar(127.F)),
-                                scalar(spec.epsilon));
-                break;
-            case Operation::RMS_NORM_RESIDUAL:
-            case Operation::RMS_NORM: {
-                auto square = binary(ynn_binary_multiply, operands[0], operands[0]);
-                auto mean_square =
-                    binary(ynn_binary_multiply, reduce(ynn_reduce_sum, square), scalar(1.F / inputs[0].size(-1)));
-                auto inverse =
-                    unary(ynn_unary_reciprocal_square_root, binary(ynn_binary_add, mean_square, scalar(spec.epsilon)));
-                result = binary(ynn_binary_multiply, binary(ynn_binary_multiply, operands[0], inverse), operands[1]);
-                if (spec.operation == Operation::RMS_NORM_RESIDUAL) {
-                    result = binary(ynn_binary_add, operands[2], result);
-                    if (operands.size() == 4) result = binary(ynn_binary_multiply, result, operands[3]);
-                }
-                break;
-            }
-            case Operation::RESIDUAL_NORM:
-            case Operation::LAYER_NORM: {
-                const auto input = paired ? binary(ynn_binary_add, operands[0], operands[1]) : operands[0];
-                if (paired) residual = input;
-                auto reciprocal = scalar(1.0F / inputs[0].size(-1));
-                auto mean = binary(ynn_binary_multiply, reduce(ynn_reduce_sum, input), reciprocal);
-                auto centered = binary(ynn_binary_subtract, input, mean);
-                auto variance =
-                    binary(ynn_binary_multiply, reduce(ynn_reduce_sum, binary(ynn_binary_multiply, centered, centered)),
-                           reciprocal);
-                auto normalized = binary(
-                    ynn_binary_multiply, centered,
-                    unary(ynn_unary_reciprocal_square_root, binary(ynn_binary_add, variance, scalar(spec.epsilon))));
-                result = binary(ynn_binary_add, binary(ynn_binary_multiply, normalized, operands[dynamic_count]),
-                                operands[dynamic_count + 1]);
-                break;
-            }
-            case Operation::SOFTMAX:
-                check(::ynn::define_softmax(native, operands[0], 1.0F, result));
-                break;
-            case Operation::LOG_SOFTMAX: {
-                auto shifted = binary(ynn_binary_subtract, operands[0], reduce(ynn_reduce_max, operands[0]));
-                result = binary(ynn_binary_subtract, shifted,
-                                unary(ynn_unary_log, reduce(ynn_reduce_sum, unary(ynn_unary_exp, shifted))));
-                break;
-            }
-            case Operation::TRANSPOSE: {
-                std::vector<std::int32_t> axes(spec.attributes.begin(), spec.attributes.end());
-                check(ynn_define_static_transpose(native, axes.size(), axes.data(), operands[0], &result, 0));
-                break;
-            }
-            case Operation::SLICE: {
-                const auto axis = static_cast<std::int32_t>(spec.attributes[0]);
-                const std::int64_t end = spec.attributes[1] + spec.attributes[2], stride = 1;
-                check(ynn_define_static_slice(native, 1, &axis, &spec.attributes[1], &end, &stride, operands[0],
-                                              &result, 0));
-                break;
-            }
-            case Operation::GATHER: {
-                const auto axis = static_cast<std::int32_t>(spec.attributes[0]);
-                auto indices = operands[1];
-                if (inputs[1].dimensions() == 1) {
-                    const auto normalized = axis < 0 ? axis + static_cast<std::int32_t>(inputs[0].dimensions()) : axis;
-                    if (normalized < 0 || static_cast<std::size_t>(normalized) >= inputs[0].dimensions())
-                        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "gather axis outside tensor rank"});
-                    std::vector<std::size_t> index_shape(inputs[0].dimensions(), 1);
-                    index_shape[normalized] = inputs[1].numel();
-                    indices = YNN_INVALID_VALUE_ID;
-                    check(ynn_define_static_reshape(native, index_shape.size(), index_shape.data(), operands[1],
-                                                    &indices, 0));
-                }
-                check(ynn_define_gather(native, 1, &axis, inputs[0].dimensions() + inputs[1].dimensions() - 1,
-                                        operands[0], indices, &result, 0));
-                break;
-            }
-            case Operation::CONCAT:
-                check(ynn_define_concatenate(native, spec.attributes[0], operands.size(), operands.data(), &result, 0));
-                break;
-            default:
-                throw ops::Failure({ErrorCode::UNSUPPORTED, "CPU backend does not support operation: " +
-                                                                std::string(operation_name(spec.operation))});
-        }
-        auto output_id = static_cast<std::uint32_t>(graph_input_count);
-        if (pad_columns) {
-            const std::int32_t axis = -1;
-            const std::int64_t start = 0, end = inputs[1].size(0), stride = 1;
-            auto sliced = YNN_INVALID_VALUE_ID;
-            check(ynn_define_static_slice(native, 1, &axis, &start, &end, &stride, result, &sliced, 0));
-            result = sliced;
-        }
-        check(ynn_define_tensor(native, type(dtype), 0, nullptr, nullptr, YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &output_id));
-        check(ynn_define_copy(native, result, &output_id, 0));
-        if (paired) {
-            auto residual_id = output_id + 1;
-            check(ynn_define_tensor(native, type(dtype), 0, nullptr, nullptr, YNN_VALUE_FLAG_EXTERNAL_OUTPUT,
-                                    &residual_id));
-            check(ynn_define_copy(native, residual, &residual_id, 0));
-        }
-        std::size_t operator_threads = 0;
-        const bool small_packed_projection =
-            spec.operation == Operation::PACKED_LINEAR && inputs[0].numel() == inputs[0].size(-1) &&
-            static_cast<std::size_t>(inputs[0].size(-1)) * static_cast<std::size_t>(inputs[1].size(0)) <= 384 * 1024;
-        const bool small_elementwise =
-            (spec.operation == Operation::GELU_GATE || spec.operation == Operation::SILU_GATE ||
-             spec.operation == Operation::GELU_MULTIPLY || spec.operation == Operation::SILU_MULTIPLY ||
-             spec.operation == Operation::GELU || spec.operation == Operation::ADD ||
-             spec.operation == Operation::MULTIPLY || spec.operation == Operation::TANH ||
+        if (BroadcastBinaryOp::supports(spec, inputs)) return std::make_unique<BroadcastBinaryOp>(spec, inputs, arena_);
+        if (spec.operation == Operation::CAST && inputs.size() == 1)
+            return std::make_unique<CastOp>(spec, inputs[0], arena_);
+        if (LayerNormOp::supports(spec, inputs)) return std::make_unique<LayerNormOp>(spec, inputs, arena_);
+        if ((spec.operation == Operation::SOFTMAX || spec.operation == Operation::LOG_SOFTMAX) && inputs.size() == 1 &&
+            inputs[0].dimensions() > 0)
+            return std::make_unique<SoftmaxOp>(spec, inputs[0], arena_);
+        if ((spec.operation == Operation::GELU || spec.operation == Operation::TANH ||
              spec.operation == Operation::STATIC_ROUND) &&
-            inputs[0].numel() <= 65536;
-        if (small_packed_projection || small_elementwise) operator_threads = 1;
-#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-        const bool small_projection = spec.operation == Operation::QUANTIZED_LINEAR &&
-                                      inputs[0].numel() == inputs[0].size(-1) && inputs[1].numel() <= 4 * 1024 * 1024;
-        const bool small_attention = spec.operation == Operation::ATTENTION && inputs[0].size(0) == 1 &&
-                                     inputs[0].size(1) == 1 && inputs[1].numel() <= 256 * 1024;
-        if (small_projection || small_attention) operator_threads = 1;
-#endif
-        auto executable = require(std::move(graph).compile(operator_threads));
-        require(executable.reshape());
-        auto shape = require(executable.shape(output_id));
-        auto op = std::make_unique<CpuOperator>(std::move(executable), graph_input_count, dynamic_count, dtype,
-                                                std::vector<std::int64_t>(shape.begin(), shape.end()), arena_,
-                                                std::move(constant_owners), has_packed_zero ? inputs[3] : Tensor{},
-                                                has_packed_zero ? static_cast<std::size_t>(spec.attributes[1]) : 0);
-        if (constant) {
-            if (inputs[1].size(0) < 65536) {
-                for (std::size_t index = dynamic_count; index < inputs.size(); ++index) inputs[index].release_pages();
-            }
-#if defined(__APPLE__)
-            if (inputs[1].nbytes() >= (std::size_t{8} << 20)) ::malloc_zone_pressure_relief(nullptr, 0);
-#endif
-        }
-        return op;
+            inputs.size() == 1)
+            return std::make_unique<UnaryElementwiseOp>(spec, inputs[0], arena_);
+        if (spec.operation == Operation::TRANSPOSE && inputs.size() == 1 &&
+            spec.attributes.size() == inputs[0].dimensions())
+            return std::make_unique<TransposeOp>(spec, inputs[0], arena_);
+        if (spec.operation == Operation::GATHER && inputs.size() == 2 && !spec.attributes.empty() &&
+            (inputs[1].dtype() == DType::I32 || inputs[1].dtype() == DType::I64))
+            return std::make_unique<GatherOp>(spec, inputs, arena_);
+        if (spec.operation == Operation::CONCAT && inputs.size() > 0 && !spec.attributes.empty())
+            return std::make_unique<ConcatOp>(spec, inputs, arena_);
+        if (spec.operation == Operation::PACKED_LINEAR && (inputs.size() == 3 || inputs.size() == 4) &&
+            spec.attributes.size() >= 3)
+            return std::make_unique<PortablePackedLinearOp>(spec, inputs, arena_);
+        throw ops::Failure({ErrorCode::UNSUPPORTED,
+                            "CPU backend does not support operation: " + std::string(operation_name(spec.operation))});
     }
 
 private:
     tensor::Arena arena_;
     ynn::FeedForwardCache feed_forward_cache_;
     std::map<PackedTileKey, Tensor> packed_tile_cache_;
+    std::map<DenseTileKey, PackedDenseEntry> dense_tile_cache_;
 };
 } // namespace
 auto cpu_operators() -> std::unique_ptr<OperatorBackend> { return std::make_unique<CpuBackend>(); }

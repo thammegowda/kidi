@@ -7,7 +7,7 @@
 #include "kidi/model/whisper.h"
 #include "kidi/model/gemma4_vision.h"
 #include "kidi/runtime/ynn/graph.h"
-#include "kidi/runtime/ynn/numa.h"
+#include "ynnpack/base/topology.h"
 #if defined(KIDI_HAS_CUDA)
 #include "ynnpack/include/ynnpack_cuda.h"
 #include <cuda_profiler_api.h>
@@ -706,8 +706,8 @@ auto main(int argc, char** argv) -> int {
               (mode == "vision" && argc >= 6)))
             throw std::runtime_error("invalid mode, thread count, repeat count, or WAV argument");
         kidi::runtime::ynn::set_thread_count(threads);
-        const auto numa_node = kidi::runtime::ynn::confine_to_numa_node(static_cast<std::size_t>(threads));
-        kidi::runtime::ynn::confine_to_performance_cpus(static_cast<std::size_t>(threads));
+        const auto numa_node = ::ynn::confine_to_numa_node(static_cast<std::size_t>(threads));
+        ::ynn::confine_to_performance_cpus(static_cast<std::size_t>(threads));
         require(kidi::runtime::ynn::reserve_thread_pool(threads));
         emit({{"stage", "runtime"},
               {"arch", kidi::runtime::ynn::supported_arch_names()},

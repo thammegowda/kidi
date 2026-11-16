@@ -130,8 +130,6 @@ add_library(kidi
     src/kidi/runtime/ynn/feed_forward_cache.cpp
     src/kidi/runtime/ynn/operators.cpp
     src/kidi/runtime/ynn/graph.cpp
-    src/kidi/runtime/ynn/numa.cpp
-    src/kidi/runtime/ynn/worker_pool.cpp
     src/kidi/search/hnsw.cpp
     src/kidi/tensor/backend.cpp
     src/kidi/tensor/cpu_backend.cpp

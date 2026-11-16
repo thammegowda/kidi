@@ -33,18 +33,18 @@ comparison.
 
 | Runtime | Precision | Model (GiB) | Prefill (tok/s) | Decode (tok/s) | TTFT (ms) | Peak RSS (GiB) | chrF ↑ |
 |---|---|---:|---:|---:|---:|---:|---:|
-| **Kidi BF16** | BF16 | 8.50 | 255.48 | 16.80 | 121.34 | 5.31 | 57.23 |
-| **Kidi Q8** | INT8 per-channel | 4.37 | 490.67 | 34.11 | 63.18 | 2.83 | 57.48 |
-| **Kidi Q8 + HNSW** | INT8 per-channel | 4.42 | 525.83 | 39.01 | 58.95 | 2.34 | 57.41 |
+| **Kidi BF16** | BF16 | 8.50 | 256.17 | 17.28 | 121.01 | 5.31 | 57.28 |
+| **Kidi Q8** | INT8 per-channel | 4.37 | 513.04 | 35.72 | 60.42 | 2.90 | 57.28 |
+| **Kidi Q8 + HNSW** | INT8 per-channel | 4.42 | 551.72 | 41.34 | 56.19 | 2.61 | 57.16 |
 | **Arm ExecuTorch Q8** | INT8 per-channel | 4.70 | 436.82 | 28.42 | 70.97 | 2.44 | 57.26 |
 | **ONNX Runtime Q8** | INT8 per-channel | 4.69 | 309.40 | 31.29 | 100.19 | 2.25 | 56.95 |
 | **llama.cpp Q8** | Q8_0 (g=32) | 4.61 | 184.33 | 33.30 | 168.17 | 6.58 | 57.10 |
-| **Kidi Q4_g128** | Asymmetric Q4_g128 | 2.27 | 558.71 | 60.31 | 55.49 | 1.47 | 56.19 |
-| **Kidi Q4_g128 + HNSW** | Asymmetric Q4_g128 | 2.32 | 535.99 | 67.32 | 57.84 | 1.56 | 56.22 |
+| **Kidi Q4_g128** | Asymmetric Q4_g128 | 2.27 | 621.16 | 64.30 | 49.91 | 1.48 | 55.89 |
+| **Kidi Q4_g128 + HNSW** | Asymmetric Q4_g128 | 2.32 | 625.52 | 73.64 | 49.56 | 1.61 | 55.85 |
 | **Arm ExecuTorch Q4_g128** | Symmetric Q4_g128 | 2.39 | 234.11 | 43.51 | 132.42 | 1.84 | 55.27 |
 | **ONNX Runtime Q4_g128** | Symmetric Q4_g128 | 2.41 | 396.27 | 50.65 | 78.23 | 1.45 | 55.35 |
-| **Kidi Q4_g32** | Asymmetric Q4_g32 | 2.47 | 508.14 | 52.18 | 61.01 | 1.92 | 56.46 |
-| **Kidi Q4_g32 + HNSW** | Asymmetric Q4_g32 | 2.52 | 513.49 | 58.88 | 60.37 | 1.93 | 56.38 |
+| **Kidi Q4_g32** | Asymmetric Q4_g32 | 2.47 | 502.42 | 55.21 | 61.70 | 2.04 | 56.32 |
+| **Kidi Q4_g32 + HNSW** | Asymmetric Q4_g32 | 2.52 | 509.93 | 63.46 | 60.79 | 1.92 | 56.28 |
 | **llama.cpp Q4_0** | Q4_0 (g=32) | 2.47 | 146.19 | 48.17 | 212.05 | 4.87 | 56.04 |
 | **Google LiteRT-LM MixedQ†** | INT2/INT4 mixed | 2.41 | 159.74 | 47.54 | 194.07 | 1.31 | 56.59 |
 

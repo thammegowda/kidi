@@ -34,8 +34,8 @@
 #include "kidi/model/gemma4.h"
 #include "kidi/model/registry.h"
 #include "kidi/runtime/ynn/graph.h"
-#include "kidi/runtime/ynn/numa.h"
 #include "kidi/tensor/backend.h"
+#include "ynnpack/base/topology.h"
 
 namespace {
 
@@ -69,8 +69,8 @@ auto configure_cpu_threads(const kidi::cli::Namespace& arguments, std::int32_t t
     const auto& backend = arguments.get<std::string>("backend");
     if (backend == "auto" || backend == "ynnpack") {
         const auto resolved = kidi::runtime::ynn::thread_count();
-        kidi::runtime::ynn::confine_to_numa_node(resolved);
-        kidi::runtime::ynn::confine_to_performance_cpus(resolved);
+        ::ynn::confine_to_numa_node(resolved);
+        ::ynn::confine_to_performance_cpus(resolved);
         (void)kidi::runtime::ynn::reserve_thread_pool(resolved);
     }
 }

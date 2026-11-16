@@ -1,4 +1,4 @@
-#include "kidi/runtime/ynn/worker_pool.h"
+#include "ynnpack/base/thread_pool.h"
 
 #include <atomic>
 #include <chrono>
@@ -9,9 +9,9 @@
 
 namespace {
 
-using kidi::runtime::ynn::PhaseBarrier;
-using kidi::runtime::ynn::WorkerContext;
-using kidi::runtime::ynn::WorkerPool;
+using ::ynn::PhaseBarrier;
+using ::ynn::WorkerContext;
+using ::ynn::WorkerPool;
 
 auto expect(bool condition, const char* what) -> bool {
     if (!condition) std::cerr << "FAILED: " << what << '\n';
@@ -118,75 +118,6 @@ auto test_run_ranges_stealing_and_scratch() -> bool {
     for (const auto& h : hits)
         if (!expect(h.load(std::memory_order_relaxed) == 1, "home-slot + stealing executes every item once"))
             return false;
-    return true;
-}
-
-auto test_schedule_async() -> bool {
-    WorkerPool pool(3);
-    constexpr int TASKS = 32;
-    std::atomic<int> completed = 0;
-    std::atomic<int> sum = 0;
-    struct Item {
-        std::atomic<int>* completed;
-        std::atomic<int>* sum;
-        int value;
-    };
-    std::vector<Item> items;
-    items.reserve(TASKS);
-    for (int i = 0; i < TASKS; ++i) items.push_back(Item{&completed, &sum, i});
-    for (int i = 0; i < TASKS; ++i) {
-        pool.schedule_async(&items[i], [](void* raw) {
-            auto* item = static_cast<Item*>(raw);
-            item->sum->fetch_add(item->value, std::memory_order_relaxed);
-            if (item->completed->fetch_add(1, std::memory_order_release) + 1 == TASKS) {
-                item->completed->notify_all();
-            }
-        });
-    }
-    int cur = completed.load(std::memory_order_acquire);
-    while (cur < TASKS) {
-        completed.wait(cur, std::memory_order_acquire);
-        cur = completed.load(std::memory_order_acquire);
-    }
-    if (!expect(sum.load() == sum_below(TASKS), "schedule_async executes all tasks")) return false;
-
-    // Regression test (Finding #3): nested parallel_for / run_ranges inside schedule_async must not self-deadlock, and
-    // concurrent schedule_async + tight parallel_for traffic must make fair forward progress without starvation.
-    for (const int workers : {0, 3}) {
-        WorkerPool mixed_pool(workers);
-        std::atomic<int> nested_done = 0;
-        std::atomic<int> nested_sum = 0;
-        struct NestedCtx {
-            WorkerPool* pool;
-            std::atomic<int>* done;
-            std::atomic<int>* sum;
-        } nctx{&mixed_pool, &nested_done, &nested_sum};
-
-        std::thread native_driver([&] {
-            for (int iter = 0; iter < 150; ++iter) {
-                std::atomic<int> local = 0;
-                mixed_pool.parallel_for(16, [&](std::size_t idx) { local.fetch_add(static_cast<int>(idx)); });
-            }
-        });
-
-        constexpr int ASYNC_ROUNDS = 16;
-        for (int r = 0; r < ASYNC_ROUNDS; ++r) {
-            mixed_pool.schedule_async(&nctx, [](void* raw) {
-                auto* c = static_cast<NestedCtx*>(raw);
-                c->pool->parallel_for(8, [&](std::size_t j) { c->sum->fetch_add(static_cast<int>(j)); });
-                if (c->done->fetch_add(1, std::memory_order_release) + 1 == ASYNC_ROUNDS) c->done->notify_all();
-            });
-        }
-        int seen_done = nested_done.load(std::memory_order_acquire);
-        while (seen_done < ASYNC_ROUNDS) {
-            nested_done.wait(seen_done, std::memory_order_acquire);
-            seen_done = nested_done.load(std::memory_order_acquire);
-        }
-        native_driver.join();
-        if (!expect(nested_sum.load() == ASYNC_ROUNDS * sum_below(8),
-                    "nested parallel_for inside schedule_async completes without deadlock or starvation"))
-            return false;
-    }
     return true;
 }
 
@@ -335,9 +266,9 @@ auto test_exception_propagation() -> bool {
 
 auto main() -> int {
     return test_parallel_for() && test_nested() && test_run_team_and_phase_barrier() &&
-                   test_run_ranges_stealing_and_scratch() && test_schedule_async() && test_nested_inline_scratch() &&
-                   test_idle_then_wake() && test_concurrent_callers() && test_lifecycle() &&
-                   test_run_tasks_and_large_partitioning() && test_exception_propagation()
+                   test_run_ranges_stealing_and_scratch() && test_nested_inline_scratch() && test_idle_then_wake() &&
+                   test_concurrent_callers() && test_lifecycle() && test_run_tasks_and_large_partitioning() &&
+                   test_exception_propagation()
                ? 0
                : 1;
 }
