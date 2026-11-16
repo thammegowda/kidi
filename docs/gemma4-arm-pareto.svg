@@ -13,10 +13,10 @@
     </filter>
   </defs>
   <rect width="1200" height="560" rx="14" fill="url(#bg-grad)" stroke="#cbd5e1" stroke-width="1.2"/>
-  <text x="600" y="31" text-anchor="middle" font-size="17.5" font-weight="800" letter-spacing="-0.3" fill="#0f172a">Gemma 4 E2B on Arm CPU (Apple M5, 4 Threads) — Speed vs. Translation Quality</text>
-  <text x="600" y="51" text-anchor="middle" font-size="12.5" font-weight="500" fill="#475569">150 WMT23 test sentences (ja, uk, de → en) · SacreBLEU chrF vs. human reference · Upper-right is faster &amp; higher quality (↗)</text>
+  <text x="600" y="31" text-anchor="middle" font-size="17.5" font-weight="800" letter-spacing="-0.3" fill="#0f172a">Gemma 4 E2B on Arm CPU (Apple M5, 4 Threads) — Speed vs. Generation Quality</text>
+  <text x="600" y="51" text-anchor="middle" font-size="12.5" font-weight="500" fill="#475569">Text generation quality measured via translation on 150 WMT23 sentences (ja, uk, de → en) · SacreBLEU chrF vs. reference · Upper-right is faster &amp; higher quality (↗)</text>
   <rect x="74.0" y="92.0" width="488.0" height="336.0" rx="6" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2" filter="url(#card-shadow)"/>
-  <text x="74.0" y="81.0" text-anchor="start" font-size="13.5" font-weight="700" fill="#0f172a">A. Prefill Throughput vs. Translation Quality</text>
+  <text x="74.0" y="81.0" text-anchor="start" font-size="13.5" font-weight="700" fill="#0f172a">A. Prefill Throughput vs. Generation Quality</text>
   <rect x="488.0" y="67.0" width="74" height="19" rx="9.5" fill="#ffedd5" stroke="#fed7aa" stroke-width="1"/>
   <text x="525.0" y="80.0" text-anchor="middle" font-size="10.5" font-weight="700" fill="#9a3412">Better ↗</text>
   <line x1="74.0" y1="428.0" x2="74.0" y2="433.0" stroke="#64748b" stroke-width="1.2"/>
@@ -111,7 +111,7 @@
   <circle cx="155.8" cy="339.4" r="5.6" fill="#ffffff" stroke="#0173B2" stroke-width="2.6"/>
   <text x="155.8" y="326.9" text-anchor="middle" font-size="10.5" font-weight="600" fill="#0173B2" stroke="#ffffff" stroke-width="3.2" stroke-linejoin="round" paint-order="stroke">Arm ET Q4 (g=128)</text>
   <rect x="648.0" y="92.0" width="488.0" height="336.0" rx="6" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2" filter="url(#card-shadow)"/>
-  <text x="648.0" y="81.0" text-anchor="start" font-size="13.5" font-weight="700" fill="#0f172a">B. Decode Throughput vs. Translation Quality</text>
+  <text x="648.0" y="81.0" text-anchor="start" font-size="13.5" font-weight="700" fill="#0f172a">B. Decode Throughput vs. Generation Quality</text>
   <rect x="1062.0" y="67.0" width="74" height="19" rx="9.5" fill="#ffedd5" stroke="#fed7aa" stroke-width="1"/>
   <text x="1099.0" y="80.0" text-anchor="middle" font-size="10.5" font-weight="700" fill="#9a3412">Better ↗</text>
   <line x1="705.4" y1="92.0" x2="705.4" y2="428.0" stroke="#f1f5f9" stroke-width="1"/>

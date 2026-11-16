@@ -1,0 +1,12 @@
+label	runtime	tier	base_decode	hnsw_decode	specdec_decode	hnsw_specdec_decode	hnsw_speedup	specdec_speedup	hnsw_specdec_speedup	base_chrf	hnsw_chrf	notes
+Kidi BF16	Kidi	BF16	17.75	20.60	30.08	34.38	1.1606	1.6946	1.9369	57.27	57.27	1.00x BF16 base; K=2
+Kidi Q8	Kidi	Q8	35.25	39.36	61.63	65.38	1.1166	1.7484	1.8548	57.31	57.27	K=2
+Arm ExecuTorch Q8	Arm ET	Q8	28.42							57.26		No Gemma 4 CPU SpecDec
+ONNX Runtime Q8	ONNX	Q8	31.29							56.95		No Gemma 4 CPU SpecDec
+llama.cpp Q8_0	llama.cpp	Q8	33.68		55.68			1.6532		57.10		K=2, Q8_0 assistant, p_min=0.4, prio=2
+Kidi Q4 (g=32)	Kidi	Q4_g32	53.91	60.23	60.10	64.51	1.1172	1.1148	1.1966	56.26	56.10	K=2
+llama.cpp Q4_0	llama.cpp	Q4_g32	49.67		60.09			1.2098		56.04		K=2, Q8_0 assistant, p_min=0.4, prio=2
+Kidi Q4 (g=128)	Kidi	Q4_g128	63.48	70.10	90.12	95.67	1.1043	1.4197	1.5071	55.86	55.93	K=2
+ONNX Runtime Q4 (g=128)	ONNX	Q4_g128	50.65							55.35		No Gemma 4 CPU SpecDec
+Arm ExecuTorch Q4 (g=128)	Arm ET	Q4_g128	43.51							55.27		No Gemma 4 CPU SpecDec
+LiteRT-LM MixedQ†	LiteRT-LM	MixedQ	49.35		40.76			0.8259		56.59		Bundled TFLite drafter

@@ -18,7 +18,7 @@ Kidi (*"spark"* in Kannada) runs modern generative AI models locally on your har
   - **Checkpoints & Formats:** Zero-copy `mmap` Safetensors, GGUF/GGML, YAML (`yaml-cpp`), JSON (`nlohmann/json`), and parallel gzip ([`pigzpp`](https://github.com/thammegowda/pigzpp) / `zlib-ng`)
   - **Desktop Server & UI ([`liteapp`](https://github.com/thammegowda/liteapp)):** Embedded C++ HTTP + WebSocket loopback server, EPUB/ZIP virtual filesystem, and bundled web/Android UI bridge (`kidi-app`)
 - **State-of-the-Art Edge CPU & GPU Speed:** Custom ARM64 SME2 and fused zero-copy NEON `sdot` kernels (`BlockwiseInt4Linear`), graph capture/replay, and `mmap`-backed weight streaming deliver faster prefill, faster decode, and lower RAM usage than ExecuTorch, ONNX Runtime, and `llama.cpp`.
-- **High-Fidelity Low-Bit Quantization:** Built on findings from our [**WMT 2026 LLM compression paper**](https://aclanthology.org/2026.wmt-main.136/) (*Quantize, Qualify, Rerank: A Recipe for Compressing LLMs Without Losing Quality*) and [**engineering blog post**](https://gowda.ai/posts/2026/08/llm-fast-inference/). Supports native mixed 2/4/8-bit QAT checkpoints, blockwise symmetric INT4/INT8, and **blockwise asymmetric INT4 (`g=128` and `g=32`) with 11-step MSE outlier clipping** that recovers near-BF16 translation quality at 4-bit memory footprints.
+- **High-Fidelity Low-Bit Quantization:** Built on findings from our [**WMT 2026 LLM compression paper**](https://aclanthology.org/2026.wmt-main.136/) (*Quantize, Qualify, Rerank: A Recipe for Compressing LLMs Without Losing Quality*) and [**engineering blog post**](https://gowda.ai/posts/2026/08/llm-fast-inference/). Supports native mixed 2/4/8-bit QAT checkpoints, blockwise symmetric INT4/INT8, and **blockwise asymmetric INT4 (`g=128` and `g=32`) with 11-step MSE outlier clipping** that recovers near-BF16 generation quality at 4-bit memory footprints.
 - **One Engine, Every Surface:** Use the CLI and Python package for scripting, or launch the **Desktop App**, **Android App**, or **WebAssembly / WebGPU Browser App** for streaming chat, continuous voice conversations, camera/photo Q&A, and side-by-side bilingual EPUB book reading with read-aloud narration.
 
 ---
@@ -28,20 +28,32 @@ Kidi (*"spark"* in Kannada) runs modern generative AI models locally on your har
 ### Gemma 4 E2B (`google/gemma-4-E2B-it`) on Arm CPU (Apple M5, 4 Threads, Batch 1)
 
 Measured against **Arm ExecuTorch**, **ONNX Runtime**, and **`llama.cpp`** with
-4 CPU threads. Translation quality uses 150 WMT23
-sentences with the WMT26 translate-only system prompt. See the concise
-[Arm CPU benchmark](benchmarks/gemma4/arm/README.md) for methodology and
+4 CPU threads. Text generation quality is measured using machine translation
+as a benchmark task (150 WMT23 sentences with the WMT26 translate-only system
+prompt) because of its well-established evaluation metrics (`chrF`). See the
+concise [Arm CPU benchmark](benchmarks/gemma4/arm/README.md) for methodology and
 reproduction commands.
 
 <p align="center">
-  <img src="docs/gemma4-arm-pareto.svg" alt="Gemma 4 E2B on Arm CPU: Speed vs. Translation Quality Pareto Frontier" width="100%">
+  <img src="docs/gemma4-arm-pareto.svg" alt="Gemma 4 E2B on Arm CPU: Speed vs. Generation Quality Pareto Frontier" width="100%">
 </p>
 
-- **Q8:** Kidi reaches **490.7 tok/s prefill**, **34.1 tok/s decode**, and
-  **57.48 chrF**. The optional HNSW output head raises decode to **39.0 tok/s**.
-- **Q4:** Kidi Q4_g128 reaches **558.7 tok/s prefill** and **60.3 tok/s
-  decode**; Q4_g32 reaches **56.46 chrF** and **52.2 tok/s decode**, compared
-  with llama.cpp Q4_0 at **56.04 chrF** and **48.2 tok/s**.
+- **Q8 & Q4 on Arm CPU:** Kidi leads Arm ExecuTorch, ONNX Runtime, and
+  `llama.cpp` on both prefill and decode throughput while matching or exceeding
+  their generation quality (`chrF`), with an optional HNSW output head for
+  even faster decoding. See the Pareto plot above and the
+  [Arm CPU benchmark](benchmarks/gemma4/arm/README.md) for the latest exact
+  measurements.
+- **Lossless Speculative Decoding & HNSW:** On CPU, Kidi pairs any target
+  quantization (`BF16`, `Q8`, `Q4_g32`, `Q4_g128`) with an assistant draft
+  model (`--assistant-model`) for lossless speculative decoding, and stacks it
+  with HNSW output projection for multiplicative decode speedups over dense
+  inference without losing generation quality.
+
+<p align="center">
+  <img src="docs/gemma4-arm-speculative.svg" alt="Gemma 4 E2B on Arm CPU: Speculative Decoding and HNSW Speedup Comparison" width="100%">
+</p>
+
 - **CUDA Graph Pipelining:** On an NVIDIA RTX A4000 (2,322-token prompt, BF16), Kidi reaches **11,285.9 tok/s prefill** (**1.40x faster** than compiled `vLLM` at `8,062.7 tok/s`) and **64.4 tok/s decode** (see [`benchmarks/README.md`](benchmarks/README.md)).
 
 ---

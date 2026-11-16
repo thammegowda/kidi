@@ -1332,18 +1332,18 @@ def render_pareto_svg(tsv_path: Path = HERE / "results.tsv") -> str:
         '  </defs>',
         '  <rect width="1200" height="560" rx="14" fill="url(#bg-grad)" stroke="#cbd5e1" stroke-width="1.2"/>',
         '  <text x="600" y="31" text-anchor="middle" font-size="17.5" font-weight="800" letter-spacing="-0.3" fill="#0f172a">'
-        'Gemma 4 E2B on Arm CPU (Apple M5, 4 Threads) — Speed vs. Translation Quality</text>',
+        'Gemma 4 E2B on Arm CPU (Apple M5, 4 Threads) — Speed vs. Generation Quality</text>',
         '  <text x="600" y="51" text-anchor="middle" font-size="12.5" font-weight="500" fill="#475569">'
-        '150 WMT23 test sentences (ja, uk, de → en) · SacreBLEU chrF vs. human reference · Upper-right is faster &amp; higher quality (↗)</text>',
+        'Text generation quality measured via translation on 150 WMT23 sentences (ja, uk, de → en) · SacreBLEU chrF vs. reference · Upper-right is faster &amp; higher quality (↗)</text>',
     ]
 
     panels = [
-        ("A. Prefill Throughput vs. Translation Quality",
+        ("A. Prefill Throughput vs. Generation Quality",
          "prefill_tps", 74.0, 562.0, 100.0, 900.0,
          [100, 200, 300, 400, 500, 600, 700, 800, 900],
          "Prefill Speed (tokens / sec) →",
          prefill_labels),
-        ("B. Decode Throughput vs. Translation Quality",
+        ("B. Decode Throughput vs. Generation Quality",
          "decode_tps", 648.0, 1136.0, 12.0, 80.0,
          [20, 30, 40, 50, 60, 70, 80],
          "Autoregressive Decode Speed (tokens / sec) →",
