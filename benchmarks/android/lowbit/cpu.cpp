@@ -48,13 +48,13 @@ auto run_cpu(const Problem& problem, const Options& options) -> Measurement {
     std::vector<std::int8_t> sym_act;
     std::vector<float> sym_act_scale(problem.m, 1.0F);
     ::ynn::dense_linear_plan plan{};
-    std::vector<std::uint8_t> dense_packed;
+    ::ynn::aligned_byte_buffer dense_packed;
     std::vector<std::int32_t> dense_sums;
     std::vector<float> dense_a_scales(problem.m, 1.0F);
     std::vector<std::int32_t> dense_a_zps(problem.m, 0);
     bool dense_transposed_a = false;
     std::size_t dense_tile_m = 1, dense_a_bytes = 0, dense_scratch_bytes = 0;
-    std::vector<std::byte> dense_a_packed;
+    ::ynn::aligned_byte_buffer dense_a_packed;
     std::vector<std::int32_t> dense_scratch;
 
     if (use_sym) {

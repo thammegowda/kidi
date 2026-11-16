@@ -1806,7 +1806,8 @@ private:
     std::vector<std::int64_t> out_shape_;
     std::vector<std::size_t> a_batch_shape_, b_batch_shape_, a_batch_strides_, b_batch_strides_;
     std::vector<float> bias_f32_, dynamic_bias_f32_, out_f32_;
-    std::vector<std::byte> a_conv_, a_packed_, dynamic_b_;
+    std::vector<std::byte> a_conv_;
+    ::ynn::aligned_byte_buffer a_packed_, dynamic_b_;
     OutputPool pool_;
 };
 
@@ -2012,7 +2013,7 @@ private:
     std::vector<float> w_scales_, dynamic_scales_, bias_f32_, dynamic_bias_f32_, a_scales_;
     std::vector<std::int32_t> a_zps_, dynamic_sums_, fallback_scratch_;
     std::vector<std::int8_t> q_a_;
-    std::vector<std::byte> a_packed_, dynamic_b_;
+    ::ynn::aligned_byte_buffer a_packed_, dynamic_b_;
     OutputPool pool_;
 };
 

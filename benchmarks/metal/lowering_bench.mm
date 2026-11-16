@@ -92,8 +92,8 @@ auto to_bf16(std::span<const float> values) -> std::vector<std::uint16_t> {
 
 struct YnnProjection {
     ::ynn::dense_linear_plan plan;
-    std::vector<std::uint8_t> packed_weights;
-    std::vector<std::uint8_t> packed_input;
+    ::ynn::aligned_byte_buffer packed_weights;
+    ::ynn::aligned_byte_buffer packed_input;
     bool transposed_a = false;
     std::size_t tile_m = 1;
     std::vector<float> output;
@@ -110,7 +110,7 @@ auto make_ynn_projection(std::size_t rows, const std::vector<float>& weights) ->
         !status) {
         return std::unexpected(std::move(status.error()));
     }
-    std::vector<std::uint8_t> packed(plan.total_bytes);
+    ::ynn::aligned_byte_buffer packed(plan.total_bytes);
     ::ynn::pack_dense_linear_tiles(plan, false, weights.data(), OUTPUT_SIZE * sizeof(float), 0, plan.blocks_n,
                                    packed.data());
     bool transposed_a = false;
@@ -120,7 +120,7 @@ auto make_ynn_projection(std::size_t rows, const std::vector<float>& weights) ->
     return YnnProjection{
         .plan = plan,
         .packed_weights = std::move(packed),
-        .packed_input = std::vector<std::uint8_t>(a_packed_bytes),
+        .packed_input = ::ynn::aligned_byte_buffer(a_packed_bytes),
         .transposed_a = transposed_a,
         .tile_m = tile_m,
         .output = std::vector<float>(rows * OUTPUT_SIZE),
