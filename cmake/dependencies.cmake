@@ -15,25 +15,12 @@ endfunction()
 kidi_require_submodule("yaml-cpp" "yaml-cpp/CMakeLists.txt")
 kidi_require_submodule("nlohmann-json" "nlohmann-json/CMakeLists.txt")
 kidi_require_submodule("uni-algo" "uni-algo/CMakeLists.txt")
-kidi_require_submodule("Abseil" "abseil-cpp/CMakeLists.txt")
-kidi_require_submodule("RE2" "re2/CMakeLists.txt")
 kidi_require_submodule("tokenizerspp" "tokenizerspp/CMakeLists.txt")
-kidi_require_submodule("spdlog" "spdlog/CMakeLists.txt")
 kidi_require_submodule("ynnpack-dev" "ynnpack-dev/CMakeLists.txt")
 
 add_subdirectory(
     "${KIDI_THIRD_PARTY_DIR}/ynnpack-dev"
     "${PROJECT_BINARY_DIR}/third_party/ynnpack-dev"
-    EXCLUDE_FROM_ALL
-)
-
-set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
-set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
-set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
-add_subdirectory(
-    "${KIDI_THIRD_PARTY_DIR}/spdlog"
-    "${PROJECT_BINARY_DIR}/third_party/spdlog"
     EXCLUDE_FROM_ALL
 )
 
@@ -53,10 +40,6 @@ set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE NEVER)
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 set(JSON_Install OFF CACHE BOOL "" FORCE)
 set(UNI_ALGO_INSTALL OFF CACHE BOOL "" FORCE)
-set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
-set(ABSL_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-set(RE2_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(RE2_USE_ICU OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     nlohmann_json
@@ -68,47 +51,14 @@ FetchContent_Declare(
     SOURCE_DIR "${KIDI_THIRD_PARTY_DIR}/uni-algo"
     BINARY_DIR "${PROJECT_BINARY_DIR}/third_party/uni-algo"
 )
-FetchContent_Declare(
-    abseil-cpp
-    SOURCE_DIR "${KIDI_THIRD_PARTY_DIR}/abseil-cpp"
-    BINARY_DIR "${PROJECT_BINARY_DIR}/third_party/abseil-cpp"
-)
-FetchContent_Declare(
-    re2
-    SOURCE_DIR "${KIDI_THIRD_PARTY_DIR}/re2"
-    BINARY_DIR "${PROJECT_BINARY_DIR}/third_party/re2"
-)
 
-FetchContent_MakeAvailable(nlohmann_json uni_algo abseil-cpp)
-if(EMSCRIPTEN)
-    function(kidi_suppress_abseil_warnings directory)
-        get_property(targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
-        foreach(target IN LISTS targets)
-            get_target_property(type "${target}" TYPE)
-            if(type MATCHES "^(STATIC|SHARED|MODULE|OBJECT)_LIBRARY$" OR type STREQUAL "EXECUTABLE")
-                target_compile_options("${target}" PRIVATE
-                    "SHELL:-Wno-deprecated-pragma"
-                    "SHELL:-Wno-sign-conversion"
-                    "SHELL:-Wno-c++98-compat-extra-semi"
-                )
-            endif()
-        endforeach()
-        get_property(subdirectories DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
-        foreach(subdirectory IN LISTS subdirectories)
-            kidi_suppress_abseil_warnings("${subdirectory}")
-        endforeach()
-    endfunction()
-    # Abseil enables these warnings on each target after inherited directory options.
-    kidi_suppress_abseil_warnings("${KIDI_THIRD_PARTY_DIR}/abseil-cpp")
-endif()
-# Only the Abseil libraries RE2 links are built; the default target skips the rest.
-set_property(DIRECTORY "${KIDI_THIRD_PARTY_DIR}/abseil-cpp" PROPERTY EXCLUDE_FROM_ALL TRUE)
-set(_KIDI_SKIP_INSTALL_RULES "${CMAKE_SKIP_INSTALL_RULES}")
-set(CMAKE_SKIP_INSTALL_RULES ON)
-FetchContent_MakeAvailable(re2)
-set_property(DIRECTORY "${KIDI_THIRD_PARTY_DIR}/re2" PROPERTY EXCLUDE_FROM_ALL TRUE)
-set(CMAKE_SKIP_INSTALL_RULES "${_KIDI_SKIP_INSTALL_RULES}")
-unset(_KIDI_SKIP_INSTALL_RULES)
+FetchContent_MakeAvailable(nlohmann_json uni_algo)
+target_compile_definitions(uni-algo PUBLIC
+    UNI_ALGO_DISABLE_COLLATE
+    UNI_ALGO_DISABLE_SEGMENT_GRAPHEME
+    UNI_ALGO_DISABLE_SEGMENT_WORD
+    UNI_ALGO_DISABLE_SYSTEM_LOCALE
+)
 
 set(TOKENIZERPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(TOKENIZERPP_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)

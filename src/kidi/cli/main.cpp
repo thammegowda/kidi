@@ -11,11 +11,8 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 
-#include <spdlog/cfg/env.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
-#include <spdlog/spdlog.h>
-
 #include "kidi/cli/argparse.h"
+#include "kidi/cli/log.h"
 #include "kidi/cli/main.h"
 #include "kidi/audio/wav.h"
 #include "kidi/cli/interactive.h"
@@ -78,23 +75,23 @@ auto configure_cpu_threads(const kidi::cli::Namespace& arguments, std::int32_t t
 auto inspect(const std::filesystem::path& directory) -> int {
     auto document = kidi::checkpoint::load_config(directory);
     if (!document) {
-        spdlog::error("{}", document.error().message);
+        kidi::cli::log::error("{}", document.error().message);
         return 1;
     }
     if (auto validation = kidi::model::validate_model_config((*document)["model"]); !validation) {
-        spdlog::error("{}", validation.error().message);
+        kidi::cli::log::error("{}", validation.error().message);
         return 1;
     }
     const auto type = (*document)["model"]["type"].as<std::string>();
     if (type == "whisper") {
         auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
         if (!weights) {
-            spdlog::error("{}", weights.error().message);
+            kidi::cli::log::error("{}", weights.error().message);
             return 1;
         }
         const auto parameter = weights->tensor("model.encoder.conv1.weight");
         if (!parameter) {
-            spdlog::error("{}", parameter.error().message);
+            kidi::cli::log::error("{}", parameter.error().message);
             return 1;
         }
         std::cout << "format: huggingface\n"
@@ -111,14 +108,14 @@ auto inspect(const std::filesystem::path& directory) -> int {
     if (type == "gemma4_text") {
         auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
         if (!weights) {
-            spdlog::error("{}", weights.error().message);
+            kidi::cli::log::error("{}", weights.error().message);
             return 1;
         }
         const bool qat = static_cast<bool>((*document)["model"]["quantization_config"]);
         const auto embedding = weights->tensor(qat ? "model.language_model.embed_tokens.embedding_quantized"
                                                    : "model.language_model.embed_tokens.weight");
         if (!embedding) {
-            spdlog::error("{}", embedding.error().message);
+            kidi::cli::log::error("{}", embedding.error().message);
             return 1;
         }
         std::cout << "format: " << (*document)["format_version"].as<int>() << '\n'
@@ -135,12 +132,12 @@ auto inspect(const std::filesystem::path& directory) -> int {
     if (type == "omnivoice") {
         auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
         if (!weights) {
-            spdlog::error("{}", weights.error().message);
+            kidi::cli::log::error("{}", weights.error().message);
             return 1;
         }
         const auto embedding = weights->tensor("llm.embed_tokens.weight");
         if (!embedding) {
-            spdlog::error("{}", embedding.error().message);
+            kidi::cli::log::error("{}", embedding.error().message);
             return 1;
         }
         const auto& model = (*document)["model"];
@@ -160,12 +157,12 @@ auto inspect(const std::filesystem::path& directory) -> int {
     if (type == "kokoro") {
         auto weights = kidi::checkpoint::Weights::load((*document)["weights_file"].as<std::string>());
         if (!weights) {
-            spdlog::error("{}", weights.error().message);
+            kidi::cli::log::error("{}", weights.error().message);
             return 1;
         }
         const auto embedding = weights->tensor("bert.module.embeddings.word_embeddings.weight");
         if (!embedding) {
-            spdlog::error("{}", embedding.error().message);
+            kidi::cli::log::error("{}", embedding.error().message);
             return 1;
         }
         const auto& model = (*document)["model"];
@@ -182,7 +179,7 @@ auto inspect(const std::filesystem::path& directory) -> int {
     }
     auto package = kidi::checkpoint::Package::load(directory);
     if (!package) {
-        spdlog::error("{}", package.error().message);
+        kidi::cli::log::error("{}", package.error().message);
         return 1;
     }
     const auto& config = package->config();
@@ -297,7 +294,7 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
         const auto started = std::chrono::steady_clock::now();
         auto session = load_chat_session(arguments, directory, assistant_directory);
         if (!session) {
-            spdlog::error("{}", session.error().message);
+            kidi::cli::log::error("{}", session.error().message);
             return 1;
         }
         auto& generator = session->generator;
@@ -313,7 +310,7 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
                                                      .prefill_tokens_per_step = options.prefill_chunk_size};
         auto configured = generator.configure_serving(limits);
         if (!configured) {
-            spdlog::error("{}", configured.error().message);
+            kidi::cli::log::error("{}", configured.error().message);
             return 2;
         }
         bool ended = false;
@@ -331,7 +328,7 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
                 std::string line;
                 if (!std::getline(input, line)) {
                     if (!input.eof()) {
-                        spdlog::error("failed reading chat input");
+                        kidi::cli::log::error("failed reading chat input");
                         return 1;
                     }
                     ended = true;
@@ -341,7 +338,7 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
                 const auto request = nlohmann::json::parse(line, nullptr, false);
                 auto messages = chat_messages(request);
                 if (!messages) {
-                    spdlog::error("input line {}: {}", line_number, messages.error().message);
+                    kidi::cli::log::error("input line {}: {}", line_number, messages.error().message);
                     return 2;
                 }
                 auto request_options = options;
@@ -349,7 +346,7 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
                     request_options.maximum_new_tokens = request["max_tokens"].get<std::size_t>();
                 auto queued = generator.enqueue_chat(*messages, request_options);
                 if (!queued) {
-                    spdlog::error("input line {}: {}", line_number, queued.error().message);
+                    kidi::cli::log::error("input line {}: {}", line_number, queued.error().message);
                     return queued.error().code == kidi::ErrorCode::INVALID_ARGUMENT ? 2 : 1;
                 }
                 ordered.push_back({request.value("id", nlohmann::json(*queued)), {}});
@@ -357,7 +354,7 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
             if (!generator.pending_requests()) break;
             auto step = generator.step();
             if (!step) {
-                spdlog::error("{}", step.error().message);
+                kidi::cli::log::error("{}", step.error().message);
                 return 1;
             }
             const auto& result = *step;
@@ -401,7 +398,7 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
             }
             output.flush();
             if (!output) {
-                spdlog::error("failed writing generation results");
+                kidi::cli::log::error("failed writing generation results");
                 return 1;
             }
         }
@@ -420,7 +417,7 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
         }
         return 0;
     } catch (const std::exception& error) {
-        spdlog::error("{}", error.what());
+        kidi::cli::log::error("{}", error.what());
         return 1;
     }
 }
@@ -431,18 +428,18 @@ auto generate_translation(const kidi::cli::Namespace& arguments, const std::file
     const auto batch_window =
         arguments.contains("batch_window") ? arguments.get<std::int32_t>("batch_window") : batch_size;
     if (batch_size < 1 || batch_size > 256) {
-        spdlog::error("batch size must be between 1 and 256");
+        kidi::cli::log::error("batch size must be between 1 and 256");
         return 2;
     }
     if (batch_window < batch_size || batch_window > 4096) {
-        spdlog::error("batch window must be between batch-size and 4096");
+        kidi::cli::log::error("batch window must be between batch-size and 4096");
         return 2;
     }
     auto* profile_ptr = arguments.get<bool>("profile") ? &profile : nullptr;
     const auto device = inference_device(arguments);
     auto translator = kidi::inference::Translator::load(directory, device, profile_ptr, batch_size);
     if (!translator) {
-        spdlog::error("{}", translator.error().message);
+        kidi::cli::log::error("{}", translator.error().message);
         return 1;
     }
 
@@ -464,7 +461,7 @@ auto generate_translation(const kidi::cli::Namespace& arguments, const std::file
             if (!line.empty()) sources.push_back(line);
         auto translations = translator->translate_batch(sources, options, profile_ptr);
         if (!translations) {
-            spdlog::error("batch ending at input line {}: {}", line_number, translations.error().message);
+            kidi::cli::log::error("batch ending at input line {}: {}", line_number, translations.error().message);
             return false;
         }
         std::size_t index = 0;
@@ -481,7 +478,7 @@ auto generate_translation(const kidi::cli::Namespace& arguments, const std::file
         output.flush();
         pending.clear();
         if (!output) {
-            spdlog::error("cannot write output: {}", arguments.get<std::string>("output"));
+            kidi::cli::log::error("cannot write output: {}", arguments.get<std::string>("output"));
             return false;
         }
         return true;
@@ -494,7 +491,7 @@ auto generate_translation(const kidi::cli::Namespace& arguments, const std::file
     }
     if (!pending.empty() && !flush()) return 1;
     if (input.bad()) {
-        spdlog::error("cannot read input: {}", arguments.get<std::string>("input"));
+        kidi::cli::log::error("cannot read input: {}", arguments.get<std::string>("input"));
         return 1;
     }
     if (arguments.get<bool>("stats")) {
@@ -522,19 +519,19 @@ auto prepare_command(const kidi::cli::Namespace& arguments, const std::filesyste
                      kidi::model::Task task) -> int {
     const auto threads = arguments.get<std::int32_t>("threads");
     if (threads <= 0) {
-        spdlog::error("thread count must be positive");
+        kidi::cli::log::error("thread count must be positive");
         return 2;
     }
     configure_cpu_threads(arguments, threads);
     auto config = kidi::checkpoint::load_config(directory);
     if (!config) {
-        spdlog::error("{}", config.error().message);
+        kidi::cli::log::error("{}", config.error().message);
         return 1;
     }
     const auto type = (*config)["model"]["type"].as<std::string>();
     if (!kidi::model::supports_task(type, task)) {
-        spdlog::error("{} expects a model supporting {}, but this package is {}", arguments.get<std::string>("command"),
-                      kidi::model::task_name(task), type);
+        kidi::cli::log::error("{} expects a model supporting {}, but this package is {}",
+                              arguments.get<std::string>("command"), kidi::model::task_name(task), type);
         return 2;
     }
     return 0;
@@ -547,7 +544,7 @@ auto run_with_streams(const kidi::cli::Namespace& arguments,
     const auto& output_path = arguments.get<std::string>("output");
     if (input_path != "-" && output_path != "-" && std::filesystem::exists(output_path) &&
         std::filesystem::equivalent(input_path, output_path)) {
-        spdlog::error("input and output must be different files");
+        kidi::cli::log::error("input and output must be different files");
         return 2;
     }
     std::ifstream input_file;
@@ -557,7 +554,7 @@ auto run_with_streams(const kidi::cli::Namespace& arguments,
     if (input_path != "-") {
         input_file.open(input_path);
         if (!input_file) {
-            spdlog::error("cannot open input file: {}", input_path);
+            kidi::cli::log::error("cannot open input file: {}", input_path);
             return 1;
         }
         input = &input_file;
@@ -565,7 +562,7 @@ auto run_with_streams(const kidi::cli::Namespace& arguments,
     if (output_path != "-") {
         output_file.open(output_path);
         if (!output_file) {
-            spdlog::error("cannot open output file: {}", output_path);
+            kidi::cli::log::error("cannot open output file: {}", output_path);
             return 1;
         }
         output = &output_file;
@@ -595,13 +592,13 @@ auto resolve_hub_argument(const std::filesystem::path& path, const std::filesyst
         const kidi::checkpoint::Hub hub{"https://huggingface.co", cache};
         auto resolved = hub.download(std::string_view(text).substr(1));
         if (!resolved) {
-            spdlog::error("{}", resolved.error().message);
+            kidi::cli::log::error("{}", resolved.error().message);
             return 1;
         }
         resolved_out = std::move(*resolved);
         return 0;
     } catch (const std::exception& error) {
-        spdlog::error("{}", error.what());
+        kidi::cli::log::error("{}", error.what());
         return 1;
     }
 }
@@ -625,7 +622,7 @@ auto chat_command(const kidi::cli::Namespace& arguments, const std::filesystem::
         return status;
     auto session = load_chat_session(arguments, directory, assistant_directory);
     if (!session) {
-        spdlog::error("{}", session.error().message);
+        kidi::cli::log::error("{}", session.error().message);
         return 1;
     }
     return kidi::cli::interactive_chat(session->generator, session->options, arguments, session->load_ns);
@@ -634,34 +631,34 @@ auto chat_command(const kidi::cli::Namespace& arguments, const std::filesystem::
 auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
     const auto threads = arguments.get<std::int32_t>("threads");
     if (threads <= 0) {
-        spdlog::error("thread count must be positive");
+        kidi::cli::log::error("thread count must be positive");
         return 2;
     }
     const auto& backend = arguments.get<std::string>("backend");
     if (backend != "auto" && backend != "ynnpack" && !kidi::tensor::parse_cuda_device(backend)) {
-        spdlog::error("Whisper requires the YNNPACK or CUDA backend");
+        kidi::cli::log::error("Whisper requires the YNNPACK or CUDA backend");
         return 2;
     }
     const auto chunk_seconds = arguments.get<std::size_t>("chunk_seconds");
     const auto maximum_tokens = arguments.get<std::size_t>("max_new_tokens");
     if (!chunk_seconds || chunk_seconds > 30 || !maximum_tokens || maximum_tokens > 444) {
-        spdlog::error("Whisper requires --chunk-seconds from 1 to 30 and --max-new-tokens from 1 to 444");
+        kidi::cli::log::error("Whisper requires --chunk-seconds from 1 to 30 and --max-new-tokens from 1 to 444");
         return 2;
     }
     const auto& input_path = arguments.get<std::filesystem::path>("input");
     auto reader = kidi::audio::WavReader::open(input_path);
     if (!reader) {
-        spdlog::error("{}", reader.error().message);
+        kidi::cli::log::error("{}", reader.error().message);
         return 2;
     }
     if (reader->sample_rate() != 16000) {
-        spdlog::error("Whisper requires a 16 kHz PCM WAV; resample the input before transcription");
+        kidi::cli::log::error("Whisper requires a 16 kHz PCM WAV; resample the input before transcription");
         return 2;
     }
     const auto& output_path = arguments.get<std::string>("output");
     if (output_path != "-" && std::filesystem::exists(output_path) &&
         std::filesystem::equivalent(input_path, output_path)) {
-        spdlog::error("transcript output must not overwrite the input audio");
+        kidi::cli::log::error("transcript output must not overwrite the input audio");
         return 2;
     }
     configure_cpu_threads(arguments, threads);
@@ -669,7 +666,7 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
     const auto device = kidi::tensor::parse_cuda_device(backend).value_or(kidi::tensor::Device::cpu());
     auto transcriber = kidi::inference::Transcriber::load(directory, device);
     if (!transcriber) {
-        spdlog::error("{}", transcriber.error().message);
+        kidi::cli::log::error("{}", transcriber.error().message);
         return 1;
     }
     const auto load_ns =
@@ -684,7 +681,7 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
     if (output_path != "-") {
         file.open(output_path);
         if (!file) {
-            spdlog::error("cannot open output file: {}", output_path);
+            kidi::cli::log::error("cannot open output file: {}", output_path);
             return 1;
         }
         output = &file;
@@ -697,17 +694,17 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
     for (std::uint64_t chunk = 0; chunk < chunks; ++chunk) {
         auto samples = reader->read(chunk_samples);
         if (!samples) {
-            spdlog::error("{}", samples.error().message);
+            kidi::cli::log::error("{}", samples.error().message);
             return 2;
         }
-        if (chunks > 1) spdlog::info("transcribing chunk {}/{}", chunk + 1, chunks);
+        if (chunks > 1) kidi::cli::log::info("transcribing chunk {}/{}", chunk + 1, chunks);
         auto result = transcriber->transcribe(*samples, reader->sample_rate(), options);
         if (!result) {
-            spdlog::error("chunk {}: {}", chunk + 1, result.error().message);
+            kidi::cli::log::error("chunk {}: {}", chunk + 1, result.error().message);
             return result.error().code == kidi::ErrorCode::INVALID_ARGUMENT ? 2 : 1;
         }
         if (result->token_ids.size() == maximum_tokens) {
-            spdlog::warn(
+            kidi::cli::log::warn(
                 "chunk {} reached --max-new-tokens {}; output may be incomplete. "
                 "Increase the token limit (up to 444) or reduce --chunk-seconds",
                 chunk + 1, maximum_tokens);
@@ -715,7 +712,7 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
         }
         *output << result->text << '\n' << std::flush;
         if (!*output) {
-            spdlog::error("cannot write transcription: {}", output_path);
+            kidi::cli::log::error("cannot write transcription: {}", output_path);
             return 1;
         }
         stats.feature_ns += result->stats.feature_ns;
@@ -745,20 +742,20 @@ auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesy
     if (duration != "auto") {
         auto seconds = kidi::inference::parse_synthesis_number(duration);
         if (!seconds || *seconds <= 0) {
-            spdlog::error("duration must be 'auto' or a positive number of seconds");
+            kidi::cli::log::error("duration must be 'auto' or a positive number of seconds");
             return 2;
         }
         duration_seconds = *seconds;
     }
     auto voice = kidi::inference::parse_voice_attributes(arguments.get<std::vector<std::string>>("voice"));
     if (!voice) {
-        spdlog::error("{}", voice.error().message);
+        kidi::cli::log::error("{}", voice.error().message);
         return 2;
     }
     const auto started = std::chrono::steady_clock::now();
     auto synthesizer = kidi::inference::Synthesizer::load(directory, device);
     if (!synthesizer) {
-        spdlog::error("{}", synthesizer.error().message);
+        kidi::cli::log::error("{}", synthesizer.error().message);
         return 1;
     }
     const auto load_ns =
@@ -776,25 +773,25 @@ auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesy
     };
     auto result = synthesizer->synthesize(arguments.get<std::string>("text"), options);
     if (!result) {
-        spdlog::error("{}", result.error().message);
+        kidi::cli::log::error("{}", result.error().message);
         return result.error().code == kidi::ErrorCode::INVALID_ARGUMENT ? 2 : 1;
     }
     const auto output = arguments.get<std::filesystem::path>("output");
     auto saved = kidi::audio::save_wav(output, result->samples, result->sample_rate);
     if (!saved) {
-        spdlog::error("{}", saved.error().message);
+        kidi::cli::log::error("{}", saved.error().message);
         return 1;
     }
     if (arguments.contains("tokens_output")) {
         const auto path = arguments.get<std::filesystem::path>("tokens_output");
         std::ofstream tokens(path);
         if (!tokens) {
-            spdlog::error("cannot create audio-token output: {}", path.string());
+            kidi::cli::log::error("cannot create audio-token output: {}", path.string());
             return 1;
         }
         tokens << nlohmann::json(result->tokens).dump() << '\n';
         if (!tokens) {
-            spdlog::error("cannot write audio-token output: {}", path.string());
+            kidi::cli::log::error("cannot write audio-token output: {}", path.string());
             return 1;
         }
     }
@@ -811,11 +808,7 @@ auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesy
 } // namespace
 
 auto kidi::cli::main(int argc, const char* const argv[]) -> int {
-    auto logger = spdlog::get("kidi");
-    if (!logger) logger = spdlog::stderr_color_mt("kidi");
-    spdlog::set_default_logger(std::move(logger));
-    spdlog::set_pattern("[%n] [%l] %v");
-    spdlog::cfg::load_env_levels();
+    kidi::cli::log::init_from_env();
     kidi::cli::ArgumentParser parser("kidi", "Run translation, transcription, text generation and TTS models.");
     parser.version("kidi " + std::string(kidi::version()));
     auto& commands = parser.add_subparsers().required();
@@ -1034,10 +1027,10 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         throw std::logic_error("unhandled command: " + command);
     } catch (const kidi::cli::ParseError& error) {
         std::cerr << error.usage();
-        spdlog::error("{}", error.what());
+        kidi::cli::log::error("{}", error.what());
         return 2;
     } catch (const std::exception& error) {
-        spdlog::error("{}", error.what());
+        kidi::cli::log::error("{}", error.what());
         return 1;
     }
 }

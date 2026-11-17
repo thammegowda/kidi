@@ -1,4 +1,5 @@
 #include "kidi/cli/index.h"
+#include "kidi/cli/log.h"
 #include "kidi/checkpoint/config.h"
 #include "kidi/checkpoint/weights.h"
 #include "kidi/model/gemma4.h"
@@ -23,7 +24,6 @@
 #include <sstream>
 #include <thread>
 #include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
 
 namespace kidi::cli {
 namespace {
@@ -193,7 +193,7 @@ auto configure_index_parser(ArgumentParser& parser) -> void {
 auto index_command(const Namespace& arguments, const std::filesystem::path& directory) -> int {
     const auto threads = arguments.get<std::size_t>("threads");
     if (!threads || threads > std::max(1U, std::thread::hardware_concurrency())) {
-        spdlog::error("HNSW thread count must be between 1 and the available logical CPU count");
+        log::error("HNSW thread count must be between 1 and the available logical CPU count");
         return 2;
     }
     const auto& requested_builder = arguments.get<std::string>("builder");
@@ -201,13 +201,13 @@ auto index_command(const Namespace& arguments, const std::filesystem::path& dire
     if (requested_builder != "cpu") {
         const auto available = cuda_index_available();
         if (!available) {
-            spdlog::error("{}", available.error().message);
+            log::error("{}", available.error().message);
             return 1;
         }
         use_cuda = *available;
     }
     if (requested_builder == "cuda" && !use_cuda) {
-        spdlog::error("CUDA index construction is unavailable; enable KIDI_ENABLE_CUDA and provide a CUDA device");
+        log::error("CUDA index construction is unavailable; enable KIDI_ENABLE_CUDA and provide a CUDA device");
         return 2;
     }
     runtime::ynn::set_thread_count(threads);
@@ -215,46 +215,45 @@ auto index_command(const Namespace& arguments, const std::filesystem::path& dire
     if (threads > 1) {
         const auto reserved = runtime::ynn::reserve_thread_pool(threads);
         if (!reserved) {
-            spdlog::error("{}", reserved.error().message);
+            log::error("{}", reserved.error().message);
             return 1;
         }
         parallel_for = runtime::ynn::parallel_for;
     }
     auto config = checkpoint::load_config(directory);
     if (!config) {
-        spdlog::error("{}", config.error().message);
+        log::error("{}", config.error().message);
         return 1;
     }
     auto valid = model::Gemma4Impl::validate_config((*config)["model"]);
     if (!valid) {
-        spdlog::error("{}", valid.error().message);
+        log::error("{}", valid.error().message);
         return 1;
     }
     if ((*config)["model"]["quantization_config"]) {
-        spdlog::error("HNSW learning requires original FP32/BF16 Gemma weights");
+        log::error("HNSW learning requires original FP32/BF16 Gemma weights");
         return 2;
     }
     auto weights = checkpoint::Weights::load((*config)["weights_file"].as<std::string>());
     if (!weights) {
-        spdlog::error("{}", weights.error().message);
+        log::error("{}", weights.error().message);
         return 1;
     }
     auto vectors = weights->tensor("model.language_model.embed_tokens.weight");
     if (!vectors) {
-        spdlog::error("{}", vectors.error().message);
+        log::error("{}", vectors.error().message);
         return 1;
     }
     auto output = arguments.get<std::filesystem::path>("output");
     if (output.empty()) output = directory / "lm_head.hnsw";
     output = std::filesystem::absolute(output);
     if (std::filesystem::exists(output)) {
-        spdlog::error("HNSW index already exists; choose a fresh --output or remove it explicitly: {}",
-                      output.string());
+        log::error("HNSW index already exists; choose a fresh --output or remove it explicitly: {}", output.string());
         return 2;
     }
     const auto m = arguments.get<std::size_t>("m");
     if (m > std::numeric_limits<std::uint32_t>::max()) {
-        spdlog::error("HNSW M exceeds uint32 bounds");
+        log::error("HNSW M exceeds uint32 bounds");
         return 2;
     }
     const search::HnswBuildOptions options{
@@ -290,12 +289,12 @@ auto index_command(const Namespace& arguments, const std::filesystem::path& dire
         return search::HnswIndex::build(*vectors, options, progress, std::move(parallel_for));
     }();
     if (!index) {
-        spdlog::error("{}", index.error().message);
+        log::error("{}", index.error().message);
         return index.error().code == ErrorCode::INVALID_ARGUMENT ? 2 : 1;
     }
     auto saved = index->save(output);
     if (!saved) {
-        spdlog::error("{}", saved.error().message);
+        log::error("{}", saved.error().message);
         return 1;
     }
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();

@@ -2,13 +2,14 @@
 
 #include <chrono>
 #include <csignal>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <optional>
+#include <string>
 #include <string_view>
-
-#include <spdlog/fmt/fmt.h>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -87,6 +88,27 @@ auto elapsed_ns(Clock::time_point from, Clock::time_point to) -> std::uint64_t {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count();
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+#define KIDI_PRINTF_FORMAT(format_index, first_arg) __attribute__((format(printf, format_index, first_arg)))
+#else
+#define KIDI_PRINTF_FORMAT(format_index, first_arg)
+#endif
+
+KIDI_PRINTF_FORMAT(1, 2) auto cformat(const char* fmt, ...) -> std::string {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    const int n = std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (n <= 0) return {};
+    if (static_cast<std::size_t>(n) < sizeof(buf)) return std::string(buf, static_cast<std::size_t>(n));
+    std::string out(static_cast<std::size_t>(n), '\0');
+    va_start(args, fmt);
+    std::vsnprintf(out.data(), out.size() + 1, fmt, args);
+    va_end(args);
+    return out;
+}
+
 auto memory_summary() -> std::string {
     std::optional<std::uint64_t> process_bytes, total;
 #if defined(__APPLE__)
@@ -128,16 +150,16 @@ auto memory_summary() -> std::string {
     std::optional<std::uint64_t> free;
 #endif
     constexpr double GIB = 1024. * 1024. * 1024.;
-    const auto used = process_bytes ? fmt::format("{:.1f}GiB", *process_bytes / GIB) : std::string("n/a");
-    const auto capacity = total ? fmt::format("{:g}GiB", *total / GIB) : std::string("n/a");
+    const auto used = process_bytes ? cformat("%.1fGiB", *process_bytes / GIB) : std::string("n/a");
+    const auto capacity = total ? cformat("%gGiB", *total / GIB) : std::string("n/a");
 #if defined(__APPLE__)
-    const auto remaining = headroom ? fmt::format("{}%", *headroom) : std::string("n/a");
-    return fmt::format("RAM {} {} headroom {} total", used, remaining, capacity);
+    const auto remaining = headroom ? cformat("%d%%", *headroom) : std::string("n/a");
+    return cformat("RAM %s %s headroom %s total", used.c_str(), remaining.c_str(), capacity.c_str());
 #else
     const auto remaining = free && total && *total && *free <= *total
-                               ? fmt::format("{:.0f}%", 100. * static_cast<double>(*free) / *total)
+                               ? cformat("%.0f%%", 100. * static_cast<double>(*free) / *total)
                                : std::string("n/a");
-    return fmt::format("RAM {} {} free {} total", used, remaining, capacity);
+    return cformat("RAM %s %s free %s total", used.c_str(), remaining.c_str(), capacity.c_str());
 #endif
 }
 } // namespace
@@ -177,7 +199,8 @@ auto interactive_chat(inference::Generator& generator, inference::GenerationOpti
     clear();
     label("Kidi chat", "\033[1;36m");
     std::cout << "  /help for commands; Ctrl-C cancels a reply; Ctrl-D exits.\n";
-    label(fmt::format("[load {:.2f}s | {}]\n", load_ns / 1e9, memory_summary()), "\033[2m");
+    const auto mem_init = memory_summary();
+    label(cformat("[load %.2fs | %s]\n", load_ns / 1e9, mem_init.c_str()), "\033[2m");
     while (std::cout) {
         interrupted = 0;
         label("You> ", "\033[1;32m");
@@ -286,17 +309,17 @@ auto interactive_chat(inference::Generator& generator, inference::GenerationOpti
             history.push_back({"assistant", std::move(completed->text)});
             const auto& stats = completed->stats;
             const auto decode_speed = stats.decode_tokens && stats.decode_ns
-                                          ? fmt::format("{:.1f}tok/s", stats.decode_tokens * 1e9 / stats.decode_ns)
+                                          ? cformat("%.1ftok/s", stats.decode_tokens * 1e9 / stats.decode_ns)
                                           : std::string("n/a tok/s");
             const auto draft_summary =
-                stats.speculative ? fmt::format(" | draft {}/{}", stats.accepted_draft_tokens, stats.draft_tokens)
+                stats.speculative ? cformat(" | draft %zu/%zu", stats.accepted_draft_tokens, stats.draft_tokens)
                                   : std::string{};
             const auto first_ns = elapsed_ns(entered, first_text.value_or(*finished));
             const auto last_ns = elapsed_ns(entered, *finished);
-            label(
-                fmt::format("[{}tok @ {}{} | 1st {:.2f}s last {:.2f}s | {}]\n", completed->generation.token_ids.size(),
-                            decode_speed, draft_summary, first_ns / 1e9, last_ns / 1e9, memory_summary()),
-                "\033[2m");
+            const auto mem_turn = memory_summary();
+            label(cformat("[%zutok @ %s%s | 1st %.2fs last %.2fs | %s]\n", completed->generation.token_ids.size(),
+                          decode_speed.c_str(), draft_summary.c_str(), first_ns / 1e9, last_ns / 1e9, mem_turn.c_str()),
+                  "\033[2m");
             if (arguments.get<bool>("profile"))
                 std::cerr << "kidi_chat|request_id=" << *queued << "|prompt_tokens=" << completed->stats.prompt_tokens
                           << "|generated_tokens=" << completed->generation.token_ids.size()

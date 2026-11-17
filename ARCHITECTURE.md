@@ -350,9 +350,9 @@ prefix to long-form conditional attention: the current reference-conditioned
 unreferenced single-sentence path retains its previous latency, and 32 steps
 remain available as the quality-first setting.
 
-CLI diagnostics use spdlog on stderr. Translation results and inspection output
+CLI diagnostics use `kidi::cli::log` on stderr. Translation results and inspection output
 remain on stdout; machine-readable metric/profile records retain their unadorned
-format on stderr. `SPDLOG_LEVEL` controls the human-readable logger.
+format on stderr. `KIDI_LOG_LEVEL` (or `SPDLOG_LEVEL`) controls the human-readable logger.
 
 Both the native `kidi` binary and the Python `python -m kidi` launcher share the
 same C++ CLI and resolve `--model @owner/repo[@revision]` (and `--assistant-model`)
