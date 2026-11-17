@@ -105,7 +105,17 @@ auto main() -> int {
 #endif
         auto invalid_threads = command;
         invalid_threads.back() = "0";
-        check(run(invalid_threads).first == 2, "zero indexing threads were accepted");
+        std::string error_output;
+        check(run(invalid_threads, &error_output).first == 2 &&
+                  error_output.find("[kidi] [error] HNSW thread count") != std::string::npos,
+              "zero indexing threads were accepted or missing formatted error");
+#if !defined(_WIN32)
+        setenv("SPDLOG_LEVEL", "off", 1);
+        std::string suppressed_output;
+        check(run(invalid_threads, &suppressed_output).first == 2 && suppressed_output.empty(),
+              "SPDLOG_LEVEL=off did not suppress CLI error logging");
+        unsetenv("SPDLOG_LEVEL");
+#endif
         auto sparse = require(inference::Generator::load(root, tensor::Device::cpu()));
         inference::GenerationOptions options{
             .maximum_new_tokens = 4,

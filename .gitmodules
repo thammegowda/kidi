@@ -11,15 +11,6 @@
 [submodule "uni-algo"]
 	path = third_party/uni-algo
 	url = https://github.com/uni-algo/uni-algo.git
-[submodule "abseil-cpp"]
-	path = third_party/abseil-cpp
-	url = https://github.com/abseil/abseil-cpp.git
-[submodule "re2"]
-	path = third_party/re2
-	url = https://github.com/google/re2.git
-[submodule "third_party/spdlog"]
-	path = third_party/spdlog
-	url = https://github.com/gabime/spdlog.git
 [submodule "third_party/ynnpack-dev"]
 	path = third_party/ynnpack-dev
 	url = https://github.com/thammegowda/ynnpack-dev.git

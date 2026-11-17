@@ -98,6 +98,16 @@ Assistant checkpoints are variant-specific (for example,
 --draft-tokens 2 --backend ynnpack --max-active 1` (`--hnsw` / `ef=800` for
 HNSW).
 
+## Runtime Binary Footprint
+
+| Runtime | Artifacts Measured | Stripped (MiB) | Unstripped (MiB) | Notes |
+|---|---|---:|---:|---|
+| **Kidi (`kidi_android_baseline` / `kidi`)** | Single static binary (`kidi_android_baseline` / full `kidi` CLI) | **4.12 / 4.72** | 5.04 / 5.82 | Zero external non-OS dylibs; statically bundles C++ HF `tokenizer.json` + Jinja templates ([`tokenizerspp`](https://github.com/thammegowda/tokenizerspp) + `uni-algo`), SIMD image codecs ([`tahoma-vision`](https://github.com/thammegowda/tahoma-vision) + `libjpeg-turbo` + PNG/[`pigzpp`](https://github.com/thammegowda/pigzpp)/`zlib-ng`), WAV/Mel/vocoder audio, HNSW search, Metal kernels, and 6 model families |
+| **llama.cpp (`llamacpp`)** | `llamacpp_gemma4_bench` + `libllama.0.dylib` + `libggml*.dylib` | **4.48** | 5.10 | C++ probe + GGML CPU/KleidiAI shared libraries (reads GGUF vocabulary) |
+| **Arm ExecuTorch v1.5.1 (`arm`)** | `arm_gemma4_bench` (single static binary) | **7.87** | 10.30 | Zero external non-OS dylibs; ExecuTorch runtime + XNNPACK + KleidiAI (excludes tokenizer, vision/audio codecs, and checkpoint parsers) |
+| **ONNX Runtime v1.31.1 (`onnx`)** | `libonnxruntime.1.31.1.dylib` | **20.10** | 31.51 | Standalone native ONNX Runtime C/C++ shared library (excludes Python interpreter and tokenizer) |
+| **Google LiteRT-LM v0.17.1 (`litert`)** | `liblitert-lm.dylib` | **52.18** | 66.01 | Standalone native Google LiteRT-LM C++ shared library (excludes Python interpreter) |
+
 ## Key Takeaways
 
 - **Q8:** Kidi provides the strongest overall speed/quality balance. The HNSW
