@@ -66,11 +66,52 @@ class CpuBenchmarkTest(unittest.TestCase):
         baseline = BENCHMARK.summarize(self.records(), self.settings(), 3)
         current = copy.deepcopy(baseline)
         current["short"]["decode_tps"]["median"] = 40
+        current["short"]["decode_interval_tps"]["median"] = 200
+        current["short"]["prefill_through_first_token_tps"]["median"] = 150
         BENCHMARK.compare(current, baseline)
         self.assertEqual(current["short"]["baseline_decode_speedup"], 2)
+        self.assertEqual(current["short"]["baseline_decode_interval_speedup"], 2)
+        self.assertEqual(current["short"]["baseline_prefill_speedup"], 1.5)
         current["short"]["token_ids"][0] = 99
         with self.assertRaisesRegex(ValueError, "token IDs differ"):
             BENCHMARK.compare(current, baseline)
+
+    def test_backfills_missing_baseline_prefill_metric_from_records(self):
+        records = self.records()
+        baseline_summary = BENCHMARK.summarize(records, self.settings(), 3)
+        del baseline_summary["short"]["prefill_through_first_token_tps"]
+        backfilled = BENCHMARK.backfill_baseline_summary({"records": records, "summary": baseline_summary}, 1)
+        self.assertEqual(backfilled["short"]["prefill_through_first_token_tps"]["median"], 100)
+        current = BENCHMARK.summarize(records, self.settings(), 3)
+        current["short"]["prefill_through_first_token_tps"]["median"] = 150
+        BENCHMARK.compare(current, backfilled)
+        self.assertEqual(current["short"]["baseline_prefill_speedup"], 1.5)
+
+    def test_thread_scaling_estimates_efficiency_and_serial_overhead(self):
+        base = BENCHMARK.summarize(self.records(), self.settings(), 3)
+        four = copy.deepcopy(base)
+        base["short"]["decode_interval_tps"]["median"] = 20.0
+        base["short"]["prefill_through_first_token_tps"]["median"] = 100.0
+        four["short"]["decode_interval_tps"]["median"] = 50.0
+        four["short"]["prefill_through_first_token_tps"]["median"] = 300.0
+        runs = {
+            "1": {"status": "completed", "summary": base},
+            "4": {"status": "completed", "summary": four},
+        }
+        scaling = BENCHMARK.compute_thread_scaling(runs, ("short",))["short"]
+        self.assertEqual(scaling["base_threads"], 1)
+        self.assertAlmostEqual(scaling["points"][1]["decode_speedup"], 2.5)
+        self.assertAlmostEqual(scaling["points"][1]["decode_efficiency"], 0.625)
+        # T(1)=50 ms, T(4)=20 ms => s + p = 50, s + p/4 = 20 => p = 40 ms, s = 10 ms.
+        self.assertAlmostEqual(scaling["points"][1]["implied_serial_overhead_ms"], 10.0)
+
+    def test_thread_scaling_rejects_token_mismatches(self):
+        base = BENCHMARK.summarize(self.records(), self.settings(), 3)
+        four = copy.deepcopy(base)
+        four["short"]["token_ids"][0] = 99
+        runs = {"1": {"status": "completed", "summary": base}, "4": {"status": "completed", "summary": four}}
+        with self.assertRaisesRegex(ValueError, "token IDs differ"):
+            BENCHMARK.compute_thread_scaling(runs, ("short",))
 
     def test_environment_forces_cpu_and_explicit_profiling(self):
         with patch.dict(os.environ, {"KIDI_ACCELERATOR": "cuda:0", "KIDI_REPLAY": "0",

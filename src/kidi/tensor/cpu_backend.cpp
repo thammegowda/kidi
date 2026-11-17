@@ -15,7 +15,7 @@
 namespace kidi::tensor {
 namespace {
 
-constexpr std::size_t YNNPACK_ALIGNMENT = 64;
+constexpr std::size_t YNNPACK_ALIGNMENT = 256;
 constexpr std::size_t MAPPED_THRESHOLD = std::size_t{1} << 20;
 
 class CpuStorage final : public Storage {

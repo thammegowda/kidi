@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -12,31 +13,11 @@
 
 #include <ynnpack.h>
 
+#include "kidi/core/precision.h"
 #include "kidi/ops/context.h"
 #include "kidi/runtime/ynn/feed_forward_cache.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/tensor/tensor.h"
-
-namespace {
-
-auto run(kidi::runtime::ynn::Executable& executable, std::span<float> input, std::span<float> output) -> bool {
-    auto status = executable.bind(0, input.data());
-    if (status) status = executable.bind(1, output.data());
-    if (status) status = executable.invoke();
-    if (!status) std::cerr << status.error().message << '\n';
-    return status.has_value();
-}
-
-auto run(kidi::runtime::ynn::Executable& executable, const kidi::tensor::Tensor& input, kidi::tensor::Tensor& output)
-    -> bool {
-    auto status = executable.bind(0, input);
-    if (status) status = executable.bind(1, output);
-    if (status) status = executable.invoke();
-    if (!status) std::cerr << status.error().message << '\n';
-    return status.has_value();
-}
-
-} // namespace
 
 auto main() -> int {
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
@@ -130,6 +111,72 @@ auto main() -> int {
     const auto cached_values = kidi::ops::require(cached_ffn.data<float>());
     if (!std::ranges::equal(expected_values, populated_values) || !std::ranges::equal(expected_values, cached_values))
         return 1;
+
+    // Verify fused GATED_FEED_FORWARD matches composed PACKED_LINEAR + GELU/SILU_MULTIPLY + PACKED_LINEAR across
+    // bits = 2, 4, 8 and both M = 1 (decode) and M = 17 (odd multi-row prefill) with 4 worker threads.
+    kidi::runtime::ynn::set_thread_count(4);
+    for (const std::int32_t bits : {2, 4, 8}) {
+        const std::size_t vals_per_byte = static_cast<std::size_t>(8 / bits);
+        for (const std::int32_t m_rows : {1, 17}) {
+            std::vector<float> x_vals(m_rows * INPUT_SIZE);
+            for (std::size_t i = 0; i < x_vals.size(); ++i)
+                x_vals[i] = static_cast<float>(static_cast<int>((i * 5) % 19) - 9) * 0.0625F;
+            std::vector<std::uint8_t> gu_b(2 * INTERMEDIATE * (INPUT_SIZE / vals_per_byte));
+            for (std::size_t i = 0; i < gu_b.size(); ++i) gu_b[i] = static_cast<std::uint8_t>((i * 11 + 7) & 0xFFU);
+            std::vector<std::uint8_t> dn_b(INPUT_SIZE * (INTERMEDIATE / vals_per_byte));
+            for (std::size_t i = 0; i < dn_b.size(); ++i) dn_b[i] = static_cast<std::uint8_t>((i * 17 + 3) & 0xFFU);
+            const auto x_t = kidi::ops::require(
+                kidi::tensor::Tensor::from_host({1, m_rows, INPUT_SIZE}, std::span<const float>(x_vals)));
+            const auto gu_t = kidi::ops::require(kidi::tensor::Tensor::from_host(
+                {2 * INTERMEDIATE, static_cast<std::int64_t>(INPUT_SIZE / vals_per_byte)},
+                std::span<const std::uint8_t>(gu_b)));
+            const auto dn_t = kidi::ops::require(
+                kidi::tensor::Tensor::from_host({INPUT_SIZE, static_cast<std::int64_t>(INTERMEDIATE / vals_per_byte)},
+                                                std::span<const std::uint8_t>(dn_b)));
+
+            for (const bool silu : {false, true}) {
+                kidi::ops::Context ctx(kidi::tensor::Device::cpu());
+                const auto fused =
+                    ctx.gated_feed_forward(x_t, gu_t, gate_up_scale_tensor, dn_t, down_scale_tensor, bits, INPUT_SIZE,
+                                           INTERMEDIATE, 0.125F, 0.0625F, 0.03125F, 0.125F, silu);
+                const auto proj = ctx.packed_linear(x_t, gu_t, gate_up_scale_tensor, bits, INPUT_SIZE, 0.125F, 0.0625F);
+                const auto g_slice = ctx.slice(proj, -1, 0, INTERMEDIATE);
+                const auto u_slice = ctx.slice(proj, -1, INTERMEDIATE, INTERMEDIATE);
+                const auto hid = silu ? ctx.silu_multiply(g_slice, u_slice) : ctx.gelu_multiply(g_slice, u_slice);
+                const auto composed =
+                    ctx.packed_linear(hid, dn_t, down_scale_tensor, bits, INTERMEDIATE, 0.03125F, 0.125F);
+                const auto f_span = kidi::ops::require(fused.data<float>());
+                const auto c_span = kidi::ops::require(composed.data<float>());
+                for (std::size_t i = 0; i < f_span.size(); ++i) {
+                    if (std::abs(f_span[i] - c_span[i]) > 1e-5F) {
+                        std::cerr << "FFN mismatch bits=" << bits << " rows=" << m_rows << " silu=" << silu
+                                  << " idx=" << i << " fused=" << f_span[i] << " composed=" << c_span[i] << '\n';
+                        return 1;
+                    }
+                }
+            }
+#if defined(__APPLE__)
+            // Cross-check calibrated SymmetricPackedLinear (bits = 2, 4, 8, including K = 2056 non-multiple of 32)
+            // against Apple Accelerate LOWBIT_PARITY reference math.
+            kidi::ops::Context fast_ctx(kidi::tensor::Device::cpu());
+            kidi::ops::Context parity_ctx(kidi::tensor::Device::cpu());
+            parity_ctx.set_precision(kidi::core::InferencePrecision::LOWBIT_PARITY);
+            const auto fast_out =
+                fast_ctx.packed_linear(x_t, gu_t, gate_up_scale_tensor, bits, INPUT_SIZE, 0.125F, 0.0625F);
+            const auto ref_out =
+                parity_ctx.packed_linear(x_t, gu_t, gate_up_scale_tensor, bits, INPUT_SIZE, 0.125F, 0.0625F);
+            const auto fast_span = kidi::ops::require(fast_out.data<float>());
+            const auto ref_span = kidi::ops::require(ref_out.data<float>());
+            for (std::size_t i = 0; i < fast_span.size(); ++i) {
+                if (std::abs(fast_span[i] - ref_span[i]) > 1e-5F) {
+                    std::cerr << "Calibrated packed_linear parity mismatch bits=" << bits << " rows=" << m_rows
+                              << " idx=" << i << " fast=" << fast_span[i] << " ref=" << ref_span[i] << '\n';
+                    return 1;
+                }
+            }
+#endif
+        }
+    }
     std::filesystem::remove_all(cache_root);
 #endif
 
@@ -140,72 +187,14 @@ auto main() -> int {
     }
 #endif
 
-    auto graph = kidi::runtime::ynn::Graph::create(2);
-    if (!graph) {
-        std::cerr << graph.error().message << '\n';
-        return 1;
-    }
-
-    constexpr std::array<std::size_t, 2> SHAPE = {2, 2};
-    std::uint32_t input_id = 0;
-    std::uint32_t output_id = 1;
-    auto status =
-        kidi::runtime::ynn::check_status(ynn_define_tensor(graph->get(), ynn_type_fp32, SHAPE.size(), SHAPE.data(),
-                                                           nullptr, YNN_VALUE_FLAG_EXTERNAL_INPUT, &input_id),
-                                         "define input");
-    if (status) {
-        status =
-            kidi::runtime::ynn::check_status(ynn_define_tensor(graph->get(), ynn_type_fp32, SHAPE.size(), nullptr,
-                                                               nullptr, YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &output_id),
-                                             "define output");
-    }
-    if (status) {
-        status =
-            kidi::runtime::ynn::check_status(ynn_define_copy(graph->get(), input_id, &output_id, 0), "define copy");
-    }
-    if (!status) {
-        std::cerr << status.error().message << '\n';
-        return 1;
-    }
-
-    auto invalid_threads = std::move(*graph).compile(std::numeric_limits<std::size_t>::max());
-    if (invalid_threads || invalid_threads.error().code != kidi::ErrorCode::INVALID_ARGUMENT) return 1;
     kidi::runtime::ynn::set_thread_count(2);
-    auto executable = std::move(*graph).compile(1);
     if (kidi::runtime::ynn::thread_count() != 2) return 1;
-    if (!executable) {
-        std::cerr << executable.error().message << '\n';
+    std::array<int, 16> parallel_hits{};
+    if (!kidi::runtime::ynn::parallel_for(parallel_hits.size(), [&](std::size_t idx) { parallel_hits[idx] = 1; })) {
         return 1;
     }
-
-    status = executable->reshape();
-    if (!status) {
-        std::cerr << status.error().message << '\n';
-        return 1;
-    }
-    std::array input = {1.0F, 2.0F, 3.0F, 4.0F};
-    std::array<float, 4> output{};
-    if (!run(*executable, input, output) || output != input) return 1;
-
-    input = {4.0F, 3.0F, 2.0F, 1.0F};
-    output = {};
-    if (!run(*executable, input, output) || output != input) return 1;
-
-    constexpr std::array large_values = {5.0F, 6.0F, 7.0F, 8.0F};
-    auto large_input = kidi::tensor::Tensor::from_host({2, 2}, std::span<const float>(large_values));
-    auto large_output = kidi::tensor::Tensor::zeros({2, 2}, kidi::tensor::DType::F32);
-    if (!large_input || !large_output) {
-        std::cerr << (large_input ? large_output.error().message : large_input.error().message) << '\n';
-        return 1;
-    }
-    if (!run(*executable, *large_input, *large_output)) return 1;
-    auto output_values = large_output->data<float>();
-    if (!output_values || !std::ranges::equal(*output_values, large_values)) return 1;
-
-    const auto output_shape = executable->shape(output_id);
-    if (!output_shape || *output_shape != std::vector<std::size_t>(SHAPE.begin(), SHAPE.end())) {
-        std::cerr << "unexpected output shape\n";
-        return 1;
+    for (int v : parallel_hits) {
+        if (v != 1) return 1;
     }
     return 0;
 }

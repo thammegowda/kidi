@@ -25,6 +25,7 @@
 #include <ynnpack.h>
 
 #include "kidi/runtime/ynn/graph.h"
+#include "ynnpack/composites/composites.h"
 
 namespace {
 
@@ -90,59 +91,38 @@ auto to_bf16(std::span<const float> values) -> std::vector<std::uint16_t> {
 }
 
 struct YnnProjection {
-    kidi::runtime::ynn::Executable executable;
+    ::ynn::dense_linear_plan plan;
+    ::ynn::aligned_byte_buffer packed_weights;
+    ::ynn::aligned_byte_buffer packed_input;
+    bool transposed_a = false;
+    std::size_t tile_m = 1;
     std::vector<float> output;
     double compile_ms;
 };
 
-auto make_ynn_projection(std::size_t rows, const std::vector<float>& weights, const std::vector<float>& bias)
-    -> kidi::Result<YnnProjection> {
+auto make_ynn_projection(std::size_t rows, const std::vector<float>& weights) -> kidi::Result<YnnProjection> {
     kidi::runtime::ynn::set_thread_count(CPU_THREADS);
     const auto started = Clock::now();
-    auto graph = kidi::runtime::ynn::Graph::create(2);
-    if (!graph) return std::unexpected(std::move(graph.error()));
-
-    const std::array<std::size_t, 2> input_shape = {rows, INPUT_SIZE};
-    const std::array<std::size_t, 2> output_shape = {rows, OUTPUT_SIZE};
-    const std::array<std::size_t, 2> weight_shape = {INPUT_SIZE, OUTPUT_SIZE};
-    const std::array<std::size_t, 1> bias_shape = {OUTPUT_SIZE};
-    std::uint32_t input_id = 0;
-    std::uint32_t output_id = 1;
-    std::uint32_t weight_id = YNN_INVALID_VALUE_ID;
-    std::uint32_t bias_id = YNN_INVALID_VALUE_ID;
-    auto status = kidi::runtime::ynn::check_status(
-        ynn_define_tensor(graph->get(), ynn_type_fp32, input_shape.size(), input_shape.data(), nullptr,
-                          YNN_VALUE_FLAG_EXTERNAL_INPUT, &input_id),
-        "define benchmark input");
-    if (status) {
-        status = kidi::runtime::ynn::check_status(
-            ynn_define_tensor(graph->get(), ynn_type_fp32, output_shape.size(), output_shape.data(), nullptr,
-                              YNN_VALUE_FLAG_EXTERNAL_OUTPUT, &output_id),
-            "define benchmark output");
+    ::ynn::dense_linear_plan plan{};
+    if (auto status = kidi::runtime::ynn::check_status(
+            ::ynn::make_dense_linear_plan(ynn_type_fp32, ynn_type_fp32, ynn_type_fp32, OUTPUT_SIZE, INPUT_SIZE, &plan),
+            "create dense linear plan");
+        !status) {
+        return std::unexpected(std::move(status.error()));
     }
-    if (status) {
-        status = kidi::runtime::ynn::check_status(ynn_define_tensor(graph->get(), ynn_type_fp32, weight_shape.size(),
-                                                                    weight_shape.data(), weights.data(), 0, &weight_id),
-                                                  "define benchmark weight");
-    }
-    if (status) {
-        status = kidi::runtime::ynn::check_status(ynn_define_tensor(graph->get(), ynn_type_fp32, bias_shape.size(),
-                                                                    bias_shape.data(), bias.data(), 0, &bias_id),
-                                                  "define benchmark bias");
-    }
-    if (status) {
-        status = kidi::runtime::ynn::check_status(
-            ynn_define_dot(graph->get(), 1, input_id, weight_id, bias_id, &output_id, 0),
-            "define benchmark projection");
-    }
-    if (!status) return std::unexpected(std::move(status.error()));
-
-    auto executable = std::move(*graph).compile();
-    if (!executable) return std::unexpected(std::move(executable.error()));
-    if (auto reshape = executable->reshape(); !reshape) return std::unexpected(std::move(reshape.error()));
+    ::ynn::aligned_byte_buffer packed(plan.total_bytes);
+    ::ynn::pack_dense_linear_tiles(plan, false, weights.data(), OUTPUT_SIZE * sizeof(float), 0, plan.blocks_n,
+                                   packed.data());
+    bool transposed_a = false;
+    std::size_t tile_m = 1, a_packed_bytes = 0;
+    ::ynn::dense_linear_select_kernel(plan, rows, &transposed_a, &tile_m, &a_packed_bytes);
     const auto compile_ms = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
     return YnnProjection{
-        .executable = std::move(*executable),
+        .plan = plan,
+        .packed_weights = std::move(packed),
+        .packed_input = ::ynn::aligned_byte_buffer(a_packed_bytes),
+        .transposed_a = transposed_a,
+        .tile_m = tile_m,
         .output = std::vector<float>(rows * OUTPUT_SIZE),
         .compile_ms = compile_ms,
     };
@@ -154,10 +134,8 @@ auto run(std::size_t rows, std::size_t warmups, std::size_t iterations, std::siz
     const auto weights = make_values(INPUT_SIZE * OUTPUT_SIZE, 0x2468ACE1U, 0.03F);
     const auto bias = make_values(OUTPUT_SIZE, 0x10203040U, 0.1F);
 
-    auto ynn = make_ynn_projection(rows, weights, bias);
+    auto ynn = make_ynn_projection(rows, weights);
     if (!ynn) throw std::runtime_error(ynn.error().message);
-    require(ynn->executable.bind(0, const_cast<float*>(input.data())));
-    require(ynn->executable.bind(1, ynn->output.data()));
 
     id<MTLDevice> metal_device = MTLCreateSystemDefaultDevice();
     if (metal_device == nil) throw std::runtime_error("no Metal device is available");
@@ -271,7 +249,17 @@ auto run(std::size_t rows, std::size_t warmups, std::size_t iterations, std::siz
     };
     std::vector<std::int32_t> ynn_tokens(rows);
     const auto invoke_ynn = [&] {
-        require(ynn->executable.invoke());
+        const void* eff_a = input.data();
+        if (ynn->transposed_a) {
+            ::ynn::dense_linear_pack_a(ynn->plan, rows, ynn->tile_m, input.data(), INPUT_SIZE * sizeof(float),
+                                       ynn->packed_input.data());
+            eff_a = ynn->packed_input.data();
+        }
+        require(kidi::runtime::ynn::parallel_ranges(ynn->plan.blocks_n, 1, [&](std::size_t t_begin, std::size_t t_end) {
+            ::ynn::dense_linear_run_tiles(ynn->plan, rows, ynn->transposed_a, ynn->tile_m, eff_a,
+                                          INPUT_SIZE * sizeof(float), ynn->packed_weights.data(), bias.data(),
+                                          ynn->output.data(), OUTPUT_SIZE, t_begin, t_end);
+        }));
         if (device_argmax) {
             for (std::size_t row = 0; row < rows; ++row) {
                 const auto begin = ynn->output.begin() + static_cast<std::ptrdiff_t>(row * OUTPUT_SIZE);

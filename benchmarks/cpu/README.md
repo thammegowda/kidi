@@ -39,11 +39,22 @@ shows median warm decode speed, its observed range, warm first-token latency,
 peak process RSS, and baseline speedup when comparing. Peak RSS includes
 model loading and warmup and is not an incremental allocation measure.
 
-Thread sweep, with configurations run sequentially:
+Thread sweep, with configurations run sequentially (reports scaling speedup,
+parallel efficiency, and Amdahl-estimated serial/synchronization overhead):
 
 ```bash
-python benchmarks/cpu/run.py --threads 4 8 16 --tokens 128 --repeats 5 \
+python benchmarks/cpu/run.py --threads 1 2 4 8 --tokens 128 --repeats 5 \
   --output .cache/benchmarks/cpu/threads.json
+```
+
+Use `--preset arm-e2b` to match the exact [Arm Gemma 4 E2B](../gemma4/arm/README.md)
+speed protocol (`4` threads, `1024` context/prefill chunk, `--packed-prefill`,
+`64` output tokens, `1` warmup, `3` repeats, and the 31-token binary-search prompt):
+
+```bash
+python benchmarks/cpu/run.py --preset arm-e2b \
+  --model .cache/benchmarks/arm-gemma4/shared-asym-clip-hnsw --hnsw-ef 400 \
+  --output .cache/benchmarks/cpu/arm-q4-g128-hnsw-baseline.json
 ```
 
 For operator-level diagnostics, disable replay so individual operators remain

@@ -24,7 +24,7 @@ auto for_independent_ranges(std::size_t size, std::size_t work_per_item, Functio
     const auto tasks = size * work_per_item < 32768 ? std::size_t{1} : std::min(runtime::ynn::thread_count(), size);
     if (tasks <= 1) return function(0, size);
     const auto block = (size + tasks - 1) / tasks;
-    require(runtime::ynn::parallel_for(tasks, [&](std::size_t task) {
+    require(runtime::ynn::parallel_tasks(tasks, [&](std::size_t task) {
         const auto begin = task * block;
         if (begin < size) function(begin, std::min(begin + block, size));
     }));

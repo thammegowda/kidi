@@ -1,6 +1,7 @@
 """Repeat warm CPU Gemma workloads through the existing native benchmark."""
 
 import argparse
+import copy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -15,8 +16,10 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = "@google/gemma-4-E4B-it-qat-mobile-transformers"
-METRICS = ("decode_tps", "decode_interval_tps", "prefill_tps", "first_token_ms",
-           "generation_ms", "preparation_ms", "peak_rss_kib")
+DEFAULT_PROMPT = "Explain how binary search works in detail."
+ARM_E2B_PROMPT = "Explain how binary search works in at least 300 words, including an example and its time complexity."
+METRICS = ("decode_tps", "decode_interval_tps", "prefill_tps", "prefill_through_first_token_tps",
+           "first_token_ms", "generation_ms", "preparation_ms", "peak_rss_kib")
 
 
 def digest(path):
@@ -68,6 +71,30 @@ def summarize(records, settings, repeats):
     return summary
 
 
+def backfill_baseline_summary(baseline_run, warmups):
+    summary = copy.deepcopy(baseline_run["summary"])
+    records = baseline_run.get("records") or []
+    for workload, current in summary.items():
+        missing = [name for name in METRICS if name not in current]
+        if not missing:
+            continue
+        rows = [
+            row for row in records
+            if row.get("stage") == "generation" and row.get("workload") == workload and not row.get("warmup")
+        ]
+        if not rows:
+            rows = [
+                row for row in records
+                if row.get("stage") == "generation" and row.get("workload") == workload
+            ][warmups:]
+        if not rows:
+            raise KeyError(f"{workload}: baseline summary missing {missing[0]}")
+        for name in missing:
+            values = [row[name] for row in rows]
+            current[name] = {"median": median(values), "min": min(values), "max": max(values), "stdev": pstdev(values)}
+    return summary
+
+
 def compare(summary, reference):
     for workload, current in summary.items():
         previous = reference[workload]
@@ -75,6 +102,53 @@ def compare(summary, reference):
                 current["input_token_ids"] != previous["input_token_ids"]):
             raise ValueError(f"{workload}: token IDs differ from baseline")
         current["baseline_decode_speedup"] = current["decode_tps"]["median"] / previous["decode_tps"]["median"]
+        current["baseline_decode_interval_speedup"] = (
+            current["decode_interval_tps"]["median"] / previous["decode_interval_tps"]["median"]
+        )
+        current["baseline_prefill_speedup"] = (
+            current["prefill_through_first_token_tps"]["median"] /
+            previous["prefill_through_first_token_tps"]["median"]
+        )
+
+
+def compute_thread_scaling(runs, workloads):
+    thread_counts = sorted(int(key) for key in runs if runs[key].get("status") == "completed")
+    if len(thread_counts) < 2:
+        return {}
+    base_threads = thread_counts[0]
+    scaling = {}
+    for workload in workloads:
+        base = runs[str(base_threads)]["summary"][workload]
+        base_decode = base["decode_interval_tps"]["median"]
+        base_prefill = base["prefill_through_first_token_tps"]["median"]
+        base_ms_per_tok = 1000.0 / base_decode
+        entries = []
+        for threads in thread_counts:
+            cur = runs[str(threads)]["summary"][workload]
+            if cur["token_ids"] != base["token_ids"] or cur["input_token_ids"] != base["input_token_ids"]:
+                raise ValueError(f"{workload}: token IDs differ between {base_threads} and {threads} threads")
+            dec = cur["decode_interval_tps"]["median"]
+            pre = cur["prefill_through_first_token_tps"]["median"]
+            ratio = threads / base_threads
+            decode_speedup = dec / base_decode
+            prefill_speedup = pre / base_prefill
+            ms_per_tok = 1000.0 / dec
+            serial_ms = None
+            if threads > base_threads:
+                # Amdahl two-point estimate: T(n) = s + p / (n / base_threads), T(base) = s + p.
+                serial_ms = max(0.0, (ms_per_tok - base_ms_per_tok / ratio) / (1.0 - 1.0 / ratio))
+            entries.append({
+                "threads": threads,
+                "prefill_tps": pre,
+                "prefill_speedup": prefill_speedup,
+                "decode_tps": dec,
+                "decode_speedup": decode_speedup,
+                "decode_efficiency": decode_speedup / ratio,
+                "decode_ms_per_tok": ms_per_tok,
+                "implied_serial_overhead_ms": serial_ms,
+            })
+        scaling[workload] = {"base_threads": base_threads, "points": entries}
+    return scaling
 
 
 def operator_summary(text):
@@ -108,16 +182,19 @@ def benchmark_environment(replay, profile_ops, warmups, hnsw_ef=None):
 def main(argv=None):
     available_threads = max(1, os.cpu_count() or 1)
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--preset", choices=("default", "arm-e2b"), default="default",
+                        help="protocol preset ('arm-e2b' matches benchmarks/gemma4/arm speed settings)")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--threads", type=int, nargs="+", default=[min(8, available_threads)])
+    parser.add_argument("--threads", type=int, nargs="+", default=None)
     parser.add_argument("--tokens", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--context-tokens", type=int, default=16384)
-    parser.add_argument("--prefill-chunk", type=int, default=128)
-    parser.add_argument("--packed-prefill", action="store_true")
+    parser.add_argument("--context-tokens", type=int, default=None)
+    parser.add_argument("--prefill-chunk", type=int, default=None)
+    parser.add_argument("--packed-prefill", action="store_true", default=None)
+    parser.add_argument("--unpacked-prefill", dest="packed_prefill", action="store_false")
     parser.add_argument("--workload", choices=("short", "long", "both"), default="short")
-    parser.add_argument("--prompt", default="Explain how binary search works in detail.")
+    parser.add_argument("--prompt", default=None)
     parser.add_argument("--replay", choices=("default", "on", "off"), default="default")
     parser.add_argument("--profile-ops", action="store_true")
     parser.add_argument("--dense-lm-head", action="store_true", help="bypass the checkpoint HNSW index")
@@ -130,6 +207,17 @@ def main(argv=None):
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path, default=ROOT / ".cache/benchmarks/cpu/latest.json")
     arguments = parser.parse_args(argv)
+    arm_preset = arguments.preset == "arm-e2b"
+    if arguments.threads is None:
+        arguments.threads = [min(4 if arm_preset else 8, available_threads)]
+    if arguments.context_tokens is None:
+        arguments.context_tokens = 1024 if arm_preset else 16384
+    if arguments.prefill_chunk is None:
+        arguments.prefill_chunk = 1024 if arm_preset else 128
+    if arguments.packed_prefill is None:
+        arguments.packed_prefill = arm_preset
+    if arguments.prompt is None:
+        arguments.prompt = ARM_E2B_PROMPT if arm_preset else DEFAULT_PROMPT
     if (not 1 <= arguments.repeats <= 20 or not 1 <= arguments.warmups <= 20 or
             not 2 <= arguments.tokens < arguments.context_tokens or arguments.prefill_chunk < 1 or
             arguments.jobs < 1 or not math.isfinite(arguments.timeout) or arguments.timeout <= 0 or
@@ -214,7 +302,8 @@ def main(argv=None):
                                             arguments.hnsw_ef)
         report["environment"] = {key: value for key, value in environment.items() if key.startswith("KIDI_")}
         save()
-        print("threads workload   decode tok/s (min..max)    warm TTFT ms   peak GiB   baseline", flush=True)
+        print("threads workload  prefill tok/s   decode tok/s (min..max)    warm TTFT ms   peak GiB   vs base (pre/dec)",
+              flush=True)
         for threads in arguments.threads:
             command = [str(binary), "gemma", str(model), str(threads), str(arguments.repeats), json.dumps(settings)]
             stdout = output.parent / f"{output.stem}-j{threads}.stdout.jsonl"
@@ -241,18 +330,36 @@ def main(argv=None):
             if reference:
                 if str(threads) not in reference["runs"]:
                     raise ValueError(f"baseline has no {threads}-thread run")
-                compare(run["summary"], reference["runs"][str(threads)]["summary"])
+                compare(run["summary"],
+                        backfill_baseline_summary(reference["runs"][str(threads)], arguments.warmups))
             for workload, summary in run["summary"].items():
-                speed = summary["decode_tps"]
-                relative = f'{summary["baseline_decode_speedup"]:.3f}x' if reference else "-"
-                print(f'{threads:7} {workload:8} {speed["median"]:8.2f} ({speed["min"]:.2f}..{speed["max"]:.2f})'
+                speed = summary["decode_interval_tps"]
+                prefill = summary["prefill_through_first_token_tps"]["median"]
+                relative = (f'{summary["baseline_prefill_speedup"]:.3f}x/{summary["baseline_decode_interval_speedup"]:.3f}x'
+                            if reference else "-")
+                print(f'{threads:7} {workload:8} {prefill:14.2f} {speed["median"]:8.2f} ({speed["min"]:.2f}..{speed["max"]:.2f})'
                       f' {summary["first_token_ms"]["median"]:13.2f}'
-                      f' {summary["peak_rss_kib"]["max"] / 2**20:10.2f} {relative:>10}', flush=True)
+                      f' {summary["peak_rss_kib"]["max"] / 2**20:10.2f} {relative:>18}', flush=True)
             for operation in run.get("operators", [])[:5]:
                 print(f'  {operation["phase"]}/{operation["op"]}: {operation["run_ns"] / 1e6:.2f} ms'
                       f' in {operation["calls"]} calls', flush=True)
             run["status"] = "completed"
             save()
+        workloads = ("short", "long") if settings["workload"] == "both" else (settings["workload"],)
+        scaling = compute_thread_scaling(report["runs"], workloads)
+        if scaling:
+            report["scaling"] = scaling
+            for workload, data in scaling.items():
+                base_t = data["base_threads"]
+                print(f"\nScaling ({workload}, base={base_t}T):", flush=True)
+                print("threads  prefill tok/s  pre gain  decode tok/s  dec gain  efficiency  ms/tok  serial+sync ms",
+                      flush=True)
+                for pt in data["points"]:
+                    serial = "-" if pt["implied_serial_overhead_ms"] is None else f'{pt["implied_serial_overhead_ms"]:.2f}'
+                    print(f'{pt["threads"]:7} {pt["prefill_tps"]:14.2f} {pt["prefill_speedup"]:8.2f}x'
+                          f' {pt["decode_tps"]:13.2f} {pt["decode_speedup"]:8.2f}x'
+                          f' {pt["decode_efficiency"] * 100:10.1f}% {pt["decode_ms_per_tok"]:7.2f} {serial:>15}',
+                          flush=True)
         if digest(binary) != report["source"]["binary_sha256"]:
             raise RuntimeError("benchmark binary changed during measurement")
         if ("hnsw_index_sha256" in report["source"] and

@@ -1,4 +1,4 @@
-#include "kidi/runtime/ynn/numa.h"
+#include "ynnpack/base/topology.h"
 
 #include <algorithm>
 #include <array>
@@ -13,7 +13,7 @@
 
 namespace {
 
-using kidi::runtime::ynn::NumaNode;
+using ::ynn::NumaNode;
 
 auto expect(bool condition, const char* what) -> bool {
     if (!condition) std::cerr << "FAILED: " << what << '\n';
@@ -21,7 +21,7 @@ auto expect(bool condition, const char* what) -> bool {
 }
 
 auto test_parse() -> bool {
-    using kidi::runtime::ynn::parse_cpu_list;
+    using ::ynn::parse_cpu_list;
     return expect(parse_cpu_list("0-3,8,10-11\n") == std::vector<int>{0, 1, 2, 3, 8, 10, 11}, "ranges and singles") &&
            expect(parse_cpu_list("5") == std::vector<int>{5}, "single") &&
            expect(parse_cpu_list("").empty(), "empty") && expect(parse_cpu_list("3-1").empty(), "descending range") &&
@@ -30,7 +30,7 @@ auto test_parse() -> bool {
 }
 
 auto test_choose() -> bool {
-    using kidi::runtime::ynn::choose_numa_node;
+    using ::ynn::choose_numa_node;
     const std::array<NumaNode, 2> two = {NumaNode{0, {0, 1, 2, 3}}, NumaNode{1, {4, 5, 6, 7}}};
     const std::array<NumaNode, 2> uneven = {NumaNode{0, {0, 1}}, NumaNode{1, {4, 5, 6, 7}}};
     const std::array<NumaNode, 1> one = {NumaNode{0, {0, 1, 2, 3}}};
@@ -62,10 +62,10 @@ auto test_confine() -> bool {
     std::thread([&] {
         const auto before = affinity();
         setenv("KIDI_NUMA", "off", 1);
-        ok = expect(!kidi::runtime::ynn::confine_to_numa_node(1), "KIDI_NUMA=off disables confinement") &&
+        ok = expect(!::ynn::confine_to_numa_node(1), "KIDI_NUMA=off disables confinement") &&
              expect(affinity() == before, "KIDI_NUMA=off leaves the affinity alone");
         unsetenv("KIDI_NUMA");
-        const auto node = kidi::runtime::ynn::confine_to_numa_node(1);
+        const auto node = ::ynn::confine_to_numa_node(1);
         const auto after = affinity();
         ok = expect(!after.empty(), "affinity stays non-empty") &&
              expect(std::ranges::includes(before, after), "confinement only narrows the affinity") && ok;
@@ -74,7 +74,7 @@ auto test_confine() -> bool {
             std::vector<int> inherited;
             std::thread([&] { inherited = affinity(); }).join();
             ok = expect(inherited == after, "threads created later inherit the confinement") && ok;
-            ok = expect(!kidi::runtime::ynn::confine_to_numa_node(1) || affinity() == after,
+            ok = expect(!::ynn::confine_to_numa_node(1) || affinity() == after,
                         "a second call stays on the same node") &&
                  ok;
         } else {
@@ -84,9 +84,40 @@ auto test_confine() -> bool {
     return ok;
 }
 #else
-auto test_confine() -> bool { return expect(!kidi::runtime::ynn::confine_to_numa_node(1), "unsupported platform"); }
+auto test_confine() -> bool { return expect(!::ynn::confine_to_numa_node(1), "unsupported platform"); }
 #endif
+
+auto test_choose_performance_cpus() -> bool {
+    using ::ynn::choose_performance_cpus;
+    using ::ynn::count_performance_cpus;
+    using ::ynn::CpuCapacity;
+    const std::array<CpuCapacity, 8> hybrid = {
+        CpuCapacity{0, 448},  CpuCapacity{1, 448},  CpuCapacity{2, 448},  CpuCapacity{3, 448},
+        CpuCapacity{4, 1024}, CpuCapacity{5, 1024}, CpuCapacity{6, 1024}, CpuCapacity{7, 1024},
+    };
+    const std::array<CpuCapacity, 8> tri_cluster = {
+        CpuCapacity{0, 320}, CpuCapacity{1, 320}, CpuCapacity{2, 320}, CpuCapacity{3, 320},
+        CpuCapacity{4, 768}, CpuCapacity{5, 768}, CpuCapacity{6, 768}, CpuCapacity{7, 1024},
+    };
+    const std::array<CpuCapacity, 4> uniform = {
+        CpuCapacity{0, 1024},
+        CpuCapacity{1, 1024},
+        CpuCapacity{2, 1024},
+        CpuCapacity{3, 1024},
+    };
+    return expect(choose_performance_cpus(hybrid, 4) == std::vector<int>{4, 5, 6, 7}, "picks P-cores when 4 fit") &&
+           expect(choose_performance_cpus(hybrid, 2) == std::vector<int>{4, 5, 6, 7}, "keeps full P-core cluster") &&
+           expect(choose_performance_cpus(tri_cluster, 4) == std::vector<int>{4, 5, 6, 7},
+                  "tri-cluster picks Prime + Perf cores") &&
+           expect(choose_performance_cpus(hybrid, 8).empty(), "all cores requested needs no narrowing") &&
+           expect(choose_performance_cpus(uniform, 2).empty(), "uniform topology needs no P-core narrowing") &&
+           expect(choose_performance_cpus(hybrid, 0).empty(), "zero threads needs no narrowing") &&
+           expect(count_performance_cpus(hybrid) == 4, "2-tier auto count picks 4 P-cores") &&
+           expect(count_performance_cpus(tri_cluster) == 4, "3-tier auto count picks Prime + Perf cores") &&
+           expect(count_performance_cpus(uniform) == 4, "uniform auto count keeps all cores") &&
+           expect(count_performance_cpus({}) == 0, "empty topology returns 0");
+}
 
 } // namespace
 
-auto main() -> int { return test_parse() && test_choose() && test_confine() ? 0 : 1; }
+auto main() -> int { return test_parse() && test_choose() && test_choose_performance_cpus() && test_confine() ? 0 : 1; }

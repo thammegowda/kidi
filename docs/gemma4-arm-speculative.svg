@@ -1,0 +1,206 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 661" width="100%" height="100%" style="font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+  <defs>
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8fafc"/><stop offset="100%" stop-color="#f1f5f9"/>
+    </linearGradient>
+    <filter id="card-shadow" x="-2%" y="-2%" width="104%" height="106%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.05"/>
+    </filter>
+  </defs>
+  <rect width="1200" height="661" rx="14" fill="url(#bg-grad)" stroke="#cbd5e1" stroke-width="1.2"/>
+  <text x="600.0" y="31" text-anchor="middle" font-size="17" font-weight="800" letter-spacing="-0.3" fill="#0f172a">Gemma 4 E2B on Arm CPU (Apple M5, 4P Threads) — Speculative Decoding (K=2) &amp; HNSW</text>
+  <text x="600.0" y="51" text-anchor="middle" font-size="12" font-weight="500" fill="#475569">Speed (31-token prompt, 64 output tokens; brackets vs. Kidi BF16 17.75 tok/s) vs. Generation Quality (150 WMT23 chrF)</text>
+  <rect x="185.0" y="110.0" width="980.0" height="437.0" rx="6" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2" filter="url(#card-shadow)"/>
+  <line x1="185.0" y1="547.0" x2="185.0" y2="552.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="185.0" y="565.0" text-anchor="middle" font-size="11" font-weight="500" fill="#475569">0</text>
+  <line x1="288.4" y1="110.0" x2="288.4" y2="547.0" stroke="#f1f5f9" stroke-width="1"/>
+  <line x1="288.4" y1="547.0" x2="288.4" y2="552.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="288.4" y="565.0" text-anchor="middle" font-size="11" font-weight="500" fill="#475569">20</text>
+  <line x1="391.8" y1="110.0" x2="391.8" y2="547.0" stroke="#f1f5f9" stroke-width="1"/>
+  <line x1="391.8" y1="547.0" x2="391.8" y2="552.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="391.8" y="565.0" text-anchor="middle" font-size="11" font-weight="500" fill="#475569">40</text>
+  <line x1="495.2" y1="110.0" x2="495.2" y2="547.0" stroke="#f1f5f9" stroke-width="1"/>
+  <line x1="495.2" y1="547.0" x2="495.2" y2="552.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="495.2" y="565.0" text-anchor="middle" font-size="11" font-weight="500" fill="#475569">60</text>
+  <line x1="598.6" y1="110.0" x2="598.6" y2="547.0" stroke="#f1f5f9" stroke-width="1"/>
+  <line x1="598.6" y1="547.0" x2="598.6" y2="552.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="598.6" y="565.0" text-anchor="middle" font-size="11" font-weight="500" fill="#475569">80</text>
+  <line x1="701.9" y1="110.0" x2="701.9" y2="547.0" stroke="#f1f5f9" stroke-width="1"/>
+  <line x1="701.9" y1="547.0" x2="701.9" y2="552.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="701.9" y="565.0" text-anchor="middle" font-size="11" font-weight="500" fill="#475569">100</text>
+  <text x="490.0" y="584.0" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1e293b">Decode Speed (tokens / sec) →</text>
+  <rect x="815.0" y="111.0" width="349.0" height="435.0" fill="#f8fafc" opacity="0.65"/>
+  <line x1="815.0" y1="110.0" x2="815.0" y2="547.0" stroke="#cbd5e1" stroke-width="1.2"/>
+  <text x="992.5" y="80.0" text-anchor="middle" font-size="11.5" font-weight="700" fill="#1e293b">Generation Quality (WMT23 chrF ↑) →</text>
+  <line x1="846.3" y1="110.0" x2="846.3" y2="547.0" stroke="#e2e8f0" stroke-width="1"/>
+  <line x1="846.3" y1="105.0" x2="846.3" y2="110.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="846.3" y="101.0" text-anchor="middle" font-size="10.5" font-weight="600" fill="#475569">55.0</text>
+  <line x1="902.5" y1="110.0" x2="902.5" y2="547.0" stroke="#e2e8f0" stroke-width="1"/>
+  <line x1="902.5" y1="105.0" x2="902.5" y2="110.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="902.5" y="101.0" text-anchor="middle" font-size="10.5" font-weight="600" fill="#475569">55.5</text>
+  <line x1="958.8" y1="110.0" x2="958.8" y2="547.0" stroke="#e2e8f0" stroke-width="1"/>
+  <line x1="958.8" y1="105.0" x2="958.8" y2="110.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="958.8" y="101.0" text-anchor="middle" font-size="10.5" font-weight="600" fill="#475569">56.0</text>
+  <line x1="1015.0" y1="110.0" x2="1015.0" y2="547.0" stroke="#e2e8f0" stroke-width="1"/>
+  <line x1="1015.0" y1="105.0" x2="1015.0" y2="110.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="1015.0" y="101.0" text-anchor="middle" font-size="10.5" font-weight="600" fill="#475569">56.5</text>
+  <line x1="1071.2" y1="110.0" x2="1071.2" y2="547.0" stroke="#e2e8f0" stroke-width="1"/>
+  <line x1="1071.2" y1="105.0" x2="1071.2" y2="110.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="1071.2" y="101.0" text-anchor="middle" font-size="10.5" font-weight="600" fill="#475569">57.0</text>
+  <line x1="1127.5" y1="110.0" x2="1127.5" y2="547.0" stroke="#e2e8f0" stroke-width="1"/>
+  <line x1="1127.5" y1="105.0" x2="1127.5" y2="110.0" stroke="#64748b" stroke-width="1.2"/>
+  <text x="1127.5" y="101.0" text-anchor="middle" font-size="10.5" font-weight="600" fill="#475569">57.5</text>
+  <line x1="1101.6" y1="110.0" x2="1101.6" y2="547.0" stroke="#64748b" stroke-width="1.4" stroke-dasharray="4,3"/>
+  <text x="1101.6" y="564.0" text-anchor="middle" font-size="10" font-weight="600" font-style="italic" fill="#475569">BF16 Ref (57.27)</text>
+  <text x="175.0" y="143.6" text-anchor="end" font-size="11.5" font-weight="700" fill="#0f172a">Kidi BF16</text>
+  <rect x="185.0" y="117.0" width="91.8" height="9.5" rx="2.5" fill="#94a3b8"/>
+  <text x="281.8" y="125.0" font-size="9.5" font-weight="600" fill="#475569">17.75 (1.00x)</text>
+  <line x1="821.0" y1="121.8" x2="1101.6" y2="121.8" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1101.6" cy="121.8" r="4.1" fill="#94a3b8" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="1094.6" y="125.0" text-anchor="end" font-size="9.0" font-weight="600" fill="#475569">57.27</text>
+  <rect x="185.0" y="128.9" width="106.5" height="9.5" rx="2.5" fill="#0284c7"/>
+  <text x="296.5" y="136.9" font-size="9.5" font-weight="600" fill="#0369a1">20.60 (1.16x)</text>
+  <line x1="821.0" y1="133.7" x2="1101.6" y2="133.7" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1101.6" cy="133.7" r="4.1" fill="#0284c7" stroke="#ffffff" stroke-width="1.1"/>
+  <rect x="185.0" y="140.8" width="155.5" height="9.5" rx="2.5" fill="#D55E00"/>
+  <text x="345.5" y="148.8" font-size="9.5" font-weight="600" fill="#c2410c">30.08 (1.69x)</text>
+  <line x1="821.0" y1="145.6" x2="1101.6" y2="145.6" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1101.6" cy="145.6" r="4.1" fill="#D55E00" stroke="#ffffff" stroke-width="1.1"/>
+  <rect x="185.0" y="152.7" width="177.7" height="9.5" rx="2.5" fill="#7c2d12"/>
+  <text x="367.7" y="160.7" font-size="9.5" font-weight="700" fill="#7c2d12">34.38 (1.94x)</text>
+  <line x1="821.0" y1="157.4" x2="1101.6" y2="157.4" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1101.6" cy="157.4" r="4.1" fill="#7c2d12" stroke="#ffffff" stroke-width="1.1"/>
+  <line x1="28" y1="169.2" x2="1165.0" y2="169.2" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="175.0" y="202.8" text-anchor="end" font-size="11.5" font-weight="700" fill="#0f172a">Kidi Q8</text>
+  <rect x="185.0" y="176.2" width="182.2" height="9.5" rx="2.5" fill="#94a3b8"/>
+  <text x="372.2" y="184.2" font-size="9.5" font-weight="600" fill="#475569">35.25 (1.99x)</text>
+  <line x1="821.0" y1="180.9" x2="1106.1" y2="180.9" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1106.1" cy="180.9" r="4.1" fill="#94a3b8" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="1099.1" y="184.1" text-anchor="end" font-size="9.0" font-weight="600" fill="#475569">57.31</text>
+  <rect x="185.0" y="188.1" width="203.5" height="9.5" rx="2.5" fill="#0284c7"/>
+  <text x="393.5" y="196.1" font-size="9.5" font-weight="600" fill="#0369a1">39.36 (2.22x)</text>
+  <line x1="821.0" y1="192.8" x2="1101.6" y2="192.8" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1101.6" cy="192.8" r="4.1" fill="#0284c7" stroke="#ffffff" stroke-width="1.1"/>
+  <rect x="185.0" y="200.0" width="318.6" height="9.5" rx="2.5" fill="#D55E00"/>
+  <text x="508.6" y="208.0" font-size="9.5" font-weight="600" fill="#c2410c">61.63 (3.47x)</text>
+  <line x1="821.0" y1="204.8" x2="1106.1" y2="204.8" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1106.1" cy="204.8" r="4.1" fill="#D55E00" stroke="#ffffff" stroke-width="1.1"/>
+  <rect x="185.0" y="211.9" width="338.0" height="9.5" rx="2.5" fill="#7c2d12"/>
+  <text x="528.0" y="219.9" font-size="9.5" font-weight="700" fill="#7c2d12">65.38 (3.68x)</text>
+  <line x1="821.0" y1="216.6" x2="1101.6" y2="216.6" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1101.6" cy="216.6" r="4.1" fill="#7c2d12" stroke="#ffffff" stroke-width="1.1"/>
+  <line x1="185.0" y1="228.4" x2="1165.0" y2="228.4" stroke="#f1f5f9" stroke-width="1"/>
+  <text x="175.0" y="244.1" text-anchor="end" font-size="11.5" font-weight="600" fill="#334155">Arm ExecuTorch Q8</text>
+  <rect x="185.0" y="235.4" width="146.9" height="9.5" rx="2.5" fill="#94a3b8"/>
+  <text x="336.9" y="243.4" font-size="9.5" font-weight="600" fill="#475569">28.42 (1.60x · no SpecDec)</text>
+  <line x1="821.0" y1="240.1" x2="1100.5" y2="240.1" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1100.5" cy="240.1" r="4.1" fill="#94a3b8" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="1093.5" y="243.3" text-anchor="end" font-size="9.0" font-weight="600" fill="#475569">57.26</text>
+  <line x1="185.0" y1="251.9" x2="1165.0" y2="251.9" stroke="#f1f5f9" stroke-width="1"/>
+  <text x="175.0" y="267.6" text-anchor="end" font-size="11.5" font-weight="600" fill="#334155">ONNX Runtime Q8</text>
+  <rect x="185.0" y="258.9" width="161.8" height="9.5" rx="2.5" fill="#94a3b8"/>
+  <text x="351.8" y="266.9" font-size="9.5" font-weight="600" fill="#475569">31.29 (1.76x · no SpecDec)</text>
+  <line x1="821.0" y1="263.6" x2="1065.6" y2="263.6" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1065.6" cy="263.6" r="4.1" fill="#94a3b8" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="1058.6" y="266.8" text-anchor="end" font-size="9.0" font-weight="600" fill="#475569">56.95</text>
+  <line x1="185.0" y1="275.4" x2="1165.0" y2="275.4" stroke="#f1f5f9" stroke-width="1"/>
+  <text x="175.0" y="297.1" text-anchor="end" font-size="11.5" font-weight="600" fill="#334155">llama.cpp Q8_0</text>
+  <rect x="185.0" y="282.4" width="174.1" height="9.5" rx="2.5" fill="#94a3b8"/>
+  <text x="364.1" y="290.4" font-size="9.5" font-weight="600" fill="#475569">33.68 (1.90x)</text>
+  <line x1="821.0" y1="287.1" x2="1082.5" y2="287.1" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1082.5" cy="287.1" r="4.1" fill="#94a3b8" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="1075.5" y="290.3" text-anchor="end" font-size="9.0" font-weight="600" fill="#475569">57.10</text>
+  <rect x="185.0" y="294.3" width="287.8" height="9.5" rx="2.5" fill="#D55E00"/>
+  <text x="477.8" y="302.3" font-size="9.5" font-weight="600" fill="#c2410c">55.68 (3.14x)</text>
+  <line x1="821.0" y1="299.0" x2="1082.5" y2="299.0" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1082.5" cy="299.0" r="4.1" fill="#D55E00" stroke="#ffffff" stroke-width="1.1"/>
+  <line x1="28" y1="310.8" x2="1165.0" y2="310.8" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="175.0" y="344.4" text-anchor="end" font-size="11.5" font-weight="700" fill="#0f172a">Kidi Q4 (g=32)</text>
+  <rect x="185.0" y="317.8" width="278.7" height="9.5" rx="2.5" fill="#94a3b8"/>
+  <text x="468.7" y="325.8" font-size="9.5" font-weight="600" fill="#475569">53.91 (3.04x)</text>
+  <line x1="821.0" y1="322.5" x2="988.0" y2="322.5" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="988.0" cy="322.5" r="4.1" fill="#94a3b8" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="995.0" y="325.7" text-anchor="start" font-size="9.0" font-weight="600" fill="#475569">56.26</text>
+  <rect x="185.0" y="329.7" width="311.4" height="9.5" rx="2.5" fill="#0284c7"/>
+  <text x="501.4" y="337.7" font-size="9.5" font-weight="600" fill="#0369a1">60.23 (3.39x)</text>
+  <line x1="821.0" y1="334.4" x2="970.0" y2="334.4" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="970.0" cy="334.4" r="4.1" fill="#0284c7" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="977.0" y="337.6" text-anchor="start" font-size="9.0" font-weight="600" fill="#0369a1">56.10</text>
+  <rect x="185.0" y="341.6" width="310.7" height="9.5" rx="2.5" fill="#D55E00"/>
+  <text x="500.7" y="349.6" font-size="9.5" font-weight="600" fill="#c2410c">60.10 (3.39x)</text>
+  <line x1="821.0" y1="346.3" x2="988.0" y2="346.3" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="988.0" cy="346.3" r="4.1" fill="#D55E00" stroke="#ffffff" stroke-width="1.1"/>
+  <rect x="185.0" y="353.5" width="333.5" height="9.5" rx="2.5" fill="#7c2d12"/>
+  <text x="523.5" y="361.5" font-size="9.5" font-weight="700" fill="#7c2d12">64.51 (3.63x)</text>
+  <line x1="821.0" y1="358.2" x2="970.0" y2="358.2" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="970.0" cy="358.2" r="4.1" fill="#7c2d12" stroke="#ffffff" stroke-width="1.1"/>
+  <line x1="185.0" y1="370.0" x2="1165.0" y2="370.0" stroke="#f1f5f9" stroke-width="1"/>
+  <text x="175.0" y="391.7" text-anchor="end" font-size="11.5" font-weight="600" fill="#334155">llama.cpp Q4_0</text>
+  <rect x="185.0" y="377.0" width="256.8" height="9.5" rx="2.5" fill="#94a3b8"/>
+  <text x="446.8" y="385.0" font-size="9.5" font-weight="600" fill="#475569">49.67 (2.80x)</text>
+  <line x1="821.0" y1="381.7" x2="963.2" y2="381.7" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="963.2" cy="381.7" r="4.1" fill="#94a3b8" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="970.2" y="384.9" text-anchor="start" font-size="9.0" font-weight="600" fill="#475569">56.04</text>
+  <rect x="185.0" y="388.9" width="310.6" height="9.5" rx="2.5" fill="#D55E00"/>
+  <text x="500.6" y="396.9" font-size="9.5" font-weight="600" fill="#c2410c">60.09 (3.39x)</text>
+  <line x1="821.0" y1="393.6" x2="963.2" y2="393.6" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="963.2" cy="393.6" r="4.1" fill="#D55E00" stroke="#ffffff" stroke-width="1.1"/>
+  <line x1="28" y1="405.4" x2="1165.0" y2="405.4" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="175.0" y="439.0" text-anchor="end" font-size="11.5" font-weight="700" fill="#0f172a">Kidi Q4 (g=128)</text>
+  <rect x="185.0" y="412.4" width="328.2" height="9.5" rx="2.5" fill="#94a3b8"/>
+  <text x="518.2" y="420.4" font-size="9.5" font-weight="600" fill="#475569">63.48 (3.58x)</text>
+  <line x1="821.0" y1="417.1" x2="943.0" y2="417.1" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="943.0" cy="417.1" r="4.1" fill="#94a3b8" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="950.0" y="420.3" text-anchor="start" font-size="9.0" font-weight="600" fill="#475569">55.86</text>
+  <rect x="185.0" y="424.3" width="362.4" height="9.5" rx="2.5" fill="#0284c7"/>
+  <text x="552.4" y="432.3" font-size="9.5" font-weight="600" fill="#0369a1">70.10 (3.95x)</text>
+  <line x1="821.0" y1="429.0" x2="950.9" y2="429.0" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="950.9" cy="429.0" r="4.1" fill="#0284c7" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="957.9" y="432.2" text-anchor="start" font-size="9.0" font-weight="600" fill="#0369a1">55.93</text>
+  <rect x="185.0" y="436.2" width="465.9" height="9.5" rx="2.5" fill="#D55E00"/>
+  <text x="655.9" y="444.2" font-size="9.5" font-weight="600" fill="#c2410c">90.12 (5.08x)</text>
+  <line x1="821.0" y1="440.9" x2="943.0" y2="440.9" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="943.0" cy="440.9" r="4.1" fill="#D55E00" stroke="#ffffff" stroke-width="1.1"/>
+  <rect x="185.0" y="448.1" width="494.6" height="9.5" rx="2.5" fill="#7c2d12"/>
+  <text x="684.6" y="456.1" font-size="9.5" font-weight="700" fill="#7c2d12">95.67 (5.39x)</text>
+  <line x1="821.0" y1="452.8" x2="950.9" y2="452.8" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="950.9" cy="452.8" r="4.1" fill="#7c2d12" stroke="#ffffff" stroke-width="1.1"/>
+  <line x1="185.0" y1="464.6" x2="1165.0" y2="464.6" stroke="#f1f5f9" stroke-width="1"/>
+  <text x="175.0" y="480.3" text-anchor="end" font-size="11.5" font-weight="600" fill="#334155">ONNX Runtime Q4 (g=128)</text>
+  <rect x="185.0" y="471.6" width="261.8" height="9.5" rx="2.5" fill="#94a3b8"/>
+  <text x="451.8" y="479.6" font-size="9.5" font-weight="600" fill="#475569">50.65 (2.85x · no SpecDec)</text>
+  <line x1="821.0" y1="476.3" x2="885.6" y2="476.3" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="885.6" cy="476.3" r="4.1" fill="#94a3b8" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="892.6" y="479.5" text-anchor="start" font-size="9.0" font-weight="600" fill="#475569">55.35</text>
+  <line x1="185.0" y1="488.1" x2="1165.0" y2="488.1" stroke="#f1f5f9" stroke-width="1"/>
+  <text x="175.0" y="503.8" text-anchor="end" font-size="11.5" font-weight="600" fill="#334155">Arm ExecuTorch Q4 (g=128)</text>
+  <rect x="185.0" y="495.1" width="224.9" height="9.5" rx="2.5" fill="#94a3b8"/>
+  <text x="414.9" y="503.1" font-size="9.5" font-weight="600" fill="#475569">43.51 (2.45x · no SpecDec)</text>
+  <line x1="821.0" y1="499.8" x2="876.6" y2="499.8" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="876.6" cy="499.8" r="4.1" fill="#94a3b8" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="883.6" y="503.0" text-anchor="start" font-size="9.0" font-weight="600" fill="#475569">55.27</text>
+  <line x1="28" y1="511.6" x2="1165.0" y2="511.6" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="175.0" y="533.3" text-anchor="end" font-size="11.5" font-weight="600" fill="#334155">LiteRT-LM MixedQ†</text>
+  <rect x="185.0" y="518.6" width="255.1" height="9.5" rx="2.5" fill="#94a3b8"/>
+  <text x="445.1" y="526.6" font-size="9.5" font-weight="600" fill="#475569">49.35 (2.78x)</text>
+  <line x1="821.0" y1="523.3" x2="1025.1" y2="523.3" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1025.1" cy="523.3" r="4.1" fill="#94a3b8" stroke="#ffffff" stroke-width="1.1"/>
+  <text x="1032.1" y="526.5" text-anchor="start" font-size="9.0" font-weight="600" fill="#475569">56.59</text>
+  <rect x="185.0" y="530.5" width="210.7" height="9.5" rx="2.5" fill="#D55E00"/>
+  <text x="400.7" y="538.5" font-size="9.5" font-weight="600" fill="#c2410c">40.76 (2.30x)</text>
+  <line x1="821.0" y1="535.2" x2="1025.1" y2="535.2" stroke="#e2e8f0" stroke-width="0.9"/>
+  <circle cx="1025.1" cy="535.2" r="4.1" fill="#D55E00" stroke="#ffffff" stroke-width="1.1"/>
+  <line x1="185.0" y1="110.0" x2="185.0" y2="547.0" stroke="#64748b" stroke-width="1.3"/>
+  <line x1="185.0" y1="547.0" x2="1165.0" y2="547.0" stroke="#64748b" stroke-width="1.3"/>
+  <line x1="815.0" y1="110.0" x2="1165.0" y2="110.0" stroke="#64748b" stroke-width="1.3"/>
+  <rect x="40" y="597" width="1125" height="48" rx="9" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.2"/>
+  <rect x="56.0" y="615.5" width="11" height="11" rx="2.5" fill="#94a3b8"/>
+  <text x="72.0" y="625.0" font-size="11" font-weight="600" fill="#0f172a">Baseline (SpecDec Off)</text>
+  <rect x="232.8" y="615.5" width="11" height="11" rx="2.5" fill="#0284c7"/>
+  <text x="248.8" y="625.0" font-size="11" font-weight="600" fill="#0f172a">+ HNSW (ef=800)</text>
+  <rect x="364.8" y="615.5" width="11" height="11" rx="2.5" fill="#D55E00"/>
+  <text x="380.8" y="625.0" font-size="11" font-weight="700" fill="#0f172a">+ SpecDec (K=2)</text>
+  <rect x="496.8" y="615.5" width="11" height="11" rx="2.5" fill="#7c2d12"/>
+  <text x="512.8" y="625.0" font-size="11" font-weight="700" fill="#0f172a">+ HNSW + SpecDec (K=2)</text>
+  <text x="1145" y="625.0" text-anchor="end" font-size="9.8" font-weight="500" fill="#64748b">† LiteRT-LM uses bundled TFLite drafter (MixedQ) · Dots share mode color &amp; chrF scale</text>
+</svg>
