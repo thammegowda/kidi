@@ -1,6 +1,7 @@
 """Repeat warm CPU Gemma workloads through the existing native benchmark."""
 
 import argparse
+import copy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -70,6 +71,30 @@ def summarize(records, settings, repeats):
     return summary
 
 
+def backfill_baseline_summary(baseline_run, warmups):
+    summary = copy.deepcopy(baseline_run["summary"])
+    records = baseline_run.get("records") or []
+    for workload, current in summary.items():
+        missing = [name for name in METRICS if name not in current]
+        if not missing:
+            continue
+        rows = [
+            row for row in records
+            if row.get("stage") == "generation" and row.get("workload") == workload and not row.get("warmup")
+        ]
+        if not rows:
+            rows = [
+                row for row in records
+                if row.get("stage") == "generation" and row.get("workload") == workload
+            ][warmups:]
+        if not rows:
+            raise KeyError(f"{workload}: baseline summary missing {missing[0]}")
+        for name in missing:
+            values = [row[name] for row in rows]
+            current[name] = {"median": median(values), "min": min(values), "max": max(values), "stdev": pstdev(values)}
+    return summary
+
+
 def compare(summary, reference):
     for workload, current in summary.items():
         previous = reference[workload]
@@ -100,6 +125,8 @@ def compute_thread_scaling(runs, workloads):
         entries = []
         for threads in thread_counts:
             cur = runs[str(threads)]["summary"][workload]
+            if cur["token_ids"] != base["token_ids"] or cur["input_token_ids"] != base["input_token_ids"]:
+                raise ValueError(f"{workload}: token IDs differ between {base_threads} and {threads} threads")
             dec = cur["decode_interval_tps"]["median"]
             pre = cur["prefill_through_first_token_tps"]["median"]
             ratio = threads / base_threads
@@ -303,7 +330,8 @@ def main(argv=None):
             if reference:
                 if str(threads) not in reference["runs"]:
                     raise ValueError(f"baseline has no {threads}-thread run")
-                compare(run["summary"], reference["runs"][str(threads)]["summary"])
+                compare(run["summary"],
+                        backfill_baseline_summary(reference["runs"][str(threads)], arguments.warmups))
             for workload, summary in run["summary"].items():
                 speed = summary["decode_interval_tps"]
                 prefill = summary["prefill_through_first_token_tps"]["median"]

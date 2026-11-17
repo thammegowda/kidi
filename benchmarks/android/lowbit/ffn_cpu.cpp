@@ -4,9 +4,11 @@
 #include "kidi/runtime/ynn/graph.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -54,7 +56,8 @@ auto run_ffn_cpu(const FfnStack& stack, const Options& options) -> FfnMeasuremen
     const auto m = stack.m, hidden = stack.hidden;
     const auto layers = stack.layers.size();
     runtime::ynn::set_thread_count(options.threads);
-    ops::Context context(tensor::Device::cpu());
+    const bool replay_mode = options.mode == "replay";
+    ops::Context context(tensor::Device::cpu(), true, replay_mode);
 
     const auto start = Clock::now();
     std::vector<PreparedLayer> prepared;
@@ -79,50 +82,65 @@ auto run_ffn_cpu(const FfnStack& stack, const Options& options) -> FfnMeasuremen
         });
     }
 
-    auto make_input_f32 = [&](const std::vector<std::int8_t>& input_q, float scale) {
-        std::vector<float> vals(input_q.size());
-        for (std::size_t i = 0; i < input_q.size(); ++i) vals[i] = static_cast<float>(input_q[i]) * scale;
-        return ops::require(tensor::Tensor::from_host(
-            {1, static_cast<std::int64_t>(m), static_cast<std::int64_t>(hidden)}, std::span<const float>(vals)));
-    };
-    const auto run_stack = [&](const std::vector<std::int8_t>& input_q) {
-        auto x = make_input_f32(input_q, stack.layers.front().input_scale);
+    std::array<std::vector<float>, 2> inputs_f32;
+    const float first_input_scale = stack.layers.front().input_scale;
+    for (std::size_t idx = 0; idx < 2; ++idx) {
+        inputs_f32[idx].resize(stack.inputs[idx].size());
+        for (std::size_t i = 0; i < stack.inputs[idx].size(); ++i)
+            inputs_f32[idx][i] = static_cast<float>(stack.inputs[idx][i]) * first_input_scale;
+    }
+    auto x_input = ops::require(tensor::Tensor::zeros(
+        {1, static_cast<std::int64_t>(m), static_cast<std::int64_t>(hidden)}, tensor::DType::F32));
+    auto* x_ptr = ops::require(x_input.data<float>()).data();
+    const std::size_t x_bytes = inputs_f32[0].size() * sizeof(float);
+
+    const auto exec_stack = [&](const tensor::Tensor& initial) {
+        auto x = initial;
         for (const auto& layer : prepared) {
-            if (options.mode == "replay") {
-                x = context.gated_feed_forward(x, layer.gate_up_weight, layer.gate_up_scale, layer.down_weight,
-                                               layer.down_scale, layer.bits, static_cast<std::int32_t>(hidden),
-                                               static_cast<std::int32_t>(layer.intermediate), layer.input_scale,
-                                               layer.gate_up_scale_val, layer.hidden_scale, layer.output_scale);
-            } else {
-                const auto proj = context.packed_linear(x, layer.gate_up_weight, layer.gate_up_scale, layer.bits,
-                                                        static_cast<std::int32_t>(hidden), layer.input_scale,
-                                                        layer.gate_up_scale_val);
-                const auto g = context.slice(proj, -1, 0, layer.intermediate);
-                const auto u = context.slice(proj, -1, layer.intermediate, layer.intermediate);
-                const auto h = context.static_round(context.gelu_multiply(g, u), layer.hidden_scale);
-                x = context.packed_linear(h, layer.down_weight, layer.down_scale, layer.bits,
-                                          static_cast<std::int32_t>(layer.intermediate), layer.hidden_scale,
-                                          layer.output_scale);
-            }
+            const auto proj =
+                context.packed_linear(x, layer.gate_up_weight, layer.gate_up_scale, layer.bits,
+                                      static_cast<std::int32_t>(hidden), layer.input_scale, layer.gate_up_scale_val);
+            const auto g = context.slice(proj, -1, 0, layer.intermediate);
+            const auto u = context.slice(proj, -1, layer.intermediate, layer.intermediate);
+            const auto h = context.static_round(context.gelu_multiply(g, u), layer.hidden_scale);
+            x = context.packed_linear(h, layer.down_weight, layer.down_scale, layer.bits,
+                                      static_cast<std::int32_t>(layer.intermediate), layer.hidden_scale,
+                                      layer.output_scale);
         }
-        context.synchronize();
         return x;
     };
+    const auto run_stack = [&]() {
+        tensor::Tensor out;
+        if (replay_mode) {
+            const auto outputs = context.replay(
+                "ffn_cpu_stack", std::span<const tensor::Tensor>(&x_input, 1),
+                [&](std::span<const tensor::Tensor> in) { return std::vector<tensor::Tensor>{exec_stack(in[0])}; },
+                false);
+            out = outputs[0];
+        } else {
+            out = exec_stack(x_input);
+        }
+        context.synchronize();
+        return out;
+    };
 
-    // Warm one step so packed tile caches are included in prepare_ms.
-    (void)run_stack(stack.inputs[0]);
+    // Warm one step so packed tile caches and replay capture are included in prepare_ms.
+    std::memcpy(x_ptr, inputs_f32[0].data(), x_bytes);
+    (void)run_stack();
     measurement.prepare_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-    measurement.launches_per_step = options.mode == "replay" ? layers : layers * 5;
+    measurement.launches_per_step = replay_mode ? 1 : layers * 6;
 
     for (int iteration = 0; iteration < options.warmups + options.runs; ++iteration) {
+        std::memcpy(x_ptr, inputs_f32[iteration % 2].data(), x_bytes);
         const auto begin = Clock::now();
-        (void)run_stack(stack.inputs[iteration % 2]);
+        (void)run_stack();
         const auto elapsed = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
         if (iteration >= options.warmups) measurement.step_ms.push_back(elapsed);
     }
     const float inv_out = 1.0F / stack.layers.back().output_scale;
     for (int input = 0; input < 2; ++input) {
-        const auto out = run_stack(stack.inputs[input]);
+        std::memcpy(x_ptr, inputs_f32[input].data(), x_bytes);
+        const auto out = run_stack();
         const auto vals = ops::require(out.data<float>());
         measurement.outputs[input].resize(vals.size());
         for (std::size_t i = 0; i < vals.size(); ++i) {

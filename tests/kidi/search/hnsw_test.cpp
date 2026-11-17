@@ -265,12 +265,34 @@ auto brute_force_checks(const std::filesystem::path& root, bool bfloat, std::siz
         const auto before_wrap = actual.front().id;
         workspace.epoch = std::numeric_limits<std::uint32_t>::max();
         check(require(moved.search(query, workspace)).front().id == before_wrap, "visited epoch wrap changed results");
+
+        const auto parallel_actual = require(moved.search_parallel(query, workspace));
+        check(parallel_actual.size() == candidates, "search_parallel did not return the configured candidate subset");
+        std::vector<std::uint32_t> parallel_ids;
+        for (std::size_t rank = 0; rank < candidates; ++rank) {
+            parallel_ids.push_back(parallel_actual[rank].id);
+            check(std::abs(parallel_actual[rank].distance - expected[rank].first) < 1e-4F,
+                  "search_parallel disagrees with brute-force inner products");
+            if (rank == 0 || expected[rank].first != expected[rank - 1].first)
+                check(parallel_actual[rank].id == expected[rank].second,
+                      "search_parallel returned the wrong brute-force neighbor");
+        }
+        std::ranges::sort(parallel_ids);
+        check(std::ranges::adjacent_find(parallel_ids) == parallel_ids.end(),
+              "search_parallel returned repeated row IDs");
+        workspace.epoch = std::numeric_limits<std::uint32_t>::max();
+        check(require(moved.search_parallel(query, workspace)).front().id == before_wrap,
+              "search_parallel visited epoch wrap changed results");
     }
     query[0] = std::numeric_limits<float>::quiet_NaN();
     check(!moved.search(query, workspace), "nonfinite query was accepted");
+    check(!moved.search_parallel(query, workspace), "search_parallel accepted nonfinite query");
     check(!moved.search({}, workspace), "wrong query dimension was accepted");
+    check(!moved.search_parallel({}, workspace), "search_parallel accepted wrong query dimension");
     query[0] = 0;
     check(!moved.search(query, workspace, 4, 3), "search effort smaller than candidate count was accepted");
+    check(!moved.search_parallel(query, workspace, 4, 3),
+          "search_parallel accepted search effort smaller than candidate count");
     if (bfloat && width == 67) malformed_indexes(root, path, vectors);
 }
 
@@ -478,11 +500,9 @@ auto quantized_distance_checks(const std::filesystem::path& root, std::int32_t b
                 const float scale = rdiff > 0.F ? rdiff / 255.F : 1.F;
                 const float min_error = -128.F + rmin * inverse;
                 const float max_error = 127.F + rmax * inverse;
-                const float fzp =
-                    min_error + max_error > 0.F ? -128.F - rmin * inverse : 127.F - rmax * inverse;
-                const auto zp = rdiff > 0.F
-                                    ? static_cast<std::int32_t>(std::rint(std::clamp(fzp, -128.F, 127.F)))
-                                    : -128;
+                const float fzp = min_error + max_error > 0.F ? -128.F - rmin * inverse : 127.F - rmax * inverse;
+                const auto zp =
+                    rdiff > 0.F ? static_cast<std::int32_t>(std::rint(std::clamp(fzp, -128.F, 127.F))) : -128;
                 for (std::size_t c = 0; c < group; ++c) {
                     const auto q = std::clamp<std::int32_t>(
                         static_cast<std::int32_t>(std::round(query[b * group + c] * inverse)) + zp, -128, 127);
@@ -508,6 +528,16 @@ auto quantized_distance_checks(const std::filesystem::path& root, std::int32_t b
             const auto expected = 1.F - static_cast<float>(dot);
             check(std::abs(neighbor.distance - expected) < 0.00005F * (1.F + std::abs(expected)),
                   "packed search differs from scalar reference scores");
+        }
+        const auto parallel_found = require(index.search_parallel(query, workspace));
+        check(parallel_found.size() == rows, "exhaustive packed search_parallel did not return every row");
+        for (const auto& neighbor : parallel_found) {
+            double dot = 0.;
+            for (std::size_t c = 0; c < width; ++c)
+                dot += static_cast<double>(rounded[c]) * decoded[neighbor.id * width + c];
+            const auto expected = 1.F - static_cast<float>(dot);
+            check(std::abs(neighbor.distance - expected) < 0.00005F * (1.F + std::abs(expected)),
+                  "packed search_parallel differs from scalar reference scores");
         }
     }
 }
