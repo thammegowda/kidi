@@ -16,10 +16,24 @@ been tested on Apple Silicon/macOS 26; do not assume Linux or Windows parity
 without running their build and numerical checks.
 
 ```bash
-git clone --recurse-submodules https://github.com/thammegowda/kidi.git
+git clone https://github.com/thammegowda/kidi.git
 cd kidi
-git submodule update --init --recursive
+make setup
 ```
+
+`make setup` runs `scripts/setup.sh` on Ubuntu 24.04+ and macOS, on x64 or ARM64.
+It installs native build tools, initializes submodules, prepares the Python test
+environment and public RTG fixture, and stages locked web dependencies. Ubuntu
+uses APT (root or passwordless sudo is required); macOS requires Homebrew and
+Xcode Command Line Tools already installed. Android and Emscripten SDKs remain
+separate setup steps.
+
+If Node.js 24+ and npm are missing, setup installs the official Node.js 24 binary
+under `.cache/tools/`, verifying its SHA-256 checksum. Make targets automatically
+use these local tools. For direct shell commands, run
+`export PATH="$PWD/.cache/tools/bin:$PATH"`. Use `make test` after setup;
+`make setup-test` runs the same script with `--tests-only`, refreshing only the
+Python test environment and fixtures without installing system tools.
 
 C/C++ dependencies are pinned submodules under `third_party/`.
 [ynnpack-dev](https://github.com/thammegowda/ynnpack-dev) owns nested Slinky,
@@ -635,10 +649,14 @@ Keep generated model files, local reports and large binary artifacts out of Git.
 The [Pages workflow](.github/workflows/pages.yml) builds/tests Wasm variants for
 relevant changes, reusing SDK/compiler caches; merges to `main` deploy the
 browser app. The separate [native workflow](.github/workflows/native.yml) runs
-native unit tests and installed Python-wheel smoke tests on macOS 26 without
-downloading models. One Release build serves both: the wheel build configures
+native unit tests and installed Python-wheel smoke tests on macOS 26 ARM64
+(Apple Clang) and Ubuntu 24.04 x64 and ARM64 (GCC 14), without downloading models.
+On each platform, one Release build serves both: the wheel build configures
 `build-ci` with tests enabled, and the test programs reuse its objects. Compiled
-objects (ccache) are saved even when tests fail. It does not block Pages deployment.
+objects (ccache) are cached separately by platform and compiler, even when tests
+fail. It does not block Pages deployment. Configure branch protection or a
+ruleset to require all three native matrix jobs before merging; defining the workflow
+alone does not make these checks mandatory.
 
 See [GitHub Pages setup](web/README-dev.md#github-pages) for one-time configuration.
 The generated browser directory is self-contained for static hosting; model

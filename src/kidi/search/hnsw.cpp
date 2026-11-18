@@ -569,7 +569,7 @@ auto HnswIndex::search_parallel(std::span<const float> query, HnswWorkspace& wor
     const bool use_parallel = runtime::ynn::thread_count() > 1;
     std::optional<Error> parallel_error;
     const ynn::hnsw_task_runner_fn runner =
-        use_parallel ? [](void* exec_ctx, std::size_t tasks, void* body_ctx, void (*body)(void*, std::size_t)) {
+        use_parallel ? +[](void* exec_ctx, std::size_t tasks, void* body_ctx, void (*body)(void*, std::size_t)) {
             auto status = runtime::ynn::parallel_tasks(tasks, body_ctx, body);
             if (!status) {
                 auto* err = static_cast<std::optional<Error>*>(exec_ctx);

@@ -11,12 +11,19 @@ APP_PORT ?= 10010
 TEST_PYTHON := .cache/test-venv/bin/python
 TEST_DIST := .cache/test-dist
 
+export PATH := $(CURDIR)/.cache/tools/bin:$(PATH)
 export KIDI_HUB PYTHON
 
-.PHONY: setup-test build-test build-python-test prepare-test native-test ynnpack-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
+.PHONY: setup setup-test build-test build-python-test prepare-test native-test ynnpack-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
+
+refresh:
+	git submodule update --init --recursive --depth 10 --jobs 12
+
+setup:
+	bash scripts/setup.sh
 
 setup-test:
-	bash tests/setup.sh
+	bash scripts/setup.sh --tests-only
 
 build-test:
 	cmake --preset release
@@ -52,6 +59,7 @@ regression-test: setup-test build-test
 
 prepare-test: build-test build-python-test
 	cmake --preset debug -DKIDI_BUILD_INTEGRATION_TESTS=ON \
+		-DKIDI_TEST_NODE="$$(command -v node)" \
 		-DKIDI_TEST_PYTHON="$(abspath $(TEST_PYTHON))" -DKIDI_TEST_BINARY="$(abspath $(KIDI_BIN))" \
 		-DKIDI_TEST_BACKEND="$(BACKEND)" -DKIDI_TEST_THREADS="$(THREADS)" -DKIDI_TEST_MIN_CHRF="$(MIN_CHRF)"
 	cmake --build --preset debug
