@@ -29,8 +29,9 @@ Xcode Command Line Tools already installed. Android and Emscripten SDKs remain
 separate setup steps.
 
 If Node.js 24+ and npm are missing, setup installs the official Node.js 24 binary
-under `.cache/tools/`, verifying its SHA-256 checksum. Make targets automatically
-use these local tools. For direct shell commands, run
+under `.cache/tools/`, verifying its SHA-256 checksum. `make test` also runs
+this Node-only setup automatically, without APT or Homebrew. Make targets use
+these local tools. For direct shell commands, run
 `export PATH="$PWD/.cache/tools/bin:$PATH"`. Use `make test` after setup;
 `make setup-test` runs the same script with `--tests-only`, refreshing only the
 Python test environment and fixtures without installing system tools.
@@ -544,6 +545,10 @@ invocation. The pinned public model downloads on the first run; no Hub login is
 required. Individual targets are `native-test`, `python-test`, `web-test`, and
 `regression-test`. See [tests/data/README.md](tests/data/README.md) for fixtures
 and numerical contracts.
+
+RTG regression defaults to `KIDI_BACKEND=ynnpack`. Override it with
+`make test KIDI_BACKEND=mps` on a supported Mac; the generic `BACKEND` variable
+is ignored.
 
 To check long-file Whisper processing with a local checkpoint and a short English
 mono PCM16 16 kHz WAV (at most 30 seconds):

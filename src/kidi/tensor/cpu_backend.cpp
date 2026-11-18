@@ -7,12 +7,18 @@
 #include <new>
 #include <utility>
 
+#include "ynnpack/composites/composites.h"
+
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
 
 namespace kidi::tensor {
+auto ComputeCapabilities::host_supports_native_calibrated_packed(std::int32_t bits) noexcept -> bool {
+    return ::ynn::is_symmetric_linear_supported(bits);
+}
+
 namespace {
 
 constexpr std::size_t YNNPACK_ALIGNMENT = 256;

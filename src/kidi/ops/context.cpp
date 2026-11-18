@@ -972,7 +972,8 @@ auto Context::gated_feed_forward(const Tensor& input, const Tensor& gate_up_weig
                                  std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
                                  float gate_up_output_scale, float down_input_scale, float down_output_scale, bool silu)
     -> Tensor {
-    if (impl_->precision != core::InferencePrecision::CHECKPOINT) {
+    if (impl_->precision != core::InferencePrecision::CHECKPOINT ||
+        !device().capabilities().compute.supports_native_calibrated_packed(bits)) {
         const auto gate_up = packed_linear(input, gate_up_weight, gate_up_scales, bits, input_size, gate_up_input_scale,
                                            gate_up_output_scale);
         const auto gate = slice(gate_up, -1, 0, intermediate_size);

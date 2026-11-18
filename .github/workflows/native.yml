@@ -97,6 +97,11 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
       - name: Install macOS build tools
         if: runner.os == 'macOS'
         run: brew install ninja ccache

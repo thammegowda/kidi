@@ -1,7 +1,7 @@
 PYTHON ?= python3
 KIDI_HUB ?= $(HOME)/.cache/kidi/model-hub
 KIDI_BIN ?= build-release/kidi
-BACKEND ?= ynnpack
+KIDI_BACKEND ?= ynnpack
 THREADS ?= 8
 MIN_CHRF ?= 99.0
 PORT ?= 8080
@@ -22,6 +22,10 @@ refresh:
 setup:
 	bash scripts/setup.sh
 
+.PHONY: setup-node
+setup-node:
+	bash scripts/setup.sh --node-only
+
 setup-test:
 	bash scripts/setup.sh --tests-only
 
@@ -29,7 +33,7 @@ build-test:
 	cmake --preset release
 	cmake --build --preset release --target kidi_cli
 
-native-test:
+native-test: setup-node
 	cmake --preset debug -DKIDI_BUILD_INTEGRATION_TESTS=OFF
 	cmake --build --preset debug
 	ctest --preset debug -L native
@@ -45,7 +49,7 @@ build-python-test: setup-test
 python-test: build-python-test
 	$(TEST_PYTHON) -m unittest discover -s tests -p '*_test.py'
 
-web-deps:
+web-deps: setup-node
 	node web/tools/prepare-libs.mjs
 
 web-test: web-deps
@@ -55,13 +59,13 @@ web-smoke-test: web-deps
 	npm --prefix web run test:pages -- "$(abspath $(WEB_DIR))"
 
 regression-test: setup-test build-test
-	$(TEST_PYTHON) tests/rtg_regression.py run --binary "$(KIDI_BIN)" --backend "$(BACKEND)" --threads "$(THREADS)" --min-chrf "$(MIN_CHRF)"
+	$(TEST_PYTHON) tests/rtg_regression.py run --binary "$(KIDI_BIN)" --backend "$(KIDI_BACKEND)" --threads "$(THREADS)" --min-chrf "$(MIN_CHRF)"
 
-prepare-test: build-test build-python-test
+prepare-test: setup-node build-test build-python-test
 	cmake --preset debug -DKIDI_BUILD_INTEGRATION_TESTS=ON \
 		-DKIDI_TEST_NODE="$$(command -v node)" \
 		-DKIDI_TEST_PYTHON="$(abspath $(TEST_PYTHON))" -DKIDI_TEST_BINARY="$(abspath $(KIDI_BIN))" \
-		-DKIDI_TEST_BACKEND="$(BACKEND)" -DKIDI_TEST_THREADS="$(THREADS)" -DKIDI_TEST_MIN_CHRF="$(MIN_CHRF)"
+		-DKIDI_TEST_BACKEND="$(KIDI_BACKEND)" -DKIDI_TEST_THREADS="$(THREADS)" -DKIDI_TEST_MIN_CHRF="$(MIN_CHRF)"
 	cmake --build --preset debug
 
 test: prepare-test
