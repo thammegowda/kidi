@@ -14,7 +14,7 @@ TEST_DIST := .cache/test-dist
 export PATH := $(CURDIR)/.cache/tools/bin:$(PATH)
 export KIDI_HUB PYTHON
 
-.PHONY: setup setup-test build-test build-python-test prepare-test native-test ynnpack-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
+.PHONY: setup setup-test build-test build-python-test prepare-test native-test release-cuda ynnpack-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
 
 refresh:
 	git submodule update --init --recursive --depth 10 --jobs 12
@@ -37,6 +37,10 @@ native-test: setup-node
 	cmake --preset debug -DKIDI_BUILD_INTEGRATION_TESTS=OFF
 	cmake --build --preset debug
 	ctest --preset debug -L native
+
+release-cuda:
+	cmake --preset release-cuda
+	cmake --build --preset release-cuda --target kidi_cli
 
 ynnpack-test:
 	$(MAKE) -C third_party/ynnpack-dev test

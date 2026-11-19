@@ -16,8 +16,11 @@ option(KIDI_STRIP_BINARIES "Strip local symbol tables from Release executables" 
 option(KIDI_BUILD_INTEGRATION_TESTS "Register Python, browser, and model regression tests" OFF)
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
-option(KIDI_ENABLE_CUDA "Build NVIDIA CUDA inference and GPU HNSW indexing" OFF)
+option(KIDI_ENABLE_CUDA "Build NVIDIA CUDA inference and optional cuVS GPU HNSW indexing" OFF)
 set(KIDI_CUVS_ROOT "" CACHE PATH "cuVS SDK root for CUDA HNSW construction")
+if(KIDI_ENABLE_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "Target CUDA architectures")
+endif()
 set(YNNPACK_ENABLE_CUDA ${KIDI_ENABLE_CUDA} CACHE BOOL "Build YNNPACK CUDA" FORCE)
 set(KIDI_DESKTOP_APP_DEFAULT ON)
 if(ANDROID OR EMSCRIPTEN)
@@ -411,22 +414,61 @@ add_library(kidi_cli_main STATIC
 target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi nlohmann_json::nlohmann_json)
 if(KIDI_ENABLE_CUDA)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        message(FATAL_ERROR "CUDA builds currently require Linux for cuVS HNSW construction")
+        message(FATAL_ERROR "CUDA builds currently require Linux")
     endif()
     find_package(CUDAToolkit REQUIRED)
     find_package(Threads REQUIRED)
-    find_path(KIDI_CUVS_INCLUDE_DIR cuvs/neighbors/hnsw.h HINTS "${KIDI_CUVS_ROOT}/include" REQUIRED)
-    find_path(KIDI_DLPACK_INCLUDE_DIR dlpack/dlpack.h REQUIRED)
-    find_library(KIDI_CUVS_C_LIBRARY cuvs_c HINTS "${KIDI_CUVS_ROOT}/lib64" "${KIDI_CUVS_ROOT}/lib" REQUIRED)
-    # cuVS exposes a host API; avoid linking a second CUDA runtime into this adapter.
-    set_source_files_properties(src/kidi/cli/index.cu PROPERTIES LANGUAGE CXX)
-    add_executable(kidi_index_cuda_helper src/kidi/cli/index.cu)
-    set_target_properties(kidi_index_cuda_helper PROPERTIES OUTPUT_NAME kidi-index-cuda)
-    target_include_directories(kidi_index_cuda_helper PRIVATE
-        "${KIDI_CUVS_INCLUDE_DIR}" "${KIDI_DLPACK_INCLUDE_DIR}" ${CUDAToolkit_INCLUDE_DIRS})
-    target_link_libraries(kidi_index_cuda_helper PRIVATE "${KIDI_CUVS_C_LIBRARY}" Threads::Threads)
-    install(TARGETS kidi_index_cuda_helper RUNTIME DESTINATION bin)
-    add_dependencies(kidi_cli_main kidi_index_cuda_helper)
+    set(_KIDI_CUVS_HINTS)
+    if(KIDI_CUVS_ROOT)
+        list(APPEND _KIDI_CUVS_HINTS "${KIDI_CUVS_ROOT}")
+    elseif(Python3_EXECUTABLE)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c
+                "import importlib.util, pathlib; s = importlib.util.find_spec('libcuvs'); print(pathlib.Path(s.origin).parent if s and s.origin else '')"
+            OUTPUT_VARIABLE _KIDI_PY_CUVS_ROOT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(_KIDI_PY_CUVS_ROOT)
+            list(APPEND _KIDI_CUVS_HINTS "${_KIDI_PY_CUVS_ROOT}")
+        endif()
+    endif()
+    set(_KIDI_CUVS_INC_HINTS)
+    set(_KIDI_CUVS_LIB_HINTS)
+    foreach(_cuvs_prefix IN LISTS _KIDI_CUVS_HINTS)
+        list(APPEND _KIDI_CUVS_INC_HINTS "${_cuvs_prefix}/include")
+        list(APPEND _KIDI_CUVS_LIB_HINTS "${_cuvs_prefix}/lib64" "${_cuvs_prefix}/lib")
+    endforeach()
+    find_path(KIDI_CUVS_INCLUDE_DIR cuvs/neighbors/hnsw.h HINTS ${_KIDI_CUVS_INC_HINTS})
+    find_path(KIDI_DLPACK_INCLUDE_DIR dlpack/dlpack.h HINTS ${_KIDI_CUVS_INC_HINTS})
+    find_library(KIDI_CUVS_C_LIBRARY cuvs_c HINTS ${_KIDI_CUVS_LIB_HINTS})
+    unset(_KIDI_CUVS_HINTS)
+    unset(_KIDI_PY_CUVS_ROOT)
+    unset(_KIDI_CUVS_INC_HINTS)
+    unset(_KIDI_CUVS_LIB_HINTS)
+    if(KIDI_CUVS_INCLUDE_DIR AND KIDI_DLPACK_INCLUDE_DIR AND KIDI_CUVS_C_LIBRARY)
+        message(STATUS "Found cuVS for GPU HNSW construction: ${KIDI_CUVS_C_LIBRARY}")
+        # cuVS exposes a host API; avoid linking a second CUDA runtime into this adapter.
+        set_source_files_properties(src/kidi/cli/index.cu PROPERTIES LANGUAGE CXX)
+        add_executable(kidi_index_cuda_helper src/kidi/cli/index.cu)
+        set_target_properties(kidi_index_cuda_helper PROPERTIES OUTPUT_NAME kidi-index-cuda)
+        target_include_directories(kidi_index_cuda_helper PRIVATE
+            "${KIDI_CUVS_INCLUDE_DIR}" "${KIDI_DLPACK_INCLUDE_DIR}" ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(kidi_index_cuda_helper PRIVATE "${KIDI_CUVS_C_LIBRARY}" Threads::Threads)
+        install(TARGETS kidi_index_cuda_helper RUNTIME DESTINATION bin)
+        add_dependencies(kidi_cli_main kidi_index_cuda_helper)
+        target_compile_definitions(kidi_cli_main PUBLIC KIDI_HAS_CUVS=1)
+    elseif(KIDI_CUVS_ROOT)
+        message(FATAL_ERROR
+            "KIDI_CUVS_ROOT was set to '${KIDI_CUVS_ROOT}', but cuVS/DLPack could not be found "
+            "(KIDI_CUVS_INCLUDE_DIR=${KIDI_CUVS_INCLUDE_DIR}, "
+            "KIDI_DLPACK_INCLUDE_DIR=${KIDI_DLPACK_INCLUDE_DIR}, "
+            "KIDI_CUVS_C_LIBRARY=${KIDI_CUVS_C_LIBRARY})")
+    else()
+        message(STATUS
+            "cuVS SDK not found; building CUDA inference without GPU HNSW index construction "
+            "(set KIDI_CUVS_ROOT to enable)")
+    endif()
 endif()
 
 add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)

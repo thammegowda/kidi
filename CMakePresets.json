@@ -21,6 +21,15 @@
         "CMAKE_BUILD_TYPE": "Release",
         "KIDI_BUILD_TESTS": "OFF"
       }
+    },
+    {
+      "name": "release-cuda",
+      "displayName": "Release (CUDA)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-release-cuda",
+      "cacheVariables": {
+        "KIDI_ENABLE_CUDA": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -31,6 +40,10 @@
     {
       "name": "release",
       "configurePreset": "release"
+    },
+    {
+      "name": "release-cuda",
+      "configurePreset": "release-cuda"
     }
   ],
   "testPresets": [

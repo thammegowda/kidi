@@ -62,20 +62,22 @@ runtime memory must be measured separately from artifact size.
 
 ### CUDA
 
-The optional NVIDIA backend requires Linux, the CUDA 13+ toolkit, a cuVS SDK
-with its C API and shared-library dependencies, DLPack headers, and a compatible
-GPU. `KIDI_ENABLE_CUDA=ON` enables both CUDA inference and GPU HNSW index
-construction. From an initialized checkout, enable it for the standalone CLI:
+The optional NVIDIA backend requires Linux, the CUDA 13+ toolkit, and a
+compatible GPU. If a cuVS SDK (with its C API and DLPack headers) is also
+present, `KIDI_ENABLE_CUDA=ON` additionally builds the `kidi-index-cuda` GPU
+HNSW index construction helper. From an initialized checkout, enable CUDA for
+the standalone CLI:
 
 ```bash
-cmake --preset release -DKIDI_ENABLE_CUDA=ON
-cmake --build --preset release --target kidi_cli
-build-release/kidi chat --model /path/to/gemma-model --backend cuda:0
+make release-cuda
+build-release-cuda/kidi chat --model /path/to/gemma-model --backend cuda:0
 ```
 
-For a nonstandard SDK installation, add `-DKIDI_CUVS_ROOT=/path/to/cuvs` and,
-if needed, `-DKIDI_DLPACK_INCLUDE_DIR=/path/to/include` to the configure command.
-CUDA configuration fails if these required dependencies cannot be found.
+For a nonstandard cuVS SDK installation, add `-DKIDI_CUVS_ROOT=/path/to/cuvs`
+and, if needed, `-DKIDI_DLPACK_INCLUDE_DIR=/path/to/include` to the configure
+command. When `KIDI_CUVS_ROOT` is set explicitly, configuration fails if those
+dependencies cannot be found; otherwise CUDA inference builds without GPU HNSW
+index construction.
 
 For the Python launcher, build and install a CUDA-enabled package separately:
 

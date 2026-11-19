@@ -5,7 +5,7 @@
 #include "kidi/model/gemma4.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/search/hnsw.h"
-#if defined(KIDI_HAS_CUDA)
+#if defined(KIDI_HAS_CUVS)
 #include "kidi/ops/context.h"
 #include "kidi/tensor/backend.h"
 #include <cerrno>
@@ -27,7 +27,7 @@
 
 namespace kidi::cli {
 namespace {
-#if defined(KIDI_HAS_CUDA)
+#if defined(KIDI_HAS_CUVS)
 class TemporaryDirectory {
 public:
     TemporaryDirectory() {
@@ -207,7 +207,8 @@ auto index_command(const Namespace& arguments, const std::filesystem::path& dire
         use_cuda = *available;
     }
     if (requested_builder == "cuda" && !use_cuda) {
-        log::error("CUDA index construction is unavailable; enable KIDI_ENABLE_CUDA and provide a CUDA device");
+        log::error(
+            "CUDA index construction is unavailable; build with cuVS (KIDI_ENABLE_CUDA=ON and cuVS SDK) and provide a CUDA device");
         return 2;
     }
     runtime::ynn::set_thread_count(threads);
