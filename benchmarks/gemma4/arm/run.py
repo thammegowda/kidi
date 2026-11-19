@@ -439,6 +439,7 @@ def check_sources(source):
 def prepare(model_path, work, source, profile_name="int4-g128"):
     import executorch
     import torch
+    from packaging.version import Version
     from safetensors import safe_open
     from safetensors.torch import load_file, save_file
 
@@ -448,7 +449,7 @@ def prepare(model_path, work, source, profile_name="int4-g128"):
     bits = profile["bits"]
     group_size = profile["group_size"]
     check_sources(source)
-    if importlib.metadata.version("executorch") != EXECUTORCH_VERSION:
+    if Version(importlib.metadata.version("executorch")).public != EXECUTORCH_VERSION:
         raise ValueError("install the pinned Arm benchmark requirements in an isolated environment")
     executorch.__path__.append(str(source))
     from executorch.examples.models.gemma4.text_decoder.convert_weights import _get_weight_mapping
@@ -620,7 +621,8 @@ def prepare(model_path, work, source, profile_name="int4-g128"):
         "source_sha256": digest(checkpoint), "source_config_sha256": digest(model_path / "config.json"),
         "executorch_commit": EXECUTORCH_COMMIT,
         "packages": {name: importlib.metadata.version(name) for name in ("executorch", "torch", "torchao")},
-        "files": {str(path.relative_to(work)): digest(path) for path in sorted(canonical.iterdir())},
+        "files": {str(path.relative_to(work)): digest(path)
+                  for path in sorted(canonical.iterdir()) if path.is_file() and not path.name.startswith(".")},
         "pte": pte.name, "pte_sha256": digest(pte),
         "quantized_linears": quantized_linears, "xnnpack_delegates": len(delegates),
     }

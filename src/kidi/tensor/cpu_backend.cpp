@@ -32,6 +32,9 @@ public:
         if (size_bytes >= MAPPED_THRESHOLD && alignment <= 4096) {
             void* mapping = ::mmap(nullptr, size_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (mapping != MAP_FAILED) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+                if (size_bytes >= (std::size_t{2} << 20)) (void)::madvise(mapping, size_bytes, MADV_HUGEPAGE);
+#endif
                 owner_ = std::shared_ptr<const void>(
                     mapping, [size_bytes](const void* pointer) { ::munmap(const_cast<void*>(pointer), size_bytes); });
                 data_ = static_cast<const std::byte*>(mapping);
