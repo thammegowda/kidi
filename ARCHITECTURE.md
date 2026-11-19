@@ -87,7 +87,8 @@ operations; Android Gmail or webpage integration is not introduced here.
 | `app` | Typed assistant actions, request validation, and prompt/message policy |
 | `runtime/ynn` | Private prepared CPU operators and YNNPACK ownership |
 | `runtime/mps` | Private prepared Metal operators, command batches, INT8 kernels |
-| `kidi-ops/kidi_ops/cuda` | CUDA storage, prepared operators, replay, and kernels |
+| `kidi-ops/src/cuda` | CUDA storage, prepared operators, replay, and kernels |
+| `kidi-ops/src/qnn` | QNN host step compiler and standalone HTP op package |
 | `text`, `cli` | Tokenization and command/input/output policy |
 
 RTG is an import/package format, not the owner of general modeling code. Do not
@@ -1279,7 +1280,7 @@ of a 128-token INT8-KV prefill step found element-wise work dominating (GELU-tan
 chain 30%, other multiply/add 26%, quantize/dequantize 20%, RMS norms 10%), while
 HMX matmuls were 3.6% and attention 1%.
 
-`kidi-ops` is a standalone QNN HTP op package (QHPI,
+`kidi-ops/src/qnn/htp` is a standalone QNN HTP op package (QHPI,
 multithreaded HVX) that restores those fusions on the NPU. `GeluMultiply` maps
 the UINT8 gate/up projection output directly to the UINT8 input of the down
 projection in one pass, and `RmsNorm` covers plain and residual norms with an

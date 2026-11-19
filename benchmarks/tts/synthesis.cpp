@@ -19,7 +19,7 @@
 #include "kidi/audio/wav.h"
 #include "kidi/runtime/ynn/graph.h"
 #if defined(KIDI_HAS_CUDA)
-#include "kidi_ops/cuda/runtime.h"
+#include "cuda/runtime.h"
 #endif
 
 namespace {

@@ -9,7 +9,7 @@
 #include "kidi/runtime/ynn/graph.h"
 #include "ynnpack/base/topology.h"
 #if defined(KIDI_HAS_CUDA)
-#include "kidi_ops/cuda/runtime.h"
+#include "cuda/runtime.h"
 #endif
 
 #include <nlohmann/json.hpp>

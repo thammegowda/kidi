@@ -1,7 +1,7 @@
 #include "kidi/ops/context.h"
 #include "kidi/layers/gemma4.h"
 #include "kidi/layers/audio.h"
-#include "kidi_ops/cuda/runtime.h"
+#include "cuda/runtime.h"
 #include <array>
 #include <cmath>
 #include <cstring>

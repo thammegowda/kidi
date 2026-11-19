@@ -1,4 +1,4 @@
-#include "kidi_ops/cuda/runtime.h"
+#include "cuda/runtime.h"
 #include <cuda_runtime_api.h>
 #include <cublas_v2.h>
 

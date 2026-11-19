@@ -1,12 +1,18 @@
-#include "kidi_ops/cuda/storage.h"
-#include "kidi_ops/cuda/runtime.h"
+#include "cuda/storage.h"
+#include "cuda/runtime.h"
 #include <cuda_runtime_api.h>
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
 
-namespace kidi::tensor {
+namespace kidi::cuda {
 namespace {
+using tensor::Backend;
+using tensor::Device;
+using tensor::DeviceKind;
+using tensor::Readback;
+using tensor::Storage;
+
 class CudaStorage final : public Storage {
 public:
     CudaStorage(Device device, std::size_t bytes)
@@ -206,13 +212,14 @@ private:
     mutable std::vector<std::shared_ptr<CudaReadback>> readbacks_;
 };
 } // namespace
-auto make_cuda_backend() -> std::shared_ptr<Backend> { return std::make_shared<CudaBackend>(); }
-auto cuda_buffer(const Tensor& tensor) -> Result<CudaBufferView> {
+auto buffer_view(const tensor::Tensor& tensor) -> Result<BufferView> {
     const auto* storage = dynamic_cast<const CudaStorage*>(tensor.storage_.get());
     if (!storage || !tensor.is_contiguous()) return error("CUDA execution requires a contiguous CUDA tensor");
     const auto offset = static_cast<std::size_t>(tensor.storage_offset()) * element_size(tensor.dtype());
     if (offset > storage->size_bytes() || tensor.nbytes() > storage->size_bytes() - offset)
         return error("CUDA tensor view is out of bounds");
-    return CudaBufferView{storage->data() + offset, tensor.nbytes()};
+    return BufferView{storage->data() + offset, tensor.nbytes()};
 }
-} // namespace kidi::tensor
+} // namespace kidi::cuda
+
+auto kidi::tensor::make_cuda_backend() -> std::shared_ptr<Backend> { return std::make_shared<cuda::CudaBackend>(); }

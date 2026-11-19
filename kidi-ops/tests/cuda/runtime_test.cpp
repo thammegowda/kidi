@@ -1,4 +1,4 @@
-#include "kidi_ops/cuda/runtime.h"
+#include "cuda/runtime.h"
 #include <algorithm>
 #include <array>
 #include <cmath>

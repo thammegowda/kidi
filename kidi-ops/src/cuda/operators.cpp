@@ -2,8 +2,8 @@
 #include "kidi/graph/compiler.h"
 #include "kidi/graph/graph.h"
 #include "kidi/ops/context.h"
-#include "kidi_ops/cuda/storage.h"
-#include "kidi_ops/cuda/runtime.h"
+#include "cuda/storage.h"
+#include "cuda/runtime.h"
 #include <cuda_runtime_api.h>
 #include <chrono>
 #include <cstdlib>
@@ -12,9 +12,17 @@
 #include <map>
 #include <tuple>
 
-namespace kidi::runtime {
+namespace kidi::cuda {
 namespace {
 using ops::require;
+using runtime::AllocationStats;
+using runtime::Operation;
+using runtime::Operator;
+using runtime::OperatorBackend;
+using runtime::OperatorSpec;
+using runtime::OutputPool;
+using runtime::TensorInputs;
+using runtime::operation_name;
 using tensor::Device;
 using tensor::Tensor;
 static_assert(static_cast<int>(Operation::GELU_GATE) == static_cast<int>(kidi::cuda::Op::GELU_GATE));
@@ -28,7 +36,7 @@ auto view(const Tensor& tensor, bool bind = true) -> kidi::cuda::Tensor {
     result.rank = static_cast<int>(tensor.dimensions());
     result.device = tensor.device().index;
     std::copy(tensor.shape().begin(), tensor.shape().end(), result.shape.begin());
-    if (bind) result.data = require(tensor::cuda_buffer(tensor)).data;
+    if (bind) result.data = require(buffer_view(tensor)).data;
     return result;
 }
 class CudaOperator final : public Operator {
@@ -71,8 +79,8 @@ public:
         if (destination.device() != device_ || result.dtype() != destination.dtype() ||
             !std::ranges::equal(result.shape(), destination.shape()))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "CUDA in-place output shape or dtype changed"});
-        kidi::cuda::copy_device(require(tensor::cuda_buffer(destination)).data,
-                               require(tensor::cuda_buffer(result)).data, result.nbytes(), device_.index);
+        kidi::cuda::copy_device(require(buffer_view(destination)).data,
+                               require(buffer_view(result)).data, result.nbytes(), device_.index);
         return destination;
     }
     auto run_pair(TensorInputs inputs) -> std::array<Tensor, 2> override {
@@ -103,9 +111,9 @@ public:
         for (std::size_t index = 0; index < inputs.size(); ++index)
             bindings[index] = view(constants_[index].defined() ? constants_[index] : inputs[index]);
         try {
-            if (outputs.size() == 2) residual_->run(bindings.data(), 2, require(tensor::cuda_buffer(outputs[0])).data);
+            if (outputs.size() == 2) residual_->run(bindings.data(), 2, require(buffer_view(outputs[0])).data);
             program_.run(bindings.data(), static_cast<int>(inputs.size()),
-                         require(tensor::cuda_buffer(outputs.back())).data);
+                         require(buffer_view(outputs.back())).data);
         } catch (const std::exception& error) {
             throw ops::Failure({ErrorCode::RUNTIME, error.what()});
         }
@@ -221,11 +229,11 @@ public:
         if (!direct_slots_.empty()) {
             binding_table_ =
                 require(Tensor::empty({static_cast<std::int64_t>(direct_slots_.size())}, tensor::DType::U64, device_));
-            auto* table = static_cast<void**>(require(tensor::cuda_buffer(binding_table_)).data);
+            auto* table = static_cast<void**>(require(buffer_view(binding_table_)).data);
             latest_bindings_.resize(direct_slots_.size());
             for (std::size_t index = 0; index < direct_slots_.size(); ++index) {
                 const auto& input = bindings_[direct_slots_[index]]->value;
-                dynamic_bindings_.push_back({require(tensor::cuda_buffer(input)).data, input.nbytes(), table + index});
+                dynamic_bindings_.push_back({require(buffer_view(input)).data, input.nbytes(), table + index});
             }
         }
         prepare_projections();
@@ -296,20 +304,20 @@ public:
         sizes_.resize(mutated_.size());
         for (std::size_t index = 0; index < mutated_.size(); ++index) {
             const auto slot = mutated_[index];
-            destinations_[index] = require(tensor::cuda_buffer(inputs[slot])).data;
-            sources_[index] = require(tensor::cuda_buffer(bindings_[slot]->value)).data;
+            destinations_[index] = require(buffer_view(inputs[slot])).data;
+            sources_[index] = require(buffer_view(bindings_[slot]->value)).data;
             sizes_[index] = inputs[slot].nbytes();
         }
         kidi::cuda::copy_device_batch(destinations_.data(), sources_.data(), sizes_.data(), sizes_.size(),
                                      device_.index);
         if (selection_.defined())
-            check_cuda(cudaMemcpyAsync(resources_->selection, require(tensor::cuda_buffer(selection_)).data,
+            check_cuda(cudaMemcpyAsync(resources_->selection, require(buffer_view(selection_)).data,
                                        selection_.nbytes(), cudaMemcpyDeviceToHost, resources_->stream));
         for (std::size_t index = 0; index < outputs.size(); ++index) {
             auto& output = exports_[index];
             if (output.device() != Device::cpu()) {
-                kidi::cuda::copy_device(require(tensor::cuda_buffer(output)).data,
-                                       require(tensor::cuda_buffer(graph_.outputs()[index])).data, output.nbytes(),
+                kidi::cuda::copy_device(require(buffer_view(output)).data,
+                                       require(buffer_view(graph_.outputs()[index])).data, output.nbytes(),
                                        device_.index);
             }
             outputs[index] = output;
@@ -405,8 +413,8 @@ private:
                 const auto original = nodes[index].outputs()[0];
                 const auto length = static_cast<std::int64_t>(original.size(-1));
                 auto* packed =
-                    static_cast<std::byte*>(require(tensor::cuda_buffer(group.weight)).data) + start * width * 2;
-                kidi::cuda::copy_device(packed, require(tensor::cuda_buffer(nodes[index].inputs()[1])).data,
+                    static_cast<std::byte*>(require(buffer_view(group.weight)).data) + start * width * 2;
+                kidi::cuda::copy_device(packed, require(buffer_view(nodes[index].inputs()[1])).data,
                                        nodes[index].inputs()[1].nbytes(), device_.index);
                 const auto flat = require(group.output.reshape({columns}));
                 for (auto& node : nodes)
@@ -438,7 +446,7 @@ private:
     auto copy_inputs(std::span<const Tensor> inputs) -> void {
         bool changed = false;
         for (std::size_t index = 0; index < direct_slots_.size(); ++index) {
-            const auto pointer = require(tensor::cuda_buffer(inputs[direct_slots_[index]])).data;
+            const auto pointer = require(buffer_view(inputs[direct_slots_[index]])).data;
             if (pointer != latest_bindings_[index]) changed = true;
         }
         if (changed) {
@@ -462,9 +470,9 @@ private:
                 resources_->bindings.push_back(std::move(created));
             }
             for (std::size_t index = 0; index < direct_slots_.size(); ++index)
-                latest_bindings_[index] = require(tensor::cuda_buffer(inputs[direct_slots_[index]])).data;
+                latest_bindings_[index] = require(buffer_view(inputs[direct_slots_[index]])).data;
             std::memcpy(upload->data, latest_bindings_.data(), latest_bindings_.size() * sizeof(void*));
-            check_cuda(cudaMemcpyAsync(require(tensor::cuda_buffer(binding_table_)).data, upload->data,
+            check_cuda(cudaMemcpyAsync(require(buffer_view(binding_table_)).data, upload->data,
                                        latest_bindings_.size() * sizeof(void*), cudaMemcpyHostToDevice,
                                        resources_->stream));
             check_cuda(cudaEventRecord(upload->ready, resources_->stream));
@@ -475,8 +483,8 @@ private:
         std::size_t copies = 0;
         for (std::size_t index = 0; index < inputs.size(); ++index) {
             if (bindings_[index]->direct) continue;
-            destinations_[copies] = require(tensor::cuda_buffer(bindings_[index]->value)).data;
-            sources_[copies] = require(tensor::cuda_buffer(inputs[index])).data;
+            destinations_[copies] = require(buffer_view(bindings_[index]->value)).data;
+            sources_[copies] = require(buffer_view(inputs[index])).data;
             sizes_[copies++] = inputs[index].nbytes();
         }
         kidi::cuda::copy_device_batch(destinations_.data(), sources_.data(), sizes_.data(), copies, device_.index);
@@ -498,7 +506,7 @@ private:
                 auto& group = projections_[projection_nodes_[index]];
                 if (group.nodes.front() == index) {
                     const std::array bindings{view(node.inputs()[0]), view(group.weight)};
-                    group.program->run(bindings.data(), 2, require(tensor::cuda_buffer(group.output)).data);
+                    group.program->run(bindings.data(), 2, require(buffer_view(group.output)).data);
                 }
             }
             if (!resources_->profiles.empty())
@@ -664,7 +672,7 @@ public:
             const auto source = require(inputs[index].host_bytes());
             auto* pinned = static_cast<std::byte*>(upload->data) + offsets[index];
             std::memcpy(pinned, source.data(), source.size());
-            check_cuda(cudaMemcpyAsync(require(tensor::cuda_buffer(staged[index])).data, pinned, source.size(),
+            check_cuda(cudaMemcpyAsync(require(buffer_view(staged[index])).data, pinned, source.size(),
                                        cudaMemcpyHostToDevice, nullptr));
         }
         check_cuda(cudaEventRecord(upload->ready, nullptr));
@@ -718,8 +726,8 @@ public:
                      std::size_t destination_bytes, std::size_t offset) -> void override {
         if (destination.device() != device_ || source.device() != device_)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "CUDA slice operands belong to different devices"});
-        auto* target = static_cast<std::byte*>(require(tensor::cuda_buffer(destination)).data);
-        const auto* input = static_cast<const std::byte*>(require(tensor::cuda_buffer(source)).data);
+        auto* target = static_cast<std::byte*>(require(buffer_view(destination)).data);
+        const auto* input = static_cast<const std::byte*>(require(buffer_view(source)).data);
         if (outer * source_bytes > source.nbytes() || outer * destination_bytes > destination.nbytes() ||
             offset > destination_bytes || source_bytes > destination_bytes - offset)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "CUDA slice copy is out of bounds"});
@@ -738,7 +746,8 @@ private:
     std::vector<std::unique_ptr<CudaUpload>> uploads_;
 };
 } // namespace
-auto cuda_operators(tensor::Device device) -> std::unique_ptr<OperatorBackend> {
-    return std::make_unique<CudaBackend>(device);
+} // namespace kidi::cuda
+
+auto kidi::runtime::cuda_operators(tensor::Device device) -> std::unique_ptr<OperatorBackend> {
+    return std::make_unique<cuda::CudaBackend>(device);
 }
-} // namespace kidi::runtime
