@@ -19,7 +19,7 @@
 #include "kidi/audio/wav.h"
 #include "kidi/runtime/ynn/graph.h"
 #if defined(KIDI_HAS_CUDA)
-#include "ynnpack/include/ynnpack_cuda.h"
+#include "kidi_ops/cuda/runtime.h"
 #endif
 
 namespace {
@@ -179,8 +179,8 @@ auto main(int argc, char** argv) -> int {
                       << "|rtf=" << (total_ns / 1e9 / audio_seconds) << "|token_hash=" << token_hash(tokens);
 #if defined(KIDI_HAS_CUDA)
             if (cuda)
-                std::cout << "|gpu_live_bytes=" << ynn::cuda::allocated_bytes(device.index)
-                          << "|gpu_peak_bytes=" << ynn::cuda::peak_allocated_bytes(device.index);
+                std::cout << "|gpu_live_bytes=" << kidi::cuda::allocated_bytes(device.index)
+                          << "|gpu_peak_bytes=" << kidi::cuda::peak_allocated_bytes(device.index);
 #endif
             std::cout << '\n';
         }

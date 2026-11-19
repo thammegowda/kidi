@@ -11,6 +11,10 @@ target_include_directories(kidi_ops_headers INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/kidi_ops/ops>
 )
 
+if(KIDI_ENABLE_CUDA)
+    add_subdirectory(kidi_ops/cuda)
+endif()
+
 if(KIDI_OPS_BUILD_HOST_TESTS)
     enable_testing()
     add_executable(kidi_ops_attention_math_test tests/attention_math_test.cpp)

@@ -362,8 +362,8 @@ Checkpoint I/O -> Model-owned configuration and preparation hooks
 ```
 
 Kidi uses C++23 with a shared model implementation across backends. CPU uses
-YNNPACK; Apple GPUs use Metal; NVIDIA GPUs can use the optional YNNPACK CUDA
-runtime (`KIDI_ENABLE_CUDA=ON`). Models are ordinary C++ composed from reusable
+YNNPACK; Apple GPUs use Metal; NVIDIA GPUs can use the optional `kidi-ops` CUDA
+backend (`KIDI_ENABLE_CUDA=ON`). Models are ordinary C++ composed from reusable
 layers and concrete tensors, not exported model graphs. Backend-specific
 operator preparation and fusion remain internal to the runtime.
 
@@ -413,23 +413,19 @@ seconds** (`--threads 10`), producing a **39,927,380-byte** graph-only file.
 Progress includes row counts, percentage, elapsed time, rate and an
 interval-based ETA.
 
-CUDA-enabled builds also include native cuVS offline construction, which builds
-the graph on CUDA and exports it for CPU search. The existing
-`KIDI_ENABLE_CUDA=ON` setting enables inference and indexing together; there is
-no separate vector-search feature switch. See the [CUDA requirements](#cuda).
-`--builder auto` selects this backend when compiled and a CUDA device is present;
+With the optional cuVS helper, CUDA-enabled builds can construct the graph on
+CUDA and export it for CPU search. See the [CUDA requirements](#cuda).
+`--builder auto` selects this backend when the helper and a CUDA device are present;
 `--builder cpu` forces the deterministic builder. For example:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 build-release/kidi index --model /path/to/gemma-4 --builder cuda --threads 4
+CUDA_VISIBLE_DEVICES=0 build-release-cuda/kidi index --model /path/to/gemma-4 --builder cuda --threads 4
 ```
 
 The native `kidi-index-cuda` helper runs in a separate process, so a cuVS SDK
 built against another CUDA major version cannot interfere with inference's
 CUDA libraries. Keep the helper beside `kidi` or on `PATH`. No Python runtime is
-used. The command has only three source files: `cli/index.h`, `cli/index.cpp`,
-and `cli/index.cu`. The existing `KIDI_HAS_CUDA` macro selects CUDA dispatch or
-unavailable-backend stubs; only the CUDA-only `index.cu` target links the cuVS SDK.
+used. Only the `kidi-ops` helper links the cuVS SDK; the CLI discovers it at runtime.
 GPU construction uses raw FP32 representations of the original weights,
 then verifies every exported vector, label and ordered live edge before packing
 the graph. cuVS does not expose per-node progress or a seeded construction API;

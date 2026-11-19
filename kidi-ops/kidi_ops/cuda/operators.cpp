@@ -2,8 +2,8 @@
 #include "kidi/graph/compiler.h"
 #include "kidi/graph/graph.h"
 #include "kidi/ops/context.h"
-#include "kidi/tensor/cuda.h"
-#include "ynnpack/include/ynnpack_cuda.h"
+#include "kidi_ops/cuda/storage.h"
+#include "kidi_ops/cuda/runtime.h"
 #include <cuda_runtime_api.h>
 #include <chrono>
 #include <cstdlib>
@@ -17,14 +17,14 @@ namespace {
 using ops::require;
 using tensor::Device;
 using tensor::Tensor;
-static_assert(static_cast<int>(Operation::GELU_GATE) == static_cast<int>(ynn::cuda::Op::GELU_GATE));
-static_assert(static_cast<int>(tensor::DType::E5M2) == static_cast<int>(ynn::cuda::Type::E5M2));
+static_assert(static_cast<int>(Operation::GELU_GATE) == static_cast<int>(kidi::cuda::Op::GELU_GATE));
+static_assert(static_cast<int>(tensor::DType::E5M2) == static_cast<int>(kidi::cuda::Type::E5M2));
 
-auto view(const Tensor& tensor, bool bind = true) -> ynn::cuda::Tensor {
+auto view(const Tensor& tensor, bool bind = true) -> kidi::cuda::Tensor {
     if (tensor.dimensions() > 8)
         throw ops::Failure({ErrorCode::UNSUPPORTED, "CUDA tensors support at most eight dimensions"});
-    ynn::cuda::Tensor result;
-    result.type = static_cast<ynn::cuda::Type>(tensor.dtype());
+    kidi::cuda::Tensor result;
+    result.type = static_cast<kidi::cuda::Type>(tensor.dtype());
     result.rank = static_cast<int>(tensor.dimensions());
     result.device = tensor.device().index;
     std::copy(tensor.shape().begin(), tensor.shape().end(), result.shape.begin());
@@ -33,22 +33,22 @@ auto view(const Tensor& tensor, bool bind = true) -> ynn::cuda::Tensor {
 }
 class CudaOperator final : public Operator {
 public:
-    CudaOperator(ynn::cuda::Descriptor descriptor, std::vector<Tensor> constants, Device device)
+    CudaOperator(kidi::cuda::Descriptor descriptor, std::vector<Tensor> constants, Device device)
         : program_(descriptor, device.index),
           constants_(std::move(constants)),
           selected_(
-              descriptor.operation == ynn::cuda::Op::GREEDY_TOKEN &&
+              descriptor.operation == kidi::cuda::Op::GREEDY_TOKEN &&
               (!descriptor.attribute_count || descriptor.attributes[0] == static_cast<int>(ops::TokenOutput::HOST))),
-          scatter_(descriptor.operation == ynn::cuda::Op::SCATTER),
+          scatter_(descriptor.operation == kidi::cuda::Op::SCATTER),
           device_(device) {
         const auto& output = program_.output();
         shape_.assign(output.shape.begin(), output.shape.begin() + output.rank);
         dtype_ = static_cast<tensor::DType>(output.type);
-        if (descriptor.operation == ynn::cuda::Op::RESIDUAL_NORM) {
+        if (descriptor.operation == kidi::cuda::Op::RESIDUAL_NORM) {
             auto sum = descriptor;
-            sum.operation = ynn::cuda::Op::ADD;
+            sum.operation = kidi::cuda::Op::ADD;
             sum.input_count = 2;
-            residual_ = std::make_unique<ynn::cuda::Program>(sum, device.index);
+            residual_ = std::make_unique<kidi::cuda::Program>(sum, device.index);
         }
     }
     auto run(TensorInputs inputs) -> Tensor override {
@@ -71,7 +71,7 @@ public:
         if (destination.device() != device_ || result.dtype() != destination.dtype() ||
             !std::ranges::equal(result.shape(), destination.shape()))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "CUDA in-place output shape or dtype changed"});
-        ynn::cuda::copy_device(require(tensor::cuda_buffer(destination)).data,
+        kidi::cuda::copy_device(require(tensor::cuda_buffer(destination)).data,
                                require(tensor::cuda_buffer(result)).data, result.nbytes(), device_.index);
         return destination;
     }
@@ -99,7 +99,7 @@ public:
             if (output.dtype() != dtype_ || !std::ranges::equal(output.shape(), shape_))
                 throw ops::Failure(
                     {ErrorCode::INVALID_ARGUMENT, "CUDA output shape or dtype changed after preparation"});
-        std::array<ynn::cuda::Tensor, 8> bindings{};
+        std::array<kidi::cuda::Tensor, 8> bindings{};
         for (std::size_t index = 0; index < inputs.size(); ++index)
             bindings[index] = view(constants_[index].defined() ? constants_[index] : inputs[index]);
         try {
@@ -120,7 +120,7 @@ public:
     }
 
 private:
-    ynn::cuda::Program program_;
+    kidi::cuda::Program program_;
     std::vector<Tensor> constants_;
     std::vector<std::int64_t> shape_;
     tensor::DType dtype_;
@@ -128,7 +128,7 @@ private:
     Device device_;
     OutputPool pool_;
     OutputPool residual_pool_;
-    std::unique_ptr<ynn::cuda::Program> residual_;
+    std::unique_ptr<kidi::cuda::Program> residual_;
 };
 
 auto check_cuda(cudaError_t status) -> void {
@@ -259,7 +259,7 @@ public:
             check_cuda(cudaHostAlloc(&resources_->selection, selection_.nbytes(), cudaHostAllocDefault));
         check_cuda(cudaEventRecord(resources_->before, nullptr));
         check_cuda(cudaStreamWaitEvent(resources_->stream, resources_->before, 0));
-        const ynn::cuda::StreamScope stream(resources_->stream);
+        const kidi::cuda::StreamScope stream(resources_->stream);
         copy_inputs(source.inputs());
         execute_nodes();
         check_cuda(cudaStreamSynchronize(resources_->stream));
@@ -285,7 +285,7 @@ public:
         const CudaDeviceScope selected(device_);
         check_cuda(cudaEventRecord(resources_->before, nullptr));
         check_cuda(cudaStreamWaitEvent(resources_->stream, resources_->before, 0));
-        const ynn::cuda::StreamScope stream(resources_->stream);
+        const kidi::cuda::StreamScope stream(resources_->stream);
         if (resources_->phases[0]) check_cuda(cudaEventRecord(resources_->phases[0], resources_->stream));
         copy_inputs(inputs);
         if (resources_->phases[1]) check_cuda(cudaEventRecord(resources_->phases[1], resources_->stream));
@@ -300,7 +300,7 @@ public:
             sources_[index] = require(tensor::cuda_buffer(bindings_[slot]->value)).data;
             sizes_[index] = inputs[slot].nbytes();
         }
-        ynn::cuda::copy_device_batch(destinations_.data(), sources_.data(), sizes_.data(), sizes_.size(),
+        kidi::cuda::copy_device_batch(destinations_.data(), sources_.data(), sizes_.data(), sizes_.size(),
                                      device_.index);
         if (selection_.defined())
             check_cuda(cudaMemcpyAsync(resources_->selection, require(tensor::cuda_buffer(selection_)).data,
@@ -308,7 +308,7 @@ public:
         for (std::size_t index = 0; index < outputs.size(); ++index) {
             auto& output = exports_[index];
             if (output.device() != Device::cpu()) {
-                ynn::cuda::copy_device(require(tensor::cuda_buffer(output)).data,
+                kidi::cuda::copy_device(require(tensor::cuda_buffer(output)).data,
                                        require(tensor::cuda_buffer(graph_.outputs()[index])).data, output.nbytes(),
                                        device_.index);
             }
@@ -361,7 +361,7 @@ private:
     struct ProjectionGroup {
         std::vector<std::size_t> nodes;
         Tensor weight, output;
-        std::unique_ptr<ynn::cuda::Program> program;
+        std::unique_ptr<kidi::cuda::Program> program;
     };
     auto prepare_projections() -> void {
         auto nodes = graph_.nodes();
@@ -406,7 +406,7 @@ private:
                 const auto length = static_cast<std::int64_t>(original.size(-1));
                 auto* packed =
                     static_cast<std::byte*>(require(tensor::cuda_buffer(group.weight)).data) + start * width * 2;
-                ynn::cuda::copy_device(packed, require(tensor::cuda_buffer(nodes[index].inputs()[1])).data,
+                kidi::cuda::copy_device(packed, require(tensor::cuda_buffer(nodes[index].inputs()[1])).data,
                                        nodes[index].inputs()[1].nbytes(), device_.index);
                 const auto flat = require(group.output.reshape({columns}));
                 for (auto& node : nodes)
@@ -423,15 +423,15 @@ private:
                 projection_nodes_[index] = projections_.size();
                 start += length;
             }
-            ynn::cuda::Descriptor descriptor;
-            descriptor.operation = ynn::cuda::Op::LINEAR;
+            kidi::cuda::Descriptor descriptor;
+            descriptor.operation = kidi::cuda::Op::LINEAR;
             descriptor.input_count = 2;
             descriptor.inputs[0] = view(nodes[first].inputs()[0]);
             descriptor.inputs[1] = view(group.weight);
-            descriptor.output.type = ynn::cuda::Type::BF16;
+            descriptor.output.type = kidi::cuda::Type::BF16;
             descriptor.attribute_count = 1;
             descriptor.attributes[0] = 1;
-            group.program = std::make_unique<ynn::cuda::Program>(descriptor, device_.index);
+            group.program = std::make_unique<kidi::cuda::Program>(descriptor, device_.index);
             projections_.push_back(std::move(group));
         }
     }
@@ -479,10 +479,10 @@ private:
             sources_[copies] = require(tensor::cuda_buffer(inputs[index])).data;
             sizes_[copies++] = inputs[index].nbytes();
         }
-        ynn::cuda::copy_device_batch(destinations_.data(), sources_.data(), sizes_.data(), copies, device_.index);
+        kidi::cuda::copy_device_batch(destinations_.data(), sources_.data(), sizes_.data(), copies, device_.index);
     }
     auto execute_nodes() -> void {
-        const ynn::cuda::BindingScope bindings(dynamic_bindings_.data(), dynamic_bindings_.size());
+        const kidi::cuda::BindingScope bindings(dynamic_bindings_.data(), dynamic_bindings_.size());
         cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
         if (!resources_->profiles.empty()) check_cuda(cudaStreamIsCapturing(resources_->stream, &status));
         const auto flags = status == cudaStreamCaptureStatusActive ? cudaEventRecordExternal : cudaEventRecordDefault;
@@ -512,7 +512,7 @@ private:
     std::vector<std::size_t> mutated_;
     std::vector<std::size_t> direct_slots_;
     std::vector<void*> latest_bindings_;
-    std::vector<ynn::cuda::TensorBinding> dynamic_bindings_;
+    std::vector<kidi::cuda::TensorBinding> dynamic_bindings_;
     std::vector<Tensor> exports_;
     std::vector<void*> destinations_;
     std::vector<const void*> sources_;
@@ -680,9 +680,9 @@ public:
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
         if (inputs.size() > 8 || spec.attributes.size() > 32)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "CUDA operand or attribute count exceeded"});
-        ynn::cuda::Descriptor descriptor;
-        descriptor.operation = static_cast<ynn::cuda::Op>(spec.operation);
-        descriptor.output.type = static_cast<ynn::cuda::Type>(spec.dtype);
+        kidi::cuda::Descriptor descriptor;
+        descriptor.operation = static_cast<kidi::cuda::Op>(spec.operation);
+        descriptor.output.type = static_cast<kidi::cuda::Type>(spec.dtype);
         descriptor.input_count = static_cast<int>(inputs.size());
         descriptor.attribute_count = static_cast<int>(spec.attributes.size());
         descriptor.epsilon = spec.epsilon;
@@ -724,14 +724,14 @@ public:
             offset > destination_bytes || source_bytes > destination_bytes - offset)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "CUDA slice copy is out of bounds"});
         for (std::size_t index = 0; index < outer; ++index)
-            ynn::cuda::copy_device(target + index * destination_bytes + offset, input + index * source_bytes,
+            kidi::cuda::copy_device(target + index * destination_bytes + offset, input + index * source_bytes,
                                    source_bytes, device_.index);
     }
 
 private:
     Device device_;
     std::shared_ptr<graph::Compiler> compiler_;
-    std::shared_ptr<ynn::cuda::ProjectionCache> projection_cache_ = ynn::cuda::make_projection_cache();
+    std::shared_ptr<kidi::cuda::ProjectionCache> projection_cache_ = kidi::cuda::make_projection_cache();
     using ConstantKey = std::tuple<const void*, std::int64_t, tensor::DType, std::vector<std::int64_t>>;
     std::map<ConstantKey, std::pair<Tensor, Tensor>> constants_;
     OutputPool staging_;

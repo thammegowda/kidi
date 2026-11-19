@@ -1,6 +1,18 @@
 # KidiOps
 
-KidiOps is Kidi's standalone Qualcomm QNN HTP custom-operation package. It
+KidiOps houses accelerator implementations. Kidi core owns the tensor, operator,
+and graph compiler interfaces; YNNPACK owns CPU kernels.
+
+## CUDA
+
+The CUDA module owns kernels, cuBLAS dispatch, storage, and graph replay. It is
+built only with `KIDI_ENABLE_CUDA=ON` and requires CUDA 13 or later. Run
+`make release-cuda` from the Kidi root. The optional `kidi-index-cuda` executable
+keeps cuVS and DLPack dependencies separate from inference.
+
+## Qualcomm QNN HTP
+
+The standalone Qualcomm QNN HTP custom-operation package
 contains the existing structured-attention, GELU-multiply, and RMS-normalization
 kernels together with their SDK-independent math tests and Hexagon simulator
 tests.

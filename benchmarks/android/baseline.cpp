@@ -9,8 +9,7 @@
 #include "kidi/runtime/ynn/graph.h"
 #include "ynnpack/base/topology.h"
 #if defined(KIDI_HAS_CUDA)
-#include "ynnpack/include/ynnpack_cuda.h"
-#include <cuda_profiler_api.h>
+#include "kidi_ops/cuda/runtime.h"
 #endif
 
 #include <nlohmann/json.hpp>
@@ -63,8 +62,8 @@ auto emit(nlohmann::json record, int threads) -> void {
         record["accelerator"] = accelerator;
 #if defined(KIDI_HAS_CUDA)
         if (const auto device = kidi::tensor::parse_cuda_device(accelerator)) {
-            record["gpu_live_bytes"] = ynn::cuda::allocated_bytes(device->index);
-            record["gpu_peak_bytes"] = ynn::cuda::peak_allocated_bytes(device->index);
+            record["gpu_live_bytes"] = kidi::cuda::allocated_bytes(device->index);
+            record["gpu_peak_bytes"] = kidi::cuda::peak_allocated_bytes(device->index);
         }
 #endif
     }
@@ -228,8 +227,7 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
 #if defined(KIDI_HAS_CUDA)
             const bool profile_cuda = std::getenv("KIDI_CUDA_PROFILE") && iteration >= warmups &&
                                       gemma_device().kind == kidi::tensor::DeviceKind::CUDA;
-            if (profile_cuda && cudaProfilerStart() != cudaSuccess)
-                throw std::runtime_error("CUDA profiler start failed");
+            if (profile_cuda) kidi::cuda::start_profiler();
 #endif
             require(generator.enqueue(serialized, options));
             const auto submitted = Clock::now();
@@ -297,8 +295,7 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
             }
             if (!completed) throw std::runtime_error("missing generation completion");
 #if defined(KIDI_HAS_CUDA)
-            if (profile_cuda && cudaProfilerStop() != cudaSuccess)
-                throw std::runtime_error("CUDA profiler stop failed");
+            if (profile_cuda) kidi::cuda::stop_profiler();
 #endif
         }
     }

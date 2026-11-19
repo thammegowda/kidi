@@ -5,12 +5,14 @@
 #include "kidi/model/gemma4.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/search/hnsw.h"
-#if defined(KIDI_HAS_CUVS)
+#if defined(KIDI_HAS_CUDA)
 #include "kidi/ops/context.h"
 #include "kidi/tensor/backend.h"
 #include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <random>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -27,7 +29,7 @@
 
 namespace kidi::cli {
 namespace {
-#if defined(KIDI_HAS_CUVS)
+#if defined(KIDI_HAS_CUDA)
 class TemporaryDirectory {
 public:
     TemporaryDirectory() {
@@ -92,14 +94,41 @@ auto run_helper(std::vector<std::string> arguments) -> Result<void> {
     return {};
 }
 
+auto find_cuda_index_helper() -> std::optional<std::string> {
+    constexpr auto name = "kidi-index-cuda";
+    std::error_code error;
+    const auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (!error) {
+        const auto sibling = executable.parent_path() / name;
+        if (std::filesystem::is_regular_file(sibling, error) && ::access(sibling.c_str(), X_OK) == 0)
+            return sibling.string();
+    }
+    if (const auto* path_env = std::getenv("PATH")) {
+        std::string_view remaining(path_env);
+        while (!remaining.empty()) {
+            const auto split = remaining.find(':');
+            const auto entry = remaining.substr(0, split);
+            if (!entry.empty()) {
+                const auto candidate = std::filesystem::path(entry) / name;
+                if (std::filesystem::is_regular_file(candidate, error) && ::access(candidate.c_str(), X_OK) == 0)
+                    return candidate.string();
+            }
+            if (split == std::string_view::npos) break;
+            remaining.remove_prefix(split + 1);
+        }
+    }
+    return std::nullopt;
+}
+
 auto cuda_index_available() -> Result<bool> {
+    if (!find_cuda_index_helper()) return false;
     auto backend = tensor::BackendRegistry::instance().backend(tensor::Device::cuda());
     if (!backend) return std::unexpected(std::move(backend.error()));
     return (*backend)->is_available(tensor::Device::cuda());
 }
 
-auto build_cuda_index(const tensor::Tensor& vectors, search::HnswBuildOptions options, std::size_t threads)
-    -> Result<search::HnswIndex> {
+auto build_cuda_index(const tensor::Tensor& vectors, search::HnswBuildOptions options,
+                      std::size_t threads) -> Result<search::HnswIndex> {
     try {
         if (!vectors.defined() || !vectors.is_host_accessible() || !vectors.is_contiguous() ||
             vectors.dimensions() != 2 || !vectors.size(0) || vectors.size(0) > (1U << 24) ||
@@ -124,15 +153,7 @@ auto build_cuda_index(const tensor::Tensor& vectors, search::HnswBuildOptions op
             output.close();
             if (!output) throw ops::Failure({ErrorCode::IO, "failed closing staged cuVS vectors"});
         }
-        std::string helper = "kidi-index-cuda";
-        std::error_code executable_error;
-        const auto executable = std::filesystem::read_symlink("/proc/self/exe", executable_error);
-        if (!executable_error) {
-            const auto sibling = executable.parent_path() / helper;
-            if (std::filesystem::is_regular_file(sibling)) helper = sibling.string();
-        } else {
-            std::cerr << "kidi_index_cuda|helper_lookup=PATH|reason=" << executable_error.message() << '\n';
-        }
+        const auto helper = find_cuda_index_helper().value_or("kidi-index-cuda");
         ops::require(
             run_helper({helper, temporary.input().string(), temporary.output().string(),
                         std::to_string(vectors.size(0)), std::to_string(vectors.size(1)), std::to_string(options.m),
@@ -208,7 +229,8 @@ auto index_command(const Namespace& arguments, const std::filesystem::path& dire
     }
     if (requested_builder == "cuda" && !use_cuda) {
         log::error(
-            "CUDA index construction is unavailable; build with cuVS (KIDI_ENABLE_CUDA=ON and cuVS SDK) and provide a CUDA device");
+            "CUDA index construction is unavailable; build with cuVS (KIDI_ENABLE_CUDA=ON and cuVS SDK) and provide a "
+            "CUDA device");
         return 2;
     }
     runtime::ynn::set_thread_count(threads);

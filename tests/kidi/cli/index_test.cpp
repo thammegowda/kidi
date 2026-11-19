@@ -91,7 +91,7 @@ auto main() -> int {
         serial_command.insert(serial_command.end(), {"--output", (root / "serial.hnsw").string()});
         check(run(serial_command).first == 0 && read(root / "serial.hnsw") == original,
               "CLI graph depends on thread count");
-#if !defined(KIDI_HAS_CUVS)
+#if !defined(KIDI_HAS_CUDA)
         auto automatic_command = serial_command;
         const auto builder = std::ranges::find(automatic_command, "--builder");
         automatic_command.erase(builder, builder + 2);

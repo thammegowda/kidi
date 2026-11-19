@@ -1,5 +1,5 @@
-#include "kidi/tensor/cuda.h"
-#include "ynnpack/include/ynnpack_cuda.h"
+#include "kidi_ops/cuda/storage.h"
+#include "kidi_ops/cuda/runtime.h"
 #include <cuda_runtime_api.h>
 #include <atomic>
 #include <mutex>
@@ -10,8 +10,8 @@ namespace {
 class CudaStorage final : public Storage {
 public:
     CudaStorage(Device device, std::size_t bytes)
-        : data_(ynn::cuda::allocate(bytes, device.index)), bytes_(bytes), device_(device) {}
-    ~CudaStorage() override { ynn::cuda::release(data_); }
+        : data_(kidi::cuda::allocate(bytes, device.index)), bytes_(bytes), device_(device) {}
+    ~CudaStorage() override { kidi::cuda::release(data_); }
     auto device() const noexcept -> Device override { return device_; }
     auto size_bytes() const noexcept -> std::size_t override { return bytes_; }
     auto data() const noexcept -> std::byte* { return static_cast<std::byte*>(data_); }
@@ -104,11 +104,11 @@ class CudaBackend final : public Backend {
 public:
     auto name() const noexcept -> std::string_view override { return "cuda"; }
     auto device_name(Device device) const -> std::string override {
-        return is_available(device) ? ynn::cuda::device_name(device.index) : "CUDA unavailable";
+        return is_available(device) ? kidi::cuda::device_name(device.index) : "CUDA unavailable";
     }
     auto device_kind() const noexcept -> DeviceKind override { return DeviceKind::CUDA; }
     auto is_available(Device device) const noexcept -> bool override {
-        return device.kind == DeviceKind::CUDA && ynn::cuda::available(device.index);
+        return device.kind == DeviceKind::CUDA && kidi::cuda::available(device.index);
     }
     auto is_host_accessible(Device) const noexcept -> bool override { return false; }
     auto supports_execution() const noexcept -> bool override { return true; }
@@ -131,7 +131,7 @@ public:
         auto* cuda = dynamic_cast<CudaStorage*>(&storage);
         if (!cuda) return error("invalid CUDA storage");
         try {
-            ynn::cuda::clear(cuda->data(), cuda->size_bytes(), cuda->device().index);
+            kidi::cuda::clear(cuda->data(), cuda->size_bytes(), cuda->device().index);
             return {};
         } catch (const std::exception& exception) {
             return error(exception.what());
@@ -143,7 +143,7 @@ public:
         if (!cuda || offset > cuda->size_bytes() || source.size() > cuda->size_bytes() - offset)
             return error("CUDA copy is out of bounds");
         try {
-            ynn::cuda::copy_to_device(cuda->data() + offset, source.data(), source.size(), cuda->device().index);
+            kidi::cuda::copy_to_device(cuda->data() + offset, source.data(), source.size(), cuda->device().index);
             return {};
         } catch (const std::exception& exception) {
             return error(exception.what());
@@ -155,7 +155,7 @@ public:
         if (!cuda || offset > cuda->size_bytes() || destination.size() > cuda->size_bytes() - offset)
             return error("CUDA copy is out of bounds");
         try {
-            ynn::cuda::copy_to_host(destination.data(), cuda->data() + offset, destination.size(),
+            kidi::cuda::copy_to_host(destination.data(), cuda->data() + offset, destination.size(),
                                     cuda->device().index);
             return {};
         } catch (const std::exception& exception) {
@@ -194,7 +194,7 @@ public:
     auto synchronize(Device device) const -> Result<void> override {
         if (!is_available(device)) return error(unavailable_reason(device));
         try {
-            ynn::cuda::synchronize(device.index);
+            kidi::cuda::synchronize(device.index);
             return {};
         } catch (const std::exception& exception) {
             return error(exception.what());

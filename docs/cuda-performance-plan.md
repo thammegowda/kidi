@@ -15,8 +15,8 @@ measure throughput and concurrent workloads separately. Preserve CPU-only builds
 native quantized checkpoints, explicit `cuda:N` selection, and the prohibition on
 silent CPU operator fallback.
 
-Kernels and preparation remain in YNNPACK's CUDA backend; graph capture/replay and
-generation scheduling belong to Kidi.
+CUDA kernels, preparation, and backend-specific capture/replay live in `kidi-ops`;
+shared graph orchestration and generation scheduling belong to Kidi core.
 Reuse Kidi's eager models, prepared operators, and fixed-shape captured-step
 interfaces. Do not add a second model implementation, whole-model compiler,
 LibTorch dependency, or exported-model conversion requirement.
@@ -138,8 +138,8 @@ Use three ownership levels:
 
 Model/layer code remains ordinary eager C++. `ops::Context` owns dispatch validation
 and delegates step reuse to Kidi's `graph::Session`. Kidi also owns backend graph
-orchestration, including future native CUDA capture/replay. YNNPACK owns CUDA
-operators, kernels, dispatch, and prepared storage. Backend `graph::Compiler`
+orchestration. The `kidi-ops` CUDA backend owns operators, kernels, dispatch,
+and prepared storage. Backend `graph::Compiler`
 implementations produce `graph::Executable` objects through the common Kidi contract.
 
 All caches are bounded by memory and specialization count. Weight and graph keys
