@@ -1,4 +1,5 @@
 #include "cuda/runtime.h"
+#include "cuda/launch.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <array>
@@ -768,7 +769,7 @@ void check_projection_rebinding(int device) {
         const auto check = [](cudaError_t status) {
             if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
         };
-        check(cudaSetDevice(device));
+        const DeviceScope device_scope(device);
         cudaStream_t stream{};
         check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         const std::unique_ptr<std::remove_pointer_t<cudaStream_t>, decltype(&cudaStreamDestroy)> stream_owner(

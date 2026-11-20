@@ -14,6 +14,11 @@ fi
 
 setup_tests() {
     local environment="$root/.cache/test-venv"
+    case "${KIDI_TEST_PRESET:-debug}" in
+        debug) ;;
+        debug-cuda) environment+=-cuda ;;
+        *) printf 'Test setup requires the debug or debug-cuda preset.\n' >&2; return 2 ;;
+    esac
     local requirements="$root/tests/requirements.txt"
     local flag="$environment/._OK"
 
@@ -28,7 +33,8 @@ setup_tests() {
         cp "$requirements" "$flag"
     fi
 
-    "$environment/bin/python" tests/rtg_regression.py setup
+    setup_node
+    node web/tools/prepare-libs.mjs --tests
 }
 
 setup_node() (
@@ -91,7 +97,7 @@ case "$(uname -s)" in
         fi
         elevate=()
         if [[ "$EUID" -ne 0 ]]; then
-            elevate=(sudo -n)
+            elevate=(sudo -A)
         fi
         "${elevate[@]}" apt-get update
         "${elevate[@]}" apt-get install -y build-essential gcc-14 g++-14 cmake ninja-build ccache \
@@ -121,6 +127,5 @@ setup_node
 
 "${PYTHON:-python3}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else "Python 3.12+ is required; set PYTHON to a compatible interpreter.")'
 git submodule update --init --recursive --depth 10 --jobs 8
-setup_tests
 node web/tools/prepare-libs.mjs
-printf '\nSetup complete. Run make test.\n'
+printf '\nBuild setup complete. Run make debug or make release; make setup-test installs test tools.\n'

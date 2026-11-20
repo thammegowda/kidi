@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createHash} from 'node:crypto';
-import {access, mkdtemp, readFile, readdir, rm, stat} from 'node:fs/promises';
+import {spawnSync} from 'node:child_process';
+import {access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -76,4 +77,47 @@ test('desktop and Android dependency mappings retain packaged licenses', async (
             '/libs/dompurify/LICENSE-MPL', '/libs/highlightjs/LICENSE', '/libs/mermaid/LICENSE'])
             assert.ok(mappings.has(path), `${manifest} requires ${path}`);
     }
+});
+
+test('build setup omits test tools and preserves them after test setup', {
+    skip: process.platform === 'win32' && 'uses a POSIX npm shim',
+}, async t => {
+    await prepareWebLibraries();
+    const fixture = await mkdtemp(join(tmpdir(), 'kidi-web-setup-'));
+    t.after(() => rm(fixture, {recursive: true, force: true}));
+    for (const directory of ['tools', 'bin', 'node_modules'])
+        await mkdir(join(fixture, directory));
+    for (const file of ['package.json', 'package-lock.json', 'tools/prepare-libs.mjs'])
+        await copyFile(join(root, 'web', file), join(fixture, file));
+    for (const dependency of ['mermaid', 'pdfjs-dist'])
+        await symlink(join(root, 'web/node_modules', dependency), join(fixture, 'node_modules', dependency));
+    await writeFile(join(fixture, 'bin/npm'), `#!${process.execPath}
+import {appendFileSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs';
+const args = process.argv.slice(2);
+appendFileSync('npm-calls.jsonl', JSON.stringify(args) + '\\n');
+if (args.includes('--include=dev')) {
+    const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
+    mkdirSync('node_modules/playwright', {recursive: true});
+    writeFileSync('node_modules/playwright/package.json',
+        JSON.stringify({version: manifest.devDependencies.playwright}));
+}
+`, {mode: 0o755});
+    const prepare = (...args) => {
+        const result = spawnSync(process.execPath, [join(fixture, 'tools/prepare-libs.mjs'), ...args], {
+            env: {...process.env, PATH: `${join(fixture, 'bin')}:${process.env.PATH}`},
+            encoding: 'utf8',
+        });
+        assert.ifError(result.error);
+        assert.equal(result.status, 0, result.stderr);
+    };
+    prepare();
+    await assert.rejects(access(join(fixture, 'node_modules/playwright')), {code: 'ENOENT'});
+    prepare('--tests');
+    await access(join(fixture, 'node_modules/playwright/package.json'));
+    prepare();
+    await access(join(fixture, 'node_modules/playwright/package.json'));
+    const calls = (await readFile(join(fixture, 'npm-calls.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(calls.length, 2, 'build setup must reuse an installation that includes test tools');
+    assert.ok(calls[0].includes('--omit=dev'));
+    assert.ok(calls[1].includes('--include=dev'));
 });

@@ -22,19 +22,19 @@ make setup
 ```
 
 `make setup` runs `scripts/setup.sh` on Ubuntu 24.04+ and macOS, on x64 or ARM64.
-It installs native build tools, initializes submodules, prepares the Python test
-environment and public RTG fixture, and stages locked web dependencies. Ubuntu
-uses APT (root or passwordless sudo is required); macOS requires Homebrew and
+It installs native build tools, initializes submodules recursively, and stages
+locked frontend build dependencies, without installing test-only packages or
+downloading test models. Ubuntu uses APT (root or sudo is required); macOS requires Homebrew and
 Xcode Command Line Tools already installed. Android and Emscripten SDKs remain
 separate setup steps.
 
 If Node.js 24+ and npm are missing, setup installs the official Node.js 24 binary
-under `.cache/tools/`, verifying its SHA-256 checksum. `make test` also runs
-this Node-only setup automatically, without APT or Homebrew. Make targets use
+under `.cache/tools/`, verifying its SHA-256 checksum. Make targets use
 these local tools. For direct shell commands, run
-`export PATH="$PWD/.cache/tools/bin:$PATH"`. Use `make test` after setup;
-`make setup-test` runs the same script with `--tests-only`, refreshing only the
-Python test environment and fixtures without installing system tools.
+`export PATH="$PWD/.cache/tools/bin:$PATH"`. `make setup-test` installs the
+Python test/build tools and browser test tools without APT or Homebrew.
+`make test` and `make test-cuda` prepare their test tools automatically.
+Model fixtures are acquired only by the test goals that need them.
 
 C/C++ dependencies are pinned submodules under `third_party/`.
 [ynnpack-dev](https://github.com/thammegowda/ynnpack-dev) owns nested Slinky,
@@ -50,10 +50,24 @@ CLI-only and Python wheel targets do not acquire web packages or require Node.js
 ## Native Build
 
 ```bash
-cmake --preset release
-cmake --build --preset release --target kidi_cli
+make release
 build-release/kidi --help
 ```
+
+The standard goals use matching CMake configure/build presets:
+
+| Goal | Build directory | Configuration |
+|---|---|---|
+| `debug` | `build-debug` | Debug symbols and native tests; CUDA off |
+| `test` | `build-debug` | Debug build, Python tests, and supported model regressions |
+| `release` | `build-release` | Release, no tests or debug symbols |
+| `debug-cuda` | `build-debug-cuda` | Same as `debug`, with CUDA on |
+| `test-cuda` | `build-debug-cuda` | Same as `test`, restricted to CUDA-compatible suites |
+| `release-cuda` | `build-release-cuda` | Same as `release`, with CUDA on |
+
+Build goals do not run tests. Test goals build their corresponding Debug
+artifacts before running CTest. CUDA builds additionally require the CUDA toolkit;
+setup does not install GPU drivers or SDKs.
 
 The standalone executable needs no Python or separate inference runtime, but
 accepts local model paths only. The Python launcher supplies Hugging Face Hub
@@ -560,22 +574,46 @@ Native unit tests, without downloading a model:
 make native-test
 ```
 
-This configures Debug with integration tests disabled. For the complete suite:
+This builds the `debug` preset with integration tests disabled. To include Python
+and supported model regression tests:
 
 ```bash
 make test
 ```
 
-`make test` builds required artifacts and runs native tests, installed-wheel
-Python tests, browser tests, and the 50-sentence RTG regression through one CTest
-invocation. The pinned public model downloads on the first run; no Hub login is
-required. Individual targets are `native-test`, `python-test`, `web-test`, and
+`make test` builds and tests `build-debug/kidi`, runs Python tests against an
+installed Debug wheel, and runs the 50-sentence RTG regression through one CTest
+invocation. It never uses the Release binary. The pinned public model downloads
+on the first CPU regression run; no Hub login is required.
+Browser and extension suites remain separate. Individual targets are
+`native-test`, `python-test`, `web-test`, and
 `regression-test`. See [tests/data/README.md](tests/data/README.md) for fixtures
 and numerical contracts.
 
 RTG regression defaults to `KIDI_BACKEND=ynnpack`. Override it with
 `make test KIDI_BACKEND=mps` on a supported Mac; the generic `BACKEND` variable
 is ignored.
+
+On Linux with an NVIDIA GPU and the CUDA toolkit, test the CUDA backend with:
+
+```bash
+make test-cuda KIDI_CUTLASS_ROOT=/path/to/cutlass
+```
+
+This configures the `debug-cuda` preset (`build-debug-cuda/`, Debug with
+`KIDI_ENABLE_CUDA=ON`) and runs native tests plus Python tests against a
+CUDA-enabled Debug wheel. This includes the `cuda`-labelled kernel tests and
+CUDA model numerical checks. The RTG translation regression is excluded because
+RTG currently has no CUDA backend; browser and extension tests are also excluded.
+The Gemma 4 numerical fixture is a regression test on both CPU and CUDA.
+Optional Python chat regressions use CUDA when `KIDI_CHAT_MODEL` is set.
+CPU and CUDA test environments are isolated under `.cache/test-venv` and
+`.cache/test-venv-cuda`; wheel build trees live under the corresponding Debug
+build directory's `python/` subdirectory.
+`KIDI_CUTLASS_ROOT` is optional and applies to all CUDA Make goals and the test
+wheel. Without it, CUTLASS-only kernels are not built or tested.
+Run only the kernel tests with
+`ctest --preset debug-cuda -L cuda`.
 
 To check long-file Whisper processing with a local checkpoint and a short English
 mono PCM16 16 kHz WAV (at most 30 seconds):
@@ -593,6 +631,7 @@ sample in each output line, and fail explicitly when the per-window token limit 
 Browser unit, loader, generated-glue, and site-packaging tests:
 
 ```bash
+make setup-test
 make web-test
 ```
 

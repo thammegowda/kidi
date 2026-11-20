@@ -13,7 +13,7 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
 
 option(KIDI_BUILD_TESTS "Build kidi tests" ON)
 option(KIDI_STRIP_BINARIES "Strip local symbol tables from Release executables" ON)
-option(KIDI_BUILD_INTEGRATION_TESTS "Register Python, browser, and model regression tests" OFF)
+option(KIDI_BUILD_INTEGRATION_TESTS "Register Python and supported model regression tests" OFF)
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
 option(KIDI_ENABLE_CUDA "Build NVIDIA CUDA inference and optional cuVS GPU HNSW indexing" OFF)

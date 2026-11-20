@@ -63,7 +63,8 @@ preserved, and a high score does not establish multilingual translation quality.
 Decoding settings: YNNPACK CPU, eight threads, greedy beam one, batch/window one,
 50 maximum extra tokens, and length penalty 0.6. Expected translations are kept
 in Moses-tokenized form. The model is downloaded and checksum-verified by
-`make setup-test`, not stored in this repository.
+`make test` or `make regression-test`, not stored in this repository.
+`make setup-test` installs test tools only.
 
 Scoring uses SacreBLEU 2.6.0 corpus chrF2: character order 6, word order 0,
 beta 2, case-sensitive, whitespace excluded, effective order enabled. The

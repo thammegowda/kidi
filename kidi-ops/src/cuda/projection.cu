@@ -87,10 +87,20 @@ __global__ void quantize_rows(Launch plan, signed char* quantized, float* scales
     minimum = s_min[0];
     maximum = s_max[0];
     const float difference = maximum - minimum;
+    // Match the CPU's dynamic quantization, including half-away-from-zero input rounding.
     const float scale = difference == 0.F ? 1.F : difference / 255.F;
-    const int zero = difference == 0.F
-                         ? -128
-                         : static_cast<int>(fminf(255.F, fmaxf(0.F, -minimum * (255.F / difference))) + 0.5F) - 128;
+    const float inverse_scale = difference == 0.F ? 0.F : 255.F / difference;
+    int zero = -128;
+    if (difference > 0.F) {
+        // Separate rounding prevents fused multiply-add from changing a zero-point tie.
+        const float scaled_minimum = __fmul_rn(minimum, inverse_scale);
+        const float scaled_maximum = __fmul_rn(maximum, inverse_scale);
+        const float minimum_error = __fadd_rn(-128.F, scaled_minimum);
+        const float maximum_error = __fadd_rn(127.F, scaled_maximum);
+        const float candidate = minimum_error + maximum_error > 0.F ? __fadd_rn(-128.F, -scaled_minimum)
+                                                                    : __fadd_rn(127.F, -scaled_maximum);
+        zero = static_cast<int>(nearbyintf(fminf(127.F, fmaxf(-128.F, candidate))));
+    }
     if (threadIdx.x == 0) {
         scales[row] = scale;
         zeros[row] = zero;
@@ -101,16 +111,16 @@ __global__ void quantize_rows(Launch plan, signed char* quantized, float* scales
         for (std::int64_t vec = threadIdx.x; vec < width / 4; vec += blockDim.x) {
             const float4 v = src[vec];
             char4 q;
-            q.x = static_cast<signed char>(fminf(127.F, fmaxf(-128.F, nearbyintf(v.x / scale) + zero)));
-            q.y = static_cast<signed char>(fminf(127.F, fmaxf(-128.F, nearbyintf(v.y / scale) + zero)));
-            q.z = static_cast<signed char>(fminf(127.F, fmaxf(-128.F, nearbyintf(v.z / scale) + zero)));
-            q.w = static_cast<signed char>(fminf(127.F, fmaxf(-128.F, nearbyintf(v.w / scale) + zero)));
+            q.x = static_cast<signed char>(fminf(127.F, fmaxf(-128.F, roundf(v.x * inverse_scale) + zero)));
+            q.y = static_cast<signed char>(fminf(127.F, fmaxf(-128.F, roundf(v.y * inverse_scale) + zero)));
+            q.z = static_cast<signed char>(fminf(127.F, fmaxf(-128.F, roundf(v.z * inverse_scale) + zero)));
+            q.w = static_cast<signed char>(fminf(127.F, fmaxf(-128.F, roundf(v.w * inverse_scale) + zero)));
             dst[vec] = q;
         }
     } else {
         for (std::int64_t column = threadIdx.x; column < width; column += blockDim.x)
             quantized[base + column] = static_cast<signed char>(
-                fminf(127.F, fmaxf(-128.F, nearbyintf(read(plan.inputs[0], base + column) / scale) + zero)));
+                fminf(127.F, fmaxf(-128.F, roundf(read(plan.inputs[0], base + column) * inverse_scale) + zero)));
     }
 }
 

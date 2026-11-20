@@ -40,25 +40,26 @@ async function currentAssets(destination, fingerprint) {
     }
 }
 
-async function currentInstall(installed, fingerprint, pins) {
+async function currentInstall(installed, fingerprint, dependencies) {
     if (await readOptional(installed) !== fingerprint) return false;
-    for (const [name, version] of Object.entries({...pins.dependencies, ...pins.devDependencies})) {
+    for (const [name, version] of Object.entries(dependencies)) {
         const source = await readOptional(join(modules, name, 'package.json'));
         if (!source || JSON.parse(source).version !== version) return false;
     }
     return true;
 }
 
-export async function prepareWebLibraries(destination = libraries) {
+export async function prepareWebLibraries(destination = libraries, {includeTests = false} = {}) {
     destination = resolve(destination);
     const manifest = await readFile(join(web, 'package.json'));
     const lockfile = await readFile(join(web, 'package-lock.json'));
     const pins = JSON.parse(manifest);
+    const dependencies = {...pins.dependencies, ...(includeTests ? pins.devDependencies : {})};
     const installHash = createHash('sha256')
         .update(JSON.stringify([pins.dependencies, pins.devDependencies, pins.engines])).update(lockfile).digest('hex');
     const fingerprint = createHash('sha256').update(installHash).update(await readFile(script)).digest('hex');
     const installed = join(modules, '.kidi-lock');
-    if (await currentInstall(installed, installHash, pins) && await currentAssets(destination, fingerprint)) return;
+    if (await currentInstall(installed, installHash, dependencies) && await currentAssets(destination, fingerprint)) return;
     await mkdir(libraries, {recursive: true});
     const deadline = Date.now() + 300000;
     while (true) {
@@ -72,10 +73,10 @@ export async function prepareWebLibraries(destination = libraries) {
     }
     const stamp = join(destination, '.stamp');
     try {
-        if (await currentInstall(installed, installHash, pins) && await currentAssets(destination, fingerprint)) return;
-        if (!await currentInstall(installed, installHash, pins)) {
+        if (await currentInstall(installed, installHash, dependencies) && await currentAssets(destination, fingerprint)) return;
+        if (!await currentInstall(installed, installHash, dependencies)) {
             const result = spawnSync(process.platform === 'win32' ? 'npm.cmd' : 'npm',
-                ['ci', '--include=dev', '--ignore-scripts', '--no-audit', '--no-fund'],
+                ['ci', includeTests ? '--include=dev' : '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'],
                 {cwd: web, stdio: 'inherit', shell: process.platform === 'win32'});
             if (result.error) throw result.error;
             if (result.status !== 0)
@@ -105,4 +106,11 @@ export async function prepareWebLibraries(destination = libraries) {
     }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === script) await prepareWebLibraries(process.argv[2]);
+if (process.argv[1] && resolve(process.argv[1]) === script) {
+    const args = process.argv.slice(2);
+    const includeTests = args.includes('--tests');
+    const destinations = args.filter(arg => arg !== '--tests');
+    if (destinations.length > 1 || destinations.some(arg => arg.startsWith('--')))
+        throw new Error('Usage: node web/tools/prepare-libs.mjs [destination] [--tests]');
+    await prepareWebLibraries(destinations[0], {includeTests});
+}
