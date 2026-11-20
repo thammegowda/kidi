@@ -1,10 +1,16 @@
 #include "cuda/runtime.h"
+#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
+#include "cuda/dense_gemm.h"
+#include "cuda/int8_gemm.h"
+#endif
 
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#if defined(KIDI_CUDA_USE_CUBLAS)
 #include <cublas_v2.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -54,6 +60,7 @@ private:
     bool changed_ = false;
 };
 
+#if defined(KIDI_CUDA_USE_CUBLAS)
 struct BlasHandle {
     cublasHandle_t handle = nullptr;
     cudaStream_t stream = nullptr;
@@ -83,6 +90,7 @@ struct BlasHandle {
 };
 thread_local std::unordered_map<int, std::unique_ptr<BlasHandle>> blas_handles;
 thread_local std::unordered_map<int, std::unique_ptr<BlasHandle>> tensor_blas_handles;
+#endif
 
 struct View {
     void* data;
@@ -382,18 +390,20 @@ __global__ void normalize(Launch plan) {
     }
 }
 
-template <Op Operation>
-__global__ void bfloat_normalize(Launch plan) {
+constexpr int rms_values_per_thread = 10;
+
+template <typename Element, Op Operation>
+__global__ void dense_rms_normalize(Launch plan) {
     __shared__ float partial[8];
     const auto width = plan.output.shape[plan.output.rank - 1], row = static_cast<std::int64_t>(blockIdx.x);
-    const auto* input = static_cast<const __nv_bfloat16*>(plan.inputs[0].data) + row * width;
+    const auto* input = static_cast<const Element*>(plan.inputs[0].data) + row * width;
     const auto* scale = static_cast<const float*>(plan.inputs[1].data);
-    float values[8]{}, sum = 0;
+    float values[rms_values_per_thread]{}, sum = 0;
 #pragma unroll
-    for (int chunk = 0; chunk < 8; ++chunk) {
+    for (int chunk = 0; chunk < rms_values_per_thread; ++chunk) {
         const auto column = threadIdx.x + chunk * 256;
         if (column < width) {
-            values[chunk] = __bfloat162float(input[column]);
+            values[chunk] = static_cast<float>(input[column]);
             sum = fmaf(values[chunk], values[chunk], sum);
         }
     }
@@ -409,28 +419,48 @@ __global__ void bfloat_normalize(Launch plan) {
     __syncthreads();
     const float inverse = partial[0];
 #pragma unroll
-    for (int chunk = 0; chunk < 8; ++chunk) {
+    for (int chunk = 0; chunk < rms_values_per_thread; ++chunk) {
         const auto column = threadIdx.x + chunk * 256;
         if (column >= width) continue;
         float result = values[chunk] * inverse * scale[column];
         if constexpr (Operation == Op::RMS_NORM_RESIDUAL) {
-            result = __bfloat162float(__float2bfloat16(result)) +
-                     __bfloat162float(static_cast<const __nv_bfloat16*>(plan.inputs[2].data)[row * width + column]);
+            result = static_cast<float>(static_cast<Element>(result)) +
+                     static_cast<float>(static_cast<const Element*>(plan.inputs[2].data)[row * width + column]);
             if (plan.count == 4)
-                result = __bfloat162float(__float2bfloat16(result)) * static_cast<const float*>(plan.inputs[3].data)[0];
+                result = static_cast<float>(static_cast<Element>(result)) *
+                         static_cast<const float*>(plan.inputs[3].data)[0];
         }
         if constexpr (Operation == Op::RMS_ROTARY) {
             const auto half = width / 2, partner = (column + half) % width;
             const float paired =
-                __bfloat162float(__float2bfloat16(__bfloat162float(input[partner]) * inverse * scale[partner]));
+                static_cast<float>(static_cast<Element>(static_cast<float>(input[partner]) * inverse * scale[partner]));
             const auto sequence = row / plan.output.shape[2] % plan.output.shape[1];
             const auto angle = sequence * half + column % half;
-            result =
-                __bfloat162float(__float2bfloat16(result)) * static_cast<const float*>(plan.inputs[2].data)[angle] +
-                (column < half ? -paired : paired) * static_cast<const float*>(plan.inputs[3].data)[angle];
+            result = static_cast<float>(static_cast<Element>(result)) *
+                         static_cast<const float*>(plan.inputs[2].data)[angle] +
+                     (column < half ? -paired : paired) * static_cast<const float*>(plan.inputs[3].data)[angle];
         }
-        static_cast<__nv_bfloat16*>(plan.output.data)[row * width + column] = __float2bfloat16(result);
+        static_cast<Element*>(plan.output.data)[row * width + column] = static_cast<Element>(result);
     }
+}
+
+template <typename Element>
+bool launch_dense_rms(Launch plan, Op operation, unsigned int rows) {
+    const auto floating = static_cast<int>(Type::F32);
+    if (plan.inputs[0].type != plan.output.type || plan.attribute_count || plan.inputs[1].type != floating ||
+        plan.output.shape[plan.output.rank - 1] > 256 * rms_values_per_thread)
+        return false;
+    if (operation == Op::RMS_NORM) {
+        dense_rms_normalize<Element, Op::RMS_NORM><<<rows, 256, 0, execution_stream>>>(plan);
+    } else if (operation == Op::RMS_NORM_RESIDUAL && plan.inputs[2].type == plan.output.type &&
+               (plan.count == 3 || plan.inputs[3].type == floating)) {
+        dense_rms_normalize<Element, Op::RMS_NORM_RESIDUAL><<<rows, 256, 0, execution_stream>>>(plan);
+    } else if (operation == Op::RMS_ROTARY && plan.inputs[2].type == floating && plan.inputs[3].type == floating) {
+        dense_rms_normalize<Element, Op::RMS_ROTARY><<<rows, 256, 0, execution_stream>>>(plan);
+    } else {
+        return false;
+    }
+    return true;
 }
 
 struct TokenCandidate {
@@ -595,6 +625,7 @@ __device__ void write_projection(Launch plan, std::size_t row, std::size_t colum
     write(plan.output, row * columns + column, result);
 }
 
+#if defined(KIDI_CUDA_USE_CUBLAS) || defined(KIDI_CUDA_USE_CUTLASS_INT8)
 __global__ void projection_epilogue(Launch plan, const int* accumulators, const int* sums, const float* scales,
                                     const int* zeros) {
     const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -603,6 +634,7 @@ __global__ void projection_epilogue(Launch plan, const int* accumulators, const 
     const auto row = index / columns, column = index % columns;
     write_projection(plan, row, column, accumulators[index] - zeros[row] * sums[column], scales);
 }
+#endif
 
 template <int Bits>
 __global__ void quantized_vector(Launch plan, const signed char* quantized, const float* scales, const int* zeros) {
@@ -786,6 +818,7 @@ __global__ void attention_mask(Launch plan, float* scores, std::int64_t heads, s
     scores[index] += read(plan.inputs[3], broadcast_index(index, score_view, plan.inputs[3]));
 }
 
+#if defined(KIDI_CUDA_USE_CUBLAS)
 void execute_attention_scores(Launch plan, float* scores, int device, std::int64_t heads, std::int64_t key_heads,
                               std::int64_t keys, bool reference) {
     const auto queries = plan.inputs[0].shape[1], width = plan.inputs[0].shape[2] / heads;
@@ -825,6 +858,7 @@ void execute_attention_scores(Launch plan, float* scores, int device, std::int64
         attention_mask<<<static_cast<unsigned int>((score_count + 255) / 256), 256, 0, execution_stream>>>(plan, scores,
                                                                                                            heads, keys);
 }
+                                                                                #endif
 
 __global__ void attention_values(Launch plan, const float* scores, std::int64_t heads, std::int64_t key_heads,
                                  std::int64_t keys) {
@@ -843,6 +877,7 @@ __global__ void attention_values(Launch plan, const float* scores, std::int64_t 
     write(plan.output, index, value);
 }
 
+#if defined(KIDI_CUDA_USE_CUBLAS)
 __global__ void bfloat_probabilities(const float* source, __nv_bfloat16* output, std::size_t elements) {
     const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < elements) output[index] = __float2bfloat16(source[index]);
@@ -876,6 +911,7 @@ void execute_attention_values(Launch plan, const __nv_bfloat16* probabilities, i
                 throw std::runtime_error("CUDA: attention value GEMM failed with status " + std::to_string(status));
         }
 }
+        #endif
 
 template <int Vector>
 __device__ void load_bfloat_vector(const __nv_bfloat16* source, float (&output)[Vector]) {
@@ -1009,42 +1045,46 @@ __global__ void bfloat_decode_merge(Launch plan, const float* partials, std::int
             __float2bfloat16(result[column] / denominator);
 }
 
-template <int Width>
-__global__ void bfloat_decode_attention(Launch plan, std::int64_t heads, std::int64_t key_heads, std::int64_t keys) {
+template <typename Element, int Width>
+__global__ void parallel_attention(Launch plan, std::int64_t heads, std::int64_t key_heads, std::int64_t keys) {
     extern __shared__ float probabilities[];
     __shared__ float partial[8];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const auto head = blockIdx.x % heads, batch = blockIdx.x / heads;
+    const auto queries = plan.inputs[0].shape[1];
+    const auto head = blockIdx.x % heads, row = blockIdx.x / heads % queries, batch = blockIdx.x / heads / queries;
     const auto key_head = head / (heads / key_heads);
     const auto offset = plan.attribute_count >= 3 ? plan.attributes[2] : 0;
     const auto key_batch = plan.inputs[1].shape[0] == 1 ? 0 : batch;
-    const auto* query = static_cast<const __nv_bfloat16*>(plan.inputs[0].data) + (batch * heads + head) * Width;
-    const auto* key = static_cast<const __nv_bfloat16*>(address(plan.inputs[1])) +
+    const auto value_batch = plan.inputs[2].shape[0] == 1 ? 0 : batch;
+    const auto* query =
+        static_cast<const Element*>(plan.inputs[0].data) + static_cast<std::int64_t>(blockIdx.x) * Width;
+    const auto* key = static_cast<const Element*>(address(plan.inputs[1])) +
                       (key_batch * plan.inputs[1].shape[1] + offset) * key_heads * Width + key_head * Width;
-    const auto* value = static_cast<const __nv_bfloat16*>(address(plan.inputs[2])) +
-                        (key_batch * plan.inputs[2].shape[1] + offset) * key_heads * Width + key_head * Width;
+    const auto* value = static_cast<const Element*>(address(plan.inputs[2])) +
+                        (value_batch * plan.inputs[2].shape[1] + offset) * key_heads * Width + key_head * Width;
     float activation[Width / 32];
 #pragma unroll
-    for (int chunk = 0; chunk < Width / 32; ++chunk) activation[chunk] = __bfloat162float(query[lane + chunk * 32]);
+    for (int chunk = 0; chunk < Width / 32; ++chunk) activation[chunk] = static_cast<float>(query[lane + chunk * 32]);
     const float scale = plan.epsilon > 0 ? plan.epsilon : rsqrtf(static_cast<float>(Width));
     View score_view{};
     score_view.rank = 4;
     score_view.shape[0] = plan.inputs[0].shape[0];
     score_view.shape[1] = heads;
-    score_view.shape[2] = 1;
+    score_view.shape[2] = queries;
     score_view.shape[3] = keys;
     for (std::int64_t position = warp; position < keys; position += 8) {
         float score = 0;
 #pragma unroll
         for (int chunk = 0; chunk < Width / 32; ++chunk)
-            score =
-                fmaf(activation[chunk], __bfloat162float(key[position * key_heads * Width + lane + chunk * 32]), score);
+            score = fmaf(activation[chunk], static_cast<float>(key[position * key_heads * Width + lane + chunk * 32]),
+                         score);
         for (int delta = 16; delta > 0; delta /= 2) score += __shfl_down_sync(0xffffffff, score, delta);
         if (lane == 0) {
             score *= scale;
             if (plan.count == 4)
-                score += read(plan.inputs[3],
-                              broadcast_index((batch * heads + head) * keys + position, score_view, plan.inputs[3]));
+                score +=
+                    read(plan.inputs[3], broadcast_index(((batch * heads + head) * queries + row) * keys + position,
+                                                         score_view, plan.inputs[3]));
             probabilities[position] = score;
         }
     }
@@ -1075,10 +1115,56 @@ __global__ void bfloat_decode_attention(Launch plan, std::int64_t heads, std::in
         float result = 0;
         for (std::int64_t position = 0; position < keys; ++position)
             result =
-                fmaf(probabilities[position], __bfloat162float(value[position * key_heads * Width + column]), result);
-        static_cast<__nv_bfloat16*>(plan.output.data)[(batch * heads + head) * Width + column] =
-            __float2bfloat16(result / denominator);
+                fmaf(probabilities[position], static_cast<float>(value[position * key_heads * Width + column]), result);
+        static_cast<Element*>(plan.output.data)[static_cast<std::int64_t>(blockIdx.x) * Width + column] =
+            static_cast<Element>(result / denominator);
     }
+}
+
+using AttentionLauncher = void (*)(Launch, std::int64_t, std::int64_t, std::int64_t);
+
+template <typename Element, int Width>
+void launch_parallel_attention(Launch plan, std::int64_t heads, std::int64_t key_heads, std::int64_t keys) {
+    const auto rows = static_cast<unsigned int>(plan.elements / Width);
+    parallel_attention<Element, Width>
+        <<<rows, 256, keys * sizeof(float), execution_stream>>>(plan, heads, key_heads, keys);
+    check(cudaGetLastError());
+}
+
+template <typename Element>
+auto parallel_attention_launcher(std::int64_t width) -> AttentionLauncher {
+    switch (width) {
+        case 32:
+            return launch_parallel_attention<Element, 32>;
+        case 64:
+            return launch_parallel_attention<Element, 64>;
+        case 128:
+            return launch_parallel_attention<Element, 128>;
+        case 256:
+            return launch_parallel_attention<Element, 256>;
+        case 512:
+            return launch_parallel_attention<Element, 512>;
+        default:
+            return nullptr;
+    }
+}
+
+auto select_parallel_attention(const Descriptor& descriptor, std::int64_t keys, std::int64_t width)
+    -> AttentionLauncher {
+    const auto type = descriptor.inputs[0].type;
+    if (descriptor.reference_attention || keys <= 0 || keys > 8192 || type != descriptor.inputs[1].type ||
+        type != descriptor.output.type)
+        return nullptr;
+    if (type == Type::BF16
+#if defined(KIDI_CUDA_USE_CUBLAS)
+        && descriptor.inputs[0].shape[1] == 1
+#endif
+    )
+        return parallel_attention_launcher<__nv_bfloat16>(width);
+#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
+    if (type == Type::F32 && descriptor.inputs[0].shape[1] > 1) return parallel_attention_launcher<float>(width);
+#endif
+    return nullptr;
 }
 
 __global__ void matrix(Launch plan) {
@@ -1187,11 +1273,53 @@ __global__ void bfloat_vector_block(Launch plan, std::int64_t width) {
     }
 }
 
-void execute_matrix(Launch plan, int device) {
+#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
+struct DenseDevice {
+    int major, multiprocessors;
+};
+
+const DenseDevice& dense_device(int device) {
+    static thread_local std::map<int, DenseDevice> devices;
+    auto found = devices.find(device);
+    if (found == devices.end()) {
+        DenseDevice properties{};
+        check(cudaDeviceGetAttribute(&properties.major, cudaDevAttrComputeCapabilityMajor, device));
+        check(cudaDeviceGetAttribute(&properties.multiprocessors, cudaDevAttrMultiProcessorCount, device));
+        found = devices.emplace(device, properties).first;
+    }
+    return found->second;
+}
+
+__global__ void float_vector(Launch plan, std::int64_t width, std::int64_t columns) {
+    const int lane = threadIdx.x % 32;
+    const auto column = static_cast<std::int64_t>(blockIdx.x) * 4 + threadIdx.x / 32;
+    if (column >= columns) return;
+    const auto* input = static_cast<const float*>(plan.inputs[0].data);
+    const auto* weight = static_cast<const float*>(plan.inputs[1].data) + column * width;
+    float4 sums{};
+    for (std::int64_t contraction = lane * 4; contraction < width; contraction += 32 * 4) {
+        const auto left = *reinterpret_cast<const float4*>(input + contraction);
+        const auto right = *reinterpret_cast<const float4*>(weight + contraction);
+        sums.x = fmaf(left.x, right.x, sums.x);
+        sums.y = fmaf(left.y, right.y, sums.y);
+        sums.z = fmaf(left.z, right.z, sums.z);
+        sums.w = fmaf(left.w, right.w, sums.w);
+    }
+    float sum = sums.x + sums.y + sums.z + sums.w;
+    for (int delta = 16; delta > 0; delta /= 2) sum += __shfl_down_sync(0xffffffff, sum, delta);
+    if (lane == 0) {
+        if (plan.count == 3) sum += read(plan.inputs[2], column);
+        static_cast<float*>(plan.output.data)[column] = sum;
+    }
+}
+#endif
+
+void execute_matrix(Launch plan, int device, [[maybe_unused]] bool optimized = true,
+                    [[maybe_unused]] void* workspace = nullptr, [[maybe_unused]] int slices = 1) {
     const auto blocks = static_cast<unsigned int>((plan.elements + 255) / 256);
     const auto& left = plan.inputs[0];
     const auto& right = plan.inputs[1];
-    const auto rows = left.shape[left.rank - 2], width = left.shape[left.rank - 1];
+    const auto width = left.shape[left.rank - 1];
     const auto columns = plan.output.shape[plan.output.rank - 1];
     const bool bfloat = left.type == static_cast<int>(Type::BF16) && right.type == static_cast<int>(Type::BF16) &&
                         plan.output.type == static_cast<int>(Type::BF16);
@@ -1206,6 +1334,8 @@ void execute_matrix(Launch plan, int device) {
                                                                                                       columns);
         return;
     }
+#if defined(KIDI_CUDA_USE_CUBLAS)
+    const auto rows = left.shape[left.rank - 2];
     if ((!bfloat && (left.type != static_cast<int>(Type::F32) || right.type != static_cast<int>(Type::F32) ||
                      plan.output.type != static_cast<int>(Type::F32))) ||
         !width) {
@@ -1264,6 +1394,45 @@ void execute_matrix(Launch plan, int device) {
         bias.inputs[1] = plan.inputs[2];
         pointwise<<<blocks, 256, 0, execution_stream>>>(bias);
     }
+#else
+    (void)device;
+#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
+    const bool fp32 = left.type == static_cast<int>(Type::F32) && right.type == static_cast<int>(Type::F32) &&
+                      plan.output.type == static_cast<int>(Type::F32);
+    if (optimized && (fp32 || (bfloat && plan.count == 2 && width % 8 == 0 && columns % 8 == 0)) && right.rank == 2 &&
+        plan.attribute_count && plan.attributes[0] && width > 0 && width <= INT32_MAX && columns > 0 &&
+        columns <= INT32_MAX && plan.elements / columns <= INT32_MAX &&
+        reinterpret_cast<std::uintptr_t>(left.data) % 16 == 0 &&
+        reinterpret_cast<std::uintptr_t>(right.data) % 16 == 0 &&
+        reinterpret_cast<std::uintptr_t>(plan.output.data) % 16 == 0) {
+        const auto rows = static_cast<int>(plan.elements / columns);
+        if (fp32 && rows == 1 && width % 4 == 0) {
+            float_vector<<<static_cast<unsigned int>((columns + 3) / 4), 128, 0, execution_stream>>>(plan, width,
+                                                                                                     columns);
+            return;
+        }
+        const auto major = dense_device(device).major;
+        if (fp32) {
+            launch_float_gemm(rows, static_cast<int>(columns), static_cast<int>(width), left.data, right.data,
+                              plan.output.data, execution_stream, major >= 8, workspace, slices);
+            if (plan.count == 3) {
+                Launch bias = plan;
+                bias.operation = static_cast<int>(Op::ADD);
+                bias.inputs[0] = plan.output;
+                bias.inputs[1] = plan.inputs[2];
+                pointwise<<<blocks, 256, 0, execution_stream>>>(bias);
+            }
+            return;
+        }
+        if (major >= 8) {
+            launch_bfloat_gemm(rows, static_cast<int>(columns), static_cast<int>(width), left.data, right.data,
+                               plan.output.data, execution_stream, workspace, slices);
+            return;
+        }
+    }
+#endif
+    matrix<<<blocks, 256, 0, execution_stream>>>(plan);
+#endif
 }
 
 __global__ void embedding_sum(Launch plan) {
@@ -1874,18 +2043,22 @@ struct Program::Impl {
     std::unique_ptr<void, decltype(&release)> matrix_input{nullptr, release};
     const void* matrix_source = nullptr;
     const void* prepared_weight = nullptr;
+    AttentionLauncher attention_launcher = nullptr;
     bool tensor_projection = false;
     bool vector_projection = false;
+    int dense_slices = 1;
     explicit Impl(Descriptor value, int selected_device) : descriptor(value), device(selected_device) {
         DeviceScope scope(device);
         infer(descriptor);
         descriptor.output.device = device;
         const auto operation = descriptor.operation;
         const auto& input = descriptor.inputs[0];
+#if defined(KIDI_CUDA_USE_CUBLAS)
         if (!descriptor.reference_projection && descriptor.output.type != Type::BF16 &&
             (operation == Op::LINEAR || operation == Op::MATMUL) &&
             (input.type == Type::BF16 || input.type == Type::F16))
             matrix_input.reset(allocate(input.elements() * sizeof(float), device));
+#endif
         const bool convolution = operation == Op::CONV1D || operation == Op::SNAKE_CONV1D;
         const bool snake_linear = operation == Op::SNAKE_QUANTIZED_LINEAR;
         const int weight_index = operation == Op::SNAKE_CONV1D || snake_linear ? 2 : 1;
@@ -1894,6 +2067,25 @@ struct Program::Impl {
                           : last_width ? static_cast<std::int64_t>(input.elements() / last_width)
                                        : 0;
         const auto width = convolution ? input.shape[2] * descriptor.attributes[0] : last_width;
+#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
+        const bool bfloat = input.type == Type::BF16;
+        if (!descriptor.reference_projection && (operation == Op::LINEAR || operation == Op::MATMUL) &&
+            descriptor.input_count == 2 && (bfloat || input.type == Type::F32) &&
+            descriptor.inputs[1].type == input.type && descriptor.output.type == input.type &&
+            descriptor.inputs[1].rank == 2 && descriptor.attribute_count && descriptor.attributes[0] && width > 0 &&
+            width <= INT32_MAX && width % (bfloat ? 8 : 4) == 0 && rows <= 128) {
+            const auto output_columns = descriptor.output.shape[descriptor.output.rank - 1];
+            if (output_columns > 0 && output_columns <= 4096 && output_columns % 8 == 0) {
+                const auto& properties = dense_device(device);
+                if (properties.major >= 8) {
+                    dense_slices = dense_gemm_slices(static_cast<int>(rows), static_cast<int>(output_columns),
+                                                     static_cast<int>(width), properties.multiprocessors, bfloat);
+                    if (dense_slices > 1)
+                        scratch.reset(allocate(descriptor.output.elements() * dense_slices * sizeof(float), device));
+                }
+            }
+        }
+#endif
         if (convolution || snake_linear) columns.reset(allocate(rows * width * sizeof(float), device));
         if (operation == Op::PACKED_LINEAR || operation == Op::QUANTIZED_LINEAR ||
             ((convolution || snake_linear) && descriptor.inputs[weight_index].type == Type::I8)) {
@@ -1917,13 +2109,21 @@ struct Program::Impl {
                                 (operation != Op::PACKED_LINEAR || descriptor.attributes[1] == width) && rows > 0 &&
                                 rows <= 4 && width > 0 && width <= 65536 && width % (32 / bits) == 0 &&
                                 output_columns > 0 && output_columns <= INT32_MAX;
-            tensor_projection = !descriptor.reference_projection && properties.major >= 7 &&
+#if defined(KIDI_CUDA_USE_CUBLAS) || defined(KIDI_CUDA_USE_CUTLASS_INT8)
+#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
+            constexpr int MIN_MAJOR = 8, WIDTH_ALIGNMENT = 16;
+#else
+            constexpr int MIN_MAJOR = 7, WIDTH_ALIGNMENT = 4;
+#endif
+            tensor_projection = !descriptor.reference_projection && properties.major >= MIN_MAJOR &&
                                 (transposed || operation == Op::PACKED_LINEAR) && supported_weights && width > 0 &&
-                                width <= 65536 && width % 4 == 0 && output_columns > 0 && output_columns <= INT32_MAX &&
+                                width <= 65536 && width % WIDTH_ALIGNMENT == 0 && output_columns > 0 &&
+                                output_columns <= INT32_MAX &&
                                 output_columns % 4 == 0 && rows > 0 && rows <= INT32_MAX;
             if (tensor_projection && !vector_projection) {
                 accumulators.reset(allocate(descriptor.output.elements() * sizeof(int), device));
             }
+#endif
         } else if (operation == Op::DIFFUSION_UPDATE) {
             scratch.reset(allocate(input.elements() * sizeof(float), device));
         } else if (operation == Op::GREEDY_TOKEN && input.shape[input.rank - 1] > 4096) {
@@ -1936,12 +2136,12 @@ struct Program::Impl {
                 throw std::runtime_error("CUDA: quantized KV attention not yet supported");
             const auto keys =
                 descriptor.attribute_count >= 4 ? descriptor.attributes[3] : descriptor.inputs[1].shape[1];
-            scratch.reset(
-                allocate(input.shape[0] * descriptor.attributes[0] * input.shape[1] * keys * sizeof(float), device));
+#if defined(KIDI_CUDA_USE_CUBLAS)
             if (!descriptor.reference_attention && input.type == Type::BF16 &&
                 descriptor.inputs[1].type == Type::BF16 && descriptor.output.type == Type::BF16 && input.shape[1] > 1)
                 probabilities.reset(allocate(
                     input.shape[0] * descriptor.attributes[0] * input.shape[1] * keys * sizeof(__nv_bfloat16), device));
+#endif
             const auto head_width = input.shape[2] / descriptor.attributes[0];
             if (!descriptor.reference_attention && input.type == Type::BF16 &&
                 descriptor.inputs[1].type == Type::BF16 && input.shape[1] == 1 &&
@@ -1949,6 +2149,12 @@ struct Program::Impl {
                 attention_partials.reset(allocate(
                     input.shape[0] * descriptor.attributes[0] * ((keys + 63) / 64) * (head_width + 2) * sizeof(float),
                     device));
+            if (!attention_partials) {
+                attention_launcher = select_parallel_attention(descriptor, keys, head_width);
+                if (!attention_launcher)
+                    scratch.reset(allocate(
+                        input.shape[0] * descriptor.attributes[0] * input.shape[1] * keys * sizeof(float), device));
+            }
         }
     }
     void floating(Launch launch, const Tensor& weight) {
@@ -1956,9 +2162,10 @@ struct Program::Impl {
             if (descriptor.reference_projection || launch.count == 3)
                 matrix<<<static_cast<unsigned int>((launch.elements + 255) / 256), 256, 0, execution_stream>>>(launch);
             else
-                execute_matrix(launch, device);
+                execute_matrix(launch, device, true, scratch.get(), dense_slices);
             return;
         }
+#if defined(KIDI_CUDA_USE_CUBLAS)
         if (matrix_input) {
             Launch converted{};
             converted.operation = static_cast<int>(Op::CAST);
@@ -1988,7 +2195,10 @@ struct Program::Impl {
             launch.inputs[1].type = static_cast<int>(Type::F32);
             launch.inputs[1].data = matrix_weight->values.get();
         }
-        execute_matrix(launch, device);
+        #else
+            (void)weight;
+        #endif
+        execute_matrix(launch, device, !descriptor.reference_projection, scratch.get(), dense_slices);
     }
     void project(Launch launch, unsigned int blocks) {
         const auto output_columns = launch.output.shape[launch.output.rank - 1];
@@ -2010,12 +2220,22 @@ struct Program::Impl {
                     static_cast<int*>(zeros.get()));
             return;
         }
-        if (!tensor_projection || vector_projection || reinterpret_cast<std::uintptr_t>(launch.inputs[1].data) % 4) {
+    #if defined(KIDI_CUDA_USE_CUBLAS) || defined(KIDI_CUDA_USE_CUTLASS_INT8)
+    #if defined(KIDI_CUDA_USE_CUTLASS_INT8)
+        constexpr std::size_t WEIGHT_ALIGNMENT = 16;
+    #else
+        constexpr std::size_t WEIGHT_ALIGNMENT = 4;
+    #endif
+        if (!tensor_projection || vector_projection ||
+            reinterpret_cast<std::uintptr_t>(launch.inputs[1].data) % WEIGHT_ALIGNMENT)
+    #endif
+        {
             quantized_matrix<<<blocks, 256, 0, execution_stream>>>(launch, static_cast<signed char*>(scratch.get()),
                                                                    static_cast<float*>(scales.get()),
                                                                    static_cast<int*>(zeros.get()));
             return;
         }
+#if defined(KIDI_CUDA_USE_CUBLAS) || defined(KIDI_CUDA_USE_CUTLASS_INT8)
         const auto width = launch.inputs[0].shape[launch.inputs[0].rank - 1];
         const auto bits = launch.operation == static_cast<int>(Op::PACKED_LINEAR) ? launch.attributes[0] : 8;
         if (!descriptor.immutable_weights || prepared_weight != launch.inputs[1].data) {
@@ -2028,6 +2248,13 @@ struct Program::Impl {
             check(cudaStreamWaitEvent(execution_stream, prepared->ready));
             prepared_weight = launch.inputs[1].data;
         }
+#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
+        launch_int8_gemm(static_cast<int>(rows), static_cast<int>(output_columns), static_cast<int>(width),
+                         static_cast<const std::int8_t*>(scratch.get()),
+                         static_cast<const std::int8_t*>(prepared->expanded ? prepared->expanded.get()
+                                                                           : launch.inputs[1].data),
+                         static_cast<std::int32_t*>(accumulators.get()), execution_stream);
+#else
         auto& owner = tensor_blas_handles[device];
         if (!owner) owner = std::make_unique<BlasHandle>(device, CUBLAS_DEFAULT_MATH);
         owner->bind_stream();
@@ -2039,9 +2266,11 @@ struct Program::Impl {
             accumulators.get(), CUDA_R_32I, static_cast<int>(output_columns), CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
         if (status != CUBLAS_STATUS_SUCCESS)
             throw std::runtime_error("CUDA: integer cuBLAS GEMM failed with status " + std::to_string(status));
+#endif
         projection_epilogue<<<blocks, 256, 0, execution_stream>>>(
             launch, static_cast<int*>(accumulators.get()), static_cast<int*>(prepared->sums.get()),
             static_cast<float*>(scales.get()), static_cast<int*>(zeros.get()));
+#endif
     }
 };
 Program::Program(Descriptor descriptor, int device) : impl_(std::make_unique<Impl>(descriptor, device)) {}
@@ -2134,19 +2363,13 @@ void Program::run(const Tensor* inputs, int count, void* output) {
                operation == Op::LAYER_NORM || operation == Op::RESIDUAL_NORM || operation == Op::SOFTMAX ||
                operation == Op::LOG_SOFTMAX) {
         const auto rows = static_cast<unsigned int>(launch.elements / launch.output.shape[launch.output.rank - 1]);
-        const bool bfloat = launch.inputs[0].type == static_cast<int>(Type::BF16) &&
-                            launch.output.type == static_cast<int>(Type::BF16) &&
-                            launch.output.shape[launch.output.rank - 1] <= 2048 && !launch.attribute_count;
-        if (bfloat && operation == Op::RMS_NORM)
-            bfloat_normalize<Op::RMS_NORM><<<rows, 256, 0, execution_stream>>>(launch);
-        else if (bfloat && operation == Op::RMS_NORM_RESIDUAL)
-            bfloat_normalize<Op::RMS_NORM_RESIDUAL><<<rows, 256, 0, execution_stream>>>(launch);
-        else if (bfloat && operation == Op::RMS_ROTARY)
-            bfloat_normalize<Op::RMS_ROTARY><<<rows, 256, 0, execution_stream>>>(launch);
-        else if (launch.output.type == static_cast<int>(Type::BF16))
-            normalize<true><<<rows, 256, 0, execution_stream>>>(launch);
-        else
+        if (launch.output.type == static_cast<int>(Type::BF16)) {
+            if (!launch_dense_rms<__nv_bfloat16>(launch, operation, rows))
+                normalize<true><<<rows, 256, 0, execution_stream>>>(launch);
+        } else if (launch.output.type != static_cast<int>(Type::F32) ||
+                   !launch_dense_rms<float>(launch, operation, rows)) {
             normalize<false><<<rows, 256, 0, execution_stream>>>(launch);
+        }
     } else if (operation == Op::SCATTER && output == inputs[0].data) {
         const auto bytes = [](Type type) -> std::size_t {
             return type == Type::F32 || type == Type::I32 ? 4 : type == Type::F16 || type == Type::BF16 ? 2 : 1;
@@ -2241,31 +2464,18 @@ void Program::run(const Tensor* inputs, int count, void* output) {
             check(cudaGetLastError());
             return;
         }
-        if (!descriptor.reference_attention && descriptor.inputs[0].type == Type::BF16 &&
-            descriptor.inputs[1].type == Type::BF16 && descriptor.inputs[0].shape[1] == 1 && keys > 0 && keys <= 8192 &&
-            (width == 32 || width == 64 || width == 128 || width == 256 || width == 512)) {
-            const auto rows = static_cast<unsigned int>(descriptor.inputs[0].shape[0] * heads);
-            if (width == 32)
-                bfloat_decode_attention<32>
-                    <<<rows, 256, keys * sizeof(float), execution_stream>>>(launch, heads, key_heads, keys);
-            if (width == 64)
-                bfloat_decode_attention<64>
-                    <<<rows, 256, keys * sizeof(float), execution_stream>>>(launch, heads, key_heads, keys);
-            if (width == 128)
-                bfloat_decode_attention<128>
-                    <<<rows, 256, keys * sizeof(float), execution_stream>>>(launch, heads, key_heads, keys);
-            if (width == 256)
-                bfloat_decode_attention<256>
-                    <<<rows, 256, keys * sizeof(float), execution_stream>>>(launch, heads, key_heads, keys);
-            if (width == 512)
-                bfloat_decode_attention<512>
-                    <<<rows, 256, keys * sizeof(float), execution_stream>>>(launch, heads, key_heads, keys);
-            check(cudaGetLastError());
+        if (impl_->attention_launcher) {
+            impl_->attention_launcher(launch, heads, key_heads, keys);
             return;
         }
         const auto score_count = descriptor.inputs[0].shape[0] * heads * descriptor.inputs[0].shape[1] * keys;
+#if defined(KIDI_CUDA_USE_CUBLAS)
         execute_attention_scores(launch, static_cast<float*>(impl_->scratch.get()), impl_->device, heads, key_heads,
                                  keys, descriptor.reference_attention);
+#else
+        attention_scores<<<static_cast<unsigned int>((score_count + 255) / 256), 256, 0, execution_stream>>>(
+            launch, static_cast<float*>(impl_->scratch.get()), heads, key_heads, keys);
+    #endif
         Launch softmax{};
         softmax.operation = static_cast<int>(Op::SOFTMAX);
         softmax.inputs[0] =
@@ -2274,13 +2484,16 @@ void Program::run(const Tensor* inputs, int count, void* output) {
                               4,
                               {descriptor.inputs[0].shape[0], heads, descriptor.inputs[0].shape[1], keys}};
         normalize<false><<<static_cast<unsigned int>(score_count / keys), 256, 0, execution_stream>>>(softmax);
+    #if defined(KIDI_CUDA_USE_CUBLAS)
         if (impl_->probabilities) {
             bfloat_probabilities<<<static_cast<unsigned int>((score_count + 255) / 256), 256, 0, execution_stream>>>(
                 static_cast<float*>(impl_->scratch.get()), static_cast<__nv_bfloat16*>(impl_->probabilities.get()),
                 score_count);
             execute_attention_values(launch, static_cast<const __nv_bfloat16*>(impl_->probabilities.get()),
                                      impl_->device, heads, key_heads, keys);
-        } else {
+        } else
+    #endif
+        {
             attention_values<<<blocks, 256, 0, execution_stream>>>(launch, static_cast<float*>(impl_->scratch.get()),
                                                                    heads, key_heads, keys);
         }

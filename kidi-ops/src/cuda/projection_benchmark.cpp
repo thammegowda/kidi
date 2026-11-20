@@ -1,6 +1,8 @@
 #include "cuda/runtime.h"
 #include <cuda_runtime_api.h>
+#if defined(KIDI_CUDA_USE_CUBLAS)
 #include <cublas_v2.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -52,6 +54,7 @@ float measure(Program& program, const std::array<Tensor, 4>& inputs, int count, 
     return measure_launch([&] { program.run(inputs.data(), count, output); }, inputs[0].device, repeats);
 }
 
+#if defined(KIDI_CUDA_USE_CUBLAS)
 void benchmark_bfloat_vector(int width, int columns, int device) {
     std::vector<std::uint16_t> values(width), weights(static_cast<std::size_t>(columns) * width);
     const auto fill = [](auto& data, int multiplier) {
@@ -130,6 +133,7 @@ void benchmark_bfloat_vector(int width, int columns, int device) {
               << ",\"maximum_cublas_math_error\":" << maximum_cublas_math_error << "}\n"
               << std::flush;
 }
+#endif
 
 void benchmark_mixed_matrix(int rows, int device) {
     constexpr int width = 2560, columns = 10752;
@@ -267,6 +271,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "bf16") {
+#if defined(KIDI_CUDA_USE_CUBLAS)
             for (const auto columns : {256, 1536, 2048, 12288, 24576, 262144})
                 benchmark_bfloat_vector(1536, columns, device);
             benchmark_bfloat_vector(12288, 1536, device);
@@ -274,6 +279,9 @@ int main(int argc, char** argv) {
             benchmark_bfloat_vector(2048, 1536, device);
             benchmark_bfloat_vector(4096, 1536, device);
             return 0;
+#else
+            throw std::runtime_error("The BF16 vector comparison requires a cuBLAS build");
+#endif
         }
         for (const auto rows : {1, 4, 8, 16, 128}) {
             benchmark(rows, 768, 3072, device);
