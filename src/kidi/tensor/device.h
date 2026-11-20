@@ -37,6 +37,7 @@ struct SamplingCapabilities {
 enum class ExecutionDomain { HOST, DEVICE };
 enum class TransformerSupport { NONE, QUANTIZED, GENERAL };
 enum class AudioExecution { NONE, LOWERED, NATIVE };
+enum class CalibratedPackedCompute { NONE, INT8, LOW_BIT, HOST_DISPATCH };
 enum class HostAccess { DIRECT, EXPLICIT_TRANSFER, DEFERRED_TRANSFER };
 enum class AttentionExecution { STANDARD, FUSED };
 
@@ -46,10 +47,27 @@ struct ComputeCapabilities {
     AudioExecution audio = AudioExecution::NONE;
     bool embedding = false;
     bool embedding_sum = false;
+    CalibratedPackedCompute calibrated_packed = CalibratedPackedCompute::NONE;
 
     constexpr auto host() const noexcept -> bool { return execution == ExecutionDomain::HOST; }
     constexpr auto supports(TransformerSupport required) const noexcept -> bool { return transformer >= required; }
     constexpr auto native_audio() const noexcept -> bool { return audio == AudioExecution::NATIVE; }
+    constexpr auto supports_native_calibrated_packed(std::int32_t bits) const noexcept -> bool {
+        switch (calibrated_packed) {
+            case CalibratedPackedCompute::NONE:
+                return false;
+            case CalibratedPackedCompute::INT8:
+                return bits == 8;
+            case CalibratedPackedCompute::LOW_BIT:
+                return bits == 2 || bits == 4 || bits == 8;
+            case CalibratedPackedCompute::HOST_DISPATCH:
+                return host_supports_native_calibrated_packed(bits);
+        }
+        std::unreachable();
+    }
+
+private:
+    static auto host_supports_native_calibrated_packed(std::int32_t bits) noexcept -> bool;
 };
 
 struct AttentionCapabilities {
@@ -188,16 +206,20 @@ inline constexpr auto CPU_GELU_KERNEL = FeedForwardKernel::PACKED_LARGE;
 
 inline constexpr EnumMap<DeviceKind, DeviceProfile, static_cast<std::size_t>(DeviceKind::COUNT)> DEVICE_PROFILES{
     std::array{
-        std::pair{DeviceKind::CPU,
-                  DeviceProfile{.capabilities = {.compute = {ExecutionDomain::HOST, TransformerSupport::GENERAL,
-                                                             AudioExecution::LOWERED, true},
-                                                 .attention = {.int8_cache_tokens = 512},
-                                                 .memory = {HostAccess::DIRECT, true}},
-                                .policy = {.transformer = {.gelu = CPU_GELU_KERNEL,
-                                                           .silu = FeedForwardKernel::PACKED_GATE,
-                                                           .prefill = PrefillStrategy::LAST_TOKEN,
-                                                           .crop_history = true},
-                                           .replay = {.generator_opt_in = true}}}},
+        std::pair{
+            DeviceKind::CPU,
+            DeviceProfile{.capabilities = {.compute = {.execution = ExecutionDomain::HOST,
+                                                       .transformer = TransformerSupport::GENERAL,
+                                                       .audio = AudioExecution::LOWERED,
+                                                       .embedding = true,
+                                                       .calibrated_packed = CalibratedPackedCompute::HOST_DISPATCH},
+                                           .attention = {.int8_cache_tokens = 512},
+                                           .memory = {HostAccess::DIRECT, true}},
+                          .policy = {.transformer = {.gelu = CPU_GELU_KERNEL,
+                                                     .silu = FeedForwardKernel::PACKED_GATE,
+                                                     .prefill = PrefillStrategy::LAST_TOKEN,
+                                                     .crop_history = true},
+                                     .replay = {.generator_opt_in = true}}}},
         std::pair{DeviceKind::Q_NPU, DeviceProfile{}},
         std::pair{DeviceKind::CUDA,
                   DeviceProfile{.capabilities = {.compute = {.transformer = TransformerSupport::QUANTIZED,
@@ -212,7 +234,8 @@ inline constexpr EnumMap<DeviceKind, DeviceProfile, static_cast<std::size_t>(Dev
                                                            .decode_ahead_tokens = 16}}}},
         std::pair{DeviceKind::A_GPU,
                   DeviceProfile{.capabilities = {.compute = {.transformer = TransformerSupport::GENERAL,
-                                                             .audio = AudioExecution::NATIVE},
+                                                             .audio = AudioExecution::NATIVE,
+                                                             .calibrated_packed = CalibratedPackedCompute::INT8},
                                                  .sampling = {TokenSelection::BATCHED_DEVICE},
                                                  .attention = {.execution = AttentionExecution::FUSED},
                                                  .memory = {.access = HostAccess::DIRECT}},
@@ -230,7 +253,8 @@ inline constexpr EnumMap<DeviceKind, DeviceProfile, static_cast<std::size_t>(Dev
             DeviceProfile{.capabilities = {.compute = {.transformer = TransformerSupport::QUANTIZED,
                                                        .audio = AudioExecution::NATIVE,
                                                        .embedding = true,
-                                                       .embedding_sum = true},
+                                                       .embedding_sum = true,
+                                                       .calibrated_packed = CalibratedPackedCompute::LOW_BIT},
                                            .sampling = {TokenSelection::DEVICE, true},
                                            .attention = {.int8_cache_tokens = std::numeric_limits<std::size_t>::max()},
                                            .memory = {HostAccess::DEFERRED_TRANSFER, true}},
@@ -240,20 +264,21 @@ inline constexpr EnumMap<DeviceKind, DeviceProfile, static_cast<std::size_t>(Dev
                                                      .attention_query_rows = std::numeric_limits<std::int64_t>::max()},
                                      .replay = {.region_layers = 4, .cache_capacity = 4},
                                      .dispatch = {.parameters = ParameterBinding::DYNAMIC, .cache_capacity = 2048}}}},
-        std::pair{
-            DeviceKind::VULKAN,
-            DeviceProfile{.capabilities = {.compute = {.transformer = TransformerSupport::QUANTIZED, .embedding = true},
-                                           .sampling = {TokenSelection::DEVICE},
-                                           .attention = {.int8_cache_tokens = 512},
-                                           .memory = {HostAccess::DIRECT, true}},
-                          .policy = {.parameters = {.projections = ParameterResidency::HOST,
-                                                    .embeddings = ParameterResidency::HOST,
-                                                    .normalization = ParameterResidency::HOST},
-                                     .transformer = {.gelu = FeedForwardKernel::PACKED_LARGE,
-                                                     .silu = FeedForwardKernel::PACKED_LARGE,
-                                                     .prefill = PrefillStrategy::LAST_TOKEN,
-                                                     .crop_history = true},
-                                     .replay = {.generator_opt_in = true}}}},
+        std::pair{DeviceKind::VULKAN,
+                  DeviceProfile{.capabilities = {.compute = {.transformer = TransformerSupport::QUANTIZED,
+                                                             .embedding = true,
+                                                             .calibrated_packed = CalibratedPackedCompute::LOW_BIT},
+                                                 .sampling = {TokenSelection::DEVICE},
+                                                 .attention = {.int8_cache_tokens = 512},
+                                                 .memory = {HostAccess::DIRECT, true}},
+                                .policy = {.parameters = {.projections = ParameterResidency::HOST,
+                                                          .embeddings = ParameterResidency::HOST,
+                                                          .normalization = ParameterResidency::HOST},
+                                           .transformer = {.gelu = FeedForwardKernel::PACKED_LARGE,
+                                                           .silu = FeedForwardKernel::PACKED_LARGE,
+                                                           .prefill = PrefillStrategy::LAST_TOKEN,
+                                                           .crop_history = true},
+                                           .replay = {.generator_opt_in = true}}}},
     }};
 
 struct Device {

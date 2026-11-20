@@ -1,7 +1,8 @@
 #include "kidi/ops/context.h"
 #include "kidi/layers/gemma4.h"
 #include "kidi/layers/audio.h"
-#include "ynnpack/include/ynnpack_cuda.h"
+#include "cuda/runtime.h"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -140,6 +141,112 @@ auto check_projection_groups() -> bool {
     return captures == 2;
 }
 
+auto check_w8a16_projection_groups() -> bool {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    for (const std::int32_t group_size : {256, 128}) {
+        ops::Context context(device, false, true, DType::BF16), eager(device, false, false, DType::BF16);
+        context.set_precision(core::InferencePrecision::Q8A16);
+        eager.set_precision(core::InferencePrecision::Q8A16);
+        const std::int64_t groups = 256 / group_size;
+        std::vector<Tensor> weights, proj_scales, norm_scales;
+        for (const int columns : {64, 128, 256}) {
+            std::vector<std::uint8_t> w(columns * 256);
+            for (std::size_t index = 0; index < w.size(); ++index)
+                w[index] = static_cast<std::uint8_t>(static_cast<int>(index * 13 % 251) - 125);
+            weights.push_back(
+                require(Tensor::from_bytes({columns, 256}, DType::U8, std::as_bytes(std::span(w)), device)));
+            std::vector<float> pscales(columns * groups);
+            for (std::size_t index = 0; index < pscales.size(); ++index) pscales[index] = ((index % 7) + 1) * 0.015625F;
+            proj_scales.push_back(
+                require(Tensor::from_host({columns, groups}, std::span<const float>(pscales), device)));
+            norm_scales.push_back(require(
+                Tensor::from_host({columns}, std::span<const float>(std::vector<float>(columns, 1.F)), device)));
+        }
+        const auto scale =
+            require(Tensor::from_host({256}, std::span<const float>(std::vector<float>(256, 1.F)), device));
+        std::size_t captures = 0;
+        for (int iteration = 0; iteration < 5; ++iteration) {
+            std::array<float, 256> values{};
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = (static_cast<int>((index + iteration) * 7 % 23) - 11) * 0.125F;
+            const auto input = context.cast(
+                require(Tensor::from_host({1, 1, 256}, std::span<const float>(values), device)), DType::BF16);
+            const std::array arguments{input};
+            const auto outputs =
+                context.replay("cuda-w8a16-projections", arguments, [&](std::span<const Tensor> operands) {
+                    ++captures;
+                    const auto normalized = context.rms_norm(operands[0], scale, 1e-6F);
+                    std::vector<Tensor> result;
+                    for (std::size_t index = 0; index < weights.size(); ++index)
+                        result.push_back(
+                            context.rms_norm(context.packed_linear(normalized, weights[index], proj_scales[index], 8,
+                                                                   group_size, 0.F, 0.F),
+                                             norm_scales[index], 1e-6F));
+                    return result;
+                });
+            const auto normalized = eager.rms_norm(input, scale, 1e-6F);
+            for (std::size_t index = 0; index < weights.size(); ++index) {
+                const auto expected = eager.rms_norm(
+                    eager.packed_linear(normalized, weights[index], proj_scales[index], 8, group_size, 0.F, 0.F),
+                    norm_scales[index], 1e-6F);
+                if (require(outputs[index].copy_to_host()) != require(expected.copy_to_host())) return false;
+            }
+        }
+        if (captures != 2) return false;
+    }
+    // Verify F32 W8A8 sibling projection fusion.
+    {
+        ops::Context context(device, false, true), eager(device, false, false);
+        std::vector<Tensor> weights, proj_scales, norm_scales;
+        for (const int columns : {64, 128, 256}) {
+            std::vector<std::uint8_t> w(columns * 256);
+            for (std::size_t index = 0; index < w.size(); ++index)
+                w[index] = static_cast<std::uint8_t>(static_cast<int>(index * 13 % 251) - 125);
+            weights.push_back(
+                require(Tensor::from_bytes({columns, 256}, DType::U8, std::as_bytes(std::span(w)), device)));
+            std::vector<float> pscales(columns);
+            for (std::size_t index = 0; index < pscales.size(); ++index) pscales[index] = ((index % 7) + 1) * 0.015625F;
+            proj_scales.push_back(require(Tensor::from_host({columns, 1}, std::span<const float>(pscales), device)));
+            norm_scales.push_back(require(
+                Tensor::from_host({columns}, std::span<const float>(std::vector<float>(columns, 1.F)), device)));
+        }
+        const auto scale =
+            require(Tensor::from_host({256}, std::span<const float>(std::vector<float>(256, 1.F)), device));
+        std::size_t captures = 0;
+        for (int iteration = 0; iteration < 5; ++iteration) {
+            std::array<float, 256> values{};
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = (static_cast<int>((index + iteration) * 7 % 23) - 11) * 0.125F;
+            const auto input = require(Tensor::from_host({1, 1, 256}, std::span<const float>(values), device));
+            const std::array arguments{input};
+            const auto outputs =
+                context.replay("cuda-w8a8-projections", arguments, [&](std::span<const Tensor> operands) {
+                    ++captures;
+                    const auto normalized = context.rms_norm(operands[0], scale, 1e-6F);
+                    std::vector<Tensor> result;
+                    for (std::size_t index = 0; index < weights.size(); ++index)
+                        result.push_back(context.rms_norm(
+                            context.packed_linear(normalized, weights[index], proj_scales[index], 8, 256, 0.F, 0.F),
+                            norm_scales[index], 1e-6F));
+                    return result;
+                });
+            const auto normalized = eager.rms_norm(input, scale, 1e-6F);
+            for (std::size_t index = 0; index < weights.size(); ++index) {
+                const auto expected = eager.rms_norm(
+                    eager.packed_linear(normalized, weights[index], proj_scales[index], 8, 256, 0.F, 0.F),
+                    norm_scales[index], 1e-6F);
+                if (require(outputs[index].copy_to_host()) != require(expected.copy_to_host())) return false;
+            }
+        }
+        if (captures != 2) return false;
+    }
+    return true;
+}
+
 auto check_input_staging() -> bool {
     using namespace kidi;
     using ops::require;
@@ -164,8 +271,8 @@ auto check_input_staging() -> bool {
             return false;
         const auto already = context.stage_inputs(staged);
         if (already[0].storage_identity() != staged[0].storage_identity()) return false;
-        if (iteration == 1) stable_bytes = ynn::cuda::allocated_bytes();
-        if (iteration > 1 && ynn::cuda::allocated_bytes() != stable_bytes) return false;
+        if (iteration == 1) stable_bytes = kidi::cuda::allocated_bytes();
+        if (iteration > 1 && kidi::cuda::allocated_bytes() != stable_bytes) return false;
         for (auto& value : values) value += 1.F;
     }
     return true;
@@ -245,15 +352,15 @@ auto check_constant_cache_release() -> bool {
     const auto weight =
         require(Tensor::from_host({2, 4}, std::span<const float>(std::array{1.F, 0.F, 0.F, 0.F, 0.F, 0.F, 0.F, 1.F})));
     const auto bias = require(Tensor::from_host({2}, std::span<const float>(std::array{2.F, 3.F})));
-    const auto before = ynn::cuda::allocated_bytes();
+    const auto before = kidi::cuda::allocated_bytes();
     {
         const auto output = context.linear(input, weight, bias, true);
         const auto copied = require(output.to(tensor::Device::cpu()));
         if (!std::ranges::equal(require(copied.data<float>()), std::array{3.F, 7.F})) return false;
     }
-    if (ynn::cuda::allocated_bytes() <= before) return false;
+    if (kidi::cuda::allocated_bytes() <= before) return false;
     context.release_workspaces();
-    return ynn::cuda::allocated_bytes() == before;
+    return kidi::cuda::allocated_bytes() == before;
 }
 
 auto check_readback_source_release() -> bool {
@@ -263,7 +370,7 @@ auto check_readback_source_release() -> bool {
     using tensor::Tensor;
     const auto device = tensor::Device::cuda();
     ops::Context context(device);
-    const auto before = ynn::cuda::allocated_bytes();
+    const auto before = kidi::cuda::allocated_bytes();
     std::shared_ptr<tensor::Readback> pending;
     {
         const auto source = require(Tensor::zeros({65536}, DType::I32, device));
@@ -271,7 +378,7 @@ auto check_readback_source_release() -> bool {
     }
     context.synchronize();
     if (!require(pending->ready()) || require(pending->bytes()).size() != sizeof(std::int32_t)) return false;
-    return ynn::cuda::allocated_bytes() == before;
+    return kidi::cuda::allocated_bytes() == before;
 }
 
 auto check_greedy_partitions() -> bool {
@@ -446,10 +553,10 @@ auto check_scatter_updates() -> bool {
     const auto updates = require(Tensor::from_host({2, 3, 4}, std::span<const float>(values), context.device()));
     const auto indices = require(Tensor::from_host({3}, std::span<const std::int32_t>(rows), context.device()));
     const auto identity = cache.storage_identity();
-    const auto before = ynn::cuda::allocated_bytes();
+    const auto before = kidi::cuda::allocated_bytes();
     context.scatter_(cache, updates, indices);
     context.synchronize();
-    if (cache.storage_identity() != identity || ynn::cuda::allocated_bytes() != before) return false;
+    if (cache.storage_identity() != identity || kidi::cuda::allocated_bytes() != before) return false;
     const auto copied = require(cache.to(tensor::Device::cpu()));
     const auto actual = require(copied.data<float>());
     for (std::size_t batch = 0; batch < 2; ++batch)
@@ -604,53 +711,70 @@ auto check_projection_paths() -> bool {
     using tensor::Tensor;
     ops::Context cpu;
     ops::Context cuda(tensor::Device::cuda());
-    constexpr std::int64_t WIDTH = 16, COLUMNS = 8;
-    for (const std::int64_t rows : {1, 8}) {
-        std::vector<float> values(rows * WIDTH), scales(COLUMNS), biases(COLUMNS);
-        for (std::size_t index = 0; index < values.size(); ++index)
-            values[index] = index / WIDTH == 2   ? 0.F
-                            : index / WIDTH == 3 ? (index % 2 ? -1000.F : 1000.F)
-                                                 : (static_cast<int>(index * 13 % 41) - 17) * 0.125F;
-        for (std::size_t index = 0; index < scales.size(); ++index) {
-            scales[index] = static_cast<float>(index + 1) * 0.001F;
-            biases[index] = static_cast<float>(index) * 0.01F;
-        }
-        const auto host = require(Tensor::from_host({rows, WIDTH}, std::span<const float>(values)));
-        const auto input = require(host.to(tensor::Device::cuda()));
-        const auto scale = require(Tensor::from_host({COLUMNS, 1}, std::span<const float>(scales)));
-        const auto bias = require(Tensor::from_host({COLUMNS}, std::span<const float>(biases)));
-        for (const int bits : {0, 2, 4, 8}) {
-            std::vector<std::uint8_t> weights(COLUMNS * WIDTH / (bits ? 8 / bits : 1), 0);
-            for (std::size_t index = 0; index < COLUMNS * WIDTH; ++index) {
-                if (!bits)
-                    weights[index] = static_cast<std::uint8_t>(static_cast<int>(index * 11 % 255) - 127);
-                else {
-                    const auto value =
-                        static_cast<unsigned int>(static_cast<int>(index * 7 % (1 << bits)) - (1 << (bits - 1))) &
-                        ((1 << bits) - 1);
-                    weights[index / (8 / bits)] |= value << (index % (8 / bits) * bits);
-                }
+    constexpr std::int64_t COLUMNS = 8;
+    for (const std::int64_t width : {16, 17}) {
+        for (const std::int64_t rows : {1, 8}) {
+            std::vector<float> values(rows * width), scales(COLUMNS), biases(COLUMNS);
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = index / width == 2   ? 0.F
+                                : index / width == 3 ? (index % 2 ? -1000.F : 1000.F)
+                                                     : (static_cast<int>(index * 13 % 41) - 17) * 0.125F;
+            if (rows > 6) {
+                constexpr std::array TIES{-126.5F, 128.5F, 0.5F, -0.5F, 1.5F, -1.5F, 2.5F, -2.5F};
+                std::ranges::copy(TIES, values.begin() + 5 * width);
+                // This zero point changes when the multiply and add are fused.
+                values[6 * width] = -6901.607421875F;
+                values[6 * width + 1] = 2637.199462890625F;
             }
-            const auto weight =
-                require(Tensor::from_bytes({COLUMNS, WIDTH / (bits ? 8 / bits : 1)}, bits ? DType::U8 : DType::I8,
-                                           std::as_bytes(std::span(weights))));
-            const auto expected = bits ? cpu.packed_linear(host, weight, scale, bits, WIDTH, 0.125F, 0.0625F)
-                                       : cpu.quantized_linear(host, weight, scale, bias, true);
-            for (int repetition = 0; repetition < 2; ++repetition) {
-                const auto actual =
-                    require((bits ? cuda.packed_linear(input, weight, scale, bits, WIDTH, 0.125F, 0.0625F)
+            for (std::size_t index = 0; index < scales.size(); ++index) {
+                scales[index] = static_cast<float>(index + 1) * 0.001F;
+                biases[index] = static_cast<float>(index) * 0.01F;
+            }
+            const auto host = require(Tensor::from_host({rows, width}, std::span<const float>(values)));
+            const auto input = require(host.to(tensor::Device::cuda()));
+            const auto scale = require(Tensor::from_host({COLUMNS, 1}, std::span<const float>(scales)));
+            const auto bias = require(Tensor::from_host({COLUMNS}, std::span<const float>(biases)));
+            for (const int bits : {0, 2, 4, 8}) {
+                if (bits && width % (8 / bits)) continue;
+                std::vector<std::uint8_t> weights(COLUMNS * width / (bits ? 8 / bits : 1), 0);
+                for (std::size_t index = 0; index < COLUMNS * width; ++index) {
+                    if (!bits)
+                        weights[index] = static_cast<std::uint8_t>(static_cast<int>(index * 11 % 255) - 127);
+                    else {
+                        const auto value =
+                            static_cast<unsigned int>(static_cast<int>(index * 7 % (1 << bits)) - (1 << (bits - 1))) &
+                            ((1 << bits) - 1);
+                        weights[index / (8 / bits)] |= value << (index % (8 / bits) * bits);
+                    }
+                }
+                const auto weight =
+                    require(Tensor::from_bytes({COLUMNS, width / (bits ? 8 / bits : 1)}, bits ? DType::U8 : DType::I8,
+                                               std::as_bytes(std::span(weights))));
+                for (const float input_scale : {0.F, 0.125F}) {
+                    if (!bits && input_scale) continue;
+                    const float output_scale = input_scale ? 0.0625F : 0.F;
+                    const auto expected =
+                        bits ? cpu.packed_linear(host, weight, scale, bits, width, input_scale, output_scale)
+                             : cpu.quantized_linear(host, weight, scale, bias, true);
+                    for (int repetition = 0; repetition < 2; ++repetition) {
+                        const auto actual = require(
+                            (bits ? cuda.packed_linear(input, weight, scale, bits, width, input_scale, output_scale)
                                   : cuda.quantized_linear(input, weight, scale, bias, true))
                                 .to(tensor::Device::cpu()));
-                const auto actual_values = require(actual.data<float>()),
-                           expected_values = require(expected.data<float>());
-                for (std::size_t index = 0; index < actual_values.size(); ++index)
-                    if (std::abs(actual_values[index] - expected_values[index]) >
-                        1e-4F + (bits ? 0.F : 1e-6F * std::abs(expected_values[index]))) {
-                        std::cerr << "projection mismatch rows=" << rows << " bits=" << bits << " index=" << index
-                                  << " actual=" << actual_values[index] << " expected=" << expected_values[index]
-                                  << '\n';
-                        return false;
+                        const auto actual_values = require(actual.data<float>()),
+                                   expected_values = require(expected.data<float>());
+                        for (std::size_t index = 0; index < actual_values.size(); ++index)
+                            if (!std::isfinite(actual_values[index]) ||
+                                std::abs(actual_values[index] - expected_values[index]) >
+                                    1e-4F + (bits ? 0.F : 1e-6F * std::abs(expected_values[index]))) {
+                                std::cerr << "projection mismatch width=" << width << " rows=" << rows
+                                          << " bits=" << bits << " input_scale=" << input_scale << " index=" << index
+                                          << " actual=" << actual_values[index]
+                                          << " expected=" << expected_values[index] << '\n';
+                                return false;
+                            }
                     }
+                }
             }
         }
     }
@@ -661,7 +785,7 @@ auto check_projection_paths() -> bool {
 auto main() -> int {
     using namespace kidi;
     try {
-        if (!ynn::cuda::available()) return 77;
+        if (!kidi::cuda::available()) return 77;
         if (!check_constant_cache_release())
             throw std::runtime_error("CUDA workspace release retained unused constants");
         if (!check_dynamic_projection_weights()) throw std::runtime_error("CUDA fusion froze dynamic step weights");
@@ -670,6 +794,8 @@ auto main() -> int {
         if (!check_attention_bindings()) throw std::runtime_error("CUDA attention retained a stale KV pointer");
         if (!check_async_readback()) throw std::runtime_error("CUDA nonblocking readback snapshot failed");
         if (!check_projection_groups()) throw std::runtime_error("CUDA shared-input projection fusion failed");
+        if (!check_w8a16_projection_groups())
+            throw std::runtime_error("CUDA shared-input W8A16 projection fusion failed");
         if (!check_input_staging()) throw std::runtime_error("CUDA reusable input staging failed");
         if (!check_greedy_partitions()) throw std::runtime_error("CUDA parallel token selection changed tie-breaking");
         if (!check_bfloat_fusions()) throw std::runtime_error("CUDA BF16 fusion changed intermediate rounding");
@@ -829,9 +955,9 @@ auto main() -> int {
         const auto packed_expected = ops::require(packed_reference.data<float>());
         for (std::size_t index = 0; index < packed_actual.size(); ++index)
             if (std::abs(packed_actual[index] - packed_expected[index]) > 1e-5F) return 1;
-        std::cout << "CUDA numerical checks include W8A8 projection, embedding, cuBLAS GEMM, softmax, RMS/layer norm, "
+        std::cout << "CUDA numerical checks include W8A8 projection, embedding, GEMM, softmax, RMS/layer norm, "
                      "convolution, attention, and device routing\n";
-        for (int index = 0; index < ynn::cuda::device_count(); ++index) {
+        for (int index = 0; index < kidi::cuda::device_count(); ++index) {
             const auto device = tensor::Device::cuda(index);
             const auto selected_input = ops::require(host.to(device));
             const auto selected_bias = ops::require(other.to(tensor::Device::cpu())).to(device);
@@ -842,7 +968,7 @@ auto main() -> int {
             if (!std::ranges::equal(ops::require(copied.data<float>()), std::array<float, 6>{21, 42, 63, 24, 45, 66}))
                 return 1;
         }
-        if (tensor::Tensor::empty({1}, tensor::DType::F32, tensor::Device::cuda(ynn::cuda::device_count()))) return 1;
+        if (tensor::Tensor::empty({1}, tensor::DType::F32, tensor::Device::cuda(kidi::cuda::device_count()))) return 1;
         std::cout << "Kidi CUDA storage, broadcast and in-place tests PASS\n";
         return 0;
     } catch (const std::exception& error) {

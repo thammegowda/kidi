@@ -87,7 +87,8 @@ operations; Android Gmail or webpage integration is not introduced here.
 | `app` | Typed assistant actions, request validation, and prompt/message policy |
 | `runtime/ynn` | Private prepared CPU operators and YNNPACK ownership |
 | `runtime/mps` | Private prepared Metal operators, command batches, INT8 kernels |
-| `runtime/cuda` | Private prepared CUDA operators, quantized YNNPACK CUDA execution |
+| `kidi-ops/src/cuda` | CUDA storage, prepared operators, replay, and kernels |
+| `kidi-ops/src/qnn` | QNN host step compiler and standalone HTP op package |
 | `text`, `cli` | Tokenization and command/input/output policy |
 
 RTG is an import/package format, not the owner of general modeling code. Do not
@@ -1134,7 +1135,7 @@ FP32 tensors; no input is mutated. Gemma 4 uses it for post-attention, post-MLP,
 post-per-layer-input residuals. CPU and Metal implement the same equation without
 duplicating model topology or introducing model-level graphs.
 
-CUDA is an optional eager backend using YNNPACK CUDA operators for native quantized
+CUDA is an optional eager backend in `kidi-ops` for native quantized
 projections, attention, normalization, embeddings, token selection, and audio
 operations. It uses the same models and capability contract as other backends;
 unsupported CUDA operations fail rather than falling back to CPU. QNN is
@@ -1279,7 +1280,7 @@ of a 128-token INT8-KV prefill step found element-wise work dominating (GELU-tan
 chain 30%, other multiply/add 26%, quantize/dequantize 20%, RMS norms 10%), while
 HMX matmuls were 3.6% and attention 1%.
 
-`kidi-ops` is a standalone QNN HTP op package (QHPI,
+`kidi-ops/src/qnn/htp` is a standalone QNN HTP op package (QHPI,
 multithreaded HVX) that restores those fusions on the NPU. `GeluMultiply` maps
 the UINT8 gate/up projection output directly to the UINT8 input of the down
 projection in one pass, and `RmsNorm` covers plain and residual norms with an

@@ -100,9 +100,10 @@ struct Context::Impl {
         std::size_t rows, packed_columns, scale_count;
         auto operator<=>(const DequantizedKey&) const = default;
     };
-    std::map<const std::byte*, PackedBinding> packed_weights;
+    std::map<const void*, PackedBinding> packed_weights;
     std::map<const void*, Tensor> packed_zeros;
     std::map<DequantizedKey, DequantizedBinding> dequantized_weights;
+    tensor::DType parameter_dtype = tensor::DType::F32;
     core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
     std::uint64_t preparation = 0;
     bool profiling = false;
@@ -207,10 +208,9 @@ struct Context::Impl {
         if (spec.operation == Operation::PACKED_LINEAR) {
             const auto bits = spec.attributes[0], group = spec.attributes[1];
             invalid((bits != 2 && bits != 4 && bits != 8) || group <= 0, "invalid packed linear precision or group");
-            invalid(input.dtype() != tensor::DType::F32 || input.dimensions() < 2 || !input.size(-1) ||
-                        input.size(-1) % group || group % (8 / bits) || inputs[1].dtype() != tensor::DType::U8 ||
-                        inputs[1].dimensions() != 2 || !inputs[1].size(0) ||
-                        inputs[1].size(1) != input.size(-1) / (8 / bits) ||
+            invalid(!floating(input.dtype()) || input.dimensions() < 2 || !input.size(-1) || input.size(-1) % group ||
+                        group % (8 / bits) || inputs[1].dtype() != tensor::DType::U8 || inputs[1].dimensions() != 2 ||
+                        !inputs[1].size(0) || inputs[1].size(1) != input.size(-1) / (8 / bits) ||
                         (inputs[2].dtype() != tensor::DType::F32 && inputs[2].dtype() != tensor::DType::F16) ||
                         inputs[2].dimensions() != 2 || inputs[2].size(0) != inputs[1].size(0) ||
                         inputs[2].size(1) != input.size(-1) / group,
@@ -473,6 +473,7 @@ Context::Context(tensor::Device device, bool packed_prefill, std::optional<bool>
 #endif
     else
         throw Failure({ErrorCode::UNSUPPORTED, "no eager backend for requested device"});
+    impl_->parameter_dtype = parameter_dtype;
     impl_->activation_dtype = impl_->backend->activation_dtype(parameter_dtype);
     if (device.capabilities().compute.host()) impl_->compiler = default_compiler;
     const auto configured_replay = replay_enabled.value_or(!(replay && std::string_view(replay) == "0"));
@@ -525,6 +526,12 @@ auto Context::set_precision(core::InferencePrecision precision) noexcept -> void
     impl_->replays.clear_outputs();
     impl_->dequantized_weights.clear();
     impl_->precision = precision;
+    const auto effective_dtype =
+        (precision == core::InferencePrecision::BF16 || precision == core::InferencePrecision::Q8A16) &&
+                !device().capabilities().compute.host()
+            ? tensor::DType::BF16
+            : impl_->parameter_dtype;
+    impl_->activation_dtype = impl_->backend->activation_dtype(effective_dtype);
 }
 auto Context::precision() const noexcept -> core::InferencePrecision { return impl_->precision; }
 auto Context::replay_enabled() const noexcept -> bool { return impl_->replays.enabled(); }
@@ -743,7 +750,7 @@ auto Context::scaled_dot_product_attention(const Tensor& query, const Tensor& ke
 }
 auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight) -> Tensor {
     if (transpose_weight && !bias.defined() && !impl_->packed_weights.empty()) {
-        const auto found = impl_->packed_weights.find(require(weight.host_bytes()).data());
+        const auto found = impl_->packed_weights.find(weight.storage_identity());
         const bool single_row = input.dimensions() > 0 && input.numel() == input.size(-1);
         if (found != impl_->packed_weights.end() && found->second.source.dtype() == weight.dtype() &&
             std::ranges::equal(found->second.source.shape(), weight.shape()) &&
@@ -751,7 +758,11 @@ auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bi
             auto& binding = found->second;
             if (!binding.packed.values.defined()) {
                 const auto started = Clock::now();
-                auto packed = require(pack_weight(binding.source, binding.bits, binding.group_size, binding.asymmetric_clip));
+                const auto host_source = binding.source.is_host_accessible()
+                                             ? binding.source
+                                             : require(binding.source.to(tensor::Device::cpu()));
+                auto packed =
+                    require(pack_weight(host_source, binding.bits, binding.group_size, binding.asymmetric_clip));
                 binding.source.release_pages(false);
                 packed.values = require(packed.values.to(device()));
                 packed.scales = require(packed.scales.to(device()));
@@ -788,7 +799,7 @@ auto Context::prepare_linear_weights(const Tensor& weight, std::int32_t bits, st
         (bits != 2 && bits != 4 && bits != 8) || group_size <= 0 || group_size % (8 / bits) ||
         weight.size(1) % group_size || !weight.size(0) || !weight.size(1))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed weight dimensions, precision or group size"});
-    const auto address = require(weight.host_bytes()).data();
+    const auto address = weight.storage_identity();
     if (const auto found = impl_->packed_weights.find(address); found != impl_->packed_weights.end()) {
         if (found->second.bits != bits || found->second.group_size != group_size ||
             found->second.packed_prefill != packed_prefill || found->second.asymmetric_clip != asymmetric_clip ||
@@ -802,8 +813,9 @@ auto Context::prepare_linear_weights(const Tensor& weight, std::int32_t bits, st
             address, Impl::PackedBinding{weight, {}, bits, group_size, packed_prefill, asymmetric_clip, false});
         return;
     }
-    auto packed = require(pack_weight(weight, bits, group_size, asymmetric_clip));
-    weight.release_pages(false);
+    const auto host_weight = weight.is_host_accessible() ? weight : require(weight.to(tensor::Device::cpu()));
+    auto packed = require(pack_weight(host_weight, bits, group_size, asymmetric_clip));
+    if (weight.is_host_accessible()) weight.release_pages(false);
     packed.values = require(packed.values.to(device()));
     packed.scales = require(packed.scales.to(device()));
     if (packed.zeros.defined()) packed.zeros = require(packed.zeros.to(device()));
@@ -828,6 +840,13 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
         if (const auto found = impl_->packed_zeros.find(scales.storage_identity());
             found != impl_->packed_zeros.end() && found->second.defined())
             bound_zero = &found->second;
+    }
+    if (device().kind == tensor::DeviceKind::CUDA && impl_->precision == core::InferencePrecision::Q8A16 && bits == 8 &&
+        (!bound_zero || !bound_zero->defined())) {
+        const auto activation = input.dtype() == tensor::DType::BF16 ? input : cast(input, tensor::DType::BF16);
+        const std::array<std::int64_t, 3> attributes{bits, group_size, 0};
+        return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::BF16, 0.F},
+                          {&activation, &weight, &scales});
     }
     if (impl_->precision != core::InferencePrecision::CHECKPOINT &&
         impl_->precision != core::InferencePrecision::LOWBIT_PARITY) {
@@ -931,11 +950,16 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
             runtime::parity::packed_linear(input, weight, scales, bits, group_size, input_scale, output_scale));
     }
     const std::array<std::int64_t, 3> attributes{bits, group_size, std::bit_cast<std::int32_t>(output_scale)};
+    const auto output_dtype = device().kind == tensor::DeviceKind::CUDA && bits == 8 &&
+                                      impl_->activation_dtype == tensor::DType::BF16 &&
+                                      input.dtype() == tensor::DType::BF16 && input_scale == 0.F &&
+                                      output_scale == 0.F && (!bound_zero || !bound_zero->defined())
+                                  ? tensor::DType::BF16
+                                  : tensor::DType::F32;
     if (bound_zero && bound_zero->defined())
-        return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
+        return impl_->run({Operation::PACKED_LINEAR, attributes, output_dtype, input_scale},
                           {&input, &weight, &scales, bound_zero});
-    return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
-                      {&input, &weight, &scales});
+    return impl_->run({Operation::PACKED_LINEAR, attributes, output_dtype, input_scale}, {&input, &weight, &scales});
 }
 auto Context::gelu(const Tensor& input, bool approximate) -> Tensor {
     const std::array<std::int64_t, 1> attributes{approximate};
@@ -972,7 +996,8 @@ auto Context::gated_feed_forward(const Tensor& input, const Tensor& gate_up_weig
                                  std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
                                  float gate_up_output_scale, float down_input_scale, float down_output_scale, bool silu)
     -> Tensor {
-    if (impl_->precision != core::InferencePrecision::CHECKPOINT) {
+    if (impl_->precision != core::InferencePrecision::CHECKPOINT ||
+        !device().capabilities().compute.supports_native_calibrated_packed(bits)) {
         const auto gate_up = packed_linear(input, gate_up_weight, gate_up_scales, bits, input_size, gate_up_input_scale,
                                            gate_up_output_scale);
         const auto gate = slice(gate_up, -1, 0, intermediate_size);
@@ -1001,11 +1026,11 @@ auto Context::gelu_(Tensor& input, bool approximate) -> Tensor& {
 }
 auto Context::tanh(const Tensor& input) -> Tensor { return impl_->run({Operation::TANH, {}, input.dtype()}, {&input}); }
 auto Context::static_round(const Tensor& input, float scale) -> Tensor {
-    if (!input.defined() || input.dtype() != tensor::DType::F32 || input.device() != device() ||
-        !std::isfinite(scale) || scale < 0)
+    if (!input.defined() || (input.dtype() != tensor::DType::F32 && input.dtype() != impl_->activation_dtype) ||
+        input.device() != device() || !std::isfinite(scale) || scale < 0)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid static activation rounding"});
     if (scale == 0) return input;
-    return impl_->run({Operation::STATIC_ROUND, {}, tensor::DType::F32, scale}, {&input});
+    return impl_->run({Operation::STATIC_ROUND, {}, input.dtype(), scale}, {&input});
 }
 auto Context::rotary(const Tensor& input, const Tensor& cosine, const Tensor& sine) -> Tensor {
     return impl_->run({Operation::ROTARY, {}, input.dtype()}, {&input, &cosine, &sine});

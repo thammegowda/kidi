@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+namespace kidi::cuda {
 namespace {
 auto check(cuvsError_t result) -> void {
     if (result == CUVS_SUCCESS) return;
@@ -46,9 +47,7 @@ auto integer(std::string_view text) -> std::size_t {
         throw std::invalid_argument("expected positive integer cuVS helper arguments");
     return value;
 }
-} // namespace
-
-auto main(int argc, char** argv) -> int {
+auto run_index_tool(int argc, char** argv) -> int {
     try {
         if (argc != 8) {
             std::cerr << "usage: kidi-index-cuda VECTORS.f32 OUTPUT ROWS WIDTH M EF THREADS\n";
@@ -108,3 +107,7 @@ auto main(int argc, char** argv) -> int {
         return 1;
     }
 }
+} // namespace
+} // namespace kidi::cuda
+
+auto main(int argc, char** argv) -> int { return kidi::cuda::run_index_tool(argc, argv); }

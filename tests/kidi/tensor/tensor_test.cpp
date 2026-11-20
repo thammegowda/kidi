@@ -85,6 +85,12 @@ auto main() -> int {
     static_assert(!Device::cuda().capabilities().compute.supports(kidi::tensor::TransformerSupport::GENERAL));
     static_assert(Device::apple_gpu().capabilities().compute.supports(kidi::tensor::TransformerSupport::GENERAL));
     static_assert(Device::apple_gpu().capabilities().compute.supports(kidi::tensor::TransformerSupport::QUANTIZED));
+    static_assert(!Device::cuda().capabilities().compute.supports_native_calibrated_packed(8));
+    static_assert(!Device::apple_gpu().capabilities().compute.supports_native_calibrated_packed(4));
+    static_assert(Device::apple_gpu().capabilities().compute.supports_native_calibrated_packed(8));
+    static_assert(Device::web_gpu().capabilities().compute.supports_native_calibrated_packed(2));
+    static_assert(!Device::web_gpu().capabilities().compute.supports_native_calibrated_packed(3));
+    static_assert(Device::vulkan().capabilities().compute.supports_native_calibrated_packed(4));
     static_assert(Device::apple_gpu().parameter_device(kidi::tensor::ParameterRole::EMBEDDING) == Device::cpu());
     static_assert(Device::apple_gpu().parameter_device(kidi::tensor::ParameterRole::PROJECTION,
                                                        kidi::tensor::ParameterKind::QUANTIZED) == Device::cpu());

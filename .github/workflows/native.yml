@@ -9,6 +9,7 @@ on:
       - 'CMakeLists.txt'
       - 'CMakePresets.json'
       - 'cmake/**'
+      - 'kidi-ops/**'
       - 'src/kidi/**'
       - 'third_party/**'
       - 'python/**'
@@ -26,6 +27,7 @@ on:
       - 'CMakeLists.txt'
       - 'CMakePresets.json'
       - 'cmake/**'
+      - 'kidi-ops/**'
       - 'src/kidi/**'
       - 'third_party/**'
       - 'python/**'
@@ -46,14 +48,35 @@ concurrency:
 
 jobs:
   test:
-    runs-on: macos-26
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS ARM64 / Apple Clang
+            os: macos-26
+            cc: clang
+            cxx: clang++
+            cache-id: macos26-clang
+          - name: Linux x64 / GCC 14
+            os: ubuntu-24.04
+            cc: gcc-14
+            cxx: g++-14
+            cache-id: ubuntu2404-gcc14
+          - name: Linux ARM64 / GCC 14
+            os: ubuntu-24.04-arm
+            cc: gcc-14
+            cxx: g++-14
+            cache-id: ubuntu2404-gcc14
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
       CCACHE_DIR: ${{ github.workspace }}/.cache/ccache-native
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_COMPILERCHECK: content
       CCACHE_MAXSIZE: 500M
-      # macOS arm64 runners have 3 cores: build and test with all of them.
       CMAKE_GENERATOR: Ninja
       CMAKE_BUILD_PARALLEL_LEVEL: '3'
       CTEST_PARALLEL_LEVEL: '3'
@@ -76,16 +99,28 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      - name: Install build tools
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
         run: brew install ninja ccache
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache gcc-14 g++-14
 
       - name: Restore compiled objects
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: native-ccache-v2-${{ runner.os }}-${{ runner.arch }}-macos26-${{ github.sha }}
+          key: native-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache-id }}-${{ github.sha }}
           restore-keys: |
-            native-ccache-v2-${{ runner.os }}-${{ runner.arch }}-macos26-
+            native-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache-id }}-
 
       # One Release build serves the wheel and the tests: the wheel build configures build-ci with tests enabled and
       # compiles the library, and the test programs then link against the same objects.
@@ -105,7 +140,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: native-ccache-v2-${{ runner.os }}-${{ runner.arch }}-macos26-${{ github.sha }}
+          key: native-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache-id }}-${{ github.sha }}
 
       - name: Run native unit tests
         run: ctest --test-dir build-ci --output-on-failure

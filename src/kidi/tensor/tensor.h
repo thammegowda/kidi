@@ -14,6 +14,15 @@
 #include "kidi/tensor/dtype.h"
 
 namespace kidi::tensor {
+class Tensor;
+} // namespace kidi::tensor
+
+namespace kidi::cuda {
+struct BufferView;
+auto buffer_view(const tensor::Tensor& tensor) -> Result<BufferView>;
+} // namespace kidi::cuda
+
+namespace kidi::tensor {
 
 namespace detail {
 /// Inline metadata for common tensor ranks, with an owning fallback for larger ranks.
@@ -61,10 +70,8 @@ private:
 } // namespace detail
 
 struct MetalBufferView;
-struct CudaBufferView;
 struct WebGpuBufferView;
 class RowSource;
-class Tensor;
 auto external_tensor(std::vector<std::int64_t> shape, DType dtype, std::shared_ptr<const RowSource> source)
     -> Result<Tensor>;
 auto is_external(const Tensor& tensor) noexcept -> bool;
@@ -147,7 +154,7 @@ private:
            detail::Dimensions strides, std::int64_t storage_offset) noexcept;
 
     friend auto metal_buffer(const Tensor& tensor) -> Result<MetalBufferView>;
-    friend auto cuda_buffer(const Tensor& tensor) -> Result<CudaBufferView>;
+    friend auto cuda::buffer_view(const Tensor& tensor) -> Result<cuda::BufferView>;
     friend auto web_gpu_buffer(const Tensor& tensor) -> Result<WebGpuBufferView>;
     friend auto adopt_web_gpu_buffer(std::uint32_t handle, std::vector<std::int64_t> shape, DType dtype,
                                      std::int32_t packed_layout) -> Result<Tensor>;

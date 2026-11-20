@@ -41,6 +41,7 @@ public:
     auto has_hnsw() const noexcept -> bool;
     auto check_hnsw_binding() const -> void;
     auto release_workspaces() const -> void;
+    auto set_packed_weights(Tensor weight, Tensor scale, std::int32_t bits, std::int32_t group_size) -> void;
 
 private:
     friend class GatedFeedForwardImpl;

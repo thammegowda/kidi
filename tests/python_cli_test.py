@@ -342,7 +342,8 @@ class PythonCliTest(unittest.TestCase):
         import wave
 
         command = ([os.environ["KIDI_BIN"]] if "KIDI_BIN" in os.environ else [sys.executable, "-m", "kidi"])
-        command += ["transcribe", "-m", os.environ["KIDI_WHISPER_MODEL"], "--language", "en"]
+        command += ["transcribe", "-m", os.environ["KIDI_WHISPER_MODEL"], "--language", "en",
+                    "--backend", os.environ.get("KIDI_TEST_BACKEND", "ynnpack")]
         source = os.environ["KIDI_WHISPER_WAV"]
         with wave.open(source, "rb") as audio:
             self.assertEqual((audio.getnchannels(), audio.getsampwidth(), audio.getframerate()), (1, 2, 16000))

@@ -54,9 +54,12 @@ With Node.js 24+ and npm, run from the repository root:
 make web-deps
 ```
 
-[`prepare-libs.mjs`](../tools/prepare-libs.mjs) runs `npm ci --include=dev
+[`prepare-libs.mjs`](../tools/prepare-libs.mjs) runs `npm ci --omit=dev
 --ignore-scripts --no-audit --no-fund` when the installed lock changes, then stages
 only Mermaid and PDF.js files here. Package installation scripts are disabled.
+`make setup-test` calls it with `--tests` to include development-only test tools
+such as Playwright. Later build-only preparation preserves an existing test-tool
+installation.
 Their directories, preparation metadata, and `web/node_modules/` are ignored
 by Git. The preparation step must never overwrite vendored libraries or icons.
 

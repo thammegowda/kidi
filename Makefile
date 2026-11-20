@@ -1,30 +1,48 @@
 PYTHON ?= python3
 KIDI_HUB ?= $(HOME)/.cache/kidi/model-hub
-KIDI_BIN ?= build-release/kidi
-BACKEND ?= ynnpack
+KIDI_BIN ?= build-debug/kidi
+KIDI_BACKEND ?= ynnpack
 THREADS ?= 8
 MIN_CHRF ?= 99.0
 PORT ?= 8080
 WEB_DIR ?= build-web
 APP_CONFIG ?= examples/kidi-app.yaml
 APP_PORT ?= 10010
-TEST_PYTHON := .cache/test-venv/bin/python
-TEST_DIST := .cache/test-dist
+KIDI_CUTLASS_ROOT ?=
+TEST_PRESET ?= debug
+TEST_BUILD := build-$(TEST_PRESET)
+TEST_ENV := .cache/test-venv$(if $(filter debug-cuda,$(TEST_PRESET)),-cuda)
+TEST_PYTHON := $(TEST_ENV)/bin/python
+TEST_DIST := .cache/test-dist$(if $(filter debug-cuda,$(TEST_PRESET)),-cuda)
+TEST_CUDA := $(if $(filter debug-cuda,$(TEST_PRESET)),ON,OFF)
+TEST_BACKEND := $(if $(filter debug-cuda,$(TEST_PRESET)),cuda,$(KIDI_BACKEND))
+CUDA_CMAKE_ARGS = $(if $(KIDI_CUTLASS_ROOT),-DKIDI_CUTLASS_ROOT="$(abspath $(KIDI_CUTLASS_ROOT))")
 
+export PATH := $(CURDIR)/.cache/tools/bin:$(PATH)
 export KIDI_HUB PYTHON
 
-.PHONY: setup-test build-test build-python-test prepare-test native-test ynnpack-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
+.PHONY: setup setup-test debug debug-cuda release release-cuda build-test build-python-test prepare-test native-test test-cuda ynnpack-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
+
+refresh:
+	git submodule update --init --recursive --depth 10 --jobs 12
+
+setup:
+	bash scripts/setup.sh
+
+.PHONY: setup-node
+setup-node:
+	bash scripts/setup.sh --node-only
 
 setup-test:
-	bash tests/setup.sh
+	KIDI_TEST_PRESET="$(TEST_PRESET)" bash scripts/setup.sh --tests-only
 
-build-test:
-	cmake --preset release
-	cmake --build --preset release --target kidi_cli
+debug debug-cuda release release-cuda:
+	cmake --preset $@ $(if $(filter %-cuda,$@),$(CUDA_CMAKE_ARGS))
+	cmake --build --preset $@
 
-native-test:
-	cmake --preset debug -DKIDI_BUILD_INTEGRATION_TESTS=OFF
-	cmake --build --preset debug
+build-test: debug
+
+native-test: debug
 	ctest --preset debug -L native
 
 ynnpack-test:
@@ -32,13 +50,17 @@ ynnpack-test:
 
 build-python-test: setup-test
 	rm -rf "$(TEST_DIST)"
-	$(TEST_PYTHON) -m pip wheel --disable-pip-version-check --no-deps . --wheel-dir "$(TEST_DIST)"
+	$(TEST_PYTHON) -m pip wheel --disable-pip-version-check --no-deps --no-build-isolation . \
+		--wheel-dir "$(TEST_DIST)" -Cbuild-dir="$(TEST_BUILD)/python" \
+		-Ccmake.args=--preset=$(TEST_PRESET) -Ccmake.build-type=Debug -Cinstall.strip=false \
+		-Ccmake.define.KIDI_ENABLE_CUDA=$(TEST_CUDA) \
+		$(if $(filter ON,$(TEST_CUDA)),$(if $(KIDI_CUTLASS_ROOT),-Ccmake.define.KIDI_CUTLASS_ROOT="$(abspath $(KIDI_CUTLASS_ROOT))"))
 	wheel=$$(find "$(TEST_DIST)" -name 'kidi-*.whl' -print -quit); test -n "$$wheel"; $(TEST_PYTHON) -m pip install --disable-pip-version-check --force-reinstall --no-deps "$$wheel"
 
 python-test: build-python-test
 	$(TEST_PYTHON) -m unittest discover -s tests -p '*_test.py'
 
-web-deps:
+web-deps: setup-node
 	node web/tools/prepare-libs.mjs
 
 web-test: web-deps
@@ -47,17 +69,21 @@ web-test: web-deps
 web-smoke-test: web-deps
 	npm --prefix web run test:pages -- "$(abspath $(WEB_DIR))"
 
-regression-test: setup-test build-test
-	$(TEST_PYTHON) tests/rtg_regression.py run --binary "$(KIDI_BIN)" --backend "$(BACKEND)" --threads "$(THREADS)" --min-chrf "$(MIN_CHRF)"
+regression-test: setup-test debug
+	$(TEST_PYTHON) tests/rtg_regression.py setup
+	$(TEST_PYTHON) tests/rtg_regression.py run --binary "$(KIDI_BIN)" --backend "$(KIDI_BACKEND)" --threads "$(THREADS)" --min-chrf "$(MIN_CHRF)"
 
-prepare-test: build-test build-python-test
-	cmake --preset debug -DKIDI_BUILD_INTEGRATION_TESTS=ON \
-		-DKIDI_TEST_PYTHON="$(abspath $(TEST_PYTHON))" -DKIDI_TEST_BINARY="$(abspath $(KIDI_BIN))" \
-		-DKIDI_TEST_BACKEND="$(BACKEND)" -DKIDI_TEST_THREADS="$(THREADS)" -DKIDI_TEST_MIN_CHRF="$(MIN_CHRF)"
-	cmake --build --preset debug
+prepare-test: build-python-test
+	$(if $(filter debug,$(TEST_PRESET)),$(TEST_PYTHON) tests/rtg_regression.py setup)
+	cmake --preset $(TEST_PRESET) -DKIDI_BUILD_INTEGRATION_TESTS=ON \
+		-DKIDI_TEST_PYTHON="$(abspath $(TEST_PYTHON))" \
+		-DKIDI_TEST_BACKEND="$(TEST_BACKEND)" -DKIDI_TEST_THREADS="$(THREADS)" -DKIDI_TEST_MIN_CHRF="$(MIN_CHRF)" \
+		$(if $(filter ON,$(TEST_CUDA)),$(CUDA_CMAKE_ARGS))
+	cmake --build --preset $(TEST_PRESET)
 
-test: prepare-test
-	ctest --preset debug
+test test-cuda:
+	$(MAKE) prepare-test TEST_PRESET=$(patsubst test%,debug%,$@)
+	ctest --preset $(patsubst test%,debug%,$@)
 
 app:
 	cmake --preset release -DKIDI_BUILD_DESKTOP_APP=ON

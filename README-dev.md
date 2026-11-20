@@ -16,10 +16,25 @@ been tested on Apple Silicon/macOS 26; do not assume Linux or Windows parity
 without running their build and numerical checks.
 
 ```bash
-git clone --recurse-submodules https://github.com/thammegowda/kidi.git
+git clone https://github.com/thammegowda/kidi.git
 cd kidi
-git submodule update --init --recursive
+make setup
 ```
+
+`make setup` runs `scripts/setup.sh` on Ubuntu 24.04+ and macOS, on x64 or ARM64.
+It installs native build tools, initializes submodules recursively, and stages
+locked frontend build dependencies, without installing test-only packages or
+downloading test models. Ubuntu uses APT (root or sudo is required); macOS requires Homebrew and
+Xcode Command Line Tools already installed. Android and Emscripten SDKs remain
+separate setup steps.
+
+If Node.js 24+ and npm are missing, setup installs the official Node.js 24 binary
+under `.cache/tools/`, verifying its SHA-256 checksum. Make targets use
+these local tools. For direct shell commands, run
+`export PATH="$PWD/.cache/tools/bin:$PATH"`. `make setup-test` installs the
+Python test/build tools and browser test tools without APT or Homebrew.
+`make test` and `make test-cuda` prepare their test tools automatically.
+Model fixtures are acquired only by the test goals that need them.
 
 C/C++ dependencies are pinned submodules under `third_party/`.
 [ynnpack-dev](https://github.com/thammegowda/ynnpack-dev) owns nested Slinky,
@@ -35,10 +50,24 @@ CLI-only and Python wheel targets do not acquire web packages or require Node.js
 ## Native Build
 
 ```bash
-cmake --preset release
-cmake --build --preset release --target kidi_cli
+make release
 build-release/kidi --help
 ```
+
+The standard goals use matching CMake configure/build presets:
+
+| Goal | Build directory | Configuration |
+|---|---|---|
+| `debug` | `build-debug` | Debug symbols and native tests; CUDA off |
+| `test` | `build-debug` | Debug build, Python tests, and supported model regressions |
+| `release` | `build-release` | Release, no tests or debug symbols |
+| `debug-cuda` | `build-debug-cuda` | Same as `debug`, with CUDA on |
+| `test-cuda` | `build-debug-cuda` | Same as `test`, restricted to CUDA-compatible suites |
+| `release-cuda` | `build-release-cuda` | Same as `release`, with CUDA on |
+
+Build goals do not run tests. Test goals build their corresponding Debug
+artifacts before running CTest. CUDA builds additionally require the CUDA toolkit;
+setup does not install GPU drivers or SDKs.
 
 The standalone executable needs no Python or separate inference runtime, but
 accepts local model paths only. The Python launcher supplies Hugging Face Hub
@@ -47,20 +76,51 @@ runtime memory must be measured separately from artifact size.
 
 ### CUDA
 
-The optional NVIDIA backend requires Linux, the CUDA 13+ toolkit, a cuVS SDK
-with its C API and shared-library dependencies, DLPack headers, and a compatible
-GPU. `KIDI_ENABLE_CUDA=ON` enables both CUDA inference and GPU HNSW index
-construction. From an initialized checkout, enable it for the standalone CLI:
+The optional NVIDIA backend requires Linux, the CUDA 13+ toolkit, and a
+compatible GPU. From an initialized checkout, build the standalone portable
+static CUDA CLI (`build-release-cuda/kidi`):
 
 ```bash
-cmake --preset release -DKIDI_ENABLE_CUDA=ON
-cmake --build --preset release --target kidi_cli
-build-release/kidi chat --model /path/to/gemma-model --backend cuda:0
+make release-cuda
+build-release-cuda/kidi chat --model /path/to/gemma-model --backend cuda:0
 ```
 
-For a nonstandard SDK installation, add `-DKIDI_CUVS_ROOT=/path/to/cuvs` and,
-if needed, `-DKIDI_DLPACK_INCLUDE_DIR=/path/to/include` to the configure command.
-CUDA configuration fails if these required dependencies cannot be found.
+The `release-cuda` preset statically links the CUDA, C++, and libgcc runtimes
+and uses Kidi's native CUDA kernels without cuBLAS or cuBLASLt. The CLI needs a
+compatible NVIDIA driver and system glibc, with no CUDA toolkit shared-library
+dependencies (`VerifyPortableElf.cmake`). Model files remain separate. If a cuVS
+SDK (with its C API and DLPack headers) is also present, `KIDI_ENABLE_CUDA=ON`
+additionally builds the separate `kidi-index-cuda` GPU HNSW index construction
+helper (`-DKIDI_CUVS_ROOT=/path/to/cuvs`, `-DKIDI_DLPACK_INCLUDE_DIR=/path/to/include`).
+
+The preset embeds `sm_80` and `sm_90` GPU code and `compute_90` PTX. Override
+`CMAKE_CUDA_ARCHITECTURES` at configure time for other targets. To enable
+Tensor Core GEMMs and FlashAttention-2 with a build-time CUTLASS checkout
+(tested with `v4.6.0-8-ge64a9136`):
+
+```bash
+cmake --preset release-cuda -DKIDI_CUTLASS_ROOT=/path/to/cutlass
+cmake --build --preset release-cuda --target kidi_cli
+```
+
+This compiles BF16, W8A16, and W8A8 Tensor Core GEMMs, tiled BF16/FP32
+FlashAttention-2 prefill (`head_dim` 64/128/256/512), and a tiled FP32 CUDA-core
+GEMM into the `15.69 MiB` CLI without adding any CUDA toolkit shared-library
+dependencies (`VerifyPortableElf.cmake`). The dense fast paths support eligible
+transposed weights (`sm_80` and `sm_90`); FP32 does not use TF32. Native CUDA
+W8A16 (`--precision w8a16`) runs both calibrated INT8 checkpoints and unquantized
+BF16 checkpoints with INT8 weights and BF16 activations/KV cache, while W8A8
+accelerates affine INT8 and calibrated/uncalibrated packed INT8 projections (plus
+single-group packed INT4/INT2 projections expanded to INT8) with fused
+epilogues and partitioned FP32 FlashDecoding. Small-row decode uses specialized
+vector kernels and CUDA Graph sibling fusion when eligible. On H100 (Gemma 4 E4B,
+162-token prompt / 128-token prefill chunks), compact BF16 reaches `9,281`
+prefill / `134.1` decode tok/s (`0.78 ms` exact-128 attention, `11.93 ms`
+exact-128 window vs `14.21 ms` historical shared cuBLAS), compact W8A16 reaches
+`8,503` prefill / `159.3` decode tok/s at `7.95 GiB` peak VRAM, and compact W8A8
+reaches `7,735` prefill / `139.3` decode tok/s (`9,974` / `138.5` at 1,098
+tokens). See the [CUDA performance plan](docs/cuda-performance-plan.md) for
+shapes, graph capture, and benchmark details.
 
 For the Python launcher, build and install a CUDA-enabled package separately:
 
@@ -345,8 +405,8 @@ Checkpoint I/O -> Model-owned configuration and preparation hooks
 ```
 
 Kidi uses C++23 with a shared model implementation across backends. CPU uses
-YNNPACK; Apple GPUs use Metal; NVIDIA GPUs can use the optional YNNPACK CUDA
-runtime (`KIDI_ENABLE_CUDA=ON`). Models are ordinary C++ composed from reusable
+YNNPACK; Apple GPUs use Metal; NVIDIA GPUs can use the optional `kidi-ops` CUDA
+backend (`KIDI_ENABLE_CUDA=ON`). Models are ordinary C++ composed from reusable
 layers and concrete tensors, not exported model graphs. Backend-specific
 operator preparation and fusion remain internal to the runtime.
 
@@ -396,23 +456,19 @@ seconds** (`--threads 10`), producing a **39,927,380-byte** graph-only file.
 Progress includes row counts, percentage, elapsed time, rate and an
 interval-based ETA.
 
-CUDA-enabled builds also include native cuVS offline construction, which builds
-the graph on CUDA and exports it for CPU search. The existing
-`KIDI_ENABLE_CUDA=ON` setting enables inference and indexing together; there is
-no separate vector-search feature switch. See the [CUDA requirements](#cuda).
-`--builder auto` selects this backend when compiled and a CUDA device is present;
+With the optional cuVS helper, CUDA-enabled builds can construct the graph on
+CUDA and export it for CPU search. See the [CUDA requirements](#cuda).
+`--builder auto` selects this backend when the helper and a CUDA device are present;
 `--builder cpu` forces the deterministic builder. For example:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 build-release/kidi index --model /path/to/gemma-4 --builder cuda --threads 4
+CUDA_VISIBLE_DEVICES=0 build-release-cuda/kidi index --model /path/to/gemma-4 --builder cuda --threads 4
 ```
 
 The native `kidi-index-cuda` helper runs in a separate process, so a cuVS SDK
 built against another CUDA major version cannot interfere with inference's
 CUDA libraries. Keep the helper beside `kidi` or on `PATH`. No Python runtime is
-used. The command has only three source files: `cli/index.h`, `cli/index.cpp`,
-and `cli/index.cu`. The existing `KIDI_HAS_CUDA` macro selects CUDA dispatch or
-unavailable-backend stubs; only the CUDA-only `index.cu` target links the cuVS SDK.
+used. Only the `kidi-ops` helper links the cuVS SDK; the CLI discovers it at runtime.
 GPU construction uses raw FP32 representations of the original weights,
 then verifies every exported vector, label and ordered live edge before packing
 the graph. cuVS does not expose per-node progress or a seeded construction API;
@@ -518,18 +574,46 @@ Native unit tests, without downloading a model:
 make native-test
 ```
 
-This configures Debug with integration tests disabled. For the complete suite:
+This builds the `debug` preset with integration tests disabled. To include Python
+and supported model regression tests:
 
 ```bash
 make test
 ```
 
-`make test` builds required artifacts and runs native tests, installed-wheel
-Python tests, browser tests, and the 50-sentence RTG regression through one CTest
-invocation. The pinned public model downloads on the first run; no Hub login is
-required. Individual targets are `native-test`, `python-test`, `web-test`, and
+`make test` builds and tests `build-debug/kidi`, runs Python tests against an
+installed Debug wheel, and runs the 50-sentence RTG regression through one CTest
+invocation. It never uses the Release binary. The pinned public model downloads
+on the first CPU regression run; no Hub login is required.
+Browser and extension suites remain separate. Individual targets are
+`native-test`, `python-test`, `web-test`, and
 `regression-test`. See [tests/data/README.md](tests/data/README.md) for fixtures
 and numerical contracts.
+
+RTG regression defaults to `KIDI_BACKEND=ynnpack`. Override it with
+`make test KIDI_BACKEND=mps` on a supported Mac; the generic `BACKEND` variable
+is ignored.
+
+On Linux with an NVIDIA GPU and the CUDA toolkit, test the CUDA backend with:
+
+```bash
+make test-cuda KIDI_CUTLASS_ROOT=/path/to/cutlass
+```
+
+This configures the `debug-cuda` preset (`build-debug-cuda/`, Debug with
+`KIDI_ENABLE_CUDA=ON`) and runs native tests plus Python tests against a
+CUDA-enabled Debug wheel. This includes the `cuda`-labelled kernel tests and
+CUDA model numerical checks. The RTG translation regression is excluded because
+RTG currently has no CUDA backend; browser and extension tests are also excluded.
+The Gemma 4 numerical fixture is a regression test on both CPU and CUDA.
+Optional Python chat regressions use CUDA when `KIDI_CHAT_MODEL` is set.
+CPU and CUDA test environments are isolated under `.cache/test-venv` and
+`.cache/test-venv-cuda`; wheel build trees live under the corresponding Debug
+build directory's `python/` subdirectory.
+`KIDI_CUTLASS_ROOT` is optional and applies to all CUDA Make goals and the test
+wheel. Without it, CUTLASS-only kernels are not built or tested.
+Run only the kernel tests with
+`ctest --preset debug-cuda -L cuda`.
 
 To check long-file Whisper processing with a local checkpoint and a short English
 mono PCM16 16 kHz WAV (at most 30 seconds):
@@ -547,6 +631,7 @@ sample in each output line, and fail explicitly when the per-window token limit 
 Browser unit, loader, generated-glue, and site-packaging tests:
 
 ```bash
+make setup-test
 make web-test
 ```
 
@@ -635,10 +720,14 @@ Keep generated model files, local reports and large binary artifacts out of Git.
 The [Pages workflow](.github/workflows/pages.yml) builds/tests Wasm variants for
 relevant changes, reusing SDK/compiler caches; merges to `main` deploy the
 browser app. The separate [native workflow](.github/workflows/native.yml) runs
-native unit tests and installed Python-wheel smoke tests on macOS 26 without
-downloading models. One Release build serves both: the wheel build configures
+native unit tests and installed Python-wheel smoke tests on macOS 26 ARM64
+(Apple Clang) and Ubuntu 24.04 x64 and ARM64 (GCC 14), without downloading models.
+On each platform, one Release build serves both: the wheel build configures
 `build-ci` with tests enabled, and the test programs reuse its objects. Compiled
-objects (ccache) are saved even when tests fail. It does not block Pages deployment.
+objects (ccache) are cached separately by platform and compiler, even when tests
+fail. It does not block Pages deployment. Configure branch protection or a
+ruleset to require all three native matrix jobs before merging; defining the workflow
+alone does not make these checks mandatory.
 
 See [GitHub Pages setup](web/README-dev.md#github-pages) for one-time configuration.
 The generated browser directory is self-contained for static hosting; model

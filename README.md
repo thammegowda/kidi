@@ -11,7 +11,7 @@ Kidi (*"spark"* in Kannada) runs modern generative AI models locally on your har
 ## Why Kidi?
 
 - **Batteries-Included Single Binary (`~4.7 MiB`):** Zero runtime dependency on PyTorch, Transformers, OpenCV, Pillow, or Python. A single static binary compiles in our purpose-built C++ libraries:
-  - **Compute & Shaders ([`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev)):** Our extended fork of YNNPACK (`ARM64` NEON/DOTPROD/SME2, `x86` AVX2/AVX-512, `Wasm` SIMD128, CUDA) + embedded Apple Metal kernels
+  - **Compute & Shaders:** [`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) CPU kernels (ARM64 NEON/DOTPROD/SME2, x86 AVX2/AVX-512, Wasm SIMD128), [`kidi-ops`](kidi-ops/README.md) CUDA kernels, and embedded Apple Metal kernels
   - **Tokenization & Text ([`tokenizerspp`](https://github.com/thammegowda/tokenizerspp)):** Native C++ Hugging Face `tokenizer.json` engine, Unicode (`uni-algo`), UTF-8 Unicode regex, G2P phonemizer, and linguistic sentence splitter
   - **Vision & Image Codecs ([`tahoma-vision`](https://github.com/thammegowda/tahoma-vision) & [`pigzpp`](https://github.com/thammegowda/pigzpp)):** SIMD-accelerated **JPEG (`libjpeg-turbo`)**, **PNG ([`pigzpp`](https://github.com/thammegowda/pigzpp) + `zlib-ng`)**, and PPM decoding + vision tensor preprocessing
   - **Audio & Speech:** WAV PCM I/O, Whisper log-Mel spectrogram frontend, and neural vocoders (Higgs Audio 2 / Kokoro)
@@ -78,7 +78,7 @@ reproduction commands.
 |---|---|---|
 | **[`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) + ARM64 NEON/SME2 / x86 AVX** | `--backend ynnpack` | Portable default on macOS, Linux, Windows, Android (`arm64`), and WebAssembly SIMD |
 | **Apple Metal (MPS)** | `--backend mps` | Default on Apple Silicon macOS for supported chat and OmniVoice TTS models |
-| **NVIDIA CUDA** | `--backend cuda:0` | Opt-in CUDA 13 + cuBLAS backend with asynchronous graph capture/replay pipelining |
+| **NVIDIA CUDA** | `--backend cuda:0` | Opt-in compact static CUDA 13 backend with asynchronous graph capture/replay pipelining |
 | **Vulkan** | `--backend vulkan` | Cross-platform GPU compute used on Android and desktop |
 | **Qualcomm QNN (Hexagon NPU)** | Android / Snapdragon | Step-compiled NPU graph execution for mobile inference |
 | **WebAssembly + WebGPU** | Browser (`make wasm`) | Runs entirely in Chrome/Edge/Firefox/Safari with IndexedDB/OPFS model caching |
@@ -210,7 +210,7 @@ Kidi is built atop modular, open-source C++ libraries and quantization research:
 
 | Project / Publication | Description |
 |---|---|
-| **[`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev)** | Custom fork of YNNPACK with low-bit LLM operators, ARM64 NEON/DOTPROD/SME2, x86 AVX2/AVX-512, WebAssembly SIMD128, and CUDA kernels |
+| **[`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev)** | Custom fork of YNNPACK with low-bit LLM operators, ARM64 NEON/DOTPROD/SME2, x86 AVX2/AVX-512, and WebAssembly SIMD128 |
 | **[`tokenizerspp`](https://github.com/thammegowda/tokenizerspp)** | Fast, standalone C++ Hugging Face `tokenizer.json` implementation (BPE, Unigram, WordPiece, pre-tokenizers, and chat templates) |
 | **[`tahoma-vision`](https://github.com/thammegowda/tahoma-vision)** | Lightweight SIMD-accelerated C++ vision library for JPEG (`libjpeg-turbo`), PNG ([`pigzpp`](https://github.com/thammegowda/pigzpp) + `zlib-ng`), PPM, and image preprocessing |
 | **[`pigzpp`](https://github.com/thammegowda/pigzpp)** | Modern C++ parallel gzip/deflate compression and decompression library built on `zlib-ng` |

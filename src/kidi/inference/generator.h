@@ -87,7 +87,7 @@ struct ModelLoadOptions {
     std::int32_t group_size = 128;
     bool packed_prefill = false;
     bool dense_lm_head = false;
-    std::filesystem::path assistant_model;
+    std::filesystem::path assistant_model{};
     std::size_t draft_tokens = 3;
 };
 

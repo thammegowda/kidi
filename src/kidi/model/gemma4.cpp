@@ -1,5 +1,6 @@
 #include "kidi/graph/compiler.h"
 #include "kidi/model/gemma4.h"
+#include "kidi/ops/quantization.h"
 #include "kidi/runtime/operator.h"
 #include "kidi/runtime/ynn/graph.h"
 
@@ -407,7 +408,28 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, RuntimeQuant
         }
 
         impl_->context.synchronize();
-        require(set_state(state));
+        const bool cuda_direct_pack =
+            weight_bits && device().kind == tensor::DeviceKind::CUDA && !impl_->qat && weight_bits == 8;
+        StateDict host_linear_weights;
+        Tensor host_lm_head_source;
+        if (cuda_direct_pack) {
+            if (const auto found = state.find("embed_tokens.weight"); found != state.end())
+                host_lm_head_source = found->second;
+            for (auto it = state.begin(); it != state.end();) {
+                const auto& [name, value] = *it;
+                if (name.ends_with(".weight") && value.dimensions() == 2 && name != "embed_tokens.weight" &&
+                    name != "embed_tokens_per_layer.weight") {
+                    host_linear_weights.emplace(name.substr(0, name.size() - std::string_view(".weight").size()),
+                                                std::move(it->second));
+                    it = state.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            require(set_state(state, false));
+        } else {
+            require(set_state(state));
+        }
 
         const bool unsigned_embeddings = impl_->qat && device().kind == tensor::DeviceKind::CPU && !signed_packed;
         impl_->tokens->set_unsigned_packed(unsigned_embeddings);
@@ -432,7 +454,25 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, RuntimeQuant
                     impl_->context.bind_packed_zero(found->second, std::move(dev_zero));
             }
         }
-        if (weight_bits) {
+        if (cuda_direct_pack) {
+            visit_modules([&](const std::string& name, core::Module& module) {
+                auto* linear = dynamic_cast<layers::LinearImpl*>(&module);
+                if (!linear) return;
+                Tensor source;
+                if (name == "lm_head" && host_lm_head_source.defined())
+                    source = host_lm_head_source;
+                else if (const auto found = host_linear_weights.find(name); found != host_linear_weights.end())
+                    source = std::move(found->second);
+                else
+                    return;
+                const auto width = static_cast<std::int32_t>(source.size(1));
+                auto packed = require(ops::pack_weight(source, 8, width, false));
+                if (name != "lm_head" && source.is_host_accessible()) source.release_pages(false);
+                auto values = require(packed.values.to(device()));
+                auto scales = require(packed.scales.to(device()));
+                linear->set_packed_weights(std::move(values), std::move(scales), 8, width);
+            });
+        } else if (weight_bits) {
             const bool asym_clip = std::getenv("KIDI_ASYMMETRIC_CLIP") != nullptr &&
                                    std::string_view(std::getenv("KIDI_ASYMMETRIC_CLIP")) == "1";
             for (const auto& [name, weight] : state_dict())

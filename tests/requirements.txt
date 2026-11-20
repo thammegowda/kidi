@@ -1,2 +1,4 @@
 huggingface-hub[cli]>=1.33,<3
 sacrebleu==2.6.0
+scikit-build-core>=0.12
+nanobind>=2.4
