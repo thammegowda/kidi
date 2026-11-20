@@ -63,21 +63,50 @@ runtime memory must be measured separately from artifact size.
 ### CUDA
 
 The optional NVIDIA backend requires Linux, the CUDA 13+ toolkit, and a
-compatible GPU. If a cuVS SDK (with its C API and DLPack headers) is also
-present, `KIDI_ENABLE_CUDA=ON` additionally builds the `kidi-index-cuda` GPU
-HNSW index construction helper. From an initialized checkout, enable CUDA for
-the standalone CLI:
+compatible GPU. From an initialized checkout, build the standalone portable
+static CUDA CLI (`build-release-cuda/kidi`):
 
 ```bash
 make release-cuda
 build-release-cuda/kidi chat --model /path/to/gemma-model --backend cuda:0
 ```
 
-For a nonstandard cuVS SDK installation, add `-DKIDI_CUVS_ROOT=/path/to/cuvs`
-and, if needed, `-DKIDI_DLPACK_INCLUDE_DIR=/path/to/include` to the configure
-command. When `KIDI_CUVS_ROOT` is set explicitly, configuration fails if those
-dependencies cannot be found; otherwise CUDA inference builds without GPU HNSW
-index construction.
+The `release-cuda` preset statically links the CUDA, C++, and libgcc runtimes
+and uses Kidi's native CUDA kernels without cuBLAS or cuBLASLt. The CLI needs a
+compatible NVIDIA driver and system glibc, with no CUDA toolkit shared-library
+dependencies (`VerifyPortableElf.cmake`). Model files remain separate. If a cuVS
+SDK (with its C API and DLPack headers) is also present, `KIDI_ENABLE_CUDA=ON`
+additionally builds the separate `kidi-index-cuda` GPU HNSW index construction
+helper (`-DKIDI_CUVS_ROOT=/path/to/cuvs`, `-DKIDI_DLPACK_INCLUDE_DIR=/path/to/include`).
+
+The preset embeds `sm_80` and `sm_90` GPU code and `compute_90` PTX. Override
+`CMAKE_CUDA_ARCHITECTURES` at configure time for other targets. To enable
+Tensor Core GEMMs and FlashAttention-2 with a build-time CUTLASS checkout
+(tested with `v4.6.0-8-ge64a9136`):
+
+```bash
+cmake --preset release-cuda -DKIDI_CUTLASS_ROOT=/path/to/cutlass
+cmake --build --preset release-cuda --target kidi_cli
+```
+
+This compiles BF16, W8A16, and W8A8 Tensor Core GEMMs, tiled BF16/FP32
+FlashAttention-2 prefill (`head_dim` 64/128/256/512), and a tiled FP32 CUDA-core
+GEMM into the `15.69 MiB` CLI without adding any CUDA toolkit shared-library
+dependencies (`VerifyPortableElf.cmake`). The dense fast paths support eligible
+transposed weights (`sm_80` and `sm_90`); FP32 does not use TF32. Native CUDA
+W8A16 (`--precision w8a16`) runs both calibrated INT8 checkpoints and unquantized
+BF16 checkpoints with INT8 weights and BF16 activations/KV cache, while W8A8
+accelerates affine INT8 and calibrated/uncalibrated packed INT8 projections (plus
+single-group packed INT4/INT2 projections expanded to INT8) with fused
+epilogues and partitioned FP32 FlashDecoding. Small-row decode uses specialized
+vector kernels and CUDA Graph sibling fusion when eligible. On H100 (Gemma 4 E4B,
+162-token prompt / 128-token prefill chunks), compact BF16 reaches `9,281`
+prefill / `134.1` decode tok/s (`0.78 ms` exact-128 attention, `11.93 ms`
+exact-128 window vs `14.21 ms` historical shared cuBLAS), compact W8A16 reaches
+`8,503` prefill / `159.3` decode tok/s at `7.95 GiB` peak VRAM, and compact W8A8
+reaches `7,735` prefill / `139.3` decode tok/s (`9,974` / `138.5` at 1,098
+tokens). See the [CUDA performance plan](docs/cuda-performance-plan.md) for
+shapes, graph capture, and benchmark details.
 
 For the Python launcher, build and install a CUDA-enabled package separately:
 

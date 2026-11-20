@@ -140,6 +140,112 @@ auto check_projection_groups() -> bool {
     return captures == 2;
 }
 
+auto check_w8a16_projection_groups() -> bool {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    for (const std::int32_t group_size : {256, 128}) {
+        ops::Context context(device, false, true, DType::BF16), eager(device, false, false, DType::BF16);
+        context.set_precision(core::InferencePrecision::Q8A16);
+        eager.set_precision(core::InferencePrecision::Q8A16);
+        const std::int64_t groups = 256 / group_size;
+        std::vector<Tensor> weights, proj_scales, norm_scales;
+        for (const int columns : {64, 128, 256}) {
+            std::vector<std::uint8_t> w(columns * 256);
+            for (std::size_t index = 0; index < w.size(); ++index)
+                w[index] = static_cast<std::uint8_t>(static_cast<int>(index * 13 % 251) - 125);
+            weights.push_back(
+                require(Tensor::from_bytes({columns, 256}, DType::U8, std::as_bytes(std::span(w)), device)));
+            std::vector<float> pscales(columns * groups);
+            for (std::size_t index = 0; index < pscales.size(); ++index) pscales[index] = ((index % 7) + 1) * 0.015625F;
+            proj_scales.push_back(
+                require(Tensor::from_host({columns, groups}, std::span<const float>(pscales), device)));
+            norm_scales.push_back(require(
+                Tensor::from_host({columns}, std::span<const float>(std::vector<float>(columns, 1.F)), device)));
+        }
+        const auto scale =
+            require(Tensor::from_host({256}, std::span<const float>(std::vector<float>(256, 1.F)), device));
+        std::size_t captures = 0;
+        for (int iteration = 0; iteration < 5; ++iteration) {
+            std::array<float, 256> values{};
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = (static_cast<int>((index + iteration) * 7 % 23) - 11) * 0.125F;
+            const auto input = context.cast(
+                require(Tensor::from_host({1, 1, 256}, std::span<const float>(values), device)), DType::BF16);
+            const std::array arguments{input};
+            const auto outputs =
+                context.replay("cuda-w8a16-projections", arguments, [&](std::span<const Tensor> operands) {
+                    ++captures;
+                    const auto normalized = context.rms_norm(operands[0], scale, 1e-6F);
+                    std::vector<Tensor> result;
+                    for (std::size_t index = 0; index < weights.size(); ++index)
+                        result.push_back(
+                            context.rms_norm(context.packed_linear(normalized, weights[index], proj_scales[index], 8,
+                                                                   group_size, 0.F, 0.F),
+                                             norm_scales[index], 1e-6F));
+                    return result;
+                });
+            const auto normalized = eager.rms_norm(input, scale, 1e-6F);
+            for (std::size_t index = 0; index < weights.size(); ++index) {
+                const auto expected = eager.rms_norm(
+                    eager.packed_linear(normalized, weights[index], proj_scales[index], 8, group_size, 0.F, 0.F),
+                    norm_scales[index], 1e-6F);
+                if (require(outputs[index].copy_to_host()) != require(expected.copy_to_host())) return false;
+            }
+        }
+        if (captures != 2) return false;
+    }
+    // Verify F32 W8A8 sibling projection fusion.
+    {
+        ops::Context context(device, false, true), eager(device, false, false);
+        std::vector<Tensor> weights, proj_scales, norm_scales;
+        for (const int columns : {64, 128, 256}) {
+            std::vector<std::uint8_t> w(columns * 256);
+            for (std::size_t index = 0; index < w.size(); ++index)
+                w[index] = static_cast<std::uint8_t>(static_cast<int>(index * 13 % 251) - 125);
+            weights.push_back(
+                require(Tensor::from_bytes({columns, 256}, DType::U8, std::as_bytes(std::span(w)), device)));
+            std::vector<float> pscales(columns);
+            for (std::size_t index = 0; index < pscales.size(); ++index) pscales[index] = ((index % 7) + 1) * 0.015625F;
+            proj_scales.push_back(require(Tensor::from_host({columns, 1}, std::span<const float>(pscales), device)));
+            norm_scales.push_back(require(
+                Tensor::from_host({columns}, std::span<const float>(std::vector<float>(columns, 1.F)), device)));
+        }
+        const auto scale =
+            require(Tensor::from_host({256}, std::span<const float>(std::vector<float>(256, 1.F)), device));
+        std::size_t captures = 0;
+        for (int iteration = 0; iteration < 5; ++iteration) {
+            std::array<float, 256> values{};
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = (static_cast<int>((index + iteration) * 7 % 23) - 11) * 0.125F;
+            const auto input = require(Tensor::from_host({1, 1, 256}, std::span<const float>(values), device));
+            const std::array arguments{input};
+            const auto outputs =
+                context.replay("cuda-w8a8-projections", arguments, [&](std::span<const Tensor> operands) {
+                    ++captures;
+                    const auto normalized = context.rms_norm(operands[0], scale, 1e-6F);
+                    std::vector<Tensor> result;
+                    for (std::size_t index = 0; index < weights.size(); ++index)
+                        result.push_back(context.rms_norm(
+                            context.packed_linear(normalized, weights[index], proj_scales[index], 8, 256, 0.F, 0.F),
+                            norm_scales[index], 1e-6F));
+                    return result;
+                });
+            const auto normalized = eager.rms_norm(input, scale, 1e-6F);
+            for (std::size_t index = 0; index < weights.size(); ++index) {
+                const auto expected = eager.rms_norm(
+                    eager.packed_linear(normalized, weights[index], proj_scales[index], 8, 256, 0.F, 0.F),
+                    norm_scales[index], 1e-6F);
+                if (require(outputs[index].copy_to_host()) != require(expected.copy_to_host())) return false;
+            }
+        }
+        if (captures != 2) return false;
+    }
+    return true;
+}
+
 auto check_input_staging() -> bool {
     using namespace kidi;
     using ops::require;
@@ -670,6 +776,8 @@ auto main() -> int {
         if (!check_attention_bindings()) throw std::runtime_error("CUDA attention retained a stale KV pointer");
         if (!check_async_readback()) throw std::runtime_error("CUDA nonblocking readback snapshot failed");
         if (!check_projection_groups()) throw std::runtime_error("CUDA shared-input projection fusion failed");
+        if (!check_w8a16_projection_groups())
+            throw std::runtime_error("CUDA shared-input W8A16 projection fusion failed");
         if (!check_input_staging()) throw std::runtime_error("CUDA reusable input staging failed");
         if (!check_greedy_partitions()) throw std::runtime_error("CUDA parallel token selection changed tie-breaking");
         if (!check_bfloat_fusions()) throw std::runtime_error("CUDA BF16 fusion changed intermediate rounding");
@@ -829,7 +937,7 @@ auto main() -> int {
         const auto packed_expected = ops::require(packed_reference.data<float>());
         for (std::size_t index = 0; index < packed_actual.size(); ++index)
             if (std::abs(packed_actual[index] - packed_expected[index]) > 1e-5F) return 1;
-        std::cout << "CUDA numerical checks include W8A8 projection, embedding, cuBLAS GEMM, softmax, RMS/layer norm, "
+        std::cout << "CUDA numerical checks include W8A8 projection, embedding, GEMM, softmax, RMS/layer norm, "
                      "convolution, attention, and device routing\n";
         for (int index = 0; index < kidi::cuda::device_count(); ++index) {
             const auto device = tensor::Device::cuda(index);

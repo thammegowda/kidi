@@ -11,15 +11,10 @@
 #include <vector>
 
 namespace {
-#if defined(KIDI_CUDA_USE_CUBLAS)
-constexpr bool USE_CUBLAS = true;
-#else
-constexpr bool USE_CUBLAS = false;
-#endif
 #if defined(KIDI_CUDA_USE_CUTLASS_INT8)
 constexpr bool USE_INT8_GEMM = true;
 #else
-constexpr bool USE_INT8_GEMM = USE_CUBLAS;
+constexpr bool USE_INT8_GEMM = false;
 #endif
 
 void check_bfloat_bias(int device) {
@@ -218,7 +213,7 @@ void check_attention(int device, std::int64_t keys = 19) {
     constexpr Type type = bfloat ? Type::BF16 : Type::F32;
     const auto capacity = keys + 5;
     for (const std::int64_t queries : {1, 17})
-        for (const std::int64_t width : {32, 256, 512})
+        for (const std::int64_t width : {32, 64, 128, 256, 512})
             for (const std::int64_t key_heads : {1, 2, 4})
                 for (const bool shared : {false, true}) {
                     const auto key_batches = shared ? 1 : batches;
@@ -275,8 +270,7 @@ void check_attention(int device, std::int64_t keys = 19) {
                             descriptor.reference_attention = false;
                             const auto previous_bytes = allocated_bytes(device);
                             Program native(descriptor, device);
-                            if (!USE_CUBLAS && queries > 1 && (bfloat || USE_INT8_GEMM) &&
-                                allocated_bytes(device) != previous_bytes)
+                            if (queries > 1 && (bfloat || USE_INT8_GEMM) && allocated_bytes(device) != previous_bytes)
                                 throw std::runtime_error("CUDA fused attention allocated a score buffer");
                             native.run(inputs.data(), descriptor.input_count, output.get());
                             copy_to_host(actual.data(), output.get(), actual.size() * sizeof(Element), device);
@@ -339,7 +333,7 @@ void check_bfloat_matrix(int device, int rows, int width, int columns = 33, bool
         const auto previous_bytes = allocated_bytes(device);
         Program native(descriptor, device);
         const auto prepared_bytes = allocated_bytes(device);
-        const auto workspace_limit = transpose && allow_split_workspace ? 2 * 1024 * 1024 : 0;
+        const auto workspace_limit = transpose && allow_split_workspace ? 8 * 1024 * 1024 : 0;
         if (prepared_bytes - previous_bytes > static_cast<std::size_t>(workspace_limit))
             throw std::runtime_error("CUDA native BF16 GEMM exceeded the workspace budget");
         if (native.output().type != Type::BF16) throw std::runtime_error("CUDA BF16 output dtype changed");
@@ -428,6 +422,152 @@ void check_wide_rms(int device) {
     for (std::size_t index = 0; index < actual.size(); ++index) {
         const auto expected = (2.F + (index < width ? normalized : -normalized)) * multiplier;
         if (actual[index] != encode(expected)) throw std::runtime_error("CUDA wide RMS residual rounding mismatch");
+    }
+}
+
+void check_w8a16_projection(int device) {
+    using namespace kidi::cuda;
+    using Buffer = std::unique_ptr<void, decltype(&release)>;
+    const auto encode = [](float value) -> std::uint16_t {
+        return static_cast<std::uint16_t>(std::bit_cast<std::uint32_t>(value) >> 16);
+    };
+    const auto decode = [](std::uint16_t rounded) -> float {
+        return std::bit_cast<float>(static_cast<std::uint32_t>(rounded) << 16);
+    };
+    for (const int rows : {1, 3, 19, 65, 129}) {
+        for (const int columns : {72, 4112}) {
+            if (rows == 65 && columns > 72) continue;
+            for (const int width : {64, 1600}) {
+                for (const int group_size : {64, width}) {
+                    if (width % group_size != 0) continue;
+                    const int groups = width / group_size;
+                    std::vector<std::uint16_t> values(static_cast<std::size_t>(rows) * width);
+                    std::vector<std::int8_t> weights(static_cast<std::size_t>(columns) * width);
+                    std::vector<float> scales(static_cast<std::size_t>(columns) * groups);
+                    for (std::size_t index = 0; index < values.size(); ++index)
+                        values[index] = encode(static_cast<float>(static_cast<int>(index * 13 % 29) - 14) * 0.0625F);
+                    for (std::size_t index = 0; index < weights.size(); ++index)
+                        weights[index] = static_cast<std::int8_t>(static_cast<int>(index * 17 % 251) - 125);
+                    for (std::size_t index = 0; index < scales.size(); ++index)
+                        scales[index] = static_cast<float>(index % 7 + 1) * 0.00390625F;
+                    Buffer input(allocate(values.size() * sizeof(std::uint16_t), device), release),
+                        weight(allocate(weights.size(), device), release),
+                        scale(allocate(scales.size() * sizeof(float), device), release),
+                        output(allocate(static_cast<std::size_t>(rows) * columns * sizeof(std::uint16_t), device),
+                               release);
+                    copy_to_device(input.get(), values.data(), values.size() * sizeof(std::uint16_t), device);
+                    copy_to_device(weight.get(), weights.data(), weights.size(), device);
+                    copy_to_device(scale.get(), scales.data(), scales.size() * sizeof(float), device);
+                    const std::array<Tensor, 3> inputs{Tensor{input.get(), Type::BF16, 2, {rows, width}, device},
+                                                       Tensor{weight.get(), Type::U8, 2, {columns, width}, device},
+                                                       Tensor{scale.get(), Type::F32, 2, {columns, groups}, device}};
+                    Descriptor descriptor;
+                    descriptor.operation = Op::PACKED_LINEAR;
+                    descriptor.input_count = 3;
+                    std::copy(inputs.begin(), inputs.end(), descriptor.inputs.begin());
+                    descriptor.output.type = Type::BF16;
+                    descriptor.attribute_count = 3;
+                    descriptor.attributes = {8, group_size, 0};
+                    descriptor.reference_projection = true;
+                    Program reference(descriptor, device);
+                    reference.run(inputs.data(), 3, output.get());
+                    std::vector<std::uint16_t> expected(static_cast<std::size_t>(rows) * columns),
+                        actual(expected.size());
+                    copy_to_host(expected.data(), output.get(), expected.size() * sizeof(std::uint16_t), device);
+                    descriptor.reference_projection = false;
+                    Program optimized(descriptor, device);
+                    if (optimized.output().type != Type::BF16)
+                        throw std::runtime_error("CUDA W8A16 output dtype changed");
+                    const auto prepared_bytes = allocated_bytes(device);
+                    optimized.run(inputs.data(), 3, output.get());
+                    if (allocated_bytes(device) != prepared_bytes)
+                        throw std::runtime_error("CUDA W8A16 allocated during launch");
+                    copy_to_host(actual.data(), output.get(), actual.size() * sizeof(std::uint16_t), device);
+                    for (std::size_t index = 0; index < actual.size(); ++index) {
+                        const float lhs = decode(actual[index]), rhs = decode(expected[index]);
+                        if (!std::isfinite(lhs) || std::abs(lhs - rhs) > 0.008F * (1.F + std::abs(rhs)))
+                            throw std::runtime_error("CUDA W8A16 projection differs from reference");
+                    }
+                }
+            }
+        }
+    }
+}
+
+void check_w8a8_projection(int device) {
+    using namespace kidi::cuda;
+    using Buffer = std::unique_ptr<void, decltype(&release)>;
+    for (const int rows : {1, 3, 17, 65, 129}) {
+        for (const int columns : {128, 4096}) {
+            if (rows == 65 && columns > 128) continue;
+            constexpr int width = 256;
+            std::vector<float> values(static_cast<std::size_t>(rows) * width);
+            std::vector<std::int8_t> weights(static_cast<std::size_t>(columns) * width);
+            std::vector<float> scales(columns), biases(columns);
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = static_cast<float>(static_cast<int>(index * 13 % 29) - 14) * 0.0625F;
+            for (std::size_t index = 0; index < weights.size(); ++index)
+                weights[index] = static_cast<std::int8_t>(static_cast<int>(index * 17 % 251) - 125);
+            for (int index = 0; index < columns; ++index) {
+                scales[index] = static_cast<float>(index % 7 + 1) * 0.00390625F;
+                biases[index] = static_cast<float>(index % 5 - 2) * 0.015625F;
+            }
+            Buffer input(allocate(values.size() * sizeof(float), device), release),
+                weight(allocate(weights.size(), device), release),
+                scale(allocate(scales.size() * sizeof(float), device), release),
+                bias(allocate(biases.size() * sizeof(float), device), release),
+                output(allocate(static_cast<std::size_t>(rows) * columns * sizeof(float), device), release);
+            copy_to_device(input.get(), values.data(), values.size() * sizeof(float), device);
+            copy_to_device(weight.get(), weights.data(), weights.size(), device);
+            copy_to_device(scale.get(), scales.data(), scales.size() * sizeof(float), device);
+            copy_to_device(bias.get(), biases.data(), biases.size() * sizeof(float), device);
+            for (const bool calibrated : {false, true}) {
+                for (const bool with_bias : {false, true}) {
+                    if (calibrated && with_bias) continue;
+                    const std::array<Tensor, 4> inputs{
+                        Tensor{input.get(), Type::F32, 2, {rows, width}, device},
+                        Tensor{weight.get(), with_bias ? Type::I8 : Type::U8, 2, {columns, width}, device},
+                        Tensor{scale.get(), Type::F32, 2, {columns, 1}, device},
+                        Tensor{bias.get(), Type::F32, 1, {columns}, device}};
+                    Descriptor descriptor;
+                    descriptor.operation = with_bias ? Op::QUANTIZED_LINEAR : Op::PACKED_LINEAR;
+                    descriptor.input_count = with_bias ? 4 : 3;
+                    std::copy(inputs.begin(), inputs.end(), descriptor.inputs.begin());
+                    descriptor.output.type = Type::F32;
+                    descriptor.attribute_count = with_bias ? 1 : 3;
+                    if (with_bias) {
+                        descriptor.attributes[0] = 1;
+                    } else {
+                        descriptor.attributes = {8, width, 0};
+                        if (calibrated) {
+                            descriptor.epsilon = 0.0625F;
+                            const float out_scale = 0.125F;
+                            std::int32_t encoded = 0;
+                            std::memcpy(&encoded, &out_scale, sizeof(encoded));
+                            descriptor.attributes[2] = encoded;
+                        }
+                    }
+                    descriptor.reference_projection = true;
+                    Program reference(descriptor, device);
+                    reference.run(inputs.data(), descriptor.input_count, output.get());
+                    std::vector<float> expected(static_cast<std::size_t>(rows) * columns), actual(expected.size());
+                    copy_to_host(expected.data(), output.get(), expected.size() * sizeof(float), device);
+                    descriptor.reference_projection = false;
+                    Program optimized(descriptor, device);
+                    optimized.run(inputs.data(), descriptor.input_count, output.get());
+                    const auto prepared_bytes = allocated_bytes(device);
+                    optimized.run(inputs.data(), descriptor.input_count, output.get());
+                    if (allocated_bytes(device) != prepared_bytes)
+                        throw std::runtime_error("CUDA W8A8 allocated during launch");
+                    copy_to_host(actual.data(), output.get(), actual.size() * sizeof(float), device);
+                    for (std::size_t index = 0; index < actual.size(); ++index) {
+                        if (!std::isfinite(actual[index]) ||
+                            std::abs(actual[index] - expected[index]) > 1e-4F * (1.F + std::abs(expected[index])))
+                            throw std::runtime_error("CUDA W8A8 projection differs from reference");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -534,7 +674,7 @@ void check_mixed_matrix(int device) {
                     const auto bytes = allocated_bytes(device);
                     Program shared(descriptor, device);
                     verify(shared);
-                    if (allocated_bytes(device) - bytes != (USE_CUBLAS && bfloat ? sizeof(values) : 0))
+                    if (allocated_bytes(device) != bytes)
                         throw std::runtime_error("CUDA mixed matrix cache duplicated immutable weights");
                 }
                 descriptor.immutable_weights = false;
@@ -611,9 +751,8 @@ void check_projection_rebinding(int device) {
             copy_to_host(actual.data(), larger_output.get(), sizeof(actual), device);
             for (const auto value : actual)
                 if (std::abs(value - 16.F) > 1e-5F) throw std::runtime_error("CUDA shared projection cache mismatch");
-            const auto workspace_bytes =
-                rows * 2 * width + rows * 2 * sizeof(float) + rows * 2 * sizeof(int) +
-                (USE_INT8_GEMM ? 2 : 1) * sizeof(actual);
+            const auto workspace_bytes = rows * 2 * width + rows * 2 * sizeof(float) + rows * 2 * sizeof(int) +
+                                         (USE_INT8_GEMM ? 2 : 1) * sizeof(actual);
             if (allocated_bytes(device) - previous_bytes != workspace_bytes)
                 throw std::runtime_error("CUDA projection cache duplicated immutable weights");
         }
@@ -655,7 +794,8 @@ void check_projection_rebinding(int device) {
         check(cudaGraphInstantiate(&executable, graph, 0));
         const std::unique_ptr<std::remove_pointer_t<cudaGraphExec_t>, decltype(&cudaGraphExecDestroy)> executable_owner(
             executable, cudaGraphExecDestroy);
-        if (allocated_bytes(device) != warm_bytes) throw std::runtime_error("CUDA graph allocated projection workspace");
+        if (allocated_bytes(device) != warm_bytes)
+            throw std::runtime_error("CUDA graph allocated projection workspace");
         auto replay_values = values;
         for (const float shift : {0.F, 1.F}) {
             for (std::size_t index = 0; index < replay_values.size(); ++index)
@@ -893,12 +1033,92 @@ int main() {
             check_attention(device);
             check_attention(device, 257);
             check_attention<float>(device);
+            {
+                // Gemma 4 E4B GQA prefill check: 8 query heads, 2 KV heads, sliding + causal (-1e9F and -INFINITY).
+                constexpr std::int64_t batches = 1, queries = 129, heads = 8, key_heads = 2, keys = 640, offset = 0;
+                for (const std::int64_t width : {256, 512}) {
+                    for (const float masked_value : {-1e9F, -INFINITY}) {
+                        std::vector<std::uint16_t> query(batches * queries * heads * width),
+                            key(batches * keys * key_heads * width), value(key.size());
+                        for (std::size_t index = 0; index < query.size(); ++index) {
+                            const float number = static_cast<float>(static_cast<int>(index * 7 % 31) - 15) * 0.015625F;
+                            std::uint32_t bits = 0;
+                            std::memcpy(&bits, &number, sizeof(bits));
+                            query[index] = static_cast<std::uint16_t>(bits >> 16);
+                        }
+                        for (std::size_t index = 0; index < key.size(); ++index) {
+                            const float n1 = static_cast<float>(static_cast<int>(index * 11 % 31) - 15) * 0.015625F;
+                            const float n2 = static_cast<float>(static_cast<int>(index * 13 % 31) - 15) * 0.015625F;
+                            std::uint32_t b1 = 0, b2 = 0;
+                            std::memcpy(&b1, &n1, sizeof(b1));
+                            std::memcpy(&b2, &n2, sizeof(b2));
+                            key[index] = static_cast<std::uint16_t>(b1 >> 16);
+                            value[index] = static_cast<std::uint16_t>(b2 >> 16);
+                        }
+                        std::vector<float> mask(queries * keys);
+                        for (std::int64_t row = 0; row < queries; ++row)
+                            for (std::int64_t column = 0; column < keys; ++column) {
+                                const std::int64_t q_abs = (keys - queries) + row;
+                                const bool allowed = column <= q_abs && (width == 512 || q_abs - column < 256);
+                                mask[row * keys + column] = allowed ? (column % 5 ? 0.F : 0.125F) : masked_value;
+                            }
+                        std::unique_ptr<void, decltype(&release)> q_buf(allocate(query.size() * 2, device), release),
+                            k_buf(allocate(key.size() * 2, device), release),
+                            v_buf(allocate(value.size() * 2, device), release),
+                            m_buf(allocate(mask.size() * 4, device), release),
+                            o_buf(allocate(query.size() * 2, device), release);
+                        copy_to_device(q_buf.get(), query.data(), query.size() * 2, device);
+                        copy_to_device(k_buf.get(), key.data(), key.size() * 2, device);
+                        copy_to_device(v_buf.get(), value.data(), value.size() * 2, device);
+                        copy_to_device(m_buf.get(), mask.data(), mask.size() * 4, device);
+                        std::array<Tensor, 4> inputs{
+                            Tensor{q_buf.get(), Type::BF16, 3, {batches, queries, heads * width}, device},
+                            Tensor{k_buf.get(), Type::BF16, 3, {batches, keys, key_heads * width}, device},
+                            Tensor{v_buf.get(), Type::BF16, 3, {batches, keys, key_heads * width}, device},
+                            Tensor{m_buf.get(), Type::F32, 4, {1, 1, queries, keys}, device}};
+                        Descriptor d;
+                        d.operation = Op::ATTENTION;
+                        d.input_count = 4;
+                        std::copy(inputs.begin(), inputs.end(), d.inputs.begin());
+                        d.attribute_count = 4;
+                        d.attributes = {heads, key_heads, offset, keys};
+                        d.epsilon = 1.F;
+                        d.reference_attention = true;
+                        Program ref(d, device);
+                        ref.run(inputs.data(), 4, o_buf.get());
+                        std::vector<std::uint16_t> expected(query.size()), actual(query.size());
+                        copy_to_host(expected.data(), o_buf.get(), expected.size() * 2, device);
+                        d.reference_attention = false;
+                        const auto prev_bytes = allocated_bytes(device);
+                        Program nat(d, device);
+                        if (allocated_bytes(device) != prev_bytes)
+                            throw std::runtime_error("CUDA FlashAttention GQA allocated a score buffer");
+                        nat.run(inputs.data(), 4, o_buf.get());
+                        copy_to_host(actual.data(), o_buf.get(), actual.size() * 2, device);
+                        for (std::size_t index = 0; index < actual.size(); ++index) {
+                            const auto dec = [](std::uint16_t u) {
+                                return std::bit_cast<float>(static_cast<std::uint32_t>(u) << 16);
+                            };
+                            const float t = dec(expected[index]), r = dec(actual[index]);
+                            const float tol = (15.F * 0.015625F) / 256.F + 0.0001F + 0.008F * std::abs(t);
+                            if (!std::isfinite(r) || std::abs(r - t) > tol)
+                                throw std::runtime_error("CUDA FlashAttention GQA mismatch");
+                        }
+                    }
+                }
+            }
             check_sparse_scatter(device);
             for (const int rows : {1, 4})
                 for (const int width : {8, 256, 1536, 6144, 12288}) check_bfloat_matrix(device, rows, width);
+            check_bfloat_matrix(device, 1, 256, 4112);
             check_bfloat_matrix(device, 9, 256, 72);
             check_bfloat_matrix(device, 9, 1560, 72, true);
-            check_bfloat_matrix(device, 65, 40, 4096);
+            check_bfloat_matrix(device, 65, 40, 4096, true);
+            check_bfloat_matrix(device, 129, 1600, 72, true);
+            check_bfloat_matrix(device, 128, 2560, 8192, true);
+            check_bfloat_matrix(device, 128, 256, 2560, true);
+            check_w8a16_projection(device);
+            check_w8a8_projection(device);
             check_float_matrix(device, 1);
             check_float_matrix(device, 37, 132);
             check_float_matrix(device, 34, 1564);

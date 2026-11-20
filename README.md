@@ -78,7 +78,7 @@ reproduction commands.
 |---|---|---|
 | **[`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) + ARM64 NEON/SME2 / x86 AVX** | `--backend ynnpack` | Portable default on macOS, Linux, Windows, Android (`arm64`), and WebAssembly SIMD |
 | **Apple Metal (MPS)** | `--backend mps` | Default on Apple Silicon macOS for supported chat and OmniVoice TTS models |
-| **NVIDIA CUDA** | `--backend cuda:0` | Opt-in CUDA 13 + cuBLAS backend with asynchronous graph capture/replay pipelining |
+| **NVIDIA CUDA** | `--backend cuda:0` | Opt-in compact static CUDA 13 backend with asynchronous graph capture/replay pipelining |
 | **Vulkan** | `--backend vulkan` | Cross-platform GPU compute used on Android and desktop |
 | **Qualcomm QNN (Hexagon NPU)** | Android / Snapdragon | Step-compiled NPU graph execution for mobile inference |
 | **WebAssembly + WebGPU** | Browser (`make wasm`) | Runs entirely in Chrome/Edge/Firefox/Safari with IndexedDB/OPFS model caching |

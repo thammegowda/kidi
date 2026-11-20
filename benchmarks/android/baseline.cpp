@@ -95,6 +95,8 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
         throw std::invalid_argument("Gemma benchmark prompt must not be empty");
     const auto weight_bits = settings.value("weight_bits", 0);
     const auto group_size = settings.value("group_size", 128);
+    const auto precision = kidi::core::parse_precision(settings.value("precision", std::string("checkpoint")));
+    if (!precision) throw std::invalid_argument("invalid benchmark precision");
     const auto cache_precision =
         kidi::core::parse_kv_cache_precision(settings.value("kv_cache_precision", std::string("auto")));
     if (!cache_precision) throw std::invalid_argument("invalid benchmark KV-cache precision");
@@ -102,6 +104,7 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
     auto generator = require(kidi::inference::Generator::load(
         directory,
         kidi::inference::ModelLoadOptions{.device = gemma_device(),
+                                          .precision = *precision,
                                           .kv_cache_precision = *cache_precision,
                                           .weight_bits = weight_bits,
                                           .group_size = group_size,

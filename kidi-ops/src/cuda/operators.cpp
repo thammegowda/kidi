@@ -17,12 +17,12 @@ namespace {
 using ops::require;
 using runtime::AllocationStats;
 using runtime::Operation;
+using runtime::operation_name;
 using runtime::Operator;
 using runtime::OperatorBackend;
 using runtime::OperatorSpec;
 using runtime::OutputPool;
 using runtime::TensorInputs;
-using runtime::operation_name;
 using tensor::Device;
 using tensor::Tensor;
 static_assert(static_cast<int>(Operation::GELU_GATE) == static_cast<int>(kidi::cuda::Op::GELU_GATE));
@@ -79,8 +79,8 @@ public:
         if (destination.device() != device_ || result.dtype() != destination.dtype() ||
             !std::ranges::equal(result.shape(), destination.shape()))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "CUDA in-place output shape or dtype changed"});
-        kidi::cuda::copy_device(require(buffer_view(destination)).data,
-                               require(buffer_view(result)).data, result.nbytes(), device_.index);
+        kidi::cuda::copy_device(require(buffer_view(destination)).data, require(buffer_view(result)).data,
+                                result.nbytes(), device_.index);
         return destination;
     }
     auto run_pair(TensorInputs inputs) -> std::array<Tensor, 2> override {
@@ -112,8 +112,7 @@ public:
             bindings[index] = view(constants_[index].defined() ? constants_[index] : inputs[index]);
         try {
             if (outputs.size() == 2) residual_->run(bindings.data(), 2, require(buffer_view(outputs[0])).data);
-            program_.run(bindings.data(), static_cast<int>(inputs.size()),
-                         require(buffer_view(outputs.back())).data);
+            program_.run(bindings.data(), static_cast<int>(inputs.size()), require(buffer_view(outputs.back())).data);
         } catch (const std::exception& error) {
             throw ops::Failure({ErrorCode::RUNTIME, error.what()});
         }
@@ -309,7 +308,7 @@ public:
             sizes_[index] = inputs[slot].nbytes();
         }
         kidi::cuda::copy_device_batch(destinations_.data(), sources_.data(), sizes_.data(), sizes_.size(),
-                                     device_.index);
+                                      device_.index);
         if (selection_.defined())
             check_cuda(cudaMemcpyAsync(resources_->selection, require(buffer_view(selection_)).data,
                                        selection_.nbytes(), cudaMemcpyDeviceToHost, resources_->stream));
@@ -317,8 +316,8 @@ public:
             auto& output = exports_[index];
             if (output.device() != Device::cpu()) {
                 kidi::cuda::copy_device(require(buffer_view(output)).data,
-                                       require(buffer_view(graph_.outputs()[index])).data, output.nbytes(),
-                                       device_.index);
+                                        require(buffer_view(graph_.outputs()[index])).data, output.nbytes(),
+                                        device_.index);
             }
             outputs[index] = output;
         }
@@ -368,13 +367,14 @@ public:
 private:
     struct ProjectionGroup {
         std::vector<std::size_t> nodes;
-        Tensor weight, output;
+        Tensor weight, scales, output;
+        bool packed = false;
         std::unique_ptr<kidi::cuda::Program> program;
     };
     auto prepare_projections() -> void {
         auto nodes = graph_.nodes();
         projection_nodes_.assign(nodes.size(), SIZE_MAX);
-        const auto eligible = [&](const graph::Node& node) {
+        const auto eligible_bf16 = [&](const graph::Node& node) {
             return node.operation == Operation::LINEAR && node.input_count == 2 && node.attributes.size() == 1 &&
                    node.attributes[0] == 1 && node.inputs()[0].dtype() == tensor::DType::BF16 &&
                    node.inputs()[1].dtype() == tensor::DType::BF16 && node.inputs()[1].device() == device_ &&
@@ -386,36 +386,83 @@ private:
                        return output.storage_identity() == node.outputs()[0].storage_identity();
                    });
         };
+        const auto eligible_packed = [&](const graph::Node& node) {
+            if (node.operation != Operation::PACKED_LINEAR || node.input_count != 3 || node.attributes.size() != 3 ||
+                node.attributes[0] != 8 || node.attributes[1] <= 0)
+                return false;
+            const auto& activation = node.inputs()[0];
+            const auto& weight = node.inputs()[1];
+            const auto& scales = node.inputs()[2];
+            const auto width = activation.dimensions() > 0 ? static_cast<std::int64_t>(activation.size(-1)) : 0;
+            const auto group_size = node.attributes[1];
+            const bool w8a16 = activation.dtype() == tensor::DType::BF16 &&
+                               node.outputs()[0].dtype() == tensor::DType::BF16 && node.attributes[2] == 0 &&
+                               node.epsilon == 0.F;
+            const bool w8a8 = (activation.dtype() == tensor::DType::F32 || activation.dtype() == tensor::DType::BF16) &&
+                              node.outputs()[0].dtype() == tensor::DType::F32 && group_size == width;
+            return (w8a16 || w8a8) && activation.numel() == width && width > 0 && width % group_size == 0 &&
+                   (weight.dtype() == tensor::DType::U8 || weight.dtype() == tensor::DType::I8) &&
+                   weight.device() == device_ && weight.dimensions() == 2 && weight.size(1) == width &&
+                   scales.dtype() == tensor::DType::F32 && scales.device() == device_ &&
+                   scales.numel() == weight.size(0) * (width / group_size) &&
+                   node.sources[0].kind == graph::Source::Kind::NODE &&
+                   node.sources[1].kind == graph::Source::Kind::EXTERNAL &&
+                   node.sources[2].kind == graph::Source::Kind::EXTERNAL &&
+                   std::ranges::none_of(graph_.outputs(), [&](const auto& output) {
+                       return output.storage_identity() == node.outputs()[0].storage_identity();
+                   });
+        };
         for (std::size_t first = 0; first < nodes.size(); ++first) {
-            if (projection_nodes_[first] != SIZE_MAX || !eligible(nodes[first])) continue;
+            const bool bf16 = eligible_bf16(nodes[first]);
+            const bool packed = !bf16 && eligible_packed(nodes[first]);
+            if (projection_nodes_[first] != SIZE_MAX || (!bf16 && !packed)) continue;
             ProjectionGroup group;
+            group.packed = packed;
             const auto& source = nodes[first].sources[0];
             std::int64_t columns = 0;
             for (std::size_t index = first; index < nodes.size(); ++index) {
-                if (projection_nodes_[index] != SIZE_MAX || !eligible(nodes[index])) continue;
+                if (projection_nodes_[index] != SIZE_MAX) continue;
+                if (bf16 ? !eligible_bf16(nodes[index]) : !eligible_packed(nodes[index])) continue;
                 const auto& other = nodes[index].sources[0];
                 if (source.kind != other.kind || source.index != other.index || source.output != other.output ||
                     source.offset != other.offset ||
                     !std::ranges::equal(nodes[first].inputs()[0].shape(), nodes[index].inputs()[0].shape()))
+                    continue;
+                if (packed && (nodes[first].inputs()[0].dtype() != nodes[index].inputs()[0].dtype() ||
+                               nodes[first].outputs()[0].dtype() != nodes[index].outputs()[0].dtype() ||
+                               nodes[first].attributes[1] != nodes[index].attributes[1] ||
+                               nodes[first].attributes[2] != nodes[index].attributes[2] ||
+                               nodes[first].epsilon != nodes[index].epsilon ||
+                               nodes[first].inputs()[1].dtype() != nodes[index].inputs()[1].dtype()))
                     continue;
                 group.nodes.push_back(index);
                 columns += nodes[index].inputs()[1].size(0);
             }
             if (group.nodes.size() < 2) continue;
             const auto width = static_cast<std::int64_t>(nodes[first].inputs()[0].size(-1));
-            group.weight = require(Tensor::empty({columns, width}, tensor::DType::BF16, device_));
+            const auto group_size = packed ? nodes[first].attributes[1] : width;
+            const auto groups = width / group_size;
+            group.weight = require(Tensor::empty({columns, width}, nodes[first].inputs()[1].dtype(), device_));
+            if (packed) group.scales = require(Tensor::empty({columns, groups}, tensor::DType::F32, device_));
             auto shape = std::vector<std::int64_t>(nodes[first].outputs()[0].shape().begin(),
                                                    nodes[first].outputs()[0].shape().end());
             shape.back() = columns;
-            group.output = require(Tensor::empty(shape, tensor::DType::BF16, device_));
+            group.output = require(Tensor::empty(shape, nodes[first].outputs()[0].dtype(), device_));
             std::int64_t start = 0;
             for (const auto index : group.nodes) {
                 const auto original = nodes[index].outputs()[0];
                 const auto length = static_cast<std::int64_t>(original.size(-1));
-                auto* packed =
-                    static_cast<std::byte*>(require(buffer_view(group.weight)).data) + start * width * 2;
-                kidi::cuda::copy_device(packed, require(buffer_view(nodes[index].inputs()[1])).data,
-                                       nodes[index].inputs()[1].nbytes(), device_.index);
+                const auto elem_bytes = static_cast<std::int64_t>(tensor::element_size(group.weight.dtype()));
+                auto* dst_weight =
+                    static_cast<std::byte*>(require(buffer_view(group.weight)).data) + start * width * elem_bytes;
+                kidi::cuda::copy_device(dst_weight, require(buffer_view(nodes[index].inputs()[1])).data,
+                                        nodes[index].inputs()[1].nbytes(), device_.index);
+                if (packed) {
+                    auto* packed_scales = static_cast<std::byte*>(require(buffer_view(group.scales)).data) +
+                                          start * groups * static_cast<std::int64_t>(sizeof(float));
+                    kidi::cuda::copy_device(packed_scales, require(buffer_view(nodes[index].inputs()[2])).data,
+                                            nodes[index].inputs()[2].nbytes(), device_.index);
+                }
                 const auto flat = require(group.output.reshape({columns}));
                 for (auto& node : nodes)
                     for (auto& operand : node.operands) {
@@ -432,13 +479,27 @@ private:
                 start += length;
             }
             kidi::cuda::Descriptor descriptor;
-            descriptor.operation = kidi::cuda::Op::LINEAR;
-            descriptor.input_count = 2;
-            descriptor.inputs[0] = view(nodes[first].inputs()[0]);
-            descriptor.inputs[1] = view(group.weight);
-            descriptor.output.type = kidi::cuda::Type::BF16;
-            descriptor.attribute_count = 1;
-            descriptor.attributes[0] = 1;
+            if (packed) {
+                descriptor.operation = kidi::cuda::Op::PACKED_LINEAR;
+                descriptor.input_count = 3;
+                descriptor.inputs[0] = view(nodes[first].inputs()[0]);
+                descriptor.inputs[1] = view(group.weight);
+                descriptor.inputs[2] = view(group.scales);
+                descriptor.output.type = static_cast<kidi::cuda::Type>(nodes[first].outputs()[0].dtype());
+                descriptor.attribute_count = 3;
+                descriptor.attributes[0] = 8;
+                descriptor.attributes[1] = group_size;
+                descriptor.attributes[2] = nodes[first].attributes[2];
+                descriptor.epsilon = nodes[first].epsilon;
+            } else {
+                descriptor.operation = kidi::cuda::Op::LINEAR;
+                descriptor.input_count = 2;
+                descriptor.inputs[0] = view(nodes[first].inputs()[0]);
+                descriptor.inputs[1] = view(group.weight);
+                descriptor.output.type = kidi::cuda::Type::BF16;
+                descriptor.attribute_count = 1;
+                descriptor.attributes[0] = 1;
+            }
             group.program = std::make_unique<kidi::cuda::Program>(descriptor, device_.index);
             projections_.push_back(std::move(group));
         }
@@ -505,8 +566,13 @@ private:
             } else {
                 auto& group = projections_[projection_nodes_[index]];
                 if (group.nodes.front() == index) {
-                    const std::array bindings{view(node.inputs()[0]), view(group.weight)};
-                    group.program->run(bindings.data(), 2, require(buffer_view(group.output)).data);
+                    if (group.packed) {
+                        const std::array bindings{view(node.inputs()[0]), view(group.weight), view(group.scales)};
+                        group.program->run(bindings.data(), 3, require(buffer_view(group.output)).data);
+                    } else {
+                        const std::array bindings{view(node.inputs()[0]), view(group.weight)};
+                        group.program->run(bindings.data(), 2, require(buffer_view(group.output)).data);
+                    }
                 }
             }
             if (!resources_->profiles.empty())
@@ -733,7 +799,7 @@ public:
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "CUDA slice copy is out of bounds"});
         for (std::size_t index = 0; index < outer; ++index)
             kidi::cuda::copy_device(target + index * destination_bytes + offset, input + index * source_bytes,
-                                   source_bytes, device_.index);
+                                    source_bytes, device_.index);
     }
 
 private:

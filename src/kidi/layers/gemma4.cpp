@@ -203,7 +203,8 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
         if (!small_fusion && !uncalibrated)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "fused feed-forward requires positive trained scales"});
     }
-    if ((kernel == tensor::FeedForwardKernel::PACKED_GATE && (fused_silu || input.dtype() == tensor::DType::BF16)) ||
+    if ((kernel == tensor::FeedForwardKernel::PACKED_GATE &&
+         (fused_silu || input.dtype() == tensor::DType::BF16 || context.device().kind == tensor::DeviceKind::CUDA)) ||
         (kernel == tensor::FeedForwardKernel::PACKED_LARGE && !large_fusion)) {
         const auto projected = gate_up_->forward(context, input);
         return down_->forward(context, fused_silu ? context.silu_gate(projected) : context.gelu_gate(projected));
@@ -305,7 +306,7 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
             const auto value_scale = require(value_scale_.data<float>())[0];
             key_quantization = {{key_scale}, {0}, static_cast<std::size_t>(head_width_)};
             value_quantization = {{value_scale}, {0}, static_cast<std::size_t>(head_width_)};
-            if (!byte_cache) {
+            if (!byte_cache && context.precision() != core::InferencePrecision::Q8A16) {
                 key = context.static_round(key, key_scale);
                 value = context.static_round(value, value_scale);
             }

@@ -409,6 +409,14 @@ set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
 target_link_libraries(kidi_cli PRIVATE kidi_cli_main)
 kidi_optimize_executable(kidi_cli)
 
+if(KIDI_ENABLE_CUDA)
+    target_link_options(kidi_cli PRIVATE -static-libstdc++ -static-libgcc)
+    add_custom_command(TARGET kidi_cli POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" "-DREADELF=${CMAKE_READELF}" "-DBINARY=$<TARGET_FILE:kidi_cli>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/third_party/liteapp/cmake/VerifyPortableElf.cmake"
+        VERBATIM)
+endif()
+
 if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
     foreach(_kidi_target IN ITEMS kidi_argparse kidi kidi_cli_main)
         target_compile_options(${_kidi_target} PRIVATE -ffunction-sections -fdata-sections)

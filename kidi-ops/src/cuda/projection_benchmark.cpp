@@ -1,8 +1,5 @@
 #include "cuda/runtime.h"
 #include <cuda_runtime_api.h>
-#if defined(KIDI_CUDA_USE_CUBLAS)
-#include <cublas_v2.h>
-#endif
 
 #include <algorithm>
 #include <array>
@@ -54,7 +51,6 @@ float measure(Program& program, const std::array<Tensor, 4>& inputs, int count, 
     return measure_launch([&] { program.run(inputs.data(), count, output); }, inputs[0].device, repeats);
 }
 
-#if defined(KIDI_CUDA_USE_CUBLAS)
 void benchmark_bfloat_vector(int width, int columns, int device) {
     std::vector<std::uint16_t> values(width), weights(static_cast<std::size_t>(columns) * width);
     const auto fill = [](auto& data, int multiplier) {
@@ -83,23 +79,15 @@ void benchmark_bfloat_vector(int width, int columns, int device) {
     descriptor.output.type = Type::BF16;
     descriptor.attribute_count = 1;
     descriptor.attributes[0] = 1;
-    Program automatic(descriptor, device);
-    cublasHandle_t handle{};
-    if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS)
-        throw std::runtime_error("cuBLAS benchmark initialization failed");
-    const float alpha = 1, beta = 0;
-    const auto baseline = [&] {
-        const auto status = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, columns, 1, width, &alpha, weight.get(),
-                                         CUDA_R_16BF, width, input.get(), CUDA_R_16BF, width, &beta, output.get(),
-                                         CUDA_R_16BF, columns, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-        if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cuBLAS vector benchmark failed");
-    };
-    const auto baseline_us = measure_launch(baseline, device, 10);
+    descriptor.reference_projection = true;
+    Program reference(descriptor, device);
+    const auto baseline_us = measure(reference, inputs, 2, output.get(), 10);
     std::vector<std::uint16_t> expected(columns), actual(columns);
     copy_to_host(expected.data(), output.get(), expected.size() * sizeof(std::uint16_t), device);
+    descriptor.reference_projection = false;
+    Program automatic(descriptor, device);
     const auto automatic_us = measure(automatic, inputs, 2, output.get(), 10);
     copy_to_host(actual.data(), output.get(), actual.size() * sizeof(std::uint16_t), device);
-    cublasDestroy(handle);
     const auto decode = [](std::uint16_t rounded) {
         const std::uint32_t bits = static_cast<std::uint32_t>(rounded) << 16;
         float number = 0;
@@ -107,7 +95,7 @@ void benchmark_bfloat_vector(int width, int columns, int device) {
         return number;
     };
     float maximum_error = 0;
-    double maximum_math_error = 0, maximum_cublas_math_error = 0;
+    double maximum_math_error = 0;
     for (std::size_t index = 0; index < actual.size(); ++index) {
         const auto target = decode(expected[index]), result = decode(actual[index]);
         const auto error = std::abs(result - target);
@@ -123,17 +111,14 @@ void benchmark_bfloat_vector(int width, int columns, int device) {
         if (!std::isfinite(result) || std::abs(result - oracle) > bound)
             throw std::runtime_error("BF16 vector exceeds the FP32 accumulation/BF16 rounding error bound");
         maximum_math_error = std::max(maximum_math_error, std::abs(result - oracle));
-        maximum_cublas_math_error = std::max(maximum_cublas_math_error, std::abs(target - oracle));
         maximum_error = std::max(maximum_error, error);
     }
     std::cout << "{\"operation\":\"bf16_vector\",\"width\":" << width << ",\"columns\":" << columns
-              << ",\"cublas_us\":" << baseline_us << ",\"automatic_us\":" << automatic_us
+              << ",\"reference_us\":" << baseline_us << ",\"automatic_us\":" << automatic_us
               << ",\"speedup\":" << baseline_us / automatic_us << ",\"maximum_error\":" << maximum_error
-              << ",\"maximum_math_error\":" << maximum_math_error
-              << ",\"maximum_cublas_math_error\":" << maximum_cublas_math_error << "}\n"
+              << ",\"maximum_math_error\":" << maximum_math_error << "}\n"
               << std::flush;
 }
-#endif
 
 void benchmark_mixed_matrix(int rows, int device) {
     constexpr int width = 2560, columns = 10752;
@@ -271,7 +256,6 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "bf16") {
-#if defined(KIDI_CUDA_USE_CUBLAS)
             for (const auto columns : {256, 1536, 2048, 12288, 24576, 262144})
                 benchmark_bfloat_vector(1536, columns, device);
             benchmark_bfloat_vector(12288, 1536, device);
@@ -279,9 +263,6 @@ int main(int argc, char** argv) {
             benchmark_bfloat_vector(2048, 1536, device);
             benchmark_bfloat_vector(4096, 1536, device);
             return 0;
-#else
-            throw std::runtime_error("The BF16 vector comparison requires a cuBLAS build");
-#endif
         }
         for (const auto rows : {1, 4, 8, 16, 128}) {
             benchmark(rows, 768, 3072, device);

@@ -23,10 +23,11 @@ CPU kernels.
 
 ## CUDA
 
-The CUDA module owns kernels, cuBLAS dispatch, storage, and graph replay. It is
-built only with `KIDI_ENABLE_CUDA=ON` and requires CUDA 13 or later. Run
-`make release-cuda` from the Kidi root. The optional `kidi-index-cuda` executable
-keeps cuVS and DLPack dependencies separate from inference.
+The CUDA module owns native CUDA/CUTLASS kernels, static runtime dispatch,
+storage, and graph replay. It is built only with `KIDI_ENABLE_CUDA=ON` and
+requires CUDA 13 or later. Run `make release-cuda` from the Kidi root. The
+optional `kidi-index-cuda` executable keeps cuVS and DLPack dependencies
+separate from inference.
 
 ## Qualcomm QNN
 

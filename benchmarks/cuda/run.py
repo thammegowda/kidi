@@ -153,7 +153,7 @@ def main():
     paths.append(ROOT / "third_party/ynnpack-dev/ynnpack/kernels/dot/dot.cc")
     report["source"]["file_sha256"] = {str(path.relative_to(ROOT)): digest(path) for path in sorted(set(paths))}
     report["source"]["binary_sha256"] = {name: digest(ROOT / "build-release" / name) for name in ("kidi", "kidi_android_baseline", "kidi_tts_bench")}
-    report["memory_note"] = "GPU peaks include runtime-owned allocations only, excluding driver/context and cuBLAS-private allocations."
+    report["memory_note"] = "GPU peaks include runtime-owned allocations only, excluding driver/context allocations."
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
 
     def save():
