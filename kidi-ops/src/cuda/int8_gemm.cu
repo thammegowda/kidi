@@ -1,4 +1,5 @@
 #include "cuda/int8_gemm.h"
+#include "cuda/launch.h"
 #include "cuda/ptx_mma.cuh"
 
 #include <cuda_bf16.h>
@@ -272,23 +273,10 @@ void run_w8a8(int slices, cudaStream_t stream, int rows, int columns, int width,
     const dim3 grid(static_cast<unsigned int>((columns - 1) / TileCols + 1),
                     static_cast<unsigned int>((rows - 1) / TileRows + 1), static_cast<unsigned int>(slices));
     if constexpr (smem > 48 * 1024) {
-        static thread_local std::uint64_t configured = 0;
-        int device = 0;
-        cudaGetDevice(&device);
-        const auto bit = device >= 0 && device < 64 ? std::uint64_t{1} << device : 0;
-        if (!bit || !(configured & bit)) {
-            cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
-            if (cudaStreamIsCapturing(stream, &capturing) == cudaSuccess &&
-                capturing == cudaStreamCaptureStatusNone) {
-                const auto status =
-                    cudaFuncSetAttribute(pipelined_w8a8_gemm<TileRows, TileCols, MWarps, NWarps>,
-                                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-                if (status != cudaSuccess)
-                    throw std::runtime_error(std::string("CUDA: setting W8A8 shared-memory limit failed: ") +
-                                             cudaGetErrorString(status));
-                configured |= bit;
-            }
-        }
+        const auto status = allow_shared_memory<pipelined_w8a8_gemm<TileRows, TileCols, MWarps, NWarps>>(smem, stream);
+        if (status != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA: setting W8A8 shared-memory limit failed: ") +
+                                     cudaGetErrorString(status));
     }
     pipelined_w8a8_gemm<TileRows, TileCols, MWarps, NWarps>
         <<<grid, static_cast<unsigned int>(MWarps * NWarps * 32), smem, stream>>>(

@@ -37,6 +37,23 @@ private:
     bool changed_ = false;
 };
 
+// Opts `Kernel` into `bytes` of dynamic shared memory (needed above 48 KiB) on the current device.
+// The attribute is per device, so it is cached per device bit. It is skipped while `stream` is capturing.
+template <auto Kernel>
+cudaError_t allow_shared_memory(int bytes, cudaStream_t stream) {
+    static thread_local std::uint64_t configured = 0;
+    int device = 0;
+    if (const auto status = cudaGetDevice(&device); status != cudaSuccess) return status;
+    const std::uint64_t bit = device >= 0 && device < 64 ? std::uint64_t{1} << device : 0;
+    if (bit && (configured & bit)) return cudaSuccess;
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capturing) != cudaSuccess || capturing != cudaStreamCaptureStatusNone)
+        return cudaSuccess;
+    const auto status = cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    if (status == cudaSuccess) configured |= bit;
+    return status;
+}
+
 struct DenseDevice {
     int major, multiprocessors;
 };

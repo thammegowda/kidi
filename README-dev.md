@@ -33,7 +33,7 @@ under `.cache/tools/`, verifying its SHA-256 checksum. Make targets use
 these local tools. For direct shell commands, run
 `export PATH="$PWD/.cache/tools/bin:$PATH"`. `make setup-test` installs the
 Python test/build tools and browser test tools without APT or Homebrew.
-`make test` and `make test-cuda` prepare their test tools automatically.
+`make test-all` and `make test-all-cuda` prepare their test tools automatically.
 Model fixtures are acquired only by the test goals that need them.
 
 C/C++ dependencies are pinned submodules under `third_party/`.
@@ -586,42 +586,47 @@ Smaller downloads come from quantization, not from container overhead alone.
 
 ## Tests
 
-Native unit tests, without downloading a model:
-
-```bash
-make native-test
-```
-
-This builds the `debug` preset with integration tests disabled. To include Python
-and supported model regression tests:
+For the fast C++ loop, run the native GoogleTest cases only:
 
 ```bash
 make test
 ```
 
-`make test` builds and tests `build-debug/kidi`, runs Python tests against an
+This builds the `debug` preset with integration tests disabled and runs CTest in
+parallel: at most 12 jobs (`TEST_JOBS` can lower this but is clamped to 12), of which at
+most 8 may be `cuda`-labelled GPU tests. The GPU cap is a CTest resource pool in
+`cmake/ctest-resources.json`, applied by the test presets; plain
+`ctest --test-dir` without `--resource-spec-file` does not enforce it. It needs no Python venv, wheel, or
+model download. `make native-test` is an alias. To include the Python and model
+regression tests:
+
+```bash
+make test-all
+```
+
+`make test-all` builds and tests `build-debug/kidi`, runs Python tests against an
 installed Debug wheel, and runs the 50-sentence RTG regression through one CTest
 invocation. It never uses the Release binary. The pinned public model downloads
 on the first CPU regression run; no Hub login is required.
 Browser and extension suites remain separate. Individual targets are
-`native-test`, `python-test`, `web-test`, and
-`regression-test`. See [tests/data/README.md](tests/data/README.md) for fixtures
-and numerical contracts.
+`python-test`, `web-test`, and `regression-test`. See
+[tests/data/README.md](tests/data/README.md) for fixtures and numerical contracts.
 
 RTG regression defaults to `KIDI_BACKEND=ynnpack`. Override it with
-`make test KIDI_BACKEND=mps` on a supported Mac; the generic `BACKEND` variable
-is ignored.
+`make test-all KIDI_BACKEND=mps` on a supported Mac; the generic `BACKEND`
+variable is ignored.
 
 On Linux with an NVIDIA GPU and the CUDA toolkit, test the CUDA backend with:
 
 ```bash
 make test-cuda KIDI_CUTLASS_ROOT=/path/to/cutlass
+make test-all-cuda KIDI_CUTLASS_ROOT=/path/to/cutlass
 ```
 
-This configures the `debug-cuda` preset (`build-debug-cuda/`, Debug with
-`KIDI_ENABLE_CUDA=ON`) and runs native tests plus Python tests against a
-CUDA-enabled Debug wheel. This includes the `cuda`-labelled kernel tests and
-CUDA model numerical checks. The RTG translation regression is excluded because
+Both configure the `debug-cuda` preset (`build-debug-cuda/`, Debug with
+`KIDI_ENABLE_CUDA=ON`). `make test-cuda` runs native tests only;
+`make test-all-cuda` also runs Python tests against a CUDA-enabled Debug wheel.
+Both include the `cuda`-labelled kernel tests and CUDA model numerical checks. The RTG translation regression is excluded because
 RTG currently has no CUDA backend; browser and extension tests are also excluded.
 The Gemma 4 numerical fixture is a regression test on both CPU and CUDA.
 Optional Python chat regressions use CUDA when `KIDI_CHAT_MODEL` is set.
@@ -630,7 +635,7 @@ CPU and CUDA test environments are isolated under `.cache/test-venv` and
 build directory's `python/` subdirectory.
 `KIDI_CUTLASS_ROOT` is optional and applies to all CUDA Make goals and the test
 wheel. Without it, CUTLASS-only kernels are not built or tested.
-Run only the kernel tests with
+Run only the GPU tests (kernels plus CUDA model checks) with
 `ctest --preset debug-cuda -L cuda`.
 
 Native tests are GoogleTest binaries (GoogleTest comes from the `ynnpack-dev`

@@ -1,5 +1,6 @@
 #include "cuda/flash_attention.h"
 #include "cuda/flash_attention_device.cuh"
+#include "cuda/launch.h"
 #include "cuda/ptx_mma.cuh"
 #include "cuda/runtime.h"
 
@@ -637,13 +638,10 @@ auto run_fa2(const FlashAttentionArgs& args, std::int64_t m_s0, std::int64_t m_s
     const auto blocks = static_cast<unsigned int>(args.batches * args.key_heads * head_groups * q_tiles);
     const bool float_io = args.query.type == static_cast<int>(Type::F32);
     auto* kernel = float_io ? flash_attention_fa2<HeadDim, true> : flash_attention_fa2<HeadDim, false>;
-    static bool configured[2] = {};
-    if (!configured[float_io]) {
-        if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(Config::Smem)) != cudaSuccess)
-            return false;
-        configured[float_io] = true;
-    }
+    constexpr int smem = static_cast<int>(Config::Smem);
+    const auto status = float_io ? allow_shared_memory<flash_attention_fa2<HeadDim, true>>(smem, stream)
+                                 : allow_shared_memory<flash_attention_fa2<HeadDim, false>>(smem, stream);
+    if (status != cudaSuccess) return false;
     kernel<<<blocks, Config::Threads, Config::Smem, stream>>>(args, g_pack, q_per_cta, head_groups,
                                                               static_cast<int>(q_tiles), m_s0, m_s2);
     return true;

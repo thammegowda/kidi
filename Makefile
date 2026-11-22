@@ -9,6 +9,10 @@ WEB_DIR ?= build-web
 APP_CONFIG ?= examples/kidi-app.yaml
 APP_PORT ?= 10010
 KIDI_CUTLASS_ROOT ?=
+# Parallel CTest jobs: min(cores, 12). GPU tests are further capped at 8 by cmake/ctest-resources.json.
+TEST_JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+# Hard ceiling: TEST_JOBS may lower parallelism but never exceed 12 concurrent tests.
+CTEST_JOBS := $(shell n=$$(( $(TEST_JOBS) + 0 )) 2>/dev/null || n=12; [ $$n -ge 1 ] 2>/dev/null || n=1; echo $$((n < 12 ? n : 12)))
 TEST_PRESET ?= debug
 TEST_BUILD := build-$(TEST_PRESET)
 TEST_ENV := .cache/test-venv$(if $(filter debug-cuda,$(TEST_PRESET)),-cuda)
@@ -21,7 +25,7 @@ CUDA_CMAKE_ARGS = $(if $(KIDI_CUTLASS_ROOT),-DKIDI_CUTLASS_ROOT="$(abspath $(KID
 export PATH := $(CURDIR)/.cache/tools/bin:$(PATH)
 export KIDI_HUB PYTHON
 
-.PHONY: setup setup-test debug debug-cuda release release-cuda build-test build-python-test prepare-test native-test test-cuda ynnpack-test python-test web-deps web-test-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
+.PHONY: setup setup-test debug debug-cuda release release-cuda build-test build-python-test prepare-test native-test test-cuda test-all test-all-cuda ynnpack-test python-test web-deps web-test-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
 
 refresh:
 	git submodule update --init --recursive --depth 10 --jobs 12
@@ -42,8 +46,7 @@ debug debug-cuda release release-cuda:
 
 build-test: debug
 
-native-test: debug
-	ctest --preset debug -L native
+native-test: test
 
 ynnpack-test:
 	$(MAKE) -C third_party/ynnpack-dev test
@@ -84,9 +87,17 @@ prepare-test: build-python-test
 		$(if $(filter ON,$(TEST_CUDA)),$(CUDA_CMAKE_ARGS))
 	cmake --build --preset $(TEST_PRESET)
 
+# Fast C++ loop: GoogleTest cases only; no Python wheel, venv, or model download.
 test test-cuda:
-	$(MAKE) prepare-test TEST_PRESET=$(patsubst test%,debug%,$@)
-	ctest --preset $(patsubst test%,debug%,$@)
+	cmake --preset $(patsubst test%,debug%,$@) -DKIDI_BUILD_INTEGRATION_TESTS=OFF \
+		$(if $(filter %-cuda,$@),$(CUDA_CMAKE_ARGS))
+	cmake --build --preset $(patsubst test%,debug%,$@)
+	ctest --preset $(patsubst test%,debug%,$@) -j $(CTEST_JOBS)
+
+# Everything: native tests plus Python wheel tests and the RTG regression.
+test-all test-all-cuda:
+	$(MAKE) prepare-test TEST_PRESET=$(patsubst test-all%,debug%,$@)
+	ctest --preset $(patsubst test-all%,debug%,$@) -j $(CTEST_JOBS)
 
 app:
 	cmake --preset release -DKIDI_BUILD_DESKTOP_APP=ON
