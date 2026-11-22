@@ -2,12 +2,43 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
+#include <stdexcept>
 
 #include <yaml-cpp/yaml.h>
 
 #include "kidi/audio/whisper.h"
 
 namespace {
+auto create_fixture_directory() -> std::filesystem::path {
+    const auto root = std::filesystem::temp_directory_path();
+    std::random_device random;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        auto candidate = root / ("kidi-whisper-audio-test-" + std::to_string(random()));
+        if (std::filesystem::create_directory(candidate)) return candidate;
+    }
+    throw std::runtime_error("cannot create a unique Whisper test directory");
+}
+
+struct PreprocessorFixture {
+    const std::filesystem::path directory = create_fixture_directory();
+    const std::filesystem::path config = directory / "preprocessor_config.json";
+
+    ~PreprocessorFixture() {
+        std::error_code error;
+        std::filesystem::remove(config, error);
+        if (!error) std::filesystem::remove(directory, error);
+        if (error) std::cerr << "failed to clean up Whisper test fixture: " << error.message() << '\n';
+    }
+};
+
+auto write_config(const std::filesystem::path& path, const YAML::Node& config) -> void {
+    std::ofstream output(path);
+    output << YAML::Dump(config);
+    output.close();
+    if (!output) throw std::runtime_error("failed to write Whisper preprocessor config: " + path.string());
+}
+
 auto write_preprocessor(const std::filesystem::path& path, int bins, bool embedded) -> void {
     YAML::Node config;
     config["feature_extractor_type"] = "WhisperFeatureExtractor";
@@ -21,22 +52,24 @@ auto write_preprocessor(const std::filesystem::path& path, int bins, bool embedd
         for (int mel = 0; mel < bins; ++mel)
             for (int frequency = 0; frequency < 201; ++frequency)
                 config["mel_filters"][mel].push_back(frequency == mel ? 1.F : 0.F);
-    std::ofstream(path) << YAML::Dump(config);
+    write_config(path, config);
 }
 } // namespace
 
-auto main() -> int {
-    const auto directory = std::filesystem::temp_directory_path() / "kidi-whisper-audio-test";
-    std::filesystem::remove_all(directory);
-    std::filesystem::create_directories(directory);
-    const auto config = directory / "preprocessor_config.json";
+auto main() -> int try {
+    const PreprocessorFixture fixture;
+    const auto& config = fixture.config;
     const std::vector<float> silence(400);
     for (const std::size_t bins : {80, 128}) {
         for (const bool embedded : {true, false}) {
             write_preprocessor(config, static_cast<int>(bins), embedded);
             auto extractor = kidi::audio::WhisperFeatureExtractor::load(config);
-            if (!extractor || extractor->bins() != bins) {
-                std::cerr << "failed to load Whisper preprocessor\n";
+            if (!extractor) {
+                std::cerr << "failed to load Whisper preprocessor: " << extractor.error().message << '\n';
+                return 1;
+            }
+            if (extractor->bins() != bins) {
+                std::cerr << "expected " << bins << " Whisper mel bins, got " << extractor->bins() << '\n';
                 return 1;
             }
             auto features = extractor->extract(silence, 16000);
@@ -67,11 +100,13 @@ auto main() -> int {
     write_preprocessor(config, 128, true);
     auto invalid = YAML::LoadFile(config.string());
     invalid["mel_filters"][0] = YAML::Node(YAML::NodeType::Sequence);
-    std::ofstream(config) << YAML::Dump(invalid);
+    write_config(config, invalid);
     if (kidi::audio::WhisperFeatureExtractor::load(config)) {
         std::cerr << "invalid mel filter shape was accepted\n";
         return 1;
     }
-    std::filesystem::remove_all(directory);
     return 0;
+} catch (const std::runtime_error& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
 }
