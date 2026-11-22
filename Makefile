@@ -21,7 +21,7 @@ CUDA_CMAKE_ARGS = $(if $(KIDI_CUTLASS_ROOT),-DKIDI_CUTLASS_ROOT="$(abspath $(KID
 export PATH := $(CURDIR)/.cache/tools/bin:$(PATH)
 export KIDI_HUB PYTHON
 
-.PHONY: setup setup-test debug debug-cuda release release-cuda build-test build-python-test prepare-test native-test test-cuda ynnpack-test python-test web-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
+.PHONY: setup setup-test debug debug-cuda release release-cuda build-test build-python-test prepare-test native-test test-cuda ynnpack-test python-test web-deps web-test-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
 
 refresh:
 	git submodule update --init --recursive --depth 10 --jobs 12
@@ -63,10 +63,13 @@ python-test: build-python-test
 web-deps: setup-node
 	node web/tools/prepare-libs.mjs
 
+web-test-deps: setup-node
+	node web/tools/prepare-libs.mjs --tests
+
 web-test: web-deps
 	node --test tests/browser/*_test.mjs third_party/liteapp/tests/browser/*_test.mjs
 
-web-smoke-test: web-deps
+web-smoke-test: web-test-deps
 	npm --prefix web run test:pages -- "$(abspath $(WEB_DIR))"
 
 regression-test: setup-test debug

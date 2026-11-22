@@ -123,16 +123,15 @@ jobs:
           test -z "$(find build-pages -name '*.safetensors' -print -quit)"
 
       - name: Restore Chromium smoke test browser
-        id: playwright
         uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-v1-${{ runner.os }}-${{ runner.arch }}-ubuntu24-${{ hashFiles('web/package-lock.json') }}
+          key: playwright-v2-${{ runner.os }}-${{ runner.arch }}-ubuntu24-${{ hashFiles('web/package-lock.json') }}
 
-      - name: Install Chromium smoke test browser
-        if: steps.playwright.outputs.cache-hit != 'true'
+      - name: Ensure the pinned Chromium smoke test browser is installed
         run: |
-          npm --prefix web exec -- playwright install --only-shell chromium
+          make web-test-deps
+          npm --prefix web exec --no -- playwright install --only-shell chromium
 
       - name: Test packaged Pages app in Chromium
         run: make web-smoke-test WEB_DIR=build-pages
