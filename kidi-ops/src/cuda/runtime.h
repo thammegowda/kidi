@@ -52,6 +52,9 @@ enum class Op {
     SCATTER_KV
 };
 
+// Optional work a PACKED_LINEAR applies to its input inside the activation quantization (attributes[3]).
+enum class ProjectionPrologue { NONE, RMS_NORM, GELU_GATE };
+
 struct Tensor {
     void* data = nullptr;
     Type type = Type::F32;

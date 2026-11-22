@@ -379,56 +379,85 @@ void check_nonbroadcast_causal_attention(int device, bool per_key) {
 void check_structured_prefill_attention(int device) {
     using namespace kidi::cuda;
     using Buffer = std::unique_ptr<void, decltype(&release)>;
-    constexpr std::int64_t heads = 8, key_heads = 2, keys = 300;
+    constexpr std::int64_t keys = 300;
+    struct Case {
+        std::int64_t first, window, offset = 0, batches = 1, heads = 8, key_heads = 2;
+        bool bfloat_io = false, masked = true;
+    };
+    const Case cases[]{{0, 0}, {0, 128}, {190, 0}, {190, 128},
+                       {0, 0, 64, 2, 6, 2, true, false},
+                       {190, 128, 64, 2, 6, 2, true},
+                       {-65, 128, 64, 2}};
     const auto bfloat = [](float number) {
         std::uint32_t bits = 0;
         std::memcpy(&bits, &number, sizeof(bits));
         return static_cast<std::uint16_t>(bits >> 16);
     };
     for (const std::int64_t width : {256, 512})
-        for (const std::int64_t first : {0, 190})
-            for (const std::int64_t window : {0, 128}) {
+        for (const auto& test : cases) {
+                const auto [first, window, offset, batches, heads, key_heads, bfloat_io, masked] = test;
                 const auto queries = keys - first;
-                std::vector<float> query(queries * heads * width);
-                std::vector<std::uint16_t> key(keys * key_heads * width), value(key.size());
+                std::vector<float> query(batches * queries * heads * width);
+                std::vector<std::uint16_t> key(batches * keys * key_heads * width), value(key.size()),
+                    bfloat_query(query.size());
                 for (std::size_t index = 0; index < query.size(); ++index)
                     query[index] = static_cast<float>(static_cast<int>(index * 7 % 61) - 30) * 0.03125F;
+                for (std::size_t index = 0; index < query.size(); ++index) bfloat_query[index] = bfloat(query[index]);
                 for (std::size_t index = 0; index < key.size(); ++index) {
                     key[index] = bfloat(static_cast<float>(static_cast<int>(index * 11 % 37) - 18) * 0.0625F);
                     value[index] = bfloat(static_cast<float>(static_cast<int>(index * 13 % 31) - 15) * 0.0625F);
                 }
-                std::vector<std::int32_t> positions(queries);
-                for (std::int64_t row = 0; row < queries; ++row) positions[row] = static_cast<std::int32_t>(first + row);
+                std::vector<std::int32_t> positions(batches * queries);
+                for (std::int64_t row = 0; row < batches * queries; ++row)
+                    positions[row] = static_cast<std::int32_t>(first + row % queries);
+                const auto query_bytes = query.size() * (bfloat_io ? sizeof(std::uint16_t) : sizeof(float));
                 Buffer query_buffer(allocate(query.size() * sizeof(float), device), release),
                     key_buffer(allocate(key.size() * sizeof(std::uint16_t), device), release),
                     value_buffer(allocate(value.size() * sizeof(std::uint16_t), device), release),
                     positions_buffer(allocate(positions.size() * sizeof(std::int32_t), device), release),
                     output(allocate(query.size() * sizeof(float), device), release);
-                copy_to_device(query_buffer.get(), query.data(), query.size() * sizeof(float), device);
+                copy_to_device(query_buffer.get(), bfloat_io ? static_cast<const void*>(bfloat_query.data())
+                                                             : static_cast<const void*>(query.data()),
+                               query_bytes, device);
                 copy_to_device(key_buffer.get(), key.data(), key.size() * sizeof(std::uint16_t), device);
                 copy_to_device(value_buffer.get(), value.data(), value.size() * sizeof(std::uint16_t), device);
                 copy_to_device(positions_buffer.get(), positions.data(), positions.size() * sizeof(std::int32_t),
                                device);
                 const std::array<Tensor, 4> inputs{
-                    Tensor{query_buffer.get(), Type::F32, 3, {1, queries, heads * width}, device},
-                    Tensor{key_buffer.get(), Type::BF16, 3, {1, keys, key_heads * width}, device},
-                    Tensor{value_buffer.get(), Type::BF16, 3, {1, keys, key_heads * width}, device},
-                    Tensor{positions_buffer.get(), Type::I32, 4, {1, 1, queries, 1}, device}};
+                    Tensor{query_buffer.get(), bfloat_io ? Type::BF16 : Type::F32, 3,
+                           {batches, queries, heads * width}, device},
+                    Tensor{key_buffer.get(), Type::BF16, 3, {batches, keys, key_heads * width}, device},
+                    Tensor{value_buffer.get(), Type::BF16, 3, {batches, keys, key_heads * width}, device},
+                    Tensor{positions_buffer.get(), Type::I32, 4, {batches, 1, queries, 1}, device}};
                 Descriptor descriptor;
                 descriptor.operation = Op::ATTENTION;
-                descriptor.input_count = 4;
+                descriptor.input_count = masked ? 4 : 3;
                 std::copy(inputs.begin(), inputs.end(), descriptor.inputs.begin());
                 descriptor.attribute_count = 7;
-                descriptor.attributes = {heads, key_heads, 0, keys, 0, 1, window};
+                descriptor.attributes = {heads, key_heads, offset, keys - offset, 0, 1, window};
                 descriptor.epsilon = 0.0625F;
                 std::vector<float> expected(query.size()), actual(query.size());
+                const auto read_output = [&](std::vector<float>& values) {
+                    if (!bfloat_io) {
+                        copy_to_host(values.data(), output.get(), values.size() * sizeof(float), device);
+                        return;
+                    }
+                    std::vector<std::uint16_t> rounded(values.size());
+                    copy_to_host(rounded.data(), output.get(), rounded.size() * sizeof(std::uint16_t), device);
+                    for (std::size_t index = 0; index < values.size(); ++index) {
+                        const std::uint32_t bits = static_cast<std::uint32_t>(rounded[index]) << 16;
+                        std::memcpy(&values[index], &bits, sizeof(float));
+                    }
+                };
                 descriptor.reference_attention = true;
-                Program(descriptor, device).run(inputs.data(), 4, output.get());
-                copy_to_host(expected.data(), output.get(), expected.size() * sizeof(float), device);
+                Program(descriptor, device).run(inputs.data(), descriptor.input_count, output.get());
+                read_output(expected);
                 descriptor.reference_attention = false;
-                Program(descriptor, device).run(inputs.data(), 4, output.get());
-                copy_to_host(actual.data(), output.get(), actual.size() * sizeof(float), device);
-                for (std::size_t index = 0; index < actual.size(); ++index)
+                Program(descriptor, device).run(inputs.data(), descriptor.input_count, output.get());
+                read_output(actual);
+                for (std::size_t index = 0; index < actual.size(); ++index) {
+                    // The scalar reference's all-masked softmax is undefined; fused attention returns zero.
+                    if (masked && positions[index / (heads * width)] < offset) expected[index] = 0.F;
                     if (!std::isfinite(actual[index]) ||
                         std::abs(actual[index] - expected[index]) > 0.004F + 0.008F * std::abs(expected[index])) {
                         std::cerr << "structured attention mismatch width=" << width << " first=" << first
@@ -436,6 +465,7 @@ void check_structured_prefill_attention(int device) {
                                   << " actual=" << actual[index] << '\n';
                         throw std::runtime_error("CUDA structured prefill attention differs from reference");
                     }
+                }
             }
 }
 

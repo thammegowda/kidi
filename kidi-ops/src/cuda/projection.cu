@@ -12,6 +12,138 @@ namespace kidi::cuda {
 namespace {
 namespace kernel {
 
+struct RowQuantization {
+    float scale, inverse_scale;
+    int zero;
+};
+
+// Match the CPU's dynamic asymmetric quantization, including half-away-from-zero input rounding.
+__device__ inline RowQuantization row_quantization(float minimum, float maximum) {
+    const float difference = maximum - minimum;
+    const float scale = difference == 0.F ? 1.F : difference / 255.F;
+    const float inverse_scale = difference == 0.F ? 0.F : 255.F / difference;
+    int zero = -128;
+    if (difference > 0.F) {
+        // Separate rounding prevents fused multiply-add from changing a zero-point tie.
+        const float scaled_minimum = __fmul_rn(minimum, inverse_scale);
+        const float scaled_maximum = __fmul_rn(maximum, inverse_scale);
+        const float minimum_error = __fadd_rn(-128.F, scaled_minimum);
+        const float maximum_error = __fadd_rn(127.F, scaled_maximum);
+        const float candidate = minimum_error + maximum_error > 0.F ? __fadd_rn(-128.F, -scaled_minimum)
+                                                                    : __fadd_rn(127.F, -scaled_maximum);
+        zero = static_cast<int>(nearbyintf(fminf(127.F, fmaxf(-128.F, candidate))));
+    }
+    return {scale, inverse_scale, zero};
+}
+
+// Block-wide reduction over 256 threads; every thread receives the result.
+template <typename Reduce>
+__device__ inline float block_reduce(float value, float identity, float* shared, Reduce reduce) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int delta = 16; delta > 0; delta >>= 1) value = reduce(value, __shfl_down_sync(0xffffffffu, value, delta));
+    if (lane == 0) shared[warp] = value;
+    __syncthreads();
+    if (warp == 0) {
+        value = lane < 8 ? shared[lane] : identity;
+        for (int delta = 16; delta > 0; delta >>= 1) value = reduce(value, __shfl_down_sync(0xffffffffu, value, delta));
+        if (lane == 0) shared[8] = value;
+    }
+    __syncthreads();
+    const float result = shared[8];
+    __syncthreads();
+    return result;
+}
+
+// One row per 256-thread block: apply the RMS-norm or GELU-gate prologue in registers, then quantize the row
+// to int8 for the W8A8 projection. Arithmetic mirrors dense_rms_normalize, gated_activation and quantize_rows
+// so the fused island is bit-identical to the unfused sequence. RMS keeps dense_rms_normalize's column order
+// (its sum order fixes the result); the elementwise GELU gate reads float4 vectors.
+template <int Vector>
+__device__ inline std::int64_t prologue_column(int index) {
+    return (threadIdx.x + index / Vector * 256) * Vector + index % Vector;
+}
+
+template <int Values, int Vector>
+__global__ void prologue_quantize(Launch plan, float rms_epsilon, std::int64_t width,
+                                  signed char* quantized, float* scales, int* zeros) {
+    __shared__ float shared[9];
+    const auto row = static_cast<std::int64_t>(blockIdx.x);
+    const auto* input = static_cast<const float*>(plan.inputs[0].data);
+    float values[Values];
+    if constexpr (Vector == 1) {
+        const auto* source = input + row * width;
+        const auto* weight = static_cast<const float*>(plan.inputs[3].data);
+        float sum = 0;
+#pragma unroll
+        for (int index = 0; index < Values; ++index) {
+            const auto column = prologue_column<1>(index);
+            values[index] = column < width ? source[column] : 0.F;
+            if (column < width) sum = fmaf(values[index], values[index], sum);
+        }
+        const float total = block_reduce(sum, 0.F, shared, [](float a, float b) { return a + b; });
+        const float inverse = rsqrtf(total / static_cast<float>(width) + rms_epsilon);
+#pragma unroll
+        for (int index = 0; index < Values; ++index) {
+            const auto column = prologue_column<1>(index);
+            if (column < width) values[index] = values[index] * inverse * weight[column];
+        }
+    } else {
+        const auto* gate = reinterpret_cast<const float4*>(input + row * 2 * width);
+        const auto* up = reinterpret_cast<const float4*>(input + row * 2 * width + width);
+        const auto gelu = [](float g, float u) {
+            return 0.5F * g * (1 + tanhf(0.7978845608028654F * (g + 0.044715F * g * g * g))) * u;
+        };
+#pragma unroll
+        for (int chunk = 0; chunk < Values / 4; ++chunk) {
+            const auto vector = threadIdx.x + chunk * 256;
+            float4 g{}, u{};
+            if (vector * 4 < width) {
+                g = gate[vector];
+                u = up[vector];
+            }
+            values[chunk * 4] = gelu(g.x, u.x);
+            values[chunk * 4 + 1] = gelu(g.y, u.y);
+            values[chunk * 4 + 2] = gelu(g.z, u.z);
+            values[chunk * 4 + 3] = gelu(g.w, u.w);
+        }
+    }
+    auto* destination = quantized + row * width;
+    const bool calibrated = plan.epsilon > 0;
+    float minimum = 0.F, maximum = 0.F;
+    if (!calibrated) {
+#pragma unroll
+        for (int index = 0; index < Values; ++index) {
+            minimum = fminf(minimum, values[index]);
+            maximum = fmaxf(maximum, values[index]);
+        }
+        minimum = block_reduce(minimum, 0.F, shared, [](float a, float b) { return fminf(a, b); });
+        maximum = block_reduce(maximum, 0.F, shared, [](float a, float b) { return fmaxf(a, b); });
+    }
+    const auto dynamic = row_quantization(minimum, maximum);
+    const float scale = calibrated ? plan.epsilon : dynamic.scale;
+    const int zero = calibrated ? 0 : dynamic.zero;
+    if (threadIdx.x == 0) {
+        scales[row] = scale;
+        zeros[row] = zero;
+    }
+    const auto quantize = [&](float value) {
+        return static_cast<signed char>(fminf(127.F, fmaxf(-128.F, calibrated ? nearbyintf(value / scale)
+                                                                             : roundf(value * dynamic.inverse_scale) +
+                                                                                   zero)));
+    };
+#pragma unroll
+    for (int index = 0; index < Values; index += Vector) {
+        const auto column = prologue_column<Vector>(index);
+        if (column >= width) continue;
+        if constexpr (Vector == 1)
+            destination[column] = quantize(values[index]);
+        else
+            *reinterpret_cast<char4*>(destination + column) =
+                make_char4(quantize(values[index]), quantize(values[index + 1]), quantize(values[index + 2]),
+                           quantize(values[index + 3]));
+    }
+}
+
 __global__ void quantize_rows(Launch plan, signed char* quantized, float* scales, int* zeros) {
     __shared__ float s_min[8], s_max[8];
     const auto width = plan.inputs[0].shape[plan.inputs[0].rank - 1];
@@ -84,23 +216,7 @@ __global__ void quantize_rows(Launch plan, signed char* quantized, float* scales
         }
     }
     __syncthreads();
-    minimum = s_min[0];
-    maximum = s_max[0];
-    const float difference = maximum - minimum;
-    // Match the CPU's dynamic quantization, including half-away-from-zero input rounding.
-    const float scale = difference == 0.F ? 1.F : difference / 255.F;
-    const float inverse_scale = difference == 0.F ? 0.F : 255.F / difference;
-    int zero = -128;
-    if (difference > 0.F) {
-        // Separate rounding prevents fused multiply-add from changing a zero-point tie.
-        const float scaled_minimum = __fmul_rn(minimum, inverse_scale);
-        const float scaled_maximum = __fmul_rn(maximum, inverse_scale);
-        const float minimum_error = __fadd_rn(-128.F, scaled_minimum);
-        const float maximum_error = __fadd_rn(127.F, scaled_maximum);
-        const float candidate = minimum_error + maximum_error > 0.F ? __fadd_rn(-128.F, -scaled_minimum)
-                                                                    : __fadd_rn(127.F, -scaled_maximum);
-        zero = static_cast<int>(nearbyintf(fminf(127.F, fmaxf(-128.F, candidate))));
-    }
+    const auto [scale, inverse_scale, zero] = row_quantization(s_min[0], s_max[0]);
     if (threadIdx.x == 0) {
         scales[row] = scale;
         zeros[row] = zero;
@@ -667,6 +783,25 @@ auto quantize_rows(const Launch& plan, std::int64_t rows, void* scratch, void* s
     -> void {
     kernel::quantize_rows<<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
         plan, static_cast<signed char*>(scratch), static_cast<float*>(scales), static_cast<int*>(zeros));
+}
+
+auto prologue_quantize(const Launch& plan, ProjectionPrologue kind, float rms_epsilon, std::int64_t rows,
+                       std::int64_t width, void* scratch, void* scales, void* zeros, cudaStream_t stream) -> void {
+    const auto blocks = static_cast<unsigned int>(rows);
+    auto* quantized = static_cast<signed char*>(scratch);
+    auto* row_scales = static_cast<float*>(scales);
+    auto* row_zeros = static_cast<int*>(zeros);
+    if (kind == ProjectionPrologue::GELU_GATE) {
+        if (width % 4 || reinterpret_cast<std::uintptr_t>(plan.inputs[0].data) % 16)
+            throw std::runtime_error("CUDA: GELU-gate prologue requires 16-byte aligned rows");
+        kernel::prologue_quantize<prologue_values_per_thread, 4>
+            <<<blocks, 256, 0, stream>>>(plan, rms_epsilon, width, quantized, row_scales, row_zeros);
+    } else if (width <= 256 * 10)
+        kernel::prologue_quantize<10, 1>
+            <<<blocks, 256, 0, stream>>>(plan, rms_epsilon, width, quantized, row_scales, row_zeros);
+    else
+        kernel::prologue_quantize<prologue_values_per_thread, 1>
+            <<<blocks, 256, 0, stream>>>(plan, rms_epsilon, width, quantized, row_scales, row_zeros);
 }
 
 auto execute_matrix(const Launch& plan, int device, bool optimized, void* workspace, int slices, cudaStream_t stream)

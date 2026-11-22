@@ -208,12 +208,19 @@ struct Context::Impl {
         if (spec.operation == Operation::PACKED_LINEAR) {
             const auto bits = spec.attributes[0], group = spec.attributes[1];
             invalid((bits != 2 && bits != 4 && bits != 8) || group <= 0, "invalid packed linear precision or group");
-            invalid(!floating(input.dtype()) || input.dimensions() < 2 || !input.size(-1) || input.size(-1) % group ||
+            // A GELU-gate prologue halves the input width; an RMS-norm prologue keeps it.
+            const auto prologue = spec.attributes.size() >= 4 ? spec.attributes[3] : 0;
+            const bool gate = prologue == 2;
+            invalid(prologue < 0 || prologue > 2 || (gate && input.dimensions() && input.size(-1) % 2) ||
+                        (prologue == 1 && inputs.size() != 4) || (gate && inputs.size() != 3),
+                    "invalid packed linear prologue");
+            const auto width = input.dimensions() ? input.size(-1) / (gate ? 2 : 1) : 0;
+            invalid(!floating(input.dtype()) || input.dimensions() < 2 || !width || width % group ||
                         group % (8 / bits) || inputs[1].dtype() != tensor::DType::U8 || inputs[1].dimensions() != 2 ||
-                        !inputs[1].size(0) || inputs[1].size(1) != input.size(-1) / (8 / bits) ||
+                        !inputs[1].size(0) || inputs[1].size(1) != width / (8 / bits) ||
                         (inputs[2].dtype() != tensor::DType::F32 && inputs[2].dtype() != tensor::DType::F16) ||
                         inputs[2].dimensions() != 2 || inputs[2].size(0) != inputs[1].size(0) ||
-                        inputs[2].size(1) != input.size(-1) / group,
+                        inputs[2].size(1) != width / group,
                     "packed linear shape or dtype mismatch");
         }
         if (spec.operation == Operation::GATED_FEED_FORWARD) {
@@ -838,9 +845,34 @@ auto Context::quantized_linear(const Tensor& input, const Tensor& weight, const 
     const std::array<std::int64_t, 1> attributes{transpose_weight};
     return impl_->run({Operation::QUANTIZED_LINEAR, attributes}, {&input, &weight, &scale, &bias});
 }
+auto Context::apply(const Tensor& input, const ProjectionPrologue& prologue) -> Tensor {
+    switch (prologue.kind) {
+        case ProjectionPrologue::Kind::NONE:
+            return input;
+        case ProjectionPrologue::Kind::RMS_NORM:
+            if (!prologue.scale) throw Failure({ErrorCode::INVALID_ARGUMENT, "RMS-norm prologue requires a scale"});
+            return rms_norm(input, *prologue.scale, prologue.epsilon);
+        case ProjectionPrologue::Kind::GELU_GATE:
+            return gelu_gate(input);
+    }
+    throw Failure({ErrorCode::INVALID_ARGUMENT, "unknown projection prologue"});
+}
+auto Context::fuses(const Tensor& input, const ProjectionPrologue& prologue) const -> bool {
+    // Fuse only multi-row CUDA W8A8 prefill; decode graphs keep their grouped single-row projections.
+    constexpr std::int64_t max_width = 10240, min_rows = 32;
+    if (prologue.kind == ProjectionPrologue::Kind::NONE || device().kind != tensor::DeviceKind::CUDA ||
+        impl_->precision != core::InferencePrecision::CHECKPOINT || impl_->activation_dtype != tensor::DType::F32 ||
+        !input.defined() || input.dtype() != tensor::DType::F32 || input.dimensions() < 2 || !input.size(-1))
+        return false;
+    const bool gate = prologue.kind == ProjectionPrologue::Kind::GELU_GATE;
+    const auto width = input.size(-1) / (gate ? 2 : 1);
+    return (!gate || width % 4 == 0) && width <= max_width && input.numel() / input.size(-1) >= min_rows &&
+           (gate || (prologue.scale && prologue.scale->dtype() == tensor::DType::F32 &&
+                     prologue.scale->numel() == static_cast<std::size_t>(width)));
+}
 auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Tensor& scales, std::int32_t bits,
-                            std::int32_t group_size, float input_scale, float output_scale, const Tensor& zeros)
-    -> Tensor {
+                            std::int32_t group_size, float input_scale, float output_scale, const Tensor& zeros,
+                            const ProjectionPrologue& prologue) -> Tensor {
     if (!std::isfinite(input_scale) || input_scale < 0 || !std::isfinite(output_scale) || output_scale < 0)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid calibrated projection scales"});
     const Tensor* bound_zero = zeros.defined() ? &zeros : nullptr;
@@ -848,6 +880,21 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
         if (const auto found = impl_->packed_zeros.find(scales.storage_identity());
             found != impl_->packed_zeros.end() && found->second.defined())
             bound_zero = &found->second;
+    }
+    if (prologue.kind != ProjectionPrologue::Kind::NONE) {
+        const bool gate = prologue.kind == ProjectionPrologue::Kind::GELU_GATE;
+        const auto width = input.size(-1) / (gate ? 2 : 1);
+        if (!fuses(input, prologue) || bits != 8 || bound_zero || group_size != width)
+            return packed_linear(apply(input, prologue), weight, scales, bits, group_size, input_scale, output_scale,
+                                 zeros);
+        // Attribute layout: {bits, group, output_scale, prologue kind (1 = RMS norm, 2 = GELU gate), epsilon}.
+        const std::array<std::int64_t, 5> attributes{bits, group_size, std::bit_cast<std::int32_t>(output_scale),
+                                                     gate ? 2 : 1, std::bit_cast<std::int32_t>(prologue.epsilon)};
+        if (gate)
+            return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
+                              {&input, &weight, &scales});
+        return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
+                          {&input, &weight, &scales, prologue.scale});
     }
     if (device().kind == tensor::DeviceKind::CUDA && impl_->precision == core::InferencePrecision::Q8A16 && bits == 8 &&
         (!bound_zero || !bound_zero->defined())) {

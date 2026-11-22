@@ -8,6 +8,8 @@ class RmsNormImpl : public Module {
 public:
     RmsNormImpl(std::int32_t width, float epsilon, bool learned = true, bool quantized = false);
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
+    /// This normalization as a projection prologue, so a following projection can fuse it.
+    auto prologue() const -> ops::ProjectionPrologue;
     auto forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine, const Tensor& sine) const
         -> Tensor;
     auto forward_rotary_slice(ops::Context& context, const Tensor& input, const Tensor& cosine, const Tensor& sine,
@@ -60,6 +62,7 @@ public:
     GatedFeedForwardImpl(std::int32_t hidden, std::int32_t intermediate, std::int32_t packed_bits = 0,
                          GatedActivation activation = GatedActivation::GELU, std::int32_t group_size = 0);
     auto forward(ops::Context& context, const Tensor& input) const -> Tensor;
+    auto forward(ops::Context& context, const Tensor& input, const ops::ProjectionPrologue& prologue) const -> Tensor;
     auto forward_stages(ops::Context& context, const Tensor& input) const -> GatedFeedForwardStages;
 
 private:
@@ -89,7 +92,8 @@ public:
     auto forward(ops::Context& context, const Tensor& input, KeyValue& cache, std::size_t position, const Tensor& mask,
                  const Tensor& cosine, const Tensor& sine, std::int64_t key_start = 0) const -> Tensor;
     auto forward_segments(ops::Context& context, const Tensor& input, std::span<const Gemma4AttentionSegment> segments,
-                          const Tensor& cosine, const Tensor& sine, bool cache_only = false) const -> Tensor;
+                          const Tensor& cosine, const Tensor& sine, bool cache_only = false,
+                          const ops::ProjectionPrologue& prologue = {}) const -> Tensor;
     auto has_cache_scales() const -> bool;
     auto cache_quantization() const -> std::array<ops::BlockwiseQuantization, 2>;
 

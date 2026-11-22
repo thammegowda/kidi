@@ -11,6 +11,14 @@ auto prepare_projection_weights(const Launch& plan, int bits, void* expanded, vo
 auto quantize_rows(const Launch& plan, std::int64_t rows, void* scratch, void* scales, void* zeros, cudaStream_t stream)
     -> void;
 
+// Widest row the fused projection prologue keeps in registers (256 threads x values per thread).
+inline constexpr int prologue_values_per_thread = 40;
+inline constexpr std::int64_t prologue_max_width = 256 * prologue_values_per_thread;
+
+// Applies an RMS-norm or GELU-gate prologue to the F32 input rows and quantizes them for a W8A8 projection.
+auto prologue_quantize(const Launch& plan, ProjectionPrologue kind, float rms_epsilon, std::int64_t rows,
+                       std::int64_t width, void* scratch, void* scales, void* zeros, cudaStream_t stream) -> void;
+
 auto execute_matrix(const Launch& plan, int device, bool optimized, void* workspace, int slices, cudaStream_t stream)
     -> void;
 

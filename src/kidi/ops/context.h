@@ -46,6 +46,15 @@ struct BlockwiseQuantization {
     std::size_t block_size = 0;
 };
 
+/// Work applied to a projection's input before it is quantized. CUDA prefill fuses it into the projection's
+/// activation quantization; other paths run it as a separate operation first.
+struct ProjectionPrologue {
+    enum class Kind { NONE, RMS_NORM, GELU_GATE };
+    Kind kind = Kind::NONE;
+    const Tensor* scale = nullptr; ///< RMS-norm weight.
+    float epsilon = 0;             ///< RMS-norm epsilon.
+};
+
 /// Execution mode for the current call; public operations scope and restore it.
 extern thread_local bool is_inplace;
 
@@ -146,7 +155,11 @@ public:
                           bool transpose_weight = false) -> Tensor;
     auto packed_linear(const Tensor& input, const Tensor& weight, const Tensor& scales, std::int32_t bits,
                        std::int32_t group_size, float input_scale = 0.F, float output_scale = 0.F,
-                       const Tensor& zeros = {}) -> Tensor;
+                       const Tensor& zeros = {}, const ProjectionPrologue& prologue = {}) -> Tensor;
+    /// True when packed projections of `input` can fuse `prologue`; otherwise each one runs it separately.
+    auto fuses(const Tensor& input, const ProjectionPrologue& prologue) const -> bool;
+    /// Runs a projection prologue as its own operation.
+    auto apply(const Tensor& input, const ProjectionPrologue& prologue) -> Tensor;
     auto gelu(const Tensor& input, bool approximate = false) -> Tensor;
     auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
     auto silu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;

@@ -33,6 +33,8 @@ public:
                std::int32_t packed_bits = 0, bool quantized_bias = false, std::int32_t group_size = 0);
     ~LinearImpl();
     auto forward(ops::Context&, const Tensor&) const -> Tensor;
+    /// Applies `prologue` to the input first; packed projections may fuse it into their activation quantization.
+    auto forward(ops::Context&, const Tensor&, const ops::ProjectionPrologue& prologue) const -> Tensor;
     /// Returns I32 [rows] token IDs; an indexed head is approximate and does not materialize vocabulary logits.
     auto select(ops::Context&, const Tensor&, ops::TokenOutput output = ops::TokenOutput::HOST) const -> Tensor;
     /// Scores `candidates` rows of a transposed unquantized weight table and returns the greedy winner.

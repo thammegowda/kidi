@@ -561,8 +561,13 @@ struct Program::Impl {
     bool w8a16_projection = false;
     bool fused_w8a8 = false;
     int dense_slices = 1;
+    ProjectionPrologue prologue = ProjectionPrologue::NONE;
+    float prologue_epsilon = 0;
+    Tensor prologue_input{};
     explicit Impl(Descriptor value, int selected_device) : descriptor(value), device(selected_device) {
         DeviceScope scope(device);
+        if (descriptor.operation == Op::PACKED_LINEAR && descriptor.attribute_count >= 4 && descriptor.attributes[3])
+            adopt_prologue();
         infer(descriptor);
         descriptor.output.device = device;
         const auto operation = descriptor.operation;
@@ -644,7 +649,8 @@ struct Program::Impl {
                                 (bits == 2 || bits == 4 || bits == 8) &&
                                 (operation != Op::PACKED_LINEAR || descriptor.attributes[1] == width) && rows > 0 &&
                                 rows <= 4 && width > 0 && width <= 65536 && width % (32 / bits) == 0 &&
-                                output_columns > 0 && output_columns <= INT32_MAX;
+                                output_columns > 0 && output_columns <= INT32_MAX &&
+                                prologue == ProjectionPrologue::NONE;
 #if defined(KIDI_CUDA_USE_CUTLASS_INT8)
             constexpr int MIN_MAJOR = 8, WIDTH_ALIGNMENT = 16;
             tensor_projection = !descriptor.reference_projection && properties.major >= MIN_MAJOR &&
@@ -703,6 +709,27 @@ struct Program::Impl {
             }
         }
     }
+    // The projection sees the prologue's output shape; only its quantization step reads the original input.
+    void adopt_prologue() {
+        prologue = static_cast<ProjectionPrologue>(descriptor.attributes[3]);
+        if (descriptor.attribute_count >= 5) {
+            const auto bits = static_cast<std::int32_t>(descriptor.attributes[4]);
+            std::memcpy(&prologue_epsilon, &bits, sizeof(bits));
+        }
+        prologue_input = descriptor.inputs[0];
+        auto& input = descriptor.inputs[0];
+        const auto input_width = input.rank ? input.shape[input.rank - 1] : 0;
+        const auto width = prologue == ProjectionPrologue::GELU_GATE ? input_width / 2 : input_width;
+        const bool rms = prologue == ProjectionPrologue::RMS_NORM;
+        if ((!rms && prologue != ProjectionPrologue::GELU_GATE) || input.type != Type::F32 || width <= 0 ||
+            width > prologue_max_width || descriptor.attributes[0] != 8 || descriptor.attributes[1] != width ||
+            (prologue == ProjectionPrologue::GELU_GATE && input_width % 2) ||
+            descriptor.input_count != (rms ? 4 : 3) ||
+            (rms && (descriptor.inputs[3].type != Type::F32 || descriptor.inputs[3].elements() !=
+                                                                     static_cast<std::size_t>(width))))
+            throw std::runtime_error("CUDA: unsupported projection prologue");
+        input.shape[input.rank - 1] = width;
+    }
     void floating(Launch launch) {
         floating_projection(launch, device, descriptor.reference_projection, shared_workspace.get(), scratch.get(),
                             dense_slices, execution_stream);
@@ -758,7 +785,8 @@ void Program::run(const Tensor* inputs, int count, void* output) {
     for (int index = 0; index < count; ++index) {
         if (inputs[index].device != impl_->device)
             throw std::runtime_error("CUDA: operands belong to different devices");
-        const auto& expected = descriptor.inputs[index];
+        const auto& expected =
+            index == 0 && impl_->prologue != ProjectionPrologue::NONE ? impl_->prologue_input : descriptor.inputs[index];
         if (inputs[index].rank != expected.rank || inputs[index].type != expected.type ||
             !std::equal(inputs[index].shape.begin(), inputs[index].shape.begin() + inputs[index].rank,
                         expected.shape.begin()))
@@ -823,6 +851,16 @@ void Program::run(const Tensor* inputs, int count, void* output) {
     } else if (operation == Op::PACKED_LINEAR || operation == Op::QUANTIZED_LINEAR) {
         if (impl_->w8a16_projection) {
             impl_->project_w8a16(launch);
+        } else if (impl_->prologue != ProjectionPrologue::NONE) {
+            const auto& projected_input = descriptor.inputs[0];
+            const auto width = projected_input.shape[projected_input.rank - 1];
+            const auto rows = static_cast<std::int64_t>(projected_input.elements() / width);
+            prologue_quantize(launch, impl_->prologue, impl_->prologue_epsilon, rows, width, impl_->scratch.get(),
+                              impl_->scales.get(), impl_->zeros.get(), execution_stream);
+            Launch projected = launch;
+            projected.inputs[0].shape[projected.inputs[0].rank - 1] = width;
+            projected.count = 3;
+            impl_->project(projected);
         } else {
             const auto rows =
                 descriptor.inputs[0].elements() / descriptor.inputs[0].shape[descriptor.inputs[0].rank - 1];

@@ -29,7 +29,7 @@ if(KIDI_CUTLASS_ROOT)
     target_include_directories(kidi_ops_cuda_runtime SYSTEM PRIVATE "${KIDI_CUTLASS_ROOT}/include")
     target_compile_definitions(kidi_ops_cuda_runtime PRIVATE KIDI_CUDA_USE_CUTLASS_INT8=1)
     if(CMAKE_CUDA_ARCHITECTURES MATCHES "(^|;)(90|native|all)")
-        # wgmma/TMA need the arch-specific sm_90a target, so the Hopper GEMM is built only for it.
+        # Hopper's TMA/WGMMA GEMM requires the arch-specific sm_90a target.
         add_library(kidi_ops_cuda_sm90 OBJECT int8_gemm_sm90.cu)
         target_include_directories(kidi_ops_cuda_sm90 PRIVATE "${kidi_ops_SOURCE_DIR}/src")
         target_include_directories(kidi_ops_cuda_sm90 SYSTEM PRIVATE "${KIDI_CUTLASS_ROOT}/include")

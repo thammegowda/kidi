@@ -69,6 +69,13 @@ The separate Kidi output regression check compares tokens and chrF with the
 saved Kidi output; it does not establish accuracy. `--save-baseline` explicitly
 replaces the saved Kidi baseline.
 
+Gemma CUDA warm-up preallocates one full-context KV cache. Eager and serving
+generation reuse matching-capacity text-only states after device work and
+pending readbacks complete; this is allocation reuse, not prompt-prefix reuse.
+The pool respects serving limits, appears in `Generator::memory().cache_bytes`,
+and is cleared by `release_workspaces()`. Multimodal and speculative states are
+not pooled.
+
 ## Native Build
 
 ```bash

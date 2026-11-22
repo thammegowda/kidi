@@ -455,6 +455,9 @@ auto check_async_serving(const YAML::Node& config) -> void {
     write_tokenizer(directory / "tokenizer.json");
     auto pipelined = require(inference::Generator::load(directory, device));
     auto serial = require(inference::Generator::load(directory, device));
+    require(pipelined.warm_up(4, 64));
+    const auto preallocated_bytes = pipelined.memory().cache_bytes;
+    if (!preallocated_bytes) throw std::runtime_error("CUDA warm-up did not preallocate its KV cache");
     require(pipelined.configure_serving({.maximum_active = 1,
                                          .maximum_requests = 1,
                                          .cache_token_budget = 64,
@@ -504,6 +507,29 @@ auto check_async_serving(const YAML::Node& config) -> void {
     const auto generated = require(pipelined.generate("gamma", options));
     if (generated.generation.token_ids != synchronous.generation.token_ids || generated.stats.decode_queue_peak != 8)
         throw std::runtime_error("serial generation bypassed the device-feedback pipeline");
+    const auto reusable_bytes = pipelined.memory().cache_bytes;
+    if (reusable_bytes != preallocated_bytes)
+        throw std::runtime_error("completed CUDA request discarded or duplicated its preallocated KV cache");
+    for (const auto* prompt : {"alpha beta gamma", "alpha", "gamma"}) {
+        require(serial.release_workspaces());
+        const auto fresh = run(serial, prompt, options);
+        const auto reused = require(pipelined.generate(prompt, options));
+        if (reused.generation.token_ids != fresh.generation.token_ids || reused.stats.reused_prompt_tokens ||
+            pipelined.memory().cache_bytes != reusable_bytes)
+            throw std::runtime_error("reused CUDA state retained prompt data or duplicated the KV cache");
+    }
+    const auto serial_bytes = serial.memory().cache_bytes;
+    const auto eager_reused = require(serial.generate("gamma", options));
+    if (eager_reused.generation.token_ids != synchronous.generation.token_ids ||
+        serial.memory().cache_bytes != serial_bytes)
+        throw std::runtime_error("eager CUDA generation failed to reuse its request cache");
+    for (const std::size_t capacity : {32, 64}) {
+        options.context_size = capacity;
+        const auto resized = require(pipelined.generate("gamma", options));
+        if (resized.generation.token_ids != synchronous.generation.token_ids ||
+            pipelined.memory().cache_bytes != preallocated_bytes * capacity / 64)
+            throw std::runtime_error("CUDA cache reuse ignored a change in request capacity");
+    }
     const auto cancelled = require(pipelined.enqueue("gamma", options));
     require(pipelined.step());
     require(pipelined.step());
@@ -517,6 +543,8 @@ auto check_async_serving(const YAML::Node& config) -> void {
             throw std::runtime_error("cancelled in-flight decode released its cache budget before completion");
     }
     require(pipelined.release_workspaces());
+    if (pipelined.memory().cache_bytes)
+        throw std::runtime_error("release_workspaces retained reusable CUDA request caches");
     std::filesystem::remove_all(directory);
 }
 

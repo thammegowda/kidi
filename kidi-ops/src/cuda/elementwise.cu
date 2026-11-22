@@ -30,12 +30,6 @@ __global__ void pointwise(Launch plan) {
                  read(plan.inputs[1], index);
     if (plan.operation == static_cast<int>(Op::SILU_MULTIPLY))
         result = left / (1 + expf(-left)) * read(plan.inputs[1], index);
-    if (plan.operation == static_cast<int>(Op::SILU_GATE)) {
-        const auto width = plan.output.shape[plan.output.rank - 1];
-        const auto offset = index / width * 2 * width + index % width;
-        const float gate = read(plan.inputs[0], offset);
-        result = gate / (1 + expf(-gate)) * read(plan.inputs[0], offset + width);
-    }
     if (plan.operation == static_cast<int>(Op::ROTARY)) {
         const auto width = plan.output.shape[3], half = width / 2;
         const auto column = index % width;
@@ -239,6 +233,48 @@ __global__ void dense_rms_normalize(Launch plan) {
     }
 }
 
+// RMS norm + rotary for one head row (width = 32 * Values) per warp. Head rows are too short to fill a
+// 256-thread block, so dense_rms_normalize would be latency bound. Lane l holds columns l + 32 * j; the sum
+// replays dense_rms_normalize's reduction tree exactly (thread l + 32w owns j = w + 8k), keeping results
+// bit-identical.
+template <typename Element, int Values>
+__global__ void warp_rms_rotary(Launch plan, unsigned int rows) {
+    const auto row = static_cast<std::int64_t>(blockIdx.x) * 8 + threadIdx.x / 32;
+    if (row >= rows) return;
+    constexpr int width = 32 * Values, half = width / 2;
+    const int lane = threadIdx.x % 32;
+    const auto* input = static_cast<const Element*>(plan.inputs[0].data) + row * width;
+    const auto* scale = static_cast<const float*>(plan.inputs[1].data);
+    float values[Values], partial[8];
+#pragma unroll
+    for (int j = 0; j < Values; ++j) values[j] = static_cast<float>(input[lane + 32 * j]);
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        partial[w] = 0;
+#pragma unroll
+        for (int j = w; j < Values; j += 8) partial[w] = fmaf(values[j], values[j], partial[w]);
+        for (int delta = 16; delta > 0; delta /= 2) partial[w] += __shfl_down_sync(0xffffffff, partial[w], delta);
+    }
+    const float sum = ((partial[0] + partial[4]) + (partial[2] + partial[6])) +
+                      ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+    const float inverse = __shfl_sync(0xffffffff, rsqrtf(sum / static_cast<float>(width) + plan.epsilon), 0);
+    const auto sequence = row / plan.output.shape[2] % plan.output.shape[1];
+    const auto* cosine = static_cast<const float*>(plan.inputs[2].data) + sequence * half;
+    const auto* sine = static_cast<const float*>(plan.inputs[3].data) + sequence * half;
+    auto* output = static_cast<Element*>(plan.output.data) + row * width;
+#pragma unroll
+    for (int j = 0; j < Values; ++j) {
+        const auto column = lane + 32 * j, partner = (j + Values / 2) % Values;
+        const auto partner_column = lane + 32 * partner;
+        const float normalized = static_cast<float>(static_cast<Element>(values[j] * inverse * scale[column]));
+        const float paired =
+            static_cast<float>(static_cast<Element>(values[partner] * inverse * scale[partner_column]));
+        const auto angle = column % half;
+        output[column] = static_cast<Element>(normalized * cosine[angle] +
+                                              (column < half ? -paired : paired) * sine[angle]);
+    }
+}
+
 template <typename Element>
 bool dense_rms(const Launch& plan, Op operation, unsigned int rows, cudaStream_t stream) {
     const auto floating = static_cast<int>(Type::F32);
@@ -251,7 +287,13 @@ bool dense_rms(const Launch& plan, Op operation, unsigned int rows, cudaStream_t
                (plan.count == 3 || plan.inputs[3].type == floating)) {
         dense_rms_normalize<Element, Op::RMS_NORM_RESIDUAL><<<rows, 256, 0, stream>>>(plan);
     } else if (operation == Op::RMS_ROTARY && plan.inputs[2].type == floating && plan.inputs[3].type == floating) {
-        dense_rms_normalize<Element, Op::RMS_ROTARY><<<rows, 256, 0, stream>>>(plan);
+        const auto width = plan.output.shape[plan.output.rank - 1];
+        if (width == 256)
+            warp_rms_rotary<Element, 8><<<(rows + 7) / 8, 256, 0, stream>>>(plan, rows);
+        else if (width == 512)
+            warp_rms_rotary<Element, 16><<<(rows + 7) / 8, 256, 0, stream>>>(plan, rows);
+        else
+            dense_rms_normalize<Element, Op::RMS_ROTARY><<<rows, 256, 0, stream>>>(plan);
     } else {
         return false;
     }

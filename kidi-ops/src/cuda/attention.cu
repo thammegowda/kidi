@@ -96,13 +96,13 @@ __device__ void load_decode_vector(const Element* source, float (&output)[Vector
     }
 }
 
-template <typename Element, int Width, int Group, int Partition, typename CacheElement = Element>
+template <typename Element, int Width, int Partition, typename CacheElement>
 __global__ void decode_partitions(Launch plan, float* partials, std::int64_t heads, std::int64_t key_heads,
                                   std::int64_t keys, std::int64_t partitions) {
     constexpr int Vector = Width / 32, Warps = 4;
-    __shared__ float maxima[Warps][Group], denominators[Warps][Group], outputs[Warps][Group][Width];
+    __shared__ float maxima[Warps], denominators[Warps], outputs[Warps][Width];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const auto batch = static_cast<std::int64_t>(blockIdx.x), head = static_cast<std::int64_t>(blockIdx.y) * Group;
+    const auto batch = static_cast<std::int64_t>(blockIdx.x), head = static_cast<std::int64_t>(blockIdx.y);
     const auto key_head = head / (heads / key_heads);
     const auto offset = plan.attribute_count >= 3 ? plan.attributes[2] : 0;
     const auto key_batch = plan.inputs[1].shape[0] == 1 ? 0 : batch;
@@ -111,12 +111,8 @@ __global__ void decode_partitions(Launch plan, float* partials, std::int64_t hea
                       (key_batch * plan.inputs[1].shape[1] + offset) * key_heads * Width + key_head * Width;
     const auto* value = static_cast<const CacheElement*>(address(plan.inputs[2])) +
                         (key_batch * plan.inputs[2].shape[1] + offset) * key_heads * Width + key_head * Width;
-    float activation[Group][Vector], accumulated[Group][Vector]{}, maximum[Group], denominator[Group]{};
-#pragma unroll
-    for (int group = 0; group < Group; ++group) {
-        load_decode_vector<Element, Vector>(query + group * Width + lane * Vector, activation[group]);
-        maximum[group] = -INFINITY;
-    }
+    float activation[Vector], accumulated[Vector]{}, maximum = -INFINITY, denominator = 0;
+    load_decode_vector<Element, Vector>(query + lane * Vector, activation);
     const float scale = plan.epsilon > 0 ? plan.epsilon : rsqrtf(static_cast<float>(Width));
     View score_view{};
     score_view.rank = 4;
@@ -130,72 +126,63 @@ __global__ void decode_partitions(Launch plan, float* partials, std::int64_t hea
         float key_values[Vector], value_values[Vector];
         load_decode_vector<CacheElement, Vector>(key + position * key_heads * Width + lane * Vector, key_values);
         load_decode_vector<CacheElement, Vector>(value + position * key_heads * Width + lane * Vector, value_values);
-#pragma unroll
-        for (int group = 0; group < Group; ++group) {
-            float score = 0;
-#pragma unroll
-            for (int column = 0; column < Vector; ++column)
-                score = fmaf(activation[group][column], key_values[column], score);
-            for (int delta = 16; delta > 0; delta /= 2) score += __shfl_xor_sync(0xffffffff, score, delta);
-            score *= scale;
-            if (plan.count == 4) {
-                const auto mask_index =
-                    broadcast_index((batch * heads + head + group) * keys + position, score_view, plan.inputs[3]);
-                if (plan.inputs[3].type == static_cast<int>(Type::I32) && plan.attribute_count >= 7 &&
-                    plan.attributes[5] == 1) {
-                    const auto query_position = static_cast<const std::int32_t*>(address(plan.inputs[3]))[mask_index];
-                    const auto key_position = offset + position;
-                    const auto window = plan.attributes[6];
-                    if (key_position > query_position || (window && query_position - key_position >= window))
-                        score = -INFINITY;
-                } else {
-                    score += read(plan.inputs[3], mask_index);
-                }
-            }
-            const float updated = fmaxf(maximum[group], score);
-            const float previous = maximum[group] == -INFINITY ? 0.F : __expf(maximum[group] - updated);
-            const float probability = score == -INFINITY ? 0.F : __expf(score - updated);
-            denominator[group] = denominator[group] * previous + probability;
-#pragma unroll
-            for (int column = 0; column < Vector; ++column)
-                accumulated[group][column] = accumulated[group][column] * previous + probability * value_values[column];
-            maximum[group] = updated;
-        }
-    }
-#pragma unroll
-    for (int group = 0; group < Group; ++group) {
-        if (lane == 0) {
-            maxima[warp][group] = maximum[group];
-            denominators[warp][group] = denominator[group];
-        }
+        float score = 0;
 #pragma unroll
         for (int column = 0; column < Vector; ++column)
-            outputs[warp][group][lane * Vector + column] = accumulated[group][column];
+            score = fmaf(activation[column], key_values[column], score);
+        for (int delta = 16; delta > 0; delta /= 2) score += __shfl_xor_sync(0xffffffff, score, delta);
+        score *= scale;
+        if (plan.count == 4) {
+            const auto mask_index =
+                broadcast_index((batch * heads + head) * keys + position, score_view, plan.inputs[3]);
+            if (plan.inputs[3].type == static_cast<int>(Type::I32) && plan.attribute_count >= 7 &&
+                plan.attributes[5] == 1) {
+                const auto query_position = static_cast<const std::int32_t*>(address(plan.inputs[3]))[mask_index];
+                const auto key_position = offset + position;
+                const auto window = plan.attributes[6];
+                if (key_position > query_position || (window && query_position - key_position >= window))
+                    score = -INFINITY;
+            } else {
+                score += read(plan.inputs[3], mask_index);
+            }
+        }
+        const float updated = fmaxf(maximum, score);
+        const float previous = maximum == -INFINITY ? 0.F : __expf(maximum - updated);
+        const float probability = score == -INFINITY ? 0.F : __expf(score - updated);
+        denominator = denominator * previous + probability;
+#pragma unroll
+        for (int column = 0; column < Vector; ++column)
+            accumulated[column] = accumulated[column] * previous + probability * value_values[column];
+        maximum = updated;
     }
+    if (lane == 0) {
+        maxima[warp] = maximum;
+        denominators[warp] = denominator;
+    }
+#pragma unroll
+    for (int column = 0; column < Vector; ++column)
+        outputs[warp][lane * Vector + column] = accumulated[column];
     __syncthreads();
     if (warp != 0) return;
+
+    float merged_maximum = -INFINITY, merged_denominator = 0;
 #pragma unroll
-    for (int group = 0; group < Group; ++group) {
-        float merged_maximum = -INFINITY, merged_denominator = 0;
+    for (int source = 0; source < Warps; ++source) merged_maximum = fmaxf(merged_maximum, maxima[source]);
+    float merged[Vector]{};
 #pragma unroll
-        for (int source = 0; source < Warps; ++source) merged_maximum = fmaxf(merged_maximum, maxima[source][group]);
-        float merged[Vector]{};
+    for (int source = 0; source < Warps; ++source) {
+        const float factor = maxima[source] == -INFINITY ? 0.F : __expf(maxima[source] - merged_maximum);
+        merged_denominator += denominators[source] * factor;
 #pragma unroll
-        for (int source = 0; source < Warps; ++source) {
-            const float factor =
-                maxima[source][group] == -INFINITY ? 0.F : __expf(maxima[source][group] - merged_maximum);
-            merged_denominator += denominators[source][group] * factor;
+        for (int column = 0; column < Vector; ++column)
+            merged[column] += outputs[source][lane * Vector + column] * factor;
+    }
+    auto* destination = partials + ((batch * heads + head) * partitions + blockIdx.z) * (Width + 2);
 #pragma unroll
-            for (int column = 0; column < Vector; ++column)
-                merged[column] += outputs[source][group][lane * Vector + column] * factor;
-        }
-        auto* destination = partials + ((batch * heads + head + group) * partitions + blockIdx.z) * (Width + 2);
-#pragma unroll
-        for (int column = 0; column < Vector; ++column) destination[lane * Vector + column] = merged[column];
-        if (lane == 0) {
-            destination[Width] = merged_maximum;
-            destination[Width + 1] = merged_denominator;
-        }
+    for (int column = 0; column < Vector; ++column) destination[lane * Vector + column] = merged[column];
+    if (lane == 0) {
+        destination[Width] = merged_maximum;
+        destination[Width + 1] = merged_denominator;
     }
 }
 
@@ -458,33 +445,24 @@ auto decode_attention(const Launch& plan, float* partials, std::int64_t batches,
     constexpr int short_partition_size = static_cast<int>(DECODE_ATTENTION_PARTITION_SIZE);
     constexpr int long_partition_size = 32;
     constexpr std::int64_t long_context_threshold = 2048;
-    constexpr int group = 1;
     const auto dispatch_decode = [&](auto partition_tag, auto tag, auto cache_tag) {
         constexpr int partition_size = decltype(partition_tag)::value;
         const auto partitions = (keys + partition_size - 1) / partition_size;
-        const dim3 grid(static_cast<unsigned int>(batches), static_cast<unsigned int>(heads / group),
+        const dim3 grid(static_cast<unsigned int>(batches), static_cast<unsigned int>(heads),
                         static_cast<unsigned int>(partitions));
         using Element = decltype(tag);
         using CacheElement = decltype(cache_tag);
-        if (width == 256) {
-            if (group == 2)
-                decode_partitions<Element, 256, 2, partition_size, CacheElement>
-                    <<<grid, 128, 0, stream>>>(plan, partials, heads, key_heads, keys, partitions);
-            else
-                decode_partitions<Element, 256, 1, partition_size, CacheElement>
-                    <<<grid, 128, 0, stream>>>(plan, partials, heads, key_heads, keys, partitions);
-            decode_merge<Element, 256>
+        const auto launch = [&](auto width_tag) {
+            constexpr int head_width = decltype(width_tag)::value;
+            decode_partitions<Element, head_width, partition_size, CacheElement>
+                <<<grid, 128, 0, stream>>>(plan, partials, heads, key_heads, keys, partitions);
+            decode_merge<Element, head_width>
                 <<<static_cast<unsigned int>(batches * heads), 256, 0, stream>>>(plan, partials, partitions);
-        } else {
-            if (group == 2)
-                decode_partitions<Element, 512, 2, partition_size, CacheElement>
-                    <<<grid, 128, 0, stream>>>(plan, partials, heads, key_heads, keys, partitions);
-            else
-                decode_partitions<Element, 512, 1, partition_size, CacheElement>
-                    <<<grid, 128, 0, stream>>>(plan, partials, heads, key_heads, keys, partitions);
-            decode_merge<Element, 512>
-                <<<static_cast<unsigned int>(batches * heads), 256, 0, stream>>>(plan, partials, partitions);
-        }
+        };
+        if (width == 256)
+            launch(std::integral_constant<int, 256>{});
+        else
+            launch(std::integral_constant<int, 512>{});
     };
     const auto dispatch_input = [&](auto partition_tag) {
         if (input_type == static_cast<int>(Type::BF16))

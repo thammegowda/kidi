@@ -617,7 +617,10 @@ auto Gemma4Impl::rewind(LanguageModelState& state, std::size_t position) -> Resu
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 cache rewind"});
         impl_->context.synchronize();
         gemma_state->position = position;
-        if (position == 0) gemma_state->prefilling = true;
+        if (position == 0) {
+            gemma_state->prefilling = true;
+            gemma_state->profile_started = false;
+        }
         return {};
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());

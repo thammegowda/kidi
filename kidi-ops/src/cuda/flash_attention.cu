@@ -691,8 +691,16 @@ auto run_fa2(const FlashAttentionArgs& args, std::int64_t m_s0, std::int64_t m_s
 }
 
 template <int HeadDim>
-void run_bf16(const FlashAttentionArgs& args, int g_pack, int q_per_cta, int head_groups, int q_tiles,
-              std::int64_t m_s0, std::int64_t m_s1, std::int64_t m_s2, std::int64_t m_s3, cudaStream_t stream) {
+auto run_bf16(const FlashAttentionArgs& args, const std::int64_t (&mask_strides)[4], bool use_fa2,
+              cudaStream_t stream) -> bool {
+    const auto& [m_s0, m_s1, m_s2, m_s3] = mask_strides;
+    if (use_fa2 && run_fa2<HeadDim>(args, m_s0, m_s2, stream)) return true;
+
+    const int g_total = static_cast<int>(args.heads / args.key_heads);
+    const int g_pack = (g_total <= kBr && (kBr % g_total) == 0) ? g_total : 1;
+    const int q_per_cta = kBr / g_pack;
+    const int head_groups = g_total / g_pack;
+    const int q_tiles = static_cast<int>((args.queries + q_per_cta - 1) / q_per_cta);
     const std::size_t smem =
         (kBc * HeadDim + kBr * kBc) * sizeof(__nv_bfloat16) + kWarps * kBr * kSStride * sizeof(float);
     const unsigned int blocks = static_cast<unsigned int>(args.batches * args.key_heads * head_groups * q_tiles);
@@ -702,21 +710,15 @@ void run_bf16(const FlashAttentionArgs& args, int g_pack, int q_per_cta, int hea
     else
         flash_attention_bf16_kernel<HeadDim, false>
             <<<blocks, kThreads, smem, stream>>>(args, g_pack, q_per_cta, head_groups, q_tiles, m_s0, m_s1, m_s2, m_s3);
+    return true;
 }
 
 } // namespace
 
 auto flash_attention_bf16(const FlashAttentionArgs& args, cudaStream_t stream) -> bool {
-    if (args.head_dim != 64 && args.head_dim != 128 && args.head_dim != 256 && args.head_dim != 512) return false;
     if (args.batches <= 0 || args.queries <= 0 || args.heads <= 0 || args.key_heads <= 0 || args.keys <= 0 ||
         args.heads % args.key_heads != 0)
         return false;
-
-    const int g_total = static_cast<int>(args.heads / args.key_heads);
-    const int g_pack = (g_total <= kBr && (kBr % g_total) == 0) ? g_total : 1;
-    const int q_per_cta = kBr / g_pack;
-    const int head_groups = g_total / g_pack;
-    const int q_tiles = static_cast<int>((args.queries + q_per_cta - 1) / q_per_cta);
 
     std::int64_t m_strides[4]{};
     if (args.has_mask) {
@@ -730,44 +732,19 @@ auto flash_attention_bf16(const FlashAttentionArgs& args, cudaStream_t stream) -
         }
     }
 
+    const int g_total = static_cast<int>(args.heads / args.key_heads);
     const int fa_pack = g_total <= kFaMinRows && kFaMinRows % g_total == 0 ? g_total : 1;
     const bool structured = args.has_mask && args.mask.type == 3 && m_strides[1] == 0 && m_strides[3] == 0;
-    if ((structured || !args.has_mask) && args.queries * fa_pack >= kFaMinRows) {
-        switch (args.head_dim) {
-            case 64:
-                if (run_fa2<64>(args, m_strides[0], m_strides[2], stream)) return true;
-                break;
-            case 128:
-                if (run_fa2<128>(args, m_strides[0], m_strides[2], stream)) return true;
-                break;
-            case 256:
-                if (run_fa2<256>(args, m_strides[0], m_strides[2], stream)) return true;
-                break;
-            case 512:
-                if (run_fa2<512>(args, m_strides[0], m_strides[2], stream)) return true;
-                break;
-            default:
-                break;
-        }
-    }
-
+    const bool use_fa2 = (structured || !args.has_mask) && args.queries * fa_pack >= kFaMinRows;
     switch (args.head_dim) {
         case 64:
-            run_bf16<64>(args, g_pack, q_per_cta, head_groups, q_tiles, m_strides[0], m_strides[1], m_strides[2],
-                         m_strides[3], stream);
-            return true;
+            return run_bf16<64>(args, m_strides, use_fa2, stream);
         case 128:
-            run_bf16<128>(args, g_pack, q_per_cta, head_groups, q_tiles, m_strides[0], m_strides[1], m_strides[2],
-                          m_strides[3], stream);
-            return true;
+            return run_bf16<128>(args, m_strides, use_fa2, stream);
         case 256:
-            run_bf16<256>(args, g_pack, q_per_cta, head_groups, q_tiles, m_strides[0], m_strides[1], m_strides[2],
-                          m_strides[3], stream);
-            return true;
+            return run_bf16<256>(args, m_strides, use_fa2, stream);
         case 512:
-            run_bf16<512>(args, g_pack, q_per_cta, head_groups, q_tiles, m_strides[0], m_strides[1], m_strides[2],
-                          m_strides[3], stream);
-            return true;
+            return run_bf16<512>(args, m_strides, use_fa2, stream);
         default:
             return false;
     }

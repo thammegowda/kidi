@@ -424,6 +424,47 @@ auto check_w8a16_projection_groups() -> bool {
     return true;
 }
 
+// A fused RMS-norm or GELU-gate prologue must quantize exactly like the separate operation it replaces.
+auto check_projection_prologues() -> bool {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    ops::Context context(device);
+    constexpr std::int64_t rows = 64, columns = 128;
+    const auto filled = [&](std::vector<std::int64_t> shape, std::size_t count, float step) {
+        std::vector<float> values(count);
+        for (std::size_t index = 0; index < count; ++index)
+            values[index] = (static_cast<int>(index * 37 % 101) - 50) * step;
+        return require(Tensor::from_host(shape, std::span<const float>(values), device));
+    };
+    using Kind = ops::ProjectionPrologue::Kind;
+    for (const auto& [kind, width] : {std::pair{Kind::RMS_NORM, 512}, {Kind::RMS_NORM, 3072}, {Kind::GELU_GATE, 1024}}) {
+        const bool gate = kind == Kind::GELU_GATE;
+        const auto input_width = gate ? 2 * width : width;
+        const auto input = filled({1, rows, input_width}, rows * input_width, 0.03125F);
+        const auto norm = filled({width}, width, 0.015625F);
+        std::vector<std::uint8_t> packed(columns * width);
+        for (std::size_t index = 0; index < packed.size(); ++index)
+            packed[index] = static_cast<std::uint8_t>(index * 29 % 251);
+        const auto weight =
+            require(Tensor::from_bytes({columns, width}, DType::U8, std::as_bytes(std::span(packed)), device));
+        std::vector<float> scale_values(columns);
+        for (std::size_t index = 0; index < scale_values.size(); ++index) scale_values[index] = (index % 5 + 1) * 0.01F;
+        const auto scales = require(Tensor::from_host({columns, 1}, std::span<const float>(scale_values), device));
+        const ops::ProjectionPrologue prologue{.kind = kind, .scale = gate ? nullptr : &norm, .epsilon = 1e-6F};
+        if (!context.fuses(input, prologue)) return false;
+        for (const float input_scale : {0.F, 0.05F}) {
+            const auto fused = context.packed_linear(input, weight, scales, 8, width, input_scale, 0.F, {}, prologue);
+            const auto expected =
+                context.packed_linear(context.apply(input, prologue), weight, scales, 8, width, input_scale, 0.F);
+            if (require(fused.copy_to_host()) != require(expected.copy_to_host())) return false;
+        }
+    }
+    return true;
+}
+
 auto check_input_staging() -> bool {
     using namespace kidi;
     using ops::require;
@@ -1039,6 +1080,7 @@ auto main() -> int {
         if (!check_w8a16_projection_groups())
             throw std::runtime_error("CUDA shared-input W8A16 projection fusion failed");
         if (!check_input_staging()) throw std::runtime_error("CUDA reusable input staging failed");
+        if (!check_projection_prologues()) throw std::runtime_error("CUDA fused projection prologue changed output");
         if (!check_greedy_partitions()) throw std::runtime_error("CUDA parallel token selection changed tie-breaking");
         if (!check_bfloat_fusions()) throw std::runtime_error("CUDA BF16 fusion changed intermediate rounding");
         if (!check_cuda_graph()) throw std::runtime_error("CUDA graph input staging or cache writeback failed");

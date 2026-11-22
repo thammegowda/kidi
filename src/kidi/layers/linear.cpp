@@ -192,12 +192,19 @@ auto LinearImpl::bind_hnsw(const std::filesystem::path& path, const Tensor& pack
 }
 
 auto LinearImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
+    return forward(context, input, {});
+}
+
+auto LinearImpl::forward(ops::Context& context, const Tensor& input, const ops::ProjectionPrologue& prologue) const
+    -> Tensor {
     if (!weight_.defined() || (has_bias_ && !bias_.defined()))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "linear state has not been initialized"});
     if (packed_bits_) {
         return context.packed_linear(input, weight_, packed_scale_, packed_bits_, group_size_,
-                                     require(input_scale_.data<float>())[0], require(output_scale_.data<float>())[0]);
+                                     require(input_scale_.data<float>())[0], require(output_scale_.data<float>())[0],
+                                     {}, prologue);
     }
+    if (prologue.kind != ops::ProjectionPrologue::Kind::NONE) return forward(context, context.apply(input, prologue));
     if (qstate_) return context.quantized_linear(input, weight_, qstate_->scale, bias(), transpose_);
     return context.linear(input, weight_, bias(), transpose_);
 }

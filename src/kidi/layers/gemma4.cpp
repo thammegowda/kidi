@@ -46,6 +46,9 @@ auto RmsNormImpl::weight() const -> const Tensor& {
 auto RmsNormImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
     return context.rms_norm(input, weight(), epsilon_);
 }
+auto RmsNormImpl::prologue() const -> ops::ProjectionPrologue {
+    return {.kind = ops::ProjectionPrologue::Kind::RMS_NORM, .scale = &weight(), .epsilon = epsilon_};
+}
 auto RmsNormImpl::forward_rotary(ops::Context& context, const Tensor& input, const Tensor& cosine,
                                  const Tensor& sine) const -> Tensor {
     return context.rms_rotary(input, weight(), cosine, sine, epsilon_);
@@ -170,9 +173,23 @@ GatedFeedForwardImpl::GatedFeedForwardImpl(std::int32_t hidden, std::int32_t int
     register_module("down_proj", down_);
 }
 auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
-    const auto rows = input.numel() / input.size(-1);
+    return forward(context, input, {});
+}
+auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input,
+                                   const ops::ProjectionPrologue& prologue) const -> Tensor {
     const auto& policy = context.device().policy().transformer;
     const auto kernel = activation_ == GatedActivation::GELU ? policy.gelu : policy.silu;
+    const bool fused_silu = activation_ == GatedActivation::SILU;
+    if (kernel == tensor::FeedForwardKernel::PACKED_GATE &&
+        (fused_silu || input.dtype() == tensor::DType::BF16 || context.device().kind == tensor::DeviceKind::CUDA)) {
+        // Two quantization islands: [prologue -> gate_up] and [GELU gate -> down].
+        const auto projected = gate_up_->forward(context, input, prologue);
+        if (fused_silu) return down_->forward(context, context.silu_gate(projected));
+        return down_->forward(context, projected, {.kind = ops::ProjectionPrologue::Kind::GELU_GATE});
+    }
+    if (prologue.kind != ops::ProjectionPrologue::Kind::NONE)
+        return forward(context, context.apply(input, prologue), {});
+    const auto rows = input.numel() / input.size(-1);
     const bool per_channel = gate_up_->group_size_ == gate_up_->input_size_ && down_->group_size_ == down_->input_size_;
     const bool small_fusion = kernel == tensor::FeedForwardKernel::PACKED_SMALL && rows < 4 && per_channel &&
                               gate_up_->input_size_ % 128 == 0 && down_->input_size_ % 32 == 0;
@@ -180,7 +197,6 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
                               rows >= (activation_ == GatedActivation::GELU ? 32 : 4);
     const bool packed_fusion =
         kernel == tensor::FeedForwardKernel::PACKED_INT8 && rows >= 4 && per_channel && gate_up_->packed_bits_ == 8;
-    const bool fused_silu = activation_ == GatedActivation::SILU;
     if ((large_fusion || small_fusion || packed_fusion) && gate_up_->packed_bits_ &&
         gate_up_->packed_bits_ == down_->packed_bits_) {
         const Tensor& gate_input = gate_up_->input_scale_;
@@ -203,9 +219,7 @@ auto GatedFeedForwardImpl::forward(ops::Context& context, const Tensor& input) c
         if (!small_fusion && !uncalibrated)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "fused feed-forward requires positive trained scales"});
     }
-    if ((kernel == tensor::FeedForwardKernel::PACKED_GATE &&
-         (fused_silu || input.dtype() == tensor::DType::BF16 || context.device().kind == tensor::DeviceKind::CUDA)) ||
-        (kernel == tensor::FeedForwardKernel::PACKED_LARGE && !large_fusion)) {
+    if (kernel == tensor::FeedForwardKernel::PACKED_LARGE && !large_fusion) {
         const auto projected = gate_up_->forward(context, input);
         return down_->forward(context, fused_silu ? context.silu_gate(projected) : context.gelu_gate(projected));
     }
@@ -268,9 +282,14 @@ auto Gemma4AttentionImpl::cache_quantization() const -> std::array<ops::Blockwis
     return {ops::BlockwiseQuantization{{require(key_scale_.data<float>())[0]}, {0}, width},
             ops::BlockwiseQuantization{{require(value_scale_.data<float>())[0]}, {0}, width}};
 }
-auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& input,
+auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& raw_input,
                                            std::span<const Gemma4AttentionSegment> segments, const Tensor& cosine,
-                                           const Tensor& sine, bool cache_only) const -> Tensor {
+                                           const Tensor& sine, bool cache_only,
+                                           const ops::ProjectionPrologue& fused_prologue) const -> Tensor {
+    // Query and key/value share the prologue; run it once unless both projections fuse it.
+    const bool fused = context.fuses(raw_input, fused_prologue);
+    const auto input = fused ? raw_input : context.apply(raw_input, fused_prologue);
+    const auto prologue = fused ? fused_prologue : ops::ProjectionPrologue{};
     const auto length = static_cast<std::int64_t>(input.size(1));
     std::size_t total = 0;
     for (const auto& segment : segments) {
@@ -289,13 +308,13 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
     };
     Tensor query, key, value;
     if (!cache_only)
-        query = query_norm_->forward_rotary(context, reshape(query_->forward(context, input), heads_), cosine, sine);
+        query = query_norm_->forward_rotary(context, reshape(query_->forward(context, input, prologue), heads_), cosine, sine);
     ops::BlockwiseQuantization key_quantization, value_quantization;
     // A byte cache rounds and clamps inside its own cast, so the separate rounding pass would be redundant.
     const auto byte_cache = segments.front().cache->key.dtype() == tensor::DType::I8;
     if (key_value_) {
         const auto kv_width = static_cast<std::int64_t>(key_heads_ * head_width_);
-        const auto kv = key_value_->forward(context, input);
+        const auto kv = key_value_->forward(context, input, prologue);
         if (context.device().capabilities().compute.host()) {
             key = key_norm_->forward_rotary_slice(context, kv, cosine, sine, key_heads_, head_width_, 0, 0, length);
         } else {
@@ -423,16 +442,15 @@ auto Gemma4BlockImpl::forward(ops::Context& context, const Tensor& input, const 
 auto Gemma4BlockImpl::forward_segments(ops::Context& context, const Tensor& input, const Tensor& per_layer_input,
                                        std::span<const Gemma4AttentionSegment> segments, const Tensor& cosine,
                                        const Tensor& sine, bool cache_only) const -> Tensor {
-    auto attended =
-        attention_->forward_segments(context, input_norm_->forward(context, input), segments, cosine, sine, cache_only);
+    // Prefill projection prologues avoid materializing their normalized inputs.
+    auto attended = attention_->forward_segments(context, input, segments, cosine, sine, cache_only,
+                                                 input_norm_->prologue());
     if (cache_only) return {};
     auto hidden = attention_norm_->forward_residual(context, attended, input);
+    const auto feed_forward = feed_forward_->forward(context, hidden, pre_feed_forward_norm_->prologue());
     if (!per_layer_projection_)
-        return post_feed_forward_norm_->forward_residual(
-            context, feed_forward_->forward(context, pre_feed_forward_norm_->forward(context, hidden)), hidden,
-            scalar_);
-    hidden = post_feed_forward_norm_->forward_residual(
-        context, feed_forward_->forward(context, pre_feed_forward_norm_->forward(context, hidden)), hidden);
+        return post_feed_forward_norm_->forward_residual(context, feed_forward, hidden, scalar_);
+    hidden = post_feed_forward_norm_->forward_residual(context, feed_forward, hidden);
     auto gate = per_layer_gate_->forward(context, hidden);
     auto projected = per_layer_projection_->forward(context, context.gelu_multiply(gate, per_layer_input));
     return per_layer_norm_->forward_residual(context, projected, hidden, scalar_);

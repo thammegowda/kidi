@@ -34,7 +34,6 @@ struct FlashAttentionArgs {
 };
 
 auto flash_attention_bf16(const FlashAttentionArgs& args, cudaStream_t stream) -> bool;
-
 auto flash_attention_f32(const FlashAttentionArgs& args, cudaStream_t stream) -> bool;
 
 } // namespace kidi::cuda
