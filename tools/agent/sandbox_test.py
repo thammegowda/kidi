@@ -100,13 +100,24 @@ class SandboxScriptTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root)
 
-    def run_sandboxed(self, command, *options):
+    def run_sandboxed(self, command, *options, env=None):
         return subprocess.run([str(HERE / "sandbox.sh"), *options, "--exec", str(self.ws), "--", "bash", "-c", command],
-                              env=self.env, capture_output=True, text=True)
+                              env=env or self.env, capture_output=True, text=True)
+
+    def test_agent_provider_uses_configured_endpoint_and_model_id(self):
+        env = dict(self.env, KIDI_AGENT_BASE_URL="http://127.0.0.1:8123/v1", KIDI_AGENT_MODEL_ID="test-model")
+        command = (
+            "python3 -c 'import json, os; c=json.load(open(os.path.join(os.environ[\"PI_CODING_AGENT_DIR\"], "
+            "\"models.json\"))); p=c[\"providers\"][\"kidi\"]; "
+            "assert p[\"baseUrl\"] == \"http://127.0.0.1:8123/v1\"; "
+            "assert p[\"models\"][0][\"id\"] == \"test-model\"'"
+        )
+        result = self.run_sandboxed(command, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_python_venv_and_git_review_workflow(self):
         result = self.run_sandboxed(
-            "python3 -m venv .venv && .venv/bin/python -c 'import a' && "
+            "python -c 'import sys' && python3 -m venv .venv && .venv/bin/python -c 'import a' && "
             "echo 'x = 2' > a.py && git diff --name-only | grep -qx a.py && "
             "! git add a.py 2>/dev/null && ! touch " + str(self.hooks / "pre-commit"))
         self.assertEqual(result.returncode, 0, result.stderr)

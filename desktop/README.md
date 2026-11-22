@@ -17,6 +17,12 @@ window. Never use `--dev` with an exposed or forwarded port.
 `make app-dev` builds and runs this mode on port `10010`. Override the defaults
 with `APP_CONFIG=path/to/config.yaml` or `APP_PORT=another-loopback-port`.
 
+For Inkling 2 Mini, use the CUDA build with
+[`examples/kidi-app-inkling2.yaml`](../examples/kidi-app-inkling2.yaml). The
+configuration retains the example's speech models; they are downloaded if
+needed. To use an existing Inkling checkpoint instead of downloading it,
+set `models.chat.directory` to its snapshot directory.
+
 Frontend builds require Node.js 24+ and npm to acquire Mermaid. Compact libraries
 and icons are vendored; CMake prepares the larger, ignored distributions before
 staging or embedding assets. See [dependency policy](../web/libs/README.md).

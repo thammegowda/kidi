@@ -1,6 +1,6 @@
 {
-  "defaultProvider": "inkling-vllm",
-  "defaultModel": "thinkingmachines/Inkling-2-Mini",
-  "defaultThinkingLevel": "medium",
+  "defaultProvider": "kidi",
+  "defaultModel": "kidi-local",
+  "defaultThinkingLevel": "off",
   "quietStartup": true
 }

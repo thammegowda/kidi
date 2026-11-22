@@ -253,7 +253,7 @@ auto index_command(const Namespace& arguments, const std::filesystem::path& dire
         log::error("{}", valid.error().message);
         return 1;
     }
-    if ((*config)["model"]["quantization_config"]) {
+    if (checkpoint::native_qat((*config)["model"])) {
         log::error("HNSW learning requires original FP32/BF16 Gemma weights");
         return 2;
     }

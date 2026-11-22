@@ -23,6 +23,10 @@ struct ChatMessage {
     std::vector<std::filesystem::path> images;
 };
 
+struct SpecialTokens {
+    std::optional<std::int32_t> bos, eos, pad;
+};
+
 class Tokenizer {
 public:
     Tokenizer(Tokenizer&&) noexcept;
@@ -40,14 +44,16 @@ public:
         -> Result<std::string>;
     auto format_chat(std::span<const ChatMessage> messages) const -> Result<std::string>;
     /// Renders structured messages and template arguments without imposing a thinking default.
-    auto format_chat_json(const nlohmann::ordered_json& messages,
-                          const nlohmann::ordered_json& template_args = nlohmann::ordered_json::object(),
-                          bool add_generation_prompt = true) const -> Result<std::string>;
+    auto format_chat(const nlohmann::ordered_json& messages,
+                     const nlohmann::ordered_json& template_args = nlohmann::ordered_json::object(),
+                     bool add_generation_prompt = true) const -> Result<std::string>;
     auto format_template(std::string_view name, const TemplateArguments& arguments) const -> Result<std::string>;
     auto encode_template(std::string_view name, const TemplateArguments& arguments) const
         -> Result<std::vector<std::int32_t>>;
     auto vocabulary_size() const noexcept -> std::size_t;
     auto token_id(std::string_view token) const -> std::optional<std::int32_t>;
+    /// Resolves tokenizer_config.json's BOS/EOS/pad strings, rejecting tokens absent from the vocabulary.
+    auto special_tokens() const -> Result<SpecialTokens>;
 
 private:
     struct Impl;

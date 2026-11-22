@@ -66,6 +66,7 @@ reproduction commands.
 | Model Family | Tasks | Highlights |
 |---|---|---|
 | **Gemma 4 (`E2B-it`, `E4B-it`)** | Chat, JSONL Generation, Vision (Photo Q&A) | Native QAT (mixed 2/4/8-bit), BF16, Per-Channel INT8, and Group-32/128 Symmetric & Asymmetric INT4 with tied embeddings |
+| **Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`)** | Agentic chat with reasoning and tool calls (`serve`, `generate`, `chat`) | Text-only CUDA port of the looped 24-layer MoE (128 experts, top-8) with relative-position attention; NVFP4 experts dequantized to BF16 at load (about 52 GB) |
 | **Qwen 3** | Chat & Text Generation | Grouped-query attention, SwiGLU, RMSNorm, and quantized linear execution |
 | **Whisper (`Tiny`, `Base`, `Small`, `Large-v3`, `Turbo`)** | Speech-to-Text (`transcribe`) & Speech-to-English (`translate`) | Loads directly from Hugging Face checkpoints; automatic INT8 weight caching and 30s windowed long-audio streaming |
 | **OmniVoice** | Multilingual Text-to-Speech (`synthesize`) | 600+ MB INT8 package with controllable voice attributes (`gender`, `age`, `pitch`, `accent`, `style`) and consistent long-form narrator conditioning |
@@ -127,8 +128,31 @@ options through to the model's chat template:
 Template options and tool-call argument formats are model-specific; Inkling expects `arguments` as an object, not a
 JSON-encoded string. The structured path uses the template's own thinking default unless explicitly overridden.
 Requests without `template_args` retain the existing simple-chat behavior. Structured generation currently accepts
-text only; images use the existing multimodal API. Responses still contain raw assistant text, not parsed tool calls
-or reasoning, and a model architecture must be supported separately.
+text only; images use the existing multimodal API. `generate` responses contain raw assistant text; use `serve` for
+parsed reasoning and tool calls.
+
+Generation uses each checkpoint's chat template rather than model-specific prompt markup. Stop, padding and BOS
+token IDs come from `generation_config.json`, then the root/text `config.json`, then the tokenizer's configured
+special tokens. EOS may be a single ID or a list; absent padding/BOS IDs use the first EOS ID. Raw prompts do not
+require a chat template. Parameter dtype comes from `dtype`/`torch_dtype`; older exports without either use the
+largest uncompressed floating tensor. Quantization metadata remains available to the model; only
+`quant_method: gemma` selects the native Gemma QAT execution policy. Padded embeddings are supported when the
+model exposes tokenizer-sized output logits.
+
+`kidi serve` and the desktop app run the same server module (`src/kidi/server`): one engine thread owns the model and
+batches every request, and the same routes expose an OpenAI-compatible `/v1/chat/completions` endpoint (streaming or
+not) for agent harnesses. It supports OpenAI `tools`, string tool-call `arguments`, `chat_template_kwargs`,
+`reasoning_effort`, and `max_tokens`; decoding is greedy. Models whose package declares a response format (currently
+Inkling) return `reasoning_content` and `tool_calls`; others return plain `content`. `kidi serve` is that server with
+no UI; the desktop app adds its UI (text chats call `/v1`) and a WebSocket channel for image chats and speech/ebook
+operations, whose text generation goes through the same engine.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 kidi serve -m @thinkingmachines/Inkling-2-Mini --backend cuda --port 18097 \
+  --context-size 65536 --cache-tokens 65536 --prefill-chunk-size 512
+```
+
+See [tools/agent/README.md](tools/agent/README.md) to run the Pi coding agent against it in a Landlock sandbox.
 
 Add `--assistant-model` (with `@owner/model` or a local directory) to enable CPU speculative decoding in `chat` or `generate`:
 

@@ -124,8 +124,7 @@ auto Tokenizer::load(const std::filesystem::path& path, const TemplateFiles& tem
 auto Tokenizer::format_chat(std::span<const ChatMessage> messages) const -> Result<std::string> {
     if (messages.empty() || messages.back().role != "user")
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "messages must end with a user turn"});
-    std::vector<tokenizers::ChatMessage> conversation;
-    conversation.reserve(messages.size());
+    nlohmann::ordered_json conversation = nlohmann::ordered_json::array();
     for (std::size_t index = 0; index < messages.size(); ++index) {
         const auto& message = messages[index];
         if (!message.images.empty())
@@ -134,20 +133,13 @@ auto Tokenizer::format_chat(std::span<const ChatMessage> messages) const -> Resu
         if ((instruction && index != 0) || (!instruction && message.role != "user" && message.role != "assistant"))
             return std::unexpected(
                 Error{ErrorCode::INVALID_ARGUMENT, "supported roles: initial system/developer, user, assistant"});
-        conversation.push_back({message.role, message.content});
+        conversation.push_back({{"role", message.role}, {"content", message.content}});
     }
-
-    if (!impl_->value.has_chat_template())
-        return std::unexpected(
-            Error{ErrorCode::INVALID_ARGUMENT, "chat requires tokenizer_config.json and a checkpoint chat template"});
-    auto result = impl_->value.apply_chat_template(conversation, true, "default", {{"enable_thinking", false}});
-    if (!result)
-        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "chat template: " + result.error().message()});
-    return std::move(*result);
+    return format_chat(conversation, {{"enable_thinking", false}});
 }
 
-auto Tokenizer::format_chat_json(const nlohmann::ordered_json& messages, const nlohmann::ordered_json& template_args,
-                                bool add_generation_prompt) const -> Result<std::string> {
+auto Tokenizer::format_chat(const nlohmann::ordered_json& messages, const nlohmann::ordered_json& template_args,
+                            bool add_generation_prompt) const -> Result<std::string> {
     if (!messages.is_array() || messages.empty())
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "messages must be a nonempty array"});
     if (!impl_->value.has_chat_template())
@@ -221,6 +213,23 @@ auto Tokenizer::vocabulary_size() const noexcept -> std::size_t { return impl_->
 
 auto Tokenizer::token_id(std::string_view token) const -> std::optional<std::int32_t> {
     return impl_->value.token_to_id(token);
+}
+
+auto Tokenizer::special_tokens() const -> Result<SpecialTokens> {
+    SpecialTokens result;
+    if (const auto* config = impl_->value.get_config()) {
+        const std::array entries{std::pair{&config->bos_token, &result.bos},
+                                 std::pair{&config->eos_token, &result.eos},
+                                 std::pair{&config->pad_token, &result.pad}};
+        for (const auto& [name, id] : entries) {
+            if (!*name) continue;
+            *id = token_id(**name);
+            if (!*id)
+                return std::unexpected(
+                    Error{ErrorCode::INVALID_MANIFEST, "tokenizer lacks configured special token " + **name});
+        }
+    }
+    return result;
 }
 
 } // namespace kidi::text

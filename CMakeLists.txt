@@ -118,6 +118,7 @@ add_library(kidi
     src/kidi/model/gemma4.cpp
     src/kidi/model/gemma4_assistant.cpp
     src/kidi/model/gemma4_vision.cpp
+    src/kidi/model/inkling2.cpp
     src/kidi/model/kokoro.cpp
     src/kidi/model/model.cpp
     src/kidi/model/omnivoice.cpp
@@ -140,6 +141,7 @@ add_library(kidi
     src/kidi/text/phonemizer.cpp
     src/kidi/text/sentence.cpp
     src/kidi/text/tokenizer.cpp
+    src/kidi/text/response.cpp
 )
 add_library(kidi::kidi ALIAS kidi)
 
@@ -394,13 +396,25 @@ if(APPLE)
     endif()
 endif()
 
+set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "Build LiteApp's GoogleTest suite" FORCE)
+add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
+
+# kidi's single HTTP API (OpenAI-compatible chat), hosted by both `kidi serve` and the desktop app.
+add_library(kidi_server STATIC
+    src/kidi/server/engine.cpp
+    src/kidi/server/openai.cpp
+    src/kidi/server/routes.cpp
+)
+target_link_libraries(kidi_server PUBLIC kidi::kidi liteapp::http nlohmann_json::nlohmann_json)
+
 add_library(kidi_cli_main STATIC
     src/kidi/cli/index.cpp
     src/kidi/cli/interactive.cpp
     src/kidi/cli/log.cpp
     src/kidi/cli/main.cpp
+    src/kidi/cli/serve.cpp
 )
-target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi nlohmann_json::nlohmann_json)
+target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi nlohmann_json::nlohmann_json PRIVATE kidi_server)
 if(TARGET kidi_index_cuda_helper)
     add_dependencies(kidi_cli_main kidi_index_cuda_helper)
 endif()
@@ -419,14 +433,12 @@ if(KIDI_ENABLE_CUDA)
 endif()
 
 if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
-    foreach(_kidi_target IN ITEMS kidi_argparse kidi kidi_cli_main)
+    foreach(_kidi_target IN ITEMS kidi_argparse kidi kidi_server kidi_cli_main)
         target_compile_options(${_kidi_target} PRIVATE -ffunction-sections -fdata-sections)
     endforeach()
 endif()
 
 if(KIDI_BUILD_DESKTOP_APP)
-    set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "Build LiteApp's GoogleTest suite" FORCE)
-    add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
     set(KIDI_DESKTOP_WEB_STAGE "${CMAKE_CURRENT_BINARY_DIR}/generated/desktop-web")
     set(KIDI_DESKTOP_WEB_DEPENDENCY_FILES)
     file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}")
@@ -503,6 +515,7 @@ if(KIDI_BUILD_DESKTOP_APP)
     set_target_properties(kidi_app PROPERTIES OUTPUT_NAME kidi-app)
     target_link_libraries(kidi_app PRIVATE
         kidi::kidi
+        kidi_server
         kidi_desktop_ebook
         kidi_desktop_assets
         liteapp::app

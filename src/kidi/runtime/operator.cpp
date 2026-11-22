@@ -57,7 +57,11 @@ auto operation_name(Operation operation) -> std::string_view {
                                "snake_quantized_linear",
                                "conv_transpose_fold",
                                "snake",
-                               "gelu_gate"};
+                               "gelu_gate",
+                               "residual_mix",
+                               "short_convolution",
+                               "l2_clip",
+                               "relative_attention"};
     return names.at(static_cast<std::size_t>(operation));
 }
 

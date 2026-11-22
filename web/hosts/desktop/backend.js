@@ -23,6 +23,7 @@ class DesktopBackend {
   #speechClient;
   #speechTransport;
   #speechChannel;
+  #openAIRequests = new Map();
 
   get bufferedAmount() {
     return Math.max(this.#transport?.bufferedAmount || 0, this.#speechTransport?.bufferedAmount || 0);
@@ -39,6 +40,8 @@ class DesktopBackend {
     this.#callbacks = callbacks;
     const connection = ++this.#connection;
     this.#disconnecting = false;
+    for (const controller of this.#openAIRequests.values()) controller.abort();
+    this.#openAIRequests.clear();
     this.#client?.dispose('The local session was replaced');
     this.#speechClient?.dispose('The native speech channel was replaced');
     this.#client = null;
@@ -90,6 +93,8 @@ class DesktopBackend {
         if (closed || connection !== this.#connection) return;
         closed = true;
         this.#disconnecting = true;
+        for (const controller of this.#openAIRequests.values()) controller.abort();
+        this.#openAIRequests.clear();
         this.#transport = null;
         this.#speechTransport = null;
         client.dispose(speech
@@ -116,8 +121,17 @@ class DesktopBackend {
 
   send(type, id, payload = {}) {
     if (type === 'cancel') {
+      const request = this.#openAIRequests.get(id);
+      if (request) {
+        request.abort();
+        return;
+      }
       if (!this.#client?.cancel(id) && !this.#speechClient?.cancel(id))
         this.#callbacks?.onEvent?.({v: 1, id, type: 'request.cancelled', seq: 0, payload});
+      return;
+    }
+    if (type === 'chat.start' && !payload.messages?.some(message => message.images?.length)) {
+      this.#runOpenAIChat(id, payload);
       return;
     }
     if (type === 'asr.stop') {
@@ -136,6 +150,97 @@ class DesktopBackend {
         ? 'The native speech channel is reconnecting'
         : 'The local session is reconnecting');
     client.request(type, id, payload);
+  }
+
+  async #runOpenAIChat(id, payload) {
+    const controller = new AbortController();
+    this.#openAIRequests.set(id, controller);
+    const emit = (type, eventPayload = {}) =>
+      this.#callbacks?.onEvent?.({v: 1, id, type, seq: 0, payload: eventPayload});
+    try {
+      const status = await this.status();
+      emit('chat.started', {
+        backend: status.backend,
+        runtime: status.runtime,
+        components: status.components,
+      });
+      const started = performance.now();
+      const response = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: status.components?.chat?.model_id,
+          messages: payload.messages,
+          stream: true,
+          stream_options: {include_usage: true},
+          kidi: {
+            languages: payload.languages || '',
+            language_names: payload.language_names || payload.languages || '',
+          },
+        }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error?.message || `Request failed (${response.status})`);
+      }
+      if (!response.body) throw new Error('The OpenAI-compatible response has no stream');
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let text = '';
+      let usage;
+      let kidiStats;
+      let finished = false;
+      const processLine = line => {
+        if (!line.startsWith('data:')) return;
+        const data = line.slice(5).trimStart();
+        if (data === '[DONE]') {
+          finished = true;
+          return;
+        }
+        const chunk = JSON.parse(data);
+        if (chunk.error) throw new Error(chunk.error.message || 'Chat generation failed');
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (typeof delta === 'string' && delta) {
+          text += delta;
+          emit('chat.delta', {text: delta});
+        }
+        if (chunk.usage) usage = chunk.usage;
+        if (chunk.kidi_stats) kidiStats = chunk.kidi_stats;
+      };
+      while (true) {
+        const {value, done} = await reader.read();
+        buffer += decoder.decode(value, {stream: !done});
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() || '';
+        for (const line of lines) processLine(line);
+        if (done) {
+          if (buffer) processLine(buffer);
+          break;
+        }
+      }
+      if (!finished) throw new Error('The OpenAI-compatible stream ended before completion');
+      const elapsed = performance.now() - started;
+      const completionTokens = usage?.completion_tokens || 0;
+      emit('chat.completed', {
+        text,
+        stats: kidiStats || {
+          prompt_tokens: usage?.prompt_tokens || 0,
+          decode_tokens: completionTokens,
+          elapsed_ms: elapsed,
+          decode_ms: elapsed,
+        },
+      });
+    } catch (error) {
+      if (error.name === 'AbortError')
+        emit('request.cancelled', {message: 'Generation cancelled'});
+      else
+        emit('error', {code: error.code || 'service_error', message: error.message || 'Chat request failed'});
+    } finally {
+      if (this.#openAIRequests.get(id) === controller) this.#openAIRequests.delete(id);
+    }
   }
 
   sendBinary(frame) {

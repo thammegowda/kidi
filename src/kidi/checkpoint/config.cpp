@@ -1,4 +1,5 @@
 #include "kidi/checkpoint/config.h"
+// Imports model and generation metadata from checkpoint files, independently of the inference backend.
 #include "kidi/checkpoint/ggml/reader.h"
 #include "packages_jsonl.h"
 
@@ -166,6 +167,11 @@ auto check_required(const PackageSpec& spec, const YAML::Node& manifest) -> Resu
 
 } // namespace
 
+auto native_qat(const YAML::Node& model_config) -> bool {
+    const auto quantization = model_config["quantization_config"];
+    return quantization && quantization.IsMap() && quantization["quant_method"].as<std::string>("") == "gemma";
+}
+
 auto hub_files(const YAML::Node& document) -> Result<std::vector<std::string>> {
     try {
         if (!document.IsMap())
@@ -207,6 +213,9 @@ auto hub_files(const YAML::Node& document) -> Result<std::vector<std::string>> {
         for (const auto& sidecar : spec->sidecars) {
             const auto rel = (tokenizer_parent / sidecar).generic_string();
             if (auto ok = push_checked(files, rel); !ok) return std::unexpected(ok.error());
+        }
+        if (spec->task == "chat") {
+            if (auto ok = push_checked(files, "generation_config.json"); !ok) return std::unexpected(ok.error());
         }
         if (document["tokenizers"] && document["tokenizers"].IsMap()) {
             for (const auto& entry : document["tokenizers"]) {
@@ -276,20 +285,42 @@ auto load_config(const std::filesystem::path& path) -> Result<YAML::Node> {
         if (document["external_tensors"]) config["external_tensors"] = YAML::Clone(document["external_tensors"]);
         if (manifest["vision_config"]) {
             config["vision"] = YAML::Clone(manifest["vision_config"]);
-            config["image_token_id"] = manifest["image_token_id"];
+            if (manifest["image_token_id"]) config["image_token_id"] = manifest["image_token_id"];
         }
 
         const auto model_node = !spec->model_key.empty() ? manifest[spec->model_key] : manifest["model"];
         config["model"] = YAML::Clone(model_node && model_node.IsMap() ? model_node : manifest);
         if (!spec->model_key.empty()) {
-            for (const auto* inherited : {"packed_weights_signed", "tie_word_embeddings"})
-                if (!config["model"][inherited] && manifest[inherited])
+            for (const auto* inherited : {"packed_weights_signed", "tie_word_embeddings", "dtype", "torch_dtype"})
+                if ((!config["model"][inherited] || config["model"][inherited].IsNull()) && manifest[inherited])
                     config["model"][inherited] = YAML::Clone(manifest[inherited]);
-            if (const auto quantization = manifest["quantization_config"]; quantization && quantization.IsMap())
+            if (const auto quantization = manifest["quantization_config"];
+                quantization && quantization.IsMap() &&
+                (!config["model"]["quantization_config"] || config["model"]["quantization_config"].IsNull()))
                 config["model"]["quantization_config"] = YAML::Clone(quantization);
         }
-        if (const auto model_quant = config["model"]["quantization_config"]; model_quant && model_quant.IsNull())
+        if (const auto model_quant = config["model"]["quantization_config"];
+            model_quant && model_quant.IsNull())
             config["model"].remove("quantization_config");
+        if (spec->task == "chat") {
+            config["generation"] = YAML::Node(YAML::NodeType::Map);
+            for (const auto* key : {"bos_token_id", "eos_token_id", "pad_token_id"}) {
+                const auto value = manifest[key] && !manifest[key].IsNull() ? manifest[key] : config["model"][key];
+                if (value && !value.IsNull()) config["generation"][key] = YAML::Clone(value);
+            }
+            const auto generation_path = directory / "generation_config.json";
+            if (std::filesystem::is_regular_file(generation_path)) {
+                const auto generation = YAML::LoadFile(generation_path.string());
+                if (!generation.IsMap())
+                    return std::unexpected(
+                        Error{ErrorCode::INVALID_MANIFEST, "generation_config.json must contain a mapping"});
+                for (const auto& entry : generation)
+                    if (!entry.second.IsNull())
+                        config["generation"][entry.first.as<std::string>()] = YAML::Clone(entry.second);
+            }
+        }
+        if (!config["model"]["max_position_embeddings"] && config["model"]["model_max_length"])
+            config["model"]["max_position_embeddings"] = YAML::Clone(config["model"]["model_max_length"]);
         config["model"]["type"] = spec->type;
 
         for (const auto& key : spec->copy_keys)

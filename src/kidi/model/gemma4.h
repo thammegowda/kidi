@@ -52,6 +52,7 @@ public:
     auto hidden_size() const noexcept -> std::int32_t override;
     auto vocabulary_size() const noexcept -> std::int32_t override;
     auto max_positions() const noexcept -> std::size_t override;
+    auto supports_state_recycling() const noexcept -> bool override { return true; }
     auto configure_cache(const std::filesystem::path& directory, const std::filesystem::path& source) -> void override;
     auto set_precision(core::InferencePrecision precision) noexcept -> void override;
     auto set_kv_cache_precision(core::KVCachePrecision precision) noexcept -> void override;

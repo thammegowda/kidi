@@ -12,14 +12,14 @@
 #   --no-sudo       do not use the private mount namespace even if passwordless sudo works
 #   --exec          run COMMAND instead of Pi
 #
-# Environment: KIDI_AGENT_BASE_URL (default http://127.0.0.1:18096/v1), KIDI_AGENT_HOME,
-# KIDI_AGENT_CACHE. See tools/agent/README.md for the policy and its limits.
+# Environment: KIDI_AGENT_BASE_URL (default http://127.0.0.1:18097/v1), KIDI_AGENT_MODEL_ID,
+# KIDI_AGENT_HOME, KIDI_AGENT_CACHE. See tools/agent/README.md for the policy and its limits.
 set -euo pipefail
 
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 runtime="${KIDI_AGENT_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/kidi-agent}"
 cache="${KIDI_AGENT_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/kidi-agent}"
-base_url="${KIDI_AGENT_BASE_URL:-http://127.0.0.1:18096/v1}"
+base_url="${KIDI_AGENT_BASE_URL:-http://127.0.0.1:18097/v1}"
 python=/usr/bin/python3
 
 die() { echo "sandbox.sh: $*" >&2; exit 2; }
@@ -103,11 +103,14 @@ prompt="$(<"$here/prompt.md")"
 prompt="${prompt//'{{WORKSPACE}}'/$ws}"
 prompt="${prompt//'{{NETWORK}}'/$network}"
 printf '%s\n' "${prompt//'{{SHM}}'/$shm}" > "$priv/prompt.md"
-"$python" - "$here/pi/models.json" "$priv/agent/models.json" "$base_url" <<'EOF'
+model_id="${KIDI_AGENT_MODEL_ID:-kidi-local}"
+"$python" - "$here/pi/models.json" "$priv/agent/models.json" "$base_url" "$model_id" <<'EOF'
 import json, sys
 config = json.load(open(sys.argv[1]))
 for provider in config["providers"].values():
     provider["baseUrl"] = sys.argv[3]
+    for model in provider["models"]:
+        model["id"] = sys.argv[4]
 json.dump(config, open(sys.argv[2], "w"), indent=2)
 EOF
 cp "$here/pi/settings.json" "$priv/agent/"
@@ -121,6 +124,11 @@ env_vars=(
 )
 [[ -n ${COLORTERM:-} ]] && env_vars+=(COLORTERM="$COLORTERM")
 ((https)) || env_vars+=(UV_OFFLINE=1 PIP_RETRIES=0)
+# Many tools and models call `python`; distributions often ship only `python3`.
+if ! (PATH="$path" command -v python >/dev/null) && py3="$(PATH="$path" command -v python3)"; then
+    mkdir -p "$priv/bin" && ln -s "$py3" "$priv/bin/python"
+    path="$priv/bin:$path"
+fi
 if [[ -x $ws/.venv/bin/python ]]; then
     env_vars+=(VIRTUAL_ENV="$ws/.venv")
     path="$ws/.venv/bin:$path"

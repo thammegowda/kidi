@@ -104,6 +104,8 @@ public:
     virtual auto set_kv_cache_precision(core::KVCachePrecision) noexcept -> void {}
     /// Storage dtype `create_state(capacity)` would allocate for the selected KV-cache precision.
     virtual auto kv_cache_dtype(std::size_t) const -> Result<tensor::DType> { return tensor::DType::F32; }
+    /// Whether a completed request state can be reset and reused for a new request.
+    virtual auto supports_state_recycling() const noexcept -> bool { return false; }
 
     virtual auto rewind(LanguageModelState& state, std::size_t position) -> Result<void>;
     virtual auto prefill(std::span<const std::int32_t> tokens, LanguageModelState& state) -> Result<void>;

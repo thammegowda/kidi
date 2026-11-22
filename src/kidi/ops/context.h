@@ -164,7 +164,8 @@ public:
     auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
     auto silu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
     auto gelu_gate(const Tensor& gate_up) -> Tensor;
-    auto silu_gate(const Tensor& gate_up) -> Tensor;
+    auto silu_gate(const Tensor& gate_up, float gate_cap = 0.F, float up_cap = 0.F,
+                   const Tensor& row_weights = {}) -> Tensor;
     auto gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
                             const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
                             std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
@@ -192,6 +193,23 @@ public:
     auto conv_transpose_fold(const Tensor& projected, const Tensor& bias, std::int32_t kernel, std::int32_t stride,
                              std::int32_t padding, std::int32_t output_padding, std::int32_t dilation) -> Tensor;
     auto snake(const Tensor& input, const Tensor& alpha) -> Tensor;
+
+    /// Specialized operations with CPU and CUDA implementations.
+    struct RelativeAttention {
+        std::int64_t heads, key_heads, start, window, extent;
+    };
+    /// RMS-normalizes each [tokens, width] source and mixes them per token with softmax weights from the
+    /// [queries, width] pseudo-queries; returns FP32 [queries, tokens, width].
+    auto residual_mix(std::span<const Tensor> sources, const Tensor& queries, float epsilon) -> Tensor;
+    /// Causal depthwise convolution of `padded` [W - 1 + tokens, channels] with lag-0-first `weight` [W, channels]
+    /// plus optional per-token `taps` [tokens, groups * W]; returns (convolution + current input) * scale.
+    auto short_convolution(const Tensor& padded, const Tensor& weight, const Tensor& taps, float scale) -> Tensor;
+    /// Multiplies [..., heads, width] rows by the optional [heads, width] scale and caps each row's L2 norm.
+    auto l2_clip(const Tensor& input, const Tensor& scale, float threshold) -> Tensor;
+    /// Causal attention of [tokens, heads * width] queries at positions `start + row` over [capacity, key_heads *
+    /// width] caches, with relative logits [tokens, heads, extent], sink logits [tokens, heads] and sigmoid `gate`.
+    auto relative_attention(const Tensor& query, const Tensor& key, const Tensor& value, const Tensor& relative,
+                            const Tensor& sink, const Tensor& gate, RelativeAttention shape) -> Tensor;
     auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
     auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine, float epsilon)
         -> Tensor;

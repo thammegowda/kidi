@@ -1,23 +1,28 @@
 # Coding-agent sandbox
 
-Runs the [Pi](https://github.com/earendil-works/pi) coding agent (pinned to v0.83.0, the
-version cited by the Inkling-2-Mini model card) against an OpenAI-compatible endpoint, confined
+Runs the [Pi](https://github.com/earendil-works/pi) coding agent (pinned to v0.83.0) against an
+OpenAI-compatible endpoint, confined
 by [Landlock](https://docs.kernel.org/userspace-api/landlock.html) to one workspace directory.
 Linux only; works inside unprivileged containers.
 
 ```bash
 tools/agent/setup.sh                                  # Node 22 + Pi into ~/.local/share/kidi-agent
-VLLM_ENV=... CUDA_VISIBLE_DEVICES=6 tools/agent/serve-inkling-vllm.sh   # reference endpoint
+KIDI_MODEL=/path/to/model CUDA_VISIBLE_DEVICES=7 tools/agent/serve-kidi.sh # kidi endpoint (port 18097)
 git worktree add ../kidi-task-42                      # one disposable worktree per task
+KIDI_AGENT_MODEL_ID=your-served-name tools/agent/sandbox.sh ../kidi-task-42 # if model name differs
 tools/agent/sandbox.sh ../kidi-task-42                # interactive Pi
 tools/agent/sandbox.sh ../kidi-task-42 -- -p "fix the failing test"      # one-shot
 tools/agent/sandbox.sh --allow-https ../kidi-task-42  # also allow PyPI downloads
 tools/agent/sandbox.sh --exec ../kidi-task-42 -- bash # same sandbox, no agent
+VLLM_ENV=... CUDA_VISIBLE_DEVICES=6 tools/agent/serve-inkling-vllm.sh    # optional Inkling reference (port 18096)
 ```
 
-`KIDI_AGENT_BASE_URL` selects the endpoint (default `http://127.0.0.1:18096/v1`). Pi model
-settings are in [pi/models.json](pi/models.json). Pi thinking levels are sent as Inkling's
-`reasoning_effort`; `off` is mapped to `none`, since omitting it would select vLLM's 0.9 default.
+`KIDI_AGENT_BASE_URL` selects the endpoint (default `http://127.0.0.1:18097/v1`); set
+`KIDI_AGENT_MODEL_ID` if the server advertises a different model name. The model path, served name,
+context/cache size and token limits for `serve-kidi.sh` can be set with `KIDI_MODEL`,
+`KIDI_SERVED_MODEL_NAME`, `KIDI_CONTEXT_SIZE`, `KIDI_CACHE_TOKENS`, and `KIDI_MAX_NEW_TOKENS`.
+Pi's provider defaults are in [pi/models.json](pi/models.json). The CUDA build runs without CUTLASS;
+CUTLASS is optional and used only for the SM90 int8 GEMM path.
 
 ## Policy
 
@@ -43,6 +48,7 @@ you later run `git diff` to review its work.
 ## Python
 
 - An existing `WORKSPACE/.venv` is activated (`VIRTUAL_ENV`, `PATH`).
+- Without a venv, `python` runs the system `python3` when the system has no `python`.
 - `python3 -m venv` and `uv venv` both work; uv prefers the system Python, and `uv venv -p 3.13`
   installs a managed interpreter into the cache (needs `--allow-https`).
 - uv and pip caches persist across runs, so `uv pip install --offline` works for packages

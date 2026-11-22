@@ -17,6 +17,7 @@
 #include "kidi/audio/wav.h"
 #include "kidi/cli/interactive.h"
 #include "kidi/cli/index.h"
+#include "kidi/cli/serve.h"
 #include "kidi/core/version.h"
 #include "kidi/checkpoint/package.h"
 #include "kidi/checkpoint/config.h"
@@ -111,7 +112,7 @@ auto inspect(const std::filesystem::path& directory) -> int {
             kidi::cli::log::error("{}", weights.error().message);
             return 1;
         }
-        const bool qat = static_cast<bool>((*document)["model"]["quantization_config"]);
+        const bool qat = kidi::checkpoint::native_qat((*document)["model"]);
         const auto embedding = weights->tensor(qat ? "model.language_model.embed_tokens.embedding_quantized"
                                                    : "model.language_model.embed_tokens.weight");
         if (!embedding) {
@@ -222,36 +223,6 @@ auto validate_chat_request(const nlohmann::ordered_json& request) -> kidi::Resul
     return {};
 }
 
-auto chat_messages(const nlohmann::ordered_json& request) -> kidi::Result<std::vector<kidi::text::ChatMessage>> {
-    const auto invalid = [](std::string message) {
-        return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, std::move(message)});
-    };
-    std::vector<kidi::text::ChatMessage> result;
-    for (const auto& message : request["messages"]) {
-        if (!message.is_object() || message.size() != 2 || !message.contains("role") || !message["role"].is_string() ||
-            !message.contains("content"))
-            return invalid("each message must contain role and content only");
-        std::string content;
-        if (message["content"].is_string()) {
-            content = message["content"].get<std::string>();
-        } else if (message["content"].is_array()) {
-            for (const auto& part : message["content"]) {
-                if (!part.is_object() || part.size() != 2 || !part.contains("type"))
-                    return invalid("content parts must be text objects");
-                if (part["type"] == "text" && part.contains("text") && part["text"].is_string()) {
-                    content += part["text"].get<std::string>();
-                } else {
-                    return invalid("content parts must contain text");
-                }
-            }
-        } else {
-            return invalid("content must be a string or an array of text parts");
-        }
-        result.push_back({message["role"].get<std::string>(), std::move(content)});
-    }
-    return result;
-}
-
 struct ChatSession {
     kidi::inference::Generator generator;
     kidi::inference::GenerationOptions options;
@@ -353,17 +324,9 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
                 auto request_options = options;
                 if (request.contains("max_tokens"))
                     request_options.maximum_new_tokens = request["max_tokens"].get<std::size_t>();
-                kidi::Result<std::uint64_t> queued;
-                if (request.contains("template_args")) {
-                    queued = generator.enqueue_chat_json(request["messages"], request_options, request["template_args"]);
-                } else {
-                    auto messages = chat_messages(request);
-                    if (!messages) {
-                        kidi::cli::log::error("input line {}: {}", line_number, messages.error().message);
-                        return 2;
-                    }
-                    queued = generator.enqueue_chat(*messages, request_options);
-                }
+                auto template_args = request.value("template_args", nlohmann::ordered_json::object());
+                if (!request.contains("template_args")) template_args["enable_thinking"] = false;
+                auto queued = generator.enqueue_chat(request["messages"], request_options, template_args);
                 if (!queued) {
                     kidi::cli::log::error("input line {}: {}", line_number, queued.error().message);
                     return queued.error().code == kidi::ErrorCode::INVALID_ARGUMENT ? 2 : 1;
@@ -648,6 +611,35 @@ auto chat_command(const kidi::cli::Namespace& arguments, const std::filesystem::
     return kidi::cli::interactive_chat(session->generator, session->options, arguments, session->load_ns);
 }
 
+auto serve_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
+    if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TEXT_GENERATION)) return status;
+    std::filesystem::path assistant_directory;
+    if (const auto status = resolve_hub_argument(arguments.get<std::filesystem::path>("assistant_model"),
+                                                 arguments.get<std::filesystem::path>("cache"), assistant_directory))
+        return status;
+    auto session = load_chat_session(arguments, directory, assistant_directory);
+    if (!session) {
+        kidi::cli::log::error("{}", session.error().message);
+        return 1;
+    }
+    auto configured = session->generator.configure_serving(
+        {.maximum_active = arguments.get<std::size_t>("max_active"),
+         .maximum_requests = arguments.get<std::size_t>("queue_size"),
+         .cache_token_budget = arguments.get<std::size_t>("cache_tokens"),
+         .prefill_tokens_per_step = session->options.prefill_chunk_size});
+    if (!configured) {
+        kidi::cli::log::error("{}", configured.error().message);
+        return 2;
+    }
+    auto name = arguments.get<std::string>("served_model_name");
+    if (name.empty()) name = arguments.get<std::filesystem::path>("model").string();
+    if (name.starts_with('@')) name.erase(0, 1);
+    return kidi::cli::serve(session->generator, {.host = arguments.get<std::string>("host"),
+                                                 .port = arguments.get<std::int32_t>("port"),
+                                                 .model_name = std::move(name),
+                                                 .generation = session->options});
+}
+
 auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
     const auto threads = arguments.get<std::int32_t>("threads");
     if (threads <= 0) {
@@ -840,6 +832,16 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
     generate_parser.description("Generate with a chat model reading JSONL messages. Output preserves input order.");
     auto& chat_parser = commands.add_parser("chat", "interactive multi-turn chat with streaming replies");
     chat_parser.description("Chat in the terminal with a loaded model. Type /help for shell commands.");
+    auto& serve_parser = commands.add_parser("serve", "serve an OpenAI-compatible chat completions API");
+    serve_parser.description("Serve /v1/chat/completions with streaming, reasoning, and tool calls over HTTP.");
+    serve_parser.add_argument("--host").default_value(std::string("127.0.0.1"));
+    serve_parser.add_argument("--port").default_value<std::int32_t>(8000);
+    serve_parser.add_argument("--served-model-name")
+        .dest("served_model_name")
+        .default_value(std::string{})
+        .help("model id reported to clients (default: --model)");
+    serve_parser.add_argument("--max-active").dest("max_active").default_value<std::size_t>(1);
+    serve_parser.add_argument("--queue-size").dest("queue_size").default_value<std::size_t>(64);
     auto& transcribe_parser = commands.add_parser("transcribe", "transcribe a 16 kHz WAV file with Whisper");
     transcribe_parser.description(
         "Transcribe or translate speech with Whisper Tiny, Base, Small, Large-v3, or Large-v3-Turbo. Long WAV files "
@@ -859,7 +861,7 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         .help("active concurrent requests (default: 1 with --assistant-model, else 4)");
     generate_parser.add_argument("--queue-size").dest("queue_size").default_value<std::size_t>(64);
     for (auto* command_parser :
-         {&translate_parser, &generate_parser, &chat_parser, &transcribe_parser, &synthesize_parser}) {
+         {&translate_parser, &generate_parser, &chat_parser, &serve_parser, &transcribe_parser, &synthesize_parser}) {
         command_parser->add_argument("-m", "--model")
             .type<std::filesystem::path>()
             .required()
@@ -922,7 +924,7 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         .type<std::filesystem::path>()
         .metavar("JSON")
         .help("optional generated audio-token dump");
-    for (auto* command_parser : {&generate_parser, &chat_parser}) {
+    for (auto* command_parser : {&generate_parser, &chat_parser, &serve_parser}) {
         command_parser->add_argument("--cache-tokens")
             .dest("cache_tokens")
             .default_value<std::size_t>(16384)
@@ -1042,6 +1044,7 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         if (command == "translate") return translate_command(arguments, directory);
         if (command == "generate") return generate_command(arguments, directory);
         if (command == "chat") return chat_command(arguments, directory);
+        if (command == "serve") return serve_command(arguments, directory);
         if (command == "transcribe") return transcribe_command(arguments, directory);
         if (command == "synthesize") return synthesize_command(arguments, directory);
         throw std::logic_error("unhandled command: " + command);

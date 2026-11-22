@@ -80,7 +80,11 @@ enum class Operation {
     SNAKE_QUANTIZED_LINEAR,
     CONV_TRANSPOSE_FOLD,
     SNAKE,
-    GELU_GATE
+    GELU_GATE,
+    RESIDUAL_MIX,
+    SHORT_CONVOLUTION,
+    L2_CLIP,
+    RELATIVE_ATTENTION
 };
 struct BlockwiseQuantizationSpec {
     std::span<const float> scales;

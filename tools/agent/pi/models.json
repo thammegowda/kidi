@@ -1,26 +1,23 @@
 {
   "providers": {
-    "inkling-vllm": {
-      "baseUrl": "http://127.0.0.1:18096/v1",
+    "kidi": {
+      "baseUrl": "http://127.0.0.1:18097/v1",
       "api": "openai-completions",
       "apiKey": "local",
       "compat": {
-        "supportsDeveloperRole": false,
+        "supportsDeveloperRole": true,
         "supportsReasoningEffort": false,
         "supportsStore": false,
-        "maxTokensField": "max_tokens",
-        "thinkingFormat": "chat-template",
-        "chatTemplateKwargs": { "reasoning_effort": { "$var": "thinking.effort" } }
+        "maxTokensField": "max_tokens"
       },
       "models": [
         {
-          "id": "thinkingmachines/Inkling-2-Mini",
-          "name": "Inkling-2-Mini (vLLM, GPU6)",
-          "reasoning": true,
-          "thinkingLevelMap": { "off": "none", "xhigh": "xhigh", "max": "max" },
-          "input": ["text", "image"],
-          "contextWindow": 65536,
-          "maxTokens": 16384,
+          "id": "kidi-local",
+          "name": "kidi local model",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 4096,
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
         }
       ]
