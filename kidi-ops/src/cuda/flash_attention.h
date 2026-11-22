@@ -27,6 +27,7 @@ struct FlashAttentionArgs {
     std::int64_t heads = 1;
     std::int64_t key_heads = 1;
     std::int64_t key_offset = 0;
+    std::int64_t mask_window = 0;
     std::int64_t keys = 0;
     int head_dim = 0;
     float scale = 0.F;

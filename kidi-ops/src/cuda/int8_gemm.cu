@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 
@@ -279,15 +280,58 @@ __global__ void reduce_w8a8_partials(const std::int32_t* workspace, int rows, in
 }
 
 template <int TileRows, int TileCols, int MWarps, int NWarps>
-void run_w8a8(dim3 grid, cudaStream_t stream, int rows, int columns, int width, const std::int8_t* input,
+void run_w8a8(int slices, cudaStream_t stream, int rows, int columns, int width, const std::int8_t* input,
               const std::int8_t* weights, const float* row_scales, const int* row_zeros, const int* weight_sums,
               const float* col_scales, const float* bias, float output_scale, void* target, bool bfloat_out) {
     constexpr int smem = static_cast<int>(sizeof(W8A8Shared<TileRows, TileCols>));
+    const dim3 grid(static_cast<unsigned int>((columns - 1) / TileCols + 1),
+                    static_cast<unsigned int>((rows - 1) / TileRows + 1), static_cast<unsigned int>(slices));
+    if constexpr (smem > 48 * 1024) {
+        static thread_local std::uint64_t configured = 0;
+        int device = 0;
+        cudaGetDevice(&device);
+        const auto bit = device >= 0 && device < 64 ? std::uint64_t{1} << device : 0;
+        if (!bit || !(configured & bit)) {
+            cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(stream, &capturing) == cudaSuccess &&
+                capturing == cudaStreamCaptureStatusNone) {
+                const auto status =
+                    cudaFuncSetAttribute(pipelined_w8a8_gemm<TileRows, TileCols, MWarps, NWarps>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+                if (status != cudaSuccess)
+                    throw std::runtime_error(std::string("CUDA: setting W8A8 shared-memory limit failed: ") +
+                                             cudaGetErrorString(status));
+                configured |= bit;
+            }
+        }
+    }
     pipelined_w8a8_gemm<TileRows, TileCols, MWarps, NWarps>
         <<<grid, static_cast<unsigned int>(MWarps * NWarps * 32), smem, stream>>>(
             rows, columns, width, input, weights, row_scales, row_zeros, weight_sums, col_scales, bias, output_scale,
             target, bfloat_out);
 }
+
+#if defined(KIDI_CUDA_HAS_SM90)
+constexpr int kSm90MinRows = 128;
+
+auto aligned16(std::initializer_list<const void*> pointers) -> bool {
+    for (const auto* pointer : pointers)
+        if (reinterpret_cast<std::uintptr_t>(pointer) % 16) return false;
+    return true;
+}
+
+auto hopper_device() -> bool {
+    static int cached[64] = {};
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return false;
+    if (cached[device] == 0) {
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+        cached[device] = major == 9 ? 1 : -1;
+    }
+    return cached[device] > 0;
+}
+#endif
 
 } // namespace
 
@@ -309,18 +353,25 @@ auto w8a8_gemm(int rows, int columns, int width, const std::int8_t* input, const
                const float* row_scales, const int* row_zeros, const int* weight_sums, const float* col_scales,
                const float* bias, float output_scale, void* output, bool bfloat_out, cudaStream_t stream,
                void* workspace, int slices) -> void {
-    const int tile_rows = rows <= 16 ? 16 : 64;
-    const int tile_cols = 64;
     const int active_slices = slices > 1 && workspace ? slices : 1;
-    const dim3 grid(static_cast<unsigned int>((columns + tile_cols - 1) / tile_cols),
-                    static_cast<unsigned int>((rows + tile_rows - 1) / tile_rows),
-                    static_cast<unsigned int>(active_slices));
+#if defined(KIDI_CUDA_HAS_SM90)
+    // Split-K still wins for skinny outputs below kSm90MinRows; above it the Hopper kernel is always faster.
+    if (output_scale <= 0.F && (rows >= kSm90MinRows || (rows > 16 && active_slices == 1)) && width % 16 == 0 &&
+        columns % 8 == 0 && aligned16({input, weights, output, col_scales, weight_sums, bias}) && hopper_device()) {
+        w8a8_gemm_sm90(rows, columns, width, input, weights, row_scales, row_zeros, weight_sums, col_scales, bias,
+                       output, bfloat_out, stream);
+        return;
+    }
+#endif
     void* target = active_slices > 1 ? workspace : output;
     if (rows <= 16)
-        run_w8a8<16, 64, 1, 4>(grid, stream, rows, columns, width, input, weights, row_scales, row_zeros, weight_sums,
+        run_w8a8<16, 64, 1, 4>(active_slices, stream, rows, columns, width, input, weights, row_scales, row_zeros, weight_sums,
+                               col_scales, bias, output_scale, target, bfloat_out);
+    else if (rows >= 1024)
+        run_w8a8<128, 128, 4, 2>(active_slices, stream, rows, columns, width, input, weights, row_scales, row_zeros, weight_sums,
                                col_scales, bias, output_scale, target, bfloat_out);
     else
-        run_w8a8<64, 64, 2, 2>(grid, stream, rows, columns, width, input, weights, row_scales, row_zeros, weight_sums,
+        run_w8a8<64, 64, 2, 2>(active_slices, stream, rows, columns, width, input, weights, row_scales, row_zeros, weight_sums,
                                col_scales, bias, output_scale, target, bfloat_out);
     if (active_slices > 1) {
         const std::size_t elements = static_cast<std::size_t>(rows) * columns;

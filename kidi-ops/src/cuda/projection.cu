@@ -762,7 +762,7 @@ auto quantized_projection(const Launch& plan, int device, bool reference_project
     if (vector_projection && reinterpret_cast<std::uintptr_t>(plan.inputs[1].data) % 4 == 0) {
         const auto bits = plan.operation == static_cast<int>(Op::PACKED_LINEAR) ? plan.attributes[0] : 8;
         if (bits == 8 && width % 16 == 0 && reinterpret_cast<std::uintptr_t>(plan.inputs[1].data) % 16 == 0) {
-            const bool wide = rows == 1 && output_columns >= 4096;
+            const bool wide = rows == 1 && output_columns >= 32768;
             const auto grid = static_cast<unsigned int>((output_columns + (wide ? 15 : 3)) / (wide ? 16 : 4));
             if (wide)
                 kernel::quantized_vector_fast<1, 4>

@@ -251,6 +251,14 @@ int main(int argc, char** argv) {
         const int device = argc > 1 ? std::stoi(argv[1]) : 0;
         if (!kidi::cuda::available(device)) throw std::runtime_error("CUDA device unavailable");
         check(cudaSetDevice(device));
+        if (argc > 2 && std::string(argv[2]) == "w8a8") {
+            if (argc != 6) throw std::runtime_error("usage: projection_benchmark DEVICE w8a8 ROWS WIDTH COLUMNS");
+            const int rows = std::stoi(argv[3]), width = std::stoi(argv[4]), columns = std::stoi(argv[5]);
+            if (rows <= 0 || width <= 0 || columns <= 0)
+                throw std::runtime_error("projection dimensions must be positive");
+            benchmark(rows, width, columns, device);
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "mixed") {
             for (const auto rows : {1, 4, 32}) benchmark_mixed_matrix(rows, device);
             return 0;

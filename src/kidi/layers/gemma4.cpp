@@ -274,7 +274,9 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
     const auto length = static_cast<std::int64_t>(input.size(1));
     std::size_t total = 0;
     for (const auto& segment : segments) {
-        if (!segment.cache || !segment.mask || !segment.length || segment.length > input.size(1) - total ||
+        if (!segment.cache || (!segment.mask && (!segment.query_positions || !segment.key_extent)) || !segment.length ||
+            segment.length > input.size(1) - total ||
+            (segment.unique_indices && !segment.index) ||
             segment.position > segment.cache->key.size(1) ||
             segment.length > segment.cache->key.size(1) - segment.position)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed attention segment"});
@@ -336,10 +338,19 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
                 values = context.cast(values, tensor::DType::I8, value_quantization.scales[0]);
                 cache.key_quantization = key_quantization;
                 cache.value_quantization = value_quantization;
+            } else if (!segment.index) {
+                // Scatter converts on write when the backend accepts the cache dtype; contiguous copies do not.
+                keys = context.cast(keys, cache.key.dtype());
+                values = context.cast(values, cache.value.dtype());
             }
             if (segment.index) {
-                context.scatter_(cache.key, keys, *segment.index);
-                context.scatter_(cache.value, values, *segment.index);
+                if (segment.unique_indices && context.device().kind == tensor::DeviceKind::CUDA) {
+                    context.scatter_unique_(cache.key, keys, *segment.index);
+                    context.scatter_unique_(cache.value, values, *segment.index);
+                } else {
+                    context.scatter_(cache.key, keys, *segment.index);
+                    context.scatter_(cache.value, values, *segment.index);
+                }
             } else {
                 context.copy_slice_(cache.key, keys, 1, segment.position);
                 context.copy_slice_(cache.value, values, 1, segment.position);
@@ -349,11 +360,21 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
             offset += segment.length;
             continue;
         }
-        const auto extent = static_cast<std::int64_t>(segment.mask->size(-1)) + segment.key_start;
-        auto attended =
-            context.grouped_query_attention(context.slice(query, 1, offset, segment.length), prefix(cache.key, extent),
-                                            prefix(cache.value, extent), heads_, key_heads_, *segment.mask, 1.F,
-                                            segment.key_start, cache.key_quantization, cache.value_quantization);
+        const auto extent = segment.key_extent
+                                ? segment.key_extent
+                                : static_cast<std::int64_t>(segment.mask->size(-1)) + segment.key_start;
+        if (extent <= segment.key_start || static_cast<std::size_t>(extent) > cache.key.size(1))
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "attention segment key extent is outside its cache"});
+        const auto segment_query = context.slice(query, 1, offset, segment.length);
+        auto attended = segment.query_positions
+                            ? context.grouped_query_attention_causal(
+                                  segment_query, prefix(cache.key, extent), prefix(cache.value, extent), heads_,
+                                  key_heads_, *segment.query_positions, segment.attention_window, 1.F,
+                                  segment.key_start, cache.key_quantization, cache.value_quantization)
+                            : context.grouped_query_attention(segment_query, prefix(cache.key, extent),
+                                                              prefix(cache.value, extent), heads_, key_heads_,
+                                                              *segment.mask, 1.F, segment.key_start,
+                                                              cache.key_quantization, cache.value_quantization);
         if (segments.size() == 1)
             single_output = std::move(attended);
         else

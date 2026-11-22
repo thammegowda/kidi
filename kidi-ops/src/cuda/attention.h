@@ -7,6 +7,8 @@
 
 namespace kidi::cuda {
 
+inline constexpr std::int64_t DECODE_ATTENTION_PARTITION_SIZE = 16;
+
 using AttentionLauncher = void (*)(Launch, std::int64_t, std::int64_t, std::int64_t, cudaStream_t);
 
 auto select_parallel_attention(const Descriptor& descriptor, std::int64_t keys, std::int64_t width, int device)

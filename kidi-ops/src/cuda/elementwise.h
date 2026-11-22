@@ -18,6 +18,7 @@ auto normalize(const Launch& plan, Op operation, cudaStream_t stream) -> void;
 auto greedy_token(const Launch& plan, void* candidates, cudaStream_t stream) -> void;
 auto layout(const Launch& plan, cudaStream_t stream) -> void;
 auto scatter_updates(const Launch& plan, cudaStream_t stream) -> void;
+auto scatter_key_value_updates(const Launch& plan, cudaStream_t stream) -> void;
 auto embedding(const Launch& plan, cudaStream_t stream) -> void;
 auto embedding_sum(const Launch& plan, cudaStream_t stream) -> void;
 auto diffusion_candidates(const Launch& plan, cudaStream_t stream) -> void;

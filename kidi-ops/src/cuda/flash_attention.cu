@@ -1,4 +1,6 @@
 #include "cuda/flash_attention.h"
+#include "cuda/flash_attention_device.cuh"
+#include "cuda/runtime.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -12,23 +14,17 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 namespace kidi::cuda {
 namespace {
+using namespace flash_detail;
 
 constexpr int kBr = 16;
 constexpr int kBc = 32;
 constexpr int kWarps = 4;
 constexpr int kThreads = kWarps * 32;
 constexpr int kSStride = kBc + 4;
-
-__device__ __forceinline__ const void* resolve_view(const FlashView& v) {
-    return v.binding ? static_cast<const unsigned char*>(*v.binding) + v.binding_offset : v.data;
-}
-
-__device__ __forceinline__ void* resolve_mut(const FlashView& v) {
-    return v.binding ? static_cast<unsigned char*>(*v.binding) + v.binding_offset : const_cast<void*>(v.data);
-}
 
 __device__ __forceinline__ float read_mask_elem(const void* data, int type, std::size_t idx) {
     switch (type) {
@@ -47,7 +43,7 @@ __device__ __forceinline__ int kv_swizzle_chunk(int row, int chunk) { return chu
 
 __device__ __forceinline__ int p_swizzle_chunk(int row, int chunk) { return chunk ^ ((row >> 1) & 3); }
 
-template <int HeadDim>
+template <int HeadDim, bool FloatIO>
 __global__ void __launch_bounds__(kThreads)
     flash_attention_bf16_kernel(FlashAttentionArgs args, int g_pack, int q_per_cta, int head_groups, int q_tiles,
                                 std::int64_t m_s0, std::int64_t m_s1, std::int64_t m_s2, std::int64_t m_s3) {
@@ -64,6 +60,10 @@ __global__ void __launch_bounds__(kThreads)
     __shared__ float row_m[kBr];
     __shared__ float row_l[kBr];
     __shared__ float row_alpha[kBr];
+    __shared__ int structured_key_begin;
+    __shared__ int structured_key_end;
+    __shared__ int structured_full_key_begin;
+    __shared__ int structured_full_key_end;
 
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
@@ -89,11 +89,12 @@ __global__ void __launch_bounds__(kThreads)
     const int base_h = key_head * g_total + head_group * g_pack;
     const int base_q = q_tile * q_per_cta;
 
-    const auto* q_ptr = static_cast<const __nv_bfloat16*>(resolve_view(args.query));
+    using IO = std::conditional_t<FloatIO, float, __nv_bfloat16>;
+    const auto* q_ptr = static_cast<const IO*>(resolve_view(args.query));
     const auto* k_ptr = static_cast<const __nv_bfloat16*>(resolve_view(args.key));
     const auto* v_ptr = static_cast<const __nv_bfloat16*>(resolve_view(args.value));
     const void* mask_ptr = args.has_mask ? resolve_view(args.mask) : nullptr;
-    auto* o_ptr = static_cast<__nv_bfloat16*>(resolve_mut(args.output));
+    auto* o_ptr = static_cast<IO*>(resolve_mut(args.output));
 
     const std::int64_t q_row_stride = args.heads * HeadDim;
     const std::int64_t k_batch = args.key.shape[0] == 1 ? 0 : batch;
@@ -103,6 +104,24 @@ __global__ void __launch_bounds__(kThreads)
                          static_cast<std::int64_t>(key_head) * HeadDim;
     const auto* v_base = v_ptr + (v_batch * args.value.shape[1] + args.key_offset) * kv_stride +
                          static_cast<std::int64_t>(key_head) * HeadDim;
+
+    int key_begin = 0;
+    int key_end = static_cast<int>(args.keys);
+    int full_key_begin = 0;
+    int full_key_end = 0;
+    const bool structured_bounds =
+        args.has_mask && args.mask.type == 3 && m_s1 == 0 && m_s3 == 0 && args.queries > 1 && args.keys > 512;
+    if (structured_bounds) {
+        if (tid == 0) {
+            structured_key_bounds(args, mask_ptr, batch, base_q, q_per_cta, m_s0, m_s2, structured_key_begin,
+                                  structured_key_end, structured_full_key_begin, structured_full_key_end);
+        }
+        __syncthreads();
+        key_begin = structured_key_begin;
+        key_end = structured_key_end;
+        full_key_begin = structured_full_key_begin;
+        full_key_end = structured_full_key_end;
+    }
 
     // 1. Async load Q [16 x HeadDim] into kv_smem (first 16 rows), then load q_frag via ldsm.
     constexpr int QVecs = kBr * KChunks;
@@ -115,8 +134,14 @@ __global__ void __launch_bounds__(kThreads)
         const std::int64_t g_off =
             (static_cast<std::int64_t>(batch) * args.queries + (valid ? q_idx : 0)) * q_row_stride +
             static_cast<std::int64_t>(h_idx) * HeadDim + chunk * 8;
-        cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(
-            kv_smem + r * HeadDim + kv_swizzle_chunk(r, chunk) * 8, q_ptr + g_off, valid);
+        auto* destination = kv_smem + r * HeadDim + kv_swizzle_chunk(r, chunk) * 8;
+        if constexpr (FloatIO) {
+#pragma unroll
+            for (int column = 0; column < 8; ++column)
+                destination[column] = __float2bfloat16(valid ? q_ptr[g_off + column] : 0.F);
+        } else {
+            cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(destination, q_ptr + g_off, valid);
+        }
     }
     cutlass::arch::cp_async_fence();
     cutlass::arch::cp_async_wait<0>();
@@ -150,9 +175,11 @@ __global__ void __launch_bounds__(kThreads)
     const int keys = static_cast<int>(args.keys);
     constexpr int KVVecs = kBc * KChunks;
 
-    for (int t0 = 0; t0 < keys; t0 += kBc) {
+    for (int t0 = key_begin; t0 < key_end; t0 += kBc) {
         float mask_vals[4]{};
-        if (args.has_mask) {
+        const bool fully_valid_tile =
+            structured_bounds && t0 >= full_key_begin && t0 + kBc <= full_key_end;
+        if (args.has_mask && !fully_valid_tile) {
             bool all_neg_inf = true;
             bool all_very_neg = true;
             const int k_idx = t0 + lane;
@@ -165,7 +192,16 @@ __global__ void __launch_bounds__(kThreads)
                     const std::size_t m_off =
                         static_cast<std::size_t>(batch) * m_s0 + static_cast<std::size_t>(h_idx) * m_s1 +
                         static_cast<std::size_t>(q_idx) * m_s2 + static_cast<std::size_t>(k_idx) * m_s3;
-                    const float mv = read_mask_elem(mask_ptr, args.mask.type, m_off);
+                    float mv = read_mask_elem(mask_ptr, args.mask.type, m_off);
+                    if (args.mask.type == 3) {
+                        const auto query_position =
+                            static_cast<const std::int32_t*>(mask_ptr)[m_off];
+                        const auto key_position = args.key_offset + k_idx;
+                        mv = key_position <= query_position &&
+                                     (!args.mask_window || query_position - key_position < args.mask_window)
+                                 ? 0.F
+                                 : -INFINITY;
+                    }
                     mask_vals[rl] = mv;
                     all_neg_inf &= (mv == -INFINITY);
                     all_very_neg &= (mv <= -1e8F);
@@ -317,7 +353,7 @@ __global__ void __launch_bounds__(kThreads)
         __syncthreads();
     }
 
-    // Epilogue: normalize by row_l and store BF16 outputs.
+    // Epilogue: normalize by row_l.
     const float l0 = row_l[group];
     const float l1 = row_l[group + 8];
     const float inv_l0 = l0 > 0.F ? 1.F / l0 : 0.F;
@@ -337,13 +373,321 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
     for (int d = 0; d < DNtiles; ++d) {
         const int col = d_start + d * 8 + tid4 * 2;
-        if (valid0)
-            *reinterpret_cast<__nv_bfloat162*>(out0 + col) =
-                __floats2bfloat162_rn(o_acc[d][0] * inv_l0, o_acc[d][1] * inv_l0);
-        if (valid1)
-            *reinterpret_cast<__nv_bfloat162*>(out1 + col) =
-                __floats2bfloat162_rn(o_acc[d][2] * inv_l1, o_acc[d][3] * inv_l1);
+        if constexpr (FloatIO) {
+            if (valid0)
+                *reinterpret_cast<float2*>(out0 + col) = make_float2(o_acc[d][0] * inv_l0, o_acc[d][1] * inv_l0);
+            if (valid1)
+                *reinterpret_cast<float2*>(out1 + col) = make_float2(o_acc[d][2] * inv_l1, o_acc[d][3] * inv_l1);
+        } else {
+            if (valid0)
+                *reinterpret_cast<__nv_bfloat162*>(out0 + col) =
+                    __floats2bfloat162_rn(o_acc[d][0] * inv_l0, o_acc[d][1] * inv_l0);
+            if (valid1)
+                *reinterpret_cast<__nv_bfloat162*>(out1 + col) =
+                    __floats2bfloat162_rn(o_acc[d][2] * inv_l1, o_acc[d][3] * inv_l1);
+        }
     }
+}
+
+// FlashAttention-2 style prefill kernel (Dao, 2023): every warp owns 16 query rows over the full head dimension, so
+// Q·Kᵀ, the online softmax and P stay in registers and P feeds the P·V MMA straight from the accumulator layout.
+// K/V tiles are double-buffered with cp.async. Wide heads split the output columns over two warp sets, which
+// recompute the (cheaper) score tile instead of exchanging it through shared memory.
+constexpr int kFaMinRows = 64;
+
+template <int HeadDim>
+struct FaConfig {
+    static constexpr int DSplit = HeadDim > 256 ? 2 : 1;
+    static constexpr int RowWarps = HeadDim == 256 ? 8 : 4;
+    static constexpr int Rows = 16 * RowWarps;
+    static constexpr int OutCols = HeadDim / DSplit;
+    static constexpr int Bc = HeadDim > 128 ? 32 : 64;
+    static constexpr int Threads = RowWarps * DSplit * 32;
+    static constexpr std::size_t Smem = static_cast<std::size_t>(Rows + 4 * Bc) * HeadDim * sizeof(__nv_bfloat16);
+};
+
+__device__ __forceinline__ unsigned pack_bf16(float low, float high) {
+    const __nv_bfloat162 packed = __floats2bfloat162_rn(low, high);
+    return reinterpret_cast<const unsigned&>(packed);
+}
+
+template <int HeadDim, bool FloatIO>
+__global__ void __launch_bounds__(FaConfig<HeadDim>::Threads)
+    flash_attention_fa2(FlashAttentionArgs args, int g_pack, int q_per_cta, int head_groups, int q_tiles,
+                        std::int64_t m_s0, std::int64_t m_s2) {
+    using Config = FaConfig<HeadDim>;
+    constexpr int Bc = Config::Bc;
+    constexpr int KChunks = HeadDim / 8;
+    constexpr int STiles = Bc / 8;
+    constexpr int OTiles = Config::OutCols / 8;
+    constexpr int Threads = Config::Threads;
+
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto* q_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    auto* k_smem = q_smem + Config::Rows * HeadDim;
+    auto* v_smem = k_smem + 2 * Bc * HeadDim;
+    __shared__ int bounds[4];
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int group = lane >> 2;
+    const int tid4 = lane & 3;
+    const int row_warp = warp % Config::RowWarps;
+    const int d_start = (warp / Config::RowWarps) * Config::OutCols;
+
+    int idx = blockIdx.x;
+    const int q_tile = q_tiles - 1 - idx % q_tiles; // latest (most expensive causal) tiles first
+    idx /= q_tiles;
+    const int head_group = idx % head_groups;
+    idx /= head_groups;
+    const int key_head = idx % static_cast<int>(args.key_heads);
+    const int batch = idx / static_cast<int>(args.key_heads);
+    const int base_h = key_head * static_cast<int>(args.heads / args.key_heads) + head_group * g_pack;
+    const int base_q = q_tile * q_per_cta;
+
+    using IO = std::conditional_t<FloatIO, float, __nv_bfloat16>;
+    const auto* q_ptr = static_cast<const IO*>(resolve_view(args.query));
+    const auto* positions = args.has_mask ? static_cast<const std::int32_t*>(resolve_view(args.mask)) : nullptr;
+    auto* o_ptr = static_cast<IO*>(resolve_mut(args.output));
+    const std::int64_t q_row_stride = args.heads * HeadDim;
+    const std::int64_t kv_stride = args.key_heads * HeadDim;
+    const auto* k_base = static_cast<const __nv_bfloat16*>(resolve_view(args.key)) +
+                         ((args.key.shape[0] == 1 ? 0 : batch) * args.key.shape[1] + args.key_offset) * kv_stride +
+                         static_cast<std::int64_t>(key_head) * HeadDim;
+    const auto* v_base = static_cast<const __nv_bfloat16*>(resolve_view(args.value)) +
+                         ((args.value.shape[0] == 1 ? 0 : batch) * args.value.shape[1] + args.key_offset) * kv_stride +
+                         static_cast<std::int64_t>(key_head) * HeadDim;
+    const int keys = static_cast<int>(args.keys);
+
+    int key_begin = 0, key_end = keys, full_begin = 0, full_end = positions ? 0 : keys;
+    if (positions) {
+        if (tid == 0)
+            structured_key_bounds(args, positions, batch, base_q, q_per_cta, m_s0, m_s2, bounds[0], bounds[1],
+                                  bounds[2], bounds[3]);
+        __syncthreads();
+        key_begin = bounds[0];
+        key_end = bounds[1];
+        full_begin = bounds[2];
+        full_end = bounds[3];
+    }
+
+    for (int v = tid; v < Config::Rows * KChunks; v += Threads) {
+        const int r = v / KChunks;
+        const int chunk = v % KChunks;
+        const int q_idx = base_q + r / g_pack;
+        const bool valid = q_idx < args.queries && r / g_pack < q_per_cta;
+        const std::int64_t offset =
+            (static_cast<std::int64_t>(batch) * args.queries + (valid ? q_idx : 0)) * q_row_stride +
+            static_cast<std::int64_t>(base_h + r % g_pack) * HeadDim + chunk * 8;
+        auto* destination = q_smem + r * HeadDim + kv_swizzle_chunk(r, chunk) * 8;
+        if constexpr (FloatIO) {
+            const float4 low = valid ? *reinterpret_cast<const float4*>(q_ptr + offset) : make_float4(0, 0, 0, 0);
+            const float4 high = valid ? *reinterpret_cast<const float4*>(q_ptr + offset + 4) : make_float4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(destination) = make_uint4(pack_bf16(low.x, low.y), pack_bf16(low.z, low.w),
+                                                                pack_bf16(high.x, high.y), pack_bf16(high.z, high.w));
+        } else {
+            cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(destination, q_ptr + offset,
+                                                                                     valid);
+        }
+    }
+
+    auto load_tile = [&](int buffer, int first_key) {
+        for (int v = tid; v < Bc * KChunks; v += Threads) {
+            const int row = v / KChunks;
+            const int chunk = v % KChunks;
+            const int key = first_key + row;
+            const bool valid = key < keys;
+            const std::int64_t offset = static_cast<std::int64_t>(valid ? key : 0) * kv_stride + chunk * 8;
+            const int slot = (buffer * Bc + row) * HeadDim + kv_swizzle_chunk(row, chunk) * 8;
+            cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(k_smem + slot, k_base + offset,
+                                                                                     valid);
+            cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(v_smem + slot, v_base + offset,
+                                                                                     valid);
+        }
+    };
+
+    // Query positions of the two rows this thread accumulates (row and row + 8 of its warp's 16-row slice).
+    int query_position[2]{};
+    bool row_valid[2]{};
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int r = row_warp * 16 + group + half * 8;
+        const int q_idx = base_q + r / g_pack;
+        row_valid[half] = q_idx < args.queries && r / g_pack < q_per_cta;
+        if (positions && row_valid[half])
+            query_position[half] = positions[static_cast<std::size_t>(batch) * m_s0 + static_cast<std::size_t>(q_idx) * m_s2];
+    }
+
+    using MmaOp = cutlass::arch::Mma<cutlass::gemm::GemmShape<16, 8, 16>, 32, cutlass::bfloat16_t,
+                                     cutlass::layout::RowMajor, cutlass::bfloat16_t, cutlass::layout::ColumnMajor,
+                                     float, cutlass::layout::RowMajor, cutlass::arch::OpMultiplyAdd>;
+    MmaOp mma;
+    using FragmentA = typename MmaOp::FragmentA;
+    using FragmentB = typename MmaOp::FragmentB;
+    using FragmentC = typename MmaOp::FragmentC;
+
+    FragmentC o_acc[OTiles];
+#pragma unroll
+    for (int d = 0; d < OTiles; ++d) o_acc[d].clear();
+    float row_max[2] = {-INFINITY, -INFINITY};
+    float row_sum[2] = {0.F, 0.F};
+    const float scale = args.scale * 1.4426950408889634F;
+
+    const int tiles = key_end > key_begin ? (key_end - key_begin + Bc - 1) / Bc : 0;
+    if (tiles > 0) load_tile(0, key_begin);
+    cutlass::arch::cp_async_fence();
+    for (int tile = 0; tile < tiles; ++tile) {
+        const int t0 = key_begin + tile * Bc;
+        if (tile + 1 < tiles) load_tile((tile + 1) & 1, t0 + Bc);
+        cutlass::arch::cp_async_fence();
+        cutlass::arch::cp_async_wait<1>();
+        __syncthreads();
+        const auto* k_tile = k_smem + (tile & 1) * Bc * HeadDim;
+        const auto* v_tile = v_smem + (tile & 1) * Bc * HeadDim;
+
+        FragmentC s_acc[STiles];
+#pragma unroll
+        for (int n = 0; n < STiles; ++n) s_acc[n].clear();
+#pragma unroll
+        for (int kk = 0; kk < HeadDim / 16; ++kk) {
+            const int q_row = row_warp * 16 + (lane & 15);
+            cutlass::Array<unsigned, 4> q_packed;
+            cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(
+                q_packed, q_smem + q_row * HeadDim + kv_swizzle_chunk(q_row, kk * 2 + (lane >> 4)) * 8);
+            const auto& q_frag = reinterpret_cast<const FragmentA&>(q_packed);
+#pragma unroll
+            for (int np = 0; np < STiles / 2; ++np) {
+                const int k_row = np * 16 + ((lane >> 4) * 8) + (lane & 7);
+                cutlass::Array<unsigned, 4> k_packed;
+                cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(
+                    k_packed, k_tile + k_row * HeadDim + kv_swizzle_chunk(k_row, kk * 2 + ((lane >> 3) & 1)) * 8);
+                FragmentB b_even, b_odd;
+                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_even)[0] = k_packed[0];
+                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_even)[1] = k_packed[1];
+                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_odd)[0] = k_packed[2];
+                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_odd)[1] = k_packed[3];
+                mma(s_acc[2 * np], q_frag, b_even, s_acc[2 * np]);
+                mma(s_acc[2 * np + 1], q_frag, b_odd, s_acc[2 * np + 1]);
+            }
+        }
+
+        const bool unmasked = t0 >= full_begin && t0 + Bc <= full_end;
+        float tile_max[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int n = 0; n < STiles; ++n) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int half = e >> 1;
+                const int key = t0 + n * 8 + tid4 * 2 + (e & 1);
+                bool valid = key < keys;
+                if (!unmasked && positions) {
+                    const std::int64_t key_position = args.key_offset + key;
+                    valid = valid && key_position <= query_position[half] &&
+                            (!args.mask_window || query_position[half] - key_position < args.mask_window);
+                }
+                const float score = valid ? s_acc[n][e] * scale : -INFINITY;
+                s_acc[n][e] = score;
+                tile_max[half] = fmaxf(tile_max[half], score);
+            }
+        }
+        float alpha[2];
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            tile_max[half] = fmaxf(tile_max[half], __shfl_xor_sync(0xffffffff, tile_max[half], 1));
+            tile_max[half] = fmaxf(tile_max[half], __shfl_xor_sync(0xffffffff, tile_max[half], 2));
+            const float next = fmaxf(row_max[half], tile_max[half]);
+            alpha[half] = row_max[half] == -INFINITY ? 0.F : exp2f(row_max[half] - next);
+            row_max[half] = next;
+            row_sum[half] *= alpha[half];
+        }
+#pragma unroll
+        for (int n = 0; n < STiles; ++n) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float maximum = row_max[e >> 1];
+                const float p = maximum == -INFINITY ? 0.F : exp2f(s_acc[n][e] - maximum);
+                s_acc[n][e] = p;
+                row_sum[e >> 1] += p;
+            }
+        }
+#pragma unroll
+        for (int d = 0; d < OTiles; ++d) {
+            o_acc[d][0] *= alpha[0];
+            o_acc[d][1] *= alpha[0];
+            o_acc[d][2] *= alpha[1];
+            o_acc[d][3] *= alpha[1];
+        }
+
+#pragma unroll
+        for (int kp = 0; kp < Bc / 16; ++kp) {
+            cutlass::Array<unsigned, 4> p_packed;
+            p_packed[0] = pack_bf16(s_acc[2 * kp][0], s_acc[2 * kp][1]);
+            p_packed[1] = pack_bf16(s_acc[2 * kp][2], s_acc[2 * kp][3]);
+            p_packed[2] = pack_bf16(s_acc[2 * kp + 1][0], s_acc[2 * kp + 1][1]);
+            p_packed[3] = pack_bf16(s_acc[2 * kp + 1][2], s_acc[2 * kp + 1][3]);
+            const auto& p_frag = reinterpret_cast<const FragmentA&>(p_packed);
+#pragma unroll
+            for (int dp = 0; dp < OTiles / 2; ++dp) {
+                const int v_row = kp * 16 + (lane & 15);
+                const int v_chunk = (d_start + dp * 16) / 8 + (lane >> 4);
+                cutlass::Array<unsigned, 4> v_packed;
+                cutlass::arch::ldsm<cutlass::layout::ColumnMajor, 4>(
+                    v_packed, v_tile + v_row * HeadDim + kv_swizzle_chunk(v_row, v_chunk) * 8);
+                FragmentB v_even, v_odd;
+                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_even)[0] = v_packed[0];
+                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_even)[1] = v_packed[1];
+                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_odd)[0] = v_packed[2];
+                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_odd)[1] = v_packed[3];
+                mma(o_acc[2 * dp], p_frag, v_even, o_acc[2 * dp]);
+                mma(o_acc[2 * dp + 1], p_frag, v_odd, o_acc[2 * dp + 1]);
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        row_sum[half] += __shfl_xor_sync(0xffffffff, row_sum[half], 1);
+        row_sum[half] += __shfl_xor_sync(0xffffffff, row_sum[half], 2);
+        if (!row_valid[half]) continue;
+        const int r = row_warp * 16 + group + half * 8;
+        const float inverse = row_sum[half] > 0.F ? 1.F / row_sum[half] : 0.F;
+        auto* out = o_ptr + (static_cast<std::int64_t>(batch) * args.queries + base_q + r / g_pack) * q_row_stride +
+                    static_cast<std::int64_t>(base_h + r % g_pack) * HeadDim + d_start;
+#pragma unroll
+        for (int d = 0; d < OTiles; ++d) {
+            const float x = o_acc[d][half * 2] * inverse;
+            const float y = o_acc[d][half * 2 + 1] * inverse;
+            if constexpr (FloatIO)
+                *reinterpret_cast<float2*>(out + d * 8 + tid4 * 2) = make_float2(x, y);
+            else
+                *reinterpret_cast<__nv_bfloat162*>(out + d * 8 + tid4 * 2) = __floats2bfloat162_rn(x, y);
+        }
+    }
+}
+
+template <int HeadDim>
+auto run_fa2(const FlashAttentionArgs& args, std::int64_t m_s0, std::int64_t m_s2, cudaStream_t stream) -> bool {
+    using Config = FaConfig<HeadDim>;
+    const int g_total = static_cast<int>(args.heads / args.key_heads);
+    const int g_pack = g_total <= Config::Rows && Config::Rows % g_total == 0 ? g_total : 1;
+    const int q_per_cta = Config::Rows / g_pack;
+    const int head_groups = g_total / g_pack;
+    const auto q_tiles = (args.queries + q_per_cta - 1) / q_per_cta;
+    const auto blocks = static_cast<unsigned int>(args.batches * args.key_heads * head_groups * q_tiles);
+    const bool float_io = args.query.type == static_cast<int>(Type::F32);
+    auto* kernel = float_io ? flash_attention_fa2<HeadDim, true> : flash_attention_fa2<HeadDim, false>;
+    static bool configured[2] = {};
+    if (!configured[float_io]) {
+        if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(Config::Smem)) != cudaSuccess)
+            return false;
+        configured[float_io] = true;
+    }
+    kernel<<<blocks, Config::Threads, Config::Smem, stream>>>(args, g_pack, q_per_cta, head_groups,
+                                                              static_cast<int>(q_tiles), m_s0, m_s2);
+    return true;
 }
 
 template <int HeadDim>
@@ -352,8 +696,12 @@ void run_bf16(const FlashAttentionArgs& args, int g_pack, int q_per_cta, int hea
     const std::size_t smem =
         (kBc * HeadDim + kBr * kBc) * sizeof(__nv_bfloat16) + kWarps * kBr * kSStride * sizeof(float);
     const unsigned int blocks = static_cast<unsigned int>(args.batches * args.key_heads * head_groups * q_tiles);
-    flash_attention_bf16_kernel<HeadDim>
-        <<<blocks, kThreads, smem, stream>>>(args, g_pack, q_per_cta, head_groups, q_tiles, m_s0, m_s1, m_s2, m_s3);
+    if (args.query.type == static_cast<int>(Type::F32))
+        flash_attention_bf16_kernel<HeadDim, true>
+            <<<blocks, kThreads, smem, stream>>>(args, g_pack, q_per_cta, head_groups, q_tiles, m_s0, m_s1, m_s2, m_s3);
+    else
+        flash_attention_bf16_kernel<HeadDim, false>
+            <<<blocks, kThreads, smem, stream>>>(args, g_pack, q_per_cta, head_groups, q_tiles, m_s0, m_s1, m_s2, m_s3);
 }
 
 } // namespace
@@ -379,6 +727,27 @@ auto flash_attention_bf16(const FlashAttentionArgs& args, cudaStream_t stream) -
                 if (args.mask.shape[input_axis] != 1) m_strides[axis] = stride;
                 stride *= args.mask.shape[input_axis];
             }
+        }
+    }
+
+    const int fa_pack = g_total <= kFaMinRows && kFaMinRows % g_total == 0 ? g_total : 1;
+    const bool structured = args.has_mask && args.mask.type == 3 && m_strides[1] == 0 && m_strides[3] == 0;
+    if ((structured || !args.has_mask) && args.queries * fa_pack >= kFaMinRows) {
+        switch (args.head_dim) {
+            case 64:
+                if (run_fa2<64>(args, m_strides[0], m_strides[2], stream)) return true;
+                break;
+            case 128:
+                if (run_fa2<128>(args, m_strides[0], m_strides[2], stream)) return true;
+                break;
+            case 256:
+                if (run_fa2<256>(args, m_strides[0], m_strides[2], stream)) return true;
+                break;
+            case 512:
+                if (run_fa2<512>(args, m_strides[0], m_strides[2], stream)) return true;
+                break;
+            default:
+                break;
         }
     }
 
@@ -450,6 +819,10 @@ __global__ void __launch_bounds__(kThreads, 4)
     extern __shared__ float f32_smem[];
     float* k_smem = f32_smem;
     float* v_smem = DoubleBuffer ? (f32_smem + kBcF32 * HeadDim) : f32_smem;
+    __shared__ int structured_key_begin;
+    __shared__ int structured_key_end;
+    __shared__ int structured_full_key_begin;
+    __shared__ int structured_full_key_end;
 
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
@@ -482,6 +855,24 @@ __global__ void __launch_bounds__(kThreads, 4)
     const auto* v_base = v_ptr + (v_batch * args.value.shape[1] + args.key_offset) * kv_stride +
                          static_cast<std::int64_t>(key_head) * HeadDim;
 
+    int key_begin = 0;
+    int key_end = static_cast<int>(args.keys);
+    int full_key_begin = 0;
+    int full_key_end = 0;
+    const bool structured_bounds =
+        args.has_mask && args.mask.type == 3 && m_s1 == 0 && m_s3 == 0 && args.queries > 1 && args.keys > 512;
+    if (structured_bounds) {
+        if (tid == 0) {
+            structured_key_bounds(args, mask_ptr, batch, base_q, q_per_cta, m_s0, m_s2, structured_key_begin,
+                                  structured_key_end, structured_full_key_begin, structured_full_key_end);
+        }
+        __syncthreads();
+        key_begin = structured_key_begin;
+        key_end = structured_key_end;
+        full_key_begin = structured_full_key_begin;
+        full_key_end = structured_full_key_end;
+    }
+
     float q_reg[2][Vec]{};
     float o_acc[2][Vec]{};
     float m_row[2]{-INFINITY, -INFINITY};
@@ -502,9 +893,11 @@ __global__ void __launch_bounds__(kThreads, 4)
     }
 
     const int keys = static_cast<int>(args.keys);
-    for (int t0 = 0; t0 < keys; t0 += kBcF32) {
+    for (int t0 = key_begin; t0 < key_end; t0 += kBcF32) {
         float mask_vals[2]{};
-        if (args.has_mask) {
+        const bool fully_valid_tile =
+            structured_bounds && t0 >= full_key_begin && t0 + kBcF32 <= full_key_end;
+        if (args.has_mask && !fully_valid_tile) {
             bool all_neg_inf = true;
             bool all_very_neg = true;
             bool warm = true;
@@ -520,7 +913,16 @@ __global__ void __launch_bounds__(kThreads, 4)
                         const std::size_t m_off =
                             static_cast<std::size_t>(batch) * m_s0 + static_cast<std::size_t>(h_idx) * m_s1 +
                             static_cast<std::size_t>(q_idx) * m_s2 + static_cast<std::size_t>(k_idx) * m_s3;
-                        const float mv = read_mask_elem(mask_ptr, args.mask.type, m_off);
+                        float mv = read_mask_elem(mask_ptr, args.mask.type, m_off);
+                        if (args.mask.type == 3) {
+                            const auto query_position =
+                                static_cast<const std::int32_t*>(mask_ptr)[m_off];
+                            const auto key_position = args.key_offset + k_idx;
+                            mv = key_position <= query_position &&
+                                         (!args.mask_window || query_position - key_position < args.mask_window)
+                                     ? 0.F
+                                     : -INFINITY;
+                        }
                         mask_vals[rl] = mv;
                         all_neg_inf &= (mv == -INFINITY);
                         all_very_neg &= (mv <= -1e8F);

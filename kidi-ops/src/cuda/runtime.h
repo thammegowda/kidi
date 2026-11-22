@@ -48,7 +48,8 @@ enum class Op {
     SNAKE_QUANTIZED_LINEAR,
     CONV_TRANSPOSE_FOLD,
     SNAKE,
-    GELU_GATE
+    GELU_GATE,
+    SCATTER_KV
 };
 
 struct Tensor {

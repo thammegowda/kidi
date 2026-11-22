@@ -263,10 +263,17 @@ struct Context::Impl {
                         !std::ranges::equal(key.shape(), value.shape()) ||
                         (key.size(0) != 1 && key.size(0) != input.size(0)),
                     "attention shape mismatch");
-            for (std::size_t index = 0; index < inputs.size(); ++index)
-                invalid(!floating(inputs[index].dtype()) &&
-                            !((index == 1 || index == 2) && inputs[index].dtype() == tensor::DType::I8),
-                        "attention expects FP32 tensors or an INT8 key/value cache");
+            const auto causal_positions = spec.attributes.size() >= 7 && spec.attributes[5] == 1;
+            for (std::size_t index = 0; index < inputs.size(); ++index) {
+                const auto dtype = inputs[index].dtype();
+                const auto cache_operand = index == 1 || index == 2;
+                const auto position_operand = index == 3 && dtype == tensor::DType::I32 && causal_positions &&
+                                              device.kind == tensor::DeviceKind::CUDA;
+                invalid(!floating(dtype) && !position_operand &&
+                            !(cache_operand && (dtype == tensor::DType::I8 ||
+                                                capabilities.attention.accepts_cache(input.dtype(), dtype))),
+                        "attention expects floating tensors with a backend-supported key/value cache dtype");
+            }
             invalid(key.dtype() != value.dtype(), "attention key and value must share a dtype");
             if (key.dtype() == tensor::DType::I8) {
                 invalid(!capabilities.attention.int8_cache_tokens, "INT8 attention requires a supported backend");
@@ -356,7 +363,8 @@ struct Context::Impl {
         }
         if (spec.operation == Operation::SCATTER)
             invalid(input.dimensions() != 3 || inputs[1].dimensions() != 3 || input.size(0) != inputs[1].size(0) ||
-                        input.size(2) != inputs[1].size(2) || inputs[1].dtype() != input.dtype() ||
+                        input.size(2) != inputs[1].size(2) ||
+                        !capabilities.attention.accepts_cache(inputs[1].dtype(), input.dtype()) ||
                         inputs[2].dtype() != tensor::DType::I32 || inputs[2].dimensions() != 1 ||
                         inputs[2].size(0) != inputs[1].size(1),
                     "cache scatter shape or dtype mismatch");
@@ -1065,6 +1073,38 @@ auto Context::grouped_query_attention(const Tensor& query, const Tensor& key, co
                           {value_quantization.scales, value_quantization.zero_points, value_quantization.block_size}}};
     return impl_->run(spec, {&query, &key, &value, &mask});
 }
+auto Context::grouped_query_attention_causal(const Tensor& query, const Tensor& key, const Tensor& value,
+                                             std::int32_t heads, std::int32_t key_value_heads,
+                                             const Tensor& query_positions, std::int64_t window, float scale,
+                                             std::int64_t key_start, const BlockwiseQuantization& key_quantization,
+                                             const BlockwiseQuantization& value_quantization) -> Tensor {
+    if (device().kind != tensor::DeviceKind::CUDA || !std::isfinite(scale) || scale <= 0 || window < 0 ||
+        key.dimensions() != 3 || key_start < 0 || static_cast<std::size_t>(key_start) >= key.size(1) ||
+        query_positions.dtype() != tensor::DType::I32 || query_positions.device() != device() ||
+        query_positions.dimensions() != 4 || query_positions.size(0) != 1 || query_positions.size(1) != 1 ||
+        query_positions.size(2) != query.size(1) || query_positions.size(3) != 1)
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "causal attention requires CUDA query positions and a positive scale"});
+    const auto quantized = key.dtype() == tensor::DType::I8;
+    if (quantized && !device().capabilities().attention.int8_cache_tokens)
+        throw Failure({ErrorCode::UNSUPPORTED, "INT8 attention caches are unsupported by this backend"});
+    const auto valid_quantization = [&](const BlockwiseQuantization& metadata) {
+        return metadata.block_size > 0 && !metadata.scales.empty() &&
+               metadata.scales.size() == metadata.zero_points.size() &&
+               std::ranges::all_of(metadata.scales, [](float value) { return std::isfinite(value) && value > 0; });
+    };
+    if (quantized != (valid_quantization(key_quantization) && valid_quantization(value_quantization)) ||
+        (!quantized && (!key_quantization.scales.empty() || !value_quantization.scales.empty())))
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid attention cache quantization metadata"});
+    const auto parity_math = impl_->precision == core::InferencePrecision::QAT_FP32 ||
+                             impl_->precision == core::InferencePrecision::LOWBIT_PARITY;
+    const std::array<std::int64_t, 7> attributes{heads, key_value_heads, key_start,
+                                                 static_cast<std::int64_t>(key.size(1)) - key_start, parity_math, 1,
+                                                 window};
+    OperatorSpec spec{Operation::ATTENTION, attributes, query.dtype(), scale};
+    spec.quantization = {{{key_quantization.scales, key_quantization.zero_points, key_quantization.block_size},
+                          {value_quantization.scales, value_quantization.zero_points, value_quantization.block_size}}};
+    return impl_->run(spec, {&query, &key, &value, &query_positions});
+}
 auto Context::rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor {
     if (impl_->precision == core::InferencePrecision::QAT_FP32 ||
         impl_->precision == core::InferencePrecision::LOWBIT_PARITY) {
@@ -1194,6 +1234,13 @@ auto Context::scatter(const Tensor& input, const Tensor& updates, const Tensor& 
 }
 auto Context::scatter_(Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor& {
     impl_->run({Operation::SCATTER, {}, input.dtype()}, {&input, &updates, &indices}, nullptr, &input);
+    return input;
+}
+auto Context::scatter_unique_(Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor& {
+    if (impl_->device.kind != tensor::DeviceKind::CUDA)
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "unique-index scatter is only available on CUDA"});
+    const std::array<std::int64_t, 1> attributes{1};
+    impl_->run({Operation::SCATTER, attributes, input.dtype()}, {&input, &updates, &indices}, nullptr, &input);
     return input;
 }
 auto Context::copy_slice_(Tensor& destination, const Tensor& source, std::int64_t axis, std::int64_t start) -> Tensor& {

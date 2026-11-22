@@ -166,14 +166,19 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
         }
         std::vector<std::vector<std::int32_t>> all_token_ids;
         std::vector<std::string> outputs;
+        std::vector<std::vector<std::int32_t>> prompt_token_ids;
         all_token_ids.reserve(prompts.size());
         outputs.reserve(prompts.size());
+        prompt_token_ids.reserve(prompts.size());
+        for (const auto& prompt : prompts) prompt_token_ids.push_back(require(tokenizer.encode(prompt)));
         std::size_t total_prompt_tokens = 0, total_output_tokens = 0;
         const auto eval_started = Clock::now();
         for (std::size_t idx = 0; idx < prompts.size(); ++idx) {
             const auto item_started = Clock::now();
             auto res = run_one(prompts[idx], max_outputs);
             const auto item_seconds = std::chrono::duration<double>(Clock::now() - item_started).count();
+            if (res.stats.prompt_tokens != prompt_token_ids[idx].size())
+                throw std::runtime_error("Gemma eval prompt token count mismatch");
             total_prompt_tokens += res.stats.prompt_tokens;
             auto ids = std::move(res.generation.token_ids);
             while (!ids.empty() && (ids.back() == 1 || ids.back() == 106)) ids.pop_back();
@@ -182,7 +187,9 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
                   {"id", item_ids[idx]},
                   {"seconds", item_seconds},
                   {"prompt_tokens", res.stats.prompt_tokens},
+                  {"input_token_ids", prompt_token_ids[idx]},
                   {"output_tokens", ids.size()},
+                  {"truncated", res.generation.truncated},
                   {"token_ids", ids}},
                  threads);
             all_token_ids.push_back(std::move(ids));

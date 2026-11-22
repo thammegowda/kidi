@@ -102,6 +102,8 @@ public:
     }
     virtual auto set_precision(core::InferencePrecision) noexcept -> void {}
     virtual auto set_kv_cache_precision(core::KVCachePrecision) noexcept -> void {}
+    /// Storage dtype `create_state(capacity)` would allocate for the selected KV-cache precision.
+    virtual auto kv_cache_dtype(std::size_t) const -> Result<tensor::DType> { return tensor::DType::F32; }
 
     virtual auto rewind(LanguageModelState& state, std::size_t position) -> Result<void>;
     virtual auto prefill(std::span<const std::int32_t> tokens, LanguageModelState& state) -> Result<void>;

@@ -236,6 +236,7 @@ public:
             }
         }
         prepare_projections();
+        prepare_scatter_pairs();
         if (projections_.empty()) graph_.plan_intermediates();
         if (const auto* profile = std::getenv("KIDI_PROFILE_OPS"); profile && std::string_view(profile) == "graph")
             for (auto& phase : resources_->phases) check_cuda(cudaEventCreate(&phase));
@@ -284,6 +285,7 @@ public:
     }
 
     auto projection_groups() const noexcept -> std::size_t { return projections_.size(); }
+    auto scatter_groups() const noexcept -> std::size_t { return scatter_groups_.size(); }
 
     auto run(std::span<const Tensor> inputs, std::span<Tensor> outputs) -> void override {
         const auto started = std::chrono::steady_clock::now();
@@ -369,6 +371,10 @@ private:
         std::vector<std::size_t> nodes;
         Tensor weight, scales, output;
         bool packed = false;
+        std::unique_ptr<kidi::cuda::Program> program;
+    };
+    struct ScatterGroup {
+        std::array<std::size_t, 2> nodes{};
         std::unique_ptr<kidi::cuda::Program> program;
     };
     auto prepare_projections() -> void {
@@ -504,6 +510,52 @@ private:
             projections_.push_back(std::move(group));
         }
     }
+    auto prepare_scatter_pairs() -> void {
+        const auto nodes = graph_.nodes();
+        scatter_nodes_.assign(nodes.size(), SIZE_MAX);
+        const auto eligible = [&](const graph::Node& node) {
+            return node.operation == Operation::SCATTER && node.mode == graph::Mode::IN_PLACE &&
+                   node.input_count == 3 && node.attributes.size() == 1 && node.attributes[0] == 1 &&
+                   node.outputs().size() == 1 && node.sources.size() == 4 &&
+                   node.inputs()[0].device() == device_ && node.inputs()[1].device() == device_ &&
+                   node.inputs()[2].device() == device_ &&
+                   node.inputs()[0].storage_identity() == node.outputs()[0].storage_identity() &&
+                   node.inputs()[0].storage_offset() == node.outputs()[0].storage_offset();
+        };
+        const auto same_source = [](const graph::Source& left, const graph::Source& right) {
+            return left.kind == right.kind && left.index == right.index && left.output == right.output &&
+                   left.storage == right.storage && left.offset == right.offset;
+        };
+        for (std::size_t first = 0; first + 1 < nodes.size(); ++first) {
+            const auto& key = nodes[first];
+            const auto& value = nodes[first + 1];
+            if (!eligible(key) || !eligible(value) || !same_source(key.sources[2], value.sources[2]) ||
+                !std::ranges::equal(key.inputs()[0].shape(), value.inputs()[0].shape()) ||
+                !std::ranges::equal(key.inputs()[1].shape(), value.inputs()[1].shape()) ||
+                !std::ranges::equal(key.inputs()[2].shape(), value.inputs()[2].shape()) ||
+                key.inputs()[0].storage_identity() == value.inputs()[0].storage_identity())
+                continue;
+            ScatterGroup group;
+            group.nodes = {first, first + 1};
+            kidi::cuda::Descriptor descriptor;
+            descriptor.operation = kidi::cuda::Op::SCATTER_KV;
+            descriptor.input_count = 5;
+            descriptor.inputs[0] = view(key.inputs()[0]);
+            descriptor.inputs[1] = view(value.inputs()[0]);
+            descriptor.inputs[2] = view(key.inputs()[1]);
+            descriptor.inputs[3] = view(value.inputs()[1]);
+            descriptor.inputs[4] = view(key.inputs()[2]);
+            descriptor.output = view(key.outputs()[0], false);
+            descriptor.attribute_count = 1;
+            descriptor.attributes[0] = 1;
+            group.program = std::make_unique<kidi::cuda::Program>(descriptor, device_.index);
+            const auto group_index = scatter_groups_.size();
+            scatter_nodes_[first] = group_index;
+            scatter_nodes_[first + 1] = group_index;
+            scatter_groups_.push_back(std::move(group));
+            ++first;
+        }
+    }
     auto copy_inputs(std::span<const Tensor> inputs) -> void {
         bool changed = false;
         for (std::size_t index = 0; index < direct_slots_.size(); ++index) {
@@ -561,7 +613,17 @@ private:
                 check_cuda(cudaEventRecordWithFlags(resources_->profiles[index].first, resources_->stream, flags));
             std::vector<Tensor> outputs(node.outputs().begin(), node.outputs().end());
             if (node.operation == Operation::GREEDY_TOKEN && selection_.defined()) outputs[0] = selection_;
-            if (projection_nodes_[index] == SIZE_MAX) {
+            if (scatter_nodes_[index] != SIZE_MAX) {
+                auto& group = scatter_groups_[scatter_nodes_[index]];
+                if (group.nodes.front() == index) {
+                    const auto& key = graph_.nodes()[group.nodes[0]];
+                    const auto& value = graph_.nodes()[group.nodes[1]];
+                    const std::array bindings{view(key.inputs()[0]), view(value.inputs()[0]), view(key.inputs()[1]),
+                                              view(value.inputs()[1]), view(key.inputs()[2])};
+                    group.program->run(bindings.data(), static_cast<int>(bindings.size()),
+                                       require(buffer_view(key.outputs()[0])).data);
+                }
+            } else if (projection_nodes_[index] == SIZE_MAX) {
                 node.prepared->run_into(node.inputs(), outputs);
             } else {
                 auto& group = projections_[projection_nodes_[index]];
@@ -579,7 +641,6 @@ private:
                 check_cuda(cudaEventRecordWithFlags(resources_->profiles[index].second, resources_->stream, flags));
         }
     }
-
     Device device_;
     graph::Graph graph_;
     std::vector<std::shared_ptr<CudaGraphInput>> bindings_;
@@ -593,6 +654,8 @@ private:
     std::vector<std::size_t> sizes_;
     std::vector<ProjectionGroup> projections_;
     std::vector<std::size_t> projection_nodes_;
+    std::vector<ScatterGroup> scatter_groups_;
+    std::vector<std::size_t> scatter_nodes_;
     Tensor selection_;
     Tensor binding_table_;
     std::string key_;
@@ -667,6 +730,7 @@ public:
                                        .count();
             std::cerr << "kidi_cuda_graph|key=" << key << "|nodes=" << source.nodes().size()
                       << "|projection_groups=" << executable->projection_groups()
+                      << "|scatter_groups=" << executable->scatter_groups()
                       << "|capture=completed|steady_ns=" << timestamp << '\n';
         }
         return executable;

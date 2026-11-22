@@ -65,6 +65,183 @@ auto check_attention_bindings() -> bool {
     return true;
 }
 
+auto check_structured_causal_masks() -> bool {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    ops::Context context(device, false, true, DType::BF16);
+    const std::vector<float> query_values(128, 0.F), key_values(192, 0.F);
+    std::vector<float> value_values(192, 1.F);
+    std::ranges::fill(value_values.begin() + 64, value_values.begin() + 128, 3.F);
+    std::ranges::fill(value_values.begin() + 128, value_values.end(), 9.F);
+    const auto query = context.cast(require(Tensor::from_host({1, 2, 64}, std::span<const float>(query_values), device)),
+                                    DType::BF16);
+    const auto key = context.cast(require(Tensor::from_host({1, 3, 64}, std::span<const float>(key_values), device)),
+                                  DType::BF16);
+    const auto value =
+        context.cast(require(Tensor::from_host({1, 3, 64}, std::span<const float>(value_values), device)), DType::BF16);
+    const std::array<float, 6> full_precision_values{0.F, -1e9F, -1e9F, 0.F, 0.F, 0.F};
+    const auto full_precision_mask =
+        require(Tensor::from_host({1, 1, 2, 3}, std::span<const float>(full_precision_values), device));
+    const std::array<std::int32_t, 2> query_position{0, 2};
+    const auto positions = require(Tensor::from_host({1, 1, 2, 1}, std::span<const std::int32_t>(query_position),
+                                                     device));
+    const auto expected = context.grouped_query_attention(query, key, value, 1, 1, full_precision_mask);
+    const auto causal = context.grouped_query_attention_causal(query, key, value, 1, 1, positions, 0);
+    const auto local = context.grouped_query_attention_causal(query, key, value, 1, 1, positions, 2);
+    const auto expected_host = require(context.cast(expected, DType::F32).to(tensor::Device::cpu()));
+    const auto causal_host = require(context.cast(causal, DType::F32).to(tensor::Device::cpu()));
+    const auto local_host = require(context.cast(local, DType::F32).to(tensor::Device::cpu()));
+    const auto expected_values = require(expected_host.data<float>());
+    const auto causal_values = require(causal_host.data<float>());
+    const auto local_values = require(local_host.data<float>());
+    for (std::size_t index = 0; index < causal_values.size(); ++index)
+        if (std::abs(causal_values[index] - expected_values[index]) > 1e-5F) {
+            std::cerr << "causal mask parity failed index=" << index << " expected=" << expected_values[index]
+                      << " actual=" << causal_values[index] << '\n';
+            return false;
+        }
+    if (std::abs(expected_values[0] - 1.F) > 1e-5F || std::abs(expected_values[64] - 13.F / 3.F) > 2e-2F ||
+        std::abs(local_values[0] - 1.F) > 1e-5F || std::abs(local_values[64] - 6.F) > 1e-5F) {
+        std::cerr << "attention expected row outputs 1, 4.333, 1, 6; got " << expected_values[0] << ", "
+                  << expected_values[64] << ", " << local_values[0] << ", " << local_values[64] << '\n';
+        return false;
+    }
+
+    constexpr std::size_t long_keys = 1024;
+    std::vector<float> long_query_values(2 * 64, 0.F), long_key_values(long_keys * 64, 0.F);
+    std::vector<float> long_value_values(long_keys * 64);
+    std::array<float, 2 * long_keys> long_causal_mask{}, long_local_mask{}, long_single_mask{};
+    for (std::size_t key_index = 0; key_index < long_keys; ++key_index) {
+        std::ranges::fill(long_value_values.begin() + key_index * 64, long_value_values.begin() + (key_index + 1) * 64,
+                          static_cast<float>(key_index / 128));
+        long_causal_mask[key_index] = key_index <= 511 ? 0.F : -1e9F;
+        long_causal_mask[long_keys + key_index] = key_index <= 510 ? 0.F : -1e9F;
+        long_local_mask[key_index] = key_index >= 256 && key_index <= 511 ? 0.F : -1e9F;
+        long_local_mask[long_keys + key_index] = key_index >= 255 && key_index <= 510 ? 0.F : -1e9F;
+        long_single_mask[key_index] = key_index == 511 ? 0.F : -1e9F;
+        long_single_mask[long_keys + key_index] = key_index == 510 ? 0.F : -1e9F;
+    }
+    const auto long_query = context.cast(
+        require(Tensor::from_host({1, 2, 64}, std::span<const float>(long_query_values), device)), DType::BF16);
+    const auto long_key = context.cast(
+        require(Tensor::from_host({1, static_cast<std::int64_t>(long_keys), 64},
+                                  std::span<const float>(long_key_values), device)),
+        DType::BF16);
+    const auto long_value = context.cast(
+        require(Tensor::from_host({1, static_cast<std::int64_t>(long_keys), 64},
+                                  std::span<const float>(long_value_values), device)),
+        DType::BF16);
+    const std::array<std::int32_t, 2> long_query_positions{511, 510};
+    const auto long_positions = require(
+        Tensor::from_host({1, 1, 2, 1}, std::span<const std::int32_t>(long_query_positions), device));
+    const auto long_causal_reference =
+        context.grouped_query_attention(long_query, long_key, long_value, 1, 1,
+                                        require(Tensor::from_host({1, 1, 2, static_cast<std::int64_t>(long_keys)},
+                                                                  std::span<const float>(long_causal_mask), device)));
+    const auto long_local_reference =
+        context.grouped_query_attention(long_query, long_key, long_value, 1, 1,
+                                        require(Tensor::from_host({1, 1, 2, static_cast<std::int64_t>(long_keys)},
+                                                                  std::span<const float>(long_local_mask), device)));
+    const auto long_single_reference =
+        context.grouped_query_attention(long_query, long_key, long_value, 1, 1,
+                                        require(Tensor::from_host({1, 1, 2, static_cast<std::int64_t>(long_keys)},
+                                                                  std::span<const float>(long_single_mask), device)));
+    const auto long_causal =
+        context.grouped_query_attention_causal(long_query, long_key, long_value, 1, 1, long_positions, 0);
+    const auto long_local =
+        context.grouped_query_attention_causal(long_query, long_key, long_value, 1, 1, long_positions, 256);
+    const auto long_single =
+        context.grouped_query_attention_causal(long_query, long_key, long_value, 1, 1, long_positions, 1);
+    const auto long_causal_reference_host =
+        require(context.cast(long_causal_reference, DType::F32).to(tensor::Device::cpu()));
+    const auto long_local_reference_host =
+        require(context.cast(long_local_reference, DType::F32).to(tensor::Device::cpu()));
+    const auto long_single_reference_host =
+        require(context.cast(long_single_reference, DType::F32).to(tensor::Device::cpu()));
+    const auto long_causal_host = require(context.cast(long_causal, DType::F32).to(tensor::Device::cpu()));
+    const auto long_local_host = require(context.cast(long_local, DType::F32).to(tensor::Device::cpu()));
+    const auto long_single_host = require(context.cast(long_single, DType::F32).to(tensor::Device::cpu()));
+    const auto long_causal_reference_values = require(long_causal_reference_host.data<float>());
+    const auto long_local_reference_values = require(long_local_reference_host.data<float>());
+    const auto long_single_reference_values = require(long_single_reference_host.data<float>());
+    const auto long_causal_values = require(long_causal_host.data<float>());
+    const auto long_local_values = require(long_local_host.data<float>());
+    const auto long_single_values = require(long_single_host.data<float>());
+    for (std::size_t index = 0; index < long_causal_values.size(); ++index) {
+        if (std::abs(long_causal_values[index] - long_causal_reference_values[index]) > 1e-2F ||
+            std::abs(long_local_values[index] - long_local_reference_values[index]) > 1e-2F ||
+            std::abs(long_single_values[index] - long_single_reference_values[index]) > 1e-2F) {
+            std::cerr << "long attention key-range parity failed index=" << index << '\n';
+            return false;
+        }
+    }
+
+    ops::Context f32_context(device, false, true, DType::F32);
+    const auto long_query_f32 =
+        require(Tensor::from_host({1, 2, 64}, std::span<const float>(long_query_values), device));
+    const auto long_key_f32 = require(
+        Tensor::from_host({1, static_cast<std::int64_t>(long_keys), 64},
+                          std::span<const float>(long_key_values), device));
+    const auto long_value_f32 = require(
+        Tensor::from_host({1, static_cast<std::int64_t>(long_keys), 64},
+                          std::span<const float>(long_value_values), device));
+    const auto long_causal_mask_f32 =
+        require(Tensor::from_host({1, 1, 2, static_cast<std::int64_t>(long_keys)},
+                                  std::span<const float>(long_causal_mask), device));
+    const auto long_causal_reference_f32 =
+        f32_context.grouped_query_attention(long_query_f32, long_key_f32, long_value_f32, 1, 1,
+                                            long_causal_mask_f32);
+    const auto long_causal_f32 =
+        f32_context.grouped_query_attention_causal(long_query_f32, long_key_f32, long_value_f32, 1, 1,
+                                                   long_positions, 0);
+    const auto long_causal_reference_f32_host =
+        require(long_causal_reference_f32.to(tensor::Device::cpu()));
+    const auto long_causal_f32_host = require(long_causal_f32.to(tensor::Device::cpu()));
+    const auto long_causal_reference_f32_values = require(long_causal_reference_f32_host.data<float>());
+    const auto long_causal_f32_values = require(long_causal_f32_host.data<float>());
+    for (std::size_t index = 0; index < long_causal_f32_values.size(); ++index) {
+        if (!std::isfinite(long_causal_f32_values[index]) ||
+            std::abs(long_causal_f32_values[index] - long_causal_reference_f32_values[index]) > 1e-2F) {
+            std::cerr << "FP32 long causal attention parity failed index=" << index << '\n';
+            return false;
+        }
+    }
+
+    constexpr std::size_t key_start = 37;
+    constexpr std::size_t cropped_keys = long_keys - key_start;
+    std::array<float, 2 * cropped_keys> cropped_local_mask{};
+    for (std::size_t row = 0; row < long_query_positions.size(); ++row) {
+        const auto position = long_query_positions[row];
+        for (std::size_t index = 0; index < cropped_keys; ++index) {
+            const auto key_position = static_cast<std::int64_t>(key_start + index);
+            cropped_local_mask[row * cropped_keys + index] =
+                key_position <= position && position - key_position < 256 ? 0.F : -1e9F;
+        }
+    }
+    const auto cropped_mask = require(
+        Tensor::from_host({1, 1, 2, static_cast<std::int64_t>(cropped_keys)},
+                          std::span<const float>(cropped_local_mask), device));
+    const auto cropped_reference = f32_context.grouped_query_attention(
+        long_query_f32, long_key_f32, long_value_f32, 1, 1, cropped_mask, 1.F, key_start);
+    const auto cropped_actual = f32_context.grouped_query_attention_causal(
+        long_query_f32, long_key_f32, long_value_f32, 1, 1, long_positions, 256, 1.F, key_start);
+    const auto cropped_reference_host = require(cropped_reference.to(tensor::Device::cpu()));
+    const auto cropped_actual_host = require(cropped_actual.to(tensor::Device::cpu()));
+    const auto cropped_reference_values = require(cropped_reference_host.data<float>());
+    const auto cropped_actual_values = require(cropped_actual_host.data<float>());
+    for (std::size_t index = 0; index < cropped_actual_values.size(); ++index) {
+        if (!std::isfinite(cropped_actual_values[index]) ||
+            std::abs(cropped_actual_values[index] - cropped_reference_values[index]) > 1e-2F) {
+            std::cerr << "FP32 cropped window attention parity failed index=" << index << '\n';
+            return false;
+        }
+    }
+    return true;
+}
+
 auto check_async_readback() -> bool {
     using namespace kidi;
     using ops::require;
@@ -546,27 +723,56 @@ auto check_scatter_updates() -> bool {
     using tensor::DType;
     using tensor::Tensor;
     ops::Context context(tensor::Device::cuda());
-    auto cache = require(Tensor::zeros({2, 9216, 4}, DType::F32, context.device()));
-    const std::array<float, 24> values{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
-                                       13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
+    const std::array<float, 24> values{1,  2,  3,  4,  5,  6,  7,  8,  0.333333F, 10, 11, 12,
+                                     13, 14, 15, 16, 17, 18, 19, 20, 21,        22, 23, 24};
     const std::array<std::int32_t, 3> rows{5, 9215, 5};
     const auto updates = require(Tensor::from_host({2, 3, 4}, std::span<const float>(values), context.device()));
     const auto indices = require(Tensor::from_host({3}, std::span<const std::int32_t>(rows), context.device()));
-    const auto identity = cache.storage_identity();
-    const auto before = kidi::cuda::allocated_bytes();
-    context.scatter_(cache, updates, indices);
+    for (const auto dtype : {DType::F32, DType::BF16}) {
+        auto cache = require(Tensor::zeros({2, 9216, 4}, dtype, context.device()));
+        const auto identity = cache.storage_identity();
+        const auto before = kidi::cuda::allocated_bytes();
+        context.scatter_(cache, updates, indices);
+        context.synchronize();
+        if (cache.storage_identity() != identity || kidi::cuda::allocated_bytes() != before) return false;
+        const auto rounded = require(context.cast(context.cast(updates, dtype), DType::F32).to(tensor::Device::cpu()));
+        const auto expected_values = require(rounded.data<float>());
+        for (const bool inplace : {true, false}) {
+            const auto result = inplace ? cache : context.scatter(cache, updates, indices);
+            const auto copied = require(context.cast(result, DType::F32).to(tensor::Device::cpu()));
+            const auto actual = require(copied.data<float>());
+            for (std::size_t batch = 0; batch < 2; ++batch)
+                for (std::size_t row = 0; row < 9216; ++row)
+                    for (std::size_t channel = 0; channel < 4; ++channel) {
+                        const auto expected = row == 5      ? expected_values[batch * 12 + 8 + channel]
+                                              : row == 9215 ? expected_values[batch * 12 + 4 + channel]
+                                                            : 0.F;
+                        if (actual[(batch * 9216 + row) * 4 + channel] != expected) return false;
+                    }
+        }
+    }
+    const std::array<std::int32_t, 3> unique_rows{1, 3, 5};
+    const auto unique_indices = require(Tensor::from_host({3}, std::span<const std::int32_t>(unique_rows),
+                                                                  context.device()));
+    auto unique_cache = require(Tensor::zeros({2, 6, 4}, DType::F32, context.device()));
+    context.scatter_unique_(unique_cache, updates, unique_indices);
     context.synchronize();
-    if (cache.storage_identity() != identity || kidi::cuda::allocated_bytes() != before) return false;
-    const auto copied = require(cache.to(tensor::Device::cpu()));
-    const auto actual = require(copied.data<float>());
+    const auto unique_result = require(unique_cache.to(tensor::Device::cpu()));
+    const auto unique_values = require(unique_result.data<float>());
     for (std::size_t batch = 0; batch < 2; ++batch)
-        for (std::size_t row = 0; row < 9216; ++row)
-            for (std::size_t channel = 0; channel < 4; ++channel) {
-                const auto expected = row == 5      ? values[batch * 12 + 8 + channel]
-                                      : row == 9215 ? values[batch * 12 + 4 + channel]
-                                                    : 0.F;
-                if (actual[(batch * 9216 + row) * 4 + channel] != expected) return false;
-            }
+        for (std::size_t row = 0; row < 6; ++row)
+                    for (std::size_t channel = 0; channel < 4; ++channel) {
+                        const auto expected = row == 1 ? values[batch * 12 + channel]
+                                              : row == 3 ? values[batch * 12 + 4 + channel]
+                                              : row == 5 ? values[batch * 12 + 8 + channel]
+                                                         : 0.F;
+                        const auto index = (batch * 6 + row) * 4 + channel;
+                        if (unique_values[index] != expected) {
+                            std::cerr << "unique-index scatter mismatch index=" << index << " expected=" << expected
+                                      << " actual=" << unique_values[index] << '\n';
+                            return false;
+                        }
+                    }
     std::array<float, 16> initial{};
     for (std::size_t index = 0; index < initial.size(); ++index) initial[index] = static_cast<float>(index + 1);
     auto aliased = require(Tensor::from_host({1, 4, 4}, std::span<const float>(initial), context.device()));
@@ -581,6 +787,40 @@ auto check_scatter_updates() -> bool {
     for (std::size_t index = 0; index < initial.size(); ++index)
         if (alias_values[index] != initial[index % 8]) return false;
     return true;
+}
+
+auto check_key_value_scatter_fusion() -> bool {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    ops::Context context(device, false, true), eager(device);
+    const std::array<float, 12> key_values{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    const std::array<float, 12> value_values{-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12};
+    const std::array<std::int32_t, 3> rows{1, 4, 6};
+    const auto key_updates = require(Tensor::from_host({1, 3, 4}, std::span<const float>(key_values), device));
+    const auto value_updates = require(Tensor::from_host({1, 3, 4}, std::span<const float>(value_values), device));
+    const auto indices = require(Tensor::from_host({3}, std::span<const std::int32_t>(rows), device));
+    auto key_cache = require(Tensor::zeros({1, 8, 4}, DType::BF16, device));
+    auto value_cache = require(Tensor::zeros({1, 8, 4}, DType::BF16, device));
+    const std::array arguments{key_cache, value_cache, key_updates, value_updates, indices};
+    const auto step = [&](std::span<const Tensor> operands) {
+        auto key = operands[0], value = operands[1];
+        context.scatter_unique_(key, operands[2], operands[4]);
+        context.scatter_unique_(value, operands[3], operands[4]);
+        return std::vector<Tensor>{key, value};
+    };
+    auto outputs = context.replay("cuda-key-value-scatter", arguments, step);
+    outputs = context.replay("cuda-key-value-scatter", arguments, step);
+
+    auto expected_key = require(Tensor::zeros({1, 8, 4}, DType::BF16, device));
+    auto expected_value = require(Tensor::zeros({1, 8, 4}, DType::BF16, device));
+    eager.scatter_(expected_key, key_updates, indices);
+    eager.scatter_(expected_value, value_updates, indices);
+    eager.synchronize();
+    return require(outputs[0].copy_to_host()) == require(expected_key.copy_to_host()) &&
+           require(outputs[1].copy_to_host()) == require(expected_value.copy_to_host());
 }
 
 auto check_scoped_layers() -> bool {
@@ -792,6 +1032,8 @@ auto main() -> int {
         if (!check_exported_cache_alias()) throw std::runtime_error("CUDA graph exported a stale cache alias");
         if (!check_readback_source_release()) throw std::runtime_error("CUDA readback retained its completed source");
         if (!check_attention_bindings()) throw std::runtime_error("CUDA attention retained a stale KV pointer");
+        if (!check_structured_causal_masks())
+            throw std::runtime_error("CUDA structured causal masks changed attention output");
         if (!check_async_readback()) throw std::runtime_error("CUDA nonblocking readback snapshot failed");
         if (!check_projection_groups()) throw std::runtime_error("CUDA shared-input projection fusion failed");
         if (!check_w8a16_projection_groups())
@@ -802,6 +1044,7 @@ auto main() -> int {
         if (!check_cuda_graph()) throw std::runtime_error("CUDA graph input staging or cache writeback failed");
         if (!check_bfloat_context()) throw std::runtime_error("CUDA BF16 context pipeline failed");
         if (!check_scatter_updates()) throw std::runtime_error("CUDA sparse cache scatter failed");
+        if (!check_key_value_scatter_fusion()) throw std::runtime_error("CUDA fused key/value scatter failed");
         if (!check_scoped_layers()) throw std::runtime_error("CUDA scoped placement or layer parity failed");
         if (!check_diffusion_feedback()) throw std::runtime_error("CUDA diffusion embedding feedback failed");
         if (!check_projection_paths()) throw std::runtime_error("accelerated projection CPU parity failed");

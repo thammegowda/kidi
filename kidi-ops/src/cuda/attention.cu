@@ -36,7 +36,16 @@ __global__ void attention_scores(Launch plan, float* scores, std::int64_t heads,
         score_view.shape[1] = heads;
         score_view.shape[2] = queries;
         score_view.shape[3] = keys;
-        value += read(plan.inputs[3], broadcast_index(index, score_view, plan.inputs[3]));
+        if (plan.inputs[3].type == static_cast<int>(Type::I32) && plan.attribute_count >= 7 &&
+            plan.attributes[5] == 1) {
+            const auto mask_index = broadcast_index(index, score_view, plan.inputs[3]);
+            const auto query_position = static_cast<const std::int32_t*>(address(plan.inputs[3]))[mask_index];
+            const auto key_position = key + plan.attributes[2];
+            const auto window = plan.attributes[6];
+            if (key_position > query_position || (window && query_position - key_position >= window)) value = -INFINITY;
+        } else {
+            value += read(plan.inputs[3], broadcast_index(index, score_view, plan.inputs[3]));
+        }
     }
     scores[index] = value;
 }
@@ -87,10 +96,10 @@ __device__ void load_decode_vector(const Element* source, float (&output)[Vector
     }
 }
 
-template <typename Element, int Width, int Group>
+template <typename Element, int Width, int Group, int Partition, typename CacheElement = Element>
 __global__ void decode_partitions(Launch plan, float* partials, std::int64_t heads, std::int64_t key_heads,
                                   std::int64_t keys, std::int64_t partitions) {
-    constexpr int Vector = Width / 32, Warps = 4, Partition = 64;
+    constexpr int Vector = Width / 32, Warps = 4;
     __shared__ float maxima[Warps][Group], denominators[Warps][Group], outputs[Warps][Group][Width];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const auto batch = static_cast<std::int64_t>(blockIdx.x), head = static_cast<std::int64_t>(blockIdx.y) * Group;
@@ -98,9 +107,9 @@ __global__ void decode_partitions(Launch plan, float* partials, std::int64_t hea
     const auto offset = plan.attribute_count >= 3 ? plan.attributes[2] : 0;
     const auto key_batch = plan.inputs[1].shape[0] == 1 ? 0 : batch;
     const auto* query = static_cast<const Element*>(plan.inputs[0].data) + (batch * heads + head) * Width;
-    const auto* key = static_cast<const Element*>(address(plan.inputs[1])) +
+    const auto* key = static_cast<const CacheElement*>(address(plan.inputs[1])) +
                       (key_batch * plan.inputs[1].shape[1] + offset) * key_heads * Width + key_head * Width;
-    const auto* value = static_cast<const Element*>(address(plan.inputs[2])) +
+    const auto* value = static_cast<const CacheElement*>(address(plan.inputs[2])) +
                         (key_batch * plan.inputs[2].shape[1] + offset) * key_heads * Width + key_head * Width;
     float activation[Group][Vector], accumulated[Group][Vector]{}, maximum[Group], denominator[Group]{};
 #pragma unroll
@@ -119,8 +128,8 @@ __global__ void decode_partitions(Launch plan, float* partials, std::int64_t hea
     const auto end = min(begin + Partition, keys);
     for (std::int64_t position = begin + warp; position < end; position += Warps) {
         float key_values[Vector], value_values[Vector];
-        load_decode_vector<Element, Vector>(key + position * key_heads * Width + lane * Vector, key_values);
-        load_decode_vector<Element, Vector>(value + position * key_heads * Width + lane * Vector, value_values);
+        load_decode_vector<CacheElement, Vector>(key + position * key_heads * Width + lane * Vector, key_values);
+        load_decode_vector<CacheElement, Vector>(value + position * key_heads * Width + lane * Vector, value_values);
 #pragma unroll
         for (int group = 0; group < Group; ++group) {
             float score = 0;
@@ -129,9 +138,20 @@ __global__ void decode_partitions(Launch plan, float* partials, std::int64_t hea
                 score = fmaf(activation[group][column], key_values[column], score);
             for (int delta = 16; delta > 0; delta /= 2) score += __shfl_xor_sync(0xffffffff, score, delta);
             score *= scale;
-            if (plan.count == 4)
-                score += read(plan.inputs[3], broadcast_index((batch * heads + head + group) * keys + position,
-                                                              score_view, plan.inputs[3]));
+            if (plan.count == 4) {
+                const auto mask_index =
+                    broadcast_index((batch * heads + head + group) * keys + position, score_view, plan.inputs[3]);
+                if (plan.inputs[3].type == static_cast<int>(Type::I32) && plan.attribute_count >= 7 &&
+                    plan.attributes[5] == 1) {
+                    const auto query_position = static_cast<const std::int32_t*>(address(plan.inputs[3]))[mask_index];
+                    const auto key_position = offset + position;
+                    const auto window = plan.attributes[6];
+                    if (key_position > query_position || (window && query_position - key_position >= window))
+                        score = -INFINITY;
+                } else {
+                    score += read(plan.inputs[3], mask_index);
+                }
+            }
             const float updated = fmaxf(maximum[group], score);
             const float previous = maximum[group] == -INFINITY ? 0.F : __expf(maximum[group] - updated);
             const float probability = score == -INFINITY ? 0.F : __expf(score - updated);
@@ -206,7 +226,7 @@ __global__ void decode_merge(Launch plan, const float* partials, std::int64_t pa
     }
 }
 
-template <typename Element, int Width>
+template <typename Element, int Width, typename CacheElement = Element>
 __global__ void parallel_attention(Launch plan, std::int64_t heads, std::int64_t key_heads, std::int64_t keys) {
     extern __shared__ float probabilities[];
     __shared__ float partial[8];
@@ -219,9 +239,9 @@ __global__ void parallel_attention(Launch plan, std::int64_t heads, std::int64_t
     const auto value_batch = plan.inputs[2].shape[0] == 1 ? 0 : batch;
     const auto* query =
         static_cast<const Element*>(plan.inputs[0].data) + static_cast<std::int64_t>(blockIdx.x) * Width;
-    const auto* key = static_cast<const Element*>(address(plan.inputs[1])) +
+    const auto* key = static_cast<const CacheElement*>(address(plan.inputs[1])) +
                       (key_batch * plan.inputs[1].shape[1] + offset) * key_heads * Width + key_head * Width;
-    const auto* value = static_cast<const Element*>(address(plan.inputs[2])) +
+    const auto* value = static_cast<const CacheElement*>(address(plan.inputs[2])) +
                         (value_batch * plan.inputs[2].shape[1] + offset) * key_heads * Width + key_head * Width;
     float activation[Width / 32];
 #pragma unroll
@@ -242,10 +262,21 @@ __global__ void parallel_attention(Launch plan, std::int64_t heads, std::int64_t
         for (int delta = 16; delta > 0; delta /= 2) score += __shfl_down_sync(0xffffffff, score, delta);
         if (lane == 0) {
             score *= scale;
-            if (plan.count == 4)
-                score +=
-                    read(plan.inputs[3], broadcast_index(((batch * heads + head) * queries + row) * keys + position,
-                                                         score_view, plan.inputs[3]));
+            if (plan.count == 4) {
+                const auto mask_index =
+                    broadcast_index(((batch * heads + head) * queries + row) * keys + position, score_view,
+                                    plan.inputs[3]);
+                if (plan.inputs[3].type == static_cast<int>(Type::I32) && plan.attribute_count >= 7 &&
+                    plan.attributes[5] == 1) {
+                    const auto query_position = static_cast<const std::int32_t*>(address(plan.inputs[3]))[mask_index];
+                    const auto key_position = offset + position;
+                    const auto window = plan.attributes[6];
+                    if (key_position > query_position || (window && query_position - key_position >= window))
+                        score = -INFINITY;
+                } else {
+                    score += read(plan.inputs[3], mask_index);
+                }
+            }
             probabilities[position] = score;
         }
     }
@@ -282,27 +313,28 @@ __global__ void parallel_attention(Launch plan, std::int64_t heads, std::int64_t
     }
 }
 
-template <typename Element, int Width>
+template <typename Element, int Width, typename CacheElement = Element>
 void run_parallel_attention(Launch plan, std::int64_t heads, std::int64_t key_heads, std::int64_t keys,
                             cudaStream_t stream) {
     const auto rows = static_cast<unsigned int>(plan.elements / Width);
-    parallel_attention<Element, Width><<<rows, 256, keys * sizeof(float), stream>>>(plan, heads, key_heads, keys);
+    parallel_attention<Element, Width, CacheElement><<<rows, 256, keys * sizeof(float), stream>>>(
+        plan, heads, key_heads, keys);
     check(cudaGetLastError());
 }
 
-template <typename Element>
+template <typename Element, typename CacheElement = Element>
 auto parallel_attention_launcher(std::int64_t width) -> AttentionLauncher {
     switch (width) {
         case 32:
-            return run_parallel_attention<Element, 32>;
+            return run_parallel_attention<Element, 32, CacheElement>;
         case 64:
-            return run_parallel_attention<Element, 64>;
+            return run_parallel_attention<Element, 64, CacheElement>;
         case 128:
-            return run_parallel_attention<Element, 128>;
+            return run_parallel_attention<Element, 128, CacheElement>;
         case 256:
-            return run_parallel_attention<Element, 256>;
+            return run_parallel_attention<Element, 256, CacheElement>;
         case 512:
-            return run_parallel_attention<Element, 512>;
+            return run_parallel_attention<Element, 512, CacheElement>;
         default:
             return nullptr;
     }
@@ -328,10 +360,13 @@ void dispatch_flash_attention(Launch plan, std::int64_t heads, std::int64_t key_
                          reinterpret_cast<std::uintptr_t>(plan.inputs[2].data) % 16 == 0 &&
                          reinterpret_cast<std::uintptr_t>(plan.output.data) % 16 == 0;
     const bool bfloat = plan.inputs[0].type == static_cast<int>(Type::BF16);
+    const bool bfloat_cache = plan.inputs[1].type == static_cast<int>(Type::BF16);
     if (!aligned) {
         if (keys <= 8192) {
             if (bfloat)
                 run_parallel_attention<__nv_bfloat16, Width>(plan, heads, key_heads, keys, stream);
+            else if (bfloat_cache)
+                run_parallel_attention<float, Width, __nv_bfloat16>(plan, heads, key_heads, keys, stream);
             else
                 run_parallel_attention<float, Width>(plan, heads, key_heads, keys, stream);
             return;
@@ -352,8 +387,11 @@ void dispatch_flash_attention(Launch plan, std::int64_t heads, std::int64_t key_
             args.mask.type = 1;
         else if (mask_type == Type::F16)
             args.mask.type = 2;
+        else if (mask_type == Type::I32 && plan.attribute_count >= 7 && plan.attributes[5] == 1)
+            args.mask.type = 3;
         else
             throw std::runtime_error("CUDA: unsupported FlashAttention mask dtype");
+        args.mask_window = args.mask.type == 3 ? plan.attributes[6] : 0;
     }
     args.output = to_flash_view(plan.output);
     args.batches = plan.inputs[0].shape[0];
@@ -364,7 +402,7 @@ void dispatch_flash_attention(Launch plan, std::int64_t heads, std::int64_t key_
     args.keys = keys;
     args.head_dim = Width;
     args.scale = plan.epsilon > 0.F ? plan.epsilon : 1.F / std::sqrt(static_cast<float>(Width));
-    const bool launched = bfloat ? flash_attention_bf16(args, stream) : flash_attention_f32(args, stream);
+    const bool launched = bfloat_cache ? flash_attention_bf16(args, stream) : flash_attention_f32(args, stream);
     if (!launched) throw std::runtime_error("CUDA: unsupported FlashAttention launch configuration");
     check(cudaGetLastError());
 }
@@ -390,20 +428,23 @@ auto flash_attention_launcher(std::int64_t width) -> AttentionLauncher {
 auto select_parallel_attention(const Descriptor& descriptor, std::int64_t keys, std::int64_t width, int device)
     -> AttentionLauncher {
     const auto type = descriptor.inputs[0].type;
-    if (descriptor.reference_attention || keys <= 0 || type != descriptor.inputs[1].type ||
-        type != descriptor.output.type)
+    const auto cache_type = descriptor.inputs[1].type;
+    const bool mixed = type == Type::F32 && cache_type == Type::BF16;
+    if (descriptor.reference_attention || keys <= 0 || (!mixed && type != cache_type) || type != descriptor.output.type)
         return nullptr;
 #if defined(KIDI_CUDA_USE_CUTLASS_INT8)
-    if (type == Type::BF16 && descriptor.inputs[0].shape[1] > 1 && dense_device(device).major >= 8) {
+    if (cache_type == Type::BF16 && descriptor.inputs[0].shape[1] > 1 && dense_device(device).major >= 8) {
         if (auto launcher = flash_attention_launcher(width)) return launcher;
     }
-    if (type == Type::F32 && (descriptor.inputs[0].shape[1] >= 64 || keys > 512) && dense_device(device).major >= 8) {
+    if (type == Type::F32 && cache_type == Type::F32 &&
+        (descriptor.inputs[0].shape[1] >= 64 || keys > 512) && dense_device(device).major >= 8) {
         if (auto launcher = flash_attention_launcher(width)) return launcher;
     }
 #else
     (void)device;
 #endif
     if (keys > 8192) return nullptr;
+    if (mixed) return parallel_attention_launcher<float, __nv_bfloat16>(width);
     if (type == Type::BF16) return parallel_attention_launcher<__nv_bfloat16>(width);
 #if defined(KIDI_CUDA_USE_CUTLASS_INT8)
     if (type == Type::F32 && descriptor.inputs[0].shape[1] > 1) return parallel_attention_launcher<float>(width);
@@ -414,36 +455,49 @@ auto select_parallel_attention(const Descriptor& descriptor, std::int64_t keys, 
 auto decode_attention(const Launch& plan, float* partials, std::int64_t batches, std::int64_t heads,
                       std::int64_t key_heads, std::int64_t keys, std::int64_t width, int input_type,
                       cudaStream_t stream) -> void {
-    const auto partitions = (keys + 63) / 64;
-    const int group = (heads / key_heads) % 2 == 0 ? 2 : 1;
-    const dim3 grid(static_cast<unsigned int>(batches), static_cast<unsigned int>(heads / group),
-                    static_cast<unsigned int>(partitions));
-    const auto dispatch_decode = [&](auto tag) {
+    constexpr int short_partition_size = static_cast<int>(DECODE_ATTENTION_PARTITION_SIZE);
+    constexpr int long_partition_size = 32;
+    constexpr std::int64_t long_context_threshold = 2048;
+    constexpr int group = 1;
+    const auto dispatch_decode = [&](auto partition_tag, auto tag, auto cache_tag) {
+        constexpr int partition_size = decltype(partition_tag)::value;
+        const auto partitions = (keys + partition_size - 1) / partition_size;
+        const dim3 grid(static_cast<unsigned int>(batches), static_cast<unsigned int>(heads / group),
+                        static_cast<unsigned int>(partitions));
         using Element = decltype(tag);
+        using CacheElement = decltype(cache_tag);
         if (width == 256) {
             if (group == 2)
-                decode_partitions<Element, 256, 2>
+                decode_partitions<Element, 256, 2, partition_size, CacheElement>
                     <<<grid, 128, 0, stream>>>(plan, partials, heads, key_heads, keys, partitions);
             else
-                decode_partitions<Element, 256, 1>
+                decode_partitions<Element, 256, 1, partition_size, CacheElement>
                     <<<grid, 128, 0, stream>>>(plan, partials, heads, key_heads, keys, partitions);
             decode_merge<Element, 256>
                 <<<static_cast<unsigned int>(batches * heads), 256, 0, stream>>>(plan, partials, partitions);
         } else {
             if (group == 2)
-                decode_partitions<Element, 512, 2>
+                decode_partitions<Element, 512, 2, partition_size, CacheElement>
                     <<<grid, 128, 0, stream>>>(plan, partials, heads, key_heads, keys, partitions);
             else
-                decode_partitions<Element, 512, 1>
+                decode_partitions<Element, 512, 1, partition_size, CacheElement>
                     <<<grid, 128, 0, stream>>>(plan, partials, heads, key_heads, keys, partitions);
             decode_merge<Element, 512>
                 <<<static_cast<unsigned int>(batches * heads), 256, 0, stream>>>(plan, partials, partitions);
         }
     };
-    if (input_type == static_cast<int>(Type::BF16))
-        dispatch_decode(__nv_bfloat16{});
+    const auto dispatch_input = [&](auto partition_tag) {
+        if (input_type == static_cast<int>(Type::BF16))
+            dispatch_decode(partition_tag, __nv_bfloat16{}, __nv_bfloat16{});
+        else if (plan.inputs[1].type == static_cast<int>(Type::BF16))
+            dispatch_decode(partition_tag, float{}, __nv_bfloat16{});
+        else
+            dispatch_decode(partition_tag, float{}, float{});
+    };
+    if (keys >= long_context_threshold)
+        dispatch_input(std::integral_constant<int, long_partition_size>{});
     else
-        dispatch_decode(float{});
+        dispatch_input(std::integral_constant<int, short_partition_size>{});
 }
 
 auto fallback_attention(const Launch& plan, float* scratch, std::int64_t batches, std::int64_t heads,

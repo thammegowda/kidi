@@ -112,7 +112,14 @@ W8A16 (`--precision w8a16`) runs both calibrated INT8 checkpoints and unquantize
 BF16 checkpoints with INT8 weights and BF16 activations/KV cache, while W8A8
 accelerates affine INT8 and calibrated/uncalibrated packed INT8 projections (plus
 single-group packed INT4/INT2 projections expanded to INT8) with fused
-epilogues and partitioned FP32 FlashDecoding. Small-row decode uses specialized
+epilogues and partitioned FlashDecoding. Gemma 4's AUTO KV-cache policy selects
+BF16 on CUDA even when packed Q8 checkpoints retain FP32 activations, unless
+checkpoint-provided byte-cache quantization applies. Explicit FP32 cache remains
+available; CPU AUTO behavior is unchanged. Mixed FP32-query/BF16-cache attention
+retains FP32 outputs: tensor-core prefill rounds queries inside the attention
+kernel, and decode reads FP32 queries directly. Captured decode cache writes
+convert FP32 to BF16 inside scatter rather than launching separate casts.
+Small-row decode uses specialized
 vector kernels and CUDA Graph sibling fusion when eligible. On H100 (Gemma 4 E4B,
 162-token prompt / 128-token prefill chunks), compact BF16 reaches `9,281`
 prefill / `134.1` decode tok/s (`0.78 ms` exact-128 attention, `11.93 ms`
@@ -121,6 +128,17 @@ exact-128 window vs `14.21 ms` historical shared cuBLAS), compact W8A16 reaches
 reaches `7,735` prefill / `139.3` decode tok/s (`9,974` / `138.5` at 1,098
 tokens). See the [CUDA performance plan](docs/cuda-performance-plan.md) for
 shapes, graph capture, and benchmark details.
+
+The [E4B Q8 comparison](benchmarks/cuda/2026-11-20-e4b-q8-h100-gpu7.md#bf16-cache-optimization-follow-up)
+records the matched FP32/BF16-cache follow-up, including remaining performance
+gaps. To measure a particular W8A8 projection against its scalar reference:
+
+```bash
+cmake --build --preset release-cuda --target kidi_ops_cuda_projection_benchmark
+build-release-cuda/kidi-ops/src/cuda/kidi_ops_cuda_projection_benchmark 0 w8a8 2048 2560 10240
+```
+
+Arguments after `w8a8` are rows, input width, and output columns.
 
 For the Python launcher, build and install a CUDA-enabled package separately:
 

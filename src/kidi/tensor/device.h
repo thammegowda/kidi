@@ -9,6 +9,8 @@
 #include <string_view>
 #include <utility>
 
+#include "kidi/tensor/dtype.h"
+
 namespace kidi::tensor {
 
 enum class DeviceKind {
@@ -73,8 +75,14 @@ private:
 struct AttentionCapabilities {
     std::size_t int8_cache_tokens = 0;
     AttentionExecution execution = AttentionExecution::STANDARD;
+    /// Floating KV-cache dtypes that scatter writes and attention reads directly from FP32 activations.
+    DTypeSet mixed_cache_dtypes{};
 
     constexpr auto fused() const noexcept -> bool { return execution == AttentionExecution::FUSED; }
+    /// Whether a floating KV cache stored as `cache` can serve `activation` keys, values, and queries.
+    constexpr auto accepts_cache(DType activation, DType cache) const noexcept -> bool {
+        return activation == cache || (activation == DType::F32 && mixed_cache_dtypes.contains(cache));
+    }
 };
 
 struct MemoryCapabilities {
@@ -226,7 +234,8 @@ inline constexpr EnumMap<DeviceKind, DeviceProfile, static_cast<std::size_t>(Dev
                                                              .audio = AudioExecution::NATIVE,
                                                              .embedding = true,
                                                              .embedding_sum = true},
-                                                 .sampling = {TokenSelection::CHAINED_DEVICE, true}},
+                                                 .sampling = {TokenSelection::CHAINED_DEVICE, true},
+                                                 .attention = {.mixed_cache_dtypes = {DType::BF16}}},
                                 .policy = {.parameters = {.audio = ParameterResidency::HOST},
                                            .transformer = {.gelu = FeedForwardKernel::PACKED_GATE,
                                                            .silu = FeedForwardKernel::PACKED_GATE,

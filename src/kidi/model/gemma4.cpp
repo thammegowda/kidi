@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <numeric>
@@ -27,6 +28,28 @@ auto step_input(Tensor& tensor, std::vector<std::int64_t> shape, DType dtype, te
         !std::ranges::equal(tensor.shape(), shape))
         tensor = require(Tensor::empty(std::move(shape), dtype, device));
     return tensor;
+}
+auto fill_attention_mask(Tensor& mask, std::size_t position, std::size_t queries, std::size_t start, int type,
+                         std::size_t window) -> void {
+    const auto count = mask.size(-1);
+    const auto values = require(mask.data<float>());
+    for (std::size_t query = 0; query < queries; ++query)
+        for (std::size_t column = 0; column < count; ++column) {
+            const auto key = start + column, current = position + query;
+            values[query * count + column] =
+                key <= current && (type == 1 || current - key < window) ? 0.F : -1e9F;
+        }
+}
+auto make_attention_mask(tensor::Device device, std::size_t position, std::size_t queries, std::size_t start,
+                         std::size_t count, int type, std::size_t window) -> Tensor {
+    const std::vector<std::int64_t> shape{1, 1, static_cast<std::int64_t>(queries), static_cast<std::int64_t>(count)};
+    std::vector<float> values(queries * count, -1e9F);
+    for (std::size_t query = 0; query < queries; ++query)
+        for (std::size_t column = 0; column < count; ++column) {
+            const auto key = start + column, current = position + query;
+            if (key <= current && (type == 1 || current - key < window)) values[query * count + column] = 0.F;
+        }
+    return require(Tensor::from_host(shape, std::span<const float>(values), device));
 }
 auto quant_bits(const YAML::Node& config, const std::string& name) -> std::int32_t {
     const auto quantization = config["quantization_config"];
@@ -509,37 +532,39 @@ auto Gemma4Impl::configure_lm_head(const std::filesystem::path& path) -> Result<
         return std::unexpected(error.error());
     }
 }
+auto Gemma4Impl::kv_cache_dtype(std::size_t capacity) const -> Result<DType> {
+    const auto& capabilities = device().capabilities();
+    const auto activation = impl_->context.activation_dtype();
+    // The QAT path already rounds cache rows onto an INT8 grid, so bytes cost no accuracy and a quarter the reads.
+    auto byte_cache_supported = impl_->qat && capabilities.compute.supports(tensor::TransformerSupport::QUANTIZED) &&
+                                capabilities.attention.int8_cache_tokens &&
+                                capacity <= capabilities.attention.int8_cache_tokens && impl_->shared_begin > 0;
+    for (int index = 0; byte_cache_supported && index < impl_->shared_begin; ++index)
+        byte_cache_supported = impl_->layers->at(static_cast<std::size_t>(index))->has_cache_scales();
+    if (const auto requested = core::cache_dtype(impl_->kv_cache_precision)) {
+        if (*requested == DType::I8 ? !byte_cache_supported
+                                    : !capabilities.attention.accepts_cache(activation, *requested))
+            return std::unexpected(Error{ErrorCode::UNSUPPORTED,
+                                         "KV-cache precision " + std::string(core::to_string(impl_->kv_cache_precision)) +
+                                             " is unsupported by this model or backend"});
+        return *requested;
+    }
+    const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
+    if (byte_cache_supported && (cache_override == nullptr || std::string_view(cache_override) != "0"))
+        return DType::I8;
+    // AUTO never picks a lossy FP8/FP4 cache; those stay explicit opt-ins.
+    for (const auto candidate : {DType::BF16, DType::F32})
+        if (capabilities.attention.accepts_cache(activation, candidate)) return candidate;
+    return activation;
+}
 auto Gemma4Impl::create_state(std::size_t capacity) -> Result<std::unique_ptr<LanguageModelState>> {
     try {
         if (!capacity || capacity > static_cast<std::size_t>(impl_->maximum_position))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Gemma 4 cache capacity"});
         auto result = std::make_unique<Gemma4State>();
         result->capacity = capacity;
-        if ((impl_->kv_cache_precision == core::KVCachePrecision::BF16 &&
-             impl_->context.activation_dtype() != DType::BF16) ||
-            impl_->kv_cache_precision == core::KVCachePrecision::E4M3 ||
-            impl_->kv_cache_precision == core::KVCachePrecision::E5M2)
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "selected KV-cache precision is not implemented"});
-        // The QAT path already rounds cache rows onto an INT8 grid, so bytes cost no accuracy and a quarter the reads.
-        const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
-        const auto& capabilities = device().capabilities();
-        auto byte_cache_supported = impl_->qat &&
-                                    capabilities.compute.supports(tensor::TransformerSupport::QUANTIZED) &&
-                                    capabilities.attention.int8_cache_tokens &&
-                                    capacity <= capabilities.attention.int8_cache_tokens && impl_->shared_begin > 0;
-        for (int index = 0; byte_cache_supported && index < impl_->shared_begin; ++index)
-            byte_cache_supported = impl_->layers->at(static_cast<std::size_t>(index))->has_cache_scales();
-        const auto request_byte_cache = impl_->kv_cache_precision == core::KVCachePrecision::INT8;
-        if (request_byte_cache && !byte_cache_supported)
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "INT8 KV cache is unsupported by this model or backend"});
-        const auto byte_cache =
-            byte_cache_supported &&
-            (request_byte_cache || (impl_->kv_cache_precision == core::KVCachePrecision::AUTO &&
-                                    (cache_override == nullptr || std::string_view(cache_override) != "0")));
-        const auto bfloat_cache = impl_->context.activation_dtype() == DType::BF16 &&
-                                  (impl_->kv_cache_precision == core::KVCachePrecision::AUTO ||
-                                   impl_->kv_cache_precision == core::KVCachePrecision::BF16);
-        const auto cache_dtype = byte_cache ? DType::I8 : bfloat_cache ? DType::BF16 : DType::F32;
+        const auto cache_dtype = require(kv_cache_dtype(capacity));
+        const auto byte_cache = cache_dtype == DType::I8;
         for (int index = 0; index < impl_->shared_begin; ++index) {
             const std::vector<std::int64_t> shape{1, static_cast<std::int64_t>(capacity),
                                                   impl_->key_heads * impl_->head_width[impl_->kind[index]]};
@@ -716,6 +741,8 @@ auto Gemma4Impl::run_batch(std::span<const std::int32_t> tokens, std::span<Langu
 struct Gemma4Impl::Attention {
     std::vector<std::array<Tensor, 2>> masks;
     std::vector<std::array<std::size_t, 2>> key_starts;
+    std::vector<std::size_t> key_extents;
+    std::vector<Tensor> query_positions;
     std::array<std::array<Tensor, 2>, 2> angles;
 };
 
@@ -761,10 +788,21 @@ auto Gemma4Impl::attention_inputs(Gemma4State& state, std::span<LanguageModelSta
     Attention result;
     result.masks.resize(requests);
     result.key_starts.resize(requests);
+    result.key_extents.resize(requests);
+    result.query_positions.resize(requests);
     std::vector<std::array<std::array<Tensor, 2>, 2>> row_angles(requests);
     for (std::size_t row = 0; row < requests; ++row) {
         const auto& request = batch_states.empty() ? state : static_cast<const Gemma4State&>(*batch_states[row]);
         const auto extent = std::min(request.capacity, ((request.position + step_count + 127) / 128) * 128);
+        result.key_extents[row] = extent;
+        if (device().kind == tensor::DeviceKind::CUDA) {
+            std::vector<std::int32_t> positions(step_count);
+            for (std::size_t query = 0; query < step_count; ++query)
+                positions[query] = static_cast<std::int32_t>(request.position + query);
+            result.query_positions[row] =
+                require(Tensor::from_host({1, 1, static_cast<std::int64_t>(step_count), 1},
+                                          std::span<const std::int32_t>(positions), device()));
+        }
         const auto crop_device = device().policy().transformer.crop_history;
         result.key_starts[row] = {request.crop_local_attention && crop_device &&
                                           request.position + 1 > static_cast<std::size_t>(impl_->window)
@@ -773,14 +811,9 @@ auto Gemma4Impl::attention_inputs(Gemma4State& state, std::span<LanguageModelSta
                                   0};
         for (int type = 0; type < 2; ++type) {
             const auto start = result.key_starts[row][type], count = extent - start;
-            std::vector<float> values(step_count * count, -1e9F);
-            for (std::size_t query = 0; query < step_count; ++query)
-                for (std::size_t column = start; column <= request.position + query; ++column)
-                    if (type == 1 || request.position + query - column < static_cast<std::size_t>(impl_->window))
-                        values[query * count + column - start] = 0.F;
-            result.masks[row][type] = require(
-                Tensor::from_host({1, 1, static_cast<std::int64_t>(step_count), static_cast<std::int64_t>(count)},
-                                  std::span<const float>(values), device()));
+            if (device().kind != tensor::DeviceKind::CUDA)
+                result.masks[row][type] =
+                    make_attention_mask(device(), request.position, step_count, start, count, type, impl_->window);
             row_angles[row][type] = impl_->positions(type, request.position, step_count);
         }
     }
@@ -843,6 +876,7 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
     // Key extents follow the context's step policy: 128-position buckets and local-attention crops on CPU, Vulkan and
     // WebGPU, coarser fixed shapes when an accelerator compiles the step.
     const auto extent = context.step_extent(position + length, state.capacity);
+    const bool structured_mask = device.kind == tensor::DeviceKind::CUDA;
     const bool crop =
         state.crop_local_attention && device.policy().transformer.crop_history && context.crop_local_attention();
     const std::array<std::size_t, 2> key_starts{crop && position + 1 > static_cast<std::size_t>(impl_->window)
@@ -850,29 +884,26 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
                                                     : 0,
                                                 0};
     for (int type = 0; type < 2; ++type) {
-        const auto start = key_starts[type], count = extent - start;
-        auto mask = require(step_input(inputs.masks[type],
-                                       {1, 1, static_cast<std::int64_t>(length), static_cast<std::int64_t>(count)},
-                                       DType::F32, staging_device)
-                                .data<float>());
-        for (std::size_t query = 0; query < length; ++query)
-            for (std::size_t column = 0; column < count; ++column) {
-                const auto key = start + column, current = position + query;
-                mask[query * count + column] =
-                    key <= current && (type == 1 || current - key < static_cast<std::size_t>(impl_->window)) ? 0.F
-                                                                                                             : -1e9F;
-            }
+        if (!structured_mask) {
+            const auto start = key_starts[type], count = extent - start;
+            auto& mask = step_input(inputs.masks[type],
+                                    {1, 1, static_cast<std::int64_t>(length), static_cast<std::int64_t>(count)},
+                                    DType::F32, staging_device);
+            fill_attention_mask(mask, position, length, start, type, static_cast<std::size_t>(impl_->window));
+        }
         const std::vector<std::int64_t> shape{1, static_cast<std::int64_t>(length), 1, impl_->head_width[type] / 2};
         impl_->rotary_angles(
             type, position,
             require(step_input(inputs.angles[type][0], shape, DType::F32, staging_device).data<float>()),
             require(step_input(inputs.angles[type][1], shape, DType::F32, staging_device).data<float>()));
     }
-    // Step inputs: tokens, positions, masks, angles, then key/value caches per producer layer.
+    // Step inputs: tokens, positions, optional masks, angles, then key/value caches per producer layer.
     auto& step = impl_->step_inputs;
-    step.assign({tokens, inputs.index, inputs.masks[0], inputs.masks[1], inputs.angles[0][0], inputs.angles[0][1],
-                 inputs.angles[1][0], inputs.angles[1][1]});
+    step.assign({tokens, inputs.index});
+    if (!structured_mask) step.insert(step.end(), {inputs.masks[0], inputs.masks[1]});
+    for (const auto& angles : inputs.angles) step.insert(step.end(), {angles[0], angles[1]});
     step = context.stage_inputs(step);
+    const auto cache_start = 2 + (structured_mask ? 0 : 2) + 4;
     for (const auto& cache : state.layers) step.insert(step.end(), {cache.key, cache.value});
     // Image embeddings are request data, not graph constants. Prepare the multimodal embedding on the host and bind
     // it as step inputs so the same compiled transformer body works for every image of this shape.
@@ -891,7 +922,9 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
     }
     const auto key = std::string(prefill ? "gemma4_prefill:" : "gemma4_decode:") + std::to_string(length) + ':' +
                      std::to_string(state.capacity) + ':' + std::to_string(extent) + ':' +
-                     std::to_string(key_starts[0]) + (image_rows ? ":images" : "") +
+                     std::to_string(key_starts[0]) + ':' +
+                     std::to_string(static_cast<int>(state.layers.front().key.dtype())) +
+                     (image_rows ? ":images" : "") +
                      (prefill  ? ""
                       : select ? ":token"
                                : ":logits");
@@ -911,14 +944,15 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
     const auto outputs = context.replay(replay_key, step, [&](std::span<const Tensor> operands) {
         std::vector<layers::KeyValue> caches;
         for (std::size_t producer = 0; producer < state.layers.size(); ++producer)
-            caches.push_back({operands[8 + 2 * producer], operands[9 + 2 * producer],
+            caches.push_back({operands[cache_start + 2 * producer], operands[cache_start + 1 + 2 * producer],
                               state.layers[producer].key_quantization, state.layers[producer].value_quantization});
         const auto layers = impl_->layer_count, width = impl_->per_layer_width;
         const auto rows = static_cast<std::int64_t>(length);
-        auto hidden = image_rows ? operands[8 + 2 * state.layers.size()] : impl_->tokens->forward(context, operands[0]);
+        auto hidden = image_rows ? operands[cache_start + 2 * state.layers.size()]
+                                 : impl_->tokens->forward(context, operands[0]);
         const auto per_layer = [&] {
-            if (image_rows) return operands[9 + 2 * state.layers.size()];
-            const auto token_inputs = external_rows ? operands[8 + 2 * state.layers.size()]
+            if (image_rows) return operands[cache_start + 1 + 2 * state.layers.size()];
+            const auto token_inputs = external_rows ? operands[cache_start + 2 * state.layers.size()]
                                                     : impl_->per_layer_tokens->forward(context, operands[0]);
             auto projection =
                 context.multiply(impl_->per_layer_projection->forward(context, hidden), impl_->projection_scale);
@@ -927,17 +961,27 @@ auto Gemma4Impl::captured_step(const Tensor& tokens, Gemma4State& state, Gemma4S
                                                 context.reshape(token_inputs, {1, rows, layers, width})),
                                     impl_->combination_scale);
         }();
+        const auto positions = structured_mask ? context.reshape(operands[1], {1, 1, rows, 1}) : Tensor{};
         std::array<layers::Gemma4AttentionSegment, 1> segments;
         // Prefill only has to write the producer layers' K/V; the last producer's output is never read.
         const auto count = prefill ? impl_->shared_begin : impl_->layer_count;
         for (int layer = 0; layer < count; ++layer) {
             const auto type = impl_->kind[layer];
             const bool cache_only = prefill && layer + 1 == count;
-            segments[0] = {&caches[impl_->cache_layer[layer]],          position,    length, &operands[2 + type],
-                           static_cast<std::int64_t>(key_starts[type]), &operands[1]};
+            segments[0] = {&caches[impl_->cache_layer[layer]],
+                           position,
+                           length,
+                           structured_mask ? nullptr : &operands[2 + type],
+                           static_cast<std::int64_t>(key_starts[type]),
+                           &operands[1],
+                           static_cast<std::int64_t>(extent),
+                           structured_mask ? &positions : nullptr,
+                           type == 0 ? impl_->window : 0,
+                           true};
             hidden = impl_->layers->at(layer)->forward_segments(
                 context, hidden, cache_only ? Tensor{} : per_layer_input(per_layer, layer, rows), segments,
-                operands[4 + 2 * type], operands[5 + 2 * type], cache_only);
+                operands[2 + (structured_mask ? 0 : 2) + 2 * type],
+                operands[3 + (structured_mask ? 0 : 2) + 2 * type], cache_only);
         }
         for (std::size_t producer = 0; producer < state.layers.size(); ++producer) {
             state.layers[producer].key_quantization = caches[producer].key_quantization;
@@ -1005,8 +1049,16 @@ auto Gemma4Impl::prefill_impl(std::span<const std::int32_t> tokens, Gemma4State&
             const bool cache_only = layer + 1 == impl_->shared_begin;
             const auto input = cache_only ? Tensor{} : per_layer_input(per_layer, layer, length);
             const auto type = impl_->kind[layer];
-            segments[0] = {&state.layers[impl_->cache_layer[layer]], state.position, tokens.size(),
-                           &attention.masks[0][type], static_cast<std::int64_t>(attention.key_starts[0][type])};
+            const bool structured_mask = device().kind == tensor::DeviceKind::CUDA;
+            segments[0] = {&state.layers[impl_->cache_layer[layer]],
+                           state.position,
+                           tokens.size(),
+                           structured_mask ? nullptr : &attention.masks[0][type],
+                           static_cast<std::int64_t>(attention.key_starts[0][type]),
+                           nullptr,
+                           static_cast<std::int64_t>(attention.key_extents[0]),
+                           structured_mask ? &attention.query_positions[0] : nullptr,
+                           type == 0 ? impl_->window : 0};
             hidden = impl_->layers->at(layer)->forward_segments(
                 context, hidden, input, segments, attention.angles[type][0], attention.angles[type][1], cache_only);
         }
@@ -1076,19 +1128,30 @@ auto Gemma4Impl::project(std::span<const std::int32_t> tokens, Gemma4State& stat
                 hidden = context.slice(hidden, 1, query_offset, active_length);
                 per_layer = context.slice(per_layer, 1, query_offset, active_length);
                 for (int type = 0; type < 2; ++type) {
-                    attention.masks[0][type] = context.slice(attention.masks[0][type], 2, query_offset, active_length);
+                    if (attention.masks[0][type].defined())
+                        attention.masks[0][type] =
+                            context.slice(attention.masks[0][type], 2, query_offset, active_length);
                     for (auto& component : attention.angles[type])
                         component = context.slice(component, 1, query_offset, active_length);
                 }
+                if (attention.query_positions[0].defined())
+                    attention.query_positions[0] =
+                        context.slice(attention.query_positions[0], 2, query_offset, active_length);
             }
             const auto input = per_layer_input(per_layer, layer, active_length);
             const auto type = impl_->kind[layer];
             for (std::size_t row = 0; row < requests; ++row) {
                 auto& request = batch_states.empty() ? state : static_cast<Gemma4State&>(*batch_states[row]);
-                segments[row] = {&request.layers[impl_->cache_layer[layer]], request.position + query_offset,
+                const bool structured_mask = device().kind == tensor::DeviceKind::CUDA;
+                segments[row] = {&request.layers[impl_->cache_layer[layer]],
+                                 request.position + query_offset,
                                  batch_states.empty() ? static_cast<std::size_t>(active_length) : step_count,
-                                 &attention.masks[row][type],
-                                 static_cast<std::int64_t>(attention.key_starts[row][type])};
+                                 structured_mask ? nullptr : &attention.masks[row][type],
+                                 static_cast<std::int64_t>(attention.key_starts[row][type]),
+                                 nullptr,
+                                 static_cast<std::int64_t>(attention.key_extents[row]),
+                                 structured_mask ? &attention.query_positions[row] : nullptr,
+                                 type == 0 ? impl_->window : 0};
             }
             hidden = impl_->layers->at(layer)->forward_segments(context, hidden, input, segments,
                                                                 attention.angles[type][0], attention.angles[type][1]);

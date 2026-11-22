@@ -180,9 +180,6 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
         if (options.precision == core::InferencePrecision::LOWBIT_PARITY)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "lowbit-parity currently requires Apple Accelerate"});
 #endif
-        if (options.kv_cache_precision == core::KVCachePrecision::E4M3 ||
-            options.kv_cache_precision == core::KVCachePrecision::E5M2)
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "selected KV-cache precision is not implemented"});
         if (options.kv_cache_precision == core::KVCachePrecision::INT8 && !qat)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "INT8 KV cache requires a calibrated QAT checkpoint"});
         auto tokenizer = [&] {
@@ -248,6 +245,7 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
 #endif
         model->set_precision(options.precision);
         model->set_kv_cache_precision(options.kv_cache_precision);
+        require(model->kv_cache_dtype(1));
         if (!options.assistant_model.empty() && !model->accelerator().empty())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding requires a native CPU target"});
         if (!lm_head_index.empty() && options.weight_bits)

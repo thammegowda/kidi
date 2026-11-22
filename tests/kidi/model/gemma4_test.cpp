@@ -589,6 +589,47 @@ auto check_hnsw_head(kidi::model::Gemma4& network, const kidi::tensor::Tensor& w
     }
 }
 
+auto check_cuda_cache_precision(const YAML::Node& config, const kidi::checkpoint::Weights& checkpoint,
+                                 std::span<const std::int32_t> tokens) -> void {
+    using namespace kidi;
+    using ops::require;
+    const auto device = tensor::Device::cuda();
+    const auto backend = tensor::BackendRegistry::instance().backend(device);
+    if (!backend || !(*backend)->is_available(device) || !(*backend)->supports_execution()) return;
+    const ModuleScope construction(tensor::DType::F32, false, device);
+    auto network = require(model::Gemma4Impl::create(config));
+    require(network->set_checkpoint(checkpoint));
+    network->set_kv_cache_precision(core::KVCachePrecision::FP32);
+    auto reference = require(network->create_state(8));
+    const auto first = tokens.first(2);
+    const auto next = tokens.subspan(2, 1);
+    const auto expected_prefill = require(require(network->forward(first, *reference, true)).to(tensor::Device::cpu()));
+    const auto expected_decode = require(require(network->forward(next, *reference)).to(tensor::Device::cpu()));
+    const auto close = [&](const tensor::Tensor& output, const tensor::Tensor& expected) {
+        const auto host = require(output.to(tensor::Device::cpu()));
+        if (host.dtype() != tensor::DType::F32 || !std::ranges::equal(host.shape(), expected.shape()))
+            throw std::runtime_error("BF16 cache changed output dtype or geometry");
+        const auto actual = require(host.data<float>()), values = require(expected.data<float>());
+        for (std::size_t index = 0; index < actual.size(); ++index)
+            if (!std::isfinite(actual[index]) ||
+                std::abs(actual[index] - values[index]) > 0.03F + 0.02F * std::abs(values[index]))
+                throw std::runtime_error("BF16 cache changed CUDA model logits beyond tolerance");
+    };
+    for (const auto precision : {core::KVCachePrecision::AUTO, core::KVCachePrecision::BF16}) {
+        network->set_kv_cache_precision(precision);
+        auto state = require(network->create_state(8));
+        for (const auto& layer : static_cast<const model::Gemma4State&>(*state).layers)
+            if (layer.key.dtype() != tensor::DType::BF16 || layer.value.dtype() != tensor::DType::BF16)
+                throw std::runtime_error("CUDA cache did not use BF16 storage");
+        close(require(network->forward(first, *state, true)), expected_prefill);
+        auto fork = require(network->fork_state(*state, first.size(), 8));
+        close(require(network->forward(next, *state)), expected_decode);
+        close(require(network->forward(next, *fork)), expected_decode);
+        require(network->rewind(*state, 0));
+        close(require(network->forward(first, *state, true)), expected_prefill);
+    }
+}
+
 auto check_bfloat_model(const YAML::Node& config, const kidi::checkpoint::Weights& checkpoint,
                         std::span<const std::int32_t> tokens) -> bool {
     using namespace kidi;
@@ -722,6 +763,7 @@ auto main() -> int {
             const auto token_tensor = ops::require(reference.tensor("tokens"));
             const auto expected = ops::require(reference.tensor("logits"));
             const auto tokens = ops::require(token_tensor.data<std::int32_t>());
+            check_cuda_cache_precision(config, checkpoint, tokens);
             if (fixture == std::string_view("gemma4") && !check_bfloat_model(config, checkpoint, tokens))
                 return failed(__LINE__);
             if (fixture == std::string_view("gemma4")) check_async_serving(config);

@@ -76,6 +76,11 @@ struct Gemma4AttentionSegment {
     /// When set, K/V rows are written at these I32 cache positions with `scatter_`, so the offset can change
     /// between replays of a captured step; `position` then only validates the write.
     const Tensor* index = nullptr;
+    std::int64_t key_extent = 0;
+    /// Compact CUDA causal-mask descriptor; window 0 selects global attention.
+    const Tensor* query_positions = nullptr;
+    std::int64_t attention_window = 0;
+    bool unique_indices = false;
 };
 class Gemma4AttentionImpl : public Module {
 public:

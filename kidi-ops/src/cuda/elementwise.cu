@@ -332,6 +332,10 @@ __global__ void greedy(Launch plan) {
 }
 
 __device__ void copy_element(const View& output, std::size_t destination, const View& input, std::size_t source) {
+    if (output.type != input.type) {
+        write(output, destination, read(input, source));
+        return;
+    }
     const auto type = static_cast<Type>(output.type);
     if (type == Type::F32 || type == Type::I32)
         static_cast<std::uint32_t*>(address(output))[destination] =
@@ -403,14 +407,26 @@ __global__ void scatter_updates(Launch plan) {
     const auto* indices = static_cast<const int*>(address(plan.inputs[2]));
     const auto target = indices[row];
     if (target < 0 || target >= plan.output.shape[1]) return;
-    for (std::int64_t later = row + 1; later < rows; ++later)
-        if (indices[later] == target) return;
+    if (!plan.attribute_count || !plan.attributes[0])
+        for (std::int64_t later = row + 1; later < rows; ++later)
+            if (indices[later] == target) return;
     const auto destination = (batch * plan.output.shape[1] + target) * width + index % width;
-    const auto type = static_cast<Type>(plan.output.type);
-    const int bytes = type == Type::F16 || type == Type::BF16 ? 2 : type == Type::F32 || type == Type::I32 ? 4 : 1;
-    auto* output = static_cast<unsigned char*>(address(plan.output));
-    const auto* source = static_cast<const unsigned char*>(address(plan.inputs[1]));
-    for (int byte = 0; byte < bytes; ++byte) output[destination * bytes + byte] = source[index * bytes + byte];
+    copy_element(plan.output, destination, plan.inputs[1], index);
+}
+
+__global__ void scatter_key_value_updates(Launch plan) {
+    const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= plan.elements) return;
+    const auto width = plan.inputs[2].shape[2], rows = plan.inputs[2].shape[1];
+    const auto row = index / width % rows, batch = index / (width * rows);
+    const auto* indices = static_cast<const int*>(address(plan.inputs[4]));
+    const auto target = indices[row];
+    if (target < 0 || target >= plan.inputs[0].shape[1]) return;
+    const auto column = index % width;
+    const auto key_destination = (batch * plan.inputs[0].shape[1] + target) * width + column;
+    const auto value_destination = (batch * plan.inputs[1].shape[1] + target) * width + column;
+    copy_element(plan.inputs[0], key_destination, plan.inputs[2], index);
+    copy_element(plan.inputs[1], value_destination, plan.inputs[3], index);
 }
 
 __global__ void embedding(Launch plan) {
@@ -591,6 +607,12 @@ auto layout(const Launch& plan, cudaStream_t stream) -> void {
 auto scatter_updates(const Launch& plan, cudaStream_t stream) -> void {
     if (plan.elements)
         kernel::scatter_updates<<<static_cast<unsigned int>((plan.elements + 255) / 256), 256, 0, stream>>>(plan);
+}
+
+auto scatter_key_value_updates(const Launch& plan, cudaStream_t stream) -> void {
+    if (plan.elements)
+        kernel::scatter_key_value_updates<<<static_cast<unsigned int>((plan.elements + 255) / 256), 256, 0, stream>>>(
+            plan);
 }
 
 auto embedding(const Launch& plan, cudaStream_t stream) -> void {

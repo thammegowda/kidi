@@ -133,6 +133,13 @@ public:
                                  std::int32_t key_value_heads, const Tensor& mask, float scale = 1.F,
                                  std::int64_t key_start = 0, const BlockwiseQuantization& key_quantization = {},
                                  const BlockwiseQuantization& value_quantization = {}) -> Tensor;
+    /// CUDA causal attention uses I32 query positions shaped [1, 1, queries, 1]; window 0 means unbounded history.
+    auto grouped_query_attention_causal(const Tensor& query, const Tensor& key, const Tensor& value,
+                                        std::int32_t heads, std::int32_t key_value_heads,
+                                        const Tensor& query_positions, std::int64_t window, float scale = 1.F,
+                                        std::int64_t key_start = 0,
+                                        const BlockwiseQuantization& key_quantization = {},
+                                        const BlockwiseQuantization& value_quantization = {}) -> Tensor;
     auto rotary(const Tensor& input, const Tensor& cosine, const Tensor& sine) -> Tensor;
     auto linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight = false) -> Tensor;
     auto quantized_linear(const Tensor& input, const Tensor& weight, const Tensor& scale, const Tensor& bias,
@@ -194,6 +201,8 @@ public:
     auto concat(std::span<const Tensor> inputs, std::int64_t axis) -> Tensor;
     auto scatter(const Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor;
     auto scatter_(Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor&;
+    /// In-place scatter for index tensors known to contain unique positions.
+    auto scatter_unique_(Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor&;
     auto copy_slice_(Tensor& destination, const Tensor& source, std::int64_t axis, std::int64_t start) -> Tensor&;
     auto reshape(const Tensor& input, std::vector<std::int64_t> shape) -> Tensor;
 

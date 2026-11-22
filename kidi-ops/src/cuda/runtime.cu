@@ -108,6 +108,8 @@ int minimum_inputs(const Descriptor& descriptor) {
         case Op::SCATTER:
         case Op::DIFFUSION_UPDATE:
             return 3;
+        case Op::SCATTER_KV:
+            return 5;
         case Op::RESIDUAL_NORM:
         case Op::RMS_ROTARY:
         case Op::QUANTIZED_LINEAR:
@@ -212,11 +214,39 @@ void infer(Descriptor& descriptor) {
         case Op::SCATTER:
             if (descriptor.input_count != 3 || input.rank != 3 || descriptor.inputs[1].rank != 3 ||
                 descriptor.inputs[2].rank != 1 || descriptor.inputs[2].type != Type::I32 ||
-                descriptor.inputs[1].type != input.type || descriptor.inputs[1].shape[0] != input.shape[0] ||
+                descriptor.attribute_count > 1 ||
+                (descriptor.attribute_count == 1 && descriptor.attributes[0] != 1) ||
+                (descriptor.inputs[1].type != input.type &&
+                 !(input.type == Type::BF16 && descriptor.inputs[1].type == Type::F32)) ||
+                descriptor.inputs[1].shape[0] != input.shape[0] ||
                 descriptor.inputs[1].shape[2] != input.shape[2] ||
                 descriptor.inputs[1].shape[1] != descriptor.inputs[2].shape[0])
                 throw std::runtime_error("CUDA: invalid scatter geometry");
             break;
+        case Op::SCATTER_KV: {
+            const auto& value_cache = descriptor.inputs[1];
+            const auto& key_updates = descriptor.inputs[2];
+            const auto& value_updates = descriptor.inputs[3];
+            const auto& indices = descriptor.inputs[4];
+            const auto cache_accepts = [](Type cache, Type updates) {
+                return cache == updates || (cache == Type::BF16 && updates == Type::F32);
+            };
+            const bool caches_match =
+                value_cache.rank == input.rank &&
+                std::equal(value_cache.shape.begin(), value_cache.shape.begin() + value_cache.rank, input.shape.begin());
+            const bool updates_match =
+                key_updates.rank == 3 && value_updates.rank == key_updates.rank &&
+                std::equal(value_updates.shape.begin(), value_updates.shape.begin() + value_updates.rank,
+                           key_updates.shape.begin()) &&
+                key_updates.shape[0] == input.shape[0] && key_updates.shape[2] == input.shape[2] &&
+                key_updates.shape[1] == indices.shape[0];
+            if (descriptor.input_count != 5 || !caches_match || input.rank != 3 || key_updates.rank != 3 ||
+                indices.rank != 1 || indices.type != Type::I32 || descriptor.attribute_count != 1 ||
+                descriptor.attributes[0] != 1 || !updates_match || !cache_accepts(input.type, key_updates.type) ||
+                !cache_accepts(value_cache.type, value_updates.type))
+                throw std::runtime_error("CUDA: invalid key/value scatter geometry");
+            break;
+        }
         case Op::GELU_GATE:
         case Op::SILU_GATE:
             output.shape[input.rank - 1] /= 2;
@@ -656,10 +686,14 @@ struct Program::Impl {
                 descriptor.attribute_count >= 4 ? descriptor.attributes[3] : descriptor.inputs[1].shape[1];
             const auto head_width = input.shape[2] / descriptor.attributes[0];
             if (!descriptor.reference_attention && (input.type == Type::BF16 || input.type == Type::F32) &&
-                descriptor.inputs[1].type == input.type && descriptor.output.type == input.type &&
+                (descriptor.inputs[1].type == input.type ||
+                 (input.type == Type::F32 && descriptor.inputs[1].type == Type::BF16)) &&
+                descriptor.output.type == input.type &&
                 input.shape[1] == 1 && (head_width == 256 || head_width == 512))
                 attention_partials.reset(allocate(
-                    input.shape[0] * descriptor.attributes[0] * ((keys + 63) / 64) * (head_width + 2) * sizeof(float),
+                    input.shape[0] * descriptor.attributes[0] *
+                        ((keys + DECODE_ATTENTION_PARTITION_SIZE - 1) / DECODE_ATTENTION_PARTITION_SIZE) *
+                        (head_width + 2) * sizeof(float),
                     device));
             if (!attention_partials) {
                 attention_launcher = select_parallel_attention(descriptor, keys, head_width, device);
@@ -743,7 +777,8 @@ void Program::run(const Tensor* inputs, int count, void* output) {
     const bool relocated =
         launch.output.binding ||
         std::any_of(launch.inputs, launch.inputs + count, [](const View& tensor) { return tensor.binding != nullptr; });
-    if (relocated && operation != Op::SCATTER && !(operation == Op::ATTENTION && descriptor.inputs[0].shape[1] == 1))
+    if (relocated && operation != Op::SCATTER && operation != Op::SCATTER_KV &&
+        !(operation == Op::ATTENTION && descriptor.inputs[0].shape[1] == 1))
         throw std::runtime_error("CUDA: relocated operands are only supported by scatter and single-query attention");
     if (operation == Op::CONV1D || operation == Op::SNAKE_CONV1D || operation == Op::SNAKE_QUANTIZED_LINEAR) {
         const bool convolution = operation != Op::SNAKE_QUANTIZED_LINEAR;
@@ -812,6 +847,24 @@ void Program::run(const Tensor* inputs, int count, void* output) {
         }
         launch.elements = inputs[1].elements();
         scatter_updates(launch, execution_stream);
+    } else if (operation == Op::SCATTER_KV && output == inputs[0].data) {
+        const auto bytes = [](Type type) -> std::size_t {
+            return type == Type::F32 || type == Type::I32 ? 4 : type == Type::F16 || type == Type::BF16 ? 2 : 1;
+        };
+        const auto overlaps = [&](int left, int right) {
+            const auto left_begin = reinterpret_cast<std::uintptr_t>(inputs[left].data);
+            const auto right_begin = reinterpret_cast<std::uintptr_t>(inputs[right].data);
+            const auto left_end = left_begin + inputs[left].elements() * bytes(inputs[left].type);
+            const auto right_end = right_begin + inputs[right].elements() * bytes(inputs[right].type);
+            return left_begin < right_end && right_begin < left_end;
+        };
+        bool source_overlaps_cache = false;
+        for (int source = 2; source < 5; ++source)
+            source_overlaps_cache = source_overlaps_cache || overlaps(0, source) || overlaps(1, source);
+        if (overlaps(0, 1) || output != inputs[0].data || source_overlaps_cache)
+            throw std::runtime_error("CUDA: in-place key/value scatter requires nonoverlapping operands");
+        launch.elements = inputs[2].elements();
+        scatter_key_value_updates(launch, execution_stream);
     } else if (operation == Op::SLICE) {
         const auto& source = inputs[0];
         const auto axis =
