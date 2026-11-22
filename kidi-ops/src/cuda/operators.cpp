@@ -25,7 +25,9 @@ using runtime::OutputPool;
 using runtime::TensorInputs;
 using tensor::Device;
 using tensor::Tensor;
-static_assert(static_cast<int>(Operation::GELU_GATE) == static_cast<int>(kidi::cuda::Op::GELU_GATE));
+static_assert(static_cast<int>(Operation::SILU_GATE) == static_cast<int>(kidi::cuda::Op::SILU_GATE));
+static_assert(static_cast<int>(Operation::RELATIVE_ATTENTION) ==
+              static_cast<int>(kidi::cuda::Op::RELATIVE_ATTENTION));
 static_assert(static_cast<int>(tensor::DType::E5M2) == static_cast<int>(kidi::cuda::Type::E5M2));
 
 auto view(const Tensor& tensor, bool bind = true) -> kidi::cuda::Tensor {

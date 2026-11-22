@@ -1,9 +1,7 @@
 #include "cuda/projection.h"
 #include "cuda/elementwise.h"
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
 #include "cuda/dense_gemm.h"
 #include "cuda/int8_gemm.h"
-#endif
 
 #include <climits>
 #include <cstring>
@@ -317,7 +315,6 @@ __device__ void write_projection(Launch plan, std::size_t row, std::size_t colum
     write(plan.output, row * columns + column, result);
 }
 
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
 __global__ void projection_epilogue(Launch plan, const int* accumulators, const int* sums, const float* scales,
                                     const int* zeros) {
     const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -326,7 +323,6 @@ __global__ void projection_epilogue(Launch plan, const int* accumulators, const 
     const auto row = index / columns, column = index % columns;
     write_projection(plan, row, column, accumulators[index] - zeros[row] * sums[column], scales);
 }
-#endif
 
 template <int Bits>
 __global__ void quantized_vector(Launch plan, const signed char* quantized, const float* scales, const int* zeros) {
@@ -739,7 +735,6 @@ void run_w8a16_vector(const Launch& launch, unsigned int grid, std::int64_t rows
         w8a16_vector<4, ColsPerWarp, Grouped><<<grid, 128, 0, stream>>>(launch, width, columns, group_size);
 }
 
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
 __global__ void float_vector(Launch plan, std::int64_t width, std::int64_t columns) {
     const int lane = threadIdx.x % 32;
     const auto column = static_cast<std::int64_t>(blockIdx.x) * 4 + threadIdx.x / 32;
@@ -762,7 +757,6 @@ __global__ void float_vector(Launch plan, std::int64_t width, std::int64_t colum
         static_cast<float*>(plan.output.data)[column] = sum;
     }
 }
-#endif
 
 } // namespace kernel
 } // namespace
@@ -834,7 +828,6 @@ auto execute_matrix(const Launch& plan, int device, bool optimized, void* worksp
     (void)device;
     (void)workspace;
     (void)slices;
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
     const bool fp32 = left.type == static_cast<int>(Type::F32) && right.type == static_cast<int>(Type::F32) &&
                       plan.output.type == static_cast<int>(Type::F32);
     if (optimized && (fp32 || (bfloat && plan.count == 2 && width % 8 == 0 && columns % 8 == 0)) && right.rank == 2 &&
@@ -868,7 +861,6 @@ auto execute_matrix(const Launch& plan, int device, bool optimized, void* worksp
             return;
         }
     }
-#endif
     kernel::matrix<<<blocks, 256, 0, stream>>>(plan);
 }
 
@@ -883,7 +875,8 @@ auto floating_projection(const Launch& plan, int device, bool reference_projecti
         }
         return;
     }
-    execute_matrix(plan, device, !reference_projection, scratch, dense_slices, stream);
+    execute_matrix(plan, device, !reference_projection, shared_workspace ? shared_workspace : scratch, dense_slices,
+                   stream);
 }
 
 auto quantized_projection(const Launch& plan, int device, bool reference_projection, bool vector_projection,
@@ -945,18 +938,15 @@ auto quantized_projection(const Launch& plan, int device, bool reference_project
     (void)accumulators;
     (void)shared_workspace;
     (void)dense_slices;
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
     constexpr std::size_t WEIGHT_ALIGNMENT = 16;
     if (!tensor_projection || vector_projection ||
         reinterpret_cast<std::uintptr_t>(plan.inputs[1].data) % WEIGHT_ALIGNMENT)
-#endif
     {
         kernel::quantized_matrix<<<blocks, 256, 0, stream>>>(plan, static_cast<const signed char*>(scratch),
                                                              static_cast<const float*>(scales),
                                                              static_cast<const int*>(zeros));
         return;
     }
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
     if (fused_w8a8) {
         const float* bias_ptr =
             plan.operation == static_cast<int>(Op::QUANTIZED_LINEAR) && plan.count >= 4 && plan.inputs[3].data
@@ -983,7 +973,6 @@ auto quantized_projection(const Launch& plan, int device, bool reference_project
     kernel::projection_epilogue<<<blocks, 256, 0, stream>>>(
         plan, static_cast<const int*>(accumulators), static_cast<const int*>(prepared_sums),
         static_cast<const float*>(scales), static_cast<const int*>(zeros));
-#endif
 }
 
 auto w8a16_projection(const Launch& plan, int device, bool reference_projection, void* shared_workspace, void* scratch,
@@ -1018,7 +1007,6 @@ auto w8a16_projection(const Launch& plan, int device, bool reference_projection,
     (void)shared_workspace;
     (void)scratch;
     (void)dense_slices;
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
     if (!reference_projection && aligned && rows > 4 && rows <= INT32_MAX && width > 0 && width <= INT32_MAX &&
         width % 64 == 0 && group_size > 0 && group_size % 64 == 0 && width % group_size == 0 && output_columns > 0 &&
         output_columns <= INT32_MAX && output_columns % 8 == 0 && dense_device(device).major >= 8) {
@@ -1028,7 +1016,6 @@ auto w8a16_projection(const Launch& plan, int device, bool reference_projection,
                    shared_workspace ? shared_workspace : scratch, dense_slices);
         return;
     }
-#endif
     kernel::w8a16_matrix<<<blocks, 256, 0, stream>>>(plan);
 }
 

@@ -1,11 +1,7 @@
 #include "cuda/dense_gemm.h"
+#include "cuda/ptx_mma.cuh"
 
 #include <cuda_bf16.h>
-#include <cutlass/arch/memory_sm75.h>
-#include <cutlass/arch/memory_sm80.h>
-#include <cutlass/arch/mma_sm80.h>
-#include <cutlass/gemm/device/gemm.h>
-#include <cutlass/gemm/device/gemm_splitk_parallel.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -15,64 +11,11 @@
 namespace kidi::cuda {
 namespace {
 
-template <typename Gemm, typename Element>
-void run_gemm(int rows, int columns, int width, const void* input, const void* weights, void* output,
-              cudaStream_t stream) {
-    auto* result = static_cast<Element*>(output);
-    const typename Gemm::Arguments arguments{{rows, columns, width},
-                                             {static_cast<const Element*>(input), width},
-                                             {static_cast<const Element*>(weights), width},
-                                             {result, columns},
-                                             {result, columns},
-                                             {1, 0}};
-    const auto status = Gemm{}(arguments, nullptr, stream);
-    if (status != cutlass::Status::kSuccess)
-        throw std::runtime_error(std::string("CUDA: CUTLASS dense GEMM failed: ") + cutlassGetStatusString(status));
-}
-
-template <typename Split>
-void split_gemm(int rows, int columns, int width, const void* input, const void* weights, void* output,
-                cudaStream_t stream, void* workspace, int slices) {
-    using Bfloat = cutlass::bfloat16_t;
-    auto* result = static_cast<Bfloat*>(output);
-    const typename Split::Arguments arguments{{rows, columns, width},
-                                              {static_cast<const Bfloat*>(input), width},
-                                              {static_cast<const Bfloat*>(weights), width},
-                                              {result, columns},
-                                              {result, columns},
-                                              {1, 0},
-                                              slices};
-    const auto status = Split{}(arguments, workspace, stream);
-    if (status != cutlass::Status::kSuccess)
-        throw std::runtime_error(std::string("CUDA: CUTLASS BF16 split-K failed: ") + cutlassGetStatusString(status));
-}
-
 constexpr int FloatRows = 32, FloatColumns = 64, FloatDepth = 32, FloatStages = 3, FloatThreads = 128;
-using Bfloat16x64 = cutlass::gemm::GemmShape<16, 64, 32>;
-using BfloatWarp16x64 = cutlass::gemm::GemmShape<16, 32, 32>;
-using Bfloat32x64 = cutlass::gemm::GemmShape<32, 64, 64>;
-using BfloatWarp32x64 = cutlass::gemm::GemmShape<16, 32, 64>;
-using Bfloat64x64 = cutlass::gemm::GemmShape<64, 64, 64>;
-using BfloatWarp64x64 = cutlass::gemm::GemmShape<32, 32, 64>;
-using Bfloat64x128 = cutlass::gemm::GemmShape<64, 128, 64>;
-using BfloatWarp64x128 = cutlass::gemm::GemmShape<32, 64, 64>;
-using BfloatInstruction = cutlass::gemm::GemmShape<16, 8, 16>;
-using BfloatEpilogue = cutlass::epilogue::thread::LinearCombination<cutlass::bfloat16_t, 8, float, float>;
-using Bfloat = cutlass::bfloat16_t;
-
-template <typename Tile, typename Warp, int Stages = 3>
-using BfloatGemm =
-    cutlass::gemm::device::Gemm<Bfloat, cutlass::layout::RowMajor, Bfloat, cutlass::layout::ColumnMajor, Bfloat,
-                                cutlass::layout::RowMajor, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-                                Tile, Warp, BfloatInstruction, BfloatEpilogue,
-                                cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, Stages, 8, 8>;
-
-template <typename Tile, typename Warp, int Stages = 3>
-using BfloatSplitGemm = cutlass::gemm::device::GemmSplitKParallel<
-    Bfloat, cutlass::layout::RowMajor, Bfloat, cutlass::layout::ColumnMajor, Bfloat, cutlass::layout::RowMajor, float,
-    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, Tile, Warp, BfloatInstruction, BfloatEpilogue,
-    cutlass::epilogue::thread::Convert<float, 8, float>, cutlass::reduction::thread::ReduceAdd<float, float, 8>,
-    cutlass::gemm::threadblock::GemmSplitKHorizontalThreadblockSwizzle, Stages, 8, 8>;
+using Bfloat = __nv_bfloat16;
+using BfloatA = ptx::Fragment<unsigned, 4>;
+using BfloatB = ptx::Fragment<unsigned, 2>;
+using BfloatC = ptx::Fragment<float, 4>;
 
 constexpr int W8Depth = 64, W8WeightStride = 80, W8Stages = 3;
 
@@ -102,8 +45,7 @@ __device__ void stage_w8a16_activations(__nv_bfloat16 (*shared)[W8Depth], const 
         const bool valid = origin + row < rows && depth + chunk * 8 < width;
         const auto* source =
             valid ? input + static_cast<std::int64_t>(origin + row) * width + depth + chunk * 8 : input;
-        cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(&shared[row][(chunk ^ (row & 3)) * 8],
-                                                                                 source, valid);
+        ptx::cp_async_zfill_16<false>(&shared[row][(chunk ^ (row & 3)) * 8], source, valid);
     }
 }
 
@@ -116,8 +58,7 @@ __device__ void stage_w8a16_weights(std::int8_t (*shared)[W8WeightStride], const
         const bool valid = origin + column < columns && depth + chunk * 16 < width;
         const auto* source =
             valid ? weights + static_cast<std::int64_t>(origin + column) * width + depth + chunk * 16 : weights;
-        cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(&shared[column][chunk * 16], source,
-                                                                                 valid);
+        ptx::cp_async_zfill_16<true>(&shared[column][chunk * 16], source, valid);
     }
 }
 
@@ -150,11 +91,8 @@ __global__ void __launch_bounds__(MWarps * NWarps * 32)
     }
     if (tiles <= 0) return;
 
-    using Mma = cutlass::arch::Mma<BfloatInstruction, 32, Bfloat, cutlass::layout::RowMajor, Bfloat,
-                                   cutlass::layout::ColumnMajor, float, cutlass::layout::RowMajor,
-                                   cutlass::arch::OpMultiplyAdd>;
-    typename Mma::FragmentC accumulators[RowMmas][ColMmas];
-    typename Mma::FragmentC totals[Grouped ? RowMmas : 1][Grouped ? ColMmas : 1];
+    BfloatC accumulators[RowMmas][ColMmas];
+    BfloatC totals[Grouped ? RowMmas : 1][Grouped ? ColMmas : 1];
 #pragma unroll
     for (int mi = 0; mi < RowMmas; ++mi)
 #pragma unroll
@@ -170,10 +108,9 @@ __global__ void __launch_bounds__(MWarps * NWarps * 32)
             stage_w8a16_weights<TileCols, Threads>(shared.parameters[tile], weights, columns, width, col_start,
                                                    (start + tile) * W8Depth);
         }
-        cutlass::arch::cp_async_fence();
+        ptx::cp_async_fence();
     }
 
-    Mma mma;
     const int sub = lane >> 3, sub_row = (sub & 1) * 8 + (lane & 7), sub_col = sub >> 1;
     for (int tile = 0; tile < tiles; ++tile) {
         const int next = tile + W8Stages - 1, next_slot = next % W8Stages;
@@ -183,35 +120,35 @@ __global__ void __launch_bounds__(MWarps * NWarps * 32)
             stage_w8a16_weights<TileCols, Threads>(shared.parameters[next_slot], weights, columns, width, col_start,
                                                    (start + next) * W8Depth);
         }
-        cutlass::arch::cp_async_fence();
-        cutlass::arch::cp_async_wait<W8Stages - 1>();
+        ptx::cp_async_fence();
+        ptx::cp_async_wait<W8Stages - 1>();
         __syncthreads();
         const int slot = tile % W8Stages;
 
 #pragma unroll
         for (int step = 0; step < 4; ++step) {
-            typename Mma::FragmentA frag_a[RowMmas];
+            BfloatA frag_a[RowMmas];
 #pragma unroll
             for (int mi = 0; mi < RowMmas; ++mi) {
                 const int r = warp_m * WarpRows + mi * 16 + sub_row;
                 const int c8 = (step * 2 + sub_col) ^ (r & 3);
-                cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(
-                    reinterpret_cast<cutlass::Array<unsigned, 4>&>(frag_a[mi]), &shared.activations[slot][r][c8 * 8]);
+                ptx::ldmatrix_x4<false>(frag_a[mi], &shared.activations[slot][r][c8 * 8]);
             }
-            typename Mma::FragmentB frag_b[ColMmas];
+            BfloatB frag_b[ColMmas];
 #pragma unroll
             for (int ni = 0; ni < ColMmas; ++ni) {
                 const int n = warp_n * (TileCols / NWarps) + ni * 8 + group_lane;
                 const auto* row_b = &shared.parameters[slot][n][step * 16];
-                auto* packed = reinterpret_cast<std::uint32_t*>(&frag_b[ni]);
-                packed[0] = convert_int8_pair_to_bfloat2(*reinterpret_cast<const std::uint16_t*>(row_b + tid * 2));
-                packed[1] = convert_int8_pair_to_bfloat2(*reinterpret_cast<const std::uint16_t*>(row_b + 8 + tid * 2));
+                frag_b[ni][0] =
+                    convert_int8_pair_to_bfloat2(*reinterpret_cast<const std::uint16_t*>(row_b + tid * 2));
+                frag_b[ni][1] =
+                    convert_int8_pair_to_bfloat2(*reinterpret_cast<const std::uint16_t*>(row_b + 8 + tid * 2));
             }
 #pragma unroll
             for (int mi = 0; mi < RowMmas; ++mi)
 #pragma unroll
                 for (int ni = 0; ni < ColMmas; ++ni)
-                    mma(accumulators[mi][ni], frag_a[mi], frag_b[ni], accumulators[mi][ni]);
+                    ptx::mma_bf16_m16n8k16(accumulators[mi][ni], frag_a[mi], frag_b[ni], accumulators[mi][ni]);
         }
         __syncthreads();
 
@@ -314,8 +251,7 @@ __device__ void stage_float_tile(float (*shared)[FloatDepth], const float* opera
         const bool valid = origin + row < rows && depth + column < width;
         const auto* source =
             valid ? operand + static_cast<std::int64_t>(origin + row) * width + depth + column : operand;
-        cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(&shared[row][column ^ ((row & 7) * 4)],
-                                                                                 source, valid);
+        ptx::cp_async_zfill_16<true>(&shared[row][column ^ ((row & 7) * 4)], source, valid);
     }
 }
 
@@ -341,7 +277,7 @@ __global__ void pipelined_float_gemm(int rows, int columns, int width, const flo
             stage_float_tile<FloatColumns>(parameters[tile], weights, columns, width, column_start,
                                            (start + tile) * FloatDepth);
         }
-        cutlass::arch::cp_async_fence();
+        ptx::cp_async_fence();
     }
     for (int tile = 0; tile < tiles; ++tile) {
         const int next = tile + FloatStages - 1, next_slot = next % FloatStages;
@@ -351,19 +287,18 @@ __global__ void pipelined_float_gemm(int rows, int columns, int width, const flo
             stage_float_tile<FloatColumns>(parameters[next_slot], weights, columns, width, column_start,
                                            (start + next) * FloatDepth);
         }
-        cutlass::arch::cp_async_fence();
-        cutlass::arch::cp_async_wait<FloatStages - 1>();
+        ptx::cp_async_fence();
+        ptx::cp_async_wait<FloatStages - 1>();
         __syncthreads();
         const int slot = tile % FloatStages;
 #pragma unroll
         for (int depth = 0; depth < FloatDepth; depth += 4) {
-            using Pack = cutlass::AlignedArray<float, 4>;
-            Pack left[4], right[4];
+            float4 left[4], right[4];
 #pragma unroll
             for (int value = 0; value < 4; ++value) {
                 const int row = row_lane + value * 4, column = column_lane + value * 8;
-                left[value] = *reinterpret_cast<const Pack*>(&activations[slot][row][depth ^ ((row & 7) * 4)]);
-                right[value] = *reinterpret_cast<const Pack*>(&parameters[slot][column][depth ^ ((column & 7) * 4)]);
+                left[value] = *reinterpret_cast<const float4*>(&activations[slot][row][depth ^ ((row & 7) * 4)]);
+                right[value] = *reinterpret_cast<const float4*>(&parameters[slot][column][depth ^ ((column & 7) * 4)]);
             }
 #pragma unroll
             for (int element = 0; element < 4; ++element)
@@ -371,7 +306,9 @@ __global__ void pipelined_float_gemm(int rows, int columns, int width, const flo
                 for (int row = 0; row < 4; ++row)
 #pragma unroll
                     for (int column = 0; column < 4; ++column)
-                        sums[row][column] = fmaf(left[row][element], right[column][element], sums[row][column]);
+                        sums[row][column] =
+                            fmaf(reinterpret_cast<const float*>(&left[row])[element],
+                                 reinterpret_cast<const float*>(&right[column])[element], sums[row][column]);
         }
         __syncthreads();
     }
@@ -385,6 +322,81 @@ __global__ void pipelined_float_gemm(int rows, int columns, int width, const flo
                 output[static_cast<std::int64_t>(target_row) * columns + target_column] = sums[row][column];
         }
     }
+}
+
+__global__ void bfloat_mma_gemm(int rows, int columns, int width, const Bfloat* input, const Bfloat* weights,
+                                Bfloat* output) {
+    __shared__ __align__(16) Bfloat activations[16][16];
+    __shared__ __align__(16) Bfloat parameters[16][16];
+    const int row_start = static_cast<int>(blockIdx.y) * 16;
+    const int column_start = static_cast<int>(blockIdx.x) * 16;
+    const int lane = threadIdx.x;
+    BfloatC accumulators[2];
+    accumulators[0].clear();
+    accumulators[1].clear();
+
+    for (int depth = 0; depth < width; depth += 16) {
+        for (int index = lane; index < 16 * 16; index += 32) {
+            const int row = index / 16;
+            const int column = index % 16;
+            const int input_row = row_start + row;
+            const int input_column = depth + column;
+            const int weight_row = column_start + row;
+            activations[row][column] =
+                input_row < rows && input_column < width ? input[input_row * width + input_column] : __float2bfloat16(0.F);
+            parameters[row][column] = weight_row < columns && input_column < width
+                                          ? weights[weight_row * width + input_column]
+                                          : __float2bfloat16(0.F);
+        }
+        __syncthreads();
+
+        BfloatA a;
+        BfloatA packed_b;
+        const int row = lane & 15;
+        const int depth_chunk = (lane >> 4) * 8;
+        ptx::ldmatrix_x4<false>(a, &activations[row][depth_chunk]);
+        const int weight_row = (lane >> 4) * 8 + (lane & 7);
+        const int weight_depth_chunk = ((lane >> 3) & 1) * 8;
+        ptx::ldmatrix_x4<false>(packed_b, &parameters[weight_row][weight_depth_chunk]);
+        const BfloatB b0{{packed_b[0], packed_b[1]}};
+        const BfloatB b1{{packed_b[2], packed_b[3]}};
+        ptx::mma_bf16_m16n8k16(accumulators[0], a, b0, accumulators[0]);
+        ptx::mma_bf16_m16n8k16(accumulators[1], a, b1, accumulators[1]);
+        __syncthreads();
+    }
+
+    const int lane_row = lane >> 2;
+    const int lane_column = (lane & 3) * 2;
+    const int row0 = row_start + lane_row;
+    const int row1 = row0 + 8;
+    const int column0 = column_start + lane_column;
+    const int column1 = column0 + 8;
+    if (row0 < rows) {
+        if (column0 < columns) output[row0 * columns + column0] = __float2bfloat16(accumulators[0][0]);
+        if (column0 + 1 < columns) output[row0 * columns + column0 + 1] = __float2bfloat16(accumulators[0][1]);
+        if (column1 < columns) output[row0 * columns + column1] = __float2bfloat16(accumulators[1][0]);
+        if (column1 + 1 < columns) output[row0 * columns + column1 + 1] = __float2bfloat16(accumulators[1][1]);
+    }
+    if (row1 < rows) {
+        if (column0 < columns) output[row1 * columns + column0] = __float2bfloat16(accumulators[0][2]);
+        if (column0 + 1 < columns) output[row1 * columns + column0 + 1] = __float2bfloat16(accumulators[0][3]);
+        if (column1 < columns) output[row1 * columns + column1] = __float2bfloat16(accumulators[1][2]);
+        if (column1 + 1 < columns) output[row1 * columns + column1 + 1] = __float2bfloat16(accumulators[1][3]);
+    }
+}
+
+__global__ void scalar_float_gemm(int rows, int columns, int width, const float* input, const float* weights,
+                                  float* output) {
+    const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto elements = static_cast<std::size_t>(rows) * columns;
+    if (index >= elements) return;
+    const int row = static_cast<int>(index / columns);
+    const int column = static_cast<int>(index % columns);
+    float sum = 0.F;
+    for (int depth = 0; depth < width; ++depth)
+        sum = fmaf(input[static_cast<std::size_t>(row) * width + depth],
+                   weights[static_cast<std::size_t>(column) * width + depth], sum);
+    output[index] = sum;
 }
 
 __global__ void sum_float_partials(const float* workspace, float* output, std::size_t elements, int slices) {
@@ -448,37 +460,15 @@ auto w8a16_gemm_slices(int rows, int columns, int width, int group_size, int mul
 
 auto bfloat_gemm(int rows, int columns, int width, const void* input, const void* weights, void* output,
                  cudaStream_t stream, void* workspace, int slices) -> void {
-    if (rows > 32 && columns >= 4096) {
-        run_gemm<BfloatGemm<Bfloat64x128, BfloatWarp64x128, 3>, Bfloat>(rows, columns, width, input, weights, output,
-                                                                        stream);
-        return;
-    }
-    if (rows > 16 && columns <= 512) {
-        if (slices > 1) {
-            split_gemm<BfloatSplitGemm<Bfloat32x64, BfloatWarp32x64, 3>>(rows, columns, width, input, weights, output,
-                                                                         stream, workspace, slices);
-        } else {
-            run_gemm<BfloatGemm<Bfloat32x64, BfloatWarp32x64, 3>, Bfloat>(rows, columns, width, input, weights, output,
-                                                                          stream);
-        }
-        return;
-    }
-    if (rows > 16) {
-        if (slices > 1) {
-            split_gemm<BfloatSplitGemm<Bfloat64x64, BfloatWarp64x64, 3>>(rows, columns, width, input, weights, output,
-                                                                         stream, workspace, slices);
-        } else {
-            run_gemm<BfloatGemm<Bfloat64x64, BfloatWarp64x64, 3>, Bfloat>(rows, columns, width, input, weights, output,
-                                                                          stream);
-        }
-        return;
-    }
-    if (slices > 1) {
-        split_gemm<BfloatSplitGemm<Bfloat16x64, BfloatWarp16x64, 4>>(rows, columns, width, input, weights, output,
-                                                                     stream, workspace, slices);
-        return;
-    }
-    run_gemm<BfloatGemm<Bfloat16x64, BfloatWarp16x64, 4>, Bfloat>(rows, columns, width, input, weights, output, stream);
+    (void)workspace;
+    (void)slices;
+    const dim3 grid(static_cast<unsigned int>((columns + 15) / 16),
+                    static_cast<unsigned int>((rows + 15) / 16));
+    bfloat_mma_gemm<<<grid, 32, 0, stream>>>(rows, columns, width, static_cast<const Bfloat*>(input),
+                                             static_cast<const Bfloat*>(weights), static_cast<Bfloat*>(output));
+    const auto status = cudaGetLastError();
+    if (status != cudaSuccess)
+        throw std::runtime_error(std::string("CUDA: BF16 GEMM failed: ") + cudaGetErrorString(status));
 }
 
 auto w8a16_gemm(int rows, int columns, int width, int group_size, const void* input, const void* weights,
@@ -532,11 +522,15 @@ auto float_gemm(int rows, int columns, int width, const void* input, const void*
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
         return;
     }
-    using Gemm = cutlass::gemm::device::Gemm<float, cutlass::layout::RowMajor, float, cutlass::layout::ColumnMajor,
-                                             float, cutlass::layout::RowMajor, float, cutlass::arch::OpClassSimt,
-                                             cutlass::arch::Sm50, cutlass::gemm::GemmShape<32, 32, 8>,
-                                             cutlass::gemm::GemmShape<16, 16, 8>, cutlass::gemm::GemmShape<1, 1, 1>>;
-    run_gemm<Gemm, float>(rows, columns, width, input, weights, output, stream);
+    (void)workspace;
+    (void)slices;
+    const auto elements = static_cast<std::size_t>(rows) * columns;
+    scalar_float_gemm<<<static_cast<unsigned int>((elements + 255) / 256), 256, 0, stream>>>(
+        rows, columns, width, static_cast<const float*>(input), static_cast<const float*>(weights),
+        static_cast<float*>(output));
+    const auto status = cudaGetLastError();
+    if (status != cudaSuccess)
+        throw std::runtime_error(std::string("CUDA: FP32 GEMM failed: ") + cudaGetErrorString(status));
 }
 
 } // namespace kidi::cuda

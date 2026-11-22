@@ -1,16 +1,10 @@
 #include "cuda/flash_attention.h"
 #include "cuda/flash_attention_device.cuh"
+#include "cuda/ptx_mma.cuh"
 #include "cuda/runtime.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <cutlass/arch/memory_sm75.h>
-#include <cutlass/arch/memory_sm80.h>
-#include <cutlass/arch/mma_sm80.h>
-#include <cutlass/array.h>
-#include <cutlass/bfloat16.h>
-#include <cutlass/gemm/gemm.h>
-#include <cutlass/layout/matrix.h>
 
 #include <cmath>
 #include <cstdint>
@@ -140,20 +134,16 @@ __global__ void __launch_bounds__(kThreads)
             for (int column = 0; column < 8; ++column)
                 destination[column] = __float2bfloat16(valid ? q_ptr[g_off + column] : 0.F);
         } else {
-            cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(destination, q_ptr + g_off, valid);
+            ptx::cp_async_zfill_16<false>(destination, q_ptr + g_off, valid);
         }
     }
-    cutlass::arch::cp_async_fence();
-    cutlass::arch::cp_async_wait<0>();
+    ptx::cp_async_fence();
+    ptx::cp_async_wait<0>();
     __syncthreads();
 
-    using MmaOp = cutlass::arch::Mma<cutlass::gemm::GemmShape<16, 8, 16>, 32, cutlass::bfloat16_t,
-                                     cutlass::layout::RowMajor, cutlass::bfloat16_t, cutlass::layout::ColumnMajor,
-                                     float, cutlass::layout::RowMajor, cutlass::arch::OpMultiplyAdd>;
-    MmaOp mma;
-    using FragmentA = typename MmaOp::FragmentA;
-    using FragmentB = typename MmaOp::FragmentB;
-    using FragmentC = typename MmaOp::FragmentC;
+    using FragmentA = ptx::Fragment<unsigned, 4>;
+    using FragmentB = ptx::Fragment<unsigned, 2>;
+    using FragmentC = ptx::Fragment<float, 4>;
 
     FragmentA q_frag[QMmas];
     const int d_start = warp * DSub;
@@ -161,10 +151,7 @@ __global__ void __launch_bounds__(kThreads)
     for (int m = 0; m < QMmas; ++m) {
         const int q_row = lane & 15;
         const int q_chunk = (d_start + m * 16) / 8 + ((lane >> 4) & 1);
-        cutlass::Array<unsigned, 4> packed;
-        cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(
-            packed, kv_smem + q_row * HeadDim + kv_swizzle_chunk(q_row, q_chunk) * 8);
-        q_frag[m] = reinterpret_cast<const FragmentA&>(packed);
+        ptx::ldmatrix_x4<false>(q_frag[m], kv_smem + q_row * HeadDim + kv_swizzle_chunk(q_row, q_chunk) * 8);
     }
     __syncthreads();
 
@@ -218,12 +205,12 @@ __global__ void __launch_bounds__(kThreads)
             const int chunk = v % KChunks;
             const int k_pos = t0 + row;
             const bool valid = k_pos < keys;
-            cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(
-                kv_smem + row * HeadDim + kv_swizzle_chunk(row, chunk) * 8,
-                k_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + chunk * 8, valid);
+            ptx::cp_async_zfill_16<false>(kv_smem + row * HeadDim + kv_swizzle_chunk(row, chunk) * 8,
+                                          k_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + chunk * 8,
+                                          valid);
         }
-        cutlass::arch::cp_async_fence();
-        cutlass::arch::cp_async_wait<0>();
+        ptx::cp_async_fence();
+        ptx::cp_async_wait<0>();
         __syncthreads();
 
         // Phase 1: S_partial = Q_warp @ K_warp^T.
@@ -237,16 +224,12 @@ __global__ void __launch_bounds__(kThreads)
             for (int np = 0; np < SNtiles / 2; ++np) {
                 const int k_row = np * 16 + ((lane >> 4) * 8) + (lane & 7);
                 const int k_chunk = (d_start + m * 16) / 8 + ((lane >> 3) & 1);
-                cutlass::Array<unsigned, 4> k_packed;
-                cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(
-                    k_packed, kv_smem + k_row * HeadDim + kv_swizzle_chunk(k_row, k_chunk) * 8);
-                FragmentB b_even, b_odd;
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_even)[0] = k_packed[0];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_even)[1] = k_packed[1];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_odd)[0] = k_packed[2];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_odd)[1] = k_packed[3];
-                mma(s_acc[2 * np + 0], q_frag[m], b_even, s_acc[2 * np + 0]);
-                mma(s_acc[2 * np + 1], q_frag[m], b_odd, s_acc[2 * np + 1]);
+                FragmentA k_packed;
+                ptx::ldmatrix_x4<false>(k_packed, kv_smem + k_row * HeadDim + kv_swizzle_chunk(k_row, k_chunk) * 8);
+                const FragmentB b_even{{k_packed[0], k_packed[1]}};
+                const FragmentB b_odd{{k_packed[2], k_packed[3]}};
+                ptx::mma_bf16_m16n8k16(s_acc[2 * np + 0], q_frag[m], b_even, s_acc[2 * np + 0]);
+                ptx::mma_bf16_m16n8k16(s_acc[2 * np + 1], q_frag[m], b_odd, s_acc[2 * np + 1]);
             }
         }
 
@@ -266,11 +249,11 @@ __global__ void __launch_bounds__(kThreads)
             const int chunk = v % KChunks;
             const int k_pos = t0 + row;
             const bool valid = k_pos < keys;
-            cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(
-                kv_smem + row * HeadDim + kv_swizzle_chunk(row, chunk) * 8,
-                v_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + chunk * 8, valid);
+            ptx::cp_async_zfill_16<false>(kv_smem + row * HeadDim + kv_swizzle_chunk(row, chunk) * 8,
+                                          v_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + chunk * 8,
+                                          valid);
         }
-        cutlass::arch::cp_async_fence();
+        ptx::cp_async_fence();
 
         // Phase 2: Reduce S across 4 warps, apply mask, online softmax, write P_bf16 to p_smem.
         const int k_pos = t0 + lane;
@@ -307,7 +290,7 @@ __global__ void __launch_bounds__(kThreads)
             p_smem[r * kBc + p_swizzle_chunk(r, p_chunk) * 8 + p_in] = __float2bfloat16(p_val);
         }
 
-        cutlass::arch::cp_async_wait<0>();
+        ptx::cp_async_wait<0>();
         __syncthreads();
 
         // Phase 3: Rescale O and accumulate O += P @ V.
@@ -329,25 +312,19 @@ __global__ void __launch_bounds__(kThreads)
         for (int kp = 0; kp < kBc / 16; ++kp) {
             const int p_row = lane & 15;
             const int p_c = kp * 2 + ((lane >> 4) & 1);
-            cutlass::Array<unsigned, 4> p_packed;
-            cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(p_packed,
-                                                              p_smem + p_row * kBc + p_swizzle_chunk(p_row, p_c) * 8);
-            const auto& p_frag = reinterpret_cast<const FragmentA&>(p_packed);
+            FragmentA p_frag;
+            ptx::ldmatrix_x4<false>(p_frag, p_smem + p_row * kBc + p_swizzle_chunk(p_row, p_c) * 8);
 
 #pragma unroll
             for (int dp = 0; dp < DNtiles / 2; ++dp) {
                 const int v_row = kp * 16 + (lane & 15);
                 const int v_chunk = (d_start + dp * 16) / 8 + ((lane >> 4) & 1);
-                cutlass::Array<unsigned, 4> v_packed;
-                cutlass::arch::ldsm<cutlass::layout::ColumnMajor, 4>(
-                    v_packed, kv_smem + v_row * HeadDim + kv_swizzle_chunk(v_row, v_chunk) * 8);
-                FragmentB v_even, v_odd;
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_even)[0] = v_packed[0];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_even)[1] = v_packed[1];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_odd)[0] = v_packed[2];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_odd)[1] = v_packed[3];
-                mma(o_acc[2 * dp + 0], p_frag, v_even, o_acc[2 * dp + 0]);
-                mma(o_acc[2 * dp + 1], p_frag, v_odd, o_acc[2 * dp + 1]);
+                FragmentA v_packed;
+                ptx::ldmatrix_x4<true>(v_packed, kv_smem + v_row * HeadDim + kv_swizzle_chunk(v_row, v_chunk) * 8);
+                const FragmentB v_even{{v_packed[0], v_packed[1]}};
+                const FragmentB v_odd{{v_packed[2], v_packed[3]}};
+                ptx::mma_bf16_m16n8k16(o_acc[2 * dp + 0], p_frag, v_even, o_acc[2 * dp + 0]);
+                ptx::mma_bf16_m16n8k16(o_acc[2 * dp + 1], p_frag, v_odd, o_acc[2 * dp + 1]);
             }
         }
         __syncthreads();
@@ -487,8 +464,7 @@ __global__ void __launch_bounds__(FaConfig<HeadDim>::Threads)
             *reinterpret_cast<uint4*>(destination) = make_uint4(pack_bf16(low.x, low.y), pack_bf16(low.z, low.w),
                                                                 pack_bf16(high.x, high.y), pack_bf16(high.z, high.w));
         } else {
-            cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(destination, q_ptr + offset,
-                                                                                     valid);
+            ptx::cp_async_zfill_16<false>(destination, q_ptr + offset, valid);
         }
     }
 
@@ -500,10 +476,8 @@ __global__ void __launch_bounds__(FaConfig<HeadDim>::Threads)
             const bool valid = key < keys;
             const std::int64_t offset = static_cast<std::int64_t>(valid ? key : 0) * kv_stride + chunk * 8;
             const int slot = (buffer * Bc + row) * HeadDim + kv_swizzle_chunk(row, chunk) * 8;
-            cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(k_smem + slot, k_base + offset,
-                                                                                     valid);
-            cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Global>(v_smem + slot, v_base + offset,
-                                                                                     valid);
+            ptx::cp_async_zfill_16<true>(k_smem + slot, k_base + offset, valid);
+            ptx::cp_async_zfill_16<true>(v_smem + slot, v_base + offset, valid);
         }
     };
 
@@ -519,13 +493,9 @@ __global__ void __launch_bounds__(FaConfig<HeadDim>::Threads)
             query_position[half] = positions[static_cast<std::size_t>(batch) * m_s0 + static_cast<std::size_t>(q_idx) * m_s2];
     }
 
-    using MmaOp = cutlass::arch::Mma<cutlass::gemm::GemmShape<16, 8, 16>, 32, cutlass::bfloat16_t,
-                                     cutlass::layout::RowMajor, cutlass::bfloat16_t, cutlass::layout::ColumnMajor,
-                                     float, cutlass::layout::RowMajor, cutlass::arch::OpMultiplyAdd>;
-    MmaOp mma;
-    using FragmentA = typename MmaOp::FragmentA;
-    using FragmentB = typename MmaOp::FragmentB;
-    using FragmentC = typename MmaOp::FragmentC;
+    using FragmentA = ptx::Fragment<unsigned, 4>;
+    using FragmentB = ptx::Fragment<unsigned, 2>;
+    using FragmentC = ptx::Fragment<float, 4>;
 
     FragmentC o_acc[OTiles];
 #pragma unroll
@@ -536,12 +506,12 @@ __global__ void __launch_bounds__(FaConfig<HeadDim>::Threads)
 
     const int tiles = key_end > key_begin ? (key_end - key_begin + Bc - 1) / Bc : 0;
     if (tiles > 0) load_tile(0, key_begin);
-    cutlass::arch::cp_async_fence();
+    ptx::cp_async_fence();
     for (int tile = 0; tile < tiles; ++tile) {
         const int t0 = key_begin + tile * Bc;
         if (tile + 1 < tiles) load_tile((tile + 1) & 1, t0 + Bc);
-        cutlass::arch::cp_async_fence();
-        cutlass::arch::cp_async_wait<1>();
+        ptx::cp_async_fence();
+        ptx::cp_async_wait<1>();
         __syncthreads();
         const auto* k_tile = k_smem + (tile & 1) * Bc * HeadDim;
         const auto* v_tile = v_smem + (tile & 1) * Bc * HeadDim;
@@ -552,23 +522,18 @@ __global__ void __launch_bounds__(FaConfig<HeadDim>::Threads)
 #pragma unroll
         for (int kk = 0; kk < HeadDim / 16; ++kk) {
             const int q_row = row_warp * 16 + (lane & 15);
-            cutlass::Array<unsigned, 4> q_packed;
-            cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(
-                q_packed, q_smem + q_row * HeadDim + kv_swizzle_chunk(q_row, kk * 2 + (lane >> 4)) * 8);
-            const auto& q_frag = reinterpret_cast<const FragmentA&>(q_packed);
+            FragmentA q_frag;
+            ptx::ldmatrix_x4<false>(q_frag, q_smem + q_row * HeadDim + kv_swizzle_chunk(q_row, kk * 2 + (lane >> 4)) * 8);
 #pragma unroll
             for (int np = 0; np < STiles / 2; ++np) {
                 const int k_row = np * 16 + ((lane >> 4) * 8) + (lane & 7);
-                cutlass::Array<unsigned, 4> k_packed;
-                cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(
-                    k_packed, k_tile + k_row * HeadDim + kv_swizzle_chunk(k_row, kk * 2 + ((lane >> 3) & 1)) * 8);
-                FragmentB b_even, b_odd;
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_even)[0] = k_packed[0];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_even)[1] = k_packed[1];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_odd)[0] = k_packed[2];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_odd)[1] = k_packed[3];
-                mma(s_acc[2 * np], q_frag, b_even, s_acc[2 * np]);
-                mma(s_acc[2 * np + 1], q_frag, b_odd, s_acc[2 * np + 1]);
+                FragmentA k_packed;
+                ptx::ldmatrix_x4<false>(k_packed,
+                                        k_tile + k_row * HeadDim + kv_swizzle_chunk(k_row, kk * 2 + ((lane >> 3) & 1)) * 8);
+                const FragmentB b_even{{k_packed[0], k_packed[1]}};
+                const FragmentB b_odd{{k_packed[2], k_packed[3]}};
+                ptx::mma_bf16_m16n8k16(s_acc[2 * np], q_frag, b_even, s_acc[2 * np]);
+                ptx::mma_bf16_m16n8k16(s_acc[2 * np + 1], q_frag, b_odd, s_acc[2 * np + 1]);
             }
         }
 
@@ -621,26 +586,20 @@ __global__ void __launch_bounds__(FaConfig<HeadDim>::Threads)
 
 #pragma unroll
         for (int kp = 0; kp < Bc / 16; ++kp) {
-            cutlass::Array<unsigned, 4> p_packed;
-            p_packed[0] = pack_bf16(s_acc[2 * kp][0], s_acc[2 * kp][1]);
-            p_packed[1] = pack_bf16(s_acc[2 * kp][2], s_acc[2 * kp][3]);
-            p_packed[2] = pack_bf16(s_acc[2 * kp + 1][0], s_acc[2 * kp + 1][1]);
-            p_packed[3] = pack_bf16(s_acc[2 * kp + 1][2], s_acc[2 * kp + 1][3]);
-            const auto& p_frag = reinterpret_cast<const FragmentA&>(p_packed);
+            const FragmentA p_frag{{pack_bf16(s_acc[2 * kp][0], s_acc[2 * kp][1]),
+                                    pack_bf16(s_acc[2 * kp][2], s_acc[2 * kp][3]),
+                                    pack_bf16(s_acc[2 * kp + 1][0], s_acc[2 * kp + 1][1]),
+                                    pack_bf16(s_acc[2 * kp + 1][2], s_acc[2 * kp + 1][3])}};
 #pragma unroll
             for (int dp = 0; dp < OTiles / 2; ++dp) {
                 const int v_row = kp * 16 + (lane & 15);
                 const int v_chunk = (d_start + dp * 16) / 8 + (lane >> 4);
-                cutlass::Array<unsigned, 4> v_packed;
-                cutlass::arch::ldsm<cutlass::layout::ColumnMajor, 4>(
-                    v_packed, v_tile + v_row * HeadDim + kv_swizzle_chunk(v_row, v_chunk) * 8);
-                FragmentB v_even, v_odd;
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_even)[0] = v_packed[0];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_even)[1] = v_packed[1];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_odd)[0] = v_packed[2];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(v_odd)[1] = v_packed[3];
-                mma(o_acc[2 * dp], p_frag, v_even, o_acc[2 * dp]);
-                mma(o_acc[2 * dp + 1], p_frag, v_odd, o_acc[2 * dp + 1]);
+                FragmentA v_packed;
+                ptx::ldmatrix_x4<true>(v_packed, v_tile + v_row * HeadDim + kv_swizzle_chunk(v_row, v_chunk) * 8);
+                const FragmentB v_even{{v_packed[0], v_packed[1]}};
+                const FragmentB v_odd{{v_packed[2], v_packed[3]}};
+                ptx::mma_bf16_m16n8k16(o_acc[2 * dp], p_frag, v_even, o_acc[2 * dp]);
+                ptx::mma_bf16_m16n8k16(o_acc[2 * dp + 1], p_frag, v_odd, o_acc[2 * dp + 1]);
             }
         }
         __syncthreads();
@@ -915,25 +874,25 @@ __global__ void __launch_bounds__(kThreads, 4)
             const int col4 = (v % KChunks4) * 4;
             const int k_pos = t0 + row;
             const bool valid = k_pos < keys;
-            cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(
-                k_smem + row * HeadDim + col4, k_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + col4,
-                valid);
+            ptx::cp_async_zfill_16<false>(k_smem + row * HeadDim + col4,
+                                          k_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + col4,
+                                          valid);
         }
-        cutlass::arch::cp_async_fence();
+        ptx::cp_async_fence();
         if constexpr (DoubleBuffer) {
             for (int v = tid; v < KVVecs; v += kThreads) {
                 const int row = v / KChunks4;
                 const int col4 = (v % KChunks4) * 4;
                 const int k_pos = t0 + row;
                 const bool valid = k_pos < keys;
-                cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(
-                    v_smem + row * HeadDim + col4,
-                    v_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + col4, valid);
+                ptx::cp_async_zfill_16<false>(v_smem + row * HeadDim + col4,
+                                              v_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + col4,
+                                              valid);
             }
-            cutlass::arch::cp_async_fence();
-            cutlass::arch::cp_async_wait<1>();
+            ptx::cp_async_fence();
+            ptx::cp_async_wait<1>();
         } else {
-            cutlass::arch::cp_async_wait<0>();
+            ptx::cp_async_wait<0>();
         }
         __syncthreads();
 
@@ -966,11 +925,11 @@ __global__ void __launch_bounds__(kThreads, 4)
                 const int col4 = (v % KChunks4) * 4;
                 const int k_pos = t0 + row;
                 const bool valid = k_pos < keys;
-                cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(
-                    v_smem + row * HeadDim + col4,
-                    v_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + col4, valid);
+                ptx::cp_async_zfill_16<false>(v_smem + row * HeadDim + col4,
+                                              v_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + col4,
+                                              valid);
             }
-            cutlass::arch::cp_async_fence();
+            ptx::cp_async_fence();
         }
 
         float p_val[2]{};
@@ -998,7 +957,7 @@ __global__ void __launch_bounds__(kThreads, 4)
             }
         }
 
-        cutlass::arch::cp_async_wait<0>();
+        ptx::cp_async_wait<0>();
         __syncthreads();
 
         for (int k = 0; k < kBcF32; ++k) {

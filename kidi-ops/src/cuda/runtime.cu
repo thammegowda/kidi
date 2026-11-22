@@ -1,12 +1,11 @@
 #include "cuda/runtime.h"
 #include "cuda/attention.h"
 #include "cuda/elementwise.h"
+#include "cuda/fused_ops.h"
 #include "cuda/launch.h"
 #include "cuda/projection.h"
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
 #include "cuda/dense_gemm.h"
 #include "cuda/int8_gemm.h"
-#endif
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -110,6 +109,11 @@ int minimum_inputs(const Descriptor& descriptor) {
             return 3;
         case Op::SCATTER_KV:
             return 5;
+        case Op::RESIDUAL_MIX:
+        case Op::SHORT_CONVOLUTION:
+            return 2;
+        case Op::RELATIVE_ATTENTION:
+            return 6;
         case Op::RESIDUAL_NORM:
         case Op::RMS_ROTARY:
         case Op::QUANTIZED_LINEAR:
@@ -127,6 +131,81 @@ int minimum_inputs(const Descriptor& descriptor) {
         }
         default:
             return 1;
+    }
+}
+
+/// Output geometry of specialized fused operations; see cuda/fused_ops.h.
+void infer_fused(Descriptor& descriptor) {
+    const auto& input = descriptor.inputs[0];
+    auto& output = descriptor.output;
+    const auto count = descriptor.input_count;
+    const auto fail = [](bool condition, const char* message) {
+        if (condition) throw std::runtime_error(std::string("CUDA: invalid ") + message);
+    };
+    switch (descriptor.operation) {
+        case Op::RESIDUAL_MIX: {
+            const auto& queries = descriptor.inputs[count - 1];
+            fail(count > 8 || queries.rank != 2 || queries.shape[0] > 4 || input.rank != 2 ||
+                     queries.shape[1] != input.shape[1],
+                 "residual mix geometry");
+            for (int index = 1; index < count - 1; ++index)
+                fail(descriptor.inputs[index].rank != 2 || descriptor.inputs[index].shape[0] != input.shape[0] ||
+                         descriptor.inputs[index].shape[1] != input.shape[1],
+                     "residual mix sources");
+            output.rank = 3;
+            output.shape = {queries.shape[0], input.shape[0], input.shape[1]};
+            output.type = Type::F32;
+            break;
+        }
+        case Op::SHORT_CONVOLUTION: {
+            const auto width = descriptor.attribute_count == 1 ? descriptor.attributes[0] : 0;
+            const auto& weight = descriptor.inputs[1];
+            fail(count > 3 || width <= 0 || input.rank != 2 || input.shape[0] < width || weight.rank != 2 ||
+                     weight.shape[0] != width || weight.shape[1] != input.shape[1] ||
+                     (count == 3 && (descriptor.inputs[2].rank != 2 ||
+                                     descriptor.inputs[2].shape[0] != input.shape[0] - width + 1 ||
+                                     descriptor.inputs[2].shape[1] % width ||
+                                     input.shape[1] % (descriptor.inputs[2].shape[1] / width))),
+                 "short convolution geometry");
+            output.shape[0] = input.shape[0] - width + 1;
+            break;
+        }
+        case Op::L2_CLIP: {
+            const auto width = input.shape[input.rank - 1];
+            fail(count > 2 || !input.rank || width <= 0 ||
+                     (count == 2 && (descriptor.inputs[1].rank != 2 || input.rank < 3 ||
+                                     descriptor.inputs[1].shape[0] != input.shape[input.rank - 2] ||
+                                     descriptor.inputs[1].shape[1] != width)),
+                 "L2 clip geometry");
+            break;
+        }
+        case Op::RELATIVE_ATTENTION: {
+            const auto* attributes = descriptor.attributes.data();
+            const auto heads = attributes[0], key_heads = attributes[1], extent = attributes[4];
+            const auto tokens = input.shape[0];
+            fail(count != 6 || descriptor.attribute_count != 5 || heads <= 0 || key_heads <= 0 || heads % key_heads ||
+                     input.rank != 2 || input.shape[1] % heads,
+                 "relative attention heads");
+            const auto width = input.shape[1] / heads;
+            const auto& key = descriptor.inputs[1];
+            const auto& value = descriptor.inputs[2];
+            fail(width % 32 || width > 256 || key.rank != 2 || key.shape[1] != key_heads * width ||
+                     !std::equal(key.shape.begin(), key.shape.begin() + 2, value.shape.begin()) ||
+                     attributes[2] < 0 || attributes[2] + tokens > key.shape[0] || attributes[3] < 0 || extent < 0 ||
+                     descriptor.inputs[3].elements() != static_cast<std::size_t>(tokens * heads * extent) ||
+                     descriptor.inputs[4].elements() != static_cast<std::size_t>(tokens * heads) ||
+                     descriptor.inputs[5].elements() != input.elements(),
+                 "relative attention geometry");
+            break;
+        }
+        case Op::SILU_GATE:
+            fail(count > 2 || input.rank != 2 || input.shape[1] % 2 || descriptor.attribute_count != 2 ||
+                     (count == 2 && descriptor.inputs[1].elements() != static_cast<std::size_t>(input.shape[0])),
+                 "softcap gate geometry");
+            output.shape[1] /= 2;
+            break;
+        default:
+            break;
     }
 }
 
@@ -248,7 +327,13 @@ void infer(Descriptor& descriptor) {
             break;
         }
         case Op::GELU_GATE:
+            output.shape[input.rank - 1] /= 2;
+            break;
         case Op::SILU_GATE:
+            if (descriptor.attribute_count == 2) {
+                infer_fused(descriptor);
+                break;
+            }
             output.shape[input.rank - 1] /= 2;
             break;
         case Op::RMS_ROTARY:
@@ -330,6 +415,12 @@ void infer(Descriptor& descriptor) {
             break;
         case Op::DIFFUSION_UPDATE:
             output.type = Type::I32;
+            break;
+        case Op::RESIDUAL_MIX:
+        case Op::SHORT_CONVOLUTION:
+        case Op::L2_CLIP:
+        case Op::RELATIVE_ATTENTION:
+            infer_fused(descriptor);
             break;
         case Op::MATMUL:
         case Op::LINEAR: {
@@ -580,7 +671,6 @@ struct Program::Impl {
                           : last_width ? static_cast<std::int64_t>(input.elements() / last_width)
                                        : 0;
         const auto width = convolution ? input.shape[2] * descriptor.attributes[0] : last_width;
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
         const bool bfloat = input.type == Type::BF16;
         if (!descriptor.reference_projection && (operation == Op::LINEAR || operation == Op::MATMUL) &&
             descriptor.input_count == 2 && (bfloat || input.type == Type::F32) &&
@@ -603,11 +693,9 @@ struct Program::Impl {
                 }
             }
         }
-#endif
         if (convolution || snake_linear) columns.reset(allocate(rows * width * sizeof(float), device));
         if (operation == Op::PACKED_LINEAR && descriptor.output.type == Type::BF16) {
             w8a16_projection = true;
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
             const auto output_columns = descriptor.output.shape[descriptor.output.rank - 1];
             const auto group_size = descriptor.attributes[1];
             if (!descriptor.reference_projection && rows > 4 && rows <= 256 && width > 0 && width <= INT32_MAX &&
@@ -627,7 +715,6 @@ struct Program::Impl {
                     }
                 }
             }
-#endif
         } else if (operation == Op::PACKED_LINEAR || operation == Op::QUANTIZED_LINEAR ||
                    ((convolution || snake_linear) && descriptor.inputs[weight_index].type == Type::I8)) {
             scratch.reset(allocate(rows * width, device));
@@ -651,7 +738,6 @@ struct Program::Impl {
                                 rows <= 4 && width > 0 && width <= 65536 && width % (32 / bits) == 0 &&
                                 output_columns > 0 && output_columns <= INT32_MAX &&
                                 prologue == ProjectionPrologue::NONE;
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
             constexpr int MIN_MAJOR = 8, WIDTH_ALIGNMENT = 16;
             tensor_projection = !descriptor.reference_projection && properties.major >= MIN_MAJOR &&
                                 (transposed || operation == Op::PACKED_LINEAR) && supported_weights && width > 0 &&
@@ -677,7 +763,6 @@ struct Program::Impl {
             } else if (tensor_projection && !vector_projection) {
                 accumulators.reset(allocate(descriptor.output.elements() * sizeof(int), device));
             }
-#endif
         } else if (operation == Op::DIFFUSION_UPDATE) {
             scratch.reset(allocate(input.elements() * sizeof(float), device));
         } else if (operation == Op::GREEDY_TOKEN && input.shape[input.rank - 1] > 4096) {
@@ -735,7 +820,6 @@ struct Program::Impl {
                             dense_slices, execution_stream);
     }
     void project(Launch launch) {
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
         const auto output_columns = launch.output.shape[launch.output.rank - 1];
         const auto width = launch.inputs[0].shape[launch.inputs[0].rank - 1];
         const bool need_prepared =
@@ -757,7 +841,6 @@ struct Program::Impl {
         }
         (void)output_columns;
         (void)width;
-#endif
         quantized_projection(launch, device, descriptor.reference_projection, vector_projection, tensor_projection,
                              fused_w8a8, scratch.get(), scales.get(), zeros.get(),
                              prepared ? (prepared->expanded ? prepared->expanded.get() : nullptr) : nullptr,
@@ -926,6 +1009,8 @@ void Program::run(const Tensor* inputs, int count, void* output) {
     } else if (operation == Op::TRANSPOSE || operation == Op::GATHER || operation == Op::CONCAT ||
                operation == Op::SCATTER) {
         layout(launch, execution_stream);
+    } else if (operation == Op::SILU_GATE && descriptor.attribute_count == 2) {
+        fused_operation(launch, operation, execution_stream);
     } else if (operation == Op::GELU_GATE || operation == Op::SILU_GATE) {
         gated_activation(launch, execution_stream);
     } else if (operation == Op::EMBEDDING) {
@@ -938,6 +1023,9 @@ void Program::run(const Tensor* inputs, int count, void* output) {
         diffusion_candidates(launch, execution_stream);
     } else if (operation == Op::DIFFUSION_UPDATE) {
         diffusion_update(launch, static_cast<float*>(impl_->scratch.get()), execution_stream);
+    } else if (operation == Op::RESIDUAL_MIX || operation == Op::SHORT_CONVOLUTION || operation == Op::L2_CLIP ||
+               operation == Op::RELATIVE_ATTENTION) {
+        fused_operation(launch, operation, execution_stream);
     } else if (operation == Op::ATTENTION) {
         const auto heads = descriptor.attributes[0],
                    key_heads = descriptor.attribute_count >= 2 ? descriptor.attributes[1] : heads;
