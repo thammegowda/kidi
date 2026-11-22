@@ -733,6 +733,12 @@ voice-cloning encoder, which is intentionally absent from the converted package.
 
 Keep generated model files, local reports and large binary artifacts out of Git.
 
+## Coding Agents
+
+[tools/agent](tools/agent/README.md) runs the Pi coding agent against a local
+model endpoint, confined by Landlock to one workspace (typically a disposable
+`git worktree`), with Python venv/uv support and read-only git metadata.
+
 ## CI and Deployment
 
 The [Pages workflow](.github/workflows/pages.yml) builds/tests Wasm variants for

@@ -308,6 +308,7 @@ target_link_libraries(kidi
         ynnpack
         ynnpack_composites
         yaml-cpp::yaml-cpp
+        nlohmann_json::nlohmann_json
     PRIVATE
         uni-algo::uni-algo
         tokenizerpp

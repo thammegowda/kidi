@@ -117,6 +117,19 @@ printf '%s\n' '{"messages":[{"role":"user","content":"Explain binary search in t
   kidi generate -m @google/gemma-4-E2B-it-qat-mobile-transformers
 ```
 
+For structured, text-only conversations, include `template_args` (even `{}`) to pass message fields and template
+options through to the model's chat template:
+
+```json
+{"messages":[{"role":"user","content":"Weather in Paris?"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","function":{"name":"weather","arguments":{"city":"Paris"}}}]},{"role":"tool","tool_call_id":"c1","content":"Sunny"}],"template_args":{"tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"reasoning_effort":"low"}}
+```
+
+Template options and tool-call argument formats are model-specific; Inkling expects `arguments` as an object, not a
+JSON-encoded string. The structured path uses the template's own thinking default unless explicitly overridden.
+Requests without `template_args` retain the existing simple-chat behavior. Structured generation currently accepts
+text only; images use the existing multimodal API. Responses still contain raw assistant text, not parsed tool calls
+or reasoning, and a model architecture must be supported separately.
+
 Add `--assistant-model` (with `@owner/model` or a local directory) to enable CPU speculative decoding in `chat` or `generate`:
 
 ```bash

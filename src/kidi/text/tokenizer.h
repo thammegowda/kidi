@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "kidi/core/error.h"
+#include <nlohmann/json.hpp>
 
 namespace kidi::text {
 
@@ -38,6 +39,10 @@ public:
     auto decode_delta(std::span<const std::int32_t> ids, std::string& emitted, bool final = false) const
         -> Result<std::string>;
     auto format_chat(std::span<const ChatMessage> messages) const -> Result<std::string>;
+    /// Renders structured messages and template arguments without imposing a thinking default.
+    auto format_chat_json(const nlohmann::ordered_json& messages,
+                          const nlohmann::ordered_json& template_args = nlohmann::ordered_json::object(),
+                          bool add_generation_prompt = true) const -> Result<std::string>;
     auto format_template(std::string_view name, const TemplateArguments& arguments) const -> Result<std::string>;
     auto encode_template(std::string_view name, const TemplateArguments& arguments) const
         -> Result<std::vector<std::int32_t>>;

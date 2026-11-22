@@ -100,12 +100,62 @@ auto main(int argc, char** argv) -> int {
     if (chat->format_chat({}) || chat->format_chat(std::span(conversation).first(3))) return 1;
     const std::array invalid{kidi::text::ChatMessage{"tool", "ignored"}, kidi::text::ChatMessage{"user", "Hi"}};
     if (chat->format_chat(invalid)) return 1;
+    const auto simple = nlohmann::ordered_json::parse(R"([{"role":"user","content":"Hi"}])");
+    auto structured = chat->format_chat_json(simple, {{"enable_thinking", true}}, false);
+    if (!structured || *structured != "<bos>user:Hi;thinking") return 1;
+    if (chat->format_chat_json(nlohmann::ordered_json::array()) ||
+        chat->format_chat_json(simple, {{"messages", "reserved"}}) ||
+        chat->format_chat_json(nlohmann::ordered_json::parse(R"([{"content":"missing role"}])")))
+        return 1;
     auto templated = kidi::text::Tokenizer::load(plain_path, {{"synthesis", synthesis_template}});
     if (!templated) return 1;
     auto synthesis = templated->format_template(
         "synthesis", {{"language", "English"}, {"instruction", "female"}, {"text", "Hello"}});
     if (!synthesis || *synthesis != "<lang>English</lang><style>female</style>Hello") return 1;
     if (templated->format_template("missing", {})) return 1;
+
+    std::ofstream(directory / "chat_template.jinja")
+        << "{% if enable_thinking is defined %}specified{% else %}default{% endif %}";
+    auto defaults = kidi::text::Tokenizer::load(plain_path);
+    if (!defaults) return 1;
+    auto unspecified = defaults->format_chat_json(simple);
+    auto disabled = defaults->format_chat_json(simple, {{"enable_thinking", false}});
+    if (!unspecified || *unspecified != "default" || !disabled || *disabled != "specified") return 1;
+
+    std::filesystem::copy_file(KIDI_INKLING_TEMPLATE, directory / "chat_template.jinja",
+                               std::filesystem::copy_options::overwrite_existing);
+    auto inkling = kidi::text::Tokenizer::load(plain_path);
+    if (!inkling) return 1;
+    auto history = nlohmann::ordered_json::parse(R"([
+      {"role":"system","content":"Be brief."},
+      {"role":"user","content":"Weather?"},
+      {"role":"assistant","content":null,"reasoning_content":"Look it up.",
+       "tool_calls":[{"id":"call1","function":{"name":"weather","arguments":{"city":"Paris"}}}]},
+      {"role":"tool","tool_call_id":"call1","content":"Sunny"}
+    ])");
+    const auto args = nlohmann::ordered_json::parse(R"({
+      "tools":[{"type":"function","function":{"name":"weather","description":"Forecast",
+        "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],
+      "reasoning_effort":"low"
+    })");
+    auto agentic = inkling->format_chat_json(history, args);
+    const std::string expected =
+        R"(<|message_system|>tool_declare<|content_xml|>[{"description":"Forecast","name":"weather","parameters":{"properties":{"city":{"type":"string"}},"type":"object"},"type":"function"}]<|end_message|>)"
+        "<|message_system|><|content_text|>Be brief.<|end_message|>"
+        "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|>"
+        "<|message_user|><|content_text|>Weather?<|end_message|>"
+        "<|message_model|><|content_thinking|>Look it up.<|end_message|>"
+        R"(<|message_model|>weather<|content_invoke_tool_json|>{"name":"weather","args":{"city":"Paris"}}<|end_message|>)"
+        "<|content_model_end_sampling|><|message_tool|>weather<|content_text|>Sunny<|end_message|>";
+    if (!agentic || *agentic != expected) {
+        std::cerr << "Inkling structured chat mismatch: " << (agentic ? *agentic : agentic.error().message) << '\n';
+        return 1;
+    }
+    if (inkling->format_chat_json(history, {{"reasoning_effort", "bad"}})) return 1;
+    history.push_back({{"role", "system"}, {"content", "Be concise."}});
+    if (!inkling->format_chat_json(history, args)) return 1;
+    history[2]["tool_calls"][0]["function"]["arguments"] = R"({"city":"Paris"})";
+    if (inkling->format_chat_json(history, args)) return 1;
 
     std::ofstream(directory / "bytes.json") << R"({
       "version":"1.0", "decoder":{"type":"ByteFallback"},

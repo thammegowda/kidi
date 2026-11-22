@@ -202,7 +202,7 @@ auto inspect(const std::filesystem::path& directory) -> int {
     return 0;
 }
 
-auto chat_messages(const nlohmann::json& request) -> kidi::Result<std::vector<kidi::text::ChatMessage>> {
+auto validate_chat_request(const nlohmann::ordered_json& request) -> kidi::Result<void> {
     const auto invalid = [](std::string message) {
         return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, std::move(message)});
     };
@@ -210,13 +210,22 @@ auto chat_messages(const nlohmann::json& request) -> kidi::Result<std::vector<ki
         request["messages"].empty())
         return invalid("expected an object with a nonempty messages array");
     for (const auto& [key, value] : request.items())
-        if (key != "messages" && key != "id" && key != "max_tokens")
+        if (key != "messages" && key != "id" && key != "max_tokens" && key != "template_args")
             return invalid("unsupported request field: " + key);
     if (request.contains("id") && !request["id"].is_string() && !request["id"].is_number_integer())
         return invalid("id must be a string or integer");
     if (request.contains("max_tokens") &&
         (!request["max_tokens"].is_number_integer() || request["max_tokens"] <= 0 || request["max_tokens"] > INT32_MAX))
         return invalid("max_tokens must be a positive integer within int32 bounds");
+    if (request.contains("template_args") && !request["template_args"].is_object())
+        return invalid("template_args must be an object");
+    return {};
+}
+
+auto chat_messages(const nlohmann::ordered_json& request) -> kidi::Result<std::vector<kidi::text::ChatMessage>> {
+    const auto invalid = [](std::string message) {
+        return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, std::move(message)});
+    };
     std::vector<kidi::text::ChatMessage> result;
     for (const auto& message : request["messages"]) {
         if (!message.is_object() || message.size() != 2 || !message.contains("role") || !message["role"].is_string() ||
@@ -335,21 +344,32 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
                     break;
                 }
                 ++line_number;
-                const auto request = nlohmann::json::parse(line, nullptr, false);
-                auto messages = chat_messages(request);
-                if (!messages) {
-                    kidi::cli::log::error("input line {}: {}", line_number, messages.error().message);
+                const auto request = nlohmann::ordered_json::parse(line, nullptr, false);
+                auto valid = validate_chat_request(request);
+                if (!valid) {
+                    kidi::cli::log::error("input line {}: {}", line_number, valid.error().message);
                     return 2;
                 }
                 auto request_options = options;
                 if (request.contains("max_tokens"))
                     request_options.maximum_new_tokens = request["max_tokens"].get<std::size_t>();
-                auto queued = generator.enqueue_chat(*messages, request_options);
+                kidi::Result<std::uint64_t> queued;
+                if (request.contains("template_args")) {
+                    queued = generator.enqueue_chat_json(request["messages"], request_options, request["template_args"]);
+                } else {
+                    auto messages = chat_messages(request);
+                    if (!messages) {
+                        kidi::cli::log::error("input line {}: {}", line_number, messages.error().message);
+                        return 2;
+                    }
+                    queued = generator.enqueue_chat(*messages, request_options);
+                }
                 if (!queued) {
                     kidi::cli::log::error("input line {}: {}", line_number, queued.error().message);
                     return queued.error().code == kidi::ErrorCode::INVALID_ARGUMENT ? 2 : 1;
                 }
-                ordered.push_back({request.value("id", nlohmann::json(*queued)), {}});
+                ordered.push_back(
+                    {request.contains("id") ? nlohmann::json(request["id"]) : nlohmann::json(*queued), {}});
             }
             if (!generator.pending_requests()) break;
             auto step = generator.step();

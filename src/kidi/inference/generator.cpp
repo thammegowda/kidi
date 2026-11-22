@@ -43,6 +43,29 @@ auto elapsed(Clock::time_point start) -> std::uint64_t {
 auto should_capture_prefill(std::string_view accelerator, std::size_t prompt_tokens) -> bool {
     return accelerator != "qnn-htp" || prompt_tokens >= QNN_PREFILL_CAPTURE_TOKENS;
 }
+
+auto validate_text_chat(const nlohmann::ordered_json& messages) -> Result<void> {
+    if (!messages.is_array() || messages.empty())
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "messages must be a nonempty array"});
+    for (const auto& message : messages) {
+        if (!message.is_object() || !message.contains("role") || !message["role"].is_string())
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "each message must have a string role"});
+        if (message.contains("images"))
+            return std::unexpected(Error{ErrorCode::UNSUPPORTED, "structured chat generation is text-only"});
+        if (!message.contains("content") || message["content"].is_null() || message["content"].is_string()) continue;
+        const auto& content = message["content"];
+        if (!content.is_array())
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "message content must be text, null or an array"});
+        for (const auto& part : content) {
+            if (part.is_string()) continue;
+            if (!part.is_object() || !part.contains("type") || !part["type"].is_string() ||
+                (part["type"] != "text" && part["type"] != "input_text") || !part.contains("text") ||
+                !part["text"].is_string())
+                return std::unexpected(Error{ErrorCode::UNSUPPORTED, "structured chat generation is text-only"});
+        }
+    }
+    return {};
+}
 } // namespace
 
 struct Generator::DraftBackend {
@@ -800,6 +823,27 @@ auto Generator::chat_prompt_tokens(std::span<const text::ChatMessage> messages) 
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
+auto Generator::enqueue_chat_json(const nlohmann::ordered_json& messages, GenerationOptions options,
+                                  const nlohmann::ordered_json& template_args) -> Result<std::uint64_t> {
+    auto valid = validate_text_chat(messages);
+    if (!valid) return std::unexpected(std::move(valid.error()));
+    auto prompt = tokenizer_.format_chat_json(messages, template_args);
+    if (!prompt) return std::unexpected(std::move(prompt.error()));
+    options.raw_prompt = true;
+    return enqueue(*prompt, options);
+}
+
+auto Generator::chat_prompt_tokens_json(const nlohmann::ordered_json& messages,
+                                        const nlohmann::ordered_json& template_args) const -> Result<std::size_t> {
+    auto valid = validate_text_chat(messages);
+    if (!valid) return std::unexpected(std::move(valid.error()));
+    auto prompt = tokenizer_.format_chat_json(messages, template_args);
+    if (!prompt) return std::unexpected(std::move(prompt.error()));
+    auto ids = tokenizer_.encode(*prompt);
+    if (!ids) return std::unexpected(std::move(ids.error()));
+    return ids->size();
+}
+
 auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> Result<std::uint64_t> {
     try {
         options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);

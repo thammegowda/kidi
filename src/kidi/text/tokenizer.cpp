@@ -146,6 +146,19 @@ auto Tokenizer::format_chat(std::span<const ChatMessage> messages) const -> Resu
     return std::move(*result);
 }
 
+auto Tokenizer::format_chat_json(const nlohmann::ordered_json& messages, const nlohmann::ordered_json& template_args,
+                                bool add_generation_prompt) const -> Result<std::string> {
+    if (!messages.is_array() || messages.empty())
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "messages must be a nonempty array"});
+    if (!impl_->value.has_chat_template())
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT, "chat requires tokenizer_config.json and a checkpoint chat template"});
+    auto result = impl_->value.apply_chat_template_json(messages, add_generation_prompt, "default", template_args);
+    if (!result)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "chat template: " + result.error().message()});
+    return std::move(*result);
+}
+
 auto Tokenizer::format_template(std::string_view name, const TemplateArguments& arguments) const
     -> Result<std::string> {
     nlohmann::json values = nlohmann::json::object();
