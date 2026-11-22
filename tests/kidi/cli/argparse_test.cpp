@@ -1,9 +1,10 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
-#include <iostream>
 #include <string>
 #include <string_view>
+
+#include <gtest/gtest.h>
 
 #include "kidi/cli/argparse.h"
 
@@ -35,12 +36,14 @@ auto contains(std::string_view value, std::string_view part) -> bool {
     return value.find(part) != std::string_view::npos;
 }
 
-} // namespace
+class ArgparseTest : public ::testing::Test {
+protected:
+    void SetUp() override { configure(parser); }
 
-auto main() -> int {
-    kidi::cli::ArgumentParser parser("kidi", "small inference toolkit");
-    configure(parser);
+    kidi::cli::ArgumentParser parser{"kidi", "small inference toolkit"};
+};
 
+TEST_F(ArgparseTest, ParsesTypedSubcommand) {
     constexpr std::array<std::string_view, 20> ARGUMENTS = {
         "predict",
         "--beam-size=3",
@@ -64,69 +67,69 @@ auto main() -> int {
         "--option=pitch=high",
     };
     const auto arguments = parser.parse_args(ARGUMENTS);
-    if (arguments.get<std::string>("command") != "predict" || arguments.get<std::int32_t>("beam_size") != 3 ||
-        !arguments.get<bool>("score") || !arguments.get<bool>("stats") || !arguments.get<bool>("profile") ||
-        arguments.get<std::int32_t>("threads") != 3 || arguments.get<std::filesystem::path>("model") != "model" ||
-        arguments.get<std::string>("input") != "input.txt" || arguments.get<std::string>("output") != "output.txt" ||
-        arguments.get<std::string>("inp_type") != "jsonl" || arguments.get<float>("length_penalty") != 0.7F ||
-        arguments.get<std::vector<std::string>>("option") !=
-            std::vector<std::string>{"gender=female", "age=young adult", "pitch=high"}) {
-        std::cerr << "typed subcommand parse failed\n";
-        return 1;
-    }
+    EXPECT_EQ(arguments.get<std::string>("command"), "predict") << "typed subcommand parse failed";
+    EXPECT_EQ(arguments.get<std::int32_t>("beam_size"), 3) << "typed subcommand parse failed";
+    EXPECT_TRUE(arguments.get<bool>("score")) << "typed subcommand parse failed";
+    EXPECT_TRUE(arguments.get<bool>("stats")) << "typed subcommand parse failed";
+    EXPECT_TRUE(arguments.get<bool>("profile")) << "typed subcommand parse failed";
+    EXPECT_EQ(arguments.get<std::int32_t>("threads"), 3) << "typed subcommand parse failed";
+    EXPECT_EQ(arguments.get<std::filesystem::path>("model"), "model") << "typed subcommand parse failed";
+    EXPECT_EQ(arguments.get<std::string>("input"), "input.txt") << "typed subcommand parse failed";
+    EXPECT_EQ(arguments.get<std::string>("output"), "output.txt") << "typed subcommand parse failed";
+    EXPECT_EQ(arguments.get<std::string>("inp_type"), "jsonl") << "typed subcommand parse failed";
+    EXPECT_EQ(arguments.get<float>("length_penalty"), 0.7F) << "typed subcommand parse failed";
+    EXPECT_EQ(arguments.get<std::vector<std::string>>("option"),
+              (std::vector<std::string>{"gender=female", "age=young adult", "pitch=high"}))
+        << "typed subcommand parse failed";
+}
 
+TEST_F(ArgparseTest, PrintsSubcommandHelp) {
     constexpr std::array<std::string_view, 2> HELP_ARGUMENTS = {"predict", "--help"};
     const auto help = parser.parse_args(HELP_ARGUMENTS);
-    if (help.status() != kidi::cli::ParseStatus::HELP || !contains(help.output(), "usage: kidi predict") ||
-        !contains(help.output(), "--beam-size N") || !contains(help.output(), "--stats") ||
-        !contains(help.output(), "--profile") || !contains(help.output(), "--option KEY=VALUE") ||
-        !contains(help.output(), "--threads N") || !contains(help.output(), "--in FILE") ||
-        !contains(help.output(), "--out FILE") || !contains(help.output(), "--inp-type {text,jsonl}") ||
-        !contains(help.output(), "--model DIR")) {
-        std::cerr << "subcommand help failed\n";
-        return 1;
-    }
+    EXPECT_EQ(help.status(), kidi::cli::ParseStatus::HELP) << "subcommand help failed";
+    for (const auto* part : {"usage: kidi predict", "--beam-size N", "--stats", "--profile", "--option KEY=VALUE",
+                             "--threads N", "--in FILE", "--out FILE", "--inp-type {text,jsonl}", "--model DIR"})
+        EXPECT_TRUE(contains(help.output(), part)) << "subcommand help failed: missing " << part;
+}
 
+TEST_F(ArgparseTest, AppliesPredictDefaults) {
     constexpr std::array<std::string_view, 3> DEFAULT_ARGUMENTS = {"predict", "-m", "model"};
     const auto defaults = parser.parse_args(DEFAULT_ARGUMENTS);
-    if (defaults.get<std::string>("input") != "-" || defaults.get<std::string>("output") != "-" ||
-        defaults.get<std::string>("inp_type") != "text" || defaults.get<bool>("score") || defaults.get<bool>("stats") ||
-        defaults.get<bool>("profile") || !defaults.get<std::vector<std::string>>("option").empty() ||
-        defaults.contains("threads")) {
-        std::cerr << "predict defaults failed\n";
-        return 1;
-    }
+    EXPECT_EQ(defaults.get<std::string>("input"), "-") << "predict defaults failed";
+    EXPECT_EQ(defaults.get<std::string>("output"), "-") << "predict defaults failed";
+    EXPECT_EQ(defaults.get<std::string>("inp_type"), "text") << "predict defaults failed";
+    EXPECT_FALSE(defaults.get<bool>("score")) << "predict defaults failed";
+    EXPECT_FALSE(defaults.get<bool>("stats")) << "predict defaults failed";
+    EXPECT_FALSE(defaults.get<bool>("profile")) << "predict defaults failed";
+    EXPECT_TRUE(defaults.get<std::vector<std::string>>("option").empty()) << "predict defaults failed";
+    EXPECT_FALSE(defaults.contains("threads")) << "predict defaults failed";
+}
 
+TEST_F(ArgparseTest, AppliesDefaultValue) {
     constexpr std::array<std::string_view, 3> INSPECT_ARGUMENTS = {"inspect", "--model", "model"};
     const auto inspect = parser.parse_args(INSPECT_ARGUMENTS);
-    if (inspect.get<std::string>("format") != "text") {
-        std::cerr << "default value failed\n";
-        return 1;
-    }
-
-    try {
-        constexpr std::array<std::string_view, 2> INVALID_ARGUMENTS = {"predict", "--beam-size=nope"};
-        static_cast<void>(parser.parse_args(INVALID_ARGUMENTS));
-        std::cerr << "invalid integer was accepted\n";
-        return 1;
-    } catch (const kidi::cli::ParseError& error) {
-        if (!contains(error.what(), "expected an integer") || !contains(error.usage(), "kidi predict")) {
-            std::cerr << "invalid integer diagnostic failed\n";
-            return 1;
-        }
-    }
-
-    try {
-        constexpr std::array<std::string_view, 1> INCOMPLETE_ARGUMENTS = {"predict"};
-        static_cast<void>(parser.parse_args(INCOMPLETE_ARGUMENTS));
-        std::cerr << "missing positional was accepted\n";
-        return 1;
-    } catch (const kidi::cli::ParseError& error) {
-        if (!contains(error.what(), "--model")) {
-            std::cerr << "missing positional diagnostic failed\n";
-            return 1;
-        }
-    }
-
-    return 0;
+    EXPECT_EQ(inspect.get<std::string>("format"), "text") << "default value failed";
 }
+
+TEST_F(ArgparseTest, RejectsInvalidInteger) {
+    constexpr std::array<std::string_view, 2> INVALID_ARGUMENTS = {"predict", "--beam-size=nope"};
+    try {
+        static_cast<void>(parser.parse_args(INVALID_ARGUMENTS));
+        FAIL() << "invalid integer was accepted";
+    } catch (const kidi::cli::ParseError& error) {
+        EXPECT_TRUE(contains(error.what(), "expected an integer")) << "invalid integer diagnostic failed";
+        EXPECT_TRUE(contains(error.usage(), "kidi predict")) << "invalid integer diagnostic failed";
+    }
+}
+
+TEST_F(ArgparseTest, RejectsMissingRequired) {
+    constexpr std::array<std::string_view, 1> INCOMPLETE_ARGUMENTS = {"predict"};
+    try {
+        static_cast<void>(parser.parse_args(INCOMPLETE_ARGUMENTS));
+        FAIL() << "missing positional was accepted";
+    } catch (const kidi::cli::ParseError& error) {
+        EXPECT_TRUE(contains(error.what(), "--model")) << "missing positional diagnostic failed";
+    }
+}
+
+} // namespace

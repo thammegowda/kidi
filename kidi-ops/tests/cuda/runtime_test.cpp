@@ -6,17 +6,14 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
-#include <iostream>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
 
+#include <gtest/gtest.h>
+
 namespace {
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
-constexpr bool USE_INT8_GEMM = true;
-#else
-constexpr bool USE_INT8_GEMM = false;
-#endif
+constexpr bool USE_FLASH_ATTENTION = true;
 
 void check_bfloat_bias(int device) {
     using namespace kidi::cuda;
@@ -40,7 +37,7 @@ void check_bfloat_bias(int device) {
     program.run(inputs.data(), 3, output.get());
     std::uint16_t actual = 0;
     copy_to_host(&actual, output.get(), sizeof(actual), device);
-    if (actual != 0x3f83) throw std::runtime_error("CUDA BF16 linear rounded before applying its bias");
+    EXPECT_EQ(actual, 0x3f83) << "CUDA BF16 linear rounded before applying its bias";
 }
 
 void check_integer_layout(int device) {
@@ -71,8 +68,9 @@ void check_integer_layout(int device) {
             const auto original = operation == Op::TRANSPOSE ? (index % 2) * 3 + index / 2
                                   : operation == Op::GATHER  ? (1 - index / 3) * 3 + index % 3
                                                              : index % values.size();
-            if (actual[index] != values[original])
-                throw std::runtime_error("CUDA integer layout lost storage precision");
+            ASSERT_EQ(actual[index], values[original])
+                << "CUDA integer layout lost storage precision: operation=" << static_cast<int>(operation)
+                << " index=" << index;
         }
     }
 }
@@ -101,8 +99,9 @@ void check_gelu(int device) {
                                           ? std::tanh(0.7978845608028654F * (value + 0.044715F * value * value * value))
                                           : std::erf(value * 0.7071067811865475F);
             const float expected = 0.5F * value * (1.F + probability);
-            if (std::abs(actual[index] - expected) > 2e-6F)
-                throw std::runtime_error("CUDA GELU ignored the requested approximation mode");
+            ASSERT_NEAR(actual[index], expected, 2e-6F)
+                << "CUDA GELU ignored the requested approximation mode: approximate=" << approximate
+                << " index=" << index;
         }
     }
 }
@@ -128,8 +127,10 @@ void check_scalar_and_empty(int device) {
         program.run(inputs.data(), 2, output.get());
         std::array<float, 3> actual{};
         copy_to_host(actual.data(), output.get(), program.output().elements() * sizeof(float), device);
-        if (broadcast ? actual != std::array<float, 3>{5.F, 6.F, 7.F} : actual[0] != 4.F)
-            throw std::runtime_error("CUDA scalar preparation or broadcasting failed");
+        if (broadcast)
+            ASSERT_EQ(actual, (std::array<float, 3>{5.F, 6.F, 7.F})) << "CUDA scalar preparation or broadcasting failed";
+        else
+            ASSERT_EQ(actual[0], 4.F) << "CUDA scalar preparation or broadcasting failed";
     }
     const std::array<Tensor, 2> inputs{Tensor{nullptr, Type::F32, 2, {2, 0}, device},
                                        Tensor{nullptr, Type::F32, 2, {0, 3}, device}};
@@ -141,7 +142,7 @@ void check_scalar_and_empty(int device) {
     program.run(inputs.data(), 2, output.get());
     std::array<float, 6> actual{};
     copy_to_host(actual.data(), output.get(), sizeof(actual), device);
-    if (actual != std::array<float, 6>{}) throw std::runtime_error("CUDA zero-width matrix produced nonzero output");
+    EXPECT_EQ(actual, (std::array<float, 6>{})) << "CUDA zero-width matrix produced nonzero output";
 }
 
 void check_greedy_selection(int device) {
@@ -166,8 +167,8 @@ void check_greedy_selection(int device) {
         program.run(&operand, 1, output.get());
         std::array<std::int32_t, 4> actual{};
         copy_to_host(actual.data(), output.get(), sizeof(actual), device);
-        if (actual != std::array<std::int32_t, 4>{1, -1, -1, -1})
-            throw std::runtime_error("CUDA greedy selection accepted invalid scores or changed tie-breaking");
+        ASSERT_EQ(actual, (std::array<std::int32_t, 4>{1, -1, -1, -1}))
+            << "CUDA greedy selection accepted invalid scores or changed tie-breaking: width=" << width;
     }
 }
 
@@ -199,8 +200,8 @@ void check_slice(int device) {
                 for (int column = 0; column < 16; ++column) {
                     const std::array coordinates{batch, row, column};
                     if (coordinates[normalized] < 1) continue;
-                    if (actual[index++] != values[(batch * 3 + row) * 16 + column])
-                        throw std::runtime_error("CUDA pitched slice did not preserve exact storage");
+                    ASSERT_EQ(actual[index++], values[(batch * 3 + row) * 16 + column])
+                        << "CUDA pitched slice did not preserve exact storage: axis=" << axis;
                 }
     }
 }
@@ -279,9 +280,9 @@ void check_attention(int device, std::int64_t keys = 19, bool long_decode_only =
                             descriptor.reference_attention = false;
                             const auto previous_bytes = allocated_bytes(device);
                             Program native(descriptor, device);
-                            if (queries > 1 && (bfloat_cache || USE_INT8_GEMM) &&
-                                allocated_bytes(device) != previous_bytes)
-                                throw std::runtime_error("CUDA fused attention allocated a score buffer");
+                            if (queries > 1 && (bfloat_cache || USE_FLASH_ATTENTION))
+                                ASSERT_EQ(allocated_bytes(device), previous_bytes)
+                                    << "CUDA fused attention allocated a score buffer";
                             native.run(inputs.data(), descriptor.input_count, output.get());
                             copy_to_host(actual.data(), output.get(), actual.size() * sizeof(Element), device);
                             for (std::size_t index = 0; index < actual.size(); ++index) {
@@ -301,13 +302,15 @@ void check_attention(int device, std::int64_t keys = 19, bool long_decode_only =
                                     bfloat || (bfloat_cache && queries > 1)
                                         ? probability_rounding + 0.0001F + 0.008F * std::abs(target)
                                         : 0.000002F;
-                                if (!std::isfinite(result) || std::abs(result - target) > tolerance) {
-                                    std::cerr << "attention mismatch queries=" << queries << " width=" << width
-                                              << " key_heads=" << key_heads << " shared=" << shared
-                                              << " masked=" << masked << " scale=" << scale << " index=" << index
-                                              << " expected=" << target << " actual=" << result << '\n';
-                                    throw std::runtime_error("CUDA attention differs from scalar reference");
-                                }
+                                const auto mismatch = [&] {
+                                    return ::testing::Message()
+                                           << "CUDA attention differs from scalar reference: queries=" << queries
+                                           << " width=" << width << " key_heads=" << key_heads
+                                           << " shared=" << shared << " masked=" << masked << " scale=" << scale
+                                           << " index=" << index;
+                                };
+                                ASSERT_TRUE(std::isfinite(result)) << mismatch();
+                                ASSERT_NEAR(result, target, tolerance) << mismatch();
                             }
                         }
                 }
@@ -368,8 +371,10 @@ void check_nonbroadcast_causal_attention(int device, bool per_key) {
             const float expected = static_cast<float>(ones) / allowed;
             for (int col = 0; col < width; ++col) {
                 const auto result = actual[(row * heads + head) * width + col];
-                if (!std::isfinite(result) || std::abs(result - expected) > (bfloat_cache ? 0.002F : 1e-4F))
-                    throw std::runtime_error("CUDA nonbroadcast causal attention differs from reference");
+                ASSERT_TRUE(std::isfinite(result))
+                    << "CUDA nonbroadcast causal attention differs from reference: per_key=" << per_key;
+                ASSERT_NEAR(result, expected, bfloat_cache ? 0.002F : 1e-4F)
+                    << "CUDA nonbroadcast causal attention differs from reference: per_key=" << per_key;
             }
         }
 }
@@ -458,13 +463,12 @@ void check_structured_prefill_attention(int device) {
                 for (std::size_t index = 0; index < actual.size(); ++index) {
                     // The scalar reference's all-masked softmax is undefined; fused attention returns zero.
                     if (masked && positions[index / (heads * width)] < offset) expected[index] = 0.F;
-                    if (!std::isfinite(actual[index]) ||
-                        std::abs(actual[index] - expected[index]) > 0.004F + 0.008F * std::abs(expected[index])) {
-                        std::cerr << "structured attention mismatch width=" << width << " first=" << first
-                                  << " window=" << window << " index=" << index << " expected=" << expected[index]
-                                  << " actual=" << actual[index] << '\n';
-                        throw std::runtime_error("CUDA structured prefill attention differs from reference");
-                    }
+                    ASSERT_TRUE(std::isfinite(actual[index]))
+                        << "CUDA structured prefill attention differs from reference: width=" << width
+                        << " first=" << first << " window=" << window << " index=" << index;
+                    ASSERT_NEAR(actual[index], expected[index], 0.004F + 0.008F * std::abs(expected[index]))
+                        << "CUDA structured prefill attention differs from reference: width=" << width
+                        << " first=" << first << " window=" << window << " index=" << index;
                 }
             }
 }
@@ -502,14 +506,14 @@ void check_bfloat_matrix(int device, int rows, int width, int columns = 33, bool
         Program native(descriptor, device);
         const auto prepared_bytes = allocated_bytes(device);
         const auto workspace_limit = transpose && allow_split_workspace ? 8 * 1024 * 1024 : 0;
-        if (prepared_bytes - previous_bytes > static_cast<std::size_t>(workspace_limit))
-            throw std::runtime_error("CUDA native BF16 GEMM exceeded the workspace budget");
-        if (native.output().type != Type::BF16) throw std::runtime_error("CUDA BF16 output dtype changed");
+        ASSERT_LE(prepared_bytes - previous_bytes, static_cast<std::size_t>(workspace_limit))
+            << "CUDA native BF16 GEMM exceeded the workspace budget: transpose=" << transpose;
+        ASSERT_EQ(native.output().type, Type::BF16) << "CUDA BF16 output dtype changed";
         native.run(inputs.data(), 2, output.get());
         copy_to_host(actual.data(), output.get(), actual.size() * sizeof(std::uint16_t), device);
-        if (actual != expected) throw std::runtime_error("CUDA native BF16 GEMM differs from reference");
-        if (allocated_bytes(device) != prepared_bytes)
-            throw std::runtime_error("CUDA native BF16 GEMM allocated during launch");
+        ASSERT_EQ(actual, expected) << "CUDA native BF16 GEMM differs from reference: transpose=" << transpose;
+        ASSERT_EQ(allocated_bytes(device), prepared_bytes)
+            << "CUDA native BF16 GEMM allocated during launch: transpose=" << transpose;
     }
 }
 
@@ -539,13 +543,12 @@ void check_float_matrix(int device, int rows, int width = 128) {
     const auto prepared_bytes = allocated_bytes(device);
     program.run(inputs.data(), 2, output.get());
     copy_to_host(actual.data(), output.get(), actual.size() * sizeof(float), device);
-    if (allocated_bytes(device) != prepared_bytes)
-        throw std::runtime_error("CUDA native FP32 GEMM allocated during launch");
+    ASSERT_EQ(allocated_bytes(device), prepared_bytes) << "CUDA native FP32 GEMM allocated during launch";
     for (int row = 0; row < rows; ++row)
         for (int column = 0; column < columns; ++column) {
             const auto expected = static_cast<float>((row % 3 + 1) * (column % 3 + 1) * (width / 2)) / 2048.F;
-            if (actual[row * columns + column] != expected)
-                throw std::runtime_error("CUDA FP32 projection lost precision");
+            ASSERT_EQ(actual[row * columns + column], expected)
+                << "CUDA FP32 projection lost precision: row=" << row << " column=" << column;
         }
 }
 
@@ -589,7 +592,7 @@ void check_wide_rms(int device) {
     const auto normalized = bfloat ? 1.F : scales.front();
     for (std::size_t index = 0; index < actual.size(); ++index) {
         const auto expected = (2.F + (index < width ? normalized : -normalized)) * multiplier;
-        if (actual[index] != encode(expected)) throw std::runtime_error("CUDA wide RMS residual rounding mismatch");
+        ASSERT_EQ(actual[index], encode(expected)) << "CUDA wide RMS residual rounding mismatch: index=" << index;
     }
 }
 
@@ -644,17 +647,20 @@ void check_w8a16_projection(int device) {
                     copy_to_host(expected.data(), output.get(), expected.size() * sizeof(std::uint16_t), device);
                     descriptor.reference_projection = false;
                     Program optimized(descriptor, device);
-                    if (optimized.output().type != Type::BF16)
-                        throw std::runtime_error("CUDA W8A16 output dtype changed");
+                    ASSERT_EQ(optimized.output().type, Type::BF16) << "CUDA W8A16 output dtype changed";
                     const auto prepared_bytes = allocated_bytes(device);
                     optimized.run(inputs.data(), 3, output.get());
-                    if (allocated_bytes(device) != prepared_bytes)
-                        throw std::runtime_error("CUDA W8A16 allocated during launch");
+                    ASSERT_EQ(allocated_bytes(device), prepared_bytes) << "CUDA W8A16 allocated during launch";
                     copy_to_host(actual.data(), output.get(), actual.size() * sizeof(std::uint16_t), device);
                     for (std::size_t index = 0; index < actual.size(); ++index) {
                         const float lhs = decode(actual[index]), rhs = decode(expected[index]);
-                        if (!std::isfinite(lhs) || std::abs(lhs - rhs) > 0.008F * (1.F + std::abs(rhs)))
-                            throw std::runtime_error("CUDA W8A16 projection differs from reference");
+                        ASSERT_TRUE(std::isfinite(lhs)) << "CUDA W8A16 projection differs from reference: rows="
+                                                        << rows << " columns=" << columns << " width=" << width
+                                                        << " group_size=" << group_size << " index=" << index;
+                        ASSERT_NEAR(lhs, rhs, 0.008F * (1.F + std::abs(rhs)))
+                            << "CUDA W8A16 projection differs from reference: rows=" << rows
+                            << " columns=" << columns << " width=" << width << " group_size=" << group_size
+                            << " index=" << index;
                     }
                 }
             }
@@ -725,13 +731,17 @@ void check_w8a8_projection(int device) {
                     optimized.run(inputs.data(), descriptor.input_count, output.get());
                     const auto prepared_bytes = allocated_bytes(device);
                     optimized.run(inputs.data(), descriptor.input_count, output.get());
-                    if (allocated_bytes(device) != prepared_bytes)
-                        throw std::runtime_error("CUDA W8A8 allocated during launch");
+                    ASSERT_EQ(allocated_bytes(device), prepared_bytes) << "CUDA W8A8 allocated during launch";
                     copy_to_host(actual.data(), output.get(), actual.size() * sizeof(float), device);
                     for (std::size_t index = 0; index < actual.size(); ++index) {
-                        if (!std::isfinite(actual[index]) ||
-                            std::abs(actual[index] - expected[index]) > 1e-4F * (1.F + std::abs(expected[index])))
-                            throw std::runtime_error("CUDA W8A8 projection differs from reference");
+                        ASSERT_TRUE(std::isfinite(actual[index]))
+                            << "CUDA W8A8 projection differs from reference: rows=" << rows
+                            << " columns=" << columns << " calibrated=" << calibrated << " bias=" << with_bias
+                            << " index=" << index;
+                        ASSERT_NEAR(actual[index], expected[index], 1e-4F * (1.F + std::abs(expected[index])))
+                            << "CUDA W8A8 projection differs from reference: rows=" << rows
+                            << " columns=" << columns << " calibrated=" << calibrated << " bias=" << with_bias
+                            << " index=" << index;
                     }
                 }
             }
@@ -764,22 +774,18 @@ void check_sparse_scatter(int device) {
     for (std::size_t row = 0; row < 4; ++row)
         for (std::size_t channel = 0; channel < 4; ++channel) {
             const auto expected = row == 1 ? values[4 + channel] : row == 3 ? values[8 + channel] : 0;
-            if (actual[row * 4 + channel] != expected) throw std::runtime_error("CUDA sparse scatter mismatch");
+            ASSERT_EQ(actual[row * 4 + channel], expected)
+                << "CUDA sparse scatter mismatch: row=" << row << " channel=" << channel;
         }
     inputs[1].data = cache.get();
-    bool rejected = false;
-    try {
-        program.run(inputs.data(), 3, cache.get());
-    } catch (const std::runtime_error&) {
-        rejected = true;
-    }
-    if (!rejected) throw std::runtime_error("CUDA sparse scatter accepted overlapping inputs");
+    EXPECT_THROW(program.run(inputs.data(), 3, cache.get()), std::runtime_error)
+        << "CUDA sparse scatter accepted overlapping inputs";
     inputs[1].data = updates.get();
     Buffer copied(allocate(sizeof(initial), device), release);
     program.run(inputs.data(), 3, copied.get());
     std::array<std::int32_t, 16> fallback{};
     copy_to_host(fallback.data(), copied.get(), sizeof(fallback), device);
-    if (fallback != actual) throw std::runtime_error("CUDA fallback scatter lost integer precision");
+    EXPECT_EQ(fallback, actual) << "CUDA fallback scatter lost integer precision";
 }
 
 void check_mixed_matrix(int device) {
@@ -831,7 +837,8 @@ void check_mixed_matrix(int device) {
                     copy_to_host(expected.data(), output.get(), sizeof(expected), device);
                     program.run(inputs.data(), 2, output.get());
                     copy_to_host(actual.data(), output.get(), sizeof(actual), device);
-                    if (actual != expected) throw std::runtime_error("CUDA mixed matrix differs from reference");
+                    ASSERT_EQ(actual, expected) << "CUDA mixed matrix differs from reference: bfloat=" << bfloat
+                                                << " type=" << static_cast<int>(type) << " transpose=" << transpose;
                 };
                 descriptor.reference_projection = false;
                 descriptor.projection_cache = make_projection_cache();
@@ -842,8 +849,8 @@ void check_mixed_matrix(int device) {
                     const auto bytes = allocated_bytes(device);
                     Program shared(descriptor, device);
                     verify(shared);
-                    if (allocated_bytes(device) != bytes)
-                        throw std::runtime_error("CUDA mixed matrix cache duplicated immutable weights");
+                    ASSERT_EQ(allocated_bytes(device), bytes)
+                        << "CUDA mixed matrix cache duplicated immutable weights";
                 }
                 descriptor.immutable_weights = false;
                 Program dynamic(descriptor, device);
@@ -852,6 +859,44 @@ void check_mixed_matrix(int device) {
                 copy_to_device(weight.get(), weights.data(), sizeof(weights), device);
                 verify(dynamic);
             }
+}
+
+// Small F32 projections split K across slices; with a projection cache the partials live in its shared workspace.
+void check_split_float_projection(int device) {
+    using namespace kidi::cuda;
+    using Buffer = std::unique_ptr<void, decltype(&release)>;
+    constexpr int rows = 16, width = 2048, columns = 128;
+    std::vector<float> values(rows * width), weights(columns * width);
+    for (std::size_t index = 0; index < values.size(); ++index) values[index] = static_cast<float>(index % 7) - 3;
+    for (std::size_t index = 0; index < weights.size(); ++index) weights[index] = static_cast<float>(index % 5) - 2;
+    Buffer input(allocate(values.size() * sizeof(float), device), release),
+        weight(allocate(weights.size() * sizeof(float), device), release),
+        output(allocate(rows * columns * sizeof(float), device), release);
+    copy_to_device(input.get(), values.data(), values.size() * sizeof(float), device);
+    copy_to_device(weight.get(), weights.data(), weights.size() * sizeof(float), device);
+    std::array<Tensor, 2> inputs{Tensor{input.get(), Type::F32, 2, {rows, width}, device},
+                                 Tensor{weight.get(), Type::F32, 2, {columns, width}, device}};
+    Descriptor descriptor;
+    descriptor.operation = Op::LINEAR;
+    descriptor.input_count = 2;
+    descriptor.inputs[0] = inputs[0];
+    descriptor.inputs[1] = inputs[1];
+    descriptor.attribute_count = 1;
+    descriptor.attributes[0] = 1;
+    descriptor.projection_cache = make_projection_cache();
+    Program program(descriptor, device);
+    program.run(inputs.data(), 2, output.get());
+    std::vector<float> actual(rows * columns);
+    copy_to_host(actual.data(), output.get(), actual.size() * sizeof(float), device);
+    for (int row = 0; row < rows; ++row)
+        for (int column = 0; column < columns; ++column) {
+            double expected = 0;
+            for (int k = 0; k < width; ++k)
+                expected += static_cast<double>(values[row * width + k]) * weights[column * width + k];
+            ASSERT_NEAR(actual[row * columns + column], expected, 1e-3)
+                << "CUDA split F32 projection with a projection cache differs: row=" << row
+                << " column=" << column;
+        }
 }
 
 void check_projection_rebinding(int device) {
@@ -893,8 +938,7 @@ void check_projection_rebinding(int device) {
             std::array<float, rows * columns> actual{};
             copy_to_host(actual.data(), output.get(), sizeof(actual), device);
             for (const auto value : actual)
-                if (std::abs(value - expected) > 1e-5F)
-                    throw std::runtime_error("CUDA projection weight rebinding failed");
+                ASSERT_NEAR(value, expected, 1e-5F) << "CUDA projection weight rebinding failed: bits=" << bits;
         };
         Program dynamic(descriptor, device);
         verify(dynamic, 8.F);
@@ -918,11 +962,11 @@ void check_projection_rebinding(int device) {
             std::array<float, rows * 2 * columns> actual{};
             copy_to_host(actual.data(), larger_output.get(), sizeof(actual), device);
             for (const auto value : actual)
-                if (std::abs(value - 16.F) > 1e-5F) throw std::runtime_error("CUDA shared projection cache mismatch");
+                ASSERT_NEAR(value, 16.F, 1e-5F) << "CUDA shared projection cache mismatch: bits=" << bits;
             const auto workspace_bytes = rows * 2 * width + rows * 2 * sizeof(float) + rows * 2 * sizeof(int) +
-                                         (USE_INT8_GEMM ? 2 : 1) * sizeof(actual);
-            if (allocated_bytes(device) - previous_bytes != workspace_bytes)
-                throw std::runtime_error("CUDA projection cache duplicated immutable weights");
+                                         (USE_FLASH_ATTENTION ? 2 : 1) * sizeof(actual);
+            ASSERT_EQ(allocated_bytes(device) - previous_bytes, workspace_bytes)
+                << "CUDA projection cache duplicated immutable weights: bits=" << bits;
         }
 
         Descriptor activation;
@@ -962,8 +1006,7 @@ void check_projection_rebinding(int device) {
         check(cudaGraphInstantiate(&executable, graph, 0));
         const std::unique_ptr<std::remove_pointer_t<cudaGraphExec_t>, decltype(&cudaGraphExecDestroy)> executable_owner(
             executable, cudaGraphExecDestroy);
-        if (allocated_bytes(device) != warm_bytes)
-            throw std::runtime_error("CUDA graph allocated projection workspace");
+        ASSERT_EQ(allocated_bytes(device), warm_bytes) << "CUDA graph allocated projection workspace: bits=" << bits;
         auto replay_values = values;
         for (const float shift : {0.F, 1.F}) {
             for (std::size_t index = 0; index < replay_values.size(); ++index)
@@ -975,9 +1018,12 @@ void check_projection_rebinding(int device) {
             check(cudaMemsetAsync(activated.get(), 0, sizeof(actual), stream));
             check(cudaGraphLaunch(executable, stream));
             copy_to_host(actual.data(), activated.get(), sizeof(actual), device);
-            for (std::size_t index = 0; index < actual.size(); ++index)
-                if (!std::isfinite(actual[index]) || std::abs(actual[index] - expected[index]) > 1e-5F)
-                    throw std::runtime_error("CUDA projection and GEGLU graph replay mismatch");
+            for (std::size_t index = 0; index < actual.size(); ++index) {
+                ASSERT_TRUE(std::isfinite(actual[index]))
+                    << "CUDA projection and GEGLU graph replay mismatch: bits=" << bits << " index=" << index;
+                ASSERT_NEAR(actual[index], expected[index], 1e-5F)
+                    << "CUDA projection and GEGLU graph replay mismatch: bits=" << bits << " index=" << index;
+            }
         }
     }
 }
@@ -986,14 +1032,6 @@ void check_descriptor_validation(int device) {
     using namespace kidi::cuda;
     using Buffer = std::unique_ptr<void, decltype(&release)>;
     Buffer buffer(allocate(256 * sizeof(float), device), release);
-    const auto rejected = [&](const Descriptor& descriptor) {
-        try {
-            Program program(descriptor, device);
-        } catch (const std::runtime_error&) {
-            return true;
-        }
-        return false;
-    };
     Descriptor descriptor;
     descriptor.input_count = 1;
     descriptor.inputs[0] = Tensor{buffer.get(), Type::F32, 3, {1, 2, 8}, device};
@@ -1001,7 +1039,8 @@ void check_descriptor_validation(int device) {
          {Op::ADD, Op::MULTIPLY, Op::MATMUL, Op::LINEAR, Op::GATHER, Op::RMS_NORM, Op::LAYER_NORM, Op::ROTARY,
           Op::PACKED_LINEAR, Op::QUANTIZED_LINEAR, Op::ATTENTION, Op::EMBEDDING_SUM, Op::DIFFUSION_UPDATE}) {
         descriptor.operation = operation;
-        if (!rejected(descriptor)) throw std::runtime_error("CUDA accepted an operation with too few inputs");
+        EXPECT_THROW(Program(descriptor, device), std::runtime_error)
+            << "CUDA accepted an operation with too few inputs: operation=" << static_cast<int>(operation);
     }
 
     Descriptor attention;
@@ -1012,13 +1051,14 @@ void check_descriptor_validation(int device) {
     attention.attribute_count = 1;
     for (const std::int64_t heads : {0, 3, 16}) {
         attention.attributes[0] = heads;
-        if (!rejected(attention)) throw std::runtime_error("CUDA accepted invalid attention heads");
+        EXPECT_THROW(Program(attention, device), std::runtime_error)
+            << "CUDA accepted invalid attention heads: heads=" << heads;
     }
     attention.attribute_count = 4;
     attention.attributes = {2, 2, 3, 2};
-    if (!rejected(attention)) throw std::runtime_error("CUDA accepted attention keys beyond the cache");
+    EXPECT_THROW(Program(attention, device), std::runtime_error) << "CUDA accepted attention keys beyond the cache";
     attention.attributes = {2, 2, 2, 2};
-    if (rejected(attention)) throw std::runtime_error("CUDA rejected valid attention");
+    EXPECT_NO_THROW(Program(attention, device)) << "CUDA rejected valid attention";
 }
 
 void check_relocated_scatter(int device) {
@@ -1054,12 +1094,12 @@ void check_relocated_scatter(int device) {
     }
     copy_to_host(original.data(), cache.get(), sizeof(initial), device);
     copy_to_host(moved.data(), target.get(), sizeof(initial), device);
-    if (original != initial) throw std::runtime_error("CUDA scatter wrote to the address a cache was relocated from");
+    EXPECT_EQ(original, initial) << "CUDA scatter wrote to the address a cache was relocated from";
     for (std::size_t row = 0; row < 4; ++row)
         for (std::size_t channel = 0; channel < 4; ++channel) {
             const auto expected = row == 3 ? values[channel] : row == 1 ? values[4 + channel] : 0;
-            if (moved[row * 4 + channel] != expected)
-                throw std::runtime_error("CUDA scatter ignored its relocated operands");
+            ASSERT_EQ(moved[row * 4 + channel], expected)
+                << "CUDA scatter ignored its relocated operands: row=" << row << " channel=" << channel;
         }
 }
 
@@ -1116,23 +1156,18 @@ void check_relocated_attention(int device) {
         };
         const auto expected = result(fixed);
         const auto moved = operands(1, old_key.get(), old_value.get());
-        if (result(moved) == expected) throw std::runtime_error("CUDA relocation test cannot tell stale caches apart");
+        ASSERT_NE(result(moved), expected) << "CUDA relocation test cannot tell stale caches apart: width=" << width;
         {
             const BindingScope scope(bindings.data(), bindings.size());
-            if (result(moved) != expected) throw std::runtime_error("CUDA decode attention ignored a relocated cache");
+            ASSERT_EQ(result(moved), expected) << "CUDA decode attention ignored a relocated cache: width=" << width;
         }
         auto prefill = descriptor;
         const auto prefill_inputs = operands(2, old_key.get(), old_value.get());
         std::copy(prefill_inputs.begin(), prefill_inputs.end(), prefill.inputs.begin());
         Program batched(prefill, device);
         const BindingScope scope(bindings.data(), bindings.size());
-        bool rejected = false;
-        try {
-            batched.run(prefill_inputs.data(), 3, output.get());
-        } catch (const std::runtime_error&) {
-            rejected = true;
-        }
-        if (!rejected) throw std::runtime_error("CUDA accepted a relocated cache in a multi-query attention");
+        EXPECT_THROW(batched.run(prefill_inputs.data(), 3, output.get()), std::runtime_error)
+            << "CUDA accepted a relocated cache in a multi-query attention: width=" << width;
     }
 }
 
@@ -1155,189 +1190,278 @@ void check_relocation_limits(int device) {
     std::copy(inputs.begin(), inputs.end(), descriptor.inputs.begin());
     Program program(descriptor, device);
     const BindingScope scope(&binding, 1);
-    bool rejected = false;
-    try {
-        program.run(inputs.data(), 2, output.get());
-    } catch (const std::runtime_error&) {
-        rejected = true;
+    EXPECT_THROW(program.run(inputs.data(), 2, output.get()), std::runtime_error)
+        << "CUDA accepted a relocated operand on a path that ignores relocation";
+}
+
+// Gemma 4 E4B GQA prefill check: 8 query heads, 2 KV heads, sliding + causal (-1e9F and -INFINITY).
+void check_gqa_prefill_attention(int device) {
+    using namespace kidi::cuda;
+    constexpr std::int64_t batches = 1, queries = 129, heads = 8, key_heads = 2, keys = 640, offset = 0;
+    for (const std::int64_t width : {256, 512}) {
+        for (const float masked_value : {-1e9F, -INFINITY}) {
+            std::vector<std::uint16_t> query(batches * queries * heads * width),
+                key(batches * keys * key_heads * width), value(key.size());
+            for (std::size_t index = 0; index < query.size(); ++index) {
+                const float number = static_cast<float>(static_cast<int>(index * 7 % 31) - 15) * 0.015625F;
+                std::uint32_t bits = 0;
+                std::memcpy(&bits, &number, sizeof(bits));
+                query[index] = static_cast<std::uint16_t>(bits >> 16);
+            }
+            for (std::size_t index = 0; index < key.size(); ++index) {
+                const float n1 = static_cast<float>(static_cast<int>(index * 11 % 31) - 15) * 0.015625F;
+                const float n2 = static_cast<float>(static_cast<int>(index * 13 % 31) - 15) * 0.015625F;
+                std::uint32_t b1 = 0, b2 = 0;
+                std::memcpy(&b1, &n1, sizeof(b1));
+                std::memcpy(&b2, &n2, sizeof(b2));
+                key[index] = static_cast<std::uint16_t>(b1 >> 16);
+                value[index] = static_cast<std::uint16_t>(b2 >> 16);
+            }
+            std::vector<float> mask(queries * keys);
+            for (std::int64_t row = 0; row < queries; ++row)
+                for (std::int64_t column = 0; column < keys; ++column) {
+                    const std::int64_t q_abs = (keys - queries) + row;
+                    const bool allowed = column <= q_abs && (width == 512 || q_abs - column < 256);
+                    mask[row * keys + column] = allowed ? (column % 5 ? 0.F : 0.125F) : masked_value;
+                }
+            std::unique_ptr<void, decltype(&release)> q_buf(allocate(query.size() * 2, device), release),
+                k_buf(allocate(key.size() * 2, device), release),
+                v_buf(allocate(value.size() * 2, device), release),
+                m_buf(allocate(mask.size() * 4, device), release),
+                o_buf(allocate(query.size() * 2, device), release);
+            copy_to_device(q_buf.get(), query.data(), query.size() * 2, device);
+            copy_to_device(k_buf.get(), key.data(), key.size() * 2, device);
+            copy_to_device(v_buf.get(), value.data(), value.size() * 2, device);
+            copy_to_device(m_buf.get(), mask.data(), mask.size() * 4, device);
+            std::array<Tensor, 4> inputs{
+                Tensor{q_buf.get(), Type::BF16, 3, {batches, queries, heads * width}, device},
+                Tensor{k_buf.get(), Type::BF16, 3, {batches, keys, key_heads * width}, device},
+                Tensor{v_buf.get(), Type::BF16, 3, {batches, keys, key_heads * width}, device},
+                Tensor{m_buf.get(), Type::F32, 4, {1, 1, queries, keys}, device}};
+            Descriptor d;
+            d.operation = Op::ATTENTION;
+            d.input_count = 4;
+            std::copy(inputs.begin(), inputs.end(), d.inputs.begin());
+            d.attribute_count = 4;
+            d.attributes = {heads, key_heads, offset, keys};
+            d.epsilon = 1.F;
+            d.reference_attention = true;
+            Program ref(d, device);
+            ref.run(inputs.data(), 4, o_buf.get());
+            std::vector<std::uint16_t> expected(query.size()), actual(query.size());
+            copy_to_host(expected.data(), o_buf.get(), expected.size() * 2, device);
+            d.reference_attention = false;
+            const auto prev_bytes = allocated_bytes(device);
+            Program nat(d, device);
+            ASSERT_EQ(allocated_bytes(device), prev_bytes) << "CUDA FlashAttention GQA allocated a score buffer";
+            nat.run(inputs.data(), 4, o_buf.get());
+            copy_to_host(actual.data(), o_buf.get(), actual.size() * 2, device);
+            for (std::size_t index = 0; index < actual.size(); ++index) {
+                const auto dec = [](std::uint16_t u) {
+                    return std::bit_cast<float>(static_cast<std::uint32_t>(u) << 16);
+                };
+                const float t = dec(expected[index]), r = dec(actual[index]);
+                const float tol = (15.F * 0.015625F) / 256.F + 0.0001F + 0.008F * std::abs(t);
+                ASSERT_TRUE(std::isfinite(r)) << "CUDA FlashAttention GQA mismatch: width=" << width
+                                              << " masked_value=" << masked_value << " index=" << index;
+                ASSERT_NEAR(r, t, tol) << "CUDA FlashAttention GQA mismatch: width=" << width
+                                       << " masked_value=" << masked_value << " index=" << index;
+            }
+        }
     }
-    if (!rejected) throw std::runtime_error("CUDA accepted a relocated operand on a path that ignores relocation");
+}
+
+class CudaRuntimeTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        if (!kidi::cuda::available()) GTEST_SKIP() << "CUDA device unavailable";
+    }
+
+    template <typename Check>
+    static void on_each_device(Check&& check) {
+        for (int device = 0; device < kidi::cuda::device_count(); ++device) {
+            SCOPED_TRACE(::testing::Message() << "device " << device);
+            check(device);
+        }
+    }
+};
+
+TEST_F(CudaRuntimeTest, RejectsInvalidDevices) {
+    using namespace kidi::cuda;
+    EXPECT_FALSE(available(-1)) << "CUDA invalid device accepted";
+    EXPECT_FALSE(available(device_count())) << "CUDA invalid device accepted";
+}
+
+TEST_F(CudaRuntimeTest, BfloatBias) { on_each_device(check_bfloat_bias); }
+
+TEST_F(CudaRuntimeTest, IntegerLayout) { on_each_device(check_integer_layout); }
+
+TEST_F(CudaRuntimeTest, Gelu) { on_each_device(check_gelu); }
+
+TEST_F(CudaRuntimeTest, ScalarAndEmpty) { on_each_device(check_scalar_and_empty); }
+
+TEST_F(CudaRuntimeTest, GreedySelection) { on_each_device(check_greedy_selection); }
+
+TEST_F(CudaRuntimeTest, Slice) { on_each_device(check_slice); }
+
+TEST_F(CudaRuntimeTest, Attention) {
+    on_each_device([](int device) {
+        {
+            SCOPED_TRACE("BF16 keys=19");
+            check_attention(device);
+        }
+        {
+            SCOPED_TRACE("BF16 keys=257");
+            check_attention(device, 257);
+        }
+        {
+            SCOPED_TRACE("F32 keys=19");
+            check_attention<float>(device);
+        }
+        {
+            SCOPED_TRACE("F32 query, BF16 cache keys=19");
+            check_attention<float, std::uint16_t>(device);
+        }
+        {
+            SCOPED_TRACE("F32 query, BF16 cache keys=257");
+            check_attention<float, std::uint16_t>(device, 257);
+        }
+        {
+            SCOPED_TRACE("F32 query, BF16 cache keys=513");
+            check_attention<float, std::uint16_t>(device, 513);
+        }
+        for (const std::int64_t keys : {2047, 2048, 2049}) {
+            SCOPED_TRACE(::testing::Message() << "F32 query, BF16 cache long decode keys=" << keys);
+            check_attention<float, std::uint16_t>(device, keys, true);
+        }
+    });
+}
+
+TEST_F(CudaRuntimeTest, NonbroadcastCausal) {
+    on_each_device([](int device) {
+        for (bool per_key : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "per_key=" << per_key);
+            if (USE_FLASH_ATTENTION) check_nonbroadcast_causal_attention<float>(device, per_key);
+            check_nonbroadcast_causal_attention<std::uint16_t>(device, per_key);
+        }
+    });
+}
+
+TEST_F(CudaRuntimeTest, StructuredPrefill) {
+    if (!USE_FLASH_ATTENTION) GTEST_SKIP() << "FlashAttention disabled";
+    on_each_device(check_structured_prefill_attention);
+}
+
+TEST_F(CudaRuntimeTest, GqaPrefillAttention) { on_each_device(check_gqa_prefill_attention); }
+
+TEST_F(CudaRuntimeTest, SparseScatter) { on_each_device(check_sparse_scatter); }
+
+TEST_F(CudaRuntimeTest, BfloatMatrix) {
+    on_each_device([](int device) {
+        const auto run = [device](int rows, int width, int columns = 33, bool allow_split_workspace = false) {
+            SCOPED_TRACE(::testing::Message() << "rows=" << rows << " width=" << width << " columns=" << columns);
+            check_bfloat_matrix(device, rows, width, columns, allow_split_workspace);
+        };
+        for (const int rows : {1, 4})
+            for (const int width : {8, 256, 1536, 6144, 12288}) run(rows, width);
+        run(1, 256, 4112);
+        run(9, 256, 72);
+        run(9, 1560, 72, true);
+        run(65, 40, 4096, true);
+        run(129, 1600, 72, true);
+        run(128, 2560, 8192, true);
+        run(128, 256, 2560, true);
+    });
+}
+
+TEST_F(CudaRuntimeTest, W8A16Projection) { on_each_device(check_w8a16_projection); }
+
+TEST_F(CudaRuntimeTest, W8A8Projection) { on_each_device(check_w8a8_projection); }
+
+TEST_F(CudaRuntimeTest, FloatMatrix) {
+    on_each_device([](int device) {
+        const auto run = [device](int rows, int width = 128) {
+            SCOPED_TRACE(::testing::Message() << "rows=" << rows << " width=" << width);
+            check_float_matrix(device, rows, width);
+        };
+        run(1);
+        run(37, 132);
+        run(34, 1564);
+    });
+}
+
+TEST_F(CudaRuntimeTest, WideRms) {
+    on_each_device([](int device) {
+        {
+            SCOPED_TRACE("BF16");
+            check_wide_rms<std::uint16_t>(device);
+        }
+        {
+            SCOPED_TRACE("F32");
+            check_wide_rms<float>(device);
+        }
+    });
+}
+
+TEST_F(CudaRuntimeTest, MixedMatrix) { on_each_device(check_mixed_matrix); }
+
+TEST_F(CudaRuntimeTest, ProjectionRebinding) { on_each_device(check_projection_rebinding); }
+
+TEST_F(CudaRuntimeTest, SplitFloatProjection) { on_each_device(check_split_float_projection); }
+
+TEST_F(CudaRuntimeTest, DescriptorValidation) { on_each_device(check_descriptor_validation); }
+
+TEST_F(CudaRuntimeTest, RelocatedScatter) { on_each_device(check_relocated_scatter); }
+
+TEST_F(CudaRuntimeTest, RelocatedAttention) { on_each_device(check_relocated_attention); }
+
+TEST_F(CudaRuntimeTest, RelocationLimits) { on_each_device(check_relocation_limits); }
+
+// Kept last: its final allocation check also covers buffers leaked by the tests above.
+TEST_F(CudaRuntimeTest, BroadcastDevices) {
+    using namespace kidi::cuda;
+    const std::array<float, 6> left{1, 2, 3, 4, 5, 6};
+    const std::array<float, 3> right{10, 20, 30};
+    Tensor inputs[2]{{allocate(sizeof(left)), Type::F32, 2, {2, 3}}, {allocate(sizeof(right)), Type::F32, 1, {3}}};
+    copy_to_device(inputs[0].data, left.data(), sizeof(left));
+    copy_to_device(inputs[1].data, right.data(), sizeof(right));
+    Descriptor descriptor;
+    descriptor.operation = Op::ADD;
+    descriptor.input_count = 2;
+    descriptor.inputs[0] = inputs[0];
+    descriptor.inputs[1] = inputs[1];
+    Program program(descriptor);
+    void* output = allocate(sizeof(left));
+    program.run(inputs, 2, output);
+    std::array<float, 6> result{};
+    copy_to_host(result.data(), output, sizeof(result));
+    EXPECT_EQ(result, (std::array<float, 6>{11, 22, 33, 14, 25, 36})) << "CUDA broadcast mismatch";
+    release(output);
+    release(inputs[0].data);
+    release(inputs[1].data);
+    EXPECT_EQ(allocated_bytes(), 0U) << "CUDA allocation leak";
+    const int previous = current_device();
+    for (int device = 0; device < device_count(); ++device) {
+        SCOPED_TRACE(::testing::Message() << "device " << device);
+        auto selected_inputs = std::array<Tensor, 2>{inputs[0], inputs[1]};
+        selected_inputs[0].device = selected_inputs[1].device = device;
+        selected_inputs[0].data = allocate(sizeof(left), device);
+        selected_inputs[1].data = allocate(sizeof(right), device);
+        copy_to_device(selected_inputs[0].data, left.data(), sizeof(left), device);
+        copy_to_device(selected_inputs[1].data, right.data(), sizeof(right), device);
+        Program selected_program(descriptor, device);
+        void* selected_output = allocate(sizeof(left), device);
+        selected_program.run(selected_inputs.data(), 2, selected_output);
+        copy_to_host(result.data(), selected_output, sizeof(result), device);
+        EXPECT_EQ(result, (std::array<float, 6>{11, 22, 33, 14, 25, 36})) << "CUDA selected-device mismatch";
+        EXPECT_EQ(current_device(), previous) << "CUDA current device was not restored";
+        selected_inputs[0].device = device_count();
+        EXPECT_THROW(selected_program.run(selected_inputs.data(), 2, selected_output), std::runtime_error)
+            << "CUDA mixed-device operands accepted";
+        release(selected_output);
+        release(selected_inputs[0].data);
+        release(selected_inputs[1].data);
+    }
+    EXPECT_EQ(allocated_bytes(), 0U) << "CUDA selected-device allocation leak";
 }
 } // namespace
-
-int main() {
-    using namespace kidi::cuda;
-    try {
-        if (!available()) throw std::runtime_error("CUDA device unavailable");
-        if (available(-1) || available(device_count())) throw std::runtime_error("CUDA invalid device accepted");
-        const std::array<float, 6> left{1, 2, 3, 4, 5, 6};
-        const std::array<float, 3> right{10, 20, 30};
-        Tensor inputs[2]{{allocate(sizeof(left)), Type::F32, 2, {2, 3}}, {allocate(sizeof(right)), Type::F32, 1, {3}}};
-        copy_to_device(inputs[0].data, left.data(), sizeof(left));
-        copy_to_device(inputs[1].data, right.data(), sizeof(right));
-        Descriptor descriptor;
-        descriptor.operation = Op::ADD;
-        descriptor.input_count = 2;
-        descriptor.inputs[0] = inputs[0];
-        descriptor.inputs[1] = inputs[1];
-        Program program(descriptor);
-        void* output = allocate(sizeof(left));
-        program.run(inputs, 2, output);
-        std::array<float, 6> result{};
-        copy_to_host(result.data(), output, sizeof(result));
-        if (result != std::array<float, 6>{11, 22, 33, 14, 25, 36}) throw std::runtime_error("CUDA broadcast mismatch");
-        release(output);
-        release(inputs[0].data);
-        release(inputs[1].data);
-        if (allocated_bytes()) throw std::runtime_error("CUDA allocation leak");
-        const int previous = current_device();
-        for (int device = 0; device < device_count(); ++device) {
-            check_bfloat_bias(device);
-            check_integer_layout(device);
-            check_gelu(device);
-            check_scalar_and_empty(device);
-            check_greedy_selection(device);
-            check_slice(device);
-            check_attention(device);
-            check_attention(device, 257);
-            check_attention<float>(device);
-            check_attention<float, std::uint16_t>(device);
-            check_attention<float, std::uint16_t>(device, 257);
-            check_attention<float, std::uint16_t>(device, 513);
-            for (const std::int64_t keys : {2047, 2048, 2049})
-                check_attention<float, std::uint16_t>(device, keys, true);
-            for (bool per_key : {false, true}) {
-                if (USE_INT8_GEMM) check_nonbroadcast_causal_attention<float>(device, per_key);
-                check_nonbroadcast_causal_attention<std::uint16_t>(device, per_key);
-            }
-            if (USE_INT8_GEMM) check_structured_prefill_attention(device);
-            {
-                // Gemma 4 E4B GQA prefill check: 8 query heads, 2 KV heads, sliding + causal (-1e9F and -INFINITY).
-                constexpr std::int64_t batches = 1, queries = 129, heads = 8, key_heads = 2, keys = 640, offset = 0;
-                for (const std::int64_t width : {256, 512}) {
-                    for (const float masked_value : {-1e9F, -INFINITY}) {
-                        std::vector<std::uint16_t> query(batches * queries * heads * width),
-                            key(batches * keys * key_heads * width), value(key.size());
-                        for (std::size_t index = 0; index < query.size(); ++index) {
-                            const float number = static_cast<float>(static_cast<int>(index * 7 % 31) - 15) * 0.015625F;
-                            std::uint32_t bits = 0;
-                            std::memcpy(&bits, &number, sizeof(bits));
-                            query[index] = static_cast<std::uint16_t>(bits >> 16);
-                        }
-                        for (std::size_t index = 0; index < key.size(); ++index) {
-                            const float n1 = static_cast<float>(static_cast<int>(index * 11 % 31) - 15) * 0.015625F;
-                            const float n2 = static_cast<float>(static_cast<int>(index * 13 % 31) - 15) * 0.015625F;
-                            std::uint32_t b1 = 0, b2 = 0;
-                            std::memcpy(&b1, &n1, sizeof(b1));
-                            std::memcpy(&b2, &n2, sizeof(b2));
-                            key[index] = static_cast<std::uint16_t>(b1 >> 16);
-                            value[index] = static_cast<std::uint16_t>(b2 >> 16);
-                        }
-                        std::vector<float> mask(queries * keys);
-                        for (std::int64_t row = 0; row < queries; ++row)
-                            for (std::int64_t column = 0; column < keys; ++column) {
-                                const std::int64_t q_abs = (keys - queries) + row;
-                                const bool allowed = column <= q_abs && (width == 512 || q_abs - column < 256);
-                                mask[row * keys + column] = allowed ? (column % 5 ? 0.F : 0.125F) : masked_value;
-                            }
-                        std::unique_ptr<void, decltype(&release)> q_buf(allocate(query.size() * 2, device), release),
-                            k_buf(allocate(key.size() * 2, device), release),
-                            v_buf(allocate(value.size() * 2, device), release),
-                            m_buf(allocate(mask.size() * 4, device), release),
-                            o_buf(allocate(query.size() * 2, device), release);
-                        copy_to_device(q_buf.get(), query.data(), query.size() * 2, device);
-                        copy_to_device(k_buf.get(), key.data(), key.size() * 2, device);
-                        copy_to_device(v_buf.get(), value.data(), value.size() * 2, device);
-                        copy_to_device(m_buf.get(), mask.data(), mask.size() * 4, device);
-                        std::array<Tensor, 4> inputs{
-                            Tensor{q_buf.get(), Type::BF16, 3, {batches, queries, heads * width}, device},
-                            Tensor{k_buf.get(), Type::BF16, 3, {batches, keys, key_heads * width}, device},
-                            Tensor{v_buf.get(), Type::BF16, 3, {batches, keys, key_heads * width}, device},
-                            Tensor{m_buf.get(), Type::F32, 4, {1, 1, queries, keys}, device}};
-                        Descriptor d;
-                        d.operation = Op::ATTENTION;
-                        d.input_count = 4;
-                        std::copy(inputs.begin(), inputs.end(), d.inputs.begin());
-                        d.attribute_count = 4;
-                        d.attributes = {heads, key_heads, offset, keys};
-                        d.epsilon = 1.F;
-                        d.reference_attention = true;
-                        Program ref(d, device);
-                        ref.run(inputs.data(), 4, o_buf.get());
-                        std::vector<std::uint16_t> expected(query.size()), actual(query.size());
-                        copy_to_host(expected.data(), o_buf.get(), expected.size() * 2, device);
-                        d.reference_attention = false;
-                        const auto prev_bytes = allocated_bytes(device);
-                        Program nat(d, device);
-                        if (allocated_bytes(device) != prev_bytes)
-                            throw std::runtime_error("CUDA FlashAttention GQA allocated a score buffer");
-                        nat.run(inputs.data(), 4, o_buf.get());
-                        copy_to_host(actual.data(), o_buf.get(), actual.size() * 2, device);
-                        for (std::size_t index = 0; index < actual.size(); ++index) {
-                            const auto dec = [](std::uint16_t u) {
-                                return std::bit_cast<float>(static_cast<std::uint32_t>(u) << 16);
-                            };
-                            const float t = dec(expected[index]), r = dec(actual[index]);
-                            const float tol = (15.F * 0.015625F) / 256.F + 0.0001F + 0.008F * std::abs(t);
-                            if (!std::isfinite(r) || std::abs(r - t) > tol)
-                                throw std::runtime_error("CUDA FlashAttention GQA mismatch");
-                        }
-                    }
-                }
-            }
-            check_sparse_scatter(device);
-            for (const int rows : {1, 4})
-                for (const int width : {8, 256, 1536, 6144, 12288}) check_bfloat_matrix(device, rows, width);
-            check_bfloat_matrix(device, 1, 256, 4112);
-            check_bfloat_matrix(device, 9, 256, 72);
-            check_bfloat_matrix(device, 9, 1560, 72, true);
-            check_bfloat_matrix(device, 65, 40, 4096, true);
-            check_bfloat_matrix(device, 129, 1600, 72, true);
-            check_bfloat_matrix(device, 128, 2560, 8192, true);
-            check_bfloat_matrix(device, 128, 256, 2560, true);
-            check_w8a16_projection(device);
-            check_w8a8_projection(device);
-            check_float_matrix(device, 1);
-            check_float_matrix(device, 37, 132);
-            check_float_matrix(device, 34, 1564);
-            check_wide_rms<std::uint16_t>(device);
-            check_wide_rms<float>(device);
-            check_mixed_matrix(device);
-            check_projection_rebinding(device);
-            check_descriptor_validation(device);
-            check_relocated_scatter(device);
-            check_relocated_attention(device);
-            check_relocation_limits(device);
-            auto selected_inputs = std::array<Tensor, 2>{inputs[0], inputs[1]};
-            selected_inputs[0].device = selected_inputs[1].device = device;
-            selected_inputs[0].data = allocate(sizeof(left), device);
-            selected_inputs[1].data = allocate(sizeof(right), device);
-            copy_to_device(selected_inputs[0].data, left.data(), sizeof(left), device);
-            copy_to_device(selected_inputs[1].data, right.data(), sizeof(right), device);
-            Program selected_program(descriptor, device);
-            void* selected_output = allocate(sizeof(left), device);
-            selected_program.run(selected_inputs.data(), 2, selected_output);
-            copy_to_host(result.data(), selected_output, sizeof(result), device);
-            if (result != std::array<float, 6>{11, 22, 33, 14, 25, 36})
-                throw std::runtime_error("CUDA selected-device mismatch");
-            if (current_device() != previous) throw std::runtime_error("CUDA current device was not restored");
-            selected_inputs[0].device = device_count();
-            bool rejected = false;
-            try {
-                selected_program.run(selected_inputs.data(), 2, selected_output);
-            } catch (const std::runtime_error&) {
-                rejected = true;
-            }
-            if (!rejected) throw std::runtime_error("CUDA mixed-device operands accepted");
-            release(selected_output);
-            release(selected_inputs[0].data);
-            release(selected_inputs[1].data);
-        }
-        if (allocated_bytes()) throw std::runtime_error("CUDA selected-device allocation leak");
-        std::cout << "CUDA broadcast and allocation tests PASS on " << device_name() << '\n';
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
-    }
-}

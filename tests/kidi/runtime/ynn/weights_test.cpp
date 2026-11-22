@@ -3,11 +3,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <string>
 
 #include "kidi/checkpoint/weights.h"
 #include "kidi/ops/context.h"
+
+#include <gtest/gtest.h>
 
 namespace {
 
@@ -28,18 +29,13 @@ auto write_weights(const std::filesystem::path& path) -> void {
     output.write(reinterpret_cast<const char*>(VALUES.data()), sizeof(VALUES));
 }
 
-} // namespace
-
-auto main() -> int {
+TEST(YnnWeightsTest, LinearOnMappedWeight) {
     const auto path = std::filesystem::temp_directory_path() / "kidi-ynnpack-weights.safetensors";
     write_weights(path);
     auto weights = kidi::checkpoint::Weights::load(path);
     auto weight =
         weights ? weights->tensor("weight") : kidi::Result<kidi::tensor::Tensor>{std::unexpected(weights.error())};
-    if (!weight) {
-        std::cerr << "failed to load mapped weight\n";
-        return 1;
-    }
+    ASSERT_TRUE(weight.has_value()) << "failed to load mapped weight: " << weight.error().message;
 
     constexpr std::array INPUT_VALUES = {4.0F, 5.0F};
     auto input = kidi::ops::require(
@@ -50,9 +46,9 @@ auto main() -> int {
     const auto out_values = kidi::ops::require(output.data<float>());
     std::filesystem::remove(path);
 
-    if (out_values.size() != 2 || out_values[0] != 14.0F || out_values[1] != 32.0F) {
-        std::cerr << "unexpected YNNPACK output: " << out_values[0] << ", " << out_values[1] << '\n';
-        return 1;
-    }
-    return 0;
+    ASSERT_EQ(out_values.size(), 2U) << "unexpected YNNPACK output size";
+    EXPECT_EQ(out_values[0], 14.0F) << "unexpected YNNPACK output";
+    EXPECT_EQ(out_values[1], 32.0F) << "unexpected YNNPACK output";
 }
+
+} // namespace

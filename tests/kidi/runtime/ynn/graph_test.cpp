@@ -6,11 +6,12 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <limits>
 #include <span>
+#include <string>
 #include <vector>
 
+#include <gtest/gtest.h>
 #include <ynnpack.h>
 #include "ynnpack/composites/composites.h"
 
@@ -20,13 +21,49 @@
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/tensor/tensor.h"
 
-auto main() -> int {
+namespace {
+
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
-    const auto cache_root = std::filesystem::temp_directory_path() / "kidi-ynn-feed-forward-cache-test";
-    std::filesystem::remove_all(cache_root);
-    std::filesystem::create_directories(cache_root);
-    const auto source = cache_root / "weights.bin";
-    std::ofstream(source, std::ios::binary).write("source", 6);
+constexpr std::int32_t ROWS = 32, INPUT_SIZE = 128, INTERMEDIATE = 2056, BITS = 4;
+
+class YnnGraphTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+        cache_root = std::filesystem::temp_directory_path() /
+                     (std::string("kidi-ynn-feed-forward-cache-test-") + info->name());
+        std::filesystem::remove_all(cache_root);
+        std::filesystem::create_directories(cache_root);
+        source = cache_root / "weights.bin";
+        std::ofstream(source, std::ios::binary).write("source", 6);
+    }
+
+    void TearDown() override {
+        std::error_code ignored;
+        std::filesystem::permissions(cache_root, std::filesystem::perms::owner_all, ignored);
+        std::filesystem::remove_all(cache_root, ignored);
+    }
+
+    std::filesystem::path cache_root;
+    std::filesystem::path source;
+};
+
+auto gate_up_scale_tensor() -> kidi::tensor::Tensor {
+    std::vector<float> gate_up_scales(2 * INTERMEDIATE);
+    for (std::size_t index = 0; index < gate_up_scales.size(); ++index)
+        gate_up_scales[index] = 0.00390625F * static_cast<float>(1 + index % 5);
+    return kidi::ops::require(
+        kidi::tensor::Tensor::from_host({2 * INTERMEDIATE, 1}, std::span<const float>(gate_up_scales)));
+}
+
+auto down_scale_tensor() -> kidi::tensor::Tensor {
+    std::vector<float> down_scales(INPUT_SIZE);
+    for (std::size_t index = 0; index < down_scales.size(); ++index)
+        down_scales[index] = 0.00390625F * static_cast<float>(1 + index % 7);
+    return kidi::ops::require(kidi::tensor::Tensor::from_host({INPUT_SIZE, 1}, std::span<const float>(down_scales)));
+}
+
+TEST_F(YnnGraphTest, FeedForwardCacheValidation) {
     kidi::runtime::ynn::FeedForwardCache cache;
     cache.configure(cache_root / "cache", source);
     kidi::runtime::ynn::FeedForwardCacheSpec cache_spec{
@@ -34,10 +71,12 @@ auto main() -> int {
     const std::array<std::uint8_t, 6> cached_bytes{1, 2, 3, 5, 8, 13};
     cache.store(cache_spec, cached_bytes);
     const auto cached = cache.load(cache_spec, cached_bytes.size());
-    if (!cached || !cached.owner || !std::ranges::equal(cached.bytes, cached_bytes)) return 1;
+    ASSERT_TRUE(cached) << "stored entry loads";
+    EXPECT_TRUE(cached.owner) << "loaded entry has an owner";
+    EXPECT_TRUE(std::ranges::equal(cached.bytes, cached_bytes)) << "loaded bytes match stored bytes";
     auto incompatible = cache_spec;
     incompatible.bits = 8;
-    if (cache.load(incompatible, cached_bytes.size())) return 1;
+    EXPECT_FALSE(cache.load(incompatible, cached_bytes.size())) << "incompatible spec misses";
     const auto source_time = std::filesystem::last_write_time(source);
     std::ofstream(source, std::ios::binary | std::ios::trunc).write("change", 6);
     std::filesystem::last_write_time(source, source_time);
@@ -45,11 +84,11 @@ auto main() -> int {
     replaced.source_hash = 18;
     kidi::runtime::ynn::FeedForwardCache replacement;
     replacement.configure(cache_root / "cache", source);
-    if (replacement.load(replaced, cached_bytes.size())) return 1;
+    EXPECT_FALSE(replacement.load(replaced, cached_bytes.size())) << "replaced source hash misses";
     std::ofstream(source, std::ios::binary | std::ios::app).write("changed", 7);
     kidi::runtime::ynn::FeedForwardCache stale;
     stale.configure(cache_root / "cache", source);
-    if (stale.load(cache_spec, cached_bytes.size())) return 1;
+    EXPECT_FALSE(stale.load(cache_spec, cached_bytes.size())) << "stale source misses";
     const auto read_only_parent = cache_root / "read-only";
     std::filesystem::create_directories(read_only_parent);
     std::filesystem::permissions(read_only_parent,
@@ -57,14 +96,19 @@ auto main() -> int {
     kidi::runtime::ynn::FeedForwardCache uncreatable;
     uncreatable.configure(read_only_parent / "nested", source);
     std::filesystem::permissions(read_only_parent, std::filesystem::perms::owner_all);
-    if (uncreatable.enabled() || uncreatable.writable()) return 1;
+    EXPECT_FALSE(uncreatable.enabled()) << "uncreatable cache dir disables the cache";
+    EXPECT_FALSE(uncreatable.writable()) << "uncreatable cache dir is not writable";
     ::setenv("KIDI_FFN_CACHE", "0", 1);
     kidi::runtime::ynn::FeedForwardCache disabled;
     disabled.configure(cache_root / "disabled", source);
     ::unsetenv("KIDI_FFN_CACHE");
-    if (disabled.enabled() || disabled.writable()) return 1;
+    EXPECT_FALSE(disabled.enabled()) << "KIDI_FFN_CACHE=0 disables the cache";
+    EXPECT_FALSE(disabled.writable()) << "KIDI_FFN_CACHE=0 cache is not writable";
+}
 
-    constexpr std::int32_t ROWS = 32, INPUT_SIZE = 128, INTERMEDIATE = 2056, BITS = 4;
+TEST_F(YnnGraphTest, CachedFeedForward) {
+    if (!ynn::is_symmetric_linear_supported(BITS))
+        GTEST_SKIP() << "symmetric linear unsupported for bits=" << BITS;
     std::vector<float> activations(ROWS * INPUT_SIZE);
     for (std::size_t index = 0; index < activations.size(); ++index)
         activations[index] = static_cast<float>(static_cast<int>(index % 17) - 8) * 0.0625F;
@@ -74,50 +118,43 @@ auto main() -> int {
     std::vector<std::uint8_t> down_bytes(INPUT_SIZE * (INTERMEDIATE / 2));
     for (std::size_t index = 0; index < down_bytes.size(); ++index)
         down_bytes[index] = static_cast<std::uint8_t>((index * 7 + 3) & 0xFFU);
-    std::vector<float> gate_up_scales(2 * INTERMEDIATE), down_scales(INPUT_SIZE);
-    for (std::size_t index = 0; index < gate_up_scales.size(); ++index)
-        gate_up_scales[index] = 0.00390625F * static_cast<float>(1 + index % 5);
-    for (std::size_t index = 0; index < down_scales.size(); ++index)
-        down_scales[index] = 0.00390625F * static_cast<float>(1 + index % 7);
     const auto input_tensor =
         kidi::ops::require(kidi::tensor::Tensor::from_host({1, ROWS, INPUT_SIZE}, std::span<const float>(activations)));
     const auto gate_up_tensor = kidi::ops::require(kidi::tensor::Tensor::from_host(
         {2 * INTERMEDIATE, INPUT_SIZE / 2}, std::span<const std::uint8_t>(gate_up_bytes)));
     const auto down_tensor = kidi::ops::require(
         kidi::tensor::Tensor::from_host({INPUT_SIZE, INTERMEDIATE / 2}, std::span<const std::uint8_t>(down_bytes)));
-    const auto gate_up_scale_tensor = kidi::ops::require(
-        kidi::tensor::Tensor::from_host({2 * INTERMEDIATE, 1}, std::span<const float>(gate_up_scales)));
-    const auto down_scale_tensor =
-        kidi::ops::require(kidi::tensor::Tensor::from_host({INPUT_SIZE, 1}, std::span<const float>(down_scales)));
+    const auto gate_up_scales = gate_up_scale_tensor();
+    const auto down_scales = down_scale_tensor();
     const auto run_ffn = [&](kidi::ops::Context& context) {
-        return context.gated_feed_forward(input_tensor, gate_up_tensor, gate_up_scale_tensor, down_tensor,
-                                          down_scale_tensor, BITS, INPUT_SIZE, INTERMEDIATE, 0.125F, 0.0625F, 0.03125F,
-                                          0.125F);
+        return context.gated_feed_forward(input_tensor, gate_up_tensor, gate_up_scales, down_tensor, down_scales, BITS,
+                                          INPUT_SIZE, INTERMEDIATE, 0.125F, 0.0625F, 0.03125F, 0.125F);
     };
-    if (ynn::is_symmetric_linear_supported(BITS)) {
-        kidi::ops::Context reference_context(kidi::tensor::Device::cpu());
-        const auto reference_ffn = run_ffn(reference_context);
-        const auto ffn_cache_dir = cache_root / "ffn-multi-tile";
-        kidi::ops::Context populate_context(kidi::tensor::Device::cpu());
-        populate_context.configure_cache(ffn_cache_dir, source);
-        const auto populated_ffn = run_ffn(populate_context);
-        if (std::filesystem::is_empty(ffn_cache_dir)) return 1;
-        std::filesystem::permissions(ffn_cache_dir,
-                                     std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
-        kidi::ops::Context cached_context(kidi::tensor::Device::cpu());
-        cached_context.configure_cache(ffn_cache_dir, source);
-        const auto cached_ffn = run_ffn(cached_context);
-        std::filesystem::permissions(ffn_cache_dir, std::filesystem::perms::owner_all);
-        const auto expected_values = kidi::ops::require(reference_ffn.data<float>());
-        const auto populated_values = kidi::ops::require(populated_ffn.data<float>());
-        const auto cached_values = kidi::ops::require(cached_ffn.data<float>());
-        if (!std::ranges::equal(expected_values, populated_values) ||
-            !std::ranges::equal(expected_values, cached_values))
-            return 1;
-    }
+    kidi::ops::Context reference_context(kidi::tensor::Device::cpu());
+    const auto reference_ffn = run_ffn(reference_context);
+    const auto ffn_cache_dir = cache_root / "ffn-multi-tile";
+    kidi::ops::Context populate_context(kidi::tensor::Device::cpu());
+    populate_context.configure_cache(ffn_cache_dir, source);
+    const auto populated_ffn = run_ffn(populate_context);
+    ASSERT_FALSE(std::filesystem::is_empty(ffn_cache_dir)) << "populating run writes the cache";
+    std::filesystem::permissions(ffn_cache_dir,
+                                 std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
+    kidi::ops::Context cached_context(kidi::tensor::Device::cpu());
+    cached_context.configure_cache(ffn_cache_dir, source);
+    const auto cached_ffn = run_ffn(cached_context);
+    std::filesystem::permissions(ffn_cache_dir, std::filesystem::perms::owner_all);
+    const auto expected_values = kidi::ops::require(reference_ffn.data<float>());
+    const auto populated_values = kidi::ops::require(populated_ffn.data<float>());
+    const auto cached_values = kidi::ops::require(cached_ffn.data<float>());
+    EXPECT_TRUE(std::ranges::equal(expected_values, populated_values)) << "populating run matches reference";
+    EXPECT_TRUE(std::ranges::equal(expected_values, cached_values)) << "cached run matches reference";
+}
 
-    // Verify fused GATED_FEED_FORWARD matches composed PACKED_LINEAR + GELU/SILU_MULTIPLY + PACKED_LINEAR across
-    // bits = 2, 4, 8 and both M = 1 (decode) and M = 17 (odd multi-row prefill) with 4 worker threads.
+// Verify fused GATED_FEED_FORWARD matches composed PACKED_LINEAR + GELU/SILU_MULTIPLY + PACKED_LINEAR across
+// bits = 2, 4, 8 and both M = 1 (decode) and M = 17 (odd multi-row prefill) with 4 worker threads.
+TEST(YnnFusedTest, FeedForward) {
+    const auto gate_up_scales = gate_up_scale_tensor();
+    const auto down_scales = down_scale_tensor();
     kidi::runtime::ynn::set_thread_count(4);
     for (const std::int32_t bits : {2, 4, 8}) {
         const std::size_t vals_per_byte = static_cast<std::size_t>(8 / bits);
@@ -141,22 +178,18 @@ auto main() -> int {
             for (const bool silu : {false, true}) {
                 kidi::ops::Context ctx(kidi::tensor::Device::cpu());
                 const auto fused =
-                    ctx.gated_feed_forward(x_t, gu_t, gate_up_scale_tensor, dn_t, down_scale_tensor, bits, INPUT_SIZE,
+                    ctx.gated_feed_forward(x_t, gu_t, gate_up_scales, dn_t, down_scales, bits, INPUT_SIZE,
                                            INTERMEDIATE, 0.125F, 0.0625F, 0.03125F, 0.125F, silu);
-                const auto proj = ctx.packed_linear(x_t, gu_t, gate_up_scale_tensor, bits, INPUT_SIZE, 0.125F, 0.0625F);
+                const auto proj = ctx.packed_linear(x_t, gu_t, gate_up_scales, bits, INPUT_SIZE, 0.125F, 0.0625F);
                 const auto g_slice = ctx.slice(proj, -1, 0, INTERMEDIATE);
                 const auto u_slice = ctx.slice(proj, -1, INTERMEDIATE, INTERMEDIATE);
                 const auto hid = silu ? ctx.silu_multiply(g_slice, u_slice) : ctx.gelu_multiply(g_slice, u_slice);
-                const auto composed =
-                    ctx.packed_linear(hid, dn_t, down_scale_tensor, bits, INTERMEDIATE, 0.03125F, 0.125F);
+                const auto composed = ctx.packed_linear(hid, dn_t, down_scales, bits, INTERMEDIATE, 0.03125F, 0.125F);
                 const auto f_span = kidi::ops::require(fused.data<float>());
                 const auto c_span = kidi::ops::require(composed.data<float>());
                 for (std::size_t i = 0; i < f_span.size(); ++i) {
-                    if (std::abs(f_span[i] - c_span[i]) > 1e-5F) {
-                        std::cerr << "FFN mismatch bits=" << bits << " rows=" << m_rows << " silu=" << silu
-                                  << " idx=" << i << " fused=" << f_span[i] << " composed=" << c_span[i] << '\n';
-                        return 1;
-                    }
+                    ASSERT_NEAR(f_span[i], c_span[i], 1e-5F)
+                        << "FFN mismatch bits=" << bits << " rows=" << m_rows << " silu=" << silu << " idx=" << i;
                 }
             }
 #if defined(__APPLE__)
@@ -165,40 +198,34 @@ auto main() -> int {
             kidi::ops::Context fast_ctx(kidi::tensor::Device::cpu());
             kidi::ops::Context parity_ctx(kidi::tensor::Device::cpu());
             parity_ctx.set_precision(kidi::core::InferencePrecision::LOWBIT_PARITY);
-            const auto fast_out =
-                fast_ctx.packed_linear(x_t, gu_t, gate_up_scale_tensor, bits, INPUT_SIZE, 0.125F, 0.0625F);
-            const auto ref_out =
-                parity_ctx.packed_linear(x_t, gu_t, gate_up_scale_tensor, bits, INPUT_SIZE, 0.125F, 0.0625F);
+            const auto fast_out = fast_ctx.packed_linear(x_t, gu_t, gate_up_scales, bits, INPUT_SIZE, 0.125F, 0.0625F);
+            const auto ref_out = parity_ctx.packed_linear(x_t, gu_t, gate_up_scales, bits, INPUT_SIZE, 0.125F, 0.0625F);
             const auto fast_span = kidi::ops::require(fast_out.data<float>());
             const auto ref_span = kidi::ops::require(ref_out.data<float>());
             for (std::size_t i = 0; i < fast_span.size(); ++i) {
-                if (std::abs(fast_span[i] - ref_span[i]) > 1e-5F) {
-                    std::cerr << "Calibrated packed_linear parity mismatch bits=" << bits << " rows=" << m_rows
-                              << " idx=" << i << " fast=" << fast_span[i] << " ref=" << ref_span[i] << '\n';
-                    return 1;
-                }
+                ASSERT_NEAR(fast_span[i], ref_span[i], 1e-5F)
+                    << "Calibrated packed_linear parity mismatch bits=" << bits << " rows=" << m_rows << " idx=" << i;
             }
 #endif
         }
     }
-    std::filesystem::remove_all(cache_root);
+}
 #endif
 
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-    if (kidi::runtime::ynn::supported_arch_flags() == 0) {
-        std::cerr << "Apple arm64 YNNPACK feature detection returned no supported kernels\n";
-        return 1;
-    }
+TEST(YnnGraphArchTest, AppleArm64Kernels) {
+    EXPECT_NE(kidi::runtime::ynn::supported_arch_flags(), 0)
+        << "Apple arm64 YNNPACK feature detection returned no supported kernels";
+}
 #endif
 
+TEST(YnnThreadTest, ParallelFor) {
     kidi::runtime::ynn::set_thread_count(2);
-    if (kidi::runtime::ynn::thread_count() != 2) return 1;
+    ASSERT_EQ(kidi::runtime::ynn::thread_count(), 2);
     std::array<int, 16> parallel_hits{};
-    if (!kidi::runtime::ynn::parallel_for(parallel_hits.size(), [&](std::size_t idx) { parallel_hits[idx] = 1; })) {
-        return 1;
-    }
-    for (int v : parallel_hits) {
-        if (v != 1) return 1;
-    }
-    return 0;
+    ASSERT_TRUE(
+        kidi::runtime::ynn::parallel_for(parallel_hits.size(), [&](std::size_t idx) { parallel_hits[idx] = 1; }));
+    for (int v : parallel_hits) EXPECT_EQ(v, 1);
 }
+
+} // namespace

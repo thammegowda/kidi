@@ -633,6 +633,15 @@ wheel. Without it, CUTLASS-only kernels are not built or tested.
 Run only the kernel tests with
 `ctest --preset debug-cuda -L cuda`.
 
+Native tests are GoogleTest binaries (GoogleTest comes from the `ynnpack-dev`
+submodule). CTest lists each case separately as `<Suite>.<Name>`, so select a
+suite or one case with `-R`, or run a binary directly with `--gtest_filter`:
+
+```bash
+ctest --test-dir build-debug -R '^ChatTest\.' --output-on-failure
+./build-debug/kidi_chat_test --gtest_filter='ChatTest.*'
+```
+
 To check long-file Whisper processing with a local checkpoint and a short English
 mono PCM16 16 kHz WAV (at most 30 seconds):
 

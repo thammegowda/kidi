@@ -10,12 +10,10 @@
 #include <sstream>
 #include <thread>
 
+#include <gtest/gtest.h>
+
 namespace {
 using kidi::ops::require;
-
-auto check(bool valid, const char* message) -> void {
-    if (!valid) throw std::runtime_error(message);
-}
 
 auto run(std::vector<std::string> arguments, std::string* progress = nullptr) -> std::pair<int, std::string> {
     std::vector<const char*> argv;
@@ -37,13 +35,13 @@ auto run(std::vector<std::string> arguments, std::string* progress = nullptr) ->
 
 auto read(const std::filesystem::path& path) -> std::string {
     std::ifstream input(path, std::ios::binary);
-    check(input.good(), "cannot read index test output");
+    EXPECT_TRUE(input.good()) << "cannot read index test output: " << path;
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
 auto prepare(const std::filesystem::path& directory) -> void {
     const std::filesystem::path fixture(KIDI_GEMMA4_FIXTURE);
-    check(std::filesystem::create_directory(directory), "cannot create index CLI fixture");
+    ASSERT_TRUE(std::filesystem::create_directory(directory)) << "cannot create index CLI fixture";
     std::filesystem::copy_file(fixture / "model.safetensors", directory / "model.safetensors");
     auto manifest = YAML::LoadFile((fixture / "config.json").string());
     manifest["decode"]["maximum_new_tokens"] = 4;
@@ -57,93 +55,103 @@ auto prepare(const std::filesystem::path& directory) -> void {
         "alpha":6,"beta":7,"gamma":8,"delta":9,"theta":10,"zeta":11,"eta":12,"iota":13,"kappa":14,"lambda":15}}
     })";
 }
-} // namespace
 
-auto main() -> int {
-    using namespace kidi;
-    const auto root = std::filesystem::temp_directory_path() /
-                      ("kidi-index-cli-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    try {
-        prepare(root);
-        auto dense = require(inference::Generator::load(
-            root, inference::ModelLoadOptions{.device = tensor::Device::cpu(), .dense_lm_head = true}));
-        const auto threads = std::min<std::size_t>(4, std::max(1U, std::thread::hardware_concurrency()));
-        std::vector<std::string> command{
-            "kidi",         "index", "--model",           root.string(),
-            "--m",          "4",     "--ef-construction", "32",
-            "--candidates", "4",     "--ef-search",       "16",
-            "--builder",    "cpu",   "--threads",         std::to_string(threads),
-        };
-        std::string progress;
-        const auto [status, output] = run(command, &progress);
-        check(status == 0, "native CLI failed to build a complete index");
-        const auto report = nlohmann::json::parse(output);
-        const auto path = root / "lm_head.hnsw";
-        check(report["nodes"] == 16 && report["candidates"] == 4 && report["threads"] == threads &&
-                  report["bytes"] == std::filesystem::file_size(path),
-              "index CLI did not report the requested construction parameters");
-        check(progress.find("100.00%") != std::string::npos && progress.find("ETA") != std::string::npos,
-              "index progress omitted percentage or ETA");
-        const auto original = read(path);
-        check(run(command).first == 2 && read(path) == original, "CLI replaced an existing index");
-        auto serial_command = command;
-        serial_command.back() = "1";
-        serial_command.insert(serial_command.end(), {"--output", (root / "serial.hnsw").string()});
-        check(run(serial_command).first == 0 && read(root / "serial.hnsw") == original,
-              "CLI graph depends on thread count");
-#if !defined(KIDI_HAS_CUDA)
-        auto automatic_command = serial_command;
-        const auto builder = std::ranges::find(automatic_command, "--builder");
-        automatic_command.erase(builder, builder + 2);
-        automatic_command.back() = (root / "automatic.hnsw").string();
-        const auto [automatic_status, automatic_output] = run(automatic_command);
-        check(automatic_status == 0 && nlohmann::json::parse(automatic_output)["builder"] == "cpu" &&
-                  read(root / "automatic.hnsw") == original,
-              "CPU-only build did not automatically select native CPU indexing");
-        automatic_command.insert(automatic_command.end(), {"--builder", "cuda"});
-        check(run(automatic_command).first == 2, "CPU-only build accepted CUDA indexing");
-#endif
-        auto invalid_threads = command;
-        invalid_threads.back() = "0";
-        std::string error_output;
-        check(run(invalid_threads, &error_output).first == 2 &&
-                  error_output.find("[kidi] [error] HNSW thread count") != std::string::npos,
-              "zero indexing threads were accepted or missing formatted error");
-#if !defined(_WIN32)
-        setenv("SPDLOG_LEVEL", "off", 1);
-        std::string suppressed_output;
-        check(run(invalid_threads, &suppressed_output).first == 2 && suppressed_output.empty(),
-              "SPDLOG_LEVEL=off did not suppress CLI error logging");
-        unsetenv("SPDLOG_LEVEL");
-#endif
-        auto sparse = require(inference::Generator::load(root, tensor::Device::cpu()));
-        inference::GenerationOptions options{
-            .maximum_new_tokens = 4,
-            .context_size = 16,
-            .prefill_chunk_size = 2,
-            .raw_prompt = true,
-            .ignore_eos = true,
-        };
-        for (const auto* prompt : {"alpha beta gamma delta", "zeta eta", "theta iota"}) {
-            const auto expected = require(dense.generate(prompt, options));
-            const auto actual = require(sparse.generate(prompt, options));
-            check(actual.generation.token_ids == expected.generation.token_ids && actual.text == expected.text,
-                  "checkpoint-autoloaded candidate subset changed fixture generation");
-        }
-        std::ofstream(path, std::ios::binary | std::ios::trunc) << "broken";
-        check(!inference::Generator::load(root, tensor::Device::cpu()),
-              "corrupt checkpoint index was silently ignored");
-        check(inference::Generator::load(
-                  root, inference::ModelLoadOptions{.device = tensor::Device::cpu(), .dense_lm_head = true})
-                  .has_value(),
-              "explicit dense override did not bypass the checkpoint index");
-        std::filesystem::remove_all(root);
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << "index CLI test: " << error.what() << '\n';
+class IndexCliTest : public ::testing::Test {
+protected:
+    void SetUp() override { ASSERT_NO_FATAL_FAILURE(prepare(root)); }
+    void TearDown() override {
         std::error_code cleanup;
         std::filesystem::remove_all(root, cleanup);
-        if (cleanup) std::cerr << "index CLI test cleanup: " << cleanup.message() << '\n';
-        return 1;
+        if (cleanup) ADD_FAILURE() << "index CLI test cleanup: " << cleanup.message();
     }
+
+    const std::filesystem::path root =
+        std::filesystem::temp_directory_path() /
+        ("kidi-index-cli-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+};
+
+TEST_F(IndexCliTest, BuildsIndex) {
+    using namespace kidi;
+    auto dense = require(inference::Generator::load(
+        root, inference::ModelLoadOptions{.device = tensor::Device::cpu(), .dense_lm_head = true}));
+    const auto threads = std::min<std::size_t>(4, std::max(1U, std::thread::hardware_concurrency()));
+    std::vector<std::string> command{
+        "kidi",         "index", "--model",           root.string(),
+        "--m",          "4",     "--ef-construction", "32",
+        "--candidates", "4",     "--ef-search",       "16",
+        "--builder",    "cpu",   "--threads",         std::to_string(threads),
+    };
+    std::string progress;
+    const auto [status, output] = run(command, &progress);
+    ASSERT_EQ(status, 0) << "native CLI failed to build a complete index";
+    const auto report = nlohmann::json::parse(output);
+    const auto path = root / "lm_head.hnsw";
+    EXPECT_EQ(report["nodes"], 16) << "index CLI did not report the requested construction parameters";
+    EXPECT_EQ(report["candidates"], 4) << "index CLI did not report the requested construction parameters";
+    EXPECT_EQ(report["threads"], threads) << "index CLI did not report the requested construction parameters";
+    EXPECT_EQ(report["bytes"], std::filesystem::file_size(path))
+        << "index CLI did not report the requested construction parameters";
+    EXPECT_NE(progress.find("100.00%"), std::string::npos) << "index progress omitted percentage or ETA";
+    EXPECT_NE(progress.find("ETA"), std::string::npos) << "index progress omitted percentage or ETA";
+    const auto original = read(path);
+    EXPECT_EQ(run(command).first, 2) << "CLI replaced an existing index";
+    EXPECT_EQ(read(path), original) << "CLI replaced an existing index";
+    auto serial_command = command;
+    serial_command.back() = "1";
+    serial_command.insert(serial_command.end(), {"--output", (root / "serial.hnsw").string()});
+    EXPECT_EQ(run(serial_command).first, 0) << "CLI graph depends on thread count";
+    EXPECT_EQ(read(root / "serial.hnsw"), original) << "CLI graph depends on thread count";
+#if !defined(KIDI_HAS_CUDA)
+    auto automatic_command = serial_command;
+    const auto builder = std::ranges::find(automatic_command, "--builder");
+    automatic_command.erase(builder, builder + 2);
+    automatic_command.back() = (root / "automatic.hnsw").string();
+    const auto [automatic_status, automatic_output] = run(automatic_command);
+    ASSERT_EQ(automatic_status, 0) << "CPU-only build did not automatically select native CPU indexing";
+    EXPECT_EQ(nlohmann::json::parse(automatic_output)["builder"], "cpu")
+        << "CPU-only build did not automatically select native CPU indexing";
+    EXPECT_EQ(read(root / "automatic.hnsw"), original)
+        << "CPU-only build did not automatically select native CPU indexing";
+    automatic_command.insert(automatic_command.end(), {"--builder", "cuda"});
+    EXPECT_EQ(run(automatic_command).first, 2) << "CPU-only build accepted CUDA indexing";
+#endif
+    auto invalid_threads = command;
+    invalid_threads.back() = "0";
+    std::string error_output;
+    EXPECT_EQ(run(invalid_threads, &error_output).first, 2)
+        << "zero indexing threads were accepted or missing formatted error";
+    EXPECT_NE(error_output.find("[kidi] [error] HNSW thread count"), std::string::npos)
+        << "zero indexing threads were accepted or missing formatted error";
+#if !defined(_WIN32)
+    setenv("SPDLOG_LEVEL", "off", 1);
+    std::string suppressed_output;
+    EXPECT_EQ(run(invalid_threads, &suppressed_output).first, 2)
+        << "SPDLOG_LEVEL=off did not suppress CLI error logging";
+    EXPECT_TRUE(suppressed_output.empty()) << "SPDLOG_LEVEL=off did not suppress CLI error logging";
+    unsetenv("SPDLOG_LEVEL");
+#endif
+    auto sparse = require(inference::Generator::load(root, tensor::Device::cpu()));
+    inference::GenerationOptions options{
+        .maximum_new_tokens = 4,
+        .context_size = 16,
+        .prefill_chunk_size = 2,
+        .raw_prompt = true,
+        .ignore_eos = true,
+    };
+    for (const auto* prompt : {"alpha beta gamma delta", "zeta eta", "theta iota"}) {
+        SCOPED_TRACE(prompt);
+        const auto expected = require(dense.generate(prompt, options));
+        const auto actual = require(sparse.generate(prompt, options));
+        EXPECT_EQ(actual.generation.token_ids, expected.generation.token_ids)
+            << "checkpoint-autoloaded candidate subset changed fixture generation";
+        EXPECT_EQ(actual.text, expected.text) << "checkpoint-autoloaded candidate subset changed fixture generation";
+    }
+    std::ofstream(path, std::ios::binary | std::ios::trunc) << "broken";
+    EXPECT_FALSE(inference::Generator::load(root, tensor::Device::cpu()))
+        << "corrupt checkpoint index was silently ignored";
+    EXPECT_TRUE(inference::Generator::load(
+                    root, inference::ModelLoadOptions{.device = tensor::Device::cpu(), .dense_lm_head = true})
+                    .has_value())
+        << "explicit dense override did not bypass the checkpoint index";
 }
+} // namespace

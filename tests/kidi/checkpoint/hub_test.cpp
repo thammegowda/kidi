@@ -1,39 +1,45 @@
 #include "kidi/checkpoint/hub.h"
 
 #include <fstream>
-#include <iostream>
+#include <stdexcept>
 
-auto main() -> int {
-    namespace fs = std::filesystem;
+#include <gtest/gtest.h>
+
+namespace {
+
+namespace fs = std::filesystem;
+
+TEST(HubTest, ResolvesLocalModels) {
     const auto root = fs::temp_directory_path() / "kidi-hub-test";
     std::error_code error;
     fs::remove_all(root, error);
     fs::create_directories(root / "owner/model");
     std::ofstream(root / "owner/model/config.json") << "{}\n";
-    try {
+    {
         const kidi::checkpoint::Hub hub{"https://huggingface.co", root};
         const auto model = hub.resolve("owner/model");
         const auto file = hub.get_file("owner/model", "config.json");
-        if (!model || *model != root / "owner/model" || !file || *file != *model / "config.json" ||
-            hub.remote() != "https://huggingface.co" || hub.local() != root || hub.resolve("../model") ||
-            hub.resolve("owner/..") || hub.resolve("owner/model", "../main") ||
-            hub.get_file("owner/model", "../secret") || hub.download("owner/model@"))
-            return 1;
-        const auto home = kidi::checkpoint::Hub::expand_home("~");
-        if (home.empty() || kidi::checkpoint::Hub::expand_home("~/models/gemma") != home / "models/gemma" ||
-            kidi::checkpoint::Hub::expand_home("/abs/path") != "/abs/path")
-            return 1;
-        bool invalid_home = false;
-        try {
-            (void)kidi::checkpoint::Hub::expand_home("~other/model");
-        } catch (const std::invalid_argument&) {
-            invalid_home = true;
-        }
-        if (!invalid_home) return 1;
-    } catch (const std::exception& exception) {
-        std::cerr << exception.what() << '\n';
-        return 1;
+        ASSERT_TRUE(model.has_value()) << model.error().message;
+        EXPECT_EQ(*model, root / "owner/model");
+        ASSERT_TRUE(file.has_value()) << file.error().message;
+        EXPECT_EQ(*file, *model / "config.json");
+        EXPECT_EQ(hub.remote(), "https://huggingface.co");
+        EXPECT_EQ(hub.local(), root);
+        EXPECT_FALSE(hub.resolve("../model"));
+        EXPECT_FALSE(hub.resolve("owner/.."));
+        EXPECT_FALSE(hub.resolve("owner/model", "../main"));
+        EXPECT_FALSE(hub.get_file("owner/model", "../secret"));
+        EXPECT_FALSE(hub.download("owner/model@"));
     }
     fs::remove_all(root, error);
-    return 0;
 }
+
+TEST(HubTest, ExpandsHome) {
+    const auto home = kidi::checkpoint::Hub::expand_home("~");
+    EXPECT_FALSE(home.empty());
+    EXPECT_EQ(kidi::checkpoint::Hub::expand_home("~/models/gemma"), home / "models/gemma");
+    EXPECT_EQ(kidi::checkpoint::Hub::expand_home("/abs/path"), "/abs/path");
+    EXPECT_THROW((void)kidi::checkpoint::Hub::expand_home("~other/model"), std::invalid_argument);
+}
+
+} // namespace

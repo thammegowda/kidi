@@ -10,26 +10,26 @@
 #include <fstream>
 #include <iostream>
 
+#include <gtest/gtest.h>
+
 namespace {
 using namespace kidi;
 using ops::require;
-auto close(const tensor::Tensor& actual, const tensor::Tensor& expected) -> bool {
-    if (!std::ranges::equal(actual.shape(), expected.shape())) return false;
+auto close(const tensor::Tensor& actual, const tensor::Tensor& expected) -> ::testing::AssertionResult {
+    if (!std::ranges::equal(actual.shape(), expected.shape())) return ::testing::AssertionFailure() << "shapes differ";
     const auto left = require(actual.data<float>()), right = require(expected.data<float>());
     for (std::size_t index = 0; index < left.size(); ++index)
-        if (!std::isfinite(left[index]) || std::abs(left[index] - right[index]) > 2e-4F) {
-            std::cerr << "assistant activation mismatch at " << index << ": " << left[index] << " != " << right[index]
-                      << '\n';
-            return false;
-        }
-    return true;
+        if (!std::isfinite(left[index]) || std::abs(left[index] - right[index]) > 2e-4F)
+            return ::testing::AssertionFailure()
+                   << "assistant activation mismatch at " << index << ": " << left[index] << " != " << right[index];
+    return ::testing::AssertionSuccess();
 }
 auto row(const tensor::Tensor& value, std::size_t index) -> tensor::Tensor {
     const auto rows = require(value.select(0, 0));
     const auto selected = require(rows.select(0, index));
     return require(selected.reshape({1, 1, static_cast<std::int64_t>(selected.size(0))}));
 }
-auto check_reference(const std::filesystem::path& target_directory, const std::filesystem::path& directory) -> bool {
+void check_reference(const std::filesystem::path& target_directory, const std::filesystem::path& directory) {
     const auto config = YAML::LoadFile((target_directory / "config.json").string());
     const auto assistant_config = YAML::LoadFile((directory / "config.json").string());
     const auto reference = require(checkpoint::Weights::load(directory / "reference.safetensors"));
@@ -42,7 +42,7 @@ auto check_reference(const std::filesystem::path& target_directory, const std::f
     auto& state = static_cast<model::Gemma4State&>(*state_ptr);
     tensor::Tensor target_hidden;
     require(target->forward(input, state, true, &target_hidden));
-    if (!close(target_hidden, require(reference.tensor("target_hidden")))) return false;
+    ASSERT_TRUE(close(target_hidden, require(reference.tensor("target_hidden"))));
     std::vector<std::vector<std::byte>> caches;
     for (const auto& layer : state.layers) {
         caches.push_back(require(layer.key.copy_to_host()));
@@ -51,6 +51,7 @@ auto check_reference(const std::filesystem::path& target_directory, const std::f
     auto assistant = require(model::Gemma4AssistantImpl::create(assistant_config, config));
     require(assistant->set_checkpoint(require(checkpoint::Weights::load(directory / "model.safetensors"))));
     for (const bool ordered : {true, false}) {
+        SCOPED_TRACE(ordered ? "ordered" : "dense");
         auto current = assistant;
         if (!ordered) {
             auto dense = YAML::Clone(assistant_config);
@@ -69,12 +70,10 @@ auto check_reference(const std::filesystem::path& target_directory, const std::f
         auto hidden = row(target_hidden, input.size() - 1);
         for (std::size_t step = 0; step < expected_tokens.size(); ++step) {
             auto output = require(current->forward(*target, hidden, token, state));
-            if (output.token != expected_tokens[step]) {
-                std::cerr << "assistant token mismatch, ordered=" << ordered << ", step=" << step << ": "
-                          << output.token << " != " << expected_tokens[step] << '\n';
-                return false;
-            }
-            if (!close(output.hidden, row(expected_hidden, step)) || state.position != input.size()) return false;
+            ASSERT_EQ(output.token, expected_tokens[step])
+                << "assistant token mismatch, ordered=" << ordered << ", step=" << step;
+            ASSERT_TRUE(close(output.hidden, row(expected_hidden, step))) << "step " << step;
+            ASSERT_EQ(state.position, input.size()) << "step " << step;
             token = output.token;
             hidden = std::move(output.hidden);
         }
@@ -82,22 +81,22 @@ auto check_reference(const std::filesystem::path& target_directory, const std::f
     std::size_t index = 0;
     for (const auto& layer : state.layers)
         for (const auto* tensor : {&layer.key, &layer.value})
-            if (require(tensor->copy_to_host()) != caches[index++]) return false;
+            ASSERT_EQ(require(tensor->copy_to_host()), caches[index++]) << "target cache " << index - 1 << " changed";
     auto invalid = YAML::Clone(assistant_config);
     invalid["centroid_intermediate_top_k"] = 5;
-    if (model::Gemma4AssistantImpl::create(invalid, config)) return false;
+    EXPECT_FALSE(model::Gemma4AssistantImpl::create(invalid, config)) << "centroid_intermediate_top_k";
     invalid = YAML::Clone(assistant_config);
     invalid["backbone_hidden_size"] = 9;
-    if (model::Gemma4AssistantImpl::create(invalid, config)) return false;
+    EXPECT_FALSE(model::Gemma4AssistantImpl::create(invalid, config)) << "backbone_hidden_size";
     auto empty_ptr = require(target->create_state(16));
     auto& empty = static_cast<model::Gemma4State&>(*empty_ptr);
-    return !assistant->forward(*target, row(target_hidden, 0), 2, empty) &&
-           !assistant->forward(*target, row(target_hidden, 0), 16, state);
+    EXPECT_FALSE(assistant->forward(*target, row(target_hidden, 0), 2, empty));
+    EXPECT_FALSE(assistant->forward(*target, row(target_hidden, 0), 16, state));
 }
-auto check_generation(const std::filesystem::path& fixture, const std::filesystem::path& assistant) -> bool {
+void check_generation(const std::filesystem::path& fixture, const std::filesystem::path& assistant) {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto directory = std::filesystem::temp_directory_path() / ("kidi-mtp-" + std::to_string(stamp));
-    if (!std::filesystem::create_directory(directory)) throw std::runtime_error("cannot create MTP test directory");
+    ASSERT_TRUE(std::filesystem::create_directory(directory)) << "cannot create MTP test directory";
     struct Cleanup {
         std::filesystem::path path;
         ~Cleanup() {
@@ -121,14 +120,16 @@ auto check_generation(const std::filesystem::path& fixture, const std::filesyste
     const auto qat = static_cast<bool>(config["quantization_config"]);
     for (const auto cache_precision : qat ? std::array{core::KVCachePrecision::FP32, core::KVCachePrecision::INT8}
                                           : std::array{core::KVCachePrecision::FP32, core::KVCachePrecision::FP32}) {
+        SCOPED_TRACE(core::to_string(cache_precision));
         auto baseline = require(
             inference::Generator::load(directory, {.kv_cache_precision = cache_precision, .dense_lm_head = true}));
         auto speculative = require(inference::Generator::load(directory, {.kv_cache_precision = cache_precision,
                                                                           .dense_lm_head = true,
                                                                           .assistant_model = assistant,
                                                                           .draft_tokens = 3}));
-        if (!speculative.speculative() || baseline.speculative() || speculative.kv_cache_precision() != cache_precision)
-            return false;
+        ASSERT_TRUE(speculative.speculative());
+        ASSERT_FALSE(baseline.speculative());
+        ASSERT_EQ(speculative.kv_cache_precision(), cache_precision);
         for (const auto prompt : {"alpha beta gamma", "<eos>"})
             for (const bool ignore_eos : {true, false})
                 for (const std::size_t maximum : {1, 2, 10}) {
@@ -139,33 +140,25 @@ auto check_generation(const std::filesystem::path& fixture, const std::filesyste
                                                                .ignore_eos = ignore_eos};
                     const auto expected = require(baseline.generate(prompt, options));
                     const auto actual = require(speculative.generate(prompt, options));
-                    if (actual.generation.token_ids != expected.generation.token_ids ||
-                        actual.generation.decoder_steps != expected.generation.decoder_steps ||
-                        actual.generation.truncated != expected.generation.truncated || actual.text != expected.text ||
-                        !actual.stats.speculative) {
-                        std::cerr << "generation mismatch: " << fixture.filename()
-                                  << ", cache=" << core::to_string(cache_precision) << ", prompt=" << prompt
-                                  << ", limit=" << maximum << ", ignore_eos=" << ignore_eos << '\n';
-                        std::cerr << "expected:";
-                        for (const auto token : expected.generation.token_ids) std::cerr << ' ' << token;
-                        std::cerr << "\nactual:";
-                        for (const auto token : actual.generation.token_ids) std::cerr << ' ' << token;
-                        std::cerr << '\n';
-                        return false;
-                    }
+                    SCOPED_TRACE(::testing::Message() << "generation mismatch: " << fixture.filename() << ", cache="
+                                                      << core::to_string(cache_precision) << ", prompt=" << prompt
+                                                      << ", limit=" << maximum << ", ignore_eos=" << ignore_eos);
+                    ASSERT_EQ(actual.generation.token_ids, expected.generation.token_ids);
+                    ASSERT_EQ(actual.generation.decoder_steps, expected.generation.decoder_steps);
+                    ASSERT_EQ(actual.generation.truncated, expected.generation.truncated);
+                    ASSERT_EQ(actual.text, expected.text);
+                    ASSERT_TRUE(actual.stats.speculative);
                 }
     }
-    if (inference::Generator::load(directory, {.kv_cache_precision = core::KVCachePrecision::E4M3,
-                                               .dense_lm_head = true,
-                                               .assistant_model = assistant}) ||
-        inference::Generator::load(directory,
-                                   {.dense_lm_head = true, .assistant_model = assistant, .draft_tokens = 17}))
-        return false;
+    ASSERT_FALSE(inference::Generator::load(
+        directory,
+        {.kv_cache_precision = core::KVCachePrecision::E4M3, .dense_lm_head = true, .assistant_model = assistant}));
+    ASSERT_FALSE(inference::Generator::load(directory,
+                                            {.dense_lm_head = true, .assistant_model = assistant, .draft_tokens = 17}));
     auto speculative = require(inference::Generator::load(
         directory, {.dense_lm_head = true, .assistant_model = assistant, .draft_tokens = 3}));
-    if (speculative.configure_serving({.maximum_active = 2}) ||
-        speculative.configure_serving({.maximum_active = 1, .deferred_tokens = true}))
-        return false;
+    ASSERT_FALSE(speculative.configure_serving({.maximum_active = 2}));
+    ASSERT_FALSE(speculative.configure_serving({.maximum_active = 1, .deferred_tokens = true}));
     require(speculative.configure_serving(
         {.maximum_active = 1, .maximum_requests = 2, .cache_token_budget = 16, .prefill_tokens_per_step = 4}));
     const inference::GenerationOptions streaming{.maximum_new_tokens = 10,
@@ -184,11 +177,13 @@ auto check_generation(const std::filesystem::path& fixture, const std::filesyste
             if (event.token) emitted.push_back(*event.token);
             if (event.completed) completed = std::move(event.completed);
         }
-    if (!completed || emitted != completed->generation.token_ids || text != completed->text ||
-        !completed->stats.verification_steps || !completed->stats.draft_tokens)
-        return false;
+    ASSERT_TRUE(completed);
+    ASSERT_EQ(emitted, completed->generation.token_ids);
+    ASSERT_EQ(text, completed->text);
+    ASSERT_TRUE(completed->stats.verification_steps);
+    ASSERT_TRUE(completed->stats.draft_tokens);
     require(speculative.release_workspaces());
-    if (speculative.generate_batch(std::array<std::string, 1>{"alpha"})) return false;
+    ASSERT_FALSE(speculative.generate_batch(std::array<std::string, 1>{"alpha"}));
     if (!qat) {
         const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
         auto target = require(model::Gemma4Impl::create(config));
@@ -210,30 +205,24 @@ auto check_generation(const std::filesystem::path& fixture, const std::filesyste
                                                    .ignore_eos = true};
         const auto expected = require(dense.generate("alpha beta gamma", options));
         const auto actual = require(indexed.generate("alpha beta gamma", options));
-        if (actual.generation.token_ids != expected.generation.token_ids || actual.text != expected.text ||
-            !actual.stats.speculative)
-            return false;
+        ASSERT_EQ(actual.generation.token_ids, expected.generation.token_ids);
+        ASSERT_EQ(actual.text, expected.text);
+        ASSERT_TRUE(actual.stats.speculative);
     }
-    return true;
+}
+
+auto target_fixture() -> std::filesystem::path { return KIDI_GEMMA4_FIXTURE; }
+auto assistant_fixture() -> std::filesystem::path { return target_fixture().parent_path() / "gemma4-assistant"; }
+
+TEST(Gemma4DraftTest, SharesTargetCache) {
+    check_reference(target_fixture(), assistant_fixture());
+}
+
+TEST(Gemma4DraftTest, MatchesGreedy) {
+    check_generation(target_fixture(), assistant_fixture());
+}
+
+TEST(Gemma4DraftTest, QatMatchesGreedy) {
+    check_generation(target_fixture().parent_path() / "gemma4-qat", assistant_fixture());
 }
 } // namespace
-
-auto main() -> int {
-    try {
-        const auto target = std::filesystem::path(KIDI_GEMMA4_FIXTURE);
-        const auto assistant = target.parent_path() / "gemma4-assistant";
-        if (!check_reference(target, assistant)) {
-            std::cerr << "Gemma MTP assistant reference failed\n";
-            return 1;
-        }
-        if (!check_generation(target, assistant) || !check_generation(target.parent_path() / "gemma4-qat", assistant)) {
-            std::cerr << "Gemma MTP generation parity failed\n";
-            return 1;
-        }
-        std::cout << "Gemma MTP reference, shared KV, streaming, and greedy parity passed\n";
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
-    }
-}

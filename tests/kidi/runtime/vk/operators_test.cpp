@@ -12,9 +12,12 @@
 #include <cstdlib>
 #include <iostream>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <gtest/gtest.h>
 
 namespace {
 
@@ -70,16 +73,18 @@ auto byte_values(const Tensor& input) -> std::vector<std::int8_t> {
 auto assert_close(std::string_view name, const Tensor& expected, const Tensor& actual, float tolerance = 2e-4F)
     -> void {
     const auto left = values(expected), right = values(actual);
-    if (left.size() != right.size()) throw std::runtime_error(std::string(name) + " size mismatch");
-    for (std::size_t index = 0; index < left.size(); ++index)
-        if (!std::isfinite(right[index]) || std::abs(left[index] - right[index]) > tolerance)
-            throw std::runtime_error(std::string(name) + " mismatch at " + std::to_string(index) + ": " +
-                                     std::to_string(left[index]) + " != " + std::to_string(right[index]));
+    ASSERT_EQ(left.size(), right.size()) << name << " size mismatch";
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        ASSERT_TRUE(std::isfinite(right[index]))
+            << name << " mismatch at " << index << ": " << left[index] << " != " << right[index];
+        ASSERT_LE(std::abs(left[index] - right[index]), tolerance)
+            << name << " mismatch at " << index << ": " << left[index] << " != " << right[index];
+    }
 }
 
 auto assert_equal(std::string_view name, const Tensor& expected, const Tensor& actual) -> void {
     const auto left = int_values(expected), right = int_values(actual);
-    if (left != right) throw std::runtime_error(std::string(name) + " integer mismatch");
+    EXPECT_EQ(left, right) << name << " integer mismatch";
 }
 
 auto make_sequence(std::size_t count, float scale = 0.03125F) -> std::vector<float> {
@@ -113,7 +118,7 @@ auto check_pointwise(std::size_t rows) -> void {
     assert_close("static_round", cpu.static_round(left, 0.125F), vk.static_round(to_vulkan(left), 0.125F));
     const auto rounded = vk.cast(to_vulkan(left), DType::I8, 0.125F);
     const auto expected = cpu.cast(left, DType::I8, 0.125F);
-    if (byte_values(expected) != byte_values(rounded)) throw std::runtime_error("calibrated cast mismatch");
+    EXPECT_EQ(byte_values(expected), byte_values(rounded)) << "calibrated cast mismatch";
 }
 
 auto check_linear(std::size_t rows) -> void {
@@ -405,7 +410,7 @@ auto load_gemma(const std::filesystem::path& directory, const YAML::Node& config
     return model;
 }
 
-auto run_gemma_teacher_forced(const std::filesystem::path& directory, int copies) -> int {
+auto run_gemma_teacher_forced(const std::filesystem::path& directory, int copies) -> std::size_t {
     constexpr std::size_t CONTEXT = 9216;
     constexpr std::size_t STEPS = 64;
     const auto chunk = std::getenv("KIDI_DIAG_CHUNK") ? std::strtoull(std::getenv("KIDI_DIAG_CHUNK"), nullptr, 10) : 32;
@@ -470,44 +475,104 @@ auto run_gemma_teacher_forced(const std::filesystem::path& directory, int copies
               << " mismatches=" << mismatches << " generated=";
     for (const auto token : generated) std::cout << (token == generated.front() ? "" : ",") << token;
     std::cout << '\n';
-    return mismatches == 0 ? 0 : 2;
+    return mismatches;
+}
+
+class VulkanOpsTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        if (!available()) GTEST_SKIP() << "Vulkan backend unavailable; skipping";
+    }
+};
+
+TEST_F(VulkanOpsTest, Pointwise) {
+    for (const auto rows : {std::size_t{1}, std::size_t{32}, std::size_t{128}}) {
+        SCOPED_TRACE("rows=" + std::to_string(rows));
+        check_pointwise(rows);
+    }
+}
+
+TEST_F(VulkanOpsTest, Linear) {
+    for (const auto rows : {std::size_t{1}, std::size_t{32}, std::size_t{128}}) {
+        SCOPED_TRACE("rows=" + std::to_string(rows));
+        check_linear(rows);
+    }
+}
+
+TEST_F(VulkanOpsTest, PackedProjection) {
+    {
+        SCOPED_TRACE("rows=1 width=1536 columns=512 bits=4");
+        check_packed_projection(1, 1536, 512, 4);
+    }
+    {
+        SCOPED_TRACE("rows=1 width=6144 columns=512 bits=2");
+        check_packed_projection(1, 6144, 512, 2);
+    }
+    {
+        SCOPED_TRACE("rows=7 width=64 columns=256 bits=8");
+        check_packed_projection(7, 64, 256, 8);
+    }
+    {
+        SCOPED_TRACE("rows=32 width=64 columns=256 bits=4");
+        check_packed_projection(32, 64, 256, 4);
+    }
+}
+
+TEST_F(VulkanOpsTest, GatedFeedForward) {
+    {
+        SCOPED_TRACE("rows=1 gelu");
+        check_gated_feed_forward(1);
+    }
+    {
+        SCOPED_TRACE("rows=32 gelu");
+        check_gated_feed_forward(32);
+    }
+    {
+        SCOPED_TRACE("rows=32 silu");
+        check_gated_feed_forward(32, true);
+    }
+}
+
+TEST_F(VulkanOpsTest, Embedding) { check_embedding(); }
+
+TEST_F(VulkanOpsTest, NormRotary) {
+    for (const auto rows : {std::size_t{1}, std::size_t{32}}) {
+        SCOPED_TRACE("rows=" + std::to_string(rows));
+        check_norm_rotary(rows);
+    }
+}
+
+TEST_F(VulkanOpsTest, Attention) {
+    for (const auto rows : {std::size_t{1}, std::size_t{32}}) {
+        SCOPED_TRACE("rows=" + std::to_string(rows));
+        check_attention(rows);
+    }
+}
+
+TEST_F(VulkanOpsTest, NativeAttention) {
+    {
+        SCOPED_TRACE("rows=7 batch=1");
+        check_native_attention(7, 1);
+    }
+    {
+        SCOPED_TRACE("rows=5 batch=2");
+        check_native_attention(5, 2);
+    }
+}
+
+TEST_F(VulkanOpsTest, Indexing) { check_indexing(); }
+
+TEST_F(VulkanOpsTest, Selection) { check_selection(); }
+
+// Teacher-forced Gemma CPU/Vulkan diagnostic. KIDI_TEST_VK_GEMMA_CHECKPOINT=<checkpoint dir> enables it;
+// KIDI_TEST_VK_GEMMA_COPIES=<n> (default 1) repeats the prompt text n times.
+TEST(VulkanGemmaTest, TeacherForced) {
+    const auto* directory = std::getenv("KIDI_TEST_VK_GEMMA_CHECKPOINT");
+    if (directory == nullptr || *directory == '\0') GTEST_SKIP() << "KIDI_TEST_VK_GEMMA_CHECKPOINT not set";
+    if (!available()) GTEST_SKIP() << "Vulkan backend unavailable; skipping";
+    const auto* copies_value = std::getenv("KIDI_TEST_VK_GEMMA_COPIES");
+    const int copies = copies_value != nullptr ? std::atoi(copies_value) : 1;
+    EXPECT_EQ(run_gemma_teacher_forced(directory, copies), 0U) << "CPU and Vulkan greedy tokens diverged";
 }
 
 } // namespace
-
-auto main(int argc, char** argv) -> int {
-    try {
-        if (argc >= 3 && std::string_view(argv[1]) == "gemma-diagnostic") {
-            const int copies = argc >= 4 ? std::atoi(argv[3]) : 1;
-            return run_gemma_teacher_forced(argv[2], copies);
-        }
-        if (!available()) {
-            std::cout << "Vulkan backend unavailable; skipping\n";
-            return 0;
-        }
-        for (const auto rows : {std::size_t{1}, std::size_t{32}, std::size_t{128}}) {
-            check_pointwise(rows);
-            check_linear(rows);
-        }
-        check_packed_projection(1, 1536, 512, 4);
-        check_packed_projection(1, 6144, 512, 2);
-        check_packed_projection(7, 64, 256, 8);
-        check_packed_projection(32, 64, 256, 4);
-        check_gated_feed_forward(1);
-        check_gated_feed_forward(32);
-        check_gated_feed_forward(32, true);
-        check_embedding();
-        for (const auto rows : {std::size_t{1}, std::size_t{32}}) {
-            check_norm_rotary(rows);
-            check_attention(rows);
-        }
-        check_native_attention(7, 1);
-        check_native_attention(5, 2);
-        check_indexing();
-        check_selection();
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
-    }
-}

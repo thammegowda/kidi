@@ -2,10 +2,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <limits>
 #include <string>
 #include <string_view>
+
+#include <gtest/gtest.h>
 
 #include "kidi/checkpoint/package.h"
 #include "kidi/model/registry.h"
@@ -68,85 +69,109 @@ auto write_empty_safetensors(const std::filesystem::path& path) -> void {
     output.write(HEADER.data(), static_cast<std::streamsize>(HEADER.size()));
 }
 
-} // namespace
+class PackageTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        directory = std::filesystem::temp_directory_path() /
+                    (std::string("kidi-rtg-package-test-") +
+                     ::testing::UnitTest::GetInstance()->current_test_info()->name());
+        std::filesystem::remove_all(directory);
+        std::filesystem::create_directories(directory);
+        write_empty_safetensors(directory / "model.safetensors");
+        write(directory / "tokenizer.src.json", TOKENIZER_JSON);
+        write(directory / "tokenizer.tgt.json", TOKENIZER_JSON);
+        write(directory / "config.json", MANIFEST_JSON);
+    }
 
-auto main() -> int {
-    const auto directory = std::filesystem::temp_directory_path() / "kidi-rtg-package-test";
-    std::filesystem::remove_all(directory);
-    std::filesystem::create_directories(directory);
-    write_empty_safetensors(directory / "model.safetensors");
-    write(directory / "tokenizer.src.json", TOKENIZER_JSON);
-    write(directory / "tokenizer.tgt.json", TOKENIZER_JSON);
-    write(directory / "config.json", MANIFEST_JSON);
+    void TearDown() override {
+        std::error_code error;
+        std::filesystem::remove_all(directory, error);
+    }
 
+    std::filesystem::path directory;
+};
+
+TEST_F(PackageTest, LoadsRtgPackage) {
     auto package = kidi::checkpoint::Package::load(directory);
-    if (!package || package->source_tokenizer().token_id("<s>") != 2 ||
-        package->target_tokenizer().vocabulary_size() != 5 ||
-        package->config()["model"]["source_pad_id"].as<int>() != 0 ||
-        package->config()["decode"]["begin_id"].as<int>() != 2 ||
-        package->config()["decode"]["end_id"].as<int>() != 3) {
-        std::cerr << "valid RTG package was rejected\n";
-        return 1;
-    }
-    if (kidi::checkpoint::Package::load(directory / "config.json")) {
-        std::cerr << "manifest path was accepted as a model directory\n";
-        return 1;
-    }
+    ASSERT_TRUE(package.has_value()) << "valid RTG package was rejected: " << package.error().message;
+    EXPECT_EQ(package->source_tokenizer().token_id("<s>"), 2) << "valid RTG package was rejected";
+    EXPECT_EQ(package->target_tokenizer().vocabulary_size(), 5U) << "valid RTG package was rejected";
+    EXPECT_EQ(package->config()["model"]["source_pad_id"].as<int>(), 0) << "valid RTG package was rejected";
+    EXPECT_EQ(package->config()["decode"]["begin_id"].as<int>(), 2) << "valid RTG package was rejected";
+    EXPECT_EQ(package->config()["decode"]["end_id"].as<int>(), 3) << "valid RTG package was rejected";
+    EXPECT_FALSE(kidi::checkpoint::Package::load(directory / "config.json"))
+        << "manifest path was accepted as a model directory";
+}
 
+TEST_F(PackageTest, ValidatesTransformerConfig) {
+    auto package = kidi::checkpoint::Package::load(directory);
+    ASSERT_TRUE(package.has_value()) << package.error().message;
     auto model_config = YAML::Clone(package->config()["model"]);
-    if (!kidi::model::TransformerImpl::validate_config(model_config)) return 1;
+    ASSERT_TRUE(kidi::model::TransformerImpl::validate_config(model_config));
     auto scratch = kidi::model::TransformerImpl::create(model_config);
-    if (!scratch) return 1;
+    ASSERT_TRUE(scratch.has_value()) << scratch.error().message;
     const auto initialized = (*scratch)->state_dict();
-    if (!initialized.contains("encoder.0.qkv.weight") || !initialized.at("encoder.0.qkv.weight").defined()) return 1;
+    ASSERT_TRUE(initialized.contains("encoder.0.qkv.weight"));
+    EXPECT_TRUE(initialized.at("encoder.0.qkv.weight").defined());
     const auto target = initialized.at("target_embedding.weight").host_bytes();
     const auto projection = initialized.at("generator.weight").host_bytes();
-    if (!target || !projection || target->data() != projection->data()) return 1;
+    ASSERT_TRUE(target);
+    ASSERT_TRUE(projection);
+    EXPECT_EQ(target->data(), projection->data());
     for (const auto* key : {"type", "hidden_size", "source_pad_id"}) {
         auto invalid = YAML::Clone(model_config);
         invalid.remove(key);
         auto result = kidi::model::TransformerImpl::create(invalid);
-        if (result || result.error().code != kidi::ErrorCode::INVALID_MANIFEST) return 1;
+        ASSERT_FALSE(result) << key;
+        EXPECT_EQ(result.error().code, kidi::ErrorCode::INVALID_MANIFEST) << key;
     }
     auto invalid = YAML::Clone(model_config);
     invalid["attention_heads"] = 3;
-    if (kidi::model::TransformerImpl::validate_config(invalid)) return 1;
+    EXPECT_FALSE(kidi::model::TransformerImpl::validate_config(invalid));
     invalid = YAML::Clone(model_config);
     invalid["hidden_size"] = 0;
-    if (kidi::model::TransformerImpl::validate_config(invalid)) return 1;
+    EXPECT_FALSE(kidi::model::TransformerImpl::validate_config(invalid));
     invalid = YAML::Clone(model_config);
     invalid["source_pad_id"] = -1;
-    if (kidi::model::TransformerImpl::validate_config(invalid)) return 1;
+    EXPECT_FALSE(kidi::model::TransformerImpl::validate_config(invalid));
     invalid = YAML::Clone(model_config);
     invalid["layer_norm_epsilon"] = std::numeric_limits<float>::quiet_NaN();
-    if (kidi::model::TransformerImpl::validate_config(invalid)) return 1;
+    EXPECT_FALSE(kidi::model::TransformerImpl::validate_config(invalid));
     const auto malformed_type = kidi::model::validate_model_config(YAML::Load("{type: {nested: value}}"));
-    if (malformed_type || malformed_type.error().code != kidi::ErrorCode::INVALID_MANIFEST) return 1;
+    ASSERT_FALSE(malformed_type);
+    EXPECT_EQ(malformed_type.error().code, kidi::ErrorCode::INVALID_MANIFEST);
     auto encoder_memory = (*scratch)->encode_text(std::array{std::vector<std::int32_t>{1, 2}});
-    if (!encoder_memory) return 1;
+    ASSERT_TRUE(encoder_memory.has_value()) << encoder_memory.error().message;
     auto batched_state = (*scratch)->create_decoder_state(*encoder_memory, 2, 8);
-    if (!batched_state) return 1;
+    ASSERT_TRUE(batched_state.has_value()) << batched_state.error().message;
     const std::array<std::int32_t, 2> batched_tokens{1, 2};
     const auto single_forward = (*scratch)->forward(batched_tokens, **batched_state);
-    if (single_forward || single_forward.error().code != kidi::ErrorCode::INVALID_ARGUMENT) return 1;
+    ASSERT_FALSE(single_forward);
+    EXPECT_EQ(single_forward.error().code, kidi::ErrorCode::INVALID_ARGUMENT);
+}
 
+TEST_F(PackageTest, RejectsDecodeSettings) {
     auto invalid_decode = YAML::Load(std::string(MANIFEST_JSON));
     invalid_decode["io"]["input_format"] = "plain";
     write(directory / "config.json", YAML::Dump(invalid_decode));
     auto translator = kidi::inference::Translator::load(directory, kidi::module_device);
-    if (translator || translator.error().code != kidi::ErrorCode::INVALID_MANIFEST) return 1;
+    ASSERT_FALSE(translator);
+    EXPECT_EQ(translator.error().code, kidi::ErrorCode::INVALID_MANIFEST);
     invalid_decode["io"]["input_format"] = "moses_tokenized";
     invalid_decode["decode"]["beam_size"] = 0;
     write(directory / "config.json", YAML::Dump(invalid_decode));
     translator = kidi::inference::Translator::load(directory, kidi::module_device);
-    if (translator || translator.error().code != kidi::ErrorCode::INVALID_ARGUMENT) return 1;
+    ASSERT_FALSE(translator);
+    EXPECT_EQ(translator.error().code, kidi::ErrorCode::INVALID_ARGUMENT);
     invalid_decode["decode"]["beam_size"] = 1;
     invalid_decode["decode"]["length_penalty"] = std::numeric_limits<float>::quiet_NaN();
     write(directory / "config.json", YAML::Dump(invalid_decode));
     translator = kidi::inference::Translator::load(directory, kidi::module_device);
-    if (translator || translator.error().code != kidi::ErrorCode::INVALID_ARGUMENT) return 1;
+    ASSERT_FALSE(translator);
+    EXPECT_EQ(translator.error().code, kidi::ErrorCode::INVALID_ARGUMENT);
+}
 
-    write(directory / "config.json", MANIFEST_JSON);
+TEST_F(PackageTest, DerivesSpecialIds) {
     const std::string original(TOKENIZER_JSON);
     auto reordered = original;
     const std::string vocabulary = R"("<pad>": 0, "<unk>": 1, "<s>": 2, "</s>": 3, "hi": 4)";
@@ -154,17 +179,16 @@ auto main() -> int {
                       R"("<pad>": 4, "<unk>": 0, "<s>": 1, "</s>": 2, "hi": 3)");
     write(directory / "tokenizer.tgt.json", reordered);
     auto different_ids = kidi::checkpoint::Package::load(directory);
-    if (!different_ids || different_ids->config()["model"]["source_pad_id"].as<int>() != 0 ||
-        different_ids->config()["decode"]["source_end_id"].as<int>() != 3 ||
-        different_ids->config()["decode"]["begin_id"].as<int>() != 1 ||
-        different_ids->config()["decode"]["end_id"].as<int>() != 2 ||
-        different_ids->config()["decode"]["pad_id"].as<int>() != 4)
-        return 1;
+    ASSERT_TRUE(different_ids.has_value()) << different_ids.error().message;
+    EXPECT_EQ(different_ids->config()["model"]["source_pad_id"].as<int>(), 0);
+    EXPECT_EQ(different_ids->config()["decode"]["source_end_id"].as<int>(), 3);
+    EXPECT_EQ(different_ids->config()["decode"]["begin_id"].as<int>(), 1);
+    EXPECT_EQ(different_ids->config()["decode"]["end_id"].as<int>(), 2);
+    EXPECT_EQ(different_ids->config()["decode"]["pad_id"].as<int>(), 4);
     auto missing = original;
     missing.replace(missing.find("<s>"), 3, "<missing>");
     write(directory / "tokenizer.tgt.json", missing);
-    if (kidi::checkpoint::Package::load(directory)) return 1;
-
-    std::filesystem::remove_all(directory);
-    return 0;
+    EXPECT_FALSE(kidi::checkpoint::Package::load(directory));
 }
+
+} // namespace
