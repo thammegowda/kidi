@@ -12,6 +12,7 @@
 #include <vector>
 
 #include <ynnpack.h>
+#include "ynnpack/composites/composites.h"
 
 #include "kidi/core/precision.h"
 #include "kidi/ops/context.h"
@@ -93,24 +94,27 @@ auto main() -> int {
                                           down_scale_tensor, BITS, INPUT_SIZE, INTERMEDIATE, 0.125F, 0.0625F, 0.03125F,
                                           0.125F);
     };
-    kidi::ops::Context reference_context(kidi::tensor::Device::cpu());
-    const auto reference_ffn = run_ffn(reference_context);
-    const auto ffn_cache_dir = cache_root / "ffn-multi-tile";
-    kidi::ops::Context populate_context(kidi::tensor::Device::cpu());
-    populate_context.configure_cache(ffn_cache_dir, source);
-    const auto populated_ffn = run_ffn(populate_context);
-    if (std::filesystem::is_empty(ffn_cache_dir)) return 1;
-    std::filesystem::permissions(ffn_cache_dir,
-                                 std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
-    kidi::ops::Context cached_context(kidi::tensor::Device::cpu());
-    cached_context.configure_cache(ffn_cache_dir, source);
-    const auto cached_ffn = run_ffn(cached_context);
-    std::filesystem::permissions(ffn_cache_dir, std::filesystem::perms::owner_all);
-    const auto expected_values = kidi::ops::require(reference_ffn.data<float>());
-    const auto populated_values = kidi::ops::require(populated_ffn.data<float>());
-    const auto cached_values = kidi::ops::require(cached_ffn.data<float>());
-    if (!std::ranges::equal(expected_values, populated_values) || !std::ranges::equal(expected_values, cached_values))
-        return 1;
+    if (ynn::is_symmetric_linear_supported(BITS)) {
+        kidi::ops::Context reference_context(kidi::tensor::Device::cpu());
+        const auto reference_ffn = run_ffn(reference_context);
+        const auto ffn_cache_dir = cache_root / "ffn-multi-tile";
+        kidi::ops::Context populate_context(kidi::tensor::Device::cpu());
+        populate_context.configure_cache(ffn_cache_dir, source);
+        const auto populated_ffn = run_ffn(populate_context);
+        if (std::filesystem::is_empty(ffn_cache_dir)) return 1;
+        std::filesystem::permissions(ffn_cache_dir,
+                                     std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
+        kidi::ops::Context cached_context(kidi::tensor::Device::cpu());
+        cached_context.configure_cache(ffn_cache_dir, source);
+        const auto cached_ffn = run_ffn(cached_context);
+        std::filesystem::permissions(ffn_cache_dir, std::filesystem::perms::owner_all);
+        const auto expected_values = kidi::ops::require(reference_ffn.data<float>());
+        const auto populated_values = kidi::ops::require(populated_ffn.data<float>());
+        const auto cached_values = kidi::ops::require(cached_ffn.data<float>());
+        if (!std::ranges::equal(expected_values, populated_values) ||
+            !std::ranges::equal(expected_values, cached_values))
+            return 1;
+    }
 
     // Verify fused GATED_FEED_FORWARD matches composed PACKED_LINEAR + GELU/SILU_MULTIPLY + PACKED_LINEAR across
     // bits = 2, 4, 8 and both M = 1 (decode) and M = 17 (odd multi-row prefill) with 4 worker threads.

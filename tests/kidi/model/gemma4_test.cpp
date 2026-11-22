@@ -455,6 +455,9 @@ auto check_async_serving(const YAML::Node& config) -> void {
     write_tokenizer(directory / "tokenizer.json");
     auto pipelined = require(inference::Generator::load(directory, device));
     auto serial = require(inference::Generator::load(directory, device));
+    require(pipelined.warm_up(4, 64));
+    const auto preallocated_bytes = pipelined.memory().cache_bytes;
+    if (!preallocated_bytes) throw std::runtime_error("CUDA warm-up did not preallocate its KV cache");
     require(pipelined.configure_serving({.maximum_active = 1,
                                          .maximum_requests = 1,
                                          .cache_token_budget = 64,
@@ -504,6 +507,29 @@ auto check_async_serving(const YAML::Node& config) -> void {
     const auto generated = require(pipelined.generate("gamma", options));
     if (generated.generation.token_ids != synchronous.generation.token_ids || generated.stats.decode_queue_peak != 8)
         throw std::runtime_error("serial generation bypassed the device-feedback pipeline");
+    const auto reusable_bytes = pipelined.memory().cache_bytes;
+    if (reusable_bytes != preallocated_bytes)
+        throw std::runtime_error("completed CUDA request discarded or duplicated its preallocated KV cache");
+    for (const auto* prompt : {"alpha beta gamma", "alpha", "gamma"}) {
+        require(serial.release_workspaces());
+        const auto fresh = run(serial, prompt, options);
+        const auto reused = require(pipelined.generate(prompt, options));
+        if (reused.generation.token_ids != fresh.generation.token_ids || reused.stats.reused_prompt_tokens ||
+            pipelined.memory().cache_bytes != reusable_bytes)
+            throw std::runtime_error("reused CUDA state retained prompt data or duplicated the KV cache");
+    }
+    const auto serial_bytes = serial.memory().cache_bytes;
+    const auto eager_reused = require(serial.generate("gamma", options));
+    if (eager_reused.generation.token_ids != synchronous.generation.token_ids ||
+        serial.memory().cache_bytes != serial_bytes)
+        throw std::runtime_error("eager CUDA generation failed to reuse its request cache");
+    for (const std::size_t capacity : {32, 64}) {
+        options.context_size = capacity;
+        const auto resized = require(pipelined.generate("gamma", options));
+        if (resized.generation.token_ids != synchronous.generation.token_ids ||
+            pipelined.memory().cache_bytes != preallocated_bytes * capacity / 64)
+            throw std::runtime_error("CUDA cache reuse ignored a change in request capacity");
+    }
     const auto cancelled = require(pipelined.enqueue("gamma", options));
     require(pipelined.step());
     require(pipelined.step());
@@ -517,6 +543,8 @@ auto check_async_serving(const YAML::Node& config) -> void {
             throw std::runtime_error("cancelled in-flight decode released its cache budget before completion");
     }
     require(pipelined.release_workspaces());
+    if (pipelined.memory().cache_bytes)
+        throw std::runtime_error("release_workspaces retained reusable CUDA request caches");
     std::filesystem::remove_all(directory);
 }
 
@@ -586,6 +614,47 @@ auto check_hnsw_head(kidi::model::Gemma4& network, const kidi::tensor::Tensor& w
         std::filesystem::remove(path, cleanup);
         if (cleanup) std::cerr << "HNSW fixture cleanup: " << cleanup.message() << '\n';
         return false;
+    }
+}
+
+auto check_cuda_cache_precision(const YAML::Node& config, const kidi::checkpoint::Weights& checkpoint,
+                                 std::span<const std::int32_t> tokens) -> void {
+    using namespace kidi;
+    using ops::require;
+    const auto device = tensor::Device::cuda();
+    const auto backend = tensor::BackendRegistry::instance().backend(device);
+    if (!backend || !(*backend)->is_available(device) || !(*backend)->supports_execution()) return;
+    const ModuleScope construction(tensor::DType::F32, false, device);
+    auto network = require(model::Gemma4Impl::create(config));
+    require(network->set_checkpoint(checkpoint));
+    network->set_kv_cache_precision(core::KVCachePrecision::FP32);
+    auto reference = require(network->create_state(8));
+    const auto first = tokens.first(2);
+    const auto next = tokens.subspan(2, 1);
+    const auto expected_prefill = require(require(network->forward(first, *reference, true)).to(tensor::Device::cpu()));
+    const auto expected_decode = require(require(network->forward(next, *reference)).to(tensor::Device::cpu()));
+    const auto close = [&](const tensor::Tensor& output, const tensor::Tensor& expected) {
+        const auto host = require(output.to(tensor::Device::cpu()));
+        if (host.dtype() != tensor::DType::F32 || !std::ranges::equal(host.shape(), expected.shape()))
+            throw std::runtime_error("BF16 cache changed output dtype or geometry");
+        const auto actual = require(host.data<float>()), values = require(expected.data<float>());
+        for (std::size_t index = 0; index < actual.size(); ++index)
+            if (!std::isfinite(actual[index]) ||
+                std::abs(actual[index] - values[index]) > 0.03F + 0.02F * std::abs(values[index]))
+                throw std::runtime_error("BF16 cache changed CUDA model logits beyond tolerance");
+    };
+    for (const auto precision : {core::KVCachePrecision::AUTO, core::KVCachePrecision::BF16}) {
+        network->set_kv_cache_precision(precision);
+        auto state = require(network->create_state(8));
+        for (const auto& layer : static_cast<const model::Gemma4State&>(*state).layers)
+            if (layer.key.dtype() != tensor::DType::BF16 || layer.value.dtype() != tensor::DType::BF16)
+                throw std::runtime_error("CUDA cache did not use BF16 storage");
+        close(require(network->forward(first, *state, true)), expected_prefill);
+        auto fork = require(network->fork_state(*state, first.size(), 8));
+        close(require(network->forward(next, *state)), expected_decode);
+        close(require(network->forward(next, *fork)), expected_decode);
+        require(network->rewind(*state, 0));
+        close(require(network->forward(first, *state, true)), expected_prefill);
     }
 }
 
@@ -722,6 +791,7 @@ auto main() -> int {
             const auto token_tensor = ops::require(reference.tensor("tokens"));
             const auto expected = ops::require(reference.tensor("logits"));
             const auto tokens = ops::require(token_tensor.data<std::int32_t>());
+            check_cuda_cache_precision(config, checkpoint, tokens);
             if (fixture == std::string_view("gemma4") && !check_bfloat_model(config, checkpoint, tokens))
                 return failed(__LINE__);
             if (fixture == std::string_view("gemma4")) check_async_serving(config);

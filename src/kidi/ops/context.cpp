@@ -100,9 +100,10 @@ struct Context::Impl {
         std::size_t rows, packed_columns, scale_count;
         auto operator<=>(const DequantizedKey&) const = default;
     };
-    std::map<const std::byte*, PackedBinding> packed_weights;
+    std::map<const void*, PackedBinding> packed_weights;
     std::map<const void*, Tensor> packed_zeros;
     std::map<DequantizedKey, DequantizedBinding> dequantized_weights;
+    tensor::DType parameter_dtype = tensor::DType::F32;
     core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
     std::uint64_t preparation = 0;
     bool profiling = false;
@@ -207,13 +208,19 @@ struct Context::Impl {
         if (spec.operation == Operation::PACKED_LINEAR) {
             const auto bits = spec.attributes[0], group = spec.attributes[1];
             invalid((bits != 2 && bits != 4 && bits != 8) || group <= 0, "invalid packed linear precision or group");
-            invalid(input.dtype() != tensor::DType::F32 || input.dimensions() < 2 || !input.size(-1) ||
-                        input.size(-1) % group || group % (8 / bits) || inputs[1].dtype() != tensor::DType::U8 ||
-                        inputs[1].dimensions() != 2 || !inputs[1].size(0) ||
-                        inputs[1].size(1) != input.size(-1) / (8 / bits) ||
+            // A GELU-gate prologue halves the input width; an RMS-norm prologue keeps it.
+            const auto prologue = spec.attributes.size() >= 4 ? spec.attributes[3] : 0;
+            const bool gate = prologue == 2;
+            invalid(prologue < 0 || prologue > 2 || (gate && input.dimensions() && input.size(-1) % 2) ||
+                        (prologue == 1 && inputs.size() != 4) || (gate && inputs.size() != 3),
+                    "invalid packed linear prologue");
+            const auto width = input.dimensions() ? input.size(-1) / (gate ? 2 : 1) : 0;
+            invalid(!floating(input.dtype()) || input.dimensions() < 2 || !width || width % group ||
+                        group % (8 / bits) || inputs[1].dtype() != tensor::DType::U8 || inputs[1].dimensions() != 2 ||
+                        !inputs[1].size(0) || inputs[1].size(1) != width / (8 / bits) ||
                         (inputs[2].dtype() != tensor::DType::F32 && inputs[2].dtype() != tensor::DType::F16) ||
                         inputs[2].dimensions() != 2 || inputs[2].size(0) != inputs[1].size(0) ||
-                        inputs[2].size(1) != input.size(-1) / group,
+                        inputs[2].size(1) != width / group,
                     "packed linear shape or dtype mismatch");
         }
         if (spec.operation == Operation::GATED_FEED_FORWARD) {
@@ -263,10 +270,17 @@ struct Context::Impl {
                         !std::ranges::equal(key.shape(), value.shape()) ||
                         (key.size(0) != 1 && key.size(0) != input.size(0)),
                     "attention shape mismatch");
-            for (std::size_t index = 0; index < inputs.size(); ++index)
-                invalid(!floating(inputs[index].dtype()) &&
-                            !((index == 1 || index == 2) && inputs[index].dtype() == tensor::DType::I8),
-                        "attention expects FP32 tensors or an INT8 key/value cache");
+            const auto causal_positions = spec.attributes.size() >= 7 && spec.attributes[5] == 1;
+            for (std::size_t index = 0; index < inputs.size(); ++index) {
+                const auto dtype = inputs[index].dtype();
+                const auto cache_operand = index == 1 || index == 2;
+                const auto position_operand = index == 3 && dtype == tensor::DType::I32 && causal_positions &&
+                                              device.kind == tensor::DeviceKind::CUDA;
+                invalid(!floating(dtype) && !position_operand &&
+                            !(cache_operand && (dtype == tensor::DType::I8 ||
+                                                capabilities.attention.accepts_cache(input.dtype(), dtype))),
+                        "attention expects floating tensors with a backend-supported key/value cache dtype");
+            }
             invalid(key.dtype() != value.dtype(), "attention key and value must share a dtype");
             if (key.dtype() == tensor::DType::I8) {
                 invalid(!capabilities.attention.int8_cache_tokens, "INT8 attention requires a supported backend");
@@ -356,7 +370,8 @@ struct Context::Impl {
         }
         if (spec.operation == Operation::SCATTER)
             invalid(input.dimensions() != 3 || inputs[1].dimensions() != 3 || input.size(0) != inputs[1].size(0) ||
-                        input.size(2) != inputs[1].size(2) || inputs[1].dtype() != input.dtype() ||
+                        input.size(2) != inputs[1].size(2) ||
+                        !capabilities.attention.accepts_cache(inputs[1].dtype(), input.dtype()) ||
                         inputs[2].dtype() != tensor::DType::I32 || inputs[2].dimensions() != 1 ||
                         inputs[2].size(0) != inputs[1].size(1),
                     "cache scatter shape or dtype mismatch");
@@ -473,6 +488,7 @@ Context::Context(tensor::Device device, bool packed_prefill, std::optional<bool>
 #endif
     else
         throw Failure({ErrorCode::UNSUPPORTED, "no eager backend for requested device"});
+    impl_->parameter_dtype = parameter_dtype;
     impl_->activation_dtype = impl_->backend->activation_dtype(parameter_dtype);
     if (device.capabilities().compute.host()) impl_->compiler = default_compiler;
     const auto configured_replay = replay_enabled.value_or(!(replay && std::string_view(replay) == "0"));
@@ -525,6 +541,12 @@ auto Context::set_precision(core::InferencePrecision precision) noexcept -> void
     impl_->replays.clear_outputs();
     impl_->dequantized_weights.clear();
     impl_->precision = precision;
+    const auto effective_dtype =
+        (precision == core::InferencePrecision::BF16 || precision == core::InferencePrecision::Q8A16) &&
+                !device().capabilities().compute.host()
+            ? tensor::DType::BF16
+            : impl_->parameter_dtype;
+    impl_->activation_dtype = impl_->backend->activation_dtype(effective_dtype);
 }
 auto Context::precision() const noexcept -> core::InferencePrecision { return impl_->precision; }
 auto Context::replay_enabled() const noexcept -> bool { return impl_->replays.enabled(); }
@@ -743,7 +765,7 @@ auto Context::scaled_dot_product_attention(const Tensor& query, const Tensor& ke
 }
 auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bias, bool transpose_weight) -> Tensor {
     if (transpose_weight && !bias.defined() && !impl_->packed_weights.empty()) {
-        const auto found = impl_->packed_weights.find(require(weight.host_bytes()).data());
+        const auto found = impl_->packed_weights.find(weight.storage_identity());
         const bool single_row = input.dimensions() > 0 && input.numel() == input.size(-1);
         if (found != impl_->packed_weights.end() && found->second.source.dtype() == weight.dtype() &&
             std::ranges::equal(found->second.source.shape(), weight.shape()) &&
@@ -751,7 +773,11 @@ auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bi
             auto& binding = found->second;
             if (!binding.packed.values.defined()) {
                 const auto started = Clock::now();
-                auto packed = require(pack_weight(binding.source, binding.bits, binding.group_size, binding.asymmetric_clip));
+                const auto host_source = binding.source.is_host_accessible()
+                                             ? binding.source
+                                             : require(binding.source.to(tensor::Device::cpu()));
+                auto packed =
+                    require(pack_weight(host_source, binding.bits, binding.group_size, binding.asymmetric_clip));
                 binding.source.release_pages(false);
                 packed.values = require(packed.values.to(device()));
                 packed.scales = require(packed.scales.to(device()));
@@ -788,7 +814,7 @@ auto Context::prepare_linear_weights(const Tensor& weight, std::int32_t bits, st
         (bits != 2 && bits != 4 && bits != 8) || group_size <= 0 || group_size % (8 / bits) ||
         weight.size(1) % group_size || !weight.size(0) || !weight.size(1))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed weight dimensions, precision or group size"});
-    const auto address = require(weight.host_bytes()).data();
+    const auto address = weight.storage_identity();
     if (const auto found = impl_->packed_weights.find(address); found != impl_->packed_weights.end()) {
         if (found->second.bits != bits || found->second.group_size != group_size ||
             found->second.packed_prefill != packed_prefill || found->second.asymmetric_clip != asymmetric_clip ||
@@ -802,8 +828,9 @@ auto Context::prepare_linear_weights(const Tensor& weight, std::int32_t bits, st
             address, Impl::PackedBinding{weight, {}, bits, group_size, packed_prefill, asymmetric_clip, false});
         return;
     }
-    auto packed = require(pack_weight(weight, bits, group_size, asymmetric_clip));
-    weight.release_pages(false);
+    const auto host_weight = weight.is_host_accessible() ? weight : require(weight.to(tensor::Device::cpu()));
+    auto packed = require(pack_weight(host_weight, bits, group_size, asymmetric_clip));
+    if (weight.is_host_accessible()) weight.release_pages(false);
     packed.values = require(packed.values.to(device()));
     packed.scales = require(packed.scales.to(device()));
     if (packed.zeros.defined()) packed.zeros = require(packed.zeros.to(device()));
@@ -818,9 +845,34 @@ auto Context::quantized_linear(const Tensor& input, const Tensor& weight, const 
     const std::array<std::int64_t, 1> attributes{transpose_weight};
     return impl_->run({Operation::QUANTIZED_LINEAR, attributes}, {&input, &weight, &scale, &bias});
 }
+auto Context::apply(const Tensor& input, const ProjectionPrologue& prologue) -> Tensor {
+    switch (prologue.kind) {
+        case ProjectionPrologue::Kind::NONE:
+            return input;
+        case ProjectionPrologue::Kind::RMS_NORM:
+            if (!prologue.scale) throw Failure({ErrorCode::INVALID_ARGUMENT, "RMS-norm prologue requires a scale"});
+            return rms_norm(input, *prologue.scale, prologue.epsilon);
+        case ProjectionPrologue::Kind::GELU_GATE:
+            return gelu_gate(input);
+    }
+    throw Failure({ErrorCode::INVALID_ARGUMENT, "unknown projection prologue"});
+}
+auto Context::fuses(const Tensor& input, const ProjectionPrologue& prologue) const -> bool {
+    // Fuse only multi-row CUDA W8A8 prefill; decode graphs keep their grouped single-row projections.
+    constexpr std::int64_t max_width = 10240, min_rows = 32;
+    if (prologue.kind == ProjectionPrologue::Kind::NONE || device().kind != tensor::DeviceKind::CUDA ||
+        impl_->precision != core::InferencePrecision::CHECKPOINT || impl_->activation_dtype != tensor::DType::F32 ||
+        !input.defined() || input.dtype() != tensor::DType::F32 || input.dimensions() < 2 || !input.size(-1))
+        return false;
+    const bool gate = prologue.kind == ProjectionPrologue::Kind::GELU_GATE;
+    const auto width = input.size(-1) / (gate ? 2 : 1);
+    return (!gate || width % 4 == 0) && width <= max_width && input.numel() / input.size(-1) >= min_rows &&
+           (gate || (prologue.scale && prologue.scale->dtype() == tensor::DType::F32 &&
+                     prologue.scale->numel() == static_cast<std::size_t>(width)));
+}
 auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Tensor& scales, std::int32_t bits,
-                            std::int32_t group_size, float input_scale, float output_scale, const Tensor& zeros)
-    -> Tensor {
+                            std::int32_t group_size, float input_scale, float output_scale, const Tensor& zeros,
+                            const ProjectionPrologue& prologue) -> Tensor {
     if (!std::isfinite(input_scale) || input_scale < 0 || !std::isfinite(output_scale) || output_scale < 0)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid calibrated projection scales"});
     const Tensor* bound_zero = zeros.defined() ? &zeros : nullptr;
@@ -828,6 +880,28 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
         if (const auto found = impl_->packed_zeros.find(scales.storage_identity());
             found != impl_->packed_zeros.end() && found->second.defined())
             bound_zero = &found->second;
+    }
+    if (prologue.kind != ProjectionPrologue::Kind::NONE) {
+        const bool gate = prologue.kind == ProjectionPrologue::Kind::GELU_GATE;
+        const auto width = input.size(-1) / (gate ? 2 : 1);
+        if (!fuses(input, prologue) || bits != 8 || bound_zero || group_size != width)
+            return packed_linear(apply(input, prologue), weight, scales, bits, group_size, input_scale, output_scale,
+                                 zeros);
+        // Attribute layout: {bits, group, output_scale, prologue kind (1 = RMS norm, 2 = GELU gate), epsilon}.
+        const std::array<std::int64_t, 5> attributes{bits, group_size, std::bit_cast<std::int32_t>(output_scale),
+                                                     gate ? 2 : 1, std::bit_cast<std::int32_t>(prologue.epsilon)};
+        if (gate)
+            return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
+                              {&input, &weight, &scales});
+        return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
+                          {&input, &weight, &scales, prologue.scale});
+    }
+    if (device().kind == tensor::DeviceKind::CUDA && impl_->precision == core::InferencePrecision::Q8A16 && bits == 8 &&
+        (!bound_zero || !bound_zero->defined())) {
+        const auto activation = input.dtype() == tensor::DType::BF16 ? input : cast(input, tensor::DType::BF16);
+        const std::array<std::int64_t, 3> attributes{bits, group_size, 0};
+        return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::BF16, 0.F},
+                          {&activation, &weight, &scales});
     }
     if (impl_->precision != core::InferencePrecision::CHECKPOINT &&
         impl_->precision != core::InferencePrecision::LOWBIT_PARITY) {
@@ -931,11 +1005,16 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
             runtime::parity::packed_linear(input, weight, scales, bits, group_size, input_scale, output_scale));
     }
     const std::array<std::int64_t, 3> attributes{bits, group_size, std::bit_cast<std::int32_t>(output_scale)};
+    const auto output_dtype = device().kind == tensor::DeviceKind::CUDA && bits == 8 &&
+                                      impl_->activation_dtype == tensor::DType::BF16 &&
+                                      input.dtype() == tensor::DType::BF16 && input_scale == 0.F &&
+                                      output_scale == 0.F && (!bound_zero || !bound_zero->defined())
+                                  ? tensor::DType::BF16
+                                  : tensor::DType::F32;
     if (bound_zero && bound_zero->defined())
-        return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
+        return impl_->run({Operation::PACKED_LINEAR, attributes, output_dtype, input_scale},
                           {&input, &weight, &scales, bound_zero});
-    return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::F32, input_scale},
-                      {&input, &weight, &scales});
+    return impl_->run({Operation::PACKED_LINEAR, attributes, output_dtype, input_scale}, {&input, &weight, &scales});
 }
 auto Context::gelu(const Tensor& input, bool approximate) -> Tensor {
     const std::array<std::int64_t, 1> attributes{approximate};
@@ -972,7 +1051,8 @@ auto Context::gated_feed_forward(const Tensor& input, const Tensor& gate_up_weig
                                  std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
                                  float gate_up_output_scale, float down_input_scale, float down_output_scale, bool silu)
     -> Tensor {
-    if (impl_->precision != core::InferencePrecision::CHECKPOINT) {
+    if (impl_->precision != core::InferencePrecision::CHECKPOINT ||
+        !device().capabilities().compute.supports_native_calibrated_packed(bits)) {
         const auto gate_up = packed_linear(input, gate_up_weight, gate_up_scales, bits, input_size, gate_up_input_scale,
                                            gate_up_output_scale);
         const auto gate = slice(gate_up, -1, 0, intermediate_size);
@@ -1001,11 +1081,11 @@ auto Context::gelu_(Tensor& input, bool approximate) -> Tensor& {
 }
 auto Context::tanh(const Tensor& input) -> Tensor { return impl_->run({Operation::TANH, {}, input.dtype()}, {&input}); }
 auto Context::static_round(const Tensor& input, float scale) -> Tensor {
-    if (!input.defined() || input.dtype() != tensor::DType::F32 || input.device() != device() ||
-        !std::isfinite(scale) || scale < 0)
+    if (!input.defined() || (input.dtype() != tensor::DType::F32 && input.dtype() != impl_->activation_dtype) ||
+        input.device() != device() || !std::isfinite(scale) || scale < 0)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid static activation rounding"});
     if (scale == 0) return input;
-    return impl_->run({Operation::STATIC_ROUND, {}, tensor::DType::F32, scale}, {&input});
+    return impl_->run({Operation::STATIC_ROUND, {}, input.dtype(), scale}, {&input});
 }
 auto Context::rotary(const Tensor& input, const Tensor& cosine, const Tensor& sine) -> Tensor {
     return impl_->run({Operation::ROTARY, {}, input.dtype()}, {&input, &cosine, &sine});
@@ -1039,6 +1119,38 @@ auto Context::grouped_query_attention(const Tensor& query, const Tensor& key, co
     spec.quantization = {{{key_quantization.scales, key_quantization.zero_points, key_quantization.block_size},
                           {value_quantization.scales, value_quantization.zero_points, value_quantization.block_size}}};
     return impl_->run(spec, {&query, &key, &value, &mask});
+}
+auto Context::grouped_query_attention_causal(const Tensor& query, const Tensor& key, const Tensor& value,
+                                             std::int32_t heads, std::int32_t key_value_heads,
+                                             const Tensor& query_positions, std::int64_t window, float scale,
+                                             std::int64_t key_start, const BlockwiseQuantization& key_quantization,
+                                             const BlockwiseQuantization& value_quantization) -> Tensor {
+    if (device().kind != tensor::DeviceKind::CUDA || !std::isfinite(scale) || scale <= 0 || window < 0 ||
+        key.dimensions() != 3 || key_start < 0 || static_cast<std::size_t>(key_start) >= key.size(1) ||
+        query_positions.dtype() != tensor::DType::I32 || query_positions.device() != device() ||
+        query_positions.dimensions() != 4 || query_positions.size(0) != 1 || query_positions.size(1) != 1 ||
+        query_positions.size(2) != query.size(1) || query_positions.size(3) != 1)
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "causal attention requires CUDA query positions and a positive scale"});
+    const auto quantized = key.dtype() == tensor::DType::I8;
+    if (quantized && !device().capabilities().attention.int8_cache_tokens)
+        throw Failure({ErrorCode::UNSUPPORTED, "INT8 attention caches are unsupported by this backend"});
+    const auto valid_quantization = [&](const BlockwiseQuantization& metadata) {
+        return metadata.block_size > 0 && !metadata.scales.empty() &&
+               metadata.scales.size() == metadata.zero_points.size() &&
+               std::ranges::all_of(metadata.scales, [](float value) { return std::isfinite(value) && value > 0; });
+    };
+    if (quantized != (valid_quantization(key_quantization) && valid_quantization(value_quantization)) ||
+        (!quantized && (!key_quantization.scales.empty() || !value_quantization.scales.empty())))
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid attention cache quantization metadata"});
+    const auto parity_math = impl_->precision == core::InferencePrecision::QAT_FP32 ||
+                             impl_->precision == core::InferencePrecision::LOWBIT_PARITY;
+    const std::array<std::int64_t, 7> attributes{heads, key_value_heads, key_start,
+                                                 static_cast<std::int64_t>(key.size(1)) - key_start, parity_math, 1,
+                                                 window};
+    OperatorSpec spec{Operation::ATTENTION, attributes, query.dtype(), scale};
+    spec.quantization = {{{key_quantization.scales, key_quantization.zero_points, key_quantization.block_size},
+                          {value_quantization.scales, value_quantization.zero_points, value_quantization.block_size}}};
+    return impl_->run(spec, {&query, &key, &value, &query_positions});
 }
 auto Context::rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor {
     if (impl_->precision == core::InferencePrecision::QAT_FP32 ||
@@ -1169,6 +1281,13 @@ auto Context::scatter(const Tensor& input, const Tensor& updates, const Tensor& 
 }
 auto Context::scatter_(Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor& {
     impl_->run({Operation::SCATTER, {}, input.dtype()}, {&input, &updates, &indices}, nullptr, &input);
+    return input;
+}
+auto Context::scatter_unique_(Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor& {
+    if (impl_->device.kind != tensor::DeviceKind::CUDA)
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "unique-index scatter is only available on CUDA"});
+    const std::array<std::int64_t, 1> attributes{1};
+    impl_->run({Operation::SCATTER, attributes, input.dtype()}, {&input, &updates, &indices}, nullptr, &input);
     return input;
 }
 auto Context::copy_slice_(Tensor& destination, const Tensor& source, std::int64_t axis, std::int64_t start) -> Tensor& {

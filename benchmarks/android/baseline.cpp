@@ -9,8 +9,7 @@
 #include "kidi/runtime/ynn/graph.h"
 #include "ynnpack/base/topology.h"
 #if defined(KIDI_HAS_CUDA)
-#include "ynnpack/include/ynnpack_cuda.h"
-#include <cuda_profiler_api.h>
+#include "cuda/runtime.h"
 #endif
 
 #include <nlohmann/json.hpp>
@@ -63,8 +62,8 @@ auto emit(nlohmann::json record, int threads) -> void {
         record["accelerator"] = accelerator;
 #if defined(KIDI_HAS_CUDA)
         if (const auto device = kidi::tensor::parse_cuda_device(accelerator)) {
-            record["gpu_live_bytes"] = ynn::cuda::allocated_bytes(device->index);
-            record["gpu_peak_bytes"] = ynn::cuda::peak_allocated_bytes(device->index);
+            record["gpu_live_bytes"] = kidi::cuda::allocated_bytes(device->index);
+            record["gpu_peak_bytes"] = kidi::cuda::peak_allocated_bytes(device->index);
         }
 #endif
     }
@@ -96,6 +95,8 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
         throw std::invalid_argument("Gemma benchmark prompt must not be empty");
     const auto weight_bits = settings.value("weight_bits", 0);
     const auto group_size = settings.value("group_size", 128);
+    const auto precision = kidi::core::parse_precision(settings.value("precision", std::string("checkpoint")));
+    if (!precision) throw std::invalid_argument("invalid benchmark precision");
     const auto cache_precision =
         kidi::core::parse_kv_cache_precision(settings.value("kv_cache_precision", std::string("auto")));
     if (!cache_precision) throw std::invalid_argument("invalid benchmark KV-cache precision");
@@ -103,6 +104,7 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
     auto generator = require(kidi::inference::Generator::load(
         directory,
         kidi::inference::ModelLoadOptions{.device = gemma_device(),
+                                          .precision = *precision,
                                           .kv_cache_precision = *cache_precision,
                                           .weight_bits = weight_bits,
                                           .group_size = group_size,
@@ -164,14 +166,19 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
         }
         std::vector<std::vector<std::int32_t>> all_token_ids;
         std::vector<std::string> outputs;
+        std::vector<std::vector<std::int32_t>> prompt_token_ids;
         all_token_ids.reserve(prompts.size());
         outputs.reserve(prompts.size());
+        prompt_token_ids.reserve(prompts.size());
+        for (const auto& prompt : prompts) prompt_token_ids.push_back(require(tokenizer.encode(prompt)));
         std::size_t total_prompt_tokens = 0, total_output_tokens = 0;
         const auto eval_started = Clock::now();
         for (std::size_t idx = 0; idx < prompts.size(); ++idx) {
             const auto item_started = Clock::now();
             auto res = run_one(prompts[idx], max_outputs);
             const auto item_seconds = std::chrono::duration<double>(Clock::now() - item_started).count();
+            if (res.stats.prompt_tokens != prompt_token_ids[idx].size())
+                throw std::runtime_error("Gemma eval prompt token count mismatch");
             total_prompt_tokens += res.stats.prompt_tokens;
             auto ids = std::move(res.generation.token_ids);
             while (!ids.empty() && (ids.back() == 1 || ids.back() == 106)) ids.pop_back();
@@ -180,7 +187,9 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
                   {"id", item_ids[idx]},
                   {"seconds", item_seconds},
                   {"prompt_tokens", res.stats.prompt_tokens},
+                  {"input_token_ids", prompt_token_ids[idx]},
                   {"output_tokens", ids.size()},
+                  {"truncated", res.generation.truncated},
                   {"token_ids", ids}},
                  threads);
             all_token_ids.push_back(std::move(ids));
@@ -228,8 +237,7 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
 #if defined(KIDI_HAS_CUDA)
             const bool profile_cuda = std::getenv("KIDI_CUDA_PROFILE") && iteration >= warmups &&
                                       gemma_device().kind == kidi::tensor::DeviceKind::CUDA;
-            if (profile_cuda && cudaProfilerStart() != cudaSuccess)
-                throw std::runtime_error("CUDA profiler start failed");
+            if (profile_cuda) kidi::cuda::start_profiler();
 #endif
             require(generator.enqueue(serialized, options));
             const auto submitted = Clock::now();
@@ -297,8 +305,7 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
             }
             if (!completed) throw std::runtime_error("missing generation completion");
 #if defined(KIDI_HAS_CUDA)
-            if (profile_cuda && cudaProfilerStop() != cudaSuccess)
-                throw std::runtime_error("CUDA profiler stop failed");
+            if (profile_cuda) kidi::cuda::stop_profiler();
 #endif
         }
     }

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <string_view>
 #include <utility>
 
@@ -85,6 +86,23 @@ constexpr auto to_string(DType dtype) noexcept -> std::string_view {
     }
     std::unreachable();
 }
+
+class DTypeSet {
+public:
+    constexpr DTypeSet() noexcept = default;
+    constexpr DTypeSet(std::initializer_list<DType> dtypes) noexcept {
+        for (const auto dtype : dtypes) bits_ |= bit(dtype);
+    }
+
+    constexpr auto contains(DType dtype) const noexcept -> bool { return (bits_ & bit(dtype)) != 0; }
+
+private:
+    static constexpr auto bit(DType dtype) noexcept -> std::uint32_t {
+        return std::uint32_t{1} << static_cast<std::uint32_t>(dtype);
+    }
+
+    std::uint32_t bits_ = 0;
+};
 
 template <typename Value>
 struct DTypeOf;

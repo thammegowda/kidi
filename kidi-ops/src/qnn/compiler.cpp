@@ -56,7 +56,7 @@
 #include "kidi/graph/graph.h"
 #include "kidi/ops/context.h"
 
-namespace kidi::runtime {
+namespace kidi::qnn {
 namespace {
 
 /// Kidi's HTP op package: fused GELU*up, fused RMSNorm, and opt-in structured attention.
@@ -65,6 +65,13 @@ using graph::Graph;
 using graph::Node;
 using graph::Source;
 using ops::require;
+using runtime::Operation;
+using runtime::Operator;
+using runtime::OperatorBackend;
+using runtime::OperatorSpec;
+using runtime::TensorInputs;
+using runtime::cpu_operators;
+using runtime::operation_name;
 using tensor::DType;
 using tensor::Tensor;
 
@@ -3410,9 +3417,7 @@ auto cache_has_entries() -> bool {
     return false;
 }
 
-} // namespace
-
-auto npu_step_compiler() -> Result<std::shared_ptr<graph::Compiler>> {
+auto step_compiler() -> Result<std::shared_ptr<graph::Compiler>> {
     static std::mutex mutex;
     // QNN/FastRPC teardown can outlive C++ static destruction; keep the singleton alive until process exit.
     static auto* compiler = new std::shared_ptr<graph::Compiler>;
@@ -3439,4 +3444,7 @@ auto npu_step_compiler() -> Result<std::shared_ptr<graph::Compiler>> {
     }
 }
 
-} // namespace kidi::runtime
+} // namespace
+} // namespace kidi::qnn
+
+auto kidi::runtime::npu_step_compiler() -> Result<std::shared_ptr<graph::Compiler>> { return qnn::step_compiler(); }

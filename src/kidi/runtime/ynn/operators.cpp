@@ -1136,7 +1136,8 @@ private:
             return;
         }
 
-        const auto min_tile_grain = tiles >= threads * 8 ? std::size_t{2} : std::size_t{1};
+        const auto min_tile_grain =
+            tiles >= threads * 16 ? std::size_t{4} : (tiles >= threads * 8 ? std::size_t{2} : std::size_t{1});
         if (M * K_ < 8192 || total_blocks < 4) {
             ::ynn::quantize_blockwise_blocks_f32(bits_, M, K_, block_size_, use_bsum, x, act_q_.data(),
                                                  act_scale_.data(), bsum_ptr, 0, total_blocks);

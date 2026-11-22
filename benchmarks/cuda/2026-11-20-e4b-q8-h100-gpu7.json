@@ -1,0 +1,1236 @@
+{
+  "cuda_profile_comparison": {
+    "date": "2026-11-21",
+    "physical_gpu": 7,
+    "kidi_binary_sha256": "cd150efc047a04d942e70539b8fced3ca2b1a4cf738ea991037a967d3ba1d4e9",
+    "engine_diff_sha256": "91122b5608335da5f92611f3ede840eb238154fa8a24126450e2e3d94bb1326f",
+    "protocol": {
+      "prompt_tokens": [128, 2048],
+      "output_tokens": 128,
+      "warmup_requests": 2,
+      "traced_requests_per_workload": 1,
+      "decode_graphs_per_request": 127,
+      "nsys_traces": 6,
+      "ncu_reports": 5,
+      "vllm_worker_multiproc_method": "spawn",
+      "models_and_settings": "Original pinned Q8 models and protocol; BF16 KV for both; compiled vLLM and CUDA graphs enabled",
+      "phase_boundary": "First decode graph node",
+      "kernel_grouping": "Broad semantic categories; vLLM fused kernels span operations and some sampling is in Other"
+    },
+    "p128_decode_kernel_ms_per_token": {
+      "kidi": {
+        "norm_activation_elementwise_quantization": 2.3537,
+        "attention": 1.3718,
+        "int8_projections": 2.2939,
+        "kv_write": 0.1120,
+        "head_and_sampling": 0.2469,
+        "other": 0.0080,
+        "total": 6.3863,
+        "kernels_per_token": 1033
+      },
+      "vllm": {
+        "norm_activation_elementwise_quantization": 1.1809,
+        "attention": 0.5124,
+        "int8_projections": 2.5564,
+        "kv_write": 0.0497,
+        "head_and_sampling": 0.4651,
+        "other": 0.0548,
+        "total": 4.8193,
+        "kernels_per_token": 934.95
+      }
+    },
+    "p2048_prefill_kernel_ms": {
+      "kidi": {
+        "int8_projections": 52.8160,
+        "attention": 23.9219,
+        "norm_activation_elementwise_quantization": 20.4859,
+        "total": 97.7606,
+        "int8_projection_count": 277
+      },
+      "vllm": {
+        "int8_projections": 13.5858,
+        "attention": 1.5709,
+        "norm_activation_elementwise_quantization": 6.4568,
+        "total": 22.4551,
+        "int8_projection_count": 253
+      }
+    },
+    "whole_graph_decode_gpu_active_percent": {
+      "kidi": 99.4407,
+      "vllm": 99.3696,
+      "measurement": "Union of graphs, eager kernels, copies and memsets from first decode graph to final GPU activity"
+    },
+    "representative_ncu": {
+      "decode_attention_d256": {
+        "kidi_us": 38.048,
+        "vllm_us": 12.352,
+        "kidi_ctas": 16,
+        "vllm_ctas": 128,
+        "kidi_sm_throughput_percent": 1.5829,
+        "vllm_sm_throughput_percent": 19.0895
+      },
+      "residual_norm": {
+        "kidi_us": 8.000,
+        "vllm_us": 6.816,
+        "caveat": "vLLM kernel also fuses residual/RMSNorm/quantization; this is not identical fused work"
+      },
+      "prefill_int8_projection": {
+        "m": 2048,
+        "k": 2560,
+        "n": 10752,
+        "kidi_us": 439.008,
+        "vllm_us": 94.688,
+        "kidi_sm_throughput_percent": 46.8620,
+        "vllm_sm_throughput_percent": 79.4380
+      }
+    },
+    "additional_inefficiencies": {
+      "kidi_warm_request_malloc_calls": 57,
+      "kidi_warm_request_free_calls": 57,
+      "vllm_warm_request_malloc_free_calls": 0,
+      "kidi_p2048_prefill_h2d_bytes": 39877000,
+      "vllm_p2048_prefill_h2d_bytes": 32,
+      "kidi_p2048_prefill_dense_mask_bytes": 33554432,
+      "kidi_p2048_prefill_d2d_bytes": 440426504,
+      "kidi_cache_write_kernels_per_token": 48,
+      "vllm_cache_write_kernels_per_token": 24
+    },
+    "prefill_mask_optimization": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "prompt_tokens": 2048,
+      "measured_requests_per_run": 5,
+      "candidate_runs": 3,
+      "baseline_dense_masks": {
+        "ttft_ms": 122.438554,
+        "prefill_through_first_token_tokens_per_second": 16726.757488,
+        "decode_tokens_per_second": 157.120797,
+        "peak_gpu_allocation_bytes": 22242996680
+      },
+      "structured_causal_masks": {
+        "ttft_ms_median_of_run_medians": 106.798647,
+        "prefill_through_first_token_tokens_per_second_median": 19176.272897,
+        "decode_tokens_per_second_median": 156.132091,
+        "peak_gpu_allocation_bytes": 22209416648,
+        "deterministic": true
+      },
+      "ttft_improvement_percent": 12.77,
+      "prefill_throughput_improvement_percent": 14.64,
+      "peak_gpu_allocation_reduction_bytes": 33580032,
+      "implementation": "CUDA attention consumes I32 query positions and applies causal/window bounds in-kernel instead of transferring dense FP32 masks",
+      "validation": "make test-cuda passed 47/47"
+    },
+    "causal_key_range_optimization": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "prompt_tokens": 2048,
+      "measured_requests_per_run": 5,
+      "candidate_process_runs": 4,
+      "baseline": "Structured causal masks, before key-loop bounds",
+      "baseline_run_medians": {
+        "ttft_ms": 106.798647,
+        "prefill_through_first_token_tokens_per_second": 19176.272897,
+        "decode_tokens_per_second": 156.132091
+      },
+      "candidate_median_of_process_medians": {
+        "ttft_ms": 101.532175,
+        "prefill_through_first_token_tokens_per_second": 20170.945941,
+        "decode_tokens_per_second": 156.851585,
+        "peak_gpu_allocation_bytes": 22209416648,
+        "deterministic": true
+      },
+      "ttft_improvement_percent": 4.93,
+      "prefill_throughput_improvement_percent": 5.19,
+      "implementation": "For multi-query attention with more than 512 keys, bound each CTA key loop from the minimum/maximum query positions; windowed attention also skips keys before the earliest visible position",
+      "additional_prompt_lengths_checked": [128, 512],
+      "validation": "make test-cuda passed 47/47, including 1024-key causal/windowed parity"
+    },
+    "unique_index_cache_scatter": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "prompt_tokens": 2048,
+      "measured_requests_per_run": 5,
+      "candidate_process_runs": 2,
+      "baseline": "Causal key-range build",
+      "baseline_run_medians": {
+        "ttft_ms": 101.532175,
+        "prefill_through_first_token_tokens_per_second": 20170.945941,
+        "decode_tokens_per_second": 156.851585
+      },
+      "candidate_median_of_process_medians": {
+        "ttft_ms": 100.989415,
+        "prefill_through_first_token_tokens_per_second": 20279.488142,
+        "decode_tokens_per_second": 156.919690,
+        "peak_gpu_allocation_bytes": 22209416648,
+        "deterministic": true
+      },
+      "ttft_improvement_percent": 0.53,
+      "prefill_throughput_improvement_percent": 0.54,
+      "implementation": "Captured CUDA Gemma steps mark their generated position indices unique so the scatter kernel can skip duplicate-index arbitration; general scatter semantics are unchanged",
+      "profile": {
+        "scatter_launches": 336,
+        "scatter_gpu_time_ns": 801213,
+        "share_of_profiled_gpu_kernel_time_percent": 0.6
+      },
+      "validation": "make test-cuda passed 47/47; duplicate-index last-write-wins and unique-index paths tested"
+    },
+    "w8a8_prefill_tile_optimization": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "minimum_rows": 1024,
+      "selected_tile": [128, 128],
+      "selected_warp_assignment": [4, 2],
+      "dynamic_shared_memory_bytes": 61440,
+      "isolated_projection": {
+        "shape_m_k_n": [2048, 2560, 10752],
+        "baseline_tile": [128, 64],
+        "baseline_median_us": 361.8435,
+        "candidate_median_us": 342.1535,
+        "latency_improvement_percent": 5.44,
+        "maximum_error": 0.0,
+        "alternate_warp_assignment_candidate_us": 342.323
+      },
+      "full_model_p2048": {
+        "measured_requests_per_run": 5,
+        "baseline_process_runs": 2,
+        "candidate_process_runs": 3,
+        "baseline_ttft_ms": 100.989415,
+        "baseline_prefill_tokens_per_second": 20279.488142,
+        "candidate_median_ttft_ms": 100.138951,
+        "candidate_median_prefill_tokens_per_second": 20451.582322,
+        "candidate_median_decode_tokens_per_second": 156.863340,
+        "ttft_improvement_percent": 0.84,
+        "prefill_throughput_improvement_percent": 0.85,
+        "peak_gpu_allocation_bytes": 22209416648,
+        "deterministic": true
+      },
+      "profiled_prefill_gemm_gpu_time_ns": {
+        "baseline_tile_128x64": 53163564,
+        "candidate_tile_128x128": 51827776,
+        "instances": 277
+      },
+      "validation": "make test-cuda passed 47/47; projection benchmark maximum error 0; full-model outputs deterministic"
+    },
+    "fused_key_value_cache_scatter": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "candidate_process_runs": 3,
+      "measured_requests_per_run": 5,
+      "baseline": "128x128 W8A8 tile build before K/V scatter fusion",
+      "baseline_p2048": {
+        "ttft_ms": 100.138951,
+        "prefill_tokens_per_second": 20451.582322,
+        "decode_tokens_per_second": 156.863340
+      },
+      "candidate_median_by_prompt_tokens": {
+        "128": {
+          "ttft_ms": 18.434925,
+          "prefill_tokens_per_second": 6943.342596,
+          "decode_tokens_per_second": 168.228453
+        },
+        "512": {
+          "ttft_ms": 36.372926,
+          "prefill_tokens_per_second": 14076.403971,
+          "decode_tokens_per_second": 163.766771
+        },
+        "2048": {
+          "ttft_ms": 99.887771,
+          "prefill_tokens_per_second": 20503.010323,
+          "decode_tokens_per_second": 158.131484
+        }
+      },
+      "p2048_change_percent": {
+        "ttft_reduction": 0.25,
+        "prefill_throughput": 0.25,
+        "decode_throughput": 0.81
+      },
+      "decode_graph": {
+        "nodes": 808,
+        "projection_groups": 24,
+        "fused_key_value_scatter_groups": 24,
+        "scatter_kernels_per_token_before": 48,
+        "scatter_kernels_per_token_after": 24
+      },
+      "peak_gpu_allocation_bytes": 22209416648,
+      "deterministic": true,
+      "implementation": "Captured CUDA graphs fuse adjacent in-place key/value scatters only when they share the same unique index source; generic scatter semantics remain unchanged",
+      "validation": "kidi_cuda_test passed with 24 graph scatter groups; make test-cuda passed 47/47"
+    },
+    "decode_attention_head_grouping": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "partition_size_keys": 16,
+      "output_tokens": 128,
+      "process_runs_per_setting": 3,
+      "measured_requests_per_run": 5,
+      "baseline": "Two query heads per CTA when sharing a KV head",
+      "candidate": "One query head per CTA",
+      "baseline_median_by_prompt_tokens": {
+        "128": {
+          "ttft_ms": 18.57694,
+          "prefill_tokens_per_second": 6890.262874,
+          "decode_tokens_per_second": 168.710408,
+          "peak_gpu_allocation_bytes": 9336430536
+        },
+        "2048": {
+          "ttft_ms": 100.074393,
+          "prefill_tokens_per_second": 20464.775639,
+          "decode_tokens_per_second": 158.108284,
+          "peak_gpu_allocation_bytes": 22209416648
+        }
+      },
+      "candidate_median_by_prompt_tokens": {
+        "128": {
+          "ttft_ms": 18.920868,
+          "prefill_tokens_per_second": 6765.017334,
+          "decode_tokens_per_second": 172.007343,
+          "peak_gpu_allocation_bytes": 9336430536
+        },
+        "2048": {
+          "ttft_ms": 99.846513,
+          "prefill_tokens_per_second": 20511.482459,
+          "decode_tokens_per_second": 161.705008,
+          "peak_gpu_allocation_bytes": 22209416648
+        }
+      },
+      "decode_throughput_change_percent": {
+        "128": 1.95,
+        "2048": 2.27
+      },
+      "validation": "All measured requests were deterministic; kidi_cuda_test and kidi_ops_cuda_test passed"
+    },
+    "rejected_decode_attention_partition8": {
+      "physical_gpu": 7,
+      "kv_cache": "BF16",
+      "head_group_size": 1,
+      "candidate_partition_size_keys": 8,
+      "baseline_partition_size_keys": 16,
+      "process_runs_per_setting": 3,
+      "measured_requests_per_run": 5,
+      "baseline_median_by_prompt_tokens": {
+        "128": {
+          "ttft_ms": 18.920868,
+          "prefill_tokens_per_second": 6765.017334,
+          "decode_tokens_per_second": 172.007343,
+          "peak_gpu_allocation_bytes": 9336430536
+        },
+        "2048": {
+          "ttft_ms": 99.846513,
+          "prefill_tokens_per_second": 20511.482459,
+          "decode_tokens_per_second": 161.705008,
+          "peak_gpu_allocation_bytes": 22209416648
+        }
+      },
+      "candidate_median_by_prompt_tokens": {
+        "128": {
+          "ttft_ms": 18.473222,
+          "prefill_tokens_per_second": 6928.948291,
+          "decode_tokens_per_second": 171.607103,
+          "peak_gpu_allocation_bytes": 9336825800
+        },
+        "2048": {
+          "ttft_ms": 100.390688,
+          "prefill_tokens_per_second": 20400.298481,
+          "decode_tokens_per_second": 153.339945,
+          "peak_gpu_allocation_bytes": 22211983816
+        }
+      },
+      "decode_throughput_change_percent": {
+        "128": -0.23,
+        "2048": -5.17
+      },
+      "validation": "Both CUDA tests passed; candidate requests were deterministic",
+      "status": "reverted",
+      "reason": "No decode gain at 128 tokens and a 5.17% regression at 2,048 tokens; workspace increased"
+    },
+    "rejected_decode_attention_partition32_global": {
+      "physical_gpu": 7,
+      "kv_cache": "BF16",
+      "head_group_size": 1,
+      "baseline_partition_size_keys": 16,
+      "candidate_partition_size_keys": 32,
+      "process_runs_per_setting": 3,
+      "measured_requests_per_run": 5,
+      "baseline_median_decode_tokens_per_second": {
+        "128": 172.007343,
+        "2048": 161.705008
+      },
+      "candidate_median_decode_tokens_per_second": {
+        "128": 168.233663,
+        "512": 165.612522,
+        "2048": 163.282330
+      },
+      "decode_throughput_change_percent": {
+        "128": -2.19,
+        "2048": 0.98
+      },
+      "status": "rejected",
+      "reason": "A global 32-key partition regressed short-prompt decode despite a small long-prompt gain; use it only at the measured long-context threshold"
+    },
+    "adaptive_decode_attention_partition": {
+      "physical_gpu": 7,
+      "kv_cache": "BF16",
+      "head_group_size": 1,
+      "partition_size_keys": {
+        "keys_below_2048": 16,
+        "keys_at_least_2048": 32
+      },
+      "partial_workspace_partition_size_keys": 16,
+      "process_runs": 3,
+      "measured_requests_per_workload_per_run": 5,
+      "baseline_partition_size_keys": 16,
+      "baseline_median_decode_tokens_per_second": {
+        "128": 172.007343,
+        "2048": 161.705008
+      },
+      "candidate_median_by_prompt_tokens": {
+        "128": {
+          "ttft_ms": 18.64,
+          "decode_tokens_per_second": 172.085131
+        },
+        "512": {
+          "ttft_ms": 36.26,
+          "decode_tokens_per_second": 167.073687
+        },
+        "2048": {
+          "ttft_ms": 100.22,
+          "decode_tokens_per_second": 164.441242
+        }
+      },
+      "decode_throughput_change_percent": {
+        "128": 0.05,
+        "2048": 1.69
+      },
+      "validation": "Requests were deterministic; kidi_cuda_test and kidi_ops_cuda_test passed",
+      "status": "selected",
+      "reason": "Retains the 16-key schedule for short contexts and gains 1.69% decode throughput at 2,048 tokens without increasing workspace"
+    },
+    "structured_causal_valid_tile_fast_path": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "condition": "Structured causal positions, no sliding window, a complete key tile ends at or before the minimum query position",
+      "process_runs": 3,
+      "measured_requests_per_run": 5,
+      "baseline": {
+        "decode_partition": "16 keys below 2,048; 32 keys at or above 2,048",
+        "p2048_median": {
+          "ttft_ms": 100.216743,
+          "prefill_tokens_per_second": 20435.707036,
+          "decode_tokens_per_second": 164.441242
+        }
+      },
+      "candidate_p2048_median": {
+        "ttft_ms": 98.595860,
+        "prefill_tokens_per_second": 20771.663232,
+        "decode_tokens_per_second": 164.647920
+      },
+      "nsys_prefill_flash_attention_kernel_time_ms": {
+        "baseline_head_dim_256": 6.179924,
+        "candidate_head_dim_256": 6.171755,
+        "baseline_head_dim_512": 5.531032,
+        "candidate_head_dim_512": 4.339888,
+        "baseline_total": 11.710956,
+        "candidate_total": 10.511643,
+        "total_change_percent": -10.24
+      },
+      "change_percent": {
+        "ttft": -1.62,
+        "prefill_throughput": 1.64,
+        "decode_throughput": 0.13
+      },
+      "validation": "Both CUDA tests passed; all requests were deterministic and all 128 generated token IDs matched the baseline; Nsight Systems attention-kernel total fell 10.24%",
+      "status": "selected",
+      "reason": "Skips structured-mask reads and synchronization for fully valid causal tiles; improves long-prompt TTFT without changing generated tokens"
+    },
+    "structured_window_valid_tile_fast_path": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "condition": "A complete key tile lies inside every query's structured causal window",
+      "process_runs_per_setting_per_round": 3,
+      "measured_requests_per_run": 5,
+      "rounds": [
+        {
+          "order": ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"],
+          "baseline_p2048_median": {
+            "ttft_ms": 98.908,
+            "prefill_tokens_per_second": 20706.129,
+            "decode_tokens_per_second": 164.762
+          },
+          "candidate_p2048_median": {
+            "ttft_ms": 97.402,
+            "prefill_tokens_per_second": 21026.242,
+            "decode_tokens_per_second": 164.858
+          },
+          "prefill_throughput_change_percent": 1.55
+        },
+        {
+          "order": ["candidate", "baseline", "baseline", "candidate", "candidate", "baseline"],
+          "baseline_p2048_median": {
+            "ttft_ms": 98.561,
+            "prefill_tokens_per_second": 20778.916,
+            "decode_tokens_per_second": 164.650
+          },
+          "candidate_p2048_median": {
+            "ttft_ms": 98.273,
+            "prefill_tokens_per_second": 20839.875,
+            "decode_tokens_per_second": 164.601
+          },
+          "prefill_throughput_change_percent": 0.29
+        }
+      ],
+      "nsys_d256_flash_attention_ms": {
+        "baseline": 6.171755,
+        "candidate": 4.944084,
+        "note": "Separate diagnostic traces with unlocked GPU clocks; 35 launches in each"
+      },
+      "validation": "Both CUDA tests passed, including reversed query positions, a one-token window, and FP32 cropped-key parity; all 60 measured requests generated identical token IDs",
+      "status": "selected",
+      "reason": "Eliminates per-key mask work on tiles valid for every query; small positive end-to-end gains in both measurement rounds"
+    },
+    "rejected_multirow_projection_fusion": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "candidate_process_runs": 3,
+      "measured_requests_per_run": 5,
+      "baseline": "128x128 W8A8 tile build",
+      "baseline_p2048": {
+        "ttft_ms": 100.138951,
+        "prefill_tokens_per_second": 20451.582322,
+        "decode_tokens_per_second": 156.863340
+      },
+      "candidate_median_of_process_medians": {
+        "ttft_ms": 100.603039,
+        "prefill_tokens_per_second": 20357.237916,
+        "decode_tokens_per_second": 157.078533
+      },
+      "p2048_change_percent": {
+        "ttft_regression": 0.46,
+        "prefill_throughput": -0.46,
+        "decode_throughput": 0.14
+      },
+      "implementation": "Combined multi-row W8A8 projection outputs and split them to original buffers with 2D device copies",
+      "validation": "Single-row and three-row CUDA parity passed; full-model requests were deterministic",
+      "status": "reverted",
+      "reason": "No verified end-to-end gain; rejected the extra output-copy path"
+    },
+    "rejected_norm_quantization_fusion": {
+      "decode_throughput_change_percent": {
+        "p128": -2.15,
+        "p512": -2.01,
+        "p2048": -1.98
+      },
+      "reason": "Fused row quantization work outweighed the removed RMSNorm launch; an algebraic one-pass variant failed correctness",
+      "status": "reverted"
+    },
+    "rejected_w8a8_tile_candidates": {
+      "physical_gpu": 7,
+      "projection_shape_m_k_n": [2048, 2560, 10752],
+      "baseline_tile": [128, 128],
+      "baseline_warp_assignment": [4, 2],
+      "baseline_median_us": 342.1535,
+      "candidates": [
+        {
+          "tile": [128, 256],
+          "warp_assignment": [4, 4],
+          "median_us": 394.96,
+          "latency_regression_percent": 15.43,
+          "maximum_error": 0.0
+        },
+        {
+          "tile": [256, 128],
+          "warp_assignment": [8, 2],
+          "median_us": 396.726,
+          "latency_regression_percent": 15.95,
+          "maximum_error": 0.0
+        },
+        {
+          "tile": [256, 64],
+          "warp_assignment": [8, 2],
+          "median_us": 472.045,
+          "latency_regression_percent": 37.96,
+          "maximum_error": 0.0
+        }
+      ],
+      "measurement": "Projection benchmark medians; each median is over five timed samples with ten kernel invocations per sample",
+      "status": "reverted",
+      "reason": "The larger 128x256, 256x128, and 256x64 candidates were slower than the 128x128 reference"
+    },
+    "invalid_w8a8_tile64x128_comparison": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "baseline_tile": [128, 128],
+      "candidate_tile": [64, 128],
+      "warp_assignment": [4, 2],
+      "baseline_process_runs": 3,
+      "candidate_process_runs": 3,
+      "measured_requests_per_run": 5,
+      "baseline_p2048_median": {
+        "ttft_ms": 132.622,
+        "prefill_tokens_per_second": 15442.354,
+        "decode_tokens_per_second": 164.969
+      },
+      "candidate_p2048_median": {
+        "ttft_ms": 112.447,
+        "prefill_tokens_per_second": 18212.970,
+        "decode_tokens_per_second": 164.919
+      },
+      "profile_cuda_gpu_kern_sum": {
+        "output_tokens": 8,
+        "w8a8_gemm_ms": 64.684647,
+        "w8a8_gemm_instances": 277,
+        "w8a8_gemm_gpu_time_percent": 47.7,
+        "quantized_vector_ms": 16.058810,
+        "quantize_rows_ms": 9.629698,
+        "flash_attention_ms": 10.427681,
+        "note": "Single Nsight Systems diagnostic trace; absolute kernel sums are not comparable to earlier traces with different unlocked GPU clocks"
+      },
+      "change_percent": {
+        "ttft": -15.21,
+        "prefill_throughput": 17.94,
+        "decode_throughput": -0.03
+      },
+      "measurement_order": ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"],
+      "validation": "Both CUDA tests passed; all six process runs were deterministic and all 128 generated token IDs matched between variants",
+      "status": "invalid",
+      "reason": "The 128x128 baseline mistakenly used a grid sized for 64-row tiles, launching extra CTAs. The measured 17.94% gain is invalid."
+    },
+    "w8a8_tile64x256_vs_64x128": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "baseline_tile": [64, 128],
+      "candidate_tile": [64, 256],
+      "warp_assignment": [2, 4],
+      "baseline_process_runs": 3,
+      "candidate_process_runs": 3,
+      "measured_requests_per_run": 5,
+      "baseline_p2048_median": {
+        "ttft_ms": 111.731,
+        "prefill_tokens_per_second": 18329.687,
+        "decode_tokens_per_second": 164.991
+      },
+      "candidate_p2048_median": {
+        "ttft_ms": 104.603,
+        "prefill_tokens_per_second": 19578.869,
+        "decode_tokens_per_second": 164.645
+      },
+      "change_percent": {
+        "ttft": -6.38,
+        "prefill_throughput": 6.82,
+        "decode_throughput": -0.21
+      },
+      "measurement_order": ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"],
+      "candidate_profile_cuda_gpu_kern_sum": {
+        "output_tokens": 8,
+        "w8a8_gemm_ms": 57.950082,
+        "w8a8_gemm_instances": 277,
+        "w8a8_gemm_gpu_time_percent": 44.9,
+        "quantized_vector_ms": 16.063164,
+        "quantize_rows_ms": 9.650018,
+        "flash_attention_ms": 10.494947,
+        "note": "Single Nsight Systems diagnostic trace; absolute kernel sums are not directly comparable across unlocked GPU clock states"
+      },
+      "validation": "Both CUDA tests passed; all six process runs were deterministic and all 128 generated token IDs matched between variants",
+      "status": "reverted",
+      "reason": "Faster than 64x128, but slower than the correctly configured 128x128 baseline"
+    },
+    "corrected_w8a8_tile64x256_vs_128x128": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "baseline_tile": [128, 128],
+      "candidate_tile": [64, 256],
+      "process_runs_per_setting": 3,
+      "measured_requests_per_run": 5,
+      "measurement_order": ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"],
+      "baseline_p2048_median": {
+        "ttft_ms": 98.780,
+        "prefill_tokens_per_second": 20732.868,
+        "decode_tokens_per_second": 164.732
+      },
+      "candidate_p2048_median": {
+        "ttft_ms": 104.351,
+        "prefill_tokens_per_second": 19626.122,
+        "decode_tokens_per_second": 164.920
+      },
+      "change_percent": {
+        "ttft": 5.64,
+        "prefill_throughput": -5.34,
+        "decode_throughput": 0.11
+      },
+      "validation": "All 30 requests were deterministic and generated identical token IDs across variants",
+      "status": "reverted",
+      "reason": "64x256 regressed prefill throughput versus the correctly configured 128x128 kernel"
+    },
+    "rejected_w8a8_four_stage_pipeline": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "tile": [128, 128],
+      "baseline_pipeline_stages": 3,
+      "candidate_pipeline_stages": 4,
+      "process_runs_per_setting": 3,
+      "measured_requests_per_run": 5,
+      "measurement_order": ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"],
+      "baseline_p2048_median": {
+        "ttft_ms": 98.672,
+        "prefill_tokens_per_second": 20755.653,
+        "decode_tokens_per_second": 164.852
+      },
+      "candidate_p2048_median": {
+        "ttft_ms": 99.051,
+        "prefill_tokens_per_second": 20676.122,
+        "decode_tokens_per_second": 164.874
+      },
+      "change_percent": {
+        "ttft": 0.38,
+        "prefill_throughput": -0.38,
+        "decode_throughput": 0.01
+      },
+      "validation": "Both CUDA tests passed and all 30 requests generated identical token IDs",
+      "status": "reverted",
+      "reason": "No verified end-to-end gain over three stages"
+    },
+    "rejected_w8a8_two_stage_pipeline": {
+      "physical_gpu": 7,
+      "model": "Gemma 4 E4B Q8",
+      "kv_cache": "BF16",
+      "tile": [128, 128],
+      "baseline_pipeline_stages": 3,
+      "candidate_pipeline_stages": 2,
+      "process_runs_per_setting": 3,
+      "measured_requests_per_run": 5,
+      "measurement_order": ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"],
+      "baseline_p2048_median": {
+        "ttft_ms": 98.306,
+        "prefill_tokens_per_second": 20832.821,
+        "decode_tokens_per_second": 164.842
+      },
+      "candidate_p2048_median": {
+        "ttft_ms": 101.515,
+        "prefill_tokens_per_second": 20174.408,
+        "decode_tokens_per_second": 164.717
+      },
+      "change_percent": {
+        "ttft": 3.26,
+        "prefill_throughput": -3.16,
+        "decode_throughput": -0.08
+      },
+      "validation": "Both CUDA tests passed and all 30 requests generated identical token IDs",
+      "status": "reverted",
+      "reason": "Prefill throughput regressed 3.16% versus three stages"
+    },
+    "rejected_prefill_quantization_thread_counts": {
+      "physical_gpu": 7,
+      "prompt_tokens": 2048,
+      "process_runs_per_setting_per_round": 3,
+      "measured_requests_per_run": 5,
+      "baseline_threads": 256,
+      "rounds": [
+        {"candidate_threads": 128, "baseline_prefill_tps": 20938.035, "candidate_prefill_tps": 21029.055,
+         "order": ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"]},
+        {"candidate_threads": 128, "baseline_prefill_tps": 20989.242, "candidate_prefill_tps": 20854.329,
+         "order": ["candidate", "baseline", "baseline", "candidate", "candidate", "baseline"]},
+        {"candidate_threads": 512, "baseline_prefill_tps": 20918.695, "candidate_prefill_tps": 20905.753,
+         "order": ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"]}
+      ],
+      "validation": "Both CUDA tests passed and all measured output token IDs matched",
+      "status": "reverted"
+    },
+    "rejected_medium_prefill_tiles": {
+      "physical_gpu": 7,
+      "prompt_tokens": 512,
+      "process_runs_per_setting": 3,
+      "measured_requests_per_run": 5,
+      "measurement_order": ["baseline", "candidate", "candidate", "baseline", "baseline", "candidate"],
+      "baseline_tile": [64, 64],
+      "candidates": [
+        {"tile": [128, 128], "warps": [4, 2], "baseline_prefill_tps": 13975.820, "candidate_prefill_tps": 13090.594},
+        {"tile": [128, 64], "warps": [4, 1], "baseline_prefill_tps": 14032.171, "candidate_prefill_tps": 13154.235},
+        {"tile": [64, 128], "warps": [2, 2], "baseline_prefill_tps": 13929.570, "candidate_prefill_tps": 12944.420}
+      ],
+      "validation": "Both CUDA tests passed and all measured output token IDs matched",
+      "status": "reverted"
+    },
+    "exploratory_sm90a_int8_gemm": {
+      "physical_gpu": 7,
+      "shape_mnk": [2048, 10752, 2560],
+      "gemm_and_separate_epilogue_us": 258.803,
+      "validation": "Sixteen sampled outputs matched an integer reference with asymmetric zero-point correction",
+      "caveat": "Standalone diagnostic excludes input quantization; not a matched Kidi projection or model benchmark",
+      "status": "not integrated"
+    },
+    "rejected_128_thread_rms_normalization": {
+      "physical_gpu": 7,
+      "process_runs": 3,
+      "measured_requests_per_workload_per_run": 5,
+      "baseline": "256-thread dense RMS normalization with one query head per attention CTA",
+      "candidate": "128-thread dense RMS normalization for rows of width at least 1,024",
+      "baseline_decode_tokens_per_second": {
+        "p128": 172.007343,
+        "p2048": 161.705008
+      },
+      "candidate_median_by_prompt_tokens": {
+        "128": {
+          "ttft_ms": 19.382049,
+          "prefill_tokens_per_second": 6604.048932,
+          "decode_tokens_per_second": 149.872466
+        },
+        "512": {
+          "ttft_ms": 37.429516,
+          "prefill_tokens_per_second": 13679.044100,
+          "decode_tokens_per_second": 145.840538
+        },
+        "2048": {
+          "ttft_ms": 101.447802,
+          "prefill_tokens_per_second": 20187.721761,
+          "decode_tokens_per_second": 141.953071
+        }
+      },
+      "decode_throughput_change_percent": {
+        "p128": -12.87,
+        "p2048": -12.20
+      },
+      "validation": "Both CUDA tests passed and all requests were deterministic",
+      "status": "reverted",
+      "reason": "Consistent 12-13% decode regression; the wider CTA specialization did not offset its extra per-thread work"
+    },
+    "optimization_priorities": [
+      "Fuse decode normalization/activation/residual/scaling with quantization while preserving rounding",
+      "Keep one query head per CTA; use 16-key partitions below 2,048 keys and 32-key partitions at or above 2,048",
+      "Keep the matched 128x128 SM90 W8A8 tile for large prefill; continue tuning against vLLM; multi-row projection merging was reverted after no full-model gain",
+      "Continue specializing causal/windowed prefill attention; compact positions, bounded traversal, and fully valid causal-tile skipping are implemented, but the original profile still showed a large gap",
+      "Reuse request workspaces and eliminate intermediate materialization; dense CUDA masks are already removed",
+      "Reduce replay staging copies; K/V cache writes now fuse to 24 decode scatter kernels per token"
+    ],
+    "caveats": [
+      "Kernel sums are profiled GPU work, not end-to-end latency; node tracing adds overhead",
+      "CPU API wait durations cannot be added to GPU times as separate overhead",
+      "Kidi uses FP32 non-quantized arithmetic and a Q8 head; vLLM uses BF16",
+      "Nsight Compute durations are isolated replay diagnostics, not benchmark measurements",
+      "Two post-trace ordinary requests per workload are diagnostic only, not a replacement benchmark",
+      "The original matched profiler run predates subsequent attention and W8A8 tile tuning; follow-up results are reported separately"
+    ],
+    "raw_artifacts": ".cache/benchmarks/e4b-cuda-compare/",
+    "analysis": ".cache/benchmarks/e4b-cuda-compare/analysis.json",
+    "manifest": ".cache/benchmarks/e4b-cuda-compare/manifest.json"
+  },
+  "cuda_bf16_followup": {
+    "source": "Uncommitted changes on 09faf21022a355e76d8d93e63bf425f0ee9a1576",
+    "binary_sha256": "626ea1e2e4367e4ebb20a2d8c891707f7eb2551633ed9b639943201210845007",
+    "physical_gpu": 7,
+    "cache": "AUTO selects BF16 on CUDA unless checkpoint byte-cache quantization applies; explicit FP32 remains supported",
+    "linear_precision": "Unchanged W8A8 packed INT8 weights and dynamic asymmetric per-token INT8 activations",
+    "attention_precision": "FP32 query and output, BF16 K/V; tensor-core prefill rounds queries internally to BF16",
+    "measured_requests_per_workload": 10,
+    "rounds": ["verified-bf16-1", "verified-bf16-2"],
+    "warmups_per_round": 2,
+    "matched_fp32_requests_per_workload": 5,
+    "protocol": "Original exact prompt IDs and timing protocol; 128 output tokens and 127 decode intervals; other engines not remeasured",
+    "results": {
+      "p128": {
+        "ttft_ms": 18.695934,
+        "prefill_tps": 6846.708722112352,
+        "decode_tps": 146.62105199211913,
+        "decode_range": [146.52594348897247, 146.68499098694073],
+        "gpu_peak_bytes": 9336270792,
+        "matched_fp32_ttft_ms": 19.575076,
+        "matched_fp32_decode_tps": 144.75333947179436,
+        "matched_fp32_gpu_peak_bytes": 10040127432
+      },
+      "p512": {
+        "ttft_ms": 36.951293500000006,
+        "prefill_tps": 13856.132959806364,
+        "decode_tps": 145.21965824235156,
+        "decode_range": [144.91992161032678, 145.5075774566137],
+        "gpu_peak_bytes": 11906683592,
+        "matched_fp32_ttft_ms": 44.419606,
+        "matched_fp32_decode_tps": 143.5869551328143,
+        "matched_fp32_gpu_peak_bytes": 12608180936
+      },
+      "p2048": {
+        "ttft_ms": 121.045767,
+        "prefill_tps": 16919.221233417666,
+        "decode_tps": 144.14660482604106,
+        "decode_range": [143.6013771046417, 144.7068105395558],
+        "gpu_peak_bytes": 22241071304,
+        "matched_fp32_ttft_ms": 223.062171,
+        "matched_fp32_decode_tps": 142.29489172296542,
+        "matched_fp32_gpu_peak_bytes": 22933131464
+      }
+    },
+    "profile": {
+      "workload": "2048-token prefill plus seven decode intervals, excluded from benchmark timing",
+      "w8a8_gemm_launches": 277,
+      "int8_vector_launches": 1779,
+      "initial_bf16_pointwise_launches": 1416,
+      "optimized_pointwise_launches": 408,
+      "scatter_launches": 336,
+      "remaining_gpu_time_percent": {
+        "int8_prefill_gemm": 37.0,
+        "bf16_flash_attention": 16.7,
+        "int8_vector": 12.5,
+        "activation_quantization": 6.7
+      }
+    },
+    "validation": {
+      "cpu_tests_passed": 46,
+      "cuda_tests_passed": 47,
+      "identical_ids_across_bf16_rounds": true,
+      "fixture_logits": "Finite and within FP32-reference tolerance across cache operations",
+      "accuracy_evaluation": false
+    },
+    "limitation": "vLLM remains faster; prefill GEMM, attention, vector projections and activation quantization remain bottlenecks",
+    "raw_results": ".cache/benchmarks/e4b-cuda-opt/"
+  },
+  "cuda_attention_partition": {
+    "physical_gpu": 7,
+    "cache_precision": "BF16",
+    "baseline_partition_size": 64,
+    "candidate_partition_size": 16,
+    "output_tokens": 128,
+    "warmups_per_run": 2,
+    "measured_requests": {
+      "baseline": 5,
+      "candidate": 10
+    },
+    "candidate_rounds": 2,
+    "candidate_binary_sha256": "ec31eb988ba01472b959a8b331b4d0934552a948f087378c8bfdfa5eaae77c59",
+    "results": {
+      "p128": {
+        "baseline_decode_tps": 146.499,
+        "candidate_decode_tps": 167.109,
+        "candidate_decode_range_tps": [166.865, 167.229],
+        "decode_speedup_percent": 14.07,
+        "baseline_ttft_ms": 18.886,
+        "candidate_ttft_ms": 18.675
+      },
+      "p512": {
+        "baseline_decode_tps": 145.273,
+        "candidate_decode_tps": 162.275,
+        "candidate_decode_range_tps": [161.964, 162.422],
+        "decode_speedup_percent": 11.70,
+        "baseline_ttft_ms": 36.777,
+        "candidate_ttft_ms": 36.991
+      },
+      "p2048": {
+        "baseline_decode_tps": 144.510,
+        "candidate_decode_tps": 156.935,
+        "candidate_decode_range_tps": [156.362, 157.346],
+        "decode_speedup_percent": 8.60,
+        "baseline_ttft_ms": 121.463,
+        "candidate_ttft_ms": 121.725
+      }
+    },
+    "rejected_8_key_trial": {
+      "binary_sha256": "da247d85a97c972ae3bdd464312b5f087a2d529fdefa714a04eff152263c7a37",
+      "measured_requests_per_workload": 5,
+      "workspace_vs_16_key": "2x",
+      "decode_tps": {
+        "p128": 168.456,
+        "p512": 159.471,
+        "p2048": 149.887
+      },
+      "decode_change_vs_16_key_percent": {
+        "p128": 0.81,
+        "p512": -1.73,
+        "p2048": -4.49
+      },
+      "validation": "47/47 CUDA test suite passed"
+    },
+    "validation": {
+      "cuda_tests_passed": 47,
+      "all_measured_requests_generated_128_tokens": true,
+      "workspace_growth": "Up to 4x for decode-attention partial outputs"
+    },
+    "raw_results": ".cache/benchmarks/e4b-cuda-compare/attention-partition/"
+  },
+  "status": "completed",
+  "completed": "2026-11-20T23:23:24.190668+00:00",
+  "protocol": {
+    "physical_gpu": 7,
+    "context": 4096,
+    "chunk": 2048,
+    "threads": 8,
+    "output_tokens": 128,
+    "warmups": 2,
+    "repeats": 5,
+    "concurrency": 1,
+    "prefix_caching": false,
+    "sampling": "greedy, ignore EOS",
+    "timing": "Already-tokenized prompt submission to first generated token; first to last generated token, 127 decode intervals. Model loading and warmups excluded; native API/host sampling overhead included.",
+    "workloads": [
+      {
+        "name": "p128",
+        "prompt_tokens": 128,
+        "prompt_sha256": "a490c0a56fe59754de5d630b66d3d28dbee715347824f53cf8aeba69235e33be"
+      },
+      {
+        "name": "p512",
+        "prompt_tokens": 512,
+        "prompt_sha256": "e8c61a35127b6f0bb4ed530e155f6ac952710ceae22d6735464ffe193c8dfff8"
+      },
+      {
+        "name": "p2048",
+        "prompt_tokens": 2048,
+        "prompt_sha256": "96f538ca058d50c5aa3993f2bd6f90f15b290be452cbbce7c702ddc966cb73b1"
+      }
+    ]
+  },
+  "models": {
+    "model": "google/gemma-4-E4B-it",
+    "revision": "4ecc2ba63bcac23ba4a767fc87025b1450f84c9c",
+    "source_sha256": {
+      "model.safetensors": "cfbd3d2f1cd71bd471c37fe2bf8546d5028d41e5736f64e1ca6c6b8893125503",
+      "tokenizer.json": "91d9cf86906f78e197021fda88214d448e5c120665d0243a8e776e046986c6bc"
+    },
+    "kidi_int8_sha256": "961c473dcd398311b03b12c36ff7230e1809cc54506afb64c2c978f8aeb85d82",
+    "quantization": "Reuse Kidi per-channel signed INT8 linear weights and FP32 scales; vLLM uses dynamic symmetric per-token INT8 activations. vLLM embeddings and tied output head retain original BF16 values.",
+    "vllm_int8_sha256": "45ccef006d89c516566bb7d2764f729f8d096f1e804b87a58c8b2a3a2ef0c141",
+    "kidi_weight_provenance_check": {
+      "quantized_matrices_checked": 379,
+      "rows_per_matrix": 3,
+      "method": "Exact INT8 values and FP32 scales reproduced from pinned BF16 source using existing pack_int8 helper"
+    }
+  },
+  "hardware": "index, uuid, name, memory.total [MiB], driver_version, power.limit [W]\n7, GPU-5556d256-0678-d566-8bdb-25194036814e, NVIDIA H100 80GB HBM3, 81559 MiB, 580.178.04, 700.00 W",
+  "kidi_commit": "09faf21022a355e76d8d93e63bf425f0ee9a1576",
+  "llamacpp_commit": "401563f10ec60754e688cd3165c1343cf4be9642",
+  "vllm_versions": {
+    "vllm": "0.34.0",
+    "torch": "2.14.0",
+    "transformers": "5.22.2",
+    "compressed-tensors": "0.17.0"
+  },
+  "vllm_settings": {
+    "model": "/scratch/azureml/cr/j/d7b464f95deb4a629517c07659d194d7/exe/wd/kidi/.cache/benchmarks/e4b-q8-gpu7/vllm-w8a8",
+    "dtype": "bfloat16",
+    "quantization": "compressed-tensors",
+    "tensor_parallel_size": 1,
+    "max_model_len": 4096,
+    "max_num_batched_tokens": 2048,
+    "max_num_seqs": 1,
+    "kv_cache_memory_bytes": 1073741824,
+    "language_model_only": true,
+    "enable_prefix_caching": false,
+    "cpu_offload_gb": 0,
+    "seed": 0,
+    "disable_log_stats": false
+  },
+  "rounds": [
+    [
+      "kidi",
+      "llamacpp",
+      "vllm"
+    ],
+    [
+      "vllm",
+      "llamacpp",
+      "kidi"
+    ]
+  ],
+  "measured_repeats_per_engine_workload": 10,
+  "artifacts_sha256": {
+    "kidi_binary": "eed21a2a4cf07b3aea69c08837ab87bc46caf29bac6e6025c2d0c6522783aad3",
+    "llamacpp_binary": "fbfde686dfed6ad6c79f3e0f228d757994f619b5910d0fc6df1f05872751ddd3",
+    "llamacpp_library": "c300fc989b6707db76e7964a6b8dd2c7966e6d8bfca3761e23bded3cf91e6287",
+    "llamacpp_cuda_library": "9da137a7d9269db4a70579f9976b1d9d245c8241d8d73ad2feb3b82331134a76",
+    "llamacpp_driver": "c3e803b5c9f53d6fe3b2e6d5de11c881bf17e8fd5dfef77b7f2100124a1316ec",
+    "llamacpp_gguf": "d267284f8c82929684ad67fff304d3339e50c6b87e74ef7af5b10c80ad773173",
+    "model_preparation": "7c1c418ea8af2a41fce4bcb6d70119088e69b40913386902457cf2201952e7e0",
+    "driver": "c75988eb66085bd507c6d93a3da6408cea7abb685be708a17dc71ad80e6056dd",
+    "vllm_driver": "c4ae9124813612ca49d67f18d0c746c474a4e800b627cbc568f71b77cf4236bb"
+  },
+  "precision_notes": {
+    "kidi": "Native per-channel signed INT8 checkpoint, packed CUDA projections, FP32 KV/attention. CUDA explicit --precision w8a8 is unsupported; native packed prefill uses W8A8 and small-row decode uses INT8 DP4A vector projections. Embeddings/tied head are Q8.",
+    "vllm": "compressed-tensors INT8 W8A8, same quantized linear matrices/scales as Kidi; dynamic symmetric INT8 activations, BF16 embeddings/tied output head and KV cache.",
+    "llamacpp": "Q8_0 converted directly from the same official BF16 source; blockwise Q8 weights, Q8_1 activation dot/MMQ kernels, GGML_CUDA_FORCE_MMQ=ON, BF16 KV cache.",
+    "comparison": "Same base weights and exact prompt token IDs, but not bit-identical quantization schemes or KV precision. This is an engine-native Q8 comparison, not a pure kernel comparison. Shared host; clocks/power not locked. Output sanity, not an accuracy benchmark."
+  },
+  "precision_validation": {
+    "kidi": "Separate Nsight run observed quantize_rows, pipelined_w8a8_gemm and quantized_vector_fast; vector source uses __dp4a on signed INT8 activations and weights.",
+    "vllm": "Startup selected CutlassInt8ScaledMMLinearKernel for CompressedTensorsW8A8Int8.",
+    "llamacpp": "Separate Nsight run observed quantize_q8_1, quantize_mmq_q8_1, mul_mat_vec_q<ggml_type(8)> and mul_mat_q<ggml_type(8)>; 43/43 layers offloaded."
+  },
+  "results": {
+    "kidi": {
+      "p128": {
+        "prompt_tokens": 128,
+        "output_tokens": 128,
+        "prefill_tps": 6537.038906837611,
+        "decode_tps": 145.3216490134214,
+        "ttft_ms": 19.580750000000002,
+        "request_ms": 893.5520365,
+        "decode_range_tps": [
+          145.13081493422095,
+          145.46084818875727
+        ],
+        "round_decode_medians_tps": [
+          145.24040773822273,
+          145.3624256747467
+        ],
+        "deterministic": true,
+        "sample_text": "## The Science Behind the Blue Sky: Deconstructing the Passage\n\nThe provided passage, despite its extreme repetition, encapsulates a fundamental and beautiful principle of atmospheric physics: **the scattering of sunlight by the Earth's atmosphere, which is responsible for the blue color of our sky.** The repetition serves not to add new information, but to intensely focus the reader's attention on this core concept, demanding a detailed scientific explanation of *why* this phenomenon occurs.\n\nTo fully explain this passage, we must break down the two key components: the composition of sunlight and the mechanism of light scattering by air molecules.\n\n### 1. Sunlight:"
+      },
+      "p512": {
+        "prompt_tokens": 512,
+        "output_tokens": 128,
+        "prefill_tps": 11545.3268079074,
+        "decode_tps": 143.5604029877827,
+        "ttft_ms": 44.347116,
+        "request_ms": 929.3287225,
+        "decode_range_tps": [
+          141.2138336625152,
+          143.7863245367913
+        ],
+        "round_decode_medians_tps": [
+          143.72913474531236,
+          143.31101690792744
+        ],
+        "deterministic": true,
+        "sample_text": "The provided text is a highly repetitive statement: \"Sunlight contains many colors. Air scatters blue light more strongly than red light.\" This repetition, while monotonous, is the core of a fundamental concept in physics and atmospheric science, specifically explaining why the sky appears blue. To provide a detailed explanation, we must analyze the two distinct parts of this statement and synthesize them into a coherent explanation of Rayleigh scattering.\n\n**Part 1: \"Sunlight contains many colors.\"**\n\nThis statement refers to the nature of white light, which is what we perceive as sunlight. Sunlight is not a single color; rather, it is a composite of"
+      },
+      "p2048": {
+        "prompt_tokens": 2048,
+        "output_tokens": 128,
+        "prefill_tps": 9128.835656969692,
+        "decode_tps": 142.55457929286138,
+        "ttft_ms": 224.344136,
+        "request_ms": 1115.058708,
+        "decode_range_tps": [
+          142.24304395562288,
+          142.8272169403318
+        ],
+        "round_decode_medians_tps": [
+          142.60539364747385,
+          142.30658907823081
+        ],
+        "deterministic": true,
+        "sample_text": "The provided text is an extremely repetitive statement: \"Sunlight contains many colors. Air scatters blue light more strongly than red light.\" This repetition, while redundant, is the core of a fundamental concept in atmospheric optics, which explains why the sky appears blue. To provide a detailed explanation, we must analyze the two distinct parts of this statement and synthesize them into a coherent scientific explanation.\n\n### Part 1: \"Sunlight contains many colors.\"\n\nThis statement refers to the nature of white light, which is what we perceive as sunlight. Sunlight is not a single, uniform color; rather, it is a composite of the entire visible"
+      }
+    },
+    "llamacpp": {
+      "p128": {
+        "prompt_tokens": 128,
+        "output_tokens": 128,
+        "prefill_tps": 7776.978137066116,
+        "decode_tps": 178.11446032325784,
+        "ttft_ms": 16.458915500000003,
+        "request_ms": 729.3827525,
+        "decode_range_tps": [
+          175.78594213079168,
+          179.6322535125609
+        ],
+        "round_decode_medians_tps": [
+          177.19331306033476,
+          178.9096828350423
+        ],
+        "deterministic": true,
+        "sample_text": "## The Science of the Rainbow: An Examination of the Saturated Phenomenon\n\nThe passage, while seemingly a simple repetition of the same phrase, is an exercise in the concept of **abstraction and the underlying principle behind the phenomenon of scattering. The passage is fundamentally asking: \"What is happening when we observes the subtle interplay of light and air?** The repeating phrase, \"Sunlight contains many colors. Sunlight contains a variety of these concepts, and the subsequent addition of the specific phenomenon, \"Air contains more strongly, allows us to analyze the principle of the phenomenon.\n\nThe core concept in this passage is the principle of **differentiated"
+      },
+      "p512": {
+        "prompt_tokens": 512,
+        "output_tokens": 128,
+        "prefill_tps": 17486.052569427433,
+        "decode_tps": 176.7960448707202,
+        "ttft_ms": 29.2804845,
+        "request_ms": 747.4617499999999,
+        "decode_range_tps": [
+          163.4016959925213,
+          177.90781565886402
+        ],
+        "round_decode_medians_tps": [
+          175.544987326502,
+          177.1609978551076
+        ],
+        "deterministic": true,
+        "sample_text": "The passage you have provided is a repetition of the phrase: \"Sunlight contains many colors. Sunlight sunlight. Sunlight contains many colors. Air scatters more than red light. Sunlight contains scatters light more than light. Light. Light.\n\nThis phenomenon, which is the principle of how the sky appears to be a seemingly vibrant, seemingly simple, phenomenon, is known as **the short-scattering phenomenon, or more commonly, the scattering of light, which is the basis of the concept of the colors of the rainbow and the appearance of the sky.\n\nTo detail this, we must first examine the phrase \"Sunlight contains sunlight.\""
+      },
+      "p2048": {
+        "prompt_tokens": 2048,
+        "output_tokens": 128,
+        "prefill_tps": 20201.647500818122,
+        "decode_tps": 173.99791746049283,
+        "ttft_ms": 101.3778715,
+        "request_ms": 830.5419440000001,
+        "decode_range_tps": [
+          170.53075894048257,
+          175.20879873975264
+        ],
+        "round_decode_medians_tps": [
+          174.48283045190257,
+          173.9337642832233
+        ],
+        "deterministic": true,
+        "sample_text": "The provided passage, while simply stated, depicts a fundamental and visually significant phenomenon: the appearance of the sky. The repeated phrase, \"Sunlight contains sunlight. Sunlight is sunlight. Sunlight is sunlight,\" is being used to illustrate the concept of the *appearance of sunlight being represented by the concept of the sky's appearance, which is heavily influenced by the atmospheric appearance of sunlight. The key phrase, \"Air scatters sunlight more strongly than red light,\" describes the actual mechanism responsible for the visible appearance of blue light when we look at the sky.\n\nTo understand the significance of this phenomenon, we must first examine the phrase \"Sunlight"
+      }
+    },
+    "vllm": {
+      "p128": {
+        "prompt_tokens": 128,
+        "output_tokens": 128,
+        "prefill_tps": 5034.30875644218,
+        "decode_tps": 201.30017769082858,
+        "ttft_ms": 25.428387569263577,
+        "request_ms": 656.5660540945828,
+        "decode_range_tps": [
+          194.99684258039082,
+          207.53529915458492
+        ],
+        "round_decode_medians_tps": [
+          207.51959235213732,
+          195.07987872103115
+        ],
+        "deterministic": false,
+        "sample_text": "## Deconstructing the Phenomenon: A Detailed Explanation of Rayleigh Scattering\n\nThe provided passage, despite its extreme repetition, points directly to one of the most fundamental and visually striking phenomena in atmospheric science: **why the sky appears blue**. The core concepts presented are: \"Sunlight contains many colors\" and \"Air scatters blue light more strongly than red light.\" To fully explain this, we must delve into the nature of sunlight, the composition of the atmosphere, and the physics of light scattering, specifically **Rayleigh Scattering**.\n\n### 1. The Composition of Sunlight (The Source)\n\nThe first statement, \"Sunlight contains many"
+      },
+      "p512": {
+        "prompt_tokens": 512,
+        "output_tokens": 128,
+        "prefill_tps": 19737.32680208352,
+        "decode_tps": 200.65276903116552,
+        "ttft_ms": 25.94074886292219,
+        "request_ms": 659.6316409995779,
+        "decode_range_tps": [
+          194.40584294026507,
+          206.82770830826814
+        ],
+        "round_decode_medians_tps": [
+          206.7970369658809,
+          194.43043335196975
+        ],
+        "deterministic": false,
+        "sample_text": "The provided passage is a highly repetitive statement: \"Sunlight contains many colors. Air scatters blue light more strongly than red light.\" This repetition, while monotonous, is designed to emphasize a fundamental concept in atmospheric optics\u2014the mechanism behind why our sky appears blue. To provide a detailed explanation, we must analyze the two core components of this statement: the composition of sunlight and the process of light scattering by the atmosphere.\n\n**1. Sunlight Contains Many Colors (The Source):**\n\nSunlight, as it originates from the Sun, is not a single color but a composite spectrum of electromagnetic radiation. This spectrum encompasses all the visible wavelengths"
+      },
+      "p2048": {
+        "prompt_tokens": 2048,
+        "output_tokens": 128,
+        "prefill_tps": 72629.55215256017,
+        "decode_tps": 199.07713915283412,
+        "ttft_ms": 28.197892010211945,
+        "request_ms": 668.0850420380011,
+        "decode_range_tps": [
+          193.020846121005,
+          205.22826968063916
+        ],
+        "round_decode_medians_tps": [
+          205.0783268026293,
+          193.04735334159835
+        ],
+        "deterministic": false,
+        "sample_text": "The provided text is an extremely repetitive statement: \"Sunlight contains many colors. Air scatters blue light more strongly than red light.\" This repetition is not intended to convey new information but rather to emphasize a fundamental concept in physics, specifically the phenomenon of **Rayleigh scattering**, which is the scientific explanation for why the sky appears blue.\n\nTo provide a detailed explanation, we must analyze the two core components of the repeated phrase: the composition of sunlight and the differential scattering by the atmosphere.\n\n### 1. Sunlight Contains Many Colors (The Composition of White Light)\n\nThe first part of the statement, \"Sunlight contains many colors"
+      }
+    }
+  },
+  "raw_artifacts": ".cache/benchmarks/e4b-q8-gpu7"
+}

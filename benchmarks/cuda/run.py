@@ -149,11 +149,11 @@ def main():
     paths = [ROOT / "CMakeLists.txt", Path(__file__).resolve(), ROOT / "benchmarks/android/baseline.cpp", ROOT / "benchmarks/tts/synthesis.cpp"]
     paths.extend((ROOT / "src/kidi").rglob("*.cpp"))
     paths.extend((ROOT / "src/kidi").rglob("*.h"))
-    paths.extend(path for path in (ROOT / "third_party/ynnpack-dev/ynnpack/cuda").iterdir() if path.is_file())
-    paths.extend([ROOT / "third_party/ynnpack-dev/ynnpack/include/ynnpack_cuda.h", ROOT / "third_party/ynnpack-dev/ynnpack/subgraph/dot.cc"])
+    paths.extend(path for path in (ROOT / "kidi-ops/src/cuda").rglob("*") if path.is_file())
+    paths.append(ROOT / "third_party/ynnpack-dev/ynnpack/kernels/dot/dot.cc")
     report["source"]["file_sha256"] = {str(path.relative_to(ROOT)): digest(path) for path in sorted(set(paths))}
     report["source"]["binary_sha256"] = {name: digest(ROOT / "build-release" / name) for name in ("kidi", "kidi_android_baseline", "kidi_tts_bench")}
-    report["memory_note"] = "GPU peaks include runtime-owned allocations only, excluding driver/context and cuBLAS-private allocations."
+    report["memory_note"] = "GPU peaks include runtime-owned allocations only, excluding driver/context allocations."
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
 
     def save():

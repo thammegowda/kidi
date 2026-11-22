@@ -164,13 +164,15 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             }
         }
         const auto checkpoint_bf16 = !qat && options.precision == core::InferencePrecision::BF16;
-        if (options.precision != core::InferencePrecision::CHECKPOINT && !qat && !checkpoint_bf16)
+        const auto cuda_w8a16 =
+            options.device.kind == tensor::DeviceKind::CUDA && options.precision == core::InferencePrecision::Q8A16;
+        if (options.precision != core::InferencePrecision::CHECKPOINT && !qat && !checkpoint_bf16 && !cuda_w8a16)
             throw ops::Failure(
                 {ErrorCode::UNSUPPORTED, "explicit projection precision currently requires a native QAT checkpoint"});
         if (options.precision != core::InferencePrecision::CHECKPOINT && options.weight_bits)
             throw ops::Failure(
                 {ErrorCode::INVALID_ARGUMENT, "precision and load-time weight packing cannot be combined"});
-        if (options.precision != core::InferencePrecision::CHECKPOINT && !checkpoint_bf16 &&
+        if (options.precision != core::InferencePrecision::CHECKPOINT && !checkpoint_bf16 && !cuda_w8a16 &&
             !options.device.capabilities().compute.host())
             throw ops::Failure(
                 {ErrorCode::UNSUPPORTED, "selected precision is currently implemented only by the CPU backend"});
@@ -178,9 +180,6 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
         if (options.precision == core::InferencePrecision::LOWBIT_PARITY)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "lowbit-parity currently requires Apple Accelerate"});
 #endif
-        if (options.kv_cache_precision == core::KVCachePrecision::E4M3 ||
-            options.kv_cache_precision == core::KVCachePrecision::E5M2)
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "selected KV-cache precision is not implemented"});
         if (options.kv_cache_precision == core::KVCachePrecision::INT8 && !qat)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "INT8 KV cache requires a calibrated QAT checkpoint"});
         auto tokenizer = [&] {
@@ -219,6 +218,10 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
                                                           : "model.language_model.embed_tokens.weight"));
         if (checkpoint_bf16 && parameter.dtype() != tensor::DType::BF16)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "BF16 execution requires BF16 checkpoint weights"});
+        if (cuda_w8a16 && !qat && parameter.dtype() != tensor::DType::BF16 && parameter.dtype() != tensor::DType::F16 &&
+            parameter.dtype() != tensor::DType::F32)
+            throw ops::Failure(
+                {ErrorCode::INVALID_ARGUMENT, "W8A16 execution on unquantized checkpoints requires floating weights"});
         std::optional<ops::StepCompilerScope> accelerator;
         auto device = options.device;
         if (device.kind == tensor::DeviceKind::Q_NPU) {
@@ -229,7 +232,8 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             config["model"], {.device = device, .parameter_dtype = parameter.dtype()}));
         {
             const core::MemoryScope memory("load:bind_weights");
-            require(model->set_checkpoint(weights, {.weight_bits = options.weight_bits,
+            const auto effective_weight_bits = cuda_w8a16 && !qat ? std::int32_t{8} : options.weight_bits;
+            require(model->set_checkpoint(weights, {.weight_bits = effective_weight_bits,
                                                     .group_size = options.group_size,
                                                     .packed_prefill = options.packed_prefill}));
         }
@@ -241,6 +245,7 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
 #endif
         model->set_precision(options.precision);
         model->set_kv_cache_precision(options.kv_cache_precision);
+        require(model->kv_cache_dtype(1));
         if (!options.assistant_model.empty() && !model->accelerator().empty())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding requires a native CPU target"});
         if (!lm_head_index.empty() && options.weight_bits)
@@ -329,12 +334,19 @@ auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size
             model_->trim_workspaces();
             prefill_warmed_ = true;
         } else {
-            auto state = require(model_->create_state(capacity));
+            const bool reusable = model_->device().kind == tensor::DeviceKind::CUDA && !drafter_ &&
+                                  dynamic_cast<model::Gemma4Impl*>(model_.get());
+            auto state = require(model_->create_state(reusable ? requested : capacity));
             const std::array tokens{token};
             // The selected token is never read, so devices that finish asynchronously need no wait here.
             require(model_->select_token(tokens, *state));
             if (model_->accelerator().empty() && !model_->device().capabilities().memory.deferred())
                 model_->trim_workspaces();
+            if (reusable) {
+                require(model_->rewind(*state, 0));
+                reusable_states_.clear();
+                reusable_states_.push_back(std::move(state));
+            }
         }
         return {};
     } catch (const ops::Failure& error) {
@@ -350,6 +362,7 @@ auto Generator::release_workspaces() -> Result<void> {
         model_->release_workspaces();
         if (drafter_) drafter_->release_workspaces();
         retired_.clear();
+        reusable_states_.clear();
         reserved_cache_tokens_ = 0;
         if (vision_) vision_->release_workspaces();
         return {};
@@ -379,6 +392,7 @@ auto Generator::memory() const -> GeneratorMemory {
         if (request.state) result.cache_bytes += request.state->cache_bytes();
     for (const auto& request : retired_)
         if (request.state) result.cache_bytes += request.state->cache_bytes();
+    for (const auto& state : reusable_states_) result.cache_bytes += state->cache_bytes();
     if (prefix_ && prefix_->state) result.cache_bytes += prefix_->state->cache_bytes();
     if (serving_prefix_ && serving_prefix_->state) result.cache_bytes += serving_prefix_->state->cache_bytes();
     for (const auto& image : images_) result.image_bytes += image.embeddings.nbytes();
@@ -455,7 +469,7 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
         }
         auto state = result.stats.reused_prompt_tokens
                          ? require(model_->fork_state(*prefix_->state, result.stats.reused_prompt_tokens, capacity))
-                         : require(model_->create_state(capacity));
+                         : acquire_state(capacity);
         model_->configure_state(*state, options.full_attention_cache,
                                 should_capture_prefill(model_->accelerator(), tokens.size()));
         const auto bytes_per_token = state->cache_bytes() / capacity;
@@ -529,6 +543,7 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
         result.stats.prefix_reserved_bytes = result.stats.prefix_cache_bytes;
         result.text = require(tokenizer_.decode(result.generation.token_ids));
         result.stats.generation_ns = elapsed(started);
+        recycle_state(state);
         return result;
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
@@ -657,6 +672,10 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
                 {ErrorCode::INVALID_ARGUMENT, "invalid serving limits, outstanding requests or failed engine"});
         prefix_.reset();
         serving_prefix_.reset();
+        std::size_t reusable_capacity = 0;
+        for (const auto& state : reusable_states_) reusable_capacity += state->sequence_capacity();
+        if (reusable_states_.size() > options.maximum_active || reusable_capacity > options.cache_token_budget)
+            reusable_states_.clear();
         running_.reserve(options.maximum_active);
         serving_ = options;
         return {};
@@ -858,13 +877,42 @@ auto Generator::retain_serving_prefix(QueuedGeneration& request) -> void {
 }
 
 auto Generator::reap_retired() -> void {
-    std::erase_if(retired_, [&](const auto& request) {
+    std::erase_if(retired_, [&](auto& request) {
         if (request.decode && !request.decode->pending.empty() &&
             !require(request.decode->pending.back().transfer->ready()))
             return false;
+        recycle_state(request.state, !request.images.empty());
         reserved_cache_tokens_ -= request.capacity;
         return true;
     });
+}
+
+auto Generator::acquire_state(std::size_t capacity) -> std::unique_ptr<model::LanguageModelState> {
+    const auto reusable = std::ranges::find_if(reusable_states_, [&](const auto& state) {
+        return state->sequence_capacity() == capacity;
+    });
+    if (reusable != reusable_states_.end()) {
+        auto state = std::move(*reusable);
+        reusable_states_.erase(reusable);
+        return state;
+    }
+    reusable_states_.clear();
+    return require(model_->create_state(capacity));
+}
+
+auto Generator::recycle_state(std::unique_ptr<model::LanguageModelState>& state, bool has_images) -> void {
+    // Gemma's rewind synchronizes queued GPU work and restores its prefill state. Image-bearing and speculative
+    // states are not reused: they carry additional request-specific state beyond the KV cache.
+    const auto maximum = serving_ ? serving_->maximum_active : 1;
+    if (!state || model_->device().kind != tensor::DeviceKind::CUDA || drafter_ ||
+        !dynamic_cast<model::Gemma4Impl*>(model_.get()) || has_images || reusable_states_.size() >= maximum)
+        return;
+    std::size_t capacity = state->sequence_capacity();
+    const auto budget = serving_ ? serving_->cache_token_budget : capacity;
+    for (const auto& cached : reusable_states_) capacity += cached->sequence_capacity();
+    if (capacity > budget) return;
+    require(model_->rewind(*state, 0));
+    reusable_states_.push_back(std::move(state));
 }
 
 auto Generator::cancel(std::uint64_t request_id) -> Result<void> {
@@ -878,8 +926,13 @@ auto Generator::cancel(std::uint64_t request_id) -> Result<void> {
         if (running->decode && !running->decode->pending.empty())
             retired_.push_back(std::move(*running));
         else {
-            reserved_cache_tokens_ -= running->capacity;
             retain_serving_prefix(*running);
+            try {
+                recycle_state(running->state, !running->images.empty());
+            } catch (const ops::Failure& error) {
+                return std::unexpected(error.error());
+            }
+            reserved_cache_tokens_ -= running->capacity;
         }
         running_.erase(running);
         return {};
@@ -913,7 +966,7 @@ auto Generator::step() -> Result<GenerationStep> {
                     require(model_->rewind(*request.state, common));
                 }
                 serving_prefix_.reset();
-                if (!request.state) request.state = require(model_->create_state(request.capacity));
+                if (!request.state) request.state = acquire_state(request.capacity);
                 if (!request.images.empty()) require(request.state->attach_embeddings(request.images));
                 model_->configure_state(
                     *request.state, request.options.full_attention_cache,
@@ -924,8 +977,9 @@ auto Generator::step() -> Result<GenerationStep> {
             }
         };
         const auto retire = [&] {
-            std::erase_if(running_, [&](const auto& request) {
+            std::erase_if(running_, [&](auto& request) {
                 if (!request.completion_emitted) return false;
+                recycle_state(request.state, !request.images.empty());
                 reserved_cache_tokens_ -= request.capacity;
                 return true;
             });

@@ -55,6 +55,7 @@ public:
     auto configure_cache(const std::filesystem::path& directory, const std::filesystem::path& source) -> void override;
     auto set_precision(core::InferencePrecision precision) noexcept -> void override;
     auto set_kv_cache_precision(core::KVCachePrecision precision) noexcept -> void override;
+    auto kv_cache_dtype(std::size_t capacity) const -> Result<tensor::DType> override;
     auto configure_lm_head(const std::filesystem::path& index) -> Result<void> override;
     auto create_state(std::size_t capacity) -> Result<std::unique_ptr<LanguageModelState>> override;
     auto configure_state(LanguageModelState& state, bool full_attention_cache, bool capture_prefill) -> void override;

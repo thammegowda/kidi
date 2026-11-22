@@ -79,8 +79,8 @@ browser module tree is shipped rather than a hand-maintained list of imports.
 To test a built site in a real browser:
 
 ```bash
-make web-deps
-npm --prefix web exec -- playwright install chromium
+make web-test-deps
+npm --prefix web exec --no -- playwright install --only-shell chromium
 make wasm WEB_DIR=build-pages
 make web-smoke-test WEB_DIR=build-pages
 ```

@@ -1,7 +1,8 @@
 #include "kidi/ops/context.h"
 #include "kidi/layers/gemma4.h"
 #include "kidi/layers/audio.h"
-#include "ynnpack/include/ynnpack_cuda.h"
+#include "cuda/runtime.h"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -60,6 +61,183 @@ auto check_attention_bindings() -> bool {
         const auto values = require(copied.data<float>());
         for (std::size_t column = 0; column < static_cast<std::size_t>(width); ++column)
             if (values[128 * width + column] != 1.F) return false;
+    }
+    return true;
+}
+
+auto check_structured_causal_masks() -> bool {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    ops::Context context(device, false, true, DType::BF16);
+    const std::vector<float> query_values(128, 0.F), key_values(192, 0.F);
+    std::vector<float> value_values(192, 1.F);
+    std::ranges::fill(value_values.begin() + 64, value_values.begin() + 128, 3.F);
+    std::ranges::fill(value_values.begin() + 128, value_values.end(), 9.F);
+    const auto query = context.cast(require(Tensor::from_host({1, 2, 64}, std::span<const float>(query_values), device)),
+                                    DType::BF16);
+    const auto key = context.cast(require(Tensor::from_host({1, 3, 64}, std::span<const float>(key_values), device)),
+                                  DType::BF16);
+    const auto value =
+        context.cast(require(Tensor::from_host({1, 3, 64}, std::span<const float>(value_values), device)), DType::BF16);
+    const std::array<float, 6> full_precision_values{0.F, -1e9F, -1e9F, 0.F, 0.F, 0.F};
+    const auto full_precision_mask =
+        require(Tensor::from_host({1, 1, 2, 3}, std::span<const float>(full_precision_values), device));
+    const std::array<std::int32_t, 2> query_position{0, 2};
+    const auto positions = require(Tensor::from_host({1, 1, 2, 1}, std::span<const std::int32_t>(query_position),
+                                                     device));
+    const auto expected = context.grouped_query_attention(query, key, value, 1, 1, full_precision_mask);
+    const auto causal = context.grouped_query_attention_causal(query, key, value, 1, 1, positions, 0);
+    const auto local = context.grouped_query_attention_causal(query, key, value, 1, 1, positions, 2);
+    const auto expected_host = require(context.cast(expected, DType::F32).to(tensor::Device::cpu()));
+    const auto causal_host = require(context.cast(causal, DType::F32).to(tensor::Device::cpu()));
+    const auto local_host = require(context.cast(local, DType::F32).to(tensor::Device::cpu()));
+    const auto expected_values = require(expected_host.data<float>());
+    const auto causal_values = require(causal_host.data<float>());
+    const auto local_values = require(local_host.data<float>());
+    for (std::size_t index = 0; index < causal_values.size(); ++index)
+        if (std::abs(causal_values[index] - expected_values[index]) > 1e-5F) {
+            std::cerr << "causal mask parity failed index=" << index << " expected=" << expected_values[index]
+                      << " actual=" << causal_values[index] << '\n';
+            return false;
+        }
+    if (std::abs(expected_values[0] - 1.F) > 1e-5F || std::abs(expected_values[64] - 13.F / 3.F) > 2e-2F ||
+        std::abs(local_values[0] - 1.F) > 1e-5F || std::abs(local_values[64] - 6.F) > 1e-5F) {
+        std::cerr << "attention expected row outputs 1, 4.333, 1, 6; got " << expected_values[0] << ", "
+                  << expected_values[64] << ", " << local_values[0] << ", " << local_values[64] << '\n';
+        return false;
+    }
+
+    constexpr std::size_t long_keys = 1024;
+    std::vector<float> long_query_values(2 * 64, 0.F), long_key_values(long_keys * 64, 0.F);
+    std::vector<float> long_value_values(long_keys * 64);
+    std::array<float, 2 * long_keys> long_causal_mask{}, long_local_mask{}, long_single_mask{};
+    for (std::size_t key_index = 0; key_index < long_keys; ++key_index) {
+        std::ranges::fill(long_value_values.begin() + key_index * 64, long_value_values.begin() + (key_index + 1) * 64,
+                          static_cast<float>(key_index / 128));
+        long_causal_mask[key_index] = key_index <= 511 ? 0.F : -1e9F;
+        long_causal_mask[long_keys + key_index] = key_index <= 510 ? 0.F : -1e9F;
+        long_local_mask[key_index] = key_index >= 256 && key_index <= 511 ? 0.F : -1e9F;
+        long_local_mask[long_keys + key_index] = key_index >= 255 && key_index <= 510 ? 0.F : -1e9F;
+        long_single_mask[key_index] = key_index == 511 ? 0.F : -1e9F;
+        long_single_mask[long_keys + key_index] = key_index == 510 ? 0.F : -1e9F;
+    }
+    const auto long_query = context.cast(
+        require(Tensor::from_host({1, 2, 64}, std::span<const float>(long_query_values), device)), DType::BF16);
+    const auto long_key = context.cast(
+        require(Tensor::from_host({1, static_cast<std::int64_t>(long_keys), 64},
+                                  std::span<const float>(long_key_values), device)),
+        DType::BF16);
+    const auto long_value = context.cast(
+        require(Tensor::from_host({1, static_cast<std::int64_t>(long_keys), 64},
+                                  std::span<const float>(long_value_values), device)),
+        DType::BF16);
+    const std::array<std::int32_t, 2> long_query_positions{511, 510};
+    const auto long_positions = require(
+        Tensor::from_host({1, 1, 2, 1}, std::span<const std::int32_t>(long_query_positions), device));
+    const auto long_causal_reference =
+        context.grouped_query_attention(long_query, long_key, long_value, 1, 1,
+                                        require(Tensor::from_host({1, 1, 2, static_cast<std::int64_t>(long_keys)},
+                                                                  std::span<const float>(long_causal_mask), device)));
+    const auto long_local_reference =
+        context.grouped_query_attention(long_query, long_key, long_value, 1, 1,
+                                        require(Tensor::from_host({1, 1, 2, static_cast<std::int64_t>(long_keys)},
+                                                                  std::span<const float>(long_local_mask), device)));
+    const auto long_single_reference =
+        context.grouped_query_attention(long_query, long_key, long_value, 1, 1,
+                                        require(Tensor::from_host({1, 1, 2, static_cast<std::int64_t>(long_keys)},
+                                                                  std::span<const float>(long_single_mask), device)));
+    const auto long_causal =
+        context.grouped_query_attention_causal(long_query, long_key, long_value, 1, 1, long_positions, 0);
+    const auto long_local =
+        context.grouped_query_attention_causal(long_query, long_key, long_value, 1, 1, long_positions, 256);
+    const auto long_single =
+        context.grouped_query_attention_causal(long_query, long_key, long_value, 1, 1, long_positions, 1);
+    const auto long_causal_reference_host =
+        require(context.cast(long_causal_reference, DType::F32).to(tensor::Device::cpu()));
+    const auto long_local_reference_host =
+        require(context.cast(long_local_reference, DType::F32).to(tensor::Device::cpu()));
+    const auto long_single_reference_host =
+        require(context.cast(long_single_reference, DType::F32).to(tensor::Device::cpu()));
+    const auto long_causal_host = require(context.cast(long_causal, DType::F32).to(tensor::Device::cpu()));
+    const auto long_local_host = require(context.cast(long_local, DType::F32).to(tensor::Device::cpu()));
+    const auto long_single_host = require(context.cast(long_single, DType::F32).to(tensor::Device::cpu()));
+    const auto long_causal_reference_values = require(long_causal_reference_host.data<float>());
+    const auto long_local_reference_values = require(long_local_reference_host.data<float>());
+    const auto long_single_reference_values = require(long_single_reference_host.data<float>());
+    const auto long_causal_values = require(long_causal_host.data<float>());
+    const auto long_local_values = require(long_local_host.data<float>());
+    const auto long_single_values = require(long_single_host.data<float>());
+    for (std::size_t index = 0; index < long_causal_values.size(); ++index) {
+        if (std::abs(long_causal_values[index] - long_causal_reference_values[index]) > 1e-2F ||
+            std::abs(long_local_values[index] - long_local_reference_values[index]) > 1e-2F ||
+            std::abs(long_single_values[index] - long_single_reference_values[index]) > 1e-2F) {
+            std::cerr << "long attention key-range parity failed index=" << index << '\n';
+            return false;
+        }
+    }
+
+    ops::Context f32_context(device, false, true, DType::F32);
+    const auto long_query_f32 =
+        require(Tensor::from_host({1, 2, 64}, std::span<const float>(long_query_values), device));
+    const auto long_key_f32 = require(
+        Tensor::from_host({1, static_cast<std::int64_t>(long_keys), 64},
+                          std::span<const float>(long_key_values), device));
+    const auto long_value_f32 = require(
+        Tensor::from_host({1, static_cast<std::int64_t>(long_keys), 64},
+                          std::span<const float>(long_value_values), device));
+    const auto long_causal_mask_f32 =
+        require(Tensor::from_host({1, 1, 2, static_cast<std::int64_t>(long_keys)},
+                                  std::span<const float>(long_causal_mask), device));
+    const auto long_causal_reference_f32 =
+        f32_context.grouped_query_attention(long_query_f32, long_key_f32, long_value_f32, 1, 1,
+                                            long_causal_mask_f32);
+    const auto long_causal_f32 =
+        f32_context.grouped_query_attention_causal(long_query_f32, long_key_f32, long_value_f32, 1, 1,
+                                                   long_positions, 0);
+    const auto long_causal_reference_f32_host =
+        require(long_causal_reference_f32.to(tensor::Device::cpu()));
+    const auto long_causal_f32_host = require(long_causal_f32.to(tensor::Device::cpu()));
+    const auto long_causal_reference_f32_values = require(long_causal_reference_f32_host.data<float>());
+    const auto long_causal_f32_values = require(long_causal_f32_host.data<float>());
+    for (std::size_t index = 0; index < long_causal_f32_values.size(); ++index) {
+        if (!std::isfinite(long_causal_f32_values[index]) ||
+            std::abs(long_causal_f32_values[index] - long_causal_reference_f32_values[index]) > 1e-2F) {
+            std::cerr << "FP32 long causal attention parity failed index=" << index << '\n';
+            return false;
+        }
+    }
+
+    constexpr std::size_t key_start = 37;
+    constexpr std::size_t cropped_keys = long_keys - key_start;
+    std::array<float, 2 * cropped_keys> cropped_local_mask{};
+    for (std::size_t row = 0; row < long_query_positions.size(); ++row) {
+        const auto position = long_query_positions[row];
+        for (std::size_t index = 0; index < cropped_keys; ++index) {
+            const auto key_position = static_cast<std::int64_t>(key_start + index);
+            cropped_local_mask[row * cropped_keys + index] =
+                key_position <= position && position - key_position < 256 ? 0.F : -1e9F;
+        }
+    }
+    const auto cropped_mask = require(
+        Tensor::from_host({1, 1, 2, static_cast<std::int64_t>(cropped_keys)},
+                          std::span<const float>(cropped_local_mask), device));
+    const auto cropped_reference = f32_context.grouped_query_attention(
+        long_query_f32, long_key_f32, long_value_f32, 1, 1, cropped_mask, 1.F, key_start);
+    const auto cropped_actual = f32_context.grouped_query_attention_causal(
+        long_query_f32, long_key_f32, long_value_f32, 1, 1, long_positions, 256, 1.F, key_start);
+    const auto cropped_reference_host = require(cropped_reference.to(tensor::Device::cpu()));
+    const auto cropped_actual_host = require(cropped_actual.to(tensor::Device::cpu()));
+    const auto cropped_reference_values = require(cropped_reference_host.data<float>());
+    const auto cropped_actual_values = require(cropped_actual_host.data<float>());
+    for (std::size_t index = 0; index < cropped_actual_values.size(); ++index) {
+        if (!std::isfinite(cropped_actual_values[index]) ||
+            std::abs(cropped_actual_values[index] - cropped_reference_values[index]) > 1e-2F) {
+            std::cerr << "FP32 cropped window attention parity failed index=" << index << '\n';
+            return false;
+        }
     }
     return true;
 }
@@ -140,6 +318,153 @@ auto check_projection_groups() -> bool {
     return captures == 2;
 }
 
+auto check_w8a16_projection_groups() -> bool {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    for (const std::int32_t group_size : {256, 128}) {
+        ops::Context context(device, false, true, DType::BF16), eager(device, false, false, DType::BF16);
+        context.set_precision(core::InferencePrecision::Q8A16);
+        eager.set_precision(core::InferencePrecision::Q8A16);
+        const std::int64_t groups = 256 / group_size;
+        std::vector<Tensor> weights, proj_scales, norm_scales;
+        for (const int columns : {64, 128, 256}) {
+            std::vector<std::uint8_t> w(columns * 256);
+            for (std::size_t index = 0; index < w.size(); ++index)
+                w[index] = static_cast<std::uint8_t>(static_cast<int>(index * 13 % 251) - 125);
+            weights.push_back(
+                require(Tensor::from_bytes({columns, 256}, DType::U8, std::as_bytes(std::span(w)), device)));
+            std::vector<float> pscales(columns * groups);
+            for (std::size_t index = 0; index < pscales.size(); ++index) pscales[index] = ((index % 7) + 1) * 0.015625F;
+            proj_scales.push_back(
+                require(Tensor::from_host({columns, groups}, std::span<const float>(pscales), device)));
+            norm_scales.push_back(require(
+                Tensor::from_host({columns}, std::span<const float>(std::vector<float>(columns, 1.F)), device)));
+        }
+        const auto scale =
+            require(Tensor::from_host({256}, std::span<const float>(std::vector<float>(256, 1.F)), device));
+        std::size_t captures = 0;
+        for (int iteration = 0; iteration < 5; ++iteration) {
+            std::array<float, 256> values{};
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = (static_cast<int>((index + iteration) * 7 % 23) - 11) * 0.125F;
+            const auto input = context.cast(
+                require(Tensor::from_host({1, 1, 256}, std::span<const float>(values), device)), DType::BF16);
+            const std::array arguments{input};
+            const auto outputs =
+                context.replay("cuda-w8a16-projections", arguments, [&](std::span<const Tensor> operands) {
+                    ++captures;
+                    const auto normalized = context.rms_norm(operands[0], scale, 1e-6F);
+                    std::vector<Tensor> result;
+                    for (std::size_t index = 0; index < weights.size(); ++index)
+                        result.push_back(
+                            context.rms_norm(context.packed_linear(normalized, weights[index], proj_scales[index], 8,
+                                                                   group_size, 0.F, 0.F),
+                                             norm_scales[index], 1e-6F));
+                    return result;
+                });
+            const auto normalized = eager.rms_norm(input, scale, 1e-6F);
+            for (std::size_t index = 0; index < weights.size(); ++index) {
+                const auto expected = eager.rms_norm(
+                    eager.packed_linear(normalized, weights[index], proj_scales[index], 8, group_size, 0.F, 0.F),
+                    norm_scales[index], 1e-6F);
+                if (require(outputs[index].copy_to_host()) != require(expected.copy_to_host())) return false;
+            }
+        }
+        if (captures != 2) return false;
+    }
+    // Verify F32 W8A8 sibling projection fusion.
+    {
+        ops::Context context(device, false, true), eager(device, false, false);
+        std::vector<Tensor> weights, proj_scales, norm_scales;
+        for (const int columns : {64, 128, 256}) {
+            std::vector<std::uint8_t> w(columns * 256);
+            for (std::size_t index = 0; index < w.size(); ++index)
+                w[index] = static_cast<std::uint8_t>(static_cast<int>(index * 13 % 251) - 125);
+            weights.push_back(
+                require(Tensor::from_bytes({columns, 256}, DType::U8, std::as_bytes(std::span(w)), device)));
+            std::vector<float> pscales(columns);
+            for (std::size_t index = 0; index < pscales.size(); ++index) pscales[index] = ((index % 7) + 1) * 0.015625F;
+            proj_scales.push_back(require(Tensor::from_host({columns, 1}, std::span<const float>(pscales), device)));
+            norm_scales.push_back(require(
+                Tensor::from_host({columns}, std::span<const float>(std::vector<float>(columns, 1.F)), device)));
+        }
+        const auto scale =
+            require(Tensor::from_host({256}, std::span<const float>(std::vector<float>(256, 1.F)), device));
+        std::size_t captures = 0;
+        for (int iteration = 0; iteration < 5; ++iteration) {
+            std::array<float, 256> values{};
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = (static_cast<int>((index + iteration) * 7 % 23) - 11) * 0.125F;
+            const auto input = require(Tensor::from_host({1, 1, 256}, std::span<const float>(values), device));
+            const std::array arguments{input};
+            const auto outputs =
+                context.replay("cuda-w8a8-projections", arguments, [&](std::span<const Tensor> operands) {
+                    ++captures;
+                    const auto normalized = context.rms_norm(operands[0], scale, 1e-6F);
+                    std::vector<Tensor> result;
+                    for (std::size_t index = 0; index < weights.size(); ++index)
+                        result.push_back(context.rms_norm(
+                            context.packed_linear(normalized, weights[index], proj_scales[index], 8, 256, 0.F, 0.F),
+                            norm_scales[index], 1e-6F));
+                    return result;
+                });
+            const auto normalized = eager.rms_norm(input, scale, 1e-6F);
+            for (std::size_t index = 0; index < weights.size(); ++index) {
+                const auto expected = eager.rms_norm(
+                    eager.packed_linear(normalized, weights[index], proj_scales[index], 8, 256, 0.F, 0.F),
+                    norm_scales[index], 1e-6F);
+                if (require(outputs[index].copy_to_host()) != require(expected.copy_to_host())) return false;
+            }
+        }
+        if (captures != 2) return false;
+    }
+    return true;
+}
+
+// A fused RMS-norm or GELU-gate prologue must quantize exactly like the separate operation it replaces.
+auto check_projection_prologues() -> bool {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    ops::Context context(device);
+    constexpr std::int64_t rows = 64, columns = 128;
+    const auto filled = [&](std::vector<std::int64_t> shape, std::size_t count, float step) {
+        std::vector<float> values(count);
+        for (std::size_t index = 0; index < count; ++index)
+            values[index] = (static_cast<int>(index * 37 % 101) - 50) * step;
+        return require(Tensor::from_host(shape, std::span<const float>(values), device));
+    };
+    using Kind = ops::ProjectionPrologue::Kind;
+    for (const auto& [kind, width] : {std::pair{Kind::RMS_NORM, 512}, {Kind::RMS_NORM, 3072}, {Kind::GELU_GATE, 1024}}) {
+        const bool gate = kind == Kind::GELU_GATE;
+        const auto input_width = gate ? 2 * width : width;
+        const auto input = filled({1, rows, input_width}, rows * input_width, 0.03125F);
+        const auto norm = filled({width}, width, 0.015625F);
+        std::vector<std::uint8_t> packed(columns * width);
+        for (std::size_t index = 0; index < packed.size(); ++index)
+            packed[index] = static_cast<std::uint8_t>(index * 29 % 251);
+        const auto weight =
+            require(Tensor::from_bytes({columns, width}, DType::U8, std::as_bytes(std::span(packed)), device));
+        std::vector<float> scale_values(columns);
+        for (std::size_t index = 0; index < scale_values.size(); ++index) scale_values[index] = (index % 5 + 1) * 0.01F;
+        const auto scales = require(Tensor::from_host({columns, 1}, std::span<const float>(scale_values), device));
+        const ops::ProjectionPrologue prologue{.kind = kind, .scale = gate ? nullptr : &norm, .epsilon = 1e-6F};
+        if (!context.fuses(input, prologue)) return false;
+        for (const float input_scale : {0.F, 0.05F}) {
+            const auto fused = context.packed_linear(input, weight, scales, 8, width, input_scale, 0.F, {}, prologue);
+            const auto expected =
+                context.packed_linear(context.apply(input, prologue), weight, scales, 8, width, input_scale, 0.F);
+            if (require(fused.copy_to_host()) != require(expected.copy_to_host())) return false;
+        }
+    }
+    return true;
+}
+
 auto check_input_staging() -> bool {
     using namespace kidi;
     using ops::require;
@@ -164,8 +489,8 @@ auto check_input_staging() -> bool {
             return false;
         const auto already = context.stage_inputs(staged);
         if (already[0].storage_identity() != staged[0].storage_identity()) return false;
-        if (iteration == 1) stable_bytes = ynn::cuda::allocated_bytes();
-        if (iteration > 1 && ynn::cuda::allocated_bytes() != stable_bytes) return false;
+        if (iteration == 1) stable_bytes = kidi::cuda::allocated_bytes();
+        if (iteration > 1 && kidi::cuda::allocated_bytes() != stable_bytes) return false;
         for (auto& value : values) value += 1.F;
     }
     return true;
@@ -245,15 +570,15 @@ auto check_constant_cache_release() -> bool {
     const auto weight =
         require(Tensor::from_host({2, 4}, std::span<const float>(std::array{1.F, 0.F, 0.F, 0.F, 0.F, 0.F, 0.F, 1.F})));
     const auto bias = require(Tensor::from_host({2}, std::span<const float>(std::array{2.F, 3.F})));
-    const auto before = ynn::cuda::allocated_bytes();
+    const auto before = kidi::cuda::allocated_bytes();
     {
         const auto output = context.linear(input, weight, bias, true);
         const auto copied = require(output.to(tensor::Device::cpu()));
         if (!std::ranges::equal(require(copied.data<float>()), std::array{3.F, 7.F})) return false;
     }
-    if (ynn::cuda::allocated_bytes() <= before) return false;
+    if (kidi::cuda::allocated_bytes() <= before) return false;
     context.release_workspaces();
-    return ynn::cuda::allocated_bytes() == before;
+    return kidi::cuda::allocated_bytes() == before;
 }
 
 auto check_readback_source_release() -> bool {
@@ -263,7 +588,7 @@ auto check_readback_source_release() -> bool {
     using tensor::Tensor;
     const auto device = tensor::Device::cuda();
     ops::Context context(device);
-    const auto before = ynn::cuda::allocated_bytes();
+    const auto before = kidi::cuda::allocated_bytes();
     std::shared_ptr<tensor::Readback> pending;
     {
         const auto source = require(Tensor::zeros({65536}, DType::I32, device));
@@ -271,7 +596,7 @@ auto check_readback_source_release() -> bool {
     }
     context.synchronize();
     if (!require(pending->ready()) || require(pending->bytes()).size() != sizeof(std::int32_t)) return false;
-    return ynn::cuda::allocated_bytes() == before;
+    return kidi::cuda::allocated_bytes() == before;
 }
 
 auto check_greedy_partitions() -> bool {
@@ -439,27 +764,56 @@ auto check_scatter_updates() -> bool {
     using tensor::DType;
     using tensor::Tensor;
     ops::Context context(tensor::Device::cuda());
-    auto cache = require(Tensor::zeros({2, 9216, 4}, DType::F32, context.device()));
-    const std::array<float, 24> values{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
-                                       13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
+    const std::array<float, 24> values{1,  2,  3,  4,  5,  6,  7,  8,  0.333333F, 10, 11, 12,
+                                     13, 14, 15, 16, 17, 18, 19, 20, 21,        22, 23, 24};
     const std::array<std::int32_t, 3> rows{5, 9215, 5};
     const auto updates = require(Tensor::from_host({2, 3, 4}, std::span<const float>(values), context.device()));
     const auto indices = require(Tensor::from_host({3}, std::span<const std::int32_t>(rows), context.device()));
-    const auto identity = cache.storage_identity();
-    const auto before = ynn::cuda::allocated_bytes();
-    context.scatter_(cache, updates, indices);
+    for (const auto dtype : {DType::F32, DType::BF16}) {
+        auto cache = require(Tensor::zeros({2, 9216, 4}, dtype, context.device()));
+        const auto identity = cache.storage_identity();
+        const auto before = kidi::cuda::allocated_bytes();
+        context.scatter_(cache, updates, indices);
+        context.synchronize();
+        if (cache.storage_identity() != identity || kidi::cuda::allocated_bytes() != before) return false;
+        const auto rounded = require(context.cast(context.cast(updates, dtype), DType::F32).to(tensor::Device::cpu()));
+        const auto expected_values = require(rounded.data<float>());
+        for (const bool inplace : {true, false}) {
+            const auto result = inplace ? cache : context.scatter(cache, updates, indices);
+            const auto copied = require(context.cast(result, DType::F32).to(tensor::Device::cpu()));
+            const auto actual = require(copied.data<float>());
+            for (std::size_t batch = 0; batch < 2; ++batch)
+                for (std::size_t row = 0; row < 9216; ++row)
+                    for (std::size_t channel = 0; channel < 4; ++channel) {
+                        const auto expected = row == 5      ? expected_values[batch * 12 + 8 + channel]
+                                              : row == 9215 ? expected_values[batch * 12 + 4 + channel]
+                                                            : 0.F;
+                        if (actual[(batch * 9216 + row) * 4 + channel] != expected) return false;
+                    }
+        }
+    }
+    const std::array<std::int32_t, 3> unique_rows{1, 3, 5};
+    const auto unique_indices = require(Tensor::from_host({3}, std::span<const std::int32_t>(unique_rows),
+                                                                  context.device()));
+    auto unique_cache = require(Tensor::zeros({2, 6, 4}, DType::F32, context.device()));
+    context.scatter_unique_(unique_cache, updates, unique_indices);
     context.synchronize();
-    if (cache.storage_identity() != identity || ynn::cuda::allocated_bytes() != before) return false;
-    const auto copied = require(cache.to(tensor::Device::cpu()));
-    const auto actual = require(copied.data<float>());
+    const auto unique_result = require(unique_cache.to(tensor::Device::cpu()));
+    const auto unique_values = require(unique_result.data<float>());
     for (std::size_t batch = 0; batch < 2; ++batch)
-        for (std::size_t row = 0; row < 9216; ++row)
-            for (std::size_t channel = 0; channel < 4; ++channel) {
-                const auto expected = row == 5      ? values[batch * 12 + 8 + channel]
-                                      : row == 9215 ? values[batch * 12 + 4 + channel]
-                                                    : 0.F;
-                if (actual[(batch * 9216 + row) * 4 + channel] != expected) return false;
-            }
+        for (std::size_t row = 0; row < 6; ++row)
+                    for (std::size_t channel = 0; channel < 4; ++channel) {
+                        const auto expected = row == 1 ? values[batch * 12 + channel]
+                                              : row == 3 ? values[batch * 12 + 4 + channel]
+                                              : row == 5 ? values[batch * 12 + 8 + channel]
+                                                         : 0.F;
+                        const auto index = (batch * 6 + row) * 4 + channel;
+                        if (unique_values[index] != expected) {
+                            std::cerr << "unique-index scatter mismatch index=" << index << " expected=" << expected
+                                      << " actual=" << unique_values[index] << '\n';
+                            return false;
+                        }
+                    }
     std::array<float, 16> initial{};
     for (std::size_t index = 0; index < initial.size(); ++index) initial[index] = static_cast<float>(index + 1);
     auto aliased = require(Tensor::from_host({1, 4, 4}, std::span<const float>(initial), context.device()));
@@ -474,6 +828,40 @@ auto check_scatter_updates() -> bool {
     for (std::size_t index = 0; index < initial.size(); ++index)
         if (alias_values[index] != initial[index % 8]) return false;
     return true;
+}
+
+auto check_key_value_scatter_fusion() -> bool {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    ops::Context context(device, false, true), eager(device);
+    const std::array<float, 12> key_values{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    const std::array<float, 12> value_values{-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12};
+    const std::array<std::int32_t, 3> rows{1, 4, 6};
+    const auto key_updates = require(Tensor::from_host({1, 3, 4}, std::span<const float>(key_values), device));
+    const auto value_updates = require(Tensor::from_host({1, 3, 4}, std::span<const float>(value_values), device));
+    const auto indices = require(Tensor::from_host({3}, std::span<const std::int32_t>(rows), device));
+    auto key_cache = require(Tensor::zeros({1, 8, 4}, DType::BF16, device));
+    auto value_cache = require(Tensor::zeros({1, 8, 4}, DType::BF16, device));
+    const std::array arguments{key_cache, value_cache, key_updates, value_updates, indices};
+    const auto step = [&](std::span<const Tensor> operands) {
+        auto key = operands[0], value = operands[1];
+        context.scatter_unique_(key, operands[2], operands[4]);
+        context.scatter_unique_(value, operands[3], operands[4]);
+        return std::vector<Tensor>{key, value};
+    };
+    auto outputs = context.replay("cuda-key-value-scatter", arguments, step);
+    outputs = context.replay("cuda-key-value-scatter", arguments, step);
+
+    auto expected_key = require(Tensor::zeros({1, 8, 4}, DType::BF16, device));
+    auto expected_value = require(Tensor::zeros({1, 8, 4}, DType::BF16, device));
+    eager.scatter_(expected_key, key_updates, indices);
+    eager.scatter_(expected_value, value_updates, indices);
+    eager.synchronize();
+    return require(outputs[0].copy_to_host()) == require(expected_key.copy_to_host()) &&
+           require(outputs[1].copy_to_host()) == require(expected_value.copy_to_host());
 }
 
 auto check_scoped_layers() -> bool {
@@ -604,53 +992,70 @@ auto check_projection_paths() -> bool {
     using tensor::Tensor;
     ops::Context cpu;
     ops::Context cuda(tensor::Device::cuda());
-    constexpr std::int64_t WIDTH = 16, COLUMNS = 8;
-    for (const std::int64_t rows : {1, 8}) {
-        std::vector<float> values(rows * WIDTH), scales(COLUMNS), biases(COLUMNS);
-        for (std::size_t index = 0; index < values.size(); ++index)
-            values[index] = index / WIDTH == 2   ? 0.F
-                            : index / WIDTH == 3 ? (index % 2 ? -1000.F : 1000.F)
-                                                 : (static_cast<int>(index * 13 % 41) - 17) * 0.125F;
-        for (std::size_t index = 0; index < scales.size(); ++index) {
-            scales[index] = static_cast<float>(index + 1) * 0.001F;
-            biases[index] = static_cast<float>(index) * 0.01F;
-        }
-        const auto host = require(Tensor::from_host({rows, WIDTH}, std::span<const float>(values)));
-        const auto input = require(host.to(tensor::Device::cuda()));
-        const auto scale = require(Tensor::from_host({COLUMNS, 1}, std::span<const float>(scales)));
-        const auto bias = require(Tensor::from_host({COLUMNS}, std::span<const float>(biases)));
-        for (const int bits : {0, 2, 4, 8}) {
-            std::vector<std::uint8_t> weights(COLUMNS * WIDTH / (bits ? 8 / bits : 1), 0);
-            for (std::size_t index = 0; index < COLUMNS * WIDTH; ++index) {
-                if (!bits)
-                    weights[index] = static_cast<std::uint8_t>(static_cast<int>(index * 11 % 255) - 127);
-                else {
-                    const auto value =
-                        static_cast<unsigned int>(static_cast<int>(index * 7 % (1 << bits)) - (1 << (bits - 1))) &
-                        ((1 << bits) - 1);
-                    weights[index / (8 / bits)] |= value << (index % (8 / bits) * bits);
-                }
+    constexpr std::int64_t COLUMNS = 8;
+    for (const std::int64_t width : {16, 17}) {
+        for (const std::int64_t rows : {1, 8}) {
+            std::vector<float> values(rows * width), scales(COLUMNS), biases(COLUMNS);
+            for (std::size_t index = 0; index < values.size(); ++index)
+                values[index] = index / width == 2   ? 0.F
+                                : index / width == 3 ? (index % 2 ? -1000.F : 1000.F)
+                                                     : (static_cast<int>(index * 13 % 41) - 17) * 0.125F;
+            if (rows > 6) {
+                constexpr std::array TIES{-126.5F, 128.5F, 0.5F, -0.5F, 1.5F, -1.5F, 2.5F, -2.5F};
+                std::ranges::copy(TIES, values.begin() + 5 * width);
+                // This zero point changes when the multiply and add are fused.
+                values[6 * width] = -6901.607421875F;
+                values[6 * width + 1] = 2637.199462890625F;
             }
-            const auto weight =
-                require(Tensor::from_bytes({COLUMNS, WIDTH / (bits ? 8 / bits : 1)}, bits ? DType::U8 : DType::I8,
-                                           std::as_bytes(std::span(weights))));
-            const auto expected = bits ? cpu.packed_linear(host, weight, scale, bits, WIDTH, 0.125F, 0.0625F)
-                                       : cpu.quantized_linear(host, weight, scale, bias, true);
-            for (int repetition = 0; repetition < 2; ++repetition) {
-                const auto actual =
-                    require((bits ? cuda.packed_linear(input, weight, scale, bits, WIDTH, 0.125F, 0.0625F)
+            for (std::size_t index = 0; index < scales.size(); ++index) {
+                scales[index] = static_cast<float>(index + 1) * 0.001F;
+                biases[index] = static_cast<float>(index) * 0.01F;
+            }
+            const auto host = require(Tensor::from_host({rows, width}, std::span<const float>(values)));
+            const auto input = require(host.to(tensor::Device::cuda()));
+            const auto scale = require(Tensor::from_host({COLUMNS, 1}, std::span<const float>(scales)));
+            const auto bias = require(Tensor::from_host({COLUMNS}, std::span<const float>(biases)));
+            for (const int bits : {0, 2, 4, 8}) {
+                if (bits && width % (8 / bits)) continue;
+                std::vector<std::uint8_t> weights(COLUMNS * width / (bits ? 8 / bits : 1), 0);
+                for (std::size_t index = 0; index < COLUMNS * width; ++index) {
+                    if (!bits)
+                        weights[index] = static_cast<std::uint8_t>(static_cast<int>(index * 11 % 255) - 127);
+                    else {
+                        const auto value =
+                            static_cast<unsigned int>(static_cast<int>(index * 7 % (1 << bits)) - (1 << (bits - 1))) &
+                            ((1 << bits) - 1);
+                        weights[index / (8 / bits)] |= value << (index % (8 / bits) * bits);
+                    }
+                }
+                const auto weight =
+                    require(Tensor::from_bytes({COLUMNS, width / (bits ? 8 / bits : 1)}, bits ? DType::U8 : DType::I8,
+                                               std::as_bytes(std::span(weights))));
+                for (const float input_scale : {0.F, 0.125F}) {
+                    if (!bits && input_scale) continue;
+                    const float output_scale = input_scale ? 0.0625F : 0.F;
+                    const auto expected =
+                        bits ? cpu.packed_linear(host, weight, scale, bits, width, input_scale, output_scale)
+                             : cpu.quantized_linear(host, weight, scale, bias, true);
+                    for (int repetition = 0; repetition < 2; ++repetition) {
+                        const auto actual = require(
+                            (bits ? cuda.packed_linear(input, weight, scale, bits, width, input_scale, output_scale)
                                   : cuda.quantized_linear(input, weight, scale, bias, true))
                                 .to(tensor::Device::cpu()));
-                const auto actual_values = require(actual.data<float>()),
-                           expected_values = require(expected.data<float>());
-                for (std::size_t index = 0; index < actual_values.size(); ++index)
-                    if (std::abs(actual_values[index] - expected_values[index]) >
-                        1e-4F + (bits ? 0.F : 1e-6F * std::abs(expected_values[index]))) {
-                        std::cerr << "projection mismatch rows=" << rows << " bits=" << bits << " index=" << index
-                                  << " actual=" << actual_values[index] << " expected=" << expected_values[index]
-                                  << '\n';
-                        return false;
+                        const auto actual_values = require(actual.data<float>()),
+                                   expected_values = require(expected.data<float>());
+                        for (std::size_t index = 0; index < actual_values.size(); ++index)
+                            if (!std::isfinite(actual_values[index]) ||
+                                std::abs(actual_values[index] - expected_values[index]) >
+                                    1e-4F + (bits ? 0.F : 1e-6F * std::abs(expected_values[index]))) {
+                                std::cerr << "projection mismatch width=" << width << " rows=" << rows
+                                          << " bits=" << bits << " input_scale=" << input_scale << " index=" << index
+                                          << " actual=" << actual_values[index]
+                                          << " expected=" << expected_values[index] << '\n';
+                                return false;
+                            }
                     }
+                }
             }
         }
     }
@@ -661,21 +1066,27 @@ auto check_projection_paths() -> bool {
 auto main() -> int {
     using namespace kidi;
     try {
-        if (!ynn::cuda::available()) return 77;
+        if (!kidi::cuda::available()) return 77;
         if (!check_constant_cache_release())
             throw std::runtime_error("CUDA workspace release retained unused constants");
         if (!check_dynamic_projection_weights()) throw std::runtime_error("CUDA fusion froze dynamic step weights");
         if (!check_exported_cache_alias()) throw std::runtime_error("CUDA graph exported a stale cache alias");
         if (!check_readback_source_release()) throw std::runtime_error("CUDA readback retained its completed source");
         if (!check_attention_bindings()) throw std::runtime_error("CUDA attention retained a stale KV pointer");
+        if (!check_structured_causal_masks())
+            throw std::runtime_error("CUDA structured causal masks changed attention output");
         if (!check_async_readback()) throw std::runtime_error("CUDA nonblocking readback snapshot failed");
         if (!check_projection_groups()) throw std::runtime_error("CUDA shared-input projection fusion failed");
+        if (!check_w8a16_projection_groups())
+            throw std::runtime_error("CUDA shared-input W8A16 projection fusion failed");
         if (!check_input_staging()) throw std::runtime_error("CUDA reusable input staging failed");
+        if (!check_projection_prologues()) throw std::runtime_error("CUDA fused projection prologue changed output");
         if (!check_greedy_partitions()) throw std::runtime_error("CUDA parallel token selection changed tie-breaking");
         if (!check_bfloat_fusions()) throw std::runtime_error("CUDA BF16 fusion changed intermediate rounding");
         if (!check_cuda_graph()) throw std::runtime_error("CUDA graph input staging or cache writeback failed");
         if (!check_bfloat_context()) throw std::runtime_error("CUDA BF16 context pipeline failed");
         if (!check_scatter_updates()) throw std::runtime_error("CUDA sparse cache scatter failed");
+        if (!check_key_value_scatter_fusion()) throw std::runtime_error("CUDA fused key/value scatter failed");
         if (!check_scoped_layers()) throw std::runtime_error("CUDA scoped placement or layer parity failed");
         if (!check_diffusion_feedback()) throw std::runtime_error("CUDA diffusion embedding feedback failed");
         if (!check_projection_paths()) throw std::runtime_error("accelerated projection CPU parity failed");
@@ -829,9 +1240,9 @@ auto main() -> int {
         const auto packed_expected = ops::require(packed_reference.data<float>());
         for (std::size_t index = 0; index < packed_actual.size(); ++index)
             if (std::abs(packed_actual[index] - packed_expected[index]) > 1e-5F) return 1;
-        std::cout << "CUDA numerical checks include W8A8 projection, embedding, cuBLAS GEMM, softmax, RMS/layer norm, "
+        std::cout << "CUDA numerical checks include W8A8 projection, embedding, GEMM, softmax, RMS/layer norm, "
                      "convolution, attention, and device routing\n";
-        for (int index = 0; index < ynn::cuda::device_count(); ++index) {
+        for (int index = 0; index < kidi::cuda::device_count(); ++index) {
             const auto device = tensor::Device::cuda(index);
             const auto selected_input = ops::require(host.to(device));
             const auto selected_bias = ops::require(other.to(tensor::Device::cpu())).to(device);
@@ -842,7 +1253,7 @@ auto main() -> int {
             if (!std::ranges::equal(ops::require(copied.data<float>()), std::array<float, 6>{21, 42, 63, 24, 45, 66}))
                 return 1;
         }
-        if (tensor::Tensor::empty({1}, tensor::DType::F32, tensor::Device::cuda(ynn::cuda::device_count()))) return 1;
+        if (tensor::Tensor::empty({1}, tensor::DType::F32, tensor::Device::cuda(kidi::cuda::device_count()))) return 1;
         std::cout << "Kidi CUDA storage, broadcast and in-place tests PASS\n";
         return 0;
     } catch (const std::exception& error) {

@@ -70,7 +70,7 @@ auto select_device(std::string_view accelerator, bool speech = false) -> Result<
 
 /// Live bytes held by generation state, on whichever device owns it.
 struct GeneratorMemory {
-    std::size_t cache_bytes = 0; // KV caches of running requests and retained prompt prefixes
+    std::size_t cache_bytes = 0; // KV caches of running requests, retained prefixes and reusable CUDA states
     std::size_t image_bytes = 0; // reusable image embeddings
 };
 
@@ -87,7 +87,7 @@ struct ModelLoadOptions {
     std::int32_t group_size = 128;
     bool packed_prefill = false;
     bool dense_lm_head = false;
-    std::filesystem::path assistant_model;
+    std::filesystem::path assistant_model{};
     std::size_t draft_tokens = 3;
 };
 
@@ -123,7 +123,8 @@ public:
     auto speculative() const noexcept -> bool { return static_cast<bool>(drafter_); }
     auto vision_supported() const -> bool { return static_cast<bool>(config_["vision"]); }
     auto memory() const -> GeneratorMemory;
-    /// Prepares reusable request shapes and weights before the first request.
+    /// Prepares reusable request shapes and weights before the first request, including one full-context Gemma
+    /// CUDA KV cache. Serving recycles text-only CUDA states after all pending work completes.
     auto warm_up(std::size_t prefill_chunk_size = 128, std::size_t context_size = 0) -> Result<void>;
     /// Releases request-shaped execution graphs and workspaces while retaining model weights.
     /// All queued and running requests must be drained first.
@@ -189,6 +190,8 @@ private:
         tensor::Tensor draft_hidden;
     };
     auto retain_serving_prefix(QueuedGeneration& request) -> void;
+    auto acquire_state(std::size_t capacity) -> std::unique_ptr<model::LanguageModelState>;
+    auto recycle_state(std::unique_ptr<model::LanguageModelState>& state, bool has_images = false) -> void;
     auto reap_retired() -> void;
     /// Throws on devices whose selected tokens reach the host only on a later call (see `deferred_tokens`).
     auto require_immediate_tokens() const -> void;
@@ -204,6 +207,7 @@ private:
     std::deque<QueuedGeneration> waiting_;
     std::vector<QueuedGeneration> running_;
     std::vector<QueuedGeneration> retired_;
+    std::vector<std::unique_ptr<model::LanguageModelState>> reusable_states_;
     std::size_t reserved_cache_tokens_ = 0;
     std::uint64_t next_request_id_ = 1, prefill_after_ = 0;
     bool serving_failed_ = false;

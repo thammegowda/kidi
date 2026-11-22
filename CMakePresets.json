@@ -9,7 +9,10 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "KIDI_BUILD_TESTS": "ON"
+        "BUILD_TESTING": "ON",
+        "KIDI_BUILD_TESTS": "ON",
+        "KIDI_BUILD_INTEGRATION_TESTS": "OFF",
+        "KIDI_ENABLE_CUDA": "OFF"
       }
     },
     {
@@ -19,7 +22,33 @@
       "binaryDir": "${sourceDir}/build-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "KIDI_BUILD_TESTS": "OFF"
+        "BUILD_TESTING": "OFF",
+        "KIDI_BUILD_TESTS": "OFF",
+        "KIDI_BUILD_INTEGRATION_TESTS": "OFF",
+        "KIDI_ENABLE_CUDA": "OFF",
+        "KIDI_STRIP_BINARIES": "ON"
+      }
+    },
+    {
+      "name": "release-cuda",
+      "displayName": "Release (CUDA)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-release-cuda",
+      "cacheVariables": {
+        "KIDI_ENABLE_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "80-real;90",
+        "BUILD_SHARED_LIBS": "OFF"
+      }
+    },
+    {
+      "name": "debug-cuda",
+      "displayName": "Debug (CUDA)",
+      "inherits": "debug",
+      "binaryDir": "${sourceDir}/build-debug-cuda",
+      "cacheVariables": {
+        "KIDI_ENABLE_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "80-real;90",
+        "BUILD_SHARED_LIBS": "OFF"
       }
     }
   ],
@@ -31,12 +60,27 @@
     {
       "name": "release",
       "configurePreset": "release"
+    },
+    {
+      "name": "release-cuda",
+      "configurePreset": "release-cuda"
+    },
+    {
+      "name": "debug-cuda",
+      "configurePreset": "debug-cuda"
     }
   ],
   "testPresets": [
     {
       "name": "debug",
       "configurePreset": "debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "debug-cuda",
+      "configurePreset": "debug-cuda",
       "output": {
         "outputOnFailure": true
       }

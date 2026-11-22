@@ -33,17 +33,17 @@ def model_directory() -> Path:
 
 def verify_model(directory: Path) -> None:
     if not (directory / "config.json").is_file() or not (directory / "config.json").stat().st_size:
-        raise ValueError(f"Model config.json not installed at {directory}; run make setup-test first")
+        raise ValueError(f"Model config.json not installed at {directory}; run make regression-test to prepare it")
     for filename, expected in CHECKSUMS.items():
         path = directory / filename
         if not path.is_file():
-            raise ValueError(f"Model file {filename} missing at {directory}; run make setup-test first")
+            raise ValueError(f"Model file {filename} missing at {directory}; run make regression-test to prepare it")
         digest = hashlib.sha256()
         with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
                 digest.update(chunk)
         if digest.hexdigest() != expected:
-            raise ValueError(f"Model checksum mismatch: {filename}; remove {directory} and rerun make setup-test")
+            raise ValueError(f"Model checksum mismatch: {filename}; remove {directory} and rerun make regression-test")
 
 
 def setup() -> None:

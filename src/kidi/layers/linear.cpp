@@ -138,6 +138,19 @@ auto LinearImpl::release_workspaces() const -> void {
     hnsw_->search_workspaces.clear();
 }
 
+auto LinearImpl::set_packed_weights(Tensor weight, Tensor scale, std::int32_t bits, std::int32_t group_size) -> void {
+    if ((bits != 2 && bits != 4 && bits != 8) || !transpose_ || has_bias_ || group_size <= 0 ||
+        group_size % (8 / bits) || input_size_ % group_size || !weight.defined() || !scale.defined())
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed linear replacement"});
+    weight_ = std::move(weight);
+    packed_scale_ = std::move(scale);
+    packed_bits_ = bits;
+    group_size_ = group_size;
+    const float zero = 0.F;
+    input_scale_ = require(Tensor::from_host({}, std::span<const float>(&zero, 1)));
+    output_scale_ = require(Tensor::from_host({}, std::span<const float>(&zero, 1)));
+}
+
 auto LinearImpl::check_hnsw_binding() const -> void {
     if (!hnsw_) return;
     if (weight_.storage_identity() != hnsw_->indexed_weight.storage_identity() ||
@@ -179,12 +192,19 @@ auto LinearImpl::bind_hnsw(const std::filesystem::path& path, const Tensor& pack
 }
 
 auto LinearImpl::forward(ops::Context& context, const Tensor& input) const -> Tensor {
+    return forward(context, input, {});
+}
+
+auto LinearImpl::forward(ops::Context& context, const Tensor& input, const ops::ProjectionPrologue& prologue) const
+    -> Tensor {
     if (!weight_.defined() || (has_bias_ && !bias_.defined()))
         throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "linear state has not been initialized"});
     if (packed_bits_) {
         return context.packed_linear(input, weight_, packed_scale_, packed_bits_, group_size_,
-                                     require(input_scale_.data<float>())[0], require(output_scale_.data<float>())[0]);
+                                     require(input_scale_.data<float>())[0], require(output_scale_.data<float>())[0],
+                                     {}, prologue);
     }
+    if (prologue.kind != ops::ProjectionPrologue::Kind::NONE) return forward(context, context.apply(input, prologue));
     if (qstate_) return context.quantized_linear(input, weight_, qstate_->scale, bias(), transpose_);
     return context.linear(input, weight_, bias(), transpose_);
 }

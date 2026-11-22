@@ -62,6 +62,7 @@ __pycache__/
 !/benchmarks/cuda/2026-10-25-controlled-e2b-four-way-tgpc01.json
 !/benchmarks/cuda/2026-10-25-bf16-pipelined-long-tgpc01.json
 !/benchmarks/cuda/2026-10-25-async-decode-validation-tgpc01.json
+!/benchmarks/cuda/2026-11-20-e4b-q8-h100-gpu7.json
 /benchmarks/**/*.quality.json
 /benchmarks/**/*.jsonl
 /benchmarks/**/results.json

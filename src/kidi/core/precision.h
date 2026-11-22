@@ -5,6 +5,8 @@
 #include <string_view>
 #include <utility>
 
+#include "kidi/tensor/dtype.h"
+
 namespace kidi::core {
 
 /// Compute policy for packed checkpoint projections. CHECKPOINT preserves each layer's trained weight bit width.
@@ -144,6 +146,25 @@ constexpr auto parse_kv_cache_precision(std::string_view name) noexcept -> std::
     if (name == "e4m3" || name == "fp8-e4m3") return KVCachePrecision::E4M3;
     if (name == "e5m2" || name == "fp8-e5m2") return KVCachePrecision::E5M2;
     return std::nullopt;
+}
+
+/// Storage dtype for an explicit cache precision; AUTO lets the model pick from backend capabilities.
+constexpr auto cache_dtype(KVCachePrecision precision) noexcept -> std::optional<tensor::DType> {
+    switch (precision) {
+        case KVCachePrecision::AUTO:
+            return std::nullopt;
+        case KVCachePrecision::FP32:
+            return tensor::DType::F32;
+        case KVCachePrecision::BF16:
+            return tensor::DType::BF16;
+        case KVCachePrecision::INT8:
+            return tensor::DType::I8;
+        case KVCachePrecision::E4M3:
+            return tensor::DType::E4M3;
+        case KVCachePrecision::E5M2:
+            return tensor::DType::E5M2;
+    }
+    std::unreachable();
 }
 
 } // namespace kidi::core

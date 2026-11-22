@@ -92,6 +92,13 @@ public:
     auto parameter_specs() const -> ParameterSpecMap;
     auto set_state(const StateDict& state, bool strict = true, bool copy = false) -> Result<void>;
 
+    template <typename Visitor>
+    auto visit_modules(Visitor&& visitor, const std::string& prefix = "") -> void {
+        visitor(prefix, *this);
+        for (const auto& [name, module] : modules_)
+            module->visit_modules(visitor, prefix.empty() ? name : prefix + "." + name);
+    }
+
 protected:
     auto register_parameter(std::string name, tensor::Tensor& parameter) -> void;
     auto register_parameter(std::string name, tensor::Tensor& parameter, std::vector<std::int64_t> shape,
