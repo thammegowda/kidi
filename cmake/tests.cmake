@@ -14,22 +14,37 @@ if(NOT TARGET gtest)
 endif()
 include(GoogleTest)
 
+set(KIDI_GPU_LAUNCHER sh "${PROJECT_SOURCE_DIR}/cmake/gpu-launch.sh")
+# CTest 3.28+ runs this first and schedules GPU tests from the pool it writes, sized to the
+# GPUs visible at test time; tests with RESOURCE_GROUPS must require the `gpu_pool` fixture.
+set(KIDI_GPU_POOL "${PROJECT_BINARY_DIR}/ctest-resources.json")
+add_test(NAME GpuPool COMMAND ${KIDI_GPU_LAUNCHER} --spec "${KIDI_GPU_POOL}")
+set_tests_properties(GpuPool PROPERTIES
+    LABELS native
+    FIXTURES_SETUP gpu_pool
+    GENERATED_RESOURCE_SPEC_FILE "${KIDI_GPU_POOL}")
+
 # Registers every TEST() in an existing GoogleTest executable with CTest as `<Suite>.<Name>`.
 # Names stay short so CTest status lines fit one terminal row; select a binary by suite, e.g.
 # `ctest -R '^Gemma4'`. Keep suite names unique across binaries and full names <= 40 chars.
 function(kidi_discover_tests target)
-    cmake_parse_arguments(TEST "" "COST" "LABELS" ${ARGN})
+    cmake_parse_arguments(TEST "" "COST;RESOURCE_LOCK" "LABELS" ${ARGN})
     if(NOT TEST_LABELS)
         set(TEST_LABELS native)
     endif()
     list(JOIN TEST_LABELS "\\\\;" labels)
     set(properties LABELS "${labels}")
-    # `cuda` tests each take one slot of the 8-slot `gpus` pool in cmake/ctest-resources.json.
+    # `cuda` tests each take one GPU from the `gpus` pool written by GpuPool, and
+    # cmake/gpu-launch.sh pins the test to it, so concurrent GPU tests land on different GPUs.
     if("cuda" IN_LIST TEST_LABELS)
-        list(APPEND properties RESOURCE_GROUPS gpus:1)
+        list(APPEND properties RESOURCE_GROUPS gpus:1 FIXTURES_REQUIRED gpu_pool)
+        set_property(TARGET ${target} PROPERTY TEST_LAUNCHER ${KIDI_GPU_LAUNCHER})
     endif()
     if(TEST_COST)
         list(APPEND properties COST ${TEST_COST})
+    endif()
+    if(TEST_RESOURCE_LOCK)
+        list(APPEND properties RESOURCE_LOCK ${TEST_RESOURCE_LOCK})
     endif()
     # Parameter generators already name cases (e.g. `/qat`); skip CMake's `# GetParam() = ...` suffix.
     gtest_discover_tests(${target}
@@ -41,7 +56,7 @@ endfunction()
 # kidi_add_test(<target> <source> [STANDALONE] [LINK libs...] [LABELS labels...] [COST n])
 # Builds a GoogleTest executable linked against kidi::kidi (unless STANDALONE).
 function(kidi_add_test target source)
-    cmake_parse_arguments(TEST "STANDALONE" "COST" "LINK;LABELS" ${ARGN})
+    cmake_parse_arguments(TEST "STANDALONE" "COST;RESOURCE_LOCK" "LINK;LABELS" ${ARGN})
     add_executable(${target} "${source}")
     if(NOT TEST_STANDALONE)
         target_link_libraries(${target} PRIVATE kidi::kidi)
@@ -50,6 +65,9 @@ function(kidi_add_test target source)
     set(discover_args LABELS ${TEST_LABELS})
     if(TEST_COST)
         list(APPEND discover_args COST ${TEST_COST})
+    endif()
+    if(TEST_RESOURCE_LOCK)
+        list(APPEND discover_args RESOURCE_LOCK ${TEST_RESOURCE_LOCK})
     endif()
     kidi_discover_tests(${target} ${discover_args})
 endfunction()
@@ -74,7 +92,8 @@ kidi_add_test(kidi_phonemizer_test tests/kidi/text/phonemizer_test.cpp)
 kidi_add_test(kidi_sentence_test tests/kidi/text/sentence_test.cpp)
 kidi_add_test(kidi_rtg_package_test tests/kidi/checkpoint/package_test.cpp)
 kidi_add_test(kidi_gemma4_test tests/kidi/model/gemma4_test.cpp COST 100 LABELS native regression cuda)
-kidi_add_test(kidi_inkling2_test tests/kidi/model/inkling2_test.cpp LABELS native cuda)
+# These checkpoints do not fit together on the single-GPU two-slot fallback.
+kidi_add_test(kidi_inkling2_test tests/kidi/model/inkling2_test.cpp LABELS native cuda RESOURCE_LOCK inkling2_model)
 kidi_add_test(kidi_kokoro_test tests/kidi/model/kokoro_test.cpp)
 kidi_add_test(kidi_model_registry_test tests/kidi/model/registry_test.cpp)
 target_compile_definitions(kidi_gemma4_test PRIVATE KIDI_GEMMA4_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/gemma4")
@@ -96,6 +115,13 @@ if(TARGET kidi_ops::cuda_runtime)
     set_target_properties(kidi_ops_cuda_test PROPERTIES EXCLUDE_FROM_ALL OFF)
     target_link_libraries(kidi_ops_cuda_test PRIVATE GTest::gtest_main)
     kidi_discover_tests(kidi_ops_cuda_test LABELS native cuda)
+    # Per-case tests are pinned to one GPU; these runs keep two GPUs visible to cover
+    # per-device state such as kernel attributes and cross-device routing.
+    foreach(binary kidi_cuda_test kidi_ops_cuda_test)
+        string(REGEX REPLACE "^kidi_(.*)_test$" "MultiGpu.\\1" name ${binary})
+        add_test(NAME ${name} COMMAND ${KIDI_GPU_LAUNCHER} $<TARGET_FILE:${binary}>)
+        set_tests_properties(${name} PROPERTIES LABELS "native;cuda" RESOURCE_GROUPS "2,gpus:1" FIXTURES_REQUIRED gpu_pool)
+    endforeach()
 endif()
 kidi_add_test(kidi_eager_test tests/kidi/layers/eager_test.cpp)
 kidi_add_test(kidi_fused_cpu_test tests/kidi/ops/fused_cpu_test.cpp)

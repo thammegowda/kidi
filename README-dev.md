@@ -593,10 +593,18 @@ make test
 ```
 
 This builds the `debug` preset with integration tests disabled and runs CTest in
-parallel: at most 12 jobs (`TEST_JOBS` can lower this but is clamped to 12), of which at
-most 8 may be `cuda`-labelled GPU tests. The GPU cap is a CTest resource pool in
-`cmake/ctest-resources.json`, applied by the test presets; plain
-`ctest --test-dir` without `--resource-spec-file` does not enforce it. It needs no Python venv, wheel, or
+parallel: at most 12 jobs (`TEST_JOBS` can lower this but is clamped to 12), and
+at most one `cuda`-labelled GPU test runs per GPU (max 8). Before GPU tests run, the
+`GpuPool` setup test (`cmake/gpu-launch.sh --spec`) writes a CTest resource pool with
+one id per visible GPU, so the pool adapts to the host: your `CUDA_VISIBLE_DEVICES` list
+when set (e.g. `CUDA_VISIBLE_DEVICES=4,5 make test-cuda` uses only GPUs 4 and 5), else
+every GPU `nvidia-smi` reports. A single-GPU host gets two slots on that GPU so
+`MultiGpu.*` can run; with no GPUs the pool is empty and CTest reports GPU tests as
+Not Run. Each GPU test takes one id and `cmake/gpu-launch.sh` pins it via `CUDA_VISIBLE_DEVICES`,
+so concurrent tests spread across GPUs. The `MultiGpu.*` entries run the CUDA kernel
+binaries with two GPUs visible to cover cross-device behavior. This works with presets
+and plain `ctest --test-dir` alike, and needs CMake 3.29+ (older CTest runs GPU tests
+unpinned and uncapped). It needs no Python venv, wheel, or
 model download. `make native-test` is an alias. To include the Python and model
 regression tests:
 
@@ -626,6 +634,15 @@ make test-all-cuda KIDI_CUTLASS_ROOT=/path/to/cutlass
 Both configure the `debug-cuda` preset (`build-debug-cuda/`, Debug with
 `KIDI_ENABLE_CUDA=ON`). `make test-cuda` runs native tests only;
 `make test-all-cuda` also runs Python tests against a CUDA-enabled Debug wheel.
+The Inkling2 model tests (~80 s) and Gemma tokenizer check resolve
+`@thinkingmachines/Inkling-2-Mini` and `@google/gemma-4-E2B-it` locally from
+the default hub (`KIDI_HUB`, or `~/.cache/kidi/model-hub`) and skip if missing;
+tests never download models. This also applies to `make test-cuda`.
+To populate the cache explicitly before test setup, run
+`bash scripts/download-test-models.sh` (requires `hf` and access to the gated Gemma model).
+Set `KIDI_HUB=/path/to/test-cache` for an isolated cache; CLI `--cache` still overrides it.
+Production code and tests share the same local-only API, for example
+`checkpoint::Hub{}.resolve("@google/gemma-4-E2B-it/tokenizer.json")`.
 Both include the `cuda`-labelled kernel tests and CUDA model numerical checks. The RTG translation regression is excluded because
 RTG currently has no CUDA backend; browser and extension tests are also excluded.
 The Gemma 4 numerical fixture is a regression test on both CPU and CUDA.

@@ -9,6 +9,7 @@
 
 #include <zlib.h>
 
+#include "kidi/checkpoint/hub.h"
 #include "kidi/text/tokenizer.h"
 
 namespace {
@@ -39,11 +40,12 @@ const std::array CONVERSATION{
     kidi::text::ChatMessage{"system", "Be brief."}, kidi::text::ChatMessage{"user", "Hi\nthere"},
     kidi::text::ChatMessage{"assistant", "Hello"}, kidi::text::ChatMessage{"user", "Again"}};
 
-// Optional: KIDI_TEST_TOKENIZER_CHECKPOINT=<checkpoint dir> checks a real Gemma tokenizer's chat template.
+// Checks a real Gemma tokenizer from the default local model hub.
 TEST(TokenizerTest, CheckpointChatTemplate) {
-    const char* directory = std::getenv("KIDI_TEST_TOKENIZER_CHECKPOINT");
-    if (!directory) GTEST_SKIP() << "KIDI_TEST_TOKENIZER_CHECKPOINT is not set";
-    auto checkpoint = kidi::text::Tokenizer::load(std::filesystem::path(directory) / "tokenizer.json");
+    const auto file = kidi::checkpoint::Hub{}.resolve("@google/gemma-4-E2B-it/tokenizer.json");
+    if (!file && file.error().code == kidi::ErrorCode::IO) GTEST_SKIP() << file.error().message;
+    ASSERT_TRUE(file.has_value()) << file.error().message;
+    auto checkpoint = kidi::text::Tokenizer::load(*file);
     ASSERT_TRUE(checkpoint.has_value()) << checkpoint.error().message;
     const std::array messages{kidi::text::ChatMessage{"user", "Hello"}};
     auto rendered = checkpoint->format_chat(messages);

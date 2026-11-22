@@ -9,7 +9,7 @@ WEB_DIR ?= build-web
 APP_CONFIG ?= examples/kidi-app.yaml
 APP_PORT ?= 10010
 KIDI_CUTLASS_ROOT ?=
-# Parallel CTest jobs: min(cores, 12). GPU tests are further capped at 8 by cmake/ctest-resources.json.
+# Parallel CTest jobs: min(cores, 12). GPU tests are further capped at one per GPU (max 8), see cmake/gpu-launch.sh.
 TEST_JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 # Hard ceiling: TEST_JOBS may lower parallelism but never exceed 12 concurrent tests.
 CTEST_JOBS := $(shell n=$$(( $(TEST_JOBS) + 0 )) 2>/dev/null || n=12; [ $$n -ge 1 ] 2>/dev/null || n=1; echo $$((n < 12 ? n : 12)))

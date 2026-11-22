@@ -73,7 +73,10 @@ TEST(WhisperMelTest, ExtractsFeatures) {
             EXPECT_EQ(features->frames, 3000U);
             ASSERT_EQ(features->values.size(), bins * 3000);
             for (auto value : features->values) ASSERT_EQ(value, -1.5F);
+            // Padding is independent of the filter bank; check it once to keep this test fast.
+            const bool check_padding = bins == 80 && embedded;
             for (const std::size_t length : {1, 159, 160, 201, 401}) {
+                if (!check_padding) break;
                 std::vector<float> signal(length);
                 for (std::size_t index = 0; index < length; ++index)
                     signal[index] = static_cast<float>(static_cast<int>(index % 17) - 8) / 16.F;

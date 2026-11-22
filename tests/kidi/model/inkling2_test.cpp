@@ -1,7 +1,8 @@
-// Opt-in Inkling-2 checks on a real checkpoint: set KIDI_INKLING2_MODEL to the Hugging Face snapshot directory.
+// Inkling-2 checks on a checkpoint in the default local model hub; skips when missing.
 // Optionally set KIDI_INKLING2_DUMP to write the prompt's FP32 logits [tokens, vocabulary] for reference comparison
 // (tools/reference/inkling2.py).
 #include "kidi/checkpoint/config.h"
+#include "kidi/checkpoint/hub.h"
 #include "kidi/checkpoint/weights.h"
 #include "kidi/inference/generator.h"
 #include "kidi/model/inkling2.h"
@@ -41,12 +42,11 @@ auto chat(inference::Generator& generator, std::string_view question) -> inferen
             if (event.request_id == id && event.completed) return std::move(*event.completed);
 }
 
-auto model_directory() -> const char* { return std::getenv("KIDI_INKLING2_MODEL"); }
-
 TEST(Inkling2Test, PrefillMatchesDecode) {
-    const auto* directory = model_directory();
-    if (!directory) GTEST_SKIP() << "KIDI_INKLING2_MODEL is not set";
-    const auto config = require(checkpoint::load_config(directory));
+    const auto directory = checkpoint::Hub{}.resolve("@thinkingmachines/Inkling-2-Mini");
+    if (!directory && directory.error().code == ErrorCode::IO) GTEST_SKIP() << directory.error().message;
+    ASSERT_TRUE(directory.has_value()) << directory.error().message;
+    const auto config = require(checkpoint::load_config(*directory));
     const auto started = std::chrono::steady_clock::now();
     auto model = require(model::create_model_as<model::CausalLanguageModel>(
         config["model"], {.device = tensor::Device::cuda(), .parameter_dtype = tensor::DType::BF16}));
@@ -98,9 +98,10 @@ TEST(Inkling2Test, PrefillMatchesDecode) {
 // A retained prefix whose recurrent state cannot rewind to the shared token count must fall back to a fresh start
 // instead of failing the serving loop, and must not change the answer.
 TEST(Inkling2Test, PrefixReuseFallback) {
-    const auto* directory = model_directory();
-    if (!directory) GTEST_SKIP() << "KIDI_INKLING2_MODEL is not set";
-    auto generator = require(inference::Generator::load(directory, {.device = tensor::Device::cuda()}));
+    const auto directory = checkpoint::Hub{}.resolve("@thinkingmachines/Inkling-2-Mini");
+    if (!directory && directory.error().code == ErrorCode::IO) GTEST_SKIP() << directory.error().message;
+    ASSERT_TRUE(directory.has_value()) << directory.error().message;
+    auto generator = require(inference::Generator::load(*directory, {.device = tensor::Device::cuda()}));
     require(generator.configure_serving({.maximum_active = 1, .maximum_requests = 1, .cache_token_budget = 512}));
     const auto fresh = chat(generator, "What color is the sky?");
     (void)chat(generator, "What color is grass?");

@@ -869,7 +869,7 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
             .help("local directory or @owner/model");
         command_parser->add_argument("-c", "--cache")
             .type<std::filesystem::path>()
-            .default_value(std::filesystem::path("~/.cache/kidi/model-hub"))
+            .default_value(kidi::checkpoint::Hub::default_cache())
             .help("Hugging Face model cache directory");
         command_parser->add_argument("--backend")
             .default_value(std::string("auto"))
@@ -988,7 +988,7 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         .help("local directory or @owner/model");
     inspect_parser.add_argument("-c", "--cache")
         .type<std::filesystem::path>()
-        .default_value(std::filesystem::path("~/.cache/kidi/model-hub"))
+        .default_value(kidi::checkpoint::Hub::default_cache())
         .help("Hugging Face model cache directory");
 
     translate_parser.add_argument("-b", "--beam-size").type<std::int32_t>().metavar("N").help("RTG beam size");
@@ -1036,7 +1036,7 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         const auto& command = arguments.get<std::string>("command");
         std::filesystem::path directory;
         const auto cache = arguments.contains("cache") ? arguments.get<std::filesystem::path>("cache")
-                                                       : std::filesystem::path("~/.cache/kidi/model-hub");
+                                                       : kidi::checkpoint::Hub::default_cache();
         if (const auto status = resolve_hub_argument(arguments.get<std::filesystem::path>("model"), cache, directory))
             return status;
         if (command == "index") return kidi::cli::index_command(arguments, directory);
