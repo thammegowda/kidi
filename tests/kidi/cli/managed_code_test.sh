@@ -7,6 +7,7 @@ curl=$3
 standalone=${4:-}
 root=$(mktemp -d)
 export XDG_RUNTIME_DIR="$root"
+export XDG_CACHE_HOME="$root/cache"
 export KIDI_MODEL="$root/model"
 export KIDI_LOG_LEVEL=info
 unset KIDI_AGENT_BASE_URL
@@ -99,6 +100,14 @@ test "$(run_code fourth)" = lambda
 read_state
 test "$pid" != "$previous_pid"
 
+# --restart replaces a healthy daemon instead of reusing it.
+previous_pid=$pid
+test "$(run_code fifth --restart 2> "$root/restart.log")" = lambda
+grep -q "stopping background inference (PID $previous_pid)" "$root/restart.log"
+read_state
+test "$pid" != "$previous_pid"
+for ((i = 0; i < 50; ++i)); do kill -0 "$previous_pid" 2>/dev/null || break; sleep .1; done
+! kill -0 "$previous_pid" 2>/dev/null
 # Optional wall-clock verification of the full production idle timeout.
 if [[ ${KIDI_TEST_REAL_IDLE:-0} == 1 ]]; then
     started=$SECONDS
@@ -166,6 +175,11 @@ test "$(grep -c 'Compacting conversation' "$root/compact.log")" -ge 2
 grep -q 'prompt tokens' "$root/compact.log"
 grep -q '/ 16 context tokens' "$root/compact.log"
 test "$(grep -c 'warning: 16-token context' "$root/compact.log")" -eq 1
+compact_session=$(grep -l '^{"type":"compact"' "$XDG_CACHE_HOME"/kidi/code/chats/*/*.jsonl)
+test -f "$compact_session"
+test "$(grep -c '^{"type":"compact"' "$compact_session")" -ge 2
+grep -q '"is_summary":true' "$compact_session"
+grep -q '^{"type":"message","role":"user","content":"Task 8 ' "$compact_session"
 
 # Context settings belong to server identity, even if the effective default
 # happens to equal the explicitly requested setting.

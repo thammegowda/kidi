@@ -43,6 +43,9 @@ for `auto` and CUDA backends, plus the requested context size, so a rebuilt exec
 `CUDA_VISIBLE_DEVICES` starts a fresh daemon.
 Clients check readiness and PID before reuse. A startup lock prevents duplicate
 cold starts; stale metadata is replaced after a crash.
+`--restart` stops the matching daemon (SIGTERM, then SIGKILL after 30 seconds)
+and starts a fresh one, e.g. after an inference failure. Other sessions using
+that daemon lose their connection. Daemons with other keys are left alone.
 
 ## Standalone client
 
@@ -64,11 +67,12 @@ Kidi's ordinary `serve --max-active` remains available for manually managed serv
 
 ## Tools and permissions
 
-Both CLIs default to interactive mode. On Linux/macOS, the pinned BSD-licensed
-linenoise editor provides arrow-key editing, Home/End, task history, multiline
-bracketed paste and Tab completion for slash commands. History stays in memory
-(up to 100 tasks / 512 KiB); approval answers are never stored. No history file
-is created. Piped input, redirected output and `TERM=dumb` use plain line input.
+Both CLIs default to interactive mode. On Linux/macOS, the pinned MIT-licensed
+FTXUI terminal UI provides arrow-key editing, Home/End, task history, multiline
+bracketed paste, PageUp/PageDown transcript scrolling and Tab completion for slash
+commands. History stays in memory (up to 100 tasks); approval answers are never
+stored in history. The UI uses the terminal's alternate screen. Piped input,
+redirected output and `TERM=dumb` use plain line input.
 
 `/help` lists commands. `/exit` quits; `/reset` clears the conversation but keeps
 session approvals. Ctrl-C clears the input or cancels the current turn, including
@@ -77,6 +81,53 @@ Ctrl-D exits on an empty input line, including at an approval prompt.
 `--color auto|always|never` controls styling; auto respects `NO_COLOR` and
 `TERM=dumb`. Valid UTF-8 is preserved; untrusted terminal controls are escaped.
 `-p` runs one task. Failed turns report errors without closing an interactive session.
+
+### Terminal presentation
+
+User input is bright green, tools are cyan with dim argument previews, model
+thinking is dim grey, and final answers are bright white. Commands are displayed
+as `$ command`, not JSON; other tools show named arguments. Long activity and
+thinking previews are abbreviated, but approval prompts show **all** arguments.
+Only actual model-provided `reasoning_content` is shown as thinking, after the
+model call completes; it is not a live reasoning stream.
+
+A grey, width-aware status bar is pinned to the bottom row of the interactive
+screen and updates between model calls, showing phase, context percentage/token
+count, token speed and model name:
+
+```text
+Ready | ctx 12.0% 29860/248832 | 42.1 tok/s req | Inkling-2-Mini
+```
+
+Context uses the server's existing exact preflight counts and response usage.
+Speed is generated tokens divided by request wall time, **including prefill
+and HTTP latency**, not decode-only speed. Missing usage is shown as `--`,
+never estimated. The transcript scrolls within the UI; use PageUp/PageDown to
+review earlier output. The layout adapts to terminal resizes. Exiting restores
+the terminal and returns to its prior screen.
+Piped/one-shot output has no status bar or answer heading.
+
+### Local transcripts
+
+Both interactive and one-shot sessions automatically append JSONL records under:
+
+```text
+$XDG_CACHE_HOME/kidi/code/chats/<workspace-key>/session-<timestamp>.jsonl
+```
+
+The cache defaults to `~/.cache`. Each canonical workspace path has its own
+stable key, so other projects' conversations are separate and symlink aliases
+share the same workspace. The first interactive turn prints its transcript path.
+Files are private (0600 on POSIX), flushed after every record, and never rewritten
+as a growing JSON array. Records include session metadata, full messages and
+reasoning, tool calls/results, errors, reset markers and compaction checkpoints.
+Reset/compaction changes the live context, not the saved audit trail. A reader can
+ignore an incomplete final line after a crash; complete earlier lines remain valid.
+No chat picker or resume command is implemented yet.
+
+Transcripts may contain source code, command output or secrets from tools.
+They stay local but are not encrypted. Use `--no-save` to disable persistence;
+save failures are reported and stop the session rather than silently losing data.
 
 ## Long sessions
 

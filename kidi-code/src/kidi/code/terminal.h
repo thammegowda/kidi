@@ -1,10 +1,12 @@
 #pragma once
 
+#include "kidi/code/agent.h"
 #include "kidi/core/error.h"
 
+#include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace kidi::code {
 
@@ -17,18 +19,27 @@ struct TerminalInput {
     std::string text;
 };
 
-// One terminal per CLI process; linenoise has process-global editing state.
+enum class TerminalTone { DEFAULT, USER, TOOL, THINKING, ASSISTANT, ERROR, CONTEXT, WARNING, DIM, SESSION };
+
 class Terminal {
 public:
     explicit Terminal(std::string_view color);
+    ~Terminal();
+    Terminal(const Terminal&) = delete;
+    auto operator=(const Terminal&) -> Terminal& = delete;
+    auto interactive() const -> bool;
+    auto run_interactive(std::function<int()> worker, std::function<void()> interrupt) -> int;
     auto read(std::string_view prompt, bool remember = true) -> Result<TerminalInput>;
     auto label(std::string_view text, std::string_view color) const -> std::string;
+    auto write(std::string_view text, TerminalTone tone = TerminalTone::DEFAULT) -> void;
+    auto tool(std::string_view name, const Json& arguments, bool full = false) -> void;
+    auto thinking(std::string_view text) -> void;
+    auto answer(std::string_view text) -> void;
+    auto status(std::string_view text) -> void;
 
 private:
-    bool edit_ = false;
-    bool color_ = false;
-    std::vector<std::string> history_;
-    std::size_t history_bytes_ = 0;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace kidi::code

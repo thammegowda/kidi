@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cerrno>
+#include <csignal>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -196,8 +197,37 @@ auto accessible(Endpoint endpoint) -> bool {
     return health && health->status == 200 && health->body == std::to_string(endpoint.pid);
 }
 
+// Guards against signalling an unrelated process that reused a stale PID.
+auto managed_process(pid_t pid, const fs::path& dir) -> bool {
+#ifdef __linux__
+    std::ifstream in("/proc/" + std::to_string(pid) + "/cmdline", std::ios::binary);
+    const auto expected = "--managed-dir=" + dir.string();
+    for (std::string argument; std::getline(in, argument, '\0');)
+        if (argument == expected) return true;
+    return false;
+#else
+    (void)dir;
+    return kill(pid, 0) == 0;
+#endif
+}
+
+auto stop_server(const fs::path& dir) -> Result<void> {
+    const auto endpoint = read_endpoint(dir / STATE_NAME);
+    if (!endpoint || !(managed_process(endpoint->pid, dir) || accessible(*endpoint))) return {};
+    log::info("stopping background inference (PID {})", endpoint->pid);
+    for (const auto [signal, wait] : {std::pair{SIGTERM, 30s}, std::pair{SIGKILL, 10s}}) {
+        if (kill(endpoint->pid, signal) < 0 && errno != ESRCH) fail_io("cannot stop managed server");
+        for (const auto deadline = Clock::now() + wait; Clock::now() < deadline;) {
+            if (!managed_process(endpoint->pid, dir)) return {};
+            std::this_thread::sleep_for(POLL_INTERVAL);
+        }
+    }
+    return std::unexpected(
+        Error{ErrorCode::RUNTIME, "background inference PID " + std::to_string(endpoint->pid) + " did not exit"});
+}
+
 auto ensure_server(const fs::path& exe, const fs::path& dir, const std::string& model, const fs::path& cache,
-                   const Namespace& arguments) -> Result<Endpoint> {
+                   const Namespace& arguments, bool restart) -> Result<Endpoint> {
     bool waiting_for_server = false;
     const auto state = dir / STATE_NAME;
     const auto deadline = Clock::now() + 30min;
@@ -205,6 +235,8 @@ auto ensure_server(const fs::path& exe, const fs::path& dir, const std::string& 
         {
             const auto startup = open_file(dir / "server.lock", O_RDWR | O_CREAT);
             if (try_lock(startup, LOCK_EX)) {
+                if (std::exchange(restart, false))
+                    if (auto stopped = stop_server(dir); !stopped) return std::unexpected(stopped.error());
                 if (const auto endpoint = read_endpoint(state); endpoint && accessible(*endpoint)) return *endpoint;
                 if (waiting_for_server && !fs::exists(state))
                     return std::unexpected(
@@ -246,15 +278,15 @@ auto managed_provider(code::OpenAIOptions options, const Namespace& arguments) -
         std::this_thread::sleep_for(POLL_INTERVAL);
     }
     if (futimens(lease->file.get(), nullptr) < 0) fail_io("cannot record managed server session start");
-    auto endpoint = ensure_server(exe, dir, options.model, cache, arguments);
+    auto endpoint = ensure_server(exe, dir, options.model, cache, arguments, arguments.get<bool>("restart"));
     if (!endpoint) return std::unexpected(endpoint.error());
     options.base_url = "http://127.0.0.1:" + std::to_string(endpoint->port) + "/v1";
 
     return code::completion_provider(
         std::move(options),
-        [lease = std::move(lease), dir, endpoint = *endpoint](
-            const code::OpenAIOptions& http_options, std::string payload, std::stop_token stop,
-            std::string_view route) -> Result<std::string> {
+        [lease = std::move(lease), dir, endpoint = *endpoint](const code::OpenAIOptions& http_options,
+                                                              std::string payload, std::stop_token stop,
+                                                              std::string_view route) -> Result<std::string> {
             auto result = code::http_completion(http_options, std::move(payload), stop, endpoint.pid, route);
             if (!result) result.error().message += "; see " + (dir / "serve.log").string();
             return result;
@@ -272,6 +304,9 @@ auto configure_managed_code_parser(ArgumentParser& parser) -> void {
         .dest("context_size")
         .default_value<std::size_t>(0)
         .help("background server context tokens (default: model configuration); larger contexts use more memory");
+    parser.add_argument("--restart")
+        .action(Action::STORE_TRUE)
+        .help("stop the background server for this model/backend/context and start a fresh one");
 }
 
 auto configure_managed_serve_parser(ArgumentParser& parser) -> void {

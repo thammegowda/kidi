@@ -67,6 +67,14 @@ auto parse_reply(const Json& body, bool allow_truncated) -> Result<Message> {
         return std::unexpected(Error{ErrorCode::RUNTIME, "OpenAI generation did not complete: " + reason});
     if ((reason == "tool_calls") != !result.tool_calls.empty())
         return invalid("OpenAI finish_reason does not match tool_calls");
+    if (body.contains("usage") && !body["usage"].is_null()) {
+        const auto& usage = body["usage"];
+        if (!usage.is_object() || !usage.contains("prompt_tokens") || !usage["prompt_tokens"].is_number_unsigned() ||
+            !usage.contains("completion_tokens") || !usage["completion_tokens"].is_number_unsigned())
+            return invalid("OpenAI usage requires unsigned prompt_tokens and completion_tokens");
+        result.usage =
+            TokenUsage{usage["prompt_tokens"].get<std::size_t>(), usage["completion_tokens"].get<std::size_t>()};
+    }
     return result;
 }
 
@@ -134,6 +142,7 @@ auto completion_provider(OpenAIOptions options, CompletionTransport transport) -
     Provider provider([options, complete](auto messages, auto tools, std::stop_token stop) {
         return complete(options, messages, tools, stop, false);
     });
+    provider.model = options.model;
     provider.summarize = [options, complete](std::span<const Message> messages, std::size_t max_tokens,
                                              std::stop_token stop) {
         auto config = options;

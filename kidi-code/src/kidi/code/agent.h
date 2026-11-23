@@ -6,6 +6,7 @@
 
 #include <concepts>
 #include <functional>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -28,6 +29,11 @@ struct ToolCall {
     Json arguments = Json::object();
 };
 
+struct TokenUsage {
+    std::size_t prompt_tokens = 0;
+    std::size_t completion_tokens = 0;
+};
+
 struct Message {
     Role role = Role::USER;
     std::string content;
@@ -35,6 +41,7 @@ struct Message {
     std::vector<ToolCall> tool_calls;
     std::string tool_call_id;
     bool is_summary = false;
+    std::optional<TokenUsage> usage;
 };
 
 struct ToolSpec {
@@ -102,6 +109,7 @@ struct Provider {
     std::function<Result<ContextUsage>(std::span<const Message>, std::span<const ToolSpec>, std::stop_token)> context;
     std::function<Result<ContextUsage>(std::span<const Message>, std::stop_token)> summary_context;
     std::function<Result<Message>(std::span<const Message>, std::size_t, std::stop_token)> summarize;
+    std::string model;
 
     Provider() = default;
     template <class F>

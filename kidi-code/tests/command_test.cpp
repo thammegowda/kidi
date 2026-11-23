@@ -1,5 +1,6 @@
 #include "kidi/code/command.h"
 #include "kidi/code/terminal.h"
+#include "kidi/code/transcript.h"
 
 #include <gtest/gtest.h>
 
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <iostream>
+#include <fstream>
 #include <poll.h>
 #include <signal.h>
 #include <sys/ioctl.h>
@@ -20,34 +22,42 @@ namespace kidi::code {
 namespace {
 
 auto test_provider(OpenAIOptions) -> Result<Provider> {
-    Provider provider(
-        [](std::span<const Message> messages, std::span<const ToolSpec>, std::stop_token stop) -> Result<Message> {
-            if (messages.back().role == Role::TOOL)
-                return Message{.role = Role::ASSISTANT, .content = "result: " + messages.back().content};
-            const auto& text = messages.back().content;
-            if (text == "wait") {
-                std::cerr << "provider waiting\n" << std::flush;
-                while (!stop.stop_requested()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                return std::unexpected(Error{ErrorCode::RUNTIME, "cancelled"});
-            }
-            if (text == "commands")
-                return Message{.role = Role::ASSISTANT,
-                               .tool_calls = {{"first", "run_command", {{"command", "printf first"}}},
-                                              {"second", "run_command", {{"command", "printf second"}}}}};
-            if (text == "sleep")
-                return Message{.role = Role::ASSISTANT,
-                               .tool_calls = {{"sleep", "run_command", {{"command", "sleep 30"}}}}};
-            if (text == "write")
-                return Message{.role = Role::ASSISTANT,
-                               .tool_calls = {{"write", "write_file", {{"path", "output"}, {"content", "written"}}}}};
-            return Message{.role = Role::ASSISTANT, .content = "echo: " + text};
-        });
+    Provider provider([](std::span<const Message> messages, std::span<const ToolSpec>,
+                         std::stop_token stop) -> Result<Message> {
+        if (messages.back().role == Role::TOOL)
+            return Message{
+                .role = Role::ASSISTANT, .content = "result: " + messages.back().content, .usage = TokenUsage{500, 16}};
+        const auto& text = messages.back().content;
+        if (text == "wait") {
+            std::cerr << "provider waiting\n" << std::flush;
+            while (!stop.stop_requested()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return std::unexpected(Error{ErrorCode::RUNTIME, "cancelled"});
+        }
+        if (text == "commands")
+            return Message{.role = Role::ASSISTANT,
+                           .tool_calls = {{"first", "run_command", {{"command", "printf first"}}},
+                                          {"second", "run_command", {{"command", "printf second"}}}}};
+        if (text == "presentation")
+            return Message{.role = Role::ASSISTANT,
+                           .content = "Checking the workspace.",
+                           .reasoning_content = "Inspect output first.\nKeep the answer brief.\033]0;untrusted\a",
+                           .tool_calls = {{"pretty", "run_command", {{"command", "printf 'hello\\nworld\\n'"}}}},
+                           .usage = TokenUsage{100, 32}};
+        if (text == "sleep")
+            return Message{.role = Role::ASSISTANT,
+                           .tool_calls = {{"sleep", "run_command", {{"command", "sleep 30"}}}}};
+        if (text == "write")
+            return Message{.role = Role::ASSISTANT,
+                           .tool_calls = {{"write", "write_file", {{"path", "output"}, {"content", "written"}}}}};
+        return Message{.role = Role::ASSISTANT, .content = "echo: " + text, .usage = TokenUsage{100, 8}};
+    });
     provider.context = [](auto, auto, std::stop_token) -> Result<ContextUsage> {
         return ContextUsage{100, 65536, 4096};
     };
     provider.summarize = [](auto, std::size_t, std::stop_token) -> Result<Message> {
         return Message{.role = Role::ASSISTANT, .content = "A handoff."};
     };
+    provider.model = "test-model";
     return provider;
 }
 
@@ -113,6 +123,7 @@ protected:
             if (child_input > STDERR_FILENO) ::close(child_input);
             if (child_output != child_input && child_output > STDERR_FILENO) ::close(child_output);
             ::setenv("TERM", "xterm", 1);
+            ::setenv("XDG_CACHE_HOME", (root_ / "cache").c_str(), 1);
             ::unsetenv("LINENOISE_ASSUME_TTY");
             if (no_color)
                 ::setenv("NO_COLOR", "1", 1);
@@ -133,7 +144,7 @@ protected:
             ::close(child_output);
         }
         if (std::ranges::find(extra, "-p") == extra.end()) {
-            ASSERT_TRUE(wait_for("> "));
+            ASSERT_TRUE(tty ? wait_empty_prompt() : wait_for("> "));
         }
     }
 
@@ -169,12 +180,14 @@ protected:
         return wait_for("> ", output_text_.find(text, from) + text.size());
     }
 
+    auto wait_empty_prompt(std::size_t from = 0) -> bool { return wait_for(">                     ", from); }
+
     auto wait_approval(std::size_t from = 0) -> bool {
         if (!wait_for("Approval required:", from)) return false;
         return wait_for("Approve?", output_text_.find("Approval required:", from));
     }
 
-    auto finish() -> void {
+    auto finish(int expected_status = 0) -> void {
         int status = 0;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         for (;;) {
@@ -186,7 +199,15 @@ protected:
         }
         child_ = -1;
         ASSERT_TRUE(WIFEXITED(status)) << status;
-        EXPECT_EQ(WEXITSTATUS(status), 0);
+        EXPECT_EQ(WEXITSTATUS(status), expected_status);
+        for (;;) {
+            pollfd ready{.fd = output_, .events = POLLIN};
+            if (::poll(&ready, 1, 0) <= 0) break;
+            char buffer[4096];
+            const auto count = ::read(output_, buffer, sizeof(buffer));
+            if (count <= 0) break;
+            output_text_.append(buffer, static_cast<std::size_t>(count));
+        }
         if (slave_ >= 0) {
             termios state{};
             ASSERT_EQ(::tcgetattr(slave_, &state), 0);
@@ -215,17 +236,30 @@ TEST_F(CodeTerminal, EditHistoryPaste) {
     ASSERT_TRUE(wait_task("echo: caXf\xc3\xa9", from));
     from = output_text_.size();
     send("\033[200~first\nsecond\033[201~\r");
-    ASSERT_TRUE(wait_task("echo: first\r\nsecond", from));
+    ASSERT_TRUE(wait_for("echo: first", from));
+    ASSERT_TRUE(wait_for("second", from));
+    ASSERT_TRUE(wait_for("> ", output_text_.find("second", from)));
     from = output_text_.size();
     const std::string large_paste(6000, 'x');
     send("\033[200~" + large_paste + "\033[201~\r");
-    ASSERT_TRUE(wait_task("echo: " + large_paste, from));
+    ASSERT_TRUE(wait_task("echo: " + large_paste.substr(0, 40), from));
     from = output_text_.size();
     send("/he\t\r");
     ASSERT_TRUE(wait_task("/permissions reset  Revoke", from));
     send("\004");
     finish();
-    EXPECT_NE(output_text_.find("\033[1;32m"), std::string::npos);
+    EXPECT_NE(output_text_.find("\033[32m"), std::string::npos);
+    bool found_large_paste = false;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root_ / "cache")) {
+        if (entry.path().extension() != ".jsonl") continue;
+        std::ifstream input(entry.path());
+        for (std::string line; std::getline(input, line);) {
+            const auto record = Json::parse(line, nullptr, false);
+            if (record.is_object() && record.value("role", "") == "user" && record.value("content", "") == large_paste)
+                found_large_paste = true;
+        }
+    }
+    EXPECT_TRUE(found_large_paste);
 }
 
 TEST_F(CodeTerminal, SessionGrants) {
@@ -235,10 +269,6 @@ TEST_F(CodeTerminal, SessionGrants) {
     send("a\r");
     ASSERT_TRUE(wait_task("result: {\"exit_code\":0,\"output\":\"second\"}"));
     auto from = output_text_.size();
-    send("\033[A\r");
-    ASSERT_TRUE(wait_task("result: {\"exit_code\":0,\"output\":\"second\"}", from));
-    EXPECT_EQ(output_text_.find("Approval required:", from), std::string::npos);
-    from = output_text_.size();
     send("/reset\r");
     ASSERT_TRUE(wait_task("Conversation cleared", from));
     send("write\r");
@@ -264,12 +294,13 @@ TEST_F(CodeTerminal, InterruptInputAndApproval) {
     start();
     auto from = output_text_.size();
     send("discard me\003");
-    ASSERT_TRUE(wait_task("\033[?2004l", from));
+    ASSERT_TRUE(wait_empty_prompt(from));
     from = output_text_.size();
     send("wait\r");
     ASSERT_TRUE(wait_for("provider waiting", from));
-    ASSERT_EQ(::kill(child_, SIGINT), 0);
-    ASSERT_TRUE(wait_task("kidi-code: ", from));
+    send("\003");
+    ASSERT_TRUE(wait_for("cancelled", from));
+    ASSERT_TRUE(wait_empty_prompt(output_text_.find("cancelled", from)));
     from = output_text_.size();
     send("write\r");
     ASSERT_TRUE(wait_approval(from));
@@ -286,10 +317,10 @@ TEST_F(CodeTerminal, InterruptInputAndApproval) {
 TEST_F(CodeTerminal, InterruptCommand) {
     start(true, {"--permissions", "full-access"});
     send("sleep\r");
-    ASSERT_TRUE(wait_for("\"command\":\"sleep 30\""));
+    ASSERT_TRUE(wait_for("$ sleep 30"));
     // Allow the approved child to enter its blocking command before sending SIGINT.
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    ASSERT_EQ(::kill(child_, SIGINT), 0);
+    send("\003");
     ASSERT_TRUE(wait_task("cancelled"));
     send("hello\r");
     ASSERT_TRUE(wait_task("echo: hello"));
@@ -329,6 +360,115 @@ TEST_F(CodeTerminal, OneShotNoApproval) {
     ASSERT_TRUE(wait_for("approval required; no approval callback"));
     finish();
     EXPECT_EQ(output_text_.find("Approve?"), std::string::npos);
+}
+
+TEST_F(CodeTerminal, PresentationAndWorkspaceTranscript) {
+    start(true, {"--permissions", "full-access"});
+    send("presentation\r");
+    ASSERT_TRUE(wait_task("result: "));
+    ASSERT_NE(output_text_.find("Thinking"), std::string::npos);
+    EXPECT_NE(output_text_.find("$ printf 'hello\\nworld\\n'"), std::string::npos);
+    EXPECT_EQ(output_text_.find("{\"command\":"), std::string::npos);
+    EXPECT_NE(output_text_.find("\\x1b]0;untrusted\\x07"), std::string::npos);
+    EXPECT_EQ(output_text_.find("\033]0;untrusted"), std::string::npos);
+    EXPECT_NE(output_text_.find("Assistant"), std::string::npos);
+    ASSERT_TRUE(wait_for("516/65536"));
+    EXPECT_NE(output_text_.find("tok/s req"), std::string::npos);
+    EXPECT_NE(output_text_.find("\033[97m\033[100m"), std::string::npos);
+    auto from = output_text_.size();
+    send("/reset\r");
+    ASSERT_TRUE(wait_task("Conversation cleared", from));
+    send("/exit\r");
+    finish();
+
+    std::vector<std::filesystem::path> sessions;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root_ / "cache"))
+        if (entry.path().extension() == ".jsonl") sessions.push_back(entry.path());
+    ASSERT_EQ(sessions.size(), 1);
+    EXPECT_EQ(std::filesystem::status(sessions[0]).permissions() & std::filesystem::perms::all,
+              std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+    std::ifstream input(sessions[0]);
+    std::vector<Json> records;
+    for (std::string line; std::getline(input, line);) {
+        auto record = Json::parse(line, nullptr, false);
+        ASSERT_TRUE(record.is_object()) << line;
+        records.push_back(std::move(record));
+    }
+    ASSERT_GE(records.size(), 7);
+    EXPECT_EQ(records.front()["workspace"], std::filesystem::canonical(root_).generic_string());
+    EXPECT_EQ(records.front()["model"], "test-model");
+    EXPECT_EQ(records.back()["type"], "reset");
+    const auto assistant = std::ranges::find_if(records, [](const auto& record) {
+        return record.value("role", "") == "assistant" && record.contains("tool_calls");
+    });
+    ASSERT_NE(assistant, records.end());
+    EXPECT_EQ((*assistant)["tool_calls"][0]["arguments"]["command"], "printf 'hello\\nworld\\n'");
+    EXPECT_EQ((*assistant)["reasoning_content"], "Inspect output first.\nKeep the answer brief.\033]0;untrusted\a");
+    const auto tool =
+        std::ranges::find_if(records, [](const auto& record) { return record.value("role", "") == "tool"; });
+    ASSERT_NE(tool, records.end());
+    EXPECT_EQ((*tool)["tool_call_id"], "pretty");
+    EXPECT_NE((*tool)["content"].template get<std::string>().find("hello"), std::string::npos);
+}
+
+TEST_F(CodeTerminal, NoSaveAndNarrowStatus) {
+    start(true, {"--no-save"});
+    winsize size{.ws_row = 30, .ws_col = 40};
+    ASSERT_EQ(::ioctl(slave_, TIOCSWINSZ, &size), 0);
+    send("hello\r");
+    ASSERT_TRUE(wait_task("echo: hello"));
+    send("/exit\r");
+    finish();
+    EXPECT_FALSE(std::filesystem::exists(root_ / "cache"));
+    EXPECT_NE(output_text_.find("Ready | ctx"), std::string::npos);
+    EXPECT_NE(output_text_.find("\033[?1049l"), std::string::npos);
+}
+
+TEST_F(CodeTerminal, TranscriptAppendAndWorkspaceIsolation) {
+    // Set the cache only in the child, as in the CLI tests, to avoid changing the test runner environment.
+    start(false, {"-p", "hello"});
+    ASSERT_TRUE(wait_for("echo: hello"));
+    finish();
+    std::filesystem::path first;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root_ / "cache"))
+        if (entry.path().extension() == ".jsonl") first = entry.path();
+    ASSERT_FALSE(first.empty());
+    const auto original_size = std::filesystem::file_size(first);
+    ::close(input_);
+    ::close(output_);
+    input_ = output_ = -1;
+    start(false, {"-p", "again"});
+    ASSERT_TRUE(wait_for("echo: again"));
+    finish();
+    std::size_t files = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root_ / "cache"))
+        if (entry.path().extension() == ".jsonl") {
+            ++files;
+            EXPECT_EQ(entry.path().parent_path(), first.parent_path());
+        }
+    EXPECT_EQ(files, 2);
+    EXPECT_EQ(std::filesystem::file_size(first), original_size);
+    ::close(input_);
+    ::close(output_);
+    input_ = output_ = -1;
+    std::filesystem::create_directory(root_ / "other");
+    start(false, {"-p", "elsewhere", "--workspace", (root_ / "other").string()});
+    ASSERT_TRUE(wait_for("echo: elsewhere"));
+    finish();
+    bool other_workspace = false;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root_ / "cache"))
+        if (entry.path().extension() == ".jsonl" && entry.path().parent_path() != first.parent_path())
+            other_workspace = true;
+    EXPECT_TRUE(other_workspace);
+}
+
+TEST_F(CodeTerminal, TranscriptFailureIsExplicit) {
+    std::ofstream(root_ / "cache") << "not a directory";
+    start(false, {"-p", "hello"});
+    ASSERT_TRUE(wait_for("transcript: create cache directory"));
+    ASSERT_TRUE(wait_for("--no-save"));
+    finish(1);
+    EXPECT_EQ(output_text_.find("echo: hello"), std::string::npos);
 }
 
 TEST(CodeTerminalText, Utf8AndControls) {

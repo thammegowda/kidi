@@ -62,6 +62,29 @@ auto response(Json message, std::string reason = "stop") -> Json {
     return {{"choices", Json::array({{{"message", std::move(message)}, {"finish_reason", std::move(reason)}}})}};
 }
 
+TEST(CodeProvider, UsageIsMeasuredNotEstimated) {
+    auto body = response({{"role", "assistant"}, {"content", "hello"}});
+    body["usage"] = {{"prompt_tokens", 120}, {"completion_tokens", 9}};
+    auto provider = completion_provider({.model = "actual-model"},
+                                        [&](auto&, auto, auto, auto) -> Result<std::string> { return body.dump(); });
+    ASSERT_TRUE(provider);
+    EXPECT_EQ(provider->model, "actual-model");
+    auto reply = (*provider)({}, {}, {});
+    ASSERT_TRUE(reply);
+    ASSERT_TRUE(reply->usage);
+    EXPECT_EQ(reply->usage->prompt_tokens, 120);
+    EXPECT_EQ(reply->usage->completion_tokens, 9);
+    body.erase("usage");
+    reply = (*provider)({}, {}, {});
+    ASSERT_TRUE(reply);
+    EXPECT_FALSE(reply->usage);
+    for (const auto& usage : {Json{{"prompt_tokens", -1}, {"completion_tokens", 2}},
+                              Json{{"prompt_tokens", 1}, {"completion_tokens", "2"}}, Json::object()}) {
+        body["usage"] = usage;
+        EXPECT_FALSE((*provider)({}, {}, {}));
+    }
+}
+
 TEST(CodeProvider, BadContextAndSummary) {
     for (const auto* body :
          {"{}", R"({"prompt_tokens":-1,"context_tokens":4096})", R"({"prompt_tokens":1,"context_tokens":0})",
