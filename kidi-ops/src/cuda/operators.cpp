@@ -28,6 +28,8 @@ using tensor::Tensor;
 static_assert(static_cast<int>(Operation::SILU_GATE) == static_cast<int>(kidi::cuda::Op::SILU_GATE));
 static_assert(static_cast<int>(Operation::RELATIVE_ATTENTION) ==
               static_cast<int>(kidi::cuda::Op::RELATIVE_ATTENTION));
+static_assert(static_cast<int>(Operation::BLEND_PROLOGUE) == static_cast<int>(kidi::cuda::Op::BLEND_PROLOGUE));
+static_assert(static_cast<int>(Operation::BLEND_EPILOGUE) == static_cast<int>(kidi::cuda::Op::BLEND_EPILOGUE));
 static_assert(static_cast<int>(tensor::DType::E5M2) == static_cast<int>(kidi::cuda::Type::E5M2));
 
 auto view(const Tensor& tensor, bool bind = true) -> kidi::cuda::Tensor {
@@ -50,6 +52,16 @@ public:
               descriptor.operation == kidi::cuda::Op::GREEDY_TOKEN &&
               (!descriptor.attribute_count || descriptor.attributes[0] == static_cast<int>(ops::TokenOutput::HOST))),
           scatter_(descriptor.operation == kidi::cuda::Op::SCATTER),
+          inplace_first_(descriptor.operation == kidi::cuda::Op::ADD ||
+                         descriptor.operation == kidi::cuda::Op::MULTIPLY ||
+                         descriptor.operation == kidi::cuda::Op::GELU ||
+                         descriptor.operation == kidi::cuda::Op::TANH ||
+                         descriptor.operation == kidi::cuda::Op::STATIC_ROUND ||
+                         descriptor.operation == kidi::cuda::Op::RMS_NORM ||
+                         descriptor.operation == kidi::cuda::Op::LAYER_NORM ||
+                         descriptor.operation == kidi::cuda::Op::SOFTMAX ||
+                         descriptor.operation == kidi::cuda::Op::LOG_SOFTMAX ||
+                         descriptor.operation == kidi::cuda::Op::L2_CLIP),
           device_(device) {
         const auto& output = program_.output();
         shape_.assign(output.shape.begin(), output.shape.begin() + output.rank);
@@ -76,6 +88,17 @@ public:
             inputs[2].storage_identity() != destination.storage_identity()) {
             run_into(inputs, {&destination, 1});
             return destination;
+        }
+        if (inplace_first_ && inputs.size() && inputs[0].storage_identity() == destination.storage_identity() &&
+            inputs[0].storage_offset() == destination.storage_offset() &&
+            std::ranges::equal(inputs[0].shape(), destination.shape())) {
+            bool distinct = true;
+            for (std::size_t index = 1; index < inputs.size(); ++index)
+                if (inputs[index].storage_identity() == destination.storage_identity()) distinct = false;
+            if (distinct) {
+                run_into(inputs, {&destination, 1});
+                return destination;
+            }
         }
         auto result = run(inputs);
         if (destination.device() != device_ || result.dtype() != destination.dtype() ||
@@ -133,7 +156,7 @@ private:
     std::vector<Tensor> constants_;
     std::vector<std::int64_t> shape_;
     tensor::DType dtype_;
-    bool selected_, scatter_;
+    bool selected_, scatter_, inplace_first_;
     Device device_;
     OutputPool pool_;
     OutputPool residual_pool_;
@@ -697,8 +720,13 @@ public:
                 for (std::size_t operand = 0; operand < node.input_count; ++operand) {
                     const auto& origin = node.sources[operand];
                     if (origin.kind != graph::Source::Kind::INPUT || origin.index != index) continue;
-                    if ((node.operation != Operation::SCATTER && node.operation != Operation::ATTENTION) ||
-                        (node.operation == Operation::ATTENTION && node.inputs()[0].size(1) != 1))
+                    if ((node.operation != Operation::SCATTER && node.operation != Operation::ATTENTION &&
+                         node.operation != Operation::RELATIVE_ATTENTION &&
+                         node.operation != Operation::SHORT_CONVOLUTION) ||
+                        (node.operation == Operation::ATTENTION && node.inputs()[0].size(1) != 1) ||
+                        (node.operation == Operation::RELATIVE_ATTENTION && node.inputs()[0].size(0) != 1) ||
+                        (node.operation == Operation::SHORT_CONVOLUTION &&
+                         (node.attributes.size() < 2 || operand != 1)))
                         supported = false;
                 }
             }
@@ -770,34 +798,40 @@ public:
             staged.push_back(staging_.acquire(input.shape(), input.dtype(), device_));
         }
         if (!bytes) return staged;
-        CudaUpload* upload = nullptr;
-        for (const auto& candidate : uploads_) {
-            const auto status = cudaEventQuery(candidate->ready);
+        std::size_t selected_index = SIZE_MAX;
+        for (std::size_t index = 0; index < uploads_.size(); ++index) {
+            const auto status = cudaEventQuery(uploads_[index]->ready);
             if (status == cudaErrorNotReady) continue;
             check_cuda(status);
-            if (!upload || candidate->capacity > upload->capacity) upload = candidate.get();
-            if (candidate->capacity >= bytes) {
-                upload = candidate.get();
+            if (selected_index == SIZE_MAX || uploads_[index]->capacity > uploads_[selected_index]->capacity)
+                selected_index = index;
+            if (uploads_[index]->capacity >= bytes) {
+                selected_index = index;
                 break;
             }
         }
-        if (!upload) {
-            if (uploads_.size() == 64)
-                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "CUDA input staging queue is full"});
-            auto created = std::make_unique<CudaUpload>();
-            created->device = device_.index;
-            check_cuda(cudaEventCreateWithFlags(&created->ready, cudaEventDisableTiming));
-            upload = created.get();
-            uploads_.push_back(std::move(created));
+        if (selected_index == SIZE_MAX) {
+            if (uploads_.size() < 256) {
+                auto created = std::make_unique<CudaUpload>();
+                created->device = device_.index;
+                check_cuda(cudaEventCreateWithFlags(&created->ready, cudaEventDisableTiming));
+                selected_index = uploads_.size();
+                uploads_.push_back(std::move(created));
+            } else {
+                check_cuda(cudaEventSynchronize(uploads_.front()->ready));
+                selected_index = 0;
+            }
         }
+        auto* upload = uploads_[selected_index].get();
         if (bytes > upload->capacity) {
             if (upload->data) {
                 check_cuda(cudaFreeHost(upload->data));
                 upload->data = nullptr;
                 upload->capacity = 0;
             }
-            check_cuda(cudaHostAlloc(&upload->data, bytes, cudaHostAllocDefault));
-            upload->capacity = bytes;
+            const auto allocated = std::max<std::size_t>(65536, std::max(std::bit_ceil(bytes), upload->capacity * 2));
+            check_cuda(cudaHostAlloc(&upload->data, allocated, cudaHostAllocDefault));
+            upload->capacity = allocated;
         }
         for (std::size_t index = 0; index < inputs.size(); ++index) {
             if (inputs[index].device() != Device::cpu() || !inputs[index].nbytes()) continue;
@@ -808,6 +842,8 @@ public:
                                        cudaMemcpyHostToDevice, nullptr));
         }
         check_cuda(cudaEventRecord(upload->ready, nullptr));
+        std::rotate(uploads_.begin() + static_cast<std::ptrdiff_t>(selected_index),
+                    uploads_.begin() + static_cast<std::ptrdiff_t>(selected_index + 1), uploads_.end());
         return staged;
     }
     auto release_cached_buffers() -> void override {

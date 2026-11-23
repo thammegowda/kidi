@@ -107,7 +107,9 @@ public:
     /// to await submitted work after returning from the current call before accessing the destination.
     auto copy_to_host_later(std::span<std::byte> destination) const -> Result<void>;
     auto copy_from_host(std::span<const std::byte> source, std::size_t offset = 0) -> Result<void>;
+    auto zero_() -> Result<void>;
     auto to(Device target) const -> Result<Tensor>;
+    static auto to_batch(std::span<const Tensor> sources, Device target) -> Result<std::vector<Tensor>>;
     auto reshape(std::vector<std::int64_t> shape) const -> Result<Tensor>;
     auto narrow(std::int64_t axis, std::int64_t start, std::int64_t length) const -> Result<Tensor>;
     auto select(std::int64_t axis, std::int64_t index) const -> Result<Tensor>;

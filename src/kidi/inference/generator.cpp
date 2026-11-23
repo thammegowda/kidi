@@ -312,7 +312,8 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             const auto effective_weight_bits = cuda_w8a16 && !qat ? std::int32_t{8} : options.weight_bits;
             require(model->set_checkpoint(weights, {.weight_bits = effective_weight_bits,
                                                     .group_size = options.group_size,
-                                                    .packed_prefill = options.packed_prefill}));
+                                                    .packed_prefill = options.packed_prefill,
+                                                    .precision = options.precision}));
         }
 #if !defined(__EMSCRIPTEN__)
         if (uses_padded_prefill(model)) {

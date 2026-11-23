@@ -4,6 +4,7 @@
 #include "cuda/runtime.h"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstring>
 
@@ -23,6 +24,104 @@ protected:
         if (!kidi::cuda::available()) GTEST_SKIP() << "CUDA device unavailable";
     }
 };
+
+TEST_F(CudaOpsTest, DequantizeExpertsMatchesCheckpoint) {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    ops::Context context(device, false, false, DType::BF16);
+    const auto e4m3 = [](std::uint8_t bits) {
+        const int exponent = (bits >> 3) & 15, mantissa = bits & 7;
+        const float magnitude = exponent ? std::ldexp(1.F + static_cast<float>(mantissa) / 8.F, exponent - 7)
+                                         : std::ldexp(static_cast<float>(mantissa) / 8.F, -6);
+        return bits & 0x80 ? -magnitude : magnitude;
+    };
+    constexpr std::int64_t EXPERTS = 2, ROWS = 4, COLUMNS = 256;
+    constexpr std::array<float, 16> E2M1{0.F,  0.5F,  1.F,  1.5F,  2.F,  3.F,  4.F,  6.F,
+                                         -0.F, -0.5F, -1.F, -1.5F, -2.F, -3.F, -4.F, -6.F};
+    const std::array<float, 2> factors{0.37F, 1.25F};
+    for (const bool nvfp4 : {false, true})
+        for (const bool interleaved : {false, true}) {
+            SCOPED_TRACE(nvfp4 ? "NVFP4" : "MXFP8");
+            SCOPED_TRACE(interleaved ? "interleaved" : "plain");
+            const auto packed_columns = COLUMNS / (nvfp4 ? 2 : 1);
+            const auto block = nvfp4 ? 16 : 32;
+            std::vector<std::uint8_t> values(EXPERTS * ROWS * packed_columns), scales(EXPERTS * ROWS * COLUMNS / block);
+            for (std::size_t index = 0; index < values.size(); ++index) {
+                values[index] = static_cast<std::uint8_t>(index);
+                if (!nvfp4 && (values[index] & 0x7F) == 0x7F) values[index] = 0x7E;
+            }
+            for (std::size_t index = 0; index < scales.size(); ++index)
+                scales[index] =
+                    nvfp4 ? static_cast<std::uint8_t>(index % 0x7F) : static_cast<std::uint8_t>(120 + index % 16);
+            const auto packed =
+                require(Tensor::from_bytes({EXPERTS, ROWS, packed_columns}, nvfp4 ? DType::U8 : DType::E4M3,
+                                           std::as_bytes(std::span(values)), device));
+            const auto scale =
+                require(Tensor::from_bytes({EXPERTS, ROWS, COLUMNS / block}, nvfp4 ? DType::E4M3 : DType::U8,
+                                           std::as_bytes(std::span(scales)), device));
+            const auto global =
+                nvfp4 ? require(Tensor::from_host({EXPERTS}, std::span<const float>(factors), device)) : Tensor{};
+            const auto expanded = context.dequantize_experts(packed, scale, global, interleaved);
+            ASSERT_EQ(expanded.dtype(), DType::BF16);
+            ASSERT_TRUE(std::ranges::equal(expanded.shape(), std::array{EXPERTS, ROWS, COLUMNS}));
+            const auto bytes = require(expanded.copy_to_host());
+            std::vector<float> reference(EXPERTS * ROWS * COLUMNS);
+            for (std::int64_t expert = 0; expert < EXPERTS; ++expert)
+                for (std::int64_t row = 0; row < ROWS; ++row)
+                    for (std::int64_t column = 0; column < COLUMNS; ++column) {
+                        const auto source = (expert * ROWS + row) * COLUMNS + column;
+                        float value;
+                        if (nvfp4) {
+                            const auto byte = values[source / 2];
+                            value = E2M1[column % 2 ? byte >> 4 : byte & 15] * e4m3(scales[source / block]) *
+                                    factors[expert];
+                        } else {
+                            value =
+                                e4m3(values[source]) * std::ldexp(1.F, static_cast<int>(scales[source / block]) - 127);
+                        }
+                        auto bits = std::bit_cast<std::uint32_t>(value);
+                        bits += 0x7FFF + ((bits >> 16) & 1);
+                        const auto target_row = interleaved ? (row % 2 ? ROWS / 2 + row / 2 : row / 2) : row;
+                        const auto target = (expert * ROWS + target_row) * COLUMNS + column;
+                        reference[target] = value;
+                        std::uint16_t actual;
+                        std::memcpy(&actual, bytes.data() + target * sizeof(actual), sizeof(actual));
+                        ASSERT_EQ(actual, bits >> 16) << "expert=" << expert << " row=" << row << " column=" << column;
+                    }
+            const auto packed_experts = context.pack_experts(packed, scale, global, interleaved);
+            const auto expected = require(ops::pack_weight(
+                require(Tensor::from_host({EXPERTS * ROWS, COLUMNS}, std::span<const float>(reference))), 8, COLUMNS));
+            EXPECT_EQ(require(packed_experts.values.copy_to_host()), require(expected.values.copy_to_host()));
+            EXPECT_EQ(require(packed_experts.scales.copy_to_host()), require(expected.scales.copy_to_host()));
+        }
+}
+
+TEST_F(CudaOpsTest, DequantizeExpertsRejectsInvalidScales) {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    ops::Context context(device, false, false, DType::BF16);
+    const auto values = require(Tensor::zeros({2, 4, 16}, DType::U8, device));
+    const auto scales = require(Tensor::zeros({2, 4, 2}, DType::E4M3, device));
+    const auto global = require(Tensor::zeros({2}, DType::F32, device));
+    EXPECT_THROW(context.dequantize_experts(values, scales), ops::Failure);
+    EXPECT_THROW(context.dequantize_experts(values, require(Tensor::zeros({2, 4, 1}, DType::E4M3, device)), global),
+                 ops::Failure);
+    EXPECT_THROW(context.dequantize_experts(values, scales, require(global.narrow(0, 0, 1))), ops::Failure);
+    EXPECT_THROW(context.dequantize_experts(require(Tensor::zeros({2, 3, 16}, DType::U8, device)),
+                                            require(Tensor::zeros({2, 3, 2}, DType::E4M3, device)), global, true),
+                 ops::Failure);
+    const std::vector<std::uint8_t> invalid(32, 0x7F);
+    EXPECT_THROW(context.pack_experts(
+                     require(Tensor::from_bytes({1, 1, 32}, DType::E4M3, std::as_bytes(std::span(invalid)), device)),
+                     require(Tensor::zeros({1, 1, 1}, DType::U8, device))),
+                 ops::Failure);
+}
 
 TEST_F(CudaOpsTest, AttentionBindings) {
     SCOPED_TRACE("CUDA attention retained a stale KV pointer");
@@ -1171,6 +1270,21 @@ TEST_F(CudaOpsTest, FusedOperations) {
         EXPECT_TRUE(close(context.short_convolution(input, weights, {}, scale), fixed)) << "short_convolution fixed";
         EXPECT_TRUE(close(context.short_convolution(input, weights, upload({T, G * W}, taps), scale), dynamic))
             << "short_convolution dynamic taps";
+        // Ring-buffered state at slot 2 holds rows [?, 0, 1, 2] of padded -> slot 2 precedes row 0 of current input.
+        std::vector<float> ring(W * C, 0.F);
+        for (std::size_t lag = 1; lag < W; ++lag)
+            for (std::size_t c = 0; c < C; ++c)
+                ring[((2 - lag + W) % W) * C + c] = padded[(W - 1 - lag) * C + c];
+        const auto current_input = upload({T, C}, std::vector<float>(padded.begin() + (W - 1) * C, padded.end()));
+        const auto slot = require(Tensor::from_host({1}, std::span<const std::int32_t>(std::array<std::int32_t, 1>{2}),
+                                                    device));
+        EXPECT_TRUE(close(context.short_convolution(current_input, upload({W, C}, ring), weights, {}, slot, scale),
+                          fixed))
+            << "short_convolution ring fixed";
+        EXPECT_TRUE(close(context.short_convolution(current_input, upload({W, C}, ring), weights,
+                                                    upload({T, G * W}, taps), slot, scale),
+                          dynamic))
+            << "short_convolution ring dynamic taps";
     }
     {   // l2_clip: scaled rows capped at the threshold
         constexpr std::size_t T = 3, H = 2, D = 32;
@@ -1227,6 +1341,47 @@ TEST_F(CudaOpsTest, FusedOperations) {
                 upload({T, H, E}, relative), upload({T, H}, sink), upload({T, H * D}, gate),
                 {.heads = H, .key_heads = KVH, .start = START, .window = window, .extent = E});
             EXPECT_TRUE(close(actual, expected)) << "relative_attention window=" << window;
+        }
+        {   // Device positions + log scaling
+            constexpr float ALPHA = 0.1F, FLOOR = 2.F;
+            const auto query = random(T * H * D), key = random(S * KVH * D), value = random(S * KVH * D),
+                       relative = random(T * H * E), sink = random(T * H), gate = random(T * H * D);
+            std::vector<float> expected(T * H * D);
+            for (std::int64_t t = 0; t < T; ++t)
+                for (std::int64_t h = 0; h < H; ++h) {
+                    const auto position = START + t, kv = h / (H / KVH);
+                    const float tau = 1.F + ALPHA * std::log(std::max(1.F, static_cast<float>(position + 1) / FLOOR));
+                    std::vector<float> logits;
+                    for (std::int64_t s = 0; s <= position; ++s) {
+                        float logit = 0;
+                        for (std::int64_t d = 0; d < D; ++d)
+                            logit += query[(t * H + h) * D + d] * key[(s * KVH + kv) * D + d];
+                        logit /= std::sqrt(static_cast<float>(D));
+                        if (position - s < E) logit += relative[(t * H + h) * E + position - s];
+                        logits.push_back(logit * tau);
+                    }
+                    logits.push_back(sink[t * H + h]);
+                    const auto peak = *std::ranges::max_element(logits);
+                    float total = 0;
+                    for (auto& logit : logits) total += logit = std::exp(logit - peak);
+                    for (std::int64_t d = 0; d < D; ++d) {
+                        float sum = 0;
+                        for (std::int64_t s = 0; s <= position; ++s)
+                            sum += logits[s] / total * value[(s * KVH + kv) * D + d];
+                        const auto g = gate[(t * H + h) * D + d];
+                        expected[(t * H + h) * D + d] = sum / (1.F + std::exp(-g));
+                    }
+                }
+            std::vector<std::int32_t> pos_values(T);
+            for (std::int64_t t = 0; t < T; ++t) pos_values[t] = static_cast<std::int32_t>(START + t);
+            const auto positions = require(Tensor::from_host({T}, std::span<const std::int32_t>(pos_values), device));
+            const auto actual = context.relative_attention(
+                upload({T, H * D}, query), upload({S, KVH * D}, key), upload({S, KVH * D}, value),
+                upload({T, H, E}, relative), upload({T, H}, sink), upload({T, H * D}, gate),
+                {.heads = H, .key_heads = KVH, .start = 0, .window = 0, .extent = E, .log_alpha = ALPHA,
+                 .log_floor = FLOOR},
+                positions);
+            EXPECT_TRUE(close(actual, expected)) << "relative_attention device positions + log scaling";
         }
     }
     {   // Softcapped SiLU gate with routing weights

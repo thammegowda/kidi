@@ -3,6 +3,7 @@
 #include "cuda/ptx_mma.cuh"
 
 #include <cuda_bf16.h>
+#include <mma.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -386,6 +387,98 @@ __global__ void bfloat_mma_gemm(int rows, int columns, int width, const Bfloat* 
     }
 }
 
+// 64x64 output tiles over 64-column depth steps: 4 warps of 32x32 tensor-core tiles. 16-byte loads of the next
+// step are issued before the current one multiplies. With split-K (gridDim.z > 1), each slice covers a depth range
+// and writes FP32 partials summed by sum_bfloat_partials.
+constexpr int BFLOAT_TILE = 64, BFLOAT_STRIDE = BFLOAT_TILE + 8, BFLOAT_THREADS = 128;
+
+__global__ void __launch_bounds__(BFLOAT_THREADS)
+    bfloat_tile_gemm(int rows, int columns, int width, int depth_per_slice, const Bfloat* input, const Bfloat* weights,
+                     Bfloat* output, float* partials) {
+    using namespace nvcuda;
+    __shared__ __align__(32) Bfloat activations[BFLOAT_TILE][BFLOAT_STRIDE];
+    __shared__ __align__(32) Bfloat parameters[BFLOAT_TILE][BFLOAT_STRIDE];
+    __shared__ __align__(32) float results[BFLOAT_TILE][BFLOAT_TILE + 4];
+    const int row_start = static_cast<int>(blockIdx.y) * BFLOAT_TILE;
+    const int column_start = static_cast<int>(blockIdx.x) * BFLOAT_TILE;
+    const int depth_start = static_cast<int>(blockIdx.z) * depth_per_slice;
+    const int depth_end = min(width, depth_start + depth_per_slice);
+    const int warp = threadIdx.x / 32, warp_row = warp / 2 * 32, warp_column = warp % 2 * 32;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> accumulators[2][2];
+#pragma unroll
+    for (auto& pair : accumulators)
+#pragma unroll
+        for (auto& accumulator : pair) wmma::fill_fragment(accumulator, 0.F);
+    uint4 next_input[4], next_weights[4];
+    const auto load = [&](int depth) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int item = static_cast<int>(threadIdx.x) + i * BFLOAT_THREADS;
+            const int row = item >> 3, column = depth + (item & 7) * 8;
+            const bool inside = column < depth_end;
+            next_input[i] = inside && row_start + row < rows
+                                ? __ldg(reinterpret_cast<const uint4*>(
+                                      input + static_cast<std::int64_t>(row_start + row) * width + column))
+                                : make_uint4(0, 0, 0, 0);
+            next_weights[i] = inside && column_start + row < columns
+                                  ? __ldg(reinterpret_cast<const uint4*>(
+                                        weights + static_cast<std::int64_t>(column_start + row) * width + column))
+                                  : make_uint4(0, 0, 0, 0);
+        }
+    };
+    load(depth_start);
+    for (int depth = depth_start; depth < depth_end; depth += BFLOAT_TILE) {
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int item = static_cast<int>(threadIdx.x) + i * BFLOAT_THREADS;
+            *reinterpret_cast<uint4*>(&activations[item >> 3][(item & 7) * 8]) = next_input[i];
+            *reinterpret_cast<uint4*>(&parameters[item >> 3][(item & 7) * 8]) = next_weights[i];
+        }
+        __syncthreads();
+        if (depth + BFLOAT_TILE < depth_end) load(depth + BFLOAT_TILE);
+#pragma unroll
+        for (int step = 0; step < BFLOAT_TILE; step += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, Bfloat, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, Bfloat, wmma::col_major> b[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                wmma::load_matrix_sync(a[i], &activations[warp_row + i * 16][step], BFLOAT_STRIDE);
+                wmma::load_matrix_sync(b[i], &parameters[warp_column + i * 16][step], BFLOAT_STRIDE);
+            }
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(accumulators[i][j], a[i], b[j], accumulators[i][j]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+            wmma::store_matrix_sync(&results[warp_row + i * 16][warp_column + j * 16], accumulators[i][j],
+                                    BFLOAT_TILE + 4, wmma::mem_row_major);
+    __syncthreads();
+    auto* slice = partials ? partials + static_cast<std::int64_t>(blockIdx.z) * rows * columns : nullptr;
+    for (int index = static_cast<int>(threadIdx.x); index < BFLOAT_TILE * BFLOAT_TILE; index += BFLOAT_THREADS) {
+        const int row = index / BFLOAT_TILE, column = index % BFLOAT_TILE;
+        if (row_start + row >= rows || column_start + column >= columns) continue;
+        const auto at = static_cast<std::int64_t>(row_start + row) * columns + column_start + column;
+        if (slice)
+            slice[at] = results[row][column];
+        else
+            output[at] = __float2bfloat16(results[row][column]);
+    }
+}
+
+__global__ void sum_bfloat_partials(const float* partials, Bfloat* output, std::size_t elements, int slices) {
+    const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    float sum = partials[index];
+    for (int slice = 1; slice < slices; ++slice) sum += partials[slice * elements + index];
+    output[index] = __float2bfloat16(sum);
+}
+
 __global__ void scalar_float_gemm(int rows, int columns, int width, const float* input, const float* weights,
                                   float* output) {
     const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -452,12 +545,28 @@ auto w8a16_gemm_slices(int rows, int columns, int width, int group_size, int mul
 
 auto bfloat_gemm(int rows, int columns, int width, const void* input, const void* weights, void* output,
                  cudaStream_t stream, void* workspace, int slices) -> void {
-    (void)workspace;
-    (void)slices;
-    const dim3 grid(static_cast<unsigned int>((columns + 15) / 16),
-                    static_cast<unsigned int>((rows + 15) / 16));
-    bfloat_mma_gemm<<<grid, 32, 0, stream>>>(rows, columns, width, static_cast<const Bfloat*>(input),
-                                             static_cast<const Bfloat*>(weights), static_cast<Bfloat*>(output));
+    // The tiled kernel loads 8-value chunks: rows must hold whole chunks (16-byte alignment is checked by callers).
+    if (width % 8 == 0) {
+        const int depth_tiles = (width + BFLOAT_TILE - 1) / BFLOAT_TILE;
+        const int active_slices = workspace ? std::max(1, std::min(slices, depth_tiles)) : 1;
+        const int depth_per_slice = (depth_tiles + active_slices - 1) / active_slices * BFLOAT_TILE;
+        const dim3 grid(static_cast<unsigned int>((columns + BFLOAT_TILE - 1) / BFLOAT_TILE),
+                        static_cast<unsigned int>((rows + BFLOAT_TILE - 1) / BFLOAT_TILE),
+                        static_cast<unsigned int>((width + depth_per_slice - 1) / depth_per_slice));
+        auto* partials = grid.z > 1 ? static_cast<float*>(workspace) : nullptr;
+        bfloat_tile_gemm<<<grid, BFLOAT_THREADS, 0, stream>>>(
+            rows, columns, width, depth_per_slice, static_cast<const Bfloat*>(input),
+            static_cast<const Bfloat*>(weights), static_cast<Bfloat*>(output), partials);
+        if (partials) {
+            const auto elements = static_cast<std::size_t>(rows) * columns;
+            sum_bfloat_partials<<<static_cast<unsigned int>((elements + 255) / 256), 256, 0, stream>>>(
+                partials, static_cast<Bfloat*>(output), elements, static_cast<int>(grid.z));
+        }
+    } else {
+        const dim3 grid(static_cast<unsigned int>((columns + 15) / 16), static_cast<unsigned int>((rows + 15) / 16));
+        bfloat_mma_gemm<<<grid, 32, 0, stream>>>(rows, columns, width, static_cast<const Bfloat*>(input),
+                                                 static_cast<const Bfloat*>(weights), static_cast<Bfloat*>(output));
+    }
     const auto status = cudaGetLastError();
     if (status != cudaSuccess)
         throw std::runtime_error(std::string("CUDA: BF16 GEMM failed: ") + cudaGetErrorString(status));

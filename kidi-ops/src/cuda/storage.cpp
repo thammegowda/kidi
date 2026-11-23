@@ -155,6 +155,26 @@ public:
             return error(exception.what());
         }
     }
+    auto copy_batch_from_host(Device device, std::span<const HostTransfer> transfers) const -> Result<void> override {
+        if (!is_available(device)) return std::unexpected(Error{ErrorCode::UNSUPPORTED, unavailable_reason(device)});
+        std::vector<kidi::cuda::HostToDeviceCopy> copies;
+        copies.reserve(transfers.size());
+        for (const auto& transfer : transfers) {
+            auto* cuda = dynamic_cast<CudaStorage*>(transfer.destination);
+            if (!cuda || cuda->device() != device || transfer.destination_offset > cuda->size_bytes() ||
+                transfer.source.size() > cuda->size_bytes() - transfer.destination_offset)
+                return error("CUDA bulk copy is out of bounds");
+            if (!transfer.source.empty())
+                copies.push_back(
+                    {cuda->data() + transfer.destination_offset, transfer.source.data(), transfer.source.size()});
+        }
+        try {
+            kidi::cuda::copy_batch_to_device(copies.data(), copies.size(), device.index);
+            return {};
+        } catch (const std::exception& exception) {
+            return error(exception.what());
+        }
+    }
     auto copy_to_host(const Storage& source, std::size_t offset, std::span<std::byte> destination) const
         -> Result<void> override {
         const auto* cuda = dynamic_cast<const CudaStorage*>(&source);

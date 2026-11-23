@@ -120,6 +120,7 @@ models:
     # Uncomment and set this to use an existing local checkpoint instead of downloading it.
     # directory: /path/to/Inkling-2-Mini/snapshot
     accelerator: cuda:0
+    # Native NVFP4/MXFP8 expert weights with BF16 activations; no expansion or gate/up rearrangement.
     precision: checkpoint
     kv_cache_precision: auto
     metal_prefill_cache_mb: 512
@@ -135,7 +136,7 @@ models:
       prefix_cache_mb: 512
 
   asr:
-    enabled: true
+    enabled: false
     model_id: "@openai/whisper-small"
     revision: main
     accelerator: cpu
@@ -150,7 +151,7 @@ models:
       silence_ms: 800
 
   tts:
-    enabled: true
+    enabled: false
     model_id: "@thammegowda/OmniVoice-q8"
     revision: main
     accelerator: auto

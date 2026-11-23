@@ -66,12 +66,18 @@ reproduction commands.
 | Model Family | Tasks | Highlights |
 |---|---|---|
 | **Gemma 4 (`E2B-it`, `E4B-it`)** | Chat, JSONL Generation, Vision (Photo Q&A) | Native QAT (mixed 2/4/8-bit), BF16, Per-Channel INT8, and Group-32/128 Symmetric & Asymmetric INT4 with tied embeddings |
-| **Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`)** | Agentic chat with reasoning and tool calls (`serve`, `generate`, `chat`) | Text-only CUDA port of the looped 24-layer MoE (128 experts, top-8) with relative-position attention; NVFP4 experts dequantized to BF16 at load (about 52 GB) |
+| **Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`)** | Agentic chat with reasoning and tool calls (`serve`, `generate`, `chat`) | Text-only CUDA port of the looped 24-layer MoE (128 experts, top-8) with relative-position attention; native NVFP4/MXFP8 expert storage and interleaved gate/up kernels, with BF16 activations. The checkpoint default avoids weight expansion and fits below 24 GiB in the tested 8K-context configuration. Optional `--precision q8a16` or `--precision bf16` converts weights for comparisons. |
 | **Qwen 3** | Chat & Text Generation | Grouped-query attention, SwiGLU, RMSNorm, and quantized linear execution |
 | **Whisper (`Tiny`, `Base`, `Small`, `Large-v3`, `Turbo`)** | Speech-to-Text (`transcribe`) & Speech-to-English (`translate`) | Loads directly from Hugging Face checkpoints; automatic INT8 weight caching and 30s windowed long-audio streaming |
 | **OmniVoice** | Multilingual Text-to-Speech (`synthesize`) | 600+ MB INT8 package with controllable voice attributes (`gender`, `age`, `pitch`, `accent`, `style`) and consistent long-form narrator conditioning |
 | **Kokoro-82M** | US-English Text-to-Speech (`synthesize`) | Compact INT8 model with bundled offline Misaki pronunciation lexicon and selectable voice packs |
 | **RTG Transformer** | Machine Translation (`translate`) | Supports the public [500-language-to-English (`rtg-500eng-v1`)](https://huggingface.co/thammegowda/rtg-500eng-v1) model |
+
+The shared CPU/CUDA block-scaled projection API accepts configurable groups (including 32/64/128),
+optional global scales, and separate E2M1 FP4, E4M3 FP8, and symmetric signed INT4 encodings.
+Native byte-scale formats retain their checkpoint semantics; floating scales are also supported.
+CUDA BF16 symmetric INT4 projections with device-resident parameters reuse these kernels;
+existing asymmetric, calibrated, and CPU packed-projection paths remain unchanged.
 
 ### Hardware Acceleration Backends
 

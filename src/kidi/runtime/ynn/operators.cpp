@@ -3,6 +3,7 @@
 #include "kidi/runtime/ynn/feed_forward_cache.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/ops/context.h"
+#include "kidi/checkpoint/ggml/dequantize.h"
 #include "ynnpack/composites/composites.h"
 #include <atomic>
 #include <array>
@@ -2713,6 +2714,126 @@ private:
     OutputPool pool_;
 };
 
+class BlockScaledLinear final : public Operator {
+public:
+    BlockScaledLinear(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
+        : gated_(spec.attributes[0] != 0),
+          gate_cap_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[1]))),
+          up_cap_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]))),
+          format_(static_cast<ops::BlockScaledFormat>(spec.attributes[3])),
+          group_(spec.attributes[4]),
+          group_shift_(spec.attributes[6]),
+          has_global_(spec.attributes[5] != 0),
+          pool_(&arena) {
+        shape_.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+        shape_.back() = static_cast<std::int64_t>(inputs[1].size(0) / (gated_ ? 2 : 1));
+    }
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, inputs[0].dtype(), tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "block-scaled projection is not an in-place operation"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    static auto bfloat(float value) -> std::uint16_t {
+        auto bits = std::bit_cast<std::uint32_t>(value);
+        return static_cast<std::uint16_t>((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
+    }
+    auto apply(TensorInputs inputs, Tensor& output) const -> void {
+        static const auto e4m3 = [] {
+            std::array<float, 256> table{};
+            for (std::size_t byte = 0; byte < table.size(); ++byte) {
+                const int exponent = (byte >> 3) & 15, mantissa = byte & 7;
+                const float magnitude = exponent ? std::ldexp(1.F + mantissa / 8.F, exponent - 7) : mantissa / 512.F;
+                table[byte] = exponent == 15 && mantissa == 7 ? NAN : (byte & 128 ? -magnitude : magnitude);
+            }
+            return table;
+        }();
+        constexpr std::array<float, 16> e2m1{0, .5F, 1, 1.5F, 2, 3, 4, 6, -0.F, -.5F, -1, -1.5F, -2, -3, -4, -6};
+        const bool fp8 = format_ == ops::BlockScaledFormat::MXFP8, bf16 = inputs[0].dtype() == DType::BF16;
+        const auto width = inputs[0].size(-1), columns = output.size(-1);
+        const auto values = require(inputs[1].host_bytes()), scales = require(inputs[2].host_bytes());
+        const auto source = require(inputs[0].host_bytes());
+        auto destination = require(output.host_bytes());
+        const float global = has_global_ ? require(inputs[3].data<float>()).front() : 1.F;
+        const auto routing = gated_ ? require(inputs.back().data<float>()) : std::span<const float>{};
+        const auto decode = [&](std::size_t row, std::size_t column) {
+            const auto index = row * width + column;
+            const auto scale_index = group_shift_ >= 0 ? index >> group_shift_ : index / group_;
+            float scale;
+            const auto scale_type = inputs[2].dtype();
+            if (scale_type == DType::U8 || scale_type == DType::E4M3) {
+                const auto byte = std::to_integer<std::uint8_t>(scales[scale_index]);
+                scale = fp8 && scale_type == DType::U8
+                            ? (byte == 255 ? NAN : std::ldexp(1.F, static_cast<int>(byte) - 127))
+                            : e4m3[byte];
+            } else if (scale_type == DType::F32)
+                std::memcpy(&scale, scales.data() + scale_index * 4, 4);
+            else {
+                std::uint16_t bits;
+                std::memcpy(&bits, scales.data() + scale_index * 2, 2);
+                scale = scale_type == DType::F16 ? checkpoint::ggml::detail::fp16_to_fp32(bits)
+                                                 : std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16);
+            }
+            float value;
+            if (!fp8) {
+                const auto byte = std::to_integer<std::uint8_t>(values[index / 2]);
+                const auto code = column % 2 ? byte >> 4 : byte & 15;
+                value = format_ == ops::BlockScaledFormat::INT4 ? static_cast<float>(code < 8 ? code : code - 16)
+                                                                : e2m1[code];
+            } else {
+                value = e4m3[std::to_integer<std::uint8_t>(values[index])];
+            }
+            value *= scale;
+            value *= global;
+            return bf16 ? std::bit_cast<float>(static_cast<std::uint32_t>(bfloat(value)) << 16) : value;
+        };
+        require(ynn::parallel_ranges(output.numel(), 8, [&](std::size_t begin, std::size_t end) {
+            for (auto index = begin; index < end; ++index) {
+                const auto token = index / columns, row = index % columns * (gated_ ? 2 : 1);
+                float gate = 0, up = 0;
+                for (std::size_t column = 0; column < width; ++column) {
+                    const auto position = token * width + column;
+                    float activation;
+                    if (bf16) {
+                        std::uint16_t bits;
+                        std::memcpy(&bits, source.data() + position * 2, 2);
+                        activation = std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16);
+                    } else
+                        std::memcpy(&activation, source.data() + position * 4, 4);
+                    gate += activation * decode(row, column);
+                    if (gated_) up += activation * decode(row + 1, column);
+                }
+                if (gated_) {
+                    if (bf16) {
+                        gate = std::bit_cast<float>(static_cast<std::uint32_t>(bfloat(gate)) << 16);
+                        up = std::bit_cast<float>(static_cast<std::uint32_t>(bfloat(up)) << 16);
+                    }
+                    gate = std::tanh(gate / gate_cap_) * gate_cap_ / (1 + std::exp(-gate)) * std::tanh(up / up_cap_) *
+                           up_cap_ * routing[token];
+                }
+                if (bf16) {
+                    const auto bits = bfloat(gate);
+                    std::memcpy(destination.data() + index * 2, &bits, 2);
+                } else
+                    std::memcpy(destination.data() + index * 4, &gate, 4);
+            }
+        }));
+    }
+    bool gated_;
+    float gate_cap_, up_cap_;
+    ops::BlockScaledFormat format_;
+    std::int64_t group_, group_shift_;
+    bool has_global_;
+    std::vector<std::int64_t> shape_;
+    OutputPool pool_;
+};
+
 class CpuBackend final : public OperatorBackend {
 public:
     CpuBackend() { require(arena_.reserve(8 * 1024 * 1024)); }
@@ -2806,6 +2927,8 @@ public:
             }
             return std::make_unique<SymmetricPackedLinear>(spec, inputs[0], inputs[1], cached_tiles, arena_);
         }
+        if (spec.operation == Operation::BLOCK_SCALED_LINEAR)
+            return std::make_unique<BlockScaledLinear>(spec, inputs, arena_);
         if (PackedFeedForward::supports(spec, inputs))
             return std::make_unique<PackedFeedForward>(spec, inputs, feed_forward_cache_, arena_);
         if (DenseLinearOp::supports(spec, inputs)) {

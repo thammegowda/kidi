@@ -1,9 +1,11 @@
 # Kidi Desktop Streaming Protocol
 
 `kidi-app CONFIG` loads one immutable YAML configuration, starts a
-capability-protected loopback server, and serves the embedded interface. HTTP is
-used only for bootstrap assets and `/api/status`; interactive work uses one
-authenticated WebSocket at `/ws`.
+capability-protected loopback server, and serves the embedded interface. HTTP
+serves bootstrap assets, `/api/status`, and streaming text chat through
+`/v1/chat/completions`. The desktop adapter reuses bootstrap metadata
+instead of querying status before every chat turn. Other interactive work,
+including image chat and speech, uses authenticated WebSockets at `/ws`.
 
 For development, `kidi-app CONFIG --port 10010 --dev` keeps the loopback bind
 and security headers but disables the one-time capability and cookie exchange.

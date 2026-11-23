@@ -37,6 +37,15 @@ __device__ __forceinline__ void cp_async_zfill_16(void* destination, const void*
 #endif
 }
 
+__device__ __forceinline__ void cp_async_4(void* destination, const void* source) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const auto shared_addr = static_cast<unsigned>(__cvta_generic_to_shared(destination));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" : : "r"(shared_addr), "l"(source));
+#else
+    *static_cast<unsigned*>(destination) = *static_cast<const unsigned*>(source);
+#endif
+}
+
 __device__ __forceinline__ void cp_async_fence() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;\n" ::);

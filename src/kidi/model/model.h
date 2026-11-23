@@ -45,6 +45,7 @@ struct RuntimeQuantization {
     std::int32_t weight_bits = 0; // 0 = checkpoint precision; 4 or 8 = load-time packing
     std::int32_t group_size = 128;
     bool packed_prefill = false;
+    core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
 };
 
 /// Base class for all top-level inference models.

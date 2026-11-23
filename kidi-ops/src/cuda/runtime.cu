@@ -12,14 +12,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 
 namespace kidi::cuda {
 namespace {
@@ -27,8 +30,19 @@ std::mutex allocations_mutex;
 struct Allocation {
     std::size_t bytes;
     int device;
+    std::size_t capacity;
 };
 std::unordered_map<void*, Allocation> allocations;
+// Released blocks are kept for reuse instead of cudaFree, which synchronizes the whole device. Each block remembers
+// an event recorded on the releasing stream; whoever reuses it waits on that event, so stream order is preserved.
+struct CachedBlock {
+    void* pointer;
+    cudaEvent_t released;
+};
+constexpr std::size_t CACHE_LIMIT = std::size_t{2} << 30;
+std::multimap<std::pair<int, std::size_t>, CachedBlock> cached_blocks;
+std::unordered_map<int, std::vector<cudaEvent_t>> spare_events;
+std::unordered_map<int, std::size_t> cached_bytes;
 std::atomic<std::size_t> live_bytes{0};
 std::size_t peak_bytes = 0;
 std::unordered_map<int, std::size_t> device_bytes, device_peaks;
@@ -106,17 +120,23 @@ int minimum_inputs(const Descriptor& descriptor) {
         case Op::ATTENTION:
         case Op::SCATTER:
         case Op::DIFFUSION_UPDATE:
+        case Op::BLOCK_SCALED_LINEAR:
+        case Op::EXPERT_LINEAR:
             return 3;
         case Op::SCATTER_KV:
             return 5;
         case Op::RESIDUAL_MIX:
         case Op::SHORT_CONVOLUTION:
+        case Op::DEQUANTIZE_EXPERTS:
+        case Op::ROUTE_EXPERTS:
+        case Op::BLEND_PROLOGUE:
             return 2;
         case Op::RELATIVE_ATTENTION:
             return 6;
         case Op::RESIDUAL_NORM:
         case Op::RMS_ROTARY:
         case Op::QUANTIZED_LINEAR:
+        case Op::BLEND_EPILOGUE:
             return 4;
         case Op::EMBEDDING:
         case Op::EMBEDDING_SUM:
@@ -135,7 +155,7 @@ int minimum_inputs(const Descriptor& descriptor) {
 }
 
 /// Output geometry of specialized fused operations; see cuda/fused_ops.h.
-void infer_fused(Descriptor& descriptor) {
+void infer_fused(Descriptor& descriptor, Type requested_type) {
     const auto& input = descriptor.inputs[0];
     auto& output = descriptor.output;
     const auto count = descriptor.input_count;
@@ -143,6 +163,160 @@ void infer_fused(Descriptor& descriptor) {
         if (condition) throw std::runtime_error(std::string("CUDA: invalid ") + message);
     };
     switch (descriptor.operation) {
+        case Op::BLOCK_SCALED_LINEAR: {
+            const auto& values = descriptor.inputs[1];
+            const auto& scales = descriptor.inputs[2];
+            const bool fp8 = descriptor.attributes[3] == 1;
+            fail(descriptor.attribute_count != 7 || descriptor.attributes[3] < 0 || descriptor.attributes[3] > 2 ||
+                     descriptor.attributes[0] < 0 || descriptor.attributes[0] > 1 || input.rank < 2 ||
+                     (input.type != Type::F32 && input.type != Type::BF16) || values.rank != 2 ||
+                     values.shape[0] <= 0 || values.shape[1] <= 0 || values.type != (fp8 ? Type::E4M3 : Type::U8),
+                 "block-scaled projection values");
+            const bool gated = descriptor.attributes[0] != 0;
+            const auto width = input.shape[input.rank - 1];
+            const auto group = descriptor.attributes[4], shift = descriptor.attributes[6];
+            const auto has_global = descriptor.attributes[5];
+            const bool byte_scale = scales.type == Type::U8 && descriptor.attributes[3] != 2;
+            fail(group <= 0 || group > INT32_MAX || shift < -1 || shift > 30 ||
+                     ((group & (group - 1)) == 0 ? (shift < 0 || (std::int64_t{1} << shift) != group) : shift != -1),
+                 "block-scaled group size");
+            fail(width <= 0 || width % group || (!fp8 && group % 2) || values.shape[1] != width / (fp8 ? 1 : 2) ||
+                     scales.rank != 2 || scales.shape[0] != values.shape[0] ||
+                     scales.shape[1] != width / group ||
+                     (!byte_scale && scales.type != Type::E4M3 && scales.type != Type::F32 &&
+                      scales.type != Type::F16 && scales.type != Type::BF16) ||
+                     has_global < 0 || has_global > 1 || count != 3 + has_global + gated ||
+                     (gated && values.shape[0] % 2),
+                 "block-scaled projection geometry");
+            if (has_global)
+                fail(descriptor.inputs[3].type != Type::F32 || descriptor.inputs[3].elements() != 1,
+                     "block-scaled global scale");
+            if (gated) {
+                float gate_cap, up_cap;
+                const auto gate_bits = static_cast<std::int32_t>(descriptor.attributes[1]);
+                const auto up_bits = static_cast<std::int32_t>(descriptor.attributes[2]);
+                std::memcpy(&gate_cap, &gate_bits, sizeof(gate_cap));
+                std::memcpy(&up_cap, &up_bits, sizeof(up_cap));
+                fail(!std::isfinite(gate_cap) || gate_cap <= 0 || !std::isfinite(up_cap) || up_cap <= 0 ||
+                         descriptor.inputs[count - 1].type != Type::F32 ||
+                         descriptor.inputs[count - 1].elements() != input.elements() / width,
+                     "block-scaled gate caps or routing weights");
+            }
+            output.shape[output.rank - 1] = values.shape[0] / (gated ? 2 : 1);
+            break;
+        }
+        case Op::ROUTE_EXPERTS: {
+            const auto& bias = descriptor.inputs[1];
+            const auto top = descriptor.attributes[0];
+            float scale;
+            const auto scale_bits = static_cast<std::int32_t>(descriptor.attributes[1]);
+            std::memcpy(&scale, &scale_bits, sizeof(scale));
+            fail(descriptor.attribute_count != 2 || count != 2 || input.rank != 2 ||
+                     (input.type != Type::F32 && input.type != Type::BF16) || input.shape[1] <= 0 ||
+                     input.shape[1] > 1024 || bias.type != Type::F32 ||
+                     bias.elements() != static_cast<std::size_t>(input.shape[1]) || top <= 0 ||
+                     top > input.shape[1] || !std::isfinite(scale),
+                 "expert routing");
+            output.rank = 3;
+            output.shape = {input.shape[0], top, 2};
+            output.type = Type::F32;
+            break;
+        }
+        case Op::BLEND_PROLOGUE:
+            fail(count != 2 || input.rank != 2 || !input.shape[0] || !input.shape[1] ||
+                     descriptor.inputs[1].rank != 2 || descriptor.inputs[1].shape[0] != input.shape[0] ||
+                     descriptor.inputs[1].shape[1] != input.shape[1] || !std::isfinite(descriptor.epsilon) ||
+                     descriptor.epsilon <= 0,
+                 "blend prologue geometry");
+            output.shape[1] = input.shape[1] * 2;
+            output.type = Type::BF16;
+            break;
+        case Op::BLEND_EPILOGUE:
+            fail(count != 4 || input.rank != 2 || !input.shape[0] || !input.shape[1] ||
+                     descriptor.inputs[1].rank != 2 || descriptor.inputs[1].shape[0] != input.shape[0] ||
+                     descriptor.inputs[1].shape[1] != input.shape[1] || descriptor.inputs[2].rank != 2 ||
+                     descriptor.inputs[2].shape[0] != input.shape[0] ||
+                     descriptor.inputs[2].shape[1] != input.shape[1] * 2 || descriptor.inputs[3].rank != 1 ||
+                     descriptor.inputs[3].shape[0] != input.shape[1] || descriptor.inputs[3].type != Type::F32 ||
+                     !std::isfinite(descriptor.epsilon) || descriptor.epsilon <= 0,
+                 "blend epilogue geometry");
+            output.type = Type::BF16;
+            break;
+        case Op::EXPERT_LINEAR: {
+            const auto& values = descriptor.inputs[1];
+            const auto& scales = descriptor.inputs[2];
+            const auto& routes = descriptor.inputs[count - 1];
+            const auto format = descriptor.attributes[3];
+            const bool fp8 = format == 1, gated = descriptor.attributes[0] != 0;
+            const auto group = descriptor.attributes[4], has_global = descriptor.attributes[5];
+            fail(descriptor.attribute_count != 7 || format < 0 || format > 2 || descriptor.attributes[0] < 0 ||
+                     descriptor.attributes[0] > 1 || has_global < 0 || has_global > 1 || count != 4 + has_global ||
+                     input.rank != (gated ? 2 : 3) || (input.type != Type::F32 && input.type != Type::BF16) ||
+                     values.rank != 3 || values.type != (fp8 ? Type::E4M3 : Type::U8) || values.shape[0] <= 0 ||
+                     values.shape[1] <= 0 || (gated && values.shape[1] % 2),
+                 "expert projection values");
+            const auto width = input.shape[input.rank - 1];
+            const bool byte_scale = scales.type == Type::U8 && format != 2;
+            fail(group <= 0 || group % 16 || width % group || width % (fp8 ? 16 : 32) ||
+                     values.shape[2] != width / (fp8 ? 1 : 2) || scales.rank != 3 || scales.shape[0] != values.shape[0] || scales.shape[1] != values.shape[1] ||
+                     scales.shape[2] != width / group ||
+                     (!byte_scale && scales.type != Type::E4M3 && scales.type != Type::F32 &&
+                      scales.type != Type::F16 && scales.type != Type::BF16),
+                 "expert projection geometry");
+            if (has_global)
+                fail(descriptor.inputs[3].type != Type::F32 ||
+                         descriptor.inputs[3].elements() != static_cast<std::size_t>(values.shape[0]),
+                     "expert projection global scales");
+            fail(routes.type != Type::F32 || routes.rank != 3 || routes.shape[0] != input.shape[0] ||
+                     routes.shape[2] != 2 || routes.shape[1] <= 0 || routes.shape[1] > 32 ||
+                     (!gated && routes.shape[1] != input.shape[1]),
+                 "expert projection routes");
+            if (gated) {
+                float gate_cap, up_cap;
+                const auto gate_bits = static_cast<std::int32_t>(descriptor.attributes[1]);
+                const auto up_bits = static_cast<std::int32_t>(descriptor.attributes[2]);
+                std::memcpy(&gate_cap, &gate_bits, sizeof(gate_cap));
+                std::memcpy(&up_cap, &up_bits, sizeof(up_cap));
+                fail(!std::isfinite(gate_cap) || gate_cap <= 0 || !std::isfinite(up_cap) || up_cap <= 0,
+                     "expert projection gate caps");
+                output.rank = 3;
+                output.shape = {input.shape[0], routes.shape[1], values.shape[1] / 2};
+            } else {
+                output.rank = 2;
+                output.shape = {input.shape[0], values.shape[1]};
+                output.type = requested_type == Type::BF16 ? Type::BF16 : Type::F32;
+            }
+            break;
+        }
+        case Op::DEQUANTIZE_EXPERTS: {
+            const bool nvfp4 = input.type == Type::U8;
+            const bool packed = output.type == Type::U8, row_scales = output.type == Type::F32;
+            const auto& scales = descriptor.inputs[1];
+            fail(input.rank != 3 || (input.type != Type::U8 && input.type != Type::E4M3) ||
+                     (output.type != Type::BF16 && !packed && !row_scales) || descriptor.attribute_count != 1 ||
+                     descriptor.attributes[0] < 0 || descriptor.attributes[0] > 1 || input.shape[0] <= 0 ||
+                     input.shape[1] <= 0 || input.shape[2] <= 0,
+                 "expert dequantization values");
+            const auto columns = input.shape[2] * (nvfp4 ? 2 : 1);
+            const auto block = nvfp4 ? 16 : 32;
+            fail(columns % block || scales.rank != 3 || scales.shape[0] != input.shape[0] ||
+                     scales.shape[1] != input.shape[1] || scales.shape[2] != columns / block ||
+                     (scales.type != Type::U8 && !(nvfp4 && scales.type == Type::E4M3)) ||
+                     count != (nvfp4 ? 3 : 2) + packed || (descriptor.attributes[0] && input.shape[1] % 2),
+                 "expert dequantization scales");
+            if (nvfp4)
+                fail(descriptor.inputs[2].type != Type::F32 || descriptor.inputs[2].rank != 1 ||
+                         descriptor.inputs[2].shape[0] != input.shape[0],
+                     "expert dequantization global scales");
+            if (packed) {
+                const auto& row_scale = descriptor.inputs[count - 1];
+                fail(row_scale.type != Type::F32 || row_scale.rank != 3 || row_scale.shape[0] != input.shape[0] ||
+                         row_scale.shape[1] != input.shape[1] || row_scale.shape[2] != 1,
+                     "expert packing row scales");
+            }
+            output.shape[2] = row_scales ? 1 : columns;
+            break;
+        }
         case Op::RESIDUAL_MIX: {
             const auto& queries = descriptor.inputs[count - 1];
             fail(count > 8 || queries.rank != 2 || queries.shape[0] > 4 || input.rank != 2 ||
@@ -158,6 +332,34 @@ void infer_fused(Descriptor& descriptor) {
             break;
         }
         case Op::SHORT_CONVOLUTION: {
+            if (descriptor.attribute_count == 2 || descriptor.attribute_count == 3) {
+                const auto width = descriptor.attributes[0], ring = descriptor.attributes[1];
+                const bool has_residual = descriptor.attribute_count == 3;
+                const bool has_taps = has_residual ? descriptor.attributes[2] != 0 : count == 5;
+                const int expected_count = (has_residual ? 5 : 4) + (has_taps ? 1 : 0);
+                const auto& state = descriptor.inputs[1];
+                const auto& weight = descriptor.inputs[2];
+                const auto& slot = descriptor.inputs[3];
+                fail((!has_residual && count != 4 && count != 5) || (has_residual && count != expected_count) ||
+                         width <= 0 || ring < width - 1 || input.rank != 2 || !input.shape[0] || state.rank != 2 ||
+                         state.shape[0] != ring || state.shape[1] != input.shape[1] || state.type != input.type ||
+                         weight.rank != 2 || weight.shape[0] != width || weight.shape[1] != input.shape[1] ||
+                         slot.type != Type::I32 || slot.elements() != 1 ||
+                         (has_taps && (descriptor.inputs[4].rank != 2 ||
+                                       descriptor.inputs[4].shape[0] != input.shape[0] ||
+                                       descriptor.inputs[4].shape[1] % width ||
+                                       input.shape[1] % (descriptor.inputs[4].shape[1] / width))),
+                     "ring short convolution geometry");
+                if (has_residual) {
+                    const auto& residual = descriptor.inputs[count - 1];
+                    fail(residual.rank != 2 || residual.shape[0] != input.shape[0] ||
+                             residual.shape[1] != input.shape[1] ||
+                             (residual.type != Type::BF16 && residual.type != Type::F32),
+                         "ring short convolution residual");
+                }
+                if (requested_type == Type::F32 || requested_type == Type::BF16) output.type = requested_type;
+                break;
+            }
             const auto width = descriptor.attribute_count == 1 ? descriptor.attributes[0] : 0;
             const auto& weight = descriptor.inputs[1];
             fail(count > 3 || width <= 0 || input.rank != 2 || input.shape[0] < width || weight.rank != 2 ||
@@ -183,9 +385,13 @@ void infer_fused(Descriptor& descriptor) {
             const auto* attributes = descriptor.attributes.data();
             const auto heads = attributes[0], key_heads = attributes[1], extent = attributes[4];
             const auto tokens = input.shape[0];
-            fail(count != 6 || descriptor.attribute_count != 5 || heads <= 0 || key_heads <= 0 || heads % key_heads ||
-                     input.rank != 2 || input.shape[1] % heads,
+            fail((count != 6 && count != 7) || descriptor.attribute_count != 7 || heads <= 0 || key_heads <= 0 ||
+                     heads % key_heads || input.rank != 2 || input.shape[1] % heads,
                  "relative attention heads");
+            // Device positions replace `start`; the kernel clamps them to the cache.
+            fail(count == 7 && (descriptor.inputs[6].type != Type::I32 ||
+                                descriptor.inputs[6].elements() != static_cast<std::size_t>(tokens)),
+                 "relative attention positions");
             const auto width = input.shape[1] / heads;
             const auto& key = descriptor.inputs[1];
             const auto& value = descriptor.inputs[2];
@@ -247,6 +453,12 @@ void infer(Descriptor& descriptor) {
             case Type::BF16:
             case Type::F32:
                 break;
+            case Type::E4M3:
+                if (descriptor.operation == Op::DEQUANTIZE_EXPERTS && index < 2) break;
+                if ((descriptor.operation == Op::BLOCK_SCALED_LINEAR || descriptor.operation == Op::EXPERT_LINEAR) &&
+                    (index == 1 || index == 2))
+                    break;
+                throw std::runtime_error("CUDA: E4M3 input requires expert dequantization");
             default:
                 throw std::runtime_error("CUDA: unsupported input dtype");
         }
@@ -256,7 +468,7 @@ void infer(Descriptor& descriptor) {
     const auto& input = descriptor.inputs[0];
     output.rank = input.rank;
     output.shape = input.shape;
-    if (descriptor.operation != Op::CAST) output.type = input.type;
+    if (descriptor.operation != Op::CAST && descriptor.operation != Op::DEQUANTIZE_EXPERTS) output.type = input.type;
     switch (descriptor.operation) {
         case Op::ADD:
         case Op::MULTIPLY: {
@@ -277,6 +489,8 @@ void infer(Descriptor& descriptor) {
         case Op::TANH:
         case Op::STATIC_ROUND:
         case Op::RMS_NORM:
+            if (requested_type == Type::BF16) output.type = Type::BF16;
+            break;
         case Op::RMS_NORM_RESIDUAL:
         case Op::LAYER_NORM:
         case Op::RESIDUAL_NORM:
@@ -331,7 +545,7 @@ void infer(Descriptor& descriptor) {
             break;
         case Op::SILU_GATE:
             if (descriptor.attribute_count == 2) {
-                infer_fused(descriptor);
+                infer_fused(descriptor, requested_type);
                 break;
             }
             output.shape[input.rank - 1] /= 2;
@@ -420,7 +634,13 @@ void infer(Descriptor& descriptor) {
         case Op::SHORT_CONVOLUTION:
         case Op::L2_CLIP:
         case Op::RELATIVE_ATTENTION:
-            infer_fused(descriptor);
+        case Op::DEQUANTIZE_EXPERTS:
+        case Op::BLOCK_SCALED_LINEAR:
+        case Op::ROUTE_EXPERTS:
+        case Op::EXPERT_LINEAR:
+        case Op::BLEND_PROLOGUE:
+        case Op::BLEND_EPILOGUE:
+            infer_fused(descriptor, requested_type);
             break;
         case Op::MATMUL:
         case Op::LINEAR: {
@@ -477,6 +697,13 @@ BindingScope::~BindingScope() {
     execution_binding_count = previous_count_;
 }
 
+std::size_t next_power_of_two(std::size_t value) {
+    if (value <= 1) return 1;
+    std::size_t power = 1;
+    while (power < value) power <<= 1;
+    return power;
+}
+
 class ProjectionCache {
 public:
     std::shared_ptr<PreparedProjection> get(Launch launch, int bits, int device) {
@@ -496,8 +723,10 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         auto& entry = workspaces_[key];
         if (entry.first && entry.second >= bytes) return entry.first;
-        auto buffer = std::shared_ptr<void>(allocate(bytes, device), release);
-        entry = {buffer, bytes};
+        const auto target = std::max<std::size_t>(std::size_t{16} << 20,
+                                                  std::max(next_power_of_two(bytes), entry.second * 2));
+        auto buffer = std::shared_ptr<void>(allocate(target, device), release);
+        entry = {buffer, target};
         return buffer;
     }
 
@@ -535,12 +764,51 @@ std::string device_name(int device) {
     check(cudaGetDeviceProperties(&properties, device));
     return properties.name;
 }
+bool capturing(cudaStream_t stream) {
+    auto status = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing(stream, &status) != cudaSuccess || status != cudaStreamCaptureStatusNone;
+}
+// Requires allocations_mutex and the block's device to be current.
+void free_cached(std::multimap<std::pair<int, std::size_t>, CachedBlock>::iterator block) {
+    cudaEventSynchronize(block->second.released);
+    cudaEventDestroy(block->second.released);
+    cudaFree(block->second.pointer);
+    cached_bytes[block->first.first] -= block->first.second;
+    cached_blocks.erase(block);
+}
+void free_cached_device(int device) {
+    for (auto block = cached_blocks.lower_bound({device, 0}); block != cached_blocks.end() && block->first.first == device;)
+        free_cached(block++);
+}
 void* allocate(std::size_t bytes, int device) {
     DeviceScope scope(device);
-    void* result = nullptr;
-    check(cudaMalloc(&result, std::max<std::size_t>(bytes, 1)));
+    bytes = std::max<std::size_t>(bytes, 1);
+    std::size_t capacity = bytes;
+    if (bytes <= (std::size_t{8} << 20))
+        capacity = std::max<std::size_t>(4096, next_power_of_two(bytes));
+    else
+        capacity = (bytes + (std::size_t{2} << 20) - 1) / (std::size_t{2} << 20) * (std::size_t{2} << 20);
     std::lock_guard<std::mutex> lock(allocations_mutex);
-    allocations.emplace(result, Allocation{bytes, device});
+    void* result = nullptr;
+    const auto cached = cached_blocks.lower_bound({device, capacity});
+    if (cached != cached_blocks.end() && cached->first.first == device && cached->first.second <= capacity * 2 &&
+        !capturing(execution_stream)) {
+        result = cached->second.pointer;
+        capacity = cached->first.second;
+        check(cudaStreamWaitEvent(execution_stream, cached->second.released, 0));
+        spare_events[device].push_back(cached->second.released);
+        cached_bytes[device] -= capacity;
+        cached_blocks.erase(cached);
+    } else if (cudaMalloc(&result, capacity) != cudaSuccess) {
+        cudaGetLastError();
+        free_cached_device(device);
+        if (cudaMalloc(&result, capacity) != cudaSuccess) {
+            cudaGetLastError();
+            capacity = bytes;
+            check(cudaMalloc(&result, capacity));
+        }
+    }
+    allocations.emplace(result, Allocation{bytes, device, capacity});
     live_bytes += bytes;
     device_bytes[device] += bytes;
     device_peaks[device] = std::max(device_peaks[device], device_bytes[device]);
@@ -552,13 +820,30 @@ void release(void* pointer) noexcept {
     std::lock_guard<std::mutex> lock(allocations_mutex);
     const auto found = allocations.find(pointer);
     if (found == allocations.end()) return;
+    const auto [bytes, device, capacity] = found->second;
     int previous = 0;
-    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(found->second.device) != cudaSuccess) return;
-    const auto status = cudaFree(pointer);
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) return;
+    cudaEvent_t released = nullptr;
+    auto& spares = spare_events[device];
+    if (!spares.empty()) {
+        released = spares.back();
+        spares.pop_back();
+    } else if (cudaEventCreateWithFlags(&released, cudaEventDisableTiming) != cudaSuccess)
+        released = nullptr;
+    bool freed = false;
+    if (released && !capturing(execution_stream) && cudaEventRecord(released, execution_stream) == cudaSuccess) {
+        cached_blocks.emplace(std::pair{device, capacity}, CachedBlock{pointer, released});
+        cached_bytes[device] += capacity;
+        while (cached_bytes[device] > CACHE_LIMIT) free_cached(cached_blocks.lower_bound({device, 0}));
+        freed = true;
+    } else {
+        if (released) spares.push_back(released);
+        freed = cudaFree(pointer) == cudaSuccess;
+    }
     cudaSetDevice(previous);
-    if (status == cudaSuccess) {
-        live_bytes -= found->second.bytes;
-        device_bytes[found->second.device] -= found->second.bytes;
+    if (freed) {
+        live_bytes -= bytes;
+        device_bytes[device] -= bytes;
         allocations.erase(found);
     }
 }
@@ -568,6 +853,117 @@ void copy_to_device(void* destination, const void* source, std::size_t bytes, in
         check(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, execution_stream));
         check(cudaStreamSynchronize(execution_stream));
     }
+}
+void copy_batch_to_device(const HostToDeviceCopy* copies, std::size_t count, int device) {
+    if (!count) return;
+    DeviceScope scope(device);
+    constexpr std::size_t CHUNK_BYTES = std::size_t{32} << 20;
+    constexpr std::size_t RING_SLOTS = 4;
+    constexpr std::size_t PARALLEL_THRESHOLD = std::size_t{512} << 10;
+    struct RingSlot {
+        void* pinned = nullptr;
+        cudaEvent_t ready = nullptr;
+    };
+    std::array<RingSlot, RING_SLOTS> ring{};
+    cudaStream_t stream = nullptr;
+    const unsigned workers = std::min<unsigned>(16, std::max<unsigned>(1, std::thread::hardware_concurrency()));
+    std::mutex work_mutex;
+    std::condition_variable work_cv, done_cv;
+    const unsigned char* job_src = nullptr;
+    unsigned char* job_dst = nullptr;
+    std::size_t job_bytes = 0, job_generation = 0;
+    unsigned job_remaining = 0;
+    bool stop_workers = false;
+    std::vector<std::thread> pool;
+    const auto cleanup = [&]() {
+        if (!pool.empty()) {
+            {
+                std::lock_guard<std::mutex> lock(work_mutex);
+                stop_workers = true;
+                ++job_generation;
+            }
+            work_cv.notify_all();
+            for (auto& thread : pool) thread.join();
+            pool.clear();
+        }
+        if (stream) cudaStreamSynchronize(stream);
+        for (auto& slot : ring) {
+            if (slot.ready) cudaEventDestroy(slot.ready);
+            if (slot.pinned) cudaFreeHost(slot.pinned);
+        }
+        if (stream) cudaStreamDestroy(stream);
+    };
+    try {
+        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        for (auto& slot : ring) {
+            check(cudaHostAlloc(&slot.pinned, CHUNK_BYTES, cudaHostAllocDefault));
+            check(cudaEventCreateWithFlags(&slot.ready, cudaEventDisableTiming));
+        }
+        if (workers > 1) {
+            pool.reserve(workers);
+            for (unsigned worker = 0; worker < workers; ++worker) {
+                pool.emplace_back([&, worker]() {
+                    std::size_t seen = 0;
+                    while (true) {
+                        const unsigned char* src = nullptr;
+                        unsigned char* dst = nullptr;
+                        std::size_t bytes = 0;
+                        {
+                            std::unique_lock<std::mutex> lock(work_mutex);
+                            work_cv.wait(lock, [&]() { return job_generation != seen; });
+                            seen = job_generation;
+                            if (stop_workers) return;
+                            src = job_src;
+                            dst = job_dst;
+                            bytes = job_bytes;
+                        }
+                        const auto slice = (bytes + workers - 1) / workers;
+                        const auto begin = static_cast<std::size_t>(worker) * slice;
+                        if (begin < bytes) {
+                            const auto length = std::min(slice, bytes - begin);
+                            std::memcpy(dst + begin, src + begin, length);
+                        }
+                        std::lock_guard<std::mutex> lock(work_mutex);
+                        if (--job_remaining == 0) done_cv.notify_one();
+                    }
+                });
+            }
+        }
+        std::size_t cursor = 0;
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto& item = copies[index];
+            for (std::size_t offset = 0; offset < item.bytes; offset += CHUNK_BYTES) {
+                const auto chunk = std::min(CHUNK_BYTES, item.bytes - offset);
+                auto& slot = ring[cursor++ % RING_SLOTS];
+                check(cudaEventSynchronize(slot.ready));
+                const auto* src = static_cast<const unsigned char*>(item.source) + offset;
+                auto* dst = static_cast<unsigned char*>(slot.pinned);
+                if (chunk >= PARALLEL_THRESHOLD && workers > 1) {
+                    {
+                        std::lock_guard<std::mutex> lock(work_mutex);
+                        job_src = src;
+                        job_dst = dst;
+                        job_bytes = chunk;
+                        job_remaining = workers;
+                        ++job_generation;
+                    }
+                    work_cv.notify_all();
+                    std::unique_lock<std::mutex> lock(work_mutex);
+                    done_cv.wait(lock, [&]() { return job_remaining == 0; });
+                } else {
+                    std::memcpy(dst, src, chunk);
+                }
+                check(cudaMemcpyAsync(static_cast<unsigned char*>(item.destination) + offset, dst, chunk,
+                                      cudaMemcpyHostToDevice, stream));
+                check(cudaEventRecord(slot.ready, stream));
+            }
+        }
+        check(cudaStreamSynchronize(stream));
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+    cleanup();
 }
 void copy_to_host(void* destination, const void* source, std::size_t bytes, int device) {
     DeviceScope scope(device);
@@ -763,6 +1159,16 @@ struct Program::Impl {
             } else if (tensor_projection && !vector_projection) {
                 accumulators.reset(allocate(descriptor.output.elements() * sizeof(int), device));
             }
+        } else if (operation == Op::EXPERT_LINEAR) {
+            const auto& values = descriptor.inputs[1];
+            const auto& routes = descriptor.inputs[descriptor.input_count - 1];
+            if (const auto bytes = expert_workspace_bytes(routes.shape[0], routes.shape[1], values.shape[0],
+                                                          values.shape[1], descriptor.attributes[0] != 0)) {
+                if (descriptor.projection_cache)
+                    shared_workspace = descriptor.projection_cache->workspace(device, bytes);
+                else
+                    scratch.reset(allocate(bytes, device));
+            }
         } else if (operation == Op::DIFFUSION_UPDATE) {
             scratch.reset(allocate(input.elements() * sizeof(float), device));
         } else if (operation == Op::GREEDY_TOKEN && input.shape[input.rank - 1] > 4096) {
@@ -889,7 +1295,9 @@ void Program::run(const Tensor* inputs, int count, void* output) {
         launch.output.binding ||
         std::any_of(launch.inputs, launch.inputs + count, [](const View& tensor) { return tensor.binding != nullptr; });
     if (relocated && operation != Op::SCATTER && operation != Op::SCATTER_KV &&
-        !(operation == Op::ATTENTION && descriptor.inputs[0].shape[1] == 1))
+        !(operation == Op::ATTENTION && descriptor.inputs[0].shape[1] == 1) &&
+        !(operation == Op::RELATIVE_ATTENTION && descriptor.inputs[0].shape[0] == 1) &&
+        !(operation == Op::SHORT_CONVOLUTION && descriptor.attribute_count >= 2))
         throw std::runtime_error("CUDA: relocated operands are only supported by scatter and single-query attention");
     if (operation == Op::CONV1D || operation == Op::SNAKE_CONV1D || operation == Op::SNAKE_QUANTIZED_LINEAR) {
         const bool convolution = operation != Op::SNAKE_QUANTIZED_LINEAR;
@@ -1024,8 +1432,13 @@ void Program::run(const Tensor* inputs, int count, void* output) {
     } else if (operation == Op::DIFFUSION_UPDATE) {
         diffusion_update(launch, static_cast<float*>(impl_->scratch.get()), execution_stream);
     } else if (operation == Op::RESIDUAL_MIX || operation == Op::SHORT_CONVOLUTION || operation == Op::L2_CLIP ||
-               operation == Op::RELATIVE_ATTENTION) {
+               operation == Op::RELATIVE_ATTENTION || operation == Op::DEQUANTIZE_EXPERTS ||
+               operation == Op::BLOCK_SCALED_LINEAR || operation == Op::ROUTE_EXPERTS ||
+               operation == Op::BLEND_PROLOGUE || operation == Op::BLEND_EPILOGUE) {
         fused_operation(launch, operation, execution_stream);
+    } else if (operation == Op::EXPERT_LINEAR) {
+        expert_linear(launch, impl_->shared_workspace ? impl_->shared_workspace.get() : impl_->scratch.get(),
+                      execution_stream);
     } else if (operation == Op::ATTENTION) {
         const auto heads = descriptor.attributes[0],
                    key_heads = descriptor.attribute_count >= 2 ? descriptor.attributes[1] : heads;

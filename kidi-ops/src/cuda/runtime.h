@@ -53,7 +53,13 @@ enum class Op {
     SHORT_CONVOLUTION,
     L2_CLIP,
     RELATIVE_ATTENTION,
-    SCATTER_KV
+    DEQUANTIZE_EXPERTS,
+    BLOCK_SCALED_LINEAR,
+    ROUTE_EXPERTS,
+    EXPERT_LINEAR,
+    SCATTER_KV,
+    BLEND_PROLOGUE,
+    BLEND_EPILOGUE
 };
 
 // Optional work a PACKED_LINEAR applies to its input inside the activation quantization (attributes[3]).
@@ -92,6 +98,12 @@ std::string device_name(int device = 0);
 void* allocate(std::size_t bytes, int device = 0);
 void release(void* pointer) noexcept;
 void copy_to_device(void* destination, const void* source, std::size_t bytes, int device = 0);
+struct HostToDeviceCopy {
+    void* destination;
+    const void* source;
+    std::size_t bytes;
+};
+void copy_batch_to_device(const HostToDeviceCopy* copies, std::size_t count, int device = 0);
 void copy_to_host(void* destination, const void* source, std::size_t bytes, int device = 0);
 void copy_device(void* destination, const void* source, std::size_t bytes, int device = 0);
 void copy_device_batch(void* const* destinations, const void* const* sources, const std::size_t* bytes,

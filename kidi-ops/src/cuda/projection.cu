@@ -811,17 +811,15 @@ auto execute_matrix(const Launch& plan, int device, bool optimized, void* worksp
         plan.elements == static_cast<std::size_t>(columns) && width > 0 && width <= 65536 && columns > 0 &&
         reinterpret_cast<std::uintptr_t>(left.data) % 16 == 0 &&
         reinterpret_cast<std::uintptr_t>(right.data) % 16 == 0) {
-        if (columns <= 4096 && width % 256 == 0) {
-            if (width >= 1024)
+        if (width % 8 == 0) {
+            if (columns > 16384)
+                kernel::bfloat_vector_wide<<<static_cast<unsigned int>((columns + 15) / 16), 128, 0, stream>>>(
+                    plan, width, columns);
+            else if (columns < 512 && width >= 1024 && width % 256 == 0)
                 kernel::bfloat_vector_block<<<static_cast<unsigned int>(columns), 128, 0, stream>>>(plan, width);
             else
                 kernel::bfloat_vector<<<static_cast<unsigned int>((columns + 3) / 4), 128, 0, stream>>>(plan, width,
                                                                                                         columns);
-            return;
-        }
-        if (width % 8 == 0) {
-            kernel::bfloat_vector_wide<<<static_cast<unsigned int>((columns + 15) / 16), 128, 0, stream>>>(plan, width,
-                                                                                                           columns);
             return;
         }
     }

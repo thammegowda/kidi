@@ -24,6 +24,7 @@ class DesktopBackend {
   #speechTransport;
   #speechChannel;
   #openAIRequests = new Map();
+  #status;
 
   get bufferedAmount() {
     return Math.max(this.#transport?.bufferedAmount || 0, this.#speechTransport?.bufferedAmount || 0);
@@ -33,6 +34,7 @@ class DesktopBackend {
     const response = await fetch('/api/status', {headers: {'Content-Type': 'application/json'}});
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error?.message || `Request failed (${response.status})`);
+    this.#status = body;
     return body;
   }
 
@@ -158,12 +160,7 @@ class DesktopBackend {
     const emit = (type, eventPayload = {}) =>
       this.#callbacks?.onEvent?.({v: 1, id, type, seq: 0, payload: eventPayload});
     try {
-      const status = await this.status();
-      emit('chat.started', {
-        backend: status.backend,
-        runtime: status.runtime,
-        components: status.components,
-      });
+      const status = this.#status || await this.status();
       const started = performance.now();
       const response = await fetch('/v1/chat/completions', {
         method: 'POST',
@@ -185,6 +182,11 @@ class DesktopBackend {
         throw new Error(body.error?.message || `Request failed (${response.status})`);
       }
       if (!response.body) throw new Error('The OpenAI-compatible response has no stream');
+      emit('chat.started', {
+        backend: status.backend,
+        runtime: status.runtime,
+        components: status.components,
+      });
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();

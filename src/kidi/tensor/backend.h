@@ -59,6 +59,12 @@ public:
     virtual auto clear(Storage& storage) const -> Result<void>;
     virtual auto copy_from_host(Storage& destination, std::size_t destination_offset,
                                 std::span<const std::byte> source) const -> Result<void> = 0;
+    struct HostTransfer {
+        Storage* destination;
+        std::size_t destination_offset = 0;
+        std::span<const std::byte> source;
+    };
+    virtual auto copy_batch_from_host(Device device, std::span<const HostTransfer> transfers) const -> Result<void>;
     virtual auto copy_to_host(const Storage& source, std::size_t source_offset, std::span<std::byte> destination) const
         -> Result<void> = 0;
     virtual auto copy_to_host_later(const Storage& source, std::size_t source_offset,

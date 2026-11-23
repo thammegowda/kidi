@@ -21,7 +21,11 @@ struct FlashAttentionArgs {
     FlashView value;
     FlashView mask;
     FlashView output;
+    FlashView relative;
+    FlashView sink;
+    FlashView gate;
     bool has_mask = false;
+    bool has_relative = false;
     std::int64_t batches = 1;
     std::int64_t queries = 1;
     std::int64_t heads = 1;
@@ -29,8 +33,11 @@ struct FlashAttentionArgs {
     std::int64_t key_offset = 0;
     std::int64_t mask_window = 0;
     std::int64_t keys = 0;
+    std::int64_t extent = 0;
     int head_dim = 0;
     float scale = 0.F;
+    float log_alpha = 0.F;
+    float log_floor = 0.F;
 };
 
 auto flash_attention_bf16(const FlashAttentionArgs& args, cudaStream_t stream) -> bool;

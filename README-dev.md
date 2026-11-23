@@ -714,6 +714,39 @@ not promises for other devices or proof of quality equivalence across quantizers
 - [Android](benchmarks/android/README.md): reproducible device benchmark setup.
 - [CPU harness](benchmarks/cpu/README.md): repeatable desktop CPU decode measurements and operator profiles.
 
+### Inkling 2 core benchmark
+
+The opt-in [model test](tests/kidi/model/inkling2_test.cpp) benchmarks native
+checkpoint weights directly, without a server, chat template, or UI:
+
+```bash
+cmake -S . -B build-release-cuda -DBUILD_TESTING=ON -DKIDI_BUILD_TESTS=ON
+cmake --build build-release-cuda --target kidi_inkling2_test -j 16
+CUDA_VISIBLE_DEVICES=7 ./build-release-cuda/kidi_inkling2_test \
+  --gtest_filter=Inkling2Test.DISABLED_CoreBenchmark --gtest_also_run_disabled_tests
+```
+
+For fast 512-token prefill + 128-token decode iteration:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 ./build-release-cuda/kidi_inkling2_test \
+  --gtest_filter=Inkling2Test.DISABLED_Quick512Benchmark --gtest_also_run_disabled_tests
+```
+
+Use an existing Release CUDA build and a locally available Inkling 2 Mini
+checkpoint. The test reports synchronized model-loading time, warm prefill at
+32/128/512 tokens, and 128 measured decode steps after 8 warmup steps, starting
+from 128- and 512-token prompts. Each inference result reports the median,
+minimum, and maximum of three runs. Tokenization, state allocation, and state
+reset are outside inference timers.
+
+`decode_forward_only` uses predetermined token IDs and keeps logits on the GPU;
+`decode_greedy` includes model token selection and the single-token host readback.
+Both run a fixed number of steps even if greedy selection produces EOS.
+These are core workloads, not directly comparable to server throughput with
+different prompts, context lengths, or stop conditions. The benchmark is disabled
+in normal correctness runs and makes no hardware-dependent speed assertions.
+
 On Linux hosts with several NUMA nodes, `kidi` commands that run on the CPU keep
 their `-j` threads on one node (`kidi::runtime::ynn::confine_to_numa_node`).
 A decoding step reads every weight once, and the weights live on the node of the

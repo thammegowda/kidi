@@ -84,7 +84,14 @@ enum class Operation {
     RESIDUAL_MIX,
     SHORT_CONVOLUTION,
     L2_CLIP,
-    RELATIVE_ATTENTION
+    RELATIVE_ATTENTION,
+    DEQUANTIZE_EXPERTS,
+    BLOCK_SCALED_LINEAR,
+    ROUTE_EXPERTS,
+    EXPERT_LINEAR,
+    SCATTER_KV,
+    BLEND_PROLOGUE,
+    BLEND_EPILOGUE
 };
 struct BlockwiseQuantizationSpec {
     std::span<const float> scales;
