@@ -68,6 +68,19 @@ auto mount_openai_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteO
                                                            {"object", "model"},
                                                            {"owned_by", "kidi"}}})}});
     });
+    server.post("/v1/chat/context", [shared, &engine](const liteapp::Request& http) {
+        const auto body = OpenAIJson::parse(http.body, nullptr, false);
+        auto prepared = prepare_openai_chat_request(body, shared->defaults);
+        if (prepared && shared->customize)
+            if (auto customized = shared->customize(body, *prepared); !customized)
+                prepared = std::unexpected(customized.error());
+        if (!prepared) return json_response(openai_error(prepared.error()), 400);
+        auto result = engine.context(prepared->messages, prepared->template_args, prepared->generation);
+        if (!result) return json_response(openai_error(result.error()), error_status(result.error()));
+        return json_response({{"prompt_tokens", result->prompt_tokens},
+                              {"context_tokens", result->context_tokens},
+                              {"prompt_limit_tokens", result->prompt_limit_tokens}});
+    });
     server.post("/v1/chat/completions", [shared, next_id, &engine](const liteapp::Request& http) {
         const auto started = Clock::now();
         const auto body = OpenAIJson::parse(http.body, nullptr, false);

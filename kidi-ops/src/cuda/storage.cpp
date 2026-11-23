@@ -112,6 +112,9 @@ public:
     auto device_name(Device device) const -> std::string override {
         return is_available(device) ? kidi::cuda::device_name(device.index) : "CUDA unavailable";
     }
+    auto free_memory(Device device) const noexcept -> std::size_t override {
+        return is_available(device) ? kidi::cuda::free_bytes(device.index) : 0;
+    }
     auto device_kind() const noexcept -> DeviceKind override { return DeviceKind::CUDA; }
     auto is_available(Device device) const noexcept -> bool override {
         return device.kind == DeviceKind::CUDA && kidi::cuda::available(device.index);

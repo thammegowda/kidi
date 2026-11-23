@@ -4,10 +4,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <concepts>
 #include <functional>
 #include <span>
 #include <stop_token>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace kidi::code {
@@ -31,6 +34,7 @@ struct Message {
     std::string reasoning_content;
     std::vector<ToolCall> tool_calls;
     std::string tool_call_id;
+    bool is_summary = false;
 };
 
 struct ToolSpec {
@@ -59,13 +63,17 @@ struct RunOptions {
     Permissions permissions;
     std::size_t max_model_calls = 16;
     std::size_t max_tool_calls = 64;
-    std::size_t max_history_bytes = 512 * 1024;
+    std::size_t max_history_bytes = 4 * 1024 * 1024; // about 1M tokens; the exact token budget usually binds first
     std::size_t max_tool_output_bytes = 64 * 1024;
     // Sent once, without being kept in history, when a model replies empty right after tool results.
     std::string continue_prompt;
+    std::string compact_prompt;
+    // Repeated compaction within one turn means the context is too small for the task; stop and say so.
+    std::size_t max_compactions = 3;
+    std::size_t max_summary_calls = 16;
 };
 
-enum class EventKind { MODEL_START, TOOL_START, TOOL_FINISH };
+enum class EventKind { MODEL_START, TOOL_START, TOOL_FINISH, COMPACT_START, COMPACT_FINISH };
 
 struct Event {
     EventKind kind;
@@ -80,13 +88,42 @@ struct Callbacks {
     std::function<void(const Event&)> observe;
 };
 
-using Provider = std::function<Result<Message>(std::span<const Message>, std::span<const ToolSpec>, std::stop_token)>;
+struct ContextUsage {
+    std::size_t prompt_tokens = 0;
+    std::size_t context_tokens = 0;
+    std::size_t completion_tokens = 0;
+    std::size_t prompt_limit_tokens = 0;
+};
+
+struct Provider {
+    using Completion =
+        std::function<Result<Message>(std::span<const Message>, std::span<const ToolSpec>, std::stop_token)>;
+    Completion complete;
+    std::function<Result<ContextUsage>(std::span<const Message>, std::span<const ToolSpec>, std::stop_token)> context;
+    std::function<Result<ContextUsage>(std::span<const Message>, std::stop_token)> summary_context;
+    std::function<Result<Message>(std::span<const Message>, std::size_t, std::stop_token)> summarize;
+
+    Provider() = default;
+    template <class F>
+        requires(!std::same_as<std::remove_cvref_t<F>, Provider> && std::constructible_from<Completion, F>)
+    Provider(F&& completion) : complete(std::forward<F>(completion)) {}
+    explicit operator bool() const { return static_cast<bool>(complete); }
+    auto operator()(std::span<const Message> messages, std::span<const ToolSpec> tools, std::stop_token stop) const
+        -> Result<Message> {
+        return complete(messages, tools, stop);
+    }
+};
 
 struct TurnResult {
     std::string text;
     std::size_t model_calls = 0;
     std::size_t tool_calls = 0;
+    std::size_t compactions = 0;
 };
+
+auto compact_history(const Provider& provider, std::span<const ToolSpec> tools, std::vector<Message>& history,
+                     const RunOptions& options, const Callbacks& callbacks = {}, std::stop_token stop = {})
+    -> Result<void>;
 
 // Synchronous, serial execution. Completed messages remain in history even on failure.
 // Callbacks and providers must return errors (not throw) and honor cooperative cancellation.

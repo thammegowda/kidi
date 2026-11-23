@@ -5,8 +5,8 @@
 
 namespace kidi::code {
 
-auto http_completion(const OpenAIOptions& options, std::string payload, std::stop_token stop, int expected_pid)
-    -> Result<std::string> {
+auto http_completion(const OpenAIOptions& options, std::string payload, std::stop_token stop, int expected_pid,
+                     std::string_view route) -> Result<std::string> {
     const auto path = options.base_url.find('/', 7);
     httplib::Client http(options.base_url.substr(0, path));
     http.set_keep_alive(true);
@@ -23,7 +23,7 @@ auto http_completion(const OpenAIOptions& options, std::string payload, std::sto
     }
     std::string body;
     bool too_large = false;
-    const auto result = http.Post(options.base_url.substr(path) + "/chat/completions", {}, payload, "application/json",
+    const auto result = http.Post(options.base_url.substr(path) + std::string(route), {}, payload, "application/json",
                                   [&](const char* chunk, std::size_t size) {
                                       if (stop.stop_requested()) return false;
                                       if (size > options.max_response_bytes - body.size()) {
@@ -56,8 +56,8 @@ auto openai_provider(OpenAIOptions options) -> Result<Provider> {
         options.base_url.substr(path) != "/v1" || options.base_url.find_first_of("@?# \t\r\n") != std::string::npos)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "expected a Kidi server URL: http://host:port/v1"});
     return completion_provider(std::move(options), [](const OpenAIOptions& config, std::string payload,
-                                                      std::stop_token stop) {
-        return http_completion(config, std::move(payload), stop);
+                                                      std::stop_token stop, std::string_view route) {
+        return http_completion(config, std::move(payload), stop, 0, route);
     });
 }
 

@@ -11,8 +11,78 @@
 namespace kidi::code {
 namespace {
 
+TEST(CodeProvider, ContextAndSummaryRequests) {
+    int completions = 0, inspections = 0;
+    auto provider = completion_provider(
+        {.model = "test-model"},
+        [&](const OpenAIOptions&, std::string payload, std::stop_token, std::string_view route) -> Result<std::string> {
+            const auto request = Json::parse(payload);
+            if (route == "/chat/context") {
+                ++inspections;
+                if (request.contains("reasoning_effort")) {
+                    EXPECT_EQ(request["reasoning_effort"], "none");
+                    EXPECT_EQ(request["chat_template_kwargs"]["enable_thinking"], false);
+                    EXPECT_FALSE(request.contains("tools"));
+                    return R"({"prompt_tokens":77,"context_tokens":4096})";
+                }
+                EXPECT_EQ(request["tools"][0]["function"]["name"], "inspect");
+                EXPECT_EQ(request["messages"][1]["tool_calls"][0]["function"]["arguments"], R"({"path":"source"})");
+                EXPECT_EQ(request["messages"][2]["tool_call_id"], "read");
+                return R"({"prompt_tokens":8000,"context_tokens":4096})";
+            }
+            ++completions;
+            EXPECT_EQ(route, "/chat/completions");
+            EXPECT_EQ(request["max_tokens"], 200);
+            EXPECT_FALSE(request.contains("tools"));
+            EXPECT_EQ(request["reasoning_effort"], "none");
+            EXPECT_EQ(request["chat_template_kwargs"]["enable_thinking"], false);
+            return R"({"choices":[{"message":{"role":"assistant","content":"handoff"},"finish_reason":"stop"}]})";
+        });
+    ASSERT_TRUE(provider);
+    std::vector<Message> history{{.role = Role::USER, .content = "Read source"},
+                                 {.role = Role::ASSISTANT, .tool_calls = {{"read", "inspect", {{"path", "source"}}}}},
+                                 {.role = Role::TOOL, .content = "contents", .tool_call_id = "read"}};
+    ToolSpec tool{.name = "inspect"};
+    auto usage = provider->context(history, std::span(&tool, 1), {});
+    ASSERT_TRUE(usage) << usage.error().message;
+    EXPECT_EQ(usage->prompt_tokens, 8000);
+    EXPECT_EQ(usage->context_tokens, 4096);
+    EXPECT_EQ(usage->completion_tokens, 4096);
+    auto summary_usage = provider->summary_context(history, {});
+    ASSERT_TRUE(summary_usage);
+    EXPECT_EQ(summary_usage->prompt_tokens, 77);
+    auto summary = provider->summarize(history, 200, {});
+    ASSERT_TRUE(summary) << summary.error().message;
+    EXPECT_EQ(summary->content, "handoff");
+    EXPECT_EQ(inspections, 2);
+    EXPECT_EQ(completions, 1);
+}
+
 auto response(Json message, std::string reason = "stop") -> Json {
     return {{"choices", Json::array({{{"message", std::move(message)}, {"finish_reason", std::move(reason)}}})}};
+}
+
+TEST(CodeProvider, BadContextAndSummary) {
+    for (const auto* body :
+         {"{}", R"({"prompt_tokens":-1,"context_tokens":4096})", R"({"prompt_tokens":1,"context_tokens":0})",
+          R"({"prompt_tokens":"1","context_tokens":4096})"}) {
+        auto provider = completion_provider(
+            {.model = "test"}, [body](auto&, auto, auto, auto) -> Result<std::string> { return std::string(body); });
+        ASSERT_TRUE(provider);
+        EXPECT_FALSE(provider->context({}, {}, {}));
+    }
+    std::string content = "partial";
+    auto provider = completion_provider({.model = "test"}, [&](auto&, auto, auto, auto) -> Result<std::string> {
+        return response({{"role", "assistant"}, {"content", content}}, "length").dump();
+    });
+    ASSERT_TRUE(provider);
+    // A truncated handoff is usable; a truncated answer or empty handoff is not.
+    auto summary = provider->summarize({}, 200, {});
+    ASSERT_TRUE(summary);
+    EXPECT_EQ(summary->content, "partial");
+    EXPECT_FALSE((*provider)({}, {}, {}));
+    content.clear();
+    EXPECT_FALSE(provider->summarize({}, 200, {}));
 }
 
 class CodeOpenAI : public testing::Test {

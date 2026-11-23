@@ -123,6 +123,9 @@ public:
     auto chat_prompt_tokens(const nlohmann::ordered_json& messages,
                             const nlohmann::ordered_json& template_args = nlohmann::ordered_json::object()) const
         -> Result<std::size_t>;
+    auto context_capacity(GenerationOptions options = {}) const -> Result<std::size_t>;
+    /// Largest context, up to the model limit, whose KV cache fits in `memory_bytes`; a multiple of 1024 tokens.
+    auto fit_context_size(std::size_t memory_bytes) -> Result<std::size_t>;
     auto step() -> Result<GenerationStep>;
     auto cancel(std::uint64_t request_id) -> Result<void>;
     auto pending_requests() const -> std::size_t { return waiting_.size() + running_.size(); }

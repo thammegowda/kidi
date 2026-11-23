@@ -86,6 +86,20 @@ auto ChatEngine::run(ChatRun request) -> Result<inference::TextGeneration> {
     }
 }
 
+auto ChatEngine::context(const nlohmann::ordered_json& messages, const nlohmann::ordered_json& template_args,
+                         inference::GenerationOptions options) -> Result<ChatContext> {
+    const std::lock_guard lock(generator_mutex_);
+    return guarded([&]() -> Result<ChatContext> {
+        auto capacity = generator_.context_capacity(options);
+        if (!capacity) return std::unexpected(capacity.error());
+        auto tokens = generator_.chat_prompt_tokens(messages, template_args);
+        if (!tokens) return std::unexpected(tokens.error());
+        const auto limit =
+            options.maximum_prompt_tokens ? std::min(*capacity - 1, options.maximum_prompt_tokens) : *capacity - 1;
+        return ChatContext{*tokens, *capacity, limit};
+    });
+}
+
 auto ChatEngine::work() -> void {
     std::unordered_map<std::uint64_t, std::shared_ptr<Job>> running;
     bool release_when_idle = false;
@@ -97,6 +111,8 @@ auto ChatEngine::work() -> void {
             if (stopping_) break;
             arrived.swap(inbox_);
         }
+        // Tokenization uses the same tokenizer/template state as the generation worker.
+        const std::lock_guard generator_lock(generator_mutex_);
         for (const auto& job : arrived) {
             auto id = guarded([&] { return job->request.enqueue(generator_); });
             if (!id) {

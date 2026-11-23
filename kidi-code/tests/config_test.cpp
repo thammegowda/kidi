@@ -30,7 +30,10 @@ TEST(CodeConfig, ParsesYamlRegistry) {
     ASSERT_TRUE(config) << config.error().message;
     EXPECT_EQ(config->system_prompt, "You are a review assistant.\nNever modify files.\n");
     EXPECT_TRUE(config->continue_prompt.empty());
+    EXPECT_TRUE(config->compact_prompt.empty());
     EXPECT_EQ(parse_agent_config("version: 1\nprompts: {system: Hi, continue: Go}\ntools: []")->continue_prompt, "Go");
+    EXPECT_EQ(parse_agent_config("version: 1\nprompts: {system: Hi, compact: Summarize}\ntools: []")->compact_prompt,
+              "Summarize");
     ASSERT_EQ(config->tools.size(), 1);
     const auto& tool = config->tools.front();
     EXPECT_EQ(tool.handler, "native_read");
@@ -85,6 +88,8 @@ TEST(CodeConfig, RejectsInvalidRegistry) {
         "version: 1\nprompts: {system: Hi, typo: bad}\ntools: []",
         "version: 1\nprompts: {continue: Go}\ntools: []",
         "version: 1\nprompts: {system: Hi, continue: ''}\ntools: []",
+        "version: 1\nprompts: {system: Hi, compact: ''}\ntools: []",
+        "version: 1\nprompts: {system: Hi, compact: 42}\ntools: []",
         "version: 1\nversion: 1\nprompts: {system: Hi}\ntools: []",
         "version: 1\nprompts: {system: Hi}\ntools: []\n---\nversion: 1",
         "version: 1\nprompts: {system: Hi}\ntools:\n"

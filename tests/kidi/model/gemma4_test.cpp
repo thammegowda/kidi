@@ -7,6 +7,7 @@
 #include "kidi/tensor/backend.h"
 #include "kidi/tensor/external.h"
 
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -371,7 +372,7 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     require(compact.enqueue(prompts[0], bounded));
     const auto step = require(compact.step());
     const auto byte_limit = device.capabilities().attention.int8_cache_tokens;
-    const auto expected_capacity = byte_limit < 1024 ? ((byte_limit + 128) / 128) * 128 : 128;
+    const auto expected_capacity = byte_limit < 1024 ? std::bit_ceil(byte_limit + 1) : std::size_t{128};
     ASSERT_EQ(step.reserved_cache_tokens, expected_capacity)
         << "compact reservation changed the cache precision policy or exceeded its bucket";
     std::optional<kidi::inference::TextGeneration> compact_result;

@@ -292,5 +292,203 @@ TEST(CodeAgent, RejectsInvalidSetup) {
     EXPECT_TRUE(history.empty());
 }
 
+auto counted(std::span<const Message> messages, std::span<const ToolSpec> tools, std::stop_token)
+    -> Result<ContextUsage> {
+    std::size_t bytes = tools.size() * 80;
+    for (const auto& message : messages) {
+        bytes += message.content.size() + message.reasoning_content.size() + 32;
+        for (const auto& call : message.tool_calls) bytes += call.arguments.dump().size() + 32;
+    }
+    return ContextUsage{bytes / 4 + 1, 4096, 512};
+}
+
+auto compactable_history() -> std::vector<Message> {
+    return {{.role = Role::SYSTEM, .content = "Original trusted rules"},
+            {.role = Role::USER, .content = "Inspect the project"},
+            {.role = Role::ASSISTANT, .tool_calls = {{"old", "read_file", {{"path", "source"}}}}},
+            {.role = Role::TOOL, .content = std::string(26000, 'x'), .tool_call_id = "old"},
+            {.role = Role::ASSISTANT, .tool_calls = {{"recent", "read_file", {{"path", "README"}}}}},
+            {.role = Role::TOOL, .content = "README inspected", .tool_call_id = "recent"}};
+}
+
+TEST(CodeAgent, CompactsWithoutReplayingTools) {
+    int calls = 0, executions = 0, summaries = 0, compactions = 0;
+    bool saw_calls = false;
+    Provider provider = [&](std::span<const Message> messages, auto tools, std::stop_token stop) -> Result<Message> {
+        EXPECT_LT(counted(messages, tools, stop)->prompt_tokens, 4096);
+        EXPECT_EQ(messages.front().content, "Trusted rules");
+        if (++calls <= 3) return tool_reply("large");
+        EXPECT_TRUE(messages[1].is_summary);
+        EXPECT_EQ(messages[2].content, "Read source files");
+        return Message{.role = Role::ASSISTANT, .content = "done"};
+    };
+    provider.context = counted;
+    provider.summarize = [&](std::span<const Message> messages, std::size_t maximum,
+                             std::stop_token stop) -> Result<Message> {
+        ++summaries;
+        EXPECT_LT(counted(messages, {}, stop)->prompt_tokens + maximum, 4096);
+        EXPECT_EQ(messages.front().content, "Summarize factual progress");
+        saw_calls |= messages.back().content.find("tool_calls") != std::string::npos;
+        return Message{.role = Role::ASSISTANT, .content = "The requested source read completed. Continue inspection."};
+    };
+    Tool tool{{"large", "large output", Json::object()},
+              Capability::READ,
+              [&](const Json&, std::stop_token) -> Result<std::string> {
+                  ++executions;
+                  return std::string(16000, 'x');
+              }};
+    std::vector<Message> history{{.role = Role::SYSTEM, .content = "Trusted rules"}};
+    RunOptions options{.compact_prompt = "Summarize factual progress"};
+    Callbacks callbacks{.observe = [&](const Event& event) {
+        if (event.kind == EventKind::COMPACT_FINISH) ++compactions;
+    }};
+    auto result = run_turn(provider, std::span(&tool, 1), history, "Read source files", options, callbacks);
+    ASSERT_TRUE(result) << result.error().message;
+    EXPECT_EQ(executions, 3);
+    EXPECT_EQ(result->model_calls, 4);
+    EXPECT_EQ(result->tool_calls, 3);
+    EXPECT_EQ(result->compactions, 3);
+    EXPECT_EQ(compactions, 3);
+    EXPECT_GE(summaries, 3);
+    EXPECT_TRUE(saw_calls);
+}
+
+TEST(CodeAgent, OverfullHistoryAndRecentPair) {
+    auto history = compactable_history();
+    int summaries = 0;
+    Provider provider = [](auto, auto, std::stop_token) -> Result<Message> {
+        return Message{.role = Role::ASSISTANT, .content = "continued"};
+    };
+    provider.context = counted;
+    provider.summarize = [&](auto messages, std::size_t maximum, std::stop_token stop) -> Result<Message> {
+        ++summaries;
+        EXPECT_LT(counted(messages, {}, stop)->prompt_tokens + maximum, 4096);
+        return Message{.role = Role::ASSISTANT, .content = "Source inspected; README remains in recent context."};
+    };
+    RunOptions options{.compact_prompt = "Summarize"};
+    auto result = compact_history(provider, {}, history, options);
+    ASSERT_TRUE(result) << result.error().message;
+    EXPECT_GE(summaries, 2);
+    ASSERT_EQ(history.size(), 5);
+    EXPECT_EQ(history[0].content, "Original trusted rules");
+    EXPECT_TRUE(history[1].is_summary);
+    EXPECT_EQ(history[2].content, "Inspect the project");
+    EXPECT_EQ(history[3].tool_calls[0].id, "recent");
+    EXPECT_EQ(history[4].tool_call_id, "recent");
+    EXPECT_TRUE(run_turn(provider, {}, history, "Continue", options));
+}
+
+TEST(CodeAgent, FailedSummaryDropsOlderHistory) {
+    for (int failure = 0; failure < 4; ++failure) {
+        SCOPED_TRACE(failure);
+        auto history = compactable_history();
+        Provider provider = [](auto, auto, std::stop_token) -> Result<Message> { return Message{}; };
+        provider.context = counted;
+        provider.summarize = [&](auto, std::size_t, std::stop_token) -> Result<Message> {
+            if (failure == 0) return std::unexpected(Error{ErrorCode::RUNTIME, "did not complete: length"});
+            if (failure == 1) return Message{.role = Role::ASSISTANT, .content = "   "};
+            if (failure == 2) return tool_reply();
+            return Message{.role = Role::ASSISTANT, .content = "first fragment"};
+        };
+        RunOptions options{.compact_prompt = "Summarize", .max_summary_calls = failure == 3 ? 1u : 16u};
+        ASSERT_TRUE(compact_history(provider, {}, history, options));
+        ASSERT_EQ(history.size(), 5);
+        EXPECT_TRUE(history[1].is_summary);
+        EXPECT_NE(history[1].content.find("dropped"), std::string::npos);
+        EXPECT_EQ(history[1].content.find("first fragment") != std::string::npos, failure == 3);
+        EXPECT_EQ(history[2].content, "Inspect the project");
+        EXPECT_EQ(history.back().tool_call_id, "recent");
+    }
+}
+
+TEST(CodeAgent, CancelledCompactionKeepsHistory) {
+    auto history = compactable_history();
+    std::stop_source source;
+    Provider provider = [](auto, auto, std::stop_token) -> Result<Message> { return Message{}; };
+    provider.context = counted;
+    provider.summarize = [&](auto, std::size_t, std::stop_token) -> Result<Message> {
+        source.request_stop();
+        return Message{.role = Role::ASSISTANT, .content = "summary"};
+    };
+    ASSERT_FALSE(compact_history(provider, {}, history, {.compact_prompt = "Summarize"}, {}, source.get_token()));
+    ASSERT_EQ(history.size(), 6);
+    EXPECT_EQ(history[3].content, std::string(26000, 'x'));
+}
+
+TEST(CodeAgent, CompactionLimitsAndLargeTask) {
+    int executions = 0;
+    Provider provider = [](auto, auto, std::stop_token) -> Result<Message> { return tool_reply("large"); };
+    provider.context = counted;
+    provider.summarize = [](auto, std::size_t, std::stop_token) -> Result<Message> {
+        return Message{.role = Role::ASSISTANT, .content = "Read completed"};
+    };
+    Tool tool{{"large", "large output", Json::object()},
+              Capability::READ,
+              [&](const Json&, std::stop_token) -> Result<std::string> {
+                  ++executions;
+                  return std::string(16000, 'x');
+              }};
+    RunOptions options{.compact_prompt = "Summarize", .max_compactions = 1};
+    std::vector<Message> history;
+    auto result = run_turn(provider, std::span(&tool, 1), history, "Read", options);
+    ASSERT_FALSE(result);
+    EXPECT_TRUE(result.error().message.starts_with("context is too small for this task"));
+    EXPECT_EQ(executions, 2);
+    EXPECT_EQ(history.back().role, Role::TOOL);
+    history.clear();
+    result = run_turn(provider, {}, history, std::string(20000, 'x'), options);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.error().message.find("shorten the request"), std::string::npos);
+    EXPECT_EQ(executions, 2);
+}
+
+TEST(CodeAgent, ByteBudgetPinsIncomingTask) {
+    auto history = compactable_history();
+    Provider provider = [](auto, auto, std::stop_token) -> Result<Message> {
+        return Message{.role = Role::ASSISTANT, .content = "done"};
+    };
+    provider.context = counted;
+    provider.summarize = [](auto, std::size_t, std::stop_token) -> Result<Message> {
+        return Message{.role = Role::ASSISTANT, .content = "Old work complete"};
+    };
+    RunOptions options{.max_history_bytes = 27000, .compact_prompt = "Summarize"};
+    const std::string incoming = "NEW TASK " + std::string(1500, 'z');
+    auto result = run_turn(provider, {}, history, incoming, options);
+    ASSERT_TRUE(result) << result.error().message;
+    EXPECT_EQ(result->compactions, 1);
+    EXPECT_EQ(history[2].content, incoming);
+}
+
+TEST(CodeAgent, NoUsefulReductionKeepsHistory) {
+    std::vector<Message> history{{.role = Role::USER, .content = "Task"},
+                                 {.role = Role::ASSISTANT, .content = std::string(200, 'x')}};
+    Provider provider = [](auto, auto, std::stop_token) -> Result<Message> { return Message{}; };
+    provider.context = counted;
+    provider.summarize = [](auto, std::size_t, std::stop_token) -> Result<Message> {
+        return Message{.role = Role::ASSISTANT, .content = std::string(700, 'y')};
+    };
+    auto result = compact_history(provider, {}, history, {.compact_prompt = "Summarize"});
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.error().message.find("did not free enough"), std::string::npos);
+    EXPECT_EQ(history.size(), 2);
+    EXPECT_EQ(history.back().content, std::string(200, 'x'));
+}
+
+TEST(CodeAgent, LargeFirstRequestStillFits) {
+    Provider provider = [](auto, auto, std::stop_token) -> Result<Message> {
+        return Message{.role = Role::ASSISTANT, .content = "done"};
+    };
+    provider.context = counted;
+    provider.summarize = [](auto, std::size_t, std::stop_token) -> Result<Message> {
+        ADD_FAILURE() << "there is no older history to summarize";
+        return Message{};
+    };
+    std::vector<Message> history;
+    auto copied = provider;
+    auto result = run_turn(copied, {}, history, std::string(13000, 'x'), {.compact_prompt = "Summarize"});
+    ASSERT_TRUE(result) << result.error().message;
+    EXPECT_EQ(result->compactions, 0);
+}
+
 } // namespace
 } // namespace kidi::code

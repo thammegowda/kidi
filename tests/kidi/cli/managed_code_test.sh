@@ -18,9 +18,12 @@ read_state() {
 }
 
 cleanup() {
-    if read_state && [[ $("$curl" -fsS --noproxy '*' --max-time 2 "http://127.0.0.1:$port/kidi-code/ready" 2>/dev/null) == "$pid" ]]; then
-        kill "$pid" || true
-    fi
+    while IFS= read -r state; do
+        read -r pid port < <(sed -nE 's/^\{"port":([0-9]+),"pid":([0-9]+)\}$/\2 \1/p' "$state")
+        if [[ -n ${pid:-} && -n ${port:-} ]] && [[ $("$curl" -fsS --noproxy '*' --max-time 2 "http://127.0.0.1:$port/kidi-code/ready" 2>/dev/null) == "$pid" ]]; then
+            kill "$pid" || true
+        fi
+    done < <(find "$root" -name server.json -type f)
     find "$root" -depth -delete
 }
 trap cleanup EXIT
@@ -66,11 +69,17 @@ if (( status )); then
     find "$root" -name serve.log -exec cat {} \;
     exit 1
 fi
+
 test "$(cat "$root/first")" = lambda
 test "$(cat "$root/second")" = lambda
 test "$(grep -h -c 'starting background inference' "$root/"{first,second}.log | sort | tr '\n' ' ')" = '0 1 '
 read_state
 test "$("$curl" -fsS --noproxy '*' --max-time 2 "http://127.0.0.1:$port/health")" = '{}'
+test "$("$curl" -fsS --noproxy '*' --max-time 2 "http://127.0.0.1:$port/v1/chat/context" \
+    -H 'Content-Type: application/json' -d '{"messages":[{"role":"system","content":"You are Kidi Code"}],
+    "tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}]}')" \
+    = '{"prompt_tokens":1,"context_tokens":16,"prompt_limit_tokens":15}'
+grep -q 'inference device: cpu:0 (backend=ynnpack)' "$(dirname "$state")/serve.log"
 previous_pid=$pid
 test "$(run_code third)" = lambda
 read_state
@@ -97,3 +106,73 @@ if [[ ${KIDI_TEST_REAL_IDLE:-0} == 1 ]]; then
     test ! -f "$state"
     (( SECONDS - started >= 599 ))
 fi
+
+# Auto on a machine without visible CUDA devices falls back to CPU. Different
+# visibility settings must not reuse the same daemon, even when both hide GPUs.
+auto_root="$root/auto-runtime"
+mkdir -m 700 "$auto_root"
+for visible in '' '-1'; do
+    test "$(XDG_RUNTIME_DIR="$auto_root" CUDA_VISIBLE_DEVICES="$visible" "$kidi" code \
+        --workspace "$root" --timeout-ms 5000 --max-tokens 8 -p auto)" = lambda
+done
+test "$(find "$auto_root" -name server.json -type f | wc -l)" -eq 2
+test "$(grep -l 'inference device: cpu:0 (backend=auto)' "$auto_root"/kidi-code-*/*/serve.log | wc -l)" -eq 2
+
+# Opt-in tiny-model CUDA smoke test; the caller selects an idle physical GPU.
+if [[ -n ${KIDI_TEST_AUTO_CUDA:-} ]]; then
+    test "$(XDG_RUNTIME_DIR="$auto_root" CUDA_VISIBLE_DEVICES="$KIDI_TEST_AUTO_CUDA" "$kidi" code \
+        --workspace "$root" --timeout-ms 30000 --max-tokens 8 -p auto-cuda)" = lambda
+    test "$(grep -l 'inference device: cuda:0 (backend=auto)' "$auto_root"/kidi-code-*/*/serve.log | wc -l)" -eq 1
+fi
+
+# Real inference with a tiny context: accumulate tasks, compact and continue.
+# The template measures long text without requiring the tiny fixture to
+# understand summaries; summarization still runs through actual inference.
+compact_runtime="$root/compact-runtime"
+compact_model="$root/compact-model"
+mkdir -m 700 "$compact_runtime" "$compact_model"
+cp "$KIDI_MODEL/"* "$compact_model/"
+cat > "$compact_model/chat_template.jinja" <<'JINJA'
+{%- if messages[0].content == 'Summarize factual progress' -%}
+theta
+{%- else -%}
+{%- for m in messages -%}
+{%- if m.role != 'system' -%}
+{%- for unused in range(1 + (m.content | length) // 1024) -%}theta {% endfor -%}
+{%- endif -%}
+{%- endfor -%}theta
+{%- endif -%}
+JINJA
+printf 'version: 1\nprompts: {system: compacttest, compact: Summarize factual progress}\ntools: []\n' \
+    > "$root/compact.yaml"
+compact_backend=ynnpack
+if [[ -n ${KIDI_TEST_AUTO_CUDA:-} ]]; then compact_backend=auto; fi
+{
+    for ((i = 0; i < 9; ++i)); do
+        printf 'Task %s ' "$i"
+        printf 'alpha %.0s' {1..650}
+        printf '\n'
+    done
+    printf '/context\n/compact\n/context\n/exit\n'
+} | XDG_RUNTIME_DIR="$compact_runtime" CUDA_VISIBLE_DEVICES="${KIDI_TEST_AUTO_CUDA:-}" \
+    "$kidi" code --model "$compact_model" --backend "$compact_backend" \
+    --workspace "$root" --config "$root/compact.yaml" --context-size 16 --max-tokens 8 --timeout-ms 5000 \
+    > "$root/compact.out" 2> "$root/compact.log"
+if [[ $(wc -l < "$root/compact.out") != 9 ]] || grep -q 'kidi-code:' "$root/compact.log"; then
+    cat "$root/compact.log"
+    exit 1
+fi
+test "$(grep -c 'Compacting conversation' "$root/compact.log")" -ge 2
+grep -q 'prompt tokens' "$root/compact.log"
+grep -q '/ 16 context tokens' "$root/compact.log"
+test "$(grep -c 'warning: 16-token context' "$root/compact.log")" -eq 1
+
+# Context settings belong to server identity, even if the effective default
+# happens to equal the explicitly requested setting.
+XDG_RUNTIME_DIR="$compact_runtime" CUDA_VISIBLE_DEVICES="${KIDI_TEST_AUTO_CUDA:-}" \
+    "$kidi" code --model "$compact_model" --backend "$compact_backend" \
+    --workspace "$root" --config "$root/compact.yaml" --max-tokens 8 --timeout-ms 5000 -p short \
+    > "$root/compact-default.out"
+test "$(find "$compact_runtime" -name server.json -type f | wc -l)" -eq 2
+# Without --context-size the daemon sizes the context from free memory (capped by the model limit).
+test "$(grep -l 'context: [0-9]* tokens (' "$compact_runtime"/kidi-code-*/*/serve.log | wc -l)" -eq 1

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <new>
 #include <utility>
@@ -157,6 +158,23 @@ public:
     auto is_host_accessible(Device device) const noexcept -> bool override { return is_available(device); }
     auto supports_execution() const noexcept -> bool override { return true; }
     auto unavailable_reason(Device) const -> std::string override { return "YNNPACK supports cpu:0 only"; }
+    auto free_memory(Device device) const noexcept -> std::size_t override {
+        if (!is_available(device)) return 0;
+        // MemAvailable counts reclaimable page cache, which mapped checkpoints fill quickly.
+        if (auto* meminfo = std::fopen("/proc/meminfo", "r")) {
+            char line[128];
+            unsigned long long kib = 0;
+            while (std::fgets(line, sizeof line, meminfo))
+                if (std::sscanf(line, "MemAvailable: %llu kB", &kib) == 1) break;
+            std::fclose(meminfo);
+            if (kib) return static_cast<std::size_t>(kib) * 1024;
+        }
+#ifdef _SC_AVPHYS_PAGES
+        const auto pages = sysconf(_SC_AVPHYS_PAGES), size = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && size > 0) return static_cast<std::size_t>(pages) * static_cast<std::size_t>(size);
+#endif
+        return 0;
+    }
 
     auto allocate(Device device, std::size_t size_bytes, std::size_t alignment) const
         -> Result<std::shared_ptr<Storage>> override {

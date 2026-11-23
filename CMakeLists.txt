@@ -420,6 +420,10 @@ add_library(kidi_cli_main STATIC
     src/kidi/cli/serve.cpp
 )
 target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi nlohmann_json::nlohmann_json PRIVATE kidi_server)
+if(KIDI_ENABLE_CUDA)
+    find_package(CUDAToolkit 13 REQUIRED)
+    target_compile_definitions(kidi_cli_main PRIVATE KIDI_CUDA_TOOLKIT_VERSION="${CUDAToolkit_VERSION}")
+endif()
 if(KIDI_BUILD_CODE)
     add_subdirectory(kidi-code)
     if(KIDI_BUILD_CODE_DEFAULT)

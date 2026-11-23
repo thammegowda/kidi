@@ -52,6 +52,9 @@ and macOS. Run `kidi code` to start or reuse a background Kidi server. The
 native command does not link libcurl. To build the standalone Kidi HTTP
 HTTP client independently of inference, use
 `cmake -S kidi-code -B .cache/kidi-code-build`.
+Both clients use the shared `/v1/chat/context` route for exact token preflight
+and compact long conversation history automatically. The handoff prompt is
+configured in embedded `kidi-code/agent.yaml` or an explicit override.
 
 ## Native Build
 
@@ -156,7 +159,10 @@ python -m kidi chat -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend 
 CUDA is disabled in default builds. Installing a CPU-only wheel does not gain
 CUDA support just because the toolkit is present. `--backend cuda` selects GPU 0;
 `--backend cuda:INDEX` selects another GPU using CUDA's device numbering, which
-respects `CUDA_VISIBLE_DEVICES`. `auto` retains the existing Metal/CPU selection.
+respects `CUDA_VISIBLE_DEVICES`. `auto` prefers available CUDA, then Metal,
+then CPU, subject to workload support. Translation requires a general-purpose
+backend, Whisper currently supports CUDA or CPU, Kokoro runs on CPU, and
+speculative decoding with `--assistant-model` remains CPU-only.
 An explicitly requested CUDA backend fails rather than falling back to CPU when
 unavailable. The same backend option is accepted by interactive `chat` and
 scripted `generate`.

@@ -768,6 +768,16 @@ std::string device_name(int device) {
     check(cudaGetDeviceProperties(&properties, device));
     return properties.name;
 }
+std::size_t free_bytes(int device) noexcept {
+    int previous = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) return 0;
+    std::size_t free = 0, total = 0;
+    const bool ok = cudaMemGetInfo(&free, &total) == cudaSuccess;
+    cudaSetDevice(previous);
+    if (!ok) return 0;
+    std::lock_guard<std::mutex> lock(allocations_mutex);
+    return free + cached_bytes[device];
+}
 bool capturing(cudaStream_t stream) {
     auto status = cudaStreamCaptureStatusNone;
     return cudaStreamIsCapturing(stream, &status) != cudaSuccess || status != cudaStreamCaptureStatusNone;

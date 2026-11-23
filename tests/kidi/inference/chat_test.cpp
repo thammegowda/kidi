@@ -1,6 +1,7 @@
 #include "kidi/cli/main.h"
 #include "kidi/inference/generator.h"
 #include "kidi/ops/context.h"
+#include "kidi/server/engine.h"
 
 #include <chrono>
 #include <fstream>
@@ -73,6 +74,26 @@ TEST_F(ChatTest, PromptsAndStopTokens) {
       "properties":{"delta":{},"alpha":{}}}}}]})");
     const auto count = require(generator.chat_prompt_tokens(messages, args));
     EXPECT_EQ(count, 7) << "structured prompt token count is incorrect";
+    {
+        kidi::server::ChatEngine engine(generator);
+        const auto context = require(engine.context(messages, args, options));
+        EXPECT_EQ(context.prompt_tokens, count);
+        EXPECT_EQ(context.context_tokens, 16);
+        EXPECT_EQ(context.prompt_limit_tokens, 15);
+        auto limited = options;
+        limited.maximum_prompt_tokens = 5;
+        EXPECT_EQ(require(engine.context(messages, args, limited)).prompt_limit_tokens, 5);
+        limited.context_size = 17;
+        EXPECT_FALSE(engine.context(messages, args, limited));
+        const auto overfull =
+            Json::array({{{"role", "user"},
+                          {"content", std::string(40, ' ') + "alpha alpha alpha alpha alpha alpha alpha alpha alpha "
+                                                             "alpha alpha alpha alpha alpha alpha alpha alpha"}}});
+        EXPECT_GT(require(engine.context(overfull, {}, options)).prompt_tokens, 16);
+        const auto generated = require(
+            engine.run({.enqueue = [&](auto& current) { return current.enqueue_chat(messages, options, args); }}));
+        EXPECT_EQ(generated.stats.prompt_tokens, context.prompt_tokens);
+    }
     require(generator.enqueue_chat(messages, options, args));
     const auto structured = complete(generator);
     EXPECT_EQ(structured.stats.prompt_tokens, count) << "generation and counting rendered different prompts";

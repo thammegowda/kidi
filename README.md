@@ -83,9 +83,9 @@ existing asymmetric, calibrated, and CPU packed-projection paths remain unchange
 
 | Backend | Flag / Target | Supported Platforms & Notes |
 |---|---|---|
-| **[`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) + ARM64 NEON/SME2 / x86 AVX** | `--backend ynnpack` | Portable default on macOS, Linux, Windows, Android (`arm64`), and WebAssembly SIMD |
+| **[`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) + ARM64 NEON/SME2 / x86 AVX** | `--backend ynnpack` | Portable CPU backend on macOS, Linux, Windows, Android (`arm64`), and WebAssembly SIMD |
 | **Apple Metal (MPS)** | `--backend mps` | Default on Apple Silicon macOS for supported chat and OmniVoice TTS models |
-| **NVIDIA CUDA** | `--backend cuda:0` | Opt-in compact static CUDA 13 backend with asynchronous graph capture/replay pipelining |
+| **NVIDIA CUDA** | `--backend cuda:0` | Optional compact static CUDA 13 backend with asynchronous graph capture/replay pipelining |
 | **Vulkan** | `--backend vulkan` | Cross-platform GPU compute used on Android and desktop |
 | **Qualcomm QNN (Hexagon NPU)** | Android / Snapdragon | Step-compiled NPU graph execution for mobile inference |
 | **WebAssembly + WebGPU** | Browser (`make wasm`) | Runs entirely in Chrome/Edge/Firefox/Safari with IndexedDB/OPFS model caching |
@@ -105,7 +105,7 @@ python -m pip install -v "kidi[hf] @ git+https://github.com/thammegowda/kidi.git
 python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers
 ```
 
-- **Select a backend:** Metal is chosen automatically on Apple Silicon when supported; pass `--backend ynnpack` for CPU or `--backend cuda:0` on CUDA builds.
+- **Select a backend:** `auto` prefers available CUDA, then Metal, then CPU, subject to workload support. Pass `--backend ynnpack` for CPU or `--backend cuda:INDEX` for a specific GPU. `kidi --version` reports backend availability.
 - **Control memory:** Native defaults use a 16,384-token context and up to 8,192 output tokens. For tighter RAM budgets, pass `--context-size 2048 --max-new-tokens 256`.
 - **Standalone C++ binary:** Build `build-release/kidi` via CMake (`make app` or `cmake --preset release`) to run local checkpoints with zero Python dependency. See the [Getting Started Guide](docs/getting-started.md) and [Developer Guide](README-dev.md).
 
@@ -162,8 +162,11 @@ See [tools/agent/README.md](tools/agent/README.md) to run the Pi coding agent ag
 For a native C++23 alternative without Node/Pi, see [Kidi Code](kidi-code/README.md):
 run `kidi code` to start or reuse a shared background inference server. The
 standalone `kidi-code` connects to an existing Kidi server over plain HTTP.
-Both have workspace file tools, an approval-gated shell command tool, and
-explicit permissions. Commands are not OS-sandboxed and Pi protocol compatibility
+Both have line editing, task history, multiline paste, colored tool activity,
+workspace file tools, explicit once-or-session approvals, and automatic
+context compaction. `/context` shows exact token usage; `/compact` summarizes
+older history manually.
+Commands are not OS-sandboxed and Pi protocol compatibility
 is not included; existing Pi workflows are unchanged.
 
 Add `--assistant-model` (with `@owner/model` or a local directory) to enable CPU speculative decoding in `chat` or `generate`:

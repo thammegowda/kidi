@@ -136,6 +136,8 @@ auto start_server(const fs::path& exe, const fs::path& dir, const File& startup,
         "--model=" + model,
         "--cache=" + cache.string(),
         "--backend=" + arguments.get<std::string>("backend"),
+        "--context-size=" + std::to_string(arguments.get<std::size_t>("context_size")),
+        "--cache-tokens=" + std::to_string(std::max<std::size_t>(16384, arguments.get<std::size_t>("context_size"))),
         "--max-active=2",
         "--managed-dir=" + dir.string(),
         "--managed-lock-fd=" + std::to_string(startup.get()),
@@ -227,10 +229,12 @@ auto managed_provider(code::OpenAIOptions options, const Namespace& arguments) -
     if (stat(exe.c_str(), &binary) < 0) fail_io("cannot identify kidi executable");
     const auto cache = fs::absolute(checkpoint::Hub::default_cache()).lexically_normal();
     const auto& backend = arguments.get<std::string>("backend");
-    const auto* visible_devices = backend.starts_with("cuda") ? std::getenv("CUDA_VISIBLE_DEVICES") : nullptr;
+    const auto* visible_devices =
+        (backend == "auto" || backend.starts_with("cuda")) ? std::getenv("CUDA_VISIBLE_DEVICES") : nullptr;
     const auto identity =
         code::Json::array({binary.st_dev, binary.st_ino, binary.st_mtime, binary.st_size, options.model, cache.string(),
-                           backend, visible_devices ? code::Json(visible_devices) : code::Json(nullptr)})
+                           backend, visible_devices ? code::Json(visible_devices) : code::Json(nullptr),
+                           arguments.get<std::size_t>("context_size")})
             .dump();
     const auto dir = runtime_directory() / std::to_string(std::hash<std::string>{}(identity));
     if (!private_directory(dir, true)) throw std::runtime_error("not a private directory: " + dir.string());
@@ -249,8 +253,9 @@ auto managed_provider(code::OpenAIOptions options, const Namespace& arguments) -
     return code::completion_provider(
         std::move(options),
         [lease = std::move(lease), dir, endpoint = *endpoint](
-            const code::OpenAIOptions& http_options, std::string payload, std::stop_token stop) -> Result<std::string> {
-            auto result = code::http_completion(http_options, std::move(payload), stop, endpoint.pid);
+            const code::OpenAIOptions& http_options, std::string payload, std::stop_token stop,
+            std::string_view route) -> Result<std::string> {
+            auto result = code::http_completion(http_options, std::move(payload), stop, endpoint.pid, route);
             if (!result) result.error().message += "; see " + (dir / "serve.log").string();
             return result;
         });
@@ -260,7 +265,13 @@ auto managed_provider(code::OpenAIOptions options, const Namespace& arguments) -
 
 auto configure_managed_code_parser(ArgumentParser& parser) -> void {
     code::configure_parser(parser, true);
-    parser.add_argument("--backend").default_value(std::string("auto")).help("inference backend for kidi serve");
+    parser.add_argument("--backend")
+        .default_value(std::string("auto"))
+        .help("inference backend; auto prefers CUDA, then Metal, then CPU");
+    parser.add_argument("--context-size")
+        .dest("context_size")
+        .default_value<std::size_t>(0)
+        .help("background server context tokens (default: model configuration); larger contexts use more memory");
 }
 
 auto configure_managed_serve_parser(ArgumentParser& parser) -> void {

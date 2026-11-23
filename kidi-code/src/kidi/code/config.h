@@ -15,6 +15,7 @@ struct ToolRegistration {
 struct AgentConfig {
     std::string system_prompt;
     std::string continue_prompt;
+    std::string compact_prompt;
     std::vector<ToolRegistration> tools;
 };
 

@@ -95,6 +95,7 @@ int device_count() noexcept;
 int current_device();
 bool available(int device = 0) noexcept;
 std::string device_name(int device = 0);
+std::size_t free_bytes(int device = 0) noexcept;
 void* allocate(std::size_t bytes, int device = 0);
 void release(void* pointer) noexcept;
 void copy_to_device(void* destination, const void* source, std::size_t bytes, int device = 0);

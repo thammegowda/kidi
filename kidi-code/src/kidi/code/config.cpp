@@ -102,12 +102,17 @@ auto parse_agent_config(std::string_view yaml) -> Result<AgentConfig> {
         if (!(*document)["version"].is_number_integer() || (*document)["version"] != 1)
             return invalid("version must be integer 1");
         const auto& prompts = (*document)["prompts"];
-        if (auto valid = fields(prompts, {"system"}, {"continue"}); !valid) return std::unexpected(valid.error());
+        if (auto valid = fields(prompts, {"system"}, {"continue", "compact"}); !valid)
+            return std::unexpected(valid.error());
         if (!nonempty_string(prompts["system"])) return invalid("prompts.system must be a nonempty string");
         AgentConfig config{.system_prompt = prompts["system"].get<std::string>()};
         if (prompts.contains("continue")) {
             if (!nonempty_string(prompts["continue"])) return invalid("prompts.continue must be a nonempty string");
             config.continue_prompt = prompts["continue"].get<std::string>();
+        }
+        if (prompts.contains("compact")) {
+            if (!nonempty_string(prompts["compact"])) return invalid("prompts.compact must be a nonempty string");
+            config.compact_prompt = prompts["compact"].get<std::string>();
         }
         const auto& tools = (*document)["tools"];
         if (!tools.is_array()) return invalid("tools must be a sequence (use [] for no tools)");

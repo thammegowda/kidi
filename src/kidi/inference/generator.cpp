@@ -11,6 +11,7 @@
 #include "kidi/tensor/backend.h"
 #include "kidi/checkpoint/config.h"
 
+#include <bit>
 #include <chrono>
 #include <optional>
 #include <cstdlib>
@@ -902,6 +903,36 @@ auto Generator::chat_prompt_tokens(const nlohmann::ordered_json& messages,
     return ids->size();
 }
 
+auto Generator::context_capacity(GenerationOptions options) const -> Result<std::size_t> {
+    const auto capacity =
+        options.context_size ? options.context_size : config_["decode"]["context_size"].as<std::size_t>();
+    if (!serving_ || !capacity || capacity > serving_->cache_token_budget ||
+        capacity > config_["model"]["max_position_embeddings"].as<std::size_t>())
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "request exceeds serving context budget"});
+    return capacity;
+}
+
+auto Generator::fit_context_size(std::size_t memory_bytes) -> Result<std::size_t> {
+    try {
+        const auto maximum = config_["model"]["max_position_embeddings"].as<std::size_t>();
+        // Two sizes give the marginal per-token cost, excluding fixed and sliding-window state.
+        constexpr std::size_t SMALL = 4096, LARGE = 8192;
+        if (maximum <= LARGE) return maximum;
+        const auto small = require(model_->create_state(SMALL))->cache_bytes();
+        const auto large = require(model_->create_state(LARGE))->cache_bytes();
+        if (large <= small) return maximum;
+        const auto per_token = (large - small + LARGE - SMALL - 1) / (LARGE - SMALL);
+        const auto fixed = small > per_token * SMALL ? small - per_token * SMALL : 0;
+        if (memory_bytes <= fixed + per_token * SMALL)
+            throw ops::Failure({ErrorCode::RUNTIME, "not enough free memory for a 4096-token context"});
+        return std::min(maximum, (memory_bytes - fixed) / per_token) / 1024 * 1024;
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
+    }
+}
+
 auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> Result<std::uint64_t> {
     try {
         options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
@@ -911,10 +942,8 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         const auto started = Clock::now();
         auto maximum = options.maximum_new_tokens ? options.maximum_new_tokens
                                                   : config_["decode"]["maximum_new_tokens"].as<std::size_t>();
-        auto capacity =
-            options.context_size ? options.context_size : config_["decode"]["context_size"].as<std::size_t>();
-        if (!maximum || !options.prefill_chunk_size || !capacity || capacity > serving_->cache_token_budget ||
-            capacity > config_["model"]["max_position_embeddings"].as<std::size_t>())
+        auto capacity = require(context_capacity(options));
+        if (!maximum || !options.prefill_chunk_size)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "request exceeds serving context budget"});
         const auto serialized = options.raw_prompt ? std::string(prompt) : user_prompt(prompt);
         auto tokens = require(tokenizer_.encode(serialized));
@@ -928,7 +957,8 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
             auto required = tokens.size() + maximum;
             const auto byte_cache_limit = model_->device().capabilities().attention.int8_cache_tokens;
             if (capacity > byte_cache_limit) required = std::max(required, byte_cache_limit + 1);
-            capacity = std::min(capacity, required + (128 - required % 128) % 128);
+            // Power-of-two buckets let growing conversations reuse states and captured decode graphs.
+            capacity = std::min(capacity, std::bit_ceil(std::max<std::size_t>(required, 128)));
         }
         if (options.prefix_cache_bytes) tokens.reserve(capacity);
         auto search = require(GreedyState::create({.vocabulary_size = tokenizer_.vocabulary_size(),
@@ -998,6 +1028,10 @@ auto Generator::acquire_state(std::size_t capacity) -> std::unique_ptr<model::La
         return state;
     }
     reusable_states_.clear();
+    // Captured graphs and workspaces are sized per capacity; drop stale ones so variable capacities do not pile up.
+    if (serving_ && serving_->compact_cache && model_->device().kind == tensor::DeviceKind::CUDA && running_.empty() &&
+        retired_.empty() && !serving_prefix_)
+        model_->trim_workspaces();
     return require(model_->create_state(capacity));
 }
 
