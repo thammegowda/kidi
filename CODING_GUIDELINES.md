@@ -125,7 +125,7 @@ to kidi-owned C++ code. Code under `third_party/` follows its upstream project.
   third-party libraries.
 - Test code follows the same naming and formatting rules as production code.
 - Native tests use GoogleTest: write `TEST`/`TEST_F` cases, not `main()` harnesses.
-  Register them with `kidi_add_test` in `cmake/tests.cmake`; each case becomes its own
+  Register them with `kidi_add_test` in `tests/CMakeLists.txt`; each case becomes its own
   CTest entry named `<Suite>.<Name>`. Keep suite names unique across binaries and
   full names (including any `/param` suffix) at most 40 characters so CTest status
   lines fit one row; prefer `Gemma4RefTest.BatchedDecode` over sentence-length names.

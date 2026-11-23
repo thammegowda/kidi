@@ -1,5 +1,3 @@
-include_guard(GLOBAL)
-
 # Reuse the GoogleTest pinned by ynnpack-dev instead of vendoring a second copy.
 if(NOT TARGET gtest)
     kidi_require_submodule("googletest" "ynnpack-dev/third_party/googletest/CMakeLists.txt")
@@ -17,7 +15,7 @@ include(GoogleTest)
 set(KIDI_GPU_LAUNCHER sh "${PROJECT_SOURCE_DIR}/cmake/gpu-launch.sh")
 # CTest 3.28+ runs this first and schedules GPU tests from the pool it writes, sized to the
 # GPUs visible at test time; tests with RESOURCE_GROUPS must require the `gpu_pool` fixture.
-set(KIDI_GPU_POOL "${PROJECT_BINARY_DIR}/ctest-resources.json")
+set(KIDI_GPU_POOL "${CMAKE_CURRENT_BINARY_DIR}/ctest-resources.json")
 add_test(NAME GpuPool COMMAND ${KIDI_GPU_LAUNCHER} --spec "${KIDI_GPU_POOL}")
 set_tests_properties(GpuPool PROPERTIES
     LABELS native
@@ -57,7 +55,11 @@ endfunction()
 # Builds a GoogleTest executable linked against kidi::kidi (unless STANDALONE).
 function(kidi_add_test target source)
     cmake_parse_arguments(TEST "STANDALONE" "COST;RESOURCE_LOCK" "LINK;LABELS" ${ARGN})
+    if(NOT IS_ABSOLUTE "${source}")
+        set(source "${PROJECT_SOURCE_DIR}/${source}")
+    endif()
     add_executable(${target} "${source}")
+    set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
     if(NOT TEST_STANDALONE)
         target_link_libraries(${target} PRIVATE kidi::kidi)
     endif()
@@ -112,7 +114,9 @@ kidi_add_test(kidi_weights_test tests/kidi/checkpoint/weights_test.cpp)
 kidi_add_test(kidi_tensor_test tests/kidi/tensor/tensor_test.cpp)
 if(TARGET kidi_ops::cuda_runtime)
     kidi_add_test(kidi_cuda_test kidi-ops/tests/cuda/operators_test.cpp LINK kidi_ops::cuda_runtime LABELS native cuda)
-    set_target_properties(kidi_ops_cuda_test PROPERTIES EXCLUDE_FROM_ALL OFF)
+    set_target_properties(kidi_ops_cuda_test PROPERTIES
+        EXCLUDE_FROM_ALL OFF
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
     target_link_libraries(kidi_ops_cuda_test PRIVATE GTest::gtest_main)
     kidi_discover_tests(kidi_ops_cuda_test LABELS native cuda)
     # Per-case tests are pinned to one GPU; these runs keep two GPUs visible to cover

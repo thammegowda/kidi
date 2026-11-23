@@ -1092,9 +1092,15 @@ auto Generator::step() -> Result<GenerationStep> {
             });
         };
         const auto complete = [&](QueuedGeneration& request) {
-            if (request.decode && request.state)
-                require(model_->rewind(*request.state, request.decode->logical_position));
-            retain_serving_prefix(request);
+            bool retain_prefix = true;
+            if (request.decode && request.state) {
+                const auto rewound = model_->rewind(*request.state, request.decode->logical_position);
+                if (!rewound) {
+                    if (rewound.error().code != ErrorCode::UNSUPPORTED) throw ops::Failure(rewound.error());
+                    retain_prefix = false;
+                }
+            }
+            if (retain_prefix) retain_serving_prefix(request);
             TextGeneration completed;
             completed.generation = std::move(request.search).result();
             completed.text = require(tokenizer_.decode(completed.generation.token_ids));

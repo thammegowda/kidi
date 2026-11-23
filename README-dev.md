@@ -661,7 +661,7 @@ suite or one case with `-R`, or run a binary directly with `--gtest_filter`:
 
 ```bash
 ctest --test-dir build-debug -R '^ChatTest\.' --output-on-failure
-./build-debug/kidi_chat_test --gtest_filter='ChatTest.*'
+./build-debug/tests/kidi_chat_test --gtest_filter='ChatTest.*'
 ```
 
 To check long-file Whisper processing with a local checkpoint and a short English
@@ -722,14 +722,14 @@ checkpoint weights directly, without a server, chat template, or UI:
 ```bash
 cmake -S . -B build-release-cuda -DBUILD_TESTING=ON -DKIDI_BUILD_TESTS=ON
 cmake --build build-release-cuda --target kidi_inkling2_test -j 16
-CUDA_VISIBLE_DEVICES=7 ./build-release-cuda/kidi_inkling2_test \
+CUDA_VISIBLE_DEVICES=7 ./build-release-cuda/tests/kidi_inkling2_test \
   --gtest_filter=Inkling2Test.DISABLED_CoreBenchmark --gtest_also_run_disabled_tests
 ```
 
 For fast 512-token prefill + 128-token decode iteration:
 
 ```bash
-CUDA_VISIBLE_DEVICES=7 ./build-release-cuda/kidi_inkling2_test \
+CUDA_VISIBLE_DEVICES=7 ./build-release-cuda/tests/kidi_inkling2_test \
   --gtest_filter=Inkling2Test.DISABLED_Quick512Benchmark --gtest_also_run_disabled_tests
 ```
 

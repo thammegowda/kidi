@@ -556,5 +556,5 @@ endif()
 include(CTest)
 
 if(BUILD_TESTING AND KIDI_BUILD_TESTS)
-    include(cmake/tests.cmake)
+    add_subdirectory(tests)
 endif()
