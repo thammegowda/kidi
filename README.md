@@ -10,14 +10,14 @@ Kidi (*"spark"* in Kannada) runs modern generative AI models locally on your har
 
 ## Why Kidi?
 
-- **Batteries-Included Single Binary (`~4.7 MiB`):** Zero runtime dependency on PyTorch, Transformers, OpenCV, Pillow, or Python. A single static binary compiles in our purpose-built C++ libraries:
+- **Batteries-Included Binary:** Kidi links its project libraries into one executable, with no runtime dependency on PyTorch, Transformers, OpenCV, Pillow, or Python. A stripped Linux x86-64 CPU Release CLI including `kidi code` measured 10.8 MiB in November 2026; size varies by platform and build options. Set `-DKIDI_BUILD_CODE=OFF` to omit the coding agent. The executable includes:
   - **Compute & Shaders:** [`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) CPU kernels (ARM64 NEON/DOTPROD/SME2, x86 AVX2/AVX-512, Wasm SIMD128), [`kidi-ops`](kidi-ops/README.md) CUDA kernels, and embedded Apple Metal kernels
   - **Tokenization & Text ([`tokenizerspp`](https://github.com/thammegowda/tokenizerspp)):** Native C++ Hugging Face `tokenizer.json` engine, Unicode (`uni-algo`), UTF-8 Unicode regex, G2P phonemizer, and linguistic sentence splitter
   - **Vision & Image Codecs ([`tahoma-vision`](https://github.com/thammegowda/tahoma-vision) & [`pigzpp`](https://github.com/thammegowda/pigzpp)):** SIMD-accelerated **JPEG (`libjpeg-turbo`)**, **PNG ([`pigzpp`](https://github.com/thammegowda/pigzpp) + `zlib-ng`)**, and PPM decoding + vision tensor preprocessing
   - **Audio & Speech:** WAV PCM I/O, Whisper log-Mel spectrogram frontend, and neural vocoders (Higgs Audio 2 / Kokoro)
   - **Checkpoints & Formats:** Zero-copy `mmap` Safetensors, GGUF/GGML, YAML (`yaml-cpp`), JSON (`nlohmann/json`), and parallel gzip ([`pigzpp`](https://github.com/thammegowda/pigzpp) / `zlib-ng`)
   - **Desktop Server & UI ([`liteapp`](https://github.com/thammegowda/liteapp)):** Embedded C++ HTTP + WebSocket loopback server, EPUB/ZIP virtual filesystem, and bundled web/Android UI bridge (`kidi-app`)
-- **State-of-the-Art Edge CPU & GPU Speed:** Custom ARM64 SME2 and fused zero-copy NEON `sdot` kernels (`BlockwiseInt4Linear`), graph capture/replay, and `mmap`-backed weight streaming deliver faster prefill, faster decode, and lower RAM usage than ExecuTorch, ONNX Runtime, and `llama.cpp`.
+- **Optimized Edge Inference:** Custom ARM64 SME2 and fused zero-copy NEON `sdot` kernels (`BlockwiseInt4Linear`), graph capture/replay, and `mmap`-backed weight streaming support CPU and GPU inference. See the benchmarks below for workload-specific comparisons.
 - **High-Fidelity Low-Bit Quantization:** Built on findings from our [**WMT 2026 LLM compression paper**](https://aclanthology.org/2026.wmt-main.136/) (*Quantize, Qualify, Rerank: A Recipe for Compressing LLMs Without Losing Quality*) and [**engineering blog post**](https://gowda.ai/posts/2026/08/llm-fast-inference/). Supports native mixed 2/4/8-bit QAT checkpoints, blockwise symmetric INT4/INT8, and **blockwise asymmetric INT4 (`g=128` and `g=32`) with 11-step MSE outlier clipping** that recovers near-BF16 generation quality at 4-bit memory footprints.
 - **One Engine, Every Surface:** Use the CLI and Python package for scripting, or launch the **Desktop App**, **Android App**, or **WebAssembly / WebGPU Browser App** for streaming chat, continuous voice conversations, camera/photo Q&A, and side-by-side bilingual EPUB book reading with read-aloud narration.
 
@@ -54,8 +54,8 @@ reproduction commands.
   <img src="docs/gemma4-arm-speculative.svg" alt="Gemma 4 E2B on Arm CPU: Speculative Decoding and HNSW Speedup Comparison" width="100%">
 </p>
 
-- **CUDA Graph Pipelining:** On an NVIDIA RTX A4000 (2,322-token prompt, BF16), Kidi reaches **11,285.9 tok/s prefill** (**1.40x faster** than compiled `vLLM` at `8,062.7 tok/s`) and **64.4 tok/s decode** (see [`benchmarks/README.md`](benchmarks/README.md)).
-- **Compact Edge Binary Footprint:** Kidi's self-contained Arm64 runtime (`4.12 MiB` stripped benchmark runner; `4.72 MiB` full multimodal `kidi` CLI) is smaller than `llama.cpp` (`4.48 MiB`), **1.9x smaller** than Arm ExecuTorch (`7.87 MiB`), **4.9x smaller** than ONNX Runtime (`20.10 MiB`), and **12.7x smaller** than Google LiteRT-LM (`52.18 MiB`) while statically bundling tokenization, vision, audio, and 6 model families (see [Runtime Binary Footprint](benchmarks/gemma4/arm/README.md#runtime-binary-footprint)).
+- **CUDA Support:** Kidi provides native CUDA kernels and graph replay. Performance depends on the GPU, model, precision, and workload; the [H100 benchmark](benchmarks/cuda/2026-11-20-e4b-q8-h100-gpu7.md) shows that vLLM can be faster.
+- **Compact Edge Binary Footprint:** In a November 2026 Arm/macOS snapshot, the stripped Kidi benchmark runner measured `4.12 MiB` and the full CLI `4.72 MiB`. These measurements predate `kidi code`; current sizes vary with revision, platform, and build configuration. See [Runtime Binary Footprint](benchmarks/gemma4/arm/README.md#runtime-binary-footprint) for comparisons.
 
 ---
 

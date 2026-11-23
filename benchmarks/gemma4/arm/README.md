@@ -100,6 +100,10 @@ HNSW).
 
 ## Runtime Binary Footprint
 
+These Arm/macOS measurements were documented in November 2026, before
+`kidi code` was added. Current sizes vary with revision, platform, compiler,
+and enabled features.
+
 | Runtime | Artifacts Measured | Stripped (MiB) | Unstripped (MiB) | Notes |
 |---|---|---:|---:|---|
 | **Kidi (`kidi_android_baseline` / `kidi`)** | Single static binary (`kidi_android_baseline` / full `kidi` CLI) | **4.12 / 4.72** | 5.04 / 5.82 | Zero external non-OS dylibs; statically bundles C++ HF `tokenizer.json` + Jinja templates ([`tokenizerspp`](https://github.com/thammegowda/tokenizerspp) + `uni-algo`), SIMD image codecs ([`tahoma-vision`](https://github.com/thammegowda/tahoma-vision) + `libjpeg-turbo` + PNG/[`pigzpp`](https://github.com/thammegowda/pigzpp)/`zlib-ng`), WAV/Mel/vocoder audio, HNSW search, Metal kernels, and 6 model families |
