@@ -717,6 +717,10 @@ public:
             bool direct = false, supported = true;
             for (const auto& node : source.nodes()) {
                 if (node.mode == graph::Mode::IN_PLACE && node.sources[node.input_count].index == index) direct = true;
+                if (node.operation == Operation::SHORT_CONVOLUTION && node.attributes.size() >= 3 &&
+                    (node.attributes[2] & 4) != 0 && node.sources[1].kind == graph::Source::Kind::INPUT &&
+                    node.sources[1].index == index)
+                    direct = true;
                 for (std::size_t operand = 0; operand < node.input_count; ++operand) {
                     const auto& origin = node.sources[operand];
                     if (origin.kind != graph::Source::Kind::INPUT || origin.index != index) continue;

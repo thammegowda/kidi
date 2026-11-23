@@ -1396,7 +1396,7 @@ auto Context::short_convolution(const Tensor& padded, const Tensor& weight, cons
 }
 auto Context::short_convolution(const Tensor& input, const Tensor& state, const Tensor& weight, const Tensor& taps,
                                 const Tensor& slot, float scale, const Tensor& residual,
-                                std::optional<tensor::DType> output_dtype) -> Tensor {
+                                std::optional<tensor::DType> output_dtype, bool update_state) -> Tensor {
     if (weight.dimensions() != 2 || !weight.size(0) || !weight.size(1) || !std::isfinite(scale))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "short convolution requires nonempty [width, channels] taps"});
     const auto width = static_cast<std::int64_t>(weight.size(0));
@@ -1407,6 +1407,8 @@ auto Context::short_convolution(const Tensor& input, const Tensor& state, const 
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid ring short convolution input, state or slot"});
     const auto rows = static_cast<std::int64_t>(input.size(0));
     const auto ring = static_cast<std::int64_t>(state.size(0));
+    if (update_state && (rows != 1 || ring < width))
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "ring short convolution in-place update requires 1 token and ring >= width"});
     if (taps.defined() && (taps.dimensions() != 2 || taps.size(0) != rows || !taps.size(1) || taps.size(1) % width ||
                            channels % (taps.size(1) / width)))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid short convolution dynamic taps"});
@@ -1416,6 +1418,8 @@ auto Context::short_convolution(const Tensor& input, const Tensor& state, const 
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid short convolution residual tensor"});
     const auto out_dtype = output_dtype.value_or(input.dtype());
     if (device().kind == tensor::DeviceKind::CPU) {
+        if (update_state)
+            throw Failure({ErrorCode::UNSUPPORTED, "CPU ring short convolution does not support in-place state update"});
         const auto input_values = cpu_floats(*this, input);
         const auto state_values = cpu_floats(*this, state);
         const auto weight_values = cpu_floats(*this, weight);
@@ -1449,13 +1453,20 @@ auto Context::short_convolution(const Tensor& input, const Tensor& state, const 
     }
     if (device().kind != tensor::DeviceKind::CUDA)
         throw Failure({ErrorCode::UNSUPPORTED, "short convolution requires CPU or CUDA"});
-    if (residual.defined()) {
-        const std::array<std::int64_t, 3> attributes{width, ring, taps.defined() ? 1 : 0};
-        if (taps.defined())
+    if (residual.defined() || update_state) {
+        const std::int64_t flags = (taps.defined() ? 1 : 0) | (residual.defined() ? 2 : 0) | (update_state ? 4 : 0);
+        const std::array<std::int64_t, 3> attributes{width, ring, flags};
+        if (taps.defined() && residual.defined())
             return impl_->run({Operation::SHORT_CONVOLUTION, attributes, out_dtype, scale},
                               {&input, &state, &weight, &slot, &taps, &residual});
+        if (taps.defined())
+            return impl_->run({Operation::SHORT_CONVOLUTION, attributes, out_dtype, scale},
+                              {&input, &state, &weight, &slot, &taps});
+        if (residual.defined())
+            return impl_->run({Operation::SHORT_CONVOLUTION, attributes, out_dtype, scale},
+                              {&input, &state, &weight, &slot, &residual});
         return impl_->run({Operation::SHORT_CONVOLUTION, attributes, out_dtype, scale},
-                          {&input, &state, &weight, &slot, &residual});
+                          {&input, &state, &weight, &slot});
     }
     const std::array<std::int64_t, 2> attributes{width, ring};
     if (taps.defined())

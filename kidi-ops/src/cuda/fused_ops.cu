@@ -251,36 +251,55 @@ __device__ void block_scaled_warp_gemv(const Launch& plan, std::int64_t first_ou
                 scales[line][1] = FORMAT != 1 ? generic_scale(expert_base + index + 16) * global : 0.F;
             }
         }
-        float x[PER_CHUNK];
+        // Load activation pairs directly in the order chunk_dot reads them (without an intermediate x[] array).
+        float2 pairs[PER_CHUNK / 2];
         const auto activation_at = activation_base + static_cast<std::int64_t>(slot) * width + column;
         if constexpr (BF16) {
             const auto* source =
                 reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(activations) + activation_at);
+            if constexpr (FORMAT == 1) {
 #pragma unroll
-            for (int quad = 0; quad < PER_CHUNK / 8; ++quad) {
-                const auto packed = source[quad];
-                const auto* halves = reinterpret_cast<const __nv_bfloat162*>(&packed);
+                for (int quad = 0; quad < 2; ++quad) {
+                    const auto packed = __ldg(source + quad);
+                    const auto* halves = reinterpret_cast<const __nv_bfloat162*>(&packed);
 #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    const auto pair = __bfloat1622float2(halves[i]);
-                    x[quad * 8 + 2 * i] = pair.x, x[quad * 8 + 2 * i + 1] = pair.y;
+                    for (int i = 0; i < 4; ++i) pairs[quad * 4 + i] = __bfloat1622float2(halves[i]);
+                }
+            } else {
+#pragma unroll
+                for (int quad = 0; quad < 4; ++quad) {
+                    const auto packed = __ldg(source + quad);
+                    const auto* halves = reinterpret_cast<const __nv_bfloat162*>(&packed);
+                    const float2 f0 = __bfloat1622float2(halves[0]);
+                    const float2 f1 = __bfloat1622float2(halves[1]);
+                    const float2 f2 = __bfloat1622float2(halves[2]);
+                    const float2 f3 = __bfloat1622float2(halves[3]);
+                    pairs[quad * 4 + 0] = make_float2(f0.x, f2.x);
+                    pairs[quad * 4 + 1] = make_float2(f0.y, f2.y);
+                    pairs[quad * 4 + 2] = make_float2(f1.x, f3.x);
+                    pairs[quad * 4 + 3] = make_float2(f1.y, f3.y);
                 }
             }
         } else {
             const auto* source = reinterpret_cast<const float4*>(static_cast<const float*>(activations) + activation_at);
+            if constexpr (FORMAT == 1) {
 #pragma unroll
-            for (int quad = 0; quad < PER_CHUNK / 4; ++quad) {
-                const auto packed = source[quad];
-                x[quad * 4] = packed.x, x[quad * 4 + 1] = packed.y, x[quad * 4 + 2] = packed.z,
-                x[quad * 4 + 3] = packed.w;
+                for (int quad = 0; quad < 4; ++quad) {
+                    const auto packed = __ldg(source + quad);
+                    pairs[quad * 2 + 0] = make_float2(packed.x, packed.y);
+                    pairs[quad * 2 + 1] = make_float2(packed.z, packed.w);
+                }
+            } else {
+#pragma unroll
+                for (int quad = 0; quad < 4; ++quad) {
+                    const auto p0 = __ldg(source + quad * 2);
+                    const auto p1 = __ldg(source + quad * 2 + 1);
+                    pairs[quad * 4 + 0] = make_float2(p0.x, p1.x);
+                    pairs[quad * 4 + 1] = make_float2(p0.y, p1.y);
+                    pairs[quad * 4 + 2] = make_float2(p0.z, p1.z);
+                    pairs[quad * 4 + 3] = make_float2(p0.w, p1.w);
+                }
             }
-        }
-        // Activation pairs in the order chunk_dot reads them (see there).
-        float2 pairs[PER_CHUNK / 2];
-#pragma unroll
-        for (int i = 0; i < PER_CHUNK / 2; ++i) {
-            const int first = FORMAT == 1 ? 2 * i : i / 4 * 8 + i % 4;
-            pairs[i] = make_float2(x[first], x[first + (FORMAT == 1 ? 1 : 4)]);
         }
 #pragma unroll
         for (int line = 0; line < LINES; ++line) {
@@ -303,19 +322,12 @@ __device__ void block_scaled_warp_gemv(const Launch& plan, std::int64_t first_ou
 
 constexpr int GEMV_WARPS = 4;
 
-// Scale decoding chosen on launch: 0 = E4M3 in 16-value groups, 1 = UE8M0 bytes, 2 = generic.
-template <bool BF16, bool ROUTED, bool GATED, int ROWS>
+template <bool BF16, bool ROUTED, bool GATED, int FORMAT, int SCALE, int ROWS>
 __global__ void __launch_bounds__(GEMV_WARPS * 32, 6) block_scaled_block_gemv(const __grid_constant__ Launch plan) {
-    const int lane = threadIdx.x % 32;
-    const auto first_output = (static_cast<std::int64_t>(blockIdx.x) * GEMV_WARPS + threadIdx.x / 32) * ROWS;
+    const int lane = threadIdx.x & 31;
+    const auto first_output = (static_cast<std::int64_t>(blockIdx.x) * GEMV_WARPS + (threadIdx.x >> 5)) * ROWS;
     if (first_output >= static_cast<std::int64_t>(plan.elements)) return;
-    switch (plan.attributes[3] * 3 + plan.attributes[7]) {
-        case 0: block_scaled_warp_gemv<BF16, ROUTED, GATED, 0, 0, ROWS>(plan, first_output, lane); break;
-        case 2: block_scaled_warp_gemv<BF16, ROUTED, GATED, 0, 2, ROWS>(plan, first_output, lane); break;
-        case 4: block_scaled_warp_gemv<BF16, ROUTED, GATED, 1, 1, ROWS>(plan, first_output, lane); break;
-        case 5: block_scaled_warp_gemv<BF16, ROUTED, GATED, 1, 2, ROWS>(plan, first_output, lane); break;
-        default: block_scaled_warp_gemv<BF16, ROUTED, GATED, 2, 2, ROWS>(plan, first_output, lane); break;
-    }
+    block_scaled_warp_gemv<BF16, ROUTED, GATED, FORMAT, SCALE, ROWS>(plan, first_output, lane);
 }
 
 // One warp per token: sigmoid scores, biased top-k selection, then weights normalized over the selected scores.
@@ -988,7 +1000,7 @@ __device__ __forceinline__ void store_bf16x4(__nv_bfloat16* p, const float in[4]
     *reinterpret_cast<uint2*>(p) = *reinterpret_cast<const uint2*>(pairs);
 }
 
-constexpr int MIX_FAST_THREADS = 512;
+constexpr int MIX_FAST_THREADS = 576;
 constexpr int MIX_FAST_WIDTH = 2304;
 
 /// One block per token: RMS-normalizes each source, softmax pseudo-query logits over sources, mix.
@@ -1064,8 +1076,8 @@ __global__ void __launch_bounds__(MIX_FAST_THREADS) residual_mix_fast(const __gr
     constexpr int SUMS = MAX_S * (MAX_Q + 1);
     __shared__ float reduction[MIX_FAST_THREADS / 32][SUMS];
     __shared__ float inverse[MAX_S], weights[MAX_Q][MAX_S];
-    __shared__ __nv_bfloat16 cache_bf16[MAX_S > 1 ? MAX_S - 1 : 1][MIX_FAST_WIDTH];
-    __shared__ float cache_last[MIX_FAST_WIDTH];
+    __shared__ __align__(16) __nv_bfloat16 cache_bf16[MAX_S > 1 ? MAX_S - 1 : 1][MIX_FAST_WIDTH];
+    __shared__ __align__(16) float cache_last[MIX_FAST_WIDTH];
     const int sources = plan.count - 1;
     const auto& queries = plan.inputs[sources];
     const auto width = queries.shape[1];
@@ -1077,26 +1089,83 @@ __global__ void __launch_bounds__(MIX_FAST_THREADS) residual_mix_fast(const __gr
 #pragma unroll
     for (int i = 0; i < SUMS; ++i) sums[i] = 0.F;
     const auto* q_ptr = static_cast<const float*>(address(queries));
-    for (auto col = static_cast<std::int64_t>(threadIdx.x); col < width; col += MIX_FAST_THREADS) {
-        float q_vals[MAX_Q];
+    auto* out = static_cast<float*>(address(plan.output));
+    bool vec4 = (width & 3) == 0 && width <= MIX_FAST_WIDTH &&
+                (reinterpret_cast<std::uintptr_t>(q_ptr) & 15) == 0 &&
+                (reinterpret_cast<std::uintptr_t>(out) & 15) == 0;
 #pragma unroll
-        for (int q = 0; q < MAX_Q; ++q) q_vals[q] = q < queries_count ? __ldg(q_ptr + q * width + col) : 0.F;
+    for (int s = 0; s < MAX_S; ++s) {
+        if (s < sources && (reinterpret_cast<std::uintptr_t>(address(plan.inputs[s])) & 15) != 0) vec4 = false;
+    }
+    if (vec4) {
+        const auto c4 = static_cast<std::int64_t>(threadIdx.x) * 4;
+        if (c4 < width) {
+            float4 q_vals[MAX_Q];
 #pragma unroll
-        for (int s = 0; s < MAX_S; ++s) {
-            if (s < sources) {
-                const void* ptr = address(plan.inputs[s]);
-                const bool is_bf16 = plan.inputs[s].type == static_cast<int>(Type::BF16);
-                const float v = is_bf16
-                                    ? __bfloat162float(__ldg(static_cast<const __nv_bfloat16*>(ptr) + token * width + col))
-                                    : __ldg(static_cast<const float*>(ptr) + token * width + col);
-                if (s + 1 < sources)
-                    cache_bf16[s][col] = __float2bfloat16(v);
-                else
-                    cache_last[col] = v;
-                sums[s] = fmaf(v, v, sums[s]);
+            for (int q = 0; q < MAX_Q; ++q)
+                q_vals[q] = q < queries_count ? __ldg(reinterpret_cast<const float4*>(q_ptr + q * width + c4))
+                                              : make_float4(0.F, 0.F, 0.F, 0.F);
 #pragma unroll
-                for (int q = 0; q < MAX_Q; ++q)
-                    if (q < queries_count) sums[MAX_S * (q + 1) + s] = fmaf(q_vals[q], v, sums[MAX_S * (q + 1) + s]);
+            for (int s = 0; s < MAX_S; ++s) {
+                if (s < sources) {
+                    const void* ptr = address(plan.inputs[s]);
+                    const bool is_bf16 = plan.inputs[s].type == static_cast<int>(Type::BF16);
+                    float4 v4;
+                    if (is_bf16) {
+                        const uint2 raw =
+                            __ldg(reinterpret_cast<const uint2*>(static_cast<const __nv_bfloat16*>(ptr) + token * width + c4));
+                        const auto* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+                        const float2 p0 = __bfloat1622float2(h[0]), p1 = __bfloat1622float2(h[1]);
+                        v4 = make_float4(p0.x, p0.y, p1.x, p1.y);
+                        if (s + 1 < sources)
+                            *reinterpret_cast<uint2*>(&cache_bf16[s][c4]) = raw;
+                        else
+                            *reinterpret_cast<float4*>(&cache_last[c4]) = v4;
+                    } else {
+                        v4 = __ldg(reinterpret_cast<const float4*>(static_cast<const float*>(ptr) + token * width + c4));
+                        if (s + 1 < sources) {
+                            const __nv_bfloat162 h[2] = {__floats2bfloat162_rn(v4.x, v4.y),
+                                                         __floats2bfloat162_rn(v4.z, v4.w)};
+                            *reinterpret_cast<uint2*>(&cache_bf16[s][c4]) = *reinterpret_cast<const uint2*>(h);
+                        } else {
+                            *reinterpret_cast<float4*>(&cache_last[c4]) = v4;
+                        }
+                    }
+                    sums[s] = fmaf(v4.x, v4.x, fmaf(v4.y, v4.y, fmaf(v4.z, v4.z, fmaf(v4.w, v4.w, sums[s]))));
+#pragma unroll
+                    for (int q = 0; q < MAX_Q; ++q) {
+                        if (q < queries_count) {
+                            const int idx = MAX_S * (q + 1) + s;
+                            sums[idx] = fmaf(q_vals[q].x, v4.x,
+                                             fmaf(q_vals[q].y, v4.y,
+                                                  fmaf(q_vals[q].z, v4.z, fmaf(q_vals[q].w, v4.w, sums[idx]))));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for (auto col = static_cast<std::int64_t>(threadIdx.x); col < width; col += MIX_FAST_THREADS) {
+            float q_vals[MAX_Q];
+#pragma unroll
+            for (int q = 0; q < MAX_Q; ++q) q_vals[q] = q < queries_count ? __ldg(q_ptr + q * width + col) : 0.F;
+#pragma unroll
+            for (int s = 0; s < MAX_S; ++s) {
+                if (s < sources) {
+                    const void* ptr = address(plan.inputs[s]);
+                    const bool is_bf16 = plan.inputs[s].type == static_cast<int>(Type::BF16);
+                    const float v =
+                        is_bf16 ? __bfloat162float(__ldg(static_cast<const __nv_bfloat16*>(ptr) + token * width + col))
+                                : __ldg(static_cast<const float*>(ptr) + token * width + col);
+                    if (s + 1 < sources)
+                        cache_bf16[s][col] = __float2bfloat16(v);
+                    else
+                        cache_last[col] = v;
+                    sums[s] = fmaf(v, v, sums[s]);
+#pragma unroll
+                    for (int q = 0; q < MAX_Q; ++q)
+                        if (q < queries_count) sums[MAX_S * (q + 1) + s] = fmaf(q_vals[q], v, sums[MAX_S * (q + 1) + s]);
+                }
             }
         }
     }
@@ -1146,17 +1215,44 @@ __global__ void __launch_bounds__(MIX_FAST_THREADS) residual_mix_fast(const __gr
         for (int s = 0; s < sources; ++s) row[s] *= inv_total;
     }
     __syncthreads();
-    auto* out = static_cast<float*>(address(plan.output));
-    for (auto col = static_cast<std::int64_t>(threadIdx.x); col < width; col += MIX_FAST_THREADS) {
+    if (vec4) {
+        const auto c4 = static_cast<std::int64_t>(threadIdx.x) * 4;
+        if (c4 < width) {
+            const float4 last = *reinterpret_cast<const float4*>(&cache_last[c4]);
 #pragma unroll
-        for (int q = 0; q < MAX_Q; ++q) {
-            if (q < queries_count) {
-                float acc = weights[q][sources - 1] * inverse[sources - 1] * cache_last[col];
+            for (int q = 0; q < MAX_Q; ++q) {
+                if (q < queries_count) {
+                    const float w_last = weights[q][sources - 1] * inverse[sources - 1];
+                    float4 acc = make_float4(w_last * last.x, w_last * last.y, w_last * last.z, w_last * last.w);
 #pragma unroll
-                for (int s = 0; s + 1 < MAX_S; ++s)
-                    if (s + 1 < sources)
-                        acc = fmaf(weights[q][s] * inverse[s], __bfloat162float(cache_bf16[s][col]), acc);
-                out[(q * tokens + token) * width + col] = acc;
+                    for (int s = 0; s + 1 < MAX_S; ++s) {
+                        if (s + 1 < sources) {
+                            const float ws = weights[q][s] * inverse[s];
+                            const uint2 raw = *reinterpret_cast<const uint2*>(&cache_bf16[s][c4]);
+                            const auto* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
+                            const float2 p0 = __bfloat1622float2(h[0]), p1 = __bfloat1622float2(h[1]);
+                            acc.x = fmaf(ws, p0.x, acc.x);
+                            acc.y = fmaf(ws, p0.y, acc.y);
+                            acc.z = fmaf(ws, p1.x, acc.z);
+                            acc.w = fmaf(ws, p1.y, acc.w);
+                        }
+                    }
+                    *reinterpret_cast<float4*>(out + (q * tokens + token) * width + c4) = acc;
+                }
+            }
+        }
+    } else {
+        for (auto col = static_cast<std::int64_t>(threadIdx.x); col < width; col += MIX_FAST_THREADS) {
+#pragma unroll
+            for (int q = 0; q < MAX_Q; ++q) {
+                if (q < queries_count) {
+                    float acc = weights[q][sources - 1] * inverse[sources - 1] * cache_last[col];
+#pragma unroll
+                    for (int s = 0; s + 1 < MAX_S; ++s)
+                        if (s + 1 < sources)
+                            acc = fmaf(weights[q][s] * inverse[s], __bfloat162float(cache_bf16[s][col]), acc);
+                    out[(q * tokens + token) * width + col] = acc;
+                }
             }
         }
     }
@@ -1172,11 +1268,14 @@ __global__ void short_convolution(const __grid_constant__ Launch plan) {
     if (plan.attribute_count >= 2) {
         const auto ring = plan.attributes[1];
         const auto slot = static_cast<std::int64_t>(static_cast<const int*>(address(plan.inputs[3]))[0]);
-        const bool has_residual = plan.attribute_count == 3;
-        const bool dynamic = has_residual ? (plan.attributes[2] != 0) : (plan.count == 5);
+        const auto flags = plan.attribute_count == 3 ? plan.attributes[2] : 0;
+        const bool dynamic = plan.attribute_count == 3 ? ((flags & 1) != 0) : (plan.count == 5);
+        const bool has_residual = plan.attribute_count == 3 && ((flags & 2) != 0);
+        const bool update_state = plan.attribute_count == 3 && ((flags & 4) != 0);
         const auto groups = dynamic ? plan.inputs[4].shape[1] / width : 1;
         const auto group = channel / (channels / groups);
-        float sum = read(plan.inputs[0], token * channels + channel);
+        const float cur_val = read(plan.inputs[0], token * channels + channel);
+        float sum = cur_val;
         for (std::int64_t lag = 0; lag < width; ++lag) {
             float tap = read(plan.inputs[2], lag * channels + channel);
             if (dynamic) tap += read(plan.inputs[4], (token * groups + group) * width + lag);
@@ -1192,6 +1291,15 @@ __global__ void short_convolution(const __grid_constant__ Launch plan) {
         }
         auto out = sum * plan.epsilon;
         if (has_residual) out += read(plan.inputs[plan.count - 1], token * channels + channel);
+        if (update_state) {
+            const auto state_index = ((slot % ring + ring) % ring) * channels + channel;
+            if (plan.inputs[1].type == static_cast<int>(Type::BF16))
+                static_cast<__nv_bfloat16*>(address(plan.inputs[1]))[state_index] = __float2bfloat16(cur_val);
+            else if (plan.inputs[1].type == static_cast<int>(Type::F16))
+                static_cast<__half*>(address(plan.inputs[1]))[state_index] = __float2half(cur_val);
+            else
+                static_cast<float*>(address(plan.inputs[1]))[state_index] = cur_val;
+        }
         write(plan.output, index, out);
         return;
     }
@@ -1220,16 +1328,17 @@ __global__ void short_convolution_bf16_w4(const __grid_constant__ Launch plan) {
     const auto c0 = static_cast<std::int64_t>(vec_index % vec_cols) * 8;
     const int slot = static_cast<const int*>(address(plan.inputs[3]))[0] & 3;
     const auto* input = static_cast<const __nv_bfloat16*>(address(plan.inputs[0]));
-    const auto* state = static_cast<const __nv_bfloat16*>(address(plan.inputs[1]));
+    auto* state = static_cast<__nv_bfloat16*>(address(plan.inputs[1]));
     const auto* weight = static_cast<const __nv_bfloat16*>(address(plan.inputs[2]));
-    const bool has_residual = plan.attribute_count == 3;
-    const bool dynamic = has_residual ? (plan.attributes[2] != 0) : (plan.count == 5);
+    const auto flags = plan.attribute_count == 3 ? plan.attributes[2] : 0;
+    const bool dynamic = plan.attribute_count == 3 ? ((flags & 1) != 0) : (plan.count == 5);
+    const bool has_residual = plan.attribute_count == 3 && ((flags & 2) != 0);
+    const bool update_state = plan.attribute_count == 3 && ((flags & 4) != 0);
     const auto groups = dynamic ? plan.inputs[4].shape[1] / 4 : 1;
     const auto group = c0 / (channels / groups);
 
     float sum[8]{};
-    const auto load8 = [](const __nv_bfloat16* p, float out[8]) {
-        const uint4 raw = __ldg(reinterpret_cast<const uint4*>(p));
+    const auto decode8 = [](const uint4& raw, float out[8]) {
         const auto* halves = reinterpret_cast<const __nv_bfloat162*>(&raw);
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -1238,8 +1347,12 @@ __global__ void short_convolution_bf16_w4(const __grid_constant__ Launch plan) {
             out[2 * i + 1] = pair.y;
         }
     };
+    const auto load8 = [&](const __nv_bfloat16* p, float out[8]) {
+        decode8(__ldg(reinterpret_cast<const uint4*>(p)), out);
+    };
+    const uint4 raw_cur = __ldg(reinterpret_cast<const uint4*>(input + token * channels + c0));
     float cur[8];
-    load8(input + token * channels + c0, cur);
+    decode8(raw_cur, cur);
 #pragma unroll
     for (int i = 0; i < 8; ++i) sum[i] = cur[i];
 #pragma unroll
@@ -1295,6 +1408,7 @@ __global__ void short_convolution_bf16_w4(const __grid_constant__ Launch plan) {
         *reinterpret_cast<float4*>(optr) = make_float4(sum[0], sum[1], sum[2], sum[3]);
         *reinterpret_cast<float4*>(optr + 4) = make_float4(sum[4], sum[5], sum[6], sum[7]);
     }
+    if (update_state) *reinterpret_cast<uint4*>(state + slot * channels + c0) = raw_cur;
 }
 
 /// One warp per row: scale, then shrink rows whose L2 norm exceeds the threshold.
@@ -1513,8 +1627,7 @@ __global__ void softcapped_silu_gate(Launch plan) {
     write(plan.output, index, result);
 }
 
-constexpr int BLEND_THREADS = 256;
-constexpr int BLEND_ITEMS = 10;
+constexpr int BLEND_THREADS = 576;
 
 /// Unit-RMS-normalizes `destination` and `message` [tokens, width] in one pass and writes concatenated BF16 [tokens, 2 * width].
 __global__ void __launch_bounds__(BLEND_THREADS) blend_prologue(const __grid_constant__ Launch plan) {
@@ -1522,23 +1635,23 @@ __global__ void __launch_bounds__(BLEND_THREADS) blend_prologue(const __grid_con
     const auto token = static_cast<std::int64_t>(blockIdx.x);
     const auto width = plan.inputs[0].shape[1];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    float d_vals[BLEND_ITEMS], m_vals[BLEND_ITEMS];
+    const auto* d_base = static_cast<const float*>(address(plan.inputs[0])) + token * width;
+    const auto* m_base = static_cast<const float*>(address(plan.inputs[1])) + token * width;
+    auto* out = static_cast<__nv_bfloat16*>(address(plan.output)) + token * 2 * width;
+    const bool vec4 = plan.inputs[0].type == static_cast<int>(Type::F32) &&
+                      plan.inputs[1].type == static_cast<int>(Type::F32) && (width & 3) == 0 &&
+                      width <= BLEND_THREADS * 4 && (reinterpret_cast<std::uintptr_t>(d_base) & 15) == 0 &&
+                      (reinterpret_cast<std::uintptr_t>(m_base) & 15) == 0 &&
+                      (reinterpret_cast<std::uintptr_t>(out) & 7) == 0;
+    float4 dv4{}, mv4{};
     float sum_d = 0, sum_m = 0;
-    const bool fast_f32 = plan.inputs[0].type == static_cast<int>(Type::F32) &&
-                          plan.inputs[1].type == static_cast<int>(Type::F32) && width <= BLEND_THREADS * BLEND_ITEMS;
-    if (fast_f32) {
-        const auto* d_ptr = static_cast<const float*>(address(plan.inputs[0])) + token * width;
-        const auto* m_ptr = static_cast<const float*>(address(plan.inputs[1])) + token * width;
-#pragma unroll
-        for (int i = 0; i < BLEND_ITEMS; ++i) {
-            const auto c = static_cast<std::int64_t>(threadIdx.x) + i * BLEND_THREADS;
-            if (c < width) {
-                const float dv = d_ptr[c], mv = m_ptr[c];
-                d_vals[i] = dv;
-                m_vals[i] = mv;
-                sum_d = fmaf(dv, dv, sum_d);
-                sum_m = fmaf(mv, mv, sum_m);
-            }
+    if (vec4) {
+        const auto c4 = static_cast<std::int64_t>(threadIdx.x) * 4;
+        if (c4 < width) {
+            dv4 = __ldg(reinterpret_cast<const float4*>(d_base + c4));
+            mv4 = __ldg(reinterpret_cast<const float4*>(m_base + c4));
+            sum_d = fmaf(dv4.x, dv4.x, fmaf(dv4.y, dv4.y, fmaf(dv4.z, dv4.z, dv4.w * dv4.w)));
+            sum_m = fmaf(mv4.x, mv4.x, fmaf(mv4.y, mv4.y, fmaf(mv4.z, mv4.z, mv4.w * mv4.w)));
         }
     } else {
         for (auto c = static_cast<std::int64_t>(threadIdx.x); c < width; c += BLEND_THREADS) {
@@ -1567,15 +1680,15 @@ __global__ void __launch_bounds__(BLEND_THREADS) blend_prologue(const __grid_con
     }
     __syncthreads();
     const float inv_d = shared[0][0], inv_m = shared[1][0];
-    auto* out = static_cast<__nv_bfloat16*>(address(plan.output)) + token * 2 * width;
-    if (fast_f32) {
-#pragma unroll
-        for (int i = 0; i < BLEND_ITEMS; ++i) {
-            const auto c = static_cast<std::int64_t>(threadIdx.x) + i * BLEND_THREADS;
-            if (c < width) {
-                out[c] = __float2bfloat16(d_vals[i] * inv_d);
-                out[width + c] = __float2bfloat16(m_vals[i] * inv_m);
-            }
+    if (vec4) {
+        const auto c4 = static_cast<std::int64_t>(threadIdx.x) * 4;
+        if (c4 < width) {
+            const __nv_bfloat162 d_out[2] = {__floats2bfloat162_rn(dv4.x * inv_d, dv4.y * inv_d),
+                                             __floats2bfloat162_rn(dv4.z * inv_d, dv4.w * inv_d)};
+            const __nv_bfloat162 m_out[2] = {__floats2bfloat162_rn(mv4.x * inv_m, mv4.y * inv_m),
+                                             __floats2bfloat162_rn(mv4.z * inv_m, mv4.w * inv_m)};
+            *reinterpret_cast<uint2*>(out + c4) = *reinterpret_cast<const uint2*>(d_out);
+            *reinterpret_cast<uint2*>(out + width + c4) = *reinterpret_cast<const uint2*>(m_out);
         }
     } else {
         for (auto c = static_cast<std::int64_t>(threadIdx.x); c < width; c += BLEND_THREADS) {
@@ -1591,25 +1704,38 @@ __global__ void __launch_bounds__(BLEND_THREADS) blend_epilogue(const __grid_con
     const auto token = static_cast<std::int64_t>(blockIdx.x);
     const auto width = plan.inputs[0].shape[1];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    float mixed_vals[BLEND_ITEMS];
-    float sum = 0;
-    const bool fast = plan.inputs[0].type == static_cast<int>(Type::F32) &&
+    const auto* d_base = static_cast<const float*>(address(plan.inputs[0])) + token * width;
+    const auto* m_base = static_cast<const float*>(address(plan.inputs[1])) + token * width;
+    const auto* gf_base = static_cast<const __nv_bfloat16*>(address(plan.inputs[2])) + token * 2 * width;
+    const auto* norm_ptr = static_cast<const float*>(address(plan.inputs[3]));
+    auto* out = static_cast<__nv_bfloat16*>(address(plan.output)) + token * width;
+    const bool vec4 = plan.inputs[0].type == static_cast<int>(Type::F32) &&
                       plan.inputs[1].type == static_cast<int>(Type::F32) &&
-                      plan.inputs[2].type == static_cast<int>(Type::BF16) && width <= BLEND_THREADS * BLEND_ITEMS;
-    if (fast) {
-        const auto* d_ptr = static_cast<const float*>(address(plan.inputs[0])) + token * width;
-        const auto* m_ptr = static_cast<const float*>(address(plan.inputs[1])) + token * width;
-        const auto* gf_ptr = static_cast<const __nv_bfloat16*>(address(plan.inputs[2])) + token * 2 * width;
-#pragma unroll
-        for (int i = 0; i < BLEND_ITEMS; ++i) {
-            const auto c = static_cast<std::int64_t>(threadIdx.x) + i * BLEND_THREADS;
-            if (c < width) {
-                const float g = tanhf(__bfloat162float(gf_ptr[c]));
-                const float f = tanhf(__bfloat162float(gf_ptr[width + c]));
-                const float v = fmaf(d_ptr[c], 1.F + f, m_ptr[c] * g);
-                mixed_vals[i] = v;
-                sum = fmaf(v, v, sum);
-            }
+                      plan.inputs[2].type == static_cast<int>(Type::BF16) && (width & 3) == 0 &&
+                      width <= BLEND_THREADS * 4 && (reinterpret_cast<std::uintptr_t>(d_base) & 15) == 0 &&
+                      (reinterpret_cast<std::uintptr_t>(m_base) & 15) == 0 &&
+                      (reinterpret_cast<std::uintptr_t>(gf_base) & 7) == 0 &&
+                      (reinterpret_cast<std::uintptr_t>(norm_ptr) & 15) == 0 &&
+                      (reinterpret_cast<std::uintptr_t>(out) & 7) == 0;
+    float4 mixed4{};
+    float sum = 0;
+    if (vec4) {
+        const auto c4 = static_cast<std::int64_t>(threadIdx.x) * 4;
+        if (c4 < width) {
+            const float4 dv4 = __ldg(reinterpret_cast<const float4*>(d_base + c4));
+            const float4 mv4 = __ldg(reinterpret_cast<const float4*>(m_base + c4));
+            const uint2 g_raw = __ldg(reinterpret_cast<const uint2*>(gf_base + c4));
+            const uint2 f_raw = __ldg(reinterpret_cast<const uint2*>(gf_base + width + c4));
+            const auto* gh = reinterpret_cast<const __nv_bfloat162*>(&g_raw);
+            const auto* fh = reinterpret_cast<const __nv_bfloat162*>(&f_raw);
+            const float2 g0 = __bfloat1622float2(gh[0]), g1 = __bfloat1622float2(gh[1]);
+            const float2 f0 = __bfloat1622float2(fh[0]), f1 = __bfloat1622float2(fh[1]);
+            mixed4.x = fmaf(dv4.x, 1.F + tanhf(f0.x), mv4.x * tanhf(g0.x));
+            mixed4.y = fmaf(dv4.y, 1.F + tanhf(f0.y), mv4.y * tanhf(g0.y));
+            mixed4.z = fmaf(dv4.z, 1.F + tanhf(f1.x), mv4.z * tanhf(g1.x));
+            mixed4.w = fmaf(dv4.w, 1.F + tanhf(f1.y), mv4.w * tanhf(g1.y));
+            sum = fmaf(mixed4.x, mixed4.x,
+                       fmaf(mixed4.y, mixed4.y, fmaf(mixed4.z, mixed4.z, mixed4.w * mixed4.w)));
         }
     } else {
         for (auto c = static_cast<std::int64_t>(threadIdx.x); c < width; c += BLEND_THREADS) {
@@ -1630,13 +1756,14 @@ __global__ void __launch_bounds__(BLEND_THREADS) blend_epilogue(const __grid_con
     }
     __syncthreads();
     const float inv = shared[0];
-    const auto* norm_ptr = static_cast<const float*>(address(plan.inputs[3]));
-    auto* out = static_cast<__nv_bfloat16*>(address(plan.output)) + token * width;
-    if (fast) {
-#pragma unroll
-        for (int i = 0; i < BLEND_ITEMS; ++i) {
-            const auto c = static_cast<std::int64_t>(threadIdx.x) + i * BLEND_THREADS;
-            if (c < width) out[c] = __float2bfloat16(mixed_vals[i] * inv * norm_ptr[c]);
+    if (vec4) {
+        const auto c4 = static_cast<std::int64_t>(threadIdx.x) * 4;
+        if (c4 < width) {
+            const float4 n4 = __ldg(reinterpret_cast<const float4*>(norm_ptr + c4));
+            const __nv_bfloat162 out2[2] = {
+                __floats2bfloat162_rn(mixed4.x * inv * n4.x, mixed4.y * inv * n4.y),
+                __floats2bfloat162_rn(mixed4.z * inv * n4.z, mixed4.w * inv * n4.w)};
+            *reinterpret_cast<uint2*>(out + c4) = *reinterpret_cast<const uint2*>(out2);
         }
     } else {
         for (auto c = static_cast<std::int64_t>(threadIdx.x); c < width; c += BLEND_THREADS) {
@@ -1670,6 +1797,24 @@ auto chunked_gemv(const Launch& plan) -> bool {
            aligned(plan.inputs[0]) && aligned(plan.inputs[1]);
 }
 
+template <bool BF16, bool ROUTED, bool GATED, int FORMAT, int SCALE>
+auto dispatch_block_gemv(const Launch& plan, cudaStream_t stream) -> void {
+    constexpr int ROWS = (ROUTED && GATED) ? 1 : GEMV_ROWS;
+    kernel::block_scaled_block_gemv<BF16, ROUTED, GATED, FORMAT, SCALE, ROWS>
+        <<<blocks(plan.elements / ROWS, kernel::GEMV_WARPS), kernel::GEMV_WARPS * 32, 0, stream>>>(plan);
+}
+
+template <bool ROUTED, bool BF16, bool GATED>
+auto dispatch_block_gemv_format(const Launch& plan, cudaStream_t stream) -> void {
+    switch (plan.attributes[3] * 3 + plan.attributes[7]) {
+        case 0: dispatch_block_gemv<BF16, ROUTED, GATED, 0, 0>(plan, stream); break;
+        case 2: dispatch_block_gemv<BF16, ROUTED, GATED, 0, 2>(plan, stream); break;
+        case 4: dispatch_block_gemv<BF16, ROUTED, GATED, 1, 1>(plan, stream); break;
+        case 5: dispatch_block_gemv<BF16, ROUTED, GATED, 1, 2>(plan, stream); break;
+        default: dispatch_block_gemv<BF16, ROUTED, GATED, 2, 2>(plan, stream); break;
+    }
+}
+
 template <bool ROUTED>
 auto launch_block_gemv(const Launch& source, cudaStream_t stream) -> void {
     auto plan = source;
@@ -1682,19 +1827,14 @@ auto launch_block_gemv(const Launch& source, cudaStream_t stream) -> void {
     else
         plan.attributes[7] = 2;
     const bool bfloat = plan.inputs[0].type == static_cast<int>(Type::BF16), gated = plan.attributes[0];
-    const auto launch = [&]<bool BF16, bool GATED>() {
-        constexpr int ROWS = GEMV_ROWS;
-        kernel::block_scaled_block_gemv<BF16, ROUTED, GATED, ROWS>
-            <<<blocks(plan.elements / ROWS, kernel::GEMV_WARPS), kernel::GEMV_WARPS * 32, 0, stream>>>(plan);
-    };
     if (bfloat && gated)
-        launch.template operator()<true, true>();
+        dispatch_block_gemv_format<ROUTED, true, true>(plan, stream);
     else if (bfloat)
-        launch.template operator()<true, false>();
+        dispatch_block_gemv_format<ROUTED, true, false>(plan, stream);
     else if (gated)
-        launch.template operator()<false, true>();
+        dispatch_block_gemv_format<ROUTED, false, true>(plan, stream);
     else
-        launch.template operator()<false, false>();
+        dispatch_block_gemv_format<ROUTED, false, false>(plan, stream);
 }
 
 // The tiled GEMM multiplies BF16 activations by NVFP4 with E4M3 scales per 16 values or MXFP8 with UE8M0 scales,
@@ -1887,8 +2027,9 @@ auto fused_operation(const Launch& plan, Op operation, cudaStream_t stream) -> v
         }
         case Op::SHORT_CONVOLUTION: {
             const auto channels = plan.output.shape[1];
-            const bool has_residual = plan.attribute_count == 3;
-            const bool dynamic = has_residual ? (plan.attributes[2] != 0) : (plan.count == 5);
+            const auto flags = plan.attribute_count == 3 ? plan.attributes[2] : 0;
+            const bool dynamic = plan.attribute_count == 3 ? ((flags & 1) != 0) : (plan.count == 5);
+            const bool has_residual = plan.attribute_count == 3 && ((flags & 2) != 0);
             const bool out_ok =
                 plan.output.type == static_cast<int>(Type::BF16) || plan.output.type == static_cast<int>(Type::F32);
             const bool res_ok = !has_residual || plan.inputs[plan.count - 1].type == static_cast<int>(Type::BF16) ||

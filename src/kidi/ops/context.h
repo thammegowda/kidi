@@ -236,10 +236,11 @@ public:
     /// plus optional per-token `taps` [tokens, groups * W]; returns (convolution + current input) * scale.
     auto short_convolution(const Tensor& padded, const Tensor& weight, const Tensor& taps, float scale) -> Tensor;
     /// Ring-buffered causal depthwise convolution of `input` [tokens, channels] reading prior rows from `state`
-    /// [ring, channels] starting before `slot` (I32 [1], index of row 0 mod `ring`), optionally adding `residual`.
+    /// [ring, channels] starting before `slot` (I32 [1], index of row 0 mod `ring`), optionally adding `residual`
+    /// and updating `state[slot]` in place when `tokens == 1 && update_state`.
     auto short_convolution(const Tensor& input, const Tensor& state, const Tensor& weight, const Tensor& taps,
                            const Tensor& slot, float scale, const Tensor& residual = {},
-                           std::optional<tensor::DType> output_dtype = {}) -> Tensor;
+                           std::optional<tensor::DType> output_dtype = {}, bool update_state = false) -> Tensor;
     /// Multiplies [..., heads, width] rows by the optional [heads, width] scale and caps each row's L2 norm.
     auto l2_clip(const Tensor& input, const Tensor& scale, float threshold) -> Tensor;
     /// Causal attention of [tokens, heads * width] queries over [capacity, key_heads * width] caches, with relative

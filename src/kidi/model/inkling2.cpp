@@ -457,10 +457,8 @@ auto Inkling2Impl::convolve(const Tensor& input, Tensor& state, const Tensor& we
     const auto T = static_cast<std::int64_t>(input.size(0));
     const auto C = static_cast<std::int64_t>(input.size(1));
     auto output = context.short_convolution(input, require(state.reshape({CONV_WIDTH, C})), weight, taps, conv_slot,
-                                            scale, residual, output_dtype);
-    if (T == 1) {
-        context.scatter_unique_(state, require(input.reshape({1, 1, C})), conv_slot);
-    } else {
+                                            scale, residual, output_dtype, T == 1);
+    if (T > 1) {
         const auto K = std::min<std::int64_t>(T, CONV_WIDTH);
         const auto tail = K == T ? input : require(input.narrow(0, T - K, K));
         context.scatter_unique_(state, require(tail.reshape({1, K, C})), tail_slots);

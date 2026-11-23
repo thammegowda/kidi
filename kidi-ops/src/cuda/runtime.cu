@@ -334,16 +334,20 @@ void infer_fused(Descriptor& descriptor, Type requested_type) {
         case Op::SHORT_CONVOLUTION: {
             if (descriptor.attribute_count == 2 || descriptor.attribute_count == 3) {
                 const auto width = descriptor.attributes[0], ring = descriptor.attributes[1];
-                const bool has_residual = descriptor.attribute_count == 3;
-                const bool has_taps = has_residual ? descriptor.attributes[2] != 0 : count == 5;
-                const int expected_count = (has_residual ? 5 : 4) + (has_taps ? 1 : 0);
+                const auto flags = descriptor.attribute_count == 3 ? descriptor.attributes[2] : 0;
+                const bool has_taps = descriptor.attribute_count == 3 ? ((flags & 1) != 0) : (count == 5);
+                const bool has_residual = descriptor.attribute_count == 3 && ((flags & 2) != 0);
+                const bool update_state = descriptor.attribute_count == 3 && ((flags & 4) != 0);
+                const int expected_count = 4 + (has_taps ? 1 : 0) + (has_residual ? 1 : 0);
                 const auto& state = descriptor.inputs[1];
                 const auto& weight = descriptor.inputs[2];
                 const auto& slot = descriptor.inputs[3];
-                fail((!has_residual && count != 4 && count != 5) || (has_residual && count != expected_count) ||
-                         width <= 0 || ring < width - 1 || input.rank != 2 || !input.shape[0] || state.rank != 2 ||
-                         state.shape[0] != ring || state.shape[1] != input.shape[1] || state.type != input.type ||
-                         weight.rank != 2 || weight.shape[0] != width || weight.shape[1] != input.shape[1] ||
+                fail((descriptor.attribute_count == 2 && count != 4 && count != 5) ||
+                         (descriptor.attribute_count == 3 && (flags < 0 || flags > 7 || count != expected_count)) ||
+                         (update_state && (input.shape[0] != 1 || ring < width)) || width <= 0 || ring < width - 1 ||
+                         input.rank != 2 || !input.shape[0] || state.rank != 2 || state.shape[0] != ring ||
+                         state.shape[1] != input.shape[1] || state.type != input.type || weight.rank != 2 ||
+                         weight.shape[0] != width || weight.shape[1] != input.shape[1] ||
                          slot.type != Type::I32 || slot.elements() != 1 ||
                          (has_taps && (descriptor.inputs[4].rank != 2 ||
                                        descriptor.inputs[4].shape[0] != input.shape[0] ||

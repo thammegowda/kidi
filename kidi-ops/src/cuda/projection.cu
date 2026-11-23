@@ -475,9 +475,9 @@ __global__ void matrix(Launch plan) {
     write(plan.output, index, sum);
 }
 
-__global__ void bfloat_vector(Launch plan, std::int64_t width, std::int64_t columns) {
-    const int lane = threadIdx.x % 32;
-    const auto column = static_cast<std::int64_t>(blockIdx.x) * 4 + threadIdx.x / 32;
+__global__ void bfloat_vector(const __grid_constant__ Launch plan, std::int64_t width, std::int64_t columns) {
+    const int lane = threadIdx.x & 31;
+    const auto column = static_cast<std::int64_t>(blockIdx.x) * 4 + (threadIdx.x >> 5);
     if (column >= columns) return;
     const auto* input = static_cast<const __nv_bfloat16*>(plan.inputs[0].data);
     const auto* weight = static_cast<const __nv_bfloat16*>(plan.inputs[1].data) + column * width;
@@ -488,8 +488,8 @@ __global__ void bfloat_vector(Launch plan, std::int64_t width, std::int64_t colu
             __nv_bfloat162 pairs[4];
         };
         Vector left, right;
-        left.packed = *reinterpret_cast<const uint4*>(input + contraction);
-        right.packed = *reinterpret_cast<const uint4*>(weight + contraction);
+        left.packed = __ldg(reinterpret_cast<const uint4*>(input + contraction));
+        right.packed = __ldg(reinterpret_cast<const uint4*>(weight + contraction));
 #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
             const float2 activation = __bfloat1622float2(left.pairs[pair]);
@@ -508,7 +508,45 @@ __global__ void bfloat_vector(Launch plan, std::int64_t width, std::int64_t colu
     }
 }
 
-__global__ void bfloat_vector_block(Launch plan, std::int64_t width) {
+__global__ void bfloat_vector_2warp(const __grid_constant__ Launch plan, std::int64_t width, std::int64_t columns) {
+    __shared__ float partial[2][2];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int col_local = warp >> 1, sub_warp = warp & 1;
+    const auto column = static_cast<std::int64_t>(blockIdx.x) * 2 + col_local;
+    if (column >= columns) return;
+    const auto* input = static_cast<const __nv_bfloat16*>(plan.inputs[0].data);
+    const auto* weight = static_cast<const __nv_bfloat16*>(plan.inputs[1].data) + column * width;
+    float sums[8]{};
+    for (std::int64_t contraction = (sub_warp * 32 + lane) * 8; contraction < width; contraction += 64 * 8) {
+        union Vector {
+            uint4 packed;
+            __nv_bfloat162 pairs[4];
+        };
+        Vector left, right;
+        left.packed = __ldg(reinterpret_cast<const uint4*>(input + contraction));
+        right.packed = __ldg(reinterpret_cast<const uint4*>(weight + contraction));
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float2 activation = __bfloat1622float2(left.pairs[pair]);
+            const float2 parameter = __bfloat1622float2(right.pairs[pair]);
+            sums[pair * 2] = fmaf(activation.x, parameter.x, sums[pair * 2]);
+            sums[pair * 2 + 1] = fmaf(activation.y, parameter.y, sums[pair * 2 + 1]);
+        }
+    }
+    float sum = 0;
+#pragma unroll
+    for (int index = 0; index < 8; ++index) sum += sums[index];
+    for (int delta = 16; delta > 0; delta /= 2) sum += __shfl_down_sync(0xffffffff, sum, delta);
+    if (lane == 0) partial[col_local][sub_warp] = sum;
+    __syncthreads();
+    if (sub_warp == 0 && lane == 0) {
+        float total = partial[col_local][0] + partial[col_local][1];
+        if (plan.count == 3) total += read(plan.inputs[2], column);
+        static_cast<__nv_bfloat16*>(plan.output.data)[column] = __float2bfloat16(total);
+    }
+}
+
+__global__ void bfloat_vector_block(const __grid_constant__ Launch plan, std::int64_t width) {
     __shared__ float partial[4];
     const auto column = static_cast<std::int64_t>(blockIdx.x);
     const auto* input = static_cast<const __nv_bfloat16*>(plan.inputs[0].data);
@@ -817,6 +855,9 @@ auto execute_matrix(const Launch& plan, int device, bool optimized, void* worksp
                     plan, width, columns);
             else if (columns < 512 && width >= 1024 && width % 256 == 0)
                 kernel::bfloat_vector_block<<<static_cast<unsigned int>(columns), 128, 0, stream>>>(plan, width);
+            else if (columns <= 4096)
+                kernel::bfloat_vector_2warp<<<static_cast<unsigned int>((columns + 1) / 2), 128, 0, stream>>>(
+                    plan, width, columns);
             else
                 kernel::bfloat_vector<<<static_cast<unsigned int>((columns + 3) / 4), 128, 0, stream>>>(plan, width,
                                                                                                         columns);
