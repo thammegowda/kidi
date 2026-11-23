@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""Zero-hoop launcher for the Pi coding agent backed by local `kidi serve`."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parent.parent
+DEFAULT_MODEL = "@thinkingmachines/Inkling-2-Mini"
+DEFAULT_PORT = 18097
+
+
+def runtime_dir() -> Path:
+    default_root = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "kidi-agent"
+    return Path(os.environ.get("KIDI_AGENT_HOME") or default_root)
+
+
+def hub_cache_dir() -> Path:
+    return Path(os.environ.get("KIDI_HUB") or (Path.home() / ".cache" / "kidi" / "model-hub")).expanduser()
+
+
+def find_kidi_binary(explicit: str | None) -> Path | None:
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    if env_bin := os.environ.get("KIDI"):
+        candidates.append(Path(env_bin))
+    candidates.extend([
+        REPO_ROOT / "build-release-cuda" / "kidi",
+        REPO_ROOT / "build-release" / "kidi",
+    ])
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    if found := shutil.which("kidi"):
+        return Path(found)
+    return None
+
+
+def has_nvidia_gpu() -> bool:
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return True
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return False
+    res = subprocess.run([smi, "-L"], capture_output=True, text=True)
+    return res.returncode == 0 and bool(res.stdout.strip())
+
+
+def pick_freest_gpu() -> str | None:
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return None
+    res = subprocess.run(
+        [smi, "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        return None
+    best_idx = None
+    best_free = -1
+    for line in res.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            free = int(parts[1])
+            if free > best_free:
+                best_free = free
+                best_idx = parts[0]
+    return best_idx
+
+
+def resolve_default_model(explicit: str | None, backend: str) -> str:
+    if explicit:
+        return explicit
+    if env_model := os.environ.get("KIDI_MODEL"):
+        return env_model
+    hub = hub_cache_dir()
+    inkling = hub / "thinkingmachines" / "Inkling-2-Mini"
+    if (inkling / "config.json").is_file() and (backend.startswith("cuda") or has_nvidia_gpu()):
+        return str(inkling)
+    if backend.startswith("cuda") or has_nvidia_gpu():
+        return DEFAULT_MODEL
+    if hub.is_dir():
+        for owner in sorted(hub.iterdir()):
+            if not owner.is_dir():
+                continue
+            for model in sorted(owner.iterdir()):
+                if (model / "config.json").is_file():
+                    return str(model)
+    raise RuntimeError(
+        "No local model specified or cached. Pass `-m @owner/model` or `-m /path/to/model`, or set KIDI_MODEL."
+    )
+
+
+def probe_server(base_url: str, timeout: float = 1.0) -> str | None:
+    url = base_url.rstrip("/") + "/models"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            payload = json.loads(resp.read().decode("utf-8"))
+            data = payload.get("data") or []
+            if data and isinstance(data[0], dict) and data[0].get("id"):
+                return str(data[0]["id"])
+            return "kidi-local"
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+
+
+def ensure_pi_installed(rt_dir: Path) -> Path:
+    pi_bin = rt_dir / "pi" / "node_modules" / ".bin" / "pi"
+    if pi_bin.is_file() and os.access(pi_bin, os.X_OK):
+        return pi_bin
+    print("kidi code: installing Pi runtime (first run only)...", file=sys.stderr, flush=True)
+    subprocess.run([str(HERE / "setup.sh")], check=True)
+    if not (pi_bin.is_file() and os.access(pi_bin, os.X_OK)):
+        raise RuntimeError(f"Pi installation did not produce {pi_bin}")
+    return pi_bin
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="kidi-code",
+        description="Start `kidi serve` if needed and launch the Pi coding agent.",
+        epilog="Any unrecognized flags or args after `--` are passed straight to Pi (e.g. `-p \"fix tests\"`, `-c`).",
+    )
+    p.add_argument("-w", "--workspace", default=os.getcwd(), help="workspace directory (default: current directory)")
+    p.add_argument("-m", "--model", help="model path or @owner/model (default: cached Inkling-2-Mini)")
+    p.add_argument("--backend", help="kidi backend: cuda[:INDEX], auto, ynnpack, mps (default: cuda if GPU present)")
+    p.add_argument("--port", type=int, default=int(os.environ.get("KIDI_PORT", DEFAULT_PORT)), help="local server port")
+    p.add_argument("--base-url", default=os.environ.get("KIDI_AGENT_BASE_URL"), help="reuse an existing OpenAI endpoint")
+    p.add_argument("--model-id", default=os.environ.get("KIDI_AGENT_MODEL_ID"), help="override advertised model id")
+    p.add_argument("--context-size", type=int, default=None, help="context window (default: 65536 on cuda, 32768 else)")
+    p.add_argument("--max-new-tokens", type=int, default=int(os.environ.get("KIDI_MAX_NEW_TOKENS", 8192)))
+    p.add_argument("--prefill-chunk-size", type=int, default=int(os.environ.get("KIDI_PREFILL_CHUNK_SIZE", 512)))
+    p.add_argument("--keep-server", action="store_true", help="keep auto-started kidi serve running after exit")
+    p.add_argument("--no-sandbox", action="store_true", help="run Pi directly without Landlock confinement")
+    p.add_argument("--allow-https", action="store_true", help="allow outbound TCP 443 inside sandbox")
+    p.add_argument("--allow-port", action="append", default=[], help="allow outbound TCP to port inside sandbox")
+    p.add_argument("--ro", action="append", default=[], help="extra read-only path inside sandbox")
+    p.add_argument("--rw", action="append", default=[], help="extra writable path inside sandbox")
+    p.add_argument("--no-sudo", action="store_true", help="disable private mount namespace in sandbox")
+    p.add_argument("--kidi-bin", help=argparse.SUPPRESS)
+    return p
+
+
+def start_server(
+    kidi_bin: Path,
+    model: str,
+    backend: str,
+    host: str,
+    port: int,
+    served_name: str,
+    context_size: int,
+    max_new_tokens: int,
+    prefill_chunk_size: int,
+    log_path: Path,
+) -> subprocess.Popen[bytes]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    if backend == "cuda" and not env.get("CUDA_VISIBLE_DEVICES"):
+        if freest := pick_freest_gpu():
+            env["CUDA_VISIBLE_DEVICES"] = freest
+
+    cmd = [
+        str(kidi_bin),
+        "serve",
+        "-m",
+        model,
+        "--backend",
+        backend,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--served-model-name",
+        served_name,
+        "--context-size",
+        str(context_size),
+        "--cache-tokens",
+        str(context_size),
+        "--prefill-chunk-size",
+        str(prefill_chunk_size),
+        "--max-new-tokens",
+        str(max_new_tokens),
+    ]
+    log_file = log_path.open("wb")
+    try:
+        proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    finally:
+        log_file.close()
+
+    base_url = f"http://{host}:{port}/v1"
+    gpu_note = f", GPU {env['CUDA_VISIBLE_DEVICES']}" if env.get("CUDA_VISIBLE_DEVICES") else ""
+    print(f"kidi code: starting server ({Path(model).name}, {backend}{gpu_note}, :{port})...", file=sys.stderr, flush=True)
+    deadline = time.monotonic() + 180.0
+    while time.monotonic() < deadline:
+        if (rc := proc.poll()) is not None:
+            tail = log_path.read_text(errors="replace").splitlines()[-20:]
+            detail = "\n".join(tail)
+            raise RuntimeError(f"kidi serve exited with status {rc}:\n{detail}")
+        if probe_server(base_url, timeout=0.5) is not None:
+            return proc
+        time.sleep(0.25)
+
+    proc.terminate()
+    raise RuntimeError(f"Timed out waiting for kidi serve at {base_url} (see {log_path})")
+
+
+def run_unsandboxed(pi_bin: Path, rt_dir: Path, ws: Path, base_url: str, model_id: str,
+                    context_window: int, max_tokens: int, pi_args: list[str]) -> int:
+    with tempfile.TemporaryDirectory(prefix="kidi-code-") as tmp:
+        agent_dir = Path(tmp) / "agent"
+        agent_dir.mkdir()
+        models = json.loads((HERE / "pi" / "models.json").read_text())
+        for provider in models["providers"].values():
+            provider["baseUrl"] = base_url
+            for m in provider["models"]:
+                m["id"] = model_id
+                m["contextWindow"] = context_window
+                m["maxTokens"] = max_tokens
+        (agent_dir / "models.json").write_text(json.dumps(models, indent=2))
+        shutil.copy2(HERE / "pi" / "settings.json", agent_dir / "settings.json")
+
+        prompt = (HERE / "prompt.md").read_text()
+        prompt = prompt.replace("{{WORKSPACE}}", str(ws))
+        prompt = prompt.replace("{{NETWORK}}", "direct host mode (--no-sandbox).")
+        prompt = prompt.replace("{{SHM}}", "`multiprocessing` works.")
+        prompt_file = Path(tmp) / "prompt.md"
+        prompt_file.write_text(prompt)
+
+        sessions_dir = rt_dir / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["PI_CODING_AGENT_DIR"] = str(agent_dir)
+        env["PI_OFFLINE"] = "1"
+        node_bin = str(rt_dir / "node" / "bin")
+        env["PATH"] = f"{node_bin}:{env.get('PATH', '')}"
+        cmd = [str(pi_bin), "--session-dir", str(sessions_dir), "--append-system-prompt", str(prompt_file), *pi_args]
+        return subprocess.run(cmd, cwd=ws, env=env).returncode
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if "--" in raw_args:
+        split = raw_args.index("--")
+        head, tail = raw_args[:split], raw_args[split + 1 :]
+    else:
+        head, tail = raw_args, []
+
+    parser = build_parser()
+    args, unknown = parser.parse_known_args(head)
+    pi_args = [*unknown, *tail]
+
+    ws = Path(args.workspace).resolve()
+    if not ws.is_dir():
+        print(f"kidi code: workspace is not a directory: {ws}", file=sys.stderr)
+        return 2
+
+    rt_dir = runtime_dir()
+    pi_bin = ensure_pi_installed(rt_dir)
+
+    base_url = args.base_url or f"http://127.0.0.1:{args.port}/v1"
+    parsed = urllib.parse.urlsplit(base_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    backend = args.backend or ("cuda" if has_nvidia_gpu() else "auto")
+    context_size = args.context_size or int(os.environ.get("KIDI_CONTEXT_SIZE") or (65536 if backend.startswith("cuda") else 32768))
+
+    server_proc: subprocess.Popen[bytes] | None = None
+    served_id = probe_server(base_url)
+    if served_id is not None:
+        model_id = args.model_id or served_id
+        print(f"kidi code: connected to existing server at {base_url} ({model_id})", file=sys.stderr, flush=True)
+    else:
+        if host not in ("127.0.0.1", "localhost"):
+            print(f"kidi code: server at {base_url} is unreachable", file=sys.stderr)
+            return 1
+        kidi_bin = find_kidi_binary(args.kidi_bin)
+        if kidi_bin is None:
+            print("kidi code: could not locate `kidi` binary (build it or set KIDI=/path/to/kidi)", file=sys.stderr)
+            return 1
+        model = resolve_default_model(args.model, backend)
+        model_id = args.model_id or "kidi-local"
+        log_path = rt_dir / "run" / f"serve-{port}.log"
+        server_proc = start_server(
+            kidi_bin=kidi_bin,
+            model=model,
+            backend=backend,
+            host=host,
+            port=port,
+            served_name=model_id,
+            context_size=context_size,
+            max_new_tokens=args.max_new_tokens,
+            prefill_chunk_size=args.prefill_chunk_size,
+            log_path=log_path,
+        )
+
+    def stop_server() -> None:
+        if server_proc is None or args.keep_server or server_proc.poll() is not None:
+            return
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+            server_proc.wait(timeout=5)
+
+    prev_term = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, lambda *_: (stop_server(), sys.exit(143)))
+    try:
+        use_sandbox = sys.platform == "linux" and not args.no_sandbox
+        if not use_sandbox:
+            return run_unsandboxed(
+                pi_bin, rt_dir, ws, base_url, model_id, context_size, args.max_new_tokens, pi_args
+            )
+
+        env = dict(os.environ)
+        env["KIDI_AGENT_BASE_URL"] = base_url
+        env["KIDI_AGENT_MODEL_ID"] = model_id
+        env["KIDI_AGENT_CONTEXT_WINDOW"] = str(context_size)
+        env["KIDI_AGENT_MAX_TOKENS"] = str(args.max_new_tokens)
+
+        cmd = [str(HERE / "sandbox.sh")]
+        if args.allow_https:
+            cmd.append("--allow-https")
+        for p in args.allow_port:
+            cmd.extend(["--allow-port", str(p)])
+        for p in args.ro:
+            cmd.extend(["--ro", p])
+        for p in args.rw:
+            cmd.extend(["--rw", p])
+        if args.no_sudo:
+            cmd.append("--no-sudo")
+        cmd.append(str(ws))
+        if pi_args:
+            cmd.extend(["--", *pi_args])
+        return subprocess.run(cmd, env=env).returncode
+    finally:
+        signal.signal(signal.SIGTERM, prev_term)
+        stop_server()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"kidi code: {exc}", file=sys.stderr)
+        raise SystemExit(1)

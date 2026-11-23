@@ -5,6 +5,24 @@ OpenAI-compatible endpoint, confined
 by [Landlock](https://docs.kernel.org/userspace-api/landlock.html) to one workspace directory.
 Linux only; works inside unprivileged containers.
 
+## Quick start (`kidi-code`)
+
+From any project directory, `tools/agent/kidi-code` automatically installs Pi on first run, starts
+`kidi serve` using your cached model (e.g. `Inkling-2-Mini`) or reuses an already-running server
+on port `18097`, and launches Pi inside the Landlock sandbox:
+
+```bash
+cd /path/to/your/project
+/path/to/kidi/tools/agent/kidi-code                        # interactive Pi in current dir
+/path/to/kidi/tools/agent/kidi-code -p "fix the test"      # one-shot
+/path/to/kidi/tools/agent/kidi-code --keep-server          # leave server running
+```
+
+Useful options: `-w/--workspace DIR`, `-m/--model MODEL`, `--backend cuda[:INDEX]|auto`,
+`--port N`, `--context-size N`, `--max-new-tokens N`, `--no-sandbox` (also used on macOS).
+
+## Manual launcher (`sandbox.sh`)
+
 ```bash
 tools/agent/setup.sh                                  # Node 22 + Pi into ~/.local/share/kidi-agent
 KIDI_MODEL=/path/to/model CUDA_VISIBLE_DEVICES=7 tools/agent/serve-kidi.sh # kidi endpoint (port 18097)

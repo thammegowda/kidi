@@ -104,13 +104,20 @@ prompt="${prompt//'{{WORKSPACE}}'/$ws}"
 prompt="${prompt//'{{NETWORK}}'/$network}"
 printf '%s\n' "${prompt//'{{SHM}}'/$shm}" > "$priv/prompt.md"
 model_id="${KIDI_AGENT_MODEL_ID:-kidi-local}"
-"$python" - "$here/pi/models.json" "$priv/agent/models.json" "$base_url" "$model_id" <<'EOF'
+"$python" - "$here/pi/models.json" "$priv/agent/models.json" "$base_url" "$model_id" \
+    "${KIDI_AGENT_CONTEXT_WINDOW:-}" "${KIDI_AGENT_MAX_TOKENS:-}" <<'EOF'
 import json, sys
 config = json.load(open(sys.argv[1]))
+ctx = int(sys.argv[5]) if sys.argv[5] else None
+max_tok = int(sys.argv[6]) if sys.argv[6] else None
 for provider in config["providers"].values():
     provider["baseUrl"] = sys.argv[3]
     for model in provider["models"]:
         model["id"] = sys.argv[4]
+        if ctx is not None:
+            model["contextWindow"] = ctx
+        if max_tok is not None:
+            model["maxTokens"] = max_tok
 json.dump(config, open(sys.argv[2], "w"), indent=2)
 EOF
 cp "$here/pi/settings.json" "$priv/agent/"

@@ -909,8 +909,8 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
             next_request_id_ == std::numeric_limits<std::uint64_t>::max())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "serving queue is unavailable or full"});
         const auto started = Clock::now();
-        const auto maximum = options.maximum_new_tokens ? options.maximum_new_tokens
-                                                        : config_["decode"]["maximum_new_tokens"].as<std::size_t>();
+        auto maximum = options.maximum_new_tokens ? options.maximum_new_tokens
+                                                  : config_["decode"]["maximum_new_tokens"].as<std::size_t>();
         auto capacity =
             options.context_size ? options.context_size : config_["decode"]["context_size"].as<std::size_t>();
         if (!maximum || !options.prefill_chunk_size || !capacity || capacity > serving_->cache_token_budget ||
@@ -920,8 +920,10 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         auto tokens = require(tokenizer_.encode(serialized));
         if (options.maximum_prompt_tokens && tokens.size() > options.maximum_prompt_tokens)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prompt exceeds the configured input-token limit"});
-        if (tokens.empty() || tokens.size() >= capacity || maximum > capacity - tokens.size())
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prompt and generation must fit the reserved context"});
+        if (tokens.empty() || tokens.size() >= capacity)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prompt exceeds the reserved context"});
+        maximum = std::min(maximum, capacity - tokens.size());
+        options.maximum_new_tokens = maximum;
         if (serving_->compact_cache) {
             auto required = tokens.size() + maximum;
             const auto byte_cache_limit = model_->device().capabilities().attention.int8_cache_tokens;

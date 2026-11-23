@@ -188,5 +188,14 @@ TEST_F(ChatTest, PromptsAndStopTokens) {
                   .generation.token_ids,
               raw.generation.token_ids)
         << "raw generation requires a chat template";
+
+    auto clamped = raw_options;
+    clamped.context_size = 16;
+    clamped.maximum_new_tokens = 20;
+    require(multiple_stops.enqueue("alpha theta eta", clamped));
+    const auto clamped_out = complete(multiple_stops);
+    EXPECT_LE(clamped_out.generation.token_ids.size(), 13U) << "serving enqueue should clamp generation to remaining context";
+    EXPECT_FALSE(multiple_stops.enqueue("a b c d e f g h i j k l m n o p", clamped))
+        << "prompt at or beyond context capacity must still be rejected";
 }
 } // namespace

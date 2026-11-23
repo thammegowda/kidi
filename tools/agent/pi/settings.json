@@ -2,5 +2,10 @@
   "defaultProvider": "kidi",
   "defaultModel": "kidi-local",
   "defaultThinkingLevel": "off",
-  "quietStartup": true
+  "quietStartup": true,
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 8192,
+    "keepRecentTokens": 6000
+  }
 }

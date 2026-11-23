@@ -7,7 +7,7 @@ set -euo pipefail
 : "${KIDI_MODEL:?set KIDI_MODEL to the model directory}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [[ -f $KIDI_MODEL/config.json ]] || { echo "missing model config: $KIDI_MODEL" >&2; exit 1; }
-context="${KIDI_CONTEXT_SIZE:-32768}"
+context="${KIDI_CONTEXT_SIZE:-65536}"
 
 exec "${KIDI:-$root/build-release-cuda/kidi}" serve -m "$KIDI_MODEL" \
     --backend cuda \
@@ -17,4 +17,4 @@ exec "${KIDI:-$root/build-release-cuda/kidi}" serve -m "$KIDI_MODEL" \
     --context-size "$context" \
     --cache-tokens "${KIDI_CACHE_TOKENS:-$context}" \
     --prefill-chunk-size "${KIDI_PREFILL_CHUNK_SIZE:-512}" \
-    --max-new-tokens "${KIDI_MAX_NEW_TOKENS:-4096}"
+    --max-new-tokens "${KIDI_MAX_NEW_TOKENS:-8192}"
