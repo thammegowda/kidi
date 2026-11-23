@@ -47,6 +47,12 @@ distributions are acquired from `web/package-lock.json` and staged as ignored
 local assets; see [web dependency policy](web/libs/README.md).
 CLI-only and Python wheel targets do not acquire web packages or require Node.js.
 
+The [native coding agent](kidi-code/README.md) is enabled by default on Linux
+and macOS. Run `kidi code` to start or reuse a background Kidi server. The
+native command does not link libcurl. To build the standalone Kidi HTTP
+HTTP client independently of inference, use
+`cmake -S kidi-code -B .cache/kidi-code-build`.
+
 ## Native Build
 
 ```bash

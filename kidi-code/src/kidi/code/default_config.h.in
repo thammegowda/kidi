@@ -1,0 +1,7 @@
+#pragma once
+
+#include <string_view>
+
+namespace kidi::code {
+inline constexpr std::string_view DEFAULT_AGENT_YAML = R"kidi_yaml(@KIDI_CODE_AGENT_YAML@)kidi_yaml";
+} // namespace kidi::code

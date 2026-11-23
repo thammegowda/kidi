@@ -50,6 +50,129 @@ auto trim(std::string_view value) -> std::string_view {
     return value;
 }
 
+// Parses relaxed argument objects such as Gemma's {path:<|"|>a, b<|"|>,limit:3}.
+class LooseParser {
+public:
+    explicit LooseParser(std::string_view text) : text_(text) {}
+
+    auto parse() -> std::optional<json> {
+        auto result = value();
+        skip_space();
+        if (!result || !text_.empty()) return std::nullopt;
+        return result;
+    }
+
+private:
+    static constexpr std::string_view GEMMA_QUOTE = "<|\"|>";
+
+    auto skip_space() -> void {
+        while (!text_.empty() &&
+               (text_.front() == ' ' || text_.front() == '\n' || text_.front() == '\r' || text_.front() == '\t'))
+            text_.remove_prefix(1);
+    }
+
+    auto consume(char expected) -> bool {
+        skip_space();
+        if (!text_.starts_with(expected)) return false;
+        text_.remove_prefix(1);
+        return true;
+    }
+
+    auto quoted() -> std::optional<std::string> {
+        if (text_.starts_with(GEMMA_QUOTE)) {
+            text_.remove_prefix(GEMMA_QUOTE.size());
+            const auto end = text_.find(GEMMA_QUOTE);
+            if (end == std::string_view::npos) return std::nullopt;
+            std::string result(text_.substr(0, end));
+            text_.remove_prefix(end + GEMMA_QUOTE.size());
+            return result;
+        }
+        if (text_.starts_with('"')) {
+            for (std::size_t i = 1; i < text_.size(); ++i) {
+                if (text_[i] == '\\') {
+                    ++i;
+                } else if (text_[i] == '"') {
+                    auto parsed = json::parse(text_.substr(0, i + 1), nullptr, false);
+                    if (!parsed.is_string()) return std::nullopt;
+                    text_.remove_prefix(i + 1);
+                    return parsed.get<std::string>();
+                }
+            }
+            return std::nullopt;
+        }
+        if (text_.starts_with('\'')) {
+            const auto end = text_.find('\'', 1);
+            if (end == std::string_view::npos) return std::nullopt;
+            std::string result(text_.substr(1, end - 1));
+            text_.remove_prefix(end + 1);
+            return result;
+        }
+        return std::nullopt;
+    }
+
+    auto bare(std::string_view stops) -> std::string_view {
+        const auto end = std::min(text_.find_first_of(stops), text_.size());
+        const auto result = trim(text_.substr(0, end));
+        text_.remove_prefix(end);
+        return result;
+    }
+
+    auto value() -> std::optional<json> {
+        if (++depth_ > 64) return std::nullopt;
+        skip_space();
+        std::optional<json> result;
+        if (text_.starts_with('{'))
+            result = object();
+        else if (text_.starts_with('['))
+            result = array();
+        else if (auto text = quoted())
+            result = json(std::move(*text));
+        else if (text_.starts_with(GEMMA_QUOTE) || text_.starts_with('"') || text_.starts_with('\''))
+            result = std::nullopt;
+        else if (const auto scalar = bare(",}]"); !scalar.empty()) {
+            auto parsed = json::parse(scalar, nullptr, false);
+            result = parsed.is_discarded() || parsed.is_structured() ? json(std::string(scalar)) : std::move(parsed);
+        }
+        --depth_;
+        return result;
+    }
+
+    auto object() -> std::optional<json> {
+        text_.remove_prefix(1);
+        auto result = json::object();
+        if (consume('}')) return result;
+        do {
+            skip_space();
+            auto key = quoted();
+            if (!key) key = std::string(bare(":,}]"));
+            if (key->empty() || !consume(':')) return std::nullopt;
+            auto item = value();
+            if (!item) return std::nullopt;
+            result[*key] = std::move(*item);
+        } while (consume(','));
+        if (!consume('}')) return std::nullopt;
+        return result;
+    }
+
+    auto array() -> std::optional<json> {
+        text_.remove_prefix(1);
+        auto result = json::array();
+        if (consume(']')) return result;
+        do {
+            auto item = value();
+            if (!item) return std::nullopt;
+            result.push_back(std::move(*item));
+        } while (consume(','));
+        if (!consume(']')) return std::nullopt;
+        return result;
+    }
+
+    std::string_view text_;
+    int depth_ = 0;
+};
+
+auto loose_value(std::string_view text) -> std::optional<json> { return LooseParser(text).parse(); }
+
 auto tool_call(std::string_view body, std::string_view header = {}) -> std::optional<ToolCall> {
     body = trim(body);
     std::string name(trim(header));
@@ -110,35 +233,9 @@ auto tool_call(std::string_view body, std::string_view header = {}) -> std::opti
     if (open == std::string_view::npos || close <= open) return std::nullopt;
     auto content = trim(body.substr(open + 1, close - open - 1));
     if (content.empty()) return ToolCall{std::move(name), json::object()};
-    json parsed = json::parse("{" + std::string(content) + "}", nullptr, false);
-    if (!parsed.is_discarded() && parsed.is_object()) return ToolCall{std::move(name), std::move(parsed)};
-
-    json values = json::object();
-    while (!content.empty()) {
-        const auto comma = content.find(',');
-        const auto entry = trim(content.substr(0, comma));
-        const auto colon = entry.find(':');
-        if (colon == std::string_view::npos) return std::nullopt;
-        const auto key_value = trim(entry.substr(0, colon));
-        auto value = trim(entry.substr(colon + 1));
-        std::string key(key_value);
-        if (key.size() >= 2 && ((key.front() == '"' && key.back() == '"') ||
-                                (key.front() == '\'' && key.back() == '\'')))
-            key = key.substr(1, key.size() - 2);
-        if (key.empty()) return std::nullopt;
-        auto json_value = json::parse(value, nullptr, false);
-        if (!json_value.is_discarded())
-            values[key] = std::move(json_value);
-        else {
-            if (value.size() >= 2 && ((value.front() == '"' && value.back() == '"') ||
-                                      (value.front() == '\'' && value.back() == '\'')))
-                value = value.substr(1, value.size() - 2);
-            values[key] = std::string(value);
-        }
-        if (comma == std::string_view::npos) break;
-        content.remove_prefix(comma + 1);
-    }
-    return ToolCall{std::move(name), std::move(values)};
+    auto values = loose_value("{" + std::string(content) + "}");
+    if (!values || !values->is_object()) return std::nullopt;
+    return ToolCall{std::move(name), std::move(*values)};
 }
 
 auto parse_function(std::string_view opening, std::string_view body) -> std::optional<ToolCall> {

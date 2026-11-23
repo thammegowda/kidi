@@ -1,5 +1,11 @@
 # Coding-agent sandbox
 
+For the native C++23 `kidi code` command (no Node/Pi) or its standalone HTTP
+client, see [Kidi Code](../../kidi-code/README.md). It provides workspace file
+tools, an approval-gated shell tool and host-controlled permissions, but not this
+launcher's OS process sandbox.
+The Pi launcher below remains unchanged.
+
 Runs the [Pi](https://github.com/earendil-works/pi) coding agent (pinned to v0.83.0) against an
 OpenAI-compatible endpoint, confined
 by [Landlock](https://docs.kernel.org/userspace-api/landlock.html) to one workspace directory.

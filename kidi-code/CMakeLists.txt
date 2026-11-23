@@ -1,0 +1,83 @@
+cmake_minimum_required(VERSION 3.25)
+
+set(KIDI_CODE_STANDALONE OFF)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(KIDI_CODE_STANDALONE ON)
+    project(kidi_code VERSION 0.1.0 LANGUAGES CXX)
+    include(CTest)
+endif()
+
+option(KIDI_CODE_BUILD_CLI "Build the standalone kidi-code executable" ${KIDI_CODE_STANDALONE})
+get_filename_component(KIDI_CODE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+
+if(NOT TARGET nlohmann_json::nlohmann_json)
+    set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+    set(JSON_Install OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${KIDI_CODE_ROOT}/third_party/nlohmann-json" "${CMAKE_CURRENT_BINARY_DIR}/json" EXCLUDE_FROM_ALL)
+endif()
+
+if(NOT TARGET yaml-cpp::yaml-cpp)
+    set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+    set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(YAML_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${KIDI_CODE_ROOT}/third_party/yaml-cpp" "${CMAKE_CURRENT_BINARY_DIR}/yaml-cpp" EXCLUDE_FROM_ALL)
+endif()
+
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/agent.yaml")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/agent.yaml" KIDI_CODE_AGENT_YAML)
+configure_file(src/kidi/code/default_config.h.in generated/default_config.h @ONLY)
+
+add_library(kidi_code
+    src/kidi/code/agent.cpp
+    src/kidi/code/config.cpp
+    src/kidi/code/openai.cpp
+    src/kidi/code/workspace.cpp
+)
+add_library(kidi::code ALIAS kidi_code)
+target_compile_features(kidi_code PUBLIC cxx_std_23)
+target_include_directories(kidi_code PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src" "${KIDI_CODE_ROOT}/src")
+target_include_directories(kidi_code PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(kidi_code PUBLIC nlohmann_json::nlohmann_json PRIVATE yaml-cpp::yaml-cpp)
+
+if(NOT TARGET liteapp::httplib)
+    find_package(Threads REQUIRED)
+    add_library(kidi_code_httplib INTERFACE)
+    add_library(liteapp::httplib ALIAS kidi_code_httplib)
+    target_include_directories(kidi_code_httplib SYSTEM INTERFACE
+        "${KIDI_CODE_ROOT}/third_party/liteapp/libs/httplib")
+    target_link_libraries(kidi_code_httplib INTERFACE Threads::Threads)
+endif()
+add_library(kidi_code_http src/kidi/code/openai_http.cpp)
+add_library(kidi::code_http ALIAS kidi_code_http)
+target_link_libraries(kidi_code_http PUBLIC kidi::code PRIVATE liteapp::httplib)
+
+if(TARGET kidi_cli_main OR KIDI_CODE_BUILD_CLI)
+    if(NOT TARGET kidi::argparse)
+        add_library(kidi_code_argparse "${KIDI_CODE_ROOT}/src/kidi/cli/argparse.cpp")
+        add_library(kidi::argparse ALIAS kidi_code_argparse)
+        target_compile_features(kidi_code_argparse PUBLIC cxx_std_23)
+        target_include_directories(kidi_code_argparse PUBLIC "${KIDI_CODE_ROOT}/src")
+    endif()
+    add_library(kidi_code_command src/kidi/code/command.cpp)
+    target_link_libraries(kidi_code_command PUBLIC kidi::code kidi::argparse)
+    if(KIDI_CODE_BUILD_CLI)
+        add_executable(kidi_code_cli src/main.cpp)
+        set_target_properties(kidi_code_cli PROPERTIES OUTPUT_NAME kidi-code)
+        target_link_libraries(kidi_code_cli PRIVATE kidi_code_command kidi::code_http)
+    endif()
+endif()
+
+if(KIDI_CODE_STANDALONE AND BUILD_TESTING)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${KIDI_CODE_ROOT}/third_party/ynnpack-dev/third_party/googletest"
+        "${CMAKE_CURRENT_BINARY_DIR}/googletest" EXCLUDE_FROM_ALL)
+    include(GoogleTest)
+    add_executable(kidi_code_test tests/agent_test.cpp tests/config_test.cpp tests/workspace_test.cpp)
+    target_link_libraries(kidi_code_test PRIVATE kidi::code GTest::gtest_main)
+    gtest_discover_tests(kidi_code_test)
+    add_executable(kidi_code_openai_test tests/openai_test.cpp)
+    target_link_libraries(kidi_code_openai_test PRIVATE kidi::code_http liteapp::httplib GTest::gtest_main)
+    gtest_discover_tests(kidi_code_openai_test)
+endif()

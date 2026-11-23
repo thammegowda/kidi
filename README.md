@@ -159,6 +159,12 @@ CUDA_VISIBLE_DEVICES=0 kidi serve -m @thinkingmachines/Inkling-2-Mini --backend 
 ```
 
 See [tools/agent/README.md](tools/agent/README.md) to run the Pi coding agent against it in a Landlock sandbox.
+For a native C++23 alternative without Node/Pi, see [Kidi Code](kidi-code/README.md):
+run `kidi code` to start or reuse a shared background inference server. The
+standalone `kidi-code` connects to an existing Kidi server over plain HTTP.
+Both have workspace file tools, an approval-gated shell command tool, and
+explicit permissions. Commands are not OS-sandboxed and Pi protocol compatibility
+is not included; existing Pi workflows are unchanged.
 
 Add `--assistant-model` (with `@owner/model` or a local directory) to enable CPU speculative decoding in `chat` or `generate`:
 

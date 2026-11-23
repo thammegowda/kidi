@@ -18,6 +18,9 @@
 #include "kidi/cli/interactive.h"
 #include "kidi/cli/index.h"
 #include "kidi/cli/serve.h"
+#ifdef KIDI_HAS_CODE
+#include "kidi/cli/managed_serve.h"
+#endif
 #include "kidi/core/version.h"
 #include "kidi/checkpoint/package.h"
 #include "kidi/checkpoint/config.h"
@@ -634,10 +637,15 @@ auto serve_command(const kidi::cli::Namespace& arguments, const std::filesystem:
     auto name = arguments.get<std::string>("served_model_name");
     if (name.empty()) name = arguments.get<std::filesystem::path>("model").string();
     if (name.starts_with('@')) name.erase(0, 1);
-    return kidi::cli::serve(session->generator, {.host = arguments.get<std::string>("host"),
-                                                 .port = arguments.get<std::int32_t>("port"),
-                                                 .model_name = std::move(name),
-                                                 .generation = session->options});
+    const kidi::cli::ServeOptions options{.host = arguments.get<std::string>("host"),
+                                          .port = arguments.get<std::int32_t>("port"),
+                                          .model_name = std::move(name),
+                                          .generation = session->options};
+#ifdef KIDI_HAS_CODE
+    if (!arguments.get<std::filesystem::path>("managed_dir").empty())
+        return kidi::cli::serve_managed(session->generator, options, arguments);
+#endif
+    return kidi::cli::serve(session->generator, options);
 }
 
 auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
@@ -824,6 +832,10 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
     kidi::cli::ArgumentParser parser("kidi", "Run translation, transcription, text generation and TTS models.");
     parser.version("kidi " + std::string(kidi::version()));
     auto& commands = parser.add_subparsers().required();
+#ifdef KIDI_HAS_CODE
+    auto& code_parser = commands.add_parser("code", "native coding agent with shared background inference");
+    kidi::cli::configure_managed_code_parser(code_parser);
+#endif
     auto& index_parser = commands.add_parser("index", "build a reusable CPU HNSW index for a model");
     kidi::cli::configure_index_parser(index_parser);
     auto& translate_parser = commands.add_parser("translate", "translate one Moses-tokenized line per input line");
@@ -842,6 +854,9 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         .help("model id reported to clients (default: --model)");
     serve_parser.add_argument("--max-active").dest("max_active").default_value<std::size_t>(1);
     serve_parser.add_argument("--queue-size").dest("queue_size").default_value<std::size_t>(64);
+#ifdef KIDI_HAS_CODE
+    kidi::cli::configure_managed_serve_parser(serve_parser);
+#endif
     auto& transcribe_parser = commands.add_parser("transcribe", "transcribe a 16 kHz WAV file with Whisper");
     transcribe_parser.description(
         "Transcribe or translate speech with Whisper Tiny, Base, Small, Large-v3, or Large-v3-Turbo. Long WAV files "
@@ -1034,6 +1049,10 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
             return 0;
         }
         const auto& command = arguments.get<std::string>("command");
+#ifdef KIDI_HAS_CODE
+        if (command == "code") return kidi::cli::managed_code_command(arguments);
+        if (command == "serve") kidi::cli::protect_managed_lock(arguments);
+#endif
         std::filesystem::path directory;
         const auto cache = arguments.contains("cache") ? arguments.get<std::filesystem::path>("cache")
                                                        : kidi::checkpoint::Hub::default_cache();

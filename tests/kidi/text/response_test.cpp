@@ -65,6 +65,15 @@ TEST(ResponseTest, GemmaChannelAndToolCall) {
         << "Gemma channel and tool call";
 }
 
+TEST(ResponseTest, GemmaQuotedArguments) {
+    auto gemma = parse_assistant_response(
+        "<|tool_call>call:write{path:<|\"|>a, b.txt<|\"|>,limit:3,tags:[<|\"|>x<|\"|>,true],"
+        "meta:{note:<|\"|>}{<|\"|>}}<tool_call|>");
+    ASSERT_EQ(gemma.tool_calls.size(), 1u);
+    EXPECT_EQ(gemma.tool_calls[0].arguments.dump(),
+              R"({"path":"a, b.txt","limit":3,"tags":["x",true],"meta":{"note":"}{"}})");
+}
+
 TEST(ResponseTest, MalformedInputStaysVisible) {
     auto broken = parse_assistant_response("<|message_model|>x<|content_invoke_tool_json|>{oops<|end_message|>");
     EXPECT_TRUE(broken.tool_calls.empty() && broken.content == "{oops") << "invalid Inkling tool JSON stays visible";

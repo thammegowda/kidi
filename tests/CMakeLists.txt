@@ -75,6 +75,26 @@ function(kidi_add_test target source)
 endfunction()
 
 kidi_add_test(kidi_argparse_test tests/kidi/cli/argparse_test.cpp STANDALONE LINK kidi::argparse)
+if(TARGET kidi::code)
+    kidi_add_test(kidi_code_test kidi-code/tests/agent_test.cpp STANDALONE LINK kidi::code)
+    target_sources(kidi_code_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-code/tests/workspace_test.cpp")
+    target_sources(kidi_code_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-code/tests/config_test.cpp")
+    if(TARGET kidi::code_http)
+        kidi_add_test(kidi_code_openai_test kidi-code/tests/openai_test.cpp
+            STANDALONE LINK kidi::code_http liteapp::httplib)
+    endif()
+endif()
+
+if(KIDI_BUILD_CODE AND KIDI_BUILD_CODE_DEFAULT AND NOT CMAKE_CROSSCOMPILING)
+    find_program(KIDI_TEST_BASH bash)
+    find_program(KIDI_TEST_CURL curl)
+    if(KIDI_TEST_BASH AND KIDI_TEST_CURL)
+        add_test(NAME kidi_code_managed
+            COMMAND "${KIDI_TEST_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/kidi/cli/managed_code_test.sh"
+                "$<TARGET_FILE:kidi_cli>" "${PROJECT_SOURCE_DIR}/tests/data/gemma4" "${KIDI_TEST_CURL}")
+        set_tests_properties(kidi_code_managed PROPERTIES TIMEOUT 30 LABELS native)
+    endif()
+endif()
 
 kidi_add_test(kidi_editor_test tests/kidi/app/editor_test.cpp)
 kidi_add_test(kidi_prompts_test tests/kidi/app/prompts_test.cpp)
