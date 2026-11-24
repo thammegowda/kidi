@@ -26,7 +26,7 @@ set_tests_properties(GpuPool PROPERTIES
 # Names stay short so CTest status lines fit one terminal row; select a binary by suite, e.g.
 # `ctest -R '^Gemma4'`. Keep suite names unique across binaries and full names <= 40 chars.
 function(kidi_discover_tests target)
-    cmake_parse_arguments(TEST "" "COST;RESOURCE_LOCK" "LABELS" ${ARGN})
+    cmake_parse_arguments(TEST "" "COST;RESOURCE_LOCK;TIMEOUT" "LABELS" ${ARGN})
     if(NOT TEST_LABELS)
         set(TEST_LABELS native)
     endif()
@@ -44,6 +44,9 @@ function(kidi_discover_tests target)
     if(TEST_RESOURCE_LOCK)
         list(APPEND properties RESOURCE_LOCK ${TEST_RESOURCE_LOCK})
     endif()
+    if(TEST_TIMEOUT)
+        list(APPEND properties TIMEOUT ${TEST_TIMEOUT})
+    endif()
     # Parameter generators already name cases (e.g. `/qat`); skip CMake's `# GetParam() = ...` suffix.
     gtest_discover_tests(${target}
         NO_PRETTY_TYPES NO_PRETTY_VALUES
@@ -51,10 +54,10 @@ function(kidi_discover_tests target)
         PROPERTIES ${properties})
 endfunction()
 
-# kidi_add_test(<target> <source> [STANDALONE] [LINK libs...] [LABELS labels...] [COST n])
+# kidi_add_test(<target> <source> [STANDALONE] [LINK libs...] [LABELS labels...] [COST n] [TIMEOUT seconds])
 # Builds a GoogleTest executable linked against kidi::kidi (unless STANDALONE).
 function(kidi_add_test target source)
-    cmake_parse_arguments(TEST "STANDALONE" "COST;RESOURCE_LOCK" "LINK;LABELS" ${ARGN})
+    cmake_parse_arguments(TEST "STANDALONE" "COST;RESOURCE_LOCK;TIMEOUT" "LINK;LABELS" ${ARGN})
     if(NOT IS_ABSOLUTE "${source}")
         set(source "${PROJECT_SOURCE_DIR}/${source}")
     endif()
@@ -71,6 +74,9 @@ function(kidi_add_test target source)
     if(TEST_RESOURCE_LOCK)
         list(APPEND discover_args RESOURCE_LOCK ${TEST_RESOURCE_LOCK})
     endif()
+    if(TEST_TIMEOUT)
+        list(APPEND discover_args TIMEOUT ${TEST_TIMEOUT})
+    endif()
     kidi_discover_tests(${target} ${discover_args})
 endfunction()
 
@@ -81,7 +87,7 @@ if(TARGET kidi::code)
     target_sources(kidi_code_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-code/tests/config_test.cpp")
     if(TARGET kidi_code_command AND UNIX)
         kidi_add_test(kidi_code_command_test kidi-code/tests/command_test.cpp
-            STANDALONE LINK kidi_code_command)
+            STANDALONE LINK kidi_code_command TIMEOUT 60)
     endif()
     if(TARGET kidi::code_http)
         kidi_add_test(kidi_code_chat_client_test kidi-code/tests/chat_client_test.cpp

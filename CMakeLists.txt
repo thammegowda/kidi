@@ -402,58 +402,60 @@ if(APPLE)
     endif()
 endif()
 
-set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "Build LiteApp's GoogleTest suite" FORCE)
-add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
+if(NOT EMSCRIPTEN)
+    set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "Build LiteApp's GoogleTest suite" FORCE)
+    add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
 
-# kidi's single HTTP API (OpenAI-compatible chat), hosted by both `kidi serve` and the desktop app.
-add_library(kidi_server STATIC
-    src/kidi/server/engine.cpp
-    src/kidi/server/chat_api.cpp
-    src/kidi/server/routes.cpp
-)
-target_link_libraries(kidi_server PUBLIC kidi::kidi liteapp::http nlohmann_json::nlohmann_json)
+    # kidi's single HTTP API (OpenAI-compatible chat), hosted by both `kidi serve` and the desktop app.
+    add_library(kidi_server STATIC
+        src/kidi/server/engine.cpp
+        src/kidi/server/chat_api.cpp
+        src/kidi/server/routes.cpp
+    )
+    target_link_libraries(kidi_server PUBLIC kidi::kidi liteapp::http nlohmann_json::nlohmann_json)
 
-add_library(kidi_cli_main STATIC
-    src/kidi/cli/index.cpp
-    src/kidi/cli/interactive.cpp
-    src/kidi/cli/log.cpp
-    src/kidi/cli/main.cpp
-    src/kidi/cli/serve.cpp
-)
-target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi nlohmann_json::nlohmann_json PRIVATE kidi_server)
-if(KIDI_ENABLE_CUDA)
-    find_package(CUDAToolkit 13 REQUIRED)
-    target_compile_definitions(kidi_cli_main PRIVATE KIDI_CUDA_TOOLKIT_VERSION="${CUDAToolkit_VERSION}")
-endif()
-if(KIDI_BUILD_CODE)
-    add_subdirectory(kidi-code)
-    if(KIDI_BUILD_CODE_DEFAULT)
-        target_sources(kidi_cli_main PRIVATE src/kidi/cli/managed_serve.cpp)
-        target_link_libraries(kidi_cli_main PRIVATE kidi_code_command kidi::code_http liteapp::httplib)
-        target_compile_definitions(kidi_cli_main PRIVATE KIDI_HAS_CODE=1)
+    add_library(kidi_cli_main STATIC
+        src/kidi/cli/index.cpp
+        src/kidi/cli/interactive.cpp
+        src/kidi/cli/log.cpp
+        src/kidi/cli/main.cpp
+        src/kidi/cli/serve.cpp
+    )
+    target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi nlohmann_json::nlohmann_json PRIVATE kidi_server)
+    if(KIDI_ENABLE_CUDA)
+        find_package(CUDAToolkit 13 REQUIRED)
+        target_compile_definitions(kidi_cli_main PRIVATE KIDI_CUDA_TOOLKIT_VERSION="${CUDAToolkit_VERSION}")
     endif()
-endif()
-if(TARGET kidi_index_cuda_helper)
-    add_dependencies(kidi_cli_main kidi_index_cuda_helper)
-endif()
+    if(KIDI_BUILD_CODE)
+        add_subdirectory(kidi-code)
+        if(KIDI_BUILD_CODE_DEFAULT)
+            target_sources(kidi_cli_main PRIVATE src/kidi/cli/managed_serve.cpp)
+            target_link_libraries(kidi_cli_main PRIVATE kidi_code_command kidi::code_http liteapp::httplib)
+            target_compile_definitions(kidi_cli_main PRIVATE KIDI_HAS_CODE=1)
+        endif()
+    endif()
+    if(TARGET kidi_index_cuda_helper)
+        add_dependencies(kidi_cli_main kidi_index_cuda_helper)
+    endif()
 
-add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)
-set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
-target_link_libraries(kidi_cli PRIVATE kidi_cli_main)
-kidi_optimize_executable(kidi_cli)
+    add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)
+    set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
+    target_link_libraries(kidi_cli PRIVATE kidi_cli_main)
+    kidi_optimize_executable(kidi_cli)
 
-if(KIDI_ENABLE_CUDA)
-    target_link_options(kidi_cli PRIVATE -static-libstdc++ -static-libgcc)
-    add_custom_command(TARGET kidi_cli POST_BUILD
-        COMMAND "${CMAKE_COMMAND}" "-DREADELF=${CMAKE_READELF}" "-DBINARY=$<TARGET_FILE:kidi_cli>"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/third_party/liteapp/cmake/VerifyPortableElf.cmake"
-        VERBATIM)
-endif()
+    if(KIDI_ENABLE_CUDA)
+        target_link_options(kidi_cli PRIVATE -static-libstdc++ -static-libgcc)
+        add_custom_command(TARGET kidi_cli POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" "-DREADELF=${CMAKE_READELF}" "-DBINARY=$<TARGET_FILE:kidi_cli>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/third_party/liteapp/cmake/VerifyPortableElf.cmake"
+            VERBATIM)
+    endif()
 
-if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
-    foreach(_kidi_target IN ITEMS kidi_argparse kidi kidi_server kidi_cli_main)
-        target_compile_options(${_kidi_target} PRIVATE -ffunction-sections -fdata-sections)
-    endforeach()
+    if(UNIX AND NOT APPLE)
+        foreach(_kidi_target IN ITEMS kidi_argparse kidi kidi_server kidi_cli_main)
+            target_compile_options(${_kidi_target} PRIVATE -ffunction-sections -fdata-sections)
+        endforeach()
+    endif()
 endif()
 
 if(KIDI_BUILD_DESKTOP_APP)
