@@ -67,7 +67,8 @@ auto inference_device(const kidi::cli::Namespace& arguments,
     if (backend != "mps" && backend != "auto" && backend != "ynnpack")
         throw std::invalid_argument("unknown backend; expected auto, ynnpack, mps, vulkan, npu, or cuda[:INDEX]");
     const bool speculative =
-        arguments.contains("assistant_model") && !arguments.get<std::filesystem::path>("assistant_model").empty();
+        (arguments.contains("assistant_model") && !arguments.get<std::filesystem::path>("assistant_model").empty()) ||
+        (arguments.contains("prompt_lookup") && arguments.get<bool>("prompt_lookup"));
     if (backend == "mps") return kidi::tensor::Device::apple_gpu();
     if (backend == "ynnpack" || speculative || cpu_only) return kidi::tensor::Device::cpu();
     return kidi::cli::auto_inference_device(kidi::tensor::BackendRegistry::instance().backends(), required,
@@ -260,9 +261,11 @@ auto load_chat_session(const kidi::cli::Namespace& arguments, const std::filesys
         kidi::core::parse_kv_cache_precision(arguments.get<std::string>("kv_cache_precision"));
     if (!kv_cache_precision)
         return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, "invalid KV-cache precision"});
-    if (arguments.contains("draft_tokens") && assistant_directory.empty())
+    const auto prompt_lookup = arguments.get<bool>("prompt_lookup");
+    if (arguments.contains("draft_tokens") && assistant_directory.empty() && !prompt_lookup)
         return std::unexpected(
-            kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, "--draft-tokens requires --assistant-model"});
+            kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT,
+                        "--draft-tokens requires --assistant-model or --prompt-lookup"});
     const auto draft_tokens =
         arguments.contains("draft_tokens") ? arguments.get<std::size_t>("draft_tokens") : std::size_t{3};
     const auto started = std::chrono::steady_clock::now();
@@ -275,6 +278,7 @@ auto load_chat_session(const kidi::cli::Namespace& arguments, const std::filesys
                                                      .packed_prefill = arguments.get<bool>("packed_prefill"),
                                                      .dense_lm_head = arguments.get<bool>("dense_lm_head"),
                                                      .assistant_model = assistant_directory,
+                                                     .prompt_lookup = prompt_lookup,
                                                      .draft_tokens = draft_tokens});
     if (!loaded) return std::unexpected(std::move(loaded.error()));
     const auto load_ns =
@@ -1060,7 +1064,11 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
             .dest("draft_tokens")
             .type<std::size_t>()
             .metavar("N")
-            .help("maximum speculative draft length, 1 to 16 (default: 3; requires --assistant-model)");
+            .help("adaptive draft cap, 1 to 16; starts at 1 (default: 3; requires assistant or prompt lookup)");
+        command_parser->add_argument("--prompt-lookup")
+            .dest("prompt_lookup")
+            .action(kidi::cli::Action::STORE_TRUE)
+            .help("draft repeated prompt/history tokens for CPU Inkling-2; greedy decoding only");
     }
 
     auto& inspect_parser = commands.add_parser("inspect", "inspect a model package");

@@ -164,10 +164,39 @@ four query tokens. `kidi code` starts its CPU server with `--threads` (default: 
 On 16 pinned Sapphire Rapids cores, a roughly 4K-token prompt prefills in about 61 seconds
 (previously 96 seconds) and decodes at about 19 tokens/s; short-context decode is about 23 tokens/s.
 
-Conversion runs once per server start, in parallel across the configured CPU threads; no checkpoint
-files are modified and no persistent converted cache is written. CPU INT8 needs more RAM than CUDA's
+The first CPU load converts weights in parallel across the configured threads and uses Kidi's checkpoint
+preparation framework to save `kidi-inkling2-cpu-int8-v1/model.safetensors` beside the source checkpoint.
+Later processes memory-map those prepared weights without repeating conversion. The cache is rebuilt when
+the source size/mtime, model configuration or prepared format changes. The first start also pays the cache
+write cost and needs about 28 GiB of extra disk space for Inkling-2-Mini; the source checkpoint is unchanged.
+CPU INT8 needs more RAM than CUDA's
 native compact storage, including prepared CPU weight tiles and context buffers. Keep the context small
 for smoke tests. CPU `--precision bf16` is not supported; CUDA retains native, INT8 and BF16 modes.
+
+### Inkling-2 speculative decoding
+
+CPU Inkling2 supports **prompt lookup**: no assistant checkpoint is needed. It copies candidate continuations
+from matching token sequences in the prompt/generated history and verifies them with the full INT8 target.
+This is useful for repeating existing code during edits, not a guarantee of higher acceptance on every coding task.
+
+```bash
+taskset -c 16-31 ./build-release/kidi code -m @thinkingmachines/Inkling-2-Mini \
+  --backend ynnpack -j 16 --prompt-lookup --draft-tokens 8 --temperature 0 --restart
+# Explicit REST server:
+taskset -c 16-31 ./build-release/kidi serve -m @thinkingmachines/Inkling-2-Mini \
+  --backend ynnpack -j 16 --prompt-lookup --draft-tokens 8 --max-active 1
+```
+
+Send REST requests with `temperature: 0`. `generate` and `chat` accept the same lookup/draft flags.
+The per-request budget starts at 1, doubles after full acceptance, shrinks to the accepted prefix (minimum 1)
+after rejection, and is bounded by `--draft-tokens` (default 3, maximum 16) and remaining generation capacity.
+No match proposes nothing, so the target decodes one token normally. Verification restores the accepted
+convolution-ring prefix without recomputing the target. KV storage remains group-32 INT8.
+Profile output includes `draft_tokens`, `accepted_draft_tokens`, `verification_steps`, `draft_ns` and `verify_ns`.
+Compare decode time as well as acceptance: lookup misses and verification overhead can make this slower.
+This mode is opt-in, CPU/text/greedy-only and limited to one active request. It cannot be combined with
+`--assistant-model`, which still denotes the existing Gemma-specific hidden-state assistant.
+That assistant now also uses the adaptive budget.
 
 ## Whisper Transcription
 

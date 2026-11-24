@@ -143,7 +143,14 @@ TEST_F(CodeWorkspace, ReplacesHardLink) {
 
 TEST_F(CodeWorkspace, BoundsAndBadArguments) {
     std::ofstream(root_ / "workspace" / "large") << std::string(1025, 'x');
-    EXPECT_FALSE(invoke("read_file", {{"path", "large"}}));
+    const auto page = invoke("read_file", {{"path", "large"}});
+    ASSERT_TRUE(page);
+    EXPECT_EQ(Json::parse(*page)["content"].get<std::string>().size(), 1024);
+    EXPECT_EQ(Json::parse(*page)["next_offset"], 1024);
+    const auto last = invoke("read_file", {{"path", "large"}, {"offset", 1024}});
+    ASSERT_TRUE(last);
+    EXPECT_EQ(Json::parse(*last)["content"], "x");
+    EXPECT_TRUE(Json::parse(*last)["next_offset"].is_null());
     EXPECT_FALSE(invoke("write_file", {{"path", "small"}, {"content", std::string(1025, 'x')}}));
     EXPECT_FALSE(std::filesystem::exists(root_ / "workspace" / "small"));
     EXPECT_FALSE(invoke("write_file", {{"path", 1}, {"content", "x"}}));
@@ -151,6 +158,53 @@ TEST_F(CodeWorkspace, BoundsAndBadArguments) {
     EXPECT_FALSE(invoke("read_file", Json::array()));
     EXPECT_FALSE(invoke("write_file", {{"path", "missing/file"}, {"content", "x"}}));
     EXPECT_FALSE(invoke("read_file", {{"path", "missing"}}));
+}
+
+TEST_F(CodeWorkspace, PagedReadPreservesUtf8AndRejectsBadRanges) {
+    std::string text;
+    for (int i = 0; i < 400; ++i) text += "\xe2\x82\xac\n";
+    std::ofstream(root_ / "workspace" / "text") << text;
+    std::string actual;
+    std::size_t offset = 0;
+    for (;;) {
+        const auto result = invoke("read_file", {{"path", "text"}, {"offset", offset}, {"max_bytes", 5}});
+        ASSERT_TRUE(result) << result.error().message;
+        const auto page = Json::parse(*result);
+        const auto content = page["content"].get<std::string>();
+        EXPECT_LE(content.size(), 5);
+        EXPECT_EQ(page["offset"], offset);
+        EXPECT_EQ(page["total_bytes"], text.size());
+        actual += content;
+        if (page["next_offset"].is_null()) break;
+        const auto next = page["next_offset"].get<std::size_t>();
+        ASSERT_GT(next, offset);
+        offset = next;
+    }
+    EXPECT_EQ(actual, text);
+    const auto eof = invoke("read_file", {{"path", "text"}, {"offset", text.size()}});
+    ASSERT_TRUE(eof);
+    EXPECT_EQ(Json::parse(*eof)["content"], "");
+    EXPECT_TRUE(Json::parse(*eof)["next_offset"].is_null());
+    for (const auto& args : {Json{{"offset", -1}}, Json{{"offset", 1.5}}, Json{{"offset", text.size() + 1}},
+                            Json{{"offset", 1}}, Json{{"max_bytes", 0}}, Json{{"max_bytes", 1025}},
+                            Json{{"max_bytes", 1}}, Json{{"max_bytes", "4"}}}) {
+        auto request = args;
+        request["path"] = "text";
+        EXPECT_FALSE(invoke("read_file", request)) << request;
+    }
+}
+
+TEST_F(CodeWorkspace, DefaultReadPageBoundsLargeToolOutput) {
+    std::ofstream(root_ / "workspace" / "large") << std::string(70000, 'x');
+    auto tools = workspace_tools(root_ / "workspace");
+    ASSERT_TRUE(tools);
+    tools_ = std::move(*tools);
+    const auto result = invoke("read_file", {{"path", "large"}});
+    ASSERT_TRUE(result) << result.error().message;
+    const auto page = Json::parse(*result);
+    EXPECT_EQ(page["content"].get<std::string>().size(), 4096);
+    EXPECT_EQ(page["next_offset"], 4096);
+    EXPECT_EQ(page["total_bytes"], 70000);
 }
 
 TEST_F(CodeWorkspace, MetadataAndCancellation) {

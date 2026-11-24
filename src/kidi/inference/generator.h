@@ -96,6 +96,7 @@ struct ModelLoadOptions {
     bool packed_prefill = false;
     bool dense_lm_head = false;
     std::filesystem::path assistant_model{};
+    bool prompt_lookup = false;
     std::size_t draft_tokens = 3;
 };
 

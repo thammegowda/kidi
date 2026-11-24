@@ -3,6 +3,7 @@
 #include "kidi/checkpoint/hub.h"
 #include "kidi/cli/log.h"
 #include "kidi/code/chat_transport.h"
+#include "kidi/inference/decoder.h"
 #include "kidi/server/routes.h"
 
 #include <httplib.h>
@@ -141,10 +142,14 @@ auto start_server(const fs::path& exe, const fs::path& dir, const File& startup,
         "--threads=" + std::to_string(arguments.get<std::int32_t>("threads")),
         "--context-size=" + std::to_string(arguments.get<std::size_t>("context_size")),
         "--cache-tokens=" + std::to_string(std::max<std::size_t>(16384, arguments.get<std::size_t>("context_size"))),
-        "--max-active=2",
+        arguments.get<bool>("prompt_lookup") ? "--max-active=1" : "--max-active=2",
         "--managed-dir=" + dir.string(),
         "--managed-lock-fd=" + std::to_string(startup.get()),
     };
+    if (arguments.get<bool>("prompt_lookup")) {
+        flags.push_back("--prompt-lookup");
+        flags.push_back("--draft-tokens=" + std::to_string(arguments.get<std::size_t>("draft_tokens")));
+    }
     std::vector<char*> argv;
     for (auto& flag : flags) argv.push_back(flag.data());
     argv.push_back(nullptr);
@@ -257,6 +262,11 @@ auto ensure_server(const fs::path& exe, const fs::path& dir, const std::string& 
 }
 
 auto managed_provider(code::ChatClientOptions options, const Namespace& arguments) -> Result<code::Provider> {
+    const auto lookup = arguments.get<bool>("prompt_lookup");
+    const auto drafts = arguments.get<std::size_t>("draft_tokens");
+    if ((!lookup && drafts != 3) || !drafts || drafts > inference::MAX_DRAFT_TOKENS)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT,
+                                     "--draft-tokens requires --prompt-lookup and a cap from 1 to 16"});
     options.model = choose_model(std::move(options.model));
     const auto exe = executable();
     struct stat binary{};
@@ -268,7 +278,8 @@ auto managed_provider(code::ChatClientOptions options, const Namespace& argument
     const auto identity =
         code::Json::array({binary.st_dev, binary.st_ino, binary.st_mtime, binary.st_size, options.model, cache.string(),
                            backend, visible_devices ? code::Json(visible_devices) : code::Json(nullptr),
-                           arguments.get<std::size_t>("context_size"), arguments.get<std::int32_t>("threads")})
+                           arguments.get<std::size_t>("context_size"), arguments.get<std::int32_t>("threads"),
+                           arguments.get<bool>("prompt_lookup"), arguments.get<std::size_t>("draft_tokens")})
             .dump();
     const auto dir = runtime_directory() / std::to_string(std::hash<std::string>{}(identity));
     if (!private_directory(dir, true)) throw std::runtime_error("not a private directory: " + dir.string());
@@ -314,6 +325,14 @@ auto configure_managed_code_parser(ArgumentParser& parser) -> void {
     parser.add_argument("--restart")
         .action(Action::STORE_TRUE)
         .help("stop the background server for this model/backend/context and start a fresh one");
+    parser.add_argument("--prompt-lookup")
+        .dest("prompt_lookup")
+        .action(Action::STORE_TRUE)
+        .help("enable CPU Inkling-2 prompt-lookup speculation; requires --temperature 0");
+    parser.add_argument("--draft-tokens")
+        .dest("draft_tokens")
+        .default_value<std::size_t>(3)
+        .help("adaptive prompt-lookup draft cap, 1 to 16 (starts at 1)");
 }
 
 auto configure_managed_serve_parser(ArgumentParser& parser) -> void {

@@ -1707,23 +1707,25 @@ auto Context::blend_prologue(const Tensor& destination, const Tensor& message, f
         const auto d = cpu_floats(*this, destination);
         const auto m = cpu_floats(*this, message);
         std::vector<float> out(static_cast<std::size_t>(rows * 2 * width));
-        for (std::int64_t t = 0; t < rows; ++t) {
-            float sd = 0, sm = 0;
-            for (std::int64_t c = 0; c < width; ++c) {
-                const float dv = d[static_cast<std::size_t>(t * width + c)];
-                const float mv = m[static_cast<std::size_t>(t * width + c)];
-                sd += dv * dv;
-                sm += mv * mv;
+        require(cpu::parallel_rows(rows, 2 * width, [&](std::int64_t first, std::int64_t last) {
+            for (auto t = first; t < last; ++t) {
+                float sd = 0, sm = 0;
+                for (std::int64_t c = 0; c < width; ++c) {
+                    const float dv = d[static_cast<std::size_t>(t * width + c)];
+                    const float mv = m[static_cast<std::size_t>(t * width + c)];
+                    sd += dv * dv;
+                    sm += mv * mv;
+                }
+                const float id = 1.F / std::sqrt(sd / static_cast<float>(width) + epsilon);
+                const float im = 1.F / std::sqrt(sm / static_cast<float>(width) + epsilon);
+                for (std::int64_t c = 0; c < width; ++c) {
+                    out[static_cast<std::size_t>(t * 2 * width + c)] =
+                        d[static_cast<std::size_t>(t * width + c)] * id;
+                    out[static_cast<std::size_t>(t * 2 * width + width + c)] =
+                        m[static_cast<std::size_t>(t * width + c)] * im;
+                }
             }
-            const float id = 1.F / std::sqrt(sd / static_cast<float>(width) + epsilon);
-            const float im = 1.F / std::sqrt(sm / static_cast<float>(width) + epsilon);
-            for (std::int64_t c = 0; c < width; ++c) {
-                out[static_cast<std::size_t>(t * 2 * width + c)] =
-                    d[static_cast<std::size_t>(t * width + c)] * id;
-                out[static_cast<std::size_t>(t * 2 * width + width + c)] =
-                    m[static_cast<std::size_t>(t * width + c)] * im;
-            }
-        }
+        }));
         return cpu_tensor(*this, {rows, 2 * width}, out, tensor::DType::BF16);
     }
     if (device().kind != tensor::DeviceKind::CUDA)

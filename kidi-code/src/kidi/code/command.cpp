@@ -57,7 +57,10 @@ auto configure_parser(cli::ArgumentParser& parser, bool managed) -> void {
     parser.add_argument("--temperature")
         .default_value<double>(-1)
         .help("sampling temperature; 0 is greedy (default: the agent config's sampling.temperature)");
-    parser.add_argument("--timeout-ms").dest("timeout_ms").default_value<std::int64_t>(120000);
+    parser.add_argument("--timeout-ms")
+        .dest("timeout_ms")
+        .default_value<std::int64_t>(120000)
+        .help("abort a model request after this long without any response bytes");
 }
 
 auto code_command(const cli::Namespace& arguments, ProviderFactory create_provider) -> int {
@@ -201,7 +204,8 @@ auto code_command(const cli::Namespace& arguments, ProviderFactory create_provid
     callbacks.observe = [&](const Event& event) {
         if (event.kind == EventKind::MODEL_START) {
             show_status("Generating");
-            terminal.activity("Waiting for model");
+            terminal.activity(context ? "Processing " + std::to_string(context->prompt_tokens) + " prompt tokens"
+                                      : "Waiting for model");
         }
         if (event.kind == EventKind::TOOL_START) {
             const auto arguments = Json::parse(event.detail, nullptr, false);

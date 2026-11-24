@@ -1,6 +1,7 @@
 #include "kidi/ops/quantization.h"
 #include "kidi/checkpoint/ggml/dequantize.h"
 #include "kidi/ops/context.h"
+#include "kidi/ops/cpu_kernels.h"
 #include "kidi/runtime/ynn/graph.h"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace kidi::ops {
 auto pack_expert_weights(const tensor::Tensor& values, const tensor::Tensor& scales, const tensor::Tensor& global,
@@ -52,31 +54,29 @@ auto pack_expert_weights(const tensor::Tensor& values, const tensor::Tensor& sca
         constexpr std::array<float, 16> E2M1{0, .5F, 1, 1.5F, 2, 3, 4, 6, -0.F, -.5F, -1, -1.5F, -2, -3, -4, -6};
         auto packed = require(Tensor::empty({experts, rows, width}, DType::U8));
         auto row_scales = require(Tensor::empty({experts, rows, 1}, DType::F32));
-        require(runtime::ynn::parallel_ranges(experts, 1, [&](std::size_t begin, std::size_t end) {
-            auto expanded = require(Tensor::empty({rows, width}, DType::F32));
-            const auto floats = require(expanded.data<float>());
-            for (auto expert = begin; expert < end; ++expert) {
+        const auto target = require(packed.data<std::uint8_t>());
+        const auto steps = require(row_scales.data<float>());
+        require(runtime::ynn::parallel_ranges(experts * rows, 32, [&](std::size_t begin, std::size_t end) {
+            std::vector<float> expanded(static_cast<std::size_t>(width));
+            for (auto item = begin; item < end; ++item) {
+                const auto expert = item / rows;
+                const auto row = item % rows;
                 if (nvfp4 && !std::isfinite(globals[expert]))
                     throw Failure({ErrorCode::INVALID_ARGUMENT, "non-finite expert global scale"});
-                for (std::int64_t row = 0; row < rows; ++row) {
-                    const auto source_row = interleaved ? (row % (rows / 2)) * 2 + row / (rows / 2) : row;
-                    for (std::int64_t column = 0; column < width; ++column) {
-                        const auto index = (expert * rows + source_row) * width + column;
-                        const auto scale = std::to_integer<std::uint8_t>(blocks[index / block]);
-                        const auto byte = std::to_integer<std::uint8_t>(source[index / (nvfp4 ? 2 : 1)]);
-                        floats[row * width + column] =
-                            nvfp4 ? E2M1[column % 2 ? byte >> 4 : byte & 15] * block_scales[scale] * globals[expert]
-                                  : decoded[byte] * block_scales[scale];
+                const auto source_row = interleaved ? (row % (rows / 2)) * 2 + row / (rows / 2) : row;
+                const auto base = (expert * rows + source_row) * width;
+                for (std::int64_t column = 0; column < width; column += block) {
+                    const auto scale = block_scales[std::to_integer<std::uint8_t>(blocks[(base + column) / block])];
+                    for (std::int64_t channel = 0; channel < block; ++channel) {
+                        const auto c = column + channel;
+                        const auto byte = std::to_integer<std::uint8_t>(source[(base + c) / (nvfp4 ? 2 : 1)]);
+                        expanded[c] = nvfp4 ? E2M1[c % 2 ? byte >> 4 : byte & 15] * scale * globals[expert]
+                                            : decoded[byte] * scale;
                     }
                 }
-                const auto quantized = require(pack_weight(expanded, 8, static_cast<std::int32_t>(width)));
-                const auto copy = [&](const Tensor& destination, const Tensor& source) {
-                    const auto target = require(require(destination.select(0, expert)).host_bytes());
-                    const auto bytes = require(source.host_bytes());
-                    std::memcpy(target.data(), bytes.data(), bytes.size());
-                };
-                copy(packed, quantized.values);
-                copy(row_scales, quantized.scales);
+                if (!cpu::pack_int8_rows({expanded.data(), cpu::Rows::Storage::F32, width}, 1,
+                                         target.data() + item * width, steps.data() + item))
+                    throw Failure({ErrorCode::INVALID_ARGUMENT, "non-finite weight or quantization scale underflow"});
             }
         }));
         return PackedWeight{std::move(packed), std::move(row_scales), {}, 8, static_cast<std::int32_t>(width)};
@@ -94,6 +94,19 @@ auto pack_rows_int8(const tensor::Tensor& weight) -> Result<PackedWeight> {
         auto scales = require(tensor::Tensor::empty({rows, 1}, tensor::DType::F32));
         const auto target_values = require(values.data<std::uint8_t>());
         const auto target_scales = require(scales.data<float>());
+        if (weight.dtype() == tensor::DType::F32 || weight.dtype() == tensor::DType::BF16) {
+            const auto source = require(weight.host_bytes());
+            const auto storage = weight.dtype() == tensor::DType::F32 ? cpu::Rows::Storage::F32
+                                                                     : cpu::Rows::Storage::BF16;
+            const auto element_bytes = tensor::element_size(weight.dtype());
+            require(runtime::ynn::parallel_ranges(rows, 32, [&](std::size_t begin, std::size_t end) {
+                if (!cpu::pack_int8_rows({source.data() + begin * width * element_bytes, storage, width},
+                                         static_cast<std::int64_t>(end - begin),
+                                         target_values.data() + begin * width, target_scales.data() + begin))
+                    throw Failure({ErrorCode::INVALID_ARGUMENT, "non-finite weight or quantization scale underflow"});
+            }));
+            return PackedWeight{std::move(values), std::move(scales), {}, 8, static_cast<std::int32_t>(width)};
+        }
         constexpr std::int64_t CHUNK = 256;
         const auto chunks = static_cast<std::size_t>((rows + CHUNK - 1) / CHUNK);
         require(runtime::ynn::parallel_ranges(chunks, 1, [&](std::size_t begin, std::size_t end) {

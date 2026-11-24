@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <span>
 
 #include "kidi/core/error.h"
@@ -19,6 +20,10 @@ struct Rows {
     const float* scales = nullptr;      // I8 only: [rows, stride / scale_group]
     std::int64_t scale_group = 0;
 };
+
+/// Converts F32/BF16 rows to signed INT8 bytes and one F32 scale per row. Rounds halves away from zero,
+/// matching checkpoint packing; returns false for non-finite inputs or underflowed scales.
+auto pack_int8_rows(const Rows& input, std::int64_t rows, std::uint8_t* output, float* scales) -> bool;
 
 struct RelativeAttentionShape {
     std::int64_t tokens, heads, key_heads, width, extent, window;
@@ -85,6 +90,10 @@ auto expert_prefill(const float* input, std::int64_t tokens, std::span<const Rou
 /// quantized per row and BF16 `output` [tokens, n]. Work is split so each pool item reads a similar weight slice.
 auto int8_linear(const float* input, std::int64_t tokens, std::int64_t k, const std::int8_t* weight,
                  const float* scales, std::int64_t n, std::uint16_t* output) -> Result<void>;
+
+/// Runs `body(begin, end)` over row ranges, on the worker pool when there is enough work to pay for the dispatch.
+auto parallel_rows(std::int64_t rows, std::int64_t width, const std::function<void(std::int64_t, std::int64_t)>& body)
+    -> Result<void>;
 
 // Width-normalized softmax mix of `sources` (each [tokens, width]) for each query row; output is
 // [query_count, tokens, width]. At most eight sources.

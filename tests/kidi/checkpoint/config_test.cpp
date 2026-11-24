@@ -1,6 +1,12 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include <gtest/gtest.h>
 
@@ -21,7 +27,7 @@ struct FixtureModel {
             .cache_directory = config["model"]["cache"].as<std::string>(),
             .format = "fixture-v1",
             .files = {"config.json", "tokenizer.json", "preprocessor_config.json", "generation_config.json"},
-            .metadata = {{"kind", "fixture"}},
+            .metadata = {{"kind", config["model"]["kind"].as<std::string>("fixture")}},
             .convert = [](const YAML::Node& model,
                           const kidi::checkpoint::Weights& weights) -> kidi::Result<kidi::StateDict> {
                 ++conversions;
@@ -323,12 +329,58 @@ TEST_F(ConfigTest, PreparesCachedCheckpoint) {
     std::filesystem::last_write_time(source, std::filesystem::last_write_time(source) + std::chrono::seconds(1));
     EXPECT_TRUE(prepare_fixture());
     EXPECT_EQ(FixtureModel::conversions, 2);
+    write(directory / "config.json", R"({"model_type":"whisper","cache":"prepared-fixture","kind":"changed"})");
+    EXPECT_TRUE(prepare_fixture());
+    EXPECT_EQ(FixtureModel::conversions, 3);
+    EXPECT_TRUE(prepare_fixture());
+    EXPECT_EQ(FixtureModel::conversions, 3);
     write(directory / "config.json", R"({"model_type":"whisper","cache":"failed-fixture","fail":true})");
     EXPECT_FALSE(prepare_fixture());
     EXPECT_FALSE(std::filesystem::exists(directory / "failed-fixture"));
-    EXPECT_EQ(FixtureModel::conversions, 3);
+    EXPECT_EQ(FixtureModel::conversions, 4);
     for (const auto& entry : std::filesystem::directory_iterator(directory))
         EXPECT_FALSE(entry.path().filename().string().starts_with(".kidi-checkpoint-")) << entry.path();
 }
+
+#if defined(__unix__) || defined(__APPLE__)
+TEST_F(ConfigTest, ConcurrentProcessesSharePreparedCheckpoint) {
+    write_hub_files(false);
+    auto tensor = kidi::tensor::Tensor::zeros({1}, kidi::tensor::DType::F32, kidi::tensor::Device::cpu());
+    ASSERT_TRUE(tensor);
+    std::filesystem::remove(directory / "model.safetensors");
+    ASSERT_TRUE(kidi::checkpoint::Weights::save(directory / "model.safetensors", {{"weight", *tensor}}));
+    auto config = YAML::Load(R"({"model_type":"whisper","cache":"prepared-fixture"})");
+    config["marker"] = (directory / "conversions.log").string();
+    write(directory / "config.json", YAML::Dump(config));
+    const auto policy = [](const YAML::Node& config) -> kidi::Result<kidi::checkpoint::Preparation> {
+        auto result = FixtureModel::preparation(config);
+        if (!result) return result;
+        result->convert = [](const YAML::Node& model, const kidi::checkpoint::Weights& weights)
+            -> kidi::Result<kidi::StateDict> {
+            std::ofstream(model["marker"].as<std::string>(), std::ios::app) << "converted\n";
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            return weights.state_dict();
+        };
+        return result;
+    };
+    pid_t children[2];
+    for (auto& child : children) {
+        child = ::fork();
+        ASSERT_GE(child, 0);
+        if (!child) ::_exit(kidi::checkpoint::prepare(directory, policy) ? 0 : 1);
+    }
+    for (const auto child : children) {
+        int status = 0;
+        ASSERT_EQ(::waitpid(child, &status, 0), child);
+        ASSERT_TRUE(WIFEXITED(status));
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+    }
+    std::ifstream marker(directory / "conversions.log");
+    std::string line;
+    ASSERT_TRUE(std::getline(marker, line));
+    EXPECT_EQ(line, "converted");
+    EXPECT_FALSE(std::getline(marker, line)) << "concurrent callers must not convert twice";
+}
+#endif
 
 } // namespace

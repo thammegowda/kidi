@@ -215,4 +215,52 @@ TEST(SpeculativeTest, RejectsDraftLimits) {
     EXPECT_FALSE(Decoder::generate_speculative(TokenScores{{}, ScoreKind::LOGITS, 1}, settings(),
                                                MAX_DRAFT_TOKENS + 1, noop_draft, noop_verify));
 }
+
+TEST(SpeculativeTest, LookupUsesLongestThenMostRecentMatch) {
+    EXPECT_EQ(prompt_lookup(std::array{1, 2, 3, 8, 1, 2, 4, 9, 1, 2, 3}, 2), (std::vector{8, 1}));
+    EXPECT_EQ(prompt_lookup(std::array{1, 2, 3, 1, 2, 4, 1, 2}, 1), (std::vector{4}));
+    EXPECT_EQ(prompt_lookup(std::array{1, 2, 3, 1, 2}, 8), (std::vector{3, 1, 2}));
+    EXPECT_TRUE(prompt_lookup(std::array{1, 2, 3}, 4).empty());
+    EXPECT_TRUE(prompt_lookup(std::array{1, 2}, 4).empty());
+    EXPECT_TRUE(prompt_lookup(std::array{1, 2, 1, 2}, 0).empty());
+}
+
+TEST(SpeculativeTest, DraftLengthAdaptsToAcceptance) {
+    auto search = GreedyState::create(settings(100));
+    ASSERT_TRUE(search);
+    ASSERT_TRUE(search->accept(TokenScores{{}, ScoreKind::LOGITS, 1}));
+    std::vector<std::int32_t> winners;
+    std::vector<std::size_t> limits;
+    std::size_t reject_after = MAX_DRAFT_TOKENS;
+    bool no_match = false;
+    const auto round = [&] {
+        return search->step_speculative(
+            4,
+            [&](std::int32_t, std::size_t limit, const GreedyState::StopPredicate&,
+                std::vector<std::int32_t>& out) -> kidi::Result<void> {
+                limits.push_back(limit);
+                if (!no_match) out.assign(limit, 2);
+                return {};
+            },
+            [&](std::span<const std::int32_t> inputs) -> kidi::Result<TokenScores> {
+                winners.assign(inputs.size(), 2);
+                if (reject_after < winners.size()) winners[reject_after] = 3;
+                return TokenScores{{}, ScoreKind::LOGITS, {}, winners};
+            });
+    };
+    for (int i = 0; i < 5; ++i) ASSERT_TRUE(round());
+    EXPECT_EQ(limits, (std::vector<std::size_t>{1, 2, 4, 4, 4}));
+    reject_after = 2;
+    ASSERT_TRUE(round());
+    reject_after = 0;
+    ASSERT_TRUE(round());
+    reject_after = MAX_DRAFT_TOKENS;
+    no_match = true;
+    ASSERT_TRUE(round());
+    ASSERT_TRUE(round());
+    no_match = false;
+    ASSERT_TRUE(round());
+    ASSERT_TRUE(round());
+    EXPECT_EQ(limits, (std::vector<std::size_t>{1, 2, 4, 4, 4, 4, 2, 1, 1, 1, 2}));
+}
 } // namespace

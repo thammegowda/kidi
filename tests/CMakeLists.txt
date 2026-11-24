@@ -121,13 +121,16 @@ kidi_add_test(kidi_gemma4_test tests/kidi/model/gemma4_test.cpp COST 100 LABELS 
 # These checkpoints do not fit together on the single-GPU two-slot fallback.
 kidi_add_test(kidi_inkling2_test tests/kidi/model/inkling2_test.cpp LABELS native cuda RESOURCE_LOCK inkling2_model)
 kidi_add_test(kidi_inkling2_cpu_test tests/kidi/model/inkling2_cpu_test.cpp RESOURCE_LOCK inkling2_model)
+# Stable source code for the teacher-forced prefill quality check.
+target_compile_definitions(kidi_inkling2_cpu_test PRIVATE
+    KIDI_INKLING2_TEXT_FIXTURE="${KIDI_THIRD_PARTY_DIR}/ynnpack-dev/third_party/googletest/googletest/src/gtest.cc")
 kidi_add_test(kidi_kokoro_test tests/kidi/model/kokoro_test.cpp)
 kidi_add_test(kidi_model_registry_test tests/kidi/model/registry_test.cpp)
 target_compile_definitions(kidi_gemma4_test PRIVATE KIDI_GEMMA4_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/gemma4")
 kidi_add_test(kidi_whisper_test tests/kidi/model/whisper_test.cpp)
 kidi_add_test(kidi_decoder_test tests/kidi/inference/decoder_test.cpp)
 kidi_add_test(kidi_chat_api_test tests/kidi/server/chat_api_test.cpp LINK kidi_server)
-kidi_add_test(kidi_chat_test tests/kidi/inference/chat_test.cpp LINK kidi_cli_main)
+kidi_add_test(kidi_chat_test tests/kidi/inference/chat_test.cpp LINK kidi_cli_main liteapp::http liteapp::httplib)
 target_sources(kidi_chat_test PRIVATE "${PROJECT_SOURCE_DIR}/tests/kidi/cli/backend_test.cpp")
 target_compile_definitions(kidi_chat_test PRIVATE KIDI_GEMMA4_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/gemma4")
 kidi_add_test(kidi_speculative_test tests/kidi/inference/speculative_test.cpp)

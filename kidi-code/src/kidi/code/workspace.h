@@ -8,7 +8,7 @@
 namespace kidi::code {
 
 struct WorkspaceOptions {
-    std::size_t max_file_bytes = 64 * 1024;
+    std::size_t max_file_bytes = 64 * 1024; // Maximum read page or file-write size.
     std::size_t max_directory_entries = 1024;
     std::size_t max_command_output = 32 * 1024;
     std::chrono::milliseconds command_timeout{60000};

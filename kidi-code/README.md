@@ -44,6 +44,22 @@ row-scaled INT8 (W8A8 matmuls); CPU KV caches use group-32 signed INT8 with FP32
 This needs more RAM than CUDA's native compact checkpoint mode. See
 [CPU inference details](../docs/getting-started.md#inkling-2-on-cpu) for precision options.
 
+For code-copy/edit workloads, opt into prompt-lookup speculative decoding without a second model:
+
+```bash
+taskset -c 16-31 ./build-release/kidi code -m @thinkingmachines/Inkling-2-Mini \
+  --backend ynnpack --threads 16 --prompt-lookup --draft-tokens 8 --temperature 0 --restart
+```
+
+The drafter copies continuations of matching 2-8-token sequences from the prompt and generated history.
+Inkling2 verifies the proposals in a batch and commits only the matching prefix plus a correction/bonus token.
+The draft budget starts at 1 per request, doubles on full acceptance, and shrinks to the accepted prefix
+(at least 1) on rejection. `--draft-tokens` caps it (default 3, maximum 16).
+No match uses ordinary one-token target execution. CPU Inkling2 restores convolution rings as well as the
+logical KV position after rejection. This mode requires greedy decoding (`--temperature 0`) and one active
+request; the managed server sets that limit automatically. It can be slower on low-repetition tasks, so it
+is off by default. It does not load the Gemma-specific `--assistant-model`.
+
 Daemon port and PID are published atomically in:
 
 ```text
@@ -52,7 +68,8 @@ $XDG_RUNTIME_DIR/kidi-code-<uid>/<server-key>/server.json
 
 Without a usable private runtime directory, the root is `/tmp/kidi-code-<uid>`.
 `serve.log` sits beside the state file. The key includes the binary, model, model cache, backend and CUDA visibility
-for `auto` and CUDA backends, plus the requested context size, so a rebuilt executable or a change to
+for `auto` and CUDA backends, plus the requested context size, thread count and prompt-lookup settings,
+so a rebuilt executable or a change to
 `CUDA_VISIBLE_DEVICES` starts a fresh daemon.
 Clients check readiness and PID before reuse. A startup lock prevents duplicate
 cold starts; stale metadata is replaced after a crash.
@@ -191,18 +208,26 @@ the log shows `context: N tokens (G GiB free on cuda:N)`. KV memory is reserved
 in power-of-two buckets as the conversation grows, so short sessions stay small.
 `--context-size` overrides the automatic choice. Contexts under 32K print a
 `[context] warning` at startup, because real coding tasks compact constantly.
-Long prompts cost prefill time: every model call re-reads the whole prompt.
-For example, Inkling-2-Mini on H100 prefills about 2K tokens/s, so a 100K-token
-prompt takes about 50 s per call. For the standalone client, configure context
+New tool output costs prompt-prefill time even when the managed server can reuse a shared history prefix;
+changing cache capacity or the rendered prefix can require a full re-prefill. Keep file and command output small,
+especially on CPU. The model activity timer shows the request's prompt-token count until text starts streaming.
+For the standalone client, configure context
 on `kidi serve` instead.
 
 | Tool | Operation |
 | --- | --- |
-| `read_file` | Read a bounded UTF-8 file |
+| `read_file` | Read UTF-8 text in byte pages (4 KiB by default); use `offset` / `max_bytes` to select a section |
 | `list_files` | List one directory; `.` is the workspace root |
 | `write_file` | Atomically replace or create a UTF-8 file |
 | `make_directory` | Create one directory |
 | `run_command` | Run `/bin/sh -c` in the workspace root |
+
+Small files are returned as plain text. A partial `read_file` result is JSON containing `content`, `offset`,
+`total_bytes` and `next_offset` (`null` at EOF). Follow `next_offset` only when more context is needed.
+Pages preserve UTF-8 character boundaries and may be requested up to the configured 64 KiB read/write limit;
+large files no longer fail simply because their total size exceeds that limit.
+Streaming responses send SSE keep-alive comments during silent model work, so disconnects can cancel long
+prefills rather than leaving abandoned work running.
 
 | `--permissions` | File writes | Commands |
 | --- | --- | --- |
@@ -212,7 +237,8 @@ on `kidi serve` instead.
 | `full-access` | Allowed | Allowed |
 
 Interactive approval offers **y** (once), **a** (any arguments to this named tool
-for this session), or **n** / empty input (deny). A session approval covers later
+for this session), or **n** / empty input (deny). In the terminal UI, these keys
+take effect immediately; plain line input still requires Enter. A session approval covers later
 commands only if explicitly granted for `run_command`; it does not approve other
 tools or override denied capabilities. There is no automatic shell-command
 allowlist. `/permissions` shows the mode and grants; `/permissions reset` revokes

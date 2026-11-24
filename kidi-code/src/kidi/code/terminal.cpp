@@ -368,6 +368,11 @@ auto Terminal::run_interactive(std::function<int()> worker, std::function<void()
             if (state.request && !text.empty()) state.input_component->OnEvent(ftxui::Event::Character(std::move(text)));
             return true;
         }
+        if (state.request && !state.request->remember && state.input_value.empty() && event.is_character() &&
+            (event.input() == "y" || event.input() == "a" || event.input() == "n")) {
+            state.complete(InputState::LINE, event.input());
+            return true;
+        }
         if (event == ftxui::Event::Return && state.request) {
             state.complete(InputState::LINE, std::exchange(state.input_value, {}));
             return true;

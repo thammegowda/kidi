@@ -115,8 +115,17 @@ auto mount_chat_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteOpt
                 if (!out.send(out.chunk({{"role", "assistant"}, {"content", ""}}))) return false;
                 std::string raw;
                 bool connected = true;
+                auto heartbeat = Clock::now();
                 auto result = engine.run({.enqueue = enqueue(request),
-                                          .cancelled = {},
+                                          .cancelled =
+                                              [&] {
+                                                  const auto now = Clock::now();
+                                                  if (now - heartbeat >= std::chrono::seconds(1)) {
+                                                      heartbeat = now;
+                                                      connected = write(": keep-alive\n\n");
+                                                  }
+                                                  return !connected;
+                                              },
                                           .on_text =
                                               [&](std::string_view delta) {
                                                   raw.append(delta);

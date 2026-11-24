@@ -312,6 +312,34 @@ TEST(FusedCpuTest, UnweightedRmsNorm) {
     EXPECT_TRUE(std::ranges::equal(ops::require(actual.data<float>()), ops::require(expected.data<float>())));
 }
 
+TEST(FusedCpuTest, FastInt8PackingMatchesGeneric) {
+    using ops::require;
+    using tensor::DType;
+    constexpr std::int64_t ROWS = 65, WIDTH = 67;
+    std::vector<float> data(ROWS * WIDTH);
+    for (std::size_t i = 0; i < data.size(); ++i)
+        data[i] = static_cast<float>(static_cast<int>(i * 37 % 509) - 254) / 8.F;
+    std::fill_n(data.begin(), WIDTH, 0.F);
+    data[WIDTH] = 127.F;
+    data[WIDTH + 1] = .5F;
+    data[WIDTH + 2] = -.5F;
+    ops::Context context;
+    for (const auto dtype : {DType::F32, DType::BF16}) {
+        const auto input = context.cast(make_tensor({ROWS, WIDTH}, data), dtype);
+        const auto expected = require(ops::pack_weight(input, 8, WIDTH));
+        const auto actual = require(ops::pack_rows_int8(input));
+        EXPECT_EQ(require(actual.values.copy_to_host()), require(expected.values.copy_to_host()));
+        EXPECT_EQ(require(actual.scales.copy_to_host()), require(expected.scales.copy_to_host()));
+    }
+    data[0] = std::numeric_limits<float>::infinity();
+    EXPECT_FALSE(ops::pack_rows_int8(make_tensor({ROWS, WIDTH}, data)));
+    data[0] = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_FALSE(ops::pack_rows_int8(make_tensor({ROWS, WIDTH}, data)));
+    data.assign(ROWS * WIDTH, 0.F);
+    data[0] = std::numeric_limits<float>::denorm_min();
+    EXPECT_FALSE(ops::pack_rows_int8(make_tensor({ROWS, WIDTH}, data)));
+}
+
 TEST(FusedCpuTest, PackCheckpointExpertsToInt8) {
     using ops::require;
     using tensor::DType;
@@ -555,7 +583,8 @@ TEST(FusedCpuTest, Int8LinearMatchesFloatReference) {
 }
 
 TEST(FusedCpuTest, BatchedExpertsMatchDecode) {
-    constexpr std::int64_t TOKENS = 5, HIDDEN = 128, INTERMEDIATE = 64;
+    // Expert 0 sees more tokens than one 16-token AMX tile so tiled prefill covers partial and full groups.
+    constexpr std::int64_t TOKENS = 21, HIDDEN = 128, INTERMEDIATE = 64;
     std::mt19937 random(13);
     std::uniform_int_distribution<int> code(-127, 127);
     std::uniform_real_distribution<float> uniform(-1.F, 1.F);
@@ -563,8 +592,12 @@ TEST(FusedCpuTest, BatchedExpertsMatchDecode) {
     for (auto& x : input) x = uniform(random);
     std::array<std::vector<std::int8_t>, 3> gate_up, down;
     std::vector<float> up_scales(2 * INTERMEDIATE, 0.002F), down_scales(HIDDEN, 0.003F);
-    const std::array<std::vector<std::int32_t>, 3> tokens{{{0, 1, 3}, {1, 2, 3}, {0, 2}}};
-    const std::array<std::vector<float>, 3> routes{{{0.2F, 0.5F, 0.1F}, {0.3F, 0.4F, 0.6F}, {0.7F, 0.2F}}};
+    std::array<std::vector<std::int32_t>, 3> tokens{{{}, {1, 2, 3}, {0, 2, 20}}};
+    for (std::int32_t t = 0; t < 19; ++t) tokens[0].push_back(t == 4 ? 20 : t);
+    std::array<std::vector<float>, 3> routes;
+    for (std::size_t e = 0; e < 3; ++e)
+        for (std::size_t r = 0; r < tokens[e].size(); ++r)
+            routes[e].push_back(0.1F + 0.05F * static_cast<float>((r + e) % 7));
     std::vector<ops::cpu::RoutedExpert> experts;
     for (std::size_t e = 0; e < 3; ++e) {
         gate_up[e].resize(2 * INTERMEDIATE * HIDDEN);
@@ -649,6 +682,45 @@ TEST(FusedCpuTest, Int8CacheUpdatesAndAttention) {
     EXPECT_THROW(context.relative_attention(q, bytes, bytes, r, s, g,
                                             {.heads = QUERIES, .key_heads = HEADS, .start = CAPACITY - 1, .extent = 4}),
                  ops::Failure);
+}
+
+TEST(FusedCpuTest, Int8PrefillAttentionMatchesDecode) {
+    // Batched prefill over an INT8 cache takes the INT8 flash path; one-token calls take the decode path.
+    constexpr std::int64_t HEADS = 6, KEY_HEADS = 2, WIDTH = 128, GROUP = 32, EXTENT = 8, ROWS = 1600, TOKENS = 37;
+    constexpr auto KV = KEY_HEADS * WIDTH;
+    std::mt19937 random(11);
+    std::uniform_real_distribution<float> uniform(-1.F, 1.F);
+    std::vector<float> floats(ROWS * KV);
+    std::vector<std::int8_t> key(floats.size()), value(floats.size());
+    std::vector<float> key_scales(ROWS * KV / GROUP), value_scales(key_scales.size());
+    for (auto& x : floats) x = uniform(random);
+    ops::cpu::quantize_rows(floats.data(), ROWS, KV, GROUP, key.data(), key_scales.data());
+    for (auto& x : floats) x = uniform(random);
+    ops::cpu::quantize_rows(floats.data(), ROWS, KV, GROUP, value.data(), value_scales.data());
+    const ops::cpu::Rows key_rows{key.data(), ops::cpu::Rows::Storage::I8, KV, key_scales.data(), GROUP};
+    const ops::cpu::Rows value_rows{value.data(), ops::cpu::Rows::Storage::I8, KV, value_scales.data(), GROUP};
+    std::vector<float> query(TOKENS * HEADS * WIDTH), gate(query.size()), relative(TOKENS * HEADS * EXTENT),
+        sink(TOKENS * HEADS), output(query.size()), single(HEADS * WIDTH);
+    for (auto* values : {&query, &gate, &relative, &sink})
+        for (auto& x : *values) x = 2.F * uniform(random);
+    std::vector<std::int32_t> positions(TOKENS);
+    std::iota(positions.begin(), positions.end(), static_cast<std::int32_t>(ROWS - TOKENS));
+    for (const auto window : {std::int64_t{0}, std::int64_t{100}}) {
+        const ops::cpu::RelativeAttentionShape shape{TOKENS, HEADS, KEY_HEADS, WIDTH, EXTENT, window, 0.1F, 64.F};
+        ASSERT_TRUE(ops::cpu::relative_attention(query.data(), key_rows, value_rows, relative.data(), sink.data(),
+                                                 gate.data(), positions, shape, output.data()));
+        auto one = shape;
+        one.tokens = 1;
+        for (std::int64_t t = 0; t < TOKENS; ++t) {
+            const auto offset = t * HEADS * WIDTH;
+            ASSERT_TRUE(ops::cpu::relative_attention(
+                query.data() + offset, key_rows, value_rows, relative.data() + t * HEADS * EXTENT,
+                sink.data() + t * HEADS, gate.data() + offset, std::span(positions).subspan(t, 1), one, single.data()));
+            // Two INT8 codes per query group (value and residual) keep float-query accuracy.
+            for (std::int64_t i = 0; i < HEADS * WIDTH; ++i)
+                ASSERT_NEAR(output[offset + i], single[i], 5e-5) << "window " << window << " token " << t;
+        }
+    }
 }
 
 TEST(FusedCpuTest, LongContextGroupedAttentionMatchesReference) {

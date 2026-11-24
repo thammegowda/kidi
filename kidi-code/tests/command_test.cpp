@@ -275,14 +275,14 @@ TEST_F(CodeTerminal, SessionGrants) {
     start();
     send("commands\r");
     ASSERT_TRUE(wait_approval());
-    send("a\r");
+    send("a");
     ASSERT_TRUE(wait_task("result: {\"exit_code\":0,\"output\":\"second\"}"));
     auto from = output_text_.size();
     send("/reset\r");
     ASSERT_TRUE(wait_task("Conversation cleared", from));
     send("write\r");
     ASSERT_TRUE(wait_approval(from));
-    send("n\r");
+    send("n");
     ASSERT_TRUE(wait_task("approval denied: write_file"));
     from = output_text_.size();
     send("/permissions reset\r");
@@ -290,13 +290,46 @@ TEST_F(CodeTerminal, SessionGrants) {
     send("commands\r");
     ASSERT_TRUE(wait_approval(from));
     from = output_text_.size();
-    send("y\r");
+    send("y");
     ASSERT_TRUE(wait_approval(from));
-    send("n\r");
+    send("n");
     ASSERT_TRUE(wait_task("approval denied: run_command", from));
     send("/exit\r");
     finish();
     EXPECT_FALSE(std::filesystem::exists(root_ / "output"));
+}
+
+TEST_F(CodeTerminal, SingleKeyApprovalAndNormalInput) {
+    start();
+    send("yarn\r");
+    ASSERT_TRUE(wait_task("echo: yarn"));
+    auto from = output_text_.size();
+    send("write\r");
+    ASSERT_TRUE(wait_approval(from));
+    send("y");
+    ASSERT_TRUE(wait_task("result:", from));
+    EXPECT_TRUE(std::filesystem::exists(root_ / "output"));
+    send("/exit\r");
+    finish();
+}
+
+TEST_F(CodeTerminal, ApprovalPasteAndInvalidInput) {
+    start();
+    send("write\r");
+    ASSERT_TRUE(wait_approval());
+    send("\033[200~n\033[201~\177y");
+    ASSERT_TRUE(wait_task("result:"));
+    EXPECT_TRUE(std::filesystem::exists(root_ / "output"));
+    auto from = output_text_.size();
+    send("write\r");
+    ASSERT_TRUE(wait_approval(from));
+    send("xy\r");
+    ASSERT_TRUE(wait_for("Choose y, a or n", from));
+    ASSERT_TRUE(wait_approval(output_text_.find("Choose y, a or n", from)));
+    send("n");
+    ASSERT_TRUE(wait_task("approval denied: write_file", from));
+    send("/exit\r");
+    finish();
 }
 
 TEST_F(CodeTerminal, InterruptInputAndApproval) {
@@ -345,7 +378,7 @@ TEST_F(CodeTerminal, StreamsTextAndKeepsModelTimerLive) {
     ASSERT_TRUE(wait_for("last piece"));
     ASSERT_TRUE(wait_task("first piece and last piece"));
     send("wait\r");
-    ASSERT_TRUE(wait_for("Waiting for model 1."));
+    ASSERT_TRUE(wait_for("Processing 100 prompt tokens 1."));
     send("\003");
     ASSERT_TRUE(wait_task("cancelled"));
     send("/exit\r");
@@ -372,6 +405,17 @@ TEST_F(CodeTerminal, PipedInput) {
     ASSERT_TRUE(wait_task("echo: hello"));
     finish();
     EXPECT_EQ(output_text_.find('\033'), std::string::npos);
+}
+
+TEST_F(CodeTerminal, PipedApprovalUsesLineInput) {
+    start(false);
+    send("write\n");
+    ASSERT_TRUE(wait_approval());
+    send("yes\n");
+    ASSERT_TRUE(wait_task("result:"));
+    EXPECT_TRUE(std::filesystem::exists(root_ / "output"));
+    send("/exit\n");
+    finish();
 }
 
 TEST_F(CodeTerminal, NoColor) {

@@ -8,6 +8,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include "kidi/model/model.h"
+#include "kidi/checkpoint/prepare.h"
 #include "kidi/ops/context.h"
 #include "kidi/ops/quantization.h"
 
@@ -19,6 +20,8 @@ struct Inkling2Visit {
     tensor::Tensor key, value;
     tensor::Tensor key_conv, value_conv, attention_conv, mlp_conv;
     tensor::Tensor key_scales, value_scales; // CPU INT8 KV: F32 [capacity, key_heads * groups_per_head]
+    std::array<tensor::Tensor, 4> rewind_inputs;
+    bool record_rewind = false;
 };
 
 struct Inkling2State : LanguageModelState {
@@ -32,6 +35,10 @@ struct Inkling2State : LanguageModelState {
     /// Convolution rings saved at `rewind_position` (0: none), so a prompt boundary can be restored.
     std::vector<tensor::Tensor> rewind_convs;
     std::size_t rewind_position = 0;
+    /// CPU speculative verification: rings at `verify_position` plus each visit's `rewind_inputs` allow
+    /// rewinding to any position in [verify_position, verify_end].
+    std::vector<tensor::Tensor> verify_convs;
+    std::size_t verify_position = 0, verify_end = 0;
 
     auto sequence_position() const noexcept -> std::size_t override { return position; }
     auto sequence_capacity() const noexcept -> std::size_t override { return capacity; }
@@ -48,6 +55,7 @@ public:
     explicit Inkling2Impl(const YAML::Node& config);
     static auto validate_config(const YAML::Node& config) -> Result<void>;
     static auto create(const YAML::Node& config) -> Result<Inkling2>;
+    static auto int8_preparation(const YAML::Node& config) -> Result<checkpoint::Preparation>;
 
     auto set_checkpoint(const checkpoint::Weights& weights) -> Result<void> override;
     auto set_checkpoint(const checkpoint::Weights& weights, RuntimeQuantization quantization) -> Result<void> override;
@@ -76,6 +84,8 @@ public:
         -> Result<tensor::Tensor> override;
 
 private:
+    static auto int8_checkpoint(const YAML::Node& config, const checkpoint::Weights& weights) -> Result<StateDict>;
+    auto load_prepared_checkpoint(const checkpoint::Weights& weights) -> Result<void>;
     /// Completed AttnRes blocks and the current partial block (BF16 [tokens, hidden]).
     struct Stream {
         std::vector<tensor::Tensor> blocks;
@@ -95,7 +105,10 @@ private:
     auto convolve(const tensor::Tensor& input, tensor::Tensor& state, const tensor::Tensor& weight,
                   const tensor::Tensor& taps, const tensor::Tensor& conv_slot, const tensor::Tensor& tail_slots,
                   float scale, const tensor::Tensor& residual = {},
-                  std::optional<tensor::DType> output_dtype = {}) -> tensor::Tensor;
+                  std::optional<tensor::DType> output_dtype = {}, tensor::Tensor* saved_input = nullptr)
+        -> tensor::Tensor;
+    auto save_convolution_input(tensor::Tensor& saved, const tensor::Tensor& input) -> void;
+    auto snapshot_verification(Inkling2State& state) -> void;
     auto stage_host_step(std::span<const std::int32_t> tokens, Inkling2State& state, bool all_logits,
                          std::optional<ops::TokenOutput> select, tensor::Tensor* hidden) -> Result<tensor::Tensor>;
     auto run_forward(const tensor::Tensor& ids, const tensor::Tensor& positions, const tensor::Tensor& conv_slot,

@@ -127,7 +127,8 @@ auto http_completion(const ChatClientOptions& options, std::string payload, std:
     http.set_connection_timeout(std::min(options.timeout, std::chrono::milliseconds(10000)));
     http.set_read_timeout(options.timeout);
     http.set_write_timeout(options.timeout);
-    http.set_max_timeout(options.timeout);
+    // No total cap: CPU prefill of a long agent turn can take minutes. The Kidi server streams keep-alives,
+    // so the read timeout only fires when the server stops responding.
     std::stop_callback cancel(stop, [&] { http.stop(); });
     if (expected_pid) {
         const auto health = http.Get("/kidi-code/ready");
@@ -187,7 +188,8 @@ auto http_completion(const ChatClientOptions& options, std::string payload, std:
             message += ": " + error["error"]["message"].get<std::string>();
         return std::unexpected(Error{ErrorCode::RUNTIME, std::move(message)});
     }
-    if (streaming) return stream.response();
+    // Some OpenAI-compatible servers ignore `stream` and reply with one JSON body.
+    if (streaming && stream.started) return stream.response();
     return body;
 }
 

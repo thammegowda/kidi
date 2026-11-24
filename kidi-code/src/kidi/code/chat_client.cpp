@@ -90,7 +90,7 @@ auto encode_request(const ChatClientOptions& options, std::span<const Message> m
     std::string payload;
     try {
         Json request{{"model", options.model},
-                     {"stream", !summary && static_cast<bool>(options.on_delta)},
+                     {"stream", static_cast<bool>(options.on_delta)},
                      {"max_tokens", options.max_tokens},
                      {"messages", Json::array()}};
         if (request["stream"] == true) request["stream_options"] = {{"include_usage", true}};
@@ -139,6 +139,8 @@ auto completion_provider(ChatClientOptions options, CompletionTransport transpor
         options.timeout.count() > std::numeric_limits<long>::max())
         return invalid("model and positive request limits are required");
     if (!transport) return invalid("completion transport is required");
+    // Always stream completions: CPU prefill can outlast the idle timeout, and only streams carry server keep-alives.
+    if (!options.on_delta) options.on_delta = [](std::string_view, bool) {};
     const auto complete = [transport](const ChatClientOptions& config, std::span<const Message> messages,
                                       std::span<const ToolSpec> tools, std::stop_token stop,
                                       bool summary) -> Result<Message> {
@@ -159,6 +161,7 @@ auto completion_provider(ChatClientOptions options, CompletionTransport transpor
                                              std::stop_token stop) {
         auto config = options;
         config.max_tokens = max_tokens;
+        config.on_delta = [](std::string_view, bool) {};
         return complete(config, messages, {}, stop, true);
     };
     const auto inspect = [options, transport](std::span<const Message> messages, std::span<const ToolSpec> tools,

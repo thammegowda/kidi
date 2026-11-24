@@ -6,6 +6,7 @@
 #include "kidi/image/gemma4.h"
 #include "kidi/model/gemma4_assistant.h"
 #include "kidi/model/gemma4_vision.h"
+#include "kidi/model/inkling2.h"
 #include "kidi/model/registry.h"
 #include "kidi/runtime/operator.h"
 #include "kidi/tensor/backend.h"
@@ -171,18 +172,26 @@ struct Generator::DraftBackend {
     }
 
     auto step(model::LanguageModel& target, model::LanguageModelState& state, tensor::Tensor& hidden,
-              GreedyState& search, std::size_t max_drafts, SpeculativeStats* stats) -> Result<SpeculativeStep> {
+              GreedyState& search, std::span<const std::int32_t> prompt, std::size_t max_drafts,
+              SpeculativeStats* stats) -> Result<SpeculativeStep> {
         tensor::Tensor verified_hidden, verified_tokens;
         std::size_t verify_position = 0;
         return search.step_speculative(
             max_drafts,
             [&](std::int32_t last_token, std::size_t limit, const GreedyState::StopPredicate& is_stop,
                 std::vector<std::int32_t>& drafts) {
-                return drafter->draft(target, hidden, last_token, state, limit, is_stop, drafts);
+                if (drafter) return drafter->draft(target, hidden, last_token, state, limit, is_stop, drafts);
+                std::vector<std::int32_t> history(prompt.begin(), prompt.end());
+                const auto& generated = search.result().token_ids;
+                history.insert(history.end(), generated.begin(), generated.end());
+                drafts = prompt_lookup(history, limit);
+                if (const auto stop = std::ranges::find_if(drafts, is_stop); stop != drafts.end())
+                    drafts.erase(stop + 1, drafts.end());
+                return Result<void>{};
             },
             [&](std::span<const std::int32_t> inputs) -> Result<TokenScores> {
                 verify_position = state.sequence_position();
-                auto tokens = target.select_token(inputs, state, true, &verified_hidden);
+                auto tokens = target.select_token(inputs, state, true, drafter ? &verified_hidden : nullptr);
                 if (!tokens) return std::unexpected(tokens.error());
                 verified_tokens = std::move(*tokens);
                 const auto selected = std::as_const(verified_tokens).data<std::int32_t>();
@@ -192,6 +201,7 @@ struct Generator::DraftBackend {
             [&](std::size_t committed_inputs) -> Result<void> {
                 if (const auto rewound = target.rewind(state, verify_position + committed_inputs); !rewound)
                     return rewound;
+                if (!drafter) return {};
                 const auto rows = verified_hidden.select(0, 0);
                 if (!rows) return std::unexpected(rows.error());
                 const auto row = rows->select(0, committed_inputs - 1);
@@ -242,17 +252,22 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             config["decode"]["maximum_new_tokens"] = 8192;
         }
         const bool qat = checkpoint::native_qat(config["model"]);
+        const bool speculative = !options.assistant_model.empty() || options.prompt_lookup;
+        if (options.prompt_lookup && !options.assistant_model.empty())
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "choose either prompt lookup or an assistant model"});
+        if (options.prompt_lookup && config["model"]["type"].as<std::string>() != "inkling2_text")
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "prompt lookup currently supports Inkling-2 targets only"});
         if (!options.assistant_model.empty() && config["model"]["type"].as<std::string>() != "gemma4_text")
             throw ops::Failure({ErrorCode::UNSUPPORTED, "the current assistant model supports Gemma 4 targets only"});
-        if (!options.assistant_model.empty() && !options.device.capabilities().compute.host())
+        if (speculative && !options.device.capabilities().compute.host())
             throw ops::Failure(
                 {ErrorCode::UNSUPPORTED, "speculative decoding currently requires CPU target execution"});
-        if (!options.assistant_model.empty() && (!options.draft_tokens || options.draft_tokens > MAX_DRAFT_TOKENS))
+        if (speculative && (!options.draft_tokens || options.draft_tokens > MAX_DRAFT_TOKENS))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
-                                "speculative decoding requires an assistant model and 1 to 16 draft tokens"});
-        if (options.assistant_model.empty() && options.draft_tokens != 3)
+                                "speculative decoding requires 1 to 16 draft tokens"});
+        if (!speculative && options.draft_tokens != 3)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
-                                "speculative decoding requires an assistant model and 1 to 16 draft tokens"});
+                                "draft tokens require an assistant model or prompt lookup"});
         std::filesystem::path lm_head_index;
         if (!options.dense_lm_head && options.device.capabilities().compute.host()) {
             const auto checkpoint_directory =
@@ -329,7 +344,17 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
         };
         const auto pad = token_or("pad_token_id", tokenizer_tokens.pad);
         const auto warmup = token_or("bos_token_id", tokenizer_tokens.bos);
-        auto weights = require(checkpoint::Weights::load(config["weights_file"].as<std::string>()));
+        auto weights_path = std::filesystem::path(config["weights_file"].as<std::string>());
+#if !defined(__EMSCRIPTEN__)
+        if (options.device.kind == tensor::DeviceKind::CPU &&
+            config["model"]["type"].as<std::string>() == "inkling2_text" &&
+            (options.precision == core::InferencePrecision::CHECKPOINT ||
+             options.precision == core::InferencePrecision::Q8A16) &&
+            (options.weight_bits == 0 || options.weight_bits == 8))
+            weights_path = require(checkpoint::prepare(directory, model::Inkling2Impl::int8_preparation)) /
+                           "model.safetensors";
+#endif
+        auto weights = require(checkpoint::Weights::load(weights_path));
         for (const auto& declared : config["external_tensors"]) {
             if (!external)
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "model declares external tensors but none were provided"});
@@ -380,7 +405,7 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
         model->set_precision(options.precision);
         model->set_kv_cache_precision(options.kv_cache_precision);
         require(model->kv_cache_dtype(1));
-        if (!options.assistant_model.empty() && !model->accelerator().empty())
+        if (speculative && !model->accelerator().empty())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding requires a native CPU target"});
         if (!lm_head_index.empty() && options.weight_bits)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "HNSW head does not support load-time weight packing"});
@@ -388,6 +413,8 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
         std::unique_ptr<DraftBackend> drafter;
         if (!options.assistant_model.empty())
             drafter = require(DraftBackend::load(options.assistant_model, config["model"], device));
+        else if (options.prompt_lookup)
+            drafter = std::make_unique<DraftBackend>();
         Generator result(std::move(config), std::move(tokenizer), std::move(model),
                          {.stop_ids = std::move(stops),
                           .pad_id = pad,
@@ -1029,7 +1056,9 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         stats.device_selection = model_->device().capabilities().sampling.supports(tensor::TokenSelection::DEVICE);
         stats.last_token_prefill = model_->last_token_prefill();
         stats.shared_prefill_tail = model_->shared_prefill_tail();
-        stats.speculative = static_cast<bool>(drafter_);
+        stats.speculative = static_cast<bool>(drafter_) && !sampled(options);
+        if (drafter_ && !drafter_->drafter && sampled(options))
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding currently requires temperature 0"});
         waiting_.push_back(
             {next_request_id_, std::move(tokens), capacity, options, std::move(search), {}, stats, started, {}});
         waiting_.back().random.seed(options.seed ? *options.seed : std::random_device{}());
@@ -1297,7 +1326,8 @@ auto Generator::step() -> Result<GenerationStep> {
                 const auto previous = request.search.result().token_ids.size();
                 SpeculativeStats step_stats;
                 const auto step_result = require(drafter_->step(*model_, *request.state, request.draft_hidden,
-                                                                request.search, draft_tokens_, &step_stats));
+                                                                request.search, request.prompt, draft_tokens_,
+                                                                &step_stats));
                 request.stats.draft_ns += step_stats.draft_ns;
                 request.stats.verify_ns += step_stats.verify_ns;
                 request.stats.draft_tokens += step_stats.draft_tokens;
@@ -1426,7 +1456,8 @@ auto Generator::step() -> Result<GenerationStep> {
                     {request.id, require(model_->select_token(input, *request.state)), 0, started, true});
             else if (final_chunk)
                 selected =
-                    require(model_->forward_token(input, *request.state, drafter_ ? &request.draft_hidden : nullptr));
+                    require(model_->forward_token(input, *request.state,
+                                                  drafter_ && drafter_->drafter ? &request.draft_hidden : nullptr));
             else if (uses_padded_prefill(model_)) {
                 const auto maximum = prefill_bucket(
                     model_, std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));

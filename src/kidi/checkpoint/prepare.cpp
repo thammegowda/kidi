@@ -8,10 +8,44 @@
 #include <random>
 #include <nlohmann/json.hpp>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
 #include "kidi/ops/context.h"
 
 namespace kidi::checkpoint {
 using ops::require;
+
+namespace {
+#if defined(__unix__) || defined(__APPLE__)
+class PreparationLock {
+public:
+    explicit PreparationLock(const std::filesystem::path& path) {
+        descriptor_ = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (descriptor_ >= 0) {
+            int result;
+            do { result = ::flock(descriptor_, LOCK_EX); } while (result < 0 && errno == EINTR);
+            if (result == 0) return;
+            const auto error = errno;
+            ::close(descriptor_);
+            errno = error;
+        }
+        throw ops::Failure({ErrorCode::IO, "cannot lock checkpoint cache: " + std::string(std::strerror(errno))});
+    }
+    ~PreparationLock() { ::close(descriptor_); }
+    PreparationLock(const PreparationLock&) = delete;
+    auto operator=(const PreparationLock&) -> PreparationLock& = delete;
+
+private:
+    int descriptor_ = -1;
+};
+#endif
+} // namespace
 
 auto prepare(const std::filesystem::path& path, PreparationHook customize) -> Result<std::filesystem::path> {
     static std::mutex conversion_mutex;
@@ -38,23 +72,29 @@ auto prepare(const std::filesystem::path& path, PreparationHook customize) -> Re
                 throw ops::Failure(
                     {ErrorCode::INVALID_MANIFEST, "package file does not exist: " + (root / sidecar).string()});
         }
+        const auto valid = [&] {
+            try {
+                std::ifstream stream(destination / "quantization.json");
+                const auto metadata = nlohmann::json::parse(stream);
+                return metadata.value("format", "") == policy.format &&
+                       metadata.at("source_bytes") == source_size && metadata.at("source_mtime") == source_time &&
+                       metadata.at("model_bytes") == std::filesystem::file_size(destination / "model.safetensors") &&
+                       std::ranges::all_of(policy.metadata, [&](const auto& item) {
+                           return metadata.contains(item.first) && metadata.at(item.first) == item.second;
+                       }) &&
+                       std::ranges::all_of(policy.files, [&](const auto& name) {
+                           return std::filesystem::is_regular_file(destination / name);
+                       });
+            } catch (const std::exception&) {
+                return false;
+            }
+        };
+        if (valid()) return destination;
+#if defined(__unix__) || defined(__APPLE__)
+        const PreparationLock process_lock(root / ("." + cache_name.string() + ".lock"));
+#endif
+        if (valid()) return destination;
         if (std::filesystem::exists(destination)) {
-            const auto valid = [&] {
-                try {
-                    std::ifstream stream(destination / "quantization.json");
-                    const auto metadata = nlohmann::json::parse(stream);
-                    return metadata.value("format", "") == policy.format &&
-                           metadata.at("source_bytes") == source_size && metadata.at("source_mtime") == source_time &&
-                           metadata.at("model_bytes") ==
-                               std::filesystem::file_size(destination / "model.safetensors") &&
-                           std::ranges::all_of(policy.files, [&](const auto& name) {
-                               return std::filesystem::is_regular_file(destination / name);
-                           });
-                } catch (const std::exception&) {
-                    return false;
-                }
-            }();
-            if (valid) return destination;
             std::cerr << "kidi_checkpoint_cache|path=" << destination << "|action=rebuild|reason=stale_or_incomplete\n";
             std::error_code removal_error;
             std::filesystem::remove_all(destination, removal_error);

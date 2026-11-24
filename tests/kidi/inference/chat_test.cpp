@@ -2,12 +2,16 @@
 #include "kidi/inference/generator.h"
 #include "kidi/ops/context.h"
 #include "kidi/server/engine.h"
+#include "kidi/server/routes.h"
 
 #include <chrono>
 #include <fstream>
+#include <future>
 #include <stdexcept>
+#include <thread>
 
 #include <gtest/gtest.h>
+#include <httplib.h>
 
 namespace {
 using kidi::ops::require;
@@ -35,6 +39,57 @@ protected:
         std::filesystem::temp_directory_path() /
         ("kidi-chat-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 };
+
+TEST_F(ChatTest, StreamsHeartbeatWhileModelHasNoText) {
+    const std::filesystem::path fixture(KIDI_GEMMA4_FIXTURE);
+    for (const auto* name : {"model.safetensors", "config.json"})
+        std::filesystem::copy_file(fixture / name, root / name);
+    Json vocabulary;
+    for (int i = 0; i < 16; ++i) vocabulary["t" + std::to_string(i)] = i;
+    std::ofstream(root / "tokenizer.json")
+        << Json{{"version", "1.0"},
+                {"pre_tokenizer", {{"type", "WhitespaceSplit"}}},
+                {"model", {{"type", "WordLevel"}, {"unk_token", "t0"}, {"vocab", vocabulary}}}};
+    std::ofstream(root / "tokenizer_config.json") << "{}";
+    std::ofstream(root / "chat_template.jinja") << "{{ messages[0].content }}";
+    auto generator = require(kidi::inference::Generator::load(root, kidi::tensor::Device::cpu()));
+    require(generator.configure_serving({1, 4, 16, 2}));
+    kidi::server::ChatEngine engine(generator);
+    auto created = liteapp::HttpServer::create();
+    ASSERT_TRUE(created);
+    auto server = std::move(*created);
+    kidi::server::mount_chat_routes(server, engine, {.model_name = "test",
+                                                     .defaults = {.maximum_new_tokens = 1, .context_size = 16}});
+    const auto bound = server.bind();
+    ASSERT_TRUE(bound);
+    std::jthread listener([&] { (void)server.listen_after_bind(); });
+    server.wait_until_ready();
+
+    std::promise<void> entered, release;
+    const auto gate = release.get_future().share();
+    auto blocked = std::async(std::launch::async, [&] {
+        return engine.run({.enqueue = [&](auto&) -> kidi::Result<std::uint64_t> {
+            entered.set_value();
+            gate.wait();
+            return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "test work released"});
+        }});
+    });
+    entered.get_future().wait();
+    httplib::Client client("127.0.0.1", *bound);
+    client.set_read_timeout(std::chrono::seconds(3));
+    std::string wire;
+    const auto response = client.Post("/v1/chat/completions", {},
+                                      R"({"messages":[{"role":"user","content":"t1"}],"stream":true})",
+                                      "application/json", [&](const char* chunk, std::size_t bytes) {
+                                          wire.append(chunk, bytes);
+                                          return wire.find(": keep-alive\n\n") == std::string::npos;
+                                      }, {});
+    release.set_value();
+    EXPECT_FALSE(blocked.get());
+    server.stop();
+    EXPECT_FALSE(response);
+    EXPECT_NE(wire.find(": keep-alive\n\n"), std::string::npos);
+}
 
 TEST_F(ChatTest, PromptsAndStopTokens) {
     const std::filesystem::path fixture(KIDI_GEMMA4_FIXTURE);

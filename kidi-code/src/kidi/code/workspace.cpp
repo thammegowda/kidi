@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <utility>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -60,6 +61,16 @@ auto string_arg(const Json& args, std::string_view key) -> Result<std::string> {
     return item->get<std::string>();
 }
 
+auto size_arg(const Json& args, std::string_view key, std::size_t fallback) -> Result<std::size_t> {
+    const auto item = args.find(key);
+    if (item == args.end()) return fallback;
+    if (!item->is_number_unsigned() && (!item->is_number_integer() || item->get<std::int64_t>() < 0))
+        return invalid(std::string(key) + " must be a nonnegative integer");
+    const auto value = item->get<std::uint64_t>();
+    if (value > std::numeric_limits<std::size_t>::max()) return invalid(std::string(key) + " is too large");
+    return static_cast<std::size_t>(value);
+}
+
 auto validate_text(const std::string& content) -> Result<void> {
     if (content.find('\0') != std::string::npos) return invalid("expected UTF-8 text without NUL bytes");
     try {
@@ -104,6 +115,12 @@ struct Workspace {
     auto read(const Json& args, std::stop_token stop) const -> Result<std::string> {
         auto path = string_arg(args, "path");
         if (!path) return std::unexpected(path.error());
+        const auto offset = size_arg(args, "offset", 0);
+        const auto limit = size_arg(args, "max_bytes", std::min<std::size_t>(4096, options.max_file_bytes));
+        if (!offset) return std::unexpected(offset.error());
+        if (!limit) return std::unexpected(limit.error());
+        if (!*limit || *limit > options.max_file_bytes || *limit == std::numeric_limits<std::size_t>::max())
+            return invalid("max_bytes must be from 1 to " + std::to_string(options.max_file_bytes));
         auto parts = components(*path, false);
         if (!parts) return std::unexpected(parts.error());
         auto parent = directory(std::span(*parts).first(parts->size() - 1));
@@ -113,24 +130,34 @@ struct Workspace {
         struct stat info{};
         if (::fstat(file.get(), &info) < 0) return io_error("stat file");
         if (!S_ISREG(info.st_mode)) return invalid("read_file requires a regular file");
-        if (info.st_size < 0 || static_cast<std::uintmax_t>(info.st_size) > options.max_file_bytes)
-            return invalid("file exceeds max_file_bytes");
+        if (info.st_size < 0 || *offset > static_cast<std::uintmax_t>(info.st_size))
+            return invalid("offset exceeds file size");
+        if (::lseek(file.get(), static_cast<off_t>(*offset), SEEK_SET) < 0) return io_error("seek file");
         std::string content;
         std::array<char, 4096> buffer;
-        while (true) {
+        while (content.size() <= *limit) {
             if (stop.stop_requested()) return std::unexpected(Error{ErrorCode::RUNTIME, "cancelled"});
-            const auto count = ::read(file.get(), buffer.data(), buffer.size());
+            const auto count = ::read(file.get(), buffer.data(), std::min(buffer.size(), *limit + 1 - content.size()));
             if (count < 0) {
                 if (errno == EINTR) continue;
                 return io_error("read file");
             }
             if (count == 0) break;
-            if (content.size() + static_cast<std::size_t>(count) > options.max_file_bytes)
-                return invalid("file exceeds max_file_bytes");
             content.append(buffer.data(), static_cast<std::size_t>(count));
         }
+        const bool truncated = content.size() > *limit;
+        if (truncated) {
+            auto end = *limit;
+            while (end && (static_cast<unsigned char>(content[end]) & 0xc0) == 0x80) --end;
+            if (!end) return invalid("max_bytes is too small for the next UTF-8 character");
+            content.resize(end);
+        }
         if (auto valid = validate_text(content); !valid) return std::unexpected(valid.error());
-        return content;
+        if (!*offset && !truncated) return content;
+        return Json{{"content", content},
+                    {"offset", *offset},
+                    {"next_offset", truncated ? Json(*offset + content.size()) : Json(nullptr)},
+                    {"total_bytes", info.st_size}}.dump();
     }
 
     auto list(const Json& args, std::stop_token stop) const -> Result<std::string> {

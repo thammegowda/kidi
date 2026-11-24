@@ -11,16 +11,32 @@
 namespace kidi::code {
 namespace {
 
+TEST(CodeProvider, HeadlessCompletionsStillStream) {
+    // Without a UI callback the request must still stream, or slow CPU prefill gets no keep-alives.
+    auto provider = completion_provider(
+        {.model = "test-model"},
+        [](const ChatClientOptions& options, std::string payload, std::stop_token, std::string_view) -> Result<std::string> {
+            EXPECT_TRUE(options.on_delta);
+            EXPECT_EQ(Json::parse(payload)["stream"], true);
+            return R"({"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]})";
+        });
+    ASSERT_TRUE(provider);
+    const auto reply = (*provider)({}, {}, {});
+    ASSERT_TRUE(reply) << reply.error().message;
+    EXPECT_EQ(reply->content, "ok");
+}
+
 TEST(CodeProvider, ContextAndSummaryRequests) {
     int completions = 0, inspections = 0;
     auto provider = completion_provider(
         {.model = "test-model",
          .temperature = 0.7F,
          .top_k = 20,
-         .on_delta = [](auto, auto) { ADD_FAILURE() << "summary/context must not stream"; }},
+         .on_delta = [](auto, auto) { ADD_FAILURE() << "summary/context text must not reach the UI"; }},
         [&](const ChatClientOptions&, std::string payload, std::stop_token, std::string_view route) -> Result<std::string> {
             const auto request = Json::parse(payload);
-            EXPECT_EQ(request["stream"], false);
+            // Summaries stream silently so server keep-alives cover long prefills.
+            EXPECT_EQ(request["stream"], route == "/chat/completions");
             if (request.contains("reasoning_effort")) {
                 EXPECT_EQ(request["temperature"], 0) << "summaries are greedy";
                 EXPECT_FALSE(request.contains("top_k"));
@@ -204,6 +220,30 @@ TEST_F(ChatClientTest, StreamsBeforeCompletionAndReassemblesTools) {
     EXPECT_EQ(reply->usage->decode_ms, 50.0);
 }
 
+TEST_F(ChatClientTest, KeepAlivesExtendSlowPrefillPastTheIdleTimeout) {
+    server_.Post("/v1/chat/completions", [&](const auto&, auto& reply) {
+        reply.set_chunked_content_provider("text/event-stream", [&](std::size_t, httplib::DataSink& sink) {
+            for (int beat = 0; beat < 8; ++beat) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!sink.write(": keep-alive\n\n", 14)) return false;
+            }
+            const std::string tail =
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}"
+                "\n\ndata: [DONE]\n\n";
+            if (!sink.write(tail.data(), tail.size())) return false;
+            sink.done();
+            return true;
+        });
+    });
+    start();
+    auto provider = http_provider(
+        {.base_url = base_url_, .timeout = std::chrono::milliseconds(400), .on_delta = [](auto, auto) {}});
+    ASSERT_TRUE(provider);
+    const auto reply = (*provider)({}, {}, {});
+    ASSERT_TRUE(reply) << reply.error().message;
+    EXPECT_EQ(reply->content, "done");
+}
+
 TEST_F(ChatClientTest, RejectsBrokenStreamsAndCancelsDuringStreaming) {
     std::string wire;
     server_.Post("/v1/chat/completions", [&](const auto&, auto& reply) {
@@ -237,7 +277,8 @@ TEST_F(ChatClientTest, HttpToolRoundTrip) {
         EXPECT_FALSE(request.has_header("Authorization"));
         const auto body = Json::parse(request.body);
         EXPECT_EQ(body["model"], "test-model");
-        EXPECT_EQ(body["stream"], false);
+        // Completions always stream; this server answers with plain JSON, which the client must still accept.
+        EXPECT_EQ(body["stream"], true);
         EXPECT_EQ(body["tools"][0]["function"]["name"], "lookup");
         if (++requests == 1) {
             EXPECT_EQ(body["messages"].back()["role"], "user");
