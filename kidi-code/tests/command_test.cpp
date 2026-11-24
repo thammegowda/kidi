@@ -43,6 +43,8 @@ auto test_provider(ChatClientOptions options) -> Result<Provider> {
             while (!stop.stop_requested()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
             return std::unexpected(Error{ErrorCode::RUNTIME, "cancelled"});
         }
+        if (text == "large")
+            return Message{.role = Role::ASSISTANT, .content = std::string(65536, 'x')};
         if (text == "commands")
             return Message{.role = Role::ASSISTANT,
                            .tool_calls = {{"first", "run_command", {{"command", "printf first"}}},
@@ -225,7 +227,7 @@ protected:
             ASSERT_GE(result, 0);
             if (result == child_) break;
             ASSERT_LT(std::chrono::steady_clock::now(), deadline) << output_text_;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            if (!drain(10)) std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         child_ = -1;
         ASSERT_TRUE(WIFEXITED(status)) << status;
@@ -399,6 +401,12 @@ TEST_F(CodeTerminal, PipedInput) {
     ASSERT_TRUE(wait_task("first piece and last piece"));
     finish();
     EXPECT_EQ(output_text_.find('\033'), std::string::npos);
+}
+
+TEST_F(CodeTerminal, FinishDrainsOutput) {
+    start(false, {"-p", "large"});
+    finish();
+    EXPECT_NE(output_text_.find(std::string(65536, 'x')), std::string::npos);
 }
 
 TEST_F(CodeTerminal, PipedApprovalUsesLineInput) {

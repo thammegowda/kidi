@@ -7,6 +7,7 @@
 #include <chrono>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <stdexcept>
 #include <thread>
 
@@ -189,6 +190,7 @@ TEST_F(ChatTest, PromptsAndStopTokens) {
     std::ofstream(input) << R"({"messages":[{"role":"user","content":"alpha"}],"template_args":[]})" << '\n';
     EXPECT_EQ(run_cli(command), 2) << "JSONL accepted non-object template arguments";
 
+    std::cerr << "ChatTest: checking template defaults\n";
     const auto simple = require(generator.generate("alpha", options));
     const auto template_default = require(generator.generate("alpha theta eta", raw_options));
     EXPECT_EQ(simple.stats.prompt_tokens, 3) << "plain generation bypassed the checkpoint chat template or its defaults";
@@ -199,6 +201,7 @@ TEST_F(ChatTest, PromptsAndStopTokens) {
               template_default.generation.token_ids)
         << "batch generation bypassed the checkpoint chat template";
 
+    std::cerr << "ChatTest: checking tokenizer metadata\n";
     // Keep the model weights but remove every Gemma token name and use tokenizer metadata instead.
     std::ofstream(root / "tokenizer.json") << R"({
       "version":"1.0", "pre_tokenizer":{"type":"WhitespaceSplit"},
@@ -219,6 +222,7 @@ TEST_F(ChatTest, PromptsAndStopTokens) {
         << "tokenizer metadata or non-Gemma warm-up changed generation";
     ASSERT_FALSE(expected.generation.token_ids.empty()) << "missing fixture output for stop-token test";
     const auto stop = expected.generation.token_ids.front();
+    std::cerr << "ChatTest: checking stop tokens\n";
     std::ofstream(root / "generation_config.json")
         << Json{{"eos_token_id", {(stop + 1) % 16, stop, stop}}, {"pad_token_id", 0}};
     auto multiple_stops = require(kidi::inference::Generator::load(root, kidi::tensor::Device::cpu()));
@@ -240,6 +244,7 @@ TEST_F(ChatTest, PromptsAndStopTokens) {
     EXPECT_EQ(serving_stopped.generation.decoder_steps, 1) << "serving ignored an additional EOS token";
     EXPECT_EQ(require(multiple_stops.generate("alpha", options)).generation.token_ids, expected.generation.token_ids)
         << "ignore_eos did not bypass the checkpoint stop list";
+    std::cerr << "ChatTest: checking invalid metadata\n";
     for (const auto* invalid : {R"({"eos_token_id":[]})", R"({"eos_token_id":16})",
                                R"({"eos_token_id":-1})", R"({"eos_token_id":[1],"pad_token_id":[0]})"}) {
         std::ofstream(root / "generation_config.json") << invalid;
@@ -258,6 +263,7 @@ TEST_F(ChatTest, PromptsAndStopTokens) {
         << "missing tokenizer EOS token was accepted";
     std::ofstream(root / "tokenizer_config.json") << R"({"eos_token":"finish"})";
     std::filesystem::remove(root / "chat_template.jinja");
+    std::cerr << "ChatTest: checking missing template\n";
     auto without_template = require(kidi::inference::Generator::load(root, kidi::tensor::Device::cpu()));
     EXPECT_FALSE(without_template.generate("alpha", options)) << "chat without a checkpoint template was accepted";
     EXPECT_EQ(require(without_template.generate("alpha gamma beta delta alpha theta eta", raw_options))
@@ -265,6 +271,7 @@ TEST_F(ChatTest, PromptsAndStopTokens) {
               raw.generation.token_ids)
         << "raw generation requires a chat template";
 
+    std::cerr << "ChatTest: checking context limits\n";
     auto clamped = raw_options;
     clamped.context_size = 16;
     clamped.maximum_new_tokens = 20;

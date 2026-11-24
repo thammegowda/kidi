@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+trap 'printf "managed_code_test.sh:%s: command failed (%s): %s\n" "$LINENO" "$?" "$BASH_COMMAND" >&2' ERR
 
 kidi=$1
 fixture=$2
@@ -191,5 +193,14 @@ XDG_RUNTIME_DIR="$compact_runtime" CUDA_VISIBLE_DEVICES="${KIDI_TEST_AUTO_CUDA:-
     --workspace "$root" --config "$root/compact.yaml" --max-tokens 8 --temperature 0 --timeout-ms 5000 -p short \
     > "$root/compact-default.out"
 test "$(find "$compact_runtime" -name server.json -type f | wc -l)" -eq 2
-# Without --context-size the daemon sizes the context from free memory (capped by the model limit).
-test "$(grep -l 'context: [0-9]* tokens (' "$compact_runtime"/kidi-code-*/*/serve.log | wc -l)" -eq 1
+for state in "$compact_runtime"/kidi-code-*/*/server.json; do
+    read -r pid port < <(sed -nE 's/^\{"port":([0-9]+),"pid":([0-9]+)\}$/\2 \1/p' "$state")
+    test "$("$curl" -fsS --noproxy '*' --max-time 2 "http://127.0.0.1:$port/v1/chat/context" \
+        -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"short"}]}')" \
+        = '{"prompt_tokens":2,"context_tokens":16,"prompt_limit_tokens":15}'
+done
+# Without --context-size the daemon sizes the context from free memory when the backend can report it.
+# TODO: The CPU backend does not report available memory on macOS, so it uses the model's default.
+if [[ $(uname -s) != Darwin ]]; then
+    test "$(grep -l 'context: [0-9]* tokens (' "$compact_runtime"/kidi-code-*/*/serve.log | wc -l)" -eq 1
+fi
