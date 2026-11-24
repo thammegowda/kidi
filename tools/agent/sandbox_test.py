@@ -94,26 +94,21 @@ class SandboxScriptTest(unittest.TestCase):
         git("worktree", "add", "-q", str(self.root / "ws"), cwd=main)
         self.ws = self.root / "ws"
         self.hooks = main / ".git" / "hooks"
-        env = dict(os.environ, KIDI_AGENT_HOME=str(self.root / "runtime"), KIDI_AGENT_CACHE=str(self.root / "cache"))
+        env = dict(os.environ, KIDI_AGENT_CACHE=str(self.root / "cache"))
         self.env = env
 
     def tearDown(self):
         shutil.rmtree(self.root)
 
     def run_sandboxed(self, command, *options, env=None):
-        return subprocess.run([str(HERE / "sandbox.sh"), *options, "--exec", str(self.ws), "--", "bash", "-c", command],
+        return subprocess.run([str(HERE / "sandbox.sh"), *options, str(self.ws), "--", "bash", "-c", command],
                               env=env or self.env, capture_output=True, text=True)
 
-    def test_agent_provider_uses_configured_endpoint_and_model_id(self):
-        env = dict(self.env, KIDI_AGENT_BASE_URL="http://127.0.0.1:8123/v1", KIDI_AGENT_MODEL_ID="test-model")
-        command = (
-            "python3 -c 'import json, os; c=json.load(open(os.path.join(os.environ[\"PI_CODING_AGENT_DIR\"], "
-            "\"models.json\"))); p=c[\"providers\"][\"kidi\"]; "
-            "assert p[\"baseUrl\"] == \"http://127.0.0.1:8123/v1\"; "
-            "assert p[\"models\"][0][\"id\"] == \"test-model\"'"
-        )
-        result = self.run_sandboxed(command, env=env)
+    def test_model_endpoint_is_passed_through_and_reachable_only_on_its_port(self):
+        env = dict(self.env, KIDI_AGENT_BASE_URL="http://127.0.0.1:8123/v1")
+        result = self.run_sandboxed('test "$KIDI_AGENT_BASE_URL" = http://127.0.0.1:8123/v1', env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tcp 8123", result.stderr)
 
     def test_python_venv_and_git_review_workflow(self):
         result = self.run_sandboxed(
@@ -133,119 +128,6 @@ class SandboxScriptTest(unittest.TestCase):
             "! (echo 'gitdir: /tmp' > .git) 2>/dev/null")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.ws / ".git").read_text(), gitfile)
-
-
-@unittest.skipUnless(HAS_LANDLOCK, "requires Linux with Landlock")
-class KidiCodeLauncherTest(unittest.TestCase):
-    def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
-        self.ws = self.root / "ws"
-        self.ws.mkdir()
-        self.rt = self.root / "runtime"
-        self.cache = self.root / "cache"
-        pi_bin = self.rt / "pi" / "node_modules" / ".bin" / "pi"
-        pi_bin.parent.mkdir(parents=True, exist_ok=True)
-        pi_bin.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
-                          "cfg = json.load(open(os.path.join(os.environ['PI_CODING_AGENT_DIR'], 'models.json')))\n"
-                          "print(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'models': cfg}))\n")
-        pi_bin.chmod(0o755)
-        node_bin = self.rt / "node" / "bin"
-        node_bin.mkdir(parents=True, exist_ok=True)
-        self.env = dict(
-            os.environ,
-            KIDI_AGENT_HOME=str(self.rt),
-            KIDI_AGENT_CACHE=str(self.cache),
-            KIDI_HUB=str(self.root / "hub"),
-        )
-
-    def tearDown(self):
-        shutil.rmtree(self.root)
-
-    def test_reuses_existing_server_and_forwards_pi_args(self):
-        import http.server
-        import json
-        import threading
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                body = json.dumps({"object": "list", "data": [{"id": "served-test-model"}]}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *args):
-                pass
-
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        port = srv.server_address[1]
-        t = threading.Thread(target=srv.serve_forever, daemon=True)
-        t.start()
-        try:
-            res = subprocess.run(
-                [sys.executable, str(HERE / "kidi-code"), "-w", str(self.ws), "--port", str(port),
-                 "--context-size", "16384", "--max-new-tokens", "2048", "-p", "hello"],
-                env=self.env, capture_output=True, text=True, check=True,
-            )
-        finally:
-            srv.shutdown()
-            srv.server_close()
-
-        out = json.loads(res.stdout)
-        self.assertEqual(out["cwd"], str(self.ws))
-        self.assertIn("-p", out["argv"])
-        self.assertIn("hello", out["argv"])
-        model = out["models"]["providers"]["kidi"]["models"][0]
-        self.assertEqual(model["id"], "served-test-model")
-        self.assertEqual(model["contextWindow"], 16384)
-        self.assertEqual(model["maxTokens"], 2048)
-
-    def test_autostarts_and_stops_kidi_serve_from_hub_cache(self):
-        import json
-
-        model_dir = self.root / "hub" / "thinkingmachines" / "Inkling-2-Mini"
-        model_dir.mkdir(parents=True)
-        (model_dir / "config.json").write_text("{}")
-
-        sock = socket.socket()
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-        sock.close()
-
-        pid_file = self.root / "server.pid"
-        args_file = self.root / "server.args"
-        mock_kidi = self.root / "mock_kidi"
-        mock_kidi.write_text(
-            "#!/usr/bin/env python3\n"
-            "import http.server, json, os, signal, sys\n"
-            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
-            f"open({str(args_file)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
-            "port = int(sys.argv[sys.argv.index('--port') + 1])\n"
-            "class H(http.server.BaseHTTPRequestHandler):\n"
-            "    def do_GET(self):\n"
-            "        b = b'{\"data\":[{\"id\":\"kidi-local\"}]}'\n"
-            "        self.send_response(200); self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)\n"
-            "    def log_message(self, *a): pass\n"
-            "srv = http.server.HTTPServer(('127.0.0.1', port), H)\n"
-            "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
-            "srv.serve_forever()\n"
-        )
-        mock_kidi.chmod(0o755)
-
-        res = subprocess.run(
-            [sys.executable, str(HERE / "kidi-code"), "--kidi-bin", str(mock_kidi),
-             "--backend", "auto", "-w", str(self.ws), "--port", str(port), "-p", "ping"],
-            env=self.env, capture_output=True, text=True, check=True,
-        )
-        out = json.loads(res.stdout)
-        self.assertEqual(out["models"]["providers"]["kidi"]["models"][0]["id"], "kidi-local")
-        srv_args = json.loads(args_file.read_text())
-        self.assertEqual(srv_args[0], "serve")
-        self.assertIn(str(model_dir), srv_args)
-        srv_pid = int(pid_file.read_text())
-        with self.assertRaises(ProcessLookupError):
-            os.kill(srv_pid, 0)
 
 
 if __name__ == "__main__":

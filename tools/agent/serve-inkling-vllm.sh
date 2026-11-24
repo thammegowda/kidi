@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serve Inkling-2-Mini with vLLM as the reference endpoint for tools/agent/sandbox.sh.
+# Serve Inkling-2-Mini with vLLM as a reference endpoint for comparing against kidi.
 #   VLLM_ENV=/path/to/venv CUDA_VISIBLE_DEVICES=6 tools/agent/serve-inkling-vllm.sh
 # Install (Inkling needs a vLLM nightly; validated with 0.34.0rc1.dev1130+g8c17e4692):
 #   uv venv -p 3.12 "$VLLM_ENV"

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Run the Pi coding agent, or any command, confined to one workspace directory.
+# Run a coding agent (e.g. kidi-code), or any command, confined to one workspace directory.
 #
-#   tools/agent/sandbox.sh [options] WORKSPACE [-- PI_ARGS...]
-#   tools/agent/sandbox.sh [options] --exec WORKSPACE -- COMMAND [ARGS...]
+#   tools/agent/sandbox.sh [options] WORKSPACE -- COMMAND [ARGS...]
 #
 # Options:
 #   --allow-https   allow outbound TCP 443 (PyPI, uv, pip); default allows only the model endpoint
@@ -10,22 +9,20 @@
 #   --ro PATH       extra read-only path (repeatable), e.g. --ro /opt/venv
 #   --rw PATH       extra writable path (repeatable)
 #   --no-sudo       do not use the private mount namespace even if passwordless sudo works
-#   --exec          run COMMAND instead of Pi
 #
-# Environment: KIDI_AGENT_BASE_URL (default http://127.0.0.1:18097/v1), KIDI_AGENT_MODEL_ID,
-# KIDI_AGENT_HOME, KIDI_AGENT_CACHE. See tools/agent/README.md for the policy and its limits.
+# Environment: KIDI_AGENT_BASE_URL (model endpoint; default http://127.0.0.1:18097/v1, passed through),
+# KIDI_AGENT_CACHE. See tools/agent/README.md for the policy and its limits.
 set -euo pipefail
 
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-runtime="${KIDI_AGENT_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/kidi-agent}"
 cache="${KIDI_AGENT_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/kidi-agent}"
 base_url="${KIDI_AGENT_BASE_URL:-http://127.0.0.1:18097/v1}"
 python=/usr/bin/python3
 
 die() { echo "sandbox.sh: $*" >&2; exit 2; }
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-https=0 exec_mode=0 use_sudo=auto
+https=0 use_sudo=auto
 ports=() extra_ro=() extra_rw=()
 while (($#)); do
     case "$1" in
@@ -34,7 +31,6 @@ while (($#)); do
         --ro) extra_ro+=("$(realpath -e "${2:?--ro needs a path}")"); shift ;;
         --rw) extra_rw+=("$(realpath -e "${2:?--rw needs a path}")"); shift ;;
         --no-sudo) use_sudo=0 ;;
-        --exec) exec_mode=1 ;;
         -h | --help) usage ;;
         -*) echo "sandbox.sh: unknown option $1" >&2; usage 2 ;;
         *) break ;;
@@ -45,11 +41,7 @@ done
 ws="$(realpath -e "$1")"; shift
 [[ -d $ws ]] || die "workspace is not a directory: $ws"
 [[ ${1:-} == -- ]] && shift
-if ((exec_mode)); then
-    (($#)) || die "--exec needs a command"
-else
-    [[ -x $runtime/pi/node_modules/.bin/pi ]] || die "Pi is not installed; run tools/agent/setup.sh"
-fi
+(($#)) || die "missing COMMAND"
 
 inside_ws() { [[ $1 == "$ws" || $1 == "$ws/"* ]]; }
 
@@ -80,52 +72,20 @@ if [[ $use_sudo == auto ]]; then
     command -v setpriv >/dev/null && command -v unshare >/dev/null && sudo -n true 2>/dev/null && use_sudo=1
 fi
 
-mkdir -p "$cache/uv" "$cache/pip" "$cache/uv-python" "$runtime/run" "$runtime/sessions"
-priv="$(mktemp -d "$runtime/run/XXXXXX")"
+mkdir -p "$cache/uv" "$cache/pip" "$cache/uv-python"
+# Per-run $HOME/$TMPDIR live outside the shared cache so concurrent runs cannot see each other's.
+priv="$(mktemp -d "${TMPDIR:-/tmp}/kidi-sandbox.XXXXXX")"
 trap 'rm -rf "$priv"' EXIT
-mkdir -p "$priv/home" "$priv/tmp" "$priv/agent"
+mkdir -p "$priv/home" "$priv/tmp"
 for key in user.name user.email; do
     value="$(git config --global --get "$key" 2>/dev/null || true)"
     [[ -n $value ]] && git config --file "$priv/home/.gitconfig" "$key" "$value"
 done
 
-if ((https)); then
-    network="outbound HTTPS is allowed (PyPI, uv, pip)."
-else
-    network="no internet; only the model endpoint is reachable. \`uv pip install --offline\` works for cached packages; otherwise ask the user to relaunch with --allow-https."
-fi
-if ((use_sudo)); then
-    shm="\`multiprocessing\` works (private /dev/shm)."
-else
-    shm="/dev/shm is unavailable, so \`multiprocessing\` pools and locks fail; prefer single-process runs (e.g. no pytest -n)."
-fi
-prompt="$(<"$here/prompt.md")"
-prompt="${prompt//'{{WORKSPACE}}'/$ws}"
-prompt="${prompt//'{{NETWORK}}'/$network}"
-printf '%s\n' "${prompt//'{{SHM}}'/$shm}" > "$priv/prompt.md"
-model_id="${KIDI_AGENT_MODEL_ID:-kidi-local}"
-"$python" - "$here/pi/models.json" "$priv/agent/models.json" "$base_url" "$model_id" \
-    "${KIDI_AGENT_CONTEXT_WINDOW:-}" "${KIDI_AGENT_MAX_TOKENS:-}" <<'EOF'
-import json, sys
-config = json.load(open(sys.argv[1]))
-ctx = int(sys.argv[5]) if sys.argv[5] else None
-max_tok = int(sys.argv[6]) if sys.argv[6] else None
-for provider in config["providers"].values():
-    provider["baseUrl"] = sys.argv[3]
-    for model in provider["models"]:
-        model["id"] = sys.argv[4]
-        if ctx is not None:
-            model["contextWindow"] = ctx
-        if max_tok is not None:
-            model["maxTokens"] = max_tok
-json.dump(config, open(sys.argv[2], "w"), indent=2)
-EOF
-cp "$here/pi/settings.json" "$priv/agent/"
-
-path="$runtime/node/bin:/usr/local/bin:/usr/bin:/bin"
+path="/usr/local/bin:/usr/bin:/bin"
 env_vars=(
     HOME="$priv/home" TMPDIR="$priv/tmp" TERM="${TERM:-xterm-256color}" LANG="${LANG:-C.UTF-8}"
-    PI_CODING_AGENT_DIR="$priv/agent" PI_OFFLINE=1
+    KIDI_AGENT_BASE_URL="$base_url"
     UV_CACHE_DIR="$cache/uv" UV_PYTHON_INSTALL_DIR="$cache/uv-python" UV_PYTHON_PREFERENCE=system
     PIP_CACHE_DIR="$cache/pip" PIP_DISABLE_PIP_VERSION_CHECK=1
 )
@@ -144,22 +104,15 @@ fi
 [[ "$(stat -c %d "$cache/uv")" == "$(stat -c %d "$ws")" ]] || env_vars+=(UV_LINK_MODE=copy)
 env_vars+=(PATH="$path")
 
-rw=("$ws" "$priv" "$cache" "$runtime/sessions" /dev/null /dev/zero /dev/full "${extra_rw[@]}")
+rw=("$ws" "$priv" "$cache" /dev/null /dev/zero /dev/full "${extra_rw[@]}")
 ((use_sudo)) && rw+=(/dev/shm)
-ro+=(/usr /bin /sbin /lib /lib32 /lib64 /etc /proc /sys /dev/urandom /dev/random
-    "$runtime/node" "$runtime/pi" "${extra_ro[@]}")
+ro+=(/usr /bin /sbin /lib /lib32 /lib64 /etc /proc /sys /dev/urandom /dev/random "${extra_ro[@]}")
 landlock=("$python" "$here/landlock_run.py")
 for p in "${rw[@]}"; do landlock+=(--rw "$p"); done
 for p in "${ro[@]}"; do landlock+=(--ro "$p"); done
 for p in "${ports[@]}"; do landlock+=(--tcp-connect "$p"); done
 
-if ((exec_mode)); then
-    command=("$@")
-else
-    command=("$runtime/pi/node_modules/.bin/pi" --session-dir "$runtime/sessions"
-        --append-system-prompt "$priv/prompt.md" "$@")
-fi
-inner=(env -i "${env_vars[@]}" "${landlock[@]}" -- "${command[@]}")
+inner=(env -i "${env_vars[@]}" "${landlock[@]}" -- "$@")
 
 echo "sandbox: rw $ws; tcp ${ports[*]}; $( ((use_sudo)) && echo "private /dev/shm, git metadata read-only" || echo "no mount namespace") " >&2
 if ((!use_sudo && ${#protect[@]})); then

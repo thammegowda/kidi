@@ -1,6 +1,6 @@
 # Kidi Code
 
-A small C++23 coding-agent library and CLI. No Node, Pi, curl or TLS dependency.
+A small C++23 coding-agent library and CLI. No Node, curl or TLS dependency.
 Inference uses Kidi's Chat Completions API over plain HTTP; external model
 providers and HTTPS are not supported.
 
@@ -214,7 +214,7 @@ stdout/stderr, capped at 32 KiB. Commands time out after 60 seconds.
 `..`, `.git`, symlinks and special files using descriptor-relative access.
 `run_command` has the user's full privileges and can access paths outside the
 workspace. Remove it from the YAML registry to disable it. The host must control
-workspace directory topology; use the existing [Pi/Landlock launcher](../tools/agent/README.md)
+workspace directory topology; run the standalone client under the [Landlock sandbox](../tools/agent/README.md)
 when kernel-level process confinement is required.
 
 ## Prompts and registry

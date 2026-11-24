@@ -1,65 +1,38 @@
 # Coding-agent sandbox
 
-For the native C++23 `kidi code` command (no Node/Pi) or its standalone HTTP
-client, see [Kidi Code](../../kidi-code/README.md). It provides workspace file
-tools, an approval-gated shell tool and host-controlled permissions, but not this
-launcher's OS process sandbox.
-The Pi launcher below remains unchanged.
+`sandbox.sh` confines a coding agent, or any command, to one workspace directory with
+[Landlock](https://docs.kernel.org/userspace-api/landlock.html). Linux only; works inside unprivileged
+containers. Use it with the standalone [`kidi-code`](../../kidi-code/README.md) client when you
+want kernel-level process confinement. `kidi code` itself is not OS-sandboxed.
 
-Runs the [Pi](https://github.com/earendil-works/pi) coding agent (pinned to v0.83.0) against an
-OpenAI-compatible endpoint, confined
-by [Landlock](https://docs.kernel.org/userspace-api/landlock.html) to one workspace directory.
-Linux only; works inside unprivileged containers.
-
-## Quick start (`kidi-code`)
-
-From any project directory, `tools/agent/kidi-code` automatically installs Pi on first run, starts
-`kidi serve` using your cached model (e.g. `Inkling-2-Mini`) or reuses an already-running server
-on port `18097`, and launches Pi inside the Landlock sandbox:
+## Quick start
 
 ```bash
-cd /path/to/your/project
-/path/to/kidi/tools/agent/kidi-code                        # interactive Pi in current dir
-/path/to/kidi/tools/agent/kidi-code -p "fix the test"      # one-shot
-/path/to/kidi/tools/agent/kidi-code --keep-server          # leave server running
+kidi serve -m @thinkingmachines/Inkling-2-Mini --backend cuda --port 18097   # outside the sandbox
+git worktree add ../kidi-task-42                                            # one disposable worktree per task
+bin=$(realpath .cache/kidi-code-build/kidi-code)                            # standalone client
+tools/agent/sandbox.sh --ro "$(dirname "$bin")" ../kidi-task-42 -- "$bin"                     # interactive
+tools/agent/sandbox.sh --ro "$(dirname "$bin")" ../kidi-task-42 -- "$bin" -p "fix the test"   # one-shot
+tools/agent/sandbox.sh --allow-https ../kidi-task-42 -- bash               # same sandbox, a shell
+VLLM_ENV=... CUDA_VISIBLE_DEVICES=6 tools/agent/serve-inkling-vllm.sh      # optional vLLM reference (port 18096)
 ```
 
-Useful options: `-w/--workspace DIR`, `-m/--model MODEL`, `--backend cuda[:INDEX]|auto`,
-`--port N`, `--context-size N`, `--max-new-tokens N`, `--no-sandbox` (also used on macOS).
-
-## Manual launcher (`sandbox.sh`)
-
-```bash
-tools/agent/setup.sh                                  # Node 22 + Pi into ~/.local/share/kidi-agent
-KIDI_MODEL=/path/to/model CUDA_VISIBLE_DEVICES=7 tools/agent/serve-kidi.sh # kidi endpoint (port 18097)
-git worktree add ../kidi-task-42                      # one disposable worktree per task
-KIDI_AGENT_MODEL_ID=your-served-name tools/agent/sandbox.sh ../kidi-task-42 # if model name differs
-tools/agent/sandbox.sh ../kidi-task-42                # interactive Pi
-tools/agent/sandbox.sh ../kidi-task-42 -- -p "fix the failing test"      # one-shot
-tools/agent/sandbox.sh --allow-https ../kidi-task-42  # also allow PyPI downloads
-tools/agent/sandbox.sh --exec ../kidi-task-42 -- bash # same sandbox, no agent
-VLLM_ENV=... CUDA_VISIBLE_DEVICES=6 tools/agent/serve-inkling-vllm.sh    # optional Inkling reference (port 18096)
-```
-
-`KIDI_AGENT_BASE_URL` selects the endpoint (default `http://127.0.0.1:18097/v1`); set
-`KIDI_AGENT_MODEL_ID` if the server advertises a different model name. The model path, served name,
-context/cache size and token limits for `serve-kidi.sh` can be set with `KIDI_MODEL`,
-`KIDI_SERVED_MODEL_NAME`, `KIDI_CONTEXT_SIZE`, `KIDI_CACHE_TOKENS`, and `KIDI_MAX_NEW_TOKENS`.
-Pi's provider defaults are in [pi/models.json](pi/models.json). The CUDA build runs without CUTLASS;
-CUTLASS is optional and used only for the SM90 int8 GEMM path.
+`KIDI_AGENT_BASE_URL` selects the model endpoint (default `http://127.0.0.1:18097/v1`). The sandbox
+allows TCP to its port only, and passes the variable through, so `kidi-code` uses it by default.
+The inference server runs outside the sandbox because the sandbox has no GPU access.
 
 ## Policy
 
 | | Access |
 |---|---|
-| Workspace, per-run `$HOME`/`$TMPDIR`, package caches (`~/.cache/kidi-agent`), Pi sessions | read/write |
-| `/usr`, `/etc`, `/lib*`, `/bin`, `/proc`, `/sys`, Node and Pi runtime, `--ro` paths | read-only |
+| Workspace, per-run `$HOME`/`$TMPDIR`, package caches (`~/.cache/kidi-agent`) | read/write |
+| `/usr`, `/etc`, `/lib*`, `/bin`, `/proc`, `/sys`, `--ro` paths (e.g. the agent binary) | read-only |
 | Everything else (your `$HOME`, other repositories, `/tmp`, `/scratch`, host `/dev/shm`) | denied |
 | Git metadata (`.git`, worktree gitdir, submodule `.git` files) | read-only: status/diff/log work, staging and commits fail |
 | TCP | connect to the model port only (plus 443 with `--allow-https`, `--allow-port N`); no listening |
 | Environment | cleared; only sandbox variables are set |
 
-With passwordless sudo, the launcher also runs the agent in a private mount namespace: a fresh
+With passwordless sudo, the launcher also runs the command in a private mount namespace: a fresh
 `/dev/shm` (so `multiprocessing` works without exposing other jobs' shared memory) and read-only
 bind mounts over git entries and this launcher when they are inside the workspace. It then drops
 to your user with no capabilities before applying Landlock. Without sudo (`--no-sudo`),
@@ -77,8 +50,6 @@ you later run `git diff` to review its work.
   installs a managed interpreter into the cache (needs `--allow-https`).
 - uv and pip caches persist across runs, so `uv pip install --offline` works for packages
   fetched in an earlier `--allow-https` run.
-- The appended system prompt ([prompt.md](prompt.md)) tells the model that each bash call is a
-  fresh shell and how to use the environment.
 
 ## Limits
 
@@ -87,8 +58,6 @@ you later run `git diff` to review its work.
   sockets are not restricted.
 - `/proc` is readable, so other processes are visible (not traceable or writable).
 - No GPU access yet: `/dev/nvidia*` is not granted.
-- Pi runs offline (`PI_OFFLINE=1`), so it cannot download its helper binaries; install `fd`
-  and `rg` on the host for its file-search tools.
 - Launch from a checkout the agent cannot modify, or review `tools/agent/` changes before
   relaunching: the launcher is only protected while a sandboxed run is active.
 

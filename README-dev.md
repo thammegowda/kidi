@@ -811,8 +811,9 @@ Keep generated model files, local reports and large binary artifacts out of Git.
 
 ## Coding Agents
 
-[tools/agent](tools/agent/README.md) runs the Pi coding agent against a local
-model endpoint, confined by Landlock to one workspace (typically a disposable
+[Kidi Code](kidi-code/README.md) is the built-in coding agent (`kidi code`).
+[tools/agent](tools/agent/README.md) confines the standalone `kidi-code` client,
+or any command, by Landlock to one workspace (typically a disposable
 `git worktree`), with Python venv/uv support and read-only git metadata.
 
 ## CI and Deployment

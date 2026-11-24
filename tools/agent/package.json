@@ -1,8 +1,0 @@
-{
-  "name": "kidi-agent-runtime",
-  "private": true,
-  "description": "Pinned Pi coding agent used by tools/agent/sandbox.sh",
-  "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.83.0"
-  }
-}
