@@ -109,6 +109,10 @@ public:
     virtual auto supports_state_recycling() const noexcept -> bool { return false; }
 
     virtual auto rewind(LanguageModelState& state, std::size_t position) -> Result<void>;
+    /// Records the state's current position as a rewind target (for models whose rewind is otherwise limited).
+    virtual auto mark_rewind_point(LanguageModelState&) -> Result<void> { return {}; }
+    /// Largest position <= `position` that `rewind` accepts for this state.
+    virtual auto rewind_floor(const LanguageModelState&, std::size_t position) const -> std::size_t { return position; }
     virtual auto prefill(std::span<const std::int32_t> tokens, LanguageModelState& state) -> Result<void>;
     virtual auto forward(std::span<const std::int32_t> tokens, LanguageModelState& state, bool all_logits = false,
                          tensor::Tensor* hidden = nullptr) -> Result<tensor::Tensor> = 0;

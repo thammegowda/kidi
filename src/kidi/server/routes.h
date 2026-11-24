@@ -4,7 +4,7 @@
 /// agents, the desktop UI) talks to the same `/health`, `/v1/models`, and `/v1/chat/completions` implementation.
 
 #include "kidi/server/engine.h"
-#include "kidi/server/openai.h"
+#include "kidi/server/chat_api.h"
 
 #include "liteapp/http/server.h"
 
@@ -18,9 +18,9 @@ struct RouteOptions {
     GenerationOptions defaults;
     /// Optional host-specific request extension, applied after standard OpenAI validation (e.g. the desktop app's
     /// system prompt). An error becomes a 400 response.
-    std::function<Result<void>(const OpenAIJson& body, OpenAIChatRequest& request)> customize;
+    std::function<Result<void>(const ChatJson& body, ChatRequest& request)> customize;
 };
 
-auto mount_openai_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteOptions options) -> void;
+auto mount_chat_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteOptions options) -> void;
 
 } // namespace kidi::server

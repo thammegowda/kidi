@@ -36,6 +36,7 @@ auto Inkling2State::cache_bytes() const noexcept -> std::size_t {
         for (const auto* tensor : {&visit.key, &visit.value, &visit.key_conv, &visit.value_conv,
                                    &visit.attention_conv, &visit.mlp_conv})
             total += tensor->nbytes();
+    for (const auto& tensor : rewind_convs) total += tensor.nbytes();
     return total;
 }
 
@@ -435,19 +436,56 @@ auto Inkling2Impl::rewind(LanguageModelState& base, std::size_t position) -> Res
     if (!state || !state->capacity || state->position > state->capacity || position > state->position)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Inkling-2 state rewind"});
     if (position == state->position) return {};
-    if (position != 0)
-        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "Inkling-2 supports rewinding only to the initial state"});
+    if (position != 0 && position != state->rewind_position)
+        return std::unexpected(
+            Error{ErrorCode::UNSUPPORTED, "Inkling-2 rewinds only to the initial state or its marked rewind point"});
     try {
+        // Keys and values are indexed by absolute position; only the short-convolution rings need restoring.
+        auto saved = state->rewind_convs.begin();
         for (auto& visit : state->visits)
             for (auto* cache : {&visit.key_conv, &visit.value_conv, &visit.attention_conv, &visit.mlp_conv})
-                require(cache->zero_());
-        state->position = 0;
+                if (position == 0)
+                    require(cache->zero_());
+                else
+                    context_->copy_slice_(*cache, *saved++, 1, 0);
+        if (position == 0) {
+            state->rewind_convs.clear();
+            state->rewind_position = 0;
+        }
+        state->position = position;
         return {};
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     } catch (const std::exception& error) {
         return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
     }
+}
+
+auto Inkling2Impl::mark_rewind_point(LanguageModelState& base) -> Result<void> {
+    auto* state = dynamic_cast<Inkling2State*>(&base);
+    if (!state) return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Inkling-2 state"});
+    try {
+        const bool allocate = state->rewind_convs.empty();
+        std::size_t index = 0;
+        for (auto& visit : state->visits)
+            for (auto* cache : {&visit.key_conv, &visit.value_conv, &visit.attention_conv, &visit.mlp_conv}) {
+                if (allocate)
+                    state->rewind_convs.push_back(require(Tensor::zeros(
+                        std::vector<std::int64_t>(cache->shape().begin(), cache->shape().end()), cache->dtype(),
+                        device())));
+                context_->copy_slice_(state->rewind_convs[index++], *cache, 1, 0);
+            }
+        state->rewind_position = state->position;
+        return {};
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    }
+}
+
+auto Inkling2Impl::rewind_floor(const LanguageModelState& base, std::size_t position) const -> std::size_t {
+    const auto* state = dynamic_cast<const Inkling2State*>(&base);
+    if (!state || position >= state->position) return position;
+    return state->rewind_position && state->rewind_position <= position ? state->rewind_position : 0;
 }
 
 auto Inkling2Impl::convolve(const Tensor& input, Tensor& state, const Tensor& weight, const Tensor& taps,

@@ -23,7 +23,7 @@ auto serve(inference::Generator& generator, const ServeOptions& options) -> int 
     }
     auto& server = *created;
     server::ChatEngine engine(generator);
-    server::mount_openai_routes(server, engine, {.model_name = options.model_name,
+    server::mount_chat_routes(server, engine, {.model_name = options.model_name,
                                                  .defaults = options.generation,
                                                  .customize = {}});
 

@@ -21,13 +21,21 @@
 namespace kidi::code {
 namespace {
 
-auto test_provider(OpenAIOptions) -> Result<Provider> {
-    Provider provider([](std::span<const Message> messages, std::span<const ToolSpec>,
+auto test_provider(ChatClientOptions options) -> Result<Provider> {
+    Provider provider([options](std::span<const Message> messages, std::span<const ToolSpec>,
                          std::stop_token stop) -> Result<Message> {
         if (messages.back().role == Role::TOOL)
             return Message{
                 .role = Role::ASSISTANT, .content = "result: " + messages.back().content, .usage = TokenUsage{500, 16}};
         const auto& text = messages.back().content;
+        if (text == "stream" && options.on_delta) {
+            options.on_delta("Inspecting.\n", true);
+            options.on_delta("first piece", false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            options.on_delta(" and last piece", false);
+            return Message{.role = Role::ASSISTANT, .content = "first piece and last piece",
+                           .reasoning_content = "Inspecting.\n"};
+        }
         if (text == "wait") {
             std::cerr << "provider waiting\n" << std::flush;
             while (!stop.stop_requested()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -242,7 +250,8 @@ TEST_F(CodeTerminal, EditHistoryPaste) {
     from = output_text_.size();
     const std::string large_paste(6000, 'x');
     send("\033[200~" + large_paste + "\033[201~\r");
-    ASSERT_TRUE(wait_task("echo: " + large_paste.substr(0, 40), from));
+    // The echoed reply wraps across many rows, so its head scrolls off; a full wrapped row must be visible.
+    ASSERT_TRUE(wait_task(large_paste.substr(0, 70), from));
     from = output_text_.size();
     send("/he\t\r");
     ASSERT_TRUE(wait_task("/permissions reset  Revoke", from));
@@ -318,6 +327,7 @@ TEST_F(CodeTerminal, InterruptCommand) {
     start(true, {"--permissions", "full-access"});
     send("sleep\r");
     ASSERT_TRUE(wait_for("$ sleep 30"));
+    ASSERT_TRUE(wait_for("run_command 1."));
     // Allow the approved child to enter its blocking command before sending SIGINT.
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     send("\003");
@@ -326,6 +336,34 @@ TEST_F(CodeTerminal, InterruptCommand) {
     ASSERT_TRUE(wait_task("echo: hello"));
     send("/exit\r");
     finish();
+}
+
+TEST_F(CodeTerminal, StreamsTextAndKeepsModelTimerLive) {
+    start();
+    send("stream\r");
+    ASSERT_TRUE(wait_for("first piece"));
+    ASSERT_TRUE(wait_for("last piece"));
+    ASSERT_TRUE(wait_task("first piece and last piece"));
+    send("wait\r");
+    ASSERT_TRUE(wait_for("Waiting for model 1."));
+    send("\003");
+    ASSERT_TRUE(wait_task("cancelled"));
+    send("/exit\r");
+    finish();
+    int saved_replies = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root_ / "cache")) {
+        if (entry.path().extension() != ".jsonl") continue;
+        std::ifstream input(entry.path());
+        for (std::string line; std::getline(input, line);) {
+            const auto record = Json::parse(line, nullptr, false);
+            if (record.is_object() && record.value("role", "") == "assistant" &&
+                record.value("content", "") == "first piece and last piece") {
+                ++saved_replies;
+                EXPECT_EQ(record["reasoning_content"], "Inspecting.\n");
+            }
+        }
+    }
+    EXPECT_EQ(saved_replies, 1);
 }
 
 TEST_F(CodeTerminal, PipedInput) {
@@ -420,7 +458,7 @@ TEST_F(CodeTerminal, NoSaveAndNarrowStatus) {
     send("/exit\r");
     finish();
     EXPECT_FALSE(std::filesystem::exists(root_ / "cache"));
-    EXPECT_NE(output_text_.find("Ready | ctx"), std::string::npos);
+    EXPECT_NE(output_text_.find("| Ready"), std::string::npos);
     EXPECT_NE(output_text_.find("\033[?1049l"), std::string::npos);
 }
 

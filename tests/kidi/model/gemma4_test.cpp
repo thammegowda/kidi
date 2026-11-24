@@ -383,8 +383,10 @@ auto check_serving_cache(const std::filesystem::path& fixture, const YAML::Node&
     ASSERT_TRUE(compact_result) << "compact cache reservation changed generated tokens";
     ASSERT_EQ(compact_result->generation.token_ids, full_result.generation.token_ids)
         << "compact cache reservation changed generated tokens";
-    bounded.maximum_new_tokens = 1024;
-    ASSERT_FALSE(compact.enqueue(prompts[0], bounded)) << "compact cache accepted context overflow";
+    // Generation is clamped to the remaining context; only a prompt that cannot fit is rejected.
+    std::string overflow;
+    for (int word = 0; word < 1100; ++word) overflow += "alpha ";
+    ASSERT_FALSE(compact.enqueue(overflow, bounded)) << "compact cache accepted context overflow";
     std::filesystem::remove_all(directory);
 }
 

@@ -12,6 +12,8 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <random>
 
 namespace kidi::inference {
 struct GenerationOptions {
@@ -19,6 +21,10 @@ struct GenerationOptions {
     std::size_t prefix_cache_bytes = 0, maximum_prompt_tokens = 0;
     bool raw_prompt = false, ignore_eos = false, full_attention_cache = false;
     bool stream_text = false;
+    // temperature 0 selects greedily on the fastest path; > 0 samples on the host from the last-row logits.
+    float temperature = 0, top_p = 1;
+    std::size_t top_k = 0;
+    std::optional<std::uint64_t> seed = std::nullopt;
     std::int32_t image_tokens = 280;
     std::size_t image_max_pixels = image::MAX_RESIZED_PIXELS;
     std::function<void(std::string_view)> on_image_progress;
@@ -206,6 +212,7 @@ private:
         std::optional<DeviceDecode> decode;
         bool completion_emitted = false;
         tensor::Tensor draft_hidden;
+        std::mt19937_64 random{};
     };
     auto retain_serving_prefix(QueuedGeneration& request) -> void;
     /// Wraps a plain prompt as one user turn using the checkpoint chat template.

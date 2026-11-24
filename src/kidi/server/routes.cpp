@@ -9,7 +9,7 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-auto json_response(const OpenAIJson& body, int status = 200) -> liteapp::Response {
+auto json_response(const ChatJson& body, int status = 200) -> liteapp::Response {
     return liteapp::Response::json(body.dump(), status);
 }
 
@@ -19,7 +19,7 @@ auto elapsed_ms(Clock::time_point started) -> double {
     return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
 }
 
-auto enqueue(const OpenAIChatRequest& request) {
+auto enqueue(const ChatRequest& request) {
     return [&request](inference::Generator& generator) {
         return generator.enqueue_chat(request.messages, request.generation, request.template_args);
     };
@@ -32,18 +32,18 @@ public:
                 std::int64_t created)
         : write_(write), id_(std::move(id)), model_(std::move(model)), created_(created) {}
 
-    auto send(const OpenAIJson& payload) -> bool { return write_("data: " + payload.dump() + "\n\n"); }
-    auto chunk(OpenAIJson delta, OpenAIJson finish_reason = nullptr) -> OpenAIJson {
-        return openai_chunk(id_, model_, created_, std::move(delta), std::move(finish_reason));
+    auto send(const ChatJson& payload) -> bool { return write_("data: " + payload.dump() + "\n\n"); }
+    auto chunk(ChatJson delta, ChatJson finish_reason = nullptr) -> ChatJson {
+        return chat_chunk(id_, model_, created_, std::move(delta), std::move(finish_reason));
     }
     auto flush(const text::AssistantResponse& parsed) -> bool {
-        OpenAIJson delta = OpenAIJson::object();
+        ChatJson delta = ChatJson::object();
         if (parsed.reasoning.size() > sent_.reasoning.size())
             delta["reasoning_content"] = parsed.reasoning.substr(sent_.reasoning.size());
         if (parsed.content.size() > sent_.content.size())
             delta["content"] = parsed.content.substr(sent_.content.size());
         if (parsed.tool_calls.size() > sent_.tool_calls.size())
-            delta["tool_calls"] = openai_tool_calls(parsed.tool_calls, sent_.tool_calls.size(), "call_" + id_);
+            delta["tool_calls"] = chat_tool_calls(parsed.tool_calls, sent_.tool_calls.size(), "call_" + id_);
         sent_ = parsed;
         return delta.empty() || send(chunk(std::move(delta)));
     }
@@ -57,38 +57,38 @@ private:
 
 } // namespace
 
-auto mount_openai_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteOptions options) -> void {
+auto mount_chat_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteOptions options) -> void {
     auto shared = std::make_shared<const RouteOptions>(std::move(options));
     auto next_id = std::make_shared<std::atomic_uint64_t>(1);
 
     server.get("/health", [](const liteapp::Request&) { return liteapp::Response::json("{}"); });
     server.get("/v1/models", [shared](const liteapp::Request&) {
         return json_response({{"object", "list"},
-                              {"data", OpenAIJson::array({{{"id", shared->model_name},
+                              {"data", ChatJson::array({{{"id", shared->model_name},
                                                            {"object", "model"},
                                                            {"owned_by", "kidi"}}})}});
     });
     server.post("/v1/chat/context", [shared, &engine](const liteapp::Request& http) {
-        const auto body = OpenAIJson::parse(http.body, nullptr, false);
-        auto prepared = prepare_openai_chat_request(body, shared->defaults);
+        const auto body = ChatJson::parse(http.body, nullptr, false);
+        auto prepared = prepare_chat_request(body, shared->defaults);
         if (prepared && shared->customize)
             if (auto customized = shared->customize(body, *prepared); !customized)
                 prepared = std::unexpected(customized.error());
-        if (!prepared) return json_response(openai_error(prepared.error()), 400);
+        if (!prepared) return json_response(chat_error(prepared.error()), 400);
         auto result = engine.context(prepared->messages, prepared->template_args, prepared->generation);
-        if (!result) return json_response(openai_error(result.error()), error_status(result.error()));
+        if (!result) return json_response(chat_error(result.error()), error_status(result.error()));
         return json_response({{"prompt_tokens", result->prompt_tokens},
                               {"context_tokens", result->context_tokens},
                               {"prompt_limit_tokens", result->prompt_limit_tokens}});
     });
     server.post("/v1/chat/completions", [shared, next_id, &engine](const liteapp::Request& http) {
         const auto started = Clock::now();
-        const auto body = OpenAIJson::parse(http.body, nullptr, false);
-        auto prepared = prepare_openai_chat_request(body, shared->defaults);
+        const auto body = ChatJson::parse(http.body, nullptr, false);
+        auto prepared = prepare_chat_request(body, shared->defaults);
         if (prepared && shared->customize)
             if (auto customized = shared->customize(body, *prepared); !customized)
                 prepared = std::unexpected(customized.error());
-        if (!prepared) return json_response(openai_error(prepared.error()), 400);
+        if (!prepared) return json_response(chat_error(prepared.error()), 400);
 
         const auto id = "chatcmpl-" + std::to_string((*next_id)++);
         const auto created =
@@ -101,9 +101,9 @@ auto mount_openai_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteO
                                       .cancelled = http.connection_closed,
                                       .on_text = {},
                                       .release_workspaces = false});
-            if (!result) return json_response(openai_error(result.error()), error_status(result.error()));
-            auto completion = openai_completion(*result, id, model, created);
-            completion["kidi_stats"] = openai_stats(*result, elapsed_ms(started));
+            if (!result) return json_response(chat_error(result.error()), error_status(result.error()));
+            auto completion = chat_completion(*result, id, model, created);
+            completion["kidi_stats"] = chat_stats(*result, elapsed_ms(started));
             return json_response(completion);
         }
 
@@ -125,16 +125,16 @@ auto mount_openai_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteO
                                               },
                                           .release_workspaces = false});
                 if (!connected) return false;
-                if (!result) return out.send(openai_error(result.error())) && write("data: [DONE]\n\n");
+                if (!result) return out.send(chat_error(result.error())) && write("data: [DONE]\n\n");
                 const auto parsed = text::parse_assistant_response(result->text);
                 if (!out.flush(parsed) ||
-                    !out.send(out.chunk(OpenAIJson::object(), openai_finish_reason(parsed, *result))))
+                    !out.send(out.chunk(ChatJson::object(), chat_finish_reason(parsed, *result))))
                     return false;
                 if (request.include_usage) {
-                    auto tail = out.chunk(OpenAIJson::object());
-                    tail["choices"] = OpenAIJson::array();
-                    tail["usage"] = openai_usage(*result);
-                    tail["kidi_stats"] = openai_stats(*result, elapsed_ms(started));
+                    auto tail = out.chunk(ChatJson::object());
+                    tail["choices"] = ChatJson::array();
+                    tail["usage"] = chat_usage(*result);
+                    tail["kidi_stats"] = chat_stats(*result, elapsed_ms(started));
                     if (!out.send(tail)) return false;
                 }
                 return write("data: [DONE]\n\n");

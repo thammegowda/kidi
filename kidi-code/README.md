@@ -84,25 +84,41 @@ Ctrl-D exits on an empty input line, including at an approval prompt.
 
 ### Terminal presentation
 
-User input is bright green, tools are cyan with dim argument previews, model
+User input is bright green, tools are cyan with compact argument previews, model
 thinking is dim grey, and final answers are bright white. Commands are displayed
 as `$ command`, not JSON; other tools show named arguments. Long activity and
 thinking previews are abbreviated, but approval prompts show **all** arguments.
-Only actual model-provided `reasoning_content` is shown as thinking, after the
-model call completes; it is not a live reasoning stream.
+Blank lines separate user turns, not every tool or label. Short tool calls fit
+on one line, thinking previews are limited to two lines/300 bytes, and completed
+tools show their elapsed time. Approval prompts still show every argument.
+Interactive model replies stream as they arrive, including actual model-provided
+`reasoning_content` (within the preview limit); final answers are not printed
+again at completion. Complete messages are still saved in the transcript.
+One-shot/piped answers and compaction summaries remain non-streaming.
 
 A grey, width-aware status bar is pinned to the bottom row of the interactive
-screen and updates between model calls, showing phase, context percentage/token
-count, token speed and model name:
+screen, showing model name, context percentage/token count, token speed,
+prefill time and the current phase. Numeric fields are fixed-width so the bar
+does not jitter; the phase stays right-aligned and is never clipped. During
+startup, context checks, generation, compaction, and tool calls it updates an
+elapsed timer every 100 ms, including when no output is arriving.
+Approval waits are explicitly labelled. Timers indicate activity, not measured
+prefill progress or a prediction of time remaining.
 
 ```text
-Ready | ctx 12.0% 29860/248832 | 42.1 tok/s req | Inkling-2-Mini
+Inkling-2-Mini | ctx  12.0%  29860/248832 |  103.9 tok/s | prefill   0.2s | Ready
 ```
 
 Context uses the server's existing exact preflight counts and response usage.
-Speed is generated tokens divided by request wall time, **including prefill
-and HTTP latency**, not decode-only speed. Missing usage is shown as `--`,
-never estimated. The transcript scrolls within the UI; use PageUp/PageDown to
+With a Kidi server, speed is the server's decode rate and `prefill` is the
+time spent processing the prompt for the last model call. Other OpenAI servers
+show `tok/s req`: generated tokens divided by request wall time, including
+prefill and HTTP latency. Missing usage is shown as `--`, never estimated.
+
+The managed server keeps the last request's KV state, so each agent turn
+prefills only what was appended since the previous prompt rather than the whole
+conversation. Plain `kidi serve` enables the same reuse with
+`--prefix-cache-mib`. The transcript scrolls within the UI; use PageUp/PageDown to
 review earlier output. The layout adapts to terminal resizes. Exiting restores
 the terminal and returns to its prior screen.
 Piped/one-shot output has no status bar or answer heading.
@@ -235,6 +251,28 @@ results. It is not retained in history; omit it to disable this retry.
 Optional `prompts.compact` controls the handoff instructions. The embedded
 configuration enables it; omitting it from an explicit override disables
 automatic and manual compaction.
+
+### Sampling
+
+Greedy decoding (temperature 0) can trap a model in a loop that repeats the same
+tool call. The embedded configuration therefore samples agent turns:
+
+```yaml
+sampling:
+  temperature: 0.6   # 0 = greedy; range [0, 2]
+  top_p: 0.95        # (0, 1]
+  top_k: 20          # 0 = disabled
+```
+
+Omitting `sampling:` means greedy. `--temperature T` overrides the configured
+temperature (`--temperature 0` restores greedy). Compaction summaries are always
+greedy. `top_p` is sent only when below 1 and `top_k` only when positive, because
+some OpenAI-compatible servers reject `top_k`.
+
+`kidi serve` accepts `temperature`, `top_p`, `top_k` and `seed` on
+`/v1/chat/completions`; the same seed reproduces the same output. Sampled
+requests skip speculative decoding and device-side token chaining, so they decode
+roughly 10% slower than greedy requests.
 
 ## Embedding
 

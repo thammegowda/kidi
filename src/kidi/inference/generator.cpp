@@ -12,6 +12,10 @@
 #include "kidi/checkpoint/config.h"
 
 #include <bit>
+#include <cmath>
+#include <random>
+#include <span>
+#include <vector>
 #include <chrono>
 #include <optional>
 #include <cstdlib>
@@ -98,6 +102,53 @@ auto validate_text_chat(const nlohmann::ordered_json& messages) -> Result<void> 
     }
     return {};
 }
+
+auto sampled(const GenerationOptions& options) -> bool { return options.temperature > 0; }
+
+// Temperature, top-k and top-p sampling over the last logits row. Tokens far below the best logit cannot be drawn
+// at any useful precision, so only the plausible candidates are sorted.
+auto sample_token(const model::LanguageModel& model, const tensor::Tensor& logits, const GenerationOptions& options,
+                  std::mt19937_64& random) -> std::int32_t {
+    ops::Context context(logits.device());
+    auto values = context.cast(logits, tensor::DType::F32);
+    context.synchronize();
+    const auto host = require(values.to(tensor::Device::cpu()));
+    const auto data = require(host.data<float>());
+    const auto vocabulary = static_cast<std::size_t>(model.vocabulary_size());
+    if (!vocabulary || data.size() < vocabulary || data.size() % vocabulary)
+        throw ops::Failure({ErrorCode::RUNTIME, "unexpected logits shape for sampling"});
+    const auto row = std::span(data).last(vocabulary);
+    float best = -std::numeric_limits<float>::infinity();
+    for (const auto value : row)
+        if (std::isfinite(value)) best = std::max(best, value);
+    if (!std::isfinite(best)) throw ops::Failure({ErrorCode::RUNTIME, "no finite logits to sample from"});
+    struct Candidate {
+        std::int32_t token;
+        double weight;
+    };
+    std::vector<Candidate> candidates;
+    for (std::size_t token = 0; token < vocabulary; ++token)
+        if (const auto scaled = (static_cast<double>(row[token]) - best) / options.temperature;
+            std::isfinite(row[token]) && scaled > -30)
+            candidates.push_back({static_cast<std::int32_t>(token), std::exp(scaled)});
+    std::ranges::sort(candidates, std::ranges::greater{}, &Candidate::weight);
+    if (options.top_k && candidates.size() > options.top_k) candidates.resize(options.top_k);
+    double total = 0;
+    for (const auto& candidate : candidates) total += candidate.weight;
+    if (options.top_p < 1) {
+        double kept = 0;
+        std::size_t count = 0;
+        while (count < candidates.size() && (count == 0 || kept < options.top_p * total))
+            kept += candidates[count++].weight;
+        candidates.resize(count);
+        total = kept;
+    }
+    auto draw = std::uniform_real_distribution<double>(0, total)(random);
+    for (const auto& candidate : candidates)
+        if ((draw -= candidate.weight) < 0) return candidate.token;
+    return candidates.back().token;
+}
+
 } // namespace
 
 struct Generator::DraftBackend {
@@ -977,6 +1028,7 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         stats.speculative = static_cast<bool>(drafter_);
         waiting_.push_back(
             {next_request_id_, std::move(tokens), capacity, options, std::move(search), {}, stats, started, {}});
+        waiting_.back().random.seed(options.seed ? *options.seed : std::random_device{}());
         return next_request_id_++;
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
@@ -1087,14 +1139,19 @@ auto Generator::step() -> Result<GenerationStep> {
                    waiting_.front().capacity <= serving_->cache_token_budget - reserved_cache_tokens_) {
                 auto& request = waiting_.front();
                 const auto chunk = std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step);
+                // A growing conversation may adopt a larger retained state when the cache budget still fits it.
+                const auto retained_capacity =
+                    serving_prefix_ ? serving_prefix_->state->sequence_capacity() : std::size_t{0};
+                const bool fits = retained_capacity == request.capacity ||
+                                  (serving_->compact_cache && retained_capacity > request.capacity &&
+                                   retained_capacity <= serving_->cache_token_budget - reserved_cache_tokens_);
                 if (serving_prefix_ && request.options.prefix_cache_bytes >= serving_prefix_->bytes &&
-                    request.image_key == serving_prefix_->image_key &&
-                    request.capacity == serving_prefix_->state->sequence_capacity() &&
-                    chunk == serving_prefix_->chunk_size &&
+                    request.image_key == serving_prefix_->image_key && fits && chunk == serving_prefix_->chunk_size &&
                     serving_prefix_->crop_local_attention == !request.options.full_attention_cache) {
                     const auto limit = std::min(serving_prefix_->tokens.size(), request.prompt.size() - 1);
                     std::size_t common = 0;
                     while (common < limit && serving_prefix_->tokens[common] == request.prompt[common]) ++common;
+                    common = model_->rewind_floor(*serving_prefix_->state, common);
                     auto rewound = model_->rewind(*serving_prefix_->state, common);
                     // Recurrent states rewind only to the start (or not at all): reuse the allocation, not the prefix.
                     if (!rewound && rewound.error().code == ErrorCode::UNSUPPORTED) {
@@ -1103,6 +1160,7 @@ auto Generator::step() -> Result<GenerationStep> {
                     }
                     if (rewound) {
                         request.stats.reused_prompt_tokens = common;
+                        request.capacity = retained_capacity;
                         request.state = std::move(serving_prefix_->state);
                     } else if (rewound.error().code != ErrorCode::UNSUPPORTED) {
                         throw ops::Failure(rewound.error());
@@ -1130,7 +1188,8 @@ auto Generator::step() -> Result<GenerationStep> {
         const auto complete = [&](QueuedGeneration& request) {
             bool retain_prefix = true;
             if (request.decode && request.state) {
-                const auto rewound = model_->rewind(*request.state, request.decode->logical_position);
+                const auto rewound = model_->rewind(
+                    *request.state, model_->rewind_floor(*request.state, request.decode->logical_position));
                 if (!rewound) {
                     if (rewound.error().code != ErrorCode::UNSUPPORTED) throw ops::Failure(rewound.error());
                     retain_prefix = false;
@@ -1214,6 +1273,20 @@ auto Generator::step() -> Result<GenerationStep> {
         for (std::size_t row = 0; row < running_.size() && !prefill_selects; ++row) {
             auto& request = running_[row];
             if (!request.search.result().decoder_steps || request.completion_emitted) continue;
+            // Sampled requests take the plain host path: the fast paths below select greedily on the device.
+            if (sampled(request.options)) {
+                const auto started = Clock::now();
+                const auto prepared = model_->preparation_ns();
+                const std::array input{request.search.token()};
+                const auto logits = require(model_->forward(input, *request.state));
+                const auto token = sample_token(*model_, logits, request.options, request.random);
+                const auto decode_ns = elapsed(started);
+                request.stats.decode_ns += decode_ns;
+                request.stats.preparation_ns += model_->preparation_ns() - prepared;
+                result.decode_ns += decode_ns;
+                accept(request, token);
+                continue;
+            }
             if (drafter_) {
                 const auto started = Clock::now();
                 const auto prepared = model_->preparation_ns() + drafter_->preparation_ns();
@@ -1319,10 +1392,9 @@ auto Generator::step() -> Result<GenerationStep> {
                 selected = require(
                     model_->forward_batch_tokens(std::span(tokens).first(count), std::span(states).first(count)));
             result.decode_ns = elapsed(started);
-            if (serving_->maximum_active == 1) {
-                running_[rows[0]].stats.decode_ns += result.decode_ns;
+            for (std::size_t index = 0; index < count; ++index) running_[rows[index]].stats.decode_ns += result.decode_ns;
+            if (serving_->maximum_active == 1)
                 running_[rows[0]].stats.preparation_ns += model_->preparation_ns() - prepared;
-            }
             for (std::size_t index = 0; index < count; ++index) accept(running_[rows[index]], selected[index]);
         }
         retire();
@@ -1341,8 +1413,11 @@ auto Generator::step() -> Result<GenerationStep> {
             const auto started = Clock::now();
             const auto prepared = model_->preparation_ns();
             std::optional<std::int32_t> selected;
-            const bool deferred = final_chunk && serving_->deferred_tokens;
-            if (deferred)
+            const bool deferred = final_chunk && serving_->deferred_tokens && !sampled(request.options);
+            if (final_chunk && sampled(request.options))
+                selected = sample_token(*model_, require(model_->forward(input, *request.state)), request.options,
+                                        request.random);
+            else if (deferred)
                 pending_tokens_.push_back(
                     {request.id, require(model_->select_token(input, *request.state)), 0, started, true});
             else if (final_chunk)
@@ -1359,6 +1434,8 @@ auto Generator::step() -> Result<GenerationStep> {
                 if (execution_length > length) require(model_->rewind(*request.state, start_position + length));
             } else
                 require(model_->prefill(input, *request.state));
+            if (final_chunk && request.options.prefix_cache_bytes)
+                require(model_->mark_rewind_point(*request.state));
             result.prefill_ns = elapsed(started);
             if (!deferred) request.stats.prefill_ns += result.prefill_ns;
             request.stats.preparation_ns += model_->preparation_ns() - prepared;

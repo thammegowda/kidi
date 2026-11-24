@@ -32,6 +32,8 @@ struct ToolCall {
 struct TokenUsage {
     std::size_t prompt_tokens = 0;
     std::size_t completion_tokens = 0;
+    /// Server-side timings from Kidi's `kidi_stats`; 0 when the server does not report them.
+    double prefill_ms = 0, decode_ms = 0;
 };
 
 struct Message {

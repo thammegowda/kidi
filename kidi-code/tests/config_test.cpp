@@ -34,6 +34,18 @@ TEST(CodeConfig, ParsesYamlRegistry) {
     EXPECT_EQ(parse_agent_config("version: 1\nprompts: {system: Hi, continue: Go}\ntools: []")->continue_prompt, "Go");
     EXPECT_EQ(parse_agent_config("version: 1\nprompts: {system: Hi, compact: Summarize}\ntools: []")->compact_prompt,
               "Summarize");
+    EXPECT_EQ(config->sampling.temperature, 0);
+    const auto sampled =
+        parse_agent_config("version: 1\nprompts: {system: Hi}\nsampling: {temperature: 0.6, top_p: 0.9, top_k: 20}\n"
+                           "tools: []");
+    ASSERT_TRUE(sampled) << sampled.error().message;
+    EXPECT_FLOAT_EQ(sampled->sampling.temperature, 0.6F);
+    EXPECT_FLOAT_EQ(sampled->sampling.top_p, 0.9F);
+    EXPECT_EQ(sampled->sampling.top_k, 20);
+    for (const auto* bad : {"{temperature: 3}", "{top_p: 0}", "{top_k: -1}", "{seed: 1}"})
+        EXPECT_FALSE(parse_agent_config(std::string("version: 1\nprompts: {system: Hi}\nsampling: ") + bad +
+                                        "\ntools: []"))
+            << bad;
     ASSERT_EQ(config->tools.size(), 1);
     const auto& tool = config->tools.front();
     EXPECT_EQ(tool.handler, "native_read");

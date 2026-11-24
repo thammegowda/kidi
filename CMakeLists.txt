@@ -407,7 +407,7 @@ add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
 # kidi's single HTTP API (OpenAI-compatible chat), hosted by both `kidi serve` and the desktop app.
 add_library(kidi_server STATIC
     src/kidi/server/engine.cpp
-    src/kidi/server/openai.cpp
+    src/kidi/server/chat_api.cpp
     src/kidi/server/routes.cpp
 )
 target_link_libraries(kidi_server PUBLIC kidi::kidi liteapp::http nlohmann_json::nlohmann_json)

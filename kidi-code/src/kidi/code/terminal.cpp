@@ -1,23 +1,29 @@
 #include "kidi/code/terminal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <ftxui/component/component.hpp>
+#include <ftxui/component/loop.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/string.hpp>
 #include <unistd.h>
 #endif
 
@@ -30,7 +36,12 @@ auto preview(std::string_view text, std::size_t lines = 6, std::size_t bytes = 1
     while (end < clean.size() && end < bytes && count < lines)
         if (clean[end++] == '\n') ++count;
     while (end < clean.size() && end && (static_cast<unsigned char>(clean[end]) & 0xc0) == 0x80) --end;
-    if (end < clean.size()) clean = clean.substr(0, end) + "\n... (display truncated)";
+    if (end < clean.size()) {
+        clean.resize(end);
+        while (!clean.empty() && clean.back() == '\n') clean.pop_back();
+        clean += "... (display truncated)";
+    }
+    while (!clean.empty() && clean.back() == '\n') clean.pop_back();
     return clean;
 }
 
@@ -154,6 +165,12 @@ struct Terminal::Impl {
     std::vector<Entry> entries;
     std::vector<std::string> history;
     std::string status;
+    std::string activity;
+    std::atomic<bool> activity_running{false};
+    std::chrono::steady_clock::time_point activity_started;
+    std::optional<std::size_t> active_tool;
+    std::optional<TerminalTone> stream_tone;
+    std::size_t reasoning_bytes = 0, reasoning_lines = 0;
     std::string input_value;
     std::string prompt;
     std::size_t history_index = 0;
@@ -174,6 +191,13 @@ struct Terminal::Impl {
     std::exception_ptr worker_exception;
 
 #if defined(__unix__) || defined(__APPLE__)
+    auto viewport_height() const -> std::size_t {
+        const auto extra_input = std::min<std::ptrdiff_t>(3, std::ranges::count(input_value, '\n'));
+        const auto approval = request && !request->remember ? 1 : 0;
+        return static_cast<std::size_t>(std::max<std::ptrdiff_t>(
+            1, ftxui::Terminal::Size().dimy - 4 - extra_input - approval));
+    }
+
     auto post(ftxui::Task task) -> void {
         screen.Post(std::move(task));
         screen.PostEvent(ftxui::Event::Custom);
@@ -188,9 +212,15 @@ struct Terminal::Impl {
                 {terminal_text(text.substr(start, end == std::string_view::npos ? end : end - start)), tone});
             if (end == std::string_view::npos) break;
             start = end + 1;
-        } while (start <= text.size());
-        if (entries.size() > 4000) entries.erase(entries.begin(), entries.begin() + 1000);
-        follow_tail = true;
+        } while (start < text.size());
+        if (entries.size() > 4000) {
+            entries.erase(entries.begin(), entries.begin() + 1000);
+            if (active_tool) {
+                if (*active_tool < 1000) active_tool.reset();
+                else *active_tool -= 1000;
+            }
+            scroll_end = scroll_end > 1000 ? scroll_end - 1000 : 0;
+        }
     }
 
     auto complete(InputState state, std::string text = {}) -> void {
@@ -201,7 +231,11 @@ struct Terminal::Impl {
             if (history.size() == 100) history.erase(history.begin());
             history.push_back(text);
         }
-        if (!text.empty()) append((active->remember ? "> " : "? ") + text, TerminalTone::USER);
+        if (!text.empty()) {
+            follow_tail = true;
+            if (active->remember && !entries.empty()) append("", TerminalTone::DEFAULT);
+            append((active->remember ? "> " : "? ") + text, TerminalTone::USER);
+        }
         {
             const std::lock_guard lock(active->mutex);
             active->result = {state, std::move(text)};
@@ -253,30 +287,60 @@ auto Terminal::run_interactive(std::function<int()> worker, std::function<void()
     state.input_component = ftxui::Input(input_options);
     state.root = ftxui::Renderer(state.input_component, [&] {
         const auto dimensions = ftxui::Terminal::Size();
-        const auto height = static_cast<std::size_t>(std::max(1, dimensions.dimy - 7));
+        const auto height = state.viewport_height();
         auto end = state.follow_tail ? state.entries.size() : std::min(state.scroll_end, state.entries.size());
-        const auto begin = end > height ? end - height : 0;
+        // Wrap long lines instead of clipping them; fill the viewport from the newest row upward.
+        const auto width = static_cast<std::size_t>(std::max(8, dimensions.dimx - 2));
         ftxui::Elements transcript;
-        transcript.reserve(end - begin);
-        for (auto index = begin; index < end; ++index) {
-            auto line = ftxui::text(state.entries[index].text);
-            if (state.color) line = line | ftxui::color(ftxui_color(state.entries[index].tone));
-            transcript.push_back(std::move(line));
+        for (auto index = end; index > 0 && transcript.size() < height; --index) {
+            const auto& entry = state.entries[index - 1];
+            std::vector<std::string> rows(1);
+            std::size_t used = 0;
+            for (auto& glyph : ftxui::Utf8ToGlyphs(entry.text)) {
+                const auto cells = static_cast<std::size_t>(std::max(0, ftxui::string_width(glyph)));
+                if (used + cells > width) {
+                    rows.emplace_back();
+                    used = 0;
+                }
+                rows.back() += glyph;
+                used += cells;
+            }
+            for (auto row = rows.rbegin(); row != rows.rend() && transcript.size() < height; ++row) {
+                auto line = ftxui::text(std::move(*row));
+                if (state.color) line = line | ftxui::color(ftxui_color(entry.tone));
+                transcript.push_back(std::move(line));
+            }
         }
+        std::ranges::reverse(transcript);
         if (transcript.empty()) transcript.push_back(ftxui::text(" "));
         auto log = ftxui::vbox(std::move(transcript)) | ftxui::vscroll_indicator | ftxui::frame | ftxui::flex;
-        auto status = ftxui::text(state.status.empty() ? "Ready" : state.status);
+        // Stable metrics on the left; the changing phase or live timer at the right end, never clipped.
+        std::string metrics = state.status.empty() ? "Ready" : state.status, phase;
+        if (const auto split = metrics.rfind(" | "); split != std::string::npos) {
+            phase = metrics.substr(split + 3);
+            metrics.resize(split);
+        }
+        if (!state.activity.empty()) {
+            const auto seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - state.activity_started).count();
+            std::ostringstream live;
+            live << (state.request ? "Awaiting approval" : state.activity) << ' ' << std::fixed
+                 << std::setprecision(1) << seconds << 's';
+            phase = live.str();
+        }
+        auto status = ftxui::hbox({ftxui::text(metrics) | ftxui::xflex_shrink,
+                                   ftxui::text(phase.empty() ? "" : " | " + phase), ftxui::filler()});
         if (state.color) status = status | ftxui::bgcolor(ftxui::Color::GrayDark) | ftxui::color(ftxui::Color::White);
         auto prompt = state.request ? state.input_component->Render() : ftxui::text(" ");
-        prompt = prompt | ftxui::flex;
+        prompt = prompt | ftxui::size(ftxui::HEIGHT, ftxui::LESS_THAN, 4);
         if (state.request && !state.request->remember) {
             auto approval = ftxui::text(" Approval required: y = allow once | a = allow tool for session | n = deny ");
             if (state.color) approval = approval | ftxui::color(ftxui::Color::Yellow);
-            return ftxui::vbox({ftxui::text(" Kidi Code | Approval") | ftxui::bold, ftxui::separator(), log,
+            return ftxui::vbox({ftxui::text(" Kidi Code | Approval") | ftxui::bold, log,
                                 ftxui::separator(), approval, prompt,
                                 status | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, dimensions.dimx)});
         }
-        return ftxui::vbox({ftxui::text(" Kidi Code | Native coding agent") | ftxui::bold, ftxui::separator(),
+        return ftxui::vbox({ftxui::text(" Kidi Code | Native coding agent") | ftxui::bold,
                             log | ftxui::flex, ftxui::separator(), prompt,
                             status | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, dimensions.dimx)});
     });
@@ -334,13 +398,13 @@ auto Terminal::run_interactive(std::function<int()> worker, std::function<void()
         }
         if (event == ftxui::Event::PageUp) {
             state.follow_tail = false;
-            const auto page = static_cast<std::size_t>(std::max(1, ftxui::Terminal::Size().dimy - 7));
+            const auto page = state.viewport_height();
             if (!state.scroll_end) state.scroll_end = state.entries.size();
             state.scroll_end = state.scroll_end > page ? state.scroll_end - page : page;
             return true;
         }
         if (event == ftxui::Event::PageDown) {
-            const auto page = static_cast<std::size_t>(std::max(1, ftxui::Terminal::Size().dimy - 7));
+            const auto page = state.viewport_height();
             state.scroll_end = std::min(state.entries.size(), state.scroll_end + page);
             state.follow_tail = state.scroll_end >= state.entries.size();
             return true;
@@ -360,6 +424,8 @@ auto Terminal::run_interactive(std::function<int()> worker, std::function<void()
         return false;
     });
 
+    // Install the screen before workers post: FTXUI drops tasks sent to an inactive screen.
+    ftxui::Loop loop(&state.screen, state.root);
     state.running = true;
     struct BracketedPaste {
         BracketedPaste() { std::cout << "\033[?2004h" << std::flush; }
@@ -376,7 +442,19 @@ auto Terminal::run_interactive(std::function<int()> worker, std::function<void()
             state.screen.Exit();
         });
     });
-    state.screen.Loop(state.root);
+    std::jthread ticker([&](std::stop_token stop) {
+        std::mutex mutex;
+        std::condition_variable_any wake;
+        std::unique_lock lock(mutex);
+        while (!stop.stop_requested()) {
+            wake.wait_for(lock, stop, std::chrono::milliseconds(100), [] { return false; });
+            if (!stop.stop_requested() && state.activity_running.load())
+                state.screen.PostEvent(ftxui::Event::Custom);
+        }
+    });
+    loop.Run();
+    ticker.request_stop();
+    ticker.join();
     background.join();
     state.running = false;
     if (state.worker_exception) std::rethrow_exception(state.worker_exception);
@@ -442,18 +520,23 @@ auto Terminal::write(std::string_view text, TerminalTone tone) -> void {
 }
 
 auto Terminal::tool(std::string_view name, const Json& arguments, bool full) -> void {
-    write("[tool] " + terminal_text(name) + "\n", TerminalTone::TOOL);
+    std::string summary = "[tool] " + terminal_text(name);
+    if (full) write(summary + "\n", TerminalTone::TOOL);
     for (const auto& [key, value] : arguments.items()) {
         const auto text =
             value.is_string() ? value.get<std::string>() : value.dump(2, ' ', false, Json::error_handler_t::replace);
         const auto prefix = name == "run_command" && key == "command" ? "  $ " : "  " + terminal_text(key) + ": ";
-        write(prefix + (full ? terminal_text(text) : preview(text)) + "\n", TerminalTone::DIM);
+        if (full)
+            write(prefix + terminal_text(text) + "\n", TerminalTone::DIM);
+        else
+            summary += prefix + text;
     }
+    if (!full) write(preview(summary, 2, 300) + "\n", TerminalTone::TOOL);
 }
 
 auto Terminal::thinking(std::string_view text) -> void {
     if (text.empty()) return;
-    write("Thinking\n" + preview(text) + "\n", TerminalTone::THINKING);
+    write("Thinking: " + preview(text, 2, 300) + "\n", TerminalTone::THINKING);
 }
 
 auto Terminal::answer(std::string_view text) -> void {
@@ -461,14 +544,108 @@ auto Terminal::answer(std::string_view text) -> void {
         std::cout << terminal_text(text) << '\n' << std::flush;
         return;
     }
-    write("Assistant\n", TerminalTone::ASSISTANT);
-    write(terminal_text(text) + "\n", TerminalTone::ASSISTANT);
+    write("Assistant: " + terminal_text(text) + "\n", TerminalTone::ASSISTANT);
 }
 
 auto Terminal::status(std::string_view text) -> void {
     if (!impl_->edit || !impl_->running) return;
 #if defined(__unix__) || defined(__APPLE__)
     impl_->post([state = impl_.get(), text = terminal_text(text)] { state->status = text; });
+#endif
+}
+
+auto Terminal::activity(std::string_view text, bool tool) -> void {
+    if (!impl_->edit || !impl_->running) return;
+#if defined(__unix__) || defined(__APPLE__)
+    impl_->post([state = impl_.get(), text = terminal_text(text), tool] {
+        state->activity = text;
+        state->activity_running.store(true);
+        state->activity_started = std::chrono::steady_clock::now();
+        state->active_tool.reset();
+        if (tool)
+            for (auto index = state->entries.size(); index > 0; --index)
+                if (state->entries[index - 1].tone == TerminalTone::TOOL &&
+                    state->entries[index - 1].text.starts_with("[tool] ")) {
+                    state->active_tool = index - 1;
+                    break;
+                }
+    });
+#endif
+}
+
+auto Terminal::finish_activity(bool failed) -> void {
+    if (!impl_->edit || !impl_->running) return;
+#if defined(__unix__) || defined(__APPLE__)
+    impl_->post([state = impl_.get(), failed] {
+        if (state->active_tool) {
+            std::ostringstream timing;
+            timing << (failed ? " [failed, " : " [done, ") << std::fixed << std::setprecision(1)
+                   << std::chrono::duration<double>(
+                          std::chrono::steady_clock::now() - state->activity_started).count()
+                   << "s]";
+            auto& text = state->entries[*state->active_tool].text;
+            const auto arguments = text.find("  ");
+            text.insert(arguments == std::string::npos ? text.size() : arguments, timing.str());
+        }
+        state->active_tool.reset();
+        state->activity.clear();
+        state->activity_running.store(false);
+    });
+#endif
+}
+
+auto Terminal::stream(std::string_view text, bool thinking) -> void {
+    if (text.empty() || !impl_->edit || !impl_->running) return;
+#if defined(__unix__) || defined(__APPLE__)
+    impl_->post([state = impl_.get(), text = terminal_text(text), thinking] {
+        const auto tone = thinking ? TerminalTone::THINKING : TerminalTone::ASSISTANT;
+        if (thinking && (state->reasoning_bytes >= 300 || state->reasoning_lines >= 2)) return;
+        if (state->stream_tone != tone) {
+            if (state->stream_tone && !state->entries.empty() && state->entries.back().text.empty())
+                state->entries.pop_back();
+            state->append(thinking ? "Thinking: " : "Assistant: ", tone);
+            state->stream_tone = tone;
+        }
+        auto visible = std::string_view(text);
+        bool truncated = false;
+        if (thinking) {
+            auto length = std::min(visible.size(), 300 - state->reasoning_bytes);
+            while (length < visible.size() && length &&
+                   (static_cast<unsigned char>(visible[length]) & 0xc0) == 0x80) --length;
+            std::size_t lines = state->reasoning_lines;
+            for (std::size_t index = 0; index < length; ++index)
+                if (visible[index] == '\n' && ++lines >= 2) {
+                    length = index;
+                    break;
+                }
+            truncated = length < visible.size();
+            visible = visible.substr(0, length);
+            state->reasoning_bytes += length;
+            state->reasoning_lines = lines;
+            if (truncated) state->reasoning_bytes = 300;
+        }
+        std::size_t start = 0;
+        for (;;) {
+            const auto end = visible.find('\n', start);
+            state->entries.back().text += visible.substr(start, end == std::string::npos ? end : end - start);
+            if (end == std::string::npos) break;
+            state->append("", tone);
+            start = end + 1;
+        }
+        if (truncated) state->entries.back().text += "... (thinking preview)";
+    });
+#endif
+}
+
+auto Terminal::end_stream() -> void {
+    if (!impl_->edit || !impl_->running) return;
+#if defined(__unix__) || defined(__APPLE__)
+    impl_->post([state = impl_.get()] {
+        if (state->stream_tone && !state->entries.empty() && state->entries.back().text.empty())
+            state->entries.pop_back();
+        state->stream_tone.reset();
+        state->reasoning_bytes = state->reasoning_lines = 0;
+    });
 #endif
 }
 

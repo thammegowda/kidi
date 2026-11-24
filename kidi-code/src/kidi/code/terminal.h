@@ -36,6 +36,10 @@ public:
     auto thinking(std::string_view text) -> void;
     auto answer(std::string_view text) -> void;
     auto status(std::string_view text) -> void;
+    auto activity(std::string_view text, bool tool = false) -> void;
+    auto finish_activity(bool failed = false) -> void;
+    auto stream(std::string_view text, bool thinking) -> void;
+    auto end_stream() -> void;
 
 private:
     struct Impl;

@@ -142,7 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-m", "--model", help="model path or @owner/model (default: cached Inkling-2-Mini)")
     p.add_argument("--backend", help="kidi backend: cuda[:INDEX], auto, ynnpack, mps (default: cuda if GPU present)")
     p.add_argument("--port", type=int, default=int(os.environ.get("KIDI_PORT", DEFAULT_PORT)), help="local server port")
-    p.add_argument("--base-url", default=os.environ.get("KIDI_AGENT_BASE_URL"), help="reuse an existing OpenAI endpoint")
+    p.add_argument("--base-url", default=os.environ.get("KIDI_AGENT_BASE_URL"), help="reuse an existing OpenAI-compatible endpoint")
     p.add_argument("--model-id", default=os.environ.get("KIDI_AGENT_MODEL_ID"), help="override advertised model id")
     p.add_argument("--context-size", type=int, default=None, help="context window (default: 65536 on cuda, 32768 else)")
     p.add_argument("--max-new-tokens", type=int, default=int(os.environ.get("KIDI_MAX_NEW_TOKENS", 8192)))

@@ -11,7 +11,7 @@ auto main(int argc, char** argv) -> int {
             std::cout << arguments.output();
             return 0;
         }
-        return kidi::code::code_command(arguments, kidi::code::openai_provider);
+        return kidi::code::code_command(arguments, kidi::code::http_provider);
     } catch (const kidi::cli::ParseError& error) {
         std::cerr << error.usage() << "kidi-code: " << error.what() << '\n';
         return 2;

@@ -1,5 +1,5 @@
-#include "kidi/code/openai.h"
-#include "kidi/code/openai_transport.h"
+#include "kidi/code/chat_client.h"
+#include "kidi/code/chat_transport.h"
 #include "kidi/code/workspace.h"
 
 #include <gtest/gtest.h>
@@ -14,9 +14,17 @@ namespace {
 TEST(CodeProvider, ContextAndSummaryRequests) {
     int completions = 0, inspections = 0;
     auto provider = completion_provider(
-        {.model = "test-model"},
-        [&](const OpenAIOptions&, std::string payload, std::stop_token, std::string_view route) -> Result<std::string> {
+        {.model = "test-model",
+         .temperature = 0.7F,
+         .top_k = 20,
+         .on_delta = [](auto, auto) { ADD_FAILURE() << "summary/context must not stream"; }},
+        [&](const ChatClientOptions&, std::string payload, std::stop_token, std::string_view route) -> Result<std::string> {
             const auto request = Json::parse(payload);
+            EXPECT_EQ(request["stream"], false);
+            if (request.contains("reasoning_effort")) {
+                EXPECT_EQ(request["temperature"], 0) << "summaries are greedy";
+                EXPECT_FALSE(request.contains("top_k"));
+            }
             if (route == "/chat/context") {
                 ++inspections;
                 if (request.contains("reasoning_effort")) {
@@ -74,6 +82,13 @@ TEST(CodeProvider, UsageIsMeasuredNotEstimated) {
     ASSERT_TRUE(reply->usage);
     EXPECT_EQ(reply->usage->prompt_tokens, 120);
     EXPECT_EQ(reply->usage->completion_tokens, 9);
+    EXPECT_EQ(reply->usage->decode_ms, 0.0);
+    body["kidi_stats"] = {{"prefill_ms", 250.5}, {"decode_ms", 90.0}};
+    reply = (*provider)({}, {}, {});
+    ASSERT_TRUE(reply && reply->usage);
+    EXPECT_EQ(reply->usage->prefill_ms, 250.5);
+    EXPECT_EQ(reply->usage->decode_ms, 90.0);
+    body.erase("kidi_stats");
     body.erase("usage");
     reply = (*provider)({}, {}, {});
     ASSERT_TRUE(reply);
@@ -108,7 +123,7 @@ TEST(CodeProvider, BadContextAndSummary) {
     EXPECT_FALSE(provider->summarize({}, 200, {}));
 }
 
-class CodeOpenAI : public testing::Test {
+class ChatClientTest : public testing::Test {
 protected:
     httplib::Server server_;
     std::jthread thread_;
@@ -132,7 +147,91 @@ protected:
     }
 };
 
-TEST_F(CodeOpenAI, HttpToolRoundTrip) {
+TEST_F(ChatClientTest, StreamsBeforeCompletionAndReassemblesTools) {
+    std::atomic<bool> observed = false;
+    std::string answer, reasoning;
+    server_.Post("/v1/chat/completions", [&](const auto& request, auto& reply) {
+        const auto body = Json::parse(request.body);
+        EXPECT_EQ(body["stream"], true);
+        EXPECT_EQ(body["stream_options"]["include_usage"], true);
+        EXPECT_FLOAT_EQ(body["temperature"].template get<float>(), 0.5F);
+        EXPECT_FLOAT_EQ(body["top_p"].template get<float>(), 0.9F);
+        EXPECT_FALSE(body.contains("top_k")) << "top_k 0 is omitted";
+        reply.set_chunked_content_provider("text/event-stream", [&](std::size_t, httplib::DataSink& sink) {
+            const auto send = [&](Json delta, Json finish = nullptr) {
+                const auto event = "data: " + Json{{"choices", Json::array(
+                    {{{"index", 0}, {"delta", std::move(delta)}, {"finish_reason", finish}}})}}.dump() + "\r\n\r\n";
+                // Deliberately split every framing, JSON and UTF-8 boundary.
+                for (const auto byte : event)
+                    if (!sink.write(&byte, 1)) return false;
+                return true;
+            };
+            if (!sink.write(": heartbeat\r\n\r\n", 15)) return false;
+            if (!send({{"role", "assistant"}, {"reasoning_content", "inspect"}})) return false;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!observed && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            EXPECT_TRUE(observed) << "text was buffered until completion";
+            if (!send({{"content", "caf\xc3\xa9"}})) return false;
+            if (!send({{"tool_calls", Json::array({{{"index", 0}, {"id", "call-1"}, {"type", "function"},
+                {"function", {{"name", "look"}, {"arguments", "{\"key\":"}}}}})}})) return false;
+            if (!send({{"tool_calls", Json::array({{{"index", 0},
+                {"function", {{"name", "up"}, {"arguments", "\"value\"}"}}}}})}}, "tool_calls")) return false;
+            const auto tail = "data: " + Json{{"choices", Json::array()},
+                {"usage", {{"prompt_tokens", 100}, {"completion_tokens", 10}}},
+                {"kidi_stats", {{"decode_ms", 50.0}}}}.dump() + "\n\ndata: [DONE]\n\n";
+            if (!sink.write(tail.data(), tail.size())) return false;
+            sink.done();
+            return true;
+        });
+    });
+    start();
+    auto provider = http_provider({.base_url = base_url_, .temperature = 0.5F, .top_p = 0.9F, .on_delta = [&](std::string_view text, bool thinking) {
+        (thinking ? reasoning : answer) += text;
+        observed = true;
+    }});
+    ASSERT_TRUE(provider);
+    auto reply = (*provider)({}, {}, {});
+    ASSERT_TRUE(reply) << reply.error().message;
+    EXPECT_EQ(reasoning, "inspect");
+    EXPECT_EQ(answer, "caf\xc3\xa9");
+    EXPECT_EQ(reply->content, answer);
+    EXPECT_EQ(reply->reasoning_content, reasoning);
+    ASSERT_EQ(reply->tool_calls.size(), 1);
+    EXPECT_EQ(reply->tool_calls[0].name, "lookup");
+    EXPECT_EQ(reply->tool_calls[0].arguments["key"], "value");
+    ASSERT_TRUE(reply->usage);
+    EXPECT_EQ(reply->usage->decode_ms, 50.0);
+}
+
+TEST_F(ChatClientTest, RejectsBrokenStreamsAndCancelsDuringStreaming) {
+    std::string wire;
+    server_.Post("/v1/chat/completions", [&](const auto&, auto& reply) {
+        reply.set_content(wire, "text/event-stream");
+    });
+    start();
+    auto provider = http_provider({.base_url = base_url_, .on_delta = [](auto, auto) {}});
+    ASSERT_TRUE(provider);
+    for (const auto* broken : {
+             "data: not-json\n\n",
+             "data: {\"error\":{\"message\":\"failed\"}}\n\n",
+             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+             "data: [DONE]\n\n",
+             "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":-1}]}}]}\n\n"}) {
+        wire = broken;
+        const auto result = (*provider)({}, {}, {});
+        EXPECT_FALSE(result) << wire;
+    }
+    wire = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n";
+    std::stop_source stop;
+    provider = http_provider({.base_url = base_url_, .on_delta = [&](auto, auto) { stop.request_stop(); }});
+    ASSERT_TRUE(provider);
+    const auto cancelled = (*provider)({}, {}, stop.get_token());
+    ASSERT_FALSE(cancelled);
+    EXPECT_EQ(cancelled.error().message, "cancelled");
+}
+
+TEST_F(ChatClientTest, HttpToolRoundTrip) {
     int requests = 0;
     server_.Post("/v1/chat/completions", [&](const httplib::Request& request, httplib::Response& reply) {
         EXPECT_FALSE(request.has_header("Authorization"));
@@ -163,7 +262,7 @@ TEST_F(CodeOpenAI, HttpToolRoundTrip) {
         }
     });
     start();
-    auto provider = openai_provider({.base_url = base_url_ + "/", .model = "test-model"});
+    auto provider = http_provider({.base_url = base_url_ + "/", .model = "test-model"});
     ASSERT_TRUE(provider);
     int executions = 0;
     Tool tool{{"lookup", "lookup a key", {{"type", "object"}}},
@@ -181,7 +280,7 @@ TEST_F(CodeOpenAI, HttpToolRoundTrip) {
     EXPECT_EQ(requests, 2);
 }
 
-TEST_F(CodeOpenAI, HttpErrorsNoRetry) {
+TEST_F(ChatClientTest, HttpErrorsNoRetry) {
     int requests = 0;
     server_.Post("/v1/chat/completions", [&](const auto&, auto& reply) {
         ++requests;
@@ -189,7 +288,7 @@ TEST_F(CodeOpenAI, HttpErrorsNoRetry) {
         reply.set_content(R"({"error":{"message":"rate limit"}})", "application/json");
     });
     start();
-    auto provider = openai_provider({.base_url = base_url_});
+    auto provider = http_provider({.base_url = base_url_});
     ASSERT_TRUE(provider);
     auto result = (*provider)({}, {}, {});
     ASSERT_FALSE(result);
@@ -197,23 +296,23 @@ TEST_F(CodeOpenAI, HttpErrorsNoRetry) {
     EXPECT_EQ(requests, 1);
 }
 
-TEST_F(CodeOpenAI, RefusesRedirect) {
+TEST_F(ChatClientTest, RefusesRedirect) {
     int redirects = 0;
     server_.Post("/v1/chat/completions", [](const auto&, auto& reply) { reply.set_redirect("/stolen", 307); });
     server_.Post("/stolen", [&](const auto&, auto&) { ++redirects; });
     start();
-    auto provider = openai_provider({.base_url = base_url_});
+    auto provider = http_provider({.base_url = base_url_});
     ASSERT_TRUE(provider);
     EXPECT_FALSE((*provider)({}, {}, {}));
     EXPECT_EQ(redirects, 0);
 }
 
-TEST_F(CodeOpenAI, RejectsBadAndPartialReplies) {
+TEST_F(ChatClientTest, RejectsBadAndPartialReplies) {
     std::string body;
     server_.Post("/v1/chat/completions",
                  [&](const auto&, auto& reply) { reply.set_content(body, "application/json"); });
     start();
-    auto provider = openai_provider({.base_url = base_url_});
+    auto provider = http_provider({.base_url = base_url_});
     ASSERT_TRUE(provider);
     const std::vector<std::string> replies{
         "not json",
@@ -235,11 +334,11 @@ TEST_F(CodeOpenAI, RejectsBadAndPartialReplies) {
     }
 }
 
-TEST_F(CodeOpenAI, BoundsResponseAndTimeout) {
+TEST_F(ChatClientTest, BoundsResponseAndTimeout) {
     server_.Post("/v1/chat/completions",
                  [](const auto&, auto& reply) { reply.set_content(std::string(8192, 'x'), "application/json"); });
     start();
-    auto provider = openai_provider({.base_url = base_url_, .max_response_bytes = 128});
+    auto provider = http_provider({.base_url = base_url_, .max_response_bytes = 128});
     ASSERT_TRUE(provider);
     auto result = (*provider)({}, {}, {});
     ASSERT_FALSE(result);
@@ -251,18 +350,18 @@ TEST_F(CodeOpenAI, BoundsResponseAndTimeout) {
     EXPECT_EQ(result.error().message, "cancelled");
 }
 
-TEST_F(CodeOpenAI, TimeoutIsAnError) {
+TEST_F(ChatClientTest, TimeoutIsAnError) {
     server_.Post("/v1/chat/completions", [](const auto&, auto& reply) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         reply.set_content(response({{"role", "assistant"}, {"content", "late"}}).dump(), "application/json");
     });
     start();
-    auto provider = openai_provider({.base_url = base_url_, .timeout = std::chrono::milliseconds(10)});
+    auto provider = http_provider({.base_url = base_url_, .timeout = std::chrono::milliseconds(10)});
     ASSERT_TRUE(provider);
     EXPECT_FALSE((*provider)({}, {}, {}));
 }
 
-TEST_F(CodeOpenAI, ChecksDaemonIdentity) {
+TEST_F(ChatClientTest, ChecksDaemonIdentity) {
     server_.Get("/kidi-code/ready", [](const auto&, auto& reply) { reply.set_content("123", "text/plain"); });
     int requests = 0;
     server_.Post("/v1/chat/completions", [&](const auto&, auto& reply) {
@@ -276,7 +375,7 @@ TEST_F(CodeOpenAI, ChecksDaemonIdentity) {
     EXPECT_EQ(requests, 1);
 }
 
-TEST_F(CodeOpenAI, CancelsPendingRequest) {
+TEST_F(ChatClientTest, CancelsPendingRequest) {
     std::stop_source source;
     server_.Post("/v1/chat/completions", [&](const auto&, auto& reply) {
         source.request_stop();
@@ -290,17 +389,17 @@ TEST_F(CodeOpenAI, CancelsPendingRequest) {
 }
 
 TEST(CodeProvider, RejectsInvalidConfig) {
-    EXPECT_FALSE(openai_provider({.base_url = "file:///etc/passwd"}));
-    EXPECT_FALSE(openai_provider({.base_url = "https://user:pass@example.com/v1"}));
-    EXPECT_FALSE(openai_provider({.base_url = "https://example.com/v1?query"}));
-    EXPECT_FALSE(openai_provider({.base_url = "https://example.com/v1"}));
-    EXPECT_FALSE(openai_provider({.base_url = "http://user:pass@localhost:18097/v1"}));
-    EXPECT_FALSE(openai_provider({.max_tokens = 0}));
-    EXPECT_FALSE(openai_provider({.timeout = std::chrono::milliseconds(0)}));
+    EXPECT_FALSE(http_provider({.base_url = "file:///etc/passwd"}));
+    EXPECT_FALSE(http_provider({.base_url = "https://user:pass@example.com/v1"}));
+    EXPECT_FALSE(http_provider({.base_url = "https://example.com/v1?query"}));
+    EXPECT_FALSE(http_provider({.base_url = "https://example.com/v1"}));
+    EXPECT_FALSE(http_provider({.base_url = "http://user:pass@localhost:18097/v1"}));
+    EXPECT_FALSE(http_provider({.max_tokens = 0}));
+    EXPECT_FALSE(http_provider({.timeout = std::chrono::milliseconds(0)}));
 }
 
 TEST(CodeProvider, RejectsInvalidUtf8Input) {
-    auto provider = openai_provider();
+    auto provider = http_provider();
     ASSERT_TRUE(provider);
     std::vector<Message> history{{
         .role = Role::ASSISTANT,

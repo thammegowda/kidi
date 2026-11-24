@@ -16,6 +16,11 @@ struct AgentConfig {
     std::string system_prompt;
     std::string continue_prompt;
     std::string compact_prompt;
+    // temperature 0 is greedy; summaries are always greedy.
+    struct Sampling {
+        float temperature = 0, top_p = 1;
+        std::size_t top_k = 0;
+    } sampling;
     std::vector<ToolRegistration> tools;
 };
 

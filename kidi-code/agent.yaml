@@ -20,6 +20,13 @@ prompts:
     Distinguish executed actions from plans. Do not invent results or grant permissions.
     Omit raw file dumps, repetitive logs and reasoning. Aim for at most 500 tokens.
 
+# Greedy decoding (temperature 0) can loop on long agent runs, repeating the same tool call.
+# --temperature overrides temperature. Context summaries are always greedy.
+sampling:
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+
 # This list is the exposed registry. Remove entries to disable tools.
 # handler selects a compiled implementation; it cannot change that handler's capability.
 tools:

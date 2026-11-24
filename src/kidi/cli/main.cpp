@@ -7,6 +7,7 @@
 #include <fstream>
 #include <deque>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -665,6 +666,7 @@ auto serve_command(const kidi::cli::Namespace& arguments, const std::filesystem:
         return 1;
     }
     auto cache_tokens = arguments.get<std::size_t>("cache_tokens");
+    session->options.prefix_cache_bytes = arguments.get<std::size_t>("prefix_cache_mib") << 20;
     bool compact_cache = false;
 #ifdef KIDI_HAS_CODE
     // Kidi Code sessions grow long: allocate each request's KV cache on demand and, unless the user chose a
@@ -680,6 +682,8 @@ auto serve_command(const kidi::cli::Namespace& arguments, const std::filesystem:
             session->options.context_size = *fitted;
         }
         cache_tokens = std::max(cache_tokens, session->options.context_size);
+        // Agent turns resend the whole conversation; keep the last state so only the new suffix is prefilled.
+        session->options.prefix_cache_bytes = std::numeric_limits<std::size_t>::max();
     }
 #endif
     auto configured = session->generator.configure_serving(
@@ -915,6 +919,10 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         .help("model id reported to clients (default: --model)");
     serve_parser.add_argument("--max-active").dest("max_active").default_value<std::size_t>(1);
     serve_parser.add_argument("--queue-size").dest("queue_size").default_value<std::size_t>(64);
+    serve_parser.add_argument("--prefix-cache-mib")
+        .dest("prefix_cache_mib")
+        .default_value<std::size_t>(0)
+        .help("keep the last request's KV state (up to this size) to reuse shared prompt prefixes");
 #ifdef KIDI_HAS_CODE
     kidi::cli::configure_managed_serve_parser(serve_parser);
 #endif

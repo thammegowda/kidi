@@ -34,14 +34,17 @@ auto host_logits(const tensor::Tensor& logits) -> std::vector<float> {
     return {values.begin(), values.end()};
 }
 
-auto chat(inference::Generator& generator, std::string_view question) -> inference::TextGeneration {
-    const nlohmann::ordered_json messages{{{"role", "system"}, {"content", "Answer in one word."}},
-                                          {{"role", "user"}, {"content", question}}};
+auto chat_messages(inference::Generator& generator, const nlohmann::ordered_json& messages) -> inference::TextGeneration {
     const auto id = require(generator.enqueue_chat(
         messages, {.maximum_new_tokens = 48, .context_size = 512, .prefix_cache_bytes = std::size_t{1} << 30}));
     while (true)
         for (auto& event : require(generator.step()).events)
             if (event.request_id == id && event.completed) return std::move(*event.completed);
+}
+
+auto chat(inference::Generator& generator, std::string_view question) -> inference::TextGeneration {
+    return chat_messages(generator, nlohmann::ordered_json{{{"role", "system"}, {"content", "Answer in one word."}},
+                                                  {{"role", "user"}, {"content", question}}});
 }
 
 auto run_core_benchmark(bool quick_512) -> void {
@@ -285,5 +288,18 @@ TEST(Inkling2Test, PrefixReuseFallback) {
     EXPECT_TRUE(reused.text == fresh.text && reused.stats.reused_prompt_tokens == 0)
         << "prefix reuse changed the answer or reused a non-rewindable prefix";
     std::cout << "prefix fallback: " << reused.text << '\n';
+
+    // A follow-up turn resumes from the previous prompt boundary and matches a full prefill.
+    nlohmann::ordered_json turns{{{"role", "system"}, {"content", "Answer in one word."}},
+                                 {{"role", "user"}, {"content", "What color is the sky?"}}};
+    const auto first = chat_messages(generator, turns);
+    turns.push_back({{"role", "assistant"}, {"content", first.text}});
+    turns.push_back({{"role", "user"}, {"content", "And the grass?"}});
+    const auto resumed = chat_messages(generator, turns);
+    EXPECT_EQ(resumed.stats.reused_prompt_tokens, first.stats.prompt_tokens);
+    (void)chat(generator, "Name a fruit.");
+    const auto full = chat_messages(generator, turns);
+    EXPECT_EQ(full.stats.reused_prompt_tokens, 0U);
+    EXPECT_EQ(resumed.text, full.text);
 }
 } // namespace

@@ -31,7 +31,7 @@ configure_file(src/kidi/code/default_config.h.in generated/default_config.h @ONL
 add_library(kidi_code
     src/kidi/code/agent.cpp
     src/kidi/code/config.cpp
-    src/kidi/code/openai.cpp
+    src/kidi/code/chat_client.cpp
     src/kidi/code/workspace.cpp
 )
 add_library(kidi::code ALIAS kidi_code)
@@ -48,7 +48,7 @@ if(NOT TARGET liteapp::httplib)
         "${KIDI_CODE_ROOT}/third_party/liteapp/libs/httplib")
     target_link_libraries(kidi_code_httplib INTERFACE Threads::Threads)
 endif()
-add_library(kidi_code_http src/kidi/code/openai_http.cpp)
+add_library(kidi_code_http src/kidi/code/chat_http.cpp)
 add_library(kidi::code_http ALIAS kidi_code_http)
 target_link_libraries(kidi_code_http PUBLIC kidi::code PRIVATE liteapp::httplib)
 
@@ -91,9 +91,9 @@ if(KIDI_CODE_STANDALONE AND BUILD_TESTING)
     add_executable(kidi_code_test tests/agent_test.cpp tests/config_test.cpp tests/workspace_test.cpp)
     target_link_libraries(kidi_code_test PRIVATE kidi::code GTest::gtest_main)
     gtest_discover_tests(kidi_code_test)
-    add_executable(kidi_code_openai_test tests/openai_test.cpp)
-    target_link_libraries(kidi_code_openai_test PRIVATE kidi::code_http liteapp::httplib GTest::gtest_main)
-    gtest_discover_tests(kidi_code_openai_test)
+    add_executable(kidi_code_chat_client_test tests/chat_client_test.cpp)
+    target_link_libraries(kidi_code_chat_client_test PRIVATE kidi::code_http liteapp::httplib GTest::gtest_main)
+    gtest_discover_tests(kidi_code_chat_client_test)
     if(TARGET kidi_code_command AND UNIX)
         add_executable(kidi_code_command_test tests/command_test.cpp)
         target_link_libraries(kidi_code_command_test PRIVATE kidi_code_command GTest::gtest_main)

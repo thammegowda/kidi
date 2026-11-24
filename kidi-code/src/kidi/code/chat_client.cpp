@@ -1,6 +1,8 @@
-#include "kidi/code/openai_transport.h"
+#include "kidi/code/chat_transport.h"
 
+#include <algorithm>
 #include <limits>
+#include <utility>
 
 namespace kidi::code {
 namespace {
@@ -25,15 +27,15 @@ auto role_name(Role role) -> const char* {
 
 auto parse_reply(const Json& body, bool allow_truncated) -> Result<Message> {
     if (!body.contains("choices") || !body["choices"].is_array() || body["choices"].size() != 1)
-        return invalid("OpenAI response must contain exactly one choice");
+        return invalid("chat response must contain exactly one choice");
     const auto& choice = body["choices"][0];
     if (!choice.is_object() || !choice.contains("message") || !choice["message"].is_object())
-        return invalid("OpenAI response is missing an assistant message");
+        return invalid("chat response is missing an assistant message");
     const auto& message = choice["message"];
-    if (!message.contains("role") || message["role"] != "assistant") return invalid("invalid OpenAI message role");
+    if (!message.contains("role") || message["role"] != "assistant") return invalid("invalid chat message role");
     Message result{.role = Role::ASSISTANT};
     if (message.contains("content") && !message["content"].is_null()) {
-        if (!message["content"].is_string()) return invalid("OpenAI message content must be a string or null");
+        if (!message["content"].is_string()) return invalid("chat message content must be a string or null");
         result.content = message["content"].get<std::string>();
     }
     if (message.contains("reasoning_content") && !message["reasoning_content"].is_null()) {
@@ -41,15 +43,15 @@ auto parse_reply(const Json& body, bool allow_truncated) -> Result<Message> {
         result.reasoning_content = message["reasoning_content"].get<std::string>();
     }
     if (message.contains("tool_calls") && !message["tool_calls"].is_null()) {
-        if (!message["tool_calls"].is_array()) return invalid("OpenAI tool_calls must be an array");
+        if (!message["tool_calls"].is_array()) return invalid("chat tool_calls must be an array");
         for (const auto& call : message["tool_calls"]) {
             if (!call.is_object() || !call.contains("id") || !call["id"].is_string() || !call.contains("type") ||
                 call["type"] != "function" || !call.contains("function") || !call["function"].is_object())
-                return invalid("invalid OpenAI function tool call");
+                return invalid("invalid chat function tool call");
             const auto& function = call["function"];
             if (!function.contains("name") || !function["name"].is_string() || !function.contains("arguments") ||
                 !function["arguments"].is_string())
-                return invalid("OpenAI function name and arguments must be strings");
+                return invalid("chat function name and arguments must be strings");
             auto arguments = Json::parse(function["arguments"].get_ref<const std::string&>(), nullptr, false);
             if (arguments.is_discarded() || !arguments.is_object())
                 return invalid("tool arguments must encode an object");
@@ -58,34 +60,44 @@ auto parse_reply(const Json& body, bool allow_truncated) -> Result<Message> {
         }
     }
     if (!choice.contains("finish_reason") || !choice["finish_reason"].is_string())
-        return invalid("OpenAI response is missing finish_reason");
+        return invalid("chat response is missing finish_reason");
     const auto reason = choice["finish_reason"].get<std::string>();
     // A summary cut off by the token limit is still a usable handoff.
     const bool truncated = allow_truncated && reason == "length" && result.tool_calls.empty() &&
                            result.content.find_first_not_of(" \t\r\n") != std::string::npos;
     if (reason != "stop" && reason != "tool_calls" && !truncated)
-        return std::unexpected(Error{ErrorCode::RUNTIME, "OpenAI generation did not complete: " + reason});
+        return std::unexpected(Error{ErrorCode::RUNTIME, "chat generation did not complete: " + reason});
     if ((reason == "tool_calls") != !result.tool_calls.empty())
-        return invalid("OpenAI finish_reason does not match tool_calls");
+        return invalid("chat finish_reason does not match tool_calls");
     if (body.contains("usage") && !body["usage"].is_null()) {
         const auto& usage = body["usage"];
         if (!usage.is_object() || !usage.contains("prompt_tokens") || !usage["prompt_tokens"].is_number_unsigned() ||
             !usage.contains("completion_tokens") || !usage["completion_tokens"].is_number_unsigned())
-            return invalid("OpenAI usage requires unsigned prompt_tokens and completion_tokens");
+            return invalid("chat usage requires unsigned prompt_tokens and completion_tokens");
         result.usage =
             TokenUsage{usage["prompt_tokens"].get<std::size_t>(), usage["completion_tokens"].get<std::size_t>()};
+        if (const auto stats = body.find("kidi_stats"); stats != body.end() && stats->is_object())
+            for (auto [key, field] : {std::pair{"prefill_ms", &TokenUsage::prefill_ms},
+                                      std::pair{"decode_ms", &TokenUsage::decode_ms}})
+                if (const auto value = stats->find(key); value != stats->end() && value->is_number())
+                    (*result.usage).*field = std::max(0.0, value->get<double>());
     }
     return result;
 }
 
-auto encode_request(const OpenAIOptions& options, std::span<const Message> messages, std::span<const ToolSpec> tools,
+auto encode_request(const ChatClientOptions& options, std::span<const Message> messages, std::span<const ToolSpec> tools,
                     bool summary = false) -> Result<std::string> {
     std::string payload;
     try {
         Json request{{"model", options.model},
-                     {"stream", false},
+                     {"stream", !summary && static_cast<bool>(options.on_delta)},
                      {"max_tokens", options.max_tokens},
                      {"messages", Json::array()}};
+        if (request["stream"] == true) request["stream_options"] = {{"include_usage", true}};
+        const bool sample = !summary && options.temperature > 0;
+        request["temperature"] = sample ? options.temperature : 0.0F;
+        if (sample && options.top_p < 1) request["top_p"] = options.top_p;
+        if (sample && options.top_k) request["top_k"] = options.top_k;
         if (summary) {
             request["reasoning_effort"] = "none";
             request["chat_template_kwargs"] = {{"enable_thinking", false}};
@@ -122,12 +134,12 @@ auto encode_request(const OpenAIOptions& options, std::span<const Message> messa
 
 } // namespace
 
-auto completion_provider(OpenAIOptions options, CompletionTransport transport) -> Result<Provider> {
+auto completion_provider(ChatClientOptions options, CompletionTransport transport) -> Result<Provider> {
     if (options.model.empty() || !options.max_tokens || !options.max_response_bytes || options.timeout.count() <= 0 ||
         options.timeout.count() > std::numeric_limits<long>::max())
-        return invalid("model and positive OpenAI limits are required");
+        return invalid("model and positive request limits are required");
     if (!transport) return invalid("completion transport is required");
-    const auto complete = [transport](const OpenAIOptions& config, std::span<const Message> messages,
+    const auto complete = [transport](const ChatClientOptions& config, std::span<const Message> messages,
                                       std::span<const ToolSpec> tools, std::stop_token stop,
                                       bool summary) -> Result<Message> {
         if (stop.stop_requested()) return std::unexpected(Error{ErrorCode::RUNTIME, "cancelled"});
@@ -136,7 +148,7 @@ auto completion_provider(OpenAIOptions options, CompletionTransport transport) -
         auto response = transport(config, std::move(*payload), stop, "/chat/completions");
         if (!response) return std::unexpected(response.error());
         auto body = Json::parse(*response, nullptr, false);
-        if (body.is_discarded() || !body.is_object()) return invalid("OpenAI response is not a JSON object");
+        if (body.is_discarded() || !body.is_object()) return invalid("chat response is not a JSON object");
         return parse_reply(body, summary);
     };
     Provider provider([options, complete](auto messages, auto tools, std::stop_token stop) {
@@ -154,6 +166,11 @@ auto completion_provider(OpenAIOptions options, CompletionTransport transport) -
         if (stop.stop_requested()) return std::unexpected(Error{ErrorCode::RUNTIME, "cancelled"});
         auto payload = encode_request(options, messages, tools, summary);
         if (!payload) return std::unexpected(payload.error());
+        // Context inspection is always a single JSON response.
+        auto request = Json::parse(*payload);
+        request["stream"] = false;
+        request.erase("stream_options");
+        *payload = request.dump();
         auto response = transport(options, std::move(*payload), stop, "/chat/context");
         if (!response) return std::unexpected(response.error());
         const auto body = Json::parse(*response, nullptr, false);

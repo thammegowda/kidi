@@ -642,7 +642,7 @@ public:
 
     /// Desktop settings for the shared OpenAI routes. Requests without their own system message get the app's
     /// system prompt, localized by the optional `kidi.languages` / `kidi.language_names` fields the UI sends.
-    auto openai_routes() -> kidi::server::RouteOptions {
+    auto chat_routes() -> kidi::server::RouteOptions {
         return {
             .model_name = config_->chat.model_id,
             .defaults = {.maximum_new_tokens = config_->maximum_tokens,
@@ -651,7 +651,7 @@ public:
                          .prefix_cache_bytes = config_->prefix_cache_bytes,
                          .stream_text = true,
                          .on_image_progress = {}},
-            .customize = [this](const kidi::server::OpenAIJson& body, kidi::server::OpenAIChatRequest& request)
+            .customize = [this](const kidi::server::ChatJson& body, kidi::server::ChatRequest& request)
                 -> kidi::Result<void> {
                 const auto invalid = [](std::string message) -> kidi::Result<void> {
                     return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, std::move(message)});
@@ -682,7 +682,7 @@ public:
                 auto prompt = localized_system_prompt(system_prompt(), languages, language_names);
                 if (!prompt.empty())
                     request.messages.insert(request.messages.begin(),
-                                            kidi::server::OpenAIJson{{"role", "system"}, {"content", std::move(prompt)}});
+                                            kidi::server::ChatJson{{"role", "system"}, {"content", std::move(prompt)}});
                 return {};
             },
         };
@@ -745,7 +745,7 @@ private:
         });
         if (!result) return std::unexpected(result.error());
         result->text = kidi::text::parse_assistant_response(result->text).content;
-        auto stats = Json::parse(kidi::server::openai_stats(*result, milliseconds(started)).dump());
+        auto stats = Json::parse(kidi::server::chat_stats(*result, milliseconds(started)).dump());
         return ChatRunResult{.generation = std::move(*result), .stats = std::move(stats)};
     }
 
@@ -1686,7 +1686,7 @@ auto main(int argc, char** argv) -> int {
     }
     auto server = std::move(*created);
     server.get("/api/status", [backend](const liteapp::Request&) { return backend->status(); });
-    kidi::server::mount_openai_routes(server, backend->engine(), backend->openai_routes());
+    kidi::server::mount_chat_routes(server, backend->engine(), backend->chat_routes());
     server.websocket("/ws",
                      [backend](const liteapp::Request&, liteapp::WebSocket& socket) {
                          AppSession session(backend);

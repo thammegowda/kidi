@@ -27,6 +27,9 @@ struct Inkling2State : LanguageModelState {
     std::vector<tensor::Tensor> replay_inputs;
     StepInputs decode_step, prefill_step;
     std::size_t position = 0, capacity = 0;
+    /// Convolution rings saved at `rewind_position` (0: none), so a prompt boundary can be restored.
+    std::vector<tensor::Tensor> rewind_convs;
+    std::size_t rewind_position = 0;
 
     auto sequence_position() const noexcept -> std::size_t override { return position; }
     auto sequence_capacity() const noexcept -> std::size_t override { return capacity; }
@@ -58,6 +61,8 @@ public:
     auto supports_device_tokens() const -> bool override;
     auto create_state(std::size_t capacity) -> Result<std::unique_ptr<LanguageModelState>> override;
     auto rewind(LanguageModelState& state, std::size_t position) -> Result<void> override;
+    auto mark_rewind_point(LanguageModelState& state) -> Result<void> override;
+    auto rewind_floor(const LanguageModelState& state, std::size_t position) const -> std::size_t override;
     auto prefill(std::span<const std::int32_t> tokens, LanguageModelState& state) -> Result<void> override;
     auto forward(std::span<const std::int32_t> tokens, LanguageModelState& state, bool all_logits = false,
                  tensor::Tensor* hidden = nullptr) -> Result<tensor::Tensor> override;

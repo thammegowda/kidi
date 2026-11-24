@@ -97,7 +97,7 @@ auto parse_agent_config(std::string_view yaml) -> Result<AgentConfig> {
         std::size_t remaining = 16384;
         auto document = json_value(documents.front(), 0, remaining);
         if (!document) return std::unexpected(document.error());
-        if (auto valid = fields(*document, {"version", "prompts", "tools"}); !valid)
+        if (auto valid = fields(*document, {"version", "prompts", "tools"}, {"sampling"}); !valid)
             return std::unexpected(valid.error());
         if (!(*document)["version"].is_number_integer() || (*document)["version"] != 1)
             return invalid("version must be integer 1");
@@ -113,6 +113,26 @@ auto parse_agent_config(std::string_view yaml) -> Result<AgentConfig> {
         if (prompts.contains("compact")) {
             if (!nonempty_string(prompts["compact"])) return invalid("prompts.compact must be a nonempty string");
             config.compact_prompt = prompts["compact"].get<std::string>();
+        }
+        if (document->contains("sampling")) {
+            const auto& sampling = (*document)["sampling"];
+            if (auto valid = fields(sampling, {}, {"temperature", "top_p", "top_k"}); !valid)
+                return std::unexpected(valid.error());
+            const auto number = [&](const char* key, double minimum, double maximum, float& value) {
+                if (!sampling.contains(key)) return true;
+                if (!sampling[key].is_number()) return false;
+                const auto parsed = sampling[key].get<double>();
+                value = static_cast<float>(parsed);
+                return parsed >= minimum && parsed <= maximum;
+            };
+            if (!number("temperature", 0, 2, config.sampling.temperature))
+                return invalid("sampling.temperature must be a number in [0, 2]");
+            if (!number("top_p", 0, 1, config.sampling.top_p) || config.sampling.top_p <= 0)
+                return invalid("sampling.top_p must be a number in (0, 1]");
+            if (sampling.contains("top_k")) {
+                if (!sampling["top_k"].is_number_unsigned()) return invalid("sampling.top_k must be a non-negative integer");
+                config.sampling.top_k = sampling["top_k"].get<std::size_t>();
+            }
         }
         const auto& tools = (*document)["tools"];
         if (!tools.is_array()) return invalid("tools must be a sequence (use [] for no tools)");

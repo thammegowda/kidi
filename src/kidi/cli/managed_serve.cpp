@@ -2,7 +2,7 @@
 
 #include "kidi/checkpoint/hub.h"
 #include "kidi/cli/log.h"
-#include "kidi/code/openai_transport.h"
+#include "kidi/code/chat_transport.h"
 #include "kidi/server/routes.h"
 
 #include <httplib.h>
@@ -254,7 +254,7 @@ auto ensure_server(const fs::path& exe, const fs::path& dir, const std::string& 
         Error{ErrorCode::IO, "background inference did not become ready; see " + (dir / "serve.log").string()});
 }
 
-auto managed_provider(code::OpenAIOptions options, const Namespace& arguments) -> Result<code::Provider> {
+auto managed_provider(code::ChatClientOptions options, const Namespace& arguments) -> Result<code::Provider> {
     options.model = choose_model(std::move(options.model));
     const auto exe = executable();
     struct stat binary{};
@@ -284,7 +284,7 @@ auto managed_provider(code::OpenAIOptions options, const Namespace& arguments) -
 
     return code::completion_provider(
         std::move(options),
-        [lease = std::move(lease), dir, endpoint = *endpoint](const code::OpenAIOptions& http_options,
+        [lease = std::move(lease), dir, endpoint = *endpoint](const code::ChatClientOptions& http_options,
                                                               std::string payload, std::stop_token stop,
                                                               std::string_view route) -> Result<std::string> {
             auto result = code::http_completion(http_options, std::move(payload), stop, endpoint.pid, route);
@@ -316,7 +316,7 @@ auto configure_managed_serve_parser(ArgumentParser& parser) -> void {
 
 auto managed_code_command(const Namespace& arguments) -> int {
     return code::code_command(
-        arguments, [&](code::OpenAIOptions options) { return managed_provider(std::move(options), arguments); });
+        arguments, [&](code::ChatClientOptions options) { return managed_provider(std::move(options), arguments); });
 }
 
 auto protect_managed_lock(const Namespace& arguments) -> void {
@@ -344,7 +344,7 @@ auto serve_managed(inference::Generator& generator, const ServeOptions& options,
         return 1;
     }
     server::ChatEngine engine(generator);
-    server::mount_openai_routes(*http, engine, {.model_name = options.model_name, .defaults = options.generation});
+    server::mount_chat_routes(*http, engine, {.model_name = options.model_name, .defaults = options.generation});
     http->get("/kidi-code/ready", [pid](const auto&) { return liteapp::Response::text(std::to_string(pid)); });
     const auto port = http->bind();
     if (!port) {

@@ -23,7 +23,7 @@ class DesktopBackend {
   #speechClient;
   #speechTransport;
   #speechChannel;
-  #openAIRequests = new Map();
+  #chatRequests = new Map();
   #status;
 
   get bufferedAmount() {
@@ -42,8 +42,8 @@ class DesktopBackend {
     this.#callbacks = callbacks;
     const connection = ++this.#connection;
     this.#disconnecting = false;
-    for (const controller of this.#openAIRequests.values()) controller.abort();
-    this.#openAIRequests.clear();
+    for (const controller of this.#chatRequests.values()) controller.abort();
+    this.#chatRequests.clear();
     this.#client?.dispose('The local session was replaced');
     this.#speechClient?.dispose('The native speech channel was replaced');
     this.#client = null;
@@ -95,8 +95,8 @@ class DesktopBackend {
         if (closed || connection !== this.#connection) return;
         closed = true;
         this.#disconnecting = true;
-        for (const controller of this.#openAIRequests.values()) controller.abort();
-        this.#openAIRequests.clear();
+        for (const controller of this.#chatRequests.values()) controller.abort();
+        this.#chatRequests.clear();
         this.#transport = null;
         this.#speechTransport = null;
         client.dispose(speech
@@ -123,7 +123,7 @@ class DesktopBackend {
 
   send(type, id, payload = {}) {
     if (type === 'cancel') {
-      const request = this.#openAIRequests.get(id);
+      const request = this.#chatRequests.get(id);
       if (request) {
         request.abort();
         return;
@@ -133,7 +133,7 @@ class DesktopBackend {
       return;
     }
     if (type === 'chat.start' && !payload.messages?.some(message => message.images?.length)) {
-      this.#runOpenAIChat(id, payload);
+      this.#runChat(id, payload);
       return;
     }
     if (type === 'asr.stop') {
@@ -154,9 +154,9 @@ class DesktopBackend {
     client.request(type, id, payload);
   }
 
-  async #runOpenAIChat(id, payload) {
+  async #runChat(id, payload) {
     const controller = new AbortController();
-    this.#openAIRequests.set(id, controller);
+    this.#chatRequests.set(id, controller);
     const emit = (type, eventPayload = {}) =>
       this.#callbacks?.onEvent?.({v: 1, id, type, seq: 0, payload: eventPayload});
     try {
@@ -181,7 +181,7 @@ class DesktopBackend {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.error?.message || `Request failed (${response.status})`);
       }
-      if (!response.body) throw new Error('The OpenAI-compatible response has no stream');
+      if (!response.body) throw new Error('The chat completion response has no stream');
       emit('chat.started', {
         backend: status.backend,
         runtime: status.runtime,
@@ -223,7 +223,7 @@ class DesktopBackend {
           break;
         }
       }
-      if (!finished) throw new Error('The OpenAI-compatible stream ended before completion');
+      if (!finished) throw new Error('The chat completion stream ended before completion');
       const elapsed = performance.now() - started;
       const completionTokens = usage?.completion_tokens || 0;
       emit('chat.completed', {
@@ -241,7 +241,7 @@ class DesktopBackend {
       else
         emit('error', {code: error.code || 'service_error', message: error.message || 'Chat request failed'});
     } finally {
-      if (this.#openAIRequests.get(id) === controller) this.#openAIRequests.delete(id);
+      if (this.#chatRequests.get(id) === controller) this.#chatRequests.delete(id);
     }
   }
 
