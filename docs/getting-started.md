@@ -101,7 +101,7 @@ alone does not make every model compatible with Kidi.
 For image prompts on macOS, `--backend mps` keeps both the language model and the low-bit vision tower on Apple GPU;
 the vision tower does not copy intermediate blocks back to CPU during normal inference.
 
-Projection and KV-cache precision are separate load-time policies. The defaults
+For Gemma, projection and KV-cache precision are separate load-time policies. The defaults
 preserve the checkpoint projection format and automatically use the calibrated
 INT8 KV cache when the QAT model and backend support it. CPU verification can
 select `--precision fp32` or `--precision qat-fp32`; the latter preserves the
@@ -140,6 +140,34 @@ Ctrl-C cancels the current reply; Ctrl-D exits at the prompt. Use `--color never
 or set `NO_COLOR` to disable automatic colors. Interactive chat is currently greedy text-only
 generation with thinking disabled; it does not execute tools or process multimodal input.
 History is re-prefilled each turn, not retained as a cross-turn KV cache.
+
+## Inkling-2 on CPU
+
+The CPU-only build can run Inkling-2-Mini, including reasoning, tool calls and the coding agent:
+
+```bash
+./build-release/kidi code -m @thinkingmachines/Inkling-2-Mini --backend ynnpack --restart
+# Or start a server explicitly:
+./build-release/kidi serve -m @thinkingmachines/Inkling-2-Mini --backend ynnpack \
+  --precision q8a16 --threads 8 --context-size 2048
+```
+
+`--backend ynnpack` selects CPU; a CPU-only binary cannot serve `--backend cuda:7`.
+Both the default `checkpoint` precision and explicit `q8a16` convert NVFP4/MXFP8 experts to
+signed INT8 with FP32 per-row scales. Gate/up rows are rearranged at load time, and only the
+selected experts are evaluated. Dense projections and the unembedding are also packed to INT8, and
+matmuls quantize their input rows to INT8 (W8A8, AVX-512 VNNI where available) with FP32 accumulation.
+Element-wise activations stay BF16/F32; CPU KV caches store signed INT8 with one FP32 scale per 32 elements
+(groups divide each head). This uses 56.25% of BF16 KV storage, including scales, for Inkling-2-Mini.
+Prefill batches expert work without per-expert tensor gathers/scatters, and attention shares cached rows across
+four query tokens. `kidi code` starts its CPU server with `--threads` (default: up to 16).
+On 16 pinned Sapphire Rapids cores, a roughly 4K-token prompt prefills in about 61 seconds
+(previously 96 seconds) and decodes at about 19 tokens/s; short-context decode is about 23 tokens/s.
+
+Conversion runs once per server start, in parallel across the configured CPU threads; no checkpoint
+files are modified and no persistent converted cache is written. CPU INT8 needs more RAM than CUDA's
+native compact storage, including prepared CPU weight tiles and context buffers. Keep the context small
+for smoke tests. CPU `--precision bf16` is not supported; CUDA retains native, INT8 and BF16 modes.
 
 ## Whisper Transcription
 

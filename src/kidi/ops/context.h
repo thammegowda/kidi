@@ -172,7 +172,7 @@ public:
     auto dequantize_experts(const Tensor& values, const Tensor& scales, const Tensor& global = {},
                             bool interleaved = false) -> Tensor;
     /// Packs decoded expert weights directly to signed INT8 with FP32 per-row scales, without BF16 expansion.
-    /// Uses pack_weight's rounding convention and rejects non-finite values. CUDA only.
+    /// Uses pack_weight's rounding convention and rejects non-finite values. CPU or CUDA.
     auto pack_experts(const Tensor& values, const Tensor& scales, const Tensor& global = {}, bool interleaved = false)
         -> PackedWeight;
     /// CPU/CUDA projection from unchanged FP4 E2M1, FP8 E4M3 or symmetric signed INT4 block-scaled weights.
@@ -244,10 +244,15 @@ public:
     /// Multiplies [..., heads, width] rows by the optional [heads, width] scale and caps each row's L2 norm.
     auto l2_clip(const Tensor& input, const Tensor& scale, float threshold) -> Tensor;
     /// Causal attention of [tokens, heads * width] queries over [capacity, key_heads * width] caches, with relative
-    /// logits [tokens, heads, extent], sink logits [tokens, heads] and sigmoid `gate`.
+    /// logits [tokens, heads, extent], sink logits [tokens, heads] and sigmoid `gate`. CPU I8 caches require
+    /// F32 scales [capacity, key_heads * groups_per_head]; scale groups must divide each head's width.
     auto relative_attention(const Tensor& query, const Tensor& key, const Tensor& value, const Tensor& relative,
                             const Tensor& sink, const Tensor& gate, RelativeAttention shape,
-                            const Tensor& positions = {}) -> Tensor;
+                            const Tensor& positions = {}, const Tensor& key_scales = {},
+                            const Tensor& value_scales = {}) -> Tensor;
+    /// CPU: quantizes [tokens, heads, width] into I8 cache [1, capacity, heads * width] at absolute `positions`,
+    /// with F32 scales [capacity, heads * groups_per_head]. Existing rows outside `positions` are unchanged.
+    auto quantize_cache_(Tensor& cache, Tensor& scales, const Tensor& input, const Tensor& positions) -> void;
     /// Unit-RMS-normalizes `destination` and `message` [tokens, width] and writes concatenated BF16 [tokens, 2 * width].
     auto blend_prologue(const Tensor& destination, const Tensor& message, float epsilon) -> Tensor;
     /// Computes mixed = destination * (1 + tanh(forget)) + message * tanh(gain) from [tokens, 2 * width]

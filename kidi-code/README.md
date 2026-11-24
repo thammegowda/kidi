@@ -31,6 +31,19 @@ backend availability and the CUDA toolkit version in CUDA builds.
 The command is built by default on Linux/macOS (`KIDI_BUILD_CODE=OFF` disables
 it). There is no in-process inference mode.
 
+Inkling-2-Mini also runs in a CPU-only build:
+
+```bash
+./build-release/kidi code --model @thinkingmachines/Inkling-2-Mini --backend ynnpack --restart
+```
+
+CPU execution automatically converts the checkpoint's NVFP4/MXFP8 experts and dense projections to
+row-scaled INT8 (W8A8 matmuls); CPU KV caches use group-32 signed INT8 with FP32 scales.
+`-j/--threads` sets the server's CPU threads
+(default: up to 16). Conversion happens at each server start, not per request.
+This needs more RAM than CUDA's native compact checkpoint mode. See
+[CPU inference details](../docs/getting-started.md#inkling-2-on-cpu) for precision options.
+
 Daemon port and PID are published atomically in:
 
 ```text

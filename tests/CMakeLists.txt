@@ -120,6 +120,7 @@ kidi_add_test(kidi_rtg_package_test tests/kidi/checkpoint/package_test.cpp)
 kidi_add_test(kidi_gemma4_test tests/kidi/model/gemma4_test.cpp COST 100 LABELS native regression cuda)
 # These checkpoints do not fit together on the single-GPU two-slot fallback.
 kidi_add_test(kidi_inkling2_test tests/kidi/model/inkling2_test.cpp LABELS native cuda RESOURCE_LOCK inkling2_model)
+kidi_add_test(kidi_inkling2_cpu_test tests/kidi/model/inkling2_cpu_test.cpp RESOURCE_LOCK inkling2_model)
 kidi_add_test(kidi_kokoro_test tests/kidi/model/kokoro_test.cpp)
 kidi_add_test(kidi_model_registry_test tests/kidi/model/registry_test.cpp)
 target_compile_definitions(kidi_gemma4_test PRIVATE KIDI_GEMMA4_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/gemma4")

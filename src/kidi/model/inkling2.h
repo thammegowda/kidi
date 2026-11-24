@@ -9,6 +9,7 @@
 
 #include "kidi/model/model.h"
 #include "kidi/ops/context.h"
+#include "kidi/ops/quantization.h"
 
 namespace kidi::model {
 
@@ -17,6 +18,7 @@ namespace kidi::model {
 struct Inkling2Visit {
     tensor::Tensor key, value;
     tensor::Tensor key_conv, value_conv, attention_conv, mlp_conv;
+    tensor::Tensor key_scales, value_scales; // CPU INT8 KV: F32 [capacity, key_heads * groups_per_head]
 };
 
 struct Inkling2State : LanguageModelState {
@@ -37,8 +39,8 @@ struct Inkling2State : LanguageModelState {
 };
 
 /// Thinking Machines Inkling-2 text model (`inkling2_loop_text`): block attention residuals, relative-position
-/// attention with sinks, short convolutions, a sigmoid-routed MoE and a looped core of layers. CUDA only; experts
-/// remain in their mmap-backed NVFP4/MXFP8 formats and interleaved layout on CUDA by default.
+/// attention with sinks, short convolutions, a sigmoid-routed MoE and a looped core of layers. CPU uses INT8 experts;
+/// CUDA keeps native NVFP4/MXFP8 experts and BF16 caches. CPU uses group-32 INT8 KV caches; activations are BF16.
 /// `tools/reference/inkling2.py` is the executable specification.
 KIDI_MODULE(Inkling2);
 class Inkling2Impl : public CausalLanguageModel {
@@ -52,7 +54,9 @@ public:
     auto hidden_size() const noexcept -> std::int32_t override { return hidden_; }
     auto vocabulary_size() const noexcept -> std::int32_t override { return vocabulary_; }
     auto max_positions() const noexcept -> std::size_t override { return max_positions_; }
-    auto kv_cache_dtype(std::size_t) const -> Result<tensor::DType> override { return tensor::DType::BF16; }
+    auto kv_cache_dtype(std::size_t) const -> Result<tensor::DType> override {
+        return device().kind == tensor::DeviceKind::CPU ? tensor::DType::I8 : tensor::DType::BF16;
+    }
     auto preparation_ns() const noexcept -> std::uint64_t override;
     auto release_workspaces() -> void override;
     auto trim_workspaces() -> void override;
@@ -78,6 +82,7 @@ private:
         tensor::Tensor partial;
     };
     auto weight(const std::string& name) const -> const tensor::Tensor&;
+    auto project_bf16(const tensor::Tensor& input, const std::string& name) -> tensor::Tensor;
     auto visit(std::int32_t layer, Stream stream, Inkling2Visit& cache, const tensor::Tensor& positions,
                const tensor::Tensor& conv_slot, const tensor::Tensor& tail_slots,
                const std::vector<tensor::Tensor>* bank) -> Stream;
@@ -109,6 +114,7 @@ private:
     float route_scale_, gate_cap_, up_cap_, logit_cap_, qk_clip_, relative_clip_, log_alpha_, log_floor_;
     std::vector<std::int32_t> local_layers_;
     std::map<std::string, tensor::Tensor, std::less<>> weights_;
+    std::map<std::string, ops::PackedWeight, std::less<>> packed_; // CPU INT8 dense projections
     struct ExpertWeight {
         tensor::Tensor values, scales, global;
     };

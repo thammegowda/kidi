@@ -16,4 +16,9 @@ struct PackedWeight {
 };
 auto pack_weight(const tensor::Tensor& weight, std::int32_t bits = 4, std::int32_t group_size = 128,
                  bool asymmetric_clip = false) -> Result<PackedWeight>;
+/// Same result as pack_weight(weight, 8, width) for a host matrix, packed in row chunks on the CPU worker pool.
+auto pack_rows_int8(const tensor::Tensor& weight) -> Result<PackedWeight>;
+/// Requantizes checkpoint experts [experts, rows, width] to row-scaled INT8, without expanding the whole bank.
+auto pack_expert_weights(const tensor::Tensor& values, const tensor::Tensor& scales, const tensor::Tensor& global,
+                         bool interleaved) -> Result<PackedWeight>;
 } // namespace kidi::ops

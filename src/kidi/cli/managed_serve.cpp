@@ -7,6 +7,7 @@
 
 #include <httplib.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <csignal>
@@ -137,6 +138,7 @@ auto start_server(const fs::path& exe, const fs::path& dir, const File& startup,
         "--model=" + model,
         "--cache=" + cache.string(),
         "--backend=" + arguments.get<std::string>("backend"),
+        "--threads=" + std::to_string(arguments.get<std::int32_t>("threads")),
         "--context-size=" + std::to_string(arguments.get<std::size_t>("context_size")),
         "--cache-tokens=" + std::to_string(std::max<std::size_t>(16384, arguments.get<std::size_t>("context_size"))),
         "--max-active=2",
@@ -266,7 +268,7 @@ auto managed_provider(code::ChatClientOptions options, const Namespace& argument
     const auto identity =
         code::Json::array({binary.st_dev, binary.st_ino, binary.st_mtime, binary.st_size, options.model, cache.string(),
                            backend, visible_devices ? code::Json(visible_devices) : code::Json(nullptr),
-                           arguments.get<std::size_t>("context_size")})
+                           arguments.get<std::size_t>("context_size"), arguments.get<std::int32_t>("threads")})
             .dump();
     const auto dir = runtime_directory() / std::to_string(std::hash<std::string>{}(identity));
     if (!private_directory(dir, true)) throw std::runtime_error("not a private directory: " + dir.string());
@@ -304,6 +306,11 @@ auto configure_managed_code_parser(ArgumentParser& parser) -> void {
         .dest("context_size")
         .default_value<std::size_t>(0)
         .help("background server context tokens (default: model configuration); larger contexts use more memory");
+    // CPU decode scales to roughly 16 threads; beyond that the per-token dispatch overhead dominates.
+    constexpr std::int32_t DEFAULT_THREADS = 16;
+    parser.add_argument("-j", "--threads")
+        .default_value(std::clamp(static_cast<std::int32_t>(std::thread::hardware_concurrency()), 1, DEFAULT_THREADS))
+        .help("CPU inference threads for the background server");
     parser.add_argument("--restart")
         .action(Action::STORE_TRUE)
         .help("stop the background server for this model/backend/context and start a fresh one");

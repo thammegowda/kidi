@@ -271,7 +271,11 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
         const auto checkpoint_bf16 = !qat && options.precision == core::InferencePrecision::BF16;
         const auto cuda_w8a16 =
             options.device.kind == tensor::DeviceKind::CUDA && options.precision == core::InferencePrecision::Q8A16;
-        if (options.precision != core::InferencePrecision::CHECKPOINT && !qat && !checkpoint_bf16 && !cuda_w8a16)
+        const auto inkling_w8a16 = options.device.kind == tensor::DeviceKind::CPU &&
+                                  config["model"]["model_type"].as<std::string>("") == "inkling2_loop_text" &&
+                                  options.precision == core::InferencePrecision::Q8A16;
+        if (options.precision != core::InferencePrecision::CHECKPOINT && !qat && !checkpoint_bf16 &&
+            !cuda_w8a16 && !inkling_w8a16)
             throw ops::Failure(
                 {ErrorCode::UNSUPPORTED, "explicit projection precision currently requires a native QAT checkpoint"});
         if (options.precision != core::InferencePrecision::CHECKPOINT && options.weight_bits)

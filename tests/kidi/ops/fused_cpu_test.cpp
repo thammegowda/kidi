@@ -1,9 +1,12 @@
 #include "kidi/ops/context.h"
+#include "kidi/ops/cpu_kernels.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
+#include <numeric>
+#include <random>
 
 #if defined(KIDI_HAS_CUDA)
 #include "cuda/runtime.h"
@@ -301,6 +304,99 @@ TEST(FusedCpuTest, UnweightedRmsNorm) {
     const auto inverse = 1.F / std::sqrt(12.51F);
     EXPECT_NEAR(normalized[0], 3.F * inverse, TOLERANCE) << "unweighted RMS norm mismatch";
     EXPECT_NEAR(normalized[1], 4.F * inverse, TOLERANCE) << "unweighted RMS norm mismatch";
+    const auto bf16 = context.cast(make_tensor({1, 2}, norm_values), tensor::DType::BF16);
+    const auto bf16_normalized = context.rms_norm(bf16, {}, 0.01F);
+    EXPECT_EQ(bf16_normalized.dtype(), tensor::DType::BF16);
+    const auto actual = context.cast(bf16_normalized, tensor::DType::F32);
+    const auto expected = context.cast(context.cast(normalized_tensor, tensor::DType::BF16), tensor::DType::F32);
+    EXPECT_TRUE(std::ranges::equal(ops::require(actual.data<float>()), ops::require(expected.data<float>())));
+}
+
+TEST(FusedCpuTest, PackCheckpointExpertsToInt8) {
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    constexpr std::int64_t EXPERTS = 2, ROWS = 6, WIDTH = 64;
+    ops::Context context;
+    for (const bool nvfp4 : {false, true}) {
+        SCOPED_TRACE(nvfp4);
+        const auto block = nvfp4 ? 16 : 32;
+        auto values = require(Tensor::empty({EXPERTS, ROWS, WIDTH / (nvfp4 ? 2 : 1)},
+                                           nvfp4 ? DType::U8 : DType::E4M3));
+        auto scales = require(Tensor::empty({EXPERTS, ROWS, WIDTH / block}, DType::U8));
+        auto bytes = require(values.host_bytes());
+        const auto scale_bytes = require(scales.data<std::uint8_t>());
+        for (std::size_t index = 0; index < bytes.size(); ++index) {
+            const auto row = index / values.size(2);
+            bytes[index] = row == EXPERTS * ROWS - 1
+                               ? std::byte{0}
+                               : std::byte(nvfp4 ? (row % 2 ? 0xCA : 0x42) : (row % 2 ? 0xC0 : 0x38));
+        }
+        std::ranges::fill(scale_bytes, nvfp4 ? 0x38 : 127);
+        const std::array<float, 2> factors{0.5F, 2.F};
+        const auto global = nvfp4 ? make_tensor({EXPERTS}, factors) : Tensor{};
+        for (const bool interleaved : {false, true}) {
+            const auto packed = context.pack_experts(values, scales, global, interleaved);
+            ASSERT_EQ(packed.bits, 8);
+            ASSERT_EQ(packed.group_size, WIDTH);
+            const auto codes = require(packed.values.data<std::uint8_t>());
+            const auto steps = require(packed.scales.data<float>());
+            for (std::int64_t expert = 0; expert < EXPERTS; ++expert)
+                for (std::int64_t row = 0; row < ROWS; ++row)
+                    for (std::int64_t column = 0; column < WIDTH; ++column) {
+                        const auto source_row = interleaved ? (row % 3) * 2 + row / 3 : row;
+                        const auto sign = source_row % 2 ? -1.F : 1.F;
+                        const auto expected =
+                            expert == EXPERTS - 1 && source_row == ROWS - 1
+                                ? 0.F
+                                : nvfp4 ? sign * (column % 2 ? 2.F : 1.F) * factors[expert]
+                                         : (source_row % 2 ? -2.F : 1.F);
+                        const auto step = steps[expert * ROWS + row];
+                        const auto code = std::bit_cast<std::int8_t>(codes[(expert * ROWS + row) * WIDTH + column]);
+                        EXPECT_NEAR(code * step, expected, step * 0.501F);
+                    }
+        }
+        if (nvfp4) EXPECT_THROW(context.pack_experts(values, scales, {}, true), ops::Failure);
+        bytes[0] = std::byte{0x7F};
+        if (nvfp4)
+            scale_bytes[0] = 0x7F;
+        EXPECT_THROW(context.pack_experts(values, scales, global, true), ops::Failure);
+    }
+}
+
+TEST(FusedCpuTest, RingConvolutionUpdatesAfterReadingHistory) {
+    using ops::require;
+    using tensor::Tensor;
+    constexpr std::int64_t WIDTH = 4, TOKENS = 7, CHANNELS = 2;
+    ops::Context context;
+    const std::array<float, 8> filters{0.1F, 0.2F, -0.3F, 0.4F, 0.5F, -0.6F, 0.7F, 0.8F};
+    const auto weight = make_tensor({WIDTH, CHANNELS}, filters);
+    std::vector<float> input(TOKENS * CHANNELS), padded((TOKENS + WIDTH - 1) * CHANNELS);
+    std::iota(input.begin(), input.end(), 1.F);
+    std::ranges::copy(input, padded.begin() + (WIDTH - 1) * CHANNELS);
+    const auto reference = context.short_convolution(
+        make_tensor({TOKENS + WIDTH - 1, CHANNELS}, padded), weight, {}, 0.5F);
+    const auto expected = require(reference.data<float>());
+    auto state = require(Tensor::zeros({1, WIDTH, CHANNELS}, tensor::DType::F32));
+    const auto ring = require(state.reshape({WIDTH, CHANNELS}));
+    const auto values = make_tensor({TOKENS, CHANNELS}, input);
+    const auto initial_slots = require(Tensor::from_host({3}, std::span<const std::int32_t>(
+                                                                std::array<std::int32_t, 3>{0, 1, 2})));
+    context.scatter_unique_(state, require(require(values.narrow(0, 0, 3)).reshape({1, 3, CHANNELS})), initial_slots);
+    for (std::int64_t token = 3; token < TOKENS; ++token) {
+        const std::array<std::int32_t, 1> slot{static_cast<std::int32_t>(token % WIDTH)};
+        const auto position = require(Tensor::from_host({1}, std::span<const std::int32_t>(slot)));
+        const auto row = require(values.narrow(0, token, 1));
+        const auto output = context.short_convolution(row, ring, weight, {}, position, 0.5F, row, {}, true);
+        const auto actual = require(output.data<float>());
+        for (std::int64_t channel = 0; channel < CHANNELS; ++channel)
+            EXPECT_NEAR(actual[channel], expected[token * CHANNELS + channel] + input[token * CHANNELS + channel],
+                        TOLERANCE);
+    }
+    const auto history = require(state.data<float>());
+    for (std::int64_t token = 3; token < TOKENS; ++token)
+        for (std::int64_t channel = 0; channel < CHANNELS; ++channel)
+            EXPECT_EQ(history[(token % WIDTH) * CHANNELS + channel], input[token * CHANNELS + channel]);
 }
 
 TEST(FusedCpuTest, ResidualMix) {
@@ -350,6 +446,19 @@ TEST(FusedCpuTest, RelativeAttention) {
     EXPECT_NEAR(ops::require(attention.data<float>())[0], 5.F, TOLERANCE) << "relative attention mismatch";
 }
 
+TEST(FusedCpuTest, GroupedRelativeAttention) {
+    ops::Context context;
+    const std::array<float, 4> zero{};
+    const std::array<float, 4> value{10.F, 20.F, 30.F, 40.F};
+    const auto output = context.relative_attention(
+        make_tensor({1, 4}, zero), make_tensor({2, 2}, zero), make_tensor({2, 2}, value),
+        make_tensor({1, 4, 1}, zero), make_tensor({1, 4}, zero), make_tensor({1, 4}, zero),
+        {.heads = 4, .key_heads = 2, .start = 1, .window = 0, .extent = 1});
+    const auto actual = ops::require(output.data<float>());
+    for (std::size_t head = 0; head < 4; ++head)
+        EXPECT_NEAR(actual[head], head < 2 ? 20.F / 3.F : 10.F, TOLERANCE);
+}
+
 TEST(FusedCpuTest, SoftcapSiluGate) {
     ops::Context context;
     const std::array<float, 2> gate_up_values{1.F, 2.F};
@@ -360,5 +469,233 @@ TEST(FusedCpuTest, SoftcapSiluGate) {
     const auto up_value = 10.F * std::tanh(0.2F);
     const auto expected_gate = gate_value / (1.F + std::exp(-gate_up_values[0])) * up_value * 0.5F;
     EXPECT_NEAR(ops::require(gated.data<float>())[0], expected_gate, TOLERANCE) << "softcap SiLU gate mismatch";
+    const auto bf16_input = context.cast(make_tensor({1, 2}, gate_up_values), tensor::DType::BF16);
+    const auto bf16_gated = context.silu_gate(bf16_input, 10.F, 10.F, make_tensor({1}, row_weight));
+    EXPECT_EQ(bf16_gated.dtype(), tensor::DType::BF16);
+    const auto actual = context.cast(bf16_gated, tensor::DType::F32);
+    const auto expected = context.cast(context.cast(gated, tensor::DType::BF16), tensor::DType::F32);
+    EXPECT_EQ(ops::require(actual.data<float>())[0], ops::require(expected.data<float>())[0]);
+}
+TEST(FusedCpuTest, ExpertDecodeMatchesFloatReference) {
+    // 128 and 64 are multiples of 64 (VNNI path); 96 exercises the portable path and row tails.
+    for (const auto [hidden, intermediate] : {std::pair<std::int64_t, std::int64_t>{128, 64}, {96, 40}}) {
+        std::mt19937 random(7);
+        std::uniform_int_distribution<int> code(-127, 127);
+        std::uniform_real_distribution<float> uniform(-1.F, 1.F);
+        constexpr int EXPERTS = 3;
+        constexpr float GATE_CAP = 4.F, UP_CAP = 6.F;
+        std::vector<float> input(static_cast<std::size_t>(hidden));
+        for (auto& value : input) value = uniform(random);
+        std::vector<std::vector<std::int8_t>> gate_up(EXPERTS), down(EXPERTS);
+        std::vector<std::vector<float>> gate_up_scales(EXPERTS), down_scales(EXPERTS);
+        std::vector<ops::cpu::ExpertRows> rows;
+        for (int e = 0; e < EXPERTS; ++e) {
+            gate_up[e].resize(static_cast<std::size_t>(2 * intermediate * hidden));
+            down[e].resize(static_cast<std::size_t>(hidden * intermediate));
+            for (auto& value : gate_up[e]) value = static_cast<std::int8_t>(code(random));
+            for (auto& value : down[e]) value = static_cast<std::int8_t>(code(random));
+            gate_up_scales[e].assign(static_cast<std::size_t>(2 * intermediate), 0.002F);
+            down_scales[e].assign(static_cast<std::size_t>(hidden), 0.003F);
+            rows.push_back({gate_up[e].data(), gate_up_scales[e].data(), down[e].data(), down_scales[e].data(),
+                            0.25F * static_cast<float>(e + 1)});
+        }
+        std::vector<float> expected(static_cast<std::size_t>(hidden), 0.F);
+        for (int e = 0; e < EXPERTS; ++e) {
+            std::vector<float> activated(static_cast<std::size_t>(intermediate));
+            for (std::int64_t i = 0; i < intermediate; ++i) {
+                float g = 0, u = 0;
+                for (std::int64_t k = 0; k < hidden; ++k) {
+                    g += input[k] * gate_up[e][i * hidden + k] * gate_up_scales[e][i];
+                    u += input[k] * gate_up[e][(intermediate + i) * hidden + k] * gate_up_scales[e][intermediate + i];
+                }
+                activated[i] = GATE_CAP * std::tanh(g / GATE_CAP) / (1.F + std::exp(-g)) * UP_CAP *
+                               std::tanh(u / UP_CAP) * rows[e].route;
+            }
+            for (std::int64_t r = 0; r < hidden; ++r)
+                for (std::int64_t i = 0; i < intermediate; ++i)
+                    expected[r] += activated[i] * down[e][r * intermediate + i] * down_scales[e][r];
+        }
+        std::vector<float> actual(static_cast<std::size_t>(hidden));
+        ASSERT_TRUE(
+            ops::cpu::expert_decode(input.data(), rows, hidden, intermediate, GATE_CAP, UP_CAP, actual.data()));
+        float error = 0, norm = 0;
+        for (std::int64_t r = 0; r < hidden; ++r) {
+            error += (actual[r] - expected[r]) * (actual[r] - expected[r]);
+            norm += expected[r] * expected[r];
+        }
+        // INT8 activations add ~1% quantization noise relative to the float reference.
+        EXPECT_LT(std::sqrt(error / norm), 0.03F) << "hidden " << hidden;
+    }
+}
+TEST(FusedCpuTest, Int8LinearMatchesFloatReference) {
+    // K=16 with many tokens mirrors the tiny blend projections; K=4608 crosses several work items.
+    for (const auto [tokens, k, n] : {std::array<std::int64_t, 3>{24, 16, 40}, {3, 4608, 72}, {3072, 16, 40}}) {
+        std::mt19937 random(11);
+        std::uniform_int_distribution<int> code(-127, 127);
+        std::uniform_real_distribution<float> uniform(-1.F, 1.F);
+        std::vector<float> input(static_cast<std::size_t>(tokens * k)), scales(static_cast<std::size_t>(n));
+        std::vector<std::int8_t> weight(static_cast<std::size_t>(n * k));
+        for (auto& value : input) value = uniform(random);
+        for (auto& value : weight) value = static_cast<std::int8_t>(code(random));
+        for (auto& value : scales) value = 0.001F + 0.01F * std::abs(uniform(random));
+        std::vector<std::uint16_t> output(static_cast<std::size_t>(tokens * n));
+        ASSERT_TRUE(ops::cpu::int8_linear(input.data(), tokens, k, weight.data(), scales.data(), n, output.data()));
+        float error = 0, norm = 0;
+        for (std::int64_t t = 0; t < tokens; ++t)
+            for (std::int64_t j = 0; j < n; ++j) {
+                float expected = 0;
+                for (std::int64_t i = 0; i < k; ++i) expected += input[t * k + i] * weight[j * k + i];
+                expected *= scales[j];
+                const auto actual = std::bit_cast<float>(std::uint32_t{output[t * n + j]} << 16);
+                error += (actual - expected) * (actual - expected);
+                norm += expected * expected;
+            }
+        EXPECT_LT(std::sqrt(error / norm), 0.02F) << "k " << k;
+    }
+}
+
+TEST(FusedCpuTest, BatchedExpertsMatchDecode) {
+    constexpr std::int64_t TOKENS = 5, HIDDEN = 128, INTERMEDIATE = 64;
+    std::mt19937 random(13);
+    std::uniform_int_distribution<int> code(-127, 127);
+    std::uniform_real_distribution<float> uniform(-1.F, 1.F);
+    std::vector<float> input(TOKENS * HIDDEN);
+    for (auto& x : input) x = uniform(random);
+    std::array<std::vector<std::int8_t>, 3> gate_up, down;
+    std::vector<float> up_scales(2 * INTERMEDIATE, 0.002F), down_scales(HIDDEN, 0.003F);
+    const std::array<std::vector<std::int32_t>, 3> tokens{{{0, 1, 3}, {1, 2, 3}, {0, 2}}};
+    const std::array<std::vector<float>, 3> routes{{{0.2F, 0.5F, 0.1F}, {0.3F, 0.4F, 0.6F}, {0.7F, 0.2F}}};
+    std::vector<ops::cpu::RoutedExpert> experts;
+    for (std::size_t e = 0; e < 3; ++e) {
+        gate_up[e].resize(2 * INTERMEDIATE * HIDDEN);
+        down[e].resize(HIDDEN * INTERMEDIATE);
+        for (auto& x : gate_up[e]) x = static_cast<std::int8_t>(code(random));
+        for (auto& x : down[e]) x = static_cast<std::int8_t>(code(random));
+        experts.push_back({{gate_up[e].data(), up_scales.data(), down[e].data(), down_scales.data(), 0.F},
+                           tokens[e], routes[e]});
+    }
+    std::vector<float> actual(TOKENS * HIDDEN), expected(HIDDEN);
+    ASSERT_TRUE(ops::cpu::expert_prefill(input.data(), TOKENS, experts, HIDDEN, INTERMEDIATE, 4.F, 6.F, actual.data()));
+    for (std::int32_t t = 0; t < TOKENS; ++t) {
+        std::vector<ops::cpu::ExpertRows> chosen;
+        for (const auto& e : experts)
+            for (std::size_t r = 0; r < e.tokens.size(); ++r)
+                if (e.tokens[r] == t) {
+                    auto weight = e.weight;
+                    weight.route = e.routes[r];
+                    chosen.push_back(weight);
+                }
+        ASSERT_TRUE(ops::cpu::expert_decode(input.data() + t * HIDDEN, chosen, HIDDEN, INTERMEDIATE,
+                                           4.F, 6.F, expected.data()));
+        for (std::int64_t c = 0; c < HIDDEN; ++c) EXPECT_NEAR(actual[t * HIDDEN + c], expected[c], 1e-5);
+    }
+}
+
+TEST(FusedCpuTest, Int8CacheUpdatesAndAttention) {
+    using ops::require;
+    using tensor::Tensor;
+    using tensor::DType;
+    ops::Context context;
+    constexpr std::int64_t CAPACITY = 2000, HEADS = 2, WIDTH = 64, QUERIES = 6, GROUP = 32;
+    constexpr auto GROUPS = HEADS * WIDTH / GROUP;
+    auto cache = require(Tensor::zeros({1, CAPACITY, HEADS * WIDTH}, DType::I8));
+    auto scales = require(Tensor::zeros({CAPACITY, GROUPS}, DType::F32));
+    std::vector<float> input(3 * HEADS * WIDTH);
+    for (std::size_t i = 0; i < input.size(); ++i) input[i] = std::sin(static_cast<float>(i)) * (1 + i / WIDTH);
+    std::fill_n(input.data(), WIDTH, 0.F);
+    const std::array<std::int32_t, 3> indices{7, 1998, 1999};
+    const auto positions = require(Tensor::from_host({3}, std::span<const std::int32_t>(indices)));
+    const auto source = context.cast(make_tensor({3, HEADS, WIDTH}, input), DType::BF16);
+    context.quantize_cache_(cache, scales, source, positions);
+    const auto rounded = context.cast(source, DType::F32);
+    const auto original = require(rounded.data<float>());
+    const auto codes = require(cache.data<std::int8_t>());
+    const auto factors = require(scales.data<float>());
+    std::vector<float> restored(CAPACITY * HEADS * WIDTH);
+    for (std::int64_t row = 0; row < CAPACITY; ++row)
+        for (std::int64_t h = 0; h < HEADS; ++h)
+            for (std::int64_t c = 0; c < WIDTH; ++c) {
+                const auto offset = (row * HEADS + h) * WIDTH + c;
+                restored[offset] = codes[offset] * factors[offset / GROUP];
+            }
+    for (std::size_t t = 0; t < indices.size(); ++t)
+        for (std::int64_t h = 0; h < HEADS; ++h)
+            for (std::int64_t c = 0; c < WIDTH; ++c)
+                EXPECT_NEAR(restored[(indices[t] * HEADS + h) * WIDTH + c],
+                            original[(t * HEADS + h) * WIDTH + c],
+                            factors[(indices[t] * HEADS * WIDTH + h * WIDTH + c) / GROUP] * 0.51F);
+    EXPECT_EQ(factors[7 * GROUPS], 1.F);
+    EXPECT_EQ(factors[8 * GROUPS], 0.F);
+    std::vector<float> query(QUERIES * WIDTH, 0.5F), zero(query.size()), relative(QUERIES * 4, 0.1F);
+    std::vector<float> sink(QUERIES, 0.3F);
+    const auto q = make_tensor({1, QUERIES * WIDTH}, query);
+    const auto r = make_tensor({1, QUERIES, 4}, relative);
+    const auto s = make_tensor({1, QUERIES}, sink);
+    const auto g = make_tensor({1, QUERIES * WIDTH}, zero);
+    const auto floats = make_tensor({CAPACITY, HEADS * WIDTH}, restored);
+    const auto bytes = require(cache.reshape({CAPACITY, HEADS * WIDTH}));
+    for (const auto window : {0, 2}) {
+        const ops::Context::RelativeAttention shape{.heads = QUERIES, .key_heads = HEADS, .start = CAPACITY - 1,
+                                           .window = window, .extent = 4, .log_alpha = 0.2F, .log_floor = 16.F};
+        const auto actual = context.relative_attention(q, bytes, bytes, r, s, g, shape, {}, scales, scales);
+        const auto expected = context.relative_attention(q, floats, floats, r, s, g, shape);
+        const auto a = require(actual.data<float>()), e = require(expected.data<float>());
+        for (std::size_t i = 0; i < a.size(); ++i) EXPECT_NEAR(a[i], e[i], 1e-5F);
+    }
+    const std::array<std::int32_t, 3> bad_indices{0, CAPACITY, 1};
+    const auto bad = require(Tensor::from_host({3}, std::span<const std::int32_t>(bad_indices)));
+    EXPECT_THROW(context.quantize_cache_(cache, scales, source, bad), ops::Failure);
+    EXPECT_EQ(factors[0], 0.F);
+    EXPECT_THROW(context.relative_attention(q, bytes, bytes, r, s, g,
+                                            {.heads = QUERIES, .key_heads = HEADS, .start = CAPACITY - 1, .extent = 4}),
+                 ops::Failure);
+}
+
+TEST(FusedCpuTest, LongContextGroupedAttentionMatchesReference) {
+    // Decode forces key-range splitting; unordered positions and a tile tail exercise prefill causal masking.
+    constexpr std::int64_t HEADS = 6, KEY_HEADS = 2, WIDTH = 32, EXTENT = 4, ROWS = 2000;
+    std::mt19937 random(5);
+    std::uniform_real_distribution<float> uniform(-1.F, 1.F);
+    std::vector<float> key(ROWS * KEY_HEADS * WIDTH), value(key.size());
+    for (auto& x : key) x = uniform(random);
+    for (auto& x : value) x = uniform(random);
+    for (const auto& positions : {std::vector<std::int32_t>{ROWS - 1}, std::vector<std::int32_t>{9, 4, 12, 6, 7}}) {
+        const auto tokens = static_cast<std::int64_t>(positions.size());
+        std::vector<float> query(tokens * HEADS * WIDTH), gate(query.size()), relative(tokens * HEADS * EXTENT),
+            sink(tokens * HEADS), output(query.size());
+        for (auto* values : {&query, &gate, &relative, &sink})
+            for (auto& x : *values) x = 2.F * uniform(random);
+        const ops::cpu::RelativeAttentionShape shape{tokens, HEADS, KEY_HEADS, WIDTH, EXTENT, 0, 0.F, 0.F};
+        const ops::cpu::Rows key_rows{key.data(), ops::cpu::Rows::Storage::F32, KEY_HEADS * WIDTH};
+        const ops::cpu::Rows value_rows{value.data(), ops::cpu::Rows::Storage::F32, KEY_HEADS * WIDTH};
+        ASSERT_TRUE(ops::cpu::relative_attention(query.data(), key_rows, value_rows, relative.data(), sink.data(),
+                                                 gate.data(), positions, shape, output.data()));
+        for (std::int64_t t = 0; t < tokens; ++t)
+            for (std::int64_t h = 0; h < HEADS; ++h) {
+                const auto row = t * HEADS + h;
+                const auto column = h / (HEADS / KEY_HEADS) * WIDTH;
+                const auto position = positions[static_cast<std::size_t>(t)];
+                std::vector<double> logits;
+                double maximum = sink[row];
+                for (std::int64_t i = 0; i <= position; ++i) {
+                    double logit = 0;
+                    for (std::int64_t c = 0; c < WIDTH; ++c)
+                        logit += query[row * WIDTH + c] * key[i * KEY_HEADS * WIDTH + column + c];
+                    logit /= std::sqrt(static_cast<double>(WIDTH));
+                    if (position - i < EXTENT) logit += relative[row * EXTENT + position - i];
+                    logits.push_back(logit);
+                    maximum = std::max(maximum, logit);
+                }
+                double denominator = std::exp(sink[row] - maximum);
+                for (auto& logit : logits) denominator += logit = std::exp(logit - maximum);
+                for (std::int64_t c = 0; c < WIDTH; ++c) {
+                    double expected = 0;
+                    for (std::int64_t i = 0; i <= position; ++i)
+                        expected += logits[i] * value[i * KEY_HEADS * WIDTH + column + c];
+                    expected /= denominator * (1. + std::exp(-gate[row * WIDTH + c]));
+                    EXPECT_NEAR(output[row * WIDTH + c], expected, 1e-4) << "token " << t << " head " << h;
+                }
+            }
+    }
 }
 } // namespace

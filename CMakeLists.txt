@@ -132,6 +132,7 @@ add_library(kidi
     src/kidi/model/transformer.cpp
     src/kidi/model/whisper.cpp
     src/kidi/ops/context.cpp
+    src/kidi/ops/cpu_kernels.cpp
     src/kidi/ops/quantization.cpp
     src/kidi/runtime/operator.cpp
     src/kidi/runtime/parity_math.cpp
