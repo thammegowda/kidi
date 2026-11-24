@@ -28,11 +28,13 @@ auto test_provider(ChatClientOptions options) -> Result<Provider> {
             return Message{
                 .role = Role::ASSISTANT, .content = "result: " + messages.back().content, .usage = TokenUsage{500, 16}};
         const auto& text = messages.back().content;
-        if (text == "stream" && options.on_delta) {
-            options.on_delta("Inspecting.\n", true);
-            options.on_delta("first piece", false);
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            options.on_delta(" and last piece", false);
+        if (text == "stream") {
+            if (options.on_delta) {
+                options.on_delta("Inspecting.\n", true);
+                options.on_delta("first piece", false);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                options.on_delta(" and last piece", false);
+            }
             return Message{.role = Role::ASSISTANT, .content = "first piece and last piece",
                            .reasoning_content = "Inspecting.\n"};
         }
@@ -405,6 +407,14 @@ TEST_F(CodeTerminal, PipedInput) {
     ASSERT_TRUE(wait_task("echo: hello"));
     finish();
     EXPECT_EQ(output_text_.find('\033'), std::string::npos);
+}
+
+TEST_F(CodeTerminal, PipedStreamingResponseIsDisplayed) {
+    start(false);
+    send("stream\n");
+    ASSERT_TRUE(wait_task("first piece and last piece"));
+    send("/exit\n");
+    finish();
 }
 
 TEST_F(CodeTerminal, PipedApprovalUsesLineInput) {

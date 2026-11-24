@@ -9,12 +9,14 @@ on:
       - 'CMakeLists.txt'
       - 'CMakePresets.json'
       - 'cmake/**'
+      - 'kidi-code/**'
       - 'kidi-ops/**'
       - 'src/kidi/**'
       - 'third_party/**'
       - 'python/**'
       - 'pyproject.toml'
       - 'tests/kidi/**'
+      - 'tests/CMakeLists.txt'
       - 'tests/data/**'
       - 'tests/*_test.py'
       - 'benchmarks/cuda/run.py'
@@ -27,12 +29,14 @@ on:
       - 'CMakeLists.txt'
       - 'CMakePresets.json'
       - 'cmake/**'
+      - 'kidi-code/**'
       - 'kidi-ops/**'
       - 'src/kidi/**'
       - 'third_party/**'
       - 'python/**'
       - 'pyproject.toml'
       - 'tests/kidi/**'
+      - 'tests/CMakeLists.txt'
       - 'tests/data/**'
       - 'tests/*_test.py'
       - 'benchmarks/cuda/run.py'
@@ -143,7 +147,8 @@ jobs:
           key: native-ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache-id }}-${{ github.sha }}
 
       - name: Run native unit tests
-        run: ctest --test-dir build-ci --output-on-failure
+        # These runners have no GPUs; the CUDA-labeled tests require GPU resources.
+        run: ctest --test-dir build-ci --output-on-failure --no-tests=error -LE cuda
 
       - name: Install Python wheel
         shell: bash

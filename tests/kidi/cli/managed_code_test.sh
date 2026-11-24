@@ -53,8 +53,9 @@ theta
 {%- endif -%}
 JINJA
 printf 'version: 1\nprompts:\n  system: custom prompt\ntools: []\n' > "$root/agent.yaml"
+# The random-weight fixture needs greedy decoding for deterministic text and stopping.
 run_code() {
-    "$kidi" code --backend ynnpack --workspace "$root" --timeout-ms 5000 --max-tokens 8 -p "$1" "${@:2}"
+    "$kidi" code --backend ynnpack --workspace "$root" --timeout-ms 5000 --max-tokens 8 --temperature 0 -p "$1" "${@:2}"
 }
 
 # Concurrent clients have independent configurations and share one cold start.
@@ -87,7 +88,7 @@ read_state
 test "$pid" = "$previous_pid"
 if [[ -n $standalone ]]; then
     test "$("$standalone" --base-url "http://127.0.0.1:$port/v1" --workspace "$root" \
-        --max-tokens 8 --timeout-ms 5000 -p standalone)" = lambda
+        --max-tokens 8 --temperature 0 --timeout-ms 5000 -p standalone)" = lambda
 fi
 
 # A crashed daemon leaves stale metadata. The next client replaces it.
@@ -116,21 +117,23 @@ if [[ ${KIDI_TEST_REAL_IDLE:-0} == 1 ]]; then
     (( SECONDS - started >= 599 ))
 fi
 
-# Auto on a machine without visible CUDA devices falls back to CPU. Different
-# visibility settings must not reuse the same daemon, even when both hide GPUs.
+# Different CUDA visibility settings must not reuse the same auto-backend daemon.
+# With CUDA hidden, auto selects CPU on Linux and may select Metal on macOS.
 auto_root="$root/auto-runtime"
 mkdir -m 700 "$auto_root"
 for visible in '' '-1'; do
     test "$(XDG_RUNTIME_DIR="$auto_root" CUDA_VISIBLE_DEVICES="$visible" "$kidi" code \
-        --workspace "$root" --timeout-ms 5000 --max-tokens 8 -p auto)" = lambda
+        --workspace "$root" --timeout-ms 5000 --max-tokens 8 --temperature 0 -p auto)" = lambda
 done
 test "$(find "$auto_root" -name server.json -type f | wc -l)" -eq 2
-test "$(grep -l 'inference device: cpu:0 (backend=auto)' "$auto_root"/kidi-code-*/*/serve.log | wc -l)" -eq 2
+auto_device='cpu:0'
+if [[ $(uname -s) == Darwin ]]; then auto_device='(cpu:0|a_gpu:0)'; fi
+test "$(grep -lE "inference device: $auto_device \(backend=auto\)" "$auto_root"/kidi-code-*/*/serve.log | wc -l)" -eq 2
 
 # Opt-in tiny-model CUDA smoke test; the caller selects an idle physical GPU.
 if [[ -n ${KIDI_TEST_AUTO_CUDA:-} ]]; then
     test "$(XDG_RUNTIME_DIR="$auto_root" CUDA_VISIBLE_DEVICES="$KIDI_TEST_AUTO_CUDA" "$kidi" code \
-        --workspace "$root" --timeout-ms 30000 --max-tokens 8 -p auto-cuda)" = lambda
+        --workspace "$root" --timeout-ms 30000 --max-tokens 8 --temperature 0 -p auto-cuda)" = lambda
     test "$(grep -l 'inference device: cuda:0 (backend=auto)' "$auto_root"/kidi-code-*/*/serve.log | wc -l)" -eq 1
 fi
 
@@ -165,9 +168,9 @@ if [[ -n ${KIDI_TEST_AUTO_CUDA:-} ]]; then compact_backend=auto; fi
     printf '/context\n/compact\n/context\n/exit\n'
 } | XDG_RUNTIME_DIR="$compact_runtime" CUDA_VISIBLE_DEVICES="${KIDI_TEST_AUTO_CUDA:-}" \
     "$kidi" code --model "$compact_model" --backend "$compact_backend" \
-    --workspace "$root" --config "$root/compact.yaml" --context-size 16 --max-tokens 8 --timeout-ms 5000 \
+    --workspace "$root" --config "$root/compact.yaml" --context-size 16 --max-tokens 8 --temperature 0 --timeout-ms 5000 \
     > "$root/compact.out" 2> "$root/compact.log"
-if [[ $(wc -l < "$root/compact.out") != 9 ]] || grep -q 'kidi-code:' "$root/compact.log"; then
+if [[ $(wc -l < "$root/compact.out") -ne 9 ]] || grep -q 'kidi-code:' "$root/compact.log"; then
     cat "$root/compact.log"
     exit 1
 fi
@@ -185,7 +188,7 @@ grep -q '^{"type":"message","role":"user","content":"Task 8 ' "$compact_session"
 # happens to equal the explicitly requested setting.
 XDG_RUNTIME_DIR="$compact_runtime" CUDA_VISIBLE_DEVICES="${KIDI_TEST_AUTO_CUDA:-}" \
     "$kidi" code --model "$compact_model" --backend "$compact_backend" \
-    --workspace "$root" --config "$root/compact.yaml" --max-tokens 8 --timeout-ms 5000 -p short \
+    --workspace "$root" --config "$root/compact.yaml" --max-tokens 8 --temperature 0 --timeout-ms 5000 -p short \
     > "$root/compact-default.out"
 test "$(find "$compact_runtime" -name server.json -type f | wc -l)" -eq 2
 # Without --context-size the daemon sizes the context from free memory (capped by the model limit).

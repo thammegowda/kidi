@@ -118,10 +118,11 @@ test('desktop adapter uses LiteApp requests, binary uploads, and isolated speech
         speech.open();
         await setImmediate();
 
-        backend.send('chat.start', 'chat', {messages: []});
+        const messages = [{role: 'user', content: 'Describe this', images: [1]}];
+        backend.send('chat.start', 'chat', {messages});
         backend.send('tts.start', 'speech', {stream_id: 9, text: 'Hello'});
         assert.deepEqual(message(main), {
-            version: 1, kind: 'request', id: 'chat', method: 'chat.start', payload: {messages: []},
+            version: 1, kind: 'request', id: 'chat', method: 'chat.start', payload: {messages},
         });
         assert.equal(message(speech).method, 'tts.start');
         main.receive(event('chat', 0, 'chat.delta', {text: 'Hi'}));

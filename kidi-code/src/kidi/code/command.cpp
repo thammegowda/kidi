@@ -5,12 +5,13 @@
 #include "kidi/code/workspace.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstdlib>
 #include <iostream>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <set>
+#include <stop_token>
 #include <thread>
 
 namespace kidi::code {
@@ -108,8 +109,13 @@ auto code_command(const cli::Namespace& arguments, ProviderFactory create_provid
     const bool interactive = prompt.empty();
     Terminal terminal(arguments.get<std::string>("color"));
     std::set<std::string> session_grants;
-    std::atomic<std::shared_ptr<std::stop_source>> stop{std::make_shared<std::stop_source>()};
-    const auto request_stop = [&] { stop.load()->request_stop(); };
+    std::mutex stop_mutex;
+    std::stop_source stop;
+    const auto current_stop = [&] {
+        const std::lock_guard lock(stop_mutex);
+        return stop;
+    };
+    const auto request_stop = [&] { current_stop().request_stop(); };
     bool input_closed = false;
     std::vector<Message> history{{.role = Role::SYSTEM, .content = config->system_prompt}};
     std::optional<Transcript> transcript;
@@ -153,7 +159,7 @@ auto code_command(const cli::Namespace& arguments, ProviderFactory create_provid
         terminal.status(text.str());
     };
     Callbacks callbacks;
-    if (interactive) {
+    if (interactive && terminal.interactive()) {
         options_http.on_delta = [&](std::string_view text, bool thinking) {
             auto& seen = thinking ? streamed_reasoning : streamed_content;
             if (!seen) {
@@ -320,7 +326,10 @@ auto code_command(const cli::Namespace& arguments, ProviderFactory create_provid
             terminal.write("kidi-code: " + terminal_text(provider.error().message) + "\n", TerminalTone::ERROR);
             return 1;
         }
-        stop.store(std::make_shared<std::stop_source>());
+        {
+            const std::lock_guard lock(stop_mutex);
+            stop = std::stop_source{};
+        }
         if (transcript_error) {
             terminal.write("kidi-code: " + terminal_text(transcript_error->message) + "\n", TerminalTone::ERROR);
             return 1;
@@ -342,7 +351,7 @@ auto code_command(const cli::Namespace& arguments, ProviderFactory create_provid
             terminal.write("kidi-code: " + terminal_text(transcript_error->message) + "\n", TerminalTone::ERROR);
             return 1;
         }
-        const auto token = stop.load()->get_token();
+        const auto token = current_stop().get_token();
         if (control) {
             const auto specs = visible_specs();
             if (task == "/compact") {
