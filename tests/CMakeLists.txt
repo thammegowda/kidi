@@ -123,9 +123,15 @@ target_compile_definitions(kidi_tokenizer_test PRIVATE
 kidi_add_test(kidi_phonemizer_test tests/kidi/text/phonemizer_test.cpp)
 kidi_add_test(kidi_sentence_test tests/kidi/text/sentence_test.cpp)
 kidi_add_test(kidi_rtg_package_test tests/kidi/checkpoint/package_test.cpp)
-kidi_add_test(kidi_gemma4_test tests/kidi/model/gemma4_test.cpp COST 100 LABELS native regression cuda)
-# These checkpoints do not fit together on the single-GPU two-slot fallback.
-kidi_add_test(kidi_inkling2_test tests/kidi/model/inkling2_test.cpp LABELS native cuda RESOURCE_LOCK inkling2_model)
+set(gemma4_test_labels native regression)
+if(KIDI_ENABLE_CUDA)
+    list(APPEND gemma4_test_labels cuda)
+endif()
+kidi_add_test(kidi_gemma4_test tests/kidi/model/gemma4_test.cpp COST 100 LABELS ${gemma4_test_labels})
+if(KIDI_ENABLE_CUDA)
+    # These checkpoints do not fit together on the single-GPU two-slot fallback.
+    kidi_add_test(kidi_inkling2_test tests/kidi/model/inkling2_test.cpp LABELS native cuda RESOURCE_LOCK inkling2_model)
+endif()
 kidi_add_test(kidi_inkling2_cpu_test tests/kidi/model/inkling2_cpu_test.cpp RESOURCE_LOCK inkling2_model)
 # Stable source code for the teacher-forced prefill quality check.
 target_compile_definitions(kidi_inkling2_cpu_test PRIVATE

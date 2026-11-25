@@ -605,8 +605,10 @@ make test
 ```
 
 This builds the `debug` preset with integration tests disabled and runs CTest in
-parallel: at most 12 jobs (`TEST_JOBS` can lower this but is clamped to 12), and
-at most one `cuda`-labelled GPU test runs per GPU (max 8). Before GPU tests run, the
+parallel: at most 12 jobs (`TEST_JOBS` can lower this but is clamped to 12).
+The CPU preset runs the Gemma model checks without requiring CUDA; CUDA-only
+Inkling checks are registered only in CUDA builds. In CUDA builds, at most one
+`cuda`-labelled GPU test runs per GPU (max 8). Before GPU tests run, the
 `GpuPool` setup test (`cmake/gpu-launch.sh --spec`) writes a CTest resource pool with
 one id per visible GPU, so the pool adapts to the host: your `CUDA_VISIBLE_DEVICES` list
 when set (e.g. `CUDA_VISIBLE_DEVICES=4,5 make test-cuda` uses only GPUs 4 and 5), else

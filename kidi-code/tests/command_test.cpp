@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <iostream>
 #include <fstream>
@@ -72,8 +73,14 @@ auto test_provider(ChatClientOptions options) -> Result<Provider> {
 
 class CodeTerminal : public testing::Test {
 protected:
+    struct TerminalState {
+        int result;
+        int error;
+        tcflag_t flags;
+    };
+
     std::filesystem::path root_;
-    int input_ = -1, output_ = -1, slave_ = -1;
+    int input_ = -1, output_ = -1, slave_ = -1, terminal_state_ = -1;
     pid_t child_ = -1;
     std::string output_text_;
 
@@ -91,12 +98,17 @@ protected:
         if (slave_ >= 0) ::close(slave_);
         if (input_ >= 0) ::close(input_);
         if (output_ >= 0 && output_ != input_) ::close(output_);
+        if (terminal_state_ >= 0) ::close(terminal_state_);
         std::filesystem::remove_all(root_);
     }
 
     auto start(bool tty = true, std::vector<std::string> extra = {}, bool no_color = false) -> void {
         int child_input = -1, child_output = -1;
+        int state_pipe[2] = {-1, -1};
         if (tty) {
+            ASSERT_EQ(::pipe(state_pipe), 0);
+            terminal_state_ = state_pipe[0];
+            ASSERT_EQ(::fcntl(state_pipe[1], F_SETFD, FD_CLOEXEC), 0);
             input_ = ::posix_openpt(O_RDWR | O_NOCTTY);
             ASSERT_GE(input_, 0);
             ASSERT_EQ(::grantpt(input_), 0);
@@ -121,6 +133,7 @@ protected:
         if (child_ == 0) {
             ::alarm(15);
             if (tty) {
+                ::close(state_pipe[0]);
                 ::setsid();
                 ::ioctl(slave_, TIOCSCTTY, 0);
             }
@@ -146,8 +159,16 @@ protected:
             const auto status = code_command(parser.parse_args(views), test_provider);
             std::cout.flush();
             std::cerr.flush();
+            if (tty) {
+                termios state{};
+                const int result = ::tcgetattr(STDIN_FILENO, &state);
+                const TerminalState report{result, result == 0 ? 0 : errno, state.c_lflag};
+                if (::write(state_pipe[1], &report, sizeof(report)) != sizeof(report)) ::_exit(125);
+                ::close(state_pipe[1]);
+            }
             ::_exit(status);
         }
+        if (tty) ::close(state_pipe[1]);
         if (!tty) {
             ::close(child_input);
             ::close(child_output);
@@ -238,12 +259,15 @@ protected:
             if (count <= 0) break;
             output_text_.append(buffer, static_cast<std::size_t>(count));
         }
-        if (slave_ >= 0) {
-            termios state{};
-            ASSERT_EQ(::tcgetattr(slave_, &state), 0);
-            EXPECT_NE(state.c_lflag & ICANON, 0u);
-            EXPECT_NE(state.c_lflag & ECHO, 0u);
-            EXPECT_NE(state.c_lflag & ISIG, 0u);
+        if (terminal_state_ >= 0) {
+            TerminalState state{};
+            ASSERT_EQ(::read(terminal_state_, &state, sizeof(state)), sizeof(state));
+            ::close(terminal_state_);
+            terminal_state_ = -1;
+            ASSERT_EQ(state.result, 0) << std::strerror(state.error);
+            EXPECT_NE(state.flags & ICANON, 0u);
+            EXPECT_NE(state.flags & ECHO, 0u);
+            EXPECT_NE(state.flags & ISIG, 0u);
         }
     }
 };
