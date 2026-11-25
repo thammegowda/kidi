@@ -21,12 +21,19 @@ constexpr float EPSILON = 1e-6F;
 constexpr std::int32_t CONV_WIDTH = 4;
 
 auto cpu_projection(std::string_view name) -> bool {
-    constexpr std::array<std::string_view, 11> SUFFIXES{
-        "qrg_sink.weight", "wkv_dv.weight", "wk_dv.weight", "wv_dv.weight",
-        "wk_taps.weight", "wv_taps.weight", "wo_ud.weight", "rel_logits_proj.proj_t",
-        "down_weight", "gain_forget_weight", "gate.weight"};
+    constexpr std::array<std::string_view, 9> SUFFIXES{
+        "qrg_sink.weight", "wkv_dv.weight", "wk_taps.weight", "wv_taps.weight",
+        "wo_ud.weight", "rel_logits_proj.proj_t", "down_weight", "gain_forget_weight", "gate.weight"};
     return name == "unembed.weight" ||
            std::ranges::any_of(SUFFIXES, [&](std::string_view suffix) { return name.ends_with(suffix); });
+}
+
+auto narrow_packed(const ops::PackedWeight& packed, std::int64_t offset, std::int64_t rows) -> ops::PackedWeight {
+    return {require(packed.values.narrow(0, offset, rows)),
+            require(packed.scales.narrow(0, offset, rows)),
+            packed.zeros.defined() ? require(packed.zeros.narrow(0, offset, rows)) : Tensor{},
+            packed.bits,
+            packed.group_size};
 }
 
 auto host_floats(const checkpoint::Weights& weights, const std::string& name) -> std::vector<float> {
@@ -247,6 +254,7 @@ auto Inkling2Impl::load_prepared_checkpoint(const checkpoint::Weights& weights) 
                 staged_packed.emplace(name, load_packed(prefix, value.size(0), value.size(1)));
             }
         }
+        bind_local_kv_packed(staged_weights, staged_packed);
         if (!staged_weights.contains("embed.weight") || !staged_packed.contains("unembed.weight"))
             throw ops::Failure({ErrorCode::INVALID_MANIFEST, "incomplete prepared Inkling-2 CPU checkpoint"});
         decltype(experts_weights_) staged_experts(static_cast<std::size_t>(layers_),
@@ -542,10 +550,12 @@ auto Inkling2Impl::set_checkpoint(const checkpoint::Weights& weights, RuntimeQua
         context_ = std::move(context);
         // CPU runs every dense projection (everything that goes through project_bf16) as row-scaled W8A8.
         decltype(packed_) staged_packed;
-        if (cpu)
+        if (cpu) {
             for (const auto& [name, tensor] : staged_weights)
                 if (tensor.dimensions() == 2 && tensor.dtype() == DType::BF16 && cpu_projection(name))
                     staged_packed[name] = require(ops::pack_rows_int8(tensor));
+            bind_local_kv_packed(staged_weights, staged_packed);
+        }
         weights_ = std::move(staged_weights);
         packed_ = std::move(staged_packed);
         experts_weights_ = std::move(staged_experts);
@@ -711,19 +721,44 @@ auto Inkling2Impl::save_convolution_input(Tensor& saved, const Tensor& input) ->
     context_->copy_slice_(saved, input, 0, 0);
 }
 
+auto Inkling2Impl::bind_local_kv_packed(const std::map<std::string, Tensor, std::less<>>& weights,
+                                        std::map<std::string, ops::PackedWeight, std::less<>>& packed) const -> void {
+    for (std::int32_t layer = 0; layer < layers_; ++layer) {
+        if (!local(layer)) continue;
+        const auto p = "layers." + std::to_string(layer) + ".attn.";
+        const auto combined = packed.find(p + "wkv_dv.weight");
+        const auto wk = weights.find(p + "wk_dv.weight");
+        const auto wv = weights.find(p + "wv_dv.weight");
+        if (combined == packed.end() || wk == weights.end() || wv == weights.end() || wk->second.dimensions() != 2 ||
+            wv->second.dimensions() != 2 ||
+            wk->second.size(0) + wv->second.size(0) != combined->second.values.size(0))
+            throw ops::Failure({ErrorCode::INVALID_MANIFEST, "incomplete Inkling-2 local K/V packed weights"});
+        const auto k_rows = static_cast<std::int64_t>(wk->second.size(0));
+        const auto v_rows = static_cast<std::int64_t>(wv->second.size(0));
+        packed.insert_or_assign(p + "wk_dv.weight", narrow_packed(combined->second, 0, k_rows));
+        packed.insert_or_assign(p + "wv_dv.weight", narrow_packed(combined->second, k_rows, v_rows));
+    }
+}
+
 auto Inkling2Impl::convolve(const Tensor& input, Tensor& state, const Tensor& weight, const Tensor& taps,
                             const Tensor& conv_slot, const Tensor& tail_slots, float scale, const Tensor& residual,
-                            std::optional<DType> output_dtype, Tensor* saved_input) -> Tensor {
+                            std::optional<DType> output_dtype, Tensor* saved_input,
+                            bool fuse_single_update) -> Tensor {
     if (saved_input) save_convolution_input(*saved_input, input);
     auto& context = *context_;
     const auto T = static_cast<std::int64_t>(input.size(0));
     const auto C = static_cast<std::int64_t>(input.size(1));
+    const bool fused_update = fuse_single_update && T == 1;
     auto output = context.short_convolution(input, require(state.reshape({CONV_WIDTH, C})), weight, taps, conv_slot,
-                                            scale, residual, output_dtype, T == 1);
-    if (T > 1) {
-        const auto K = std::min<std::int64_t>(T, CONV_WIDTH);
-        const auto tail = K == T ? input : require(input.narrow(0, T - K, K));
-        context.scatter_unique_(state, require(tail.reshape({1, K, C})), tail_slots);
+                                            scale, residual, output_dtype, fused_update);
+    if (!fused_update) {
+        if (T == 1) {
+            context.scatter_unique_(state, require(input.reshape({1, 1, C})), conv_slot);
+        } else {
+            const auto K = std::min<std::int64_t>(T, CONV_WIDTH);
+            const auto tail = K == T ? input : require(input.narrow(0, T - K, K));
+            context.scatter_unique_(state, require(tail.reshape({1, K, C})), tail_slots);
+        }
     }
     return output;
 }
@@ -779,25 +814,10 @@ auto Inkling2Impl::attention(std::int32_t layer, const std::array<Tensor, 3>& in
     const auto& k_weight = weight(p + (is_local ? "k_sconv.weight" : "k_sconv.static_w"));
     const auto& v_weight = weight(p + (is_local ? "v_sconv.weight" : "v_sconv.static_w"));
     const auto conv_scale = is_local ? plain : dynamic;
-    const auto k_raw = k, v_raw = v;
-    if (cache.record_rewind) {
-        save_convolution_input(cache.rewind_inputs[0], k_raw);
-        save_convolution_input(cache.rewind_inputs[1], v_raw);
-    }
-    k = context.short_convolution(k_raw, require(cache.key_conv.reshape({CONV_WIDTH, kv})), k_weight, k_taps,
-                                  conv_slot, conv_scale);
-    v = context.short_convolution(v_raw, require(cache.value_conv.reshape({CONV_WIDTH, kv})), v_weight, v_taps,
-                                  conv_slot, conv_scale);
-    if (T == 1) {
-        context.scatter_unique_(cache.key_conv, require(k_raw.reshape({1, 1, kv})), conv_slot);
-        context.scatter_unique_(cache.value_conv, require(v_raw.reshape({1, 1, kv})), conv_slot);
-    } else {
-        const auto K = std::min<std::int64_t>(T, CONV_WIDTH);
-        const auto k_tail = K == T ? k_raw : require(k_raw.narrow(0, T - K, K));
-        const auto v_tail = K == T ? v_raw : require(v_raw.narrow(0, T - K, K));
-        context.scatter_unique_(cache.key_conv, require(k_tail.reshape({1, K, kv})), tail_slots);
-        context.scatter_unique_(cache.value_conv, require(v_tail.reshape({1, K, kv})), tail_slots);
-    }
+    k = convolve(k, cache.key_conv, k_weight, k_taps, conv_slot, tail_slots, conv_scale, {}, {},
+                 cache.record_rewind ? &cache.rewind_inputs[0] : nullptr, false);
+    v = convolve(v, cache.value_conv, v_weight, v_taps, conv_slot, tail_slots, conv_scale, {}, {},
+                 cache.record_rewind ? &cache.rewind_inputs[1] : nullptr, false);
     q = context.l2_clip(context.reshape(q, {T, heads_, head_width_}), weight(p + "q_l2_clip.scale"), qk_clip_);
     k = context.l2_clip(context.reshape(k, {T, key_heads_, head_width_}), {}, qk_clip_);
     v = context.rms_norm(context.reshape(v, {T, key_heads_, head_width_}), weight("ones.head"), EPSILON);
@@ -1007,16 +1027,10 @@ auto Inkling2Impl::visit(std::int32_t layer, Stream stream, Inkling2Visit& cache
     }
     const auto attended = attention(layer, inputs, cache, positions, conv_slot, tail_slots);
     const auto plain = 1.F / std::sqrt(static_cast<float>(CONV_WIDTH + 1));
-    Tensor residual;
-    if (layer % block_ == 0) {
-        stream.blocks.push_back(stream.partial);
-        residual = convolve(attended, cache.attention_conv, weight(p + "attn_sconv.weight"), {}, conv_slot, tail_slots,
-                            plain, {}, DType::F32, cache.record_rewind ? &cache.rewind_inputs[2] : nullptr);
-    } else {
-        residual = convolve(attended, cache.attention_conv, weight(p + "attn_sconv.weight"), {}, conv_slot, tail_slots,
-                            plain, stream.partial, DType::F32,
-                            cache.record_rewind ? &cache.rewind_inputs[2] : nullptr);
-    }
+    if (layer % block_ == 0) stream.blocks.push_back(stream.partial);
+    const auto residual = convolve(attended, cache.attention_conv, weight(p + "attn_sconv.weight"), {}, conv_slot,
+                                   tail_slots, plain, layer % block_ == 0 ? Tensor{} : stream.partial, DType::F32,
+                                   cache.record_rewind ? &cache.rewind_inputs[2] : nullptr);
     auto sources = stream.blocks;
     sources.push_back(residual);
     const auto mixed = row(context.residual_mix(sources, weight("attn_res.mlp_queries." + std::to_string(layer)), EPSILON), 0);

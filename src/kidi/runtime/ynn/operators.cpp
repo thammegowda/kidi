@@ -1534,6 +1534,27 @@ struct PackedDenseEntry {
     Tensor col_sums;
 };
 
+auto prepare_f32_bias(const Tensor& bias, std::size_t n, std::vector<float>& dst) -> void {
+    dst.resize(n);
+    if (bias.dtype() == DType::F32) {
+        const auto src = require(std::as_const(bias).data<float>());
+        if (src.size() == 1)
+            std::ranges::fill(dst, src[0]);
+        else
+            std::ranges::copy(src, dst.begin());
+    } else {
+        const auto raw = require(std::as_const(bias).host_bytes());
+        const auto* src = reinterpret_cast<const std::uint16_t*>(raw.data());
+        if (bias.numel() == 1) {
+            float val = 0.F;
+            ::ynn::convert_bf16_to_f32_rows(1, 1, src, 1, &val, 1, 0, 1);
+            std::ranges::fill(dst, val);
+        } else {
+            ::ynn::convert_bf16_to_f32_rows(1, n, src, n, dst.data(), n, 0, 1);
+        }
+    }
+}
+
 class DenseLinearOp final : public Operator {
 public:
     static auto supports(const OperatorSpec& spec, TensorInputs inputs) noexcept -> bool {
@@ -1645,7 +1666,7 @@ public:
         }
 
         if (inputs.size() == 3 && !spec.dynamic_parameters) {
-            prepare_bias(inputs[2], bias_f32_);
+            prepare_f32_bias(inputs[2], n_, bias_f32_);
         }
     }
 
@@ -1661,27 +1682,6 @@ public:
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
-    auto prepare_bias(const Tensor& bias, std::vector<float>& dst) const -> void {
-        dst.resize(n_);
-        if (bias.dtype() == DType::F32) {
-            const auto src = require(std::as_const(bias).data<float>());
-            if (src.size() == 1)
-                std::ranges::fill(dst, src[0]);
-            else
-                std::ranges::copy(src, dst.begin());
-        } else {
-            const auto raw = require(std::as_const(bias).host_bytes());
-            const auto* src = reinterpret_cast<const std::uint16_t*>(raw.data());
-            if (bias.numel() == 1) {
-                float val = 0.F;
-                ::ynn::convert_bf16_to_f32_rows(1, 1, src, 1, &val, 1, 0, 1);
-                std::ranges::fill(dst, val);
-            } else {
-                ::ynn::convert_bf16_to_f32_rows(1, n_, src, n_, dst.data(), n_, 0, 1);
-            }
-        }
-    }
-
     auto run_one_matrix(const void* a_ptr, DType a_dtype, const void* packed_b, const float* bias_ptr, float* out_f32)
         -> void {
         const std::size_t a_elem_bytes = tensor::element_size(b_dtype_);
@@ -1730,7 +1730,7 @@ private:
         auto* out_raw = require(output.host_bytes()).data();
         const float* bias_ptr = nullptr;
         if (inputs.size() == 3) {
-            if (bias_f32_.empty()) prepare_bias(inputs[2], dynamic_bias_f32_);
+            if (bias_f32_.empty()) prepare_f32_bias(inputs[2], n_, dynamic_bias_f32_);
             bias_ptr = bias_f32_.empty() ? dynamic_bias_f32_.data() : bias_f32_.data();
         }
 
@@ -1880,7 +1880,7 @@ public:
             check(::ynn::make_dense_linear_plan(ynn_type_int8, ynn_type_int8, ynn_type_int32, n_, k_, &plan_));
         if (!spec.dynamic_parameters) {
             prepare_scales(inputs[2], w_scales_);
-            if (inputs.size() == 4) prepare_bias(inputs[3], bias_f32_);
+            if (inputs.size() == 4) prepare_f32_bias(inputs[3], n_, bias_f32_);
         }
     }
 
@@ -1903,27 +1903,6 @@ private:
             std::ranges::fill(dst, src[0]);
         else
             std::ranges::copy(src, dst.begin());
-    }
-
-    auto prepare_bias(const Tensor& bias, std::vector<float>& dst) const -> void {
-        dst.resize(n_);
-        if (bias.dtype() == DType::F32) {
-            const auto src = require(std::as_const(bias).data<float>());
-            if (src.size() == 1)
-                std::ranges::fill(dst, src[0]);
-            else
-                std::ranges::copy(src, dst.begin());
-        } else {
-            const auto raw = require(std::as_const(bias).host_bytes());
-            const auto* src = reinterpret_cast<const std::uint16_t*>(raw.data());
-            if (bias.numel() == 1) {
-                float val = 0.F;
-                ::ynn::convert_bf16_to_f32_rows(1, 1, src, 1, &val, 1, 0, 1);
-                std::ranges::fill(dst, val);
-            } else {
-                ::ynn::convert_bf16_to_f32_rows(1, n_, src, n_, dst.data(), n_, 0, 1);
-            }
-        }
     }
 
     auto apply(TensorInputs inputs, Tensor& output) -> void {
@@ -1956,7 +1935,7 @@ private:
 
         const float* bias_ptr = nullptr;
         if (inputs.size() == 4) {
-            if (bias_f32_.empty()) prepare_bias(inputs[3], dynamic_bias_f32_);
+            if (bias_f32_.empty()) prepare_f32_bias(inputs[3], n_, dynamic_bias_f32_);
             bias_ptr = bias_f32_.empty() ? dynamic_bias_f32_.data() : bias_f32_.data();
         }
 

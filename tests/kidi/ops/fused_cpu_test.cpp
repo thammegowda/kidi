@@ -324,12 +324,36 @@ TEST(FusedCpuTest, FastInt8PackingMatchesGeneric) {
     data[WIDTH + 1] = .5F;
     data[WIDTH + 2] = -.5F;
     ops::Context context;
-    for (const auto dtype : {DType::F32, DType::BF16}) {
+    for (const auto dtype : {DType::F32, DType::BF16, DType::F16}) {
         const auto input = context.cast(make_tensor({ROWS, WIDTH}, data), dtype);
+        const auto reference = require(context.cast(input, DType::F32).data<float>());
         const auto expected = require(ops::pack_weight(input, 8, WIDTH));
         const auto actual = require(ops::pack_rows_int8(input));
         EXPECT_EQ(require(actual.values.copy_to_host()), require(expected.values.copy_to_host()));
         EXPECT_EQ(require(actual.scales.copy_to_host()), require(expected.scales.copy_to_host()));
+        const auto actual_values = require(actual.values.data<std::uint8_t>());
+        const auto actual_scales = require(actual.scales.data<float>());
+        for (std::int64_t row = 0; row < ROWS; ++row) {
+            float maximum = 0.F;
+            for (std::int64_t col = 0; col < WIDTH; ++col)
+                maximum = std::max(maximum, std::abs(reference[row * WIDTH + col]));
+            const float scale = maximum == 0.F ? 1.F : maximum / 127.F;
+            EXPECT_EQ(actual_scales[row], scale);
+            for (std::int64_t col = 0; col < WIDTH; ++col) {
+                const auto code = static_cast<std::uint8_t>(
+                    static_cast<int>(std::clamp(std::round(reference[row * WIDTH + col] / scale), -127.F, 127.F)));
+                EXPECT_EQ(actual_values[row * WIDTH + col], code);
+            }
+        }
+    }
+    constexpr std::int64_t GROUP = 4, GROUPS = 3;
+    const std::vector<float> grouped_data(data.begin(), data.begin() + 5 * GROUP * GROUPS);
+    for (const auto dtype : {DType::F32, DType::BF16, DType::F16}) {
+        const auto matrix = context.cast(make_tensor({5, GROUP * GROUPS}, grouped_data), dtype);
+        const auto grouped = require(ops::pack_weight(matrix, 8, GROUP));
+        const auto flat = require(ops::pack_rows_int8(require(matrix.reshape({5 * GROUPS, GROUP}))));
+        EXPECT_EQ(require(grouped.values.copy_to_host()), require(flat.values.copy_to_host()));
+        EXPECT_EQ(require(grouped.scales.copy_to_host()), require(flat.scales.copy_to_host()));
     }
     data[0] = std::numeric_limits<float>::infinity();
     EXPECT_FALSE(ops::pack_rows_int8(make_tensor({ROWS, WIDTH}, data)));

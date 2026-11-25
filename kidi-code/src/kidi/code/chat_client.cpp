@@ -86,14 +86,14 @@ auto parse_reply(const Json& body, bool allow_truncated) -> Result<Message> {
 }
 
 auto encode_request(const ChatClientOptions& options, std::span<const Message> messages, std::span<const ToolSpec> tools,
-                    bool summary = false) -> Result<std::string> {
+                    bool summary, bool stream) -> Result<std::string> {
     std::string payload;
     try {
         Json request{{"model", options.model},
-                     {"stream", static_cast<bool>(options.on_delta)},
+                     {"stream", stream},
                      {"max_tokens", options.max_tokens},
                      {"messages", Json::array()}};
-        if (request["stream"] == true) request["stream_options"] = {{"include_usage", true}};
+        if (stream) request["stream_options"] = {{"include_usage", true}};
         const bool sample = !summary && options.temperature > 0;
         request["temperature"] = sample ? options.temperature : 0.0F;
         if (sample && options.top_p < 1) request["top_p"] = options.top_p;
@@ -145,7 +145,7 @@ auto completion_provider(ChatClientOptions options, CompletionTransport transpor
                                       std::span<const ToolSpec> tools, std::stop_token stop,
                                       bool summary) -> Result<Message> {
         if (stop.stop_requested()) return std::unexpected(Error{ErrorCode::RUNTIME, "cancelled"});
-        auto payload = encode_request(config, messages, tools, summary);
+        auto payload = encode_request(config, messages, tools, summary, static_cast<bool>(config.on_delta));
         if (!payload) return std::unexpected(payload.error());
         auto response = transport(config, std::move(*payload), stop, "/chat/completions");
         if (!response) return std::unexpected(response.error());
@@ -167,13 +167,9 @@ auto completion_provider(ChatClientOptions options, CompletionTransport transpor
     const auto inspect = [options, transport](std::span<const Message> messages, std::span<const ToolSpec> tools,
                                               std::stop_token stop, bool summary) -> Result<ContextUsage> {
         if (stop.stop_requested()) return std::unexpected(Error{ErrorCode::RUNTIME, "cancelled"});
-        auto payload = encode_request(options, messages, tools, summary);
-        if (!payload) return std::unexpected(payload.error());
         // Context inspection is always a single JSON response.
-        auto request = Json::parse(*payload);
-        request["stream"] = false;
-        request.erase("stream_options");
-        *payload = request.dump();
+        auto payload = encode_request(options, messages, tools, summary, false);
+        if (!payload) return std::unexpected(payload.error());
         auto response = transport(options, std::move(*payload), stop, "/chat/context");
         if (!response) return std::unexpected(response.error());
         const auto body = Json::parse(*response, nullptr, false);

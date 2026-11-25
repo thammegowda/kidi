@@ -102,11 +102,13 @@ private:
     auto blend(std::int32_t layer, const std::string& stream, const tensor::Tensor& destination,
                const tensor::Tensor& message, const tensor::Tensor& norm) -> tensor::Tensor;
     auto moe(std::int32_t layer, const tensor::Tensor& input) -> tensor::Tensor;
+    auto bind_local_kv_packed(const std::map<std::string, tensor::Tensor, std::less<>>& weights,
+                              std::map<std::string, ops::PackedWeight, std::less<>>& packed) const -> void;
     auto convolve(const tensor::Tensor& input, tensor::Tensor& state, const tensor::Tensor& weight,
                   const tensor::Tensor& taps, const tensor::Tensor& conv_slot, const tensor::Tensor& tail_slots,
                   float scale, const tensor::Tensor& residual = {},
-                  std::optional<tensor::DType> output_dtype = {}, tensor::Tensor* saved_input = nullptr)
-        -> tensor::Tensor;
+                  std::optional<tensor::DType> output_dtype = {}, tensor::Tensor* saved_input = nullptr,
+                  bool fuse_single_update = true) -> tensor::Tensor;
     auto save_convolution_input(tensor::Tensor& saved, const tensor::Tensor& input) -> void;
     auto snapshot_verification(Inkling2State& state) -> void;
     auto stage_host_step(std::span<const std::int32_t> tokens, Inkling2State& state, bool all_logits,

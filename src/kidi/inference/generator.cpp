@@ -104,6 +104,12 @@ auto validate_text_chat(const nlohmann::ordered_json& messages) -> Result<void> 
     return {};
 }
 
+auto format_text_chat(const text::Tokenizer& tokenizer, const nlohmann::ordered_json& messages,
+                      const nlohmann::ordered_json& template_args) -> Result<std::string> {
+    if (auto valid = validate_text_chat(messages); !valid) return std::unexpected(std::move(valid.error()));
+    return tokenizer.format_chat(messages, template_args);
+}
+
 auto sampled(const GenerationOptions& options) -> bool { return options.temperature > 0; }
 
 // Temperature, top-k and top-p sampling over the last logits row. Tokens far below the best logit cannot be drawn
@@ -966,9 +972,7 @@ auto Generator::chat_prompt_tokens(std::span<const text::ChatMessage> messages) 
 }
 auto Generator::enqueue_chat(const nlohmann::ordered_json& messages, GenerationOptions options,
                               const nlohmann::ordered_json& template_args) -> Result<std::uint64_t> {
-    auto valid = validate_text_chat(messages);
-    if (!valid) return std::unexpected(std::move(valid.error()));
-    auto prompt = tokenizer_.format_chat(messages, template_args);
+    auto prompt = format_text_chat(tokenizer_, messages, template_args);
     if (!prompt) return std::unexpected(std::move(prompt.error()));
     options.raw_prompt = true;
     return enqueue(*prompt, options);
@@ -976,9 +980,7 @@ auto Generator::enqueue_chat(const nlohmann::ordered_json& messages, GenerationO
 
 auto Generator::chat_prompt_tokens(const nlohmann::ordered_json& messages,
                                    const nlohmann::ordered_json& template_args) const -> Result<std::size_t> {
-    auto valid = validate_text_chat(messages);
-    if (!valid) return std::unexpected(std::move(valid.error()));
-    auto prompt = tokenizer_.format_chat(messages, template_args);
+    auto prompt = format_text_chat(tokenizer_, messages, template_args);
     if (!prompt) return std::unexpected(std::move(prompt.error()));
     auto ids = tokenizer_.encode(*prompt);
     if (!ids) return std::unexpected(std::move(ids.error()));

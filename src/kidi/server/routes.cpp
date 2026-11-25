@@ -25,7 +25,16 @@ auto enqueue(const ChatRequest& request) {
     };
 }
 
-/// Emits OpenAI deltas for the part of a parsed assistant response the client has not seen yet.
+auto prepare_request(const RouteOptions& options, const liteapp::Request& http) -> Result<ChatRequest> {
+    const auto body = ChatJson::parse(http.body, nullptr, false);
+    auto prepared = prepare_chat_request(body, options.defaults);
+    if (prepared && options.customize)
+        if (auto customized = options.customize(body, *prepared); !customized)
+            return std::unexpected(customized.error());
+    return prepared;
+}
+
+/// Emits OpenAI SSE chunks for deltas produced by AssistantResponseStream.
 class DeltaWriter {
 public:
     DeltaWriter(const liteapp::Response::ContentWriter& write, std::string id, std::string model,
@@ -36,23 +45,20 @@ public:
     auto chunk(ChatJson delta, ChatJson finish_reason = nullptr) -> ChatJson {
         return chat_chunk(id_, model_, created_, std::move(delta), std::move(finish_reason));
     }
-    auto flush(const text::AssistantResponse& parsed) -> bool {
+    auto flush(const text::ResponseDelta& diff, const text::AssistantResponse& full) -> bool {
+        if (diff.empty()) return true;
         ChatJson delta = ChatJson::object();
-        if (parsed.reasoning.size() > sent_.reasoning.size())
-            delta["reasoning_content"] = parsed.reasoning.substr(sent_.reasoning.size());
-        if (parsed.content.size() > sent_.content.size())
-            delta["content"] = parsed.content.substr(sent_.content.size());
-        if (parsed.tool_calls.size() > sent_.tool_calls.size())
-            delta["tool_calls"] = chat_tool_calls(parsed.tool_calls, sent_.tool_calls.size(), "call_" + id_);
-        sent_ = parsed;
-        return delta.empty() || send(chunk(std::move(delta)));
+        if (!diff.reasoning.empty()) delta["reasoning_content"] = diff.reasoning;
+        if (!diff.content.empty()) delta["content"] = diff.content;
+        if (!diff.tool_calls.empty())
+            delta["tool_calls"] = chat_tool_calls(full.tool_calls, diff.first_tool_call, "call_" + id_);
+        return send(chunk(std::move(delta)));
     }
 
 private:
     const liteapp::Response::ContentWriter& write_;
     std::string id_, model_;
     std::int64_t created_;
-    text::AssistantResponse sent_;
 };
 
 } // namespace
@@ -69,11 +75,7 @@ auto mount_chat_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteOpt
                                                            {"owned_by", "kidi"}}})}});
     });
     server.post("/v1/chat/context", [shared, &engine](const liteapp::Request& http) {
-        const auto body = ChatJson::parse(http.body, nullptr, false);
-        auto prepared = prepare_chat_request(body, shared->defaults);
-        if (prepared && shared->customize)
-            if (auto customized = shared->customize(body, *prepared); !customized)
-                prepared = std::unexpected(customized.error());
+        auto prepared = prepare_request(*shared, http);
         if (!prepared) return json_response(chat_error(prepared.error()), 400);
         auto result = engine.context(prepared->messages, prepared->template_args, prepared->generation);
         if (!result) return json_response(chat_error(result.error()), error_status(result.error()));
@@ -83,11 +85,7 @@ auto mount_chat_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteOpt
     });
     server.post("/v1/chat/completions", [shared, next_id, &engine](const liteapp::Request& http) {
         const auto started = Clock::now();
-        const auto body = ChatJson::parse(http.body, nullptr, false);
-        auto prepared = prepare_chat_request(body, shared->defaults);
-        if (prepared && shared->customize)
-            if (auto customized = shared->customize(body, *prepared); !customized)
-                prepared = std::unexpected(customized.error());
+        auto prepared = prepare_request(*shared, http);
         if (!prepared) return json_response(chat_error(prepared.error()), 400);
 
         const auto id = "chatcmpl-" + std::to_string((*next_id)++);
@@ -113,7 +111,7 @@ auto mount_chat_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteOpt
              started](const liteapp::Response::ContentWriter& write) {
                 DeltaWriter out(write, id, shared->model_name, created);
                 if (!out.send(out.chunk({{"role", "assistant"}, {"content", ""}}))) return false;
-                std::string raw;
+                text::AssistantResponseStream stream;
                 bool connected = true;
                 auto heartbeat = Clock::now();
                 auto result = engine.run({.enqueue = enqueue(request),
@@ -128,16 +126,16 @@ auto mount_chat_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteOpt
                                               },
                                           .on_text =
                                               [&](std::string_view delta) {
-                                                  raw.append(delta);
-                                                  connected = out.flush(text::parse_assistant_response(raw, false));
+                                                  const auto diff = stream.append(delta);
+                                                  connected = out.flush(diff, stream.response());
                                                   return connected;
                                               },
                                           .release_workspaces = false});
                 if (!connected) return false;
                 if (!result) return out.send(chat_error(result.error())) && write("data: [DONE]\n\n");
-                const auto parsed = text::parse_assistant_response(result->text);
-                if (!out.flush(parsed) ||
-                    !out.send(out.chunk(ChatJson::object(), chat_finish_reason(parsed, *result))))
+                const auto tail_diff = stream.finish(result->text);
+                if (!out.flush(tail_diff, stream.response()) ||
+                    !out.send(out.chunk(ChatJson::object(), chat_finish_reason(stream.response(), *result))))
                     return false;
                 if (request.include_usage) {
                     auto tail = out.chunk(ChatJson::object());

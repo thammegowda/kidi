@@ -728,23 +728,21 @@ private:
         };
         const auto started = Clock::now();
         // The UI shows only the visible answer: model markup, reasoning, and tool-call syntax are parsed away.
-        std::string raw;
-        std::size_t shown = 0;
+        kidi::text::AssistantResponseStream stream;
         auto result = engine_->run({
             .enqueue = [&](Generator& generator) { return generator.enqueue_chat(conversation, options); },
             .cancelled = cancelled,
             .on_text =
                 [&](std::string_view delta) {
-                    raw += delta;
-                    const auto content = kidi::text::parse_assistant_response(raw, false).content;
-                    if (content.size() > shown) on_delta(std::string_view(content).substr(shown));
-                    shown = std::max(shown, content.size());
+                    const auto update = stream.append(delta);
+                    if (!update.content.empty()) on_delta(update.content);
                     return true;
                 },
             .release_workspaces = release_workspaces,
         });
         if (!result) return std::unexpected(result.error());
-        result->text = kidi::text::parse_assistant_response(result->text).content;
+        (void)stream.finish(result->text);
+        result->text = stream.response().content;
         auto stats = Json::parse(kidi::server::chat_stats(*result, milliseconds(started)).dump());
         return ChatRunResult{.generation = std::move(*result), .stats = std::move(stats)};
     }

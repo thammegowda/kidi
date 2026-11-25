@@ -431,4 +431,34 @@ auto parse_assistant_response(std::string_view text, bool complete) -> Assistant
     return response;
 }
 
+auto AssistantResponseStream::append(std::string_view delta) -> ResponseDelta {
+    raw_.append(delta);
+    return advance(raw_, false);
+}
+
+auto AssistantResponseStream::finish(std::string_view complete_text) -> ResponseDelta {
+    return advance(complete_text, true);
+}
+
+auto AssistantResponseStream::advance(std::string_view text, bool complete) -> ResponseDelta {
+    auto parsed = parse_assistant_response(text, complete);
+    ResponseDelta diff;
+    diff.first_tool_call = emitted_.tool_calls.size();
+    if (parsed.reasoning.size() > emitted_.reasoning.size())
+        diff.reasoning = parsed.reasoning.substr(emitted_.reasoning.size());
+    if (parsed.content.size() > emitted_.content.size())
+        diff.content = parsed.content.substr(emitted_.content.size());
+    if (parsed.tool_calls.size() > emitted_.tool_calls.size())
+        diff.tool_calls.assign(parsed.tool_calls.begin() + static_cast<std::ptrdiff_t>(emitted_.tool_calls.size()),
+                               parsed.tool_calls.end());
+    if (complete) {
+        emitted_ = std::move(parsed);
+    } else {
+        if (parsed.reasoning.size() > emitted_.reasoning.size()) emitted_.reasoning = std::move(parsed.reasoning);
+        if (parsed.content.size() > emitted_.content.size()) emitted_.content = std::move(parsed.content);
+        if (parsed.tool_calls.size() > emitted_.tool_calls.size()) emitted_.tool_calls = std::move(parsed.tool_calls);
+    }
+    return diff;
+}
+
 } // namespace kidi::text

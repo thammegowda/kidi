@@ -13,6 +13,15 @@
 #include <vector>
 
 namespace kidi::ops {
+namespace {
+auto pack_storage(tensor::DType dtype) -> cpu::Rows::Storage {
+    if (dtype == tensor::DType::F32) return cpu::Rows::Storage::F32;
+    if (dtype == tensor::DType::BF16) return cpu::Rows::Storage::BF16;
+    if (dtype == tensor::DType::F16) return cpu::Rows::Storage::F16;
+    throw Failure({ErrorCode::INVALID_ARGUMENT, "packed weights require F16, BF16 or F32 input"});
+}
+} // namespace
+
 auto pack_expert_weights(const tensor::Tensor& values, const tensor::Tensor& scales, const tensor::Tensor& global,
                          bool interleaved) -> Result<PackedWeight> {
     using tensor::DType;
@@ -87,39 +96,23 @@ auto pack_expert_weights(const tensor::Tensor& values, const tensor::Tensor& sca
 
 auto pack_rows_int8(const tensor::Tensor& weight) -> Result<PackedWeight> {
     try {
-        if (!weight.defined() || weight.dimensions() != 2 || !weight.is_contiguous() || !weight.is_host_accessible())
-            throw Failure({ErrorCode::INVALID_ARGUMENT, "row packing needs a contiguous host matrix"});
-        const auto rows = static_cast<std::int64_t>(weight.size(0)), width = static_cast<std::int64_t>(weight.size(1));
+        if (!weight.defined() || weight.dimensions() != 2 || !weight.is_contiguous() || !weight.is_host_accessible() ||
+            !weight.size(0) || !weight.size(1))
+            throw Failure({ErrorCode::INVALID_ARGUMENT, "row packing needs a nonempty contiguous host matrix"});
+        const auto storage = pack_storage(weight.dtype());
+        const auto rows = static_cast<std::int64_t>(weight.size(0));
+        const auto width = static_cast<std::int64_t>(weight.size(1));
         auto values = require(tensor::Tensor::empty({rows, width}, tensor::DType::U8));
         auto scales = require(tensor::Tensor::empty({rows, 1}, tensor::DType::F32));
         const auto target_values = require(values.data<std::uint8_t>());
         const auto target_scales = require(scales.data<float>());
-        if (weight.dtype() == tensor::DType::F32 || weight.dtype() == tensor::DType::BF16) {
-            const auto source = require(weight.host_bytes());
-            const auto storage = weight.dtype() == tensor::DType::F32 ? cpu::Rows::Storage::F32
-                                                                     : cpu::Rows::Storage::BF16;
-            const auto element_bytes = tensor::element_size(weight.dtype());
-            require(runtime::ynn::parallel_ranges(rows, 32, [&](std::size_t begin, std::size_t end) {
-                if (!cpu::pack_int8_rows({source.data() + begin * width * element_bytes, storage, width},
-                                         static_cast<std::int64_t>(end - begin),
-                                         target_values.data() + begin * width, target_scales.data() + begin))
-                    throw Failure({ErrorCode::INVALID_ARGUMENT, "non-finite weight or quantization scale underflow"});
-            }));
-            return PackedWeight{std::move(values), std::move(scales), {}, 8, static_cast<std::int32_t>(width)};
-        }
-        constexpr std::int64_t CHUNK = 256;
-        const auto chunks = static_cast<std::size_t>((rows + CHUNK - 1) / CHUNK);
-        require(runtime::ynn::parallel_ranges(chunks, 1, [&](std::size_t begin, std::size_t end) {
-            for (auto chunk = begin; chunk < end; ++chunk) {
-                const auto first = static_cast<std::int64_t>(chunk) * CHUNK;
-                const auto count = std::min(CHUNK, rows - first);
-                const auto part = require(pack_weight(require(weight.narrow(0, first, count)), 8,
-                                                      static_cast<std::int32_t>(width)));
-                const auto part_values = require(part.values.host_bytes());
-                const auto part_scales = require(part.scales.host_bytes());
-                std::memcpy(target_values.data() + first * width, part_values.data(), part_values.size());
-                std::memcpy(target_scales.data() + first, part_scales.data(), part_scales.size());
-            }
+        const auto source = require(weight.host_bytes());
+        const auto element_bytes = tensor::element_size(weight.dtype());
+        require(runtime::ynn::parallel_ranges(rows, 32, [&](std::size_t begin, std::size_t end) {
+            if (!cpu::pack_int8_rows({source.data() + begin * width * element_bytes, storage, width},
+                                     static_cast<std::int64_t>(end - begin), target_values.data() + begin * width,
+                                     target_scales.data() + begin))
+                throw Failure({ErrorCode::INVALID_ARGUMENT, "non-finite weight or quantization scale underflow"});
         }));
         return PackedWeight{std::move(values), std::move(scales), {}, 8, static_cast<std::int32_t>(width)};
     } catch (const Failure& error) {
@@ -137,6 +130,19 @@ auto pack_weight(const tensor::Tensor& weight, std::int32_t bits, std::int32_t g
             weight.size(1) % group_size || !weight.size(0) || !weight.size(1))
             throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid packed weight dimensions, precision or group size"});
         const auto rows = weight.size(0), width = weight.size(1), groups = width / group_size;
+        if (bits == 8) {
+            auto values = require(tensor::Tensor::empty(
+                {static_cast<std::int64_t>(rows), static_cast<std::int64_t>(width)}, tensor::DType::U8));
+            auto scales = require(tensor::Tensor::empty(
+                {static_cast<std::int64_t>(rows), static_cast<std::int64_t>(groups)}, tensor::DType::F32));
+            const auto bytes = require(weight.host_bytes());
+            auto packed = require(values.data<std::uint8_t>());
+            auto scale_values = require(scales.data<float>());
+            if (!cpu::pack_int8_rows({bytes.data(), pack_storage(weight.dtype()), group_size},
+                                     static_cast<std::int64_t>(rows * groups), packed.data(), scale_values.data()))
+                throw Failure({ErrorCode::INVALID_ARGUMENT, "non-finite weight or quantization scale underflow"});
+            return PackedWeight{std::move(values), std::move(scales), {}, 8, group_size};
+        }
         auto values = require(tensor::Tensor::zeros(
             {static_cast<std::int64_t>(rows), static_cast<std::int64_t>(width / (8 / bits))}, tensor::DType::U8));
         auto scales = require(tensor::Tensor::empty(
@@ -221,11 +227,6 @@ auto pack_weight(const tensor::Tensor& weight, std::int32_t bits, std::int32_t g
                     const auto scale = maximum == 0.F ? 1.F : maximum / limit;
                     if (scale == 0.F) throw Failure({ErrorCode::INVALID_ARGUMENT, "quantization scale underflow"});
                     scale_values[row * groups + group] = scale;
-                    if (bits == 8) {
-                        for (std::int32_t channel = 0; channel < group_size; ++channel)
-                            packed[begin + channel] = static_cast<std::uint8_t>(quantize(read(begin + channel), scale));
-                        continue;
-                    }
                     for (std::int32_t channel = 0; channel < group_size; ++channel) {
                         const auto offset = begin + channel;
                         packed[offset / (8 / bits)] |= (quantize(read(offset), scale) & ((1 << bits) - 1))

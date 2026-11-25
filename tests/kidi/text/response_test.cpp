@@ -90,4 +90,38 @@ TEST(ResponseTest, StreamingMonotonic) {
         << "unterminated tool calls are withheld while streaming";
 }
 
+TEST(ResponseTest, ResponseStreamDeltas) {
+    const std::string full = INKLING_THINKING + INKLING_CALLS;
+    kidi::text::AssistantResponseStream stream;
+    std::string reasoning, content;
+    std::vector<kidi::text::ToolCall> calls;
+    for (std::size_t pos = 0; pos < full.size(); pos += 3) {
+        const auto diff = stream.append(std::string_view(full).substr(pos, 3));
+        reasoning += diff.reasoning;
+        content += diff.content;
+        EXPECT_EQ(diff.first_tool_call, calls.size());
+        calls.insert(calls.end(), diff.tool_calls.begin(), diff.tool_calls.end());
+    }
+    const auto tail = stream.finish(full);
+    reasoning += tail.reasoning;
+    content += tail.content;
+    EXPECT_EQ(tail.first_tool_call, calls.size());
+    calls.insert(calls.end(), tail.tool_calls.begin(), tail.tool_calls.end());
+
+    const auto expected = parse_assistant_response(full);
+    EXPECT_EQ(reasoning, expected.reasoning);
+    EXPECT_EQ(content, expected.content);
+    ASSERT_EQ(calls.size(), expected.tool_calls.size());
+    for (std::size_t i = 0; i < calls.size(); ++i) {
+        EXPECT_EQ(calls[i].name, expected.tool_calls[i].name);
+        EXPECT_EQ(calls[i].arguments, expected.tool_calls[i].arguments);
+    }
+
+    // Trailing partial marker withheld during streaming is flushed on finish.
+    kidi::text::AssistantResponseStream trailing;
+    EXPECT_EQ(trailing.append("hello <").content, "hello ");
+    EXPECT_EQ(trailing.finish("hello <").content, "<");
+    EXPECT_EQ(trailing.response().content, "hello <");
+}
+
 } // namespace

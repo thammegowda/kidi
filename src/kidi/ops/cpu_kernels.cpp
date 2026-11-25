@@ -38,6 +38,17 @@ KIDI_CPU_INLINE auto bf16_to_float(std::uint16_t value) -> float {
     return std::bit_cast<float>(std::uint32_t{value} << 16);
 }
 
+KIDI_CPU_INLINE auto f16_to_float(std::uint16_t value) -> float {
+    const auto wide = static_cast<std::uint32_t>(value) << 16;
+    const auto sign = wide & 0x80000000U;
+    const auto two_w = wide + wide;
+    const auto normalized = std::bit_cast<float>((two_w >> 4) + (0xE0U << 23)) * 0x1.0p-112F;
+    const auto denormalized = std::bit_cast<float>((two_w >> 17) | (126U << 23)) - 0.5F;
+    const auto bits = sign | (two_w < (1U << 27) ? std::bit_cast<std::uint32_t>(denormalized)
+                                                 : std::bit_cast<std::uint32_t>(normalized));
+    return std::bit_cast<float>(bits);
+}
+
 // Branch-free exp (relative error ~2e-7) so element-wise loops vectorize; std::exp/std::tanh are scalar libm calls.
 KIDI_CPU_INLINE auto fast_exp(float x) -> float {
     x = std::min(88.F, std::max(-87.F, x));
@@ -254,6 +265,7 @@ auto pick_value(Rows::Storage value) -> AttendRange {
     case Rows::Storage::F32: return &attend_range<K, Rows::Storage::F32>;
     case Rows::Storage::BF16: return &attend_range<K, Rows::Storage::BF16>;
     case Rows::Storage::I8: return &attend_range<K, Rows::Storage::I8>;
+    case Rows::Storage::F16: return nullptr;
     }
     return nullptr;
 }
@@ -263,6 +275,7 @@ auto pick(Rows::Storage key, Rows::Storage value) -> AttendRange {
     case Rows::Storage::F32: return pick_value<Rows::Storage::F32>(value);
     case Rows::Storage::BF16: return pick_value<Rows::Storage::BF16>(value);
     case Rows::Storage::I8: return pick_value<Rows::Storage::I8>(value);
+    case Rows::Storage::F16: return nullptr;
     }
     return nullptr;
 }
@@ -1387,12 +1400,13 @@ auto l2_clip(const float* input, const float* scale, std::int64_t scale_rows, st
 }
 
 namespace {
-template <typename T>
+template <Rows::Storage Source, typename T>
 KIDI_CPU_INLINE auto pack_int8_rows_impl(const T* input, std::int64_t rows, std::int64_t width,
-                                        std::uint8_t* output, float* scales) -> bool {
+                                         std::uint8_t* output, float* scales) -> bool {
     const auto read = [](T value) {
-        if constexpr (std::is_same_v<T, float>) return value;
-        else return bf16_to_float(value);
+        if constexpr (Source == Rows::Storage::F32) return value;
+        else if constexpr (Source == Rows::Storage::BF16) return bf16_to_float(value);
+        else return f16_to_float(value);
     };
     for (std::int64_t row = 0; row < rows; ++row) {
         const auto* source = input + row * width;
@@ -1422,9 +1436,14 @@ KIDI_CPU_INLINE auto pack_int8_rows_impl(const T* input, std::int64_t rows, std:
 KIDI_CPU_CLONES auto pack_int8_rows(const Rows& input, std::int64_t rows, std::uint8_t* output, float* scales)
     -> bool {
     if (input.storage == Rows::Storage::BF16)
-        return pack_int8_rows_impl(static_cast<const std::uint16_t*>(input.data), rows, input.stride, output, scales);
+        return pack_int8_rows_impl<Rows::Storage::BF16>(static_cast<const std::uint16_t*>(input.data), rows,
+                                                        input.stride, output, scales);
+    if (input.storage == Rows::Storage::F16)
+        return pack_int8_rows_impl<Rows::Storage::F16>(static_cast<const std::uint16_t*>(input.data), rows,
+                                                       input.stride, output, scales);
     if (input.storage != Rows::Storage::F32) return false;
-    return pack_int8_rows_impl(static_cast<const float*>(input.data), rows, input.stride, output, scales);
+    return pack_int8_rows_impl<Rows::Storage::F32>(static_cast<const float*>(input.data), rows, input.stride, output,
+                                                   scales);
 }
 
 auto parallel_rows(std::int64_t rows, std::int64_t width, const std::function<void(std::int64_t, std::int64_t)>& body)

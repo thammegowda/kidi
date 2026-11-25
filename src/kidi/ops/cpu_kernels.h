@@ -13,7 +13,7 @@ namespace kidi::ops::cpu {
 /// Row-major matrix stored as F32, BF16 or INT8. INT8 rows carry one F32 scale per `scale_group` columns; attention
 /// reads use groups that divide the head width.
 struct Rows {
-    enum class Storage { F32, BF16, I8 };
+    enum class Storage { F32, BF16, F16, I8 };
     const void* data = nullptr;
     Storage storage = Storage::F32;
     std::int64_t stride = 0;            // elements between consecutive rows
@@ -21,7 +21,7 @@ struct Rows {
     std::int64_t scale_group = 0;
 };
 
-/// Converts F32/BF16 rows to signed INT8 bytes and one F32 scale per row. Rounds halves away from zero,
+/// Converts F32/BF16/F16 rows to signed INT8 bytes and one F32 scale per row. Rounds halves away from zero,
 /// matching checkpoint packing; returns false for non-finite inputs or underflowed scales.
 auto pack_int8_rows(const Rows& input, std::int64_t rows, std::uint8_t* output, float* scales) -> bool;
 

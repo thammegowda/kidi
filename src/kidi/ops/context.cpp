@@ -150,6 +150,22 @@ auto cpu_output(Context& context, std::vector<std::int64_t> shape, tensor::DType
     require(fill(values.data()));
     return cpu_tensor(context, std::move(shape), values, dtype);
 }
+
+auto validate_attention_quantization(const Tensor& key, const tensor::Device& device,
+                                     const BlockwiseQuantization& key_quantization,
+                                     const BlockwiseQuantization& value_quantization) -> void {
+    const auto quantized = key.dtype() == tensor::DType::I8;
+    if (quantized && !device.capabilities().attention.int8_cache_tokens)
+        throw Failure({ErrorCode::UNSUPPORTED, "INT8 attention caches are unsupported by this backend"});
+    const auto valid = [](const BlockwiseQuantization& metadata) {
+        return metadata.block_size > 0 && !metadata.scales.empty() &&
+               metadata.scales.size() == metadata.zero_points.size() &&
+               std::ranges::all_of(metadata.scales, [](float value) { return std::isfinite(value) && value > 0; });
+    };
+    if (quantized != (valid(key_quantization) && valid(value_quantization)) ||
+        (!quantized && (!key_quantization.scales.empty() || !value_quantization.scales.empty())))
+        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid attention cache quantization metadata"});
+}
 } // namespace
 DecodeScope::DecodeScope(bool enabled) : DecodeScope(enabled, enabled) {}
 DecodeScope::DecodeScope(bool attention, bool projections)
@@ -1643,17 +1659,7 @@ auto Context::grouped_query_attention(const Tensor& query, const Tensor& key, co
         key_start < 0 || static_cast<std::size_t>(key_start) > key.size(1) || !mask.size(-1) ||
         mask.size(-1) > key.size(1) - key_start)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "grouped attention requires a mask and positive scale"});
-    const auto quantized = key.dtype() == tensor::DType::I8;
-    if (quantized && !device().capabilities().attention.int8_cache_tokens)
-        throw Failure({ErrorCode::UNSUPPORTED, "INT8 attention caches are unsupported by this backend"});
-    const auto valid_quantization = [&](const BlockwiseQuantization& metadata) {
-        return metadata.block_size > 0 && !metadata.scales.empty() &&
-               metadata.scales.size() == metadata.zero_points.size() &&
-               std::ranges::all_of(metadata.scales, [](float value) { return std::isfinite(value) && value > 0; });
-    };
-    if (quantized != (valid_quantization(key_quantization) && valid_quantization(value_quantization)) ||
-        (!quantized && (!key_quantization.scales.empty() || !value_quantization.scales.empty())))
-        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid attention cache quantization metadata"});
+    validate_attention_quantization(key, device(), key_quantization, value_quantization);
     const auto key_length = !key_start && mask.size(-1) == 1 ? key.size(1) : mask.size(-1);
     const auto parity_math = impl_->precision == core::InferencePrecision::QAT_FP32 ||
                              impl_->precision == core::InferencePrecision::LOWBIT_PARITY;
@@ -1676,17 +1682,7 @@ auto Context::grouped_query_attention_causal(const Tensor& query, const Tensor& 
         query_positions.dimensions() != 4 || query_positions.size(0) != 1 || query_positions.size(1) != 1 ||
         query_positions.size(2) != query.size(1) || query_positions.size(3) != 1)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "causal attention requires CUDA query positions and a positive scale"});
-    const auto quantized = key.dtype() == tensor::DType::I8;
-    if (quantized && !device().capabilities().attention.int8_cache_tokens)
-        throw Failure({ErrorCode::UNSUPPORTED, "INT8 attention caches are unsupported by this backend"});
-    const auto valid_quantization = [&](const BlockwiseQuantization& metadata) {
-        return metadata.block_size > 0 && !metadata.scales.empty() &&
-               metadata.scales.size() == metadata.zero_points.size() &&
-               std::ranges::all_of(metadata.scales, [](float value) { return std::isfinite(value) && value > 0; });
-    };
-    if (quantized != (valid_quantization(key_quantization) && valid_quantization(value_quantization)) ||
-        (!quantized && (!key_quantization.scales.empty() || !value_quantization.scales.empty())))
-        throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid attention cache quantization metadata"});
+    validate_attention_quantization(key, device(), key_quantization, value_quantization);
     const auto parity_math = impl_->precision == core::InferencePrecision::QAT_FP32 ||
                              impl_->precision == core::InferencePrecision::LOWBIT_PARITY;
     const std::array<std::int64_t, 7> attributes{heads, key_value_heads, key_start,
