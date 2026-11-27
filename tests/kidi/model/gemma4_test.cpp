@@ -1322,16 +1322,7 @@ TEST(Gemma4Test, QatPrecisionsFinite) {
     const auto fixture = load_fixture("gemma4-qat");
     const ModuleScope construction(tensor::DType::F32, false, tensor::Device::cpu());
     auto model = create_model(*fixture);
-    std::vector precisions{
-        core::InferencePrecision::FP32,    core::InferencePrecision::BF16,    core::InferencePrecision::Q2A16,
-        core::InferencePrecision::Q4A16,   core::InferencePrecision::Q8A16,   core::InferencePrecision::Q2AE4M3,
-        core::InferencePrecision::Q4AE4M3, core::InferencePrecision::Q8AE4M3, core::InferencePrecision::Q2AE5M2,
-        core::InferencePrecision::Q4AE5M2, core::InferencePrecision::Q8AE5M2, core::InferencePrecision::QAT_FP32,
-    };
-#if defined(__APPLE__)
-    precisions.push_back(core::InferencePrecision::LOWBIT_PARITY);
-#endif
-    for (const auto precision : precisions) {
+    for (const auto precision : {core::InferencePrecision::BF16, core::InferencePrecision::QAT_FP32}) {
         SCOPED_TRACE(core::to_string(precision));
         model->set_precision(precision);
         auto precision_state = require(model->create_state(8));
@@ -1339,5 +1330,51 @@ TEST(Gemma4Test, QatPrecisionsFinite) {
         for (const auto value : require(precision_output.data<float>())) ASSERT_TRUE(std::isfinite(value));
     }
     model->set_precision(core::InferencePrecision::CHECKPOINT);
+}
+
+auto fixture_package(std::string_view fixture, const std::string& name) -> std::filesystem::path {
+    const auto source = fixture_directory(fixture);
+    const auto directory = std::filesystem::temp_directory_path() / name;
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    std::filesystem::copy_file(source / "model.safetensors", directory / "model.safetensors");
+    std::filesystem::copy_file(source / "config.json", directory / "config.json");
+    write_tokenizer(directory / "tokenizer.json");
+    return directory;
+}
+
+TEST(Gemma4Test, QatRejectsOtherWeightFormats) {
+    using namespace kidi;
+    const auto directory = fixture_package("gemma4-qat", "kidi-qat-precision-policy-test");
+    ASSERT_TRUE(inference::Generator::load(directory, inference::ModelLoadOptions{}))
+        << "QAT fixture package must load at checkpoint precision";
+    for (const auto precision :
+         {core::InferencePrecision::Q8, core::InferencePrecision::Q4, core::InferencePrecision::VQ3D_HYBRID}) {
+        SCOPED_TRACE(core::to_string(precision));
+        const auto loaded = inference::Generator::load(directory, {.precision = precision});
+        ASSERT_FALSE(loaded);
+        EXPECT_EQ(loaded.error().code, ErrorCode::UNSUPPORTED) << loaded.error().message;
+    }
+    std::filesystem::remove_all(directory);
+}
+
+TEST(Gemma4Test, Q8PrecisionPacksWeightsAtLoad) {
+    using namespace kidi;
+    using ops::require;
+    const auto fixture = load_fixture("gemma4");
+    const auto directory = fixture_package("gemma4", "kidi-q8-precision-test");
+    // Multi-row prefill keeps the BF16 matrices unless packed prefill is enabled, so compare a single-row forward.
+    const auto logits = [&](inference::Generator generator) {
+        const auto output = require(generator.prefill_logits(fixture->tokens.first(1)));
+        const auto values = require(output.data<float>());
+        return std::vector<float>(values.begin(), values.end());
+    };
+    auto q8 = require(inference::Generator::load(directory, {.precision = core::InferencePrecision::Q8}));
+    EXPECT_EQ(q8.precision(), core::InferencePrecision::Q8);
+    const auto expected = logits(require(inference::Generator::load(directory, tensor::Device::cpu(), 8, 128)));
+    EXPECT_EQ(logits(std::move(q8)), expected) << "q8 must match explicit per-channel INT8 load-time packing";
+    EXPECT_NE(logits(require(inference::Generator::load(directory, inference::ModelLoadOptions{}))), expected)
+        << "q8 must change the BF16 checkpoint weights";
+    std::filesystem::remove_all(directory);
 }
 } // namespace

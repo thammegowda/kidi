@@ -273,8 +273,6 @@ auto load_chat_session(const kidi::cli::Namespace& arguments, const std::filesys
         kidi::inference::Generator::load(directory, {.device = device,
                                                      .precision = *precision,
                                                      .kv_cache_precision = *kv_cache_precision,
-                                                     .weight_bits = arguments.get<std::int32_t>("weight_bits"),
-                                                     .group_size = arguments.get<std::int32_t>("group_size"),
                                                      .packed_prefill = arguments.get<bool>("packed_prefill"),
                                                      .dense_lm_head = arguments.get<bool>("dense_lm_head"),
                                                      .assistant_model = assistant_directory,
@@ -1025,28 +1023,17 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
             .dest("full_attention_cache")
             .action(kidi::cli::Action::STORE_TRUE)
             .help("disable CPU local-history cropping for the previous numerical path");
-        command_parser->add_argument("--weight-bits")
-            .dest("weight_bits")
-            .default_value<std::int32_t>(0)
-            .help("0: original weights; 4 or 8: load-time groupwise packing");
         command_parser->add_argument("--precision")
             .default_value(std::string("checkpoint"))
-            .choices({"checkpoint", "lowbit-parity", "checkpoint-parity",
-                      "fp32",       "bf16",          "q2a16",
-                      "i2a16",      "q4a16",         "i4a16",
-                      "q8a16",      "i8a16",         "w8a16",
-                      "q2ae4m3",    "i2a8",          "q4ae4m3",
-                      "i4a8",       "q8ae4m3",       "i8a8",
-                      "w8a8",       "w8afp8",        "i8afp8",
-                      "q2ae5m2",    "q4ae5m2",       "q8ae5m2",
-                      "w8ae5m2",    "qat-fp32"})
-            .help("projection compute policy; explicit policies currently require a native QAT checkpoint");
+            .choices({"checkpoint", "bf16", "q8", "q4", "vq3d-hybrid"})
+            .help(
+                "weight and compute policy: checkpoint (stored format), bf16 (reference), q8 (INT8 per channel, "
+                "packed at load), q4 (INT4 in groups of 128, packed at load), vq3d-hybrid (Inkling-2 VQ experts)");
         command_parser->add_argument("--kv-cache-precision")
             .dest("kv_cache_precision")
             .default_value(std::string("auto"))
-            .choices({"auto", "fp32", "bf16", "int8", "i8", "e4m3", "e5m2"})
-            .help("KV-cache storage policy; auto, fp32, and calibrated int8 are currently implemented");
-        command_parser->add_argument("--group-size").dest("group_size").default_value<std::int32_t>(128);
+            .choices({"auto", "fp32", "bf16", "int8"})
+            .help("KV-cache storage policy; auto picks the model and device default");
         command_parser->add_argument("--packed-prefill")
             .dest("packed_prefill")
             .action(kidi::cli::Action::STORE_TRUE)

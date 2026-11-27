@@ -42,10 +42,27 @@ auto host_floats(const checkpoint::Weights& weights, const std::string& name) ->
     return {data.begin(), data.end()};
 }
 
+auto expert_global_scale(const checkpoint::Weights& weights, const std::string& name, const Tensor& values) -> Tensor {
+    if (values.dtype() != DType::U8) return {};
+    auto factors = host_floats(weights, name + "_weight_amax");
+    const auto denominator = host_floats(weights, name + "_weight_outer_scale_denominator");
+    if (denominator.size() != 1 || !std::isfinite(denominator.front()) || denominator.front() <= 0)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Inkling-2 expert scale denominator"});
+    for (auto& value : factors) value /= denominator.front();
+    if (!std::ranges::all_of(factors, [](float value) { return std::isfinite(value); }))
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "non-finite Inkling-2 global expert scale"});
+    return require(Tensor::from_host({static_cast<std::int64_t>(values.size(0))}, std::span<const float>(factors)));
+}
+
 auto step_input(Tensor& tensor, std::vector<std::int64_t> shape, DType dtype) -> Tensor& {
     if (!tensor.defined() || tensor.dtype() != dtype || !std::ranges::equal(tensor.shape(), shape))
         tensor = require(Tensor::empty(std::move(shape), dtype, tensor::Device::cpu()));
     return tensor;
+}
+
+auto retains_local_history(const Inkling2State& state, std::size_t rewind, std::int32_t window) -> bool {
+    return rewind == 0 || state.local_capacity >= state.capacity || state.position <= state.local_capacity ||
+           state.position - rewind <= state.local_capacity - static_cast<std::size_t>(window) + 1;
 }
 } // namespace
 
@@ -112,9 +129,11 @@ Inkling2Impl::Inkling2Impl(const YAML::Node& config)
       log_alpha_(config["log_scaling_alpha"].as<float>()),
       log_floor_(config["log_scaling_n_floor"].as<float>()),
       local_layers_(config["local_layer_ids"].as<std::vector<std::int32_t>>()) {
-    if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::CPU)
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "Inkling-2 requires a CPU or CUDA backend"});
-    context_ = std::make_unique<ops::Context>(device(), false, std::nullopt, DType::BF16);
+    if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::CPU &&
+        device().kind != tensor::DeviceKind::A_GPU)
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "Inkling-2 requires a CPU, CUDA, or Metal backend"});
+    activation_ = device().kind == tensor::DeviceKind::A_GPU ? DType::F32 : DType::BF16;
+    context_ = std::make_unique<ops::Context>(device(), false, std::nullopt, activation_);
 }
 
 auto Inkling2Impl::create(const YAML::Node& config) -> Result<Inkling2> {
@@ -153,8 +172,8 @@ auto Inkling2Impl::project_bf16(const Tensor& input, const std::string& name) ->
         const auto k = static_cast<std::int64_t>(packed.values.size(1));
         // Small projections skip the cast/quantize/cast op chain, including flattened prefill head rows.
         const auto n = static_cast<std::int64_t>(packed.values.size(0));
-        if (tokens > 0 && n * k < (1 << 20) && input.size(1) == k && packed.group_size == k &&
-            input.is_contiguous() && input.is_host_accessible() &&
+        if (device().kind == tensor::DeviceKind::CPU && tokens > 0 && n * k < (1 << 20) && input.size(1) == k &&
+            packed.group_size == k && input.is_contiguous() && input.is_host_accessible() &&
             (input.dtype() == DType::BF16 || input.dtype() == DType::F32)) {
             thread_local std::vector<float> floats;
             const float* values = nullptr;
@@ -173,11 +192,13 @@ auto Inkling2Impl::project_bf16(const Tensor& input, const std::string& name) ->
                                           reinterpret_cast<std::uint16_t*>(require(output.host_bytes()).data())));
             return output;
         }
-        return context_->cast(context_->packed_linear(context_->cast(input, DType::F32), found->second.values,
-                                                      found->second.scales, 8, found->second.group_size),
-                              DType::BF16);
+        const auto x = input.dtype() == DType::F32 ? input : context_->cast(input, DType::F32);
+        const auto y =
+            context_->packed_linear(x, found->second.values, found->second.scales, 8, found->second.group_size);
+        return activation_ == DType::F32 ? y : context_->cast(y, DType::BF16);
     }
-    return context_->cast(context_->linear(input, weight(name), {}, true), DType::BF16);
+    const auto out = context_->linear(input, weight(name), {}, true);
+    return activation_ == DType::F32 ? out : context_->cast(out, DType::BF16);
 }
 
 auto Inkling2Impl::set_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
@@ -193,6 +214,148 @@ auto Inkling2Impl::int8_preparation(const YAML::Node& config) -> Result<checkpoi
         .metadata = {{"model_config", YAML::Dump(config["model"])}},
         .convert = int8_checkpoint,
     };
+}
+
+auto Inkling2Impl::vq_preparation(const YAML::Node& config) -> Result<checkpoint::Preparation> {
+    if (const auto valid = validate_config(config["model"]); !valid) return std::unexpected(valid.error());
+    const std::string tag(core::to_string(core::InferencePrecision::VQ3D_HYBRID));
+    return checkpoint::Preparation{
+        .source = config["weights_file"].as<std::string>(),
+        .cache_directory = "kidi-inkling2-" + tag + "-v2",
+        .format = "kidi-inkling2-" + tag + "-v2",
+        .metadata = {{"model_config", YAML::Dump(config["model"])}, {"precision", tag}},
+        .convert = vq_checkpoint,
+    };
+}
+
+auto Inkling2Impl::vq_checkpoint(const YAML::Node& config, const checkpoint::Weights& weights) -> Result<StateDict> {
+    try {
+        const ModuleScope construction(DType::BF16, false, tensor::Device::cpu());
+        auto model = require(create(config));
+        require(model->set_checkpoint(weights, {.precision = core::InferencePrecision::VQ3D_HYBRID}));
+        StateDict result;
+        const std::array<std::int32_t, 1> version{2};
+        result.emplace("kidi.vq.version", require(Tensor::from_host({1}, std::span<const std::int32_t>(version))));
+        // Store dense projections directly as compact row-scaled INT8 (halves dense RAM & skips re-packing on load).
+        for (const auto& [name, value] : model->weights_) {
+            if (model->packed_.contains(name) && !name.ends_with("rel_logits_proj.proj_t")) continue;
+            result.emplace(std::string(PREFIX) + name, value);
+        }
+        for (const auto& [name, packed] : model->packed_) {
+            if (name.ends_with("wk_dv.weight") || name.ends_with("wv_dv.weight")) continue;
+            const auto prefix = std::string(PACKED_PREFIX) + name;
+            result.emplace(prefix + ".values", packed.values);
+            result.emplace(prefix + ".scales", packed.scales);
+        }
+        for (std::size_t layer = 0; layer < model->stacked_experts_.size(); ++layer)
+            for (std::size_t proj = 0; proj < 2; ++proj) {
+                const auto prefix = "kidi.vq.expert." + std::to_string(layer) + "." + std::to_string(proj);
+                const auto& w = model->stacked_experts_[layer][proj];
+                const std::array<std::int32_t, 1> fmt_code{static_cast<std::int32_t>(w.format)};
+                result.emplace(prefix + ".format",
+                               require(Tensor::from_host({1}, std::span<const std::int32_t>(fmt_code))));
+                result.emplace(prefix + ".values", w.values);
+                result.emplace(prefix + ".scales", w.scales);
+                result.emplace(prefix + ".global", w.global);
+            }
+        return result;
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    }
+}
+
+auto Inkling2Impl::load_prepared_vq_checkpoint(const checkpoint::Weights& weights) -> Result<void> {
+    try {
+        const auto version = require(weights.tensor("kidi.vq.version"));
+        if (version.dtype() != DType::I32 || version.numel() != 1 || require(version.data<std::int32_t>()).front() != 2)
+            throw ops::Failure({ErrorCode::INVALID_MANIFEST, "invalid prepared Inkling-2 VQ checkpoint version"});
+        const bool metal = device().kind == tensor::DeviceKind::A_GPU;
+        decltype(weights_) staged_weights;
+        for (const auto& name : weights.names()) {
+            if (!name.starts_with(PREFIX)) continue;
+            const auto local_name = name.substr(PREFIX.size());
+            auto t = require(weights.tensor(name));
+            // Stage only the requested rows instead of keeping the full vocabulary resident on Metal.
+            if (metal && local_name == "embed.weight") {
+                if (t.dimensions() != 2 || t.size(0) < static_cast<std::size_t>(vocabulary_) ||
+                    t.size(1) != static_cast<std::size_t>(hidden_) || !t.is_host_accessible())
+                    throw ops::Failure({ErrorCode::INVALID_MANIFEST, "invalid Inkling-2 host embedding matrix"});
+                staged_weights.emplace(local_name, std::move(t));
+                continue;
+            }
+            if (metal && t.dtype() == DType::BF16 && !cpu_projection(local_name)) {
+                const auto raw = require(std::as_const(t).host_bytes());
+                const auto* src = reinterpret_cast<const std::uint16_t*>(raw.data());
+                std::vector<float> f32(t.numel());
+                for (std::size_t i = 0; i < f32.size(); ++i)
+                    f32[i] = std::bit_cast<float>(static_cast<std::uint32_t>(src[i]) << 16);
+                std::vector<std::int64_t> sh(t.shape().begin(), t.shape().end());
+                staged_weights.emplace(
+                    local_name, require(Tensor::from_host(std::move(sh), std::span<const float>(f32), device())));
+            } else {
+                staged_weights.emplace(local_name, require(t.to(device())));
+            }
+            t.release_pages(false);
+        }
+        decltype(packed_) staged_packed;
+        const auto load_packed = [&](std::string_view name) {
+            if (metal) return require(weights.tensor(name, device()));
+            const auto source = require(weights.tensor(name));
+            auto result = require(source.to(device()));
+            source.release_pages(false);
+            return result;
+        };
+        for (const auto& name : weights.names()) {
+            if (!name.starts_with(PACKED_PREFIX) || !name.ends_with(".values")) continue;
+            const auto local_name = name.substr(
+                PACKED_PREFIX.size(), name.size() - PACKED_PREFIX.size() - std::string_view(".values").size());
+            auto vals = load_packed(name);
+            auto scs = load_packed(std::string(PACKED_PREFIX) + local_name + ".scales");
+            const auto width = static_cast<std::int32_t>(vals.size(1));
+            staged_packed[local_name] = {std::move(vals), std::move(scs), {}, 8, width};
+        }
+        for (std::int32_t layer = 0; layer < layers_; ++layer) {
+            if (!local(layer)) continue;
+            const auto p = "layers." + std::to_string(layer) + ".attn.";
+            const auto found = staged_packed.find(p + "wkv_dv.weight");
+            if (found != staged_packed.end()) {
+                const auto half_rows = static_cast<std::int64_t>(found->second.values.size(0) / 2);
+                staged_packed.insert_or_assign(p + "wk_dv.weight", narrow_packed(found->second, 0, half_rows));
+                staged_packed.insert_or_assign(p + "wv_dv.weight", narrow_packed(found->second, half_rows, half_rows));
+            }
+        }
+        // Copy expert banks to preserve decode bandwidth when routes change between tokens.
+        const auto load_expert = [&](const std::string& name) {
+            const auto source = require(weights.tensor(name));
+            auto result = require(source.to(device()));
+            if (metal) source.release_pages(false);
+            return result;
+        };
+        decltype(stacked_experts_) staged_stacks(static_cast<std::size_t>(layers_));
+        for (std::int32_t layer = 0; layer < layers_; ++layer)
+            for (std::size_t proj = 0; proj < 2; ++proj) {
+                const auto prefix = "kidi.vq.expert." + std::to_string(layer) + "." + std::to_string(proj);
+                const auto type = require(weights.tensor(prefix + ".format"));
+                const auto fmt = static_cast<ops::BlockScaledFormat>(require(type.data<std::int32_t>()).front());
+                if (fmt != ops::BlockScaledFormat::VQ3D && fmt != ops::BlockScaledFormat::VQ4D)
+                    throw ops::Failure({ErrorCode::INVALID_MANIFEST, "invalid prepared Inkling-2 expert format"});
+                const auto group = fmt == ops::BlockScaledFormat::VQ3D ? 48 : 64;
+                staged_stacks[static_cast<std::size_t>(layer)][proj] = {load_expert(prefix + ".values"),
+                                                                        load_expert(prefix + ".scales"),
+                                                                        load_expert(prefix + ".global"), fmt, group};
+            }
+        activation_ = metal ? DType::F32 : DType::BF16;
+        auto context = std::make_unique<ops::Context>(device(), false, std::nullopt, activation_);
+        context_->synchronize();
+        context_ = std::move(context);
+        weights_ = std::move(staged_weights);
+        packed_ = std::move(staged_packed);
+        experts_weights_.clear();
+        stacked_experts_ = std::move(staged_stacks);
+        return {};
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    }
 }
 
 auto Inkling2Impl::int8_checkpoint(const YAML::Node& config, const checkpoint::Weights& weights) -> Result<StateDict> {
@@ -285,21 +448,25 @@ auto Inkling2Impl::load_prepared_checkpoint(const checkpoint::Weights& weights) 
 auto Inkling2Impl::set_checkpoint(const checkpoint::Weights& weights, RuntimeQuantization quantization)
     -> Result<void> {
     try {
+        const bool vq = quantization.precision == core::InferencePrecision::VQ3D_HYBRID;
         if ((quantization.weight_bits != 0 && quantization.weight_bits != 8) ||
             (quantization.precision != core::InferencePrecision::CHECKPOINT &&
-             quantization.precision != core::InferencePrecision::Q8A16 &&
-             quantization.precision != core::InferencePrecision::BF16))
+             quantization.precision != core::InferencePrecision::Q8 &&
+             quantization.precision != core::InferencePrecision::BF16 && !vq))
+            throw ops::Failure({ErrorCode::UNSUPPORTED,
+                                "Inkling-2 supports native checkpoint, INT8, BF16, or VQ3D/VQ4D expert weights"});
+        if (quantization.weight_bits && (quantization.precision == core::InferencePrecision::BF16 || vq))
             throw ops::Failure(
-                {ErrorCode::UNSUPPORTED, "Inkling-2 supports native checkpoint, INT8 or BF16 expert weights"});
-        if (quantization.weight_bits && quantization.precision == core::InferencePrecision::BF16)
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "BF16 precision cannot be combined with weight packing"});
+                {ErrorCode::INVALID_ARGUMENT, "BF16 or VQ precision cannot be combined with weight packing"});
         const bool cpu = device().kind == tensor::DeviceKind::CPU;
+        const bool metal = device().kind == tensor::DeviceKind::A_GPU;
         if (cpu && quantization.precision == core::InferencePrecision::BF16)
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "Inkling-2 CPU inference requires INT8 expert weights"});
-        const bool packed = cpu || quantization.weight_bits == 8 ||
-                            quantization.precision == core::InferencePrecision::Q8A16;
-        const bool native = quantization.precision == core::InferencePrecision::CHECKPOINT && !packed;
-        if (cpu && weights.contains("kidi.cpu.version")) return load_prepared_checkpoint(weights);
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "Inkling-2 CPU inference requires INT8 or VQ expert weights"});
+        const bool packed =
+            !vq && (cpu || quantization.weight_bits == 8 || quantization.precision == core::InferencePrecision::Q8);
+        const bool native = !vq && quantization.precision == core::InferencePrecision::CHECKPOINT && !packed;
+        if (vq && weights.contains("kidi.vq.version")) return load_prepared_vq_checkpoint(weights);
+        if (cpu && !vq && weights.contains("kidi.cpu.version")) return load_prepared_checkpoint(weights);
         decltype(weights_) staged_weights;
         std::vector<Tensor> host_sources;
         std::vector<std::pair<std::string, std::size_t>> weight_uploads;
@@ -343,20 +510,30 @@ auto Inkling2Impl::set_checkpoint(const checkpoint::Weights& weights, RuntimeQua
             if (name.ends_with("sconv.weight") && value.dtype() == DType::BF16) {
                 const auto channels = static_cast<std::int64_t>(value.size(0));
                 const auto width = static_cast<std::int64_t>(value.size(2));
-                auto lagged = require(Tensor::empty({width, channels}, DType::BF16, tensor::Device::cpu()));
                 const auto src_bytes = require(value.host_bytes());
-                const auto dst_bytes = require(lagged.host_bytes());
                 const auto* src = reinterpret_cast<const std::uint16_t*>(src_bytes.data());
-                auto* dst = reinterpret_cast<std::uint16_t*>(dst_bytes.data());
-                for (std::int64_t c = 0; c < channels; ++c)
-                    for (std::int64_t lag = 0; lag < width; ++lag)
-                        dst[lag * channels + c] = src[c * width + width - 1 - lag];
-                weight_uploads.emplace_back(name, queue_host(std::move(lagged)));
+                if (metal) {
+                    std::vector<float> lagged(static_cast<std::size_t>(width * channels));
+                    for (std::int64_t c = 0; c < channels; ++c)
+                        for (std::int64_t lag = 0; lag < width; ++lag)
+                            lagged[static_cast<std::size_t>(lag * channels + c)] = std::bit_cast<float>(
+                                static_cast<std::uint32_t>(src[c * width + width - 1 - lag]) << 16);
+                    weight_uploads.emplace_back(name, queue_floats({width, channels}, lagged));
+                } else {
+                    auto lagged = require(Tensor::empty({width, channels}, DType::BF16, tensor::Device::cpu()));
+                    const auto dst_bytes = require(lagged.host_bytes());
+                    auto* dst = reinterpret_cast<std::uint16_t*>(dst_bytes.data());
+                    for (std::int64_t c = 0; c < channels; ++c)
+                        for (std::int64_t lag = 0; lag < width; ++lag)
+                            dst[lag * channels + c] = src[c * width + width - 1 - lag];
+                    weight_uploads.emplace_back(name, queue_host(std::move(lagged)));
+                }
                 mmap_tensors.push_back(value);
                 continue;
             }
             const bool small = name.ends_with("norm.weight") || name.ends_with("sconv.weight") ||
-                               name.starts_with("attn_res.") || name.starts_with("middle_cycle");
+                               name.starts_with("attn_res.") || name.starts_with("middle_cycle") ||
+                               (metal && !cpu_projection(name) && name != "embed.weight");
             if (small || value.dtype() == DType::F32)
                 convert(name, name);
             else {
@@ -469,6 +646,7 @@ auto Inkling2Impl::set_checkpoint(const checkpoint::Weights& weights, RuntimeQua
         struct ExpertUpload {
             std::int32_t layer;
             std::size_t index, values, scales, global;
+            Tensor host_values, host_scales, host_global;
         };
         std::vector<ExpertUpload> expert_uploads;
         expert_uploads.reserve(static_cast<std::size_t>(layers_) * 2);
@@ -480,17 +658,8 @@ auto Inkling2Impl::set_checkpoint(const checkpoint::Weights& weights, RuntimeQua
                 const auto scales =
                     require(weights.tensor(std::string(PREFIX) + prefix + projection + "_weight_scale"));
                 std::size_t global_index = SIZE_MAX;
-                if (values.dtype() == DType::U8) {
-                    auto factors = host_floats(weights, prefix + projection + "_weight_amax");
-                    const auto denominator =
-                        host_floats(weights, prefix + projection + "_weight_outer_scale_denominator");
-                    if (denominator.size() != 1 || !std::isfinite(denominator.front()) || denominator.front() <= 0)
-                        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Inkling-2 expert scale denominator"});
-                    for (auto& value : factors) value /= denominator.front();
-                    if (!std::ranges::all_of(factors, [](float value) { return std::isfinite(value); }))
-                        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "non-finite Inkling-2 global expert scale"});
-                    global_index = queue_floats({experts_}, factors);
-                }
+                auto host_global = expert_global_scale(weights, prefix + projection, values);
+                if (!vq && host_global.defined()) global_index = queue_host(host_global);
                 const auto width = index ? intermediate_ : hidden_;
                 const auto rows = index ? hidden_ : 2 * intermediate_;
                 const bool nvfp4 = values.dtype() == DType::U8;
@@ -502,29 +671,53 @@ auto Inkling2Impl::set_checkpoint(const checkpoint::Weights& weights, RuntimeQua
                     scales.size(0) != values.size(0) || scales.size(1) != values.size(1) ||
                     scales.size(2) != static_cast<std::size_t>(width / (nvfp4 ? 16 : 32)))
                     throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Inkling-2 expert geometry or format mismatch"});
-                expert_uploads.push_back({layer, index, queue_host(values), queue_host(scales), global_index});
-                mmap_tensors.push_back(values);
-                mmap_tensors.push_back(scales);
+                if (vq) {
+                    expert_uploads.push_back({layer, index, SIZE_MAX, SIZE_MAX, SIZE_MAX, values, scales, host_global});
+                } else {
+                    expert_uploads.push_back(
+                        {layer, index, queue_host(values), queue_host(scales), global_index, {}, {}, {}});
+                    mmap_tensors.push_back(values);
+                    mmap_tensors.push_back(scales);
+                }
             }
         }
         const auto uploaded = require(Tensor::to_batch(host_sources, device()));
+        host_sources.clear();
+        host_sources.shrink_to_fit();
         for (const auto& mapped : mmap_tensors) mapped.release_pages(false);
         for (const auto& [name, slot] : weight_uploads) staged_weights[name] = uploaded[slot];
         for (const auto& [name, slot, offset, length] : narrow_views)
             staged_weights[name] = require(uploaded[slot].narrow(0, offset, length));
 
+        const bool stacked = native || vq;
         decltype(experts_weights_) staged_experts(
-            native ? 0 : static_cast<std::size_t>(layers_),
-            std::vector<std::array<ExpertWeight, 2>>(native ? 0 : static_cast<std::size_t>(experts_)));
-        decltype(stacked_experts_) staged_stacks(native ? static_cast<std::size_t>(layers_) : 0);
-        ops::Context loading(device(), false, false, DType::BF16);
+            stacked ? 0 : static_cast<std::size_t>(layers_),
+            std::vector<std::array<ExpertWeight, 2>>(stacked ? 0 : static_cast<std::size_t>(experts_)));
+        decltype(stacked_experts_) staged_stacks(stacked ? static_cast<std::size_t>(layers_) : 0);
+        ops::Context loading(vq ? tensor::Device::cpu() : device(), false, false, DType::BF16);
         for (const auto& entry : expert_uploads) {
+            if (vq) {
+                // Decode each NVFP4/MXFP8 bank on the CPU in 64-row chunks, then release its mapped pages.
+                // Down projections and the tail after the loop stay VQ3D; the other gate/up banks use smaller VQ4D.
+                const bool vq3d = entry.index == 1 || entry.layer >= core_end_;
+                const auto fmt = vq3d ? ops::BlockScaledFormat::VQ3D : ops::BlockScaledFormat::VQ4D;
+                auto packed_vq = require(ops::pack_vq_expert_weights(entry.host_values, entry.host_scales,
+                                                                     entry.host_global, entry.index == 0, fmt));
+                entry.host_values.release_pages(false);
+                entry.host_scales.release_pages(false);
+                staged_stacks[static_cast<std::size_t>(entry.layer)][entry.index] = {
+                    require(packed_vq.values.to(device())), require(packed_vq.scales.to(device())),
+                    require(packed_vq.global.to(device())), fmt, packed_vq.group_size};
+                continue;
+            }
             const auto& device_values = uploaded[entry.values];
             const auto& device_scales = uploaded[entry.scales];
             const Tensor global = entry.global == SIZE_MAX ? Tensor{} : uploaded[entry.global];
             if (native) {
+                const auto fmt =
+                    device_values.dtype() == DType::U8 ? ops::BlockScaledFormat::NVFP4 : ops::BlockScaledFormat::MXFP8;
                 staged_stacks[static_cast<std::size_t>(entry.layer)][entry.index] = {device_values, device_scales,
-                                                                                     global};
+                                                                                     global, fmt, 0};
             } else if (packed) {
                 const auto packed_weight =
                     loading.pack_experts(device_values, device_scales, global, entry.index == 0);
@@ -545,16 +738,29 @@ auto Inkling2Impl::set_checkpoint(const checkpoint::Weights& weights, RuntimeQua
             }
         }
         if (!native) loading.synchronize();
-        auto context = std::make_unique<ops::Context>(device(), false, std::nullopt, DType::BF16);
+        activation_ = metal ? DType::F32 : DType::BF16;
+        auto context = std::make_unique<ops::Context>(device(), false, std::nullopt, activation_);
         context_->synchronize();
         context_ = std::move(context);
-        // CPU runs every dense projection (everything that goes through project_bf16) as row-scaled W8A8.
+        // CPU and Metal run dense projections as row-scaled INT8 (halves RAM and avoids MPSGraph constant copies).
         decltype(packed_) staged_packed;
-        if (cpu) {
+        if (cpu || metal) {
             for (const auto& [name, tensor] : staged_weights)
-                if (tensor.dimensions() == 2 && tensor.dtype() == DType::BF16 && cpu_projection(name))
-                    staged_packed[name] = require(ops::pack_rows_int8(tensor));
+                if (tensor.dimensions() == 2 && tensor.dtype() == DType::BF16 && cpu_projection(name)) {
+                    auto host_t = tensor.is_host_accessible() ? tensor : require(tensor.to(tensor::Device::cpu()));
+                    auto p = require(ops::pack_rows_int8(host_t));
+                    staged_packed[name] = {
+                        require(p.values.to(device())), require(p.scales.to(device())), {}, 8, p.group_size};
+                }
             bind_local_kv_packed(staged_weights, staged_packed);
+            if (metal) {
+                for (auto it = staged_weights.begin(); it != staged_weights.end();) {
+                    if (staged_packed.contains(it->first) && !it->first.ends_with("rel_logits_proj.proj_t"))
+                        it = staged_weights.erase(it);
+                    else
+                        ++it;
+                }
+            }
         }
         weights_ = std::move(staged_weights);
         packed_ = std::move(staged_packed);
@@ -581,35 +787,92 @@ auto Inkling2Impl::supports_device_tokens() const -> bool {
            device().capabilities().sampling.supports(tensor::TokenSelection::CHAINED_DEVICE);
 }
 
+auto Inkling2Impl::cache_capacities(std::size_t capacity) const -> std::pair<std::size_t, std::size_t> {
+    const auto global = std::min(max_positions_, ((capacity + 255) / 256) * 256);
+    const auto local_cap = device().kind == tensor::DeviceKind::A_GPU && window_ > 0
+                               ? std::min(global, static_cast<std::size_t>(window_) + 512)
+                               : global;
+    return {global, local_cap};
+}
+
 auto Inkling2Impl::create_state(std::size_t capacity) -> Result<std::unique_ptr<LanguageModelState>> {
     try {
         if (!capacity || capacity > max_positions_)
             return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Inkling-2 state capacity"});
         auto state = std::make_unique<Inkling2State>();
         state->capacity = capacity;
-        const auto alloc_capacity =
-            std::min(max_positions_, std::bit_ceil(std::max<std::size_t>(512, capacity)));
+        const auto [global_cap, local_cap] = cache_capacities(capacity);
+        state->local_capacity = local_cap;
         const auto kv = static_cast<std::int64_t>(key_heads_) * head_width_;
         const auto zeros = [&](std::vector<std::int64_t> shape) {
-            return require(Tensor::zeros(std::move(shape), DType::BF16, device()));
+            return require(Tensor::zeros(std::move(shape), activation_, device()));
         };
         const auto cache_dtype = require(kv_cache_dtype(capacity));
-        const auto cache = [&] {
-            return require(Tensor::zeros({1, static_cast<std::int64_t>(alloc_capacity), kv}, cache_dtype, device()));
+        const auto cache = [&](std::size_t cap) {
+            return require(Tensor::zeros({1, static_cast<std::int64_t>(cap), kv}, cache_dtype, device()));
         };
-        const auto scales = [&] {
+        const auto scales = [&](std::size_t cap) {
             return cache_dtype == DType::I8
-                       ? require(Tensor::zeros({static_cast<std::int64_t>(alloc_capacity),
-                                                kv / std::gcd(32, head_width_)},
-                                                DType::F32, device()))
+                       ? require(Tensor::zeros({static_cast<std::int64_t>(cap), kv / std::gcd(32, head_width_)},
+                                               DType::F32, device()))
                        : Tensor{};
         };
-        for ([[maybe_unused]] const auto layer : schedule())
-            state->visits.push_back({cache(), cache(),
-                                     zeros({1, CONV_WIDTH, kv}), zeros({1, CONV_WIDTH, kv}),
-                                     zeros({1, CONV_WIDTH, hidden_}), zeros({1, CONV_WIDTH, hidden_}),
-                                     scales(), scales()});
+        for (const auto layer : schedule()) {
+            const auto cap = local(layer) ? local_cap : global_cap;
+            state->visits.push_back({cache(cap), cache(cap), zeros({1, CONV_WIDTH, kv}), zeros({1, CONV_WIDTH, kv}),
+                                     zeros({1, CONV_WIDTH, hidden_}), zeros({1, CONV_WIDTH, hidden_}), scales(cap),
+                                     scales(cap)});
+        }
         return state;
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    }
+}
+
+auto Inkling2Impl::grow_state(LanguageModelState& base, std::size_t capacity) -> Result<void> {
+    if (device().kind != tensor::DeviceKind::A_GPU) return CausalLanguageModel::grow_state(base, capacity);
+    auto* state = dynamic_cast<Inkling2State*>(&base);
+    if (!state || !state->capacity || state->position > state->capacity || capacity < state->capacity ||
+        capacity > max_positions_)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Inkling-2 cache growth"});
+    if (capacity == state->capacity) return {};
+    try {
+        const auto [global_cap, local_cap] = cache_capacities(capacity);
+        const auto layers = schedule();
+        const auto enlarge = [&](const Tensor& cache, std::int64_t axis, std::size_t rows) {
+            if (!cache.defined()) return Tensor{};
+            auto shape = std::vector(cache.shape().begin(), cache.shape().end());
+            shape[axis] = static_cast<std::int64_t>(rows);
+            auto expanded = require(Tensor::zeros(std::move(shape), cache.dtype(), device()));
+            const auto old_rows = static_cast<std::int64_t>(cache.size(axis));
+            const auto valid = static_cast<std::int64_t>(std::min(state->position, cache.size(axis)));
+            const auto width = static_cast<std::int64_t>(cache.size(-1));
+            if (valid) {
+                const auto flat = require(cache.reshape({old_rows, width}));
+                auto prefix = require(flat.narrow(0, 0, valid));
+                if (axis == 1) prefix = require(prefix.reshape({1, valid, width}));
+                context_->copy_slice_(expanded, prefix, axis, 0);
+            }
+            return expanded;
+        };
+        for (std::size_t index = 0; index < layers.size(); ++index) {
+            auto& visit = state->visits[index];
+            const auto cap = local(layers[index]) ? local_cap : global_cap;
+            if (visit.key.size(1) >= cap) continue;
+            auto key = enlarge(visit.key, 1, cap);
+            auto value = enlarge(visit.value, 1, cap);
+            auto key_scales = enlarge(visit.key_scales, 0, cap);
+            auto value_scales = enlarge(visit.value_scales, 0, cap);
+            // Once a local cache wraps, its size is fixed. Release old storage one visit at a time.
+            context_->synchronize();
+            visit.key = std::move(key);
+            visit.value = std::move(value);
+            visit.key_scales = std::move(key_scales);
+            visit.value_scales = std::move(value_scales);
+        }
+        state->local_capacity = local_cap;
+        state->capacity = capacity;
+        return {};
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     }
@@ -620,6 +883,8 @@ auto Inkling2Impl::rewind(LanguageModelState& base, std::size_t position) -> Res
     if (!state || !state->capacity || state->position > state->capacity || position > state->position)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Inkling-2 state rewind"});
     if (position == state->position) return {};
+    if (!retains_local_history(*state, position, window_))
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "Inkling-2 rewind would need overwritten local KV"});
     const bool marked = position != 0 && position == state->rewind_position && !state->rewind_convs.empty();
     const bool verified = position != 0 && !marked && !state->verify_convs.empty() &&
                           position >= state->verify_position && position <= state->verify_end;
@@ -628,7 +893,7 @@ auto Inkling2Impl::rewind(LanguageModelState& base, std::size_t position) -> Res
                                      "Inkling-2 rewinds only to the initial state, its marked rewind point or "
                                      "inside the last CPU verification block"});
     try {
-        // Keys and values are indexed by absolute position; only the short-convolution rings need restoring.
+        // Required KV rows are still resident; only the short-convolution rings need restoring.
         std::size_t index = 0;
         for (auto& visit : state->visits) {
             std::size_t slot = 0;
@@ -696,7 +961,9 @@ auto Inkling2Impl::rewind_floor(const LanguageModelState& base, std::size_t posi
     if (!state || position >= state->position) return position;
     if (!state->verify_convs.empty() && position >= state->verify_position && position <= state->verify_end)
         return position;
-    return state->rewind_position && state->rewind_position <= position ? state->rewind_position : 0;
+    return state->rewind_position <= position && retains_local_history(*state, state->rewind_position, window_)
+               ? state->rewind_position
+               : 0;
 }
 
 auto Inkling2Impl::snapshot_verification(Inkling2State& state) -> void {
@@ -764,7 +1031,8 @@ auto Inkling2Impl::convolve(const Tensor& input, Tensor& state, const Tensor& we
 }
 
 auto Inkling2Impl::attention(std::int32_t layer, const std::array<Tensor, 3>& inputs, Inkling2Visit& cache,
-                             const Tensor& positions, const Tensor& conv_slot, const Tensor& tail_slots) -> Tensor {
+                             const Tensor& positions, const Tensor& local_positions, const Tensor& conv_slot,
+                             const Tensor& tail_slots) -> Tensor {
     auto& context = *context_;
     const auto p = "layers." + std::to_string(layer) + ".attn.";
     const auto linear = [&](const Tensor& input, const std::string& name) {
@@ -825,25 +1093,31 @@ auto Inkling2Impl::attention(std::int32_t layer, const std::array<Tensor, 3>& in
     const auto relative =
         context.reshape(project_bf16(context.reshape(r, {T * heads_, width}), p + "rel_logits_proj.proj_t"),
                         {T, heads_, extent});
+    const auto& write_pos = (is_local && local_positions.defined()) ? local_positions : positions;
     if (cache.key.dtype() == DType::I8) {
-        context.quantize_cache_(cache.key, cache.key_scales, k, positions);
-        context.quantize_cache_(cache.value, cache.value_scales, v, positions);
+        context.quantize_cache_(cache.key, cache.key_scales, k, write_pos);
+        context.quantize_cache_(cache.value, cache.value_scales, v, write_pos);
     } else {
-        context.scatter_unique_(cache.key, require(k.reshape({1, T, kv})), positions);
-        context.scatter_unique_(cache.value, require(v.reshape({1, T, kv})), positions);
+        auto k_store = require(k.reshape({1, T, kv}));
+        auto v_store = require(v.reshape({1, T, kv}));
+        if (k_store.dtype() != cache.key.dtype()) k_store = context.cast(k_store, cache.key.dtype());
+        if (v_store.dtype() != cache.value.dtype()) v_store = context.cast(v_store, cache.value.dtype());
+        context.scatter_unique_(cache.key, k_store, write_pos);
+        context.scatter_unique_(cache.value, v_store, write_pos);
     }
     const auto capacity = static_cast<std::int64_t>(cache.key.size(1));
-    const auto output = context.relative_attention(
-        context.reshape(q, {T, heads_ * head_width_}), require(cache.key.reshape({capacity, kv})),
-        require(cache.value.reshape({capacity, kv})), relative, sink, gate,
-        {.heads = heads_,
-         .key_heads = key_heads_,
-         .start = 0,
-         .window = is_local ? window_ : 0,
-         .extent = extent,
-         .log_alpha = is_local ? 0.F : log_alpha_,
-         .log_floor = is_local ? 0.F : log_floor_},
-        positions, cache.key_scales, cache.value_scales);
+    const auto output = context.relative_attention(context.reshape(q, {T, heads_ * head_width_}),
+                                                   require(cache.key.reshape({capacity, kv})),
+                                                   require(cache.value.reshape({capacity, kv})), relative, sink, gate,
+                                                   {.heads = heads_,
+                                                    .key_heads = key_heads_,
+                                                    .start = 0,
+                                                    .window = is_local ? window_ : 0,
+                                                    .extent = extent,
+                                                    .log_alpha = is_local ? 0.F : log_alpha_,
+                                                    .log_floor = is_local ? 0.F : log_floor_,
+                                                    .ring_mode = is_local && local_positions.defined()},
+                                                   positions, cache.key_scales, cache.value_scales);
     return linear(output, "wo_ud.weight");
 }
 
@@ -862,9 +1136,7 @@ auto Inkling2Impl::moe(std::int32_t layer, const Tensor& input) -> Tensor {
     const auto p = "layers." + std::to_string(layer) + ".mlp.";
     const auto T = static_cast<std::int64_t>(input.size(0));
     const auto compact = [](const ExpertWeight& weight) {
-        return ops::BlockScaledWeight{
-            weight.values.dtype() == DType::U8 ? ops::BlockScaledFormat::NVFP4 : ops::BlockScaledFormat::MXFP8,
-            weight.values, weight.scales, weight.global};
+        return ops::BlockScaledWeight{weight.format, weight.values, weight.scales, weight.global, weight.group_size};
     };
     const auto router_raw = project_bf16(input, p + "gate.weight");
     // Routing stays on the GPU: no host sync, uploads or per-expert launches. Decode reads each routed expert's
@@ -874,7 +1146,7 @@ auto Inkling2Impl::moe(std::int32_t layer, const Tensor& input) -> Tensor {
             context.route_experts(router_raw, weight(p + "gate.bias.device"), experts_per_token_, route_scale_);
         const auto& [gate_up, down] = stacked_experts_[static_cast<std::size_t>(layer)];
         const auto activated = context.expert_silu(input, compact(gate_up), routes, gate_cap_, up_cap_);
-        return context.expert_linear(activated, compact(down), routes, DType::BF16);
+        return context.expert_linear(activated, compact(down), routes, activation_);
     }
     const auto router = context.cast(router_raw, DType::F32);
     const auto logits = require(router.to(tensor::Device::cpu()));
@@ -990,8 +1262,8 @@ auto Inkling2Impl::moe(std::int32_t layer, const Tensor& input) -> Tensor {
 }
 
 auto Inkling2Impl::visit(std::int32_t layer, Stream stream, Inkling2Visit& cache, const Tensor& positions,
-                         const Tensor& conv_slot, const Tensor& tail_slots, const std::vector<Tensor>* bank)
-    -> Stream {
+                         const Tensor& local_positions, const Tensor& conv_slot, const Tensor& tail_slots,
+                         const std::vector<Tensor>* bank) -> Stream {
     auto& context = *context_;
     const auto p = "layers." + std::to_string(layer) + ".";
     const auto T = static_cast<std::int64_t>(stream.partial.size(0));
@@ -1009,7 +1281,7 @@ auto Inkling2Impl::visit(std::int32_t layer, Stream stream, Inkling2Visit& cache
         if (messages.defined())
             return blend(layer, STREAMS[stream_index], destination, row(messages, static_cast<std::int64_t>(stream_index)),
                          norm);
-        return context.rms_norm(destination, norm, EPSILON, DType::BF16);
+        return context.rms_norm(destination, norm, EPSILON, activation_);
     };
     std::array<Tensor, 3> inputs;
     if (layer == 0) {
@@ -1025,7 +1297,7 @@ auto Inkling2Impl::visit(std::int32_t layer, Stream stream, Inkling2Visit& cache
             inputs[s] = is_local && s && !messages.defined() ? inputs[0]
                                       : prepare(row(destinations, count == 1 ? 0 : static_cast<std::int64_t>(s)), s, norms[s]);
     }
-    const auto attended = attention(layer, inputs, cache, positions, conv_slot, tail_slots);
+    const auto attended = attention(layer, inputs, cache, positions, local_positions, conv_slot, tail_slots);
     const auto plain = 1.F / std::sqrt(static_cast<float>(CONV_WIDTH + 1));
     if (layer % block_ == 0) stream.blocks.push_back(stream.partial);
     const auto residual = convolve(attended, cache.attention_conv, weight(p + "attn_sconv.weight"), {}, conv_slot,
@@ -1035,21 +1307,38 @@ auto Inkling2Impl::visit(std::int32_t layer, Stream stream, Inkling2Visit& cache
     sources.push_back(residual);
     const auto mixed = row(context.residual_mix(sources, weight("attn_res.mlp_queries." + std::to_string(layer)), EPSILON), 0);
     const auto mlp_input = prepare(mixed, 3, weight(p + "mlp_norm.weight"));
-    stream.partial = convolve(moe(layer, mlp_input), cache.mlp_conv, weight(p + "mlp_sconv.weight"), {}, conv_slot,
-                              tail_slots, plain, residual, DType::BF16,
-                              cache.record_rewind ? &cache.rewind_inputs[3] : nullptr);
+    stream.partial =
+        convolve(moe(layer, mlp_input), cache.mlp_conv, weight(p + "mlp_sconv.weight"), {}, conv_slot, tail_slots,
+                 plain, residual, activation_, cache.record_rewind ? &cache.rewind_inputs[3] : nullptr);
     return stream;
 }
 
-auto Inkling2Impl::execute_step(const Tensor& ids, const Tensor& positions, const Tensor& conv_slot,
-                                const Tensor& tail_slots, Inkling2State& state, std::int64_t T, bool all_logits,
-                                std::optional<ops::TokenOutput> select, Tensor* hidden) -> Tensor {
+auto Inkling2Impl::execute_step(const Tensor& ids, const Tensor& positions, const Tensor& local_positions,
+                                const Tensor& conv_slot, const Tensor& tail_slots, Inkling2State& state, std::int64_t T,
+                                bool all_logits, std::optional<ops::TokenOutput> select, Tensor* hidden) -> Tensor {
     auto& context = *context_;
-    Stream stream{{}, context.rms_norm(context.gather(weight("embed.weight"), ids, 0), weight("embed_norm.weight"),
-                                       EPSILON)};
+    const auto& embedding = weight("embed.weight");
+    auto embedded = [&] {
+        if (embedding.device() == device()) return context.gather(embedding, ids, 0);
+        auto rows = require(Tensor::empty({T, hidden_}, embedding.dtype(), device()));
+        const auto source = require(embedding.host_bytes());
+        const auto target = require(rows.host_bytes());
+        const auto stride = embedding.nbytes() / embedding.size(0);
+        const auto indices = require(ids.data<std::int32_t>());
+        for (std::size_t i = 0; i < indices.size(); ++i) {
+            const auto id = indices[i];
+            if (id < 0 || static_cast<std::size_t>(id) >= embedding.size(0))
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "Inkling-2 embedding index outside the vocabulary"});
+            std::memcpy(target.data() + i * stride, source.data() + id * stride, stride);
+        }
+        return rows;
+    }();
+    if (embedded.dtype() != activation_) embedded = context.cast(embedded, activation_);
+    Stream stream{{}, context.rms_norm(embedded, weight("embed_norm.weight"), EPSILON)};
     std::size_t visit_index = 0;
     for (std::int32_t layer = 0; layer < core_start_; ++layer)
-        stream = visit(layer, std::move(stream), state.visits[visit_index++], positions, conv_slot, tail_slots, nullptr);
+        stream = visit(layer, std::move(stream), state.visits[visit_index++], positions, local_positions, conv_slot,
+                       tail_slots, nullptr);
     const auto prelude = stream;
     for (std::int32_t pass = 0; pass < passes_; ++pass) {
         std::vector<Tensor> bank;
@@ -1060,12 +1349,12 @@ auto Inkling2Impl::execute_step(const Tensor& ids, const Tensor& positions, cons
             stream = prelude;
         }
         for (auto layer = core_start_; layer < core_end_; ++layer)
-            stream =
-                visit(layer, std::move(stream), state.visits[visit_index++], positions, conv_slot, tail_slots,
-                      pass ? &bank : nullptr);
+            stream = visit(layer, std::move(stream), state.visits[visit_index++], positions, local_positions, conv_slot,
+                           tail_slots, pass ? &bank : nullptr);
     }
     for (auto layer = core_end_; layer < layers_; ++layer)
-        stream = visit(layer, std::move(stream), state.visits[visit_index++], positions, conv_slot, tail_slots, nullptr);
+        stream = visit(layer, std::move(stream), state.visits[visit_index++], positions, local_positions, conv_slot,
+                       tail_slots, nullptr);
 
     auto sources = stream.blocks;
     sources.push_back(stream.partial);
@@ -1074,9 +1363,10 @@ auto Inkling2Impl::execute_step(const Tensor& ids, const Tensor& positions, cons
         for (auto& source : sources) source = context.slice(source, 0, T - 1, 1);
     const auto mixed =
         context.reshape(context.residual_mix(sources, weight("attn_res.output_query"), EPSILON), {rows, hidden_});
-    const auto normalized = context.rms_norm(mixed, weight("norm.weight"), EPSILON, DType::BF16);
+    const auto normalized = context.rms_norm(mixed, weight("norm.weight"), EPSILON, activation_);
     if (hidden) *hidden = normalized;
-    auto logits = context.cast(project_bf16(normalized, "unembed.weight"), DType::F32);
+    auto logits = project_bf16(normalized, "unembed.weight");
+    if (logits.dtype() != DType::F32) logits = context.cast(logits, DType::F32);
     if (T > 1) {
         context.multiply_(logits, weight("inverse_logit_cap"));
         logits = context.tanh(logits);
@@ -1096,9 +1386,9 @@ auto Inkling2Impl::execute_step(const Tensor& ids, const Tensor& positions, cons
     return trimmed;
 }
 
-auto Inkling2Impl::run_forward(const Tensor& ids, const Tensor& positions, const Tensor& conv_slot,
-                               const Tensor& tail_slots, Inkling2State& state, std::int64_t T, bool all_logits,
-                               std::optional<ops::TokenOutput> select, Tensor* hidden) -> Tensor {
+auto Inkling2Impl::run_forward(const Tensor& ids, const Tensor& positions, const Tensor& local_positions,
+                               const Tensor& conv_slot, const Tensor& tail_slots, Inkling2State& state, std::int64_t T,
+                               bool all_logits, std::optional<ops::TokenOutput> select, Tensor* hidden) -> Tensor {
     auto& context = *context_;
     // T == 1 native decode runs inside a single captured CUDA graph across all sequence positions.
     if (T == 1 && !stacked_experts_.empty() && context.replay_enabled()) {
@@ -1135,7 +1425,7 @@ auto Inkling2Impl::run_forward(const Tensor& ids, const Tensor& positions, const
                 state.visits[index].mlp_conv = operands[base + 5];
             }
             Tensor captured_hidden;
-            auto result = execute_step(operands[0], operands[1], operands[2], {}, state, 1, false, select,
+            auto result = execute_step(operands[0], operands[1], {}, operands[2], {}, state, 1, false, select,
                                        hidden ? &captured_hidden : nullptr);
             if (hidden) return std::vector{std::move(result), std::move(captured_hidden)};
             return std::vector{std::move(result)};
@@ -1143,7 +1433,7 @@ auto Inkling2Impl::run_forward(const Tensor& ids, const Tensor& positions, const
         if (hidden) *hidden = outputs[1];
         return outputs[0];
     }
-    return execute_step(ids, positions, conv_slot, tail_slots, state, T, all_logits, select, hidden);
+    return execute_step(ids, positions, local_positions, conv_slot, tail_slots, state, T, all_logits, select, hidden);
 }
 
 auto Inkling2Impl::prefill(std::span<const std::int32_t> tokens, LanguageModelState& state) -> Result<void> {
@@ -1157,6 +1447,33 @@ auto Inkling2Impl::stage_host_step(std::span<const std::int32_t> tokens, Inkling
     try {
         if (tokens.empty() || state.position + tokens.size() > state.capacity)
             return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "Inkling-2 input exceeds state capacity"});
+        const bool ring_local = device().kind == tensor::DeviceKind::A_GPU && state.local_capacity > 0 &&
+                                state.local_capacity < state.capacity;
+        const auto max_ring_chunk = ring_local && state.local_capacity > static_cast<std::size_t>(window_)
+                                        ? state.local_capacity - static_cast<std::size_t>(window_)
+                                        : state.capacity;
+        if (ring_local && tokens.size() > max_ring_chunk) {
+            std::vector<Tensor> outputs;
+            std::vector<Tensor> hiddens;
+            for (std::size_t offset = 0; offset < tokens.size(); offset += max_ring_chunk) {
+                const auto count = std::min(max_ring_chunk, tokens.size() - offset);
+                const bool last = offset + count == tokens.size();
+                Tensor chunk_hidden;
+                auto chunk_out = stage_host_step(tokens.subspan(offset, count), state, all_logits,
+                                                 last ? select : std::nullopt, hidden ? &chunk_hidden : nullptr);
+                if (!chunk_out) return chunk_out;
+                if (all_logits || last) outputs.push_back(std::move(*chunk_out));
+                if (hidden && (all_logits || last)) hiddens.push_back(std::move(chunk_hidden));
+            }
+            if (hidden) {
+                *hidden = hiddens.size() == 1 ? std::move(hiddens.front()) : context_->concat(hiddens, 0);
+                context_->synchronize();
+            }
+            if (outputs.size() == 1) return std::move(outputs.front());
+            auto joined = context_->concat(outputs, 0);
+            context_->synchronize();
+            return joined;
+        }
         auto& context = *context_;
         const auto T = static_cast<std::int64_t>(tokens.size());
         const auto start = state.position;
@@ -1172,23 +1489,31 @@ auto Inkling2Impl::stage_host_step(std::span<const std::int32_t> tokens, Inkling
         auto& pos_host = step_input(step.positions, {T}, DType::I32);
         const auto pos_span = require(pos_host.data<std::int32_t>());
         for (std::int64_t t = 0; t < T; ++t) pos_span[t] = static_cast<std::int32_t>(start + t);
+        Tensor local_pos_host;
+        if (ring_local) {
+            local_pos_host = step_input(step.local_positions, {T}, DType::I32);
+            const auto lspan = require(local_pos_host.data<std::int32_t>());
+            for (std::int64_t t = 0; t < T; ++t)
+                lspan[t] = static_cast<std::int32_t>((start + static_cast<std::size_t>(t)) % state.local_capacity);
+        }
         auto& slot_host = step_input(step.conv_slot, {1}, DType::I32);
         require(slot_host.data<std::int32_t>())[0] = static_cast<std::int32_t>(start % CONV_WIDTH);
-        std::vector<Tensor> staged;
+        std::vector<Tensor> to_stage{token_host, pos_host, slot_host};
         if (T > 1) {
             const auto K = std::min<std::int64_t>(T, CONV_WIDTH);
             auto& tail_host = step_input(step.tail_slots, {K}, DType::I32);
             const auto tail_span = require(tail_host.data<std::int32_t>());
             for (std::int64_t i = 0; i < K; ++i)
                 tail_span[i] = static_cast<std::int32_t>((start + T - K + i) % CONV_WIDTH);
-            const std::array to_stage{token_host, pos_host, slot_host, tail_host};
-            staged = context.stage_inputs(to_stage);
-        } else {
-            const std::array to_stage{token_host, pos_host, slot_host};
-            staged = context.stage_inputs(to_stage);
+            to_stage.push_back(tail_host);
         }
-        auto output = run_forward(staged[0], staged[1], staged[2], T > 1 ? staged[3] : Tensor{}, state, T, all_logits,
-                                  select, hidden);
+        if (ring_local) to_stage.push_back(local_pos_host);
+        const auto staged = context.stage_inputs(to_stage);
+        const Tensor tail_arg = T > 1 ? staged[3] : Tensor{};
+        const Tensor local_pos_arg = ring_local ? staged.back() : Tensor{};
+        auto output =
+            run_forward(staged[0], staged[1], local_pos_arg, staged[2], tail_arg, state, T, all_logits, select, hidden);
+        context.synchronize();
         state.position += tokens.size();
         if (record_rewind) state.verify_end = state.position;
         return output;
@@ -1229,11 +1554,20 @@ auto Inkling2Impl::forward_device_token(const Tensor& token, LanguageModelState&
         require(pos_host.data<std::int32_t>())[0] = static_cast<std::int32_t>(start);
         auto& slot_host = step_input(state.decode_step.conv_slot, {1}, DType::I32);
         require(slot_host.data<std::int32_t>())[0] = static_cast<std::int32_t>(start % CONV_WIDTH);
-        const std::array to_stage{pos_host, slot_host};
+        const bool ring_local = device().kind == tensor::DeviceKind::A_GPU && state.local_capacity > 0 &&
+                                state.local_capacity < state.capacity;
+        std::vector<Tensor> to_stage{pos_host, slot_host};
+        if (ring_local) {
+            auto& lpos = step_input(state.decode_step.local_positions, {1}, DType::I32);
+            require(lpos.data<std::int32_t>())[0] = static_cast<std::int32_t>(start % state.local_capacity);
+            to_stage.push_back(lpos);
+        }
         const auto staged = context.stage_inputs(to_stage);
+        if (weight("embed.weight").device() != device()) context.synchronize();
         const auto output_mode =
             supports_device_tokens() ? ops::TokenOutput::DEVICE : ops::TokenOutput::HOST;
-        auto selected = run_forward(token, staged[0], staged[1], {}, state, 1, false, output_mode, nullptr);
+        auto selected = run_forward(token, staged[0], ring_local ? staged[2] : Tensor{}, staged[1], {}, state, 1, false,
+                                    output_mode, nullptr);
         state.position += 1;
         return require(require(selected.to(device())).reshape({1}));
     } catch (const ops::Failure& error) {

@@ -14,6 +14,8 @@
 
 #include "kidi/checkpoint/ggml/reader.h"
 #include "kidi/checkpoint/weights.h"
+#include "kidi/ops/context.h"
+#include "kidi/tensor/backend.h"
 
 namespace {
 
@@ -280,6 +282,46 @@ TEST_F(SafetensorsTest, MapsTensorViews) {
     EXPECT_EQ((*values)[1], -2.5F) << "mapped tensor view is incorrect";
     EXPECT_FALSE(tensor->data<float>().has_value()) << "mapped tensor view is incorrect";
 }
+
+#if defined(__APPLE__)
+TEST_F(SafetensorsTest, MapsReadonlyMetalTensorView) {
+    const auto device = kidi::tensor::Device::apple_gpu();
+    const auto backend = kidi::tensor::BackendRegistry::instance().backend(device);
+    if (!backend || !(*backend)->is_available(device)) GTEST_SKIP() << "Metal device unavailable";
+    auto mapped = weights->tensor("weight", device);
+    ASSERT_TRUE(mapped.has_value()) << mapped.error().message;
+    EXPECT_EQ(mapped->device(), device);
+    EXPECT_EQ(mapped->numel(), 2U);
+    EXPECT_FALSE(mapped->host_bytes()) << "mapped Metal weights must not be writable";
+    weights.reset();
+    tensor.reset();
+    kidi::ops::Context gpu(device);
+    const auto output = gpu.cast(gpu.cast(*mapped, kidi::tensor::DType::BF16), kidi::tensor::DType::F32);
+    gpu.synchronize();
+    const auto values = output.data<float>();
+    ASSERT_TRUE(values.has_value()) << values.error().message;
+    EXPECT_EQ((*values)[0], 1.25F);
+    EXPECT_EQ((*values)[1], -2.5F);
+}
+
+TEST_F(SafetensorsTest, CopiesUnalignedMetalTensorView) {
+    const auto device = kidi::tensor::Device::apple_gpu();
+    const auto backend = kidi::tensor::BackendRegistry::instance().backend(device);
+    if (!backend || !(*backend)->is_available(device)) GTEST_SKIP() << "Metal device unavailable";
+    const auto source = weights->tensor("e4m3");
+    ASSERT_TRUE(source.has_value()) << source.error().message;
+    const auto source_bytes = source->host_bytes();
+    ASSERT_TRUE(source_bytes.has_value()) << source_bytes.error().message;
+    ASSERT_NE(reinterpret_cast<std::uintptr_t>(source_bytes->data()) % 4, 0U);
+
+    auto copied = weights->tensor("e4m3", device);
+    ASSERT_TRUE(copied.has_value()) << copied.error().message;
+    const auto copied_bytes = copied->host_bytes();
+    ASSERT_TRUE(copied_bytes.has_value()) << copied_bytes.error().message;
+    EXPECT_EQ(copied->device(), device);
+    EXPECT_TRUE(std::ranges::equal(*source_bytes, *copied_bytes));
+}
+#endif
 
 TEST_F(SafetensorsTest, MapsDataTypes) {
     const auto bf16 = weights->tensor("bf16");

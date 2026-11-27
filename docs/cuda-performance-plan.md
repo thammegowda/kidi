@@ -376,7 +376,7 @@ prefill across `sm_80` and `sm_90`:
   bank-conflict-free `W8WeightStride=80` shared memory, `prmt+lop3+hsub2` fast
   `int8 -> bfloat162` conversion, whole-group Split-K, 128-bit `w8a16_vector`
   decode GEMV, horizontal `q_proj + kv_proj` CUDA Graph fusion (`M=1`), and
-  direct load-time BF16-to-W8A16 packing (`--precision w8a16`) without duplicate
+  direct load-time BF16-to-W8A16 packing (`--precision q8`) without duplicate
   BF16 projection VRAM.
 - **Native CUDA W8A8 (`pipelined_w8a8_gemm` + `quantized_vector_fast` +
   `decode_partitions<float>` + `flash_attention_f32`):** zero-spill `64x64x64`/

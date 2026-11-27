@@ -231,7 +231,7 @@ TEST(Inkling2Test, CompactWeightsMatchBfloatReference) {
         auto state = require(model->create_state(256));
         reference = host_logits(require(model->forward(prompt, *state, true)));
     }
-    for (const auto precision : {core::InferencePrecision::CHECKPOINT, core::InferencePrecision::Q8A16}) {
+    for (const auto precision : {core::InferencePrecision::CHECKPOINT, core::InferencePrecision::Q8}) {
         auto model = require(model::create_model_as<model::CausalLanguageModel>(
             config["model"], {.device = tensor::Device::cuda(), .parameter_dtype = tensor::DType::BF16}));
         const auto conflicting =

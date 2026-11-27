@@ -43,22 +43,18 @@ TEST(PrecisionTest, ParsesInferencePrecisions) {
     using namespace kidi;
     using core::InferencePrecision;
     constexpr auto MESSAGE = "inference precision parsing failed";
-    EXPECT_EQ(core::parse_precision("fp32"), InferencePrecision::FP32) << MESSAGE;
-    EXPECT_EQ(core::parse_precision("lowbit-parity"), InferencePrecision::LOWBIT_PARITY) << MESSAGE;
-    EXPECT_EQ(core::parse_precision("i2a16"), InferencePrecision::Q2A16) << MESSAGE;
-    EXPECT_EQ(core::parse_precision("i4a16"), InferencePrecision::Q4A16) << MESSAGE;
-    EXPECT_EQ(core::parse_precision("i8a16"), InferencePrecision::Q8A16) << MESSAGE;
-    EXPECT_EQ(core::parse_precision("i8a8"), InferencePrecision::Q8AE4M3) << MESSAGE;
-    EXPECT_EQ(core::parse_precision("w8afp8"), InferencePrecision::Q8AE4M3) << MESSAGE;
-    EXPECT_EQ(core::to_string(InferencePrecision::Q4AE5M2), "q4ae5m2") << MESSAGE;
+    EXPECT_EQ(core::parse_precision("q8"), InferencePrecision::Q8) << MESSAGE;
+    EXPECT_EQ(core::parse_precision("q4"), InferencePrecision::Q4) << MESSAGE;
+    EXPECT_EQ(core::parse_precision("qat-fp32"), InferencePrecision::QAT_FP32) << MESSAGE;
+    EXPECT_FALSE(core::parse_precision("i8a8")) << MESSAGE;
     EXPECT_FALSE(core::parse_precision("unknown")) << MESSAGE;
 }
 
 TEST(PrecisionTest, ParsesKVCachePrecisions) {
     using namespace kidi;
     constexpr auto MESSAGE = "KV-cache precision parsing failed";
-    EXPECT_EQ(core::parse_kv_cache_precision("i8"), core::KVCachePrecision::INT8) << MESSAGE;
-    EXPECT_EQ(core::parse_kv_cache_precision("fp8-e4m3"), core::KVCachePrecision::E4M3) << MESSAGE;
+    EXPECT_EQ(core::parse_kv_cache_precision("int8"), core::KVCachePrecision::INT8) << MESSAGE;
+    EXPECT_FALSE(core::parse_kv_cache_precision("e4m3")) << MESSAGE;
     EXPECT_EQ(core::to_string(core::KVCachePrecision::FP32), "fp32") << MESSAGE;
     EXPECT_FALSE(core::parse_kv_cache_precision("unknown")) << MESSAGE;
 }
@@ -77,21 +73,15 @@ protected:
         kidi::ops::require(kidi::tensor::Tensor::from_host({2, 1}, std::span<const float>(SCALE_VALUES)));
 };
 
-TEST_F(PackedPrecisionTest, PrecisionIndependent) {
+TEST_F(PackedPrecisionTest, Bf16ReferenceIgnoresActivationRounding) {
     using namespace kidi;
-    using core::InferencePrecision;
     using ops::require;
-    for (const auto precision : {InferencePrecision::FP32, InferencePrecision::BF16,
-                                 InferencePrecision::Q8A16}) {
-        SCOPED_TRACE(core::to_string(precision));
-        ops::Context context;
-        context.set_precision(precision);
-        const auto output = context.packed_linear(input, weight, scales, 8, 2, 0.1F, 0.1F);
-        const auto values = require(output.data<float>());
-        const auto tolerance = precision == InferencePrecision::FP32 ? 1.0e-5F : 2.0e-3F;
-        EXPECT_NEAR(values[0], 0.35F, tolerance) << "inference precision changed packed-linear result";
-        EXPECT_NEAR(values[1], -0.0125F, tolerance) << "inference precision changed packed-linear result";
-    }
+    ops::Context context;
+    context.set_precision(core::InferencePrecision::BF16);
+    const auto output = context.packed_linear(input, weight, scales, 8, 2, 0.1F, 0.1F);
+    const auto values = require(output.data<float>());
+    EXPECT_NEAR(values[0], 0.35F, 2.0e-3F) << "BF16 reference changed packed-linear result";
+    EXPECT_NEAR(values[1], -0.0125F, 2.0e-3F) << "BF16 reference changed packed-linear result";
 }
 
 TEST_F(PackedPrecisionTest, DequantCacheScales) {
@@ -101,29 +91,26 @@ TEST_F(PackedPrecisionTest, DequantCacheScales) {
     const std::array alternate_scale_values{1.F, 0.5F};
     const auto alternate_scales =
         require(tensor::Tensor::from_host({2, 1}, std::span<const float>(alternate_scale_values)));
+    // Zero activation scales disable QAT rounding, leaving the FP32 dequantized product.
     ops::Context cache_context;
-    cache_context.set_precision(InferencePrecision::FP32);
-    static_cast<void>(cache_context.packed_linear(input, weight, scales, 8, 2, 0.1F, 0.1F));
-    const auto alternate =
-        cache_context.packed_linear(input, weight, alternate_scales, 8, 2, 0.1F, 0.1F);
+    cache_context.set_precision(InferencePrecision::QAT_FP32);
+    static_cast<void>(cache_context.packed_linear(input, weight, scales, 8, 2, 0.F, 0.F));
+    const auto alternate = cache_context.packed_linear(input, weight, alternate_scales, 8, 2, 0.F, 0.F);
     const auto alternate_values = require(alternate.data<float>());
     EXPECT_NEAR(alternate_values[0], 0.7F, TOLERANCE) << "dequantized weight cache ignored changed scales";
     EXPECT_NEAR(alternate_values[1], -0.025F, TOLERANCE) << "dequantized weight cache ignored changed scales";
 }
 
-#if defined(__APPLE__)
-TEST_F(PackedPrecisionTest, LowBitParity) {
+TEST_F(PackedPrecisionTest, QatFp32KeepsActivationRounding) {
     using namespace kidi;
-    using core::InferencePrecision;
     using ops::require;
-    ops::Context lowbit_context;
-    lowbit_context.set_precision(InferencePrecision::LOWBIT_PARITY);
-    const auto lowbit = lowbit_context.packed_linear(input, weight, scales, 8, 2, 0.1F, 0.1F);
-    const auto lowbit_values = require(lowbit.data<float>());
-    EXPECT_NEAR(lowbit_values[0], 0.4F, TOLERANCE) << "low-bit parity projection produced unexpected SRQ output";
-    EXPECT_NEAR(lowbit_values[1], 0.F, TOLERANCE) << "low-bit parity projection produced unexpected SRQ output";
+    ops::Context context;
+    context.set_precision(core::InferencePrecision::QAT_FP32);
+    const auto output = context.packed_linear(input, weight, scales, 8, 2, 0.1F, 0.1F);
+    const auto values = require(output.data<float>());
+    EXPECT_NEAR(values[0], 0.4F, TOLERANCE) << "QAT-FP32 projection produced unexpected SRQ output";
+    EXPECT_NEAR(values[1], 0.F, TOLERANCE) << "QAT-FP32 projection produced unexpected SRQ output";
 }
-#endif
 
 TEST(PrecisionTest, UnpacksLowBitWeights) {
     using namespace kidi;
@@ -139,45 +126,11 @@ TEST(PrecisionTest, UnpacksLowBitWeights) {
     const auto low_bit_scales =
         require(tensor::Tensor::from_host({1}, std::span<const float>(low_bit_scale_values)));
     ops::Context low_bit_context;
-    low_bit_context.set_precision(InferencePrecision::FP32);
-    const auto low_bit_output = low_bit_context.packed_linear(
-        low_bit_input, low_bit_weight, low_bit_scales, 4, 4, 0.1F, 0.1F);
+    low_bit_context.set_precision(InferencePrecision::QAT_FP32);
+    const auto low_bit_output =
+        low_bit_context.packed_linear(low_bit_input, low_bit_weight, low_bit_scales, 4, 4, 0.F, 0.F);
     EXPECT_NEAR(require(low_bit_output.data<float>())[0], -5.F, TOLERANCE)
-        << "FP32 precision did not unpack signed 4-bit weights";
-    for (const auto [precision, expected] :
-         {std::pair{InferencePrecision::Q2A16, -6.F},
-          std::pair{InferencePrecision::Q4A16, -4.857143F}}) {
-        ops::Context context;
-        context.set_precision(precision);
-        const auto output =
-            context.packed_linear(low_bit_input, low_bit_weight, low_bit_scales, 4, 4, 0.1F, 0.1F);
-        const auto actual = require(output.data<float>())[0];
-        EXPECT_NEAR(actual, expected, 0.03F) << "explicit weight precision result differs";
-    }
-}
-
-TEST_F(PackedPrecisionTest, Fp8Activations) {
-    using namespace kidi;
-    using core::InferencePrecision;
-    using ops::require;
-    for (const auto [precision, dtype] :
-         {std::pair{InferencePrecision::Q8AE4M3, tensor::DType::E4M3},
-          std::pair{InferencePrecision::Q8AE5M2, tensor::DType::E5M2}}) {
-        SCOPED_TRACE(core::to_string(precision));
-        ops::Context context;
-        context.set_precision(precision);
-        const auto rounded = context.cast(context.cast(input, dtype), tensor::DType::F32);
-        const auto rounded_values = require(rounded.data<float>());
-        const auto expected_second = dtype == tensor::DType::E4M3 ? -0.203125F : -0.1875F;
-        EXPECT_NEAR(rounded_values[0], 0.15625F, TOLERANCE) << "CPU FP8 conversion produced unexpected values";
-        EXPECT_NEAR(rounded_values[1], expected_second, TOLERANCE) << "CPU FP8 conversion produced unexpected values";
-        const std::array expected{rounded_values[0] - rounded_values[1],
-                                  0.25F * rounded_values[0] + 0.25F * rounded_values[1]};
-        const auto output = context.packed_linear(input, weight, scales, 8, 2, 0.1F, 0.1F);
-        const auto values = require(output.data<float>());
-        EXPECT_NEAR(values[0], expected[0], TOLERANCE) << "FP8 activation precision changed packed-linear result";
-        EXPECT_NEAR(values[1], expected[1], TOLERANCE) << "FP8 activation precision changed packed-linear result";
-    }
+        << "QAT-FP32 precision did not unpack signed 4-bit weights";
 }
 
 TEST(PrecisionTest, Bf16LinearAndTiedLinear) {

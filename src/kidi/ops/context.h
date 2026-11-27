@@ -185,13 +185,14 @@ public:
     /// CUDA top-k routing without a host round trip: ranks sigmoid(logits) + bias and normalizes the selected
     /// sigmoid scores to sum to `scale`. Returns [tokens, top, 2] FP32 rows of (expert index, routing weight).
     auto route_experts(const Tensor& logits, const Tensor& bias, std::int32_t top, float scale) -> Tensor;
-    /// CUDA routed gate/up projection over stacked experts (values [experts, rows, packed]); reads each selected
-    /// expert's interleaved gate/up row pairs in place. Returns [tokens, slots, rows / 2] activations that include
-    /// the softcapped SiLU gate and routing weight. The global scale, when present, holds one FP32 per expert.
+    /// Routed gate/up projection over stacked experts (values [experts, rows, packed]): CUDA block-scaled formats or
+    /// CPU/Metal VQ3D/VQ4D. Reads each selected expert's interleaved gate/up row pairs in place. Returns
+    /// [tokens, slots, rows / 2] activations that include the softcapped SiLU gate and routing weight. The global
+    /// scale, when present, holds one FP32 per expert (one per expert row for VQ formats).
     auto expert_silu(const Tensor& input, const BlockScaledWeight& weight, const Tensor& routes, float gate_cap,
                      float up_cap) -> Tensor;
-    /// CUDA routed down projection of [tokens, slots, width] activations; returns [tokens, rows] summed over
-    /// slots (FP32 by default, or BF16 when requested).
+    /// Routed down projection (CUDA block-scaled formats or CPU/Metal VQ3D/VQ4D) of [tokens, slots, width]
+    /// activations; returns [tokens, rows] summed over slots (FP32 by default, or BF16 when requested).
     auto expert_linear(const Tensor& input, const BlockScaledWeight& weight, const Tensor& routes,
                        std::optional<tensor::DType> output_dtype = {}) -> Tensor;
     auto gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
@@ -228,6 +229,7 @@ public:
     struct RelativeAttention {
         std::int64_t heads, key_heads, start, window, extent;
         float log_alpha = 0, log_floor = 0;
+        bool ring_mode = false;
     };
     /// RMS-normalizes each [tokens, width] source and mixes them per token with softmax weights from the
     /// [queries, width] pseudo-queries; returns FP32 [queries, tokens, width].

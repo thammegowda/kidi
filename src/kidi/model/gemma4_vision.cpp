@@ -26,12 +26,10 @@ constexpr std::int64_t VISION_ROWS = 32;
 auto slice_rows(const ops::Context& context, bool attention) -> std::int64_t {
     const auto& capabilities = context.device().capabilities();
     if (capabilities.compute.host()) {
-        const auto precision = context.precision();
-        if (precision == core::InferencePrecision::LOWBIT_PARITY ||
-            (attention && precision == core::InferencePrecision::QAT_FP32))
+        if (attention && context.precision() == core::InferencePrecision::QAT_FP32)
             return std::numeric_limits<std::int64_t>::max();
+        return VISION_ROWS;
     }
-    if (capabilities.compute.host()) return VISION_ROWS;
     if (attention && !capabilities.attention.fused())
         return static_cast<std::int64_t>(context.device().policy().transformer.attention_query_rows);
     return std::numeric_limits<std::int64_t>::max();
@@ -400,8 +398,7 @@ auto Gemma4VisionImpl::forward(const image::Gemma4Image& image, const BlockObser
                 for (int channel = 0; channel < state.head_width / 4; ++channel) {
                     const auto coordinate = axis ? patch / image.patch_columns : patch % image.patch_columns;
                     const auto exponent = static_cast<float>(channel) * 4 / state.head_width;
-                    const auto parity_math = state.precision == core::InferencePrecision::QAT_FP32 ||
-                                             state.precision == core::InferencePrecision::LOWBIT_PARITY;
+                    const auto parity_math = state.precision == core::InferencePrecision::QAT_FP32;
                     const auto frequency = parity_math
                                                ? 1.F / std::pow(state.theta, exponent)
                                                : std::pow(state.theta, -exponent);

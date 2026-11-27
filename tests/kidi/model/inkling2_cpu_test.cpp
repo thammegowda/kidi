@@ -28,7 +28,7 @@ TEST(Inkling2CpuTest, Int8PrefillDecodeAndRewind) {
     const auto config = require(checkpoint::load_config(*directory));
     auto model = require(model::create_model_as<model::CausalLanguageModel>(
         config["model"], {.device = tensor::Device::cpu(), .parameter_dtype = tensor::DType::BF16}));
-    // The default CPU policy must pack experts even without an explicit --precision q8a16.
+    // The default CPU policy must pack experts even without an explicit --precision q8.
     require(model->set_checkpoint(require(checkpoint::Weights::load(config["weights_file"].as<std::string>()))));
     const auto tokenizer = require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
     const auto tokens = require(tokenizer.encode("The capital of France is"));

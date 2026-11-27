@@ -327,7 +327,7 @@ auto Gemma4AttentionImpl::forward_segments(ops::Context& context, const Tensor& 
             const auto value_scale = require(value_scale_.data<float>())[0];
             key_quantization = {{key_scale}, {0}, static_cast<std::size_t>(head_width_)};
             value_quantization = {{value_scale}, {0}, static_cast<std::size_t>(head_width_)};
-            if (!byte_cache && context.precision() != core::InferencePrecision::Q8A16) {
+            if (!byte_cache && context.precision() != core::InferencePrecision::Q8) {
                 key = context.static_round(key, key_scale);
                 value = context.static_round(value, value_scale);
             }

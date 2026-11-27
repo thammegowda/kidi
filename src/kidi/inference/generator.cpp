@@ -32,6 +32,14 @@ namespace {
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t QNN_PREFILL_CAPTURE_TOKENS = 2048;
 constexpr std::size_t CPU_PREFILL_BUCKET = 128;
+/// Compute policy after load-time packing: Q4 and Q8 run the native packed kernels, except that CUDA Q8 keeps BF16
+/// activations (W8A16).
+auto runtime_precision(core::InferencePrecision precision, tensor::Device device) -> core::InferencePrecision {
+    if (precision == core::InferencePrecision::Q4 ||
+        (precision == core::InferencePrecision::Q8 && device.kind != tensor::DeviceKind::CUDA))
+        return core::InferencePrecision::CHECKPOINT;
+    return precision;
+}
 auto uses_padded_prefill(const std::shared_ptr<model::CausalLanguageModel>& model) -> bool {
 #if defined(__EMSCRIPTEN__)
     (void)model;
@@ -238,17 +246,16 @@ Generator::~Generator() = default;
 auto Generator::load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits,
                      std::int32_t group_size, bool packed_prefill, const ExternalTensorSource& external)
     -> Result<Generator> {
-    return load(directory,
-                {.device = device,
-                 .precision = core::InferencePrecision::CHECKPOINT,
-                 .kv_cache_precision = core::KVCachePrecision::AUTO,
-                 .weight_bits = weight_bits,
-                 .group_size = group_size,
-                 .packed_prefill = packed_prefill},
-                external);
+    return load_with_packing(directory, {.device = device, .packed_prefill = packed_prefill}, weight_bits, group_size,
+                             external);
 }
 auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions options,
                      const ExternalTensorSource& external) -> Result<Generator> {
+    return load_with_packing(directory, std::move(options), 0, 128, external);
+}
+auto Generator::load_with_packing(const std::filesystem::path& directory, ModelLoadOptions options,
+                                  std::int32_t weight_bits, std::int32_t group_size,
+                                  const ExternalTensorSource& external) -> Result<Generator> {
     try {
         auto config = require(checkpoint::load_config(directory));
         require(model::validate_model_config(config["model"]));
@@ -290,28 +297,32 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             }
         }
         const auto checkpoint_bf16 = !qat && options.precision == core::InferencePrecision::BF16;
+        const auto vq_mode = options.precision == core::InferencePrecision::VQ3D_HYBRID;
+        const auto model_type = config["model"]["type"].as<std::string>();
+        if (vq_mode && model_type != "inkling2_text")
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "vq3d-hybrid is currently an Inkling-2 precision"});
         const auto cuda_w8a16 =
-            options.device.kind == tensor::DeviceKind::CUDA && options.precision == core::InferencePrecision::Q8A16;
-        const auto inkling_w8a16 = options.device.kind == tensor::DeviceKind::CPU &&
-                                  config["model"]["model_type"].as<std::string>("") == "inkling2_loop_text" &&
-                                  options.precision == core::InferencePrecision::Q8A16;
-        if (options.precision != core::InferencePrecision::CHECKPOINT && !qat && !checkpoint_bf16 &&
-            !cuda_w8a16 && !inkling_w8a16)
-            throw ops::Failure(
-                {ErrorCode::UNSUPPORTED, "explicit projection precision currently requires a native QAT checkpoint"});
-        if (options.precision != core::InferencePrecision::CHECKPOINT && options.weight_bits)
-            throw ops::Failure(
-                {ErrorCode::INVALID_ARGUMENT, "precision and load-time weight packing cannot be combined"});
-        if (options.precision != core::InferencePrecision::CHECKPOINT && !checkpoint_bf16 && !cuda_w8a16 &&
+            options.device.kind == tensor::DeviceKind::CUDA && options.precision == core::InferencePrecision::Q8;
+        if (options.precision == core::InferencePrecision::Q4 || options.precision == core::InferencePrecision::Q8) {
+            // QAT weights keep their trained widths; only CUDA can run trained INT8 layers with BF16 activations.
+            if (qat && !cuda_w8a16)
+                throw ops::Failure(
+                    {ErrorCode::UNSUPPORTED, "QAT checkpoints keep their trained precision; use checkpoint"});
+            weight_bits = options.precision == core::InferencePrecision::Q4 ? 4 : (qat ? 0 : 8);
+            group_size = 128;
+        }
+        const auto precision = runtime_precision(options.precision, options.device);
+        if (options.precision == core::InferencePrecision::QAT_FP32 && !qat)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "qat-fp32 requires a native QAT checkpoint"});
+        if (precision != core::InferencePrecision::CHECKPOINT && !checkpoint_bf16 && !cuda_w8a16 &&
+            !(vq_mode &&
+              (options.device.kind == tensor::DeviceKind::CPU || options.device.kind == tensor::DeviceKind::A_GPU)) &&
             !options.device.capabilities().compute.host())
             throw ops::Failure(
                 {ErrorCode::UNSUPPORTED, "selected precision is currently implemented only by the CPU backend"});
-#if !defined(__APPLE__)
-        if (options.precision == core::InferencePrecision::LOWBIT_PARITY)
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "lowbit-parity currently requires Apple Accelerate"});
-#endif
-        if (options.kv_cache_precision == core::KVCachePrecision::INT8 && !qat)
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "INT8 KV cache requires a calibrated QAT checkpoint"});
+        if (options.kv_cache_precision == core::KVCachePrecision::INT8 && !qat && model_type != "inkling2_text")
+            throw ops::Failure(
+                {ErrorCode::UNSUPPORTED, "INT8 KV cache requires a calibrated QAT or Inkling-2 checkpoint"});
         auto tokenizer = [&] {
             const core::MemoryScope memory("load:tokenizer");
             return require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
@@ -352,13 +363,13 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
         const auto warmup = token_or("bos_token_id", tokenizer_tokens.bos);
         auto weights_path = std::filesystem::path(config["weights_file"].as<std::string>());
 #if !defined(__EMSCRIPTEN__)
-        if (options.device.kind == tensor::DeviceKind::CPU &&
-            config["model"]["type"].as<std::string>() == "inkling2_text" &&
-            (options.precision == core::InferencePrecision::CHECKPOINT ||
-             options.precision == core::InferencePrecision::Q8A16) &&
-            (options.weight_bits == 0 || options.weight_bits == 8))
-            weights_path = require(checkpoint::prepare(directory, model::Inkling2Impl::int8_preparation)) /
-                           "model.safetensors";
+        if (vq_mode) {
+            weights_path =
+                require(checkpoint::prepare(directory, model::Inkling2Impl::vq_preparation)) / "model.safetensors";
+        } else if (options.device.kind == tensor::DeviceKind::CPU && model_type == "inkling2_text" &&
+                   precision == core::InferencePrecision::CHECKPOINT && (weight_bits == 0 || weight_bits == 8))
+            weights_path =
+                require(checkpoint::prepare(directory, model::Inkling2Impl::int8_preparation)) / "model.safetensors";
 #endif
         auto weights = require(checkpoint::Weights::load(weights_path));
         for (const auto& declared : config["external_tensors"]) {
@@ -396,11 +407,10 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
                                 "padded embeddings require unpadded logits"});
         {
             const core::MemoryScope memory("load:bind_weights");
-            const auto effective_weight_bits = cuda_w8a16 && !qat ? std::int32_t{8} : options.weight_bits;
-            require(model->set_checkpoint(weights, {.weight_bits = effective_weight_bits,
-                                                    .group_size = options.group_size,
+            require(model->set_checkpoint(weights, {.weight_bits = weight_bits,
+                                                    .group_size = group_size,
                                                     .packed_prefill = options.packed_prefill,
-                                                    .precision = options.precision}));
+                                                    .precision = precision}));
         }
 #if !defined(__EMSCRIPTEN__)
         if (uses_padded_prefill(model)) {
@@ -408,12 +418,12 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             model->configure_cache(cache_root / ".kidi-cache" / "ynn-gff-v1", config["weights_file"].as<std::string>());
         }
 #endif
-        model->set_precision(options.precision);
+        model->set_precision(precision);
         model->set_kv_cache_precision(options.kv_cache_precision);
         require(model->kv_cache_dtype(1));
         if (speculative && !model->accelerator().empty())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding requires a native CPU target"});
-        if (!lm_head_index.empty() && options.weight_bits)
+        if (!lm_head_index.empty() && weight_bits)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "HNSW head does not support load-time weight packing"});
         if (!lm_head_index.empty()) require(model->configure_lm_head(lm_head_index));
         std::unique_ptr<DraftBackend> drafter;
@@ -481,6 +491,23 @@ auto Generator::execution() const -> std::string {
     if (!accelerator.empty()) result += "+" + std::string(accelerator);
     return result;
 }
+auto Generator::prefill_logits(std::span<const std::int32_t> tokens) -> Result<tensor::Tensor> {
+    try {
+        if (tokens.empty())
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "prefill_logits requires at least one token"});
+        auto state = require(model_->create_state(tokens.size() + 1));
+        auto logits = require(model_->forward(tokens, *state, /*all_logits=*/true));
+        auto host = logits.is_host_accessible() ? std::move(logits) : require(logits.to(tensor::Device::cpu()));
+        if (host.dtype() != tensor::DType::F32) {
+            ops::Context cpu(tensor::Device::cpu(), false, false, tensor::DType::F32);
+            host = cpu.cast(host, tensor::DType::F32);
+        }
+        return host;
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    }
+}
+
 auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size) -> Result<void> {
     try {
         const auto maximum_context = config_["model"]["max_position_embeddings"].as<std::size_t>();
@@ -904,7 +931,7 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, Genera
                         auto vision = model::Gemma4Vision(config_["vision"], model_->hidden_size(), native_qat());
                         auto weights = require(checkpoint::Weights::load(config_["weights_file"].as<std::string>()));
                         require(vision->set_checkpoint(weights));
-                        vision->set_precision(options_.precision);
+                        vision->set_precision(runtime_precision(options_.precision, model_->device()));
                         vision_ = vision.ptr();
                     }
                     if (options.on_image_progress) options.on_image_progress("Encoding images");
@@ -1174,31 +1201,41 @@ auto Generator::step() -> Result<GenerationStep> {
                    waiting_.front().capacity <= serving_->cache_token_budget - reserved_cache_tokens_) {
                 auto& request = waiting_.front();
                 const auto chunk = std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step);
-                // A growing conversation may adopt a larger retained state when the cache budget still fits it.
                 const auto retained_capacity =
                     serving_prefix_ ? serving_prefix_->state->sequence_capacity() : std::size_t{0};
                 const bool fits = retained_capacity == request.capacity ||
                                   (serving_->compact_cache && retained_capacity > request.capacity &&
                                    retained_capacity <= serving_->cache_token_budget - reserved_cache_tokens_);
+                const bool can_grow = serving_->compact_cache && retained_capacity < request.capacity;
                 if (serving_prefix_ && request.options.prefix_cache_bytes >= serving_prefix_->bytes &&
-                    request.image_key == serving_prefix_->image_key && fits && chunk == serving_prefix_->chunk_size &&
+                    request.image_key == serving_prefix_->image_key && (fits || can_grow) &&
+                    chunk == serving_prefix_->chunk_size &&
                     serving_prefix_->crop_local_attention == !request.options.full_attention_cache) {
                     const auto limit = std::min(serving_prefix_->tokens.size(), request.prompt.size() - 1);
                     std::size_t common = 0;
                     while (common < limit && serving_prefix_->tokens[common] == request.prompt[common]) ++common;
-                    common = model_->rewind_floor(*serving_prefix_->state, common);
-                    auto rewound = model_->rewind(*serving_prefix_->state, common);
-                    // Recurrent states rewind only to the start (or not at all): reuse the allocation, not the prefix.
-                    if (!rewound && rewound.error().code == ErrorCode::UNSUPPORTED) {
-                        common = 0;
-                        rewound = model_->rewind(*serving_prefix_->state, 0);
+                    auto& cached = *serving_prefix_->state;
+                    common = model_->rewind_floor(cached, common);
+                    bool reuse = fits;
+                    if (can_grow && common) {
+                        auto grown = model_->grow_state(cached, request.capacity);
+                        if (!grown && grown.error().code != ErrorCode::UNSUPPORTED) throw ops::Failure(grown.error());
+                        reuse = grown.has_value();
                     }
-                    if (rewound) {
-                        request.stats.reused_prompt_tokens = common;
-                        request.capacity = retained_capacity;
-                        request.state = std::move(serving_prefix_->state);
-                    } else if (rewound.error().code != ErrorCode::UNSUPPORTED) {
-                        throw ops::Failure(rewound.error());
+                    if (reuse) {
+                        auto rewound = model_->rewind(cached, common);
+                        // Some recurrent states can reuse only the allocation, not the prefix.
+                        if (!rewound && rewound.error().code == ErrorCode::UNSUPPORTED && common) {
+                            common = 0;
+                            rewound = model_->rewind(cached, 0);
+                        }
+                        if (rewound) {
+                            request.stats.reused_prompt_tokens = common;
+                            request.capacity = cached.sequence_capacity();
+                            request.state = std::move(serving_prefix_->state);
+                        } else if (rewound.error().code != ErrorCode::UNSUPPORTED) {
+                            throw ops::Failure(rewound.error());
+                        }
                     }
                 }
                 serving_prefix_.reset();

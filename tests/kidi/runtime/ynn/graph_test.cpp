@@ -192,12 +192,10 @@ TEST(YnnFusedTest, FeedForward) {
                         << "FFN mismatch bits=" << bits << " rows=" << m_rows << " silu=" << silu << " idx=" << i;
                 }
             }
-#if defined(__APPLE__)
-            // Cross-check calibrated SymmetricPackedLinear (bits = 2, 4, 8, including K = 2056 non-multiple of 32)
-            // against Apple Accelerate LOWBIT_PARITY reference math.
+            // Cross-check calibrated SymmetricPackedLinear (bits = 2, 4, 8) against the QAT-FP32 dequantized reference.
             kidi::ops::Context fast_ctx(kidi::tensor::Device::cpu());
             kidi::ops::Context parity_ctx(kidi::tensor::Device::cpu());
-            parity_ctx.set_precision(kidi::core::InferencePrecision::LOWBIT_PARITY);
+            parity_ctx.set_precision(kidi::core::InferencePrecision::QAT_FP32);
             const auto fast_out = fast_ctx.packed_linear(x_t, gu_t, gate_up_scales, bits, INPUT_SIZE, 0.125F, 0.0625F);
             const auto ref_out = parity_ctx.packed_linear(x_t, gu_t, gate_up_scales, bits, INPUT_SIZE, 0.125F, 0.0625F);
             const auto fast_span = kidi::ops::require(fast_out.data<float>());
@@ -206,7 +204,6 @@ TEST(YnnFusedTest, FeedForward) {
                 ASSERT_NEAR(fast_span[i], ref_span[i], 1e-5F)
                     << "Calibrated packed_linear parity mismatch bits=" << bits << " rows=" << m_rows << " idx=" << i;
             }
-#endif
         }
     }
 }

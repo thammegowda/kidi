@@ -82,11 +82,23 @@ not pooled.
 cmake --preset release -DKIDI_BUILD_BENCHMARKS=ON
 cmake --build --preset release --target \
   kidi_android_baseline kidi_tts_bench kidi_gemma4_quality \
-  kidi_whisper_quality --parallel 8
+  kidi_whisper_quality kidi_eval_kl --parallel 8
 ```
 
 `android/baseline.cpp` is also the native Linux/macOS Gemma and Whisper harness;
 the directory name does not require running it on Android.
+
+`quality/eval_kl.cpp` (`kidi_eval_kl`) is the developer quality check for
+quantized precisions. Record reference top-10 logits once, then score another
+precision on the same prompts for KL@10, EAR@10, top-1 agreement, and
+perplexity:
+
+```bash
+build-release/kidi_eval_kl -m MODEL --backend mps --precision checkpoint \
+  -i prompts.jsonl --save-ref .cache/benchmarks/ref.bin
+build-release/kidi_eval_kl -m MODEL --backend mps --precision vq3d-hybrid \
+  -i prompts.jsonl --ref .cache/benchmarks/ref.bin
+```
 
 Each benchmark directory documents its own optional runtimes, models, and
 dependencies. Use `.cache/benchmarks/` for generated results.

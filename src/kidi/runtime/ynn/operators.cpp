@@ -2693,6 +2693,119 @@ private:
     OutputPool pool_;
 };
 
+class VqExpertOp final : public Operator {
+public:
+    VqExpertOp(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
+        : gated_(spec.attributes[0] != 0),
+          gate_cap_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[1]))),
+          up_cap_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]))),
+          format_(static_cast<ops::BlockScaledFormat>(spec.attributes[3])),
+          dim_(format_ == ops::BlockScaledFormat::VQ3D ? 3 : 4),
+          out_dtype_(spec.dtype),
+          pool_(&arena) {
+        const auto& routes = inputs[4];
+        const auto tokens = static_cast<std::int64_t>(routes.size(0));
+        const auto top = static_cast<std::int64_t>(routes.size(1));
+        const auto rows = static_cast<std::int64_t>(inputs[1].size(1));
+        if (gated_)
+            shape_ = {tokens, top, rows / 2};
+        else
+            shape_ = {tokens, rows};
+    }
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, out_dtype_, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "VQ expert projection is not an in-place operation"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(TensorInputs inputs, Tensor& output) const -> void {
+        const auto& routes = inputs[4];
+        const auto tokens = static_cast<std::size_t>(routes.size(0));
+        const auto top = static_cast<std::size_t>(routes.size(1));
+        const auto rows = static_cast<std::size_t>(inputs[1].size(1));
+        const auto cols = static_cast<std::size_t>(inputs[0].size(-1));
+        const auto k_pad = ::ynn::vq_padded_cols(dim_, cols);
+        const auto had_col = ::ynn::vq_col_hadamard_block(cols);
+        const auto had_row = ::ynn::vq_row_hadamard_block(rows);
+        const auto row_codes = static_cast<std::size_t>(inputs[1].size(2));
+        const auto row_groups = static_cast<std::size_t>(inputs[2].size(2));
+
+        const auto in_f32 = require(inputs[0].data<float>());
+        const auto values = require(inputs[1].data<std::uint8_t>());
+        const auto scales = require(inputs[2].data<std::uint8_t>());
+        const auto global = require(inputs[3].data<float>());
+        const auto route_vals = require(routes.data<float>());
+        auto out_f32 = require(output.data<float>());
+
+        const auto in_rows = gated_ ? tokens : (tokens * top);
+        std::vector<float> x_rot(in_rows * k_pad, 0.0F);
+        for (std::size_t r = 0; r < in_rows; ++r) {
+            std::memcpy(x_rot.data() + r * k_pad, in_f32.data() + r * cols, cols * sizeof(float));
+            if (had_col) ::ynn::hadamard_transform_rows_f32(x_rot.data() + r * k_pad, 1, cols, had_col);
+        }
+
+        const auto run_expert_matvec = [&](std::size_t expert, const float* xr, float* dst) {
+            const auto* v = values.data() + expert * rows * row_codes;
+            const auto* s = scales.data() + expert * rows * row_groups;
+            const auto* g = global.data() + expert * rows;
+            ::ynn::vq_linear_rotated_f32(dim_, 1, rows, cols, xr, v, s, g, dst, 0, rows);
+        };
+
+        if (gated_) {
+            const auto hidden = rows / 2;
+            const auto pairs = tokens * top;
+            require(ynn::parallel_ranges(pairs, 1, [&](std::size_t p0, std::size_t p1) {
+                std::vector<float> y_tmp(rows);
+                for (std::size_t p = p0; p < p1; ++p) {
+                    const auto t = p / top;
+                    const auto expert = static_cast<std::size_t>(route_vals[p * 2]);
+                    const float weight = route_vals[p * 2 + 1];
+                    run_expert_matvec(expert, x_rot.data() + t * k_pad, y_tmp.data());
+                    if (had_row) ::ynn::hadamard_transform_rows_f32(y_tmp.data(), 1, rows, had_row);
+                    float* dst = out_f32.data() + p * hidden;
+                    for (std::size_t i = 0; i < hidden; ++i) {
+                        const float g = y_tmp[i];
+                        const float u = y_tmp[hidden + i];
+                        const float gc = std::tanh(g / gate_cap_) * gate_cap_;
+                        const float uc = std::tanh(u / up_cap_) * up_cap_;
+                        dst[i] = (gc / (1.0F + std::exp(-g))) * uc * weight;
+                    }
+                }
+            }));
+        } else {
+            require(ynn::parallel_ranges(tokens, 1, [&](std::size_t t0, std::size_t t1) {
+                std::vector<float> y_tmp(rows);
+                for (std::size_t t = t0; t < t1; ++t) {
+                    float* acc = out_f32.data() + t * rows;
+                    std::fill(acc, acc + rows, 0.0F);
+                    for (std::size_t slot = 0; slot < top; ++slot) {
+                        const auto p = t * top + slot;
+                        const auto expert = static_cast<std::size_t>(route_vals[p * 2]);
+                        run_expert_matvec(expert, x_rot.data() + p * k_pad, y_tmp.data());
+                        // Sum in rotated space (linear!) then un-rotate once after the top-k loop.
+                        for (std::size_t r = 0; r < rows; ++r) acc[r] += y_tmp[r];
+                    }
+                    if (had_row) ::ynn::hadamard_transform_rows_f32(acc, 1, rows, had_row);
+                }
+            }));
+        }
+    }
+
+    bool gated_;
+    float gate_cap_, up_cap_;
+    ops::BlockScaledFormat format_;
+    std::int32_t dim_;
+    DType out_dtype_;
+    std::vector<std::int64_t> shape_;
+    OutputPool pool_;
+};
+
 class BlockScaledLinear final : public Operator {
 public:
     BlockScaledLinear(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
@@ -2908,6 +3021,10 @@ public:
         }
         if (spec.operation == Operation::BLOCK_SCALED_LINEAR)
             return std::make_unique<BlockScaledLinear>(spec, inputs, arena_);
+        if (spec.operation == Operation::EXPERT_LINEAR && spec.attributes.size() >= 4 &&
+            (spec.attributes[3] == static_cast<std::int64_t>(ops::BlockScaledFormat::VQ3D) ||
+             spec.attributes[3] == static_cast<std::int64_t>(ops::BlockScaledFormat::VQ4D)))
+            return std::make_unique<VqExpertOp>(spec, inputs, arena_);
         if (PackedFeedForward::supports(spec, inputs))
             return std::make_unique<PackedFeedForward>(spec, inputs, feed_forward_cache_, arena_);
         if (DenseLinearOp::supports(spec, inputs)) {

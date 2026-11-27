@@ -296,6 +296,41 @@ TEST(FusedCpuTest, RoutedExpertProjectionsMatchReference) {
 }
 #endif
 
+TEST(FusedCpuTest, VqExpertProjectionTracksDenseWeights) {
+    constexpr std::int64_t TOKENS = 5, TOP = 2, EXPERTS = 3, ROWS = 128, WIDTH = 256;
+    std::mt19937 random(7);
+    std::normal_distribution<float> normal;
+    std::vector<float> weights(EXPERTS * ROWS * WIDTH), input(TOKENS * TOP * WIDTH), routes;
+    for (auto& value : weights) value = normal(random);
+    for (auto& value : input) value = normal(random);
+    std::vector<double> expected(TOKENS * ROWS);
+    // The down projection sums slots unweighted; expert_silu applies the routing weights.
+    for (std::int64_t token = 0; token < TOKENS; ++token)
+        for (std::int64_t slot = 0; slot < TOP; ++slot) {
+            const auto expert = (token + slot) % EXPERTS;
+            routes.insert(routes.end(), {static_cast<float>(expert), slot ? 0.625F : 0.375F});
+            for (std::int64_t row = 0; row < ROWS; ++row)
+                for (std::int64_t column = 0; column < WIDTH; ++column)
+                    expected[token * ROWS + row] += static_cast<double>(
+                        weights[(expert * ROWS + row) * WIDTH + column] * input[(token * TOP + slot) * WIDTH + column]);
+        }
+    ops::Context context;
+    // VQ3D pads the 256 columns to 288; both formats rotate 64-row blocks.
+    for (const auto [format, bound] :
+         {std::pair{ops::BlockScaledFormat::VQ3D, 0.24}, std::pair{ops::BlockScaledFormat::VQ4D, 0.35}}) {
+        const auto packed = ops::require(ops::pack_vq_weight(make_tensor({EXPERTS, ROWS, WIDTH}, weights), format));
+        const auto output = context.expert_linear(make_tensor({TOKENS, TOP, WIDTH}, input), packed,
+                                                  make_tensor({TOKENS, TOP, 2}, routes));
+        const auto actual = ops::require(output.data<float>());
+        double error = 0, norm = 0;
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            error += std::pow(actual[index] - expected[index], 2);
+            norm += std::pow(expected[index], 2);
+        }
+        EXPECT_LT(std::sqrt(error / norm), bound);
+    }
+}
+
 TEST(FusedCpuTest, UnweightedRmsNorm) {
     ops::Context context;
     const std::array<float, 2> norm_values{3.F, 4.F};

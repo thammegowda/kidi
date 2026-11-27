@@ -90,6 +90,7 @@ enum class Operation {
     ROUTE_EXPERTS,
     EXPERT_LINEAR,
     SCATTER_KV,
+    QUANTIZE_CACHE,
     BLEND_PROLOGUE,
     BLEND_EPILOGUE
 };

@@ -150,9 +150,6 @@ void check_generation(const std::filesystem::path& fixture, const std::filesyste
                     ASSERT_TRUE(actual.stats.speculative);
                 }
     }
-    ASSERT_FALSE(inference::Generator::load(
-        directory,
-        {.kv_cache_precision = core::KVCachePrecision::E4M3, .dense_lm_head = true, .assistant_model = assistant}));
     ASSERT_FALSE(inference::Generator::load(directory,
                                             {.dense_lm_head = true, .assistant_model = assistant, .draft_tokens = 17}));
     auto speculative = require(inference::Generator::load(

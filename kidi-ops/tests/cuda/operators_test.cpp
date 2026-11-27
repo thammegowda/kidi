@@ -430,8 +430,8 @@ TEST_F(CudaOpsTest, W8A16ProjectionGroups) {
     const auto device = tensor::Device::cuda();
     for (const std::int32_t group_size : {256, 128}) {
         ops::Context context(device, false, true, DType::BF16), eager(device, false, false, DType::BF16);
-        context.set_precision(core::InferencePrecision::Q8A16);
-        eager.set_precision(core::InferencePrecision::Q8A16);
+        context.set_precision(core::InferencePrecision::Q8);
+        eager.set_precision(core::InferencePrecision::Q8);
         const std::int64_t groups = 256 / group_size;
         std::vector<Tensor> weights, proj_scales, norm_scales;
         for (const int columns : {64, 128, 256}) {

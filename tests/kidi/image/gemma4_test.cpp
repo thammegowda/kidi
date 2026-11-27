@@ -69,14 +69,6 @@ TEST(Gemma4ImageTest, VisionFixtureParity) {
         const float reference_maximum = max_difference(reference_values, expected_values);
         std::cout << "QAT-FP32 parity max error: " << reference_maximum << '\n';
         EXPECT_LT(reference_maximum, 2e-6F) << "FP32 packed-linear reference max error";
-#if defined(__APPLE__)
-        model->set_precision(kidi::core::InferencePrecision::LOWBIT_PARITY);
-        const auto lowbit_actual = require(model->forward({6, 9, {pixels.begin(), pixels.end()}}));
-        const auto lowbit_values = require(lowbit_actual.data<float>());
-        const float lowbit_maximum = max_difference(lowbit_values, expected_values);
-        std::cout << "low-bit parity max error: " << lowbit_maximum << '\n';
-        EXPECT_LT(lowbit_maximum, 2e-6F) << "low-bit parity max error";
-#endif
     }
 #if defined(__APPLE__)
     {

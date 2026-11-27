@@ -67,6 +67,7 @@ auto operation_name(Operation operation) -> std::string_view {
                                "route_experts",
                                "expert_linear",
                                "scatter_kv",
+                               "quantize_cache",
                                "blend_prologue",
                                "blend_epilogue"};
     return names.at(static_cast<std::size_t>(operation));

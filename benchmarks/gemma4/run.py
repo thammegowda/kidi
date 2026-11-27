@@ -63,8 +63,8 @@ def run_kidi(args, prompt, tokenizer):
                "--context-size", str(args.context), "--max-new-tokens", str(args.decode + 1),
                "--prefill-chunk-size", str(args.chunk), "--ignore-eos", "--profile",
                "--max-active", "1", "--queue-size", "1", "--cache-tokens", str(args.context)]
-    if args.weight_bits:
-        command += ["--weight-bits", str(args.weight_bits), "--group-size", str(args.group_size)]
+    if args.precision != "checkpoint":
+        command += ["--precision", args.precision]
     if args.packed_prefill:
         command += ["--packed-prefill"]
     if args.full_attention_cache:
@@ -100,9 +100,9 @@ def run_kidi(args, prompt, tokenizer):
         raise ValueError("Executed checkpoint policy does not match model configuration")
     if native_qat:
         precision = "native mobile QAT mixed Q2/Q4/Q8; trained activation/cache scales"
-    if args.weight_bits == 4:
-        precision = f"MLP Q4 group {args.group_size} / other projections per-channel Q8 PTQ"
-    elif args.weight_bits == 8:
+    if args.precision == "q4":
+        precision = "Q4 group 128 PTQ (per-channel Q8 where a width does not divide)"
+    elif args.precision == "q8":
         precision = "per-channel Q8 PTQ"
     with args.binary.open("rb") as binary:
         binary_sha256 = hashlib.file_digest(binary, "sha256").hexdigest()
@@ -113,7 +113,8 @@ def run_kidi(args, prompt, tokenizer):
             "stderr": process.stderr, "weight_precision": precision,
             "execution": "ordered JSONL, serial admission, checkpoint chat template",
             "prefill_precision": ("native QAT packed" if args.backend == "cpu" or args.packed_prefill else "native QAT cached FP16 matrices")
-            if native_qat else "packed" if args.weight_bits and args.packed_prefill else "original floating (multi-row)"}
+            if native_qat else "packed" if args.precision != "checkpoint" and args.packed_prefill
+            else "original floating (multi-row)"}
 
 
 def run_llama(args):
@@ -227,8 +228,7 @@ def main():
     parser.add_argument("--context", type=int, default=2048)
     parser.add_argument("--chunk", type=int, default=128)
     parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--weight-bits", type=int, choices=[0, 4, 8], default=0)
-    parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument("--precision", choices=["checkpoint", "q8", "q4"], default="checkpoint")
     parser.add_argument("--packed-prefill", action="store_true")
     parser.add_argument("--full-attention-cache", action="store_true")
     parser.add_argument("--runs", type=int, default=3)
@@ -239,7 +239,7 @@ def main():
         parser.error("counts must be positive; warmups and recurrent decode tokens must be non-negative")
     if args.runtime == "llama" and (args.gguf is None or not args.gguf.is_file()):
         parser.error("--runtime llama requires an existing --gguf checkpoint")
-    if args.runtime == "llama" and (args.weight_bits or args.packed_prefill or args.full_attention_cache):
+    if args.runtime == "llama" and (args.precision != "checkpoint" or args.packed_prefill or args.full_attention_cache):
         parser.error("Kidi precision/cache overrides do not apply to llama-bench")
     args.cache.mkdir(parents=True, exist_ok=True)
     tokenizer = None

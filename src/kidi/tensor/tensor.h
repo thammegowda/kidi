@@ -140,8 +140,9 @@ public:
     static auto zeros(std::vector<std::int64_t> shape, DType dtype, Device device = Device::cpu()) -> Result<Tensor>;
     static auto from_bytes(std::vector<std::int64_t> shape, DType dtype, std::span<const std::byte> bytes,
                            Device device = Device::cpu()) -> Result<Tensor>;
+    /// Metal host blobs must cover a page-aligned, page-sized mapping and remain read-only.
     static auto from_blob(std::vector<std::int64_t> shape, DType dtype, std::span<const std::byte> bytes,
-                          std::shared_ptr<const void> owner) -> Result<Tensor>;
+                          std::shared_ptr<const void> owner, Device device = Device::cpu()) -> Result<Tensor>;
     static auto from_mutable_blob(std::vector<std::int64_t> shape, DType dtype, std::span<std::byte> bytes,
                                   std::shared_ptr<void> owner) -> Result<Tensor>;
 

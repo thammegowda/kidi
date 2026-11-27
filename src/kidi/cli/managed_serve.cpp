@@ -129,19 +129,35 @@ auto choose_model(std::string model) -> std::string {
     return model.starts_with('@') ? model : fs::canonical(model).string();
 }
 
+auto effective_precision(const Namespace& arguments, const std::string& model) -> std::string {
+    const auto prec = arguments.get<std::string>("precision");
+    if (prec != "auto") return prec;
+#if defined(__APPLE__)
+    const auto& backend = arguments.get<std::string>("backend");
+    const bool metal = backend == "auto" || backend == "mps";
+    if (metal && model.find("Inkling-2") != std::string::npos) return "vq3d-hybrid";
+#endif
+    return "checkpoint";
+}
+
 auto start_server(const fs::path& exe, const fs::path& dir, const File& startup, const std::string& model,
                   const fs::path& cache, const Namespace& arguments) -> void {
     const auto log = open_file(dir / "serve.log", O_WRONLY | O_CREAT | O_TRUNC);
     const auto input = open_file("/dev/null", O_RDONLY);
+    const auto requested_ctx = arguments.get<std::size_t>("context_size");
+    const auto cache_tokens = requested_ctx ? requested_ctx : std::size_t{16384};
+    const auto precision = effective_precision(arguments, model);
     std::vector<std::string> flags{
         exe.string(),
         "serve",
         "--model=" + model,
         "--cache=" + cache.string(),
         "--backend=" + arguments.get<std::string>("backend"),
+        "--precision=" + precision,
+        "--kv-cache-precision=" + arguments.get<std::string>("kv_cache_precision"),
         "--threads=" + std::to_string(arguments.get<std::int32_t>("threads")),
-        "--context-size=" + std::to_string(arguments.get<std::size_t>("context_size")),
-        "--cache-tokens=" + std::to_string(std::max<std::size_t>(16384, arguments.get<std::size_t>("context_size"))),
+        "--context-size=" + std::to_string(requested_ctx),
+        "--cache-tokens=" + std::to_string(cache_tokens),
         arguments.get<bool>("prompt_lookup") ? "--max-active=1" : "--max-active=2",
         "--managed-dir=" + dir.string(),
         "--managed-lock-fd=" + std::to_string(startup.get()),
@@ -278,8 +294,10 @@ auto managed_provider(code::ChatClientOptions options, const Namespace& argument
     const auto identity =
         code::Json::array({binary.st_dev, binary.st_ino, binary.st_mtime, binary.st_size, options.model, cache.string(),
                            backend, visible_devices ? code::Json(visible_devices) : code::Json(nullptr),
-                           arguments.get<std::size_t>("context_size"), arguments.get<std::int32_t>("threads"),
-                           arguments.get<bool>("prompt_lookup"), arguments.get<std::size_t>("draft_tokens")})
+                           effective_precision(arguments, options.model),
+                           arguments.get<std::string>("kv_cache_precision"), arguments.get<std::size_t>("context_size"),
+                           arguments.get<std::int32_t>("threads"), arguments.get<bool>("prompt_lookup"),
+                           arguments.get<std::size_t>("draft_tokens")})
             .dump();
     const auto dir = runtime_directory() / std::to_string(std::hash<std::string>{}(identity));
     if (!private_directory(dir, true)) throw std::runtime_error("not a private directory: " + dir.string());
@@ -313,6 +331,15 @@ auto configure_managed_code_parser(ArgumentParser& parser) -> void {
     parser.add_argument("--backend")
         .default_value(std::string("auto"))
         .help("inference backend; auto prefers CUDA, then Metal, then CPU");
+    parser.add_argument("--precision")
+        .default_value(std::string("auto"))
+        .choices({"auto", "checkpoint", "bf16", "vq3d-hybrid"})
+        .help("weight quantization policy (auto selects vq3d-hybrid for Inkling-2 on Metal)");
+    parser.add_argument("--kv-cache-precision")
+        .dest("kv_cache_precision")
+        .default_value(std::string("auto"))
+        .choices({"auto", "bf16", "fp32", "int8"})
+        .help("KV-cache dtype; auto picks the model and device default");
     parser.add_argument("--context-size")
         .dest("context_size")
         .default_value<std::size_t>(0)

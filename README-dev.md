@@ -117,7 +117,7 @@ FlashAttention-2 prefill (`head_dim` 64/128/256/512), and a tiled FP32 CUDA-core
 GEMM into the `15.69 MiB` CLI without adding any CUDA toolkit shared-library
 dependencies (`VerifyPortableElf.cmake`). The dense fast paths support eligible
 transposed weights (`sm_80` and `sm_90`); FP32 does not use TF32. Native CUDA
-W8A16 (`--precision w8a16`) runs both calibrated INT8 checkpoints and unquantized
+W8A16 (`--precision q8`) runs both calibrated INT8 checkpoints and unquantized
 BF16 checkpoints with INT8 weights and BF16 activations/KV cache, while W8A8
 accelerates affine INT8 and calibrated/uncalibrated packed INT8 projections (plus
 single-group packed INT4/INT2 projections expanded to INT8) with fused

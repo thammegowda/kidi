@@ -1,15 +1,23 @@
 #include "kidi/runtime/mps/quantized_linear.h"
 #include "kidi/tensor/metal.h"
 #include "quantized_linear_metal_source.h"
+#include "vq_kernels_metal_source.h"
+#include "mpp_kernels_metal_source.h"
+#include "ynnpack/composites/vq_linear.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <iomanip>
 #include <mutex>
 #include <map>
+#include <sstream>
 #include <tuple>
 #include <string>
 #include <utility>
@@ -19,6 +27,8 @@ namespace {
 using tensor::Device;
 using tensor::DType;
 using tensor::Tensor;
+
+constexpr std::size_t VQ_PAIRED_EXPERT_TILE = 2;
 
 struct Pipelines {
     id<MTLDevice> device;
@@ -110,7 +120,348 @@ auto bind(id<MTLComputeCommandEncoder> encoder, const Tensor& tensor, NSUInteger
     [encoder setBuffer:(__bridge id<MTLBuffer>)buffer->handle offset:buffer->offset_bytes atIndex:index];
     return {};
 }
+void append_vq_codebooks(std::ostringstream& source) {
+    source << "#include <metal_stdlib>\nusing namespace metal;\n";
+    source << std::fixed << std::setprecision(8);
+    const auto emit = [&](const char* name, const float (*table)[4]) {
+        source << "constant float4 " << name << "[128] = {\n";
+        for (int i = 0; i < 128; ++i)
+            source << "float4(" << table[i][0] << "f," << table[i][1] << "f," << table[i][2] << "f," << table[i][3]
+                   << "f),";
+        source << "};\n";
+    };
+    emit("vq3d_lut", ynn::vq3d_codebook());
+    emit("vq4d_lut", ynn::vq4d_codebook());
+}
+
+auto vq_library() -> Result<id<MTLLibrary>> {
+    static std::mutex mutex;
+    static id<MTLLibrary> cached = nil;
+    std::scoped_lock lock(mutex);
+    if (cached) return cached;
+    auto shared = pipelines();
+    if (!shared) return std::unexpected(std::move(shared.error()));
+    std::ostringstream source;
+    append_vq_codebooks(source);
+    source << KIDI_VQ_KERNELS_METAL_SOURCE;
+    @autoreleasepool {
+        MTLCompileOptions* options = [MTLCompileOptions new];
+        options.mathMode = MTLMathModeSafe;
+        NSError* error = nil;
+        cached = [(*shared)->device newLibraryWithSource:[NSString stringWithUTF8String:source.str().c_str()]
+                                                 options:options
+                                                   error:&error];
+        if (!cached)
+            return std::unexpected(Error{
+                ErrorCode::RUNTIME, "compile VQ Metal kernels: " + std::string(error.localizedDescription.UTF8String)});
+        return cached;
+    }
+}
+
+auto vq_pipeline(const char* kernel, std::uint32_t dim) -> Result<id<MTLComputePipelineState>> {
+    static std::mutex mutex;
+    static std::map<std::pair<std::string, std::uint32_t>, id<MTLComputePipelineState>> cache;
+    std::scoped_lock lock(mutex);
+    const auto key = std::pair{std::string(kernel), dim};
+    if (const auto found = cache.find(key); found != cache.end()) return found->second;
+    auto library = vq_library();
+    if (!library) return std::unexpected(std::move(library.error()));
+    MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&dim type:MTLDataTypeUInt atIndex:0];
+    NSError* error = nil;
+    id<MTLFunction> function = [*library newFunctionWithName:[NSString stringWithUTF8String:kernel]
+                                              constantValues:constants
+                                                       error:&error];
+    id<MTLComputePipelineState> pipeline =
+        function ? [[*library device] newComputePipelineStateWithFunction:function error:&error] : nil;
+    if (!pipeline) return std::unexpected(Error{ErrorCode::RUNTIME, "create VQ Metal pipeline " + std::string(kernel)});
+    cache.emplace(key, pipeline);
+    return pipeline;
+}
+
+// Metal 4 (Apple M5+ Neural Accelerator) FP16-tile library; returns nil on pre-Metal-4 devices.
+auto mpp_library() -> id<MTLLibrary> {
+    static std::mutex mutex;
+    static bool initialized = false;
+    static id<MTLLibrary> cached = nil;
+    std::scoped_lock lock(mutex);
+    if (initialized) return cached;
+    initialized = true;
+    if (const auto* env = std::getenv("KIDI_METAL_PREFILL_FP32"); env && std::string_view(env) == "1") return nil;
+    auto shared = pipelines();
+    if (!shared) return nil;
+    // MTLGPUFamilyMetal4 == 5002.
+    if (![(*shared)->device supportsFamily:static_cast<MTLGPUFamily>(5002)]) return nil;
+    std::ostringstream source;
+    source << KIDI_MPP_KERNELS_METAL_SOURCE;
+    @autoreleasepool {
+        MTLCompileOptions* options = [MTLCompileOptions new];
+        options.languageVersion = static_cast<MTLLanguageVersion>((4 << 16) | 0);
+        options.mathMode = MTLMathModeSafe;
+        NSError* error = nil;
+        cached = [(*shared)->device newLibraryWithSource:[NSString stringWithUTF8String:source.str().c_str()]
+                                                 options:options
+                                                   error:&error];
+        if (!cached && error)
+            std::fprintf(stderr, "[kidi] Metal 4 prefill library unavailable: %s\n",
+                         error.localizedDescription.UTF8String);
+        return cached;
+    }
+}
+auto mpp_pipeline(id<MTLLibrary> library, const char* kernel) -> Result<id<MTLComputePipelineState>> {
+    static std::mutex mutex;
+    static std::map<std::pair<void*, std::string>, id<MTLComputePipelineState>> cache;
+    std::scoped_lock lock(mutex);
+    const auto key = std::pair{(__bridge void*)library, std::string(kernel)};
+    if (const auto found = cache.find(key); found != cache.end()) return found->second;
+    NSError* error = nil;
+    id<MTLFunction> function = [library newFunctionWithName:[NSString stringWithUTF8String:kernel]];
+    id<MTLComputePipelineState> pipeline =
+        function ? [[library device] newComputePipelineStateWithFunction:function error:&error] : nil;
+    if (!pipeline)
+        return std::unexpected(
+            Error{ErrorCode::RUNTIME, "create Metal 4 pipeline " + std::string(kernel) + ": " +
+                                          (error ? std::string(error.localizedDescription.UTF8String) : "not found")});
+    cache.emplace(key, pipeline);
+    return pipeline;
+}
+
+struct HadamardGeometry {
+    std::uint32_t rows, src_cols, dst_cols, block;
+};
+
+struct VqGeometry {
+    std::uint32_t tokens, rows, k_pad, n_groups, row_codes, top, experts;
+    float gate_cap, up_cap;
+};
+
+auto expert_tiles(std::size_t pairs, std::size_t experts, std::size_t tile) -> std::size_t {
+    // Each expert takes one tile for its first pair, then another for every full tile of extra pairs.
+    const auto active = std::min(pairs, experts);
+    return active + (pairs - active) / tile;
+}
+
+auto encode_expert_buckets(CommandBatch& batch, id<MTLComputeCommandEncoder> encoder, const Tensor& routes,
+                           Tensor& work, std::uint32_t experts, std::uint32_t tile) -> Result<void> {
+    auto group = vq_pipeline("bucket_expert_routes", 3);
+    if (!group) return std::unexpected(std::move(group.error()));
+    auto error = batch.index_error_buffer();
+    if (!error) return std::unexpected(std::move(error.error()));
+    const struct {
+        std::uint32_t pairs, experts, tile_size;
+    } geom{static_cast<std::uint32_t>(routes.size(0) * routes.size(1)), experts, tile};
+    [encoder setComputePipelineState:*group];
+    auto status = bind(encoder, routes, 0);
+    if (status) status = bind(encoder, work, 1);
+    if (!status) return status;
+    [encoder setBytes:&geom length:sizeof(geom) atIndex:2];
+    [encoder setBuffer:(__bridge id<MTLBuffer>)*error offset:0 atIndex:3];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    return {};
+}
+
+auto encode_hadamard_rows(id<MTLComputeCommandEncoder> encoder, const Tensor& src, Tensor& dst, std::uint32_t rows,
+                          std::uint32_t src_cols, std::uint32_t dst_cols, std::uint32_t block) -> Result<void> {
+    auto pipe = vq_pipeline("hadamard_rows_f32", 3);
+    if (!pipe) return std::unexpected(std::move(pipe.error()));
+    const HadamardGeometry geom{rows, src_cols, dst_cols, block};
+    [encoder setComputePipelineState:*pipe];
+    auto status = bind(encoder, src, 0);
+    if (status) status = bind(encoder, dst, 1);
+    [encoder setBytes:&geom length:sizeof(geom) atIndex:2];
+    const std::uint32_t tile = block ? block : 64u;
+    const std::uint32_t groups_x = (dst_cols + tile - 1) / tile;
+    if (status)
+        [encoder dispatchThreadgroups:MTLSizeMake(groups_x, rows, 1)
+                threadsPerThreadgroup:MTLSizeMake(block == 32 ? 32 : 64, 1, 1)];
+    return status;
+}
 } // namespace
+
+auto vq_expert_route_words(std::size_t tokens, std::size_t top, std::size_t experts) -> std::int64_t {
+    if (tokens < 16 || tokens > 512 || !top || top > 16 || !experts || experts > 256) return 0;
+    const auto pairs = tokens * top;
+    if (pairs > 4096) return 0;
+    return static_cast<std::int64_t>(experts * pairs + 1 + 2 * expert_tiles(pairs, experts, VQ_PAIRED_EXPERT_TILE));
+}
+
+auto encode_vq_experts(CommandBatch& batch, const Tensor& input, const Tensor& values, const Tensor& scales,
+                       const Tensor& global, const Tensor& routes, Tensor& x_rot_scratch, Tensor& interleaved,
+                       Tensor& pair_scratch, Tensor& route_scratch, Tensor& output, std::int32_t dim, bool gated,
+                       float gate_cap, float up_cap) -> Result<void> {
+    if ((dim != 3 && dim != 4) || input.dtype() != DType::F32 || output.dtype() != DType::F32 ||
+        routes.dtype() != DType::F32 || values.dtype() != DType::U8 || scales.dtype() != DType::U8 ||
+        global.dtype() != DType::F32 || values.dimensions() != 3 || scales.dimensions() != 3 ||
+        routes.dimensions() != 3 || routes.size(2) != 2)
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Metal VQ expert operands"});
+    const auto tokens = static_cast<std::uint32_t>(routes.size(0));
+    const auto top = static_cast<std::uint32_t>(routes.size(1));
+    const auto experts = static_cast<std::uint32_t>(values.size(0));
+    const auto rows = static_cast<std::uint32_t>(values.size(1));
+    const auto cols = static_cast<std::uint32_t>(input.size(-1));
+    const auto k_pad = static_cast<std::uint32_t>(ynn::vq_padded_cols(dim, cols));
+    const auto had_col = static_cast<std::uint32_t>(ynn::vq_col_hadamard_block(cols));
+    const auto had_row = static_cast<std::uint32_t>(ynn::vq_row_hadamard_block(rows));
+
+    auto handle = batch.compute_encoder();
+    if (!handle) return std::unexpected(std::move(handle.error()));
+    id<MTLComputeCommandEncoder> encoder = (__bridge id<MTLComputeCommandEncoder>)*handle;
+
+    const std::uint32_t in_rows = gated ? tokens : (tokens * top);
+    const Tensor* x_buf = &input;
+    if (had_col != 0 || k_pad != cols) {
+        auto st = encode_hadamard_rows(encoder, input, x_rot_scratch, in_rows, cols, k_pad, had_col);
+        if (!st) return st;
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        x_buf = &x_rot_scratch;
+    }
+
+    const auto n_groups = static_cast<std::uint32_t>(scales.size(2));
+    const VqGeometry geom{tokens, rows,    k_pad,    n_groups, static_cast<std::uint32_t>(values.size(2)),
+                          top,    experts, gate_cap, up_cap};
+
+    Result<void> status;
+    if (interleaved.defined()) {
+        auto pack = vq_pipeline("vq_interleave_groups", static_cast<std::uint32_t>(dim));
+        if (!pack) return std::unexpected(std::move(pack.error()));
+        [encoder setComputePipelineState:*pack];
+        status = bind(encoder, *x_buf, 0);
+        if (status) status = bind(encoder, interleaved, 1);
+        if (!status) return status;
+        [encoder setBytes:&geom length:sizeof(geom) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(16u * n_groups, in_rows, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        status = encode_expert_buckets(batch, encoder, routes, route_scratch, experts, VQ_PAIRED_EXPERT_TILE);
+        if (!status) return status;
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        auto projection = vq_pipeline("vq_interleaved_expert", static_cast<std::uint32_t>(dim));
+        if (!projection) return std::unexpected(std::move(projection.error()));
+        [encoder setComputePipelineState:*projection];
+        status = bind(encoder, interleaved, 0);
+        if (status) status = bind(encoder, values, 1);
+        if (status) status = bind(encoder, scales, 2);
+        if (status) status = bind(encoder, global, 3);
+        if (status) status = bind(encoder, route_scratch, 4);
+        if (status) status = bind(encoder, pair_scratch, 5);
+        if (!status) return status;
+        const std::uint32_t gate = gated;
+        [encoder setBytes:&geom length:sizeof(geom) atIndex:6];
+        [encoder setBytes:&gate length:sizeof(gate) atIndex:7];
+        [encoder dispatchThreadgroups:MTLSizeMake((rows + 7) / 8,
+                                                  expert_tiles(tokens * top, experts, VQ_PAIRED_EXPERT_TILE), 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (!gated) {
+            auto reduce = vq_pipeline("vq_reduce_expert_rows", static_cast<std::uint32_t>(dim));
+            if (!reduce) return std::unexpected(std::move(reduce.error()));
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [encoder setComputePipelineState:*reduce];
+            status = bind(encoder, pair_scratch, 0);
+            if (status) status = bind(encoder, global, 1);
+            if (status) status = bind(encoder, routes, 2);
+            if (status) status = bind(encoder, output, 3);
+            if (!status) return status;
+            [encoder setBytes:&geom length:sizeof(geom) atIndex:4];
+            [encoder dispatchThreads:MTLSizeMake(output.numel(), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+    } else {
+        auto pipe = vq_pipeline(gated ? "vq_expert_gate_rot" : "vq_expert_down_rot", static_cast<std::uint32_t>(dim));
+        if (!pipe) return std::unexpected(std::move(pipe.error()));
+        [encoder setComputePipelineState:*pipe];
+        status = bind(encoder, *x_buf, 0);
+        if (status) status = bind(encoder, values, 1);
+        if (status) status = bind(encoder, scales, 2);
+        if (status) status = bind(encoder, global, 3);
+        if (status) status = bind(encoder, routes, 4);
+        if (status) status = bind(encoder, gated ? pair_scratch : output, 5);
+        if (!status) return status;
+        [encoder setBytes:&geom length:sizeof(geom) atIndex:6];
+        [encoder dispatchThreadgroups:MTLSizeMake((rows + 3) / 4, gated ? (tokens * top) : tokens, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+
+    if (gated) {
+        if (had_row != 0) {
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            status = encode_hadamard_rows(encoder, pair_scratch, pair_scratch, tokens * top, rows, rows, had_row);
+            if (!status) return status;
+        }
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        auto ep = vq_pipeline("vq_expert_silu_epilogue", static_cast<std::uint32_t>(dim));
+        if (!ep) return std::unexpected(std::move(ep.error()));
+        [encoder setComputePipelineState:*ep];
+        status = bind(encoder, pair_scratch, 0);
+        if (status) status = bind(encoder, routes, 1);
+        if (status) status = bind(encoder, output, 2);
+        [encoder setBytes:&geom length:sizeof(geom) atIndex:3];
+        if (status)
+            [encoder dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(tokens) * top * (rows / 2), 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    } else if (had_row != 0) {
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        status = encode_hadamard_rows(encoder, output, output, tokens, rows, rows, had_row);
+    }
+    return status;
+}
+
+auto encode_relative_attention_mpp(CommandBatch& batch, std::span<const std::int64_t> attributes, TensorInputs inputs,
+                                   Tensor& output) -> Result<bool> {
+    id<MTLLibrary> mpp = mpp_library();
+    if (!mpp) return false;
+    const auto tokens = static_cast<std::uint32_t>(inputs[0].size(0));
+    const auto heads = static_cast<std::uint32_t>(attributes[0]);
+    const auto width = static_cast<std::uint32_t>(inputs[0].size(1) / heads);
+    if (tokens < 16 || width != 128) return false;
+    auto pipeline = mpp_pipeline(mpp, "relative_attention_mpp");
+    if (!pipeline) return false;
+    auto handle = batch.compute_encoder();
+    if (!handle) return std::unexpected(std::move(handle.error()));
+    id<MTLComputeCommandEncoder> encoder = (__bridge id<MTLComputeCommandEncoder>)*handle;
+    const auto as_float = [&](std::size_t index) {
+        return std::bit_cast<float>(static_cast<std::int32_t>(attributes[index]));
+    };
+    const bool has_positions = inputs.size() == 7 || inputs.size() == 9;
+    const bool has_scales = inputs.size() == 9;
+    const std::uint32_t kv_dtype = inputs[1].dtype() == DType::F32 ? 0u : (inputs[1].dtype() == DType::BF16 ? 1u : 2u);
+    const std::uint32_t scale_stride = has_scales ? static_cast<std::uint32_t>(inputs[7].size(1)) : 1u;
+    const std::uint32_t scale_group =
+        has_scales ? static_cast<std::uint32_t>(inputs[1].size(1) / inputs[7].size(1)) : 32u;
+    if (has_scales && scale_group != 32u) return false;
+    const std::uint32_t ring_mode = attributes.size() >= 8 && attributes[7] != 0 ? 1u : 0u;
+    const struct {
+        std::uint32_t tokens, heads, key_heads, start, window, extent, width, key_stride, capacity, has_positions;
+        float log_alpha, log_floor;
+        std::uint32_t kv_dtype, scale_stride, scale_group, ring_mode;
+    } geometry{tokens,
+               heads,
+               static_cast<std::uint32_t>(attributes[1]),
+               static_cast<std::uint32_t>(attributes[2]),
+               static_cast<std::uint32_t>(attributes[3]),
+               static_cast<std::uint32_t>(attributes[4]),
+               width,
+               static_cast<std::uint32_t>(inputs[1].size(1)),
+               static_cast<std::uint32_t>(inputs[1].size(0)),
+               static_cast<std::uint32_t>(has_positions),
+               as_float(5),
+               as_float(6),
+               kv_dtype,
+               scale_stride,
+               scale_group,
+               ring_mode};
+    [encoder setComputePipelineState:*pipeline];
+    Result<void> status;
+    for (std::size_t index = 0; index < 6 && status; ++index) status = bind(encoder, inputs[index], index);
+    if (status) status = bind(encoder, inputs[has_positions ? 6 : 0], 6);
+    if (status) status = bind(encoder, output, 7);
+    [encoder setBytes:&geometry length:sizeof(geometry) atIndex:8];
+    if (status) status = bind(encoder, inputs[has_scales ? 7 : 0], 9);
+    if (status) status = bind(encoder, inputs[has_scales ? 8 : 0], 10);
+    if (status)
+        [encoder dispatchThreadgroups:MTLSizeMake((tokens + 31) / 32, heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (!status) return std::unexpected(std::move(status.error()));
+    return true;
+}
 
 auto encode_expand_packed_weight(CommandBatch& batch, const Tensor& weight, const Tensor& scales, Tensor& output,
                                  std::int32_t bits, std::int32_t group_size) -> Result<void> {

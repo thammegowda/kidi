@@ -26,12 +26,12 @@ struct Inkling2Visit {
 
 struct Inkling2State : LanguageModelState {
     struct StepInputs {
-        tensor::Tensor token, positions, conv_slot, tail_slots;
+        tensor::Tensor token, positions, local_positions, conv_slot, tail_slots;
     };
     std::vector<Inkling2Visit> visits;
     std::vector<tensor::Tensor> replay_inputs;
     StepInputs decode_step, prefill_step;
-    std::size_t position = 0, capacity = 0;
+    std::size_t position = 0, capacity = 0, local_capacity = 0;
     /// Convolution rings saved at `rewind_position` (0: none), so a prompt boundary can be restored.
     std::vector<tensor::Tensor> rewind_convs;
     std::size_t rewind_position = 0;
@@ -56,14 +56,24 @@ public:
     static auto validate_config(const YAML::Node& config) -> Result<void>;
     static auto create(const YAML::Node& config) -> Result<Inkling2>;
     static auto int8_preparation(const YAML::Node& config) -> Result<checkpoint::Preparation>;
+    static auto vq_preparation(const YAML::Node& config) -> Result<checkpoint::Preparation>;
 
     auto set_checkpoint(const checkpoint::Weights& weights) -> Result<void> override;
     auto set_checkpoint(const checkpoint::Weights& weights, RuntimeQuantization quantization) -> Result<void> override;
     auto hidden_size() const noexcept -> std::int32_t override { return hidden_; }
     auto vocabulary_size() const noexcept -> std::int32_t override { return vocabulary_; }
     auto max_positions() const noexcept -> std::size_t override { return max_positions_; }
+    auto set_kv_cache_precision(core::KVCachePrecision precision) noexcept -> void override {
+        kv_cache_precision_ = precision;
+    }
     auto kv_cache_dtype(std::size_t) const -> Result<tensor::DType> override {
-        return device().kind == tensor::DeviceKind::CPU ? tensor::DType::I8 : tensor::DType::BF16;
+        if (device().kind == tensor::DeviceKind::CPU) return tensor::DType::I8;
+        if (device().kind == tensor::DeviceKind::A_GPU) {
+            if (kv_cache_precision_ == core::KVCachePrecision::INT8) return tensor::DType::I8;
+            if (kv_cache_precision_ == core::KVCachePrecision::FP32) return tensor::DType::F32;
+            return tensor::DType::BF16;
+        }
+        return tensor::DType::BF16;
     }
     auto preparation_ns() const noexcept -> std::uint64_t override;
     auto release_workspaces() -> void override;
@@ -72,6 +82,7 @@ public:
     auto supports_state_recycling() const noexcept -> bool override { return true; }
     auto supports_device_tokens() const -> bool override;
     auto create_state(std::size_t capacity) -> Result<std::unique_ptr<LanguageModelState>> override;
+    auto grow_state(LanguageModelState& state, std::size_t capacity) -> Result<void> override;
     auto rewind(LanguageModelState& state, std::size_t position) -> Result<void> override;
     auto mark_rewind_point(LanguageModelState& state) -> Result<void> override;
     auto rewind_floor(const LanguageModelState& state, std::size_t position) const -> std::size_t override;
@@ -85,7 +96,9 @@ public:
 
 private:
     static auto int8_checkpoint(const YAML::Node& config, const checkpoint::Weights& weights) -> Result<StateDict>;
+    static auto vq_checkpoint(const YAML::Node& config, const checkpoint::Weights& weights) -> Result<StateDict>;
     auto load_prepared_checkpoint(const checkpoint::Weights& weights) -> Result<void>;
+    auto load_prepared_vq_checkpoint(const checkpoint::Weights& weights) -> Result<void>;
     /// Completed AttnRes blocks and the current partial block (BF16 [tokens, hidden]).
     struct Stream {
         std::vector<tensor::Tensor> blocks;
@@ -94,11 +107,11 @@ private:
     auto weight(const std::string& name) const -> const tensor::Tensor&;
     auto project_bf16(const tensor::Tensor& input, const std::string& name) -> tensor::Tensor;
     auto visit(std::int32_t layer, Stream stream, Inkling2Visit& cache, const tensor::Tensor& positions,
-               const tensor::Tensor& conv_slot, const tensor::Tensor& tail_slots,
+               const tensor::Tensor& local_positions, const tensor::Tensor& conv_slot, const tensor::Tensor& tail_slots,
                const std::vector<tensor::Tensor>* bank) -> Stream;
     auto attention(std::int32_t layer, const std::array<tensor::Tensor, 3>& inputs, Inkling2Visit& cache,
-                   const tensor::Tensor& positions, const tensor::Tensor& conv_slot,
-                   const tensor::Tensor& tail_slots) -> tensor::Tensor;
+                   const tensor::Tensor& positions, const tensor::Tensor& local_positions,
+                   const tensor::Tensor& conv_slot, const tensor::Tensor& tail_slots) -> tensor::Tensor;
     auto blend(std::int32_t layer, const std::string& stream, const tensor::Tensor& destination,
                const tensor::Tensor& message, const tensor::Tensor& norm) -> tensor::Tensor;
     auto moe(std::int32_t layer, const tensor::Tensor& input) -> tensor::Tensor;
@@ -113,14 +126,17 @@ private:
     auto snapshot_verification(Inkling2State& state) -> void;
     auto stage_host_step(std::span<const std::int32_t> tokens, Inkling2State& state, bool all_logits,
                          std::optional<ops::TokenOutput> select, tensor::Tensor* hidden) -> Result<tensor::Tensor>;
-    auto run_forward(const tensor::Tensor& ids, const tensor::Tensor& positions, const tensor::Tensor& conv_slot,
-                     const tensor::Tensor& tail_slots, Inkling2State& state, std::int64_t T, bool all_logits,
-                     std::optional<ops::TokenOutput> select, tensor::Tensor* hidden) -> tensor::Tensor;
-    auto execute_step(const tensor::Tensor& ids, const tensor::Tensor& positions, const tensor::Tensor& conv_slot,
-                      const tensor::Tensor& tail_slots, Inkling2State& state, std::int64_t T, bool all_logits,
-                      std::optional<ops::TokenOutput> select, tensor::Tensor* hidden) -> tensor::Tensor;
+    auto run_forward(const tensor::Tensor& ids, const tensor::Tensor& positions, const tensor::Tensor& local_positions,
+                     const tensor::Tensor& conv_slot, const tensor::Tensor& tail_slots, Inkling2State& state,
+                     std::int64_t T, bool all_logits, std::optional<ops::TokenOutput> select, tensor::Tensor* hidden)
+        -> tensor::Tensor;
+    auto execute_step(const tensor::Tensor& ids, const tensor::Tensor& positions, const tensor::Tensor& local_positions,
+                      const tensor::Tensor& conv_slot, const tensor::Tensor& tail_slots, Inkling2State& state,
+                      std::int64_t T, bool all_logits, std::optional<ops::TokenOutput> select, tensor::Tensor* hidden)
+        -> tensor::Tensor;
     auto local(std::int32_t layer) const -> bool;
     auto schedule() const -> std::vector<std::int32_t>;
+    auto cache_capacities(std::size_t capacity) const -> std::pair<std::size_t, std::size_t>;
 
     std::int32_t hidden_, layers_, heads_, key_heads_, head_width_, vocabulary_, padded_vocabulary_;
     std::int32_t experts_, experts_per_token_, intermediate_, block_, window_, relative_extent_;
@@ -132,10 +148,14 @@ private:
     std::map<std::string, ops::PackedWeight, std::less<>> packed_; // CPU INT8 dense projections
     struct ExpertWeight {
         tensor::Tensor values, scales, global;
+        ops::BlockScaledFormat format = ops::BlockScaledFormat::NVFP4;
+        std::int32_t group_size = 0;
     };
     std::vector<std::vector<std::array<ExpertWeight, 2>>> experts_weights_; // [layer][expert] = {w13, w2}
     // Native checkpoint storage stacked over experts ([layer] = {w13, w2}) for device-routed decode; empty otherwise.
     std::vector<std::array<ExpertWeight, 2>> stacked_experts_;
+    tensor::DType activation_ = tensor::DType::BF16;
+    core::KVCachePrecision kv_cache_precision_ = core::KVCachePrecision::AUTO;
     std::unique_ptr<ops::Context> context_;
 };
 

@@ -1,25 +1,18 @@
 #include "kidi/runtime/parity_math.h"
-#include "kidi/ops/context.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
 #include <limits>
-#include <vector>
 
-#if defined(__APPLE__)
-#define ACCELERATE_NEW_LAPACK
-#include <Accelerate/Accelerate.h>
-#endif
-
-// Numerical compatibility helpers for Kidi's opt-in parity modes; there is no PyTorch or Python runtime dependency.
+// Numerical compatibility helpers for Kidi's qat-fp32 verification mode; there is no PyTorch or Python runtime
+// dependency.
 // Reduction ordering is adapted from PyTorch (BSD-3-Clause): third_party/PYTORCH_LICENSE.txt.
 // The sin/cos/exp approximations are adapted from SLEEF by Naoki Shibata and contributors (BSL-1.0):
 // third_party/SLEEF_LICENSE.txt.
 namespace kidi::runtime::parity {
 namespace {
-using ops::require;
 
 // SLEEF-style two-float arithmetic retains the low component during trigonometric range reduction.
 struct DoubleFloat {
@@ -220,74 +213,6 @@ auto sum_squares(std::span<const float> values) -> float {
         result += values[index] * values[index];
     for (const auto value : accumulators[0][0]) result += value;
     return result;
-}
-
-/// Dequantizes one output tile at a time and immediately consumes it with SGEMM.
-auto packed_linear(const tensor::Tensor& input, const tensor::Tensor& weight, const tensor::Tensor& scales,
-                   std::int32_t bits, std::int32_t group_size, float input_scale, float output_scale)
-    -> Result<tensor::Tensor> {
-#if !defined(__APPLE__)
-    return std::unexpected(Error{ErrorCode::UNSUPPORTED, "lowbit-parity currently requires Apple Accelerate"});
-#else
-    try {
-        constexpr std::size_t OUTPUT_TILE = 192;
-        const auto values_per_byte = 8 / bits;
-        const auto width = weight.size(1) * values_per_byte;
-        const auto outputs = weight.size(0), groups = width / group_size;
-        const auto rows = input.numel() / width;
-        const auto input_values = require(input.data<float>());
-        const auto weight_bytes = require(weight.host_bytes());
-        const auto scale_values = require(scales.data<float>());
-        if (!std::ranges::all_of(scale_values, [](float scale) { return std::isfinite(scale) && scale > 0.F; }))
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "packed weight scales must be finite and positive"});
-        std::vector<float> rounded_input(input_values.size()), output(rows * outputs);
-        for (std::size_t index = 0; index < input_values.size(); ++index) {
-            const auto code = std::clamp(std::nearbyint(input_values[index] / input_scale), -128.F, 127.F);
-            rounded_input[index] = code * input_scale;
-        }
-        const auto* packed = reinterpret_cast<const std::uint8_t*>(weight_bytes.data());
-        const auto mask = (1 << bits) - 1;
-        const auto sign = 1 << (bits - 1);
-        std::vector<float> tile(OUTPUT_TILE * width);
-        for (std::size_t begin = 0; begin < outputs; begin += OUTPUT_TILE) {
-            const auto count = std::min(OUTPUT_TILE, outputs - begin);
-            for (std::size_t row = 0; row < count; ++row)
-                for (std::size_t column = 0; column < width; ++column) {
-                    const auto packed_column = column / values_per_byte;
-                    auto code = (packed[(begin + row) * weight.size(1) + packed_column] >>
-                                 ((column % values_per_byte) * bits)) &
-                                mask;
-                    if (code & sign) code -= 1 << bits;
-                    tile[row * width + column] =
-                        static_cast<float>(code) * scale_values[(begin + row) * groups + column / group_size];
-                }
-            if (rows >= 8) {
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, static_cast<int>(rows), static_cast<int>(count),
-                            static_cast<int>(width), 1.F, rounded_input.data(), static_cast<int>(width), tile.data(),
-                            static_cast<int>(width), 0.F, output.data() + begin, static_cast<int>(outputs));
-            } else {
-#pragma clang fp contract(off)
-                for (std::size_t input_row = 0; input_row < rows; ++input_row)
-                    for (std::size_t output_row = 0; output_row < count; ++output_row) {
-                        auto value = 0.F;
-                        for (std::size_t column = 0; column < width; ++column)
-                            value = std::fma(rounded_input[input_row * width + column],
-                                             tile[output_row * width + column], value);
-                        output[input_row * outputs + begin + output_row] = value;
-                    }
-            }
-        }
-        for (auto& value : output) {
-            const auto code = std::clamp(std::nearbyint(value / output_scale), -128.F, 127.F);
-            value = code * output_scale;
-        }
-        std::vector<std::int64_t> shape(input.shape().begin(), input.shape().end());
-        shape.back() = static_cast<std::int64_t>(outputs);
-        return tensor::Tensor::from_host(std::move(shape), std::span<const float>(output));
-    } catch (const ops::Failure& error) {
-        return std::unexpected(error.error());
-    }
-#endif
 }
 
 } // namespace kidi::runtime::parity

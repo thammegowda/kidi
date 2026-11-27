@@ -18,8 +18,8 @@ The checkpoint used for Kidi's chat examples was downloaded from Hugging Face:
 
 Use this exact `qat-mobile-transformers` model for these instructions. The BF16,
 GGUF, compressed-tensors and LiteRT-LM releases are different artifacts; do not
-substitute them into this example. Do not add `--weight-bits` or `--group-size`
-overrides: the native QAT checkpoint supplies its own quantization policy.
+substitute them into this example. Do not add a `--precision q8` or `q4` override: the native QAT checkpoint
+supplies its own quantization policy.
 
 ## 1. Install Kidi
 
@@ -103,19 +103,17 @@ the vision tower does not copy intermediate blocks back to CPU during normal inf
 
 For Gemma, projection and KV-cache precision are separate load-time policies. The defaults
 preserve the checkpoint projection format and automatically use the calibrated
-INT8 KV cache when the QAT model and backend support it. CPU verification can
-select `--precision fp32` or `--precision qat-fp32`; the latter preserves the
-checkpoint's trained activation rounding and, on Apple CPU, enables the deliberately slow official-PyTorch parity
-math used by the vision benchmark. Explicit `q2a16`, `q4a16`, and
-`q8a16` policies requantize every packed projection to that weight width with
-BF16 activations; `q*ae4m3` and `q*ae5m2` select FP8 activations. Use
+INT8 KV cache when the QAT model and backend support it. On CPU, `--precision bf16` runs a BF16 reference that
+dequantizes QAT weights. For BF16 checkpoints, `q8` packs weights to INT8 per output channel at load, and `q4` packs
+them to INT4 in groups of 128, falling back to per-channel INT8 where a projection width does not divide by 128.
+On CUDA, `q8` keeps BF16 activations and also accepts calibrated INT8 QAT checkpoints. Use
 `--kv-cache-precision fp32` to disable INT8 cache storage or
 `--kv-cache-precision int8` to require it.
 Unsupported model/backend combinations fail instead of falling back.
 
-Apple CPU users can select `--precision lowbit-parity` to retain packed QAT weights while matching the FP32
-accumulation oracle through bounded dequantization tiles. This is a correctness-oriented vision mode and is slower than
-the native checkpoint kernels.
+Developers verifying QAT kernels can use the `qat-fp32` oracle through `kidi_eval_kl` or the vision benchmark. It
+dequantizes weights for FP32 accumulation, keeps the trained activation rounding and mirrors the reductions of the
+pinned Apple-CPU PyTorch build. It is deliberately slow and is not offered by the `kidi` CLI.
 
 The model is publicly listed. For authentication or anonymous-download limits,
 run `hf auth login` in your terminal using a token with read access, then retry.
@@ -141,6 +139,22 @@ or set `NO_COLOR` to disable automatic colors. Interactive chat is currently gre
 generation with thinking disabled; it does not execute tools or process multimodal input.
 History is re-prefilled each turn, not retained as a cross-turn KV cache.
 
+## Inkling-2 on Apple Silicon
+
+```bash
+./build-release/kidi code -m @thinkingmachines/Inkling-2-Mini --backend mps
+```
+
+The managed server defaults to `vq3d-hybrid` weights and BF16 KV storage for Inkling-2 on Metal.
+With prepared VQ checkpoints, the input embedding table stays file-backed; only the requested rows are staged
+on the GPU. Aligned packed dense projections bind directly to read-only file mappings on Metal. The packed
+expert banks are still copied at startup to avoid slowing down decode. Use `--kv-cache-precision int8` to
+reduce KV memory for longer conversations. When the server grows an Inkling-2 Metal cache, it preserves the
+reusable prefix and continues prefilling only the new suffix.
+
+For larger prompt batches, Metal pairs tokens routed to the same expert and reuses each VQ code across the
+pair. It keeps the same VQ weights and FP32 accumulation order; single-token decode uses the original path.
+
 ## Inkling-2 on CPU
 
 The CPU-only build can run Inkling-2-Mini, including reasoning, tool calls and the coding agent:
@@ -149,11 +163,11 @@ The CPU-only build can run Inkling-2-Mini, including reasoning, tool calls and t
 ./build-release/kidi code -m @thinkingmachines/Inkling-2-Mini --backend ynnpack --restart
 # Or start a server explicitly:
 ./build-release/kidi serve -m @thinkingmachines/Inkling-2-Mini --backend ynnpack \
-  --precision q8a16 --threads 8 --context-size 2048
+  --precision q8 --threads 8 --context-size 2048
 ```
 
 `--backend ynnpack` selects CPU; a CPU-only binary cannot serve `--backend cuda:7`.
-Both the default `checkpoint` precision and explicit `q8a16` convert NVFP4/MXFP8 experts to
+Both the default `checkpoint` precision and explicit `q8` convert NVFP4/MXFP8 experts to
 signed INT8 with FP32 per-row scales. Gate/up rows are rearranged at load time, and only the
 selected experts are evaluated. Dense projections and the unembedding are also packed to INT8, and
 matmuls quantize their input rows to INT8 (W8A8, AVX-512 VNNI where available) with FP32 accumulation.

@@ -66,7 +66,7 @@ reproduction commands.
 | Model Family | Tasks | Highlights |
 |---|---|---|
 | **Gemma 4 (`E2B-it`, `E4B-it`)** | Chat, JSONL Generation, Vision (Photo Q&A) | Native QAT (mixed 2/4/8-bit), BF16, Per-Channel INT8, and Group-32/128 Symmetric & Asymmetric INT4 with tied embeddings |
-| **Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`)** | Agentic chat with reasoning and tool calls (`code`, `serve`, `generate`, `chat`) | Text-only CPU/CUDA port of the looped 24-layer MoE (128 experts, top-8) with relative-position attention and BF16 activations. CPU defaults to row-scaled INT8 experts/projections with INT8 (VNNI) matmuls, batched expert prefill and group-32 INT8 KV caches (about 23 tok/s short-context decode, 19 tok/s at 4K context on 16 Sapphire Rapids cores). CUDA defaults to native NVFP4/MXFP8 expert storage, interleaved gate/up kernels and BF16 KV caches, fitting below 24 GiB in the tested 8K-context configuration. `--precision q8a16` explicitly selects INT8 experts on either backend; `--precision bf16` is a CUDA-only comparison mode. |
+| **Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`)** | Agentic chat with reasoning and tool calls (`code`, `serve`, `generate`, `chat`) | Text-only CPU/CUDA port of the looped 24-layer MoE (128 experts, top-8) with relative-position attention and BF16 activations. CPU defaults to row-scaled INT8 experts/projections with INT8 (VNNI) matmuls, batched expert prefill and group-32 INT8 KV caches (about 23 tok/s short-context decode, 19 tok/s at 4K context on 16 Sapphire Rapids cores). CUDA defaults to native NVFP4/MXFP8 expert storage, interleaved gate/up kernels and BF16 KV caches, fitting below 24 GiB in the tested 8K-context configuration. `--precision q8` explicitly selects INT8 experts on either backend; `--precision bf16` is a CUDA-only comparison mode. |
 | **Qwen 3** | Chat & Text Generation | Grouped-query attention, SwiGLU, RMSNorm, and quantized linear execution |
 | **Whisper (`Tiny`, `Base`, `Small`, `Large-v3`, `Turbo`)** | Speech-to-Text (`transcribe`) & Speech-to-English (`translate`) | Loads directly from Hugging Face checkpoints; automatic INT8 weight caching and 30s windowed long-audio streaming |
 | **OmniVoice** | Multilingual Text-to-Speech (`synthesize`) | 600+ MB INT8 package with controllable voice attributes (`gender`, `age`, `pitch`, `accent`, `style`) and consistent long-form narrator conditioning |
@@ -173,7 +173,7 @@ Add `--assistant-model` (with `@owner/model` or a local directory) to enable CPU
 ```bash
 kidi chat -m @google/gemma-4-E2B-it \
   --assistant-model @google/gemma-4-E2B-it-assistant \
-  --weight-bits 8 --draft-tokens 4
+  --precision q8 --draft-tokens 4
 ```
 
 ### 2. Speech Transcription & Translation (`transcribe`)

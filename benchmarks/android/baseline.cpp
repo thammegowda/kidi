@@ -93,8 +93,8 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
         throw std::invalid_argument("Gemma workload must be short, long, both, or eval");
     if (settings.contains("prompt") && custom_prompt.empty())
         throw std::invalid_argument("Gemma benchmark prompt must not be empty");
-    const auto weight_bits = settings.value("weight_bits", 0);
-    const auto group_size = settings.value("group_size", 128);
+    if (settings.contains("weight_bits") || settings.contains("group_size"))
+        throw std::invalid_argument("weight_bits and group_size were replaced by precision q8 or q4");
     const auto precision = kidi::core::parse_precision(settings.value("precision", std::string("checkpoint")));
     if (!precision) throw std::invalid_argument("invalid benchmark precision");
     const auto cache_precision =
@@ -106,8 +106,6 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
         kidi::inference::ModelLoadOptions{.device = gemma_device(),
                                           .precision = *precision,
                                           .kv_cache_precision = *cache_precision,
-                                          .weight_bits = weight_bits,
-                                          .group_size = group_size,
                                           .packed_prefill = packed_prefill,
                                           .dense_lm_head = settings.value("dense_lm_head", false),
                                           .assistant_model = settings.value("assistant_model", std::string{}),

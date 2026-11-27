@@ -218,6 +218,9 @@ if(KIDI_BUILD_BENCHMARKS)
     add_executable(kidi_whisper_quality benchmarks/whisper/quality.cpp)
     target_link_libraries(kidi_whisper_quality PRIVATE kidi::kidi)
     kidi_optimize_executable(kidi_whisper_quality)
+    add_executable(kidi_eval_kl benchmarks/quality/eval_kl.cpp)
+    target_link_libraries(kidi_eval_kl PRIVATE kidi::kidi kidi::argparse nlohmann_json::nlohmann_json)
+    kidi_optimize_executable(kidi_eval_kl)
     if(UNIX)
         add_executable(kidi_android_baseline benchmarks/android/baseline.cpp)
         target_link_libraries(kidi_android_baseline PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
@@ -338,6 +341,8 @@ if(APPLE)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/command_batch.metal"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/eager_kernels.metal"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/quantized_linear.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/vq_kernels.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/mpp_kernels.metal"
     )
     kidi_embed_text(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/command_batch.metal"
@@ -353,6 +358,16 @@ if(APPLE)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/quantized_linear.metal"
         "${KIDI_MPS_GENERATED}/quantized_linear_metal_source.h"
         KIDI_QUANTIZED_LINEAR_METAL_SOURCE
+    )
+    kidi_embed_text(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/vq_kernels.metal"
+        "${KIDI_MPS_GENERATED}/vq_kernels_metal_source.h"
+        KIDI_VQ_KERNELS_METAL_SOURCE
+    )
+    kidi_embed_text(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/mpp_kernels.metal"
+        "${KIDI_MPS_GENERATED}/mpp_kernels_metal_source.h"
+        KIDI_MPP_KERNELS_METAL_SOURCE
     )
     target_sources(kidi
         PRIVATE

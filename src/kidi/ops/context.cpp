@@ -3,7 +3,7 @@
 #include "kidi/graph/compiler.h"
 #include "kidi/graph/session.h"
 #include "kidi/runtime/operator.h"
-#include "kidi/runtime/parity_math.h"
+
 #include "kidi/ops/quantization.h"
 #include "kidi/ops/cpu_kernels.h"
 #include <array>
@@ -71,6 +71,12 @@ auto block_scaled_attributes(const BlockScaledWeight& weight, bool gated = false
             case BlockScaledFormat::INT4:
                 group = 128;
                 break;
+            case BlockScaledFormat::VQ3D:
+                group = 48;
+                break;
+            case BlockScaledFormat::VQ4D:
+                group = 64;
+                break;
             default:
                 throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid block-scaled weight encoding"});
         }
@@ -124,8 +130,8 @@ private:
 
 auto cpu_floats(Context& context, const Tensor& input) -> HostFloats { return {context, input}; }
 
-auto cpu_tensor(Context& context, std::vector<std::int64_t> shape, std::span<const float> values,
-                tensor::DType dtype) -> Tensor {
+auto cpu_tensor(Context& context, std::vector<std::int64_t> shape, std::span<const float> values, tensor::DType dtype)
+    -> Tensor {
     if (dtype != tensor::DType::BF16) {
         auto output = require(Tensor::from_host(std::move(shape), values, context.device()));
         return dtype == tensor::DType::F32 ? output : context.cast(output, dtype);
@@ -695,7 +701,7 @@ auto Context::set_precision(core::InferencePrecision precision) noexcept -> void
     impl_->dequantized_weights.clear();
     impl_->precision = precision;
     const auto effective_dtype =
-        (precision == core::InferencePrecision::BF16 || precision == core::InferencePrecision::Q8A16) &&
+        (precision == core::InferencePrecision::BF16 || precision == core::InferencePrecision::Q8) &&
                 !device().capabilities().compute.host()
             ? tensor::DType::BF16
             : impl_->parameter_dtype;
@@ -1051,19 +1057,18 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
     }
     if (device().kind == tensor::DeviceKind::CUDA && impl_->precision == core::InferencePrecision::CHECKPOINT &&
         bits == 4 && group_size > 0 && input.dtype() == tensor::DType::BF16 && input_scale == 0.F &&
-        output_scale == 0.F && (!bound_zero || !bound_zero->defined()) &&
-        weight.dtype() == tensor::DType::U8 && weight.device() == device() && scales.device() == device() &&
+        output_scale == 0.F && (!bound_zero || !bound_zero->defined()) && weight.dtype() == tensor::DType::U8 &&
+        weight.device() == device() && scales.device() == device() &&
         (scales.dtype() == tensor::DType::F32 || scales.dtype() == tensor::DType::F16))
         return block_scaled_linear(input, {BlockScaledFormat::INT4, weight, scales, {}, group_size});
-    if (device().kind == tensor::DeviceKind::CUDA && impl_->precision == core::InferencePrecision::Q8A16 && bits == 8 &&
+    if (device().kind == tensor::DeviceKind::CUDA && impl_->precision == core::InferencePrecision::Q8 && bits == 8 &&
         (!bound_zero || !bound_zero->defined())) {
         const auto activation = input.dtype() == tensor::DType::BF16 ? input : cast(input, tensor::DType::BF16);
         const std::array<std::int64_t, 3> attributes{bits, group_size, 0};
         return impl_->run({Operation::PACKED_LINEAR, attributes, tensor::DType::BF16, 0.F},
                           {&activation, &weight, &scales});
     }
-    if (impl_->precision != core::InferencePrecision::CHECKPOINT &&
-        impl_->precision != core::InferencePrecision::LOWBIT_PARITY) {
+    if (impl_->precision == core::InferencePrecision::BF16 || impl_->precision == core::InferencePrecision::QAT_FP32) {
         const auto valid_bits = bits == 2 || bits == 4 || bits == 8;
         const auto values_per_byte = valid_bits ? 8 / bits : 0;
         const auto width = weight.dimensions() == 2 ? weight.size(1) * values_per_byte : 0;
@@ -1074,11 +1079,8 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
             scales.dtype() != tensor::DType::F32 || scales.numel() != weight.size(0) * groups)
             throw Failure({ErrorCode::UNSUPPORTED,
                            "selected precision requires CPU packed weights with compatible group scales"});
-        const auto fp8 = core::uses_e4m3_activations(impl_->precision) || core::uses_e5m2_activations(impl_->precision);
-        const auto weight_dtype = impl_->precision == core::InferencePrecision::FP32 ||
-                                          impl_->precision == core::InferencePrecision::QAT_FP32 || fp8
-                                      ? tensor::DType::F32
-                                      : tensor::DType::BF16;
+        const bool qat_fp32 = impl_->precision == core::InferencePrecision::QAT_FP32;
+        const auto weight_dtype = qat_fp32 ? tensor::DType::F32 : tensor::DType::BF16;
         const auto bytes = require(weight.host_bytes());
         const auto scale_bytes = require(scales.host_bytes());
         const auto key = Impl::DequantizedKey{
@@ -1110,24 +1112,6 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
                     dequantized[row * width + column] =
                         static_cast<float>(value) * scale_values[row * groups + column / group_size];
                 }
-            if (const auto target_bits = core::requested_weight_bits(impl_->precision)) {
-                const auto limit = (1 << (*target_bits - 1)) - 1;
-                for (std::size_t row = 0; row < weight.size(0); ++row)
-                    for (std::size_t group = 0; group < groups; ++group) {
-                        const auto begin = row * width + group * group_size;
-                        float maximum = 0.F;
-                        for (std::int32_t column = 0; column < group_size; ++column)
-                            maximum = std::max(maximum, std::abs(dequantized[begin + column]));
-                        const auto scale = maximum == 0.F ? 1.F : maximum / limit;
-                        for (std::int32_t column = 0; column < group_size; ++column) {
-                            const auto quotient = dequantized[begin + column] / scale;
-                            auto rounded = std::trunc(quotient);
-                            if (std::abs(quotient - rounded) >= 0.5F) rounded += std::copysign(1.F, quotient);
-                            dequantized[begin + column] =
-                                std::clamp(rounded, -static_cast<float>(limit), static_cast<float>(limit)) * scale;
-                        }
-                    }
-            }
             auto unpacked =
                 require(Tensor::from_host({static_cast<std::int64_t>(weight.size(0)), static_cast<std::int64_t>(width)},
                                           std::span<const float>(dequantized)));
@@ -1136,33 +1120,13 @@ auto Context::packed_linear(const Tensor& input, const Tensor& weight, const Ten
                 impl_->dequantized_weights.emplace(key, Impl::DequantizedBinding{weight, scales, std::move(unpacked)})
                     .first;
         }
-        const bool preserve_srq = impl_->precision == core::InferencePrecision::QAT_FP32;
-        auto activation = preserve_srq ? static_round(input, input_scale) : input;
-        if (fp8) {
-            const auto dtype =
-                core::uses_e4m3_activations(impl_->precision) ? tensor::DType::E4M3 : tensor::DType::E5M2;
-            activation = cast(cast(activation, dtype), tensor::DType::F32);
-        }
-        auto output = linear(activation, found->second.value, {}, true);
+        auto output = linear(qat_fp32 ? static_round(input, input_scale) : input, found->second.value, {}, true);
         if (output.dtype() != tensor::DType::F32) output = cast(output, tensor::DType::F32);
-        return preserve_srq ? static_round(output, output_scale) : output;
+        return qat_fp32 ? static_round(output, output_scale) : output;
     }
-    if (impl_->precision == core::InferencePrecision::LOWBIT_PARITY) {
-        const auto valid_bits = bits == 2 || bits == 4 || bits == 8;
-        const auto values_per_byte = valid_bits ? 8 / bits : 0;
-        const auto width = weight.dimensions() == 2 ? weight.size(1) * values_per_byte : 0;
-        const auto groups = group_size > 0 ? width / group_size : 0;
-        if (!device().capabilities().compute.host() || !valid_bits || input.dtype() != tensor::DType::F32 ||
-            input.dimensions() == 0 || input_scale <= 0 || output_scale <= 0 || group_size <= 0 ||
-            width != input.size(-1) || width % group_size || weight.dimensions() != 2 ||
-            weight.dtype() != tensor::DType::U8 || scales.dtype() != tensor::DType::F32 ||
-            scales.numel() != weight.size(0) * groups || input.numel() / width > INT_MAX || width > INT_MAX ||
-            weight.size(0) > INT_MAX)
-            throw Failure({ErrorCode::UNSUPPORTED,
-                           "lowbit-parity requires calibrated CPU packed weights with compatible group scales"});
-        return require(
-            runtime::parity::packed_linear(input, weight, scales, bits, group_size, input_scale, output_scale));
-    }
+    if (impl_->precision != core::InferencePrecision::CHECKPOINT)
+        throw Failure({ErrorCode::UNSUPPORTED, std::string(core::to_string(impl_->precision)) +
+                                                   " is not implemented for packed projections on this device"});
     const std::array<std::int64_t, 3> attributes{bits, group_size, std::bit_cast<std::int32_t>(output_scale)};
     const auto output_dtype = device().kind == tensor::DeviceKind::CUDA && bits == 8 &&
                                       impl_->activation_dtype == tensor::DType::BF16 &&
@@ -1214,9 +1178,8 @@ auto Context::silu_gate(const Tensor& gate_up, float gate_cap, float up_cap, con
     if (!std::isfinite(gate_cap) || !std::isfinite(up_cap) || !(gate_cap > 0) || !(up_cap > 0))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "softcapped SiLU gate requires positive caps"});
     if (device().kind == tensor::DeviceKind::CPU) {
-        if (gate_up.dimensions() != 2 ||
-            (row_weights.defined() && (row_weights.numel() != gate_up.size(0) ||
-                                       row_weights.dtype() != tensor::DType::F32)))
+        if (gate_up.dimensions() != 2 || (row_weights.defined() && (row_weights.numel() != gate_up.size(0) ||
+                                                                    row_weights.dtype() != tensor::DType::F32)))
             throw Failure({ErrorCode::INVALID_ARGUMENT, "softcapped SiLU gate requires [rows, 2 * width] input"});
         const auto values = cpu_floats(*this, gate_up);
         const auto weights = row_weights.defined() ? cpu_floats(*this, row_weights) : HostFloats{};
@@ -1227,8 +1190,8 @@ auto Context::silu_gate(const Tensor& gate_up, float gate_cap, float up_cap, con
                                   weights.empty() ? nullptr : weights.data(), output);
         });
     }
-    if (device().kind != tensor::DeviceKind::CUDA)
-        throw Failure({ErrorCode::UNSUPPORTED, "softcapped SiLU gate requires CPU or CUDA"});
+    if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::A_GPU)
+        throw Failure({ErrorCode::UNSUPPORTED, "softcapped SiLU gate requires CPU, CUDA or Metal"});
     if (gate_up.dimensions() != 2 ||
         (row_weights.defined() && (row_weights.dimensions() != 1 || row_weights.size(0) != gate_up.size(0) ||
                                    row_weights.dtype() != tensor::DType::F32 || row_weights.device() != device())))
@@ -1295,16 +1258,25 @@ auto Context::block_scaled_silu(const Tensor& input, const BlockScaledWeight& we
 }
 
 auto Context::route_experts(const Tensor& logits, const Tensor& bias, std::int32_t top, float scale) -> Tensor {
-    if (device().kind != tensor::DeviceKind::CUDA)
-        throw Failure({ErrorCode::UNSUPPORTED, "expert routing requires CUDA"});
+    if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::A_GPU)
+        throw Failure({ErrorCode::UNSUPPORTED, "expert routing requires CUDA or Metal"});
     const std::array<std::int64_t, 2> attributes{top, std::bit_cast<std::int32_t>(scale)};
     return impl_->run({Operation::ROUTE_EXPERTS, attributes, tensor::DType::F32}, {&logits, &bias});
 }
 
-auto Context::expert_silu(const Tensor& input, const BlockScaledWeight& weight, const Tensor& routes,
-                          float gate_cap, float up_cap) -> Tensor {
-    if (device().kind != tensor::DeviceKind::CUDA)
-        throw Failure({ErrorCode::UNSUPPORTED, "routed expert projection requires CUDA"});
+namespace {
+auto check_expert_backend(tensor::Device device, BlockScaledFormat format) -> void {
+    const bool vq = format == BlockScaledFormat::VQ3D || format == BlockScaledFormat::VQ4D;
+    if (device.kind == tensor::DeviceKind::CUDA ||
+        (vq && (device.kind == tensor::DeviceKind::CPU || device.kind == tensor::DeviceKind::A_GPU)))
+        return;
+    throw Failure({ErrorCode::UNSUPPORTED, "unsupported routed expert format for this backend"});
+}
+} // namespace
+
+auto Context::expert_silu(const Tensor& input, const BlockScaledWeight& weight, const Tensor& routes, float gate_cap,
+                          float up_cap) -> Tensor {
+    check_expert_backend(device(), weight.format);
     const auto attributes = block_scaled_attributes(weight, true, gate_cap, up_cap);
     const runtime::OperatorSpec spec{Operation::EXPERT_LINEAR, attributes, input.dtype()};
     return weight.global.defined() ? impl_->run(spec, {&input, &weight.values, &weight.scales, &weight.global, &routes})
@@ -1313,8 +1285,7 @@ auto Context::expert_silu(const Tensor& input, const BlockScaledWeight& weight, 
 
 auto Context::expert_linear(const Tensor& input, const BlockScaledWeight& weight, const Tensor& routes,
                             std::optional<tensor::DType> output_dtype) -> Tensor {
-    if (device().kind != tensor::DeviceKind::CUDA)
-        throw Failure({ErrorCode::UNSUPPORTED, "routed expert projection requires CUDA"});
+    check_expert_backend(device(), weight.format);
     const auto attributes = block_scaled_attributes(weight);
     const auto dtype = output_dtype.value_or(tensor::DType::F32);
     const runtime::OperatorSpec spec{Operation::EXPERT_LINEAR, attributes, dtype};
@@ -1377,14 +1348,13 @@ auto Context::residual_mix(std::span<const Tensor> sources, const Tensor& querie
             return cpu::residual_mix(pointers, query_values.data(), query_count, tokens, width, epsilon, output);
         });
     }
-    if (device().kind != tensor::DeviceKind::CUDA)
-        throw Failure({ErrorCode::UNSUPPORTED, "residual mix requires CPU or CUDA"});
+    if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::A_GPU)
+        throw Failure({ErrorCode::UNSUPPORTED, "residual mix requires CPU, CUDA or Metal"});
     std::vector<Tensor> inputs(sources.begin(), sources.end());
     inputs.push_back(queries);
     return impl_->run({Operation::RESIDUAL_MIX, {}, tensor::DType::F32, epsilon}, inputs);
 }
-auto Context::short_convolution(const Tensor& padded, const Tensor& weight, const Tensor& taps, float scale)
-    -> Tensor {
+auto Context::short_convolution(const Tensor& padded, const Tensor& weight, const Tensor& taps, float scale) -> Tensor {
     if (weight.dimensions() != 2 || !weight.size(0) || !weight.size(1) || !std::isfinite(scale))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "short convolution requires nonempty [width, channels] taps"});
     if (device().kind == tensor::DeviceKind::CPU) {
@@ -1414,8 +1384,8 @@ auto Context::short_convolution(const Tensor& padded, const Tensor& weight, cons
                                           {rows, channels, width, groups, scale}, output);
         });
     }
-    if (device().kind != tensor::DeviceKind::CUDA)
-        throw Failure({ErrorCode::UNSUPPORTED, "short convolution requires CPU or CUDA"});
+    if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::A_GPU)
+        throw Failure({ErrorCode::UNSUPPORTED, "short convolution requires CPU, CUDA or Metal"});
     const std::array<std::int64_t, 1> attributes{static_cast<std::int64_t>(weight.size(0))};
     if (taps.defined())
         return impl_->run({Operation::SHORT_CONVOLUTION, attributes, padded.dtype(), scale}, {&padded, &weight, &taps});
@@ -1435,13 +1405,13 @@ auto Context::short_convolution(const Tensor& input, const Tensor& state, const 
     const auto rows = static_cast<std::int64_t>(input.size(0));
     const auto ring = static_cast<std::int64_t>(state.size(0));
     if (update_state && (rows != 1 || ring < width))
-        throw Failure({ErrorCode::INVALID_ARGUMENT, "ring short convolution in-place update requires 1 token and ring >= width"});
+        throw Failure(
+            {ErrorCode::INVALID_ARGUMENT, "ring short convolution in-place update requires 1 token and ring >= width"});
     if (taps.defined() && (taps.dimensions() != 2 || taps.size(0) != rows || !taps.size(1) || taps.size(1) % width ||
                            channels % (taps.size(1) / width)))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid short convolution dynamic taps"});
-    if (residual.defined() &&
-        (residual.dimensions() != 2 || residual.size(0) != rows || residual.size(1) != channels ||
-         (residual.dtype() != tensor::DType::BF16 && residual.dtype() != tensor::DType::F32)))
+    if (residual.defined() && (residual.dimensions() != 2 || residual.size(0) != rows || residual.size(1) != channels ||
+                               (residual.dtype() != tensor::DType::BF16 && residual.dtype() != tensor::DType::F32)))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid short convolution residual tensor"});
     const auto out_dtype = output_dtype.value_or(input.dtype());
     if (device().kind == tensor::DeviceKind::CPU) {
@@ -1463,10 +1433,9 @@ auto Context::short_convolution(const Tensor& input, const Tensor& state, const 
                                : state_values.data() + (((slot_value + prior) % ring + ring) % ring) * channels;
             }
         auto result = cpu_output(*this, {rows, channels}, out_dtype, [&](float* output) {
-            return cpu::short_convolution(sources.data(), input_values.data(), weight_values.data(),
-                                          taps.defined() ? tap_values.data() : nullptr,
-                                          residual.defined() ? res_values.data() : nullptr,
-                                          {rows, channels, width, groups, scale}, output);
+            return cpu::short_convolution(
+                sources.data(), input_values.data(), weight_values.data(), taps.defined() ? tap_values.data() : nullptr,
+                residual.defined() ? res_values.data() : nullptr, {rows, channels, width, groups, scale}, output);
         });
         if (update_state) {
             auto ring_state = state;
@@ -1476,8 +1445,8 @@ auto Context::short_convolution(const Tensor& input, const Tensor& state, const 
         }
         return result;
     }
-    if (device().kind != tensor::DeviceKind::CUDA)
-        throw Failure({ErrorCode::UNSUPPORTED, "short convolution requires CPU or CUDA"});
+    if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::A_GPU)
+        throw Failure({ErrorCode::UNSUPPORTED, "short convolution requires CPU, CUDA or Metal"});
     if (residual.defined() || update_state) {
         const std::int64_t flags = (taps.defined() ? 1 : 0) | (residual.defined() ? 2 : 0) | (update_state ? 4 : 0);
         const std::array<std::int64_t, 3> attributes{width, ring, flags};
@@ -1497,8 +1466,7 @@ auto Context::short_convolution(const Tensor& input, const Tensor& state, const 
     if (taps.defined())
         return impl_->run({Operation::SHORT_CONVOLUTION, attributes, out_dtype, scale},
                           {&input, &state, &weight, &slot, &taps});
-    return impl_->run({Operation::SHORT_CONVOLUTION, attributes, out_dtype, scale},
-                      {&input, &state, &weight, &slot});
+    return impl_->run({Operation::SHORT_CONVOLUTION, attributes, out_dtype, scale}, {&input, &state, &weight, &slot});
 }
 auto Context::l2_clip(const Tensor& input, const Tensor& scale, float threshold) -> Tensor {
     if (!std::isfinite(threshold) || threshold <= 0)
@@ -1510,19 +1478,18 @@ auto Context::l2_clip(const Tensor& input, const Tensor& scale, float threshold)
         const auto rows = static_cast<std::int64_t>(input.numel()) / width;
         const auto values = cpu_floats(*this, input);
         const auto scales = scale.defined() ? cpu_floats(*this, scale) : HostFloats{};
-        if (scale.defined() &&
-            (scale.dimensions() != 2 || input.dimensions() < 3 || scale.size(0) != input.size(-2) ||
-             scale.size(1) != input.size(-1)))
+        if (scale.defined() && (scale.dimensions() != 2 || input.dimensions() < 3 || scale.size(0) != input.size(-2) ||
+                                scale.size(1) != input.size(-1)))
             throw Failure({ErrorCode::INVALID_ARGUMENT, "L2 clip scale must match the input's final two dimensions"});
         return cpu_output(*this, std::vector(input.shape().begin(), input.shape().end()), input.dtype(),
                           [&](float* output) {
                               return cpu::l2_clip(values.data(), scales.empty() ? nullptr : scales.data(),
-                                           scale.defined() ? static_cast<std::int64_t>(scale.size(0)) : 1, rows,
-                                           width, threshold, output);
+                                                  scale.defined() ? static_cast<std::int64_t>(scale.size(0)) : 1, rows,
+                                                  width, threshold, output);
                           });
     }
-    if (device().kind != tensor::DeviceKind::CUDA)
-        throw Failure({ErrorCode::UNSUPPORTED, "L2 clip requires CPU or CUDA"});
+    if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::A_GPU)
+        throw Failure({ErrorCode::UNSUPPORTED, "L2 clip requires CPU, CUDA or Metal"});
     if (scale.defined()) return impl_->run({Operation::L2_CLIP, {}, input.dtype(), threshold}, {&input, &scale});
     return impl_->run({Operation::L2_CLIP, {}, input.dtype(), threshold}, {&input});
 }
@@ -1530,20 +1497,18 @@ auto Context::relative_attention(const Tensor& query, const Tensor& key, const T
                                  const Tensor& sink, const Tensor& gate, RelativeAttention shape,
                                  const Tensor& positions, const Tensor& key_scales, const Tensor& value_scales)
     -> Tensor {
-    if (positions.defined() && (positions.dtype() != tensor::DType::I32 || positions.dimensions() != 1 ||
-                                positions.size(0) != query.size(0)))
+    if (positions.defined() &&
+        (positions.dtype() != tensor::DType::I32 || positions.dimensions() != 1 || positions.size(0) != query.size(0)))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "relative attention positions must be I32 [tokens]"});
     if (!std::isfinite(shape.log_alpha) || !std::isfinite(shape.log_floor) || shape.log_floor < 0)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid relative attention log scaling"});
     if (device().kind == tensor::DeviceKind::CPU) {
         if (query.dimensions() != 2 || key.dimensions() != 2 || !std::ranges::equal(value.shape(), key.shape()) ||
-            relative.dimensions() != 3 || sink.dimensions() != 2 ||
-            !std::ranges::equal(gate.shape(), query.shape()) ||
-            shape.heads <= 0 || shape.key_heads <= 0 || shape.heads % shape.key_heads ||
-            shape.start < 0 || shape.window < 0 || shape.extent < 0 || query.size(1) % shape.heads ||
-            relative.size(0) != query.size(0) || relative.size(1) != shape.heads ||
-            relative.size(2) != shape.extent || sink.size(0) != query.size(0) || sink.size(1) != shape.heads ||
-            key.size(1) != query.size(1) / shape.heads * shape.key_heads ||
+            relative.dimensions() != 3 || sink.dimensions() != 2 || !std::ranges::equal(gate.shape(), query.shape()) ||
+            shape.heads <= 0 || shape.key_heads <= 0 || shape.heads % shape.key_heads || shape.start < 0 ||
+            shape.window < 0 || shape.extent < 0 || query.size(1) % shape.heads || relative.size(0) != query.size(0) ||
+            relative.size(1) != shape.heads || relative.size(2) != shape.extent || sink.size(0) != query.size(0) ||
+            sink.size(1) != shape.heads || key.size(1) != query.size(1) / shape.heads * shape.key_heads ||
             shape.start + query.size(0) > key.size(0))
             throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid relative attention shapes"});
         const auto queries = cpu_floats(*this, query), offsets = cpu_floats(*this, relative);
@@ -1569,9 +1534,8 @@ auto Context::relative_attention(const Tensor& query, const Tensor& key, const T
                     {ErrorCode::INVALID_ARGUMENT, "CPU relative attention reads contiguous F32, BF16 or I8 caches"});
             if (cache.dtype() == tensor::DType::I8) {
                 if (!scales.defined() || scales.dtype() != tensor::DType::F32 || !scales.is_contiguous() ||
-                    !scales.is_host_accessible() || scales.dimensions() != 2 ||
-                    scales.size(0) != cache.size(0) || scales.size(1) == 0 ||
-                    scales.size(1) % shape.key_heads || cache.size(1) % scales.size(1))
+                    !scales.is_host_accessible() || scales.dimensions() != 2 || scales.size(0) != cache.size(0) ||
+                    scales.size(1) == 0 || scales.size(1) % shape.key_heads || cache.size(1) % scales.size(1))
                     throw Failure({ErrorCode::INVALID_ARGUMENT, "INT8 attention needs F32 per-group cache scales"});
                 return cpu::Rows{require(cache.host_bytes()).data(), cpu::Rows::Storage::I8,
                                  static_cast<std::int64_t>(cache.size(1)), require(scales.data<float>()).data(),
@@ -1584,47 +1548,68 @@ auto Context::relative_attention(const Tensor& query, const Tensor& key, const T
                              static_cast<std::int64_t>(cache.size(1))};
         };
         std::vector<float> output(static_cast<std::size_t>(query.numel()));
-        require(cpu::relative_attention(queries.data(), rows(key, key_scales), rows(value, value_scales),
-                                        offsets.data(), sinks.data(),
-                                        gates.data(), given,
-                                        {tokens, shape.heads, shape.key_heads,
-                                         static_cast<std::int64_t>(query.size(1)) / shape.heads, shape.extent,
-                                         shape.window, shape.log_alpha, shape.log_floor},
-                                        output.data()));
+        require(cpu::relative_attention(
+            queries.data(), rows(key, key_scales), rows(value, value_scales), offsets.data(), sinks.data(),
+            gates.data(), given,
+            {tokens, shape.heads, shape.key_heads, static_cast<std::int64_t>(query.size(1)) / shape.heads, shape.extent,
+             shape.window, shape.log_alpha, shape.log_floor},
+            output.data()));
         return cpu_tensor(*this, std::vector(query.shape().begin(), query.shape().end()), output, query.dtype());
     }
-    if (key_scales.defined() || value_scales.defined())
-        throw Failure({ErrorCode::UNSUPPORTED, "scaled relative attention caches require CPU"});
-    if (device().kind != tensor::DeviceKind::CUDA)
-        throw Failure({ErrorCode::UNSUPPORTED, "relative attention requires CPU or CUDA"});
-    const std::array<std::int64_t, 7> attributes{shape.heads,
+    if ((key_scales.defined() || value_scales.defined()) && device().kind != tensor::DeviceKind::A_GPU)
+        throw Failure({ErrorCode::UNSUPPORTED, "scaled relative attention caches require CPU or Metal"});
+    if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::A_GPU)
+        throw Failure({ErrorCode::UNSUPPORTED, "relative attention requires CPU, CUDA or Metal"});
+    const bool ring_mode = shape.ring_mode && shape.window > 0 && device().kind == tensor::DeviceKind::A_GPU;
+    const std::array<std::int64_t, 8> attributes{shape.heads,
                                                  shape.key_heads,
                                                  shape.start,
                                                  shape.window,
                                                  shape.extent,
                                                  std::bit_cast<std::int32_t>(shape.log_alpha),
-                                                 std::bit_cast<std::int32_t>(shape.log_floor)};
+                                                 std::bit_cast<std::int32_t>(shape.log_floor),
+                                                 ring_mode ? 1 : 0};
+    const auto attr_span =
+        ring_mode ? std::span<const std::int64_t>(attributes) : std::span<const std::int64_t>(attributes).first(7);
+    if (key_scales.defined() || value_scales.defined()) {
+        if (!positions.defined() || !key_scales.defined() || !value_scales.defined())
+            throw Failure({ErrorCode::INVALID_ARGUMENT,
+                           "Metal INT8 relative attention requires positions, key_scales, and value_scales"});
+        return impl_->run({Operation::RELATIVE_ATTENTION, attr_span, query.dtype()},
+                          {&query, &key, &value, &relative, &sink, &gate, &positions, &key_scales, &value_scales});
+    }
     if (positions.defined())
-        return impl_->run({Operation::RELATIVE_ATTENTION, attributes, query.dtype()},
+        return impl_->run({Operation::RELATIVE_ATTENTION, attr_span, query.dtype()},
                           {&query, &key, &value, &relative, &sink, &gate, &positions});
-    return impl_->run({Operation::RELATIVE_ATTENTION, attributes, query.dtype()},
+    return impl_->run({Operation::RELATIVE_ATTENTION, attr_span, query.dtype()},
                       {&query, &key, &value, &relative, &sink, &gate});
 }
 auto Context::quantize_cache_(Tensor& cache, Tensor& scales, const Tensor& input, const Tensor& positions) -> void {
+    if (device().kind == tensor::DeviceKind::A_GPU) {
+        if (input.dimensions() != 3 || cache.dimensions() != 3 || cache.size(0) != 1 || input.size(1) == 0 ||
+            input.size(2) == 0 || cache.size(2) != input.size(1) * input.size(2) ||
+            cache.dtype() != tensor::DType::I8 || scales.dimensions() != 2 || scales.size(0) != cache.size(1) ||
+            scales.size(1) == 0 || cache.size(2) != scales.size(1) * 32 || scales.dtype() != tensor::DType::F32 ||
+            positions.dtype() != tensor::DType::I32 || positions.dimensions() != 1 ||
+            positions.size(0) != input.size(0))
+            throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid Metal INT8 cache update"});
+        auto flat = require(
+            input.reshape({static_cast<std::int64_t>(input.size(0)), static_cast<std::int64_t>(cache.size(2))}));
+        impl_->run({Operation::QUANTIZE_CACHE, {}, tensor::DType::F32}, {&flat, &positions, &cache, &scales});
+        return;
+    }
     if (device().kind != tensor::DeviceKind::CPU || input.dimensions() != 3 || cache.dimensions() != 3 ||
         cache.size(0) != 1 || input.size(1) == 0 || input.size(2) == 0 ||
         cache.size(2) != input.size(1) * input.size(2) || cache.dtype() != tensor::DType::I8 ||
         !cache.is_contiguous() || !cache.is_host_accessible() || scales.dimensions() != 2 ||
         scales.size(0) != cache.size(1) || scales.size(1) == 0 || scales.size(1) % input.size(1) ||
-        cache.size(2) % scales.size(1) ||
-        scales.dtype() != tensor::DType::F32 || !scales.is_contiguous() || !scales.is_host_accessible() ||
-        positions.dtype() != tensor::DType::I32 || positions.dimensions() != 1 ||
+        cache.size(2) % scales.size(1) || scales.dtype() != tensor::DType::F32 || !scales.is_contiguous() ||
+        !scales.is_host_accessible() || positions.dtype() != tensor::DType::I32 || positions.dimensions() != 1 ||
         positions.size(0) != input.size(0) || !positions.is_contiguous() || !positions.is_host_accessible())
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid CPU INT8 cache update"});
     const auto indices = require(positions.data<std::int32_t>());
-    if (std::ranges::any_of(indices, [&](auto index) {
-            return index < 0 || static_cast<std::size_t>(index) >= cache.size(1);
-        }))
+    if (std::ranges::any_of(indices,
+                            [&](auto index) { return index < 0 || static_cast<std::size_t>(index) >= cache.size(1); }))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "INT8 cache position outside capacity"});
     const auto values = cpu_floats(*this, input);
     auto codes = require(cache.data<std::int8_t>());
@@ -1661,8 +1646,7 @@ auto Context::grouped_query_attention(const Tensor& query, const Tensor& key, co
         throw Failure({ErrorCode::INVALID_ARGUMENT, "grouped attention requires a mask and positive scale"});
     validate_attention_quantization(key, device(), key_quantization, value_quantization);
     const auto key_length = !key_start && mask.size(-1) == 1 ? key.size(1) : mask.size(-1);
-    const auto parity_math = impl_->precision == core::InferencePrecision::QAT_FP32 ||
-                             impl_->precision == core::InferencePrecision::LOWBIT_PARITY;
+    const auto parity_math = impl_->precision == core::InferencePrecision::QAT_FP32;
     const std::array<std::int64_t, 5> attributes{heads, key_value_heads, key_start,
                                                  static_cast<std::int64_t>(key_length), parity_math};
     const auto attribute_count = parity_math ? attributes.size() : attributes.size() - 1;
@@ -1683,11 +1667,9 @@ auto Context::grouped_query_attention_causal(const Tensor& query, const Tensor& 
         query_positions.size(2) != query.size(1) || query_positions.size(3) != 1)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "causal attention requires CUDA query positions and a positive scale"});
     validate_attention_quantization(key, device(), key_quantization, value_quantization);
-    const auto parity_math = impl_->precision == core::InferencePrecision::QAT_FP32 ||
-                             impl_->precision == core::InferencePrecision::LOWBIT_PARITY;
-    const std::array<std::int64_t, 7> attributes{heads, key_value_heads, key_start,
-                                                 static_cast<std::int64_t>(key.size(1)) - key_start, parity_math, 1,
-                                                 window};
+    const auto parity_math = impl_->precision == core::InferencePrecision::QAT_FP32;
+    const std::array<std::int64_t, 7> attributes{
+        heads, key_value_heads, key_start, static_cast<std::int64_t>(key.size(1)) - key_start, parity_math, 1, window};
     OperatorSpec spec{Operation::ATTENTION, attributes, query.dtype(), scale};
     spec.quantization = {{{key_quantization.scales, key_quantization.zero_points, key_quantization.block_size},
                           {value_quantization.scales, value_quantization.zero_points, value_quantization.block_size}}};
@@ -1715,8 +1697,7 @@ auto Context::blend_prologue(const Tensor& destination, const Tensor& message, f
                 const float id = 1.F / std::sqrt(sd / static_cast<float>(width) + epsilon);
                 const float im = 1.F / std::sqrt(sm / static_cast<float>(width) + epsilon);
                 for (std::int64_t c = 0; c < width; ++c) {
-                    out[static_cast<std::size_t>(t * 2 * width + c)] =
-                        d[static_cast<std::size_t>(t * width + c)] * id;
+                    out[static_cast<std::size_t>(t * 2 * width + c)] = d[static_cast<std::size_t>(t * width + c)] * id;
                     out[static_cast<std::size_t>(t * 2 * width + width + c)] =
                         m[static_cast<std::size_t>(t * width + c)] * im;
                 }
@@ -1724,9 +1705,10 @@ auto Context::blend_prologue(const Tensor& destination, const Tensor& message, f
         }));
         return cpu_tensor(*this, {rows, 2 * width}, out, tensor::DType::BF16);
     }
-    if (device().kind != tensor::DeviceKind::CUDA)
-        throw Failure({ErrorCode::UNSUPPORTED, "blend prologue requires CPU or CUDA"});
-    return impl_->run({Operation::BLEND_PROLOGUE, {}, tensor::DType::BF16, epsilon}, {&destination, &message});
+    if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::A_GPU)
+        throw Failure({ErrorCode::UNSUPPORTED, "blend prologue requires CPU, CUDA or Metal"});
+    const auto dtype = device().kind == tensor::DeviceKind::A_GPU ? tensor::DType::F32 : tensor::DType::BF16;
+    return impl_->run({Operation::BLEND_PROLOGUE, {}, dtype, epsilon}, {&destination, &message});
 }
 auto Context::blend_epilogue(const Tensor& destination, const Tensor& message, const Tensor& gain_forget,
                              const Tensor& norm, float epsilon) -> Tensor {
@@ -1747,10 +1729,10 @@ auto Context::blend_epilogue(const Tensor& destination, const Tensor& message, c
             return cpu::blend_epilogue(d.data(), m.data(), gf.data(), n.data(), rows, width, epsilon, output);
         });
     }
-    if (device().kind != tensor::DeviceKind::CUDA)
-        throw Failure({ErrorCode::UNSUPPORTED, "blend epilogue requires CPU or CUDA"});
-    return impl_->run({Operation::BLEND_EPILOGUE, {}, tensor::DType::BF16, epsilon},
-                      {&destination, &message, &gain_forget, &norm});
+    if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::A_GPU)
+        throw Failure({ErrorCode::UNSUPPORTED, "blend epilogue requires CPU, CUDA or Metal"});
+    const auto dtype = device().kind == tensor::DeviceKind::A_GPU ? tensor::DType::F32 : tensor::DType::BF16;
+    return impl_->run({Operation::BLEND_EPILOGUE, {}, dtype, epsilon}, {&destination, &message, &gain_forget, &norm});
 }
 auto Context::rms_norm(const Tensor& input, const Tensor& scale, float epsilon,
                        std::optional<tensor::DType> output_dtype) -> Tensor {
@@ -1764,14 +1746,12 @@ auto Context::rms_norm(const Tensor& input, const Tensor& scale, float epsilon,
     }
     const auto& weight = scale.defined() ? scale : implicit_scale;
     const auto dtype = output_dtype.value_or(input.dtype());
-    if (impl_->precision == core::InferencePrecision::QAT_FP32 ||
-        impl_->precision == core::InferencePrecision::LOWBIT_PARITY) {
+    if (impl_->precision == core::InferencePrecision::QAT_FP32) {
         const std::array<std::int64_t, 1> attributes{1};
         return impl_->run({Operation::RMS_NORM, attributes, tensor::DType::F32, epsilon}, {&input, &weight});
     }
     if (device().kind == tensor::DeviceKind::CPU &&
-        (input.dtype() == tensor::DType::BF16 ||
-         (input.dtype() == tensor::DType::F32 && dtype == tensor::DType::BF16)))
+        (input.dtype() == tensor::DType::BF16 || (input.dtype() == tensor::DType::F32 && dtype == tensor::DType::BF16)))
         return cast(rms_norm(cast(input, tensor::DType::F32), weight, epsilon, tensor::DType::F32), dtype);
     return impl_->run({Operation::RMS_NORM, {}, dtype, epsilon}, {&input, &weight});
 }
@@ -1836,8 +1816,7 @@ auto Context::rms_norm_residual(const Tensor& input, const Tensor& scale, const 
         !std::ranges::equal(input.shape(), residual.shape()) || !std::isfinite(epsilon) || epsilon <= 0 ||
         (output_scale.defined() && (output_scale.dtype() != tensor::DType::F32 || output_scale.numel() != 1)))
         throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid RMS residual normalization operands"});
-    if (impl_->precision == core::InferencePrecision::QAT_FP32 ||
-        impl_->precision == core::InferencePrecision::LOWBIT_PARITY) {
+    if (impl_->precision == core::InferencePrecision::QAT_FP32) {
         const std::array<std::int64_t, 1> attributes{1};
         const OperatorSpec spec{Operation::RMS_NORM_RESIDUAL, attributes, tensor::DType::F32, epsilon};
         if (output_scale.defined()) return impl_->run(spec, {&input, &scale, &residual, &output_scale});
@@ -1899,7 +1878,8 @@ auto Context::scatter_(Tensor& input, const Tensor& updates, const Tensor& indic
     return input;
 }
 auto Context::scatter_unique_(Tensor& input, const Tensor& updates, const Tensor& indices) -> Tensor& {
-    if (impl_->device.kind == tensor::DeviceKind::CPU) return scatter_(input, updates, indices);
+    if (impl_->device.kind == tensor::DeviceKind::CPU || impl_->device.kind == tensor::DeviceKind::A_GPU)
+        return scatter_(input, updates, indices);
     if (impl_->device.kind != tensor::DeviceKind::CUDA)
         throw Failure({ErrorCode::INVALID_ARGUMENT, "unique-index scatter requires CPU or CUDA"});
     const std::array<std::int64_t, 1> attributes{1};

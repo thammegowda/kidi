@@ -146,6 +146,10 @@ public:
     virtual auto supports_device_tokens() const -> bool { return false; }
 
     virtual auto create_state(std::size_t capacity) -> Result<std::unique_ptr<LanguageModelState>> = 0;
+    /// Increases a retained request's capacity without discarding its prefix.
+    virtual auto grow_state(LanguageModelState&, std::size_t) -> Result<void> {
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "model does not support growing a retained state"});
+    }
     virtual auto configure_state(LanguageModelState&, bool /*full_attention_cache*/, bool /*capture_prefill*/) -> void {
     }
     virtual auto fork_state(const LanguageModelState& source, std::size_t prefix_length, std::size_t capacity)

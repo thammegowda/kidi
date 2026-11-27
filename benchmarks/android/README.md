@@ -205,15 +205,11 @@ build-release/kidi_metal_packed_bench vision-ffn
 ```
 
 `KIDI_VISION_PRECISION` selects the projection compute policy. The default, `checkpoint`, uses the checkpoint's native
-precision. `fp32` disables activation quantization and dequantizes packed weights for FP32 computation; `bf16` uses
-BF16 activations and computation. `q2a16`, `q4a16`, and `q8a16` explicitly requantize weights to that width before BF16
-compute. Their `q*ae4m3` and `q*ae5m2` variants round activations through the selected FP8 format and use FP32
-accumulation; `i8a8` is an alias for `q8ae4m3`. `qat-fp32` is the deliberately slow numerical verification policy: it
-preserves trained activation SRQ while dequantizing each layer's checkpoint weights for FP32 accumulation. On Apple
-CPU it also mirrors the pinned PyTorch build's RMS reduction, SLEEF RoPE math, and softmax reduction; it is an oracle,
-not a performance mode. `lowbit-parity` retains packed weights, dequantizes only 192 output channels at a time into
-scratch, and uses the same parity math; it currently requires Apple Accelerate. Unsupported backend combinations never
-fall back silently. For example:
+precision; `bf16` dequantizes packed weights for a BF16 reference. `qat-fp32` is the deliberately slow numerical
+verification policy: it preserves trained activation SRQ while dequantizing each layer's checkpoint weights for FP32
+accumulation. On Apple CPU it also mirrors the pinned PyTorch build's RMS reduction, SLEEF RoPE math, and softmax
+reduction; it is an oracle, not a performance mode. Unsupported backend combinations never fall back silently. For
+example:
 
 ```sh
 KIDI_VISION_PRECISION=qat-fp32 "$REMOTE/runner" vision "$REMOTE/models/gemma4" 4 3 image.png
@@ -235,13 +231,11 @@ the square, landscape, and portrait fixtures. Final projected embeddings remain 
 because pooling/projector reductions are not part of the parity path. The native `checkpoint` mode intentionally
 retains its much faster integer projection kernels and is not expected to be bit-identical to dequantized PyTorch.
 The original drift was seeded by different RMS mean reduction and RoPE/softmax arithmetic; sparse one-quantum SRQ
-changes were then amplified by large learned norm scales and the gated MLP. The parity modes support PyTorch-compatible
+changes were then amplified by large learned norm scales and the gated MLP. The parity mode supports PyTorch-compatible
 small-range RoPE angles (absolute angle below 125), which covers this three-image suite.
 
-On an Apple M5 CPU with four threads, `lowbit-parity` keeps all 16 block outputs elementwise identical on all three
-fixtures and final embedding relative RMSE below `2.4e-7`. Steady-state encoding is about 1.72-1.76 s for 2,304-2,376
-patches, versus about 1.25 s for native `checkpoint` and 3.96 s for full `qat-fp32`. Square-image peak RSS is about
-0.89 GiB rather than about 2.03 GiB for cached FP32 weights.
+On an Apple M5 CPU with four threads, steady-state encoding of 2,304-2,376 patches takes about 1.25 s with native
+`checkpoint` and 3.96 s with `qat-fp32`, whose cached FP32 weights raise square-image peak RSS to about 2.03 GiB.
 
 With the existing PyTorch/Transformers reference environment, generate small numerical fixtures locally:
 

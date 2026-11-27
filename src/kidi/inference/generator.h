@@ -89,10 +89,9 @@ using ExternalTensorSource = std::function<Result<tensor::Tensor>(std::string_vi
 
 struct ModelLoadOptions {
     tensor::Device device = tensor::Device::cpu();
+    /// Also selects load-time packing: Q8 and Q4 quantize plain BF16 checkpoints when they load.
     core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
     core::KVCachePrecision kv_cache_precision = core::KVCachePrecision::AUTO;
-    std::int32_t weight_bits = 0;
-    std::int32_t group_size = 128;
     bool packed_prefill = false;
     bool dense_lm_head = false;
     std::filesystem::path assistant_model{};
@@ -109,7 +108,8 @@ public:
     static auto load(const std::filesystem::path& directory, ModelLoadOptions options,
                      const ExternalTensorSource& external = {}) -> Result<Generator>;
     /// Loads a registered causal model on `device`; the Qualcomm NPU device keeps the model on the CPU and
-    /// compiles captured decoding steps for the NPU.
+    /// compiles captured decoding steps for the NPU. Nonzero `weight_bits` (4 or 8) pack plain BF16 weights at load
+    /// with an explicit `group_size` for developer tools; applications select the Q4 or Q8 precision instead.
     static auto load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits = 0,
                      std::int32_t group_size = 128, bool packed_prefill = false,
                      const ExternalTensorSource& external = {}) -> Result<Generator>;
@@ -138,6 +138,9 @@ public:
     auto pending_requests() const -> std::size_t { return waiting_.size() + running_.size(); }
     auto precision() const noexcept -> core::InferencePrecision { return options_.precision; }
     auto kv_cache_precision() const noexcept -> core::KVCachePrecision { return options_.kv_cache_precision; }
+    auto tokenizer() const noexcept -> const text::Tokenizer& { return tokenizer_; }
+    /// Runs teacher-forced prefill over `tokens` and returns host FP32 logits shaped [tokens.size(), vocab_size].
+    auto prefill_logits(std::span<const std::int32_t> tokens) -> Result<tensor::Tensor>;
     auto native_qat() const -> bool { return checkpoint::native_qat(config_["model"]); }
     auto speculative() const noexcept -> bool { return static_cast<bool>(drafter_); }
     auto vision_supported() const -> bool {
@@ -162,6 +165,9 @@ private:
     };
     Generator(YAML::Node config, text::Tokenizer tokenizer, std::shared_ptr<model::CausalLanguageModel> model,
               GeneratorOptions options);
+    static auto load_with_packing(const std::filesystem::path& directory, ModelLoadOptions options,
+                                  std::int32_t weight_bits, std::int32_t group_size,
+                                  const ExternalTensorSource& external) -> Result<Generator>;
     struct DraftBackend;
     YAML::Node config_;
     text::Tokenizer tokenizer_;
