@@ -121,6 +121,7 @@ sampling:
   temperature: 0.6   # 0 = greedy; range [0, 2]
   top_p: 0.95
   top_k: 20
+reasoning_effort: medium   # none, minimal, low, medium, high or xhigh; omit to let the chat template choose
 tools:
   - name: inspect
     handler: read_file
@@ -137,7 +138,10 @@ tools:
 disable tools (`tools: []` for none). `prompts.tools` is appended to the system prompt only when tools are offered
 (never with `--permissions none`), `prompts.continue` is sent once if the model replies silently after tool results,
 and `prompts.compact` enables compaction. Without `sampling:` decoding is greedy; `--temperature` overrides
-the configured temperature, and compaction summaries are always greedy.
+the configured temperature, and compaction summaries are always greedy. `reasoning_effort` is sent with every reply
+request (`--reasoning-effort` overrides it; summaries use `none`). Inkling-2 thinks at `high` when it is unset and can
+deliberate past the reply limit before acting, so the embedded config uses `medium`. `--max-tokens` (default 16384)
+limits one reply, including reasoning and tool arguments such as a whole file passed to `write_file`.
 
 ## Standalone client
 

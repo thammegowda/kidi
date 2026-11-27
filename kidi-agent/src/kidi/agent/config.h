@@ -22,6 +22,8 @@ struct AgentConfig {
         float temperature = 0, top_p = 1;
         std::size_t top_k = 0;
     } sampling;
+    // Sent as the request's reasoning_effort when nonempty; summaries always use "none".
+    std::string reasoning_effort;
     std::vector<ToolRegistration> tools;
 };
 

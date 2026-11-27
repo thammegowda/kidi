@@ -47,7 +47,15 @@ auto configure_parser(cli::ArgumentParser& parser, bool managed) -> void {
             "(default); workspace-write: allow writes but ask before commands; full-access: allow both");
     parser.add_argument("--max-steps").dest("max_steps").default_value<std::size_t>(64);
     parser.add_argument("--max-tool-calls").dest("max_tool_calls").default_value<std::size_t>(256);
-    parser.add_argument("--max-tokens").dest("max_tokens").default_value<std::size_t>(4096);
+    parser.add_argument("--max-tokens")
+        .dest("max_tokens")
+        .default_value<std::size_t>(16384)
+        .help("token limit for one model reply, including reasoning and tool arguments");
+    parser.add_argument("--reasoning-effort")
+        .dest("reasoning_effort")
+        .default_value(std::string{})
+        .choices({"none", "minimal", "low", "medium", "high", "xhigh"})
+        .help("thinking effort for model replies (default: the agent config's reasoning_effort)");
     parser.add_argument("--temperature")
         .default_value<double>(-1)
         .help("sampling temperature; 0 is greedy (default: the agent config's sampling.temperature)");
@@ -78,6 +86,8 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
     options_http.temperature = temperature >= 0 ? static_cast<float>(temperature) : config->sampling.temperature;
     options_http.top_p = config->sampling.top_p;
     options_http.top_k = config->sampling.top_k;
+    const auto& effort = arguments.get<std::string>("reasoning_effort");
+    options_http.reasoning_effort = effort.empty() ? config->reasoning_effort : effort;
     if (arguments.contains("base_url")) {
         options_http.base_url = arguments.get<std::string>("base_url");
     }

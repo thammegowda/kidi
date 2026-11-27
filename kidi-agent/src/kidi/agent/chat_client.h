@@ -13,6 +13,8 @@ struct ChatClientOptions {
     // Ignored for summaries, which are always greedy. top_p 1 and top_k 0 are omitted from requests.
     float temperature = 0, top_p = 1;
     std::size_t top_k = 0;
+    // Sent with reply and context requests when nonempty; summaries always send "none".
+    std::string reasoning_effort;
     std::size_t max_response_bytes = 1024 * 1024;
     std::chrono::milliseconds timeout{120000};
     // Called with decoded text deltas on the request thread; true denotes reasoning, not answer text.

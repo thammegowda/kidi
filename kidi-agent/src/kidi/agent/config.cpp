@@ -97,7 +97,7 @@ auto parse_agent_config(std::string_view yaml) -> Result<AgentConfig> {
         std::size_t remaining = 16384;
         auto document = json_value(documents.front(), 0, remaining);
         if (!document) return std::unexpected(document.error());
-        if (auto valid = fields(*document, {"version", "prompts", "tools"}, {"sampling"}); !valid)
+        if (auto valid = fields(*document, {"version", "prompts", "tools"}, {"sampling", "reasoning_effort"}); !valid)
             return std::unexpected(valid.error());
         if (!(*document)["version"].is_number_integer() || (*document)["version"] != 1)
             return invalid("version must be integer 1");
@@ -137,6 +137,11 @@ auto parse_agent_config(std::string_view yaml) -> Result<AgentConfig> {
                 if (!sampling["top_k"].is_number_unsigned()) return invalid("sampling.top_k must be a non-negative integer");
                 config.sampling.top_k = sampling["top_k"].get<std::size_t>();
             }
+        }
+        if (document->contains("reasoning_effort")) {
+            if (!nonempty_string((*document)["reasoning_effort"]))
+                return invalid("reasoning_effort must be a nonempty string");
+            config.reasoning_effort = (*document)["reasoning_effort"].get<std::string>();
         }
         const auto& tools = (*document)["tools"];
         if (!tools.is_array()) return invalid("tools must be a sequence (use [] for no tools)");

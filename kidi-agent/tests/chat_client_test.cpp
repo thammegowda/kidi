@@ -134,9 +134,35 @@ TEST(AgentProvider, BadContextAndSummary) {
     auto summary = provider->summarize({}, 200, {});
     ASSERT_TRUE(summary);
     EXPECT_EQ(summary->content, "partial");
-    EXPECT_FALSE((*provider)({}, {}, {}));
+    const auto answer = (*provider)({}, {}, {});
+    ASSERT_FALSE(answer);
+    EXPECT_NE(answer.error().message.find("4096-token limit"), std::string::npos) << answer.error().message;
+    EXPECT_NE(answer.error().message.find("--max-tokens"), std::string::npos);
     content.clear();
-    EXPECT_FALSE(provider->summarize({}, 200, {}));
+    const auto empty = provider->summarize({}, 200, {});
+    ASSERT_FALSE(empty);
+    EXPECT_NE(empty.error().message.find("200-token limit"), std::string::npos) << empty.error().message;
+    EXPECT_EQ(empty.error().message.find("--max-tokens"), std::string::npos);
+}
+
+TEST(AgentProvider, SendsReasoningEffortExceptForSummaries) {
+    std::vector<Json> requests;
+    auto provider = completion_provider(
+        {.model = "test", .reasoning_effort = "medium"},
+        [&](const ChatClientOptions&, std::string payload, std::stop_token,
+            std::string_view route) -> Result<std::string> {
+            requests.push_back(Json::parse(payload));
+            if (route == "/chat/context") return std::string(R"({"prompt_tokens":1,"context_tokens":4096})");
+            return response({{"role", "assistant"}, {"content", "ok"}}).dump();
+        });
+    ASSERT_TRUE(provider);
+    ASSERT_TRUE((*provider)({}, {}, {}));
+    ASSERT_TRUE(provider->context({}, {}, {}));
+    ASSERT_TRUE(provider->summarize({}, 200, {}));
+    ASSERT_EQ(requests.size(), 3);
+    EXPECT_EQ(requests[0]["reasoning_effort"], "medium");
+    EXPECT_EQ(requests[1]["reasoning_effort"], "medium") << "context counts must render the same prompt as replies";
+    EXPECT_EQ(requests[2]["reasoning_effort"], "none");
 }
 
 class ChatClientTest : public testing::Test {

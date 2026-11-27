@@ -48,6 +48,11 @@ TEST(AgentConfig, ParsesYamlRegistry) {
         EXPECT_FALSE(parse_agent_config(std::string("version: 1\nprompts: {system: Hi}\nsampling: ") + bad +
                                         "\ntools: []"))
             << bad;
+    EXPECT_TRUE(config->reasoning_effort.empty());
+    const auto effort = parse_agent_config("version: 1\nprompts: {system: Hi}\nreasoning_effort: low\ntools: []");
+    ASSERT_TRUE(effort) << effort.error().message;
+    EXPECT_EQ(effort->reasoning_effort, "low");
+    EXPECT_FALSE(parse_agent_config("version: 1\nprompts: {system: Hi}\nreasoning_effort: 1\ntools: []"));
     ASSERT_EQ(config->tools.size(), 1);
     const auto& tool = config->tools.front();
     EXPECT_EQ(tool.handler, "native_read");

@@ -31,6 +31,10 @@ sampling:
   top_p: 0.95
   top_k: 20
 
+# Thinking effort sent with each reply request; --reasoning-effort overrides it, and removing it lets the chat
+# template decide. Inkling-2 defaults to high, where it can deliberate past --max-tokens before acting.
+reasoning_effort: medium
+
 # This list is the exposed registry. Remove entries to disable tools.
 # handler selects a compiled implementation; it cannot change that handler's capability.
 tools:

@@ -25,7 +25,7 @@ auto role_name(Role role) -> const char* {
     return "invalid";
 }
 
-auto parse_reply(const Json& body, bool allow_truncated) -> Result<Message> {
+auto parse_reply(const Json& body, bool allow_truncated, std::size_t max_tokens) -> Result<Message> {
     if (!body.contains("choices") || !body["choices"].is_array() || body["choices"].size() != 1)
         return invalid("chat response must contain exactly one choice");
     const auto& choice = body["choices"][0];
@@ -65,6 +65,11 @@ auto parse_reply(const Json& body, bool allow_truncated) -> Result<Message> {
     // A summary cut off by the token limit is still a usable handoff.
     const bool truncated = allow_truncated && reason == "length" && result.tool_calls.empty() &&
                            result.content.find_first_not_of(" \t\r\n") != std::string::npos;
+    if (reason == "length" && !truncated)
+        return std::unexpected(Error{ErrorCode::RUNTIME, "model reply hit the " + std::to_string(max_tokens) +
+                                                             "-token limit before finishing" +
+                                                             (allow_truncated ? "" : " (raise --max-tokens or lower "
+                                                                                     "--reasoning-effort)")});
     if (reason != "stop" && reason != "tool_calls" && !truncated)
         return std::unexpected(Error{ErrorCode::RUNTIME, "chat generation did not complete: " + reason});
     if ((reason == "tool_calls") != !result.tool_calls.empty())
@@ -101,6 +106,8 @@ auto encode_request(const ChatClientOptions& options, std::span<const Message> m
         if (summary) {
             request["reasoning_effort"] = "none";
             request["chat_template_kwargs"] = {{"enable_thinking", false}};
+        } else if (!options.reasoning_effort.empty()) {
+            request["reasoning_effort"] = options.reasoning_effort;
         }
         for (const auto& message : messages) {
             Json item{{"role", role_name(message.role)}, {"content", message.content}};
@@ -151,7 +158,7 @@ auto completion_provider(ChatClientOptions options, CompletionTransport transpor
         if (!response) return std::unexpected(response.error());
         auto body = Json::parse(*response, nullptr, false);
         if (body.is_discarded() || !body.is_object()) return invalid("chat response is not a JSON object");
-        return parse_reply(body, summary);
+        return parse_reply(body, summary, config.max_tokens);
     };
     Provider provider([options, complete](auto messages, auto tools, std::stop_token stop) {
         return complete(options, messages, tools, stop, false);

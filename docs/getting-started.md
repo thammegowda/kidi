@@ -136,8 +136,9 @@ template.
 | `/exit` | Exit |
 
 Ctrl-C cancels the current reply; Ctrl-D exits at the prompt. Use `--color never` or set `NO_COLOR` to disable
-colors. Sampling follows the agent configuration (temperature 0.6); pass `--temperature 0` for greedy replies. Without
-`--permissions none`, the same shell can also read and edit files in `--workspace` after asking for approval.
+colors. Sampling follows the agent configuration (temperature 0.6, medium reasoning effort); pass `--temperature 0`
+for greedy replies or `--reasoning-effort` to change how long the model thinks. Without `--permissions none`, the
+same shell can also read and edit files in `--workspace` after asking for approval.
 
 ## Inkling-2 on NVIDIA CUDA
 
