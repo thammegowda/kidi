@@ -10,17 +10,14 @@
 #include <cstdlib>
 #include <fstream>
 #include <future>
-#include <iostream>
 #include <limits>
 #include <numeric>
 #include <random>
 
+#include <gtest/gtest.h>
+
 namespace {
 using kidi::ops::require;
-
-auto check(bool valid, const char* message) -> void {
-    if (!valid) throw std::runtime_error(message);
-}
 
 auto bytes(const std::filesystem::path& path) -> std::vector<std::byte> {
     std::ifstream input(path, std::ios::binary | std::ios::ate);
@@ -73,11 +70,14 @@ auto malformed_indexes(const std::filesystem::path& root, const std::filesystem:
     const auto reject = [&](std::span<const std::byte> data) {
         save(path, data);
         const auto loaded = kidi::search::HnswIndex::load(path, vectors);
-        check(!loaded && loaded.error().code == kidi::ErrorCode::INVALID_MANIFEST,
-              "malformed index was not rejected as an invalid manifest");
+        ASSERT_FALSE(loaded) << "malformed index was not rejected as an invalid manifest";
+        EXPECT_EQ(loaded.error().code, kidi::ErrorCode::INVALID_MANIFEST)
+            << "malformed index was not rejected as an invalid manifest";
     };
-    for (const auto count : {std::size_t{0}, std::size_t{127}, original.size() - 1})
+    for (const auto count : {std::size_t{0}, std::size_t{127}, original.size() - 1}) {
+        SCOPED_TRACE("truncated to " + std::to_string(count));
         reject(std::span(original).first(count));
+    }
     auto corrupted = original;
     corrupted.back() ^= std::byte{1};
     reject(corrupted);
@@ -87,7 +87,7 @@ auto malformed_indexes(const std::filesystem::path& root, const std::filesystem:
     const auto base = static_cast<std::size_t>(integer(original, 64, 8));
     const auto upper = static_cast<std::size_t>(integer(original, 72, 8));
     const auto edges = base + 4 * (vectors.size(0) + 1);
-    check(integer(original, 32, 4) > 0, "fixture did not exercise upper levels");
+    ASSERT_GT(integer(original, 32, 4), 0U) << "fixture did not exercise upper levels";
     const std::array<std::array<std::uint64_t, 3>, 17> mutations{{
         {0, 1, 0},
         {8, 4, 99},
@@ -108,6 +108,7 @@ auto malformed_indexes(const std::filesystem::path& root, const std::filesystem:
         {upper + 7, 2, 65535},
     }};
     for (const auto& mutation : mutations) {
+        SCOPED_TRACE("mutation at offset " + std::to_string(mutation[0]));
         auto data = original;
         integer(data, static_cast<std::size_t>(mutation[0]), static_cast<std::size_t>(mutation[1]), mutation[2]);
         repair_checksums(data);
@@ -119,24 +120,25 @@ auto saving(const std::filesystem::path& root, const kidi::search::HnswIndex& in
     const auto path = root / "saved.hnsw";
     require(index.save(path));
     const auto original = bytes(path);
-    check(!index.save(path), "saving overwrote an existing index");
-    check(bytes(path) == original, "failed save changed the existing index");
-    check(!index.save({}), "empty save path was accepted");
-    check(!index.save(root / "absent" / "index"), "save with a missing parent succeeded");
-    check(!index.save(root), "saving replaced a directory");
+    EXPECT_FALSE(index.save(path)) << "saving overwrote an existing index";
+    EXPECT_TRUE(bytes(path) == original) << "failed save changed the existing index";
+    EXPECT_FALSE(index.save({})) << "empty save path was accepted";
+    EXPECT_FALSE(index.save(root / "absent" / "index")) << "save with a missing parent succeeded";
+    EXPECT_FALSE(index.save(root)) << "saving replaced a directory";
     const auto concurrent = root / "concurrent.hnsw";
     auto first = std::async(std::launch::async, [&] { return index.save(concurrent); });
     auto second = std::async(std::launch::async, [&] { return index.save(concurrent); });
     const auto left = first.get(), right = second.get();
-    check(left.has_value() != right.has_value(), "concurrent saves did not publish exactly once");
-    check(bytes(concurrent) == original, "concurrent save published an incomplete file");
+    EXPECT_NE(left.has_value(), right.has_value()) << "concurrent saves did not publish exactly once";
+    EXPECT_TRUE(bytes(concurrent) == original) << "concurrent save published an incomplete file";
 #if !defined(_WIN32)
     const auto dangling = root / "dangling";
     std::filesystem::create_symlink(root / "missing-target", dangling);
-    check(!index.save(dangling) && std::filesystem::is_symlink(dangling), "saving replaced a dangling symbolic link");
+    EXPECT_FALSE(index.save(dangling)) << "saving replaced a dangling symbolic link";
+    EXPECT_TRUE(std::filesystem::is_symlink(dangling)) << "saving replaced a dangling symbolic link";
 #endif
     for (const auto& entry : std::filesystem::directory_iterator(root))
-        check(!entry.path().filename().string().starts_with(".kidi-hnsw-"), "save left a staging directory behind");
+        EXPECT_FALSE(entry.path().filename().string().starts_with(".kidi-hnsw-")) << "save left a staging directory behind";
 }
 
 auto vector_table(std::size_t rows, std::size_t width, bool bfloat, std::vector<float>& values)
@@ -160,30 +162,37 @@ auto vector_table(std::size_t rows, std::size_t width, bool bfloat, std::vector<
 }
 
 auto check_ground_truth_graph(std::span<const std::byte> data) -> void {
-    check(integer(data, 16, 4) == 8 && integer(data, 20, 4) == 4 && integer(data, 24, 4) == 4 &&
-              integer(data, 28, 4) == 2 && integer(data, 32, 4) == 3 && integer(data, 36, 4) == 5 &&
-              integer(data, 44, 4) == 1332379836U && integer(data, 48, 4) == 828371281U &&
-              integer(data, 52, 4) == 1310553304U,
-          "8x4 ground-truth HNSW header metadata or checksums changed");
+    constexpr auto header_message = "8x4 ground-truth HNSW header metadata or checksums changed";
+    EXPECT_EQ(integer(data, 16, 4), 8U) << header_message;
+    EXPECT_EQ(integer(data, 20, 4), 4U) << header_message;
+    EXPECT_EQ(integer(data, 24, 4), 4U) << header_message;
+    EXPECT_EQ(integer(data, 28, 4), 2U) << header_message;
+    EXPECT_EQ(integer(data, 32, 4), 3U) << header_message;
+    EXPECT_EQ(integer(data, 36, 4), 5U) << header_message;
+    EXPECT_EQ(integer(data, 44, 4), 1332379836U) << header_message;
+    EXPECT_EQ(integer(data, 48, 4), 828371281U) << header_message;
+    EXPECT_EQ(integer(data, 52, 4), 1310553304U) << header_message;
     const auto base = static_cast<std::size_t>(integer(data, 64, 8));
     const auto upper = static_cast<std::size_t>(integer(data, 72, 8));
     const std::array<std::uint32_t, 9> expected_offsets{0, 2, 6, 8, 12, 14, 18, 20, 23};
     for (std::size_t node = 0; node <= 8; ++node)
-        check(integer(data, base + 4 * node, 4) == expected_offsets[node], "8x4 ground-truth base offsets changed");
+        EXPECT_EQ(integer(data, base + 4 * node, 4), expected_offsets[node])
+            << "8x4 ground-truth base offsets changed at node " << node;
     const std::array<std::uint32_t, 23> expected_base{
         1, 5, 3, 5, 0, 4, 7, 5, 1, 7, 5, 6, 1, 3, 0, 2, 3, 6, 3, 5, 3, 5, 2,
     };
     const auto edges = base + 4 * 9;
     for (std::size_t idx = 0; idx < expected_base.size(); ++idx)
-        check(integer(data, edges + 3 * idx, 3) == expected_base[idx], "8x4 ground-truth base edges changed");
+        EXPECT_EQ(integer(data, edges + 3 * idx, 3), expected_base[idx])
+            << "8x4 ground-truth base edges changed at " << idx;
     const std::array<std::uint8_t, 66> expected_upper{
         3, 0, 0, 0, 3, 0, 0, 2, 0, 5, 0, 0, 7, 0, 0, 5, 0, 0, 2, 0, 3, 0, 0, 7, 0, 0, 7, 0, 0, 2, 0, 3, 0,
         0, 5, 0, 0, 2, 0, 0, 0, 3, 0, 0, 1, 0, 5, 0, 0, 5, 0, 0, 1, 0, 3, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0,
     };
-    check(data.size() - upper == expected_upper.size(), "8x4 ground-truth upper-layer byte length changed");
+    ASSERT_EQ(data.size() - upper, expected_upper.size()) << "8x4 ground-truth upper-layer byte length changed";
     for (std::size_t idx = 0; idx < expected_upper.size(); ++idx)
-        check(std::to_integer<std::uint8_t>(data[upper + idx]) == expected_upper[idx],
-              "8x4 ground-truth upper-layer topology changed");
+        EXPECT_EQ(std::to_integer<std::uint8_t>(data[upper + idx]), expected_upper[idx])
+            << "8x4 ground-truth upper-layer topology changed at " << idx;
 }
 
 auto brute_force_checks(const std::filesystem::path& root, bool bfloat, std::size_t width) -> void {
@@ -193,25 +202,30 @@ auto brute_force_checks(const std::filesystem::path& root, bool bfloat, std::siz
     const auto vectors = vector_table(rows, width, bfloat, values);
     auto index = require(search::HnswIndex::build(
         vectors, {.m = 16, .ef_construction = 256, .seed = 42, .candidates = candidates, .ef_search = rows}));
-    check(index.size() == rows && index.width() == width && index.candidates() == candidates &&
-              index.ef_search() == rows && index.runtime_bytes() > rows * sizeof(float),
-          "incorrect index metadata");
+    EXPECT_EQ(index.size(), rows) << "incorrect index metadata";
+    EXPECT_EQ(index.width(), width) << "incorrect index metadata";
+    EXPECT_EQ(index.candidates(), candidates) << "incorrect index metadata";
+    EXPECT_EQ(index.ef_search(), rows) << "incorrect index metadata";
+    EXPECT_GT(index.runtime_bytes(), rows * sizeof(float)) << "incorrect index metadata";
     const auto path = root / (std::string(bfloat ? "bf16-" : "fp32-") + std::to_string(width) + ".hnsw");
     require(index.save(path));
     const auto serialized = bytes(path);
     const auto expected_size = width == 64 ? std::size_t{26256} : std::size_t{26244};
     const auto expected_crc = width == 64 ? 0x04C11AC2U : 0x769AA146U;
-    check(serialized.size() == expected_size && integer(serialized, 24, 4) == 32 && integer(serialized, 32, 4) == 2 &&
-              integer(serialized, 36, 4) == 183 && integer(serialized, 48, 4) == expected_crc,
-          "320-row ground-truth HNSW topology or payload checksum changed");
+    constexpr auto topology_message = "320-row ground-truth HNSW topology or payload checksum changed";
+    ASSERT_EQ(serialized.size(), expected_size) << topology_message;
+    EXPECT_EQ(integer(serialized, 24, 4), 32U) << topology_message;
+    EXPECT_EQ(integer(serialized, 32, 4), 2U) << topology_message;
+    EXPECT_EQ(integer(serialized, 36, 4), 183U) << topology_message;
+    EXPECT_EQ(integer(serialized, 48, 4), expected_crc) << topology_message;
     const auto base = static_cast<std::size_t>(integer(serialized, 64, 8));
     const auto edges = base + 4 * (rows + 1);
     const std::array<std::uint32_t, 8> expected_first8 =
         width == 64 ? std::array<std::uint32_t, 8>{129, 248, 213, 192, 155, 295, 282, 73}
                     : std::array<std::uint32_t, 8>{229, 319, 89, 284, 255, 55, 127, 6};
     for (std::size_t idx = 0; idx < expected_first8.size(); ++idx)
-        check(integer(serialized, edges + 3 * idx, 3) == expected_first8[idx],
-              "320-row ground-truth node-0 neighbor list changed");
+        EXPECT_EQ(integer(serialized, edges + 3 * idx, 3), expected_first8[idx])
+            << "320-row ground-truth node-0 neighbor list changed at " << idx;
     runtime::ynn::set_thread_count(4);
     require(runtime::ynn::reserve_thread_pool(4));
     std::size_t parallel_calls = 0;
@@ -223,15 +237,15 @@ auto brute_force_checks(const std::filesystem::path& root, bool bfloat, std::siz
         }));
     const auto parallel_path = path.string() + ".parallel";
     require(threaded.save(parallel_path));
-    check(parallel_calls > 0 && bytes(parallel_path) == serialized,
-          "threaded construction changed graph order or values");
+    EXPECT_GT(parallel_calls, 0U) << "threaded construction changed graph order or values";
+    EXPECT_TRUE(bytes(parallel_path) == serialized) << "threaded construction changed graph order or values";
     const auto failed_executor = search::HnswIndex::build(
         vectors, {.m = 16, .ef_construction = 256, .seed = 42, .candidates = candidates, .ef_search = rows}, {},
         [](std::size_t, std::function<void(std::size_t)>) -> Result<void> {
             return std::unexpected(Error{ErrorCode::RUNTIME, "test executor failure"});
         });
-    check(!failed_executor && failed_executor.error().message == "test executor failure",
-          "executor errors were not propagated");
+    ASSERT_FALSE(failed_executor) << "executor errors were not propagated";
+    EXPECT_EQ(failed_executor.error().message, "test executor failure") << "executor errors were not propagated";
     const auto readonly =
         require(tensor::Tensor::from_blob({rows, static_cast<std::int64_t>(width)}, vectors.dtype(),
                                           require(vectors.host_bytes()), std::make_shared<tensor::Tensor>(vectors)));
@@ -251,49 +265,54 @@ auto brute_force_checks(const std::filesystem::path& root, bool bfloat, std::siz
         }
         std::ranges::sort(expected);
         const auto actual = require(moved.search(query, workspace));
-        check(actual.size() == candidates, "search did not return the configured candidate subset");
+        ASSERT_EQ(actual.size(), candidates) << "search did not return the configured candidate subset";
         std::vector<std::uint32_t> ids;
         for (std::size_t rank = 0; rank < candidates; ++rank) {
             ids.push_back(actual[rank].id);
-            check(std::abs(actual[rank].distance - expected[rank].first) < 1e-4F,
-                  "search disagrees with brute-force inner products");
+            EXPECT_NEAR(actual[rank].distance, expected[rank].first, 1e-4F)
+                << "search disagrees with brute-force inner products";
             if (rank == 0 || expected[rank].first != expected[rank - 1].first)
-                check(actual[rank].id == expected[rank].second, "search returned the wrong brute-force neighbor");
+                EXPECT_EQ(actual[rank].id, expected[rank].second) << "search returned the wrong brute-force neighbor";
         }
         std::ranges::sort(ids);
-        check(std::ranges::adjacent_find(ids) == ids.end(), "search returned repeated row IDs");
+        EXPECT_TRUE(std::ranges::adjacent_find(ids) == ids.end()) << "search returned repeated row IDs";
         const auto before_wrap = actual.front().id;
         workspace.epoch = std::numeric_limits<std::uint32_t>::max();
-        check(require(moved.search(query, workspace)).front().id == before_wrap, "visited epoch wrap changed results");
+        EXPECT_EQ(require(moved.search(query, workspace)).front().id, before_wrap)
+            << "visited epoch wrap changed results";
 
         const auto parallel_actual = require(moved.search_parallel(query, workspace));
-        check(parallel_actual.size() == candidates, "search_parallel did not return the configured candidate subset");
+        ASSERT_EQ(parallel_actual.size(), candidates)
+            << "search_parallel did not return the configured candidate subset";
         std::vector<std::uint32_t> parallel_ids;
         for (std::size_t rank = 0; rank < candidates; ++rank) {
             parallel_ids.push_back(parallel_actual[rank].id);
-            check(std::abs(parallel_actual[rank].distance - expected[rank].first) < 1e-4F,
-                  "search_parallel disagrees with brute-force inner products");
+            EXPECT_NEAR(parallel_actual[rank].distance, expected[rank].first, 1e-4F)
+                << "search_parallel disagrees with brute-force inner products";
             if (rank == 0 || expected[rank].first != expected[rank - 1].first)
-                check(parallel_actual[rank].id == expected[rank].second,
-                      "search_parallel returned the wrong brute-force neighbor");
+                EXPECT_EQ(parallel_actual[rank].id, expected[rank].second)
+                    << "search_parallel returned the wrong brute-force neighbor";
         }
         std::ranges::sort(parallel_ids);
-        check(std::ranges::adjacent_find(parallel_ids) == parallel_ids.end(),
-              "search_parallel returned repeated row IDs");
+        EXPECT_TRUE(std::ranges::adjacent_find(parallel_ids) == parallel_ids.end())
+            << "search_parallel returned repeated row IDs";
         workspace.epoch = std::numeric_limits<std::uint32_t>::max();
-        check(require(moved.search_parallel(query, workspace)).front().id == before_wrap,
-              "search_parallel visited epoch wrap changed results");
+        EXPECT_EQ(require(moved.search_parallel(query, workspace)).front().id, before_wrap)
+            << "search_parallel visited epoch wrap changed results";
     }
     query[0] = std::numeric_limits<float>::quiet_NaN();
-    check(!moved.search(query, workspace), "nonfinite query was accepted");
-    check(!moved.search_parallel(query, workspace), "search_parallel accepted nonfinite query");
-    check(!moved.search({}, workspace), "wrong query dimension was accepted");
-    check(!moved.search_parallel({}, workspace), "search_parallel accepted wrong query dimension");
+    EXPECT_FALSE(moved.search(query, workspace)) << "nonfinite query was accepted";
+    EXPECT_FALSE(moved.search_parallel(query, workspace)) << "search_parallel accepted nonfinite query";
+    EXPECT_FALSE(moved.search({}, workspace)) << "wrong query dimension was accepted";
+    EXPECT_FALSE(moved.search_parallel({}, workspace)) << "search_parallel accepted wrong query dimension";
     query[0] = 0;
-    check(!moved.search(query, workspace, 4, 3), "search effort smaller than candidate count was accepted");
-    check(!moved.search_parallel(query, workspace, 4, 3),
-          "search_parallel accepted search effort smaller than candidate count");
-    if (bfloat && width == 67) malformed_indexes(root, path, vectors);
+    EXPECT_FALSE(moved.search(query, workspace, 4, 3)) << "search effort smaller than candidate count was accepted";
+    EXPECT_FALSE(moved.search_parallel(query, workspace, 4, 3))
+        << "search_parallel accepted search effort smaller than candidate count";
+    if (bfloat && width == 67) {
+        SCOPED_TRACE("malformed indexes");
+        malformed_indexes(root, path, vectors);
+    }
 }
 
 auto import_checks(const std::filesystem::path& root, bool bfloat) -> void {
@@ -341,22 +360,23 @@ auto import_checks(const std::filesystem::path& root, bool bfloat) -> void {
     const auto base = static_cast<std::size_t>(integer(packed, 64, 8));
     const auto edges = base + 4 * (rows + 1);
     for (std::size_t node = 0; node < rows; ++node) {
-        check(integer(packed, 128 + 4 * node, 4) == rows - 1 - node, "import changed internal-to-row mapping");
-        check(integer(packed, edges + 6 * node, 3) == (node + 1) % rows &&
-                  integer(packed, edges + 6 * node + 3, 3) == (node + 2) % rows,
-              "import changed ordered live neighbors");
+        EXPECT_EQ(integer(packed, 128 + 4 * node, 4), rows - 1 - node) << "import changed internal-to-row mapping";
+        EXPECT_EQ(integer(packed, edges + 6 * node, 3), (node + 1) % rows) << "import changed ordered live neighbors";
+        EXPECT_EQ(integer(packed, edges + 6 * node + 3, 3), (node + 2) % rows)
+            << "import changed ordered live neighbors";
     }
     search::HnswWorkspace workspace;
     const std::array<float, 4> query{1, 0, 0, 0};
     auto best = std::uint32_t{0};
     for (std::size_t row = 1; row < rows; ++row)
         if (values[row * width] > values[best * width]) best = static_cast<std::uint32_t>(row);
-    check(require(imported.search(query, workspace)).front().id == best, "import changed raw inner-product ranking");
+    EXPECT_EQ(require(imported.search(query, workspace)).front().id, best) << "import changed raw inner-product ranking";
     integer(source, 96 + 20, 4, std::bit_cast<std::uint32_t>(std::numeric_limits<float>::quiet_NaN()));
     save(source_path, source);
-    check(!search::HnswIndex::from_hnswlib(source_path, vectors, 3, 8), "import accepted altered vectors");
+    EXPECT_FALSE(search::HnswIndex::from_hnswlib(source_path, vectors, 3, 8)) << "import accepted altered vectors";
     save(source_path, std::span(source).first(90));
-    check(!search::HnswIndex::from_hnswlib(source_path, vectors, 3, 8), "import accepted a truncated source index");
+    EXPECT_FALSE(search::HnswIndex::from_hnswlib(source_path, vectors, 3, 8))
+        << "import accepted a truncated source index";
 }
 
 auto quantized_linear_checks(const std::filesystem::path& root) -> void {
@@ -372,6 +392,7 @@ auto quantized_linear_checks(const std::filesystem::path& root) -> void {
 
     ops::Context context(tensor::Device::cpu());
     for (const std::int32_t bits : {8, 4, 2}) {
+        SCOPED_TRACE("bits=" + std::to_string(bits));
         const std::int32_t group_size = bits == 4 ? 32 : static_cast<std::int32_t>(width);
         const std::size_t B = width / static_cast<std::size_t>(group_size);
         const std::size_t row_bytes = width / (8 / static_cast<std::size_t>(bits));
@@ -402,28 +423,27 @@ auto quantized_linear_checks(const std::filesystem::path& root) -> void {
                       require(tensor::Tensor::from_host({}, std::span<const float>(&zero_f, 1))));
         require(linear->set_state(state, true, true));
         require(linear->bind_hnsw(path));
-        check(linear->has_hnsw(), "LinearImpl::bind_hnsw did not enable HNSW");
+        EXPECT_TRUE(linear->has_hnsw()) << "LinearImpl::bind_hnsw did not enable HNSW";
         std::vector<float> q(width, 0.F);
         q[7 * 4] = 4.F;
         const auto q_tensor = require(tensor::Tensor::from_host({1, 1, width}, std::span<const float>(q)));
         const auto selected = linear->select(context, q_tensor);
-        check(require(selected.data<std::int32_t>())[0] == 7, "quantized LinearImpl::select returned wrong token");
+        EXPECT_EQ(require(selected.data<std::int32_t>())[0], 7) << "quantized LinearImpl::select returned wrong token";
         q.resize(2 * width, 0.F);
         q[width + 3 * 4] = 4.F;
         const auto batch = require(tensor::Tensor::from_host({1, 2, width}, std::span<const float>(q)));
         const auto chosen = linear->select(context, batch);
         const auto ids = require(chosen.data<std::int32_t>());
-        check(ids.size() == 2 && ids[0] == 7 && ids[1] == 3, "batched HNSW selection mixed query workspaces");
+        ASSERT_EQ(ids.size(), 2U) << "batched HNSW selection mixed query workspaces";
+        EXPECT_EQ(ids[0], 7) << "batched HNSW selection mixed query workspaces";
+        EXPECT_EQ(ids[1], 3) << "batched HNSW selection mixed query workspaces";
         linear->release_workspaces();
-        check(require(linear->select(context, q_tensor).data<std::int32_t>())[0] == 7,
-              "HNSW workspaces did not rebuild after release");
-        bool rejected = false;
-        try {
-            linear->select(context, require(tensor::Tensor::zeros({1, width / 2}, tensor::DType::F32)));
-        } catch (const ops::Failure&) {
-            rejected = true;
-        }
-        check(rejected, "HNSW linear accepted a query with the wrong width");
+        EXPECT_EQ(require(linear->select(context, q_tensor).data<std::int32_t>())[0], 7)
+            << "HNSW workspaces did not rebuild after release";
+        EXPECT_THROW(
+            (void)linear->select(context, require(tensor::Tensor::zeros({1, width / 2}, tensor::DType::F32))),
+            ops::Failure)
+            << "HNSW linear accepted a query with the wrong width";
     }
 }
 
@@ -477,12 +497,13 @@ auto quantized_distance_checks(const std::filesystem::path& root, std::int32_t b
                                                            bits, static_cast<std::int32_t>(group), act_scale));
     if (bits == 8 && !half) {
         for (const auto invalid_scale : {-1.F, std::numeric_limits<float>::quiet_NaN()})
-            check(!search::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales), {}, bits,
-                                                     static_cast<std::int32_t>(group), invalid_scale),
-                  "packed HNSW accepted an invalid activation scale");
-        check(!search::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales),
-                                                 metadata(zeros, half_zeros), bits, static_cast<std::int32_t>(group)),
-              "INT8 HNSW silently ignored affine offsets");
+            EXPECT_FALSE(search::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales), {}, bits,
+                                                           static_cast<std::int32_t>(group), invalid_scale))
+                << "packed HNSW accepted an invalid activation scale";
+        EXPECT_FALSE(search::HnswIndex::load_quantized(path, weights, metadata(scales, half_scales),
+                                                       metadata(zeros, half_zeros), bits,
+                                                       static_cast<std::int32_t>(group)))
+            << "INT8 HNSW silently ignored affine offsets";
     }
     search::HnswWorkspace workspace;
     std::vector<float> query(width), rounded(width);
@@ -520,152 +541,153 @@ auto quantized_distance_checks(const std::filesystem::path& root, std::int32_t b
                                          scale;
         }
         const auto found = require(index.search(query, workspace));
-        check(found.size() == rows, "exhaustive packed search did not return every row");
+        EXPECT_EQ(found.size(), rows) << "exhaustive packed search did not return every row";
         for (const auto& neighbor : found) {
             double dot = 0.;
             for (std::size_t c = 0; c < width; ++c)
                 dot += static_cast<double>(rounded[c]) * decoded[neighbor.id * width + c];
             const auto expected = 1.F - static_cast<float>(dot);
-            check(std::abs(neighbor.distance - expected) < 0.00005F * (1.F + std::abs(expected)),
-                  "packed search differs from scalar reference scores");
+            EXPECT_NEAR(neighbor.distance, expected, 0.00005F * (1.F + std::abs(expected)))
+                << "packed search differs from scalar reference scores";
         }
         const auto parallel_found = require(index.search_parallel(query, workspace));
-        check(parallel_found.size() == rows, "exhaustive packed search_parallel did not return every row");
+        EXPECT_EQ(parallel_found.size(), rows) << "exhaustive packed search_parallel did not return every row";
         for (const auto& neighbor : parallel_found) {
             double dot = 0.;
             for (std::size_t c = 0; c < width; ++c)
                 dot += static_cast<double>(rounded[c]) * decoded[neighbor.id * width + c];
             const auto expected = 1.F - static_cast<float>(dot);
-            check(std::abs(neighbor.distance - expected) < 0.00005F * (1.F + std::abs(expected)),
-                  "packed search_parallel differs from scalar reference scores");
+            EXPECT_NEAR(neighbor.distance, expected, 0.00005F * (1.F + std::abs(expected)))
+                << "packed search_parallel differs from scalar reference scores";
         }
     }
 }
 
-#if !defined(_WIN32)
-auto search_settings_checks(const std::filesystem::path& root) -> void {
-    using namespace kidi;
-    struct Environment {
-        std::optional<std::string> ef;
-        Environment() {
-            if (const auto* value = std::getenv("KIDI_HNSW_EF")) ef = value;
-            unsetenv("KIDI_HNSW_EF");
-        }
-        ~Environment() {
-            if (ef)
-                setenv("KIDI_HNSW_EF", ef->c_str(), 1);
-            else
-                unsetenv("KIDI_HNSW_EF");
-        }
-    } restore;
-    std::vector<float> values;
-    const auto vectors = vector_table(16, 64, false, values);
-    auto topology =
-        require(search::HnswIndex::build(vectors, {.m = 4, .ef_construction = 16, .candidates = 4, .ef_search = 16}));
-    const auto path = root / "search-settings.hnsw";
-    require(topology.save(path));
-    const ModuleScope host(tensor::DType::F32, false, tensor::Device::cpu());
-    layers::Linear linear(64, 16, true, false);
-    require(linear->set_state({{"weight", vectors}}));
-    require(linear->bind_hnsw(path));
-    ops::Context context(tensor::Device::cpu());
-    std::vector<float> query(64, 1.F);
-    const auto input = require(tensor::Tensor::from_host({1, 64}, std::span<const float>(query)));
-    const auto expected = require(linear->select(context, input).data<std::int32_t>())[0];
-    for (const auto* value : {"", "0", "-1", "abc", "8junk", "17", "18446744073709551616"}) {
-        setenv("KIDI_HNSW_EF", value, 1);
-        const auto bound = linear->bind_hnsw(path);
-        check(!bound && bound.error().code == ErrorCode::INVALID_ARGUMENT,
-              "invalid HNSW setting was silently accepted");
-        check(require(linear->select(context, input).data<std::int32_t>())[0] == expected,
-              "failed HNSW binding changed the previous search configuration");
-    }
-    setenv("KIDI_HNSW_EF", "3", 1);
-    check(!linear->bind_hnsw(path), "search effort smaller than candidate count was accepted");
-    setenv("KIDI_HNSW_EF", "16", 1);
-    require(linear->bind_hnsw(path));
-    setenv("KIDI_HNSW_EF", "invalid-after-binding", 1);
-    check(require(linear->select(context, input).data<std::int32_t>())[0] == expected,
-          "HNSW hot path reread its environment settings");
-}
-#endif
-} // namespace
+constexpr std::array<float, 32> SMALL_VALUES{
+    1, 0, 0, 0, 10, 1, 0, 0, -2, 0, 0, 0, 0, 2, 0, 0, 1, 1, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, -1, 1, 0, 0,
+};
+constexpr kidi::search::HnswBuildOptions SMALL_OPTIONS{
+    .m = 2, .ef_construction = 8, .seed = 42, .candidates = 3, .ef_search = 8};
+constexpr std::array<float, 4> SMALL_QUERY{1, 0, 0, 0};
 
-auto main() -> int {
-    using namespace kidi;
-    const auto root = std::filesystem::temp_directory_path() /
-                      ("kidi-hnsw-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    const auto first_path = root / "first.hnsw";
-    const auto second_path = root / "second.hnsw";
-    try {
-        check(std::filesystem::create_directory(root), "cannot create unique test directory");
-        const std::array<float, 32> values{
-            1, 0, 0, 0, 10, 1, 0, 0, -2, 0, 0, 0, 0, 2, 0, 0, 1, 1, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, -1, 1, 0, 0,
-        };
-        const auto vectors = require(tensor::Tensor::from_host({8, 4}, std::span<const float>(values)));
-        std::size_t progress = 0;
-        const search::HnswBuildOptions options{
-            .m = 2, .ef_construction = 8, .seed = 42, .candidates = 3, .ef_search = 8};
-        auto first = require(search::HnswIndex::build(vectors, options, [&](std::size_t completed, std::size_t total) {
-            if (completed > total || completed <= progress) throw std::runtime_error("invalid HNSW progress");
-            progress = completed;
-        }));
-        auto second = require(search::HnswIndex::build(vectors, options));
-        check(progress == vectors.size(0), "HNSW build progress is incomplete");
-        require(first.save(first_path));
-        require(second.save(second_path));
-        if (bytes(first_path) != bytes(second_path)) throw std::runtime_error("deterministic HNSW files differ");
-        check_ground_truth_graph(bytes(first_path));
-        auto loaded = require(search::HnswIndex::load(first_path, vectors));
-        require(loaded.save(root / "roundtrip.hnsw"));
-        check(bytes(root / "roundtrip.hnsw") == bytes(first_path), "graph order changed during round trip");
-        search::HnswWorkspace workspace;
-        const std::array<float, 4> query{1, 0, 0, 0};
-        const auto found = require(loaded.search(query, workspace));
-        if (found.size() != 3 || found[0].id != 1 || found[0].distance != -9.F)
-            throw std::runtime_error("native HNSW build/search returned the wrong nearest neighbor");
-        auto invalid_query = query;
-        invalid_query[0] = std::numeric_limits<float>::quiet_NaN();
-        if (loaded.search(invalid_query, workspace) || loaded.search(query, workspace, 4, 3))
-            throw std::runtime_error("invalid HNSW search was accepted");
-        auto corrupt = bytes(first_path);
-        corrupt.back() ^= std::byte{1};
-        save(second_path, corrupt);
-        if (search::HnswIndex::load(second_path, vectors)) throw std::runtime_error("corrupt HNSW index was accepted");
-        const auto wrong = require(tensor::Tensor::zeros({8, 4}, tensor::DType::F32));
-        if (search::HnswIndex::load(first_path, wrong))
-            throw std::runtime_error("mismatched HNSW vectors were accepted");
-        saving(root, first);
-        for (bool bfloat : {false, true})
-            for (const std::size_t width : {64, 67}) brute_force_checks(root, bfloat, width);
-        for (bool bfloat : {false, true}) import_checks(root, bfloat);
-        quantized_linear_checks(root);
-        for (const bool half : {false, true}) {
-            quantized_distance_checks(root, 8, 1536, 1536, false, half);
-            quantized_distance_checks(root, 2, 1536, 1536, false, half);
-            quantized_distance_checks(root, 2, 32, 128, false, half);
-            for (const bool affine : {false, true}) {
-                quantized_distance_checks(root, 4, 32, 384, affine, half);
-                quantized_distance_checks(root, 4, 128, 1536, affine, half);
-                quantized_distance_checks(root, 4, 32, 96, affine, half);
-                quantized_distance_checks(root, 4, 64, 384, affine, half);
-            }
-        }
-#if !defined(_WIN32)
-        search_settings_checks(root);
-#endif
-        const std::array<float, 32> zeros{};
-        const auto tied_vectors = require(tensor::Tensor::from_host({8, 4}, std::span<const float>(zeros)));
-        auto tied = require(search::HnswIndex::build(tied_vectors, options));
-        for (const auto& neighbor : require(tied.search(query, workspace)))
-            check(neighbor.distance == 1.F, "tied distances changed");
-        std::filesystem::remove_all(root);
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
+auto small_vectors() -> kidi::tensor::Tensor {
+    return require(kidi::tensor::Tensor::from_host({8, 4}, std::span<const float>(SMALL_VALUES)));
+}
+
+class HnswTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        root = std::filesystem::temp_directory_path() /
+               ("kidi-hnsw-" + std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + "-" +
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        ASSERT_TRUE(std::filesystem::create_directory(root)) << "cannot create unique test directory";
+    }
+
+    void TearDown() override {
         std::error_code cleanup;
         std::filesystem::remove_all(root, cleanup);
-        if (cleanup) std::cerr << "HNSW test cleanup: " << cleanup.message() << '\n';
-        return 1;
+        EXPECT_FALSE(cleanup) << "HNSW test cleanup: " << cleanup.message();
+    }
+
+    std::filesystem::path root;
+};
+
+TEST_F(HnswTest, DeterministicGroundTruthGraph) {
+    const auto vectors = small_vectors();
+    const auto first_path = root / "first.hnsw";
+    const auto second_path = root / "second.hnsw";
+    std::size_t progress = 0;
+    auto first =
+        require(kidi::search::HnswIndex::build(vectors, SMALL_OPTIONS, [&](std::size_t completed, std::size_t total) {
+            EXPECT_LE(completed, total) << "invalid HNSW progress";
+            EXPECT_GT(completed, progress) << "invalid HNSW progress";
+            progress = completed;
+        }));
+    auto second = require(kidi::search::HnswIndex::build(vectors, SMALL_OPTIONS));
+    EXPECT_EQ(progress, static_cast<std::size_t>(vectors.size(0))) << "HNSW build progress is incomplete";
+    require(first.save(first_path));
+    require(second.save(second_path));
+    EXPECT_TRUE(bytes(first_path) == bytes(second_path)) << "deterministic HNSW files differ";
+    check_ground_truth_graph(bytes(first_path));
+}
+
+TEST_F(HnswTest, LoadRoundTripAndSearch) {
+    const auto vectors = small_vectors();
+    const auto first_path = root / "first.hnsw";
+    const auto second_path = root / "second.hnsw";
+    auto first = require(kidi::search::HnswIndex::build(vectors, SMALL_OPTIONS));
+    require(first.save(first_path));
+    auto loaded = require(kidi::search::HnswIndex::load(first_path, vectors));
+    require(loaded.save(root / "roundtrip.hnsw"));
+    EXPECT_TRUE(bytes(root / "roundtrip.hnsw") == bytes(first_path)) << "graph order changed during round trip";
+    kidi::search::HnswWorkspace workspace;
+    const auto found = require(loaded.search(SMALL_QUERY, workspace));
+    ASSERT_EQ(found.size(), 3U) << "native HNSW build/search returned the wrong nearest neighbor";
+    EXPECT_EQ(found[0].id, 1U) << "native HNSW build/search returned the wrong nearest neighbor";
+    EXPECT_EQ(found[0].distance, -9.F) << "native HNSW build/search returned the wrong nearest neighbor";
+    auto invalid_query = SMALL_QUERY;
+    invalid_query[0] = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_FALSE(loaded.search(invalid_query, workspace)) << "invalid HNSW search was accepted";
+    EXPECT_FALSE(loaded.search(SMALL_QUERY, workspace, 4, 3)) << "invalid HNSW search was accepted";
+    auto corrupt = bytes(first_path);
+    corrupt.back() ^= std::byte{1};
+    save(second_path, corrupt);
+    EXPECT_FALSE(kidi::search::HnswIndex::load(second_path, vectors)) << "corrupt HNSW index was accepted";
+    const auto wrong = require(kidi::tensor::Tensor::zeros({8, 4}, kidi::tensor::DType::F32));
+    EXPECT_FALSE(kidi::search::HnswIndex::load(first_path, wrong)) << "mismatched HNSW vectors were accepted";
+}
+
+TEST_F(HnswTest, Saving) {
+    const auto first = require(kidi::search::HnswIndex::build(small_vectors(), SMALL_OPTIONS));
+    saving(root, first);
+}
+
+TEST_F(HnswTest, BruteForceFloat32) {
+    for (const std::size_t width : {64, 67}) {
+        SCOPED_TRACE("width=" + std::to_string(width));
+        brute_force_checks(root, false, width);
     }
 }
+
+TEST_F(HnswTest, BruteForceBfloat16) {
+    for (const std::size_t width : {64, 67}) {
+        SCOPED_TRACE("width=" + std::to_string(width));
+        brute_force_checks(root, true, width);
+    }
+}
+
+TEST_F(HnswTest, ImportHnswlibFloat32) { import_checks(root, false); }
+
+TEST_F(HnswTest, ImportHnswlibBfloat16) { import_checks(root, true); }
+
+TEST_F(HnswTest, QuantizedLinearSelection) { quantized_linear_checks(root); }
+
+TEST_F(HnswTest, QuantizedDistances) {
+    for (const bool half : {false, true}) {
+        const auto run = [&](std::int32_t bits, std::size_t group, std::size_t width, bool affine) {
+            SCOPED_TRACE("bits=" + std::to_string(bits) + " group=" + std::to_string(group) +
+                         " width=" + std::to_string(width) + " affine=" + std::to_string(affine) +
+                         " half=" + std::to_string(half));
+            quantized_distance_checks(root, bits, group, width, affine, half);
+        };
+        run(8, 1536, 1536, false);
+        run(2, 1536, 1536, false);
+        run(2, 32, 128, false);
+        for (const bool affine : {false, true}) {
+            run(4, 32, 384, affine);
+            run(4, 128, 1536, affine);
+            run(4, 32, 96, affine);
+            run(4, 64, 384, affine);
+        }
+    }
+}
+
+TEST(HnswTiedTest, TiedDistances) {
+    const std::array<float, 32> zeros{};
+    const auto tied_vectors = require(kidi::tensor::Tensor::from_host({8, 4}, std::span<const float>(zeros)));
+    auto tied = require(kidi::search::HnswIndex::build(tied_vectors, SMALL_OPTIONS));
+    kidi::search::HnswWorkspace workspace;
+    for (const auto& neighbor : require(tied.search(SMALL_QUERY, workspace)))
+        EXPECT_EQ(neighbor.distance, 1.F) << "tied distances changed";
+}
+} // namespace

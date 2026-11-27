@@ -1,9 +1,11 @@
 # Kidi Desktop Streaming Protocol
 
 `kidi-app CONFIG` loads one immutable YAML configuration, starts a
-capability-protected loopback server, and serves the embedded interface. HTTP is
-used only for bootstrap assets and `/api/status`; interactive work uses one
-authenticated WebSocket at `/ws`.
+capability-protected loopback server, and serves the embedded interface. HTTP
+serves bootstrap assets, `/api/status`, and streaming text chat through
+`/v1/chat/completions`. The desktop adapter reuses bootstrap metadata
+instead of querying status before every chat turn. Other interactive work,
+including image chat and speech, uses authenticated WebSockets at `/ws`.
 
 For development, `kidi-app CONFIG --port 10010 --dev` keeps the loopback bind
 and security headers but disables the one-time capability and cookie exchange.
@@ -16,6 +18,12 @@ window. Never use `--dev` with an exposed or forwarded port.
 
 `make app-dev` builds and runs this mode on port `10010`. Override the defaults
 with `APP_CONFIG=path/to/config.yaml` or `APP_PORT=another-loopback-port`.
+
+For Inkling 2 Mini, use the CUDA build with
+[`examples/kidi-app-inkling2.yaml`](../examples/kidi-app-inkling2.yaml). The
+configuration retains the example's speech models; they are downloaded if
+needed. To use an existing Inkling checkpoint instead of downloading it,
+set `models.chat.directory` to its snapshot directory.
 
 Frontend builds require Node.js 24+ and npm to acquire Mermaid. Compact libraries
 and icons are vendored; CMake prepares the larger, ignored distributions before

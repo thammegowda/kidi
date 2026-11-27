@@ -38,6 +38,64 @@ const event = (id, sequence, type, payload) => JSON.stringify({
     version: 1, kind: 'event', id, sequence, type, payload,
 });
 
+async function loadBackend(imageModule) {
+    const source = (await readFile(new URL('../../web/hosts/desktop/backend.js', import.meta.url), 'utf8'))
+        .replace("from './images.js'", `from '${imageModule}'`)
+        .replace("from './channel.mjs'",
+            `from '${new URL('../../third_party/liteapp/web/transport/channel.mjs', import.meta.url).href}'`)
+        .replace("from './event-client.mjs'",
+            `from '${new URL('../../third_party/liteapp/web/host/event-client.mjs', import.meta.url).href}'`)
+        .replace("from './websocket-transport.mjs'",
+            `from '${new URL('../../third_party/liteapp/web/transport/websocket-transport.mjs', import.meta.url).href}'`);
+    return (await import(`data:text/javascript,${encodeURIComponent(source)}#${Date.now()}`)).backend;
+}
+
+test('desktop text chat reuses bootstrap metadata without a status round trip', async () => {
+    const previous = new Map(['WebSocket', 'location', 'crypto', 'fetch'].map(key =>
+        [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
+    try {
+        Object.defineProperty(globalThis, 'WebSocket', {configurable: true, value: Socket});
+        Object.defineProperty(globalThis, 'location', {configurable: true,
+            value: {protocol: 'http:', host: '127.0.0.1:10010'}});
+        Object.defineProperty(globalThis, 'crypto', {configurable: true,
+            value: {randomUUID: () => 'generated-text-chat'}});
+        const requests = [];
+        Object.defineProperty(globalThis, 'fetch', {configurable: true, value: async (url, options) => {
+            requests.push({url, body: options.body ? JSON.parse(options.body) : undefined});
+            if (url === '/api/status')
+                return Response.json({ready: true, backend: 'cuda', runtime: {host: 'native'},
+                    components: {chat: {model_id: 'local-model'}}});
+            assert.equal(url, '/v1/chat/completions');
+            return new Response('data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n' +
+                'data: [DONE]\n\n', {headers: {'Content-Type': 'text/event-stream'}});
+        }});
+        const backend = await loadBackend('data:text/javascript,export function readImage(){}');
+        await backend.status();
+        let completed, failed;
+        const done = new Promise((resolve, reject) => { completed = resolve; failed = reject; });
+        backend.connect({onEvent: value => {
+            if (value.type === 'chat.completed') completed(value.payload);
+            if (value.type === 'error') failed(new Error(value.payload.message));
+        }});
+        const [main, speech] = Socket.instances;
+        main.open();
+        speech.open();
+        await setImmediate();
+        backend.send('chat.start', 'text-chat', {messages: [{role: 'user', content: 'Hello'}]});
+        assert.equal((await done).text, 'Hello');
+        assert.deepEqual(requests.map(value => value.url), ['/api/status', '/v1/chat/completions']);
+        assert.equal(requests[1].body.model, 'local-model');
+        speech.close();
+        await setImmediate();
+    } finally {
+        for (const socket of Socket.instances) socket.close();
+        Socket.instances.length = 0;
+        for (const [key, descriptor] of previous)
+            if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+            else delete globalThis[key];
+    }
+});
+
 test('desktop adapter uses LiteApp requests, binary uploads, and isolated speech', async () => {
     const previous = new Map(['WebSocket', 'location', 'crypto'].map(key =>
         [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
@@ -51,15 +109,7 @@ test('desktop adapter uses LiteApp requests, binary uploads, and isolated speech
         const imageSource = 'export async function readImage() {' +
             "return new Blob([new Uint8Array([1,2,3])], {type:'image/png'});}";
         const imageModule = `data:text/javascript;base64,${Buffer.from(imageSource).toString('base64')}`;
-        const source = (await readFile(new URL('../../web/hosts/desktop/backend.js', import.meta.url), 'utf8'))
-            .replace("from './images.js'", `from '${imageModule}'`)
-            .replace("from './channel.mjs'",
-                `from '${new URL('../../third_party/liteapp/web/transport/channel.mjs', import.meta.url).href}'`)
-            .replace("from './event-client.mjs'",
-                `from '${new URL('../../third_party/liteapp/web/host/event-client.mjs', import.meta.url).href}'`)
-            .replace("from './websocket-transport.mjs'",
-                `from '${new URL('../../third_party/liteapp/web/transport/websocket-transport.mjs', import.meta.url).href}'`);
-        const {backend} = await import(`data:text/javascript,${encodeURIComponent(source)}#${Date.now()}`);
+        const backend = await loadBackend(imageModule);
         const events = [], audio = [];
         backend.connect({onEvent: value => events.push(value), onAudio: value => audio.push(value)});
         assert.equal(Socket.instances.length, 2);
@@ -68,10 +118,11 @@ test('desktop adapter uses LiteApp requests, binary uploads, and isolated speech
         speech.open();
         await setImmediate();
 
-        backend.send('chat.start', 'chat', {messages: []});
+        const messages = [{role: 'user', content: 'Describe this', images: [1]}];
+        backend.send('chat.start', 'chat', {messages});
         backend.send('tts.start', 'speech', {stream_id: 9, text: 'Hello'});
         assert.deepEqual(message(main), {
-            version: 1, kind: 'request', id: 'chat', method: 'chat.start', payload: {messages: []},
+            version: 1, kind: 'request', id: 'chat', method: 'chat.start', payload: {messages},
         });
         assert.equal(message(speech).method, 'tts.start');
         main.receive(event('chat', 0, 'chat.delta', {text: 'Hi'}));

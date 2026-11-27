@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string_view>
 #include "kidi/core/precision.h"
+#include "kidi/ops/quantization.h"
 #include "kidi/tensor/tensor.h"
 
 namespace kidi::graph {
@@ -37,6 +38,18 @@ public:
 
 private:
     std::shared_ptr<graph::Compiler> previous_;
+};
+/// Contexts constructed on this thread while the scope is alive run captured steps eagerly, even with an attached
+/// step compiler; tests use them as the reference for replayed steps.
+class EagerScope {
+public:
+    EagerScope();
+    ~EagerScope();
+    EagerScope(const EagerScope&) = delete;
+    auto operator=(const EagerScope&) -> EagerScope& = delete;
+
+private:
+    bool previous_;
 };
 using tensor::Tensor;
 
@@ -75,6 +88,23 @@ auto require(Result<Type> result) -> Type {
 inline auto require(Result<void> result) -> void {
     if (!result) throw Failure(std::move(result.error()));
 }
+
+/// Operator profiling for developer tools; profiles print to stderr. HOST times operators as dispatched, SYNC also
+/// waits for each operator, and CUDA adds GRAPH (captured-step phases) and EVENTS (per-node captured-step events).
+enum class ProfileMode : std::uint8_t { OFF, HOST, SYNC, GRAPH, EVENTS };
+struct ProfileOptions {
+    ProfileMode mode = ProfileMode::OFF;
+    std::size_t skip_requests = 0;   ///< Leading requests, such as warm-ups, excluded from HOST and SYNC profiles.
+    bool log_graph_captures = false; ///< Reports each CUDA graph capture on stderr.
+};
+/// Process-wide; set before creating contexts.
+auto set_profile_options(ProfileOptions options) -> void;
+auto profile_options() -> ProfileOptions;
+auto parse_profile_mode(std::string_view name) -> std::optional<ProfileMode>;
+/// Upper bound on expanded FP16 weights Metal keeps for faster prefill (default: unlimited). Process-wide; set
+/// before creating contexts. Projections beyond the bound use the slower packed path.
+auto set_metal_prefill_cache_bytes(std::size_t bytes) -> void;
+auto metal_prefill_cache_bytes() -> std::size_t;
 
 /// Eager tensor operations: func preserves inputs; func_ mutates and returns the first tensor.
 /// In-place calls preserve shape, dtype, and storage. Synchronize before host reads on Metal.
@@ -128,7 +158,7 @@ public:
     auto crop_local_attention() const noexcept -> bool;
     auto prefill_chunk_size(std::size_t requested) const -> std::size_t;
     auto prepare_linear_weights(const Tensor& weight, std::int32_t bits, std::int32_t group_size = 128,
-                                bool packed_prefill = true, bool asymmetric_clip = false) -> void;
+                                bool packed_prefill = true) -> void;
     auto bind_packed_zero(const Tensor& scales, Tensor zeros) -> void;
     auto add(const Tensor& left, const Tensor& right) -> Tensor;
     auto add_(Tensor& left, const Tensor& right) -> Tensor&;
@@ -164,7 +194,36 @@ public:
     auto gelu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
     auto silu_multiply(const Tensor& gate, const Tensor& value) -> Tensor;
     auto gelu_gate(const Tensor& gate_up) -> Tensor;
-    auto silu_gate(const Tensor& gate_up) -> Tensor;
+    auto silu_gate(const Tensor& gate_up, float gate_cap = 0.F, float up_cap = 0.F, const Tensor& row_weights = {})
+        -> Tensor;
+    /// Expands NVFP4 (U8, E4M3 block scales and FP32 expert scales) or MXFP8 (E4M3, U8 exponents) to
+    /// BF16 [experts, rows, columns] for reference comparisons. Native inference does not expand or rearrange weights.
+    auto dequantize_experts(const Tensor& values, const Tensor& scales, const Tensor& global = {},
+                            bool interleaved = false) -> Tensor;
+    /// Packs decoded expert weights directly to signed INT8 with FP32 per-row scales, without BF16 expansion.
+    /// Uses pack_weight's rounding convention and rejects non-finite values. CPU or CUDA.
+    auto pack_experts(const Tensor& values, const Tensor& scales, const Tensor& global = {}, bool interleaved = false)
+        -> PackedWeight;
+    /// CPU/CUDA projection from unchanged FP4 E2M1, FP8 E4M3 or symmetric signed INT4 block-scaled weights.
+    /// Values have shape [rows, columns / 2] for 4-bit formats, [rows, columns] for FP8.
+    /// Group size is configurable; a scalar FP32 global scale is optional. No persistent floating expansion.
+    auto block_scaled_linear(const Tensor& input, const BlockScaledWeight& weight) -> Tensor;
+    /// Consumes adjacent gate/up row pairs directly and fuses softcapped SiLU and per-token routing weights.
+    auto block_scaled_silu(const Tensor& input, const BlockScaledWeight& weight, const Tensor& row_weights,
+                           float gate_cap, float up_cap) -> Tensor;
+    /// CUDA top-k routing without a host round trip: ranks sigmoid(logits) + bias and normalizes the selected
+    /// sigmoid scores to sum to `scale`. Returns [tokens, top, 2] FP32 rows of (expert index, routing weight).
+    auto route_experts(const Tensor& logits, const Tensor& bias, std::int32_t top, float scale) -> Tensor;
+    /// Routed gate/up projection over stacked experts (values [experts, rows, packed]): CUDA block-scaled formats or
+    /// CPU/Metal VQ3D/VQ4D. Reads each selected expert's interleaved gate/up row pairs in place. Returns
+    /// [tokens, slots, rows / 2] activations that include the softcapped SiLU gate and routing weight. The global
+    /// scale, when present, holds one FP32 per expert (one per expert row for VQ formats).
+    auto expert_silu(const Tensor& input, const BlockScaledWeight& weight, const Tensor& routes, float gate_cap,
+                     float up_cap) -> Tensor;
+    /// Routed down projection (CUDA block-scaled formats or CPU/Metal VQ3D/VQ4D) of [tokens, slots, width]
+    /// activations; returns [tokens, rows] summed over slots (FP32 by default, or BF16 when requested).
+    auto expert_linear(const Tensor& input, const BlockScaledWeight& weight, const Tensor& routes,
+                       std::optional<tensor::DType> output_dtype = {}) -> Tensor;
     auto gated_feed_forward(const Tensor& input, const Tensor& gate_up_weight, const Tensor& gate_up_scales,
                             const Tensor& down_weight, const Tensor& down_scales, std::int32_t bits,
                             std::int32_t input_size, std::int32_t intermediate_size, float gate_up_input_scale,
@@ -192,7 +251,47 @@ public:
     auto conv_transpose_fold(const Tensor& projected, const Tensor& bias, std::int32_t kernel, std::int32_t stride,
                              std::int32_t padding, std::int32_t output_padding, std::int32_t dilation) -> Tensor;
     auto snake(const Tensor& input, const Tensor& alpha) -> Tensor;
-    auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon) -> Tensor;
+
+    /// Specialized operations with CPU and CUDA implementations.
+    /// Positions are `start + row` unless a device I32 [tokens] `positions` tensor supplies them. A positive
+    /// `log_floor` multiplies each query's logits by 1 + log_alpha * log(max(1, (position + 1) / log_floor)).
+    struct RelativeAttention {
+        std::int64_t heads, key_heads, start, window, extent;
+        float log_alpha = 0, log_floor = 0;
+        bool ring_mode = false;
+    };
+    /// RMS-normalizes each [tokens, width] source and mixes them per token with softmax weights from the
+    /// [queries, width] pseudo-queries; returns FP32 [queries, tokens, width].
+    auto residual_mix(std::span<const Tensor> sources, const Tensor& queries, float epsilon) -> Tensor;
+    /// Causal depthwise convolution of `padded` [W - 1 + tokens, channels] with lag-0-first `weight` [W, channels]
+    /// plus optional per-token `taps` [tokens, groups * W]; returns (convolution + current input) * scale.
+    auto short_convolution(const Tensor& padded, const Tensor& weight, const Tensor& taps, float scale) -> Tensor;
+    /// Ring-buffered causal depthwise convolution of `input` [tokens, channels] reading prior rows from `state`
+    /// [ring, channels] starting before `slot` (I32 [1], index of row 0 mod `ring`), optionally adding `residual`
+    /// and updating `state[slot]` in place when `tokens == 1 && update_state`.
+    auto short_convolution(const Tensor& input, const Tensor& state, const Tensor& weight, const Tensor& taps,
+                           const Tensor& slot, float scale, const Tensor& residual = {},
+                           std::optional<tensor::DType> output_dtype = {}, bool update_state = false) -> Tensor;
+    /// Multiplies [..., heads, width] rows by the optional [heads, width] scale and caps each row's L2 norm.
+    auto l2_clip(const Tensor& input, const Tensor& scale, float threshold) -> Tensor;
+    /// Causal attention of [tokens, heads * width] queries over [capacity, key_heads * width] caches, with relative
+    /// logits [tokens, heads, extent], sink logits [tokens, heads] and sigmoid `gate`. CPU I8 caches require
+    /// F32 scales [capacity, key_heads * groups_per_head]; scale groups must divide each head's width.
+    auto relative_attention(const Tensor& query, const Tensor& key, const Tensor& value, const Tensor& relative,
+                            const Tensor& sink, const Tensor& gate, RelativeAttention shape,
+                            const Tensor& positions = {}, const Tensor& key_scales = {},
+                            const Tensor& value_scales = {}) -> Tensor;
+    /// CPU: quantizes [tokens, heads, width] into I8 cache [1, capacity, heads * width] at absolute `positions`,
+    /// with F32 scales [capacity, heads * groups_per_head]. Existing rows outside `positions` are unchanged.
+    auto quantize_cache_(Tensor& cache, Tensor& scales, const Tensor& input, const Tensor& positions) -> void;
+    /// Unit-RMS-normalizes `destination` and `message` [tokens, width] and writes concatenated BF16 [tokens, 2 * width].
+    auto blend_prologue(const Tensor& destination, const Tensor& message, float epsilon) -> Tensor;
+    /// Computes mixed = destination * (1 + tanh(forget)) + message * tanh(gain) from [tokens, 2 * width]
+    /// `gain_forget`, RMS-normalizes by `norm` [width], and writes BF16 [tokens, width].
+    auto blend_epilogue(const Tensor& destination, const Tensor& message, const Tensor& gain_forget,
+                        const Tensor& norm, float epsilon) -> Tensor;
+    auto rms_norm(const Tensor& input, const Tensor& scale, float epsilon,
+                  std::optional<tensor::DType> output_dtype = std::nullopt) -> Tensor;
     auto rms_rotary(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine, float epsilon)
         -> Tensor;
     auto rms_rotary_slice(const Tensor& input, const Tensor& scale, const Tensor& cosine, const Tensor& sine,

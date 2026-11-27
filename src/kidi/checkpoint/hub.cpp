@@ -212,6 +212,13 @@ auto Hub::expand_home(std::filesystem::path path) -> std::filesystem::path {
     return std::filesystem::path(home) / value.substr(2);
 }
 
+auto Hub::default_cache() -> std::filesystem::path {
+    const auto* cache = std::getenv("KIDI_HUB");
+    return expand_home(cache && *cache ? cache : "~/.cache/kidi/model-hub");
+}
+
+Hub::Hub() : Hub("https://huggingface.co", default_cache()) {}
+
 Hub::Hub(std::string remote, std::filesystem::path local)
     : remote_(std::move(remote)), local_(expand_home(std::move(local)).lexically_normal()) {
     while (remote_.ends_with('/')) remote_.pop_back();
@@ -232,7 +239,14 @@ auto Hub::repository(std::string_view model_id) const -> Result<std::filesystem:
     return local_ / std::filesystem::path(owner) / std::filesystem::path(name);
 }
 
-auto Hub::resolve(std::string_view model_id, std::string_view revision) const -> Result<std::filesystem::path> {
+auto Hub::resolve(std::string_view reference, std::string_view revision) const -> Result<std::filesystem::path> {
+    if (reference.starts_with('@')) reference.remove_prefix(1);
+    const auto owner_end = reference.find('/');
+    const auto model_end =
+        owner_end == std::string_view::npos ? std::string_view::npos : reference.find('/', owner_end + 1);
+    if (model_end != std::string_view::npos)
+        return get_file(reference.substr(0, model_end), reference.substr(model_end + 1), revision);
+    const auto model_id = reference;
     if (!safe_revision(revision))
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid Hub model revision"});
     auto directory = repository(model_id);

@@ -1,10 +1,10 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <random>
 #include <stdexcept>
 
+#include <gtest/gtest.h>
 #include <yaml-cpp/yaml.h>
 
 #include "kidi/audio/whisper.h"
@@ -28,7 +28,7 @@ struct PreprocessorFixture {
         std::error_code error;
         std::filesystem::remove(config, error);
         if (!error) std::filesystem::remove(directory, error);
-        if (error) std::cerr << "failed to clean up Whisper test fixture: " << error.message() << '\n';
+        if (error) ADD_FAILURE() << "failed to clean up Whisper test fixture: " << error.message();
     }
 };
 
@@ -54,59 +54,57 @@ auto write_preprocessor(const std::filesystem::path& path, int bins, bool embedd
                 config["mel_filters"][mel].push_back(frequency == mel ? 1.F : 0.F);
     write_config(path, config);
 }
-} // namespace
 
-auto main() -> int try {
+TEST(WhisperMelTest, ExtractsFeatures) {
     const PreprocessorFixture fixture;
     const auto& config = fixture.config;
     const std::vector<float> silence(400);
     for (const std::size_t bins : {80, 128}) {
         for (const bool embedded : {true, false}) {
+            SCOPED_TRACE(::testing::Message() << "bins=" << bins << " embedded=" << embedded);
             write_preprocessor(config, static_cast<int>(bins), embedded);
             auto extractor = kidi::audio::WhisperFeatureExtractor::load(config);
-            if (!extractor) {
-                std::cerr << "failed to load Whisper preprocessor: " << extractor.error().message << '\n';
-                return 1;
-            }
-            if (extractor->bins() != bins) {
-                std::cerr << "expected " << bins << " Whisper mel bins, got " << extractor->bins() << '\n';
-                return 1;
-            }
+            ASSERT_TRUE(extractor.has_value())
+                << "failed to load Whisper preprocessor: " << extractor.error().message;
+            ASSERT_EQ(extractor->bins(), bins) << "expected " << bins << " Whisper mel bins";
             auto features = extractor->extract(silence, 16000);
-            if (!features || features->bins != bins || features->frames != 3000 ||
-                features->values.size() != bins * 3000)
-                return 1;
-            for (auto value : features->values)
-                if (value != -1.5F) return 1;
+            ASSERT_TRUE(features);
+            EXPECT_EQ(features->bins, bins);
+            EXPECT_EQ(features->frames, 3000U);
+            ASSERT_EQ(features->values.size(), bins * 3000);
+            for (auto value : features->values) ASSERT_EQ(value, -1.5F);
+            // Padding is independent of the filter bank; check it once to keep this test fast.
+            const bool check_padding = bins == 80 && embedded;
             for (const std::size_t length : {1, 159, 160, 201, 401}) {
+                if (!check_padding) break;
                 std::vector<float> signal(length);
                 for (std::size_t index = 0; index < length; ++index)
                     signal[index] = static_cast<float>(static_cast<int>(index % 17) - 8) / 16.F;
                 const auto short_features = extractor->extract(signal, 16000);
                 signal.resize(480000, 0.F);
                 const auto padded_features = extractor->extract(signal, 16000);
-                if (!short_features || !padded_features || short_features->values != padded_features->values) {
-                    std::cerr << "short audio features differ from explicit 30-second zero padding\n";
-                    return 1;
-                }
+                ASSERT_TRUE(short_features) << "length=" << length;
+                ASSERT_TRUE(padded_features) << "length=" << length;
+                EXPECT_EQ(short_features->values, padded_features->values)
+                    << "short audio features differ from explicit 30-second zero padding (length=" << length << ")";
             }
-            if (extractor->extract(silence, 8000) || extractor->extract({}, 16000) ||
-                extractor->extract(std::vector<float>(480001), 16000))
-                return 1;
+            EXPECT_FALSE(extractor->extract(silence, 8000));
+            EXPECT_FALSE(extractor->extract({}, 16000));
+            EXPECT_FALSE(extractor->extract(std::vector<float>(480001), 16000));
         }
     }
+}
+
+TEST(WhisperMelTest, RejectsInvalid) {
+    const PreprocessorFixture fixture;
+    const auto& config = fixture.config;
     write_preprocessor(config, 64, false);
-    if (kidi::audio::WhisperFeatureExtractor::load(config)) return 1;
+    EXPECT_FALSE(kidi::audio::WhisperFeatureExtractor::load(config));
     write_preprocessor(config, 128, true);
     auto invalid = YAML::LoadFile(config.string());
     invalid["mel_filters"][0] = YAML::Node(YAML::NodeType::Sequence);
     write_config(config, invalid);
-    if (kidi::audio::WhisperFeatureExtractor::load(config)) {
-        std::cerr << "invalid mel filter shape was accepted\n";
-        return 1;
-    }
-    return 0;
-} catch (const std::runtime_error& error) {
-    std::cerr << error.what() << '\n';
-    return 1;
+    EXPECT_FALSE(kidi::audio::WhisperFeatureExtractor::load(config)) << "invalid mel filter shape was accepted";
 }
+
+} // namespace

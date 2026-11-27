@@ -67,15 +67,11 @@ constexpr std::uint32_t GEMM_I8_BITS2[] = {
 constexpr std::uint32_t GELU_MULTIPLY[] = {
 #include "gelu_multiply.inc"
 };
-constexpr std::uint32_t ATTENTION[] = {
-#include "attention.inc"
-};
 
-enum class Kernel { GEMV, GEMM, GEMV_I8, GEMM_I8, GELU_MULTIPLY, ATTENTION };
+enum class Kernel { GEMV, GEMM, GEMV_I8, GEMM_I8, GELU_MULTIPLY };
 
 auto spirv(Kernel kernel, int bits) -> std::span<const std::uint32_t> {
     if (kernel == Kernel::GELU_MULTIPLY) return GELU_MULTIPLY;
-    if (kernel == Kernel::ATTENTION) return ATTENTION;
     const bool gemv = kernel == Kernel::GEMV || kernel == Kernel::GEMV_I8;
     const bool output_i8 = kernel == Kernel::GEMV_I8 || kernel == Kernel::GEMM_I8;
     switch (bits) {
@@ -235,9 +231,7 @@ public:
         info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         info.stage.module = shader;
         info.stage.pName = "main";
-        info.layout = kernel == Kernel::ATTENTION       ? attention_pipeline_layout_
-                      : kernel == Kernel::GELU_MULTIPLY ? gelu_pipeline_layout_
-                                                        : pipeline_layout_;
+        info.layout = kernel == Kernel::GELU_MULTIPLY ? gelu_pipeline_layout_ : pipeline_layout_;
         check(vkCreateComputePipelines(device_, {}, 1, &info, nullptr, &cached), "create Vulkan pipeline");
         return cached;
     }
@@ -276,28 +270,6 @@ public:
         const auto set = descriptor_set(pool.get(), set_layout_, {&activations, &weights, &factors, &output});
         submit([&](VkCommandBuffer command) {
             encode_projection(command, kernel, bits, set, rows, width, columns, output_scale);
-            compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT, VK_PIPELINE_STAGE_HOST_BIT);
-        });
-    }
-
-    auto dispatch_attention(const GpuBuffer& query, const GpuBuffer& key, const GpuBuffer& value, const GpuBuffer& mask,
-                            GpuBuffer& output, std::uint32_t batch, std::uint32_t queries, std::uint32_t keys,
-                            std::uint32_t heads, std::uint32_t key_heads, std::uint32_t width, std::uint32_t mask_batch,
-                            float scale) -> void {
-        std::scoped_lock lock(mutex_);
-        DescriptorPool pool(device_, 5, 1);
-        const auto set = descriptor_set(pool.get(), attention_set_layout_, {&query, &key, &value, &mask, &output});
-        submit([&](VkCommandBuffer command) {
-            vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline(Kernel::ATTENTION, 8));
-            vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, attention_pipeline_layout_, 0, 1, &set, 0,
-                                    nullptr);
-            const struct {
-                std::uint32_t batch, queries, keys, heads, key_heads, width, mask_batch;
-                float scale;
-            } push{batch, queries, keys, heads, key_heads, width, mask_batch, scale};
-            vkCmdPushConstants(command, attention_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
-                               &push);
-            vkCmdDispatch(command, (queries + 3) / 4, heads, batch);
             compute_barrier(command, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT, VK_PIPELINE_STAGE_HOST_BIT);
         });
     }
@@ -416,15 +388,6 @@ private:
         gelu_set_info.pBindings = gelu_bindings;
         check(vkCreateDescriptorSetLayout(device_, &gelu_set_info, nullptr, &gelu_set_layout_),
               "create Vulkan GELU set layout");
-        VkDescriptorSetLayoutBinding attention_bindings[5]{};
-        for (std::uint32_t index = 0; index < 5; ++index)
-            attention_bindings[index] = {index, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT,
-                                         nullptr};
-        VkDescriptorSetLayoutCreateInfo attention_set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        attention_set_info.bindingCount = 5;
-        attention_set_info.pBindings = attention_bindings;
-        check(vkCreateDescriptorSetLayout(device_, &attention_set_info, nullptr, &attention_set_layout_),
-              "create Vulkan attention set layout");
         VkPushConstantRange constants{VK_SHADER_STAGE_COMPUTE_BIT, 0, 5 * sizeof(std::uint32_t)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.setLayoutCount = 1;
@@ -436,14 +399,6 @@ private:
         layout_info.pSetLayouts = &gelu_set_layout_;
         check(vkCreatePipelineLayout(device_, &layout_info, nullptr, &gelu_pipeline_layout_),
               "create Vulkan GELU pipeline layout");
-        VkPushConstantRange attention_constants{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8 * sizeof(std::uint32_t)};
-        VkPipelineLayoutCreateInfo attention_layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        attention_layout_info.setLayoutCount = 1;
-        attention_layout_info.pSetLayouts = &attention_set_layout_;
-        attention_layout_info.pushConstantRangeCount = 1;
-        attention_layout_info.pPushConstantRanges = &attention_constants;
-        check(vkCreatePipelineLayout(device_, &attention_layout_info, nullptr, &attention_pipeline_layout_),
-              "create Vulkan attention pipeline layout");
         VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pool_info.queueFamilyIndex = family_;
@@ -462,9 +417,7 @@ private:
             if (fence_) vkDestroyFence(device_, fence_, nullptr);
             if (commands_) vkDestroyCommandPool(device_, commands_, nullptr);
             if (gelu_pipeline_layout_) vkDestroyPipelineLayout(device_, gelu_pipeline_layout_, nullptr);
-            if (attention_pipeline_layout_) vkDestroyPipelineLayout(device_, attention_pipeline_layout_, nullptr);
             if (pipeline_layout_) vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
-            if (attention_set_layout_) vkDestroyDescriptorSetLayout(device_, attention_set_layout_, nullptr);
             if (gelu_set_layout_) vkDestroyDescriptorSetLayout(device_, gelu_set_layout_, nullptr);
             if (set_layout_) vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
             vkDestroyDevice(device_, nullptr);
@@ -529,13 +482,11 @@ private:
     std::uint32_t family_{};
     VkDescriptorSetLayout set_layout_{};
     VkDescriptorSetLayout gelu_set_layout_{};
-    VkDescriptorSetLayout attention_set_layout_{};
     VkPipelineLayout pipeline_layout_{};
     VkPipelineLayout gelu_pipeline_layout_{};
-    VkPipelineLayout attention_pipeline_layout_{};
     VkCommandPool commands_{};
     VkFence fence_{};
-    std::array<std::array<VkPipeline, 3>, 6> pipelines_{};
+    std::array<std::array<VkPipeline, 3>, 5> pipelines_{};
     std::vector<VkShaderModule> shaders_;
 };
 
@@ -646,88 +597,6 @@ private:
     std::vector<std::int64_t> shape_;
     Device device_;
     OutputPool* pool_;
-};
-
-class AttentionOperator final : public Operator {
-public:
-    AttentionOperator(const OperatorSpec& spec, TensorInputs inputs, Device device, OutputPool& pool)
-        : device_(device),
-          batch_(static_cast<std::uint32_t>(inputs[0].size(0))),
-          queries_(static_cast<std::uint32_t>(inputs[0].size(1))),
-          keys_(static_cast<std::uint32_t>(inputs[1].size(1))),
-          heads_(static_cast<std::uint32_t>(spec.attributes[0])),
-          key_heads_(static_cast<std::uint32_t>(spec.attributes[1])),
-          width_(static_cast<std::uint32_t>(inputs[0].size(2)) / heads_),
-          mask_batch_(static_cast<std::uint32_t>(inputs[3].size(0))),
-          scale_(spec.epsilon),
-          shape_(inputs[0].shape().begin(), inputs[0].shape().end()),
-          pool_(&pool) {
-        auto& context = GpuContext::instance();
-        query_ = context.buffer(inputs[0].nbytes());
-        key_ = context.buffer(inputs[1].nbytes());
-        value_ = context.buffer(inputs[2].nbytes());
-        mask_ = context.buffer(inputs[3].nbytes());
-        output_ = context.buffer(inputs[0].nbytes());
-    }
-
-    static auto supported(const OperatorSpec& spec, TensorInputs inputs) -> bool {
-        const auto* enabled = std::getenv("KIDI_VULKAN_ATTENTION");
-        if (!enabled || std::string_view(enabled) != "1") return false;
-        if (spec.operation != Operation::ATTENTION || spec.attributes.size() != 4 || inputs.size() != 4 ||
-            spec.attributes[2] != 0 || !std::isfinite(spec.epsilon) || spec.epsilon <= 0 ||
-            inputs[0].dtype() != DType::F32 || inputs[1].dtype() != DType::F32 || inputs[2].dtype() != DType::F32 ||
-            inputs[3].dtype() != DType::F32 || inputs[0].dimensions() != 3 || inputs[1].dimensions() != 3 ||
-            inputs[2].dimensions() != 3 || inputs[3].dimensions() != 4)
-            return false;
-        const auto batch = inputs[0].size(0);
-        const auto queries = inputs[0].size(1);
-        const auto keys = inputs[1].size(1);
-        const auto heads = spec.attributes[0];
-        const auto key_heads = spec.attributes[1];
-        if (!batch || !queries || !keys || keys > 1024 || heads <= 0 || key_heads <= 0 || heads % key_heads ||
-            inputs[1].size(0) != batch || inputs[2].size(0) != batch || inputs[2].size(1) != keys ||
-            inputs[3].size(0) != 1 && inputs[3].size(0) != batch || inputs[3].size(1) != 1 ||
-            inputs[3].size(2) != queries || inputs[3].size(3) != keys ||
-            static_cast<std::size_t>(spec.attributes[3]) != keys || inputs[0].size(2) % heads)
-            return false;
-        const auto width = inputs[0].size(2) / heads;
-        return width > 0 && width % 64 == 0 && inputs[1].size(2) == key_heads * width &&
-               inputs[2].size(2) == key_heads * width;
-    }
-
-    auto run(TensorInputs inputs) -> Tensor override {
-        auto output = pool_->acquire(shape_, DType::F32, device_);
-        compute(inputs, output);
-        return output;
-    }
-
-    auto run_(TensorInputs, Tensor&) -> Tensor override {
-        throw ops::Failure({ErrorCode::UNSUPPORTED, "attention is not an in-place operation"});
-    }
-
-    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { compute(inputs, outputs[0]); }
-
-    auto allocations() const -> AllocationStats override { return pool_->allocations(); }
-
-private:
-    auto compute(TensorInputs inputs, Tensor& output) -> void {
-        for (const auto [input, buffer] : {std::pair{&inputs[0], &query_}, std::pair{&inputs[1], &key_},
-                                           std::pair{&inputs[2], &value_}, std::pair{&inputs[3], &mask_}}) {
-            const auto bytes = require(input->host_bytes());
-            std::memcpy(buffer->mapped, bytes.data(), bytes.size());
-        }
-        GpuContext::instance().dispatch_attention(query_, key_, value_, mask_, output_, batch_, queries_, keys_, heads_,
-                                                  key_heads_, width_, mask_batch_, scale_);
-        auto target = require(output.host_bytes());
-        std::memcpy(target.data(), output_.mapped, target.size());
-    }
-
-    Device device_;
-    std::uint32_t batch_, queries_, keys_, heads_, key_heads_, width_, mask_batch_;
-    float scale_;
-    std::vector<std::int64_t> shape_;
-    OutputPool* pool_;
-    GpuBuffer query_, key_, value_, mask_, output_;
 };
 
 auto interleave_word(std::uint32_t input, int bits) -> std::uint32_t {
@@ -857,8 +726,6 @@ public:
     }
 
     static auto supported(const OperatorSpec& spec, TensorInputs inputs) -> bool {
-        const auto* disabled = std::getenv("KIDI_VULKAN_QUANTIZED");
-        if (disabled && std::string_view(disabled) == "0") return false;
         if (spec.operation != Operation::QUANTIZED_LINEAR || spec.attributes.size() != 1 || !spec.attributes[0] ||
             inputs.size() != 4 || inputs[0].dtype() != DType::F32 || inputs[1].dtype() != DType::I8 ||
             inputs[1].dimensions() != 2 || inputs[2].dtype() != DType::F32 || inputs[2].dimensions() != 2 ||
@@ -939,8 +806,6 @@ public:
     }
 
     static auto supported(const OperatorSpec& spec, TensorInputs inputs) -> bool {
-        const auto* disabled = std::getenv("KIDI_VULKAN_PACKED");
-        if (disabled && std::string_view(disabled) == "0") return false;
         if (spec.operation != Operation::PACKED_LINEAR || spec.epsilon <= 0 || inputs[2].size(1) != 1) return false;
         const auto rows = inputs[0].numel() / inputs[0].size(-1);
         const auto width = inputs[0].size(-1);
@@ -1018,8 +883,6 @@ public:
     }
 
     static auto supported(const OperatorSpec& spec, TensorInputs inputs) -> bool {
-        const auto* disabled = std::getenv("KIDI_VULKAN_GATED");
-        if (disabled && std::string_view(disabled) == "0") return false;
         if (spec.operation != Operation::GATED_FEED_FORWARD ||
             (spec.attributes.size() != 6 && spec.attributes.size() != 7) ||
             (spec.attributes.size() == 7 && spec.attributes[6] != 1) || spec.epsilon <= 0 || inputs[2].size(1) != 1 ||
@@ -1195,8 +1058,6 @@ public:
     VulkanBackend() : cpu_(cpu_operators()) {}
 
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
-        if (AttentionOperator::supported(spec, inputs))
-            return std::make_unique<AttentionOperator>(spec, inputs, Device::vulkan(), pool_);
         if (spec.operation == Operation::RMS_ROTARY)
             return std::make_unique<RmsRotaryOperator>(
                 cpu_->prepare({Operation::RMS_NORM, {}, DType::F32, spec.epsilon}, inputs.first(2)),

@@ -1,11 +1,15 @@
 #include "kidi/text/phonemizer.h"
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 
-auto main() -> int {
+#include <gtest/gtest.h>
+
+namespace {
+
+TEST(PhonemizerTest, LexiconPhonemization) {
     const auto path = std::filesystem::temp_directory_path() / "kidi-pronunciation-lexicon.tsv";
     std::ofstream(path) << "hello\th\xC9\x99l\xCB\x88O\nworld\tw\xCB\x88\xC9\x9C\xC9\xB9ld\n";
     YAML::Node vocabulary;
@@ -18,20 +22,13 @@ auto main() -> int {
     vocabulary["\xC9\xB9"] = 23;
     auto phonemizer = kidi::text::LexiconPhonemizer::load(path, vocabulary);
     std::filesystem::remove(path);
-    if (!phonemizer) {
-        std::cerr << phonemizer.error().message << '\n';
-        return 1;
-    }
+    ASSERT_TRUE(phonemizer.has_value()) << phonemizer.error().message;
     auto result = phonemizer->phonemize("Hello world.");
     constexpr std::array<std::int32_t, 13> IDS{1, 20, 3, 21, 4, 8, 5, 21, 22, 23, 3, 7, 9};
-    if (!result || result->text != "h\xC9\x99l\xCB\x88O w\xCB\x88\xC9\x9C\xC9\xB9ld." ||
-        !std::ranges::equal(result->ids, IDS)) {
-        std::cerr << "lexicon phonemization failed\n";
-        return 1;
-    }
-    if (phonemizer->phonemize("unknown")) {
-        std::cerr << "unknown lexicon word was accepted\n";
-        return 1;
-    }
-    return 0;
+    ASSERT_TRUE(result.has_value()) << "lexicon phonemization failed";
+    EXPECT_EQ(result->text, "h\xC9\x99l\xCB\x88O w\xCB\x88\xC9\x9C\xC9\xB9ld.") << "lexicon phonemization failed";
+    EXPECT_TRUE(std::ranges::equal(result->ids, IDS)) << "lexicon phonemization failed";
+    EXPECT_FALSE(phonemizer->phonemize("unknown")) << "unknown lexicon word was accepted";
 }
+
+} // namespace

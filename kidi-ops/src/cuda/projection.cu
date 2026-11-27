@@ -1,9 +1,7 @@
 #include "cuda/projection.h"
 #include "cuda/elementwise.h"
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
 #include "cuda/dense_gemm.h"
 #include "cuda/int8_gemm.h"
-#endif
 
 #include <climits>
 #include <cstring>
@@ -317,7 +315,6 @@ __device__ void write_projection(Launch plan, std::size_t row, std::size_t colum
     write(plan.output, row * columns + column, result);
 }
 
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
 __global__ void projection_epilogue(Launch plan, const int* accumulators, const int* sums, const float* scales,
                                     const int* zeros) {
     const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -326,7 +323,6 @@ __global__ void projection_epilogue(Launch plan, const int* accumulators, const 
     const auto row = index / columns, column = index % columns;
     write_projection(plan, row, column, accumulators[index] - zeros[row] * sums[column], scales);
 }
-#endif
 
 template <int Bits>
 __global__ void quantized_vector(Launch plan, const signed char* quantized, const float* scales, const int* zeros) {
@@ -479,9 +475,9 @@ __global__ void matrix(Launch plan) {
     write(plan.output, index, sum);
 }
 
-__global__ void bfloat_vector(Launch plan, std::int64_t width, std::int64_t columns) {
-    const int lane = threadIdx.x % 32;
-    const auto column = static_cast<std::int64_t>(blockIdx.x) * 4 + threadIdx.x / 32;
+__global__ void bfloat_vector(const __grid_constant__ Launch plan, std::int64_t width, std::int64_t columns) {
+    const int lane = threadIdx.x & 31;
+    const auto column = static_cast<std::int64_t>(blockIdx.x) * 4 + (threadIdx.x >> 5);
     if (column >= columns) return;
     const auto* input = static_cast<const __nv_bfloat16*>(plan.inputs[0].data);
     const auto* weight = static_cast<const __nv_bfloat16*>(plan.inputs[1].data) + column * width;
@@ -492,8 +488,8 @@ __global__ void bfloat_vector(Launch plan, std::int64_t width, std::int64_t colu
             __nv_bfloat162 pairs[4];
         };
         Vector left, right;
-        left.packed = *reinterpret_cast<const uint4*>(input + contraction);
-        right.packed = *reinterpret_cast<const uint4*>(weight + contraction);
+        left.packed = __ldg(reinterpret_cast<const uint4*>(input + contraction));
+        right.packed = __ldg(reinterpret_cast<const uint4*>(weight + contraction));
 #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
             const float2 activation = __bfloat1622float2(left.pairs[pair]);
@@ -512,7 +508,45 @@ __global__ void bfloat_vector(Launch plan, std::int64_t width, std::int64_t colu
     }
 }
 
-__global__ void bfloat_vector_block(Launch plan, std::int64_t width) {
+__global__ void bfloat_vector_2warp(const __grid_constant__ Launch plan, std::int64_t width, std::int64_t columns) {
+    __shared__ float partial[2][2];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int col_local = warp >> 1, sub_warp = warp & 1;
+    const auto column = static_cast<std::int64_t>(blockIdx.x) * 2 + col_local;
+    if (column >= columns) return;
+    const auto* input = static_cast<const __nv_bfloat16*>(plan.inputs[0].data);
+    const auto* weight = static_cast<const __nv_bfloat16*>(plan.inputs[1].data) + column * width;
+    float sums[8]{};
+    for (std::int64_t contraction = (sub_warp * 32 + lane) * 8; contraction < width; contraction += 64 * 8) {
+        union Vector {
+            uint4 packed;
+            __nv_bfloat162 pairs[4];
+        };
+        Vector left, right;
+        left.packed = __ldg(reinterpret_cast<const uint4*>(input + contraction));
+        right.packed = __ldg(reinterpret_cast<const uint4*>(weight + contraction));
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float2 activation = __bfloat1622float2(left.pairs[pair]);
+            const float2 parameter = __bfloat1622float2(right.pairs[pair]);
+            sums[pair * 2] = fmaf(activation.x, parameter.x, sums[pair * 2]);
+            sums[pair * 2 + 1] = fmaf(activation.y, parameter.y, sums[pair * 2 + 1]);
+        }
+    }
+    float sum = 0;
+#pragma unroll
+    for (int index = 0; index < 8; ++index) sum += sums[index];
+    for (int delta = 16; delta > 0; delta /= 2) sum += __shfl_down_sync(0xffffffff, sum, delta);
+    if (lane == 0) partial[col_local][sub_warp] = sum;
+    __syncthreads();
+    if (sub_warp == 0 && lane == 0) {
+        float total = partial[col_local][0] + partial[col_local][1];
+        if (plan.count == 3) total += read(plan.inputs[2], column);
+        static_cast<__nv_bfloat16*>(plan.output.data)[column] = __float2bfloat16(total);
+    }
+}
+
+__global__ void bfloat_vector_block(const __grid_constant__ Launch plan, std::int64_t width) {
     __shared__ float partial[4];
     const auto column = static_cast<std::int64_t>(blockIdx.x);
     const auto* input = static_cast<const __nv_bfloat16*>(plan.inputs[0].data);
@@ -739,7 +773,6 @@ void run_w8a16_vector(const Launch& launch, unsigned int grid, std::int64_t rows
         w8a16_vector<4, ColsPerWarp, Grouped><<<grid, 128, 0, stream>>>(launch, width, columns, group_size);
 }
 
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
 __global__ void float_vector(Launch plan, std::int64_t width, std::int64_t columns) {
     const int lane = threadIdx.x % 32;
     const auto column = static_cast<std::int64_t>(blockIdx.x) * 4 + threadIdx.x / 32;
@@ -762,7 +795,6 @@ __global__ void float_vector(Launch plan, std::int64_t width, std::int64_t colum
         static_cast<float*>(plan.output.data)[column] = sum;
     }
 }
-#endif
 
 } // namespace kernel
 } // namespace
@@ -817,24 +849,24 @@ auto execute_matrix(const Launch& plan, int device, bool optimized, void* worksp
         plan.elements == static_cast<std::size_t>(columns) && width > 0 && width <= 65536 && columns > 0 &&
         reinterpret_cast<std::uintptr_t>(left.data) % 16 == 0 &&
         reinterpret_cast<std::uintptr_t>(right.data) % 16 == 0) {
-        if (columns <= 4096 && width % 256 == 0) {
-            if (width >= 1024)
+        if (width % 8 == 0) {
+            if (columns > 16384)
+                kernel::bfloat_vector_wide<<<static_cast<unsigned int>((columns + 15) / 16), 128, 0, stream>>>(
+                    plan, width, columns);
+            else if (columns < 512 && width >= 1024 && width % 256 == 0)
                 kernel::bfloat_vector_block<<<static_cast<unsigned int>(columns), 128, 0, stream>>>(plan, width);
+            else if (columns <= 4096)
+                kernel::bfloat_vector_2warp<<<static_cast<unsigned int>((columns + 1) / 2), 128, 0, stream>>>(
+                    plan, width, columns);
             else
                 kernel::bfloat_vector<<<static_cast<unsigned int>((columns + 3) / 4), 128, 0, stream>>>(plan, width,
                                                                                                         columns);
-            return;
-        }
-        if (width % 8 == 0) {
-            kernel::bfloat_vector_wide<<<static_cast<unsigned int>((columns + 15) / 16), 128, 0, stream>>>(plan, width,
-                                                                                                           columns);
             return;
         }
     }
     (void)device;
     (void)workspace;
     (void)slices;
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
     const bool fp32 = left.type == static_cast<int>(Type::F32) && right.type == static_cast<int>(Type::F32) &&
                       plan.output.type == static_cast<int>(Type::F32);
     if (optimized && (fp32 || (bfloat && plan.count == 2 && width % 8 == 0 && columns % 8 == 0)) && right.rank == 2 &&
@@ -868,7 +900,6 @@ auto execute_matrix(const Launch& plan, int device, bool optimized, void* worksp
             return;
         }
     }
-#endif
     kernel::matrix<<<blocks, 256, 0, stream>>>(plan);
 }
 
@@ -883,7 +914,8 @@ auto floating_projection(const Launch& plan, int device, bool reference_projecti
         }
         return;
     }
-    execute_matrix(plan, device, !reference_projection, scratch, dense_slices, stream);
+    execute_matrix(plan, device, !reference_projection, shared_workspace ? shared_workspace : scratch, dense_slices,
+                   stream);
 }
 
 auto quantized_projection(const Launch& plan, int device, bool reference_projection, bool vector_projection,
@@ -945,18 +977,15 @@ auto quantized_projection(const Launch& plan, int device, bool reference_project
     (void)accumulators;
     (void)shared_workspace;
     (void)dense_slices;
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
     constexpr std::size_t WEIGHT_ALIGNMENT = 16;
     if (!tensor_projection || vector_projection ||
         reinterpret_cast<std::uintptr_t>(plan.inputs[1].data) % WEIGHT_ALIGNMENT)
-#endif
     {
         kernel::quantized_matrix<<<blocks, 256, 0, stream>>>(plan, static_cast<const signed char*>(scratch),
                                                              static_cast<const float*>(scales),
                                                              static_cast<const int*>(zeros));
         return;
     }
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
     if (fused_w8a8) {
         const float* bias_ptr =
             plan.operation == static_cast<int>(Op::QUANTIZED_LINEAR) && plan.count >= 4 && plan.inputs[3].data
@@ -983,7 +1012,6 @@ auto quantized_projection(const Launch& plan, int device, bool reference_project
     kernel::projection_epilogue<<<blocks, 256, 0, stream>>>(
         plan, static_cast<const int*>(accumulators), static_cast<const int*>(prepared_sums),
         static_cast<const float*>(scales), static_cast<const int*>(zeros));
-#endif
 }
 
 auto w8a16_projection(const Launch& plan, int device, bool reference_projection, void* shared_workspace, void* scratch,
@@ -1018,7 +1046,6 @@ auto w8a16_projection(const Launch& plan, int device, bool reference_projection,
     (void)shared_workspace;
     (void)scratch;
     (void)dense_slices;
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
     if (!reference_projection && aligned && rows > 4 && rows <= INT32_MAX && width > 0 && width <= INT32_MAX &&
         width % 64 == 0 && group_size > 0 && group_size % 64 == 0 && width % group_size == 0 && output_columns > 0 &&
         output_columns <= INT32_MAX && output_columns % 8 == 0 && dense_device(device).major >= 8) {
@@ -1028,7 +1055,6 @@ auto w8a16_projection(const Launch& plan, int device, bool reference_projection,
                    shared_workspace ? shared_workspace : scratch, dense_slices);
         return;
     }
-#endif
     kernel::w8a16_matrix<<<blocks, 256, 0, stream>>>(plan);
 }
 

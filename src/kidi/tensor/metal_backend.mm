@@ -8,23 +8,26 @@
 #include <algorithm>
 #include <cstring>
 #include <utility>
+#include <unistd.h>
 
 namespace kidi::tensor {
 namespace {
 
 class MetalStorage final : public Storage {
 public:
-    MetalStorage(Device device, id<MTLBuffer> buffer, std::size_t size_bytes)
-        : device_(device), buffer_(buffer), size_bytes_(size_bytes) {}
+    MetalStorage(Device device, id<MTLBuffer> buffer, std::size_t size_bytes, bool writable = true)
+        : device_(device), buffer_(buffer), size_bytes_(size_bytes), writable_(writable) {}
 
     auto device() const noexcept -> Device override { return device_; }
     auto size_bytes() const noexcept -> std::size_t override { return size_bytes_; }
     auto buffer() const noexcept -> id<MTLBuffer> { return buffer_; }
+    auto writable() const noexcept -> bool { return writable_; }
 
 private:
     Device device_;
     id<MTLBuffer> buffer_;
     std::size_t size_bytes_;
+    bool writable_;
 };
 
 auto metal_storage(Storage& storage) -> Result<MetalStorage*> {
@@ -65,6 +68,12 @@ public:
         if (device.kind != DeviceKind::A_GPU || device.index != 0) return "Metal backend supports a_gpu:0 only";
         return device_ == nil ? "no Metal device is available" : std::string{};
     }
+    auto free_memory(Device device) const noexcept -> std::size_t override {
+        if (!is_available(device)) return 0;
+        const auto limit = static_cast<std::size_t>(device_.recommendedMaxWorkingSetSize);
+        const auto used = static_cast<std::size_t>(device_.currentAllocatedSize);
+        return limit > used ? limit - used : 0;
+    }
 
     auto allocate(Device device, std::size_t size_bytes, std::size_t) const
         -> Result<std::shared_ptr<Storage>> override {
@@ -79,16 +88,32 @@ public:
         return std::shared_ptr<Storage>(new MetalStorage(device, buffer, size_bytes));
     }
 
-    auto wrap_host(Device, std::span<const std::byte>, std::shared_ptr<const void>) const
+    auto wrap_host(Device device, std::span<const std::byte> bytes, std::shared_ptr<const void> owner) const
         -> Result<std::shared_ptr<Storage>> override {
-        return std::unexpected(
-            Error{ErrorCode::UNSUPPORTED, "zero-copy host blobs are supported only by the CPU backend"});
+        if (!is_available(device)) return std::unexpected(Error{ErrorCode::UNSUPPORTED, unavailable_reason(device)});
+        const auto page = static_cast<std::size_t>(::getpagesize());
+        if (!owner || bytes.empty() || reinterpret_cast<std::uintptr_t>(bytes.data()) % page || bytes.size() % page)
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT,
+                                         "Metal host blobs require an owner and a page-aligned mapped range"});
+        if (bytes.size() > device_.maxBufferLength)
+            return std::unexpected(
+                Error{ErrorCode::UNSUPPORTED, "mapped Metal tensor exceeds the maximum buffer size"});
+        id<MTLBuffer> buffer = [device_ newBufferWithBytesNoCopy:const_cast<std::byte*>(bytes.data())
+                                                          length:bytes.size()
+                                                         options:MTLResourceStorageModeShared
+                                                     deallocator:^(void*, NSUInteger) {
+                                                       (void)owner;
+                                                     }];
+        if (!buffer) return std::unexpected(Error{ErrorCode::RUNTIME, "failed to wrap mapped Metal tensor storage"});
+        return std::shared_ptr<Storage>(new MetalStorage(device, buffer, bytes.size(), false));
     }
 
     auto copy_from_host(Storage& destination, std::size_t destination_offset, std::span<const std::byte> source) const
         -> Result<void> override {
         auto storage = metal_storage(destination);
         if (!storage) return std::unexpected(std::move(storage.error()));
+        if (!(*storage)->writable())
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "cannot write to read-only tensor storage"});
         auto bounds = check_copy_bounds((*storage)->size_bytes(), destination_offset, source.size());
         if (!bounds) return bounds;
         std::memcpy(static_cast<std::byte*>((*storage)->buffer().contents) + destination_offset, source.data(),
@@ -110,6 +135,8 @@ public:
     auto host_view(Storage& storage) const -> Result<std::span<std::byte>> override {
         auto typed = metal_storage(storage);
         if (!typed) return std::unexpected(std::move(typed.error()));
+        if (!(*typed)->writable())
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "tensor storage is read-only"});
         return std::span<std::byte>(static_cast<std::byte*>((*typed)->buffer().contents), (*typed)->size_bytes());
     }
 

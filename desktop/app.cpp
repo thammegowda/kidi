@@ -6,7 +6,10 @@
 #include "kidi/inference/generator.h"
 #include "kidi/inference/synthesizer.h"
 #include "kidi/inference/transcriber.h"
+#include "kidi/ops/context.h"
 #include "kidi/runtime/ynn/graph.h"
+#include "kidi/server/routes.h"
+#include "kidi/text/response.h"
 #include "kidi/text/tokenizer.h"
 #include "liteapp/app/desktop.h"
 #include "liteapp/core/activity_gate.h"
@@ -67,6 +70,20 @@ auto valid_language_setting(std::string_view language) -> bool {
             return false;
     }
     return code >= 2 && code <= 3;
+}
+
+auto localized_system_prompt(std::string prompt, std::string_view languages, std::string_view language_names)
+    -> std::string {
+    if (languages.empty()) return prompt;
+    if (languages.find(',') == std::string_view::npos)
+        prompt += "\nThe selected output language is " + std::string(language_names) +
+                  ". You must respond entirely in " + std::string(language_names) +
+                  ", regardless of the language of the user's message. This requirement overrides any "
+                  "earlier instruction to match the user's language.";
+    else
+        prompt += "\nThe user may code-switch among " + std::string(language_names) +
+                  ". Respond in the same language or language mix as the latest user message.";
+    return prompt;
 }
 
 auto milliseconds(Clock::time_point started) -> double {
@@ -292,15 +309,6 @@ auto positive_size(const YAML::Node& node, std::string_view key, std::size_t fal
     return value;
 }
 
-void configure_metal_prefill_cache(std::size_t bytes) {
-    const auto value = std::to_string(bytes);
-#if defined(_WIN32)
-    _putenv_s("KIDI_PREFILL_CACHE_BYTES", value.c_str());
-#else
-    setenv("KIDI_PREFILL_CACHE_BYTES", value.c_str(), 1);
-#endif
-}
-
 void merge_config(YAML::Node target, const YAML::Node& override) {
     if (!override || !override.IsMap()) return;
     for (const auto& entry : override) {
@@ -469,7 +477,7 @@ auto application_config(const std::filesystem::path& requested) -> kidi::Result<
 }
 
 struct ChatRunResult {
-    std::string text;
+    kidi::inference::TextGeneration generation;
     Json stats;
 };
 
@@ -487,7 +495,7 @@ public:
         if (!selected) return std::unexpected(liteapp::Error{"unavailable", selected.error().message});
 
         std::scoped_lock lock(chat_mutex_);
-        configure_metal_prefill_cache(parsed->chat.metal_prefill_cache_bytes);
+        kidi::ops::set_metal_prefill_cache_bytes(parsed->chat.metal_prefill_cache_bytes);
         kidi::runtime::ynn::set_thread_count(parsed->threads);
         if (auto reserved = kidi::runtime::ynn::reserve_thread_pool(parsed->threads); !reserved)
             return std::unexpected(liteapp::Error{"load_failed", reserved.error().message});
@@ -506,6 +514,7 @@ public:
             .compact_cache = true,
         });
         if (!configured) return std::unexpected(liteapp::Error{"load_failed", configured.error().message});
+        engine_.reset();
         generator_.emplace(std::move(*loaded));
         if (auto warmed = generator_->warm_up(parsed->prefill_chunk_tokens, parsed->context_tokens); !warmed)
             return std::unexpected(liteapp::Error{"load_failed", warmed.error().message});
@@ -522,10 +531,11 @@ public:
             std::scoped_lock prompt_lock(prompt_mutex_);
             system_prompt_ = config_->prompts.at("system");
         }
-        configure_metal_prefill_cache(config_->tts.metal_prefill_cache_bytes);
+        kidi::ops::set_metal_prefill_cache_bytes(config_->tts.metal_prefill_cache_bytes);
         model_path_ = config_->chat.directory.string();
         execution_ = generator_->execution();
         vision_supported_ = generator_->vision_supported();
+        engine_.emplace(*generator_);
         return {};
     }
 
@@ -616,16 +626,58 @@ public:
     auto chat(std::span<const ChatMessage> messages, std::string_view languages, std::string_view language_names,
               const std::function<bool()>& cancelled, const std::function<void(std::string_view)>& on_delta)
         -> kidi::Result<ChatRunResult> {
-        auto prompt = system_prompt();
-        if (!languages.empty())
-            prompt += languages.find(',') == std::string_view::npos
-                          ? "\nThe selected output language is " + std::string(language_names) +
-                                ". You must respond entirely in " + std::string(language_names) +
-                                ", regardless of the language of the user's message. This requirement overrides any "
-                                "earlier instruction to match the user's language."
-                          : "\nThe user may code-switch among " + std::string(language_names) +
-                                ". Respond in the same language or language mix as the latest user message.";
+        auto prompt = localized_system_prompt(system_prompt(), languages, language_names);
         return generate(messages, std::move(prompt), cancelled, on_delta, config_->context_tokens, 0, false);
+    }
+
+    auto engine() -> kidi::server::ChatEngine& { return *engine_; }
+
+    /// Desktop settings for the shared OpenAI routes. Requests without their own system message get the app's
+    /// system prompt, localized by the optional `kidi.languages` / `kidi.language_names` fields the UI sends.
+    auto chat_routes() -> kidi::server::RouteOptions {
+        return {
+            .model_name = config_->chat.model_id,
+            .defaults = {.maximum_new_tokens = config_->maximum_tokens,
+                         .context_size = config_->context_tokens,
+                         .prefill_chunk_size = config_->prefill_chunk_tokens,
+                         .prefix_cache_bytes = config_->prefix_cache_bytes,
+                         .stream_text = true,
+                         .on_image_progress = {}},
+            .customize = [this](const kidi::server::ChatJson& body, kidi::server::ChatRequest& request)
+                -> kidi::Result<void> {
+                const auto invalid = [](std::string message) -> kidi::Result<void> {
+                    return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, std::move(message)});
+                };
+                std::string languages;
+                std::string language_names;
+                if (body.contains("kidi")) {
+                    const auto& extension = body["kidi"];
+                    if (!extension.is_object()) return invalid("kidi options must be an object");
+                    if (extension.contains("languages")) {
+                        if (!extension["languages"].is_string()) return invalid("kidi.languages must be a string");
+                        languages = extension["languages"].get<std::string>();
+                    }
+                    if (!languages.empty() && !valid_language_setting(languages))
+                        return invalid("kidi.languages is invalid");
+                    if (extension.contains("language_names")) {
+                        if (!extension["language_names"].is_string())
+                            return invalid("kidi.language_names must be a string");
+                        language_names = extension["language_names"].get<std::string>();
+                    } else {
+                        language_names = languages;
+                    }
+                    if (language_names.size() > 256 ||
+                        std::ranges::any_of(language_names, [](unsigned char value) { return value < 0x20; }))
+                        return invalid("kidi.language_names is invalid");
+                }
+                if (request.messages.front().value("role", "") == "system") return {};
+                auto prompt = localized_system_prompt(system_prompt(), languages, language_names);
+                if (!prompt.empty())
+                    request.messages.insert(request.messages.begin(),
+                                            kidi::server::ChatJson{{"role", "system"}, {"content", std::move(prompt)}});
+                return {};
+            },
+        };
     }
 
     auto translate(std::string text, std::string previous, std::string next, std::string target_language,
@@ -652,62 +704,39 @@ private:
     auto generate(std::span<const ChatMessage> messages, std::string prompt, const std::function<bool()>& cancelled,
                   const std::function<void(std::string_view)>& on_delta, std::size_t context_tokens,
                   std::size_t maximum_prompt_tokens, bool release_workspaces) -> kidi::Result<ChatRunResult> {
-        std::scoped_lock lock(chat_mutex_);
-        if (!generator_ || !config_)
-            return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "chat model is not ready"});
+        if (!engine_) return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "chat model is not ready"});
+        std::vector<ChatMessage> conversation;
+        conversation.reserve(messages.size() + !prompt.empty());
+        if (!prompt.empty()) conversation.push_back({.role = "system", .content = std::move(prompt), .images = {}});
+        conversation.insert(conversation.end(), messages.begin(), messages.end());
+        GenerationOptions options{
+            .maximum_new_tokens = config_->maximum_tokens,
+            .context_size = context_tokens,
+            .prefill_chunk_size = config_->prefill_chunk_tokens,
+            .prefix_cache_bytes = config_->prefix_cache_bytes,
+            .maximum_prompt_tokens = maximum_prompt_tokens,
+            .stream_text = true,
+            .on_image_progress = {},
+        };
         const auto started = Clock::now();
-        auto run = [&]() -> kidi::Result<ChatRunResult> {
-            std::vector<ChatMessage> conversation;
-            conversation.reserve(messages.size() + !prompt.empty());
-            if (!prompt.empty()) conversation.push_back({.role = "system", .content = std::move(prompt), .images = {}});
-            conversation.insert(conversation.end(), messages.begin(), messages.end());
-            GenerationOptions options{
-                .maximum_new_tokens = config_->maximum_tokens,
-                .context_size = context_tokens,
-                .prefill_chunk_size = config_->prefill_chunk_tokens,
-                .prefix_cache_bytes = config_->prefix_cache_bytes,
-                .maximum_prompt_tokens = maximum_prompt_tokens,
-                .stream_text = true,
-                .on_image_progress = {},
-            };
-            auto queued = generator_->enqueue_chat(conversation, options);
-            if (!queued) return std::unexpected(queued.error());
-            const auto request_id = *queued;
-            std::optional<kidi::inference::TextGeneration> completed;
-            while (generator_->pending_requests()) {
-                if (cancelled()) {
-                    auto cancellation = generator_->cancel(request_id);
-                    if (!cancellation) return std::unexpected(cancellation.error());
-                    return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "generation cancelled"});
-                }
-                auto step = generator_->step();
-                if (!step) return std::unexpected(step.error());
-                for (auto& event : step->events) {
-                    if (event.request_id != request_id) continue;
-                    if (!event.text.empty()) on_delta(event.text);
-                    if (event.completed) completed.emplace(std::move(*event.completed));
-                }
-            }
-            if (!completed)
-                return std::unexpected(kidi::Error{kidi::ErrorCode::RUNTIME, "generation ended without a response"});
-            return ChatRunResult{
-                .text = std::move(completed->text),
-                .stats =
-                    {
-                        {"elapsed_ms", milliseconds(started)},
-                        {"prompt_tokens", completed->stats.prompt_tokens},
-                        {"decode_tokens", completed->stats.decode_tokens},
-                        {"prefill_ms", static_cast<double>(completed->stats.prefill_ns) / 1e6},
-                        {"decode_ms", static_cast<double>(completed->stats.decode_ns) / 1e6},
-                        {"preparation_ms", static_cast<double>(completed->stats.preparation_ns) / 1e6},
-                    },
-            };
-        }();
-        if (release_workspaces && !generator_->pending_requests()) {
-            auto released = generator_->release_workspaces();
-            if (!released && run) return std::unexpected(released.error());
-        }
-        return run;
+        // The UI shows only the visible answer: model markup, reasoning, and tool-call syntax are parsed away.
+        kidi::text::AssistantResponseStream stream;
+        auto result = engine_->run({
+            .enqueue = [&](Generator& generator) { return generator.enqueue_chat(conversation, options); },
+            .cancelled = cancelled,
+            .on_text =
+                [&](std::string_view delta) {
+                    const auto update = stream.append(delta);
+                    if (!update.content.empty()) on_delta(update.content);
+                    return true;
+                },
+            .release_workspaces = release_workspaces,
+        });
+        if (!result) return std::unexpected(result.error());
+        (void)stream.finish(result->text);
+        result->text = stream.response().content;
+        auto stats = Json::parse(kidi::server::chat_stats(*result, milliseconds(started)).dump());
+        return ChatRunResult{.generation = std::move(*result), .stats = std::move(stats)};
     }
 
 public:
@@ -792,7 +821,7 @@ private:
             return std::unexpected(kidi::Error{kidi::ErrorCode::UNSUPPORTED, "TTS is disabled"});
         last_tts_use_.store(speech_clock());
         if (synthesizer_) return {};
-        configure_metal_prefill_cache(config_->tts.metal_prefill_cache_bytes);
+        kidi::ops::set_metal_prefill_cache_bytes(config_->tts.metal_prefill_cache_bytes);
         const auto selected = kidi::inference::select_device(config_->tts.accelerator);
         if (!selected) return std::unexpected(selected.error());
         auto loaded = kidi::inference::Synthesizer::load(config_->tts.directory, *selected);
@@ -850,6 +879,7 @@ private:
     std::mutex tts_mutex_;
     liteapp::ActivityGate request_gate_;
     std::optional<Generator> generator_;
+    std::optional<kidi::server::ChatEngine> engine_;
     std::optional<kidi::inference::Transcriber> transcriber_;
     std::optional<kidi::inference::Synthesizer> synthesizer_;
     std::map<std::string, std::shared_ptr<const kidi::inference::VoicePrompt>, std::less<>> voice_prompts_;
@@ -1183,7 +1213,7 @@ private:
             [&context](std::string_view delta) { static_cast<void>(context.emit("chat.delta", {{"text", delta}})); });
         clear_uploaded_images();
         if (!result) return inference_failure(result.error());
-        return Json{{"text", std::move(result->text)}, {"stats", std::move(result->stats)}};
+        return Json{{"text", std::move(result->generation.text)}, {"stats", std::move(result->stats)}};
     }
 
     auto run_reader_translation(liteapp::ServiceContext& context) -> liteapp::Result<Json> {
@@ -1225,7 +1255,7 @@ private:
                 static_cast<void>(context.emit("reader.translation.delta", {{"text", delta}}));
             });
         if (!result) return inference_failure(result.error());
-        return Json{{"text", std::move(result->text)}, {"stats", std::move(result->stats)}};
+        return Json{{"text", std::move(result->generation.text)}, {"stats", std::move(result->stats)}};
     }
 
     auto run_asr(liteapp::ServiceContext& context) -> liteapp::Result<Json> {
@@ -1646,6 +1676,7 @@ auto main(int argc, char** argv) -> int {
     }
     auto server = std::move(*created);
     server.get("/api/status", [backend](const liteapp::Request&) { return backend->status(); });
+    kidi::server::mount_chat_routes(server, backend->engine(), backend->chat_routes());
     server.websocket("/ws",
                      [backend](const liteapp::Request&, liteapp::WebSocket& socket) {
                          AppSession session(backend);

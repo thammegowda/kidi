@@ -1,5 +1,6 @@
 {"model_type": "gemma4", "type": "gemma4_text", "task": "chat", "model_key": "text_config", "copy": ["decode"], "files": ["model.safetensors", "tokenizer.json"], "sidecars": ["tokenizer_config.json", "chat_template.jinja"]}
 {"model_type": "gemma4_text", "task": "chat", "copy": ["decode"], "files": ["model.safetensors", "tokenizer.json"], "sidecars": ["tokenizer_config.json", "chat_template.jinja"]}
+{"model_type":"inkling2_loop","type":"inkling2_text","task":"chat","model_key":"text_config","files":["model-00001-of-00001.safetensors","tokenizer.json"],"sidecars":["tokenizer_config.json","chat_template.jinja"]}
 {"model_type": "gemma4_assistant", "files": ["model.safetensors"]}
 {"model_type": "whisper", "task": "asr", "files": ["model.safetensors", "ggml-model.bin", "tokenizer.json", "preprocessor_config.json", "generation_config.json"]}
 {"model_type": "rtg_transformer_nmt", "task": "translation", "requires": ["decode", "io", "tokenizers"], "copy": ["io", "decode"], "files": ["model.safetensors"]}

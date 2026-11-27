@@ -10,14 +10,14 @@ Kidi (*"spark"* in Kannada) runs modern generative AI models locally on your har
 
 ## Why Kidi?
 
-- **Batteries-Included Single Binary (`~4.7 MiB`):** Zero runtime dependency on PyTorch, Transformers, OpenCV, Pillow, or Python. A single static binary compiles in our purpose-built C++ libraries:
+- **Batteries-Included Binary:** Kidi links its project libraries into one executable, with no runtime dependency on PyTorch, Transformers, OpenCV, Pillow, or Python. A stripped Linux x86-64 CPU Release CLI including `kidi agent` measured 10.8 MiB in November 2026; size varies by platform and build options. Set `-DKIDI_BUILD_AGENT=OFF` to omit the coding agent. The executable includes:
   - **Compute & Shaders:** [`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) CPU kernels (ARM64 NEON/DOTPROD/SME2, x86 AVX2/AVX-512, Wasm SIMD128), [`kidi-ops`](kidi-ops/README.md) CUDA kernels, and embedded Apple Metal kernels
   - **Tokenization & Text ([`tokenizerspp`](https://github.com/thammegowda/tokenizerspp)):** Native C++ Hugging Face `tokenizer.json` engine, Unicode (`uni-algo`), UTF-8 Unicode regex, G2P phonemizer, and linguistic sentence splitter
   - **Vision & Image Codecs ([`tahoma-vision`](https://github.com/thammegowda/tahoma-vision) & [`pigzpp`](https://github.com/thammegowda/pigzpp)):** SIMD-accelerated **JPEG (`libjpeg-turbo`)**, **PNG ([`pigzpp`](https://github.com/thammegowda/pigzpp) + `zlib-ng`)**, and PPM decoding + vision tensor preprocessing
   - **Audio & Speech:** WAV PCM I/O, Whisper log-Mel spectrogram frontend, and neural vocoders (Higgs Audio 2 / Kokoro)
   - **Checkpoints & Formats:** Zero-copy `mmap` Safetensors, GGUF/GGML, YAML (`yaml-cpp`), JSON (`nlohmann/json`), and parallel gzip ([`pigzpp`](https://github.com/thammegowda/pigzpp) / `zlib-ng`)
   - **Desktop Server & UI ([`liteapp`](https://github.com/thammegowda/liteapp)):** Embedded C++ HTTP + WebSocket loopback server, EPUB/ZIP virtual filesystem, and bundled web/Android UI bridge (`kidi-app`)
-- **State-of-the-Art Edge CPU & GPU Speed:** Custom ARM64 SME2 and fused zero-copy NEON `sdot` kernels (`BlockwiseInt4Linear`), graph capture/replay, and `mmap`-backed weight streaming deliver faster prefill, faster decode, and lower RAM usage than ExecuTorch, ONNX Runtime, and `llama.cpp`.
+- **Optimized Edge Inference:** Custom ARM64 SME2 and fused zero-copy NEON `sdot` kernels (`BlockwiseInt4Linear`), graph capture/replay, and `mmap`-backed weight streaming support CPU and GPU inference. See the benchmarks below for workload-specific comparisons.
 - **High-Fidelity Low-Bit Quantization:** Built on findings from our [**WMT 2026 LLM compression paper**](https://aclanthology.org/2026.wmt-main.136/) (*Quantize, Qualify, Rerank: A Recipe for Compressing LLMs Without Losing Quality*) and [**engineering blog post**](https://gowda.ai/posts/2026/08/llm-fast-inference/). Supports native mixed 2/4/8-bit QAT checkpoints, blockwise symmetric INT4/INT8, and **blockwise asymmetric INT4 (`g=128` and `g=32`) with 11-step MSE outlier clipping** that recovers near-BF16 generation quality at 4-bit memory footprints.
 - **One Engine, Every Surface:** Use the CLI and Python package for scripting, or launch the **Desktop App**, **Android App**, or **WebAssembly / WebGPU Browser App** for streaming chat, continuous voice conversations, camera/photo Q&A, and side-by-side bilingual EPUB book reading with read-aloud narration.
 
@@ -54,8 +54,8 @@ reproduction commands.
   <img src="docs/gemma4-arm-speculative.svg" alt="Gemma 4 E2B on Arm CPU: Speculative Decoding and HNSW Speedup Comparison" width="100%">
 </p>
 
-- **CUDA Graph Pipelining:** On an NVIDIA RTX A4000 (2,322-token prompt, BF16), Kidi reaches **11,285.9 tok/s prefill** (**1.40x faster** than compiled `vLLM` at `8,062.7 tok/s`) and **64.4 tok/s decode** (see [`benchmarks/README.md`](benchmarks/README.md)).
-- **Compact Edge Binary Footprint:** Kidi's self-contained Arm64 runtime (`4.12 MiB` stripped benchmark runner; `4.72 MiB` full multimodal `kidi` CLI) is smaller than `llama.cpp` (`4.48 MiB`), **1.9x smaller** than Arm ExecuTorch (`7.87 MiB`), **4.9x smaller** than ONNX Runtime (`20.10 MiB`), and **12.7x smaller** than Google LiteRT-LM (`52.18 MiB`) while statically bundling tokenization, vision, audio, and 6 model families (see [Runtime Binary Footprint](benchmarks/gemma4/arm/README.md#runtime-binary-footprint)).
+- **CUDA Support:** Kidi provides native CUDA kernels and graph replay. Performance depends on the GPU, model, precision, and workload; the [H100 benchmark](benchmarks/cuda/2026-11-20-e4b-q8-h100-gpu7.md) shows that vLLM can be faster.
+- **Compact Edge Binary Footprint:** In a November 2026 Arm/macOS snapshot, the stripped Kidi benchmark runner measured `4.12 MiB` and the full CLI `4.72 MiB`. These measurements predate `kidi agent`; current sizes vary with revision, platform, and build configuration. See [Runtime Binary Footprint](benchmarks/gemma4/arm/README.md#runtime-binary-footprint) for comparisons.
 
 ---
 
@@ -66,19 +66,26 @@ reproduction commands.
 | Model Family | Tasks | Highlights |
 |---|---|---|
 | **Gemma 4 (`E2B-it`, `E4B-it`)** | Chat, JSONL Generation, Vision (Photo Q&A) | Native QAT (mixed 2/4/8-bit), BF16, Per-Channel INT8, and Group-32/128 Symmetric & Asymmetric INT4 with tied embeddings |
+| **Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`)** | Agentic chat with reasoning and tool calls (`code`, `serve`, `generate`, `chat`) | Text-only CPU/CUDA port of the looped 24-layer MoE (128 experts, top-8) with relative-position attention and BF16 activations. CPU defaults to row-scaled INT8 experts/projections with INT8 (VNNI) matmuls, batched expert prefill and group-32 INT8 KV caches (about 23 tok/s short-context decode, 19 tok/s at 4K context on 16 Sapphire Rapids cores). CUDA defaults to native NVFP4/MXFP8 expert storage, interleaved gate/up kernels and BF16 KV caches, fitting below 24 GiB in the tested 8K-context configuration. `--precision q8` explicitly selects INT8 experts on either backend; `--precision bf16` is a CUDA-only comparison mode. |
 | **Qwen 3** | Chat & Text Generation | Grouped-query attention, SwiGLU, RMSNorm, and quantized linear execution |
 | **Whisper (`Tiny`, `Base`, `Small`, `Large-v3`, `Turbo`)** | Speech-to-Text (`transcribe`) & Speech-to-English (`translate`) | Loads directly from Hugging Face checkpoints; automatic INT8 weight caching and 30s windowed long-audio streaming |
 | **OmniVoice** | Multilingual Text-to-Speech (`synthesize`) | 600+ MB INT8 package with controllable voice attributes (`gender`, `age`, `pitch`, `accent`, `style`) and consistent long-form narrator conditioning |
 | **Kokoro-82M** | US-English Text-to-Speech (`synthesize`) | Compact INT8 model with bundled offline Misaki pronunciation lexicon and selectable voice packs |
 | **RTG Transformer** | Machine Translation (`translate`) | Supports the public [500-language-to-English (`rtg-500eng-v1`)](https://huggingface.co/thammegowda/rtg-500eng-v1) model |
 
+The shared CPU/CUDA block-scaled projection API accepts configurable groups (including 32/64/128),
+optional global scales, and separate E2M1 FP4, E4M3 FP8, and symmetric signed INT4 encodings.
+Native byte-scale formats retain their checkpoint semantics; floating scales are also supported.
+CUDA BF16 symmetric INT4 projections with device-resident parameters reuse these kernels;
+existing asymmetric, calibrated, and CPU packed-projection paths remain unchanged.
+
 ### Hardware Acceleration Backends
 
 | Backend | Flag / Target | Supported Platforms & Notes |
 |---|---|---|
-| **[`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) + ARM64 NEON/SME2 / x86 AVX** | `--backend ynnpack` | Portable default on macOS, Linux, Windows, Android (`arm64`), and WebAssembly SIMD |
+| **[`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) + ARM64 NEON/SME2 / x86 AVX** | `--backend ynnpack` | Portable CPU backend on macOS, Linux, Windows, Android (`arm64`), and WebAssembly SIMD |
 | **Apple Metal (MPS)** | `--backend mps` | Default on Apple Silicon macOS for supported chat and OmniVoice TTS models |
-| **NVIDIA CUDA** | `--backend cuda:0` | Opt-in compact static CUDA 13 backend with asynchronous graph capture/replay pipelining |
+| **NVIDIA CUDA** | `--backend cuda:0` | Optional compact static CUDA 13 backend with asynchronous graph capture/replay pipelining |
 | **Vulkan** | `--backend vulkan` | Cross-platform GPU compute used on Android and desktop |
 | **Qualcomm QNN (Hexagon NPU)** | Android / Snapdragon | Step-compiled NPU graph execution for mobile inference |
 | **WebAssembly + WebGPU** | Browser (`make wasm`) | Runs entirely in Chrome/Edge/Firefox/Safari with IndexedDB/OPFS model caching |
@@ -94,11 +101,11 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -v "kidi[hf] @ git+https://github.com/thammegowda/kidi.git@main"
 
-# Launch interactive streaming chat (downloads ~2.49 GB once and caches locally)
-python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers
+# Chat in the terminal without workspace tools (downloads ~2.49 GB once and caches locally)
+python -m kidi agent -m @google/gemma-4-E2B-it-qat-mobile-transformers --permissions none
 ```
 
-- **Select a backend:** Metal is chosen automatically on Apple Silicon when supported; pass `--backend ynnpack` for CPU or `--backend cuda:0` on CUDA builds.
+- **Select a backend:** `auto` prefers available CUDA, then Metal, then CPU, subject to workload support. Pass `--backend ynnpack` for CPU or `--backend cuda:INDEX` for a specific GPU. `kidi --version` reports backend availability.
 - **Control memory:** Native defaults use a 16,384-token context and up to 8,192 output tokens. For tighter RAM budgets, pass `--context-size 2048 --max-new-tokens 256`.
 - **Standalone C++ binary:** Build `build-release/kidi` via CMake (`make app` or `cmake --preset release`) to run local checkpoints with zero Python dependency. See the [Getting Started Guide](docs/getting-started.md) and [Developer Guide](README-dev.md).
 
@@ -106,9 +113,11 @@ python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers
 
 ## Command-Line Tasks
 
-### 1. Interactive Chat & Batch JSONL Generation (`chat` / `generate`)
+### 1. Interactive Chat & Batch JSONL Generation (`agent` / `generate`)
 
-In `kidi chat`, replies stream token-by-token and report throughput, TTFT, and memory usage after each turn (commands: `/clear`, `/system <prompt>`, `/multiline`, `/send`, `/help`, `/exit`).
+`kidi agent` is the interactive shell: replies stream token-by-token with throughput and context usage in the status
+line. `--permissions none` chats without workspace tools and `--system` replaces the system prompt; see
+[Kidi Agent](kidi-agent/README.md).
 
 For scripted pipelines, `kidi generate` streams JSONL requests to JSONL responses:
 
@@ -117,12 +126,58 @@ printf '%s\n' '{"messages":[{"role":"user","content":"Explain binary search in t
   kidi generate -m @google/gemma-4-E2B-it-qat-mobile-transformers
 ```
 
-Add `--assistant-model` (with `@owner/model` or a local directory) to enable CPU speculative decoding in `chat` or `generate`:
+For structured, text-only conversations, include `template_args` (even `{}`) to pass message fields and template
+options through to the model's chat template:
+
+```json
+{"messages":[{"role":"user","content":"Weather in Paris?"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","function":{"name":"weather","arguments":{"city":"Paris"}}}]},{"role":"tool","tool_call_id":"c1","content":"Sunny"}],"template_args":{"tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"reasoning_effort":"low"}}
+```
+
+Template options and tool-call argument formats are model-specific; Inkling expects `arguments` as an object, not a
+JSON-encoded string. The structured path uses the template's own thinking default unless explicitly overridden.
+Requests without `template_args` retain the existing simple-chat behavior. Structured generation currently accepts
+text only; images use the existing multimodal API. `generate` responses contain raw assistant text; use `serve` for
+parsed reasoning and tool calls.
+
+Generation uses each checkpoint's chat template rather than model-specific prompt markup. Stop, padding and BOS
+token IDs come from `generation_config.json`, then the root/text `config.json`, then the tokenizer's configured
+special tokens. EOS may be a single ID or a list; absent padding/BOS IDs use the first EOS ID. Raw prompts do not
+require a chat template. Parameter dtype comes from `dtype`/`torch_dtype`; older exports without either use the
+largest uncompressed floating tensor. Quantization metadata remains available to the model; only
+`quant_method: gemma` selects the native Gemma QAT execution policy. Padded embeddings are supported when the
+model exposes tokenizer-sized output logits.
+
+`kidi serve` and the desktop app run the same server module (`src/kidi/server`): one engine thread owns the model and
+batches every request, and the same routes expose an OpenAI-compatible `/v1/chat/completions` endpoint (streaming or
+not) for agent harnesses. It supports OpenAI `tools`, string tool-call `arguments`, `chat_template_kwargs`,
+`reasoning_effort`, and `max_tokens`; decoding is greedy. Models whose package declares a response format (currently
+Inkling) return `reasoning_content` and `tool_calls`; others return plain `content`. `kidi serve` is that server with
+no UI; the desktop app adds its UI (text chats call `/v1`) and a WebSocket channel for image chats and speech/ebook
+operations, whose text generation goes through the same engine.
 
 ```bash
-kidi chat -m @google/gemma-4-E2B-it \
+CUDA_VISIBLE_DEVICES=0 kidi serve -m @thinkingmachines/Inkling-2-Mini --backend cuda --port 18097 \
+  --context-size 65536 --cache-tokens 65536 --prefill-chunk-size 512
+```
+
+[Kidi Agent](kidi-agent/README.md) is the built-in C++23 local agent for chat and workspace tasks:
+run `kidi agent` to start or reuse a shared background inference server. The
+standalone `kidi-agent` connects to an existing Kidi server over plain HTTP.
+Both have line editing, task history, multiline paste, colored tool activity,
+workspace file tools, explicit once-or-session approvals, and automatic
+context compaction. `/context` shows exact token usage; `/compact` summarizes
+older history manually.
+Commands are not OS-sandboxed; [tools/sandbox](tools/sandbox/README.md) runs the
+standalone client in a Landlock sandbox.
+
+Add `--assistant-model` (with `@owner/model` or a local directory) to enable CPU speculative decoding in `generate` or
+`serve`:
+
+```bash
+printf '%s\n' '{"messages":[{"role":"user","content":"Explain binary search."}],"max_tokens":128}' | \
+kidi generate -m @google/gemma-4-E2B-it \
   --assistant-model @google/gemma-4-E2B-it-assistant \
-  --weight-bits 8 --draft-tokens 4
+  --precision q8 --draft-tokens 4
 ```
 
 ### 2. Speech Transcription & Translation (`transcribe`)

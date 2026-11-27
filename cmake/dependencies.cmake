@@ -24,6 +24,13 @@ add_subdirectory(
     EXCLUDE_FROM_ALL
 )
 
+if(APPLE)
+    # Apple Clang can emit hidden std::exception RTTI with -fno-rtti, preventing
+    # exceptions from libc++ from matching std::exception handlers in Kidi.
+    target_compile_options(ynnpack_base PRIVATE -frtti)
+    target_compile_options(ynnpack_composites PRIVATE -frtti)
+endif()
+
 set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
 set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)

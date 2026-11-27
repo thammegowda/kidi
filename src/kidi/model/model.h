@@ -45,6 +45,7 @@ struct RuntimeQuantization {
     std::int32_t weight_bits = 0; // 0 = checkpoint precision; 4 or 8 = load-time packing
     std::int32_t group_size = 128;
     bool packed_prefill = false;
+    core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
 };
 
 /// Base class for all top-level inference models.
@@ -104,8 +105,14 @@ public:
     virtual auto set_kv_cache_precision(core::KVCachePrecision) noexcept -> void {}
     /// Storage dtype `create_state(capacity)` would allocate for the selected KV-cache precision.
     virtual auto kv_cache_dtype(std::size_t) const -> Result<tensor::DType> { return tensor::DType::F32; }
+    /// Whether a completed request state can be reset and reused for a new request.
+    virtual auto supports_state_recycling() const noexcept -> bool { return false; }
 
     virtual auto rewind(LanguageModelState& state, std::size_t position) -> Result<void>;
+    /// Records the state's current position as a rewind target (for models whose rewind is otherwise limited).
+    virtual auto mark_rewind_point(LanguageModelState&) -> Result<void> { return {}; }
+    /// Largest position <= `position` that `rewind` accepts for this state.
+    virtual auto rewind_floor(const LanguageModelState&, std::size_t position) const -> std::size_t { return position; }
     virtual auto prefill(std::span<const std::int32_t> tokens, LanguageModelState& state) -> Result<void>;
     virtual auto forward(std::span<const std::int32_t> tokens, LanguageModelState& state, bool all_logits = false,
                          tensor::Tensor* hidden = nullptr) -> Result<tensor::Tensor> = 0;
@@ -139,6 +146,10 @@ public:
     virtual auto supports_device_tokens() const -> bool { return false; }
 
     virtual auto create_state(std::size_t capacity) -> Result<std::unique_ptr<LanguageModelState>> = 0;
+    /// Increases a retained request's capacity without discarding its prefix.
+    virtual auto grow_state(LanguageModelState&, std::size_t) -> Result<void> {
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED, "model does not support growing a retained state"});
+    }
     virtual auto configure_state(LanguageModelState&, bool /*full_attention_cache*/, bool /*capture_prefill*/) -> void {
     }
     virtual auto fork_state(const LanguageModelState& source, std::size_t prefix_length, std::size_t capacity)

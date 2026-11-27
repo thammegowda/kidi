@@ -2,11 +2,13 @@
 
 #include <array>
 #include <bit>
-#include <cassert>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <vector>
+
+#include <gtest/gtest.h>
 
 namespace {
 auto write_fixture(const std::filesystem::path& path, std::uint16_t format, std::uint16_t bits,
@@ -47,78 +49,115 @@ auto write_fixture(const std::filesystem::path& path, std::uint16_t format, std:
         for (int index = 0; index < bits / 8; ++index) output.put(static_cast<char>((raw >> (index * 8)) & 0xff));
     }
 }
-} // namespace
 
-auto main() -> int {
-    const auto path = std::filesystem::temp_directory_path() / "kidi-wav-test.wav";
+// Per-test file so tests discovered as separate ctest entries can run in parallel.
+auto test_path() -> std::filesystem::path {
+    return std::filesystem::temp_directory_path() /
+           (std::string("kidi-wav-test-") + ::testing::UnitTest::GetInstance()->current_test_info()->name() + ".wav");
+}
+const std::array STEREO{-0.5F, 0.5F, -1.F, -0.5F, 0.25F, 0.75F};
+
+TEST(WavTest, SaveLoadAndStreamRoundTrip) {
+    const auto path = test_path();
     const std::array samples{-1.F, -0.25F, 0.F, 0.25F, 1.F};
     auto saved = kidi::audio::save_wav(path, samples, 24000);
-    assert(saved);
+    ASSERT_TRUE(saved);
     auto loaded = kidi::audio::load_wav(path);
-    assert(loaded);
-    assert(loaded->sample_rate == 24000);
-    assert(loaded->samples.size() == samples.size());
+    ASSERT_TRUE(loaded);
+    EXPECT_EQ(loaded->sample_rate, 24000U);
+    ASSERT_EQ(loaded->samples.size(), samples.size());
     for (std::size_t index = 0; index < samples.size(); ++index)
-        assert(std::abs(loaded->samples[index] - samples[index]) < 1e-4F);
-    {
-        auto reader = kidi::audio::WavReader::open(path);
-        assert(reader && reader->sample_count() == samples.size() && reader->sample_rate() == 24000);
-        assert(!reader->read(0));
-        std::vector<float> streamed;
-        for (;;) {
-            auto part = reader->read(2);
-            assert(part && part->size() <= 2);
-            if (part->empty()) break;
-            streamed.insert(streamed.end(), part->begin(), part->end());
-        }
-        assert(streamed == loaded->samples);
-        assert(reader->read(1)->empty());
+        EXPECT_NEAR(loaded->samples[index], samples[index], 1e-4F) << "sample " << index;
+    auto reader = kidi::audio::WavReader::open(path);
+    ASSERT_TRUE(reader);
+    EXPECT_EQ(reader->sample_count(), samples.size());
+    EXPECT_EQ(reader->sample_rate(), 24000U);
+    EXPECT_FALSE(reader->read(0));
+    std::vector<float> streamed;
+    for (;;) {
+        auto part = reader->read(2);
+        ASSERT_TRUE(part);
+        ASSERT_LE(part->size(), 2U);
+        if (part->empty()) break;
+        streamed.insert(streamed.end(), part->begin(), part->end());
     }
+    EXPECT_EQ(streamed, loaded->samples);
+    auto end = reader->read(1);
+    ASSERT_TRUE(end);
+    EXPECT_TRUE(end->empty());
+    std::filesystem::remove(path);
+}
 
+TEST(WavTest, StreamsLongAudio) {
+    const auto path = test_path();
     std::vector<float> long_audio(480003, 0.25F);
     long_audio[480000] = -0.5F;
-    assert(kidi::audio::save_wav(path, long_audio, 16000));
-    {
-        auto reader = kidi::audio::WavReader::open(path);
-        assert(reader && reader->sample_count() == long_audio.size());
-        assert(reader->read(480000)->size() == 480000);
-        const auto tail = reader->read(480000);
-        assert(tail && tail->size() == 3 && std::abs((*tail)[0] + 0.5F) < 1e-4F);
-        assert(reader->read(480000)->empty());
-    }
+    ASSERT_TRUE(kidi::audio::save_wav(path, long_audio, 16000));
+    auto reader = kidi::audio::WavReader::open(path);
+    ASSERT_TRUE(reader);
+    EXPECT_EQ(reader->sample_count(), long_audio.size());
+    auto head = reader->read(480000);
+    ASSERT_TRUE(head);
+    EXPECT_EQ(head->size(), 480000U);
+    const auto tail = reader->read(480000);
+    ASSERT_TRUE(tail);
+    ASSERT_EQ(tail->size(), 3U);
+    EXPECT_NEAR((*tail)[0], -0.5F, 1e-4F);
+    auto end = reader->read(480000);
+    ASSERT_TRUE(end);
+    EXPECT_TRUE(end->empty());
+    std::filesystem::remove(path);
+}
 
-    const std::array stereo{-0.5F, 0.5F, -1.F, -0.5F, 0.25F, 0.75F};
+TEST(WavTest, ReadsPcmAndFloatFormats) {
+    const auto path = test_path();
     for (const auto format : {1, 3}) {
         for (const auto bits : {16, 24, 32}) {
             if (format == 3 && bits != 32) continue;
             for (const bool extensible : {false, true}) {
-                write_fixture(path, format, bits, stereo, extensible);
+                SCOPED_TRACE(::testing::Message() << "format=" << format << " bits=" << bits
+                                                  << " extensible=" << extensible);
+                write_fixture(path, format, bits, STEREO, extensible);
                 {
                     auto reader = kidi::audio::WavReader::open(path);
-                    assert(reader && reader->sample_count() == 3 && reader->sample_rate() == 16000);
+                    ASSERT_TRUE(reader);
+                    EXPECT_EQ(reader->sample_count(), 3U);
+                    EXPECT_EQ(reader->sample_rate(), 16000U);
                     const auto first = reader->read(2);
                     const auto last = reader->read(2);
-                    assert(first && last && first->size() == 2 && last->size() == 1);
-                    assert((*first)[0] == 0.F && (*first)[1] == -0.75F && (*last)[0] == 0.5F);
+                    ASSERT_TRUE(first);
+                    ASSERT_TRUE(last);
+                    ASSERT_EQ(first->size(), 2U);
+                    ASSERT_EQ(last->size(), 1U);
+                    EXPECT_EQ((*first)[0], 0.F);
+                    EXPECT_EQ((*first)[1], -0.75F);
+                    EXPECT_EQ((*last)[0], 0.5F);
                 }
                 std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1);
-                assert(!kidi::audio::WavReader::open(path));
+                EXPECT_FALSE(kidi::audio::WavReader::open(path));
             }
         }
     }
+    std::filesystem::remove(path);
+}
+
+TEST(WavTest, RejectsInvalidFiles) {
+    const auto path = test_path();
     // Corrupt the extension length, valid-bit count, and subformat GUID.
     for (const auto offset : {46, 48, 69}) {
-        write_fixture(path, 1, 16, stereo, true);
+        write_fixture(path, 1, 16, STEREO, true);
         std::fstream altered(path, std::ios::binary | std::ios::in | std::ios::out);
         altered.seekp(offset);
         altered.put('\0');
         altered.close();
-        assert(!kidi::audio::WavReader::open(path));
+        EXPECT_FALSE(kidi::audio::WavReader::open(path)) << "offset " << offset;
     }
-    write_fixture(path, 1, 16, std::span(stereo).first(5));
-    assert(!kidi::audio::WavReader::open(path));
+    write_fixture(path, 1, 16, std::span(STEREO).first(5));
+    EXPECT_FALSE(kidi::audio::WavReader::open(path));
     const std::array invalid{std::numeric_limits<float>::quiet_NaN(), 0.F};
     write_fixture(path, 3, 32, invalid);
-    assert(!kidi::audio::load_wav(path));
+    EXPECT_FALSE(kidi::audio::load_wav(path));
     std::filesystem::remove(path);
 }
+
+} // namespace

@@ -1,8 +1,6 @@
 #include "cuda/attention.h"
 #include "cuda/elementwise.h"
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
 #include "cuda/flash_attention.h"
-#endif
 
 #include <algorithm>
 #include <cmath>
@@ -327,7 +325,6 @@ auto parallel_attention_launcher(std::int64_t width) -> AttentionLauncher {
     }
 }
 
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
 auto to_flash_view(const View& source) -> FlashView {
     FlashView result{};
     result.data = source.data;
@@ -408,7 +405,6 @@ auto flash_attention_launcher(std::int64_t width) -> AttentionLauncher {
             return nullptr;
     }
 }
-#endif
 
 } // namespace
 
@@ -419,7 +415,6 @@ auto select_parallel_attention(const Descriptor& descriptor, std::int64_t keys, 
     const bool mixed = type == Type::F32 && cache_type == Type::BF16;
     if (descriptor.reference_attention || keys <= 0 || (!mixed && type != cache_type) || type != descriptor.output.type)
         return nullptr;
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
     if (cache_type == Type::BF16 && descriptor.inputs[0].shape[1] > 1 && dense_device(device).major >= 8) {
         if (auto launcher = flash_attention_launcher(width)) return launcher;
     }
@@ -427,15 +422,10 @@ auto select_parallel_attention(const Descriptor& descriptor, std::int64_t keys, 
         (descriptor.inputs[0].shape[1] >= 64 || keys > 512) && dense_device(device).major >= 8) {
         if (auto launcher = flash_attention_launcher(width)) return launcher;
     }
-#else
-    (void)device;
-#endif
     if (keys > 8192) return nullptr;
     if (mixed) return parallel_attention_launcher<float, __nv_bfloat16>(width);
     if (type == Type::BF16) return parallel_attention_launcher<__nv_bfloat16>(width);
-#if defined(KIDI_CUDA_USE_CUTLASS_INT8)
     if (type == Type::F32 && descriptor.inputs[0].shape[1] > 1) return parallel_attention_launcher<float>(width);
-#endif
     return nullptr;
 }
 

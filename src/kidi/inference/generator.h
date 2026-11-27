@@ -1,5 +1,7 @@
 #pragma once
+// Model-independent text generation, batching and request-state management over registered causal models.
 
+#include "kidi/checkpoint/config.h"
 #include "kidi/core/precision.h"
 #include "kidi/image/gemma4.h"
 #include "kidi/inference/decoder.h"
@@ -10,6 +12,8 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <random>
 
 namespace kidi::inference {
 struct GenerationOptions {
@@ -17,6 +21,10 @@ struct GenerationOptions {
     std::size_t prefix_cache_bytes = 0, maximum_prompt_tokens = 0;
     bool raw_prompt = false, ignore_eos = false, full_attention_cache = false;
     bool stream_text = false;
+    // temperature 0 selects greedily on the fastest path; > 0 samples on the host from the last-row logits.
+    float temperature = 0, top_p = 1;
+    std::size_t top_k = 0;
+    std::optional<std::uint64_t> seed = std::nullopt;
     std::int32_t image_tokens = 280;
     std::size_t image_max_pixels = image::MAX_RESIZED_PIXELS;
     std::function<void(std::string_view)> on_image_progress;
@@ -81,13 +89,13 @@ using ExternalTensorSource = std::function<Result<tensor::Tensor>(std::string_vi
 
 struct ModelLoadOptions {
     tensor::Device device = tensor::Device::cpu();
+    /// Also selects load-time packing: Q8 and Q4 quantize plain BF16 checkpoints when they load.
     core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
     core::KVCachePrecision kv_cache_precision = core::KVCachePrecision::AUTO;
-    std::int32_t weight_bits = 0;
-    std::int32_t group_size = 128;
     bool packed_prefill = false;
     bool dense_lm_head = false;
     std::filesystem::path assistant_model{};
+    bool prompt_lookup = false;
     std::size_t draft_tokens = 3;
 };
 
@@ -99,8 +107,9 @@ public:
 
     static auto load(const std::filesystem::path& directory, ModelLoadOptions options,
                      const ExternalTensorSource& external = {}) -> Result<Generator>;
-    /// Loads Gemma 4 on `device`; the Qualcomm NPU device keeps the model on the CPU and compiles captured
-    /// decoding steps for the NPU.
+    /// Loads a registered causal model on `device`; the Qualcomm NPU device keeps the model on the CPU and
+    /// compiles captured decoding steps for the NPU. Nonzero `weight_bits` (4 or 8) pack plain BF16 weights at load
+    /// with an explicit `group_size` for developer tools; applications select the Q4 or Q8 precision instead.
     static auto load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits = 0,
                      std::int32_t group_size = 128, bool packed_prefill = false,
                      const ExternalTensorSource& external = {}) -> Result<Generator>;
@@ -114,17 +123,32 @@ public:
     auto enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options = {})
         -> Result<std::uint64_t>;
     auto chat_prompt_tokens(std::span<const text::ChatMessage> messages) const -> Result<std::size_t>;
+    /// Structured text-only chat; multimodal inputs require enqueue_chat's image path.
+    auto enqueue_chat(const nlohmann::ordered_json& messages, GenerationOptions options = {},
+                      const nlohmann::ordered_json& template_args = nlohmann::ordered_json::object())
+        -> Result<std::uint64_t>;
+    auto chat_prompt_tokens(const nlohmann::ordered_json& messages,
+                            const nlohmann::ordered_json& template_args = nlohmann::ordered_json::object()) const
+        -> Result<std::size_t>;
+    auto context_capacity(GenerationOptions options = {}) const -> Result<std::size_t>;
+    /// Largest context, up to the model limit, whose KV cache fits in `memory_bytes`; a multiple of 1024 tokens.
+    auto fit_context_size(std::size_t memory_bytes) -> Result<std::size_t>;
     auto step() -> Result<GenerationStep>;
     auto cancel(std::uint64_t request_id) -> Result<void>;
     auto pending_requests() const -> std::size_t { return waiting_.size() + running_.size(); }
-    auto precision() const noexcept -> core::InferencePrecision { return precision_; }
-    auto kv_cache_precision() const noexcept -> core::KVCachePrecision { return kv_cache_precision_; }
-    auto native_qat() const -> bool { return static_cast<bool>(config_["model"]["quantization_config"]); }
+    auto precision() const noexcept -> core::InferencePrecision { return options_.precision; }
+    auto kv_cache_precision() const noexcept -> core::KVCachePrecision { return options_.kv_cache_precision; }
+    auto tokenizer() const noexcept -> const text::Tokenizer& { return tokenizer_; }
+    /// Runs teacher-forced prefill over `tokens` and returns host FP32 logits shaped [tokens.size(), vocab_size].
+    auto prefill_logits(std::span<const std::int32_t> tokens) -> Result<tensor::Tensor>;
+    auto native_qat() const -> bool { return checkpoint::native_qat(config_["model"]); }
     auto speculative() const noexcept -> bool { return static_cast<bool>(drafter_); }
-    auto vision_supported() const -> bool { return static_cast<bool>(config_["vision"]); }
+    auto vision_supported() const -> bool {
+        return config_["model"]["type"].as<std::string>() == "gemma4_text" && static_cast<bool>(config_["vision"]);
+    }
     auto memory() const -> GeneratorMemory;
-    /// Prepares reusable request shapes and weights before the first request, including one full-context Gemma
-    /// CUDA KV cache. Serving recycles text-only CUDA states after all pending work completes.
+    /// Prepares reusable request shapes and weights before the first request. Serving recycles compatible
+    /// text-only CUDA states after all pending work completes.
     auto warm_up(std::size_t prefill_chunk_size = 128, std::size_t context_size = 0) -> Result<void>;
     /// Releases request-shaped execution graphs and workspaces while retaining model weights.
     /// All queued and running requests must be drained first.
@@ -132,9 +156,18 @@ public:
     auto trim_workspaces() -> Result<void>;
 
 private:
+    struct GeneratorOptions {
+        std::vector<std::int32_t> stop_ids;
+        std::int32_t pad_id = 0;
+        std::int32_t warmup_token_id = 0;
+        core::InferencePrecision precision = core::InferencePrecision::CHECKPOINT;
+        core::KVCachePrecision kv_cache_precision = core::KVCachePrecision::AUTO;
+    };
     Generator(YAML::Node config, text::Tokenizer tokenizer, std::shared_ptr<model::CausalLanguageModel> model,
-              std::array<std::int32_t, 3> special, core::InferencePrecision precision,
-              core::KVCachePrecision kv_cache_precision);
+              GeneratorOptions options);
+    static auto load_with_packing(const std::filesystem::path& directory, ModelLoadOptions options,
+                                  std::int32_t weight_bits, std::int32_t group_size,
+                                  const ExternalTensorSource& external) -> Result<Generator>;
     struct DraftBackend;
     YAML::Node config_;
     text::Tokenizer tokenizer_;
@@ -149,9 +182,7 @@ private:
         std::size_t max_pixels;
     };
     std::vector<CachedImage> images_;
-    std::array<std::int32_t, 3> special_;
-    core::InferencePrecision precision_;
-    core::KVCachePrecision kv_cache_precision_;
+    GeneratorOptions options_;
     bool prefill_warmed_ = false;
     struct PrefixEntry {
         std::vector<std::int32_t> tokens;
@@ -188,8 +219,11 @@ private:
         std::optional<DeviceDecode> decode;
         bool completion_emitted = false;
         tensor::Tensor draft_hidden;
+        std::mt19937_64 random{};
     };
     auto retain_serving_prefix(QueuedGeneration& request) -> void;
+    /// Wraps a plain prompt as one user turn using the checkpoint chat template.
+    auto user_prompt(std::string_view prompt) const -> std::string;
     auto acquire_state(std::size_t capacity) -> std::unique_ptr<model::LanguageModelState>;
     auto recycle_state(std::unique_ptr<model::LanguageModelState>& state, bool has_images = false) -> void;
     auto reap_retired() -> void;

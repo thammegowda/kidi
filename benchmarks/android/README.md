@@ -86,8 +86,7 @@ This checks the same shared serving core used by the app, not Compose/UI overhea
 
 The dictation mode mirrors the app's speech path: it prepares the same INT8 cache from a Whisper checkpoint directory,
 warms up, then transcribes growing prefixes of the WAV at the app's draft cadence (0.8 s, then every 1.2 s) and the whole
-file, reporting feature, encode, and decode time for each pass. Set `KIDI_FIT_AUDIO=0` or `KIDI_WARM_UP=0` to compare
-against a padded 30-second window or a cold first request:
+file, reporting feature, encode, and decode time for each pass:
 
 ```sh
 "$ADB" -s SERIAL shell "timeout 600 $REMOTE/runner dictation $REMOTE/models/whisper-small 4 2 $REMOTE/speech.wav" \
@@ -141,7 +140,7 @@ Each Safetensors reference contains the unpadded input patches and position IDs,
 first configured layers' internal stages, compact axial RoPE angles, the final unpooled encoder output, pooled 768-wide
 tokens, and projected 1536-wide visual embeddings. `--stage-layers N` controls the diagnostic depth.
 `--verify-determinism` reruns every captured tensor with the thread counts from `--determinism-threads` and fails on
-any elementwise change. Push the images and references to the phone, then set `KIDI_VISION_REFERENCE_DIR` for
+any elementwise change. Push the images and references to the phone, then pass `--vision-reference DIR` for
 element-wise preprocessing and final-output metrics:
 
 The module hooks are registered through [`torch_intercept.py`](./torch_intercept.py), a reusable context manager
@@ -156,22 +155,21 @@ done
 for file in benchmarks/android/.cache/vision-suite/references/*.safetensors; do
   "$ADB" -s SERIAL push "$file" "$REMOTE/vision-suite/references/"
 done
-"$ADB" -s SERIAL shell "KIDI_VISION_REFERENCE_DIR=$REMOTE/vision-suite/references timeout 300 \
-  $REMOTE/runner vision $REMOTE/models/gemma4 4 3 \
+"$ADB" -s SERIAL shell "timeout 300 $REMOTE/runner --vision-reference $REMOTE/vision-suite/references \
+  vision $REMOTE/models/gemma4 4 3 \
   $REMOTE/vision-suite/images/square-grid.png \
   $REMOTE/vision-suite/images/landscape-shapes.png \
   $REMOTE/vision-suite/images/portrait-shapes.png"
 ```
 
-Set `KIDI_VISION_USE_REFERENCE_INPUT=1` as well to feed the saved official patch tensor into Kidi. This isolates model
+Add `--vision-reference-input` to feed the saved official patch tensor into Kidi. This isolates model
 inference correctness from decoder/resizer differences; without it, the benchmark measures the real Kidi preprocessing
 path and reports its patch error separately. When references are enabled, the timed passes compare final projected
-embeddings and one additional untimed diagnostic pass reports element-wise error after every encoder block.
-`KIDI_VISION_STAGE_LAYERS` changes the number of layers reported by that diagnostic pass (0-16).
-`KIDI_VISION_DUMP_DIR` writes matching Kidi tensors to Safetensors for offline analysis; existing files are never
-overwritten.
+embeddings and one additional untimed diagnostic pass reports element-wise error after every encoder block and the
+first three layers' internal stages. `--vision-dump DIR` writes matching Kidi tensors to Safetensors for offline
+analysis; existing files are never overwritten.
 
-On macOS, set `KIDI_ACCELERATOR=gpu` to run the standalone tower on Apple GPU. The native W8 path quantizes each
+On macOS, pass `--device gpu` to run the standalone tower on Apple GPU. The native W8 path quantizes each
 shared activation once, keeps activation and weight codes integral through 64x64 tiled projections, and applies scales
 only after accumulation. Q/K/V reuse one quantized activation, Q/K use fused axial RMSNorm/RoPE, and large equal-head
 attention uses MPSGraph's fused SDPA operation with the checkpoint's scale of 1.0. A combined Q/K/V dispatch was
@@ -181,8 +179,7 @@ together, applies GELU/multiply on-chip, and writes the down projection's INT8 i
 [FFN fusion walkthrough](../../ffn-fuse.md):
 
 ```sh
-KIDI_ACCELERATOR=gpu KIDI_VISION_PRECISION=checkpoint \
-  build-release/kidi_android_baseline vision MODEL 4 3 image.png
+build-release/kidi_android_baseline --device gpu --vision-precision checkpoint vision MODEL 4 3 image.png
 ```
 
 On an Apple M5, the three 2,304-2,376-patch fixtures take about 0.38-0.42 s after warm-up. The fixed photo produces the
@@ -204,19 +201,15 @@ build-release/kidi_metal_packed_bench vision
 build-release/kidi_metal_packed_bench vision-ffn
 ```
 
-`KIDI_VISION_PRECISION` selects the projection compute policy. The default, `checkpoint`, uses the checkpoint's native
-precision. `fp32` disables activation quantization and dequantizes packed weights for FP32 computation; `bf16` uses
-BF16 activations and computation. `q2a16`, `q4a16`, and `q8a16` explicitly requantize weights to that width before BF16
-compute. Their `q*ae4m3` and `q*ae5m2` variants round activations through the selected FP8 format and use FP32
-accumulation; `i8a8` is an alias for `q8ae4m3`. `qat-fp32` is the deliberately slow numerical verification policy: it
-preserves trained activation SRQ while dequantizing each layer's checkpoint weights for FP32 accumulation. On Apple
-CPU it also mirrors the pinned PyTorch build's RMS reduction, SLEEF RoPE math, and softmax reduction; it is an oracle,
-not a performance mode. `lowbit-parity` retains packed weights, dequantizes only 192 output channels at a time into
-scratch, and uses the same parity math; it currently requires Apple Accelerate. Unsupported backend combinations never
-fall back silently. For example:
+`--vision-precision` selects the projection compute policy. The default, `checkpoint`, uses the checkpoint's native
+precision; `bf16` dequantizes packed weights for a BF16 reference. `qat-fp32` is the deliberately slow numerical
+verification policy: it preserves trained activation SRQ while dequantizing each layer's checkpoint weights for FP32
+accumulation. On Apple CPU it also mirrors the pinned PyTorch build's RMS reduction, SLEEF RoPE math, and softmax
+reduction; it is an oracle, not a performance mode. Unsupported backend combinations never fall back silently. For
+example:
 
 ```sh
-KIDI_VISION_PRECISION=qat-fp32 "$REMOTE/runner" vision "$REMOTE/models/gemma4" 4 3 image.png
+"$REMOTE/runner" --vision-precision qat-fp32 vision "$REMOTE/models/gemma4" 4 3 image.png
 ```
 
 Compare matching official and Kidi dumps, then attribute projection differences to local computation versus propagated
@@ -235,13 +228,11 @@ the square, landscape, and portrait fixtures. Final projected embeddings remain 
 because pooling/projector reductions are not part of the parity path. The native `checkpoint` mode intentionally
 retains its much faster integer projection kernels and is not expected to be bit-identical to dequantized PyTorch.
 The original drift was seeded by different RMS mean reduction and RoPE/softmax arithmetic; sparse one-quantum SRQ
-changes were then amplified by large learned norm scales and the gated MLP. The parity modes support PyTorch-compatible
+changes were then amplified by large learned norm scales and the gated MLP. The parity mode supports PyTorch-compatible
 small-range RoPE angles (absolute angle below 125), which covers this three-image suite.
 
-On an Apple M5 CPU with four threads, `lowbit-parity` keeps all 16 block outputs elementwise identical on all three
-fixtures and final embedding relative RMSE below `2.4e-7`. Steady-state encoding is about 1.72-1.76 s for 2,304-2,376
-patches, versus about 1.25 s for native `checkpoint` and 3.96 s for full `qat-fp32`. Square-image peak RSS is about
-0.89 GiB rather than about 2.03 GiB for cached FP32 weights.
+On an Apple M5 CPU with four threads, steady-state encoding of 2,304-2,376 patches takes about 1.25 s with native
+`checkpoint` and 3.96 s with `qat-fp32`, whose cached FP32 weights raise square-image peak RSS to about 2.03 GiB.
 
 With the existing PyTorch/Transformers reference environment, generate small numerical fixtures locally:
 
@@ -325,7 +316,7 @@ activation magnitude and deep stacks decay toward zero. Correctness is therefore
 - CPU and GPU must match the integer reference exactly at full depth.
 - Replay must be bit-identical to eager and must distinguish two inputs on a live 2-layer stack for every backend.
 - HTP rounding differs from the reference, so each eager HTP graph is compared with the reference applied to its own
-  inputs and must stay within one INT8 quantum RMS. `KIDI_FFN_DIAGNOSE=1` also reports accumulated error per stage.
+  inputs and must stay within one INT8 quantum RMS. `--diagnose` also reports accumulated error per stage.
 
 This is a benchmark prototype. Kidi's runtime remains eager; see [ARCHITECTURE.md](../../ARCHITECTURE.md).
 
@@ -361,12 +352,11 @@ python -m unittest discover -s tests -p android_benchmark_test.py -v
 ## Vulkan GPU backend
 
 Build the Android benchmark with `KIDI_ENABLE_VULKAN=ON` (the Android default) and run Gemma with
-`KIDI_ACCELERATOR=gpu` to select `Device::vulkan()` when the phone reports accelerated packed signed INT8 dot products:
+`--device gpu` to select `Device::vulkan()` when the phone reports accelerated packed signed INT8 dot products:
 
 ```sh
 LD_LIBRARY_PATH=/data/local/tmp/kidi-vk \
-KIDI_ACCELERATOR=gpu \
-/data/local/tmp/kidi-vk/kidi_android_baseline gemma /data/local/tmp/kidi-baseline/models/gemma4 4 3
+/data/local/tmp/kidi-vk/kidi_android_baseline --device gpu gemma /data/local/tmp/kidi-baseline/models/gemma4 4 3
 ```
 
 `kidi_vulkan_operator_test` exercises the Vulkan eager backend and skips successfully when no suitable device is
@@ -381,10 +371,8 @@ Build the Android benchmark with `-DKIDI_ENABLE_QNN=ON -DKIDI_QNN_SDK=/path/to/q
 ```sh
 LD_LIBRARY_PATH=/data/local/tmp/kidi-qnn \
 ADSP_LIBRARY_PATH=/data/local/tmp/kidi-qnn \
-KIDI_QNN_LIBRARY_DIR=/data/local/tmp/kidi-qnn \
-KIDI_QNN_CACHE_DIR=/data/local/tmp/kidi-qnn/cache \
-KIDI_ACCELERATOR=npu \
-./kidi_android_baseline gemma /data/local/tmp/kidi-baseline/models/gemma4 4 3
+./kidi_android_baseline --device npu --qnn-dir /data/local/tmp/kidi-qnn \
+  gemma /data/local/tmp/kidi-baseline/models/gemma4 4 3
 ```
 
 `libQnnHtpPrepare.so` is only needed when the cache does not already contain a
@@ -423,7 +411,7 @@ make aarch64              # build/aarch64-android/libQnnKidiOps.so
 
 Push `libQnnKidiOpsHtp.so` next to the V79 skel (on `ADSP_LIBRARY_PATH`) and
 `libQnnKidiOps.so` on `LD_LIBRARY_PATH`, then add
-`KIDI_QNN_OP_PACKAGE=libQnnKidiOps.so KIDI_QNN_OP_PACKAGE_HTP=libQnnKidiOpsHtp.so`
+`--qnn-op-package libQnnKidiOps.so --qnn-op-package-htp libQnnKidiOpsHtp.so`
 to the run. With a 384-token prompt and a 9216-token cache,
 `kidi_npu_prefill MODEL_DIR 384 128 20` measured:
 

@@ -68,6 +68,8 @@ jobs:
 
       - name: Install build tools
         run: |
+          # The runner image's preinstalled Microsoft apt source can reject requests and fail the update.
+          grep -rlZ packages.microsoft.com /etc/apt/sources.list.d | xargs -0r sudo -n rm -f
           sudo -n apt-get update
           sudo -n apt-get install --yes --no-install-recommends ninja-build ccache
 

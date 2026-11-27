@@ -5,8 +5,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <string>
+
+#include <gtest/gtest.h>
 
 #include "kidi/checkpoint/weights.h"
 
@@ -26,56 +27,45 @@ auto write_weights(const std::filesystem::path& path) -> void {
     output.write(reinterpret_cast<const char*>(VALUES.data()), sizeof(VALUES));
 }
 
-auto near(float left, float right) -> bool { return std::abs(left - right) < 1.0e-5F; }
+constexpr float TOLERANCE = 1.0e-5F;
+
+TEST(EmbeddingTest, Forward) {
+    using namespace kidi;
+    const auto path = std::filesystem::temp_directory_path() / "kidi-embedding-test.safetensors";
+    write_weights(path);
+    auto weights = ops::require(checkpoint::Weights::load(path));
+    const ModuleScope construction(tensor::DType::F32, false);
+    layers::Embedding embedding(3, 4, 8);
+    ops::require(embedding->set_state(StateDict{{"weight", ops::require(weights.tensor("embedding"))}}));
+    std::vector devices{tensor::Device::cpu()};
+#if defined(__APPLE__)
+    devices.push_back(tensor::Device::apple_gpu());
+#endif
+    const auto frequency = std::exp(-(std::log(10000.F) / 4.F) * 2.F);
+    const std::array expected{2.F,
+                              5.F,
+                              6.F,
+                              9.F,
+                              -2.F + std::sin(1.F),
+                              -4.F + std::cos(1.F),
+                              -6.F + std::sin(frequency),
+                              -8.F + std::cos(frequency)};
+    for (auto device : devices) {
+        ops::Context context(device);
+        auto output = embedding->forward(context, std::array<std::int32_t, 4>{1, 2, 2, 1}, 2);
+        auto offset = embedding->forward(context, std::array<std::int32_t, 1>{2}, 1, 1);
+        context.synchronize();
+        auto values = ops::require(output.data<float>());
+        auto selected = ops::require(offset.data<float>());
+        for (std::size_t index = 0; index < expected.size(); ++index)
+            EXPECT_NEAR(values[index], expected[index], TOLERANCE) << "index " << index;
+        for (std::size_t index = 0; index < 4; ++index)
+            EXPECT_NEAR(selected[index], expected[index + 4], TOLERANCE) << "offset index " << index;
+        EXPECT_EQ(values[8], -2.F);
+        EXPECT_EQ(values[11], -7.F);
+        EXPECT_THROW(embedding->forward(context, std::array<std::int32_t, 1>{3}, 1), ops::Failure);
+    }
+    std::filesystem::remove(path);
+}
 
 } // namespace
-
-auto main() -> int {
-    using namespace kidi;
-    try {
-        const auto path = std::filesystem::temp_directory_path() / "kidi-embedding-test.safetensors";
-        write_weights(path);
-        auto weights = ops::require(checkpoint::Weights::load(path));
-        const ModuleScope construction(tensor::DType::F32, false);
-        layers::Embedding embedding(3, 4, 8);
-        ops::require(embedding->set_state(StateDict{{"weight", ops::require(weights.tensor("embedding"))}}));
-        std::vector devices{tensor::Device::cpu()};
-#if defined(__APPLE__)
-        devices.push_back(tensor::Device::apple_gpu());
-#endif
-        const auto frequency = std::exp(-(std::log(10000.F) / 4.F) * 2.F);
-        const std::array expected{2.F,
-                                  5.F,
-                                  6.F,
-                                  9.F,
-                                  -2.F + std::sin(1.F),
-                                  -4.F + std::cos(1.F),
-                                  -6.F + std::sin(frequency),
-                                  -8.F + std::cos(frequency)};
-        for (auto device : devices) {
-            ops::Context context(device);
-            auto output = embedding->forward(context, std::array<std::int32_t, 4>{1, 2, 2, 1}, 2);
-            auto offset = embedding->forward(context, std::array<std::int32_t, 1>{2}, 1, 1);
-            context.synchronize();
-            auto values = ops::require(output.data<float>());
-            auto selected = ops::require(offset.data<float>());
-            for (std::size_t index = 0; index < expected.size(); ++index)
-                if (!near(values[index], expected[index])) return 1;
-            for (std::size_t index = 0; index < 4; ++index)
-                if (!near(selected[index], expected[index + 4])) return 1;
-            if (values[8] != -2.F || values[11] != -7.F) return 1;
-            bool rejected = false;
-            try {
-                embedding->forward(context, std::array<std::int32_t, 1>{3}, 1);
-            } catch (const ops::Failure&) {
-                rejected = true;
-            }
-            if (!rejected) return 1;
-        }
-        std::filesystem::remove(path);
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
-    }
-}

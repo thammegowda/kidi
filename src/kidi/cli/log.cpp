@@ -96,27 +96,11 @@ auto log_mutex() -> std::mutex& {
 
 } // namespace
 
-void init_from_env() {
+auto parse_level(std::string_view name) -> std::optional<Level> { return parse_level_token(name); }
+
+void set_level(Level level) {
     (void)stderr_initial_rdbuf();
-    Level configured = Level::INFO;
-    const char* env = std::getenv("KIDI_LOG_LEVEL");
-    if (!env || *env == '\0') env = std::getenv("SPDLOG_LEVEL");
-    if (env && *env != '\0') {
-        std::string_view spec(env);
-        while (!spec.empty()) {
-            const auto comma = spec.find(',');
-            const auto entry = spec.substr(0, comma);
-            const auto eq = entry.find('=');
-            if (eq == std::string_view::npos) {
-                if (const auto parsed = parse_level_token(entry)) configured = *parsed;
-            } else if (entry.substr(0, eq) == "kidi") {
-                if (const auto parsed = parse_level_token(entry.substr(eq + 1))) configured = *parsed;
-            }
-            if (comma == std::string_view::npos) break;
-            spec.remove_prefix(comma + 1);
-        }
-    }
-    active_level.store(static_cast<int>(configured), std::memory_order_relaxed);
+    active_level.store(static_cast<int>(level), std::memory_order_relaxed);
 }
 
 void write(Level level, std::string_view message) {

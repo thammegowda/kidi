@@ -145,12 +145,28 @@ auto GreedyState::accept_speculative(std::span<const std::int32_t> drafts, Token
     return result;
 }
 
+auto prompt_lookup(std::span<const std::int32_t> history, std::size_t limit) -> std::vector<std::int32_t> {
+    if (!limit || history.size() < 3) return {};
+    for (auto length = std::min<std::size_t>(8, history.size() - 1); length >= 2; --length) {
+        const auto suffix = history.last(length);
+        // Prefer recent continuations at equal match length. Matches may overlap the suffix, but the
+        // continuation must already exist: never invent tokens by cyclically repeating a short match.
+        for (auto end = history.size() - 1; end >= length; --end)
+            if (std::ranges::equal(history.subspan(end - length, length), suffix)) {
+                const auto continuation = history.subspan(end, std::min(limit, history.size() - end));
+                return {continuation.begin(), continuation.end()};
+            }
+    }
+    return {};
+}
+
 auto GreedyState::step_speculative(std::size_t max_drafts, const DraftFunction& draft, const VerifyFunction& verify,
                                    const CommitFunction& commit, SpeculativeStats* stats) -> Result<SpeculativeStep> {
     if (finished_ || !max_drafts || max_drafts > MAX_DRAFT_TOKENS || !draft || !verify)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid speculative step request"});
     const auto remaining = remaining_steps();
-    const auto draft_limit = std::min(max_drafts, remaining > 0 ? remaining - 1 : 0);
+    const auto budget = std::min(max_drafts, draft_length_);
+    const auto draft_limit = std::min(budget, remaining > 0 ? remaining - 1 : 0);
     std::vector<std::int32_t> drafts, inputs{token_};
     drafts.reserve(draft_limit);
     inputs.reserve(draft_limit + 1);
@@ -169,7 +185,6 @@ auto GreedyState::step_speculative(std::size_t max_drafts, const DraftFunction& 
     const auto verify_started = Clock::now();
     auto scores = verify(inputs);
     if (!scores) return std::unexpected(scores.error());
-    const auto verify_ns = elapsed(verify_started);
     SpeculativeStep step;
     step.draft_tokens = drafts.size();
     step.tokens.reserve(inputs.size());
@@ -179,9 +194,18 @@ auto GreedyState::step_speculative(std::size_t max_drafts, const DraftFunction& 
     if (commit)
         if (const auto committed = commit(step.acceptance.committed_inputs); !committed)
             return std::unexpected(committed.error());
+    if (step.draft_tokens) {
+        if (step.acceptance.accepted_drafts == step.draft_tokens) {
+            // Only grow after filling the requested budget; short lookup matches aren't evidence that a
+            // longer verification would pay off.
+            if (step.draft_tokens == budget) draft_length_ = std::min(max_drafts, budget * 2);
+        } else {
+            draft_length_ = std::max<std::size_t>(1, step.acceptance.accepted_drafts);
+        }
+    }
     if (stats) {
         stats->draft_ns += draft_ns;
-        stats->verify_ns += verify_ns;
+        stats->verify_ns += elapsed(verify_started);
         stats->draft_tokens += step.draft_tokens;
         stats->accepted_draft_tokens += step.acceptance.accepted_drafts;
         ++stats->verification_steps;

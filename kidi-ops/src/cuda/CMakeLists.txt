@@ -4,15 +4,30 @@ endif()
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
     set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "Target CUDA architectures")
 endif()
+# NVIDIA's Linux packages install the toolkit under /usr/local/cuda (a symlink to the active version) without adding
+# its bin directory to PATH. CMAKE_CUDA_COMPILER, CUDACXX and nvcc on PATH take precedence.
+set(KIDI_CUDA_ROOT "/usr/local/cuda" CACHE PATH "CUDA toolkit searched when nvcc is not on PATH")
+if(NOT CMAKE_CUDA_COMPILER AND "$ENV{CUDACXX}" STREQUAL "")
+    find_program(KIDI_CUDA_NVCC nvcc PATHS "${KIDI_CUDA_ROOT}/bin" NO_CACHE)
+    if(NOT KIDI_CUDA_NVCC)
+        message(FATAL_ERROR "nvcc is not on PATH or in ${KIDI_CUDA_ROOT}/bin; install the CUDA 13+ toolkit or set "
+                            "KIDI_CUDA_ROOT")
+    endif()
+    set(CMAKE_CUDA_COMPILER "${KIDI_CUDA_NVCC}" CACHE FILEPATH "CUDA compiler" FORCE)
+endif()
 enable_language(CUDA)
 find_package(CUDAToolkit 13 REQUIRED)
 
-set(KIDI_CUTLASS_ROOT "" CACHE PATH "CUTLASS checkout for CUDA tensor-core GEMM and FlashAttention")
+set(KIDI_CUTLASS_ROOT "" CACHE PATH "Optional CUTLASS checkout for Hopper WGMMA int8 GEMM")
 add_library(kidi_ops_cuda_runtime STATIC
     runtime.cu
     elementwise.cu
+    fused_ops.cu
     attention.cu
     projection.cu
+    int8_gemm.cu
+    dense_gemm.cu
+    flash_attention.cu
 )
 add_library(kidi_ops::cuda_runtime ALIAS kidi_ops_cuda_runtime)
 target_include_directories(kidi_ops_cuda_runtime PUBLIC "${kidi_ops_SOURCE_DIR}/src")
@@ -22,12 +37,9 @@ set_target_properties(kidi_ops_cuda_runtime PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 if(KIDI_CUTLASS_ROOT)
-    if(NOT EXISTS "${KIDI_CUTLASS_ROOT}/include/cutlass/gemm/device/gemm.h")
+    if(NOT EXISTS "${KIDI_CUTLASS_ROOT}/include/cutlass/gemm/collective/collective_builder.hpp")
         message(FATAL_ERROR "KIDI_CUTLASS_ROOT must point to a CUTLASS checkout")
     endif()
-    target_sources(kidi_ops_cuda_runtime PRIVATE int8_gemm.cu dense_gemm.cu flash_attention.cu)
-    target_include_directories(kidi_ops_cuda_runtime SYSTEM PRIVATE "${KIDI_CUTLASS_ROOT}/include")
-    target_compile_definitions(kidi_ops_cuda_runtime PRIVATE KIDI_CUDA_USE_CUTLASS_INT8=1)
     if(CMAKE_CUDA_ARCHITECTURES MATCHES "(^|;)(90|native|all)")
         # Hopper's TMA/WGMMA GEMM requires the arch-specific sm_90a target.
         add_library(kidi_ops_cuda_sm90 OBJECT int8_gemm_sm90.cu)
@@ -53,9 +65,6 @@ endif()
 
 add_executable(kidi_ops_cuda_test EXCLUDE_FROM_ALL "${kidi_ops_SOURCE_DIR}/tests/cuda/runtime_test.cpp")
 target_link_libraries(kidi_ops_cuda_test PRIVATE kidi_ops::cuda_runtime CUDA::cudart_static)
-if(KIDI_CUTLASS_ROOT)
-    target_compile_definitions(kidi_ops_cuda_test PRIVATE KIDI_CUDA_USE_CUTLASS_INT8=1)
-endif()
 add_executable(kidi_ops_cuda_projection_benchmark EXCLUDE_FROM_ALL projection_benchmark.cpp)
 target_link_libraries(kidi_ops_cuda_projection_benchmark PRIVATE kidi_ops::cuda_runtime CUDA::cudart_static)
 

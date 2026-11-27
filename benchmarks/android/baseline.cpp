@@ -6,6 +6,7 @@
 #include "kidi/inference/transcriber.h"
 #include "kidi/model/whisper.h"
 #include "kidi/model/gemma4_vision.h"
+#include "kidi/ops/context.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "ynnpack/base/topology.h"
 #if defined(KIDI_HAS_CUDA)
@@ -15,8 +16,9 @@
 #include <nlohmann/json.hpp>
 #include <sys/resource.h>
 
+#include "npu_flags.h"
+
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -34,6 +36,17 @@ constexpr std::size_t CONTEXT = 9216;
 constexpr std::size_t CHUNK = 32;
 constexpr std::size_t OUTPUT_TOKENS = 64;
 
+/// Leading command-line options shared by every benchmark mode.
+struct Flags {
+    std::optional<std::string> device; ///< auto, cpu, gpu, npu or cuda[:INDEX]; unset runs on the CPU.
+    bool cuda_profiler = false;
+    bool eager = false;
+    std::string vision_precision = "checkpoint";
+    std::filesystem::path vision_reference, vision_dump;
+    bool vision_reference_input = false;
+};
+Flags flags;
+
 auto elapsed_ms(Clock::time_point start) -> double {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
@@ -50,18 +63,17 @@ auto peak_rss_kib() -> long {
 #endif
 }
 
-/// Gemma device from KIDI_ACCELERATOR (auto, cpu, gpu, or npu); defaults to cpu for reproducible baselines.
+/// Device from --device (auto, cpu, gpu, npu, or cuda[:INDEX]); defaults to cpu for reproducible baselines.
 auto gemma_device() -> kidi::tensor::Device {
-    const auto* accelerator = std::getenv("KIDI_ACCELERATOR");
-    return require(kidi::inference::select_device(accelerator ? accelerator : "cpu"));
+    return require(kidi::inference::select_device(flags.device.value_or("cpu")));
 }
 
 auto emit(nlohmann::json record, int threads) -> void {
     record["threads"] = threads;
-    if (const auto* accelerator = std::getenv("KIDI_ACCELERATOR")) {
-        record["accelerator"] = accelerator;
+    if (flags.device) {
+        record["accelerator"] = *flags.device;
 #if defined(KIDI_HAS_CUDA)
-        if (const auto device = kidi::tensor::parse_cuda_device(accelerator)) {
+        if (const auto device = kidi::tensor::parse_cuda_device(*flags.device)) {
             record["gpu_live_bytes"] = kidi::cuda::allocated_bytes(device->index);
             record["gpu_peak_bytes"] = kidi::cuda::peak_allocated_bytes(device->index);
         }
@@ -93,21 +105,23 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
         throw std::invalid_argument("Gemma workload must be short, long, both, or eval");
     if (settings.contains("prompt") && custom_prompt.empty())
         throw std::invalid_argument("Gemma benchmark prompt must not be empty");
-    const auto weight_bits = settings.value("weight_bits", 0);
-    const auto group_size = settings.value("group_size", 128);
+    if (settings.contains("weight_bits") || settings.contains("group_size"))
+        throw std::invalid_argument("weight_bits and group_size were replaced by precision q8 or q4");
     const auto precision = kidi::core::parse_precision(settings.value("precision", std::string("checkpoint")));
     if (!precision) throw std::invalid_argument("invalid benchmark precision");
     const auto cache_precision =
         kidi::core::parse_kv_cache_precision(settings.value("kv_cache_precision", std::string("auto")));
     if (!cache_precision) throw std::invalid_argument("invalid benchmark KV-cache precision");
+    // Operator profiles exclude the warm-up requests.
+    auto profile = kidi::ops::profile_options();
+    profile.skip_requests = warmups;
+    kidi::ops::set_profile_options(profile);
     const auto started = Clock::now();
     auto generator = require(kidi::inference::Generator::load(
         directory,
         kidi::inference::ModelLoadOptions{.device = gemma_device(),
                                           .precision = *precision,
                                           .kv_cache_precision = *cache_precision,
-                                          .weight_bits = weight_bits,
-                                          .group_size = group_size,
                                           .packed_prefill = packed_prefill,
                                           .dense_lm_head = settings.value("dense_lm_head", false),
                                           .assistant_model = settings.value("assistant_model", std::string{}),
@@ -235,8 +249,8 @@ auto benchmark_gemma(const std::filesystem::path& directory, int threads, int re
             options.stream_text = true;
             options.ignore_eos = true;
 #if defined(KIDI_HAS_CUDA)
-            const bool profile_cuda = std::getenv("KIDI_CUDA_PROFILE") && iteration >= warmups &&
-                                      gemma_device().kind == kidi::tensor::DeviceKind::CUDA;
+            const bool profile_cuda =
+                flags.cuda_profiler && iteration >= warmups && gemma_device().kind == kidi::tensor::DeviceKind::CUDA;
             if (profile_cuda) kidi::cuda::start_profiler();
 #endif
             require(generator.enqueue(serialized, options));
@@ -438,10 +452,8 @@ auto benchmark_vision(const std::filesystem::path& directory, std::span<const st
     const kidi::ModuleScope scope(kidi::tensor::DType::F32, false, device);
     auto vision = kidi::model::Gemma4Vision(config["vision_config"], config["text_config"]["hidden_size"].as<int>(),
                                             static_cast<bool>(config["quantization_config"]));
-    const auto* precision_name = std::getenv("KIDI_VISION_PRECISION");
-    const auto precision =
-        kidi::core::parse_precision(precision_name ? std::string_view(precision_name) : std::string_view("checkpoint"));
-    if (!precision) throw std::runtime_error("invalid KIDI_VISION_PRECISION");
+    const auto precision = kidi::core::parse_precision(flags.vision_precision);
+    if (!precision) throw std::runtime_error("invalid --vision-precision");
     vision->set_precision(*precision);
     require(vision->set_checkpoint(weights));
     emit({{"stage", "vision_load"},
@@ -450,15 +462,9 @@ auto benchmark_vision(const std::filesystem::path& directory, std::span<const st
           {"precision", kidi::core::to_string(*precision)}},
          threads);
 
-    const auto* reference_directory = std::getenv("KIDI_VISION_REFERENCE_DIR");
-    const auto* dump_directory = std::getenv("KIDI_VISION_DUMP_DIR");
-    std::size_t stage_layers = 3;
-    if (const auto* value = std::getenv("KIDI_VISION_STAGE_LAYERS")) {
-        const auto text = std::string_view(value);
-        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), stage_layers);
-        if (error != std::errc{} || end != text.data() + text.size() || stage_layers > 16)
-            throw std::runtime_error("KIDI_VISION_STAGE_LAYERS must be an integer from 0 to 16");
-    }
+    const auto* reference_directory = flags.vision_reference.empty() ? nullptr : flags.vision_reference.c_str();
+    const auto* dump_directory = flags.vision_dump.empty() ? nullptr : flags.vision_dump.c_str();
+    constexpr std::size_t stage_layers = 3;
     for (std::size_t image_index = 0; image_index < images.size(); ++image_index) {
         const auto& image = images[image_index];
         std::ifstream stream(image, std::ios::binary);
@@ -497,8 +503,7 @@ auto benchmark_vision(const std::filesystem::path& directory, std::span<const st
             prepare_record["patch_cosine"] = result.cosine;
             prepare_record["patch_max_abs"] = result.maximum;
             prepare_record["position_ids_match"] = true;
-            if (const auto* canonical = std::getenv("KIDI_VISION_USE_REFERENCE_INPUT");
-                canonical && std::string_view(canonical) == "1") {
+            if (flags.vision_reference_input) {
                 reference_pixels = pixels;
                 reference_pixels->patches.assign(expected.begin(), expected.end());
             }
@@ -661,17 +666,11 @@ auto benchmark_dictation(const std::filesystem::path& directory, const std::file
     const auto prepared = require(kidi::checkpoint::prepare(directory, kidi::model::WhisperImpl::int8_preparation));
     auto transcriber = require(kidi::inference::Transcriber::load(prepared));
     emit({{"stage", "load"}, {"model", "whisper-int8"}, {"ms", rounded(elapsed_ms(started))}}, threads);
-    // Defaults match the app: fitted audio and a warm-up at load. Set either variable to 0 to compare.
-    const auto enabled = [](const char* name) {
-        const auto* value = std::getenv(name);
-        return !value || std::string_view(value) != "0";
-    };
-    const auto fit = enabled("KIDI_FIT_AUDIO");
-    if (enabled("KIDI_WARM_UP")) {
-        const auto warm = Clock::now();
-        require(transcriber.warm_up());
-        emit({{"stage", "warm_up"}, {"ms", rounded(elapsed_ms(warm))}}, threads);
-    }
+    // Matches the app: fitted audio and a warm-up at load.
+    constexpr bool fit = true;
+    const auto warm = Clock::now();
+    require(transcriber.warm_up());
+    emit({{"stage", "warm_up"}, {"ms", rounded(elapsed_ms(warm))}}, threads);
     std::vector<std::size_t> sizes;
     for (std::size_t size = 12800; size < waveform.samples.size(); size += 19200) sizes.push_back(size);
     sizes.push_back(waveform.samples.size());
@@ -697,13 +696,72 @@ auto benchmark_dictation(const std::filesystem::path& directory, const std::file
 }
 } // namespace
 
+constexpr std::string_view USAGE =
+    "usage: kidi_android_baseline [OPTIONS] gemma|chat|whisper|image|vision|dictation MODEL THREADS REPEATS "
+    "[MEDIA ... | GEMMA_SETTINGS_JSON]\n"
+    "options:\n"
+    "  --device DEVICE           auto, cpu (default), gpu, npu, or cuda[:INDEX]\n"
+    "  --profile-ops MODE        per-operator profiles on stderr (host, sync, graph or events), without warm-ups\n"
+    "  --log-graph-captures      report CUDA graph captures on stderr\n"
+    "  --cuda-profiler           run measured Gemma requests between cudaProfilerStart and cudaProfilerStop\n"
+    "  --eager                   run captured steps eagerly, so operator profiles show individual operators\n"
+    "  --vision-precision NAME   vision projection policy (default: checkpoint)\n"
+    "  --vision-reference DIR    compare vision stages with official reference tensors in DIR\n"
+    "  --vision-reference-input  feed the reference patch tensor instead of Kidi's preprocessing\n"
+    "  --vision-dump DIR         write Kidi vision tensors to Safetensors files in DIR\n";
+
 auto main(int argc, char** argv) -> int {
-    if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
-        std::cout << "usage: kidi_android_baseline gemma|chat|whisper|image|vision|dictation MODEL THREADS REPEATS "
-                     "[MEDIA ... | GEMMA_SETTINGS_JSON]\n";
-        return 0;
-    }
     try {
+        kidi::ops::ProfileOptions profile;
+        auto npu = kidi::runtime::npu_options();
+        int first = 1;
+        while (first < argc && std::string_view(argv[first]).starts_with("--")) {
+            const std::string_view name = argv[first++];
+            const auto value = [&]() -> std::string {
+                if (first == argc) throw std::invalid_argument(std::string(name) + " requires a value");
+                return argv[first++];
+            };
+            if (name == "--help") {
+                std::cout << USAGE << NPU_FLAGS_HELP;
+                return 0;
+            }
+            if (name == "--device") {
+                flags.device = value();
+            } else if (name == "--profile-ops") {
+                const auto mode = kidi::ops::parse_profile_mode(value());
+                if (!mode) throw std::invalid_argument("--profile-ops expects host, sync, graph or events");
+                profile.mode = *mode;
+            } else if (name == "--log-graph-captures") {
+                profile.log_graph_captures = true;
+            } else if (name == "--cuda-profiler") {
+                flags.cuda_profiler = true;
+            } else if (name == "--eager") {
+                flags.eager = true;
+            } else if (name == "--vision-precision") {
+                flags.vision_precision = value();
+            } else if (name == "--vision-reference") {
+                flags.vision_reference = value();
+            } else if (name == "--vision-reference-input") {
+                flags.vision_reference_input = true;
+            } else if (name == "--vision-dump") {
+                flags.vision_dump = value();
+            } else if (!parse_npu_flag(name, value, npu)) {
+                throw std::invalid_argument("unknown option " + std::string(name));
+            }
+        }
+        if (flags.vision_reference_input && flags.vision_reference.empty())
+            throw std::invalid_argument("--vision-reference-input requires --vision-reference");
+        kidi::ops::set_profile_options(profile);
+        kidi::runtime::set_npu_options(npu);
+        // Contexts are created on this thread while models load.
+        std::optional<kidi::ops::EagerScope> eager;
+        if (flags.eager) eager.emplace();
+        argc -= first - 1;
+        argv += first - 1;
+        if (argc == 1) {
+            std::cout << USAGE << NPU_FLAGS_HELP;
+            return 0;
+        }
         if (argc < 5) throw std::runtime_error("missing benchmark arguments");
         const std::string mode(argv[1]);
         const auto threads = std::stoi(argv[3]), repeats = std::stoi(argv[4]);

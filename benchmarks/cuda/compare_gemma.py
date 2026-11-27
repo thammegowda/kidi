@@ -131,9 +131,7 @@ def main():
         prompt_reference = {}
         for label, encoding, device in cells:
             print(f"Starting {label}", flush=True)
-            environment = dict(os.environ, KIDI_ACCELERATOR=device, KIDI_CUDA_GRAPH_LOG="1", CUDA_VISIBLE_DEVICES="0", OMP_NUM_THREADS=str(arguments.threads))
-            for key in ("KIDI_PROFILE_OPS", "KIDI_PROFILE_OPS_SKIP", "KIDI_REPLAY", "KIDI_REPLAY_CAPACITY", "KIDI_INT8_KV_CACHE", "KIDI_CUDA_PROFILE"):
-                environment.pop(key, None)
+            environment = dict(os.environ, CUDA_VISIBLE_DEVICES="0", OMP_NUM_THREADS=str(arguments.threads))
             directory = report["checkpoints"][encoding]["directory"]
             native_settings = {key: protocol[key] for key in ("context_tokens", "prefill_chunk_tokens", "output_tokens", "warmups", "packed_prefill", "short_prompt_copies", "long_prompt_copies", "decode_ahead_tokens")}
             if label.startswith("vllm"):
@@ -144,7 +142,8 @@ def main():
                     "--repeats", str(arguments.repeats), "--kv-cache-mib", str(arguments.vllm_kv_mib),
                     "--short-copies", str(arguments.short_copies), "--long-copies", str(arguments.long_copies)]
             else:
-                command = [str(ROOT / "build-release/kidi_android_baseline"), "gemma", directory, str(arguments.threads),
+                command = [str(ROOT / "build-release/kidi_android_baseline"), "--device", device, "--log-graph-captures",
+                           "gemma", directory, str(arguments.threads),
                            str(arguments.repeats), json.dumps(native_settings)]
             stdout, stderr = work / f"{label}.stdout", work / f"{label}.stderr"
             run = {"status": "running", "encoding": encoding, "device": device, "command": command,
@@ -175,7 +174,7 @@ def main():
                         capture["steady_ns"] = int(capture["steady_ns"])
                         captures.append(capture)
                 if device.startswith("cuda") and not captures:
-                    raise RuntimeError(f"{label}: no CUDA graph captures logged (KIDI_CUDA_GRAPH_LOG=1)")
+                    raise RuntimeError(f"{label}: no CUDA graph captures logged (--log-graph-captures)")
                 for row in records:
                     if row["warmup"]:
                         continue

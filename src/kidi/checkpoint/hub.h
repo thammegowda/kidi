@@ -1,4 +1,5 @@
 #pragma once
+// Model hub cache lookup and explicit downloads; default cache is configured by KIDI_HUB.
 
 #include <filesystem>
 #include <string>
@@ -10,11 +11,14 @@ namespace kidi::checkpoint {
 
 class Hub {
 public:
+    Hub();
     Hub(std::string remote, std::filesystem::path local);
 
     static auto expand_home(std::filesystem::path path) -> std::filesystem::path;
+    static auto default_cache() -> std::filesystem::path;
 
-    auto resolve(std::string_view model_id, std::string_view revision = "main") const -> Result<std::filesystem::path>;
+    // Local-only lookup of [@]owner/model or [@]owner/model/path/to/file.
+    auto resolve(std::string_view reference, std::string_view revision = "main") const -> Result<std::filesystem::path>;
     auto get_file(std::string_view model_id, std::string_view file, std::string_view revision = "main") const
         -> Result<std::filesystem::path>;
     auto download(std::string_view reference) const -> Result<std::filesystem::path>;

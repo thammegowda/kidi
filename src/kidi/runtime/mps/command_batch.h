@@ -19,6 +19,8 @@ public:
     auto restart() -> Result<void>;
     auto finish() -> Result<void>;
     auto native_handle() const noexcept -> void*;
+    auto compute_encoder() -> Result<void*>;
+    auto index_error_buffer() -> Result<void*>;
     auto track_completion() -> std::function<void(std::string)>;
     auto copy_(const tensor::Tensor& source, tensor::Tensor& destination) -> Result<void>;
     auto copy_slice_(const tensor::Tensor& source, tensor::Tensor& destination, std::size_t outer,

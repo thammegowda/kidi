@@ -109,7 +109,7 @@ def run_case(case, protocol, args, environment):
         "workload": "short", "short_prompt_copies": 1, "decode_ahead_tokens": 16,
         "prompt": case["prompt"].removeprefix("<bos><|turn>user\n").removesuffix("<turn|>\n<|turn>model\n"),
     }
-    command = [str(ROOT / args.binary), "gemma", str(MODEL), str(protocol["threads"]),
+    command = [str(ROOT / args.binary), "--device", "cuda:0", "gemma", str(MODEL), str(protocol["threads"]),
                str(args.repeats), json.dumps(settings)]
     rows = execute(command, f"{args.label}-{case['name']}", environment)
     check_kidi_device(rows)
@@ -161,7 +161,8 @@ def run_quality(protocol, fixture, args, environment):
         "packed_prefill": True, "dense_lm_head": True, "kv_cache_precision": args.cache,
         "workload": "eval", "eval_protocol": str(QUALITY_PROTOCOL), "decode_ahead_tokens": 16,
     }
-    command = [str(ROOT / args.binary), "gemma", str(MODEL), str(protocol["threads"]), "1", json.dumps(settings)]
+    command = [str(ROOT / args.binary), "--device", "cuda:0", "gemma", str(MODEL), str(protocol["threads"]), "1",
+               json.dumps(settings)]
     rows = execute(command, f"{args.label}-wmt23", environment)
     check_kidi_device(rows)
     summaries = [row for row in rows if row.get("stage") == "eval"]
@@ -352,11 +353,9 @@ def main():
     if args.save_baseline and wanted != available:
         parser.error("saving a baseline requires all prompts")
 
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="7", KIDI_ACCELERATOR="cuda:0",
-                       OMP_NUM_THREADS=str(protocol["threads"]), HF_HUB_OFFLINE="1")
-    for key in ("KIDI_CUDA_PROFILE", "KIDI_PROFILE_OPS", "KIDI_PROFILE_OPS_SKIP", "KIDI_REPLAY",
-                "KIDI_REPLAY_CAPACITY", "KIDI_CUDA_GRAPH_LOG", "CUDA_LAUNCH_BLOCKING"):
-        environment.pop(key, None)
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="7", OMP_NUM_THREADS=str(protocol["threads"]),
+                       HF_HUB_OFFLINE="1")
+    environment.pop("CUDA_LAUNCH_BLOCKING", None)
     started = time.monotonic()
     if args.refresh_references:
         references = refresh_references(protocol, args, environment)

@@ -33,7 +33,7 @@ under `.cache/tools/`, verifying its SHA-256 checksum. Make targets use
 these local tools. For direct shell commands, run
 `export PATH="$PWD/.cache/tools/bin:$PATH"`. `make setup-test` installs the
 Python test/build tools and browser test tools without APT or Homebrew.
-`make test` and `make test-cuda` prepare their test tools automatically.
+`make test-all` and `make test-all-cuda` prepare their test tools automatically.
 Model fixtures are acquired only by the test goals that need them.
 
 C/C++ dependencies are pinned submodules under `third_party/`.
@@ -46,6 +46,15 @@ Compact libraries and selected icons are vendored. The larger Mermaid and PDF.js
 distributions are acquired from `web/package-lock.json` and staged as ignored
 local assets; see [web dependency policy](web/libs/README.md).
 CLI-only and Python wheel targets do not acquire web packages or require Node.js.
+
+The [Kidi agent](kidi-agent/README.md), a local shell for chat and workspace tasks, is enabled by
+default on Linux and macOS. Run `kidi agent` to start or reuse a background Kidi server. The
+native command does not link libcurl. To build the standalone Kidi HTTP
+client independently of inference, use
+`cmake -S kidi-agent -B .cache/kidi-agent-build`.
+Both clients use the shared `/v1/chat/context` route for exact token preflight
+and compact long conversation history automatically. The handoff prompt is
+configured in embedded `kidi-agent/agent.yaml` or an explicit override.
 
 ## Native Build
 
@@ -77,12 +86,16 @@ runtime memory must be measured separately from artifact size.
 ### CUDA
 
 The optional NVIDIA backend requires Linux, the CUDA 13+ toolkit, and a
-compatible GPU. From an initialized checkout, build the standalone portable
-static CUDA CLI (`build-release-cuda/kidi`):
+compatible GPU. CMake uses `CUDACXX` or `nvcc` from `PATH`, else
+`$KIDI_CUDA_ROOT/bin/nvcc`; `KIDI_CUDA_ROOT` defaults to `/usr/local/cuda`, where NVIDIA's
+packages install the toolkit, and Make goals also append its `bin` (nvcc and tools) to
+`PATH`. The CUDA presets target Ampere and newer (`80-real;90`); on hosts that also have
+older GPUs, hide them with `CUDA_VISIBLE_DEVICES`. From an initialized checkout, build
+the standalone portable static CUDA CLI (`build-release-cuda/kidi`):
 
 ```bash
 make release-cuda
-build-release-cuda/kidi chat --model /path/to/gemma-model --backend cuda:0
+build-release-cuda/kidi agent --model /path/to/gemma-model --backend cuda:0
 ```
 
 The `release-cuda` preset statically links the CUDA, C++, and libgcc runtimes
@@ -94,8 +107,10 @@ additionally builds the separate `kidi-index-cuda` GPU HNSW index construction
 helper (`-DKIDI_CUVS_ROOT=/path/to/cuvs`, `-DKIDI_DLPACK_INCLUDE_DIR=/path/to/include`).
 
 The preset embeds `sm_80` and `sm_90` GPU code and `compute_90` PTX. Override
-`CMAKE_CUDA_ARCHITECTURES` at configure time for other targets. To enable
-Tensor Core GEMMs and FlashAttention-2 with a build-time CUTLASS checkout
+`CMAKE_CUDA_ARCHITECTURES` at configure time for other targets. Kidi's native kernels provide BF16, W8A16 and W8A8
+Tensor Core GEMMs, tiled FlashAttention-2 prefill and a tiled FP32 CUDA-core GEMM without CUDA toolkit
+shared-library dependencies. Native W8A16 (`--precision q8`) runs calibrated INT8 checkpoints and BF16 checkpoints
+with INT8 weights. To also build the Hopper (`sm_90a`) WGMMA INT8 GEMM, point the build at a CUTLASS checkout
 (tested with `v4.6.0-8-ge64a9136`):
 
 ```bash
@@ -103,31 +118,7 @@ cmake --preset release-cuda -DKIDI_CUTLASS_ROOT=/path/to/cutlass
 cmake --build --preset release-cuda --target kidi_cli
 ```
 
-This compiles BF16, W8A16, and W8A8 Tensor Core GEMMs, tiled BF16/FP32
-FlashAttention-2 prefill (`head_dim` 64/128/256/512), and a tiled FP32 CUDA-core
-GEMM into the `15.69 MiB` CLI without adding any CUDA toolkit shared-library
-dependencies (`VerifyPortableElf.cmake`). The dense fast paths support eligible
-transposed weights (`sm_80` and `sm_90`); FP32 does not use TF32. Native CUDA
-W8A16 (`--precision w8a16`) runs both calibrated INT8 checkpoints and unquantized
-BF16 checkpoints with INT8 weights and BF16 activations/KV cache, while W8A8
-accelerates affine INT8 and calibrated/uncalibrated packed INT8 projections (plus
-single-group packed INT4/INT2 projections expanded to INT8) with fused
-epilogues and partitioned FlashDecoding. Gemma 4's AUTO KV-cache policy selects
-BF16 on CUDA even when packed Q8 checkpoints retain FP32 activations, unless
-checkpoint-provided byte-cache quantization applies. Explicit FP32 cache remains
-available; CPU AUTO behavior is unchanged. Mixed FP32-query/BF16-cache attention
-retains FP32 outputs: tensor-core prefill rounds queries inside the attention
-kernel, and decode reads FP32 queries directly. Captured decode cache writes
-convert FP32 to BF16 inside scatter rather than launching separate casts.
-Small-row decode uses specialized
-vector kernels and CUDA Graph sibling fusion when eligible. On H100 (Gemma 4 E4B,
-162-token prompt / 128-token prefill chunks), compact BF16 reaches `9,281`
-prefill / `134.1` decode tok/s (`0.78 ms` exact-128 attention, `11.93 ms`
-exact-128 window vs `14.21 ms` historical shared cuBLAS), compact W8A16 reaches
-`8,503` prefill / `159.3` decode tok/s at `7.95 GiB` peak VRAM, and compact W8A8
-reaches `7,735` prefill / `139.3` decode tok/s (`9,974` / `138.5` at 1,098
-tokens). See the [CUDA performance plan](docs/cuda-performance-plan.md) for
-shapes, graph capture, and benchmark details.
+See the [CUDA performance plan](docs/cuda-performance-plan.md) for supported paths and current measurements.
 
 The [E4B Q8 comparison](benchmarks/cuda/2026-11-20-e4b-q8-h100-gpu7.md#bf16-cache-optimization-follow-up)
 records the matched FP32/BF16-cache follow-up, including remaining performance
@@ -144,13 +135,16 @@ For the Python launcher, build and install a CUDA-enabled package separately:
 
 ```bash
 python -m pip install '.[hf]' -Ccmake.define.KIDI_ENABLE_CUDA=ON
-python -m kidi chat -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0
+python -m kidi agent -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0
 ```
 
 CUDA is disabled in default builds. Installing a CPU-only wheel does not gain
 CUDA support just because the toolkit is present. `--backend cuda` selects GPU 0;
 `--backend cuda:INDEX` selects another GPU using CUDA's device numbering, which
-respects `CUDA_VISIBLE_DEVICES`. `auto` retains the existing Metal/CPU selection.
+respects `CUDA_VISIBLE_DEVICES`. `auto` prefers available CUDA, then Metal,
+then CPU, subject to workload support. Translation requires a general-purpose
+backend, Whisper currently supports CUDA or CPU, Kokoro runs on CPU, and
+speculative decoding with `--assistant-model` remains CPU-only.
 An explicitly requested CUDA backend fails rather than falling back to CPU when
 unavailable. The same backend option is accepted by interactive `chat` and
 scripted `generate`.
@@ -527,9 +521,8 @@ retrieval can miss the dense winner, and packed search scores need not exactly
 match the dense backend's activation rounding. Matching one 64-token prompt is
 not proof of unchanged generation quality.
 
-`KIDI_HNSW_EF` optionally overrides search effort when the layer binds its index.
-It must be at least the candidate count stored in the graph; invalid values
-fail explicitly. Without an override, defaults remain those stored in the index.
+Search effort is stored in the index (`kidi index --ef-search`) and must be at least
+the candidate count stored in the graph.
 Check held-out generation quality, dense agreement and memory as well as speed.
 The [CPU harness](benchmarks/cpu/README.md#hnsw-lm-head-comparisons) provides
 dense/indexed controls and records the graph hash.
@@ -586,42 +579,68 @@ Smaller downloads come from quantization, not from container overhead alone.
 
 ## Tests
 
-Native unit tests, without downloading a model:
-
-```bash
-make native-test
-```
-
-This builds the `debug` preset with integration tests disabled. To include Python
-and supported model regression tests:
+For the fast C++ loop, run the native GoogleTest cases only:
 
 ```bash
 make test
 ```
 
-`make test` builds and tests `build-debug/kidi`, runs Python tests against an
+This builds the `debug` preset with integration tests disabled and runs CTest in
+parallel: at most 12 jobs (`TEST_JOBS` can lower this but is clamped to 12).
+The CPU preset runs the fixture-based Gemma model checks without requiring CUDA; real-checkpoint Inkling checks
+are registered only in CUDA builds and, for the CPU INT8 path, in `make test-all`. In CUDA builds, at most one
+`cuda`-labelled GPU test runs per GPU (max 8). Before GPU tests run, the
+`GpuPool` setup test (`cmake/gpu-launch.sh --spec`) writes a CTest resource pool with
+one id per visible GPU, so the pool adapts to the host: your `CUDA_VISIBLE_DEVICES` list
+when set (e.g. `CUDA_VISIBLE_DEVICES=4,5 make test-cuda` uses only GPUs 4 and 5), else
+every GPU `nvidia-smi` reports. A single-GPU host gets two slots on that GPU so
+`MultiGpu.*` can run; with no GPUs the pool is empty and CTest reports GPU tests as
+Not Run. Each GPU test takes one id and `cmake/gpu-launch.sh` pins it via `CUDA_VISIBLE_DEVICES`,
+so concurrent tests spread across GPUs. The `MultiGpu.*` entries run the CUDA kernel
+binaries with two GPUs visible to cover cross-device behavior. This works with presets
+and plain `ctest --test-dir` alike, and needs CMake 3.29+ (older CTest runs GPU tests
+unpinned and uncapped). It needs no Python venv, wheel, or
+model download. `make native-test` is an alias. To include the Python and model
+regression tests:
+
+```bash
+make test-all
+```
+
+`make test-all` builds and tests `build-debug/kidi`, runs Python tests against an
 installed Debug wheel, and runs the 50-sentence RTG regression through one CTest
 invocation. It never uses the Release binary. The pinned public model downloads
-on the first CPU regression run; no Hub login is required.
+on the first CPU regression run; no Hub login is required. It also runs the CPU INT8
+Inkling-2 regression when `@thinkingmachines/Inkling-2-Mini` is cached; that check builds a
+~26 GB INT8 cache and skips on hosts with less than 64 GiB of RAM.
 Browser and extension suites remain separate. Individual targets are
-`native-test`, `python-test`, `web-test`, and
-`regression-test`. See [tests/data/README.md](tests/data/README.md) for fixtures
-and numerical contracts.
+`python-test`, `web-test`, and `regression-test`. See
+[tests/data/README.md](tests/data/README.md) for fixtures and numerical contracts.
 
 RTG regression defaults to `KIDI_BACKEND=ynnpack`. Override it with
-`make test KIDI_BACKEND=mps` on a supported Mac; the generic `BACKEND` variable
-is ignored.
+`make test-all KIDI_BACKEND=mps` on a supported Mac; the generic `BACKEND`
+variable is ignored.
 
 On Linux with an NVIDIA GPU and the CUDA toolkit, test the CUDA backend with:
 
 ```bash
 make test-cuda KIDI_CUTLASS_ROOT=/path/to/cutlass
+make test-all-cuda KIDI_CUTLASS_ROOT=/path/to/cutlass
 ```
 
-This configures the `debug-cuda` preset (`build-debug-cuda/`, Debug with
-`KIDI_ENABLE_CUDA=ON`) and runs native tests plus Python tests against a
-CUDA-enabled Debug wheel. This includes the `cuda`-labelled kernel tests and
-CUDA model numerical checks. The RTG translation regression is excluded because
+Both configure the `debug-cuda` preset (`build-debug-cuda/`, Debug with
+`KIDI_ENABLE_CUDA=ON`). `make test-cuda` runs native tests only;
+`make test-all-cuda` also runs Python tests against a CUDA-enabled Debug wheel.
+The Inkling2 model tests (~80 s) and Gemma tokenizer check resolve
+`@thinkingmachines/Inkling-2-Mini` and `@google/gemma-4-E2B-it` locally from
+the default hub (`KIDI_HUB`, or `~/.cache/kidi/model-hub`) and skip if missing;
+tests never download models. This also applies to `make test-cuda`.
+To populate the cache explicitly before test setup, run
+`bash scripts/download-test-models.sh` (requires `hf` and access to the gated Gemma model).
+Set `KIDI_HUB=/path/to/test-cache` for an isolated cache; CLI `--cache` still overrides it.
+Production code and tests share the same local-only API, for example
+`checkpoint::Hub{}.resolve("@google/gemma-4-E2B-it/tokenizer.json")`.
+Both include the `cuda`-labelled kernel tests and CUDA model numerical checks. The RTG translation regression is excluded because
 RTG currently has no CUDA backend; browser and extension tests are also excluded.
 The Gemma 4 numerical fixture is a regression test on both CPU and CUDA.
 Optional Python chat regressions use CUDA when `KIDI_CHAT_MODEL` is set.
@@ -630,8 +649,17 @@ CPU and CUDA test environments are isolated under `.cache/test-venv` and
 build directory's `python/` subdirectory.
 `KIDI_CUTLASS_ROOT` is optional and applies to all CUDA Make goals and the test
 wheel. Without it, CUTLASS-only kernels are not built or tested.
-Run only the kernel tests with
+Run only the GPU tests (kernels plus CUDA model checks) with
 `ctest --preset debug-cuda -L cuda`.
+
+Native tests are GoogleTest binaries (GoogleTest comes from the `ynnpack-dev`
+submodule). CTest lists each case separately as `<Suite>.<Name>`, so select a
+suite or one case with `-R`, or run a binary directly with `--gtest_filter`:
+
+```bash
+ctest --test-dir build-debug -R '^ChatTest\.' --output-on-failure
+./build-debug/tests/kidi_chat_test --gtest_filter='ChatTest.*'
+```
 
 To check long-file Whisper processing with a local checkpoint and a short English
 mono PCM16 16 kHz WAV (at most 30 seconds):
@@ -683,14 +711,47 @@ not promises for other devices or proof of quality equivalence across quantizers
 - [Android](benchmarks/android/README.md): reproducible device benchmark setup.
 - [CPU harness](benchmarks/cpu/README.md): repeatable desktop CPU decode measurements and operator profiles.
 
+### Inkling 2 core benchmark
+
+The opt-in [model test](tests/kidi/model/inkling2_test.cpp) benchmarks native
+checkpoint weights directly, without a server, chat template, or UI:
+
+```bash
+cmake -S . -B build-release-cuda -DBUILD_TESTING=ON -DKIDI_BUILD_TESTS=ON
+cmake --build build-release-cuda --target kidi_inkling2_test -j 16
+CUDA_VISIBLE_DEVICES=7 ./build-release-cuda/tests/kidi_inkling2_test \
+  --gtest_filter=Inkling2Test.DISABLED_CoreBenchmark --gtest_also_run_disabled_tests
+```
+
+For fast 512-token prefill + 128-token decode iteration:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 ./build-release-cuda/tests/kidi_inkling2_test \
+  --gtest_filter=Inkling2Test.DISABLED_Quick512Benchmark --gtest_also_run_disabled_tests
+```
+
+Use an existing Release CUDA build and a locally available Inkling 2 Mini
+checkpoint. The test reports synchronized model-loading time, warm prefill at
+32/128/512 tokens, and 128 measured decode steps after 8 warmup steps, starting
+from 128- and 512-token prompts. Each inference result reports the median,
+minimum, and maximum of three runs. Tokenization, state allocation, and state
+reset are outside inference timers.
+
+`decode_forward_only` uses predetermined token IDs and keeps logits on the GPU;
+`decode_greedy` includes model token selection and the single-token host readback.
+Both run a fixed number of steps even if greedy selection produces EOS.
+These are core workloads, not directly comparable to server throughput with
+different prompts, context lengths, or stop conditions. The benchmark is disabled
+in normal correctness runs and makes no hardware-dependent speed assertions.
+
 On Linux hosts with several NUMA nodes, `kidi` commands that run on the CPU keep
 their `-j` threads on one node (`kidi::runtime::ynn::confine_to_numa_node`).
 A decoding step reads every weight once, and the weights live on the node of the
 thread that first wrote them, so threads spread over two sockets read about half
 of them remotely. On a two-socket Xeon at 16 threads this was worth 1.1-1.3x.
 It only acts when the process may run on several nodes and the threads fit within
-one, so `taskset`, `numactl` and cgroup cpusets are respected; `KIDI_NUMA=off`
-disables it. Applications embedding Kidi should call it before loading a model.
+one, so `taskset`, `numactl` and cgroup cpusets choose the CPUs instead.
+Applications embedding Kidi should call it before loading a model.
 
 For reusable TTS latency, run repeated synthesis through one loaded model:
 
@@ -723,7 +784,7 @@ build-release/kidi synthesize -m .cache/omnivoice-int8 \
 
 Metal expands the INT8 Qwen projections to a shared FP16 cache because native
 half GEMM substantially outperforms per-tile INT8-to-half conversion on Apple
-GPU. Set `KIDI_MPS_Q_LINEAR_FP16=0` only for numerical/performance diagnostics.
+GPU.
 
 For multi-sentence input, the synthesizer first generates the shortest sentence
 estimated at least three seconds and uses its text plus generated codec tokens as the
@@ -732,6 +793,13 @@ narrator across sentence-sized workspaces. It does not require the external-WAV
 voice-cloning encoder, which is intentionally absent from the converted package.
 
 Keep generated model files, local reports and large binary artifacts out of Git.
+
+## Agent
+
+[Kidi Agent](kidi-agent/README.md) (`kidi agent`) is the built-in local shell for chat and workspace tasks.
+[tools/sandbox](tools/sandbox/README.md) confines the standalone `kidi-agent` client,
+or any command, by Landlock to one workspace (typically a disposable
+`git worktree`), with Python venv/uv support and read-only git metadata.
 
 ## CI and Deployment
 

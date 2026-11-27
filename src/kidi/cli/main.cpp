@@ -1,11 +1,14 @@
-#include <cstddef>
-#include <cstdint>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <deque>
+#include <expected>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -15,8 +18,11 @@
 #include "kidi/cli/log.h"
 #include "kidi/cli/main.h"
 #include "kidi/audio/wav.h"
-#include "kidi/cli/interactive.h"
 #include "kidi/cli/index.h"
+#include "kidi/cli/serve.h"
+#ifdef KIDI_HAS_AGENT
+#include "kidi/cli/managed_serve.h"
+#endif
 #include "kidi/core/version.h"
 #include "kidi/checkpoint/package.h"
 #include "kidi/checkpoint/config.h"
@@ -30,13 +36,31 @@
 #include "kidi/model/kokoro.h"
 #include "kidi/model/gemma4.h"
 #include "kidi/model/registry.h"
+#include "kidi/ops/context.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/tensor/backend.h"
 #include "ynnpack/base/topology.h"
 
+namespace kidi::cli {
+auto auto_inference_device(std::span<const tensor::BackendInfo> backends, tensor::TransformerSupport required,
+                           bool allow_metal) -> tensor::Device {
+    for (const auto device : {tensor::Device::cuda(), tensor::Device::apple_gpu()}) {
+        if (device.kind == tensor::DeviceKind::A_GPU && !allow_metal) continue;
+        if (!device.capabilities().compute.supports(required)) continue;
+        if (std::ranges::any_of(backends, [&](const auto& backend) {
+                return backend.device_kind == device.kind && backend.storage_available && backend.execution_available;
+            }))
+            return device;
+    }
+    return tensor::Device::cpu();
+}
+} // namespace kidi::cli
+
 namespace {
 
-auto inference_device(const kidi::cli::Namespace& arguments) -> kidi::tensor::Device {
+auto inference_device(const kidi::cli::Namespace& arguments,
+                      kidi::tensor::TransformerSupport required = kidi::tensor::TransformerSupport::QUANTIZED,
+                      bool allow_metal = true, bool cpu_only = false) -> kidi::tensor::Device {
     const auto& backend = arguments.get<std::string>("backend");
     if (const auto device = kidi::tensor::parse_cuda_device(backend)) return *device;
     if (backend == "vulkan") return kidi::tensor::Device::vulkan();
@@ -44,11 +68,12 @@ auto inference_device(const kidi::cli::Namespace& arguments) -> kidi::tensor::De
     if (backend != "mps" && backend != "auto" && backend != "ynnpack")
         throw std::invalid_argument("unknown backend; expected auto, ynnpack, mps, vulkan, npu, or cuda[:INDEX]");
     const bool speculative =
-        arguments.contains("assistant_model") && !arguments.get<std::filesystem::path>("assistant_model").empty();
-    return backend == "mps" ||
-                   (backend == "auto" && !speculative && kidi::module_device == kidi::tensor::Device::apple_gpu())
-               ? kidi::tensor::Device::apple_gpu()
-               : kidi::tensor::Device::cpu();
+        (arguments.contains("assistant_model") && !arguments.get<std::filesystem::path>("assistant_model").empty()) ||
+        (arguments.contains("prompt_lookup") && arguments.get<bool>("prompt_lookup"));
+    if (backend == "mps") return kidi::tensor::Device::apple_gpu();
+    if (backend == "ynnpack" || speculative || cpu_only) return kidi::tensor::Device::cpu();
+    return kidi::cli::auto_inference_device(kidi::tensor::BackendRegistry::instance().backends(), required,
+                                            allow_metal);
 }
 
 /// Stable label for machine-readable stderr records.
@@ -61,10 +86,9 @@ auto backend_label(kidi::tensor::Device device) -> std::string_view {
 
 /// Applies the CPU thread count. Commands that compute on the CPU also keep those threads on one NUMA node, so the
 /// weights they stream every token are read from local memory.
-auto configure_cpu_threads(const kidi::cli::Namespace& arguments, std::int32_t threads) -> void {
+auto configure_cpu_threads(std::int32_t threads, kidi::tensor::Device device) -> void {
     kidi::runtime::ynn::set_thread_count(threads);
-    const auto& backend = arguments.get<std::string>("backend");
-    if (backend == "auto" || backend == "ynnpack") {
+    if (device == kidi::tensor::Device::cpu()) {
         const auto resolved = kidi::runtime::ynn::thread_count();
         ::ynn::confine_to_numa_node(resolved);
         ::ynn::confine_to_performance_cpus(resolved);
@@ -111,7 +135,7 @@ auto inspect(const std::filesystem::path& directory) -> int {
             kidi::cli::log::error("{}", weights.error().message);
             return 1;
         }
-        const bool qat = static_cast<bool>((*document)["model"]["quantization_config"]);
+        const bool qat = kidi::checkpoint::native_qat((*document)["model"]);
         const auto embedding = weights->tensor(qat ? "model.language_model.embed_tokens.embedding_quantized"
                                                    : "model.language_model.embed_tokens.weight");
         if (!embedding) {
@@ -202,7 +226,7 @@ auto inspect(const std::filesystem::path& directory) -> int {
     return 0;
 }
 
-auto chat_messages(const nlohmann::json& request) -> kidi::Result<std::vector<kidi::text::ChatMessage>> {
+auto validate_chat_request(const nlohmann::ordered_json& request) -> kidi::Result<void> {
     const auto invalid = [](std::string message) {
         return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, std::move(message)});
     };
@@ -210,96 +234,78 @@ auto chat_messages(const nlohmann::json& request) -> kidi::Result<std::vector<ki
         request["messages"].empty())
         return invalid("expected an object with a nonempty messages array");
     for (const auto& [key, value] : request.items())
-        if (key != "messages" && key != "id" && key != "max_tokens")
+        if (key != "messages" && key != "id" && key != "max_tokens" && key != "template_args")
             return invalid("unsupported request field: " + key);
     if (request.contains("id") && !request["id"].is_string() && !request["id"].is_number_integer())
         return invalid("id must be a string or integer");
     if (request.contains("max_tokens") &&
         (!request["max_tokens"].is_number_integer() || request["max_tokens"] <= 0 || request["max_tokens"] > INT32_MAX))
         return invalid("max_tokens must be a positive integer within int32 bounds");
-    std::vector<kidi::text::ChatMessage> result;
-    for (const auto& message : request["messages"]) {
-        if (!message.is_object() || message.size() != 2 || !message.contains("role") || !message["role"].is_string() ||
-            !message.contains("content"))
-            return invalid("each message must contain role and content only");
-        std::string content;
-        if (message["content"].is_string()) {
-            content = message["content"].get<std::string>();
-        } else if (message["content"].is_array()) {
-            for (const auto& part : message["content"]) {
-                if (!part.is_object() || part.size() != 2 || !part.contains("type"))
-                    return invalid("content parts must be text objects");
-                if (part["type"] == "text" && part.contains("text") && part["text"].is_string()) {
-                    content += part["text"].get<std::string>();
-                } else {
-                    return invalid("content parts must contain text");
-                }
-            }
-        } else {
-            return invalid("content must be a string or an array of text parts");
-        }
-        result.push_back({message["role"].get<std::string>(), std::move(content)});
-    }
-    return result;
+    if (request.contains("template_args") && !request["template_args"].is_object())
+        return invalid("template_args must be an object");
+    return {};
 }
 
-struct ChatSession {
+struct Session {
     kidi::inference::Generator generator;
     kidi::inference::GenerationOptions options;
     std::int64_t load_ns;
-    kidi::tensor::Device device;
 };
 
-auto load_chat_session(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory,
-                       const std::filesystem::path& assistant_directory) -> kidi::Result<ChatSession> {
-    const auto device = inference_device(arguments);
+auto load_session(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory,
+                  kidi::tensor::Device device, const std::filesystem::path& assistant_directory)
+    -> kidi::Result<Session> {
     const auto precision = kidi::core::parse_precision(arguments.get<std::string>("precision"));
     if (!precision) return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, "invalid precision"});
     const auto kv_cache_precision =
         kidi::core::parse_kv_cache_precision(arguments.get<std::string>("kv_cache_precision"));
     if (!kv_cache_precision)
         return std::unexpected(kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, "invalid KV-cache precision"});
-    if (arguments.contains("draft_tokens") && assistant_directory.empty())
+    const auto prompt_lookup = arguments.get<bool>("prompt_lookup");
+    if (arguments.contains("draft_tokens") && assistant_directory.empty() && !prompt_lookup)
         return std::unexpected(
-            kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT, "--draft-tokens requires --assistant-model"});
+            kidi::Error{kidi::ErrorCode::INVALID_ARGUMENT,
+                        "--draft-tokens requires --assistant-model or --prompt-lookup"});
     const auto draft_tokens =
         arguments.contains("draft_tokens") ? arguments.get<std::size_t>("draft_tokens") : std::size_t{3};
+    if (arguments.contains("metal_prefill_cache_mib"))
+        kidi::ops::set_metal_prefill_cache_bytes(std::min(arguments.get<std::size_t>("metal_prefill_cache_mib"),
+                                                          std::numeric_limits<std::size_t>::max() >> 20)
+                                                 << 20);
     const auto started = std::chrono::steady_clock::now();
     auto loaded =
         kidi::inference::Generator::load(directory, {.device = device,
                                                      .precision = *precision,
                                                      .kv_cache_precision = *kv_cache_precision,
-                                                     .weight_bits = arguments.get<std::int32_t>("weight_bits"),
-                                                     .group_size = arguments.get<std::int32_t>("group_size"),
                                                      .packed_prefill = arguments.get<bool>("packed_prefill"),
                                                      .dense_lm_head = arguments.get<bool>("dense_lm_head"),
                                                      .assistant_model = assistant_directory,
+                                                     .prompt_lookup = prompt_lookup,
                                                      .draft_tokens = draft_tokens});
     if (!loaded) return std::unexpected(std::move(loaded.error()));
     const auto load_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-    return ChatSession{std::move(*loaded),
-                       {.maximum_new_tokens = arguments.get<std::size_t>("max_new_tokens"),
-                        .context_size = arguments.get<std::size_t>("context_size"),
-                        .prefill_chunk_size = arguments.get<std::size_t>("prefill_chunk_size"),
-                        .ignore_eos = arguments.get<bool>("ignore_eos"),
-                        .full_attention_cache = arguments.get<bool>("full_attention_cache")},
-                       load_ns,
-                       device};
+    return Session{std::move(*loaded),
+                   {.maximum_new_tokens = arguments.get<std::size_t>("max_new_tokens"),
+                    .context_size = arguments.get<std::size_t>("context_size"),
+                    .prefill_chunk_size = arguments.get<std::size_t>("prefill_chunk_size"),
+                    .ignore_eos = arguments.get<bool>("ignore_eos"),
+                    .full_attention_cache = arguments.get<bool>("full_attention_cache")},
+                   load_ns};
 }
 
 auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory,
-                   const std::filesystem::path& assistant_directory, std::istream& input, std::ostream& output) -> int {
+                   kidi::tensor::Device device, const std::filesystem::path& assistant_directory, std::istream& input,
+                   std::ostream& output) -> int {
     try {
         const auto started = std::chrono::steady_clock::now();
-        auto session = load_chat_session(arguments, directory, assistant_directory);
+        auto session = load_session(arguments, directory, device, assistant_directory);
         if (!session) {
             kidi::cli::log::error("{}", session.error().message);
             return 1;
         }
         auto& generator = session->generator;
         const auto& options = session->options;
-        const auto device = session->device;
         const auto load_ns = session->load_ns;
         const auto max_active = arguments.contains("max_active")
                                     ? arguments.get<std::size_t>("max_active")
@@ -335,21 +341,24 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
                     break;
                 }
                 ++line_number;
-                const auto request = nlohmann::json::parse(line, nullptr, false);
-                auto messages = chat_messages(request);
-                if (!messages) {
-                    kidi::cli::log::error("input line {}: {}", line_number, messages.error().message);
+                const auto request = nlohmann::ordered_json::parse(line, nullptr, false);
+                auto valid = validate_chat_request(request);
+                if (!valid) {
+                    kidi::cli::log::error("input line {}: {}", line_number, valid.error().message);
                     return 2;
                 }
                 auto request_options = options;
                 if (request.contains("max_tokens"))
                     request_options.maximum_new_tokens = request["max_tokens"].get<std::size_t>();
-                auto queued = generator.enqueue_chat(*messages, request_options);
+                auto template_args = request.value("template_args", nlohmann::ordered_json::object());
+                if (!request.contains("template_args")) template_args["enable_thinking"] = false;
+                auto queued = generator.enqueue_chat(request["messages"], request_options, template_args);
                 if (!queued) {
                     kidi::cli::log::error("input line {}: {}", line_number, queued.error().message);
                     return queued.error().code == kidi::ErrorCode::INVALID_ARGUMENT ? 2 : 1;
                 }
-                ordered.push_back({request.value("id", nlohmann::json(*queued)), {}});
+                ordered.push_back(
+                    {request.contains("id") ? nlohmann::json(request["id"]) : nlohmann::json(*queued), {}});
             }
             if (!generator.pending_requests()) break;
             auto step = generator.step();
@@ -422,7 +431,7 @@ auto generate_chat(const kidi::cli::Namespace& arguments, const std::filesystem:
     }
 }
 auto generate_translation(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory,
-                          std::istream& input, std::ostream& output) -> int {
+                          kidi::tensor::Device device, std::istream& input, std::ostream& output) -> int {
     kidi::inference::InferenceStats profile;
     const auto batch_size = arguments.get<std::int32_t>("batch_size");
     const auto batch_window =
@@ -436,7 +445,6 @@ auto generate_translation(const kidi::cli::Namespace& arguments, const std::file
         return 2;
     }
     auto* profile_ptr = arguments.get<bool>("profile") ? &profile : nullptr;
-    const auto device = inference_device(arguments);
     auto translator = kidi::inference::Translator::load(directory, device, profile_ptr, batch_size);
     if (!translator) {
         kidi::cli::log::error("{}", translator.error().message);
@@ -514,27 +522,33 @@ auto generate_translation(const kidi::cli::Namespace& arguments, const std::file
     return 0;
 }
 
-/// Validates the thread count and that the package holds the model family this command serves.
+/// Validates the thread count and that the package holds the model family this command serves, then selects
+/// and configures the inference device. Returns the device, or the exit status on failure.
 auto prepare_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory,
-                     kidi::model::Task task) -> int {
+                     kidi::model::Task task) -> std::expected<kidi::tensor::Device, int> {
     const auto threads = arguments.get<std::int32_t>("threads");
     if (threads <= 0) {
         kidi::cli::log::error("thread count must be positive");
-        return 2;
+        return std::unexpected(2);
     }
-    configure_cpu_threads(arguments, threads);
     auto config = kidi::checkpoint::load_config(directory);
     if (!config) {
         kidi::cli::log::error("{}", config.error().message);
-        return 1;
+        return std::unexpected(1);
     }
     const auto type = (*config)["model"]["type"].as<std::string>();
     if (!kidi::model::supports_task(type, task)) {
         kidi::cli::log::error("{} expects a model supporting {}, but this package is {}",
                               arguments.get<std::string>("command"), kidi::model::task_name(task), type);
-        return 2;
+        return std::unexpected(2);
     }
-    return 0;
+    const auto required = task == kidi::model::Task::TRANSLATION ? kidi::tensor::TransformerSupport::GENERAL
+                                                                 : kidi::tensor::TransformerSupport::QUANTIZED;
+    const auto device = inference_device(arguments, required, true, task == kidi::model::Task::TTS && type == "kokoro");
+    kidi::cli::log::info("inference device: {} (backend={})", kidi::tensor::to_string(device),
+                         arguments.get<std::string>("backend"));
+    configure_cpu_threads(threads, device);
+    return device;
 }
 
 /// Opens the -i/-o files, defaulting to standard input and output.
@@ -571,9 +585,10 @@ auto run_with_streams(const kidi::cli::Namespace& arguments,
 }
 
 auto translate_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
-    if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TRANSLATION)) return status;
+    const auto device = prepare_command(arguments, directory, kidi::model::Task::TRANSLATION);
+    if (!device) return device.error();
     return run_with_streams(arguments, [&](std::istream& input, std::ostream& output) {
-        return generate_translation(arguments, directory, input, output);
+        return generate_translation(arguments, directory, *device, input, output);
     });
 }
 
@@ -604,28 +619,50 @@ auto resolve_hub_argument(const std::filesystem::path& path, const std::filesyst
 }
 
 auto generate_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
-    if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TEXT_GENERATION)) return status;
+    const auto device = prepare_command(arguments, directory, kidi::model::Task::TEXT_GENERATION);
+    if (!device) return device.error();
     std::filesystem::path assistant_directory;
     if (const auto status = resolve_hub_argument(arguments.get<std::filesystem::path>("assistant_model"),
                                                  arguments.get<std::filesystem::path>("cache"), assistant_directory))
         return status;
     return run_with_streams(arguments, [&](std::istream& input, std::ostream& output) {
-        return generate_chat(arguments, directory, assistant_directory, input, output);
+        return generate_chat(arguments, directory, *device, assistant_directory, input, output);
     });
 }
 
-auto chat_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
-    if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TEXT_GENERATION)) return status;
+auto serve_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
+    const auto device = prepare_command(arguments, directory, kidi::model::Task::TEXT_GENERATION);
+    if (!device) return device.error();
     std::filesystem::path assistant_directory;
     if (const auto status = resolve_hub_argument(arguments.get<std::filesystem::path>("assistant_model"),
                                                  arguments.get<std::filesystem::path>("cache"), assistant_directory))
         return status;
-    auto session = load_chat_session(arguments, directory, assistant_directory);
+    auto session = load_session(arguments, directory, *device, assistant_directory);
     if (!session) {
         kidi::cli::log::error("{}", session.error().message);
         return 1;
     }
-    return kidi::cli::interactive_chat(session->generator, session->options, arguments, session->load_ns);
+    session->options.prefix_cache_bytes = arguments.get<std::size_t>("prefix_cache_mib") << 20;
+    auto name = arguments.get<std::string>("served_model_name");
+    if (name.empty()) name = arguments.get<std::filesystem::path>("model").string();
+    if (name.starts_with('@')) name.erase(0, 1);
+    kidi::cli::ServeOptions options{.host = arguments.get<std::string>("host"),
+                                    .port = arguments.get<std::int32_t>("port"),
+                                    .model_name = std::move(name),
+                                    .generation = session->options};
+    const kidi::inference::ServingOptions serving{.maximum_active = arguments.get<std::size_t>("max_active"),
+                                                  .maximum_requests = arguments.get<std::size_t>("queue_size"),
+                                                  .cache_token_budget = arguments.get<std::size_t>("cache_tokens"),
+                                                  .prefill_tokens_per_step = session->options.prefill_chunk_size};
+#ifdef KIDI_HAS_AGENT
+    if (!arguments.get<std::filesystem::path>("managed_dir").empty())
+        return kidi::cli::serve_managed(session->generator, *device, std::move(options), serving, arguments);
+#endif
+    if (auto configured = session->generator.configure_serving(serving); !configured) {
+        kidi::cli::log::error("{}", configured.error().message);
+        return 2;
+    }
+    return kidi::cli::serve(session->generator, options);
 }
 
 auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
@@ -661,9 +698,10 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
         kidi::cli::log::error("transcript output must not overwrite the input audio");
         return 2;
     }
-    configure_cpu_threads(arguments, threads);
+    const auto device = inference_device(arguments, kidi::tensor::TransformerSupport::QUANTIZED, false);
+    kidi::cli::log::info("inference device: {} (backend={})", kidi::tensor::to_string(device), backend);
+    configure_cpu_threads(threads, device);
     const auto started = std::chrono::steady_clock::now();
-    const auto device = kidi::tensor::parse_cuda_device(backend).value_or(kidi::tensor::Device::cpu());
     auto transcriber = kidi::inference::Transcriber::load(directory, device);
     if (!transcriber) {
         kidi::cli::log::error("{}", transcriber.error().message);
@@ -735,8 +773,8 @@ auto transcribe_command(const kidi::cli::Namespace& arguments, const std::filesy
 }
 
 auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesystem::path& directory) -> int {
-    if (const auto status = prepare_command(arguments, directory, kidi::model::Task::TTS)) return status;
-    const auto device = inference_device(arguments);
+    const auto device = prepare_command(arguments, directory, kidi::model::Task::TTS);
+    if (!device) return device.error();
     std::optional<float> duration_seconds;
     const auto duration = arguments.get<std::string>("duration");
     if (duration != "auto") {
@@ -753,7 +791,7 @@ auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesy
         return 2;
     }
     const auto started = std::chrono::steady_clock::now();
-    auto synthesizer = kidi::inference::Synthesizer::load(directory, device);
+    auto synthesizer = kidi::inference::Synthesizer::load(directory, *device);
     if (!synthesizer) {
         kidi::cli::log::error("{}", synthesizer.error().message);
         return 1;
@@ -807,19 +845,44 @@ auto synthesize_command(const kidi::cli::Namespace& arguments, const std::filesy
 
 } // namespace
 
-auto kidi::cli::main(int argc, const char* const argv[]) -> int {
-    kidi::cli::log::init_from_env();
+auto kidi::cli::main(int argc, const char* const argv[], [[maybe_unused]] const Launcher& launcher) -> int {
+    kidi::cli::log::set_level(kidi::cli::log::Level::INFO);
     kidi::cli::ArgumentParser parser("kidi", "Run translation, transcription, text generation and TTS models.");
     parser.version("kidi " + std::string(kidi::version()));
+    parser.add_argument("--log-level")
+        .dest("log_level")
+        .default_value(std::string("info"))
+        .choices({"trace", "debug", "info", "warning", "error", "off"})
+        .help("stderr log verbosity; give it before the command");
     auto& commands = parser.add_subparsers().required();
+#ifdef KIDI_HAS_AGENT
+    auto& agent_parser = commands.add_parser(
+        "agent", "local agent shell for chat and workspace tasks, with shared background inference");
+    kidi::cli::configure_managed_agent_parser(agent_parser);
+#endif
     auto& index_parser = commands.add_parser("index", "build a reusable CPU HNSW index for a model");
     kidi::cli::configure_index_parser(index_parser);
     auto& translate_parser = commands.add_parser("translate", "translate one Moses-tokenized line per input line");
     translate_parser.description("Translate with an RTG model. Output preserves input order.");
     auto& generate_parser = commands.add_parser("generate", "generate one reply per JSONL chat request");
     generate_parser.description("Generate with a chat model reading JSONL messages. Output preserves input order.");
-    auto& chat_parser = commands.add_parser("chat", "interactive multi-turn chat with streaming replies");
-    chat_parser.description("Chat in the terminal with a loaded model. Type /help for shell commands.");
+    auto& serve_parser = commands.add_parser("serve", "serve an OpenAI-compatible chat completions API");
+    serve_parser.description("Serve /v1/chat/completions with streaming, reasoning, and tool calls over HTTP.");
+    serve_parser.add_argument("--host").default_value(std::string("127.0.0.1"));
+    serve_parser.add_argument("--port").default_value<std::int32_t>(8000);
+    serve_parser.add_argument("--served-model-name")
+        .dest("served_model_name")
+        .default_value(std::string{})
+        .help("model id reported to clients (default: --model)");
+    serve_parser.add_argument("--max-active").dest("max_active").default_value<std::size_t>(1);
+    serve_parser.add_argument("--queue-size").dest("queue_size").default_value<std::size_t>(64);
+    serve_parser.add_argument("--prefix-cache-mib")
+        .dest("prefix_cache_mib")
+        .default_value<std::size_t>(0)
+        .help("keep the last request's KV state (up to this size) to reuse shared prompt prefixes");
+#ifdef KIDI_HAS_AGENT
+    kidi::cli::configure_managed_serve_parser(serve_parser);
+#endif
     auto& transcribe_parser = commands.add_parser("transcribe", "transcribe a 16 kHz WAV file with Whisper");
     transcribe_parser.description(
         "Transcribe or translate speech with Whisper Tiny, Base, Small, Large-v3, or Large-v3-Turbo. Long WAV files "
@@ -827,11 +890,6 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         "in bounded windows with one loaded model.");
     auto& synthesize_parser = commands.add_parser("synthesize", "synthesize speech from text");
     synthesize_parser.description("Synthesize a mono WAV file with a TTS model.");
-    chat_parser.add_argument("--system").default_value(std::string{}).help("system instruction");
-    chat_parser.add_argument("--color")
-        .default_value(std::string("auto"))
-        .choices({"auto", "always", "never"})
-        .help("terminal colors; auto respects NO_COLOR");
     generate_parser.add_argument("--max-active")
         .dest("max_active")
         .type<std::size_t>()
@@ -839,7 +897,7 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         .help("active concurrent requests (default: 1 with --assistant-model, else 4)");
     generate_parser.add_argument("--queue-size").dest("queue_size").default_value<std::size_t>(64);
     for (auto* command_parser :
-         {&translate_parser, &generate_parser, &chat_parser, &transcribe_parser, &synthesize_parser}) {
+         {&translate_parser, &generate_parser, &serve_parser, &transcribe_parser, &synthesize_parser}) {
         command_parser->add_argument("-m", "--model")
             .type<std::filesystem::path>()
             .required()
@@ -847,11 +905,11 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
             .help("local directory or @owner/model");
         command_parser->add_argument("-c", "--cache")
             .type<std::filesystem::path>()
-            .default_value(std::filesystem::path("~/.cache/kidi/model-hub"))
+            .default_value(kidi::checkpoint::Hub::default_cache())
             .help("Hugging Face model cache directory");
         command_parser->add_argument("--backend")
             .default_value(std::string("auto"))
-            .help("auto, ynnpack, mps, vulkan, npu, or cuda[:INDEX]");
+            .help("auto (CUDA, Metal, then CPU), ynnpack, mps, vulkan, npu, or cuda[:INDEX]");
         command_parser->add_argument("-j", "--threads").default_value<std::int32_t>(4);
         command_parser->add_argument("--profile").action(kidi::cli::Action::STORE_TRUE);
     }
@@ -902,7 +960,12 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         .type<std::filesystem::path>()
         .metavar("JSON")
         .help("optional generated audio-token dump");
-    for (auto* command_parser : {&generate_parser, &chat_parser}) {
+    for (auto* command_parser : {&generate_parser, &serve_parser}) {
+        command_parser->add_argument("--metal-prefill-cache-mib")
+            .dest("metal_prefill_cache_mib")
+            .type<std::size_t>()
+            .metavar("MIB")
+            .help("limit expanded FP16 weights Metal keeps for faster prefill (default: unlimited; 0 saves memory)");
         command_parser->add_argument("--cache-tokens")
             .dest("cache_tokens")
             .default_value<std::size_t>(16384)
@@ -915,28 +978,17 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
             .dest("full_attention_cache")
             .action(kidi::cli::Action::STORE_TRUE)
             .help("disable CPU local-history cropping for the previous numerical path");
-        command_parser->add_argument("--weight-bits")
-            .dest("weight_bits")
-            .default_value<std::int32_t>(0)
-            .help("0: original weights; 4 or 8: load-time groupwise packing");
         command_parser->add_argument("--precision")
             .default_value(std::string("checkpoint"))
-            .choices({"checkpoint", "lowbit-parity", "checkpoint-parity",
-                      "fp32",       "bf16",          "q2a16",
-                      "i2a16",      "q4a16",         "i4a16",
-                      "q8a16",      "i8a16",         "w8a16",
-                      "q2ae4m3",    "i2a8",          "q4ae4m3",
-                      "i4a8",       "q8ae4m3",       "i8a8",
-                      "w8a8",       "w8afp8",        "i8afp8",
-                      "q2ae5m2",    "q4ae5m2",       "q8ae5m2",
-                      "w8ae5m2",    "qat-fp32"})
-            .help("projection compute policy; explicit policies currently require a native QAT checkpoint");
+            .choices({"checkpoint", "bf16", "q8", "q4", "vq3d-hybrid"})
+            .help(
+                "weight and compute policy: checkpoint (stored format), bf16 (reference), q8 (INT8 per channel, "
+                "packed at load), q4 (INT4 in groups of 128, packed at load), vq3d-hybrid (Inkling-2 VQ experts)");
         command_parser->add_argument("--kv-cache-precision")
             .dest("kv_cache_precision")
             .default_value(std::string("auto"))
-            .choices({"auto", "fp32", "bf16", "int8", "i8", "e4m3", "e5m2"})
-            .help("KV-cache storage policy; auto, fp32, and calibrated int8 are currently implemented");
-        command_parser->add_argument("--group-size").dest("group_size").default_value<std::int32_t>(128);
+            .choices({"auto", "fp32", "bf16", "int8"})
+            .help("KV-cache storage policy; auto picks the model and device default");
         command_parser->add_argument("--packed-prefill")
             .dest("packed_prefill")
             .action(kidi::cli::Action::STORE_TRUE)
@@ -954,7 +1006,11 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
             .dest("draft_tokens")
             .type<std::size_t>()
             .metavar("N")
-            .help("maximum speculative draft length, 1 to 16 (default: 3; requires --assistant-model)");
+            .help("adaptive draft cap, 1 to 16; starts at 1 (default: 3; requires assistant or prompt lookup)");
+        command_parser->add_argument("--prompt-lookup")
+            .dest("prompt_lookup")
+            .action(kidi::cli::Action::STORE_TRUE)
+            .help("draft repeated prompt/history tokens for CPU Inkling-2; greedy decoding only");
     }
 
     auto& inspect_parser = commands.add_parser("inspect", "inspect a model package");
@@ -966,7 +1022,7 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         .help("local directory or @owner/model");
     inspect_parser.add_argument("-c", "--cache")
         .type<std::filesystem::path>()
-        .default_value(std::filesystem::path("~/.cache/kidi/model-hub"))
+        .default_value(kidi::checkpoint::Hub::default_cache())
         .help("Hugging Face model cache directory");
 
     translate_parser.add_argument("-b", "--beam-size").type<std::int32_t>().metavar("N").help("RTG beam size");
@@ -1009,19 +1065,44 @@ auto kidi::cli::main(int argc, const char* const argv[]) -> int {
         const auto arguments = parser.parse_args(argc, argv);
         if (arguments.should_exit()) {
             std::cout << arguments.output();
+            if (arguments.status() == kidi::cli::ParseStatus::VERSION) {
+                std::vector<std::string> unavailable;
+                for (const auto& backend : kidi::tensor::BackendRegistry::instance().backends()) {
+                    if (!backend.execution_available) {
+                        unavailable.push_back(backend.name);
+                        continue;
+                    }
+                    std::cout << "available: " << backend.name;
+#ifdef KIDI_CUDA_TOOLKIT_VERSION
+                    if (backend.device_kind == kidi::tensor::DeviceKind::CUDA)
+                        std::cout << ' ' << KIDI_CUDA_TOOLKIT_VERSION;
+#endif
+                    std::cout << '\n';
+                }
+                if (!unavailable.empty()) {
+                    std::cout << "unavailable: ";
+                    for (std::size_t i = 0; i < unavailable.size(); ++i) std::cout << (i ? ", " : "") << unavailable[i];
+                    std::cout << '\n';
+                }
+            }
             return 0;
         }
+        kidi::cli::log::set_level(*kidi::cli::log::parse_level(arguments.get<std::string>("log_level")));
         const auto& command = arguments.get<std::string>("command");
+#ifdef KIDI_HAS_AGENT
+        if (command == "agent") return kidi::cli::managed_agent_command(arguments, launcher);
+        if (command == "serve") kidi::cli::protect_managed_lock(arguments);
+#endif
         std::filesystem::path directory;
         const auto cache = arguments.contains("cache") ? arguments.get<std::filesystem::path>("cache")
-                                                       : std::filesystem::path("~/.cache/kidi/model-hub");
+                                                       : kidi::checkpoint::Hub::default_cache();
         if (const auto status = resolve_hub_argument(arguments.get<std::filesystem::path>("model"), cache, directory))
             return status;
         if (command == "index") return kidi::cli::index_command(arguments, directory);
         if (command == "inspect") return inspect(directory);
         if (command == "translate") return translate_command(arguments, directory);
         if (command == "generate") return generate_command(arguments, directory);
-        if (command == "chat") return chat_command(arguments, directory);
+        if (command == "serve") return serve_command(arguments, directory);
         if (command == "transcribe") return transcribe_command(arguments, directory);
         if (command == "synthesize") return synthesize_command(arguments, directory);
         throw std::logic_error("unhandled command: " + command);

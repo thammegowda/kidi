@@ -447,6 +447,20 @@ public:
     const std::byte* data() const { return data_; }
     size_t size() const { return size_; }
 
+#if defined(__APPLE__)
+    // Use a separate mapping so dropping pages from the CPU view cannot remap a live Metal buffer.
+    auto map_pages(size_t offset, size_t length) const -> std::shared_ptr<const std::byte> {
+        const auto page = static_cast<size_t>(::getpagesize());
+        const auto mapped_size = (size_ + page - 1) / page * page;
+        if (offset % page || length == 0 || length % page || offset >= size_ || length > mapped_size - offset)
+            throw SafetensorsException("invalid safetensors page range");
+        auto* mapped = ::mmap(nullptr, length, PROT_READ, MAP_PRIVATE, descriptor_, static_cast<off_t>(offset));
+        if (mapped == MAP_FAILED) throw SafetensorsException("failed to map safetensors pages for Metal");
+        return {static_cast<const std::byte*>(mapped),
+                [length](const std::byte* data) { ::munmap(const_cast<std::byte*>(data), length); }};
+    }
+#endif
+
     void release_pages(const void* address, size_t length) const noexcept {
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
         if (data_ == nullptr || address == nullptr || length == 0) return;

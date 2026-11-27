@@ -1,6 +1,6 @@
 // Fast CPU-vs-NPU Gemma 4 prefill check for iterating on the NPU path on a phone:
 //
-//   kidi_npu_prefill MODEL_DIR [tokens=512] [chunk=128] [decode=16] [capacity=9216]
+//   kidi_npu_prefill [OPTIONS] MODEL_DIR [tokens=512] [chunk=128] [decode=16] [capacity=9216]
 //
 // Loads the model twice (CPU, and CPU with the NPU step compiler), prefills the same prompt in `chunk`-token
 // pieces, compares every producer layer's K/V rows, times each chunk, and compares greedy continuations.
@@ -23,6 +23,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "npu_flags.h"
 
 namespace {
 using kidi::ops::require;
@@ -101,12 +103,40 @@ auto compare(const Tensor& expected, const Tensor& actual, std::size_t first_row
 }
 } // namespace
 
+constexpr std::string_view USAGE =
+    "usage: kidi_npu_prefill [OPTIONS] MODEL_DIR [tokens=512] [chunk=128] [decode=16] [capacity=9216]\n"
+    "options:\n"
+    "  --side cpu|npu            run only one side, e.g. to profile the NPU model alone\n"
+    "  --replays N               repeat the first NPU prefill chunk N times in fresh states\n";
+
 auto main(int argc, char** argv) -> int {
-    if (argc < 2) {
-        std::cerr << "usage: kidi_npu_prefill MODEL_DIR [tokens=512] [chunk=128] [decode=16] [capacity=9216]\n";
-        return 2;
-    }
+    std::string side;
+    int replay_count = 0;
     try {
+        auto npu_options = kidi::runtime::npu_options();
+        int first = 1;
+        while (first < argc && std::string_view(argv[first]).starts_with("--")) {
+            const std::string_view name = argv[first++];
+            const auto value = [&]() -> std::string {
+                if (first == argc) throw std::invalid_argument(std::string(name) + " requires a value");
+                return argv[first++];
+            };
+            if (name == "--side") {
+                side = value();
+                if (side != "cpu" && side != "npu") throw std::invalid_argument("--side expects cpu or npu");
+            } else if (name == "--replays") {
+                replay_count = std::stoi(value());
+            } else if (!parse_npu_flag(name, value, npu_options)) {
+                throw std::invalid_argument("unknown option " + std::string(name));
+            }
+        }
+        kidi::runtime::set_npu_options(npu_options);
+        argc -= first - 1;
+        argv += first - 1;
+        if (argc < 2) {
+            std::cerr << USAGE << NPU_FLAGS_HELP;
+            return 2;
+        }
         const std::filesystem::path directory = argv[1];
         const auto count = argc > 2 ? std::stoul(argv[2]) : 512UL;
         const auto chunk = argc > 3 ? std::stoul(argv[3]) : 128UL;
@@ -114,18 +144,18 @@ auto main(int argc, char** argv) -> int {
         const auto capacity = argc > 5 ? std::stoul(argv[5]) : 9216UL;
         auto started = Clock::now();
         const auto tokens = prompt(directory, count);
-        // KIDI_PREFILL_SIDE=npu skips the CPU reference, e.g. to profile the NPU model alone.
-        const auto* side = std::getenv("KIDI_PREFILL_SIDE");
-        const bool npu_only = side && std::string_view(side) == "npu";
-        const bool cpu_only = side && std::string_view(side) == "cpu";
+        const bool npu_only = side == "npu";
+        const bool cpu_only = side == "cpu";
         const bool reference = !npu_only && !cpu_only;
         auto cpu = load(directory, false);
         std::printf("load cpu %.0f ms\n", milliseconds(started));
         started = Clock::now();
         auto npu = load(directory, true);
         std::printf("load npu %.0f ms\n", milliseconds(started));
-        auto cpu_state = require(cpu->create_state(capacity));
-        auto npu_state = require(npu->create_state(capacity));
+        auto cpu_owner = require(cpu->create_state(capacity));
+        auto npu_owner = require(npu->create_state(capacity));
+        auto& cpu_state = static_cast<kidi::model::Gemma4State&>(*cpu_owner);
+        auto& npu_state = static_cast<kidi::model::Gemma4State&>(*npu_owner);
         double cpu_total = 0, npu_total = 0, npu_steady = 0;
         std::size_t steady_tokens = 0;
         for (std::size_t start = 0; start < tokens.size(); start += chunk) {
@@ -148,12 +178,10 @@ auto main(int argc, char** argv) -> int {
         std::printf("prefill cpu %.1f tok/s  npu %.1f tok/s  npu-after-first-chunk %.1f tok/s\n",
                     1000.0 * tokens.size() / cpu_total, 1000.0 * tokens.size() / npu_total,
                     steady_tokens ? 1000.0 * steady_tokens / npu_steady : 0.0);
-        const auto replay_count =
-            std::getenv("KIDI_PREFILL_REPLAY") ? std::atoi(std::getenv("KIDI_PREFILL_REPLAY")) : 0;
         for (int attempt = 0; attempt < replay_count; ++attempt) {
             auto replay = require(npu->create_state(capacity));
             started = Clock::now();
-            require(npu->prefill(std::span(tokens).first(std::min(chunk, tokens.size())), replay));
+            require(npu->prefill(std::span(tokens).first(std::min(chunk, tokens.size())), *replay));
             std::printf("prefill replay %d %zu tokens %.1f ms\n", attempt + 1, std::min(chunk, tokens.size()),
                         milliseconds(started));
         }

@@ -16,6 +16,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(KIDI_HAS_METAL)
+#include <unistd.h>
+#endif
+
 #include "kidi/checkpoint/safetensors/mapped.h"
 #include "kidi/checkpoint/ggml/reader.h"
 #include "kidi/checkpoint/ggml/dequantize.h"
@@ -526,6 +530,43 @@ auto Weights::tensor(std::string_view name) const -> Result<tensor::Tensor> {
         }
     }
     return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "invalid weight tensor: " + std::string(name)});
+}
+
+auto Weights::tensor(std::string_view name, tensor::Device device) const -> Result<tensor::Tensor> {
+    auto value = tensor(name);
+    if (!value) return value;
+#if defined(KIDI_HAS_METAL)
+    if (device == tensor::Device::apple_gpu()) {
+        const auto& entry = impl_->entries.at(std::string(name));
+        const auto address = reinterpret_cast<std::uintptr_t>(entry.bytes.data());
+        if (entry.kind == Entry::Kind::VIEW && entry.owner == impl_->storage && !entry.bytes.empty() &&
+            address % 4 == 0) {
+            const auto page = static_cast<std::size_t>(::getpagesize());
+            const auto offset = address % page;
+            const auto length = (offset + entry.bytes.size() + page - 1) / page * page;
+            const auto element = data_type_size(value->dtype());
+            // Metal requires whole pages. Expose only the validated tensor within the mapped range.
+            const auto file = impl_->storage->checkpoint->owner();
+            std::shared_ptr<const std::byte> mapping;
+            try {
+                const auto file_base = reinterpret_cast<std::uintptr_t>(file->data());
+                mapping = file->map_pages(address - file_base - offset, length);
+            } catch (const safetensors::SafetensorsException& error) {
+                return std::unexpected(Error{ErrorCode::IO, error.what()});
+            }
+            auto storage = tensor::Tensor::from_blob({static_cast<std::int64_t>(length / element)}, value->dtype(),
+                                                     std::span(mapping.get(), length), mapping, device);
+            if (!storage) return std::unexpected(std::move(storage.error()));
+            auto view = storage->narrow(0, static_cast<std::int64_t>(offset / element),
+                                        static_cast<std::int64_t>(value->numel()));
+            if (!view) return view;
+            return view->reshape(entry.shape);
+        }
+    }
+#endif
+    auto transferred = value->to(device);
+    if (transferred && value->device() != device) value->release_pages(false);
+    return transferred;
 }
 
 auto Weights::float32_tensor(std::string_view name) const -> Result<tensor::Tensor> {

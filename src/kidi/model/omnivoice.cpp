@@ -155,7 +155,7 @@ auto unsupported_value(std::string_view key, std::string_view value) -> std::une
 
 auto generator_replay(tensor::Device device) -> std::optional<bool> {
 #if defined(__ANDROID__)
-    if (device.policy().replay.generator_opt_in && !std::getenv("KIDI_REPLAY")) return false;
+    if (device.policy().replay.eager_generator) return false;
 #endif
     return std::nullopt;
 }

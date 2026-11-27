@@ -3,6 +3,7 @@
 #include "kidi/runtime/ynn/feed_forward_cache.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/ops/context.h"
+#include "kidi/checkpoint/ggml/dequantize.h"
 #include "ynnpack/composites/composites.h"
 #include <atomic>
 #include <array>
@@ -1533,6 +1534,27 @@ struct PackedDenseEntry {
     Tensor col_sums;
 };
 
+auto prepare_f32_bias(const Tensor& bias, std::size_t n, std::vector<float>& dst) -> void {
+    dst.resize(n);
+    if (bias.dtype() == DType::F32) {
+        const auto src = require(std::as_const(bias).data<float>());
+        if (src.size() == 1)
+            std::ranges::fill(dst, src[0]);
+        else
+            std::ranges::copy(src, dst.begin());
+    } else {
+        const auto raw = require(std::as_const(bias).host_bytes());
+        const auto* src = reinterpret_cast<const std::uint16_t*>(raw.data());
+        if (bias.numel() == 1) {
+            float val = 0.F;
+            ::ynn::convert_bf16_to_f32_rows(1, 1, src, 1, &val, 1, 0, 1);
+            std::ranges::fill(dst, val);
+        } else {
+            ::ynn::convert_bf16_to_f32_rows(1, n, src, n, dst.data(), n, 0, 1);
+        }
+    }
+}
+
 class DenseLinearOp final : public Operator {
 public:
     static auto supports(const OperatorSpec& spec, TensorInputs inputs) noexcept -> bool {
@@ -1644,7 +1666,7 @@ public:
         }
 
         if (inputs.size() == 3 && !spec.dynamic_parameters) {
-            prepare_bias(inputs[2], bias_f32_);
+            prepare_f32_bias(inputs[2], n_, bias_f32_);
         }
     }
 
@@ -1660,27 +1682,6 @@ public:
     auto allocations() const -> AllocationStats override { return pool_.allocations(); }
 
 private:
-    auto prepare_bias(const Tensor& bias, std::vector<float>& dst) const -> void {
-        dst.resize(n_);
-        if (bias.dtype() == DType::F32) {
-            const auto src = require(std::as_const(bias).data<float>());
-            if (src.size() == 1)
-                std::ranges::fill(dst, src[0]);
-            else
-                std::ranges::copy(src, dst.begin());
-        } else {
-            const auto raw = require(std::as_const(bias).host_bytes());
-            const auto* src = reinterpret_cast<const std::uint16_t*>(raw.data());
-            if (bias.numel() == 1) {
-                float val = 0.F;
-                ::ynn::convert_bf16_to_f32_rows(1, 1, src, 1, &val, 1, 0, 1);
-                std::ranges::fill(dst, val);
-            } else {
-                ::ynn::convert_bf16_to_f32_rows(1, n_, src, n_, dst.data(), n_, 0, 1);
-            }
-        }
-    }
-
     auto run_one_matrix(const void* a_ptr, DType a_dtype, const void* packed_b, const float* bias_ptr, float* out_f32)
         -> void {
         const std::size_t a_elem_bytes = tensor::element_size(b_dtype_);
@@ -1729,7 +1730,7 @@ private:
         auto* out_raw = require(output.host_bytes()).data();
         const float* bias_ptr = nullptr;
         if (inputs.size() == 3) {
-            if (bias_f32_.empty()) prepare_bias(inputs[2], dynamic_bias_f32_);
+            if (bias_f32_.empty()) prepare_f32_bias(inputs[2], n_, dynamic_bias_f32_);
             bias_ptr = bias_f32_.empty() ? dynamic_bias_f32_.data() : bias_f32_.data();
         }
 
@@ -1879,7 +1880,7 @@ public:
             check(::ynn::make_dense_linear_plan(ynn_type_int8, ynn_type_int8, ynn_type_int32, n_, k_, &plan_));
         if (!spec.dynamic_parameters) {
             prepare_scales(inputs[2], w_scales_);
-            if (inputs.size() == 4) prepare_bias(inputs[3], bias_f32_);
+            if (inputs.size() == 4) prepare_f32_bias(inputs[3], n_, bias_f32_);
         }
     }
 
@@ -1902,27 +1903,6 @@ private:
             std::ranges::fill(dst, src[0]);
         else
             std::ranges::copy(src, dst.begin());
-    }
-
-    auto prepare_bias(const Tensor& bias, std::vector<float>& dst) const -> void {
-        dst.resize(n_);
-        if (bias.dtype() == DType::F32) {
-            const auto src = require(std::as_const(bias).data<float>());
-            if (src.size() == 1)
-                std::ranges::fill(dst, src[0]);
-            else
-                std::ranges::copy(src, dst.begin());
-        } else {
-            const auto raw = require(std::as_const(bias).host_bytes());
-            const auto* src = reinterpret_cast<const std::uint16_t*>(raw.data());
-            if (bias.numel() == 1) {
-                float val = 0.F;
-                ::ynn::convert_bf16_to_f32_rows(1, 1, src, 1, &val, 1, 0, 1);
-                std::ranges::fill(dst, val);
-            } else {
-                ::ynn::convert_bf16_to_f32_rows(1, n_, src, n_, dst.data(), n_, 0, 1);
-            }
-        }
     }
 
     auto apply(TensorInputs inputs, Tensor& output) -> void {
@@ -1955,7 +1935,7 @@ private:
 
         const float* bias_ptr = nullptr;
         if (inputs.size() == 4) {
-            if (bias_f32_.empty()) prepare_bias(inputs[3], dynamic_bias_f32_);
+            if (bias_f32_.empty()) prepare_f32_bias(inputs[3], n_, dynamic_bias_f32_);
             bias_ptr = bias_f32_.empty() ? dynamic_bias_f32_.data() : bias_f32_.data();
         }
 
@@ -2713,6 +2693,239 @@ private:
     OutputPool pool_;
 };
 
+class VqExpertOp final : public Operator {
+public:
+    VqExpertOp(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
+        : gated_(spec.attributes[0] != 0),
+          gate_cap_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[1]))),
+          up_cap_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]))),
+          format_(static_cast<ops::BlockScaledFormat>(spec.attributes[3])),
+          dim_(format_ == ops::BlockScaledFormat::VQ3D ? 3 : 4),
+          out_dtype_(spec.dtype),
+          pool_(&arena) {
+        const auto& routes = inputs[4];
+        const auto tokens = static_cast<std::int64_t>(routes.size(0));
+        const auto top = static_cast<std::int64_t>(routes.size(1));
+        const auto rows = static_cast<std::int64_t>(inputs[1].size(1));
+        if (gated_)
+            shape_ = {tokens, top, rows / 2};
+        else
+            shape_ = {tokens, rows};
+    }
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, out_dtype_, tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "VQ expert projection is not an in-place operation"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    auto apply(TensorInputs inputs, Tensor& output) const -> void {
+        const auto& routes = inputs[4];
+        const auto tokens = static_cast<std::size_t>(routes.size(0));
+        const auto top = static_cast<std::size_t>(routes.size(1));
+        const auto rows = static_cast<std::size_t>(inputs[1].size(1));
+        const auto cols = static_cast<std::size_t>(inputs[0].size(-1));
+        const auto k_pad = ::ynn::vq_padded_cols(dim_, cols);
+        const auto had_col = ::ynn::vq_col_hadamard_block(cols);
+        const auto had_row = ::ynn::vq_row_hadamard_block(rows);
+        const auto row_codes = static_cast<std::size_t>(inputs[1].size(2));
+        const auto row_groups = static_cast<std::size_t>(inputs[2].size(2));
+
+        const auto in_f32 = require(inputs[0].data<float>());
+        const auto values = require(inputs[1].data<std::uint8_t>());
+        const auto scales = require(inputs[2].data<std::uint8_t>());
+        const auto global = require(inputs[3].data<float>());
+        const auto route_vals = require(routes.data<float>());
+        auto out_f32 = require(output.data<float>());
+
+        const auto in_rows = gated_ ? tokens : (tokens * top);
+        std::vector<float> x_rot(in_rows * k_pad, 0.0F);
+        for (std::size_t r = 0; r < in_rows; ++r) {
+            std::memcpy(x_rot.data() + r * k_pad, in_f32.data() + r * cols, cols * sizeof(float));
+            if (had_col) ::ynn::hadamard_transform_rows_f32(x_rot.data() + r * k_pad, 1, cols, had_col);
+        }
+
+        const auto run_expert_matvec = [&](std::size_t expert, const float* xr, float* dst) {
+            const auto* v = values.data() + expert * rows * row_codes;
+            const auto* s = scales.data() + expert * rows * row_groups;
+            const auto* g = global.data() + expert * rows;
+            ::ynn::vq_linear_rotated_f32(dim_, 1, rows, cols, xr, v, s, g, dst, 0, rows);
+        };
+
+        if (gated_) {
+            const auto hidden = rows / 2;
+            const auto pairs = tokens * top;
+            require(ynn::parallel_ranges(pairs, 1, [&](std::size_t p0, std::size_t p1) {
+                std::vector<float> y_tmp(rows);
+                for (std::size_t p = p0; p < p1; ++p) {
+                    const auto t = p / top;
+                    const auto expert = static_cast<std::size_t>(route_vals[p * 2]);
+                    const float weight = route_vals[p * 2 + 1];
+                    run_expert_matvec(expert, x_rot.data() + t * k_pad, y_tmp.data());
+                    if (had_row) ::ynn::hadamard_transform_rows_f32(y_tmp.data(), 1, rows, had_row);
+                    float* dst = out_f32.data() + p * hidden;
+                    for (std::size_t i = 0; i < hidden; ++i) {
+                        const float g = y_tmp[i];
+                        const float u = y_tmp[hidden + i];
+                        const float gc = std::tanh(g / gate_cap_) * gate_cap_;
+                        const float uc = std::tanh(u / up_cap_) * up_cap_;
+                        dst[i] = (gc / (1.0F + std::exp(-g))) * uc * weight;
+                    }
+                }
+            }));
+        } else {
+            require(ynn::parallel_ranges(tokens, 1, [&](std::size_t t0, std::size_t t1) {
+                std::vector<float> y_tmp(rows);
+                for (std::size_t t = t0; t < t1; ++t) {
+                    float* acc = out_f32.data() + t * rows;
+                    std::fill(acc, acc + rows, 0.0F);
+                    for (std::size_t slot = 0; slot < top; ++slot) {
+                        const auto p = t * top + slot;
+                        const auto expert = static_cast<std::size_t>(route_vals[p * 2]);
+                        run_expert_matvec(expert, x_rot.data() + p * k_pad, y_tmp.data());
+                        // Sum in rotated space (linear!) then un-rotate once after the top-k loop.
+                        for (std::size_t r = 0; r < rows; ++r) acc[r] += y_tmp[r];
+                    }
+                    if (had_row) ::ynn::hadamard_transform_rows_f32(acc, 1, rows, had_row);
+                }
+            }));
+        }
+    }
+
+    bool gated_;
+    float gate_cap_, up_cap_;
+    ops::BlockScaledFormat format_;
+    std::int32_t dim_;
+    DType out_dtype_;
+    std::vector<std::int64_t> shape_;
+    OutputPool pool_;
+};
+
+class BlockScaledLinear final : public Operator {
+public:
+    BlockScaledLinear(const OperatorSpec& spec, TensorInputs inputs, tensor::Arena& arena)
+        : gated_(spec.attributes[0] != 0),
+          gate_cap_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[1]))),
+          up_cap_(std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]))),
+          format_(static_cast<ops::BlockScaledFormat>(spec.attributes[3])),
+          group_(spec.attributes[4]),
+          group_shift_(spec.attributes[6]),
+          has_global_(spec.attributes[5] != 0),
+          pool_(&arena) {
+        shape_.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+        shape_.back() = static_cast<std::int64_t>(inputs[1].size(0) / (gated_ ? 2 : 1));
+    }
+    auto run(TensorInputs inputs) -> Tensor override {
+        auto output = pool_.acquire(shape_, inputs[0].dtype(), tensor::Device::cpu());
+        apply(inputs, output);
+        return output;
+    }
+    auto run_(TensorInputs, Tensor&) -> Tensor override {
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "block-scaled projection is not an in-place operation"});
+    }
+    auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { apply(inputs, outputs[0]); }
+    auto allocations() const -> AllocationStats override { return pool_.allocations(); }
+
+private:
+    static auto bfloat(float value) -> std::uint16_t {
+        auto bits = std::bit_cast<std::uint32_t>(value);
+        return static_cast<std::uint16_t>((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
+    }
+    auto apply(TensorInputs inputs, Tensor& output) const -> void {
+        static const auto e4m3 = [] {
+            std::array<float, 256> table{};
+            for (std::size_t byte = 0; byte < table.size(); ++byte) {
+                const int exponent = (byte >> 3) & 15, mantissa = byte & 7;
+                const float magnitude = exponent ? std::ldexp(1.F + mantissa / 8.F, exponent - 7) : mantissa / 512.F;
+                table[byte] = exponent == 15 && mantissa == 7 ? NAN : (byte & 128 ? -magnitude : magnitude);
+            }
+            return table;
+        }();
+        constexpr std::array<float, 16> e2m1{0, .5F, 1, 1.5F, 2, 3, 4, 6, -0.F, -.5F, -1, -1.5F, -2, -3, -4, -6};
+        const bool fp8 = format_ == ops::BlockScaledFormat::MXFP8, bf16 = inputs[0].dtype() == DType::BF16;
+        const auto width = inputs[0].size(-1), columns = output.size(-1);
+        const auto values = require(inputs[1].host_bytes()), scales = require(inputs[2].host_bytes());
+        const auto source = require(inputs[0].host_bytes());
+        auto destination = require(output.host_bytes());
+        const float global = has_global_ ? require(inputs[3].data<float>()).front() : 1.F;
+        const auto routing = gated_ ? require(inputs.back().data<float>()) : std::span<const float>{};
+        const auto decode = [&](std::size_t row, std::size_t column) {
+            const auto index = row * width + column;
+            const auto scale_index = group_shift_ >= 0 ? index >> group_shift_ : index / group_;
+            float scale;
+            const auto scale_type = inputs[2].dtype();
+            if (scale_type == DType::U8 || scale_type == DType::E4M3) {
+                const auto byte = std::to_integer<std::uint8_t>(scales[scale_index]);
+                scale = fp8 && scale_type == DType::U8
+                            ? (byte == 255 ? NAN : std::ldexp(1.F, static_cast<int>(byte) - 127))
+                            : e4m3[byte];
+            } else if (scale_type == DType::F32)
+                std::memcpy(&scale, scales.data() + scale_index * 4, 4);
+            else {
+                std::uint16_t bits;
+                std::memcpy(&bits, scales.data() + scale_index * 2, 2);
+                scale = scale_type == DType::F16 ? checkpoint::ggml::detail::fp16_to_fp32(bits)
+                                                 : std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16);
+            }
+            float value;
+            if (!fp8) {
+                const auto byte = std::to_integer<std::uint8_t>(values[index / 2]);
+                const auto code = column % 2 ? byte >> 4 : byte & 15;
+                value = format_ == ops::BlockScaledFormat::INT4 ? static_cast<float>(code < 8 ? code : code - 16)
+                                                                : e2m1[code];
+            } else {
+                value = e4m3[std::to_integer<std::uint8_t>(values[index])];
+            }
+            value *= scale;
+            value *= global;
+            return bf16 ? std::bit_cast<float>(static_cast<std::uint32_t>(bfloat(value)) << 16) : value;
+        };
+        require(ynn::parallel_ranges(output.numel(), 8, [&](std::size_t begin, std::size_t end) {
+            for (auto index = begin; index < end; ++index) {
+                const auto token = index / columns, row = index % columns * (gated_ ? 2 : 1);
+                float gate = 0, up = 0;
+                for (std::size_t column = 0; column < width; ++column) {
+                    const auto position = token * width + column;
+                    float activation;
+                    if (bf16) {
+                        std::uint16_t bits;
+                        std::memcpy(&bits, source.data() + position * 2, 2);
+                        activation = std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16);
+                    } else
+                        std::memcpy(&activation, source.data() + position * 4, 4);
+                    gate += activation * decode(row, column);
+                    if (gated_) up += activation * decode(row + 1, column);
+                }
+                if (gated_) {
+                    if (bf16) {
+                        gate = std::bit_cast<float>(static_cast<std::uint32_t>(bfloat(gate)) << 16);
+                        up = std::bit_cast<float>(static_cast<std::uint32_t>(bfloat(up)) << 16);
+                    }
+                    gate = std::tanh(gate / gate_cap_) * gate_cap_ / (1 + std::exp(-gate)) * std::tanh(up / up_cap_) *
+                           up_cap_ * routing[token];
+                }
+                if (bf16) {
+                    const auto bits = bfloat(gate);
+                    std::memcpy(destination.data() + index * 2, &bits, 2);
+                } else
+                    std::memcpy(destination.data() + index * 4, &gate, 4);
+            }
+        }));
+    }
+    bool gated_;
+    float gate_cap_, up_cap_;
+    ops::BlockScaledFormat format_;
+    std::int64_t group_, group_shift_;
+    bool has_global_;
+    std::vector<std::int64_t> shape_;
+    OutputPool pool_;
+};
+
 class CpuBackend final : public OperatorBackend {
 public:
     CpuBackend() { require(arena_.reserve(8 * 1024 * 1024)); }
@@ -2806,6 +3019,12 @@ public:
             }
             return std::make_unique<SymmetricPackedLinear>(spec, inputs[0], inputs[1], cached_tiles, arena_);
         }
+        if (spec.operation == Operation::BLOCK_SCALED_LINEAR)
+            return std::make_unique<BlockScaledLinear>(spec, inputs, arena_);
+        if (spec.operation == Operation::EXPERT_LINEAR && spec.attributes.size() >= 4 &&
+            (spec.attributes[3] == static_cast<std::int64_t>(ops::BlockScaledFormat::VQ3D) ||
+             spec.attributes[3] == static_cast<std::int64_t>(ops::BlockScaledFormat::VQ4D)))
+            return std::make_unique<VqExpertOp>(spec, inputs, arena_);
         if (PackedFeedForward::supports(spec, inputs))
             return std::make_unique<PackedFeedForward>(spec, inputs, feed_forward_cache_, arena_);
         if (DenseLinearOp::supports(spec, inputs)) {

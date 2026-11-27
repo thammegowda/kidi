@@ -91,6 +91,15 @@ auto Backend::clear(Storage& storage) const -> Result<void> {
     return copy_from_host(storage, 0, zeros);
 }
 
+auto Backend::copy_batch_from_host(Device, std::span<const HostTransfer> transfers) const -> Result<void> {
+    for (const auto& transfer : transfers) {
+        if (auto status = copy_from_host(*transfer.destination, transfer.destination_offset, transfer.source);
+            !status)
+            return std::unexpected(std::move(status.error()));
+    }
+    return {};
+}
+
 auto Backend::copy_to_host_later(const Storage& source, std::size_t source_offset,
                                  std::span<std::byte> destination) const -> Result<void> {
     return copy_to_host(source, source_offset, destination);

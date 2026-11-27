@@ -87,6 +87,9 @@ auto main(int argc, char** argv) -> int {
         const auto steps = argc >= 7 ? positive_integer(argv[6], "steps") : 32;
         const auto settings = nlohmann::json::parse(argc >= 8 ? argv[7] : "{}");
         if (!settings.is_object()) throw std::invalid_argument("OPTIONS_JSON must be an object");
+        // Optional outputs of the first repetition: "wav_out" (waveform) and "tokens_out" (audio-token IDs).
+        const auto wav_out = settings.value("wav_out", std::string{});
+        const auto tokens_out = settings.value("tokens_out", std::string{});
         kidi::runtime::ynn::set_thread_count(threads);
 
         const auto load_start = std::chrono::steady_clock::now();
@@ -130,7 +133,7 @@ auto main(int argc, char** argv) -> int {
             std::uint64_t generation_ns = 0, decode_ns = 0, preparation_ns = 0;
             std::size_t audio_tokens = 0, samples = 0, synthesized_chunks = 0;
             std::uint32_t sample_rate = 0;
-            const auto* waveform_output = repetition == 0 ? std::getenv("KIDI_TTS_WAV_OUT") : nullptr;
+            const auto* waveform_output = repetition == 0 ? wav_out.c_str() : nullptr;
             std::vector<float> waveform;
             options.on_chunk = [repetition](std::size_t index, std::size_t total) {
                 std::cerr << "kidi_tts_chunk|repetition=" << repetition << "|index=" << index << "|total=" << total
@@ -162,7 +165,7 @@ auto main(int argc, char** argv) -> int {
             else if (tokens != reference)
                 throw std::runtime_error("repeated deterministic synthesis changed audio tokens");
             if (repetition == 0) {
-                if (const auto* output = std::getenv("KIDI_TTS_TOKENS_OUT"); output && *output) {
+                if (const auto* output = tokens_out.c_str(); *output) {
                     std::ofstream stream(output);
                     if (!stream) throw std::runtime_error("cannot create token output: " + std::string(output));
                     for (std::size_t index = 0; index < tokens.size(); ++index)

@@ -1,15 +1,22 @@
 #include "kidi/graph/compiler.h"
+// Runs serial and scheduled generation using checkpoint metadata and the causal-model interface.
 #include "kidi/inference/generator.h"
 #include <cstring>
 #include "kidi/core/memory.h"
 #include "kidi/image/gemma4.h"
 #include "kidi/model/gemma4_assistant.h"
 #include "kidi/model/gemma4_vision.h"
+#include "kidi/model/inkling2.h"
 #include "kidi/model/registry.h"
 #include "kidi/runtime/operator.h"
 #include "kidi/tensor/backend.h"
 #include "kidi/checkpoint/config.h"
 
+#include <bit>
+#include <cmath>
+#include <random>
+#include <span>
+#include <vector>
 #include <chrono>
 #include <optional>
 #include <cstdlib>
@@ -25,6 +32,14 @@ namespace {
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t QNN_PREFILL_CAPTURE_TOKENS = 2048;
 constexpr std::size_t CPU_PREFILL_BUCKET = 128;
+/// Compute policy after load-time packing: Q4 and Q8 run the native packed kernels, except that CUDA Q8 keeps BF16
+/// activations (W8A16).
+auto runtime_precision(core::InferencePrecision precision, tensor::Device device) -> core::InferencePrecision {
+    if (precision == core::InferencePrecision::Q4 ||
+        (precision == core::InferencePrecision::Q8 && device.kind != tensor::DeviceKind::CUDA))
+        return core::InferencePrecision::CHECKPOINT;
+    return precision;
+}
 auto uses_padded_prefill(const std::shared_ptr<model::CausalLanguageModel>& model) -> bool {
 #if defined(__EMSCRIPTEN__)
     (void)model;
@@ -43,6 +58,112 @@ auto elapsed(Clock::time_point start) -> std::uint64_t {
 auto should_capture_prefill(std::string_view accelerator, std::size_t prompt_tokens) -> bool {
     return accelerator != "qnn-htp" || prompt_tokens >= QNN_PREFILL_CAPTURE_TOKENS;
 }
+
+auto parameter_dtype(const YAML::Node& config, const checkpoint::Weights& weights) -> tensor::DType {
+    for (const auto* key : {"dtype", "torch_dtype"}) {
+        const auto declared = config[key];
+        if (!declared || declared.IsNull()) continue;
+        const auto name = declared.as<std::string>();
+        if (name == "bfloat16" || name == "bf16" || name == "BF16") return tensor::DType::BF16;
+        if (name == "float16" || name == "fp16" || name == "F16") return tensor::DType::F16;
+        if (name == "float32" || name == "fp32" || name == "F32") return tensor::DType::F32;
+        throw ops::Failure({ErrorCode::INVALID_MANIFEST, "unsupported checkpoint parameter dtype: " + name});
+    }
+    // Older exports omit dtype. The largest uncompressed floating tensor avoids picking small FP32 scales/norms
+    // in an otherwise BF16 checkpoint, without depending on an architecture's tensor names.
+    std::optional<tensor::DType> dtype;
+    std::size_t largest = 0;
+    for (const auto& name : weights.names()) {
+        const auto value = require(weights.tensor(name));
+        if (value.dtype() != tensor::DType::F32 && value.dtype() != tensor::DType::F16 &&
+            value.dtype() != tensor::DType::BF16)
+            continue;
+        if (value.nbytes() > largest) {
+            largest = value.nbytes();
+            dtype = value.dtype();
+        }
+    }
+    if (!dtype)
+        throw ops::Failure({ErrorCode::INVALID_MANIFEST,
+                            "checkpoint requires dtype or torch_dtype when it has no floating parameters"});
+    return *dtype;
+}
+
+auto validate_text_chat(const nlohmann::ordered_json& messages) -> Result<void> {
+    if (!messages.is_array() || messages.empty())
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "messages must be a nonempty array"});
+    for (const auto& message : messages) {
+        if (!message.is_object() || !message.contains("role") || !message["role"].is_string())
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "each message must have a string role"});
+        if (message.contains("images"))
+            return std::unexpected(Error{ErrorCode::UNSUPPORTED, "structured chat generation is text-only"});
+        if (!message.contains("content") || message["content"].is_null() || message["content"].is_string()) continue;
+        const auto& content = message["content"];
+        if (!content.is_array())
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "message content must be text, null or an array"});
+        for (const auto& part : content) {
+            if (part.is_string()) continue;
+            if (!part.is_object() || !part.contains("type") || !part["type"].is_string() ||
+                (part["type"] != "text" && part["type"] != "input_text") || !part.contains("text") ||
+                !part["text"].is_string())
+                return std::unexpected(Error{ErrorCode::UNSUPPORTED, "structured chat generation is text-only"});
+        }
+    }
+    return {};
+}
+
+auto format_text_chat(const text::Tokenizer& tokenizer, const nlohmann::ordered_json& messages,
+                      const nlohmann::ordered_json& template_args) -> Result<std::string> {
+    if (auto valid = validate_text_chat(messages); !valid) return std::unexpected(std::move(valid.error()));
+    return tokenizer.format_chat(messages, template_args);
+}
+
+auto sampled(const GenerationOptions& options) -> bool { return options.temperature > 0; }
+
+// Temperature, top-k and top-p sampling over the last logits row. Tokens far below the best logit cannot be drawn
+// at any useful precision, so only the plausible candidates are sorted.
+auto sample_token(const model::LanguageModel& model, const tensor::Tensor& logits, const GenerationOptions& options,
+                  std::mt19937_64& random) -> std::int32_t {
+    ops::Context context(logits.device());
+    auto values = context.cast(logits, tensor::DType::F32);
+    context.synchronize();
+    const auto host = require(values.to(tensor::Device::cpu()));
+    const auto data = require(host.data<float>());
+    const auto vocabulary = static_cast<std::size_t>(model.vocabulary_size());
+    if (!vocabulary || data.size() < vocabulary || data.size() % vocabulary)
+        throw ops::Failure({ErrorCode::RUNTIME, "unexpected logits shape for sampling"});
+    const auto row = std::span(data).last(vocabulary);
+    float best = -std::numeric_limits<float>::infinity();
+    for (const auto value : row)
+        if (std::isfinite(value)) best = std::max(best, value);
+    if (!std::isfinite(best)) throw ops::Failure({ErrorCode::RUNTIME, "no finite logits to sample from"});
+    struct Candidate {
+        std::int32_t token;
+        double weight;
+    };
+    std::vector<Candidate> candidates;
+    for (std::size_t token = 0; token < vocabulary; ++token)
+        if (const auto scaled = (static_cast<double>(row[token]) - best) / options.temperature;
+            std::isfinite(row[token]) && scaled > -30)
+            candidates.push_back({static_cast<std::int32_t>(token), std::exp(scaled)});
+    std::ranges::sort(candidates, std::ranges::greater{}, &Candidate::weight);
+    if (options.top_k && candidates.size() > options.top_k) candidates.resize(options.top_k);
+    double total = 0;
+    for (const auto& candidate : candidates) total += candidate.weight;
+    if (options.top_p < 1) {
+        double kept = 0;
+        std::size_t count = 0;
+        while (count < candidates.size() && (count == 0 || kept < options.top_p * total))
+            kept += candidates[count++].weight;
+        candidates.resize(count);
+        total = kept;
+    }
+    auto draw = std::uniform_real_distribution<double>(0, total)(random);
+    for (const auto& candidate : candidates)
+        if ((draw -= candidate.weight) < 0) return candidate.token;
+    return candidates.back().token;
+}
+
 } // namespace
 
 struct Generator::DraftBackend {
@@ -65,18 +186,26 @@ struct Generator::DraftBackend {
     }
 
     auto step(model::LanguageModel& target, model::LanguageModelState& state, tensor::Tensor& hidden,
-              GreedyState& search, std::size_t max_drafts, SpeculativeStats* stats) -> Result<SpeculativeStep> {
+              GreedyState& search, std::span<const std::int32_t> prompt, std::size_t max_drafts,
+              SpeculativeStats* stats) -> Result<SpeculativeStep> {
         tensor::Tensor verified_hidden, verified_tokens;
         std::size_t verify_position = 0;
         return search.step_speculative(
             max_drafts,
             [&](std::int32_t last_token, std::size_t limit, const GreedyState::StopPredicate& is_stop,
                 std::vector<std::int32_t>& drafts) {
-                return drafter->draft(target, hidden, last_token, state, limit, is_stop, drafts);
+                if (drafter) return drafter->draft(target, hidden, last_token, state, limit, is_stop, drafts);
+                std::vector<std::int32_t> history(prompt.begin(), prompt.end());
+                const auto& generated = search.result().token_ids;
+                history.insert(history.end(), generated.begin(), generated.end());
+                drafts = prompt_lookup(history, limit);
+                if (const auto stop = std::ranges::find_if(drafts, is_stop); stop != drafts.end())
+                    drafts.erase(stop + 1, drafts.end());
+                return Result<void>{};
             },
             [&](std::span<const std::int32_t> inputs) -> Result<TokenScores> {
                 verify_position = state.sequence_position();
-                auto tokens = target.select_token(inputs, state, true, &verified_hidden);
+                auto tokens = target.select_token(inputs, state, true, drafter ? &verified_hidden : nullptr);
                 if (!tokens) return std::unexpected(tokens.error());
                 verified_tokens = std::move(*tokens);
                 const auto selected = std::as_const(verified_tokens).data<std::int32_t>();
@@ -86,6 +215,7 @@ struct Generator::DraftBackend {
             [&](std::size_t committed_inputs) -> Result<void> {
                 if (const auto rewound = target.rewind(state, verify_position + committed_inputs); !rewound)
                     return rewound;
+                if (!drafter) return {};
                 const auto rows = verified_hidden.select(0, 0);
                 if (!rows) return std::unexpected(rows.error());
                 const auto row = rows->select(0, committed_inputs - 1);
@@ -105,31 +235,27 @@ struct Generator::DraftBackend {
 };
 
 Generator::Generator(YAML::Node config, text::Tokenizer tokenizer, std::shared_ptr<model::CausalLanguageModel> model,
-                     std::array<std::int32_t, 3> special, core::InferencePrecision precision,
-                     core::KVCachePrecision kv_cache_precision)
+                     GeneratorOptions options)
     : config_(std::move(config)),
       tokenizer_(std::move(tokenizer)),
       model_(std::move(model)),
-      special_(special),
-      precision_(precision),
-      kv_cache_precision_(kv_cache_precision) {}
+      options_(std::move(options)) {}
 Generator::Generator(Generator&&) noexcept = default;
 auto Generator::operator=(Generator&&) noexcept -> Generator& = default;
 Generator::~Generator() = default;
 auto Generator::load(const std::filesystem::path& directory, tensor::Device device, std::int32_t weight_bits,
                      std::int32_t group_size, bool packed_prefill, const ExternalTensorSource& external)
     -> Result<Generator> {
-    return load(directory,
-                {.device = device,
-                 .precision = core::InferencePrecision::CHECKPOINT,
-                 .kv_cache_precision = core::KVCachePrecision::AUTO,
-                 .weight_bits = weight_bits,
-                 .group_size = group_size,
-                 .packed_prefill = packed_prefill},
-                external);
+    return load_with_packing(directory, {.device = device, .packed_prefill = packed_prefill}, weight_bits, group_size,
+                             external);
 }
 auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions options,
                      const ExternalTensorSource& external) -> Result<Generator> {
+    return load_with_packing(directory, std::move(options), 0, 128, external);
+}
+auto Generator::load_with_packing(const std::filesystem::path& directory, ModelLoadOptions options,
+                                  std::int32_t weight_bits, std::int32_t group_size,
+                                  const ExternalTensorSource& external) -> Result<Generator> {
     try {
         auto config = require(checkpoint::load_config(directory));
         require(model::validate_model_config(config["model"]));
@@ -138,16 +264,23 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
                 std::min<std::size_t>(config["model"]["max_position_embeddings"].as<std::size_t>(16384), 16384);
             config["decode"]["maximum_new_tokens"] = 8192;
         }
-        const bool qat = static_cast<bool>(config["model"]["quantization_config"]);
-        if (!options.assistant_model.empty() && !options.device.capabilities().compute.host())
+        const bool qat = checkpoint::native_qat(config["model"]);
+        const bool speculative = !options.assistant_model.empty() || options.prompt_lookup;
+        if (options.prompt_lookup && !options.assistant_model.empty())
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "choose either prompt lookup or an assistant model"});
+        if (options.prompt_lookup && config["model"]["type"].as<std::string>() != "inkling2_text")
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "prompt lookup currently supports Inkling-2 targets only"});
+        if (!options.assistant_model.empty() && config["model"]["type"].as<std::string>() != "gemma4_text")
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "the current assistant model supports Gemma 4 targets only"});
+        if (speculative && !options.device.capabilities().compute.host())
             throw ops::Failure(
                 {ErrorCode::UNSUPPORTED, "speculative decoding currently requires CPU target execution"});
-        if (!options.assistant_model.empty() && (!options.draft_tokens || options.draft_tokens > MAX_DRAFT_TOKENS))
+        if (speculative && (!options.draft_tokens || options.draft_tokens > MAX_DRAFT_TOKENS))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
-                                "speculative decoding requires an assistant model and 1 to 16 draft tokens"});
-        if (options.assistant_model.empty() && options.draft_tokens != 3)
+                                "speculative decoding requires 1 to 16 draft tokens"});
+        if (!speculative && options.draft_tokens != 3)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
-                                "speculative decoding requires an assistant model and 1 to 16 draft tokens"});
+                                "draft tokens require an assistant model or prompt lookup"});
         std::filesystem::path lm_head_index;
         if (!options.dense_lm_head && options.device.capabilities().compute.host()) {
             const auto checkpoint_directory =
@@ -164,41 +297,81 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             }
         }
         const auto checkpoint_bf16 = !qat && options.precision == core::InferencePrecision::BF16;
+        const auto vq_mode = options.precision == core::InferencePrecision::VQ3D_HYBRID;
+        const auto model_type = config["model"]["type"].as<std::string>();
+        if (vq_mode && model_type != "inkling2_text")
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "vq3d-hybrid is currently an Inkling-2 precision"});
         const auto cuda_w8a16 =
-            options.device.kind == tensor::DeviceKind::CUDA && options.precision == core::InferencePrecision::Q8A16;
-        if (options.precision != core::InferencePrecision::CHECKPOINT && !qat && !checkpoint_bf16 && !cuda_w8a16)
-            throw ops::Failure(
-                {ErrorCode::UNSUPPORTED, "explicit projection precision currently requires a native QAT checkpoint"});
-        if (options.precision != core::InferencePrecision::CHECKPOINT && options.weight_bits)
-            throw ops::Failure(
-                {ErrorCode::INVALID_ARGUMENT, "precision and load-time weight packing cannot be combined"});
-        if (options.precision != core::InferencePrecision::CHECKPOINT && !checkpoint_bf16 && !cuda_w8a16 &&
+            options.device.kind == tensor::DeviceKind::CUDA && options.precision == core::InferencePrecision::Q8;
+        if (options.precision == core::InferencePrecision::Q4 || options.precision == core::InferencePrecision::Q8) {
+            // QAT weights keep their trained widths; only CUDA can run trained INT8 layers with BF16 activations.
+            if (qat && !cuda_w8a16)
+                throw ops::Failure(
+                    {ErrorCode::UNSUPPORTED, "QAT checkpoints keep their trained precision; use checkpoint"});
+            weight_bits = options.precision == core::InferencePrecision::Q4 ? 4 : (qat ? 0 : 8);
+            group_size = 128;
+        }
+        const auto precision = runtime_precision(options.precision, options.device);
+        if (options.precision == core::InferencePrecision::QAT_FP32 && !qat)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "qat-fp32 requires a native QAT checkpoint"});
+        if (precision != core::InferencePrecision::CHECKPOINT && !checkpoint_bf16 && !cuda_w8a16 &&
+            !(vq_mode &&
+              (options.device.kind == tensor::DeviceKind::CPU || options.device.kind == tensor::DeviceKind::A_GPU)) &&
             !options.device.capabilities().compute.host())
             throw ops::Failure(
                 {ErrorCode::UNSUPPORTED, "selected precision is currently implemented only by the CPU backend"});
-#if !defined(__APPLE__)
-        if (options.precision == core::InferencePrecision::LOWBIT_PARITY)
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "lowbit-parity currently requires Apple Accelerate"});
-#endif
-        if (options.kv_cache_precision == core::KVCachePrecision::INT8 && !qat)
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "INT8 KV cache requires a calibrated QAT checkpoint"});
+        if (options.kv_cache_precision == core::KVCachePrecision::INT8 && !qat && model_type != "inkling2_text")
+            throw ops::Failure(
+                {ErrorCode::UNSUPPORTED, "INT8 KV cache requires a calibrated QAT or Inkling-2 checkpoint"});
         auto tokenizer = [&] {
             const core::MemoryScope memory("load:tokenizer");
             return require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
         }();
-        if (tokenizer.vocabulary_size() != config["model"]["vocab_size"].as<std::size_t>())
-            throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Gemma 4 tokenizer vocabulary mismatch"});
-        std::array<std::int32_t, 3> special;
-        const std::array names{"<eos>", "<turn|>", "<pad>"};
-        for (std::size_t index = 0; index < names.size(); ++index) {
-            const auto token = tokenizer.token_id(names[index]);
-            if (!token)
-                throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Gemma 4 tokenizer lacks required special token"});
-            special[index] = *token;
+        const auto model_vocabulary = config["model"]["vocab_size"].as<std::size_t>();
+        if (!tokenizer.vocabulary_size() || tokenizer.vocabulary_size() > INT32_MAX ||
+            tokenizer.vocabulary_size() > model_vocabulary)
+            throw ops::Failure({ErrorCode::INVALID_MANIFEST, "tokenizer vocabulary mismatch"});
+        const auto tokenizer_tokens = require(tokenizer.special_tokens());
+        const auto generation = config["generation"];
+        const auto checked_id = [&](const YAML::Node& value) {
+            const auto id = value.as<std::int64_t>();
+            if (id < 0 || static_cast<std::size_t>(id) >= tokenizer.vocabulary_size())
+                throw ops::Failure(
+                    {ErrorCode::INVALID_MANIFEST, "generation token ID is outside the tokenizer vocabulary"});
+            return static_cast<std::int32_t>(id);
+        };
+        std::vector<std::int32_t> stops;
+        if (const auto eos = generation["eos_token_id"]; eos && !eos.IsNull()) {
+            if (eos.IsSequence()) {
+                for (const auto& value : eos) {
+                    const auto id = checked_id(value);
+                    if (!std::ranges::contains(stops, id)) stops.push_back(id);
+                }
+            } else {
+                stops.push_back(checked_id(eos));
+            }
+        } else if (tokenizer_tokens.eos) {
+            stops.push_back(*tokenizer_tokens.eos);
         }
-        if (!tokenizer.token_id("<bos>") || !tokenizer.token_id("<|turn>"))
-            throw ops::Failure({ErrorCode::INVALID_MANIFEST, "Gemma 4 tokenizer lacks chat delimiters"});
-        auto weights = require(checkpoint::Weights::load(config["weights_file"].as<std::string>()));
+        if (stops.empty())
+            throw ops::Failure({ErrorCode::INVALID_MANIFEST, "checkpoint requires at least one EOS token"});
+        const auto token_or = [&](const char* key, std::optional<std::int32_t> fallback) {
+            const auto value = generation[key];
+            return value && !value.IsNull() ? checked_id(value) : fallback.value_or(stops.front());
+        };
+        const auto pad = token_or("pad_token_id", tokenizer_tokens.pad);
+        const auto warmup = token_or("bos_token_id", tokenizer_tokens.bos);
+        auto weights_path = std::filesystem::path(config["weights_file"].as<std::string>());
+#if !defined(__EMSCRIPTEN__)
+        if (vq_mode) {
+            weights_path =
+                require(checkpoint::prepare(directory, model::Inkling2Impl::vq_preparation)) / "model.safetensors";
+        } else if (options.device.kind == tensor::DeviceKind::CPU && model_type == "inkling2_text" &&
+                   precision == core::InferencePrecision::CHECKPOINT && (weight_bits == 0 || weight_bits == 8))
+            weights_path =
+                require(checkpoint::prepare(directory, model::Inkling2Impl::int8_preparation)) / "model.safetensors";
+#endif
+        auto weights = require(checkpoint::Weights::load(weights_path));
         for (const auto& declared : config["external_tensors"]) {
             if (!external)
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "model declares external tensors but none were provided"});
@@ -213,13 +386,11 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             const auto shape = declared["shape"].as<std::vector<std::int64_t>>();
             require(weights.add(name, require(external(name, *dtype, shape))));
         }
-        const auto parameter = require(weights.tensor(config["model"]["quantization_config"]
-                                                          ? "model.language_model.norm.weight"
-                                                          : "model.language_model.embed_tokens.weight"));
-        if (checkpoint_bf16 && parameter.dtype() != tensor::DType::BF16)
+        const auto dtype = parameter_dtype(config["model"], weights);
+        if (checkpoint_bf16 && dtype != tensor::DType::BF16)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "BF16 execution requires BF16 checkpoint weights"});
-        if (cuda_w8a16 && !qat && parameter.dtype() != tensor::DType::BF16 && parameter.dtype() != tensor::DType::F16 &&
-            parameter.dtype() != tensor::DType::F32)
+        if (cuda_w8a16 && !qat && dtype != tensor::DType::BF16 && dtype != tensor::DType::F16 &&
+            dtype != tensor::DType::F32)
             throw ops::Failure(
                 {ErrorCode::INVALID_ARGUMENT, "W8A16 execution on unquantized checkpoints requires floating weights"});
         std::optional<ops::StepCompilerScope> accelerator;
@@ -229,13 +400,17 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             device = tensor::Device::cpu();
         }
         auto model = require(model::create_model_as<model::CausalLanguageModel>(
-            config["model"], {.device = device, .parameter_dtype = parameter.dtype()}));
+            config["model"], {.device = device, .parameter_dtype = dtype}));
+        if (static_cast<std::size_t>(model->vocabulary_size()) != tokenizer.vocabulary_size())
+            throw ops::Failure({ErrorCode::INVALID_MANIFEST,
+                                "model output vocabulary must match the tokenizer; "
+                                "padded embeddings require unpadded logits"});
         {
             const core::MemoryScope memory("load:bind_weights");
-            const auto effective_weight_bits = cuda_w8a16 && !qat ? std::int32_t{8} : options.weight_bits;
-            require(model->set_checkpoint(weights, {.weight_bits = effective_weight_bits,
-                                                    .group_size = options.group_size,
-                                                    .packed_prefill = options.packed_prefill}));
+            require(model->set_checkpoint(weights, {.weight_bits = weight_bits,
+                                                    .group_size = group_size,
+                                                    .packed_prefill = options.packed_prefill,
+                                                    .precision = precision}));
         }
 #if !defined(__EMSCRIPTEN__)
         if (uses_padded_prefill(model)) {
@@ -243,19 +418,25 @@ auto Generator::load(const std::filesystem::path& directory, ModelLoadOptions op
             model->configure_cache(cache_root / ".kidi-cache" / "ynn-gff-v1", config["weights_file"].as<std::string>());
         }
 #endif
-        model->set_precision(options.precision);
+        model->set_precision(precision);
         model->set_kv_cache_precision(options.kv_cache_precision);
         require(model->kv_cache_dtype(1));
-        if (!options.assistant_model.empty() && !model->accelerator().empty())
+        if (speculative && !model->accelerator().empty())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding requires a native CPU target"});
-        if (!lm_head_index.empty() && options.weight_bits)
+        if (!lm_head_index.empty() && weight_bits)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "HNSW head does not support load-time weight packing"});
         if (!lm_head_index.empty()) require(model->configure_lm_head(lm_head_index));
         std::unique_ptr<DraftBackend> drafter;
         if (!options.assistant_model.empty())
             drafter = require(DraftBackend::load(options.assistant_model, config["model"], device));
-        Generator result(std::move(config), std::move(tokenizer), std::move(model), special, options.precision,
-                         options.kv_cache_precision);
+        else if (options.prompt_lookup)
+            drafter = std::make_unique<DraftBackend>();
+        Generator result(std::move(config), std::move(tokenizer), std::move(model),
+                         {.stop_ids = std::move(stops),
+                          .pad_id = pad,
+                          .warmup_token_id = warmup,
+                          .precision = options.precision,
+                          .kv_cache_precision = options.kv_cache_precision});
         result.drafter_ = std::move(drafter);
         result.draft_tokens_ = result.drafter_ ? options.draft_tokens : 0;
         return result;
@@ -310,6 +491,23 @@ auto Generator::execution() const -> std::string {
     if (!accelerator.empty()) result += "+" + std::string(accelerator);
     return result;
 }
+auto Generator::prefill_logits(std::span<const std::int32_t> tokens) -> Result<tensor::Tensor> {
+    try {
+        if (tokens.empty())
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "prefill_logits requires at least one token"});
+        auto state = require(model_->create_state(tokens.size() + 1));
+        auto logits = require(model_->forward(tokens, *state, /*all_logits=*/true));
+        auto host = logits.is_host_accessible() ? std::move(logits) : require(logits.to(tensor::Device::cpu()));
+        if (host.dtype() != tensor::DType::F32) {
+            ops::Context cpu(tensor::Device::cpu(), false, false, tensor::DType::F32);
+            host = cpu.cast(host, tensor::DType::F32);
+        }
+        return host;
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    }
+}
+
 auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size) -> Result<void> {
     try {
         const auto maximum_context = config_["model"]["max_position_embeddings"].as<std::size_t>();
@@ -319,7 +517,7 @@ auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size
         const auto capacity = std::min(requested, CPU_PREFILL_BUCKET);
         const auto maximum =
             std::min(prefill_bucket(model_, model_->prefill_chunk_size(prefill_chunk_size)), requested - 1);
-        const auto token = *tokenizer_.token_id("<bos>");
+        const auto token = options_.warmup_token_id;
         if (uses_padded_prefill(model_)) {
             {
                 auto state = require(model_->create_state(std::max(capacity, maximum)));
@@ -335,7 +533,7 @@ auto Generator::warm_up(std::size_t prefill_chunk_size, std::size_t context_size
             prefill_warmed_ = true;
         } else {
             const bool reusable = model_->device().kind == tensor::DeviceKind::CUDA && !drafter_ &&
-                                  dynamic_cast<model::Gemma4Impl*>(model_.get());
+                                  model_->supports_state_recycling();
             auto state = require(model_->create_state(reusable ? requested : capacity));
             const std::array tokens{token};
             // The selected token is never read, so devices that finish asynchronously need no wait here.
@@ -398,6 +596,10 @@ auto Generator::memory() const -> GeneratorMemory {
     for (const auto& image : images_) result.image_bytes += image.embeddings.nbytes();
     return result;
 }
+auto Generator::user_prompt(std::string_view prompt) const -> std::string {
+    return require(tokenizer_.format_chat(
+        nlohmann::ordered_json::array({{{"role", "user"}, {"content", std::string(prompt)}}})));
+}
 auto Generator::require_immediate_tokens() const -> void {
     if (model_->device().capabilities().memory.deferred())
         throw ops::Failure({ErrorCode::UNSUPPORTED,
@@ -443,9 +645,7 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
         TextGeneration result;
         result.stats.last_token_prefill = model_->last_token_prefill();
         result.stats.shared_prefill_tail = model_->shared_prefill_tail();
-        const auto serialized = options.raw_prompt
-                                    ? std::string(prompt)
-                                    : "<bos><|turn>user\n" + std::string(prompt) + "<turn|>\n<|turn>model\n";
+        const auto serialized = options.raw_prompt ? std::string(prompt) : user_prompt(prompt);
         const auto tokens = require(tokenizer_.encode(serialized));
         result.stats.tokenize_ns = elapsed(started);
         result.stats.prompt_tokens = tokens.size();
@@ -478,13 +678,12 @@ auto Generator::generate(std::string_view prompt, GenerationOptions options) -> 
                                        options.prefix_cache_bytes / bytes_per_token / options.prefill_chunk_size) *
                                   options.prefill_chunk_size
                             : 0;
-        const std::array extra_stops{special_[1]};
         const SearchOptions search{.vocabulary_size = tokenizer_.vocabulary_size(),
-                                   .end_id = special_[0],
-                                   .pad_id = special_[2],
+                                   .end_id = options_.stop_ids.front(),
+                                   .pad_id = options_.pad_id,
                                    .maximum_steps = maximum,
                                    .compute_score = false,
-                                   .stop_ids = extra_stops,
+                                   .stop_ids = options_.stop_ids,
                                    .stop_on_eos = !options.ignore_eos};
         tensor::Tensor storage;
         std::optional<std::int32_t> selected;
@@ -572,13 +771,12 @@ auto Generator::generate_batch(std::span<const std::string> prompts, GenerationO
                                                         : config_["decode"]["maximum_new_tokens"].as<std::size_t>();
         const auto capacity =
             options.context_size ? options.context_size : config_["decode"]["context_size"].as<std::size_t>();
-        const std::array extra_stops{special_[1]};
         const SearchOptions search{.vocabulary_size = tokenizer_.vocabulary_size(),
-                                   .end_id = special_[0],
-                                   .pad_id = special_[2],
+                                   .end_id = options_.stop_ids.front(),
+                                   .pad_id = options_.pad_id,
                                    .maximum_steps = maximum,
                                    .compute_score = false,
-                                   .stop_ids = extra_stops,
+                                   .stop_ids = options_.stop_ids,
                                    .stop_on_eos = !options.ignore_eos};
         GenerationBatch result;
         result.rows.resize(prompts.size());
@@ -587,8 +785,7 @@ auto Generator::generate_batch(std::span<const std::string> prompts, GenerationO
         std::vector<std::int32_t> chosen(prompts.size()), seeds(prompts.size());
         for (std::size_t row = 0; row < prompts.size(); ++row) {
             const auto tokenizing = Clock::now();
-            const auto text =
-                options.raw_prompt ? prompts[row] : "<bos><|turn>user\n" + prompts[row] + "<turn|>\n<|turn>model\n";
+            const auto text = options.raw_prompt ? prompts[row] : user_prompt(prompts[row]);
             const auto tokens = require(tokenizer_.encode(text));
             auto& stats = result.rows[row].stats;
             stats.tokenize_ns = elapsed(tokenizing);
@@ -734,7 +931,7 @@ auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, Genera
                         auto vision = model::Gemma4Vision(config_["vision"], model_->hidden_size(), native_qat());
                         auto weights = require(checkpoint::Weights::load(config_["weights_file"].as<std::string>()));
                         require(vision->set_checkpoint(weights));
-                        vision->set_precision(precision_);
+                        vision->set_precision(runtime_precision(options_.precision, model_->device()));
                         vision_ = vision.ptr();
                     }
                     if (options.on_image_progress) options.on_image_progress("Encoding images");
@@ -800,6 +997,53 @@ auto Generator::chat_prompt_tokens(std::span<const text::ChatMessage> messages) 
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
+auto Generator::enqueue_chat(const nlohmann::ordered_json& messages, GenerationOptions options,
+                              const nlohmann::ordered_json& template_args) -> Result<std::uint64_t> {
+    auto prompt = format_text_chat(tokenizer_, messages, template_args);
+    if (!prompt) return std::unexpected(std::move(prompt.error()));
+    options.raw_prompt = true;
+    return enqueue(*prompt, options);
+}
+
+auto Generator::chat_prompt_tokens(const nlohmann::ordered_json& messages,
+                                   const nlohmann::ordered_json& template_args) const -> Result<std::size_t> {
+    auto prompt = format_text_chat(tokenizer_, messages, template_args);
+    if (!prompt) return std::unexpected(std::move(prompt.error()));
+    auto ids = tokenizer_.encode(*prompt);
+    if (!ids) return std::unexpected(std::move(ids.error()));
+    return ids->size();
+}
+
+auto Generator::context_capacity(GenerationOptions options) const -> Result<std::size_t> {
+    const auto capacity =
+        options.context_size ? options.context_size : config_["decode"]["context_size"].as<std::size_t>();
+    if (!serving_ || !capacity || capacity > serving_->cache_token_budget ||
+        capacity > config_["model"]["max_position_embeddings"].as<std::size_t>())
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "request exceeds serving context budget"});
+    return capacity;
+}
+
+auto Generator::fit_context_size(std::size_t memory_bytes) -> Result<std::size_t> {
+    try {
+        const auto maximum = config_["model"]["max_position_embeddings"].as<std::size_t>();
+        // Two sizes give the marginal per-token cost, excluding fixed and sliding-window state.
+        constexpr std::size_t SMALL = 4096, LARGE = 8192;
+        if (maximum <= LARGE) return maximum;
+        const auto small = require(model_->create_state(SMALL))->cache_bytes();
+        const auto large = require(model_->create_state(LARGE))->cache_bytes();
+        if (large <= small) return maximum;
+        const auto per_token = (large - small + LARGE - SMALL - 1) / (LARGE - SMALL);
+        const auto fixed = small > per_token * SMALL ? small - per_token * SMALL : 0;
+        if (memory_bytes <= fixed + per_token * SMALL)
+            throw ops::Failure({ErrorCode::RUNTIME, "not enough free memory for a 4096-token context"});
+        return std::min(maximum, (memory_bytes - fixed) / per_token) / 1024 * 1024;
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::RUNTIME, error.what()});
+    }
+}
+
 auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> Result<std::uint64_t> {
     try {
         options.prefill_chunk_size = model_->prefill_chunk_size(options.prefill_chunk_size);
@@ -807,35 +1051,33 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
             next_request_id_ == std::numeric_limits<std::uint64_t>::max())
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "serving queue is unavailable or full"});
         const auto started = Clock::now();
-        const auto maximum = options.maximum_new_tokens ? options.maximum_new_tokens
-                                                        : config_["decode"]["maximum_new_tokens"].as<std::size_t>();
-        auto capacity =
-            options.context_size ? options.context_size : config_["decode"]["context_size"].as<std::size_t>();
-        if (!maximum || !options.prefill_chunk_size || !capacity || capacity > serving_->cache_token_budget ||
-            capacity > config_["model"]["max_position_embeddings"].as<std::size_t>())
+        auto maximum = options.maximum_new_tokens ? options.maximum_new_tokens
+                                                  : config_["decode"]["maximum_new_tokens"].as<std::size_t>();
+        auto capacity = require(context_capacity(options));
+        if (!maximum || !options.prefill_chunk_size)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "request exceeds serving context budget"});
-        const auto serialized = options.raw_prompt
-                                    ? std::string(prompt)
-                                    : "<bos><|turn>user\n" + std::string(prompt) + "<turn|>\n<|turn>model\n";
+        const auto serialized = options.raw_prompt ? std::string(prompt) : user_prompt(prompt);
         auto tokens = require(tokenizer_.encode(serialized));
         if (options.maximum_prompt_tokens && tokens.size() > options.maximum_prompt_tokens)
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prompt exceeds the configured input-token limit"});
-        if (tokens.empty() || tokens.size() >= capacity || maximum > capacity - tokens.size())
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prompt and generation must fit the reserved context"});
+        if (tokens.empty() || tokens.size() >= capacity)
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prompt exceeds the reserved context"});
+        maximum = std::min(maximum, capacity - tokens.size());
+        options.maximum_new_tokens = maximum;
         if (serving_->compact_cache) {
             auto required = tokens.size() + maximum;
             const auto byte_cache_limit = model_->device().capabilities().attention.int8_cache_tokens;
             if (capacity > byte_cache_limit) required = std::max(required, byte_cache_limit + 1);
-            capacity = std::min(capacity, required + (128 - required % 128) % 128);
+            // Power-of-two buckets let growing conversations reuse states and captured decode graphs.
+            capacity = std::min(capacity, std::bit_ceil(std::max<std::size_t>(required, 128)));
         }
         if (options.prefix_cache_bytes) tokens.reserve(capacity);
-        const std::array extra_stops{special_[1]};
         auto search = require(GreedyState::create({.vocabulary_size = tokenizer_.vocabulary_size(),
-                                                   .end_id = special_[0],
-                                                   .pad_id = special_[2],
+                                                   .end_id = options_.stop_ids.front(),
+                                                   .pad_id = options_.pad_id,
                                                    .maximum_steps = maximum,
                                                    .compute_score = false,
-                                                   .stop_ids = extra_stops,
+                                                   .stop_ids = options_.stop_ids,
                                                    .stop_on_eos = !options.ignore_eos}));
         GenerationStats stats;
         stats.tokenize_ns = elapsed(started);
@@ -843,9 +1085,12 @@ auto Generator::enqueue(std::string_view prompt, GenerationOptions options) -> R
         stats.device_selection = model_->device().capabilities().sampling.supports(tensor::TokenSelection::DEVICE);
         stats.last_token_prefill = model_->last_token_prefill();
         stats.shared_prefill_tail = model_->shared_prefill_tail();
-        stats.speculative = static_cast<bool>(drafter_);
+        stats.speculative = static_cast<bool>(drafter_) && !sampled(options);
+        if (drafter_ && !drafter_->drafter && sampled(options))
+            throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding currently requires temperature 0"});
         waiting_.push_back(
             {next_request_id_, std::move(tokens), capacity, options, std::move(search), {}, stats, started, {}});
+        waiting_.back().random.seed(options.seed ? *options.seed : std::random_device{}());
         return next_request_id_++;
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
@@ -897,15 +1142,18 @@ auto Generator::acquire_state(std::size_t capacity) -> std::unique_ptr<model::La
         return state;
     }
     reusable_states_.clear();
+    // Captured graphs and workspaces are sized per capacity; drop stale ones so variable capacities do not pile up.
+    if (serving_ && serving_->compact_cache && model_->device().kind == tensor::DeviceKind::CUDA && running_.empty() &&
+        retired_.empty() && !serving_prefix_)
+        model_->trim_workspaces();
     return require(model_->create_state(capacity));
 }
 
 auto Generator::recycle_state(std::unique_ptr<model::LanguageModelState>& state, bool has_images) -> void {
-    // Gemma's rewind synchronizes queued GPU work and restores its prefill state. Image-bearing and speculative
-    // states are not reused: they carry additional request-specific state beyond the KV cache.
+    // Image-bearing and speculative states are not reused: they carry additional request-specific state.
     const auto maximum = serving_ ? serving_->maximum_active : 1;
     if (!state || model_->device().kind != tensor::DeviceKind::CUDA || drafter_ ||
-        !dynamic_cast<model::Gemma4Impl*>(model_.get()) || has_images || reusable_states_.size() >= maximum)
+        !model_->supports_state_recycling() || has_images || reusable_states_.size() >= maximum)
         return;
     std::size_t capacity = state->sequence_capacity();
     const auto budget = serving_ ? serving_->cache_token_budget : capacity;
@@ -953,17 +1201,42 @@ auto Generator::step() -> Result<GenerationStep> {
                    waiting_.front().capacity <= serving_->cache_token_budget - reserved_cache_tokens_) {
                 auto& request = waiting_.front();
                 const auto chunk = std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step);
+                const auto retained_capacity =
+                    serving_prefix_ ? serving_prefix_->state->sequence_capacity() : std::size_t{0};
+                const bool fits = retained_capacity == request.capacity ||
+                                  (serving_->compact_cache && retained_capacity > request.capacity &&
+                                   retained_capacity <= serving_->cache_token_budget - reserved_cache_tokens_);
+                const bool can_grow = serving_->compact_cache && retained_capacity < request.capacity;
                 if (serving_prefix_ && request.options.prefix_cache_bytes >= serving_prefix_->bytes &&
-                    request.image_key == serving_prefix_->image_key &&
-                    request.capacity == serving_prefix_->state->sequence_capacity() &&
+                    request.image_key == serving_prefix_->image_key && (fits || can_grow) &&
                     chunk == serving_prefix_->chunk_size &&
                     serving_prefix_->crop_local_attention == !request.options.full_attention_cache) {
                     const auto limit = std::min(serving_prefix_->tokens.size(), request.prompt.size() - 1);
                     std::size_t common = 0;
                     while (common < limit && serving_prefix_->tokens[common] == request.prompt[common]) ++common;
-                    request.stats.reused_prompt_tokens = common;
-                    request.state = std::move(serving_prefix_->state);
-                    require(model_->rewind(*request.state, common));
+                    auto& cached = *serving_prefix_->state;
+                    common = model_->rewind_floor(cached, common);
+                    bool reuse = fits;
+                    if (can_grow && common) {
+                        auto grown = model_->grow_state(cached, request.capacity);
+                        if (!grown && grown.error().code != ErrorCode::UNSUPPORTED) throw ops::Failure(grown.error());
+                        reuse = grown.has_value();
+                    }
+                    if (reuse) {
+                        auto rewound = model_->rewind(cached, common);
+                        // Some recurrent states can reuse only the allocation, not the prefix.
+                        if (!rewound && rewound.error().code == ErrorCode::UNSUPPORTED && common) {
+                            common = 0;
+                            rewound = model_->rewind(cached, 0);
+                        }
+                        if (rewound) {
+                            request.stats.reused_prompt_tokens = common;
+                            request.capacity = cached.sequence_capacity();
+                            request.state = std::move(serving_prefix_->state);
+                        } else if (rewound.error().code != ErrorCode::UNSUPPORTED) {
+                            throw ops::Failure(rewound.error());
+                        }
+                    }
                 }
                 serving_prefix_.reset();
                 if (!request.state) request.state = acquire_state(request.capacity);
@@ -985,9 +1258,16 @@ auto Generator::step() -> Result<GenerationStep> {
             });
         };
         const auto complete = [&](QueuedGeneration& request) {
-            if (request.decode && request.state)
-                require(model_->rewind(*request.state, request.decode->logical_position));
-            retain_serving_prefix(request);
+            bool retain_prefix = true;
+            if (request.decode && request.state) {
+                const auto rewound = model_->rewind(
+                    *request.state, model_->rewind_floor(*request.state, request.decode->logical_position));
+                if (!rewound) {
+                    if (rewound.error().code != ErrorCode::UNSUPPORTED) throw ops::Failure(rewound.error());
+                    retain_prefix = false;
+                }
+            }
+            if (retain_prefix) retain_serving_prefix(request);
             TextGeneration completed;
             completed.generation = std::move(request.search).result();
             completed.text = require(tokenizer_.decode(completed.generation.token_ids));
@@ -1065,13 +1345,28 @@ auto Generator::step() -> Result<GenerationStep> {
         for (std::size_t row = 0; row < running_.size() && !prefill_selects; ++row) {
             auto& request = running_[row];
             if (!request.search.result().decoder_steps || request.completion_emitted) continue;
+            // Sampled requests take the plain host path: the fast paths below select greedily on the device.
+            if (sampled(request.options)) {
+                const auto started = Clock::now();
+                const auto prepared = model_->preparation_ns();
+                const std::array input{request.search.token()};
+                const auto logits = require(model_->forward(input, *request.state));
+                const auto token = sample_token(*model_, logits, request.options, request.random);
+                const auto decode_ns = elapsed(started);
+                request.stats.decode_ns += decode_ns;
+                request.stats.preparation_ns += model_->preparation_ns() - prepared;
+                result.decode_ns += decode_ns;
+                accept(request, token);
+                continue;
+            }
             if (drafter_) {
                 const auto started = Clock::now();
                 const auto prepared = model_->preparation_ns() + drafter_->preparation_ns();
                 const auto previous = request.search.result().token_ids.size();
                 SpeculativeStats step_stats;
                 const auto step_result = require(drafter_->step(*model_, *request.state, request.draft_hidden,
-                                                                request.search, draft_tokens_, &step_stats));
+                                                                request.search, request.prompt, draft_tokens_,
+                                                                &step_stats));
                 request.stats.draft_ns += step_stats.draft_ns;
                 request.stats.verify_ns += step_stats.verify_ns;
                 request.stats.draft_tokens += step_stats.draft_tokens;
@@ -1170,10 +1465,9 @@ auto Generator::step() -> Result<GenerationStep> {
                 selected = require(
                     model_->forward_batch_tokens(std::span(tokens).first(count), std::span(states).first(count)));
             result.decode_ns = elapsed(started);
-            if (serving_->maximum_active == 1) {
-                running_[rows[0]].stats.decode_ns += result.decode_ns;
+            for (std::size_t index = 0; index < count; ++index) running_[rows[index]].stats.decode_ns += result.decode_ns;
+            if (serving_->maximum_active == 1)
                 running_[rows[0]].stats.preparation_ns += model_->preparation_ns() - prepared;
-            }
             for (std::size_t index = 0; index < count; ++index) accept(running_[rows[index]], selected[index]);
         }
         retire();
@@ -1192,24 +1486,30 @@ auto Generator::step() -> Result<GenerationStep> {
             const auto started = Clock::now();
             const auto prepared = model_->preparation_ns();
             std::optional<std::int32_t> selected;
-            const bool deferred = final_chunk && serving_->deferred_tokens;
-            if (deferred)
+            const bool deferred = final_chunk && serving_->deferred_tokens && !sampled(request.options);
+            if (final_chunk && sampled(request.options))
+                selected = sample_token(*model_, require(model_->forward(input, *request.state)), request.options,
+                                        request.random);
+            else if (deferred)
                 pending_tokens_.push_back(
                     {request.id, require(model_->select_token(input, *request.state)), 0, started, true});
             else if (final_chunk)
                 selected =
-                    require(model_->forward_token(input, *request.state, drafter_ ? &request.draft_hidden : nullptr));
+                    require(model_->forward_token(input, *request.state,
+                                                  drafter_ && drafter_->drafter ? &request.draft_hidden : nullptr));
             else if (uses_padded_prefill(model_)) {
                 const auto maximum = prefill_bucket(
                     model_, std::min(request.options.prefill_chunk_size, serving_->prefill_tokens_per_step));
                 const auto available = request.state->sequence_capacity() - start_position;
                 const auto execution_length = maximum <= available ? maximum : length;
-                std::vector<std::int32_t> padded(execution_length, special_[2]);
+                std::vector<std::int32_t> padded(execution_length, options_.pad_id);
                 std::ranges::copy(input, padded.begin());
                 require(model_->prefill(padded, *request.state));
                 if (execution_length > length) require(model_->rewind(*request.state, start_position + length));
             } else
                 require(model_->prefill(input, *request.state));
+            if (final_chunk && request.options.prefix_cache_bytes)
+                require(model_->mark_rewind_point(*request.state));
             result.prefill_ns = elapsed(started);
             if (!deferred) request.stats.prefill_ns += result.prefill_ns;
             request.stats.preparation_ns += model_->preparation_ns() - prepared;

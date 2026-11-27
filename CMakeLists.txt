@@ -16,6 +16,12 @@ option(KIDI_STRIP_BINARIES "Strip local symbol tables from Release executables" 
 option(KIDI_BUILD_INTEGRATION_TESTS "Register Python and supported model regression tests" OFF)
 option(KIDI_BUILD_BENCHMARKS "Build kidi benchmarks" OFF)
 option(KIDI_BUILD_PYTHON "Build the nanobind Python module" OFF)
+# `kidi agent` and its background server need POSIX process control (fork, flock) and a terminal UI.
+set(KIDI_AGENT_PLATFORM OFF)
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+    set(KIDI_AGENT_PLATFORM ON)
+endif()
+option(KIDI_BUILD_AGENT "Build the embeddable agent library and the kidi agent command" ${KIDI_AGENT_PLATFORM})
 option(KIDI_ENABLE_CUDA "Build NVIDIA CUDA inference and optional cuVS GPU HNSW indexing" OFF)
 set(KIDI_DESKTOP_APP_DEFAULT ON)
 if(ANDROID OR EMSCRIPTEN)
@@ -118,6 +124,7 @@ add_library(kidi
     src/kidi/model/gemma4.cpp
     src/kidi/model/gemma4_assistant.cpp
     src/kidi/model/gemma4_vision.cpp
+    src/kidi/model/inkling2.cpp
     src/kidi/model/kokoro.cpp
     src/kidi/model/model.cpp
     src/kidi/model/omnivoice.cpp
@@ -126,6 +133,7 @@ add_library(kidi
     src/kidi/model/transformer.cpp
     src/kidi/model/whisper.cpp
     src/kidi/ops/context.cpp
+    src/kidi/ops/cpu_kernels.cpp
     src/kidi/ops/quantization.cpp
     src/kidi/runtime/operator.cpp
     src/kidi/runtime/parity_math.cpp
@@ -140,6 +148,7 @@ add_library(kidi
     src/kidi/text/phonemizer.cpp
     src/kidi/text/sentence.cpp
     src/kidi/text/tokenizer.cpp
+    src/kidi/text/response.cpp
 )
 add_library(kidi::kidi ALIAS kidi)
 
@@ -204,12 +213,12 @@ if(KIDI_BUILD_BENCHMARKS)
         target_link_libraries(kidi_tts_bench PRIVATE kidi_ops::cuda_runtime)
     endif()
     kidi_optimize_executable(kidi_tts_bench)
-    add_executable(kidi_gemma4_quality benchmarks/gemma4/quality.cpp)
-    target_link_libraries(kidi_gemma4_quality PRIVATE kidi::kidi)
-    kidi_optimize_executable(kidi_gemma4_quality)
     add_executable(kidi_whisper_quality benchmarks/whisper/quality.cpp)
     target_link_libraries(kidi_whisper_quality PRIVATE kidi::kidi)
     kidi_optimize_executable(kidi_whisper_quality)
+    add_executable(kidi_eval_kl benchmarks/quality/eval_kl.cpp)
+    target_link_libraries(kidi_eval_kl PRIVATE kidi::kidi kidi::argparse nlohmann_json::nlohmann_json)
+    kidi_optimize_executable(kidi_eval_kl)
     if(UNIX)
         add_executable(kidi_android_baseline benchmarks/android/baseline.cpp)
         target_link_libraries(kidi_android_baseline PRIVATE kidi::kidi nlohmann_json::nlohmann_json)
@@ -308,6 +317,7 @@ target_link_libraries(kidi
         ynnpack
         ynnpack_composites
         yaml-cpp::yaml-cpp
+        nlohmann_json::nlohmann_json
     PRIVATE
         uni-algo::uni-algo
         tokenizerpp
@@ -329,6 +339,8 @@ if(APPLE)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/command_batch.metal"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/eager_kernels.metal"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/quantized_linear.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/vq_kernels.metal"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/mpp_kernels.metal"
     )
     kidi_embed_text(
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/command_batch.metal"
@@ -344,6 +356,16 @@ if(APPLE)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/quantized_linear.metal"
         "${KIDI_MPS_GENERATED}/quantized_linear_metal_source.h"
         KIDI_QUANTIZED_LINEAR_METAL_SOURCE
+    )
+    kidi_embed_text(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/vq_kernels.metal"
+        "${KIDI_MPS_GENERATED}/vq_kernels_metal_source.h"
+        KIDI_VQ_KERNELS_METAL_SOURCE
+    )
+    kidi_embed_text(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/kidi/runtime/mps/mpp_kernels.metal"
+        "${KIDI_MPS_GENERATED}/mpp_kernels_metal_source.h"
+        KIDI_MPP_KERNELS_METAL_SOURCE
     )
     target_sources(kidi
         PRIVATE
@@ -393,39 +415,62 @@ if(APPLE)
     endif()
 endif()
 
-add_library(kidi_cli_main STATIC
-    src/kidi/cli/index.cpp
-    src/kidi/cli/interactive.cpp
-    src/kidi/cli/log.cpp
-    src/kidi/cli/main.cpp
-)
-target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi nlohmann_json::nlohmann_json)
-if(TARGET kidi_index_cuda_helper)
-    add_dependencies(kidi_cli_main kidi_index_cuda_helper)
-endif()
+if(NOT EMSCRIPTEN)
+    set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "Build LiteApp's GoogleTest suite" FORCE)
+    add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
 
-add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)
-set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
-target_link_libraries(kidi_cli PRIVATE kidi_cli_main)
-kidi_optimize_executable(kidi_cli)
+    # kidi's single HTTP API (OpenAI-compatible chat), hosted by both `kidi serve` and the desktop app.
+    add_library(kidi_server STATIC
+        src/kidi/server/engine.cpp
+        src/kidi/server/chat_api.cpp
+        src/kidi/server/routes.cpp
+    )
+    target_link_libraries(kidi_server PUBLIC kidi::kidi liteapp::http nlohmann_json::nlohmann_json)
 
-if(KIDI_ENABLE_CUDA)
-    target_link_options(kidi_cli PRIVATE -static-libstdc++ -static-libgcc)
-    add_custom_command(TARGET kidi_cli POST_BUILD
-        COMMAND "${CMAKE_COMMAND}" "-DREADELF=${CMAKE_READELF}" "-DBINARY=$<TARGET_FILE:kidi_cli>"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/third_party/liteapp/cmake/VerifyPortableElf.cmake"
-        VERBATIM)
-endif()
+    add_library(kidi_cli_main STATIC
+        src/kidi/cli/index.cpp
+        src/kidi/cli/log.cpp
+        src/kidi/cli/main.cpp
+        src/kidi/cli/serve.cpp
+    )
+    target_link_libraries(kidi_cli_main PUBLIC kidi::argparse kidi::kidi nlohmann_json::nlohmann_json PRIVATE kidi_server)
+    if(KIDI_ENABLE_CUDA)
+        find_package(CUDAToolkit 13 REQUIRED)
+        target_compile_definitions(kidi_cli_main PRIVATE KIDI_CUDA_TOOLKIT_VERSION="${CUDAToolkit_VERSION}")
+    endif()
+    if(KIDI_BUILD_AGENT)
+        add_subdirectory(kidi-agent)
+        if(KIDI_AGENT_PLATFORM)
+            target_sources(kidi_cli_main PRIVATE src/kidi/cli/managed_serve.cpp)
+            target_link_libraries(kidi_cli_main PRIVATE kidi_agent_command kidi::agent_http liteapp::httplib)
+            target_compile_definitions(kidi_cli_main PRIVATE KIDI_HAS_AGENT=1)
+        endif()
+    endif()
+    if(TARGET kidi_index_cuda_helper)
+        add_dependencies(kidi_cli_main kidi_index_cuda_helper)
+    endif()
 
-if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
-    foreach(_kidi_target IN ITEMS kidi_argparse kidi kidi_cli_main)
-        target_compile_options(${_kidi_target} PRIVATE -ffunction-sections -fdata-sections)
-    endforeach()
+    add_executable(kidi_cli src/kidi/cli/entrypoint.cpp)
+    set_target_properties(kidi_cli PROPERTIES OUTPUT_NAME kidi)
+    target_link_libraries(kidi_cli PRIVATE kidi_cli_main)
+    kidi_optimize_executable(kidi_cli)
+
+    if(KIDI_ENABLE_CUDA)
+        target_link_options(kidi_cli PRIVATE -static-libstdc++ -static-libgcc)
+        add_custom_command(TARGET kidi_cli POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" "-DREADELF=${CMAKE_READELF}" "-DBINARY=$<TARGET_FILE:kidi_cli>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/third_party/liteapp/cmake/VerifyPortableElf.cmake"
+            VERBATIM)
+    endif()
+
+    if(UNIX AND NOT APPLE)
+        foreach(_kidi_target IN ITEMS kidi_argparse kidi kidi_server kidi_cli_main)
+            target_compile_options(${_kidi_target} PRIVATE -ffunction-sections -fdata-sections)
+        endforeach()
+    endif()
 endif()
 
 if(KIDI_BUILD_DESKTOP_APP)
-    set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "Build LiteApp's GoogleTest suite" FORCE)
-    add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
     set(KIDI_DESKTOP_WEB_STAGE "${CMAKE_CURRENT_BINARY_DIR}/generated/desktop-web")
     set(KIDI_DESKTOP_WEB_DEPENDENCY_FILES)
     file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}")
@@ -502,6 +547,7 @@ if(KIDI_BUILD_DESKTOP_APP)
     set_target_properties(kidi_app PROPERTIES OUTPUT_NAME kidi-app)
     target_link_libraries(kidi_app PRIVATE
         kidi::kidi
+        kidi_server
         kidi_desktop_ebook
         kidi_desktop_assets
         liteapp::app
@@ -542,5 +588,5 @@ endif()
 include(CTest)
 
 if(BUILD_TESTING AND KIDI_BUILD_TESTS)
-    include(cmake/tests.cmake)
+    add_subdirectory(tests)
 endif()

@@ -133,7 +133,7 @@ auto usage() -> void {
                  "  [--label NAME] [--warmups N] [--runs N] [--threads N] [--queue-depth N]\n"
                  "  [--qnn-lib libQnnHtp.so] [--qnn-context FILE] [--qnn-prepare] [--qnn-memory shared|client]\n"
                  "  [--qnn-graph-layers N] (NPU replay: capture the step as chunks of N layers)\n"
-                 "  [--qnn-weights container|packed] [--qnn-op fc|conv]\n"
+                 "  [--qnn-weights container|packed] [--qnn-op fc|conv] [--diagnose] (eager NPU FFN per-stage error)\n"
                  "FFN modes: eager, replay (all); eager-async, encode, replay-queued (gpu)\n";
 }
 
@@ -292,6 +292,8 @@ auto main(int argc, char** argv) -> int {
                 options.qnn_memory = next();
             else if (argument == "--qnn-graph-layers")
                 options.qnn_graph_layers = std::stoi(next());
+            else if (argument == "--diagnose")
+                options.diagnose = true;
             else if (argument == "--workload")
                 workload = next();
             else if (argument == "--mode")

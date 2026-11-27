@@ -165,18 +165,9 @@ def operator_summary(text):
     return sorted(groups.values(), key=lambda row: row["run_ns"], reverse=True)
 
 
-def benchmark_environment(replay, profile_ops, warmups, hnsw_ef=None):
-    environment = dict(os.environ, KIDI_ACCELERATOR="cpu")
-    for name in ("KIDI_REPLAY", "KIDI_PROFILE_OPS", "KIDI_PROFILE_OPS_SKIP", "KIDI_CUDA_PROFILE",
-                 "KIDI_HNSW_EF"):
-        environment.pop(name, None)
-    if replay != "default":
-        environment["KIDI_REPLAY"] = "1" if replay == "on" else "0"
-    if profile_ops:
-        environment.update(KIDI_PROFILE_OPS="host", KIDI_PROFILE_OPS_SKIP=str(warmups))
-    if hnsw_ef is not None:
-        environment["KIDI_HNSW_EF"] = str(hnsw_ef)
-    return environment
+def benchmark_options(profile_ops, eager):
+    """Native benchmark options: always CPU; operator profiles exclude the warm-up requests."""
+    return ["--device", "cpu", *(["--profile-ops", "host"] if profile_ops else []), *(["--eager"] if eager else [])]
 
 
 def main(argv=None):
@@ -195,10 +186,10 @@ def main(argv=None):
     parser.add_argument("--unpacked-prefill", dest="packed_prefill", action="store_false")
     parser.add_argument("--workload", choices=("short", "long", "both"), default="short")
     parser.add_argument("--prompt", default=None)
-    parser.add_argument("--replay", choices=("default", "on", "off"), default="default")
     parser.add_argument("--profile-ops", action="store_true")
+    parser.add_argument("--eager", action="store_true",
+                        help="run captured steps eagerly so operator profiles show individual operators")
     parser.add_argument("--dense-lm-head", action="store_true", help="bypass the checkpoint HNSW index")
-    parser.add_argument("--hnsw-ef", type=int, help="override HNSW search effort (otherwise use the index default)")
     parser.add_argument("--build", action="store_true", help="incrementally build the native benchmark first")
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build-release")
     parser.add_argument("--binary", type=Path)
@@ -224,10 +215,6 @@ def main(argv=None):
             any(threads < 1 or threads > available_threads for threads in arguments.threads) or
             len(set(arguments.threads)) != len(arguments.threads) or not arguments.prompt.strip()):
         parser.error("expected positive thread/job counts, 1-20 repeats/warmups, and 2 <= tokens < context")
-    if arguments.hnsw_ef is not None and arguments.hnsw_ef < 1:
-        parser.error("expected positive HNSW search effort")
-    if arguments.dense_lm_head and arguments.hnsw_ef is not None:
-        parser.error("--dense-lm-head cannot be combined with --hnsw-ef")
     output = arguments.output.expanduser().resolve()
     if arguments.baseline and arguments.baseline.expanduser().resolve() == output:
         parser.error("baseline and output must be different files")
@@ -237,10 +224,8 @@ def main(argv=None):
     if arguments.dense_lm_head:
         settings["dense_lm_head"] = True
     report = {"version": 1, "started": datetime.now(timezone.utc).isoformat(), "status": "running",
-              "protocol": {"settings": settings, "replay": arguments.replay, "operator_profiling": arguments.profile_ops},
+              "protocol": {"settings": settings, "operator_profiling": arguments.profile_ops, "eager": arguments.eager},
               "runs": {}}
-    if arguments.hnsw_ef is not None:
-        report["protocol"]["hnsw"] = {"ef": arguments.hnsw_ef}
     output.parent.mkdir(parents=True, exist_ok=True)
 
     def save():
@@ -255,8 +240,6 @@ def main(argv=None):
         if not model.is_dir():
             raise ValueError(f"not a model directory: {model}")
         index_path = model / "lm_head.hnsw"
-        if "hnsw" in report["protocol"] and not index_path.is_file():
-            raise ValueError("HNSW settings require MODEL/lm_head.hnsw; refusing to measure a dense fallback")
         report["model"] = str(model)
         reference = json.loads(arguments.baseline.expanduser().read_text()) if arguments.baseline else None
         if reference and (reference.get("status") != "completed" or reference["protocol"] != report["protocol"] or
@@ -298,21 +281,20 @@ def main(argv=None):
                 name = declaration.partition(":")[0]
                 if separator and name in names:
                     report["source"]["cmake"][name] = value
-        environment = benchmark_environment(arguments.replay, arguments.profile_ops, arguments.warmups,
-                                            arguments.hnsw_ef)
-        report["environment"] = {key: value for key, value in environment.items() if key.startswith("KIDI_")}
+        options = benchmark_options(arguments.profile_ops, arguments.eager)
         save()
         print("threads workload  prefill tok/s   decode tok/s (min..max)    warm TTFT ms   peak GiB   vs base (pre/dec)",
               flush=True)
         for threads in arguments.threads:
-            command = [str(binary), "gemma", str(model), str(threads), str(arguments.repeats), json.dumps(settings)]
+            command = [str(binary), *options, "gemma", str(model), str(threads), str(arguments.repeats),
+                       json.dumps(settings)]
             stdout = output.parent / f"{output.stem}-j{threads}.stdout.jsonl"
             stderr = output.parent / f"{output.stem}-j{threads}.stderr.log"
             run = {"command": command, "status": "running", "stdout": str(stdout), "stderr": str(stderr)}
             report["runs"][str(threads)] = run
             save()
             try:
-                completed = subprocess.run(command, cwd=ROOT, env=environment, capture_output=True, text=True,
+                completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
                                            timeout=arguments.timeout)
             except subprocess.TimeoutExpired as error:
                 stdout.write_text(error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else error.stdout or "")

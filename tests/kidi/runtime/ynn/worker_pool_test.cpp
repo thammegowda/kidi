@@ -3,9 +3,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
-#include <iostream>
 #include <thread>
 #include <vector>
+
+#include <gtest/gtest.h>
 
 namespace {
 
@@ -13,19 +14,13 @@ using ::ynn::PhaseBarrier;
 using ::ynn::WorkerContext;
 using ::ynn::WorkerPool;
 
-auto expect(bool condition, const char* what) -> bool {
-    if (!condition) std::cerr << "FAILED: " << what << '\n';
-    return condition;
-}
-
 constexpr auto sum_below(int n) -> int { return n * (n - 1) / 2; }
 
-auto test_parallel_for() -> bool {
+TEST(WorkerPoolTest, ParallelFor) {
     for (const int workers : {0, 1, 3, 7}) {
         WorkerPool pool(workers);
-        if (!expect(pool.thread_count() == workers, "thread_count reports the background workers")) return false;
-        if (!expect(pool.total_threads() == static_cast<std::size_t>(workers + 1), "total_threads includes caller"))
-            return false;
+        ASSERT_EQ(pool.thread_count(), workers) << "thread_count reports the background workers";
+        ASSERT_EQ(pool.total_threads(), static_cast<std::size_t>(workers + 1)) << "total_threads includes caller";
         for (int n = 0; n < 100; ++n) {
             std::atomic<int> count = 0;
             std::atomic<int> sum = 0;
@@ -33,13 +28,13 @@ auto test_parallel_for() -> bool {
                 ++count;
                 sum += static_cast<int>(i);
             });
-            if (!expect(count == n && sum == sum_below(n), "every iteration runs exactly once")) return false;
+            ASSERT_EQ(count, n) << "every iteration runs exactly once";
+            ASSERT_EQ(sum, sum_below(n)) << "every iteration runs exactly once";
         }
     }
-    return true;
 }
 
-auto test_nested() -> bool {
+TEST(WorkerPoolTest, NestedLoopsCompleteInline) {
     WorkerPool pool(3);
     std::atomic<int> count = 0;
     std::atomic<int> sum = 0;
@@ -49,10 +44,11 @@ auto test_nested() -> bool {
             sum += static_cast<int>(j);
         });
     });
-    return expect(count == 80 && sum == 10 * sum_below(8), "nested loops complete inline without deadlock");
+    EXPECT_EQ(count, 80) << "nested loops complete inline without deadlock";
+    EXPECT_EQ(sum, 10 * sum_below(8)) << "nested loops complete inline without deadlock";
 }
 
-auto test_run_team_and_phase_barrier() -> bool {
+TEST(WorkerPoolTest, RunTeamAndPhaseBarrier) {
     WorkerPool pool(3);
     std::vector<int> phase1(4, 0);
     std::vector<int> phase2(4, 0);
@@ -71,7 +67,7 @@ auto test_run_team_and_phase_barrier() -> bool {
     });
     constexpr int EXPECTED_P1_SUM = 10 + 11 + 12 + 13;
     for (int t = 0; t < 4; ++t) {
-        if (!expect(phase2[t] == EXPECTED_P1_SUM + t, "PhaseBarrier synchronizes multi-phase team state")) return false;
+        ASSERT_EQ(phase2[t], EXPECTED_P1_SUM + t) << "PhaseBarrier synchronizes multi-phase team state";
     }
 
     // Stress alternating partial-team (2 of 4) and full-team (4 of 4) PhaseBarrier launches to verify non-participating
@@ -83,13 +79,11 @@ auto test_run_team_and_phase_barrier() -> bool {
             static_cast<std::atomic<std::size_t>*>(raw)->fetch_add(1, std::memory_order_relaxed);
             (void)barrier.arrive_and_wait();
         });
-        if (!expect(seen.load(std::memory_order_relaxed) == team, "partial/full alternating team count exact"))
-            return false;
+        ASSERT_EQ(seen.load(std::memory_order_relaxed), team) << "partial/full alternating team count exact";
     }
-    return true;
 }
 
-auto test_run_ranges_stealing_and_scratch() -> bool {
+TEST(WorkerPoolTest, RunRanges) {
     WorkerPool pool(3);
     constexpr std::size_t N = 256;
     std::vector<std::atomic<int>> hits(N);
@@ -114,14 +108,12 @@ auto test_run_ranges_stealing_and_scratch() -> bool {
         if (buf[0] != worker.tid) c->aligned_ok->store(false, std::memory_order_relaxed);
         for (auto i = begin; i < end; ++i) c->hits->at(i).fetch_add(1, std::memory_order_relaxed);
     });
-    if (!expect(aligned_ok.load(), "WorkerContext provides isolated 64B-aligned per-tid scratch")) return false;
+    ASSERT_TRUE(aligned_ok.load()) << "WorkerContext provides isolated 64B-aligned per-tid scratch";
     for (const auto& h : hits)
-        if (!expect(h.load(std::memory_order_relaxed) == 1, "home-slot + stealing executes every item once"))
-            return false;
-    return true;
+        ASSERT_EQ(h.load(std::memory_order_relaxed), 1) << "home-slot + stealing executes every item once";
 }
 
-auto test_nested_inline_scratch() -> bool {
+TEST(WorkerPoolTest, NestedInlineScratch) {
     // Regression test (Finding #6): nested inline/serial calls requesting larger scratch_bytes must not alias or free
     // outer WorkerContext::scratch buffers.
     for (const int workers : {0, 3}) {
@@ -173,13 +165,11 @@ auto test_nested_inline_scratch() -> bool {
                 }
             }
         });
-        if (!expect(intact.load(), "nested inline scratch preserves outer buffers without UAF or aliasing"))
-            return false;
+        ASSERT_TRUE(intact.load()) << "nested inline scratch preserves outer buffers without UAF or aliasing";
     }
-    return true;
 }
 
-auto test_idle_then_wake() -> bool {
+TEST(WorkerPoolTest, IdleThenWake) {
     // Let every worker give up spinning and block on atomic::wait, then make sure the next loops still reach them.
     WorkerPool pool(4);
     for (int round = 0; round < 3; ++round) {
@@ -187,12 +177,11 @@ auto test_idle_then_wake() -> bool {
         std::vector<std::atomic<int>> hits(64);
         pool.parallel_for(hits.size(), [&](std::size_t i) { ++hits[i]; });
         for (const auto& hit : hits)
-            if (!expect(hit == 1, "blocked workers wake up and iterations run once")) return false;
+            ASSERT_EQ(hit, 1) << "blocked workers wake up and iterations run once";
     }
-    return true;
 }
 
-auto test_concurrent_callers() -> bool {
+TEST(WorkerPoolTest, ConcurrentCallers) {
     // Several application threads share one pool, as concurrent sessions do.
     WorkerPool pool(3);
     std::atomic<int> total = 0;
@@ -206,18 +195,17 @@ auto test_concurrent_callers() -> bool {
             }
         });
     for (auto& caller : callers) caller.join();
-    return expect(total == 800, "concurrent loops all complete");
+    EXPECT_EQ(total, 800) << "concurrent loops all complete";
 }
 
-auto test_lifecycle() -> bool {
+TEST(WorkerPoolTest, Lifecycle) {
     for (int i = 0; i < 50; ++i) {
         WorkerPool pool(i % 5);
         if (i % 2 == 0) pool.parallel_for(8, [](std::size_t) {});
     }
-    return true;
 }
 
-auto test_run_tasks_and_large_partitioning() -> bool {
+TEST(WorkerPoolTest, RunTasks) {
     WorkerPool pool(3);
     constexpr std::size_t N = 100003;
     std::vector<std::atomic<int>> hits(N);
@@ -229,12 +217,10 @@ auto test_run_tasks_and_large_partitioning() -> bool {
         static_cast<Context*>(raw)->hits->at(index).fetch_add(1, std::memory_order_relaxed);
     });
     for (const auto& h : hits)
-        if (!expect(h.load(std::memory_order_relaxed) == 1, "large run_tasks executes each index exactly once"))
-            return false;
-    return true;
+        ASSERT_EQ(h.load(std::memory_order_relaxed), 1) << "large run_tasks executes each index exactly once";
 }
 
-auto test_exception_propagation() -> bool {
+TEST(WorkerPoolTest, ExceptionPropagation) {
     WorkerPool pool(3);
     bool caught = false;
     try {
@@ -244,7 +230,7 @@ auto test_exception_propagation() -> bool {
     } catch (int value) {
         caught = (value == 42);
     }
-    if (!expect(caught, "run_ranges propagates worker exception cleanly")) return false;
+    ASSERT_TRUE(caught) << "run_ranges propagates worker exception cleanly";
 
     bool barrier_caught = false;
     try {
@@ -255,20 +241,11 @@ auto test_exception_propagation() -> bool {
     } catch (int value) {
         barrier_caught = (value == 99);
     }
-    if (!expect(barrier_caught, "PhaseBarrier aborts cleanly when a team member throws")) return false;
+    ASSERT_TRUE(barrier_caught) << "PhaseBarrier aborts cleanly when a team member throws";
 
     std::atomic<int> sum = 0;
     pool.parallel_for(32, [&](std::size_t index) { sum.fetch_add(static_cast<int>(index)); });
-    return expect(sum == sum_below(32), "pool remains usable after exceptions");
+    EXPECT_EQ(sum, sum_below(32)) << "pool remains usable after exceptions";
 }
 
 } // namespace
-
-auto main() -> int {
-    return test_parallel_for() && test_nested() && test_run_team_and_phase_barrier() &&
-                   test_run_ranges_stealing_and_scratch() && test_nested_inline_scratch() && test_idle_then_wake() &&
-                   test_concurrent_callers() && test_lifecycle() && test_run_tasks_and_large_partitioning() &&
-                   test_exception_propagation()
-               ? 0
-               : 1;
-}

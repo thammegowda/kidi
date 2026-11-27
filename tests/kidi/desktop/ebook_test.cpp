@@ -2,11 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <iostream>
 #include <span>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <gtest/gtest.h>
 
 namespace {
 
@@ -89,14 +90,7 @@ auto make_zip(const std::vector<std::pair<std::string, std::string>>& files) -> 
     return output;
 }
 
-auto expect(bool condition, const char* message) -> bool {
-    if (!condition) std::cerr << "FAILED: " << message << '\n';
-    return condition;
-}
-
-} // namespace
-
-auto main() -> int {
+TEST(EbookTest, ParsesEpubMetadataAndChapters) {
     const auto archive = make_zip({
         {"META-INF/container.xml",
          R"(<?xml version="1.0"?><container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>)"},
@@ -114,21 +108,24 @@ auto main() -> int {
         {"OEBPS/chapters/two.xhtml", "<html><head><title>Second</title></head><body><p>World.</p></body></html>"},
     });
     auto book = kidi::desktop::parse_epub(archive);
-    if (!expect(static_cast<bool>(book), "valid EPUB parses")) return 1;
-    if (!expect(book->title == "A & B", "metadata title decodes") ||
-        !expect(book->author == "Test Author", "metadata author parses") ||
-        !expect(book->language == "en", "metadata language parses") ||
-        !expect(book->chapters.size() == 2, "spine chapters parse") ||
-        !expect(book->chapters[0].title == "Opening", "chapter heading becomes title") ||
-        !expect(book->chapters[1].title == "Second", "document title is fallback"))
-        return 1;
+    ASSERT_TRUE(book) << "valid EPUB parses";
+    EXPECT_EQ(book->title, "A & B") << "metadata title decodes";
+    EXPECT_EQ(book->author, "Test Author") << "metadata author parses";
+    EXPECT_EQ(book->language, "en") << "metadata language parses";
+    ASSERT_EQ(book->chapters.size(), 2) << "spine chapters parse";
+    EXPECT_EQ(book->chapters[0].title, "Opening") << "chapter heading becomes title";
+    EXPECT_EQ(book->chapters[1].title, "Second") << "document title is fallback";
     auto chapter = kidi::desktop::read_epub_chapter(*book, 1);
-    if (!expect(chapter && chapter->find("World.") != std::string::npos, "chapter content reads")) return 1;
-    if (!expect(!kidi::desktop::read_epub_chapter(*book, 2), "out-of-range chapter is rejected")) return 1;
+    ASSERT_TRUE(chapter) << "chapter content reads";
+    EXPECT_NE(chapter->find("World."), std::string::npos) << "chapter content reads";
+    EXPECT_FALSE(kidi::desktop::read_epub_chapter(*book, 2)) << "out-of-range chapter is rejected";
+}
 
+TEST(EbookTest, RejectsUnsafePackagePath) {
     const auto unsafe = make_zip({
         {"META-INF/container.xml", R"(<container><rootfile full-path="../content.opf"/></container>)"},
     });
-    if (!expect(!kidi::desktop::parse_epub(unsafe), "unsafe package path is rejected")) return 1;
-    return 0;
+    EXPECT_FALSE(kidi::desktop::parse_epub(unsafe)) << "unsafe package path is rejected";
 }
+
+} // namespace

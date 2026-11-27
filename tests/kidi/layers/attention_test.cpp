@@ -6,10 +6,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 #include "kidi/checkpoint/weights.h"
+
+#include <gtest/gtest.h>
 
 namespace {
 
@@ -67,127 +69,178 @@ auto write_weights(const std::filesystem::path& path) -> void {
     write_values(OUTPUT_BIAS);
 }
 
-} // namespace
+constexpr float TOLERANCE = 3e-5F;
 
-auto main() -> int {
-    using namespace kidi;
-    try {
-        const auto path = std::filesystem::temp_directory_path() / "kidi-attention-test.safetensors";
+auto devices() -> std::vector<kidi::tensor::Device> {
+    std::vector devices{kidi::tensor::Device::cpu()};
+#if defined(__APPLE__)
+    devices.push_back(kidi::tensor::Device::apple_gpu());
+#endif
+    return devices;
+}
+
+class AttentionTest : public ::testing::Test {
+protected:
+    struct Projection {
+        kidi::tensor::Tensor query;
+        kidi::layers::KeyValue memory;
+        kidi::tensor::Tensor mask;
+    };
+
+    static constexpr std::array INPUT_VALUES{1.F, 2.F, 3.F, 4.F, 0.5F, -1.F, 2.F, -0.5F, 3.F, 0.25F, -2.F, 1.F};
+    static constexpr std::array MASK_VALUES{0.F, -1e9F, -1e9F, 0.F, 0.F, -1e9F, 0.F, 0.F, 0.F};
+
+    void SetUp() override {
+        using namespace kidi;
+        const auto* test = ::testing::UnitTest::GetInstance()->current_test_info();
+        path = std::filesystem::temp_directory_path() /
+               (std::string("kidi-attention-test-") + test->test_suite_name() + "-" + test->name() +
+                ".safetensors");
         write_weights(path);
-        const std::array mappings{checkpoint::StateMappingSpec{{R"(attn\.qkv\.(weight|bias))"}, "qkv.$1"},
-                                  checkpoint::StateMappingSpec{{R"(attn\.out\.(weight|bias))"}, "attention.output.$1"}};
-        auto weights = ops::require(checkpoint::Weights::load(path, mappings));
-        const ModuleScope construction(tensor::DType::F32, false);
-        layers::Linear qkv(4, 12);
-        layers::Attention attention(layers::Shape{4, 8, 2, 1e-5F});
-        ModuleMap<> modules;
+        const std::array mappings{
+            checkpoint::StateMappingSpec{{R"(attn\.qkv\.(weight|bias))"}, "qkv.$1"},
+            checkpoint::StateMappingSpec{{R"(attn\.out\.(weight|bias))"}, "attention.output.$1"}};
+        weights.emplace(ops::require(checkpoint::Weights::load(path, mappings)));
         modules->insert("qkv", qkv);
         modules->insert("attention", attention);
-        ops::require(modules->set_state(ops::require(weights.state_dict())));
-        const std::array input_values{1.F, 2.F, 3.F, 4.F, 0.5F, -1.F, 2.F, -0.5F, 3.F, 0.25F, -2.F, 1.F};
-        const std::array mask_values{0.F, -1e9F, -1e9F, 0.F, 0.F, -1e9F, 0.F, 0.F, 0.F};
-        const std::array expected{0.514999986F, 0.700000048F,  1.379999995F, 0.089999951F, 0.243209749F, 0.126859829F,
-                                  1.196354151F, -0.066927783F, 0.657077312F, 0.518348098F, 0.961920202F, 0.348947883F};
-        std::vector devices{tensor::Device::cpu()};
-#if defined(__APPLE__)
-        devices.push_back(tensor::Device::apple_gpu());
-#endif
-        for (auto device : devices) {
-            ops::Context context(device);
-            auto input =
-                ops::require(tensor::Tensor::from_host({1, 3, 4}, std::span<const float>(input_values), device));
-            auto mask =
-                ops::require(tensor::Tensor::from_host({1, 1, 3, 3}, std::span<const float>(mask_values), device));
-            auto projected = qkv->forward(context, input);
-            auto query = context.slice(projected, 2, 0, 4);
-            layers::KeyValue memory{context.slice(projected, 2, 4, 4), context.slice(projected, 2, 8, 4)};
-            auto output = attention->forward(context, query, memory, mask);
-            auto last = attention->forward(context, context.slice(query, 1, 2, 1), memory, {});
-            context.synchronize();
-            auto values = ops::require(output.data<float>()), final = ops::require(last.data<float>());
-            for (std::size_t index = 0; index < expected.size(); ++index)
-                if (std::abs(values[index] - expected[index]) > 3e-5F) return 1;
-            for (std::size_t index = 0; index < 4; ++index)
-                if (std::abs(final[index] - expected[index + 8]) > 3e-5F) return 1;
+        ops::require(modules->set_state(ops::require(weights->state_dict())));
+    }
 
-            auto batched_query = context.concat(std::array{query, query}, 0);
-            auto batched_output =
-                context.scaled_dot_product_attention(batched_query, memory.key, memory.value, 2, mask);
-            auto single_output = context.scaled_dot_product_attention(query, memory.key, memory.value, 2, mask);
-            context.synchronize();
-            const auto batch_values = ops::require(batched_output.data<float>());
-            const auto single_values = ops::require(single_output.data<float>());
-            for (std::size_t index = 0; index < batch_values.size(); ++index)
-                if (std::abs(batch_values[index] - single_values[index % single_values.size()]) > 3e-5F) return 1;
-            bool rejected = false;
-            try {
-                context.scaled_dot_product_attention(query, memory.key, memory.value, 3, mask);
-            } catch (const ops::Failure&) {
-                rejected = true;
-            }
-            if (!rejected) return 1;
-            auto mask_data = ops::require(mask.data<float>());
-            std::fill(mask_data.begin(), mask_data.end(), 0.F);
-            auto unmasked = context.scaled_dot_product_attention(query, memory.key, memory.value, 2);
-            auto rebound = context.scaled_dot_product_attention(query, memory.key, memory.value, 2, mask);
-            context.synchronize();
-            const auto unmasked_values = ops::require(unmasked.data<float>()),
-                       rebound_values = ops::require(rebound.data<float>());
-            for (std::size_t index = 0; index < unmasked_values.size(); ++index)
-                if (std::abs(unmasked_values[index] - rebound_values[index]) > 3e-5F) return 1;
+    void TearDown() override { std::filesystem::remove(path); }
 
-            // Decoder-sized heads exercise the vectorized lanes of short-query attention.
-            constexpr std::int64_t HEADS = 3, HEAD_WIDTH = 64, KEYS = 37;
-            std::vector<float> key_values(KEYS * HEADS * HEAD_WIDTH), value_values(key_values.size());
-            for (std::size_t index = 0; index < key_values.size(); ++index) {
-                key_values[index] = std::sin(0.37F * static_cast<float>(index));
-                value_values[index] = std::cos(0.11F * static_cast<float>(index));
-            }
-            const auto key = ops::require(tensor::Tensor::from_host(
-                {1, KEYS, HEADS * HEAD_WIDTH}, std::span<const float>(key_values), device));
-            const auto value = ops::require(tensor::Tensor::from_host(
-                {1, KEYS, HEADS * HEAD_WIDTH}, std::span<const float>(value_values), device));
-            for (const std::int64_t rows : {1, 5}) {
-                std::vector<float> query_values(rows * HEADS * HEAD_WIDTH), bias(rows * KEYS);
-                for (std::size_t index = 0; index < query_values.size(); ++index)
-                    query_values[index] = std::sin(0.23F * static_cast<float>(index) + 1.F);
-                for (std::size_t index = 0; index < bias.size(); ++index)
-                    bias[index] = index % KEYS > 30 ? -1e9F : 0.F;
-                const auto wide_query = ops::require(tensor::Tensor::from_host(
-                    {1, rows, HEADS * HEAD_WIDTH}, std::span<const float>(query_values), device));
-                const auto wide_mask =
-                    ops::require(tensor::Tensor::from_host({1, 1, rows, KEYS}, std::span<const float>(bias), device));
-                auto wide = context.scaled_dot_product_attention(wide_query, key, value, HEADS, wide_mask);
-                context.synchronize();
-                const auto actual = ops::require(wide.data<float>());
-                for (std::int64_t row = 0; row < rows; ++row)
-                    for (std::int64_t head = 0; head < HEADS; ++head) {
-                        std::vector<double> weights(KEYS);
-                        double largest = -1e300, total = 0;
-                        for (std::int64_t position = 0; position < KEYS; ++position) {
-                            double score = 0;
-                            for (std::int64_t index = 0; index < HEAD_WIDTH; ++index)
-                                score += static_cast<double>(query_values[(row * HEADS + head) * HEAD_WIDTH + index]) *
-                                         key_values[(position * HEADS + head) * HEAD_WIDTH + index];
-                            weights[position] = score / 8.0 + bias[row * KEYS + position];
-                            largest = std::max(largest, weights[position]);
-                        }
-                        for (auto& weight : weights) total += weight = std::exp(weight - largest);
-                        for (std::int64_t index = 0; index < HEAD_WIDTH; ++index) {
-                            double expected_value = 0;
-                            for (std::int64_t position = 0; position < KEYS; ++position)
-                                expected_value += weights[position] / total *
-                                                  value_values[(position * HEADS + head) * HEAD_WIDTH + index];
-                            if (std::abs(actual[(row * HEADS + head) * HEAD_WIDTH + index] - expected_value) > 1e-4)
-                                return 1;
-                        }
-                    }
-            }
-        }
-        std::filesystem::remove(path);
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
+    auto project(kidi::ops::Context& context) -> Projection {
+        using namespace kidi;
+        const auto device = context.device();
+        auto input = ops::require(tensor::Tensor::from_host({1, 3, 4}, std::span<const float>(INPUT_VALUES), device));
+        auto mask = ops::require(tensor::Tensor::from_host({1, 1, 3, 3}, std::span<const float>(MASK_VALUES), device));
+        auto projected = qkv->forward(context, input);
+        auto query = context.slice(projected, 2, 0, 4);
+        layers::KeyValue memory{context.slice(projected, 2, 4, 4), context.slice(projected, 2, 8, 4)};
+        return {query, memory, mask};
+    }
+
+    std::filesystem::path path;
+    std::optional<kidi::checkpoint::Weights> weights;
+    const kidi::ModuleScope construction{kidi::tensor::DType::F32, false};
+    kidi::layers::Linear qkv{4, 12};
+    kidi::layers::Attention attention{kidi::layers::Shape{4, 8, 2, 1e-5F}};
+    kidi::ModuleMap<> modules;
+};
+
+TEST_F(AttentionTest, ForwardMatchesReference) {
+    using namespace kidi;
+    const std::array expected{0.514999986F, 0.700000048F,  1.379999995F, 0.089999951F, 0.243209749F, 0.126859829F,
+                              1.196354151F, -0.066927783F, 0.657077312F, 0.518348098F, 0.961920202F, 0.348947883F};
+    for (auto device : devices()) {
+        ops::Context context(device);
+        auto [query, memory, mask] = project(context);
+        auto output = attention->forward(context, query, memory, mask);
+        auto last = attention->forward(context, context.slice(query, 1, 2, 1), memory, {});
+        context.synchronize();
+        auto values = ops::require(output.data<float>()), final = ops::require(last.data<float>());
+        for (std::size_t index = 0; index < expected.size(); ++index)
+            EXPECT_NEAR(values[index], expected[index], TOLERANCE) << "index " << index;
+        for (std::size_t index = 0; index < 4; ++index)
+            EXPECT_NEAR(final[index], expected[index + 8], TOLERANCE) << "last index " << index;
     }
 }
+
+TEST_F(AttentionTest, BatchedMatchesSingle) {
+    using namespace kidi;
+    for (auto device : devices()) {
+        ops::Context context(device);
+        auto [query, memory, mask] = project(context);
+        auto batched_query = context.concat(std::array{query, query}, 0);
+        auto batched_output = context.scaled_dot_product_attention(batched_query, memory.key, memory.value, 2, mask);
+        auto single_output = context.scaled_dot_product_attention(query, memory.key, memory.value, 2, mask);
+        context.synchronize();
+        const auto batch_values = ops::require(batched_output.data<float>());
+        const auto single_values = ops::require(single_output.data<float>());
+        for (std::size_t index = 0; index < batch_values.size(); ++index)
+            EXPECT_NEAR(batch_values[index], single_values[index % single_values.size()], TOLERANCE)
+                << "index " << index;
+    }
+}
+
+TEST_F(AttentionTest, RejectsHeadCount) {
+    using namespace kidi;
+    for (auto device : devices()) {
+        ops::Context context(device);
+        auto [query, memory, mask] = project(context);
+        EXPECT_THROW(context.scaled_dot_product_attention(query, memory.key, memory.value, 3, mask), ops::Failure);
+    }
+}
+
+TEST_F(AttentionTest, ZeroMaskMatchesUnmasked) {
+    using namespace kidi;
+    for (auto device : devices()) {
+        ops::Context context(device);
+        auto [query, memory, mask] = project(context);
+        auto mask_data = ops::require(mask.data<float>());
+        std::fill(mask_data.begin(), mask_data.end(), 0.F);
+        auto unmasked = context.scaled_dot_product_attention(query, memory.key, memory.value, 2);
+        auto rebound = context.scaled_dot_product_attention(query, memory.key, memory.value, 2, mask);
+        context.synchronize();
+        const auto unmasked_values = ops::require(unmasked.data<float>()),
+                   rebound_values = ops::require(rebound.data<float>());
+        for (std::size_t index = 0; index < unmasked_values.size(); ++index)
+            EXPECT_NEAR(unmasked_values[index], rebound_values[index], TOLERANCE) << "index " << index;
+    }
+}
+
+// Decoder-sized heads exercise the vectorized lanes of short-query attention.
+TEST(SdpaTest, DecoderSizedHeads) {
+    using namespace kidi;
+    for (auto device : devices()) {
+        ops::Context context(device);
+        constexpr std::int64_t HEADS = 3, HEAD_WIDTH = 64, KEYS = 37;
+        std::vector<float> key_values(KEYS * HEADS * HEAD_WIDTH), value_values(key_values.size());
+        for (std::size_t index = 0; index < key_values.size(); ++index) {
+            key_values[index] = std::sin(0.37F * static_cast<float>(index));
+            value_values[index] = std::cos(0.11F * static_cast<float>(index));
+        }
+        const auto key = ops::require(tensor::Tensor::from_host(
+            {1, KEYS, HEADS * HEAD_WIDTH}, std::span<const float>(key_values), device));
+        const auto value = ops::require(tensor::Tensor::from_host(
+            {1, KEYS, HEADS * HEAD_WIDTH}, std::span<const float>(value_values), device));
+        for (const std::int64_t rows : {1, 5}) {
+            SCOPED_TRACE(rows);
+            std::vector<float> query_values(rows * HEADS * HEAD_WIDTH), bias(rows * KEYS);
+            for (std::size_t index = 0; index < query_values.size(); ++index)
+                query_values[index] = std::sin(0.23F * static_cast<float>(index) + 1.F);
+            for (std::size_t index = 0; index < bias.size(); ++index)
+                bias[index] = index % KEYS > 30 ? -1e9F : 0.F;
+            const auto wide_query = ops::require(tensor::Tensor::from_host(
+                {1, rows, HEADS * HEAD_WIDTH}, std::span<const float>(query_values), device));
+            const auto wide_mask =
+                ops::require(tensor::Tensor::from_host({1, 1, rows, KEYS}, std::span<const float>(bias), device));
+            auto wide = context.scaled_dot_product_attention(wide_query, key, value, HEADS, wide_mask);
+            context.synchronize();
+            const auto actual = ops::require(wide.data<float>());
+            for (std::int64_t row = 0; row < rows; ++row)
+                for (std::int64_t head = 0; head < HEADS; ++head) {
+                    std::vector<double> weights(KEYS);
+                    double largest = -1e300, total = 0;
+                    for (std::int64_t position = 0; position < KEYS; ++position) {
+                        double score = 0;
+                        for (std::int64_t index = 0; index < HEAD_WIDTH; ++index)
+                            score += static_cast<double>(query_values[(row * HEADS + head) * HEAD_WIDTH + index]) *
+                                     key_values[(position * HEADS + head) * HEAD_WIDTH + index];
+                        weights[position] = score / 8.0 + bias[row * KEYS + position];
+                        largest = std::max(largest, weights[position]);
+                    }
+                    for (auto& weight : weights) total += weight = std::exp(weight - largest);
+                    for (std::int64_t index = 0; index < HEAD_WIDTH; ++index) {
+                        double expected_value = 0;
+                        for (std::int64_t position = 0; position < KEYS; ++position)
+                            expected_value += weights[position] / total *
+                                              value_values[(position * HEADS + head) * HEAD_WIDTH + index];
+                        EXPECT_NEAR(actual[(row * HEADS + head) * HEAD_WIDTH + index], expected_value, 1e-4)
+                            << "row " << row << " head " << head << " index " << index;
+                    }
+                }
+        }
+    }
+}
+
+} // namespace

@@ -1,6 +1,7 @@
 #include "kidi/cli/index.h"
 #include "kidi/cli/log.h"
 #include "kidi/checkpoint/config.h"
+#include "kidi/checkpoint/hub.h"
 #include "kidi/checkpoint/weights.h"
 #include "kidi/model/gemma4.h"
 #include "kidi/runtime/ynn/graph.h"
@@ -184,7 +185,7 @@ auto configure_index_parser(ArgumentParser& parser) -> void {
         .help("local directory or @owner/model");
     parser.add_argument("-c", "--cache")
         .type<std::filesystem::path>()
-        .default_value(std::filesystem::path("~/.cache/kidi/model-hub"))
+        .default_value(kidi::checkpoint::Hub::default_cache())
         .help("Hugging Face model cache directory");
     parser.add_argument("-o", "--output")
         .type<std::filesystem::path>()
@@ -253,7 +254,7 @@ auto index_command(const Namespace& arguments, const std::filesystem::path& dire
         log::error("{}", valid.error().message);
         return 1;
     }
-    if ((*config)["model"]["quantization_config"]) {
+    if (checkpoint::native_qat((*config)["model"])) {
         log::error("HNSW learning requires original FP32/BF16 Gemma weights");
         return 2;
     }

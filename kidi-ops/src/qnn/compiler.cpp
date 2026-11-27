@@ -16,7 +16,6 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -32,7 +31,6 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
-#include <limits>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -80,6 +78,18 @@ using GetProviders = Qnn_ErrorHandle_t (*)(const QnnInterface_t***, std::uint32_
 constexpr std::uint64_t FNV_OFFSET = 14695981039346656037ULL;
 constexpr std::uint64_t FNV_PRIME = 1099511628211ULL;
 constexpr std::string_view CACHE_VERSION = "kidi-qnn-v4";
+// Experimental lowering modes, fixed at their defaults: whole-step graphs instead of per-operator offload,
+// QNN attention instead of the op package's structured attention or tiles, and the U8 gated feed-forward.
+constexpr bool WHOLE_STEP = true;
+constexpr bool STRUCTURED_ATTENTION = false;
+constexpr bool STRUCTURED_TILES = false;
+constexpr std::string_view FFN_VARIANT = "u8";
+// Per-operator offload floors and the whole-step graph partition budget.
+constexpr std::size_t MIN_OPERATOR_BYTES = std::size_t{4} << 20;
+constexpr std::size_t MIN_PROJECTION_BYTES = std::size_t{8} << 20;
+constexpr std::size_t MIN_OPERATOR_ROWS = 16;
+constexpr std::size_t OPERATOR_BLOCK_ROWS = 128;
+constexpr std::size_t PARTITION_BYTES = std::size_t{256} << 20;
 
 auto diagnostic_log(const std::string& message) -> void {
     std::cerr << message << '\n';
@@ -114,10 +124,7 @@ auto hex(std::uint64_t value) -> std::string {
     return result;
 }
 
-auto getenv_string(const char* name) -> std::string {
-    const char* value = std::getenv(name);
-    return value ? std::string(value) : std::string{};
-}
+auto diagnostics() -> bool { return runtime::npu_options().diagnostics; }
 
 auto join_path(const std::string& directory, const char* name) -> std::string {
     if (directory.empty()) return name;
@@ -125,7 +132,7 @@ auto join_path(const std::string& directory, const char* name) -> std::string {
 }
 
 auto cache_directory() -> std::filesystem::path {
-    if (const auto env = getenv_string("KIDI_QNN_CACHE_DIR"); !env.empty()) return env;
+    if (auto directory = runtime::npu_options().cache_dir; !directory.empty()) return directory;
     return std::filesystem::path(".kidi-qnn-cache");
 }
 
@@ -136,7 +143,7 @@ auto prepend_adsp_paths(const std::string& directory) -> void {
     constexpr char SEPARATOR = ':';
 #endif
     std::vector<std::string> additions;
-    if (const auto skel = getenv_string("KIDI_QNN_SKEL_DIR"); !skel.empty()) additions.push_back(skel);
+    if (const auto skel = runtime::npu_options().skel_dir; !skel.empty()) additions.push_back(skel.string());
     if (!directory.empty()) {
         additions.push_back(directory);
         additions.push_back((std::filesystem::path(directory).parent_path() / "hexagon-v79" / "unsigned").string());
@@ -144,7 +151,8 @@ auto prepend_adsp_paths(const std::string& directory) -> void {
 #if defined(__ANDROID__)
     additions.insert(additions.end(), {"/vendor/lib/rfsa/adsp", "/vendor/dsp/cdsp", "/vendor/dsp"});
 #endif
-    const auto current = getenv_string("ADSP_LIBRARY_PATH");
+    const auto* adsp_path = std::getenv("ADSP_LIBRARY_PATH");
+    const std::string current = adsp_path ? adsp_path : "";
     std::string combined;
     const auto contains = [](std::string_view paths, std::string_view path) {
         for (std::size_t start = 0; start <= paths.size();) {
@@ -223,7 +231,8 @@ auto write_text(const std::filesystem::path& path, std::string_view text) -> voi
 class QnnRuntime final {
 public:
     QnnRuntime() {
-        library_dir_ = getenv_string("KIDI_QNN_LIBRARY_DIR");
+        const auto options = runtime::npu_options();
+        library_dir_ = options.library_dir.string();
         prepend_adsp_paths(library_dir_);
         const auto load = [&](const char* name, int flags = RTLD_NOW | RTLD_LOCAL) {
             auto* result = try_dlopen(name, flags);
@@ -251,22 +260,18 @@ public:
         }
         if (api_version_.empty())
             throw ops::Failure({ErrorCode::UNSUPPORTED, "libQnnHtp.so has no compatible HTP provider"});
-        if (const char* dump = std::getenv("KIDI_QNN_DUMP"); dump && *dump && api_.propertyHasCapability) {
+        if (options.diagnostics && api_.propertyHasCapability) {
             const auto status = api_.propertyHasCapability(QNN_PROPERTY_TENSOR_SUPPORT_DYNAMIC_DIMENSIONS);
             diagnostic_log("kidi_qnn_capability|dynamic_dimensions=" +
                            std::string(status == QNN_PROPERTY_SUPPORTED ? "supported" : "unsupported") +
                            "|status=" + std::to_string(qnn_error(status)));
         }
-        const auto log_level = [] {
-            if (const char* level = std::getenv("KIDI_QNN_LOG"))
-                return static_cast<QnnLog_Level_t>(std::atoi(level));
-            return QNN_LOG_LEVEL_ERROR;
-        }();
+        const auto log_level = options.diagnostics ? QNN_LOG_LEVEL_WARN : QNN_LOG_LEVEL_ERROR;
         check(api_.logCreate(log_callback, log_level, &log_), "create QNN log");
         check(api_.backendCreate(log_, nullptr, &backend_), "create QNN HTP backend");
         // The host (prepare) and DSP (execute) builds of the package have different file names so both fit in an APK.
-        if (const auto package = getenv_string("KIDI_QNN_OP_PACKAGE"); !package.empty()) {
-            auto htp_package = getenv_string("KIDI_QNN_OP_PACKAGE_HTP");
+        if (const auto package = options.op_package.string(); !package.empty()) {
+            auto htp_package = options.op_package_htp.string();
             if (htp_package.empty()) htp_package = package;
             // A missing or incompatible package only disables the fused lowering; dense QNN graphs still work.
             const auto host_status =
@@ -280,7 +285,7 @@ public:
                            "|host_status=" + std::to_string(qnn_error(host_status)) +
                            "|htp_status=" + std::to_string(qnn_error(htp_status)) +
                            "|status=" + (custom_ops_ ? "registered" : "unavailable"));
-            if (const char* dump = std::getenv("KIDI_QNN_DUMP"); dump && *dump) {
+            if (options.diagnostics) {
                 auto* library = dlopen(package.c_str(), RTLD_NOW | RTLD_LOCAL);
                 using Provider = Qnn_ErrorHandle_t (*)(QnnOpPackage_Interface_t*);
                 auto provider =
@@ -342,12 +347,10 @@ public:
         return prepare_library_ || library_loaded(join_path(library_dir_, "libQnnHtpPrepare.so"));
     }
     auto burst() const noexcept -> bool { return burst_; }
-    /// Custom attention measured slower than QNN's HMX attention, so it stays opt-in.
-    auto structured_attention() const noexcept -> bool {
-        return custom_ops_ && getenv_string("KIDI_QNN_CUSTOM_ATTENTION") == "1";
-    }
+    /// Custom attention measured slower than QNN's HMX attention, so it stays off.
+    auto structured_attention() const noexcept -> bool { return custom_ops_ && STRUCTURED_ATTENTION; }
     /// Fused GELU*up and RMSNorm restore the CPU backend's fusions on the NPU.
-    auto fused_ops() const noexcept -> bool { return custom_ops_ && getenv_string("KIDI_QNN_FUSED_OPS") != "0"; }
+    auto fused_ops() const noexcept -> bool { return custom_ops_; }
 
 private:
     auto request_burst() -> void {
@@ -461,8 +464,8 @@ public:
     auto execute(Qnn_GraphHandle_t graph, Qnn_Tensor_t* inputs, std::uint32_t input_count, Qnn_Tensor_t* outputs,
                  std::uint32_t output_count, const char* label = "") -> void {
         const auto& api = runtime_->api();
-        // KIDI_QNN_PROFILE=1 reports HTP cycles per op type for every graph execution.
-        static const bool profiling = !getenv_string("KIDI_QNN_PROFILE").empty();
+        // Operator profiling reports HTP cycles per op type for every graph execution.
+        static const bool profiling = ops::profile_options().mode != ops::ProfileMode::OFF;
         Qnn_ProfileHandle_t profile{};
         if (profiling)
             check(api.profileCreate(runtime_->backend(), QNN_PROFILE_LEVEL_DETAILED, &profile), "create QNN profile");
@@ -529,10 +532,6 @@ private:
                 message << "|" << types[item].second;
             diagnostic_log(message.str());
             if (!cycles) continue;
-            if (const auto path = getenv_string("KIDI_QNN_PROFILE_CSV"); !path.empty()) {
-                std::ofstream csv(path, std::ios::app);
-                for (const auto& [value, name] : nodes) csv << label << ',' << name << ',' << value << '\n';
-            }
             std::sort(nodes.rbegin(), nodes.rend());
             std::ostringstream top;
             top << "kidi_qnn_profile_top|graph=" << label;
@@ -788,22 +787,13 @@ auto find_gated_ffn(const std::span<const Node> nodes, std::size_t index) -> std
                          scalar_bits(node.attributes[5])};
 }
 
-auto minimum_single_projection_bytes() -> std::size_t {
-    if (const auto env = getenv_string("KIDI_QNN_MIN_PROJECTION_BYTES"); !env.empty()) {
-        std::size_t value = 0;
-        const auto result = std::from_chars(env.data(), env.data() + env.size(), value);
-        if (result.ec == std::errc{}) return value;
-    }
-    return 8 * 1024 * 1024;
-}
-
 auto find_single_projection(const std::span<const Node> nodes, std::size_t index) -> std::optional<PartitionPlan> {
     const auto& node = nodes[index];
     if (!is_calibrated_packed_linear(node) || node.outputs().size() != 1) return std::nullopt;
     const auto input_width = node.inputs()[0].size(-1);
     const auto output_width = node.outputs()[0].size(-1);
     const auto weight_bytes = node.inputs()[1].nbytes();
-    if (weight_bytes < minimum_single_projection_bytes()) return std::nullopt;
+    if (weight_bytes < MIN_PROJECTION_BYTES) return std::nullopt;
     return PartitionPlan{PartitionPlan::Kind::PACKED_LINEAR,
                          index,
                          index + 1,
@@ -1306,26 +1296,11 @@ auto hash_sampled_tensor(Hash& hash, const Tensor& tensor) -> void {
     }
 }
 
-auto environment_size(const char* name, std::size_t fallback) -> std::size_t {
-    const auto text = getenv_string(name);
-    std::size_t value = 0;
-    if (!text.empty() && std::from_chars(text.data(), text.data() + text.size(), value).ec == std::errc{}) return value;
-    return fallback;
-}
-
-auto ffn_variant() -> std::string {
-    auto variant = getenv_string("KIDI_QNN_FFN");
-    return variant.empty() ? std::string("u8") : variant;
-}
-
-auto structured_tiles_enabled() -> bool { return getenv_string("KIDI_QNN_STRUCTURED_TILES") == "1"; }
 
 /// Plans one eager operator: fused gated feed-forwards always, calibrated projections above a weight-size floor.
 auto plan_operator(const Node& node) -> std::optional<PartitionPlan> {
     if (node.operation == Operation::GATED_FEED_FORWARD) return find_gated_ffn(std::span(&node, 1), 0);
-    if (!is_calibrated_packed_linear(node) ||
-        node.inputs()[1].nbytes() < environment_size("KIDI_QNN_MIN_OPERATOR_BYTES", 4 * 1024 * 1024))
-        return std::nullopt;
+    if (!is_calibrated_packed_linear(node) || node.inputs()[1].nbytes() < MIN_OPERATOR_BYTES) return std::nullopt;
     return PartitionPlan{PartitionPlan::Kind::PACKED_LINEAR,
                          0,
                          1,
@@ -1415,13 +1390,13 @@ auto compile_operator(const std::shared_ptr<QnnRuntime>& runtime, const Node& no
         std::filesystem::create_directories(directory);
         result->context->create();
         result->built = plan.kind == PartitionPlan::Kind::GATED_FFN
-                            ? build_gated_ffn_graph(*result->context, "op", block, plan, ffn_variant())
+                            ? build_gated_ffn_graph(*result->context, "op", block, plan, std::string(FFN_VARIANT))
                             : build_projection_graph(*result->context, "op", block, plan);
         write_file(binary_path, result->context->save());
         save_metadata(metadata_path, id, std::span(&result->built, 1));
     }
     result->graph = result->context->retrieve_graph(result->built.name);
-    if (const char* dump = std::getenv("KIDI_QNN_DUMP"); dump && *dump)
+    if (diagnostics())
         std::cerr << "kidi_qnn_operator|kind="
                   << (plan.kind == PartitionPlan::Kind::GATED_FFN ? "gated_ffn" : "projection") << "|rows=" << rows
                   << "|output=" << plan.output_width << "|cache=" << (cached ? "hit" : "miss") << "|ms="
@@ -1436,12 +1411,11 @@ auto compile_operator(const std::shared_ptr<QnnRuntime>& runtime, const Node& no
 class QnnOperator final : public Operator {
 public:
     QnnOperator(std::shared_future<std::shared_ptr<CompiledOperator>> compiled, std::unique_ptr<Operator> fallback,
-                const PartitionPlan& plan, std::vector<std::int64_t> output_shape, bool verify)
+                const PartitionPlan& plan, std::vector<std::int64_t> output_shape)
         : compiled_(std::move(compiled)),
           fallback_(std::move(fallback)),
           plan_(plan),
-          output_shape_(std::move(output_shape)),
-          verify_(verify) {}
+          output_shape_(std::move(output_shape)) {}
 
     auto run(TensorInputs inputs) -> Tensor override {
         auto output = require(Tensor::empty(output_shape_, DType::F32));
@@ -1454,15 +1428,12 @@ public:
     auto run_into(TensorInputs inputs, std::span<Tensor> outputs) -> void override { dispatch(inputs, outputs[0]); }
 
     ~QnnOperator() override {
-        const char* dump = std::getenv("KIDI_QNN_DUMP");
-        if (!dump || !*dump || !(calls_ + cpu_calls_)) return;
+        if (!diagnostics() || !(calls_ + cpu_calls_)) return;
         std::cerr << "kidi_qnn_operator_timing|output=" << plan_.output_width << "|calls=" << calls_
                   << "|cpu_calls=" << cpu_calls_;
         if (calls_)
             std::cerr << "|quantize_us=" << timing_[0] / 1000 / calls_ << "|execute_us=" << timing_[1] / 1000 / calls_
                       << "|dequantize_us=" << timing_[2] / 1000 / calls_;
-        if (compared_)
-            std::cerr << "|differing=" << static_cast<double>(differing_) / compared_ << "|worst_quanta=" << worst_;
         std::cerr << '\n';
     }
 
@@ -1487,7 +1458,6 @@ private:
             return;
         }
         execute(*compiled, inputs[0], output);
-        if (verify_) compare(inputs, output);
     }
 
     auto execute(CompiledOperator& compiled, const Tensor& input, Tensor& output) -> void {
@@ -1537,30 +1507,16 @@ private:
         (void)started;
     }
 
-    /// With KIDI_QNN_VERIFY, compares against the CPU kernel in output quanta.
-    auto compare(TensorInputs inputs, const Tensor& output) -> void {
-        const auto expected = fallback_->run(inputs);
-        const auto left = require(expected.data<float>()), right = require(output.data<float>());
-        for (std::size_t index = 0; index < left.size(); ++index) {
-            const auto quanta =
-                static_cast<std::size_t>(std::lround(std::abs(left[index] - right[index]) / plan_.output_scale));
-            differing_ += quanta != 0;
-            worst_ = std::max(worst_, quanta);
-        }
-        compared_ += left.size();
-    }
-
     std::shared_future<std::shared_ptr<CompiledOperator>> compiled_;
     std::shared_ptr<CompiledOperator> compiled_value_;
     bool failed_ = false;
     std::unique_ptr<Operator> fallback_;
     PartitionPlan plan_;
     std::vector<std::int64_t> output_shape_;
-    bool verify_ = false;
     std::vector<std::uint32_t> input_dims_, output_dims_;
     std::vector<std::uint8_t> input_buffer_, output_buffer_;
     std::array<std::int64_t, 3> timing_{};
-    std::size_t calls_ = 0, cpu_calls_ = 0, differing_ = 0, compared_ = 0, worst_ = 0;
+    std::size_t calls_ = 0, cpu_calls_ = 0;
 };
 
 /// Compiles offloaded operator graphs one at a time on a background thread; libQnnHtpPrepare is CPU- and
@@ -1965,7 +1921,7 @@ struct Port {
         CONSTANT,
         IMPORT,
         EXPORT,
-        DEBUG,
+        DEBUG, // unused; kept so cached metadata keeps its kind numbers
         ROW,
         TOKEN
     };
@@ -2012,8 +1968,8 @@ auto whole_fingerprint(const Graph& graph, std::string_view key, const QnnRuntim
     hash.text(runtime.build_id());
     if (runtime.fused_ops()) hash.text("kidi-ops-fused-v1");
     if (runtime.structured_attention()) hash.text("custom-attention-v2");
-    if (structured_tiles_enabled()) hash.text("structured-tiles-v1");
-    hash.pod(environment_size("KIDI_QNN_PARTITION_MB", 256));
+    if (STRUCTURED_TILES) hash.text("structured-tiles-v1");
+    hash.pod(PARTITION_BYTES >> 20);
     std::unordered_set<const std::byte*> constants;
     for (const auto& node : graph.nodes()) {
         hash.pod(static_cast<int>(node.operation));
@@ -2054,8 +2010,7 @@ public:
           exports_(exports) {}
 
     ~WholeStepExecutable() override {
-        const char* dump = std::getenv("KIDI_QNN_DUMP");
-        if (!dump || !*dump || !steps_) return;
+        if (!diagnostics() || !steps_) return;
         std::ostringstream message;
         message << "kidi_qnn_whole|steps=" << steps_ << "|host_us=" << host_ns_ / 1000 / steps_;
         for (std::size_t index = 0; index < graphs_.size(); ++index)
@@ -2077,7 +2032,7 @@ public:
         for (auto& cache : caches_) synchronize(cache, position);
         auto host = std::chrono::steady_clock::now() - started;
         graph_ns_.resize(graphs_.size());
-        if (!steps_ && std::getenv("KIDI_QNN_DUMP")) {
+        if (!steps_ && diagnostics()) {
             std::ostringstream message;
             message << "kidi_qnn_execute|graphs=" << graphs_.size() << "|position=" << position;
             diagnostic_log(message.str());
@@ -2211,26 +2166,8 @@ private:
                         if (input.kind == Port::Kind::IMPORT && input.index == port.index)
                             std::memcpy(input.buffer.data(), port.buffer.data(), input.buffer.size());
                 break;
-            case Port::Kind::DEBUG: {
-                const auto expected = require(nodes_[port.index].outputs()[0].data<float>());
-                const auto* actual = reinterpret_cast<const Half*>(port.buffer.data());
-                double squared = 0, reference = 0, actual_energy = 0, maximum = 0;
-                const auto count = std::min(expected.size(), port.buffer.size() / sizeof(Half));
-                for (std::size_t index = 0; index < count; ++index) {
-                    const auto delta = static_cast<double>(actual[index]) - expected[index];
-                    squared += delta * delta;
-                    reference += static_cast<double>(expected[index]) * expected[index];
-                    actual_energy += static_cast<double>(actual[index]) * actual[index];
-                    maximum = std::max(maximum, std::abs(delta));
-                }
-                std::cerr << "kidi_qnn_debug|node=" << port.index
-                          << "|op=" << operation_name(nodes_[port.index].operation) << "|max=" << maximum
-                          << "|rms=" << std::sqrt(squared / std::max<std::size_t>(count, 1))
-                          << "|expected_rms=" << std::sqrt(reference / std::max<std::size_t>(count, 1))
-                          << "|actual_rms=" << std::sqrt(actual_energy / std::max<std::size_t>(count, 1))
-                          << "|relative_rms=" << std::sqrt(squared / std::max(reference, 1e-30)) << '\n';
+            case Port::Kind::DEBUG:
                 break;
-            }
             case Port::Kind::ROW: {
                 auto& cache = caches_[port.index];
                 const auto rows = port.buffer.size() / cache.width;
@@ -2309,8 +2246,7 @@ public:
             cache.handle = context_->register_memory(cache.memory.fd, cache.dims, QNN_DATATYPE_UFIXED_POINT_8);
         }
         std::size_t current = SIZE_MAX;
-        const auto limit = std::min(nodes.size(), environment_size("KIDI_QNN_NODE_LIMIT", nodes.size()));
-        for (std::size_t index = 0; index < limit; ++index) {
+        for (std::size_t index = 0; index < nodes.size(); ++index) {
             if (is_prologue_[index]) continue;
             if (partition_[index] != current) {
                 finish();
@@ -2527,7 +2463,7 @@ private:
         // Finalizing hundreds of megabytes of unpacked low-bit containers in one graph can spend minutes in
         // libQnnHtpPrepare or exhaust its memory. Smaller graphs still keep all arithmetic on the HTP and make
         // compilation observable and recoverable.
-        const auto budget = environment_size("KIDI_QNN_PARTITION_MB", 256) * 1024 * 1024;
+        const auto budget = PARTITION_BYTES;
         std::size_t part = 0, bytes = 0;
         for (std::size_t index = 0; index < nodes.size(); ++index) {
             if (is_prologue_[index]) continue;
@@ -2598,7 +2534,7 @@ private:
     auto finish() -> void {
         if (!builder_) return;
         const auto started = std::chrono::steady_clock::now();
-        if (const char* dump = std::getenv("KIDI_QNN_DUMP"); dump && *dump)
+        if (diagnostics())
             std::cerr << "kidi_qnn_finalize|graph=" << graphs_.back().name << "|nodes=" << graphs_.back().first_node
                       << '-' << graphs_.back().last_node << "|state=begin\n";
         const auto failures = graph_memory_failures.load(std::memory_order_relaxed);
@@ -2607,7 +2543,7 @@ private:
         if (graph_memory_failures.load(std::memory_order_relaxed) != failures)
             throw ops::Failure(
                 {ErrorCode::RUNTIME, "finalize QNN graph " + graphs_.back().name + " exhausted DSP mapped memory"});
-        if (const char* dump = std::getenv("KIDI_QNN_DUMP"); dump && *dump)
+        if (diagnostics())
             std::cerr << "kidi_qnn_finalize|graph=" << graphs_.back().name << "|nodes=" << graphs_.back().first_node
                       << '-' << graphs_.back().last_node << "|state=end|ms="
                       << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count()
@@ -2703,14 +2639,7 @@ private:
     auto record(std::size_t index, Value value) -> void {
         const auto& node = graph_.nodes()[index];
         const auto shape = dims_of(node.outputs()[0].shape());
-        const bool debug_attention = !getenv_string("KIDI_QNN_VERIFY_CAPTURE").empty() &&
-                                     graph_.nodes()[index].operation == Operation::ATTENTION;
-        if (debug_attention) {
-            value = builder_->expose(value, shape);
-            add_port(false, Port::Kind::DEBUG, index, value);
-        } else {
-            value = builder_->reshape(value, shape);
-        }
+        value = builder_->reshape(value, shape);
         values_[{index, 0}] = value;
         if (const auto found = exported_.find({index, 0}); found != exported_.end()) {
             const auto exposed = builder_->expose(value);
@@ -2749,8 +2678,7 @@ private:
         float maximum = 0;
         for (const auto value : captured) maximum = std::max(maximum, std::abs(value));
         const auto head_scale = std::max(maximum * 1.25F / 127.F, 1e-4F);
-        if (const char* dump = std::getenv("KIDI_QNN_DUMP"); dump && *dump)
-            std::cerr << "kidi_qnn_head|max_abs=" << maximum << "|scale=" << head_scale << '\n';
+        if (diagnostics()) std::cerr << "kidi_qnn_head|max_abs=" << maximum << "|scale=" << head_scale << '\n';
         auto output = builder_->native(QNN_DATATYPE_UFIXED_POINT_8, {rows, outputs}, per_tensor(head_scale, -128));
         builder_->op(QNN_OP_FULLY_CONNECTED, {quantized, weight}, {output});
         return output;
@@ -2949,7 +2877,7 @@ private:
         }
         auto query = builder_->transpose(builder_->reshape(operand(index, 0), {query_rows, heads, width}), {1, 0, 2});
         query = builder_->binary(QNN_OP_ELEMENT_WISE_MULTIPLY, query, builder_->scalar(node.epsilon, 3));
-        if (query_rows > 1 && structured_tiles_enabled()) {
+        if (query_rows > 1 && STRUCTURED_TILES) {
             constexpr std::uint32_t TILE = 64;
             constexpr std::uint32_t WINDOW = 512;
             const auto past = capacity - query_rows;
@@ -3172,7 +3100,7 @@ public:
     auto key_extent(std::size_t required, std::size_t capacity) const -> std::size_t override {
         if (!whole_step()) return std::min(capacity, (required + 127) / 128 * 128);
         if (runtime_->structured_attention()) return capacity;
-        if (structured_tiles_enabled()) {
+        if (STRUCTURED_TILES) {
             constexpr std::size_t TILE = 64;
             return std::min(capacity, std::max(TILE, (required + TILE - 1) / TILE * TILE));
         }
@@ -3181,7 +3109,7 @@ public:
 
     auto crop_local_attention() const -> bool override { return !whole_step(); }
 
-    static auto whole_step() -> bool { return getenv_string("KIDI_QNN_WHOLE") != "0"; }
+    static auto whole_step() -> bool { return WHOLE_STEP; }
 
     auto compiles_in_background() const -> bool override { return true; }
     auto compiles_in_background(const Graph& graph, std::string_view key) const -> bool override {
@@ -3207,7 +3135,7 @@ public:
             inputs.size() < 3 || inputs[0].dtype() != DType::F32 || inputs[0].dimensions() == 0)
             return nullptr;
         const auto rows = inputs[0].numel() / inputs[0].size(-1);
-        if (rows < environment_size("KIDI_QNN_MIN_ROWS", 16)) return nullptr;
+        if (rows < MIN_OPERATOR_ROWS) return nullptr;
         try {
             Node node{};
             node.operation = spec.operation;
@@ -3222,12 +3150,12 @@ public:
             node.operands.push_back(require(Tensor::empty(shape, DType::F32)));
             const auto plan = plan_operator(node);
             if (!plan) return nullptr;
-            const auto block = environment_size("KIDI_QNN_BLOCK_ROWS", 128);
+            const auto block = OPERATOR_BLOCK_ROWS;
             // Weights are hashed once per distinct operator; the result keys both the disk cache and shared graphs.
             Hash hash;
             hash.text(CACHE_VERSION);
             hash.text("operator");
-            hash.text(ffn_variant());
+            hash.text(FFN_VARIANT);
             hash.text(runtime_->build_id());
             hash.pod(static_cast<int>(plan->kind));
             hash.pod(block);
@@ -3246,10 +3174,6 @@ public:
                 const std::scoped_lock lock(operators_mutex_);
                 auto found = operators_.find(id);
                 if (found == operators_.end()) {
-                    if (offloaded_ >=
-                        environment_size("KIDI_QNN_MAX_OPERATORS", std::numeric_limits<std::size_t>::max()))
-                        return nullptr;
-                    ++offloaded_;
                     auto promise = std::make_shared<std::promise<std::shared_ptr<CompiledOperator>>>();
                     found = operators_.emplace(id, promise->get_future().share()).first;
                     auto job = [runtime = runtime_, node, plan = *plan, id, block, promise] {
@@ -3259,16 +3183,13 @@ public:
                             promise->set_exception(std::current_exception());
                         }
                     };
-                    if (getenv_string("KIDI_BACKGROUND_COMPILE") == "0")
-                        job();
-                    else
-                        queue_.push(std::move(job));
+                    queue_.push(std::move(job));
                 }
                 compiled = found->second;
             }
             if (!reference_backend_) reference_backend_ = cpu_operators();
             return std::make_unique<QnnOperator>(std::move(compiled), reference_backend_->prepare(spec, inputs), *plan,
-                                                 std::move(shape), !getenv_string("KIDI_QNN_VERIFY").empty());
+                                                 std::move(shape));
         } catch (const std::exception& error) {
             std::cerr << "kidi_qnn_operator|fallback=cpu|error=" << error.what() << '\n';
             return nullptr;
@@ -3278,7 +3199,7 @@ public:
     auto compile(const Graph& graph, std::string_view key) -> std::unique_ptr<graph::Executable> override {
         const bool decode = key.starts_with("gemma4_decode:") && key.ends_with(":token");
         const bool prefill = key.starts_with("gemma4_prefill:");
-        if ((!decode && !prefill) || getenv_string("KIDI_QNN_STEPS") == "0") return nullptr;
+        if (!decode && !prefill) return nullptr;
         if (whole_step()) {
             const auto started = std::chrono::steady_clock::now();
             try {
@@ -3287,17 +3208,15 @@ public:
                 const auto directory = cache_directory();
                 const auto binary_path = directory / (id + ".whole.bin");
                 const auto metadata_path = directory / (id + ".whole.json");
-                if (const char* dump = std::getenv("KIDI_QNN_DUMP"); dump && *dump) {
+                if (diagnostics()) {
                     std::ostringstream message;
                     message << "kidi_qnn_cache|key=" << key << "|id=" << id << "|present="
                             << (std::filesystem::exists(binary_path) && std::filesystem::exists(metadata_path));
                     diagnostic_log(message.str());
                 }
-                const bool diagnostics =
-                    !getenv_string("KIDI_QNN_NODE_LIMIT").empty() || !getenv_string("KIDI_QNN_VERIFY_CAPTURE").empty();
                 std::unique_ptr<graph::Executable> executable;
                 bool loaded = false;
-                if (!diagnostics && std::filesystem::exists(binary_path) && std::filesystem::exists(metadata_path)) {
+                if (std::filesystem::exists(binary_path) && std::filesystem::exists(metadata_path)) {
                     executable = StepLowering(runtime_, graph, prefill, constant_mutex_, constant_blocks_)
                                      .load(read_file(binary_path), metadata_path, id);
                     loaded = true;
@@ -3305,16 +3224,11 @@ public:
                     if (!runtime_->prepare_available())
                         throw ops::Failure({ErrorCode::UNSUPPORTED,
                                             "QNN HTP prepare library is unavailable and no whole-step cache exists"});
-                    if (!diagnostics) std::filesystem::create_directories(directory);
+                    std::filesystem::create_directories(directory);
                     executable = StepLowering(runtime_, graph, prefill, constant_mutex_, constant_blocks_)
-                                     .lower(diagnostics ? std::filesystem::path{} : binary_path,
-                                            diagnostics ? std::filesystem::path{} : metadata_path, id);
+                                     .lower(binary_path, metadata_path, id);
                 }
-                if (!getenv_string("KIDI_QNN_VERIFY_CAPTURE").empty()) {
-                    std::vector<Tensor> outputs(graph.outputs().begin(), graph.outputs().end());
-                    executable->run(graph.inputs(), outputs);
-                }
-                if (const char* dump = std::getenv("KIDI_QNN_DUMP"); dump && *dump) {
+                if (diagnostics()) {
                     std::ostringstream message;
                     message
                         << "kidi_qnn_whole|key=" << key << "|compile_ms="
@@ -3325,33 +3239,9 @@ public:
                 return executable;
             } catch (const std::exception& error) {
                 diagnostic_log("kidi_qnn_whole|key=" + std::string(key) + "|fallback=partitions|error=" + error.what());
-                if (getenv_string("KIDI_QNN_WHOLE") == "1") throw;
             }
         }
         const auto plans = plan_partitions(graph);
-        if (const char* dump = std::getenv("KIDI_QNN_DUMP_VERBOSE"); dump && *dump) {
-            std::cerr << "kidi_qnn_graph|key=" << key << "|nodes=" << graph.nodes().size() << '\n';
-            for (std::size_t index = 0; index < graph.nodes().size(); ++index) {
-                const auto& node = graph.nodes()[index];
-                if (std::getenv("KIDI_QNN_DUMP_ALL")) {
-                    std::cerr << "kidi_qnn_all|index=" << index << "|op=" << operation_name(node.operation)
-                              << "|inputs=" << node.input_count << "|outputs=" << node.outputs().size();
-                    if (!node.outputs().empty()) {
-                        std::cerr << "|shape=";
-                        for (const auto extent : node.outputs()[0].shape()) std::cerr << extent << ',';
-                    }
-                    std::cerr << '\n';
-                }
-                if (node.operation != Operation::PACKED_LINEAR) continue;
-                std::cerr << "kidi_qnn_node|index=" << index << "|op=packed_linear|input=" << node.inputs()[0].size(-1)
-                          << "|output=" << node.outputs()[0].size(-1) << "|weight_bytes=" << node.inputs()[1].nbytes()
-                          << "|bits=" << (node.attributes.empty() ? 0 : node.attributes[0])
-                          << "|group=" << (node.attributes.size() < 2 ? 0 : node.attributes[1])
-                          << "|input_scale=" << node.epsilon
-                          << "|output_scale=" << (node.attributes.size() < 3 ? 0.F : scalar_bits(node.attributes[2]))
-                          << '\n';
-            }
-        }
         if (plans.empty()) return nullptr;
         const auto id = fingerprint(graph, plans, key, runtime_->build_id());
         auto context = std::make_unique<QnnContext>(runtime_);
@@ -3386,7 +3276,7 @@ public:
         std::vector<QnnPartition> partitions;
         partitions.reserve(built.size());
         for (const auto& partition : built) partitions.emplace_back(partition, context->retrieve_graph(partition.name));
-        if (const char* dump = std::getenv("KIDI_QNN_DUMP"); dump && *dump) {
+        if (diagnostics()) {
             std::cerr << "kidi_qnn|key=" << key << "|cache=" << (loaded ? "hit" : "miss") << "|id=" << id
                       << "|partitions=" << partitions.size() << "|api=" << runtime_->api_version()
                       << "|build=" << runtime_->build_id() << "|burst=" << runtime_->burst() << '\n';
@@ -3403,7 +3293,6 @@ private:
     std::map<const void*, SharedMemory::Block> constant_blocks_;
     std::mutex operators_mutex_;
     std::map<std::string, std::shared_future<std::shared_ptr<CompiledOperator>>> operators_;
-    std::size_t offloaded_ = 0;
     std::unique_ptr<OperatorBackend> reference_backend_;
     CompileQueue queue_;
 };

@@ -181,7 +181,7 @@ __global__ void normalize(Launch plan) {
 
 constexpr int rms_values_per_thread = 10;
 
-template <typename Element, Op Operation>
+template <typename Element, typename OutputElement, Op Operation>
 __global__ void dense_rms_normalize(Launch plan) {
     __shared__ float partial[8];
     const auto width = plan.output.shape[plan.output.rank - 1], row = static_cast<std::int64_t>(blockIdx.x);
@@ -229,7 +229,7 @@ __global__ void dense_rms_normalize(Launch plan) {
                          static_cast<const float*>(plan.inputs[2].data)[angle] +
                      (column < half ? -paired : paired) * static_cast<const float*>(plan.inputs[3].data)[angle];
         }
-        static_cast<Element*>(plan.output.data)[row * width + column] = static_cast<Element>(result);
+        static_cast<OutputElement*>(plan.output.data)[row * width + column] = static_cast<OutputElement>(result);
     }
 }
 
@@ -278,14 +278,20 @@ __global__ void warp_rms_rotary(Launch plan, unsigned int rows) {
 template <typename Element>
 bool dense_rms(const Launch& plan, Op operation, unsigned int rows, cudaStream_t stream) {
     const auto floating = static_cast<int>(Type::F32);
-    if (plan.inputs[0].type != plan.output.type || plan.attribute_count || plan.inputs[1].type != floating ||
+    if (plan.attribute_count || plan.inputs[1].type != floating ||
         plan.output.shape[plan.output.rank - 1] > 256 * rms_values_per_thread)
         return false;
+    if (operation == Op::RMS_NORM && plan.inputs[0].type == floating &&
+        plan.output.type == static_cast<int>(Type::BF16)) {
+        dense_rms_normalize<float, __nv_bfloat16, Op::RMS_NORM><<<rows, 256, 0, stream>>>(plan);
+        return true;
+    }
+    if (plan.inputs[0].type != plan.output.type) return false;
     if (operation == Op::RMS_NORM) {
-        dense_rms_normalize<Element, Op::RMS_NORM><<<rows, 256, 0, stream>>>(plan);
+        dense_rms_normalize<Element, Element, Op::RMS_NORM><<<rows, 256, 0, stream>>>(plan);
     } else if (operation == Op::RMS_NORM_RESIDUAL && plan.inputs[2].type == plan.output.type &&
                (plan.count == 3 || plan.inputs[3].type == floating)) {
-        dense_rms_normalize<Element, Op::RMS_NORM_RESIDUAL><<<rows, 256, 0, stream>>>(plan);
+        dense_rms_normalize<Element, Element, Op::RMS_NORM_RESIDUAL><<<rows, 256, 0, stream>>>(plan);
     } else if (operation == Op::RMS_ROTARY && plan.inputs[2].type == floating && plan.inputs[3].type == floating) {
         const auto width = plan.output.shape[plan.output.rank - 1];
         if (width == 256)
@@ -293,7 +299,7 @@ bool dense_rms(const Launch& plan, Op operation, unsigned int rows, cudaStream_t
         else if (width == 512)
             warp_rms_rotary<Element, 16><<<(rows + 7) / 8, 256, 0, stream>>>(plan, rows);
         else
-            dense_rms_normalize<Element, Op::RMS_ROTARY><<<rows, 256, 0, stream>>>(plan);
+            dense_rms_normalize<Element, Element, Op::RMS_ROTARY><<<rows, 256, 0, stream>>>(plan);
     } else {
         return false;
     }

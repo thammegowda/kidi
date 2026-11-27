@@ -1,14 +1,21 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
+#include <vector>
+
+#include <gtest/gtest.h>
 
 #include "kidi/checkpoint/ggml/reader.h"
 #include "kidi/checkpoint/weights.h"
+#include "kidi/ops/context.h"
+#include "kidi/tensor/backend.h"
 
 namespace {
 
@@ -131,75 +138,86 @@ auto write_fixture(const std::filesystem::path& path) -> void {
     output.write(reinterpret_cast<const char*>(f16.data()), sizeof(f16));
 }
 
-} // namespace
+auto temp_path(std::string_view stem, std::string_view extension) -> std::filesystem::path {
+    return std::filesystem::temp_directory_path() /
+           (std::string(stem) + "-" + ::testing::UnitTest::GetInstance()->current_test_info()->name() +
+            std::string(extension));
+}
 
-auto main(int argc, char** argv) -> int {
-    if (argc == 3) {
-        const auto weights = kidi::checkpoint::Weights::load(argv[1]);
-        if (!weights) {
-            std::cerr << weights.error().message << '\n';
-            return 1;
-        }
-        const auto value = weights->tensor(argv[2]);
-        if (!value) {
-            std::cerr << value.error().message << '\n';
-            return 1;
-        }
-        std::cout << "tensors=" << weights->size() << " values=" << value->numel() << '\n';
-        for (const auto sample : value->data<float>()->first(std::min<std::size_t>(32, value->numel())))
-            std::cout << sample << ' ';
-        std::cout << '\n';
-        return 0;
-    }
-    const auto gguf_path = std::filesystem::temp_directory_path() / "kidi-weights-test.gguf";
+auto overwrite(const std::filesystem::path& path, std::streamoff offset, auto value) -> void {
+    std::fstream stream(path, std::ios::binary | std::ios::in | std::ios::out);
+    stream.seekp(offset);
+    stream.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+// Diagnostic: set KIDI_TEST_WEIGHTS_FILE (checkpoint path) and KIDI_TEST_WEIGHTS_TENSOR (tensor name) to dump a tensor.
+TEST(WeightsTest, DumpsTensorFromEnvironment) {
+    const char* file = std::getenv("KIDI_TEST_WEIGHTS_FILE");
+    const char* name = std::getenv("KIDI_TEST_WEIGHTS_TENSOR");
+    if (!file || !name) GTEST_SKIP() << "KIDI_TEST_WEIGHTS_FILE and KIDI_TEST_WEIGHTS_TENSOR are not set";
+    const auto weights = kidi::checkpoint::Weights::load(file);
+    ASSERT_TRUE(weights.has_value()) << weights.error().message;
+    const auto value = weights->tensor(name);
+    ASSERT_TRUE(value.has_value()) << value.error().message;
+    std::cout << "tensors=" << weights->size() << " values=" << value->numel() << '\n';
+    for (const auto sample : value->data<float>()->first(std::min<std::size_t>(32, value->numel())))
+        std::cout << sample << ' ';
+    std::cout << '\n';
+}
+
+TEST(WeightsTest, ImportsGgmlAndGguf) {
+    const auto gguf_path = temp_path("kidi-weights-test", ".gguf");
     for (const bool legacy : {false, true}) {
         for (const std::uint32_t type : {0, 1, 2, 3, 6, 7, 8, 30}) {
             if (legacy && type == 30) continue;
+            SCOPED_TRACE(::testing::Message() << "legacy=" << legacy << " type=" << type);
             const auto [expected, type_offset] = write_import_fixture(gguf_path, type, legacy);
             const std::string name = legacy ? "model.encoder.layers.0.self_attn.q_proj.weight" : "weight";
             auto imported = kidi::checkpoint::Weights::load(gguf_path);
-            if (!imported || imported->names() != std::vector<std::string>{name}) return 1;
+            ASSERT_TRUE(imported.has_value()) << imported.error().message;
+            EXPECT_EQ(imported->names(), std::vector<std::string>{name});
             const auto value = imported->tensor(name);
-            const auto data =
-                value ? value->data<float>() : kidi::Result<std::span<const float>>{std::unexpected(value.error())};
-            if (!data || value->size(0) != 1 || value->size(1) != 32 || !std::ranges::equal(*data, expected)) return 1;
+            ASSERT_TRUE(value.has_value()) << value.error().message;
+            const auto data = value->data<float>();
+            ASSERT_TRUE(data.has_value()) << data.error().message;
+            EXPECT_EQ(value->size(0), 1);
+            EXPECT_EQ(value->size(1), 32);
+            EXPECT_TRUE(std::ranges::equal(*data, expected));
             const std::array concat = {kidi::checkpoint::StateMappingSpec{{"^" + name + "$", name}, "fused", 0}};
             auto mapped = kidi::checkpoint::Weights::load(gguf_path, concat);
-            const auto fused =
-                mapped ? mapped->tensor("fused") : kidi::Result<kidi::tensor::Tensor>{std::unexpected(mapped.error())};
-            if (!fused || mapped->size() != 1 || mapped->contains(name) || fused->size(0) != 2 ||
-                !std::ranges::equal(fused->data<float>()->first(32), expected) ||
-                !std::ranges::equal(fused->data<float>()->subspan(32), expected))
-                return 1;
-            {
-                std::fstream stream(gguf_path, std::ios::binary | std::ios::in | std::ios::out);
-                stream.seekp(type_offset);
-                const std::uint32_t unsupported = 999;
-                stream.write(reinterpret_cast<const char*>(&unsupported), sizeof(unsupported));
-            }
-            if (kidi::checkpoint::Weights::load(gguf_path)) return 1;
+            ASSERT_TRUE(mapped.has_value()) << mapped.error().message;
+            const auto fused = mapped->tensor("fused");
+            ASSERT_TRUE(fused.has_value()) << fused.error().message;
+            EXPECT_EQ(mapped->size(), 1U);
+            EXPECT_FALSE(mapped->contains(name));
+            ASSERT_EQ(fused->size(0), 2);
+            EXPECT_TRUE(std::ranges::equal(fused->data<float>()->first(32), expected));
+            EXPECT_TRUE(std::ranges::equal(fused->data<float>()->subspan(32), expected));
+            overwrite(gguf_path, type_offset, std::uint32_t{999});
+            EXPECT_FALSE(kidi::checkpoint::Weights::load(gguf_path)) << "unsupported tensor type was accepted";
         }
     }
-    const auto overwrite = [&](std::streamoff offset, auto value) {
-        std::fstream stream(gguf_path, std::ios::binary | std::ios::in | std::ios::out);
-        stream.seekp(offset);
-        stream.write(reinterpret_cast<const char*>(&value), sizeof(value));
-    };
+    std::filesystem::remove(gguf_path);
+}
+
+TEST(WeightsTest, RejectsCorruptGguf) {
+    const auto gguf_path = temp_path("kidi-weights-test", ".gguf");
     for (const std::uint64_t dimension : {std::uint64_t{0}, std::uint64_t{31}, UINT64_MAX}) {
         const auto [expected, type_offset] = write_import_fixture(gguf_path, 8);
-        overwrite(type_offset - 16, dimension);
-        if (kidi::checkpoint::Weights::load(gguf_path)) return 1;
+        overwrite(gguf_path, type_offset - 16, dimension);
+        EXPECT_FALSE(kidi::checkpoint::Weights::load(gguf_path)) << "dimension=" << dimension;
     }
     {
         const auto [expected, type_offset] = write_import_fixture(gguf_path, 8);
-        overwrite(type_offset + 4, std::uint64_t{1} << 63);
-        if (kidi::checkpoint::Weights::load(gguf_path)) return 1;
+        overwrite(gguf_path, type_offset + 4, std::uint64_t{1} << 63);
+        EXPECT_FALSE(kidi::checkpoint::Weights::load(gguf_path));
     }
     {
         const auto [expected, type_offset] = write_import_fixture(gguf_path, 8);
-        overwrite((type_offset + 12 + 63) / 64 * 64, std::uint16_t{0x7c00});
+        overwrite(gguf_path, (type_offset + 12 + 63) / 64 * 64, std::uint16_t{0x7c00});
         auto imported = kidi::checkpoint::Weights::load(gguf_path);
-        if (!imported || imported->tensor("weight")) return 1;
+        ASSERT_TRUE(imported.has_value()) << imported.error().message;
+        EXPECT_FALSE(imported->tensor("weight"));
     }
     {
         const auto [expected, type_offset] = write_import_fixture(gguf_path, 8, true);
@@ -212,135 +230,220 @@ auto main(int argc, char** argv) -> int {
         std::ofstream output(gguf_path, std::ios::binary | std::ios::app);
         output.write(duplicate.data(), duplicate.size());
         output.close();
-        if (kidi::checkpoint::Weights::load(gguf_path)) return 1;
+        EXPECT_FALSE(kidi::checkpoint::Weights::load(gguf_path)) << "duplicate tensor was accepted";
     }
     write_import_fixture(gguf_path, 8);
     std::filesystem::resize_file(gguf_path, std::filesystem::file_size(gguf_path) - 1);
-    if (kidi::checkpoint::Weights::load(gguf_path)) return 1;
+    EXPECT_FALSE(kidi::checkpoint::Weights::load(gguf_path)) << "truncated file was accepted";
     std::filesystem::remove(gguf_path);
-    const auto path = std::filesystem::temp_directory_path() / "kidi-weights-test.safetensors";
-    write_fixture(path);
+}
 
-    auto weights = kidi::checkpoint::Weights::load(path);
-    if (!weights || weights->size() != 7 || !weights->contains("weight")) {
-        std::cerr << "failed to map Safetensors fixture\n";
-        return 1;
-    }
-    auto tensor = weights->tensor("weight");
-    auto values = tensor ? std::as_const(*tensor).data<float>()
-                         : kidi::Result<std::span<const float>>{std::unexpected(tensor.error())};
-    if (!tensor || !values || tensor->dtype() != kidi::checkpoint::DataType::F32 ||
-        kidi::tensor::element_size(tensor->dtype()) != sizeof(float) || tensor->shape().size() != 1 ||
-        tensor->shape()[0] != 2 || tensor->numel() != 2 || (*values)[0] != 1.25F || (*values)[1] != -2.5F ||
-        tensor->data<float>().has_value()) {
-        std::cerr << "mapped tensor view is incorrect\n";
-        return 1;
-    }
-    const auto bf16 = weights->tensor("bf16");
-    const auto int8 = weights->tensor("int8");
-    const auto e4m3 = weights->tensor("e4m3");
-    const auto e5m2 = weights->tensor("e5m2");
-    if (!bf16 || bf16->dtype() != kidi::checkpoint::DataType::BF16 || kidi::tensor::element_size(bf16->dtype()) != 2 ||
-        !int8 || int8->dtype() != kidi::checkpoint::DataType::I8 || !e4m3 ||
-        e4m3->dtype() != kidi::checkpoint::DataType::E4M3 || !e5m2 ||
-        e5m2->dtype() != kidi::checkpoint::DataType::E5M2) {
-        std::cerr << "Safetensors dtype mapping is incorrect\n";
-        return 1;
-    }
-    const auto expanded = weights->float32_tensor("f16");
-    const auto expanded_bf16 = weights->float32_tensor("bf16");
-    const auto unchanged = weights->float32_tensor("weight");
-    if (!expanded || !expanded_bf16 || !unchanged ||
-        unchanged->host_bytes()->data() != std::as_const(*tensor).host_bytes()->data() ||
-        weights->float32_tensor("int8") || weights->float32_tensor("missing")) {
-        std::cerr << "checkpoint FP32 expansion or zero-copy contract failed\n";
-        return 1;
-    }
-    const auto half_values = expanded->data<float>(), bf16_values = expanded_bf16->data<float>();
-    if (!half_values || (*half_values)[0] != 1.F || (*half_values)[1] != -2.F ||
-        (*half_values)[2] != std::ldexp(1.F, -24) || !std::signbit((*half_values)[3]) || !bf16_values ||
-        (*bf16_values)[0] != 1.25F || (*bf16_values)[1] != -2.5F) {
-        std::cerr << "FP16/BF16 expansion produced incorrect values\n";
-        return 1;
+class SafetensorsTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        path = temp_path("kidi-weights-test", ".safetensors");
+        write_fixture(path);
+        auto loaded = kidi::checkpoint::Weights::load(path);
+        ASSERT_TRUE(loaded.has_value()) << "failed to map Safetensors fixture: " << loaded.error().message;
+        weights.emplace(std::move(*loaded));
+        ASSERT_EQ(weights->size(), 7U) << "failed to map Safetensors fixture";
+        ASSERT_TRUE(weights->contains("weight")) << "failed to map Safetensors fixture";
+        auto loaded_tensor = weights->tensor("weight");
+        ASSERT_TRUE(loaded_tensor.has_value()) << "mapped tensor view is incorrect: " << loaded_tensor.error().message;
+        tensor.emplace(std::move(*loaded_tensor));
     }
 
-    const std::array mappings = {kidi::checkpoint::StateMappingSpec{
+    void TearDown() override {
+        tensor.reset();
+        weights.reset();
+        std::error_code error;
+        std::filesystem::remove(path, error);
+    }
+
+    const std::array<kidi::checkpoint::StateMappingSpec, 1> mappings = {kidi::checkpoint::StateMappingSpec{
         .sources = {R"(^weight$)", "weight2"},
         .destination = "fused",
         .concat_axis = 0,
     }};
-    auto mapped = kidi::checkpoint::Weights::load(path, mappings);
-    auto fused = mapped ? mapped->tensor("fused") : kidi::Result<kidi::tensor::Tensor>{std::unexpected(mapped.error())};
-    auto fused_values = fused ? std::as_const(*fused).data<float>()
-                              : kidi::Result<std::span<const float>>{std::unexpected(fused.error())};
-    if (!mapped || mapped->size() != 6 || mapped->contains("weight") || mapped->contains("weight2") || !fused ||
-        !fused_values || fused->shape().size() != 1 || fused->shape()[0] != 4 || (*fused_values)[0] != 1.25F ||
-        (*fused_values)[1] != -2.5F || (*fused_values)[2] != 3.0F || (*fused_values)[3] != 4.0F) {
-        std::cerr << "state mapping fusion is incorrect\n";
-        return 1;
-    }
-    const auto zero_copy_mapped = weights->mapped(mappings);
-    auto zero_copy_fused = zero_copy_mapped
-                               ? zero_copy_mapped->tensor("fused")
-                               : kidi::Result<kidi::tensor::Tensor>{std::unexpected(zero_copy_mapped.error())};
-    if (!zero_copy_fused || zero_copy_fused->data<float>().has_value() ||
-        std::as_const(*zero_copy_fused).host_bytes()->data() != std::as_const(*tensor).host_bytes()->data()) {
-        std::cerr << "adjacent state mapping fusion was not zero-copy\n";
-        return 1;
-    }
-    {
-        using kidi::checkpoint::StateMappingOp;
-        using kidi::checkpoint::StateMappingSpec;
-        const std::array rules = {
-            StateMappingSpec{.sources = {R"(^e[45]m.*$)"}, .op = StateMappingOp::IGNORE},
-            StateMappingSpec{
-                .sources = {R"(^weight$)", "weight"}, .destination = "same_scale", .op = StateMappingOp::IDENTICAL},
-            StateMappingSpec{.sources = {"0:weight2", R"(^weight2$)"}, .destination = "zero_prefixed"},
-        };
-        const auto view = weights->mapped(rules);
-        const auto zero_prefixed =
-            view ? view->tensor("zero_prefixed") : kidi::Result<kidi::tensor::Tensor>{std::unexpected(view.error())};
-        const auto zp_values = zero_prefixed
-                                   ? std::as_const(*zero_prefixed).data<float>()
-                                   : kidi::Result<std::span<const float>>{std::unexpected(zero_prefixed.error())};
-        if (!view || view->contains("e4m3") || view->contains("e5m2") || !view->contains("same_scale") || !zp_values ||
-            zp_values->size() != 4 || (*zp_values)[0] != 0.F || (*zp_values)[1] != 0.F || (*zp_values)[2] != 3.0F ||
-            (*zp_values)[3] != 4.0F) {
-            std::cerr << "mapped IGNORE/IDENTICAL/zero-reference rules failed\n";
-            return 1;
-        }
-        const std::array mismatch = {StateMappingSpec{
-            .sources = {R"(^weight$)", "weight2"}, .destination = "bad_scale", .op = StateMappingOp::IDENTICAL}};
-        if (weights->mapped(mismatch)) {
-            std::cerr << "mismatched IDENTICAL parameters were accepted\n";
-            return 1;
-        }
-        const auto prefixed =
-            kidi::checkpoint::prefix_state_mappings("llm.", "llm.", std::span<const StateMappingSpec>(mappings));
-        if (prefixed.size() != 1 || prefixed[0].sources[0] != R"(^llm\.weight$)" ||
-            prefixed[0].sources[1] != "llm.weight2" || prefixed[0].destination != "llm.fused") {
-            std::cerr << "prefix_state_mappings rewrote patterns incorrectly\n";
-            return 1;
-        }
-    }
+    std::filesystem::path path;
+    std::optional<kidi::checkpoint::Weights> weights;
+    std::optional<kidi::tensor::Tensor> tensor;
+};
 
-    const auto saved_path = std::filesystem::temp_directory_path() / "kidi-weights-roundtrip.safetensors";
+TEST_F(SafetensorsTest, MapsTensorViews) {
+    auto values = std::as_const(*tensor).data<float>();
+    ASSERT_TRUE(values.has_value()) << "mapped tensor view is incorrect";
+    EXPECT_EQ(tensor->dtype(), kidi::checkpoint::DataType::F32) << "mapped tensor view is incorrect";
+    EXPECT_EQ(kidi::tensor::element_size(tensor->dtype()), sizeof(float)) << "mapped tensor view is incorrect";
+    ASSERT_EQ(tensor->shape().size(), 1U) << "mapped tensor view is incorrect";
+    EXPECT_EQ(tensor->shape()[0], 2) << "mapped tensor view is incorrect";
+    EXPECT_EQ(tensor->numel(), 2U) << "mapped tensor view is incorrect";
+    EXPECT_EQ((*values)[0], 1.25F) << "mapped tensor view is incorrect";
+    EXPECT_EQ((*values)[1], -2.5F) << "mapped tensor view is incorrect";
+    EXPECT_FALSE(tensor->data<float>().has_value()) << "mapped tensor view is incorrect";
+}
+
+#if defined(__APPLE__)
+TEST_F(SafetensorsTest, MapsReadonlyMetalTensorView) {
+    const auto device = kidi::tensor::Device::apple_gpu();
+    const auto backend = kidi::tensor::BackendRegistry::instance().backend(device);
+    if (!backend || !(*backend)->is_available(device)) GTEST_SKIP() << "Metal device unavailable";
+    auto mapped = weights->tensor("weight", device);
+    ASSERT_TRUE(mapped.has_value()) << mapped.error().message;
+    EXPECT_EQ(mapped->device(), device);
+    EXPECT_EQ(mapped->numel(), 2U);
+    EXPECT_FALSE(mapped->host_bytes()) << "mapped Metal weights must not be writable";
+    weights.reset();
+    tensor.reset();
+    kidi::ops::Context gpu(device);
+    const auto output = gpu.cast(gpu.cast(*mapped, kidi::tensor::DType::BF16), kidi::tensor::DType::F32);
+    gpu.synchronize();
+    const auto values = output.data<float>();
+    ASSERT_TRUE(values.has_value()) << values.error().message;
+    EXPECT_EQ((*values)[0], 1.25F);
+    EXPECT_EQ((*values)[1], -2.5F);
+}
+
+TEST_F(SafetensorsTest, CopiesUnalignedMetalTensorView) {
+    const auto device = kidi::tensor::Device::apple_gpu();
+    const auto backend = kidi::tensor::BackendRegistry::instance().backend(device);
+    if (!backend || !(*backend)->is_available(device)) GTEST_SKIP() << "Metal device unavailable";
+    const auto source = weights->tensor("e4m3");
+    ASSERT_TRUE(source.has_value()) << source.error().message;
+    const auto source_bytes = source->host_bytes();
+    ASSERT_TRUE(source_bytes.has_value()) << source_bytes.error().message;
+    ASSERT_NE(reinterpret_cast<std::uintptr_t>(source_bytes->data()) % 4, 0U);
+
+    auto copied = weights->tensor("e4m3", device);
+    ASSERT_TRUE(copied.has_value()) << copied.error().message;
+    const auto copied_bytes = copied->host_bytes();
+    ASSERT_TRUE(copied_bytes.has_value()) << copied_bytes.error().message;
+    EXPECT_EQ(copied->device(), device);
+    EXPECT_TRUE(std::ranges::equal(*source_bytes, *copied_bytes));
+}
+#endif
+
+TEST_F(SafetensorsTest, MapsDataTypes) {
+    const auto bf16 = weights->tensor("bf16");
+    const auto int8 = weights->tensor("int8");
+    const auto e4m3 = weights->tensor("e4m3");
+    const auto e5m2 = weights->tensor("e5m2");
+    ASSERT_TRUE(bf16.has_value()) << "Safetensors dtype mapping is incorrect";
+    EXPECT_EQ(bf16->dtype(), kidi::checkpoint::DataType::BF16) << "Safetensors dtype mapping is incorrect";
+    EXPECT_EQ(kidi::tensor::element_size(bf16->dtype()), 2U) << "Safetensors dtype mapping is incorrect";
+    ASSERT_TRUE(int8.has_value()) << "Safetensors dtype mapping is incorrect";
+    EXPECT_EQ(int8->dtype(), kidi::checkpoint::DataType::I8) << "Safetensors dtype mapping is incorrect";
+    ASSERT_TRUE(e4m3.has_value()) << "Safetensors dtype mapping is incorrect";
+    EXPECT_EQ(e4m3->dtype(), kidi::checkpoint::DataType::E4M3) << "Safetensors dtype mapping is incorrect";
+    ASSERT_TRUE(e5m2.has_value()) << "Safetensors dtype mapping is incorrect";
+    EXPECT_EQ(e5m2->dtype(), kidi::checkpoint::DataType::E5M2) << "Safetensors dtype mapping is incorrect";
+}
+
+TEST_F(SafetensorsTest, ExpandsToFloat32) {
+    const auto expanded = weights->float32_tensor("f16");
+    const auto expanded_bf16 = weights->float32_tensor("bf16");
+    const auto unchanged = weights->float32_tensor("weight");
+    ASSERT_TRUE(expanded.has_value()) << "checkpoint FP32 expansion or zero-copy contract failed";
+    ASSERT_TRUE(expanded_bf16.has_value()) << "checkpoint FP32 expansion or zero-copy contract failed";
+    ASSERT_TRUE(unchanged.has_value()) << "checkpoint FP32 expansion or zero-copy contract failed";
+    EXPECT_EQ(unchanged->host_bytes()->data(), std::as_const(*tensor).host_bytes()->data())
+        << "checkpoint FP32 expansion or zero-copy contract failed";
+    EXPECT_FALSE(weights->float32_tensor("int8")) << "checkpoint FP32 expansion or zero-copy contract failed";
+    EXPECT_FALSE(weights->float32_tensor("missing")) << "checkpoint FP32 expansion or zero-copy contract failed";
+    const auto half_values = expanded->data<float>(), bf16_values = expanded_bf16->data<float>();
+    ASSERT_TRUE(half_values.has_value()) << "FP16/BF16 expansion produced incorrect values";
+    EXPECT_EQ((*half_values)[0], 1.F) << "FP16/BF16 expansion produced incorrect values";
+    EXPECT_EQ((*half_values)[1], -2.F) << "FP16/BF16 expansion produced incorrect values";
+    EXPECT_EQ((*half_values)[2], std::ldexp(1.F, -24)) << "FP16/BF16 expansion produced incorrect values";
+    EXPECT_TRUE(std::signbit((*half_values)[3])) << "FP16/BF16 expansion produced incorrect values";
+    ASSERT_TRUE(bf16_values.has_value()) << "FP16/BF16 expansion produced incorrect values";
+    EXPECT_EQ((*bf16_values)[0], 1.25F) << "FP16/BF16 expansion produced incorrect values";
+    EXPECT_EQ((*bf16_values)[1], -2.5F) << "FP16/BF16 expansion produced incorrect values";
+}
+
+TEST_F(SafetensorsTest, FusesStateMappings) {
+    auto mapped = kidi::checkpoint::Weights::load(path, mappings);
+    ASSERT_TRUE(mapped.has_value()) << "state mapping fusion is incorrect: " << mapped.error().message;
+    auto fused = mapped->tensor("fused");
+    ASSERT_TRUE(fused.has_value()) << "state mapping fusion is incorrect: " << fused.error().message;
+    auto fused_values = std::as_const(*fused).data<float>();
+    EXPECT_EQ(mapped->size(), 6U) << "state mapping fusion is incorrect";
+    EXPECT_FALSE(mapped->contains("weight")) << "state mapping fusion is incorrect";
+    EXPECT_FALSE(mapped->contains("weight2")) << "state mapping fusion is incorrect";
+    ASSERT_TRUE(fused_values.has_value()) << "state mapping fusion is incorrect";
+    ASSERT_EQ(fused->shape().size(), 1U) << "state mapping fusion is incorrect";
+    ASSERT_EQ(fused->shape()[0], 4) << "state mapping fusion is incorrect";
+    EXPECT_EQ((*fused_values)[0], 1.25F) << "state mapping fusion is incorrect";
+    EXPECT_EQ((*fused_values)[1], -2.5F) << "state mapping fusion is incorrect";
+    EXPECT_EQ((*fused_values)[2], 3.0F) << "state mapping fusion is incorrect";
+    EXPECT_EQ((*fused_values)[3], 4.0F) << "state mapping fusion is incorrect";
+    const auto zero_copy_mapped = weights->mapped(mappings);
+    ASSERT_TRUE(zero_copy_mapped.has_value()) << "adjacent state mapping fusion was not zero-copy";
+    auto zero_copy_fused = zero_copy_mapped->tensor("fused");
+    ASSERT_TRUE(zero_copy_fused.has_value()) << "adjacent state mapping fusion was not zero-copy";
+    EXPECT_FALSE(zero_copy_fused->data<float>().has_value()) << "adjacent state mapping fusion was not zero-copy";
+    EXPECT_EQ(std::as_const(*zero_copy_fused).host_bytes()->data(), std::as_const(*tensor).host_bytes()->data())
+        << "adjacent state mapping fusion was not zero-copy";
+}
+
+TEST_F(SafetensorsTest, AppliesMappingRules) {
+    using kidi::checkpoint::StateMappingOp;
+    using kidi::checkpoint::StateMappingSpec;
+    const std::array rules = {
+        StateMappingSpec{.sources = {R"(^e[45]m.*$)"}, .op = StateMappingOp::IGNORE},
+        StateMappingSpec{
+            .sources = {R"(^weight$)", "weight"}, .destination = "same_scale", .op = StateMappingOp::IDENTICAL},
+        StateMappingSpec{.sources = {"0:weight2", R"(^weight2$)"}, .destination = "zero_prefixed"},
+    };
+    const auto view = weights->mapped(rules);
+    ASSERT_TRUE(view.has_value()) << "mapped IGNORE/IDENTICAL/zero-reference rules failed: " << view.error().message;
+    const auto zero_prefixed = view->tensor("zero_prefixed");
+    ASSERT_TRUE(zero_prefixed.has_value()) << "mapped IGNORE/IDENTICAL/zero-reference rules failed";
+    const auto zp_values = std::as_const(*zero_prefixed).data<float>();
+    EXPECT_FALSE(view->contains("e4m3")) << "mapped IGNORE/IDENTICAL/zero-reference rules failed";
+    EXPECT_FALSE(view->contains("e5m2")) << "mapped IGNORE/IDENTICAL/zero-reference rules failed";
+    EXPECT_TRUE(view->contains("same_scale")) << "mapped IGNORE/IDENTICAL/zero-reference rules failed";
+    ASSERT_TRUE(zp_values.has_value()) << "mapped IGNORE/IDENTICAL/zero-reference rules failed";
+    ASSERT_EQ(zp_values->size(), 4U) << "mapped IGNORE/IDENTICAL/zero-reference rules failed";
+    EXPECT_EQ((*zp_values)[0], 0.F) << "mapped IGNORE/IDENTICAL/zero-reference rules failed";
+    EXPECT_EQ((*zp_values)[1], 0.F) << "mapped IGNORE/IDENTICAL/zero-reference rules failed";
+    EXPECT_EQ((*zp_values)[2], 3.0F) << "mapped IGNORE/IDENTICAL/zero-reference rules failed";
+    EXPECT_EQ((*zp_values)[3], 4.0F) << "mapped IGNORE/IDENTICAL/zero-reference rules failed";
+    const std::array mismatch = {StateMappingSpec{
+        .sources = {R"(^weight$)", "weight2"}, .destination = "bad_scale", .op = StateMappingOp::IDENTICAL}};
+    EXPECT_FALSE(weights->mapped(mismatch)) << "mismatched IDENTICAL parameters were accepted";
+    const auto prefixed =
+        kidi::checkpoint::prefix_state_mappings("llm.", "llm.", std::span<const StateMappingSpec>(mappings));
+    ASSERT_EQ(prefixed.size(), 1U) << "prefix_state_mappings rewrote patterns incorrectly";
+    EXPECT_EQ(prefixed[0].sources[0], R"(^llm\.weight$)") << "prefix_state_mappings rewrote patterns incorrectly";
+    EXPECT_EQ(prefixed[0].sources[1], "llm.weight2") << "prefix_state_mappings rewrote patterns incorrectly";
+    EXPECT_EQ(prefixed[0].destination, "llm.fused") << "prefix_state_mappings rewrote patterns incorrectly";
+}
+
+TEST_F(SafetensorsTest, SavesAndReloads) {
+    const auto saved_path = temp_path("kidi-weights-roundtrip", ".safetensors");
+    std::filesystem::remove(saved_path);
     const auto state = weights->state_dict();
-    if (!state || !kidi::checkpoint::Weights::save(saved_path, *state) ||
-        kidi::checkpoint::Weights::save(saved_path, *state)) {
-        std::cerr << "checkpoint serialization or no-overwrite contract failed\n";
-        return 1;
-    }
+    ASSERT_TRUE(state.has_value()) << "checkpoint serialization or no-overwrite contract failed";
+    ASSERT_TRUE(kidi::checkpoint::Weights::save(saved_path, *state))
+        << "checkpoint serialization or no-overwrite contract failed";
+    EXPECT_FALSE(kidi::checkpoint::Weights::save(saved_path, *state))
+        << "checkpoint serialization or no-overwrite contract failed";
     const auto reloaded = kidi::checkpoint::Weights::load(saved_path);
-    if (!reloaded || reloaded->size() != state->size()) return 1;
+    ASSERT_TRUE(reloaded.has_value()) << reloaded.error().message;
+    ASSERT_EQ(reloaded->size(), state->size());
     for (const auto& [name, expected] : *state) {
+        SCOPED_TRACE(name);
         const auto actual = reloaded->tensor(name);
-        if (!actual || actual->dtype() != expected.dtype() || !std::ranges::equal(actual->shape(), expected.shape()))
-            return 1;
+        ASSERT_TRUE(actual.has_value()) << actual.error().message;
+        EXPECT_EQ(actual->dtype(), expected.dtype());
+        EXPECT_TRUE(std::ranges::equal(actual->shape(), expected.shape()));
         const auto expected_bytes = expected.host_bytes(), actual_bytes = actual->host_bytes();
-        if (!expected_bytes || !actual_bytes || !std::ranges::equal(*expected_bytes, *actual_bytes)) return 1;
+        ASSERT_TRUE(expected_bytes.has_value());
+        ASSERT_TRUE(actual_bytes.has_value());
+        EXPECT_TRUE(std::ranges::equal(*expected_bytes, *actual_bytes));
     }
     std::filesystem::remove(saved_path);
-    std::filesystem::remove(path);
-    return 0;
 }
+
+} // namespace

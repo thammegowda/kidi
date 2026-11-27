@@ -76,6 +76,9 @@
       "configurePreset": "debug",
       "output": {
         "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 12
       }
     },
     {
@@ -83,6 +86,9 @@
       "configurePreset": "debug-cuda",
       "output": {
         "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 12
       }
     }
   ]

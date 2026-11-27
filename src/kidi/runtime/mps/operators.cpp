@@ -11,10 +11,8 @@
 #include <cmath>
 #include <optional>
 #include <algorithm>
-#include <cstdlib>
 #include <iostream>
 #include <unordered_set>
-#include <limits>
 
 namespace kidi::runtime {
 namespace {
@@ -40,23 +38,18 @@ struct Stream {
     std::unordered_set<void*> output_buffers;
     std::vector<Tensor> packed_inputs;
     std::vector<Tensor> packed_intermediates;
+    std::vector<Tensor> half_inputs;
     void* packed_input_source = nullptr;
     std::size_t packed_input_source_offset = 0;
     float packed_input_scale = 0;
-    std::size_t prefill_cache_limit = std::numeric_limits<std::size_t>::max();
-    bool profile_memory = std::getenv("KIDI_PROFILE_MEMORY") != nullptr;
+    void* half_input_source = nullptr;
+    std::size_t half_input_source_offset = 0;
+    std::size_t half_input_numel = 0;
+    std::size_t prefill_cache_limit = ops::metal_prefill_cache_bytes();
+    bool profile_memory = ops::profile_options().mode != ops::ProfileMode::OFF;
     std::size_t observed_device_bytes = 0, recommended_working_set_bytes = 0;
     std::size_t peak_pending = 0, expanded_bytes = 0;
-    Stream() {
-        pending.reserve(512);
-        if (const auto value = std::getenv("KIDI_PREFILL_CACHE_BYTES")) {
-            char* end = nullptr;
-            const auto bytes = std::strtoull(value, &end, 10);
-            if (end == value || *end || bytes > (std::uint64_t{16} << 30))
-                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prefill cache bytes must be 0..16 GiB"});
-            prefill_cache_limit = bytes;
-        }
-    }
+    Stream() { pending.reserve(512); }
     ~Stream() {
         if (profile_memory)
             std::cerr << "kidi_metal_memory|prefill_cache_limit=" << prefill_cache_limit
@@ -73,6 +66,7 @@ struct Stream {
         output_allocations.bytes += outputs.allocations().bytes - before.bytes;
         const auto handle = require(tensor::metal_buffer(output)).handle;
         if (handle == packed_input_source) packed_input_source = nullptr;
+        if (handle == half_input_source) half_input_source = nullptr;
         output_buffers.insert(handle);
         return output;
     }
@@ -109,12 +103,32 @@ struct Stream {
             require(Tensor::empty({shape.begin(), shape.end()}, DType::I8, tensor::Device::apple_gpu())));
         return packed_intermediates.back();
     }
-    auto invalidate_packed_input(const Tensor& tensor) -> void {
-        if (!packed_input_source) return;
-        const auto buffer = require(tensor::metal_buffer(tensor));
-        if (buffer.handle == packed_input_source) {
-            packed_input_source = nullptr;
+    auto half_input(const Tensor& input) -> std::pair<Tensor, bool> {
+        const auto shape = input.shape();
+        const auto found = std::ranges::find_if(
+            half_inputs, [&](const Tensor& tensor) { return std::ranges::equal(tensor.shape(), shape); });
+        Tensor output;
+        if (found != half_inputs.end()) {
+            output = *found;
+        } else {
+            half_inputs.push_back(
+                require(Tensor::empty({shape.begin(), shape.end()}, DType::F16, tensor::Device::apple_gpu())));
+            output = half_inputs.back();
         }
+        const auto source_buffer = require(tensor::metal_buffer(input));
+        const bool reusable = half_input_source == source_buffer.handle &&
+                              half_input_source_offset == source_buffer.offset_bytes &&
+                              half_input_numel == input.numel();
+        half_input_source = source_buffer.handle;
+        half_input_source_offset = source_buffer.offset_bytes;
+        half_input_numel = input.numel();
+        return {std::move(output), reusable};
+    }
+    auto invalidate_packed_input(const Tensor& tensor) -> void {
+        if (!packed_input_source && !half_input_source) return;
+        const auto buffer = require(tensor::metal_buffer(tensor));
+        if (buffer.handle == packed_input_source) packed_input_source = nullptr;
+        if (buffer.handle == half_input_source) half_input_source = nullptr;
     }
     auto commands() -> mps::CommandBatch& {
         if (!batch)
@@ -132,6 +146,7 @@ struct Stream {
         }
         pending.clear();
         packed_input_source = nullptr;
+        half_input_source = nullptr;
     }
 };
 class MetalOperator final : public Operator {
@@ -160,6 +175,11 @@ public:
     bool eager = false;
     bool quantize_int8 = false;
     bool gated_feed_forward = false;
+    bool fused = false;
+    enum class VqMode { NONE, EXPERT_GATE, EXPERT_DOWN } vq = VqMode::NONE;
+    std::int32_t vq_dim = 0;
+    float gate_cap = 0, up_cap = 0;
+    std::vector<std::int64_t> attributes;
     AudioMode audio_mode = AudioMode::NONE;
     Operation operation;
     std::array<std::int32_t, 4> audio_attributes{};
@@ -192,8 +212,49 @@ public:
         } else if (audio_mode == AudioMode::SNAKE) {
             require(mps::encode_snake(stream.commands(), inputs[0], audio_constant, output));
         } else if (eager)
-            require(mps::encode_eager(stream.commands(), operation, epsilon, inputs, output));
-        else if (quantized)
+            require(mps::encode_eager(stream.commands(), operation, epsilon, inputs, output, attributes));
+        else if (fused) {
+            if (operation == Operation::QUANTIZE_CACHE) {
+                auto cache = inputs[2];
+                auto scales = inputs[3];
+                require(mps::encode_quantize_cache_i8(stream.commands(), inputs[0], inputs[1], cache, scales));
+            } else {
+                require(mps::encode_fused(stream.commands(), operation, attributes, epsilon, inputs, output));
+            }
+        } else if (vq != VqMode::NONE) {
+            const bool gated = vq == VqMode::EXPERT_GATE;
+            const auto& routes = inputs[4];
+            const auto tokens = static_cast<std::size_t>(routes.size(0));
+            const auto top = static_cast<std::size_t>(routes.size(1));
+            const auto cols = static_cast<std::size_t>(inputs[0].size(-1));
+            const auto group = vq_dim == 3 ? std::size_t{48} : std::size_t{64};
+            const auto k_pad = ((cols + group - 1) / group) * group;
+            const auto in_rows = gated ? tokens : (tokens * top);
+            const std::array x_shape{static_cast<std::int64_t>(in_rows), static_cast<std::int64_t>(k_pad)};
+            auto x_rot = stream.acquire(x_shape, DType::F32);
+            Tensor route_scratch, pair_scratch, interleaved;
+            const auto rows = inputs[1].size(1);
+            if (k_pad >= 1024 && inputs[1].storage_offset() % 16 == 0) {
+                const auto packed_width = k_pad / group * 64;
+                constexpr std::size_t MAX_PREFILL_FLOATS = (32 << 20) / sizeof(float);
+                if (in_rows <= MAX_PREFILL_FLOATS / packed_width && tokens * top <= MAX_PREFILL_FLOATS / rows) {
+                    const auto route_words = mps::vq_expert_route_words(tokens, top, inputs[1].size(0));
+                    if (route_words) {
+                        route_scratch = stream.acquire(std::array{route_words}, DType::I32);
+                        interleaved =
+                            stream.acquire(std::array{x_shape[0], static_cast<std::int64_t>(packed_width)}, DType::F32);
+                    }
+                }
+            }
+            if (gated || interleaved.defined()) {
+                const std::array projection_shape{static_cast<std::int64_t>(tokens * top),
+                                                  static_cast<std::int64_t>(rows)};
+                pair_scratch = stream.acquire(projection_shape, DType::F32);
+            }
+            require(mps::encode_vq_experts(stream.commands(), inputs[0], inputs[1], inputs[2], inputs[3], routes, x_rot,
+                                           interleaved, pair_scratch, route_scratch, output, vq_dim, gated, gate_cap,
+                                           up_cap));
+        } else if (quantized)
             require(quantized->encode(stream.commands(), inputs[0], output));
         else if (gated_feed_forward) {
             auto [packed, reusable] = stream.packed_input(inputs[0], packed_input_scale);
@@ -285,7 +346,9 @@ public:
         stream_.output_buffers.clear();
         stream_.packed_inputs.clear();
         stream_.packed_intermediates.clear();
+        stream_.half_inputs.clear();
         stream_.packed_input_source = nullptr;
+        stream_.half_input_source = nullptr;
         prefill_programs_.clear();
     }
     auto copy_slice_(Tensor& destination, const Tensor& source, std::size_t outer, std::size_t source_bytes,
@@ -295,6 +358,130 @@ public:
             stream_.commands().copy_slice_(source, destination, outer, source_bytes, destination_bytes, offset_bytes));
         stream_.retain(source);
         stream_.retain(destination);
+    }
+    // Fused Inkling operators and VQ experts; null when the spec belongs to another Metal path.
+    auto prepare_inkling(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<MetalOperator> {
+        const auto operation = spec.operation;
+        const bool vq = operation == Operation::EXPERT_LINEAR && spec.attributes.size() == 7 &&
+                        (spec.attributes[3] == static_cast<std::int64_t>(ops::BlockScaledFormat::VQ3D) ||
+                         spec.attributes[3] == static_cast<std::int64_t>(ops::BlockScaledFormat::VQ4D));
+        const bool fused = operation == Operation::ROUTE_EXPERTS || operation == Operation::RESIDUAL_MIX ||
+                           operation == Operation::SHORT_CONVOLUTION || operation == Operation::L2_CLIP ||
+                           operation == Operation::RELATIVE_ATTENTION || operation == Operation::QUANTIZE_CACHE ||
+                           operation == Operation::BLEND_PROLOGUE || operation == Operation::BLEND_EPILOGUE;
+        if (!vq && !fused) return nullptr;
+        const auto invalid = [](bool condition, const char* message) {
+            if (condition) throw ops::Failure({ErrorCode::INVALID_ARGUMENT, message});
+        };
+        for (std::size_t index = 0; index < inputs.size(); ++index)
+            invalid(inputs[index].device() != tensor::Device::apple_gpu() || !inputs[index].is_contiguous() ||
+                        !inputs[index].numel(),
+                    "Metal fused operands must be nonempty contiguous Apple GPU tensors");
+        if (spec.dtype != DType::F32 || inputs[0].dtype() != DType::F32)
+            throw ops::Failure({ErrorCode::UNSUPPORTED, std::string("Metal ") +
+                                                            std::string(runtime::operation_name(operation)) +
+                                                            " requires F32 activations"});
+        if (fused)
+            for (std::size_t index = 0; index < inputs.size(); ++index) {
+                const bool integer =
+                    (operation == Operation::SHORT_CONVOLUTION && spec.attributes.size() > 1 && index == 3) ||
+                    (operation == Operation::RELATIVE_ATTENTION && index == 6) ||
+                    (operation == Operation::QUANTIZE_CACHE && index == 1);
+                const bool kv_cache = operation == Operation::RELATIVE_ATTENTION && (index == 1 || index == 2);
+                const bool qcache_dst = operation == Operation::QUANTIZE_CACHE && index == 2;
+                if (kv_cache) {
+                    invalid(inputs[index].dtype() != DType::F32 && inputs[index].dtype() != DType::BF16 &&
+                                inputs[index].dtype() != DType::I8,
+                            "invalid Metal relative attention KV cache dtype");
+                } else if (qcache_dst) {
+                    invalid(inputs[index].dtype() != DType::I8, "Metal INT8 cache quantization expects I8 cache");
+                } else {
+                    invalid(inputs[index].dtype() != (integer ? DType::I32 : DType::F32),
+                            "invalid Metal fused operand dtype");
+                }
+            }
+        auto result = std::make_unique<MetalOperator>(stream_);
+        result->dtype = DType::F32;
+        result->operation = operation;
+        result->epsilon = spec.epsilon;
+        result->attributes.assign(spec.attributes.begin(), spec.attributes.end());
+        result->dynamic_count = inputs.size();
+        const auto& input = inputs[0];
+        auto& shape = result->shape;
+        shape.assign(input.shape().begin(), input.shape().end());
+        if (vq) {
+            const auto& routes = inputs[4];
+            const bool gated = spec.attributes[0] != 0;
+            const std::int32_t dim =
+                static_cast<ops::BlockScaledFormat>(spec.attributes[3]) == ops::BlockScaledFormat::VQ3D ? 3 : 4;
+            invalid(inputs.size() != 5 || inputs[1].dtype() != DType::U8 || inputs[2].dtype() != DType::U8 ||
+                        inputs[3].dtype() != DType::F32 || inputs[1].dimensions() != 3 || inputs[2].dimensions() != 3 ||
+                        input.dimensions() != (gated ? 2U : 3U) || routes.dimensions() != 3 ||
+                        routes.dtype() != DType::F32,
+                    "invalid Metal VQ expert operands");
+            const auto width = input.size(-1), rows = inputs[1].size(1), experts = inputs[1].size(0);
+            const std::size_t groups = (width + (dim == 3 ? 47 : 63)) / (dim == 3 ? 48 : 64);
+            invalid(routes.size(2) != 2 || routes.size(1) > experts || input.size(0) != routes.size(0) ||
+                        inputs[1].size(2) != groups * 16 || inputs[2].size(0) != experts || inputs[2].size(1) != rows ||
+                        inputs[2].size(2) != groups || inputs[3].numel() != experts * rows ||
+                        (gated ? rows % 2 != 0 : input.size(1) != routes.size(1)),
+                    "invalid Metal VQ expert geometry");
+            result->vq_dim = dim;
+            if (gated) {
+                result->vq = MetalOperator::VqMode::EXPERT_GATE;
+                result->gate_cap = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[1]));
+                result->up_cap = std::bit_cast<float>(static_cast<std::int32_t>(spec.attributes[2]));
+                invalid(!std::isfinite(result->gate_cap) || !std::isfinite(result->up_cap) || result->gate_cap <= 0.F ||
+                            result->up_cap <= 0.F,
+                        "invalid Metal VQ gate caps");
+                shape = {static_cast<std::int64_t>(routes.size(0)), static_cast<std::int64_t>(routes.size(1)),
+                         static_cast<std::int64_t>(rows / 2)};
+            } else {
+                result->vq = MetalOperator::VqMode::EXPERT_DOWN;
+                shape = {static_cast<std::int64_t>(input.size(0)), static_cast<std::int64_t>(rows)};
+            }
+            return result;
+        }
+        result->fused = true;
+        switch (operation) {
+            case Operation::ROUTE_EXPERTS:
+                invalid(inputs.size() != 2 || input.dimensions() != 2 || inputs[1].dtype() != DType::F32 ||
+                            inputs[1].numel() != input.size(1) || spec.attributes.size() != 2 ||
+                            spec.attributes[0] <= 0,
+                        "invalid Metal expert routing geometry");
+                shape = {static_cast<std::int64_t>(input.size(0)), spec.attributes[0], 2};
+                break;
+            case Operation::RESIDUAL_MIX: {
+                const auto& queries = inputs[inputs.size() - 1];
+                invalid(inputs.size() < 2 || queries.dtype() != DType::F32 || queries.dimensions() != 2 ||
+                            input.dimensions() != 2 || queries.size(1) != input.size(1),
+                        "invalid Metal residual mix geometry");
+                for (std::size_t index = 0; index + 1 < inputs.size(); ++index)
+                    invalid(inputs[index].dtype() != DType::F32 ||
+                                !std::ranges::equal(inputs[index].shape(), input.shape()),
+                            "Metal residual mix source shapes and dtypes must match");
+                shape = {static_cast<std::int64_t>(queries.size(0)), static_cast<std::int64_t>(input.size(0)),
+                         static_cast<std::int64_t>(queries.size(1))};
+                break;
+            }
+            case Operation::SHORT_CONVOLUTION:
+                if (spec.attributes.size() == 1) {
+                    invalid(input.dimensions() != 2 || inputs[1].dimensions() != 2 ||
+                                input.size(1) != inputs[1].size(1) || shape[0] < spec.attributes[0],
+                            "invalid Metal padded short convolution geometry");
+                    shape[0] -= spec.attributes[0] - 1;
+                }
+                break;
+            case Operation::BLEND_PROLOGUE:
+                shape.back() *= 2;
+                break;
+            case Operation::QUANTIZE_CACHE:
+                shape = {1};
+                break;
+            default:
+                break;
+        }
+        return result;
     }
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
         auto result = std::make_unique<MetalOperator>(stream_);
@@ -313,9 +500,58 @@ public:
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
             return result;
         }
+        if (spec.operation == Operation::CAST && inputs.size() == 1 &&
+            inputs[0].device() == tensor::Device::apple_gpu() && inputs[0].is_contiguous() && inputs[0].numel() > 0 &&
+            ((inputs[0].dtype() == DType::BF16 && spec.dtype == DType::F32) ||
+             (inputs[0].dtype() == DType::F32 && spec.dtype == DType::BF16) ||
+             (inputs[0].dtype() == DType::F16 && spec.dtype == DType::F32) ||
+             (inputs[0].dtype() == DType::F32 && spec.dtype == DType::F16))) {
+            result->eager = true;
+            result->operation = spec.operation;
+            result->dynamic_count = 1;
+            result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            return result;
+        }
+        if (auto fused = prepare_inkling(spec, inputs)) return fused;
         bool device_fp32 = true;
         for (std::size_t index = 0; index < inputs.size(); ++index)
             device_fp32 &= inputs[index].dtype() == DType::F32 && inputs[index].device() == tensor::Device::apple_gpu();
+        if (device_fp32 && spec.operation == Operation::SLICE && inputs.size() == 1 && inputs[0].is_contiguous() &&
+            spec.attributes.size() == 3 && spec.attributes[0] >= 0 &&
+            static_cast<std::size_t>(spec.attributes[0]) < inputs[0].dimensions() && spec.attributes[1] >= 0 &&
+            spec.attributes[2] > 0 &&
+            static_cast<std::uint64_t>(spec.attributes[1]) + static_cast<std::uint64_t>(spec.attributes[2]) <=
+                inputs[0].size(static_cast<std::size_t>(spec.attributes[0]))) {
+            result->eager = true;
+            result->operation = spec.operation;
+            result->attributes.assign(spec.attributes.begin(), spec.attributes.end());
+            result->dynamic_count = 1;
+            result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+            result->shape[static_cast<std::size_t>(spec.attributes[0])] = spec.attributes[2];
+            return result;
+        }
+        if (device_fp32 && spec.operation == Operation::CONCAT && inputs.size() >= 1 && inputs.size() <= 4 &&
+            spec.attributes.size() == 1 && spec.attributes[0] >= 0 &&
+            static_cast<std::size_t>(spec.attributes[0]) < inputs[0].dimensions()) {
+            const auto axis = static_cast<std::size_t>(spec.attributes[0]);
+            bool ok = true;
+            std::int64_t total = 0;
+            for (std::size_t i = 0; i < inputs.size() && ok; ++i) {
+                ok &= inputs[i].is_contiguous() && inputs[i].dimensions() == inputs[0].dimensions();
+                for (std::size_t d = 0; d < inputs[0].dimensions() && ok; ++d)
+                    if (d != axis) ok &= inputs[i].size(d) == inputs[0].size(d);
+                total += static_cast<std::int64_t>(inputs[i].size(axis));
+            }
+            if (ok && total > 0) {
+                result->eager = true;
+                result->operation = spec.operation;
+                result->attributes.assign(spec.attributes.begin(), spec.attributes.end());
+                result->dynamic_count = inputs.size();
+                result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
+                result->shape[axis] = total;
+                return result;
+            }
+        }
         const bool simple_binary =
             (spec.operation == Operation::ADD || spec.operation == Operation::MULTIPLY) &&
             (std::ranges::equal(inputs[0].shape(), inputs[1].shape()) || inputs[1].numel() == 1 ||
@@ -329,6 +565,7 @@ public:
             result->eager = true;
             result->operation = spec.operation;
             result->epsilon = spec.epsilon;
+            result->attributes.assign(spec.attributes.begin(), spec.attributes.end());
             result->dynamic_count = inputs.size();
             result->shape.assign(inputs[0].shape().begin(), inputs[0].shape().end());
             if (spec.operation == Operation::SILU_GATE) result->shape.back() /= 2;
@@ -343,8 +580,7 @@ public:
             const auto weight_index = snake ? std::size_t{2} : std::size_t{1};
             if (spec.attributes.size() != 4 || inputs.size() != weight_index + 3 ||
                 inputs[0].device() != tensor::Device::apple_gpu() || inputs[0].dtype() != DType::F32 ||
-                inputs[0].dimensions() != 3 || inputs[0].size(0) != 1 ||
-                inputs[weight_index].dtype() != DType::I8)
+                inputs[0].dimensions() != 3 || inputs[0].size(0) != 1 || inputs[weight_index].dtype() != DType::I8)
                 throw ops::Failure({ErrorCode::UNSUPPORTED, "unsupported Metal Conv1d geometry"});
             const auto kernel = spec.attributes[0], stride = spec.attributes[1], padding = spec.attributes[2],
                        dilation = spec.attributes[3];
@@ -353,12 +589,11 @@ public:
             if (kernel <= 0 || stride <= 0 || padding < 0 || dilation <= 0 || numerator < 0)
                 throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "invalid Metal Conv1d dimensions"});
             const auto output_length = numerator / stride + 1;
-            result->audio_mode = snake ? MetalOperator::AudioMode::SNAKE_CONV1D
-                                       : MetalOperator::AudioMode::CONV1D;
+            result->audio_mode = snake ? MetalOperator::AudioMode::SNAKE_CONV1D : MetalOperator::AudioMode::CONV1D;
             result->audio_attributes = {static_cast<std::int32_t>(kernel), static_cast<std::int32_t>(stride),
                                         static_cast<std::int32_t>(padding), static_cast<std::int32_t>(dilation)};
-            result->audio_intermediate_shape = {
-                1, output_length, static_cast<std::int64_t>(inputs[0].size(2)) * kernel};
+            result->audio_intermediate_shape = {1, output_length,
+                                                static_cast<std::int64_t>(inputs[0].size(2)) * kernel};
             result->shape = {1, output_length, static_cast<std::int64_t>(inputs[weight_index].size(0))};
             result->dtype = DType::F32;
             result->dynamic_count = 1;
@@ -366,8 +601,8 @@ public:
             const auto weight = input_major_weight(inputs[weight_index]);
             result->quantized =
                 require(mps::QuantizedLinear::create(weight, inputs[weight_index + 1], inputs[weight_index + 2]));
-            auto prepared = require(Tensor::empty(result->audio_intermediate_shape, DType::F32,
-                                                  tensor::Device::apple_gpu()));
+            auto prepared =
+                require(Tensor::empty(result->audio_intermediate_shape, DType::F32, tensor::Device::apple_gpu()));
             require(result->quantized->prepare(prepared));
             return result;
         }
@@ -421,9 +656,8 @@ public:
         }
         if (spec.operation == Operation::QUANTIZED_LINEAR) {
             const auto rows = inputs[0].numel() / inputs[0].size(-1);
-            const auto* fp16 = std::getenv("KIDI_MPS_Q_LINEAR_FP16");
             const auto bias = inputs[3].data<float>();
-            const auto use_fp16 = (!fp16 || std::string_view(fp16) != "0") && rows >= 4 && spec.attributes[0] && bias &&
+            const auto use_fp16 = rows >= 4 && spec.attributes[0] && bias &&
                                   std::ranges::all_of(*bias, [](float value) { return value == 0.F; });
             if (use_fp16) {
                 result->dynamic_count = 1;

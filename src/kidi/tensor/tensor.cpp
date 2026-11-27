@@ -197,6 +197,14 @@ auto Tensor::copy_to_host_later(std::span<std::byte> destination) const -> Resul
     return backend_->copy_to_host_later(*storage_, offset, destination);
 }
 
+auto Tensor::zero_() -> Result<void> {
+    if (!defined() || !is_contiguous() || storage_offset_ != 0 || nbytes() != storage_->size_bytes()) {
+        return std::unexpected(
+            Error{ErrorCode::INVALID_ARGUMENT, "zero_ requires a contiguous tensor owning its full storage range"});
+    }
+    return backend_->clear(*storage_);
+}
+
 auto Tensor::to(Device target) const -> Result<Tensor> {
     if (!defined()) {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "cannot transfer an undefined tensor"});
@@ -210,6 +218,49 @@ auto Tensor::to(Device target) const -> Result<Tensor> {
     auto host = copy_to_host();
     if (!host) return std::unexpected(std::move(host.error()));
     return from_bytes({shape_.begin(), shape_.end()}, dtype_, *host, target);
+}
+
+auto Tensor::to_batch(std::span<const Tensor> sources, Device target) -> Result<std::vector<Tensor>> {
+    std::vector<Tensor> results;
+    results.reserve(sources.size());
+    if (sources.empty()) return results;
+    auto backend = BackendRegistry::instance().backend(target);
+    if (!backend) return std::unexpected(std::move(backend.error()));
+    if (!(*backend)->is_available(target)) {
+        return std::unexpected(Error{ErrorCode::UNSUPPORTED, std::string((*backend)->name()) +
+                                                                 " backend is unavailable for " + to_string(target) +
+                                                                 ": " + (*backend)->unavailable_reason(target)});
+    }
+    std::vector<Backend::HostTransfer> transfers;
+    transfers.reserve(sources.size());
+    for (const auto& source : sources) {
+        if (!source.defined()) {
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "cannot transfer an undefined tensor"});
+        }
+        if (source.device() == target) {
+            results.push_back(source);
+            continue;
+        }
+        if (!source.is_host_accessible()) {
+            auto single = source.to(target);
+            if (!single) return std::unexpected(std::move(single.error()));
+            results.push_back(std::move(*single));
+            continue;
+        }
+        auto bytes = source.host_bytes();
+        if (!bytes) return std::unexpected(std::move(bytes.error()));
+        auto storage = (*backend)->allocate(target, bytes->size(), 64);
+        if (!storage) return std::unexpected(std::move(storage.error()));
+        if (!bytes->empty()) transfers.push_back({storage->get(), 0, *bytes});
+        auto shape = source.shape_;
+        auto strides = contiguous_strides(shape);
+        results.push_back(Tensor(*backend, std::move(*storage), source.dtype_, std::move(shape), std::move(strides), 0));
+    }
+    if (!transfers.empty()) {
+        if (auto status = (*backend)->copy_batch_from_host(target, transfers); !status)
+            return std::unexpected(std::move(status.error()));
+    }
+    return results;
 }
 
 auto Tensor::reshape(std::vector<std::int64_t> shape) const -> Result<Tensor> {
@@ -319,16 +370,16 @@ auto Tensor::from_bytes(std::vector<std::int64_t> shape, DType dtype, std::span<
 }
 
 auto Tensor::from_blob(std::vector<std::int64_t> shape, DType dtype, std::span<const std::byte> bytes,
-                       std::shared_ptr<const void> owner) -> Result<Tensor> {
+                       std::shared_ptr<const void> owner, Device device) -> Result<Tensor> {
     auto expected = checked_nbytes(shape, dtype);
     if (!expected) return std::unexpected(std::move(expected.error()));
     if (bytes.size() != *expected) {
         return std::unexpected(
             Error{ErrorCode::INVALID_ARGUMENT, "host blob byte count does not match tensor shape and dtype"});
     }
-    auto backend = BackendRegistry::instance().backend(Device::cpu());
+    auto backend = BackendRegistry::instance().backend(device);
     if (!backend) return std::unexpected(std::move(backend.error()));
-    auto storage = (*backend)->wrap_host(Device::cpu(), bytes, std::move(owner));
+    auto storage = (*backend)->wrap_host(device, bytes, std::move(owner));
     if (!storage) return std::unexpected(std::move(storage.error()));
     auto strides = contiguous_strides(shape);
     return Tensor(std::move(*backend), std::move(*storage), dtype, std::move(shape), std::move(strides), 0);

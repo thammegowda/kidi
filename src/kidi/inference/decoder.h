@@ -50,6 +50,10 @@ struct Generation {
 
 inline constexpr std::size_t MAX_DRAFT_TOKENS = 16;
 
+/// Copies the continuation of the longest previous suffix match (2 to 8 tokens).
+/// History includes the last generated token; proposals are only hints, never committed without verification.
+auto prompt_lookup(std::span<const std::int32_t> history, std::size_t limit) -> std::vector<std::int32_t>;
+
 struct SpeculativeAcceptance {
     std::size_t accepted_drafts = 0, committed_inputs = 0;
 };
@@ -87,7 +91,9 @@ public:
     /// token. `committed_inputs` excludes the rejected verification suffix, including when a stop ends the round.
     auto accept_speculative(std::span<const std::int32_t> drafts, TokenScores scores,
                             std::vector<std::int32_t>* committed_tokens = nullptr) -> Result<SpeculativeAcceptance>;
-    /// Runs one model-agnostic speculative draft + target verification + rewind round.
+    /// Runs one draft + target verification + rewind round. The per-request budget starts at 1, doubles
+    /// after full acceptance and shrinks to the accepted prefix (at least 1) after rejection.
+    /// `max_drafts` is the cap, not a fixed batch size.
     auto step_speculative(std::size_t max_drafts, const DraftFunction& draft, const VerifyFunction& verify,
                           const CommitFunction& commit = {}, SpeculativeStats* stats = nullptr)
         -> Result<SpeculativeStep>;
@@ -107,6 +113,7 @@ private:
     Generation result_{};
     std::int32_t token_;
     bool finished_ = false;
+    std::size_t draft_length_ = 1;
 };
 
 class Decoder {

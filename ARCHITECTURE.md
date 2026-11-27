@@ -353,7 +353,7 @@ remain available as the quality-first setting.
 
 CLI diagnostics use `kidi::cli::log` on stderr. Translation results and inspection output
 remain on stdout; machine-readable metric/profile records retain their unadorned
-format on stderr. `KIDI_LOG_LEVEL` (or `SPDLOG_LEVEL`) controls the human-readable logger.
+format on stderr. `kidi --log-level LEVEL COMMAND` controls the human-readable logger.
 
 Both the native `kidi` binary and the Python `python -m kidi` launcher share the
 same C++ CLI and resolve `--model @owner/repo[@revision]` (and `--assistant-model`)
@@ -592,7 +592,7 @@ and caller-visible tensor ownership still use reference counting where required.
 This removes identified Kidi allocation/refcount churn, not every allocation inside
 YNNPACK, MPSGraph, Objective-C descriptors, or cold preparation. Profiles distinguish
 output-slot allocations from those internal allocations.
-With `KIDI_PROFILE_MEMORY=1`, Metal also reports cumulative explicit output
+With operator profiling enabled (`kidi_android_baseline --profile-ops`), Metal also reports cumulative explicit output
 allocations, prepared calibration scratch, expanded weights, external-owner slots,
 and native `currentAllocatedSize` sampled at completion boundaries. The observed
 native high-water mark can miss intra-batch transients and is not physical RSS or
@@ -699,8 +699,8 @@ state; host work that changes per call, such as token embedding lookups, masks, 
 cache indices, is written in place before the call. Capture never changes device,
 partitions a step, records host control flow, or falls back silently. Backends
 declare support through `OperatorBackend::supports_replay` and implement
-`Operator::run_into`; other backends, or `KIDI_REPLAY=0`, run `step` eagerly
-every call with identical results.
+`Operator::run_into`; other backends, or contexts created inside `ops::EagerScope`, run `step`
+eagerly every call with identical results.
 
 Per-call values such as token IDs and positions are I32 tensors, so a step can
 keep them on its device: `TokenEmbedding` looks up token tensors with the
@@ -762,8 +762,7 @@ is true compiles a copy of the graph on a worker thread while CPU replay keeps
 serving the step, so a slow first compile (tens of seconds on the NPU) does not
 stall generation; the executable takes over on the first call after it is ready,
 and a failed background compile logs `kidi_step|...|fallback=replay` and keeps CPU
-replay. `KIDI_BACKGROUND_COMPILE=0` compiles synchronously, which benchmarks use
-to measure the accelerated steady state. Its `key_extent` and
+replay. Its `key_extent` and
 `crop_local_attention` policies let models choose few, coarse step shapes, for
 example power-of-two attention extents. With a compiler attached, Gemma 4 also
 captures full power-of-two prefill chunks (producer layers writing K/V, no
@@ -1185,8 +1184,8 @@ identity and calibration stay in the individual operator bindings. The backend
 keeps up to 128 geometry lookup entries, and live operators retain their program
 when that lookup cache is cleared. No weight values are captured in these programs.
 
-Metal can optionally bound retained expanded matrices with `KIDI_PREFILL_CACHE_BYTES`
-(0..16 GiB). Matrices beyond that budget are unpacked from the original packed
+Metal can optionally bound retained expanded matrices with `--metal-prefill-cache-mib`
+(`generate` and `serve`; the desktop app's `metal_prefill_cache_mb`). Matrices beyond that budget are unpacked from the original packed
 weights into shared GPU scratch before the same FP16 matrix operator. This does
 not bound the packed model, transient/native workspace, or total process memory.
 The default retains all expanded matrices; the bounded path trades extra unpack
@@ -1257,8 +1256,8 @@ unpacked-weight budget (256 MiB by default) to keep `libQnnHtpPrepare` memory
 bounded. On the tested Gemma 4 E2B model this produces roughly five prefill
 graphs and ten decode graphs.
 
-Whole-step context binaries and JSON binding metadata are cached under
-`KIDI_QNN_CACHE_DIR`, keyed by step shape, sampled model content, lowering
+Whole-step context binaries and JSON binding metadata are cached in
+`runtime::NpuOptions::cache_dir`, keyed by step shape, sampled model content, lowering
 version, and QNN build ID. The measured 128-row/512-key prefill context is
 319 MiB and the 512-key decode context is 804 MiB; cold compilation takes about
 114 and 92 seconds, while reload takes about 4 and 8 seconds. Compilation runs
@@ -1286,15 +1285,14 @@ the UINT8 gate/up projection output directly to the UINT8 input of the down
 projection in one pass, and `RmsNorm` covers plain and residual norms with an
 output scale. The package ships as a host library for graph preparation
 (`libQnnKidiOps.so`) and a V79 DSP library (`libQnnKidiOpsHtp.so`); the
-compiler registers them when `KIDI_QNN_OP_PACKAGE` and
-`KIDI_QNN_OP_PACKAGE_HTP` name them, keys cached contexts on whether fused ops
-are in use, and keeps the stock lowering when registration fails
-(`KIDI_QNN_FUSED_OPS=0` also disables them). On SM8750 at a 9216-token cache,
+compiler registers them when `runtime::NpuOptions::op_package` and `op_package_htp`
+name them (`--qnn-op-package` in the Android benchmark tools), keys cached contexts on whether fused ops
+are in use, and keeps the stock lowering when registration fails. On SM8750 at a 9216-token cache,
 fused ops cut a steady 128-token prefill chunk from 179 ms to 64 ms and raised
 decode from 28.3 to 33.2 tokens/s with identical greedy tokens; prefill
 compilation dropped from 114 to 34-45 seconds.
 
 The package also contains `StructuredAttention`, a causal/sliding-window
 attention kernel that skips masked key tiles and reads INT8 caches. It measured
-slower than QNN's attention, so it is opt-in (`KIDI_QNN_CUSTOM_ATTENTION=1`).
+slower than QNN's attention, so it is off (`STRUCTURED_ATTENTION` in `kidi-ops/src/qnn/compiler.cpp`).
 Experimental HMX and Crouton-layout helpers are kept unregistered.

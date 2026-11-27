@@ -38,6 +38,7 @@ auto scatter_pipeline() -> id<MTLComputePipelineState> {
 } // namespace
 struct CommandBatch::Impl {
     MPSCommandBuffer* buffer;
+    id<MTLComputeCommandEncoder> compute = nil;
     bool finished = false;
     struct Completions {
         std::mutex mutex;
@@ -53,7 +54,13 @@ struct CommandBatch::Impl {
     };
     std::vector<std::shared_ptr<Ticket>> tickets;
     std::size_t next_ticket = 0;
-    id<MTLBuffer> scatter_error = nil;
+    id<MTLBuffer> index_error = nil;
+    void end_compute() noexcept {
+        if (compute != nil) {
+            [compute endEncoding];
+            compute = nil;
+        }
+    }
 };
 CommandBatch::CommandBatch(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 CommandBatch::CommandBatch(CommandBatch&&) noexcept = default;
@@ -81,16 +88,28 @@ auto CommandBatch::create() -> Result<CommandBatch> {
     if (!impl->buffer) return std::unexpected(Error{ErrorCode::RUNTIME, "create Metal command batch"});
     return CommandBatch(std::move(impl));
 }
-auto CommandBatch::native_handle() const noexcept -> void* { return (__bridge void*)impl_->buffer; }
+auto CommandBatch::native_handle() const noexcept -> void* {
+    impl_->end_compute();
+    return (__bridge void*)impl_->buffer;
+}
+auto CommandBatch::compute_encoder() -> Result<void*> {
+    if (impl_->finished) return std::unexpected(Error{ErrorCode::RUNTIME, "Metal command batch already finished"});
+    if (impl_->compute == nil) {
+        impl_->compute = [impl_->buffer computeCommandEncoder];
+        if (!impl_->compute) return std::unexpected(Error{ErrorCode::RUNTIME, "create Metal compute encoder"});
+    }
+    return (__bridge void*)impl_->compute;
+}
 auto CommandBatch::restart() -> Result<void> {
     if (!impl_->finished) return {};
     auto status = finish();
     if (!status) return status;
     impl_->buffer = [MPSCommandBuffer commandBufferFromCommandQueue:command_queue()];
     if (!impl_->buffer) return std::unexpected(Error{ErrorCode::RUNTIME, "restart Metal command batch"});
+    impl_->compute = nil;
     impl_->finished = false;
     impl_->next_ticket = 0;
-    if (impl_->scatter_error) *static_cast<std::int32_t*>(impl_->scatter_error.contents) = 0;
+    if (impl_->index_error) *static_cast<std::int32_t*>(impl_->index_error.contents) = 0;
     return {};
 }
 auto CommandBatch::copy_(const tensor::Tensor& source, tensor::Tensor& destination) -> Result<void> {
@@ -105,6 +124,7 @@ auto CommandBatch::copy_(const tensor::Tensor& source, tensor::Tensor& destinati
     if (from->handle == to->handle && from->offset_bytes < to->offset_bytes + destination.nbytes() &&
         to->offset_bytes < from->offset_bytes + source.nbytes())
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "Metal copy requires distinct source storage"});
+    impl_->end_compute();
     auto encoder = [impl_->buffer blitCommandEncoder];
     if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create in-place copy encoder"});
     [encoder copyFromBuffer:(__bridge id<MTLBuffer>)from->handle
@@ -139,6 +159,7 @@ auto CommandBatch::copy_slice_(const tensor::Tensor& source, tensor::Tensor& des
         from = tensor::metal_buffer(snapshot);
         if (!from) return std::unexpected(std::move(from.error()));
     }
+    impl_->end_compute();
     auto encoder = [impl_->buffer blitCommandEncoder];
     if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create slice copy encoder"});
     for (std::size_t block = 0; block < outer; ++block)
@@ -188,27 +209,38 @@ auto CommandBatch::scatter_(tensor::Tensor& destination, const tensor::Tensor& u
         slots = tensor::metal_buffer(index_snapshot);
         if (!slots) return std::unexpected(std::move(slots.error()));
     }
-    if (!impl_->scatter_error) {
-        impl_->scatter_error = [pipeline.device newBufferWithLength:sizeof(std::int32_t)
-                                                            options:MTLResourceStorageModeShared];
-        if (!impl_->scatter_error) return std::unexpected(Error{ErrorCode::RUNTIME, "allocate scatter error flag"});
-        *static_cast<std::int32_t*>(impl_->scatter_error.contents) = 0;
-    }
-    const std::array<std::uint64_t, 4> sizes{destination.size(1),
-                                             updates.size(2) * tensor::element_size(updates.dtype()), indices.numel(),
-                                             updates.nbytes()};
-    auto encoder = [impl_->buffer computeCommandEncoder];
-    if (!encoder) return std::unexpected(Error{ErrorCode::RUNTIME, "create scatter encoder"});
+    auto error = index_error_buffer();
+    if (!error) return std::unexpected(std::move(error.error()));
+    const std::uint64_t row_bytes = updates.size(2) * tensor::element_size(updates.dtype());
+    const std::uint64_t rows = updates.size(0) * indices.numel();
+    const std::uint32_t copy_mode =
+        (row_bytes % 16 == 0 && target->offset_bytes % 16 == 0 && source->offset_bytes % 16 == 0) ? 2u
+        : (row_bytes % 4 == 0 && target->offset_bytes % 4 == 0 && source->offset_bytes % 4 == 0)  ? 1u
+                                                                                                  : 0u;
+    const struct {
+        std::uint64_t capacity, row_bytes, indices, rows;
+        std::uint32_t copy_mode;
+    } geometry{destination.size(1), row_bytes, indices.numel(), rows, copy_mode};
+    auto encoder_handle = compute_encoder();
+    if (!encoder_handle) return std::unexpected(std::move(encoder_handle.error()));
+    id<MTLComputeCommandEncoder> encoder = (__bridge id<MTLComputeCommandEncoder>)*encoder_handle;
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:(__bridge id<MTLBuffer>)target->handle offset:target->offset_bytes atIndex:0];
     [encoder setBuffer:(__bridge id<MTLBuffer>)source->handle offset:source->offset_bytes atIndex:1];
     [encoder setBuffer:(__bridge id<MTLBuffer>)slots->handle offset:slots->offset_bytes atIndex:2];
-    [encoder setBytes:sizes.data() length:sizeof(sizes) atIndex:3];
-    [encoder setBuffer:impl_->scatter_error offset:0 atIndex:4];
-    [encoder dispatchThreads:MTLSizeMake(updates.nbytes(), 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
-    [encoder endEncoding];
+    [encoder setBytes:&geometry length:sizeof(geometry) atIndex:3];
+    [encoder setBuffer:(__bridge id<MTLBuffer>)*error offset:0 atIndex:4];
+    [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     return {};
+}
+auto CommandBatch::index_error_buffer() -> Result<void*> {
+    if (!impl_->index_error) {
+        impl_->index_error = [command_queue().device newBufferWithLength:sizeof(std::int32_t)
+                                                                 options:MTLResourceStorageModeShared];
+        if (!impl_->index_error) return std::unexpected(Error{ErrorCode::RUNTIME, "allocate Metal index error flag"});
+        *static_cast<std::int32_t*>(impl_->index_error.contents) = 0;
+    }
+    return (__bridge void*)impl_->index_error;
 }
 auto CommandBatch::track_completion() -> std::function<void(std::string)> {
     if (impl_->next_ticket == impl_->tickets.size())
@@ -232,6 +264,7 @@ auto CommandBatch::track_completion() -> std::function<void(std::string)> {
 }
 auto CommandBatch::finish() -> Result<void> {
     if (!impl_->finished) {
+        impl_->end_compute();
         [impl_->buffer commit];
         [impl_->buffer waitUntilCompleted];
         impl_->finished = true;
@@ -244,8 +277,13 @@ auto CommandBatch::finish() -> Result<void> {
         return std::unexpected(
             Error{ErrorCode::RUNTIME,
                   "Metal command batch failed: " + std::string(impl_->buffer.error.localizedDescription.UTF8String)});
-    if (impl_->scatter_error && *static_cast<const std::int32_t*>(impl_->scatter_error.contents))
-        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "cache scatter index out of bounds"});
+    if (impl_->index_error) {
+        const auto error = *static_cast<const std::int32_t*>(impl_->index_error.contents);
+        if (error)
+            return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error == 2
+                                                                          ? "Metal expert ID out of bounds"
+                                                                          : "cache scatter index out of bounds"});
+    }
     return {};
 }
 } // namespace kidi::runtime::mps

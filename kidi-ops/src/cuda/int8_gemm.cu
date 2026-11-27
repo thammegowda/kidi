@@ -1,13 +1,8 @@
 #include "cuda/int8_gemm.h"
+#include "cuda/launch.h"
+#include "cuda/ptx_mma.cuh"
 
 #include <cuda_bf16.h>
-#include <cutlass/arch/memory_sm75.h>
-#include <cutlass/arch/memory_sm80.h>
-#include <cutlass/arch/mma_sm80.h>
-#include <cutlass/array.h>
-#include <cutlass/gemm/device/gemm.h>
-#include <cutlass/gemm/gemm.h>
-#include <cutlass/layout/matrix.h>
 
 #include <algorithm>
 #include <cmath>
@@ -39,7 +34,7 @@ __device__ __forceinline__ void stage_w8a8_tile(std::int8_t (*shared)[kW8A8Strid
         const int col = (vec % VecsPerRow) * 16;
         const bool valid = origin + row < rows && depth + col < width;
         const auto* ptr = valid ? src + static_cast<std::int64_t>(origin + row) * width + depth + col : src;
-        cutlass::arch::cp_async_zfill<16, cutlass::arch::CacheOperation::Always>(&shared[row][col], ptr, valid);
+        ptx::cp_async_zfill_16<false>(&shared[row][col], ptr, valid);
     }
 }
 
@@ -82,13 +77,9 @@ __global__ void __launch_bounds__(MWarps * NWarps * 32)
     const int tile_end = slices > 1 ? total_tiles * (slice_id + 1) / slices : total_tiles;
     const int tiles = tile_end - tile_begin;
 
-    using MmaOp = cutlass::arch::Mma<cutlass::gemm::GemmShape<16, 8, 32>, 32, int8_t, cutlass::layout::RowMajor, int8_t,
-                                     cutlass::layout::ColumnMajor, int, cutlass::layout::RowMajor,
-                                     cutlass::arch::OpMultiplyAddSaturate>;
-    MmaOp mma;
-    using FragmentA = typename MmaOp::FragmentA;
-    using FragmentB = typename MmaOp::FragmentB;
-    using FragmentC = typename MmaOp::FragmentC;
+    using FragmentA = ptx::Fragment<unsigned, 4>;
+    using FragmentB = ptx::Fragment<unsigned, 2>;
+    using FragmentC = ptx::Fragment<int, 4>;
 
     FragmentC acc[RowMmas][ColMmas];
 #pragma unroll
@@ -102,7 +93,7 @@ __global__ void __launch_bounds__(MWarps * NWarps * 32)
             stage_w8a8_tile<TileRows, Threads>(shared.activations[stage], input, rows, width, row_start, depth);
             stage_w8a8_tile<TileCols, Threads>(shared.weights[stage], weights, columns, width, col_start, depth);
         }
-        cutlass::arch::cp_async_fence();
+        ptx::cp_async_fence();
     }
 
     for (int tile = 0; tile < tiles; ++tile) {
@@ -113,8 +104,8 @@ __global__ void __launch_bounds__(MWarps * NWarps * 32)
             stage_w8a8_tile<TileRows, Threads>(shared.activations[next_slot], input, rows, width, row_start, depth);
             stage_w8a8_tile<TileCols, Threads>(shared.weights[next_slot], weights, columns, width, col_start, depth);
         }
-        cutlass::arch::cp_async_fence();
-        cutlass::arch::cp_async_wait<kW8A8Stages - 1>();
+        ptx::cp_async_fence();
+        ptx::cp_async_wait<kW8A8Stages - 1>();
         __syncthreads();
 
         const int slot = tile % kW8A8Stages;
@@ -125,25 +116,20 @@ __global__ void __launch_bounds__(MWarps * NWarps * 32)
             for (int m = 0; m < RowMmas; ++m) {
                 const int a_row = warp_m * WarpRows + m * 16 + (lane & 15);
                 const int a_col = k_sub * 32 + ((lane >> 4) & 1) * 16;
-                cutlass::Array<unsigned, 4> packed;
-                cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(packed, &shared.activations[slot][a_row][a_col]);
-                a_frags[m] = reinterpret_cast<const FragmentA&>(packed);
+                ptx::ldmatrix_x4<false>(a_frags[m], &shared.activations[slot][a_row][a_col]);
             }
 #pragma unroll
             for (int np = 0; np < ColMmas / 2; ++np) {
                 const int b_row = warp_n * WarpCols + np * 16 + (lane & 15);
                 const int b_col = k_sub * 32 + ((lane >> 4) & 1) * 16;
-                cutlass::Array<unsigned, 4> packed;
-                cutlass::arch::ldsm<cutlass::layout::RowMajor, 4>(packed, &shared.weights[slot][b_row][b_col]);
-                FragmentB b_even, b_odd;
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_even)[0] = packed[0];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_even)[1] = packed[2];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_odd)[0] = packed[1];
-                reinterpret_cast<cutlass::Array<unsigned, 2>&>(b_odd)[1] = packed[3];
+                FragmentA packed;
+                ptx::ldmatrix_x4<false>(packed, &shared.weights[slot][b_row][b_col]);
+                const FragmentB b_even{{packed[0], packed[2]}};
+                const FragmentB b_odd{{packed[1], packed[3]}};
 #pragma unroll
                 for (int m = 0; m < RowMmas; ++m) {
-                    mma(acc[m][2 * np + 0], a_frags[m], b_even, acc[m][2 * np + 0]);
-                    mma(acc[m][2 * np + 1], a_frags[m], b_odd, acc[m][2 * np + 1]);
+                    ptx::mma_s8_m16n8k32(acc[m][2 * np + 0], a_frags[m], b_even, acc[m][2 * np + 0]);
+                    ptx::mma_s8_m16n8k32(acc[m][2 * np + 1], a_frags[m], b_odd, acc[m][2 * np + 1]);
                 }
             }
         }
@@ -152,7 +138,7 @@ __global__ void __launch_bounds__(MWarps * NWarps * 32)
 
     const int lane_row = lane >> 2;
     const int lane_col = (lane & 3) * 2;
-    if (slices > 1) {
+    if (slices > 1 || !row_scales) {
         auto* partials = static_cast<std::int32_t*>(output) + static_cast<std::size_t>(slice_id) * rows * columns;
 #pragma unroll
         for (int m = 0; m < RowMmas; ++m) {
@@ -287,23 +273,10 @@ void run_w8a8(int slices, cudaStream_t stream, int rows, int columns, int width,
     const dim3 grid(static_cast<unsigned int>((columns - 1) / TileCols + 1),
                     static_cast<unsigned int>((rows - 1) / TileRows + 1), static_cast<unsigned int>(slices));
     if constexpr (smem > 48 * 1024) {
-        static thread_local std::uint64_t configured = 0;
-        int device = 0;
-        cudaGetDevice(&device);
-        const auto bit = device >= 0 && device < 64 ? std::uint64_t{1} << device : 0;
-        if (!bit || !(configured & bit)) {
-            cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
-            if (cudaStreamIsCapturing(stream, &capturing) == cudaSuccess &&
-                capturing == cudaStreamCaptureStatusNone) {
-                const auto status =
-                    cudaFuncSetAttribute(pipelined_w8a8_gemm<TileRows, TileCols, MWarps, NWarps>,
-                                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-                if (status != cudaSuccess)
-                    throw std::runtime_error(std::string("CUDA: setting W8A8 shared-memory limit failed: ") +
-                                             cudaGetErrorString(status));
-                configured |= bit;
-            }
-        }
+        const auto status = allow_shared_memory<pipelined_w8a8_gemm<TileRows, TileCols, MWarps, NWarps>>(smem, stream);
+        if (status != cudaSuccess)
+            throw std::runtime_error(std::string("CUDA: setting W8A8 shared-memory limit failed: ") +
+                                     cudaGetErrorString(status));
     }
     pipelined_w8a8_gemm<TileRows, TileCols, MWarps, NWarps>
         <<<grid, static_cast<unsigned int>(MWarps * NWarps * 32), smem, stream>>>(
@@ -386,18 +359,17 @@ auto w8a8_gemm(int rows, int columns, int width, const std::int8_t* input, const
 
 auto int8_gemm(int rows, int columns, int width, const std::int8_t* input, const std::int8_t* weights,
                std::int32_t* output, cudaStream_t stream) -> void {
-    using Gemm = cutlass::gemm::device::Gemm<
-        std::int8_t, cutlass::layout::RowMajor, std::int8_t, cutlass::layout::ColumnMajor, std::int32_t,
-        cutlass::layout::RowMajor, std::int32_t, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-        cutlass::gemm::GemmShape<32, 64, 64>, cutlass::gemm::GemmShape<16, 32, 64>, cutlass::gemm::GemmShape<16, 8, 32>,
-        cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>,
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3, 16, 16>;
-    Gemm gemm;
-    const typename Gemm::Arguments arguments{{rows, columns, width}, {input, width},    {weights, width},
-                                             {output, columns},      {output, columns}, {1, 0}};
-    const auto status = gemm(arguments, nullptr, stream);
-    if (status != cutlass::Status::kSuccess)
-        throw std::runtime_error(std::string("CUDA: CUTLASS INT8 GEMM failed: ") + cutlassGetStatusString(status));
+    if (rows <= 16)
+        run_w8a8<16, 64, 1, 4>(1, stream, rows, columns, width, input, weights, nullptr, nullptr, nullptr, nullptr,
+                               nullptr, 0.F, output, false);
+    else if (rows >= 1024)
+        run_w8a8<128, 128, 4, 2>(1, stream, rows, columns, width, input, weights, nullptr, nullptr, nullptr, nullptr,
+                                 nullptr, 0.F, output, false);
+    else
+        run_w8a8<64, 64, 2, 2>(1, stream, rows, columns, width, input, weights, nullptr, nullptr, nullptr, nullptr,
+                               nullptr, 0.F, output, false);
+    const auto err = cudaGetLastError();
+    if (err != cudaSuccess) throw std::runtime_error(std::string("CUDA: INT8 GEMM failed: ") + cudaGetErrorString(err));
 }
 
 } // namespace kidi::cuda

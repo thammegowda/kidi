@@ -21,12 +21,6 @@ namespace {
 
 using GetProviders = Qnn_ErrorHandle_t (*)(const QnnInterface_t***, std::uint32_t*);
 
-auto log_callback(const char* format, QnnLog_Level_t level, std::uint64_t, va_list arguments) -> void {
-    std::fprintf(stderr, "[qnn:%d] ", static_cast<int>(level));
-    std::vfprintf(stderr, format, arguments);
-    std::fputc('\n', stderr);
-}
-
 } // namespace
 
 auto check(Qnn_ErrorHandle_t status, const std::string& operation) -> void {
@@ -70,8 +64,6 @@ Session::Session(const std::string& library) {
         }
     }
     if (api_version.empty()) throw std::runtime_error(library + " has no compatible QNN HTP provider");
-    if (const char* level = std::getenv("KIDI_QNN_LOG"))
-        check(api.logCreate(log_callback, static_cast<QnnLog_Level_t>(std::atoi(level)), &log_), "create log");
     check(api.backendCreate(log_, nullptr, &backend_), "create HTP backend");
     const char* build = nullptr;
     if (api.backendGetBuildId && api.backendGetBuildId(&build) == QNN_SUCCESS && build) build_id = build;
