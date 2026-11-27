@@ -10,7 +10,7 @@ Kidi (*"spark"* in Kannada) runs modern generative AI models locally on your har
 
 ## Why Kidi?
 
-- **Batteries-Included Binary:** Kidi links its project libraries into one executable, with no runtime dependency on PyTorch, Transformers, OpenCV, Pillow, or Python. A stripped Linux x86-64 CPU Release CLI including `kidi code` measured 10.8 MiB in November 2026; size varies by platform and build options. Set `-DKIDI_BUILD_CODE=OFF` to omit the coding agent. The executable includes:
+- **Batteries-Included Binary:** Kidi links its project libraries into one executable, with no runtime dependency on PyTorch, Transformers, OpenCV, Pillow, or Python. A stripped Linux x86-64 CPU Release CLI including `kidi agent` measured 10.8 MiB in November 2026; size varies by platform and build options. Set `-DKIDI_BUILD_AGENT=OFF` to omit the coding agent. The executable includes:
   - **Compute & Shaders:** [`ynnpack-dev`](https://github.com/thammegowda/ynnpack-dev) CPU kernels (ARM64 NEON/DOTPROD/SME2, x86 AVX2/AVX-512, Wasm SIMD128), [`kidi-ops`](kidi-ops/README.md) CUDA kernels, and embedded Apple Metal kernels
   - **Tokenization & Text ([`tokenizerspp`](https://github.com/thammegowda/tokenizerspp)):** Native C++ Hugging Face `tokenizer.json` engine, Unicode (`uni-algo`), UTF-8 Unicode regex, G2P phonemizer, and linguistic sentence splitter
   - **Vision & Image Codecs ([`tahoma-vision`](https://github.com/thammegowda/tahoma-vision) & [`pigzpp`](https://github.com/thammegowda/pigzpp)):** SIMD-accelerated **JPEG (`libjpeg-turbo`)**, **PNG ([`pigzpp`](https://github.com/thammegowda/pigzpp) + `zlib-ng`)**, and PPM decoding + vision tensor preprocessing
@@ -55,7 +55,7 @@ reproduction commands.
 </p>
 
 - **CUDA Support:** Kidi provides native CUDA kernels and graph replay. Performance depends on the GPU, model, precision, and workload; the [H100 benchmark](benchmarks/cuda/2026-11-20-e4b-q8-h100-gpu7.md) shows that vLLM can be faster.
-- **Compact Edge Binary Footprint:** In a November 2026 Arm/macOS snapshot, the stripped Kidi benchmark runner measured `4.12 MiB` and the full CLI `4.72 MiB`. These measurements predate `kidi code`; current sizes vary with revision, platform, and build configuration. See [Runtime Binary Footprint](benchmarks/gemma4/arm/README.md#runtime-binary-footprint) for comparisons.
+- **Compact Edge Binary Footprint:** In a November 2026 Arm/macOS snapshot, the stripped Kidi benchmark runner measured `4.12 MiB` and the full CLI `4.72 MiB`. These measurements predate `kidi agent`; current sizes vary with revision, platform, and build configuration. See [Runtime Binary Footprint](benchmarks/gemma4/arm/README.md#runtime-binary-footprint) for comparisons.
 
 ---
 
@@ -101,8 +101,8 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -v "kidi[hf] @ git+https://github.com/thammegowda/kidi.git@main"
 
-# Launch interactive streaming chat (downloads ~2.49 GB once and caches locally)
-python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers
+# Chat in the terminal without workspace tools (downloads ~2.49 GB once and caches locally)
+python -m kidi agent -m @google/gemma-4-E2B-it-qat-mobile-transformers --permissions none
 ```
 
 - **Select a backend:** `auto` prefers available CUDA, then Metal, then CPU, subject to workload support. Pass `--backend ynnpack` for CPU or `--backend cuda:INDEX` for a specific GPU. `kidi --version` reports backend availability.
@@ -113,9 +113,11 @@ python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers
 
 ## Command-Line Tasks
 
-### 1. Interactive Chat & Batch JSONL Generation (`chat` / `generate`)
+### 1. Interactive Chat & Batch JSONL Generation (`agent` / `generate`)
 
-In `kidi chat`, replies stream token-by-token and report throughput, TTFT, and memory usage after each turn (commands: `/clear`, `/system <prompt>`, `/multiline`, `/send`, `/help`, `/exit`).
+`kidi agent` is the interactive shell: replies stream token-by-token with throughput and context usage in the status
+line. `--permissions none` chats without workspace tools and `--system` replaces the system prompt; see
+[Kidi Agent](kidi-agent/README.md).
 
 For scripted pipelines, `kidi generate` streams JSONL requests to JSONL responses:
 
@@ -158,20 +160,22 @@ CUDA_VISIBLE_DEVICES=0 kidi serve -m @thinkingmachines/Inkling-2-Mini --backend 
   --context-size 65536 --cache-tokens 65536 --prefill-chunk-size 512
 ```
 
-[Kidi Code](kidi-code/README.md) is the built-in C++23 coding agent:
-run `kidi code` to start or reuse a shared background inference server. The
-standalone `kidi-code` connects to an existing Kidi server over plain HTTP.
+[Kidi Agent](kidi-agent/README.md) is the built-in C++23 local agent for chat and workspace tasks:
+run `kidi agent` to start or reuse a shared background inference server. The
+standalone `kidi-agent` connects to an existing Kidi server over plain HTTP.
 Both have line editing, task history, multiline paste, colored tool activity,
 workspace file tools, explicit once-or-session approvals, and automatic
 context compaction. `/context` shows exact token usage; `/compact` summarizes
 older history manually.
-Commands are not OS-sandboxed; [tools/agent](tools/agent/README.md) runs the
+Commands are not OS-sandboxed; [tools/sandbox](tools/sandbox/README.md) runs the
 standalone client in a Landlock sandbox.
 
-Add `--assistant-model` (with `@owner/model` or a local directory) to enable CPU speculative decoding in `chat` or `generate`:
+Add `--assistant-model` (with `@owner/model` or a local directory) to enable CPU speculative decoding in `generate` or
+`serve`:
 
 ```bash
-kidi chat -m @google/gemma-4-E2B-it \
+printf '%s\n' '{"messages":[{"role":"user","content":"Explain binary search."}],"max_tokens":128}' | \
+kidi generate -m @google/gemma-4-E2B-it \
   --assistant-model @google/gemma-4-E2B-it-assistant \
   --precision q8 --draft-tokens 4
 ```

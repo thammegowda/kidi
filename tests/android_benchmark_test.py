@@ -64,11 +64,11 @@ class AndroidBenchmarkTest(unittest.TestCase):
         self.assertIn("--qnn-graph-layers 18", prepare)
         self.assertIn("--qnn-graph-layers 18", measure)
         self.assertIn("ffn-35-replay-g18.bin", measure)
-        self.assertNotIn("KIDI_FFN_DIAGNOSE", measure)
+        self.assertNotIn("--diagnose", measure)
         self.assertTrue(measure.endswith("exit $status"))
         eager = lowbit.ffn_invocation("npu", "eager", 35, 20, 4, graph_layers=18)
         self.assertNotIn("--qnn-graph-layers", eager)
-        self.assertIn("KIDI_FFN_DIAGNOSE=1", eager)
+        self.assertIn("--diagnose", eager)
         self.assertIn("--threads 4", lowbit.ffn_invocation("cpu", "eager", 35, 20, 4))
 
     def test_ffn_table_reports_speedup_and_replay_equivalence(self):

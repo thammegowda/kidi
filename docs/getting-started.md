@@ -50,7 +50,7 @@ source .cache/venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install '.[hf]'
 python -m kidi --version
-python -m kidi chat --help
+python -m kidi agent --help
 ```
 
 Use your installed Python 3.12+ executable in place of `python3.12` if necessary.
@@ -72,18 +72,19 @@ installation. A Git install compiles from source; it is not a prebuilt download.
 Run this from any directory. The `@` prefix means a Hugging Face model ID:
 
 ```bash
-python -m kidi chat \
+python -m kidi agent \
   --model @google/gemma-4-E2B-it-qat-mobile-transformers \
-  --threads 4 \
+  --permissions none \
   --system "Be helpful and concise."
 ```
 
-The backend and color settings both default to `auto`. To force CPU
+`kidi agent` starts (or reuses) a background inference server for the model and opens the chat shell;
+`--permissions none` chats without workspace tools. The backend and color settings both default to `auto`. To force CPU
 execution, use `--backend ynnpack`; to require Apple Metal, use `--backend mps`.
 For an [NVIDIA CUDA build](../README-dev.md#cuda), use `--backend cuda:0`:
 
 ```bash
-python -m kidi chat -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0
+python -m kidi agent -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0
 ```
 
 `cuda` also selects GPU 0; `cuda:INDEX` selects a different device. CUDA is an
@@ -91,7 +92,7 @@ explicit choice rather than part of `auto` selection and requires a package
 built with `KIDI_ENABLE_CUDA=ON`.
 
 You can also use
-`kidi chat` instead of `python -m kidi chat` when `kidi` is on `PATH`. On first
+`kidi agent` instead of `python -m kidi agent` when `kidi` is on `PATH`. On first
 use with `@owner/model`, Kidi runs `hf download --local-dir` into
 `~/.cache/kidi/model-hub/<owner>/<model>/` and starts chat directly from the
 downloaded `config.json` and `model.safetensors` files without modifying the
@@ -120,29 +121,28 @@ run `hf auth login` in your terminal using a token with read access, then retry.
 Complete any access requirements shown on the model page. Never put tokens in
 Git commits or shared command transcripts. Download progress goes to stderr.
 
-The model loads once. Before the first `You>` prompt, Kidi prints load time and
-memory statistics. Type a question such as `What is the capital of France?` and
-press Enter. Replies stream as they are generated; each completed turn prints
-token speed, latency and memory statistics. Follow-up messages include the
-conversation history and use the original checkpoint chat template.
+The first run starts a background server that loads the model once; later `kidi agent` sessions with the same
+model and settings reuse it until it has been idle for 10 minutes. Type a question such as
+`What is the capital of France?` and press Enter. Replies stream as they are generated, and the status line shows
+context usage and token speed. Follow-up messages include the conversation history and use the checkpoint's chat
+template.
 
 | Command | Action |
 |---|---|
 | `/help` | List shell commands |
-| `/clear` | Reset history, retaining the system instruction |
-| `/system TEXT` | Change the system instruction and reset history |
-| `/multiline` | Enter multiple lines; finish with `/send` or discard with `/cancel` |
-| `/exit` or `/quit` | Exit chat |
+| `/reset` | Clear the conversation |
+| `/context` | Show exact prompt and context token counts |
+| `/compact` | Summarize older history |
+| `/exit` | Exit |
 
-Ctrl-C cancels the current reply; Ctrl-D exits at the prompt. Use `--color never`
-or set `NO_COLOR` to disable automatic colors. Interactive chat is currently greedy text-only
-generation with thinking disabled; it does not execute tools or process multimodal input.
-History is re-prefilled each turn, not retained as a cross-turn KV cache.
+Ctrl-C cancels the current reply; Ctrl-D exits at the prompt. Use `--color never` or set `NO_COLOR` to disable
+colors. Sampling follows the agent configuration (temperature 0.6); pass `--temperature 0` for greedy replies. Without
+`--permissions none`, the same shell can also read and edit files in `--workspace` after asking for approval.
 
 ## Inkling-2 on Apple Silicon
 
 ```bash
-./build-release/kidi code -m @thinkingmachines/Inkling-2-Mini --backend mps
+./build-release/kidi agent -m @thinkingmachines/Inkling-2-Mini --backend mps
 ```
 
 The managed server defaults to `vq3d-hybrid` weights and BF16 KV storage for Inkling-2 on Metal.
@@ -160,7 +160,7 @@ pair. It keeps the same VQ weights and FP32 accumulation order; single-token dec
 The CPU-only build can run Inkling-2-Mini, including reasoning, tool calls and the coding agent:
 
 ```bash
-./build-release/kidi code -m @thinkingmachines/Inkling-2-Mini --backend ynnpack --restart
+./build-release/kidi agent -m @thinkingmachines/Inkling-2-Mini --backend ynnpack --restart
 # Or start a server explicitly:
 ./build-release/kidi serve -m @thinkingmachines/Inkling-2-Mini --backend ynnpack \
   --precision q8 --threads 8 --context-size 2048
@@ -174,7 +174,7 @@ matmuls quantize their input rows to INT8 (W8A8, AVX-512 VNNI where available) w
 Element-wise activations stay BF16/F32; CPU KV caches store signed INT8 with one FP32 scale per 32 elements
 (groups divide each head). This uses 56.25% of BF16 KV storage, including scales, for Inkling-2-Mini.
 Prefill batches expert work without per-expert tensor gathers/scatters, and attention shares cached rows across
-four query tokens. `kidi code` starts its CPU server with `--threads` (default: up to 16).
+four query tokens. `kidi agent` starts its CPU server with `--threads` (default: up to 16).
 On 16 pinned Sapphire Rapids cores, a roughly 4K-token prompt prefills in about 61 seconds
 (previously 96 seconds) and decodes at about 19 tokens/s; short-context decode is about 23 tokens/s.
 
@@ -194,7 +194,7 @@ from matching token sequences in the prompt/generated history and verifies them 
 This is useful for repeating existing code during edits, not a guarantee of higher acceptance on every coding task.
 
 ```bash
-taskset -c 16-31 ./build-release/kidi code -m @thinkingmachines/Inkling-2-Mini \
+taskset -c 16-31 ./build-release/kidi agent -m @thinkingmachines/Inkling-2-Mini \
   --backend ynnpack -j 16 --prompt-lookup --draft-tokens 8 --temperature 0 --restart
 # Explicit REST server:
 taskset -c 16-31 ./build-release/kidi serve -m @thinkingmachines/Inkling-2-Mini \
@@ -259,11 +259,11 @@ last pass after stop may revise that draft.
 
 ## Cache and Revisions
 
-`chat`, `generate`, `transcribe` and `inspect` accept `-c/--cache`. It controls the Hub download
+`generate`, `serve`, `transcribe` and `inspect` accept `-c/--cache`. It controls the Hub download
 cache, not the model's KV cache or `--cache-tokens` setting:
 
 ```bash
-python -m kidi chat -m @google/gemma-4-E2B-it-qat-mobile-transformers \
+python -m kidi inspect -m @google/gemma-4-E2B-it-qat-mobile-transformers \
   --cache "$HOME/models/kidi-cache"
 ```
 
@@ -298,7 +298,7 @@ MODEL_DIR="../models/gemma-4-E2B-it-qat-mobile-transformers"
 hf download google/gemma-4-E2B-it-qat-mobile-transformers \
   config.json model.safetensors tokenizer.json tokenizer_config.json chat_template.jinja \
   --local-dir "$MODEL_DIR"
-kidi chat --model "$MODEL_DIR"
+kidi agent --model "$MODEL_DIR"
 ```
 
 No conversion step is needed; Kidi reads `config.json` directly.
@@ -328,7 +328,7 @@ line. The same `--cache` option applies.
 
 - **`python` or `kidi` not found:** activate `.cache/venv` again. Use
   `python -m kidi` to run the package installed in that environment.
-- **No `chat` command:** install a Kidi revision or wheel containing chat support;
+- **No `agent` command:** install a Kidi revision or wheel built on Linux or macOS with agent support;
   an older installed package does not update when you only rebuild a native binary.
 - **Missing submodule during installation:** run
   `git submodule update --init --recursive`, then retry `python -m pip install '.[hf]'`.
@@ -341,12 +341,12 @@ line. The same `--cache` option applies.
 - **Missing chat template/tokenizer configuration:** rerun the download command
   with all five filenames. Do not replace the checkpoint template with hand-written
   role markers.
-- **Prompt and generation do not fit the context:** use `/clear`, shorten the
+- **Prompt and generation do not fit the context:** use `/reset` or `/compact`, shorten the
   prompt, or lower `--max-new-tokens`. History plus the output budget must fit;
   increasing context also increases memory use.
 - **High memory use:** download size is not runtime memory use. Metal may retain
-  expanded FP16 prefill weights. Setting `KIDI_PREFILL_CACHE_BYTES=0` before the
-  chat command avoids retaining those expanded matrices, at a performance cost;
+  expanded FP16 prefill weights. `--metal-prefill-cache-mib 0` (on `generate` and
+  `serve`) avoids retaining those expanded matrices, at a performance cost;
   it does not cap total process memory. See the
   [memory architecture](../ARCHITECTURE.md#native-gemma-4-mobile-qat).
 

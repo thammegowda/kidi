@@ -1,6 +1,6 @@
 #pragma once
 
-/// kidi's HTTP API, mounted by both `kidi serve` and the desktop app so every client (kidi-code, other
+/// kidi's HTTP API, mounted by both `kidi serve` and the desktop app so every client (kidi-agent, other
 /// OpenAI-compatible agents, the desktop UI) talks to the same `/health`, `/v1/models`, and `/v1/chat/completions`
 /// implementation.
 

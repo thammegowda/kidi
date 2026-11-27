@@ -47,14 +47,14 @@ distributions are acquired from `web/package-lock.json` and staged as ignored
 local assets; see [web dependency policy](web/libs/README.md).
 CLI-only and Python wheel targets do not acquire web packages or require Node.js.
 
-The [native coding agent](kidi-code/README.md) is enabled by default on Linux
-and macOS. Run `kidi code` to start or reuse a background Kidi server. The
+The [Kidi agent](kidi-agent/README.md), a local shell for chat and workspace tasks, is enabled by
+default on Linux and macOS. Run `kidi agent` to start or reuse a background Kidi server. The
 native command does not link libcurl. To build the standalone Kidi HTTP
-HTTP client independently of inference, use
-`cmake -S kidi-code -B .cache/kidi-code-build`.
+client independently of inference, use
+`cmake -S kidi-agent -B .cache/kidi-agent-build`.
 Both clients use the shared `/v1/chat/context` route for exact token preflight
 and compact long conversation history automatically. The handoff prompt is
-configured in embedded `kidi-code/agent.yaml` or an explicit override.
+configured in embedded `kidi-agent/agent.yaml` or an explicit override.
 
 ## Native Build
 
@@ -91,7 +91,7 @@ static CUDA CLI (`build-release-cuda/kidi`):
 
 ```bash
 make release-cuda
-build-release-cuda/kidi chat --model /path/to/gemma-model --backend cuda:0
+build-release-cuda/kidi agent --model /path/to/gemma-model --backend cuda:0
 ```
 
 The `release-cuda` preset statically links the CUDA, C++, and libgcc runtimes
@@ -103,8 +103,10 @@ additionally builds the separate `kidi-index-cuda` GPU HNSW index construction
 helper (`-DKIDI_CUVS_ROOT=/path/to/cuvs`, `-DKIDI_DLPACK_INCLUDE_DIR=/path/to/include`).
 
 The preset embeds `sm_80` and `sm_90` GPU code and `compute_90` PTX. Override
-`CMAKE_CUDA_ARCHITECTURES` at configure time for other targets. To enable
-Tensor Core GEMMs and FlashAttention-2 with a build-time CUTLASS checkout
+`CMAKE_CUDA_ARCHITECTURES` at configure time for other targets. Kidi's native kernels provide BF16, W8A16 and W8A8
+Tensor Core GEMMs, tiled FlashAttention-2 prefill and a tiled FP32 CUDA-core GEMM without CUDA toolkit
+shared-library dependencies. Native W8A16 (`--precision q8`) runs calibrated INT8 checkpoints and BF16 checkpoints
+with INT8 weights. To also build the Hopper (`sm_90a`) WGMMA INT8 GEMM, point the build at a CUTLASS checkout
 (tested with `v4.6.0-8-ge64a9136`):
 
 ```bash
@@ -112,31 +114,7 @@ cmake --preset release-cuda -DKIDI_CUTLASS_ROOT=/path/to/cutlass
 cmake --build --preset release-cuda --target kidi_cli
 ```
 
-This compiles BF16, W8A16, and W8A8 Tensor Core GEMMs, tiled BF16/FP32
-FlashAttention-2 prefill (`head_dim` 64/128/256/512), and a tiled FP32 CUDA-core
-GEMM into the `15.69 MiB` CLI without adding any CUDA toolkit shared-library
-dependencies (`VerifyPortableElf.cmake`). The dense fast paths support eligible
-transposed weights (`sm_80` and `sm_90`); FP32 does not use TF32. Native CUDA
-W8A16 (`--precision q8`) runs both calibrated INT8 checkpoints and unquantized
-BF16 checkpoints with INT8 weights and BF16 activations/KV cache, while W8A8
-accelerates affine INT8 and calibrated/uncalibrated packed INT8 projections (plus
-single-group packed INT4/INT2 projections expanded to INT8) with fused
-epilogues and partitioned FlashDecoding. Gemma 4's AUTO KV-cache policy selects
-BF16 on CUDA even when packed Q8 checkpoints retain FP32 activations, unless
-checkpoint-provided byte-cache quantization applies. Explicit FP32 cache remains
-available; CPU AUTO behavior is unchanged. Mixed FP32-query/BF16-cache attention
-retains FP32 outputs: tensor-core prefill rounds queries inside the attention
-kernel, and decode reads FP32 queries directly. Captured decode cache writes
-convert FP32 to BF16 inside scatter rather than launching separate casts.
-Small-row decode uses specialized
-vector kernels and CUDA Graph sibling fusion when eligible. On H100 (Gemma 4 E4B,
-162-token prompt / 128-token prefill chunks), compact BF16 reaches `9,281`
-prefill / `134.1` decode tok/s (`0.78 ms` exact-128 attention, `11.93 ms`
-exact-128 window vs `14.21 ms` historical shared cuBLAS), compact W8A16 reaches
-`8,503` prefill / `159.3` decode tok/s at `7.95 GiB` peak VRAM, and compact W8A8
-reaches `7,735` prefill / `139.3` decode tok/s (`9,974` / `138.5` at 1,098
-tokens). See the [CUDA performance plan](docs/cuda-performance-plan.md) for
-shapes, graph capture, and benchmark details.
+See the [CUDA performance plan](docs/cuda-performance-plan.md) for supported paths and current measurements.
 
 The [E4B Q8 comparison](benchmarks/cuda/2026-11-20-e4b-q8-h100-gpu7.md#bf16-cache-optimization-follow-up)
 records the matched FP32/BF16-cache follow-up, including remaining performance
@@ -153,7 +131,7 @@ For the Python launcher, build and install a CUDA-enabled package separately:
 
 ```bash
 python -m pip install '.[hf]' -Ccmake.define.KIDI_ENABLE_CUDA=ON
-python -m kidi chat -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0
+python -m kidi agent -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0
 ```
 
 CUDA is disabled in default builds. Installing a CPU-only wheel does not gain
@@ -539,9 +517,8 @@ retrieval can miss the dense winner, and packed search scores need not exactly
 match the dense backend's activation rounding. Matching one 64-token prompt is
 not proof of unchanged generation quality.
 
-`KIDI_HNSW_EF` optionally overrides search effort when the layer binds its index.
-It must be at least the candidate count stored in the graph; invalid values
-fail explicitly. Without an override, defaults remain those stored in the index.
+Search effort is stored in the index (`kidi index --ef-search`) and must be at least
+the candidate count stored in the graph.
 Check held-out generation quality, dense agreement and memory as well as speed.
 The [CPU harness](benchmarks/cpu/README.md#hnsw-lm-head-comparisons) provides
 dense/indexed controls and records the graph hash.
@@ -606,8 +583,8 @@ make test
 
 This builds the `debug` preset with integration tests disabled and runs CTest in
 parallel: at most 12 jobs (`TEST_JOBS` can lower this but is clamped to 12).
-The CPU preset runs the Gemma model checks without requiring CUDA; CUDA-only
-Inkling checks are registered only in CUDA builds. In CUDA builds, at most one
+The CPU preset runs the fixture-based Gemma model checks without requiring CUDA; real-checkpoint Inkling checks
+are registered only in CUDA builds and, for the CPU INT8 path, in `make test-all`. In CUDA builds, at most one
 `cuda`-labelled GPU test runs per GPU (max 8). Before GPU tests run, the
 `GpuPool` setup test (`cmake/gpu-launch.sh --spec`) writes a CTest resource pool with
 one id per visible GPU, so the pool adapts to the host: your `CUDA_VISIBLE_DEVICES` list
@@ -629,7 +606,9 @@ make test-all
 `make test-all` builds and tests `build-debug/kidi`, runs Python tests against an
 installed Debug wheel, and runs the 50-sentence RTG regression through one CTest
 invocation. It never uses the Release binary. The pinned public model downloads
-on the first CPU regression run; no Hub login is required.
+on the first CPU regression run; no Hub login is required. It also runs the CPU INT8
+Inkling-2 regression when `@thinkingmachines/Inkling-2-Mini` is cached; that check builds a
+~26 GB INT8 cache and skips on hosts with less than 64 GiB of RAM.
 Browser and extension suites remain separate. Individual targets are
 `python-test`, `web-test`, and `regression-test`. See
 [tests/data/README.md](tests/data/README.md) for fixtures and numerical contracts.
@@ -767,8 +746,8 @@ A decoding step reads every weight once, and the weights live on the node of the
 thread that first wrote them, so threads spread over two sockets read about half
 of them remotely. On a two-socket Xeon at 16 threads this was worth 1.1-1.3x.
 It only acts when the process may run on several nodes and the threads fit within
-one, so `taskset`, `numactl` and cgroup cpusets are respected; `KIDI_NUMA=off`
-disables it. Applications embedding Kidi should call it before loading a model.
+one, so `taskset`, `numactl` and cgroup cpusets choose the CPUs instead.
+Applications embedding Kidi should call it before loading a model.
 
 For reusable TTS latency, run repeated synthesis through one loaded model:
 
@@ -801,7 +780,7 @@ build-release/kidi synthesize -m .cache/omnivoice-int8 \
 
 Metal expands the INT8 Qwen projections to a shared FP16 cache because native
 half GEMM substantially outperforms per-tile INT8-to-half conversion on Apple
-GPU. Set `KIDI_MPS_Q_LINEAR_FP16=0` only for numerical/performance diagnostics.
+GPU.
 
 For multi-sentence input, the synthesizer first generates the shortest sentence
 estimated at least three seconds and uses its text plus generated codec tokens as the
@@ -811,10 +790,10 @@ voice-cloning encoder, which is intentionally absent from the converted package.
 
 Keep generated model files, local reports and large binary artifacts out of Git.
 
-## Coding Agents
+## Agent
 
-[Kidi Code](kidi-code/README.md) is the built-in coding agent (`kidi code`).
-[tools/agent](tools/agent/README.md) confines the standalone `kidi-code` client,
+[Kidi Agent](kidi-agent/README.md) (`kidi agent`) is the built-in local shell for chat and workspace tasks.
+[tools/sandbox](tools/sandbox/README.md) confines the standalone `kidi-agent` client,
 or any command, by Landlock to one workspace (typically a disposable
 `git worktree`), with Python venv/uv support and read-only git metadata.
 

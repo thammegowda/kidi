@@ -81,7 +81,7 @@ not pooled.
 ```bash
 cmake --preset release -DKIDI_BUILD_BENCHMARKS=ON
 cmake --build --preset release --target \
-  kidi_android_baseline kidi_tts_bench kidi_gemma4_quality \
+  kidi_android_baseline kidi_tts_bench \
   kidi_whisper_quality kidi_eval_kl --parallel 8
 ```
 

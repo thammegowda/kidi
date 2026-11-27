@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
@@ -42,5 +43,17 @@ public:
 } // namespace kidi::graph
 
 namespace kidi::runtime {
+/// Qualcomm NPU settings for the QNN step compiler. Set them before the first NPU model loads; empty paths keep the
+/// defaults. Diagnostics may change at any time.
+struct NpuOptions {
+    std::filesystem::path library_dir;    ///< QNN runtime libraries (default: the dynamic loader's search path).
+    std::filesystem::path cache_dir;      ///< Compiled-context cache (default: .kidi-qnn-cache).
+    std::filesystem::path skel_dir;       ///< Hexagon skel libraries, prepended to ADSP_LIBRARY_PATH.
+    std::filesystem::path op_package;     ///< Kidi HTP op package (host build); enables the fused NPU operators.
+    std::filesystem::path op_package_htp; ///< Device build of the op package (default: op_package).
+    bool diagnostics = false;             ///< Log graph construction and QNN messages.
+};
+auto set_npu_options(NpuOptions options) -> void;
+auto npu_options() -> NpuOptions;
 auto npu_step_compiler() -> Result<std::shared_ptr<graph::Compiler>>;
 } // namespace kidi::runtime

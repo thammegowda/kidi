@@ -13,7 +13,6 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <iomanip>
 #include <mutex>
 #include <map>
@@ -187,7 +186,6 @@ auto mpp_library() -> id<MTLLibrary> {
     std::scoped_lock lock(mutex);
     if (initialized) return cached;
     initialized = true;
-    if (const auto* env = std::getenv("KIDI_METAL_PREFILL_FP32"); env && std::string_view(env) == "1") return nil;
     auto shared = pipelines();
     if (!shared) return nil;
     // MTLGPUFamilyMetal4 == 5002.

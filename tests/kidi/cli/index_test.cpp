@@ -122,14 +122,11 @@ TEST_F(IndexCliTest, BuildsIndex) {
         << "zero indexing threads were accepted or missing formatted error";
     EXPECT_NE(error_output.find("[kidi] [error] HNSW thread count"), std::string::npos)
         << "zero indexing threads were accepted or missing formatted error";
-#if !defined(_WIN32)
-    setenv("SPDLOG_LEVEL", "off", 1);
+    auto quiet = invalid_threads;
+    quiet.insert(quiet.begin() + 1, {"--log-level", "off"});
     std::string suppressed_output;
-    EXPECT_EQ(run(invalid_threads, &suppressed_output).first, 2)
-        << "SPDLOG_LEVEL=off did not suppress CLI error logging";
-    EXPECT_TRUE(suppressed_output.empty()) << "SPDLOG_LEVEL=off did not suppress CLI error logging";
-    unsetenv("SPDLOG_LEVEL");
-#endif
+    EXPECT_EQ(run(quiet, &suppressed_output).first, 2) << "--log-level off did not suppress CLI error logging";
+    EXPECT_TRUE(suppressed_output.empty()) << "--log-level off did not suppress CLI error logging";
     auto sparse = require(inference::Generator::load(root, tensor::Device::cpu()));
     inference::GenerationOptions options{
         .maximum_new_tokens = 4,

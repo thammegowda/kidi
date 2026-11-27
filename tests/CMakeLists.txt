@@ -81,28 +81,28 @@ function(kidi_add_test target source)
 endfunction()
 
 kidi_add_test(kidi_argparse_test tests/kidi/cli/argparse_test.cpp STANDALONE LINK kidi::argparse)
-if(TARGET kidi::code)
-    kidi_add_test(kidi_code_test kidi-code/tests/agent_test.cpp STANDALONE LINK kidi::code)
-    target_sources(kidi_code_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-code/tests/workspace_test.cpp")
-    target_sources(kidi_code_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-code/tests/config_test.cpp")
-    if(TARGET kidi_code_command AND UNIX)
-        kidi_add_test(kidi_code_command_test kidi-code/tests/command_test.cpp
-            STANDALONE LINK kidi_code_command TIMEOUT 60)
+if(TARGET kidi::agent)
+    kidi_add_test(kidi_agent_test kidi-agent/tests/agent_test.cpp STANDALONE LINK kidi::agent)
+    target_sources(kidi_agent_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-agent/tests/workspace_test.cpp")
+    target_sources(kidi_agent_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-agent/tests/config_test.cpp")
+    if(TARGET kidi_agent_command AND UNIX)
+        kidi_add_test(kidi_agent_command_test kidi-agent/tests/command_test.cpp
+            STANDALONE LINK kidi_agent_command TIMEOUT 60)
     endif()
-    if(TARGET kidi::code_http)
-        kidi_add_test(kidi_code_chat_client_test kidi-code/tests/chat_client_test.cpp
-            STANDALONE LINK kidi::code_http liteapp::httplib)
+    if(TARGET kidi::agent_http)
+        kidi_add_test(kidi_agent_chat_client_test kidi-agent/tests/chat_client_test.cpp
+            STANDALONE LINK kidi::agent_http liteapp::httplib)
     endif()
 endif()
 
-if(KIDI_BUILD_CODE AND KIDI_BUILD_CODE_DEFAULT AND NOT CMAKE_CROSSCOMPILING)
+if(KIDI_BUILD_AGENT AND KIDI_AGENT_PLATFORM AND NOT CMAKE_CROSSCOMPILING)
     find_program(KIDI_TEST_BASH bash)
     find_program(KIDI_TEST_CURL curl)
     if(KIDI_TEST_BASH AND KIDI_TEST_CURL)
-        add_test(NAME kidi_code_managed
-            COMMAND "${KIDI_TEST_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/kidi/cli/managed_code_test.sh"
+        add_test(NAME kidi_agent_managed
+            COMMAND "${KIDI_TEST_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/kidi/cli/managed_agent_test.sh"
                 "$<TARGET_FILE:kidi_cli>" "${PROJECT_SOURCE_DIR}/tests/data/gemma4" "${KIDI_TEST_CURL}")
-        set_tests_properties(kidi_code_managed PROPERTIES TIMEOUT 30 LABELS native)
+        set_tests_properties(kidi_agent_managed PROPERTIES TIMEOUT 30 LABELS native)
     endif()
 endif()
 
@@ -132,10 +132,13 @@ if(KIDI_ENABLE_CUDA)
     # These checkpoints do not fit together on the single-GPU two-slot fallback.
     kidi_add_test(kidi_inkling2_test tests/kidi/model/inkling2_test.cpp LABELS native cuda RESOURCE_LOCK inkling2_model)
 endif()
-kidi_add_test(kidi_inkling2_cpu_test tests/kidi/model/inkling2_cpu_test.cpp RESOURCE_LOCK inkling2_model)
-# Stable source code for the teacher-forced prefill quality check.
-target_compile_definitions(kidi_inkling2_cpu_test PRIVATE
-    KIDI_INKLING2_TEXT_FIXTURE="${KIDI_THIRD_PARTY_DIR}/ynnpack-dev/third_party/googletest/googletest/src/gtest.cc")
+if(KIDI_BUILD_INTEGRATION_TESTS)
+    # Real-checkpoint CPU INT8 regression (~26 GB cache, 64 GiB of RAM); kept out of the fast `make test` loop.
+    kidi_add_test(kidi_inkling2_cpu_test tests/kidi/model/inkling2_cpu_test.cpp RESOURCE_LOCK inkling2_model)
+    # Stable source code for the teacher-forced prefill quality check.
+    target_compile_definitions(kidi_inkling2_cpu_test PRIVATE
+        KIDI_INKLING2_TEXT_FIXTURE="${KIDI_THIRD_PARTY_DIR}/ynnpack-dev/third_party/googletest/googletest/src/gtest.cc")
+endif()
 kidi_add_test(kidi_kokoro_test tests/kidi/model/kokoro_test.cpp)
 kidi_add_test(kidi_model_registry_test tests/kidi/model/registry_test.cpp)
 target_compile_definitions(kidi_gemma4_test PRIVATE KIDI_GEMMA4_FIXTURE="${PROJECT_SOURCE_DIR}/tests/data/gemma4")

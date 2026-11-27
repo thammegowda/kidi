@@ -59,10 +59,6 @@ auto affinity() -> std::vector<int> {
 TEST(NumaTest, ConfinesToNode) {
     std::thread([] {
         const auto before = affinity();
-        setenv("KIDI_NUMA", "off", 1);
-        EXPECT_FALSE(::ynn::confine_to_numa_node(1)) << "KIDI_NUMA=off disables confinement";
-        EXPECT_EQ(affinity(), before) << "KIDI_NUMA=off leaves the affinity alone";
-        unsetenv("KIDI_NUMA");
         const auto node = ::ynn::confine_to_numa_node(1);
         const auto after = affinity();
         EXPECT_FALSE(after.empty()) << "affinity stays non-empty";

@@ -162,7 +162,7 @@ struct AudioPolicy {
 struct ReplayPolicy {
     std::size_t region_layers = 0;
     std::size_t cache_capacity = 8;
-    bool generator_opt_in = false;
+    bool eager_generator = false; ///< Android OmniVoice generator steps run eagerly.
 };
 
 struct DispatchPolicy {
@@ -227,7 +227,7 @@ inline constexpr EnumMap<DeviceKind, DeviceProfile, static_cast<std::size_t>(Dev
                                                      .silu = FeedForwardKernel::PACKED_GATE,
                                                      .prefill = PrefillStrategy::LAST_TOKEN,
                                                      .crop_history = true},
-                                     .replay = {.generator_opt_in = true}}}},
+                                     .replay = {.eager_generator = true}}}},
         std::pair{DeviceKind::Q_NPU, DeviceProfile{}},
         std::pair{DeviceKind::CUDA,
                   DeviceProfile{.capabilities = {.compute = {.transformer = TransformerSupport::QUANTIZED,
@@ -287,7 +287,7 @@ inline constexpr EnumMap<DeviceKind, DeviceProfile, static_cast<std::size_t>(Dev
                                                            .silu = FeedForwardKernel::PACKED_LARGE,
                                                            .prefill = PrefillStrategy::LAST_TOKEN,
                                                            .crop_history = true},
-                                           .replay = {.generator_opt_in = true}}}},
+                                           .replay = {.eager_generator = true}}}},
     }};
 
 struct Device {

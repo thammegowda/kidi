@@ -563,55 +563,6 @@ auto quantized_distance_checks(const std::filesystem::path& root, std::int32_t b
     }
 }
 
-#if !defined(_WIN32)
-auto search_settings_checks(const std::filesystem::path& root) -> void {
-    using namespace kidi;
-    struct Environment {
-        std::optional<std::string> ef;
-        Environment() {
-            if (const auto* value = std::getenv("KIDI_HNSW_EF")) ef = value;
-            unsetenv("KIDI_HNSW_EF");
-        }
-        ~Environment() {
-            if (ef)
-                setenv("KIDI_HNSW_EF", ef->c_str(), 1);
-            else
-                unsetenv("KIDI_HNSW_EF");
-        }
-    } restore;
-    std::vector<float> values;
-    const auto vectors = vector_table(16, 64, false, values);
-    auto topology =
-        require(search::HnswIndex::build(vectors, {.m = 4, .ef_construction = 16, .candidates = 4, .ef_search = 16}));
-    const auto path = root / "search-settings.hnsw";
-    require(topology.save(path));
-    const ModuleScope host(tensor::DType::F32, false, tensor::Device::cpu());
-    layers::Linear linear(64, 16, true, false);
-    require(linear->set_state({{"weight", vectors}}));
-    require(linear->bind_hnsw(path));
-    ops::Context context(tensor::Device::cpu());
-    std::vector<float> query(64, 1.F);
-    const auto input = require(tensor::Tensor::from_host({1, 64}, std::span<const float>(query)));
-    const auto expected = require(linear->select(context, input).data<std::int32_t>())[0];
-    for (const auto* value : {"", "0", "-1", "abc", "8junk", "17", "18446744073709551616"}) {
-        SCOPED_TRACE(std::string("KIDI_HNSW_EF=") + value);
-        setenv("KIDI_HNSW_EF", value, 1);
-        const auto bound = linear->bind_hnsw(path);
-        ASSERT_FALSE(bound) << "invalid HNSW setting was silently accepted";
-        EXPECT_EQ(bound.error().code, ErrorCode::INVALID_ARGUMENT) << "invalid HNSW setting was silently accepted";
-        EXPECT_EQ(require(linear->select(context, input).data<std::int32_t>())[0], expected)
-            << "failed HNSW binding changed the previous search configuration";
-    }
-    setenv("KIDI_HNSW_EF", "3", 1);
-    EXPECT_FALSE(linear->bind_hnsw(path)) << "search effort smaller than candidate count was accepted";
-    setenv("KIDI_HNSW_EF", "16", 1);
-    require(linear->bind_hnsw(path));
-    setenv("KIDI_HNSW_EF", "invalid-after-binding", 1);
-    EXPECT_EQ(require(linear->select(context, input).data<std::int32_t>())[0], expected)
-        << "HNSW hot path reread its environment settings";
-}
-#endif
-
 constexpr std::array<float, 32> SMALL_VALUES{
     1, 0, 0, 0, 10, 1, 0, 0, -2, 0, 0, 0, 0, 2, 0, 0, 1, 1, 0, 0, 0, 0, 3, 0, 0, 0, 0, 4, -1, 1, 0, 0,
 };
@@ -730,10 +681,6 @@ TEST_F(HnswTest, QuantizedDistances) {
         }
     }
 }
-
-#if !defined(_WIN32)
-TEST_F(HnswTest, SearchSettings) { search_settings_checks(root); }
-#endif
 
 TEST(HnswTiedTest, TiedDistances) {
     const std::array<float, 32> zeros{};

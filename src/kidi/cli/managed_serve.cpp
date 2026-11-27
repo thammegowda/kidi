@@ -2,9 +2,10 @@
 
 #include "kidi/checkpoint/hub.h"
 #include "kidi/cli/log.h"
-#include "kidi/code/chat_transport.h"
+#include "kidi/agent/chat_transport.h"
 #include "kidi/inference/decoder.h"
 #include "kidi/server/routes.h"
+#include "kidi/tensor/backend.h"
 
 #include <httplib.h>
 
@@ -18,6 +19,7 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -103,7 +105,7 @@ auto runtime_directory() -> fs::path {
     if (const auto* runtime = std::getenv("XDG_RUNTIME_DIR");
         runtime && fs::path(runtime).is_absolute() && private_directory(runtime, false))
         parent = runtime;
-    const auto root = parent / ("kidi-code-" + std::to_string(geteuid()));
+    const auto root = parent / ("kidi-agent-" + std::to_string(geteuid()));
     if (!private_directory(root, true)) throw std::runtime_error("not a private directory: " + root.string());
     return root;
 }
@@ -140,15 +142,15 @@ auto effective_precision(const Namespace& arguments, const std::string& model) -
     return "checkpoint";
 }
 
-auto start_server(const fs::path& exe, const fs::path& dir, const File& startup, const std::string& model,
-                  const fs::path& cache, const Namespace& arguments) -> void {
+auto start_server(const std::vector<std::string>& launch, const fs::path& dir, const File& startup,
+                  const std::string& model, const fs::path& cache, const Namespace& arguments) -> void {
     const auto log = open_file(dir / "serve.log", O_WRONLY | O_CREAT | O_TRUNC);
     const auto input = open_file("/dev/null", O_RDONLY);
     const auto requested_ctx = arguments.get<std::size_t>("context_size");
     const auto cache_tokens = requested_ctx ? requested_ctx : std::size_t{16384};
     const auto precision = effective_precision(arguments, model);
     std::vector<std::string> flags{
-        exe.string(),
+        "--log-level=" + arguments.get<std::string>("log_level"),
         "serve",
         "--model=" + model,
         "--cache=" + cache.string(),
@@ -162,6 +164,7 @@ auto start_server(const fs::path& exe, const fs::path& dir, const File& startup,
         "--managed-dir=" + dir.string(),
         "--managed-lock-fd=" + std::to_string(startup.get()),
     };
+    flags.insert(flags.begin(), launch.begin(), launch.end());
     if (arguments.get<bool>("prompt_lookup")) {
         flags.push_back("--prompt-lookup");
         flags.push_back("--draft-tokens=" + std::to_string(arguments.get<std::size_t>("draft_tokens")));
@@ -201,7 +204,7 @@ auto read_endpoint(const fs::path& state) -> std::optional<Endpoint> {
     std::array<char, 256> bytes{};
     in.read(bytes.data(), bytes.size());
     if (in.gcount() == 0 || !in.eof()) return {};
-    const auto json = code::Json::parse(bytes.data(), bytes.data() + in.gcount(), nullptr, false);
+    const auto json = agent::Json::parse(bytes.data(), bytes.data() + in.gcount(), nullptr, false);
     if (!json.is_object() || !json.contains("port") || !json["port"].is_number_unsigned() || !json.contains("pid") ||
         !json["pid"].is_number_unsigned())
         return {};
@@ -216,7 +219,7 @@ auto accessible(Endpoint endpoint) -> bool {
     http.set_connection_timeout(500ms);
     http.set_max_timeout(500ms);
     http.set_payload_max_length(256);
-    const auto health = http.Get("/kidi-code/ready");
+    const auto health = http.Get("/kidi-agent/ready");
     return health && health->status == 200 && health->body == std::to_string(endpoint.pid);
 }
 
@@ -249,8 +252,8 @@ auto stop_server(const fs::path& dir) -> Result<void> {
         Error{ErrorCode::RUNTIME, "background inference PID " + std::to_string(endpoint->pid) + " did not exit"});
 }
 
-auto ensure_server(const fs::path& exe, const fs::path& dir, const std::string& model, const fs::path& cache,
-                   const Namespace& arguments, bool restart) -> Result<Endpoint> {
+auto ensure_server(const std::vector<std::string>& launch, const fs::path& dir, const std::string& model,
+                   const fs::path& cache, const Namespace& arguments, bool restart) -> Result<Endpoint> {
     bool waiting_for_server = false;
     const auto state = dir / STATE_NAME;
     const auto deadline = Clock::now() + 30min;
@@ -267,7 +270,7 @@ auto ensure_server(const fs::path& exe, const fs::path& dir, const std::string& 
                               "background inference exited during startup; see " + (dir / "serve.log").string()});
                 fs::remove(state);
                 log::info("starting background inference for {}; log: {}", model, (dir / "serve.log").string());
-                start_server(exe, dir, startup, model, cache, arguments);
+                start_server(launch, dir, startup, model, cache, arguments);
             }
         }
         waiting_for_server = true;
@@ -277,27 +280,29 @@ auto ensure_server(const fs::path& exe, const fs::path& dir, const std::string& 
         Error{ErrorCode::IO, "background inference did not become ready; see " + (dir / "serve.log").string()});
 }
 
-auto managed_provider(code::ChatClientOptions options, const Namespace& arguments) -> Result<code::Provider> {
+auto managed_provider(agent::ChatClientOptions options, const Namespace& arguments, const Launcher& launcher)
+    -> Result<agent::Provider> {
     const auto lookup = arguments.get<bool>("prompt_lookup");
     const auto drafts = arguments.get<std::size_t>("draft_tokens");
     if ((!lookup && drafts != 3) || !drafts || drafts > inference::MAX_DRAFT_TOKENS)
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT,
                                      "--draft-tokens requires --prompt-lookup and a cap from 1 to 16"});
     options.model = choose_model(std::move(options.model));
-    const auto exe = executable();
+    const auto launch = launcher.command.empty() ? std::vector<std::string>{executable().string()} : launcher.command;
     struct stat binary{};
-    if (stat(exe.c_str(), &binary) < 0) fail_io("cannot identify kidi executable");
+    if (stat((launcher.binary.empty() ? executable() : launcher.binary).c_str(), &binary) < 0)
+        fail_io("cannot identify kidi executable");
     const auto cache = fs::absolute(checkpoint::Hub::default_cache()).lexically_normal();
     const auto& backend = arguments.get<std::string>("backend");
     const auto* visible_devices =
         (backend == "auto" || backend.starts_with("cuda")) ? std::getenv("CUDA_VISIBLE_DEVICES") : nullptr;
     const auto identity =
-        code::Json::array({binary.st_dev, binary.st_ino, binary.st_mtime, binary.st_size, options.model, cache.string(),
-                           backend, visible_devices ? code::Json(visible_devices) : code::Json(nullptr),
-                           effective_precision(arguments, options.model),
-                           arguments.get<std::string>("kv_cache_precision"), arguments.get<std::size_t>("context_size"),
-                           arguments.get<std::int32_t>("threads"), arguments.get<bool>("prompt_lookup"),
-                           arguments.get<std::size_t>("draft_tokens")})
+        agent::Json::array(
+            {binary.st_dev, binary.st_ino, binary.st_mtime, binary.st_size, options.model, cache.string(), backend,
+             visible_devices ? agent::Json(visible_devices) : agent::Json(nullptr),
+             effective_precision(arguments, options.model), arguments.get<std::string>("kv_cache_precision"),
+             arguments.get<std::size_t>("context_size"), arguments.get<std::int32_t>("threads"),
+             arguments.get<bool>("prompt_lookup"), arguments.get<std::size_t>("draft_tokens")})
             .dump();
     const auto dir = runtime_directory() / std::to_string(std::hash<std::string>{}(identity));
     if (!private_directory(dir, true)) throw std::runtime_error("not a private directory: " + dir.string());
@@ -309,25 +314,37 @@ auto managed_provider(code::ChatClientOptions options, const Namespace& argument
         std::this_thread::sleep_for(POLL_INTERVAL);
     }
     if (futimens(lease->file.get(), nullptr) < 0) fail_io("cannot record managed server session start");
-    auto endpoint = ensure_server(exe, dir, options.model, cache, arguments, arguments.get<bool>("restart"));
+    auto endpoint = ensure_server(launch, dir, options.model, cache, arguments, arguments.get<bool>("restart"));
     if (!endpoint) return std::unexpected(endpoint.error());
     options.base_url = "http://127.0.0.1:" + std::to_string(endpoint->port) + "/v1";
 
-    return code::completion_provider(
+    return agent::completion_provider(
         std::move(options),
-        [lease = std::move(lease), dir, endpoint = *endpoint](const code::ChatClientOptions& http_options,
+        [lease = std::move(lease), dir, endpoint = *endpoint](const agent::ChatClientOptions& http_options,
                                                               std::string payload, std::stop_token stop,
                                                               std::string_view route) -> Result<std::string> {
-            auto result = code::http_completion(http_options, std::move(payload), stop, endpoint.pid, route);
+            auto result = agent::http_completion(http_options, std::move(payload), stop, endpoint.pid, route);
             if (!result) result.error().message += "; see " + (dir / "serve.log").string();
             return result;
         });
 }
 
+/// Largest context that fits in three quarters of free device memory, leaving the rest for activations, other
+/// processes and allocator slack; 0 keeps the model's configured context when free memory is unknown.
+auto fitted_context_size(inference::Generator& generator, tensor::Device device) -> Result<std::size_t> {
+    auto backend = tensor::BackendRegistry::instance().backend(device);
+    if (!backend) return std::unexpected(backend.error());
+    const auto free = (*backend)->free_memory(device);
+    if (!free) return std::size_t{0};
+    auto fitted = generator.fit_context_size(free / 4 * 3);
+    if (fitted) log::info("context: {} tokens ({} GiB free on {})", *fitted, free >> 30, tensor::to_string(device));
+    return fitted;
+}
+
 } // namespace
 
-auto configure_managed_code_parser(ArgumentParser& parser) -> void {
-    code::configure_parser(parser, true);
+auto configure_managed_agent_parser(ArgumentParser& parser) -> void {
+    agent::configure_parser(parser, true);
     parser.add_argument("--backend")
         .default_value(std::string("auto"))
         .help("inference backend; auto prefers CUDA, then Metal, then CPU");
@@ -367,9 +384,10 @@ auto configure_managed_serve_parser(ArgumentParser& parser) -> void {
     parser.add_argument("--managed-lock-fd").dest("managed_lock_fd").default_value(-1).help("internal");
 }
 
-auto managed_code_command(const Namespace& arguments) -> int {
-    return code::code_command(
-        arguments, [&](code::ChatClientOptions options) { return managed_provider(std::move(options), arguments); });
+auto managed_agent_command(const Namespace& arguments, const Launcher& launcher) -> int {
+    return agent::agent_command(arguments, [&](agent::ChatClientOptions options) {
+        return managed_provider(std::move(options), arguments, launcher);
+    });
 }
 
 auto protect_managed_lock(const Namespace& arguments) -> void {
@@ -384,7 +402,24 @@ auto protect_managed_lock(const Namespace& arguments) -> void {
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) fail_io("cannot protect managed server lock");
 }
 
-auto serve_managed(inference::Generator& generator, const ServeOptions& options, const Namespace& arguments) -> int {
+auto serve_managed(inference::Generator& generator, tensor::Device device, ServeOptions options,
+                   inference::ServingOptions serving, const Namespace& arguments) -> int {
+    if (!options.generation.context_size) {
+        auto fitted = fitted_context_size(generator, device);
+        if (!fitted) {
+            log::error("{}", fitted.error().message);
+            return 2;
+        }
+        options.generation.context_size = *fitted;
+    }
+    serving.cache_token_budget = std::max(serving.cache_token_budget, options.generation.context_size);
+    serving.compact_cache = true;
+    // Agent turns resend the whole conversation; keep the last state so only the new suffix is prefilled.
+    options.generation.prefix_cache_bytes = std::numeric_limits<std::size_t>::max();
+    if (auto configured = generator.configure_serving(serving); !configured) {
+        log::error("{}", configured.error().message);
+        return 2;
+    }
     const auto& dir = arguments.get<fs::path>("managed_dir");
     const auto state = dir / STATE_NAME;
     const auto pid = getpid();
@@ -398,7 +433,7 @@ auto serve_managed(inference::Generator& generator, const ServeOptions& options,
     }
     server::ChatEngine engine(generator);
     server::mount_chat_routes(*http, engine, {.model_name = options.model_name, .defaults = options.generation});
-    http->get("/kidi-code/ready", [pid](const auto&) { return liteapp::Response::text(std::to_string(pid)); });
+    http->get("/kidi-agent/ready", [pid](const auto&) { return liteapp::Response::text(std::to_string(pid)); });
     const auto port = http->bind();
     if (!port) {
         log::error("cannot bind managed server: {}", port.error().message);
@@ -411,7 +446,7 @@ auto serve_managed(inference::Generator& generator, const ServeOptions& options,
     }
     const auto staging = dir / ("server." + std::to_string(pid) + ".tmp");
     std::ofstream out(staging, std::ios::trunc);
-    out << code::Json{{"port", *port}, {"pid", pid}}.dump() << '\n';
+    out << agent::Json{{"port", *port}, {"pid", pid}}.dump() << '\n';
     out.close();
     if (!out) throw std::runtime_error("cannot write managed server state: " + staging.string());
     fs::rename(staging, state);

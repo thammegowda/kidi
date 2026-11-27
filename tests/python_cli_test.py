@@ -3,12 +3,10 @@
 import os
 import importlib.util
 import json
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -101,8 +99,8 @@ class HubCliTest(unittest.TestCase):
             log_path = base / "hf.log"
             bin_dir = self._install_mock_hf(base, repos, log_path)
             with patch.dict(os.environ, {"PATH": bin_dir}):
-                self.assertEqual(kidi.main(["chat", "--help", "-m", "@google/example"]), 0)
-                self.assertEqual(kidi.main(["chat", "-m", "@google/example", "--not-an-option"]), 2)
+                self.assertEqual(kidi.main(["generate", "--help", "-m", "@google/example"]), 0)
+                self.assertEqual(kidi.main(["generate", "-m", "@google/example", "--not-an-option"]), 2)
                 self.assertEqual(kidi.main(["inspect", "-m", "/nonexistent-kidi-test"]), 1)
                 self.assertFalse(log_path.exists())
                 for args, cache_name in [
@@ -376,145 +374,6 @@ class PythonCliTest(unittest.TestCase):
             self.assertIn("reached --max-new-tokens", result.stderr)
             self.assertEqual(limited.read_text(), "")
 
-    @unittest.skipUnless(os.environ.get("KIDI_CHAT_MODEL"), "set KIDI_CHAT_MODEL for real chat CLI checks")
-    def test_interactive_chat(self):
-        command = ([os.environ["KIDI_BIN"]] if "KIDI_BIN" in os.environ else [sys.executable, "-m", "kidi"])
-        options = ["-m", os.environ["KIDI_CHAT_MODEL"],
-                   "--backend", os.environ.get("KIDI_TEST_BACKEND", "ynnpack"),
-                   "--context-size", "256", "--max-new-tokens", "16"]
-        system = "Be concise."
-        prompts = ["My name is Alex. Say hello.", "What is my name?"]
-        result = subprocess.run(command + ["chat", *options, "--system", system, "--color", "never"],
-                                input="\n".join(["/help", *prompts, "/clear", "x " * 300,
-                                                 "/system Be concise.", "/multiline", "Hello", "world",
-                                                 "/send", "/exit", "Not read."]) + "\n",
-                                text=True, capture_output=True, timeout=120)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("\x1b", result.stdout)
-        self.assertEqual(result.stdout.count("Kidi chat"), 1)
-        self.assertEqual(result.stdout.count("[load "), 1)
-        self.assertRegex(result.stdout.split("You> ", 1)[0], r"\[load [0-9.]+s \| RAM ")
-        self.assertEqual(result.stdout.count("Assistant> "), 3)
-        self.assertIn("Error: ", result.stdout)
-        self.assertIn("Conversation cleared.", result.stdout)
-        summary_pattern = (r"\[(\d+)tok @ ([0-9.]+|n/a) ?tok/s \| 1st ([0-9.]+)s last ([0-9.]+)s"
-                   r" \| RAM (?:[0-9.]+GiB|n/a) (?:[0-9]+%|n/a) (?:headroom|free)"
-                   r" (?:[0-9.]+GiB|n/a) total\]")
-        summaries = re.findall(summary_pattern, result.stdout)
-        self.assertEqual(len(summaries), 3)
-        for tokens, speed, first_token, total in summaries:
-            self.assertGreaterEqual(int(tokens), 0)
-            if speed != "n/a":
-                self.assertGreater(float(speed.split()[0]), 0)
-            self.assertGreaterEqual(float(total), float(first_token))
-        if sys.platform in {"darwin", "linux", "win32"}:
-            memory = re.findall(r"RAM ([0-9.]+)GiB ([0-9]+)% (?:headroom|free) ([0-9.]+)GiB total",
-                                result.stdout)
-            self.assertEqual(len(memory), 4)
-            for used, percent, total in memory:
-                self.assertGreater(float(used), 0)
-                self.assertGreater(float(total), 0)
-                self.assertGreaterEqual(float(percent), 0)
-                self.assertLessEqual(float(percent), 100)
-        transcript = re.sub(r"\n" + summary_pattern, "", result.stdout)
-        replies = [part.split("\nYou> ", 1)[0] for part in transcript.split("Assistant> ")[1:]]
-        messages = [{"role": "system", "content": system}, {"role": "user", "content": prompts[0]},
-                    {"role": "assistant", "content": replies[0]}, {"role": "user", "content": prompts[1]}]
-        reference = subprocess.run(command + ["generate", *options, "--max-active", "1", "--queue-size", "1"],
-                                   input=json.dumps({"messages": messages}) + "\n", text=True,
-                                   capture_output=True, timeout=120)
-        self.assertEqual(reference.returncode, 0, reference.stderr)
-        self.assertEqual(replies[1], json.loads(reference.stdout)["message"]["content"])
-        self.assertEqual(int(summaries[1][0]), len(json.loads(reference.stdout)["token_ids"]))
-        single = subprocess.run(command + ["chat", *options[:-1], "1", "--color", "never", "--profile"],
-                    input="Hi\n/exit\n", text=True, capture_output=True, timeout=120)
-        self.assertEqual(single.returncode, 0, single.stderr)
-        self.assertIn("n/a tok/s", single.stdout)
-        self.assertIn("|decode_tokens=0|decode_ns=0", single.stderr)
-        timings = {key: int(value) for key, value in re.findall(r"\|(\w+_ns)=(\d+)", single.stderr)}
-        self.assertGreaterEqual(timings["user_ttft_ns"], timings["ttft_ns"])
-        self.assertGreaterEqual(timings["user_total_ns"], max(timings["user_ttft_ns"], timings["generation_ns"]))
-        for color, expected in [("auto", False), ("always", True)]:
-            with self.subTest(color=color):
-                session = subprocess.run(command + ["chat", *options, "--color", color],
-                                         input="", text=True, capture_output=True, timeout=120,
-                                         env={**os.environ, "NO_COLOR": "1"})
-                self.assertEqual(session.returncode, 0, session.stderr)
-                self.assertEqual("\x1b[" in session.stdout, expected)
-
-    @unittest.skipUnless(os.environ.get("KIDI_CHAT_MODEL") and os.name == "posix", "requires a POSIX chat terminal")
-    def test_interactive_stream_and_cancel(self):
-        import pty
-        import select
-        import signal
-
-        command = ([os.environ["KIDI_BIN"]] if "KIDI_BIN" in os.environ else [sys.executable, "-m", "kidi"])
-        command += ["chat", "-m", os.environ["KIDI_CHAT_MODEL"],
-                    "--backend", os.environ.get("KIDI_TEST_BACKEND", "ynnpack"), "--context-size", "1024",
-                    "--max-new-tokens", "256", "--ignore-eos", "--color", "never"]
-        master, slave = pty.openpty()
-        process = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
-        os.close(slave)
-        pending = b""
-
-        def read_until(marker):
-            nonlocal pending
-            deadline = time.monotonic() + 120
-            while marker not in pending:
-                remaining = deadline - time.monotonic()
-                self.assertGreater(remaining, 0, pending[-500:])
-                if select.select([master], [], [], remaining)[0]:
-                    pending += os.read(master, 65536)
-            end = pending.index(marker) + len(marker)
-            consumed, pending = pending[:end], pending[end:]
-            return consumed
-
-        try:
-            startup = read_until(b"You> ")
-            self.assertRegex(startup, rb"\[load [0-9.]+s \| RAM ")
-            self.assertRegex(startup, rb"(?:headroom|free) (?:[0-9.]+GiB|n/a) total")
-            self.assertNotIn(b"tok/s", startup)
-            os.write(master, b"Count from one to a hundred.\n")
-            read_until(b"Assistant> ")
-            if not pending:
-                self.assertTrue(select.select([master], [], [], 120)[0], "no streamed output")
-                pending += os.read(master, 65536)
-            self.assertTrue(pending)
-            self.assertNotIn(b"You> ", pending, "reply was buffered until completion")
-            os.kill(process.pid, signal.SIGINT)
-            cancelled = read_until(b"You> ")
-            self.assertIn(b"Cancelled", cancelled)
-            self.assertNotIn(b"tok/s", cancelled)
-            os.kill(process.pid, signal.SIGINT)
-            read_until(b"You> ")
-            os.write(master, b"/clear\n")
-            self.assertIn(b"Conversation cleared.", read_until(b"You> "))
-            if sys.platform == "darwin":
-                import ctypes
-
-                class Usage(ctypes.Structure):
-                    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
-                        (name, ctypes.c_uint64) for name in
-                        ("user_time", "system_time", "package_wakeups", "interrupt_wakeups", "pageins",
-                         "wired", "resident", "footprint", "start", "exit")]
-
-                os.write(master, b"Say hello.\n")
-                response = read_until(b"You> ")
-                match = re.search(rb"RAM ([0-9.]+)GiB", response)
-                self.assertIsNotNone(match, response)
-                libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
-                libproc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
-                usage = Usage()
-                self.assertEqual(libproc.proc_pid_rusage(process.pid, 0, ctypes.byref(usage)), 0)
-                self.assertAlmostEqual(float(match[1]), usage.footprint / 2**30, delta=0.10)
-            os.write(master, b"/exit\n")
-            self.assertEqual(process.wait(timeout=10), 0)
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-            os.close(master)
-
     def test_repeatable_entrypoint(self):
         self.assertEqual(kidi.main(["--version"]), 0)
         self.assertEqual(kidi.main(["--version"]), 0)
@@ -523,11 +382,11 @@ class PythonCliTest(unittest.TestCase):
 
     def test_launchers(self):
         console = Path(sys.executable).parent / ("kidi.exe" if os.name == "nt" else "kidi")
-        for arguments, expected in [(["--version"], 0), (["generate", "--help"], 0), (["chat", "--help"], 0),
+        for arguments, expected in [(["--version"], 0), (["generate", "--help"], 0), (["serve", "--help"], 0),
                         (["translate", "--help"], 0),
                         (["generate", "--interactive"], 2), (["generate", "--system", "Hi"], 2),
                         (["generate", "--beam-size", "2"], 2), (["translate", "--max-new-tokens", "8"], 2),
-                        (["chat", "--in", "missing"], 2), (["chat", "--max-active", "2"], 2),
+                        (["serve", "--in", "missing"], 2),
                         (["unknown-command"], 2)]:
             with self.subTest(arguments=arguments):
                 module = subprocess.run([sys.executable, "-m", "kidi", *arguments], capture_output=True, check=False)

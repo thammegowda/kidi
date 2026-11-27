@@ -6,6 +6,7 @@
 #include "kidi/inference/generator.h"
 #include "kidi/inference/synthesizer.h"
 #include "kidi/inference/transcriber.h"
+#include "kidi/ops/context.h"
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/server/routes.h"
 #include "kidi/text/response.h"
@@ -308,15 +309,6 @@ auto positive_size(const YAML::Node& node, std::string_view key, std::size_t fal
     return value;
 }
 
-void configure_metal_prefill_cache(std::size_t bytes) {
-    const auto value = std::to_string(bytes);
-#if defined(_WIN32)
-    _putenv_s("KIDI_PREFILL_CACHE_BYTES", value.c_str());
-#else
-    setenv("KIDI_PREFILL_CACHE_BYTES", value.c_str(), 1);
-#endif
-}
-
 void merge_config(YAML::Node target, const YAML::Node& override) {
     if (!override || !override.IsMap()) return;
     for (const auto& entry : override) {
@@ -503,7 +495,7 @@ public:
         if (!selected) return std::unexpected(liteapp::Error{"unavailable", selected.error().message});
 
         std::scoped_lock lock(chat_mutex_);
-        configure_metal_prefill_cache(parsed->chat.metal_prefill_cache_bytes);
+        kidi::ops::set_metal_prefill_cache_bytes(parsed->chat.metal_prefill_cache_bytes);
         kidi::runtime::ynn::set_thread_count(parsed->threads);
         if (auto reserved = kidi::runtime::ynn::reserve_thread_pool(parsed->threads); !reserved)
             return std::unexpected(liteapp::Error{"load_failed", reserved.error().message});
@@ -539,7 +531,7 @@ public:
             std::scoped_lock prompt_lock(prompt_mutex_);
             system_prompt_ = config_->prompts.at("system");
         }
-        configure_metal_prefill_cache(config_->tts.metal_prefill_cache_bytes);
+        kidi::ops::set_metal_prefill_cache_bytes(config_->tts.metal_prefill_cache_bytes);
         model_path_ = config_->chat.directory.string();
         execution_ = generator_->execution();
         vision_supported_ = generator_->vision_supported();
@@ -829,7 +821,7 @@ private:
             return std::unexpected(kidi::Error{kidi::ErrorCode::UNSUPPORTED, "TTS is disabled"});
         last_tts_use_.store(speech_clock());
         if (synthesizer_) return {};
-        configure_metal_prefill_cache(config_->tts.metal_prefill_cache_bytes);
+        kidi::ops::set_metal_prefill_cache_bytes(config_->tts.metal_prefill_cache_bytes);
         const auto selected = kidi::inference::select_device(config_->tts.accelerator);
         if (!selected) return std::unexpected(selected.error());
         auto loaded = kidi::inference::Synthesizer::load(config_->tts.directory, *selected);

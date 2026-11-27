@@ -365,7 +365,7 @@ auto run_ffn_npu(const FfnStack& stack, const Options& options) -> FfnMeasuremen
     // Per-graph local error: each stage is compared with the reference applied to that stage's own HTP inputs, which
     // separates operator error from error propagated by earlier stages.
     auto diagnostics = nlohmann::json::array();
-    if (!replay && std::getenv("KIDI_FFN_DIAGNOSE")) {
+    if (!replay && options.diagnose) {
         const auto read = [&](const Io& io) {
             const auto& entry = buffer(io);
             std::vector<std::int8_t> result(static_cast<std::size_t>(stack.m) * io.width);

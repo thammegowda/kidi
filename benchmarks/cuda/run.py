@@ -163,18 +163,19 @@ def main():
     for model in arguments.models:
         label = {"gemma": "gemma4-e4b-qat", "whisper": "whisper-small-w8a8", "omnivoice": "omnivoice-q8"}[model]
         directory = inputs["models"][label]["directory"]
-        environment = dict(os.environ, KIDI_ACCELERATOR=arguments.device)
+        environment = dict(os.environ)
         if model == "omnivoice":
             settings = reference["protocol"]["omnivoice"]
+            options = {key: settings[key] for key in ("language", "pace", "seed", "voice")}
+            options["wav_out"] = str(work / "omnivoice.wav")
             command = [str(ROOT / "build-release/kidi_tts_bench"), directory, arguments.device, str(arguments.repeats + 1), "8", settings["text"], str(settings["steps"]),
-                       json.dumps({key: settings[key] for key in ("language", "pace", "seed", "voice")})]
-            environment["KIDI_TTS_WAV_OUT"] = str(work / "omnivoice.wav")
+                       json.dumps(options)]
         else:
-            command = [str(ROOT / "build-release/kidi_android_baseline"), model, directory, "8", str(arguments.repeats)]
+            command = [str(ROOT / "build-release/kidi_android_baseline"), "--device", arguments.device, model, directory, "8", str(arguments.repeats)]
             if model == "whisper":
                 command.append(inputs["audio"]["path"])
         stdout, stderr, rss = (work / f"{model}.{suffix}" for suffix in ("stdout", "stderr", "rss"))
-        run = {"command": command, "environment": {key: environment[key] for key in ("KIDI_ACCELERATOR", "KIDI_TTS_WAV_OUT") if key in environment}, "status": "running"}
+        run = {"command": command, "status": "running"}
         report["runs"][label] = run
         save()
         print(f"Starting {label} on {arguments.device}", flush=True)

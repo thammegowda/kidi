@@ -39,6 +39,18 @@ public:
 private:
     std::shared_ptr<graph::Compiler> previous_;
 };
+/// Contexts constructed on this thread while the scope is alive run captured steps eagerly, even with an attached
+/// step compiler; tests use them as the reference for replayed steps.
+class EagerScope {
+public:
+    EagerScope();
+    ~EagerScope();
+    EagerScope(const EagerScope&) = delete;
+    auto operator=(const EagerScope&) -> EagerScope& = delete;
+
+private:
+    bool previous_;
+};
 using tensor::Tensor;
 
 struct BlockwiseQuantization {
@@ -76,6 +88,23 @@ auto require(Result<Type> result) -> Type {
 inline auto require(Result<void> result) -> void {
     if (!result) throw Failure(std::move(result.error()));
 }
+
+/// Operator profiling for developer tools; profiles print to stderr. HOST times operators as dispatched, SYNC also
+/// waits for each operator, and CUDA adds GRAPH (captured-step phases) and EVENTS (per-node captured-step events).
+enum class ProfileMode : std::uint8_t { OFF, HOST, SYNC, GRAPH, EVENTS };
+struct ProfileOptions {
+    ProfileMode mode = ProfileMode::OFF;
+    std::size_t skip_requests = 0;   ///< Leading requests, such as warm-ups, excluded from HOST and SYNC profiles.
+    bool log_graph_captures = false; ///< Reports each CUDA graph capture on stderr.
+};
+/// Process-wide; set before creating contexts.
+auto set_profile_options(ProfileOptions options) -> void;
+auto profile_options() -> ProfileOptions;
+auto parse_profile_mode(std::string_view name) -> std::optional<ProfileMode>;
+/// Upper bound on expanded FP16 weights Metal keeps for faster prefill (default: unlimited). Process-wide; set
+/// before creating contexts. Projections beyond the bound use the slower packed path.
+auto set_metal_prefill_cache_bytes(std::size_t bytes) -> void;
+auto metal_prefill_cache_bytes() -> std::size_t;
 
 /// Eager tensor operations: func preserves inputs; func_ mutates and returns the first tensor.
 /// In-place calls preserve shape, dtype, and storage. Synchronize before host reads on Metal.
@@ -129,7 +158,7 @@ public:
     auto crop_local_attention() const noexcept -> bool;
     auto prefill_chunk_size(std::size_t requested) const -> std::size_t;
     auto prepare_linear_weights(const Tensor& weight, std::int32_t bits, std::int32_t group_size = 128,
-                                bool packed_prefill = true, bool asymmetric_clip = false) -> void;
+                                bool packed_prefill = true) -> void;
     auto bind_packed_zero(const Tensor& scales, Tensor zeros) -> void;
     auto add(const Tensor& left, const Tensor& right) -> Tensor;
     auto add_(Tensor& left, const Tensor& right) -> Tensor&;

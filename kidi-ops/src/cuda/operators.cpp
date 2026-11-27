@@ -5,8 +5,8 @@
 #include "cuda/storage.h"
 #include "cuda/runtime.h"
 #include <cuda_runtime_api.h>
+#include <bit>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -263,9 +263,10 @@ public:
         prepare_projections();
         prepare_scatter_pairs();
         if (projections_.empty()) graph_.plan_intermediates();
-        if (const auto* profile = std::getenv("KIDI_PROFILE_OPS"); profile && std::string_view(profile) == "graph")
+        const auto profile = ops::profile_options().mode;
+        if (profile == ops::ProfileMode::GRAPH)
             for (auto& phase : resources_->phases) check_cuda(cudaEventCreate(&phase));
-        if (const auto* profile = std::getenv("KIDI_PROFILE_OPS"); profile && std::string_view(profile) == "events") {
+        if (profile == ops::ProfileMode::EVENTS) {
             resources_->profiles.resize(graph_.nodes().size());
             for (auto& [begin, end] : resources_->profiles) {
                 check_cuda(cudaEventCreate(&begin));
@@ -758,7 +759,7 @@ public:
         }
         auto executable = std::make_unique<CudaExecutable>(source, device_, std::move(bindings), std::string(key));
         // Parsed by benchmarks/cuda/compare_gemma.py.
-        if (const auto* log = std::getenv("KIDI_CUDA_GRAPH_LOG"); log && std::string_view(log) == "1") {
+        if (ops::profile_options().log_graph_captures) {
             const auto timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now().time_since_epoch())
                                        .count();

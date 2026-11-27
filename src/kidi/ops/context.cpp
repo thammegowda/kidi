@@ -14,12 +14,12 @@
 #include <map>
 #include <list>
 #include <algorithm>
-#include <cerrno>
 #include <cmath>
 #include <cstring>
-#include <cstdlib>
 #include <iostream>
+#include <atomic>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <utility>
 #include <functional>
@@ -35,6 +35,7 @@ namespace {
 thread_local bool decode_projections = false;
 thread_local bool decode_attention = false;
 thread_local std::shared_ptr<graph::Compiler> default_compiler;
+thread_local bool eager_steps = false;
 
 class InplaceScope {
 public:
@@ -184,6 +185,8 @@ DecodeScope::~DecodeScope() {
 StepCompilerScope::StepCompilerScope(std::shared_ptr<graph::Compiler> compiler)
     : previous_(std::exchange(default_compiler, std::move(compiler))) {}
 StepCompilerScope::~StepCompilerScope() { default_compiler = std::move(previous_); }
+EagerScope::EagerScope() : previous_(std::exchange(eager_steps, true)) {}
+EagerScope::~EagerScope() { eager_steps = previous_; }
 struct Context::Impl {
     tensor::Device device;
     tensor::DType activation_dtype = tensor::DType::F32;
@@ -205,7 +208,6 @@ struct Context::Impl {
         std::int32_t bits = 0;
         std::int32_t group_size = 0;
         bool packed_prefill = false;
-        bool asymmetric_clip = false;
         bool released = false;
     };
     struct DequantizedBinding {
@@ -612,6 +614,31 @@ struct Context::Impl {
         return captured(std::move(output));
     }
 };
+namespace {
+std::mutex profile_mutex;
+ProfileOptions configured_profile;
+std::atomic<std::size_t> configured_metal_prefill_cache{std::numeric_limits<std::size_t>::max()};
+} // namespace
+
+auto set_profile_options(ProfileOptions options) -> void {
+    const std::lock_guard lock(profile_mutex);
+    configured_profile = options;
+}
+auto profile_options() -> ProfileOptions {
+    const std::lock_guard lock(profile_mutex);
+    return configured_profile;
+}
+auto parse_profile_mode(std::string_view name) -> std::optional<ProfileMode> {
+    if (name == "off") return ProfileMode::OFF;
+    if (name == "host") return ProfileMode::HOST;
+    if (name == "sync") return ProfileMode::SYNC;
+    if (name == "graph") return ProfileMode::GRAPH;
+    if (name == "events") return ProfileMode::EVENTS;
+    return std::nullopt;
+}
+auto set_metal_prefill_cache_bytes(std::size_t bytes) -> void { configured_metal_prefill_cache = bytes; }
+auto metal_prefill_cache_bytes() -> std::size_t { return configured_metal_prefill_cache; }
+
 Context::Context(tensor::Device device, bool packed_prefill, std::optional<bool> replay_enabled,
                  tensor::DType parameter_dtype)
     : impl_(std::make_unique<Impl>()) {
@@ -621,13 +648,12 @@ Context::Context(tensor::Device device, bool packed_prefill, std::optional<bool>
     impl_->operator_capacity = device.policy().dispatch.cache_capacity;
     graph::SessionOptions options;
     options.capacity = device.policy().replay.cache_capacity;
-    const auto profile = std::getenv("KIDI_PROFILE_OPS");
-    impl_->profiling = profile && (std::string_view(profile) == "host" || std::string_view(profile) == "sync");
+    const auto profile = profile_options();
+    impl_->profiling = profile.mode == ProfileMode::HOST || profile.mode == ProfileMode::SYNC;
     impl_->profile_requested = impl_->profiling;
-    if (const auto skip = std::getenv("KIDI_PROFILE_OPS_SKIP")) impl_->skip_requests = std::strtoull(skip, nullptr, 10);
+    impl_->skip_requests = profile.skip_requests;
     if (impl_->skip_requests) impl_->profiling = false;
-    impl_->synchronize_operators = profile && std::string_view(profile) == "sync";
-    const auto replay = std::getenv("KIDI_REPLAY");
+    impl_->synchronize_operators = profile.mode == ProfileMode::SYNC;
     if (device == tensor::Device::cpu()) impl_->backend = runtime::cpu_operators();
 #if defined(KIDI_HAS_CUDA)
     else if (device.kind == tensor::DeviceKind::CUDA)
@@ -650,20 +676,9 @@ Context::Context(tensor::Device device, bool packed_prefill, std::optional<bool>
     impl_->parameter_dtype = parameter_dtype;
     impl_->activation_dtype = impl_->backend->activation_dtype(parameter_dtype);
     if (device.capabilities().compute.host()) impl_->compiler = default_compiler;
-    const auto configured_replay = replay_enabled.value_or(!(replay && std::string_view(replay) == "0"));
-    const auto accelerator_replay =
-        impl_->compiler && impl_->compiler->captures_prefill() && !(replay && std::string_view(replay) == "0");
-    options.enabled = impl_->backend->supports_replay() && (configured_replay || accelerator_replay);
-    const auto background = std::getenv("KIDI_BACKGROUND_COMPILE");
-    options.background_compile = !(background && std::string_view(background) == "0");
-    if (const auto* capacity = std::getenv("KIDI_REPLAY_CAPACITY")) {
-        char* end = nullptr;
-        errno = 0;
-        const auto parsed = std::strtoull(capacity, &end, 10);
-        if (errno || end == capacity || *end || !parsed || parsed > std::numeric_limits<std::size_t>::max())
-            throw Failure({ErrorCode::INVALID_ARGUMENT, "KIDI_REPLAY_CAPACITY must be a positive integer"});
-        options.capacity = parsed;
-    }
+    const auto accelerator_replay = impl_->compiler && impl_->compiler->captures_prefill();
+    options.enabled =
+        !eager_steps && impl_->backend->supports_replay() && (replay_enabled.value_or(true) || accelerator_replay);
     impl_->replays = graph::Session(impl_->compiler ? impl_->compiler : impl_->backend->graph_compiler(), options);
 }
 Context::~Context() = default;
@@ -935,12 +950,10 @@ auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bi
                 const auto host_source = binding.source.is_host_accessible()
                                              ? binding.source
                                              : require(binding.source.to(tensor::Device::cpu()));
-                auto packed =
-                    require(pack_weight(host_source, binding.bits, binding.group_size, binding.asymmetric_clip));
+                auto packed = require(pack_weight(host_source, binding.bits, binding.group_size));
                 binding.source.release_pages(false);
                 packed.values = require(packed.values.to(device()));
                 packed.scales = require(packed.scales.to(device()));
-                if (packed.zeros.defined()) packed.zeros = require(packed.zeros.to(device()));
                 binding.packed = std::move(packed);
                 impl_->preparation += nanoseconds(started);
             }
@@ -966,7 +979,7 @@ auto Context::linear(const Tensor& input, const Tensor& weight, const Tensor& bi
     return impl_->run({Operation::LINEAR, attributes, dtype}, {&activation, &weight, &bias});
 }
 auto Context::prepare_linear_weights(const Tensor& weight, std::int32_t bits, std::int32_t group_size,
-                                     bool packed_prefill, bool asymmetric_clip) -> void {
+                                     bool packed_prefill) -> void {
     if (!weight.defined() || weight.dimensions() != 2 || !weight.is_contiguous() ||
         (weight.dtype() != tensor::DType::F16 && weight.dtype() != tensor::DType::BF16 &&
          weight.dtype() != tensor::DType::F32) ||
@@ -976,25 +989,24 @@ auto Context::prepare_linear_weights(const Tensor& weight, std::int32_t bits, st
     const auto address = weight.storage_identity();
     if (const auto found = impl_->packed_weights.find(address); found != impl_->packed_weights.end()) {
         if (found->second.bits != bits || found->second.group_size != group_size ||
-            found->second.packed_prefill != packed_prefill || found->second.asymmetric_clip != asymmetric_clip ||
+            found->second.packed_prefill != packed_prefill ||
             !std::ranges::equal(found->second.source.shape(), weight.shape()))
             throw Failure({ErrorCode::INVALID_ARGUMENT, "weight already packed with a different layout"});
         return;
     }
     if (device().kind == tensor::DeviceKind::CPU && weight.nbytes() >= (std::size_t{1} << 20) &&
         weight.nbytes() < (std::size_t{256} << 20)) {
-        impl_->packed_weights.emplace(
-            address, Impl::PackedBinding{weight, {}, bits, group_size, packed_prefill, asymmetric_clip, false});
+        impl_->packed_weights.emplace(address,
+                                      Impl::PackedBinding{weight, {}, bits, group_size, packed_prefill, false});
         return;
     }
     const auto host_weight = weight.is_host_accessible() ? weight : require(weight.to(tensor::Device::cpu()));
-    auto packed = require(pack_weight(host_weight, bits, group_size, asymmetric_clip));
+    auto packed = require(pack_weight(host_weight, bits, group_size));
     if (weight.is_host_accessible()) weight.release_pages(false);
     packed.values = require(packed.values.to(device()));
     packed.scales = require(packed.scales.to(device()));
-    if (packed.zeros.defined()) packed.zeros = require(packed.zeros.to(device()));
-    impl_->packed_weights.emplace(address, Impl::PackedBinding{weight, std::move(packed), bits, group_size,
-                                                               packed_prefill, asymmetric_clip, false});
+    impl_->packed_weights.emplace(
+        address, Impl::PackedBinding{weight, std::move(packed), bits, group_size, packed_prefill, false});
 }
 auto Context::bind_packed_zero(const Tensor& scales, Tensor zeros) -> void {
     if (scales.defined() && zeros.defined()) impl_->packed_zeros[scales.storage_identity()] = std::move(zeros);

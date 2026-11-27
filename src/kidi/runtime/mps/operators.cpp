@@ -11,10 +11,8 @@
 #include <cmath>
 #include <optional>
 #include <algorithm>
-#include <cstdlib>
 #include <iostream>
 #include <unordered_set>
-#include <limits>
 
 namespace kidi::runtime {
 namespace {
@@ -47,20 +45,11 @@ struct Stream {
     void* half_input_source = nullptr;
     std::size_t half_input_source_offset = 0;
     std::size_t half_input_numel = 0;
-    std::size_t prefill_cache_limit = std::numeric_limits<std::size_t>::max();
-    bool profile_memory = std::getenv("KIDI_PROFILE_MEMORY") != nullptr;
+    std::size_t prefill_cache_limit = ops::metal_prefill_cache_bytes();
+    bool profile_memory = ops::profile_options().mode != ops::ProfileMode::OFF;
     std::size_t observed_device_bytes = 0, recommended_working_set_bytes = 0;
     std::size_t peak_pending = 0, expanded_bytes = 0;
-    Stream() {
-        pending.reserve(512);
-        if (const auto value = std::getenv("KIDI_PREFILL_CACHE_BYTES")) {
-            char* end = nullptr;
-            const auto bytes = std::strtoull(value, &end, 10);
-            if (end == value || *end || bytes > (std::uint64_t{16} << 30))
-                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "prefill cache bytes must be 0..16 GiB"});
-            prefill_cache_limit = bytes;
-        }
-    }
+    Stream() { pending.reserve(512); }
     ~Stream() {
         if (profile_memory)
             std::cerr << "kidi_metal_memory|prefill_cache_limit=" << prefill_cache_limit
@@ -667,9 +656,8 @@ public:
         }
         if (spec.operation == Operation::QUANTIZED_LINEAR) {
             const auto rows = inputs[0].numel() / inputs[0].size(-1);
-            const auto* fp16 = std::getenv("KIDI_MPS_Q_LINEAR_FP16");
             const auto bias = inputs[3].data<float>();
-            const auto use_fp16 = (!fp16 || std::string_view(fp16) != "0") && rows >= 4 && spec.attributes[0] && bias &&
+            const auto use_fp16 = rows >= 4 && spec.attributes[0] && bias &&
                                   std::ranges::all_of(*bias, [](float value) { return value == 0.F; });
             if (use_fp16) {
                 result->dynamic_count = 1;

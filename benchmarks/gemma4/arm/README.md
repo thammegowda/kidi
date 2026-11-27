@@ -101,7 +101,7 @@ HNSW).
 ## Runtime Binary Footprint
 
 These Arm/macOS measurements were documented in November 2026, before
-`kidi code` was added. Current sizes vary with revision, platform, compiler,
+`kidi agent` was added. Current sizes vary with revision, platform, compiler,
 and enabled features.
 
 | Runtime | Artifacts Measured | Stripped (MiB) | Unstripped (MiB) | Notes |

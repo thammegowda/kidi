@@ -783,12 +783,10 @@ auto devices() -> std::vector<kidi::tensor::Device> {
     return devices;
 }
 
-// QAT checkpoints keep an INT8 KV cache unless KIDI_INT8_KV_CACHE=0 or the device cannot hold `capacity` tokens.
+// QAT checkpoints default to an INT8 KV cache unless the device cannot hold `capacity` tokens.
 auto expected_cache_dtype(bool qat, kidi::tensor::Device device, std::size_t capacity) -> kidi::tensor::DType {
-    const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
     const auto& capabilities = device.capabilities();
-    return qat && (cache_override == nullptr || std::string_view(cache_override) != "0") &&
-                   capabilities.compute.supports(kidi::tensor::TransformerSupport::QUANTIZED) &&
+    return qat && capabilities.compute.supports(kidi::tensor::TransformerSupport::QUANTIZED) &&
                    capabilities.attention.int8_cache_tokens && capacity <= capabilities.attention.int8_cache_tokens
                ? kidi::tensor::DType::I8
                : kidi::tensor::DType::F32;
@@ -954,10 +952,11 @@ TEST_P(Gemma4RefTest, ReplayedDecode) {
         const ModuleScope construction(tensor::DType::F32, false, device);
         auto model = create_model(*fixture);
         // Replayed decode steps match eagerly executed steps bit for bit.
-        setenv("KIDI_REPLAY", "0", 1);
         auto eager_model = require(model::Gemma4Impl::create(fixture->config));
-        unsetenv("KIDI_REPLAY");
-        require(eager_model->set_checkpoint(*fixture->checkpoint));
+        {
+            const ops::EagerScope eager;
+            require(eager_model->set_checkpoint(*fixture->checkpoint));
+        }
         auto replayed = require(model->create_state(8));
         auto eager = require(eager_model->create_state(8));
         for (std::size_t position = 0; position < tokens.size(); ++position) {

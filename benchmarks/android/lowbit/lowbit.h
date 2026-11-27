@@ -37,6 +37,7 @@ struct Options {
     int qnn_graph_layers = 0;
     std::string mode = "replay";
     int queue_depth = 16;
+    bool diagnose = false; // eager NPU FFN: compare each stage with the reference applied to its own inputs
 };
 
 struct Measurement {

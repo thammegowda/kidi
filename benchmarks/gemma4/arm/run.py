@@ -737,11 +737,8 @@ def prepare_hnsw_view(base_dir: Path, hnsw_index: Path, target_dir: Path) -> Pat
     return target_dir
 
 
-def measure(command, work, name, protocol, timeout, extra_env=None):
+def measure(command, work, name, protocol, timeout):
     environment = {key: value for key, value in os.environ.items() if not key.startswith("KIDI_")}
-    environment["KIDI_ACCELERATOR"] = "cpu"
-    if extra_env:
-        environment.update(extra_env)
     try:
         completed = subprocess.run(command, cwd=ROOT, env=environment, text=True, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired as error:
@@ -841,7 +838,7 @@ def format_progress_time(seconds: float) -> str:
     return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
 
-def measure_eval(command, work, name, eval_protocol, tokenizer, timeout, force=False, extra_env=None):
+def measure_eval(command, work, name, eval_protocol, tokenizer, timeout, force=False):
     completed_by_id = {} if force else load_partial_eval_items(work, name, eval_protocol, tokenizer)
     cached_count = len(completed_by_id)
     missing_ids = [idx for idx in range(eval_protocol["items"]) if idx not in completed_by_id]
@@ -890,9 +887,6 @@ def measure_eval(command, work, name, eval_protocol, tokenizer, timeout, force=F
     ]
 
     environment = {key: value for key, value in os.environ.items() if not key.startswith("KIDI_")}
-    environment["KIDI_ACCELERATOR"] = "cpu"
-    if extra_env:
-        environment.update(extra_env)
     results_dir = work / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = results_dir / f"{name}_eval.output.jsonl"
@@ -1511,9 +1505,8 @@ def main(argv=None):
     parser.add_argument("--litert-model", type=Path)
     parser.add_argument("--litert-python", type=Path, default=ROOT / ".cache/gemma-venv/bin/python")
     parser.add_argument("--hnsw-index", type=Path,
-                        help="optional lm_head.hnsw path to also benchmark HNSW ef variants")
-    parser.add_argument("--hnsw-ef", type=int, default=400,
-                        help="HNSW ef_search value when --hnsw-index is provided (default: 400)")
+                        help="optional lm_head.hnsw path to also benchmark HNSW variants with the index's ef_search "
+                             "(set when building it: kidi index --ef-search)")
     parser.add_argument("--no-bf16", action="store_true", help="skip unquantized BF16 reference model")
     parser.add_argument("--eval-lines", type=int, default=5,
                         help="number of WMT23 translation sentences for chrF quality evaluation (0 to skip)")
@@ -1587,7 +1580,6 @@ def main(argv=None):
         settings = {"prompt": PROMPT, "workload": "short", "output_tokens": 64, "context_tokens": 1024,
                     "prefill_chunk_tokens": 1024, "packed_prefill": True, "warmups": 1}
         commands = {}
-        extra_envs = {}
         bf16_model_dir = arguments.model.expanduser().resolve()
         if not arguments.no_bf16 and (bf16_model_dir / "model.safetensors").exists():
             commands["kidi_bf16"] = [
@@ -1608,7 +1600,6 @@ def main(argv=None):
                 str(work / "build-kidi/kidi_android_baseline"), "gemma", str(hnsw_shared_dir),
                 str(arguments.threads), "3", json.dumps(settings),
             ]
-            extra_envs["kidi_hnsw"] = {"KIDI_HNSW_EF": str(arguments.hnsw_ef)}
         asym_clip_dir = None
         asym_g32_dir = None
         if arguments.profile == "int4-g128" and (bf16_model_dir / "model.safetensors").exists():
@@ -1625,7 +1616,6 @@ def main(argv=None):
                     str(work / "build-kidi/kidi_android_baseline"), "gemma", str(hnsw_asym_clip_dir),
                     str(arguments.threads), "3", json.dumps(settings),
                 ]
-                extra_envs["kidi_asym_clip_hnsw"] = {"KIDI_HNSW_EF": str(arguments.hnsw_ef)}
             asym_g32_dir = prepare_asym_clip(bf16_model_dir, work, 32, "shared-asym-g32")
             commands["kidi_asym_g32"] = [
                 str(work / "build-kidi/kidi_android_baseline"), "gemma", str(asym_g32_dir),
@@ -1637,7 +1627,6 @@ def main(argv=None):
                     str(work / "build-kidi/kidi_android_baseline"), "gemma", str(hnsw_asym_g32_dir),
                     str(arguments.threads), "3", json.dumps(settings),
                 ]
-                extra_envs["kidi_asym_g32_hnsw"] = {"KIDI_HNSW_EF": str(arguments.hnsw_ef)}
         commands["arm"] = [
             str(work / "build-arm/arm_gemma4_bench"), str(work / manifest["pte"]),
             str(work / "protocol.json"),
@@ -1774,7 +1763,7 @@ def main(argv=None):
             if cached is not None:
                 report["runs"][name] = cached
             else:
-                report["runs"][name] = measure(command, work, name, protocol, arguments.timeout, extra_envs.get(name))
+                report["runs"][name] = measure(command, work, name, protocol, arguments.timeout)
                 report["runs"][name]["binary_sha256"] = checksum
                 report["runs"][name]["summary"]["text"] = tokenizer.decode(
                     report["runs"][name]["summary"]["token_ids"], skip_special_tokens=False)
@@ -1793,8 +1782,7 @@ def main(argv=None):
                     eval_cached = load_cached_eval(work, name, eval_cmd, checksum, eval_protocol, tokenizer)
                 if eval_cached is None:
                     eval_cached = measure_eval(
-                        eval_cmd, work, name, eval_protocol, tokenizer, arguments.timeout,
-                        force=force_eval, extra_env=extra_envs.get(name),
+                        eval_cmd, work, name, eval_protocol, tokenizer, arguments.timeout, force=force_eval,
                     )
                     eval_cached["binary_sha256"] = checksum
                     save_cached_eval(work, name, eval_cached, eval_protocol)

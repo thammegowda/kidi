@@ -53,15 +53,15 @@ speed protocol (`4` threads, `1024` context/prefill chunk, `--packed-prefill`,
 
 ```bash
 python benchmarks/cpu/run.py --preset arm-e2b \
-  --model .cache/benchmarks/arm-gemma4/shared-asym-clip-hnsw --hnsw-ef 400 \
+  --model .cache/benchmarks/arm-gemma4/shared-asym-clip-hnsw \
   --output .cache/benchmarks/cpu/arm-q4-g128-hnsw-baseline.json
 ```
 
-For operator-level diagnostics, disable replay so individual operators remain
+For operator-level diagnostics, run captured steps eagerly so individual operators remain
 visible in the profile:
 
 ```bash
-python benchmarks/cpu/run.py --threads 8 --profile-ops --replay off \
+python benchmarks/cpu/run.py --threads 8 --profile-ops --eager \
   --output .cache/benchmarks/cpu/operators.json
 ```
 
@@ -69,8 +69,7 @@ Operator profiles are written to the report's per-configuration stderr logs.
 The report also aggregates them by phase/operator, sorted by execution time;
 the five largest groups are printed after each configuration.
 Profiling changes timing, so profiled and unprofiled reports cannot be compared.
-The driver clears inherited replay/profiling overrides and forces CPU placement.
-Other `KIDI_*` environment values are recorded. With `--workload both`, the
+The driver passes `--device cpu` and its profiling options to `kidi_android_baseline`. With `--workload both`, the
 long prompt repeats the supplied prompt 16 times; operator profiling skips
 only the initial warmup requests, not later workload transitions.
 
@@ -78,8 +77,8 @@ Reports record the model path, native binary and harness hashes, Git revisions,
 working-diff hash, selected CMake flags, CPU affinity, load average, native
 architecture names and raw flags, and every native JSON record. Compare runs
 under similar host load; the harness does not pin cores. On multi-socket Linux
-hosts the benchmark binary confines itself to one NUMA node, as the CLI does
-(`KIDI_NUMA=off` disables it), and records the node as `numa_node` in its runtime
+hosts the benchmark binary confines itself to one NUMA node, as the CLI does,
+and records the node as `numa_node` in its runtime
 record. The node is the one the process happens to start on, and the nodes of a
 shared host can differ noticeably in speed, so compare runs that report the same
 `numa_node`, or pin both with `taskset`. No timing threshold is part of the unit tests.
@@ -100,15 +99,12 @@ python benchmarks/cpu/run.py --model /local/gemma-4 --threads 4 \
   --dense-lm-head --output .cache/benchmarks/cpu/dense.json
 python benchmarks/cpu/run.py --model /local/gemma-4 --threads 4 \
   --context-tokens 1024 --prefill-chunk 1024 --packed-prefill --repeats 5 \
-  --hnsw-ef 256 --output .cache/benchmarks/cpu/hnsw-ef256.json
+  --output .cache/benchmarks/cpu/hnsw.json
 ```
 
-`--hnsw-ef` overrides search effort; it must be at least the graph's candidate
-count. Without an override, indexed selection uses the defaults saved in the
-graph. An explicit override requires the index file, so a missing index cannot
-silently produce a dense benchmark. The harness clears inherited HNSW overrides,
-records effective overrides and the graph hash, and rejects baseline comparisons
-with different graphs or search settings.
+Indexed selection uses the search effort stored in the graph; build it with
+`kidi index --ef-search N` to try another effort. The harness records the graph
+hash and rejects baseline comparisons with different graphs.
 
 Approximate selection may change output tokens. The strict `--baseline` check
 is appropriate for code optimizations at fixed topology/settings, not for

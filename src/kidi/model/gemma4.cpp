@@ -489,23 +489,20 @@ auto Gemma4Impl::set_checkpoint(const checkpoint::Weights& weights, RuntimeQuant
                 else
                     return;
                 const auto width = static_cast<std::int32_t>(source.size(1));
-                auto packed = require(ops::pack_weight(source, 8, width, false));
+                auto packed = require(ops::pack_weight(source, 8, width));
                 if (name != "lm_head" && source.is_host_accessible()) source.release_pages(false);
                 auto values = require(packed.values.to(device()));
                 auto scales = require(packed.scales.to(device()));
                 linear->set_packed_weights(std::move(values), std::move(scales), 8, width);
             });
         } else if (weight_bits) {
-            const bool asym_clip = std::getenv("KIDI_ASYMMETRIC_CLIP") != nullptr &&
-                                   std::string_view(std::getenv("KIDI_ASYMMETRIC_CLIP")) == "1";
             for (const auto& [name, weight] : state_dict())
                 if (weight.dimensions() == 2 && name != "embed_tokens.weight" &&
                     name != "embed_tokens_per_layer.weight") {
                     const bool group_quantized = weight_bits == 4 && weight.size(1) % group_size == 0;
                     impl_->context.prepare_linear_weights(
                         weight, group_quantized ? 4 : 8,
-                        group_quantized ? group_size : static_cast<std::int32_t>(weight.size(1)), packed_prefill,
-                        group_quantized && asym_clip);
+                        group_quantized ? group_size : static_cast<std::int32_t>(weight.size(1)), packed_prefill);
                 }
         }
         return {};
@@ -549,9 +546,7 @@ auto Gemma4Impl::kv_cache_dtype(std::size_t capacity) const -> Result<DType> {
                                              " is unsupported by this model or backend"});
         return *requested;
     }
-    const auto* cache_override = std::getenv("KIDI_INT8_KV_CACHE");
-    if (byte_cache_supported && (cache_override == nullptr || std::string_view(cache_override) != "0"))
-        return DType::I8;
+    if (byte_cache_supported) return DType::I8;
     // AUTO never picks a lossy FP8/FP4 cache; those stay explicit opt-ins.
     for (const auto candidate : {DType::BF16, DType::F32})
         if (capabilities.attention.accepts_cache(activation, candidate)) return candidate;

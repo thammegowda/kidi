@@ -98,12 +98,6 @@ TEST_F(YnnGraphTest, FeedForwardCacheValidation) {
     std::filesystem::permissions(read_only_parent, std::filesystem::perms::owner_all);
     EXPECT_FALSE(uncreatable.enabled()) << "uncreatable cache dir disables the cache";
     EXPECT_FALSE(uncreatable.writable()) << "uncreatable cache dir is not writable";
-    ::setenv("KIDI_FFN_CACHE", "0", 1);
-    kidi::runtime::ynn::FeedForwardCache disabled;
-    disabled.configure(cache_root / "disabled", source);
-    ::unsetenv("KIDI_FFN_CACHE");
-    EXPECT_FALSE(disabled.enabled()) << "KIDI_FFN_CACHE=0 disables the cache";
-    EXPECT_FALSE(disabled.writable()) << "KIDI_FFN_CACHE=0 cache is not writable";
 }
 
 TEST_F(YnnGraphTest, CachedFeedForward) {

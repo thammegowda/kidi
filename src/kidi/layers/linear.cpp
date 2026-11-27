@@ -2,9 +2,7 @@
 #include "kidi/runtime/ynn/graph.h"
 #include "kidi/search/hnsw.h"
 #include <algorithm>
-#include <charconv>
 #include <cmath>
-#include <cstdlib>
 #include <limits>
 #include <map>
 #include <vector>
@@ -39,17 +37,6 @@ auto parameter_device(bool packed) -> tensor::Device {
     const auto kind =
         module_dtype == tensor::DType::I8 || packed ? tensor::ParameterKind::QUANTIZED : tensor::ParameterKind::FLOAT;
     return module_device.parameter_device(tensor::ParameterRole::PROJECTION, kind);
-}
-auto search_setting(const char* name, std::size_t fallback, std::size_t maximum) -> std::size_t {
-    const auto* value = std::getenv(name);
-    if (!value) return fallback;
-    const std::string_view text(value);
-    std::size_t parsed = 0;
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
-    if (error != std::errc{} || end != text.data() + text.size() || !parsed || parsed > maximum)
-        throw ops::Failure({ErrorCode::INVALID_ARGUMENT,
-                            std::string(name) + " must be an integer between 1 and " + std::to_string(maximum)});
-    return parsed;
 }
 } // namespace
 
@@ -178,7 +165,7 @@ auto LinearImpl::bind_hnsw(const std::filesystem::path& path, const Tensor& pack
             return require(search::HnswIndex::load(path, weight_));
         }();
         const auto vocabulary = static_cast<std::size_t>(weight_.size(0));
-        const auto ef = search_setting("KIDI_HNSW_EF", index.ef_search(), vocabulary);
+        const auto ef = index.ef_search();
         if (index.candidates() > std::min<std::size_t>(1024, vocabulary))
             throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "HNSW LM-head candidate count exceeds 1024"});
         if (ef < index.candidates())

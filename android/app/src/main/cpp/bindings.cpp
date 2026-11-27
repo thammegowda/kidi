@@ -1,5 +1,6 @@
 #include "kidi/checkpoint/prepare.h"
 #include "kidi/app/prompts.h"
+#include "kidi/graph/compiler.h"
 #include "kidi/inference/generator.h"
 #include "kidi/inference/synthesizer.h"
 #include "kidi/inference/transcriber.h"
@@ -186,8 +187,7 @@ auto hardware_info() -> nlohmann::json {
         break;
     }
 
-    const auto skel_directory =
-        std::filesystem::path(std::getenv("KIDI_QNN_SKEL_DIR") ? std::getenv("KIDI_QNN_SKEL_DIR") : "");
+    const auto skel_directory = kidi::runtime::npu_options().skel_dir;
     const bool htp_runtime = library_available("libQnnHtp.so");
     const bool fastrpc = library_available("libcdsprpc.so");
     const bool skel = !skel_directory.empty() && std::filesystem::exists(skel_directory / "libQnnHtpV79Skel.so");
@@ -255,7 +255,9 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_deviceInfo(JN
 extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_setDiagnosticLogging(JNIEnv* environment, jobject,
                                                                                         jboolean enabled) -> jstring {
     return answer(environment, [&]() -> nlohmann::json {
-        setenv("KIDI_QNN_DUMP", enabled ? "1" : "", 1);
+        auto options = kidi::runtime::npu_options();
+        options.diagnostics = enabled;
+        kidi::runtime::set_npu_options(std::move(options));
         return {{"diagnostic_logging", static_cast<bool>(enabled)}};
     });
 }
@@ -272,9 +274,11 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_setDataDirect
         const auto libraries = std::filesystem::exists(packaged / "libQnnHtp.so") ? packaged : fallback;
         const auto cache = root / "qnn-cache";
         std::filesystem::create_directories(cache);
-        setenv("KIDI_QNN_LIBRARY_DIR", libraries.c_str(), 1);
-        setenv("KIDI_QNN_CACHE_DIR", cache.c_str(), 1);
-        if (!dsp_directory_value.empty()) setenv("KIDI_QNN_SKEL_DIR", dsp_directory_value.c_str(), 1);
+        auto options = kidi::runtime::npu_options();
+        options.library_dir = libraries;
+        options.cache_dir = cache;
+        if (!dsp_directory_value.empty()) options.skel_dir = dsp_directory_value;
+        kidi::runtime::set_npu_options(std::move(options));
         return {{"qnn_library_dir", libraries.string()},
                 {"qnn_cache_dir", cache.string()},
                 {"qnn_skel_dir", dsp_directory_value}};

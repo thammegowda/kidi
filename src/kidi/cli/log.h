@@ -2,6 +2,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -35,7 +36,9 @@ struct Arg {
     Arg(float value) noexcept : kind(Kind::DOUBLE), f64(static_cast<double>(value)) {}
 };
 
-void init_from_env();
+/// Accepts trace, debug, info, warning, error, critical and off.
+auto parse_level(std::string_view name) -> std::optional<Level>;
+void set_level(Level level);
 void write(Level level, std::string_view message);
 void write_args(Level level, std::string_view fmt, std::span<const Arg> args);
 

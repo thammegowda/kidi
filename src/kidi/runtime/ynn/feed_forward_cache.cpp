@@ -3,9 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
-#include <cstdlib>
 #include <cstring>
-#include <string_view>
 #include <system_error>
 #include <type_traits>
 
@@ -94,11 +92,6 @@ auto FeedForwardCache::configure(const std::filesystem::path& directory, const s
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
     try {
         std::filesystem::path target = directory;
-        if (const auto* configured = std::getenv("KIDI_FFN_CACHE")) {
-            const std::string_view value(configured);
-            if (value.empty() || value == "0" || value == "off" || value == "false") return;
-            target = std::filesystem::path(value);
-        }
         if (target.empty() || !std::filesystem::is_regular_file(source)) return;
         std::error_code error;
         if (!std::filesystem::is_directory(target, error)) std::filesystem::create_directories(target, error);

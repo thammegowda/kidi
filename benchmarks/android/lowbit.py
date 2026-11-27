@@ -89,9 +89,9 @@ def ffn_invocation(backend, mode, layers, runs, threads, graph_layers=0):
                f"ADSP_LIBRARY_PATH={ROOT}/prepare {arguments.replace(f'--runs {runs}', '--runs 1 --warmups 0')} "
                f"--qnn-lib libQnnHtp.so --qnn-prepare --qnn-context {context} >/dev/null; fi")
     # Eager NPU runs also compare every graph with the reference applied to its own inputs (per-stage error).
-    diagnose = "KIDI_FFN_DIAGNOSE=1 " if mode == "eager" else ""
-    measure = (f"cd {ROOT}/runtime && {diagnose}LD_LIBRARY_PATH={ROOT}/runtime ADSP_LIBRARY_PATH={ROOT}/runtime "
-               f"{arguments} --qnn-lib libQnnHtp.so --qnn-context {context}")
+    diagnose = " --diagnose" if mode == "eager" else ""
+    measure = (f"cd {ROOT}/runtime && LD_LIBRARY_PATH={ROOT}/runtime ADSP_LIBRARY_PATH={ROOT}/runtime "
+               f"{arguments} --qnn-lib libQnnHtp.so --qnn-context {context}{diagnose}")
     return f"{prepare} && {keep_gate_failures(measure)}"
 
 

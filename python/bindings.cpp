@@ -26,7 +26,15 @@ NB_MODULE(_native, module) {
                 argv.push_back(argument.c_str());
             }
             argv.push_back(nullptr);
-            return kidi::cli::main(static_cast<int>(arguments.size() + 1), argv.data());
+            // Background servers (`kidi agent`) restart the CLI as `python -m kidi`, keyed by this module's file.
+            kidi::cli::Launcher launcher;
+            const auto executable = nanobind::module_::import_("sys").attr("executable");
+            if (!executable.is_none() && !nanobind::cast<std::string>(executable).empty()) {
+                launcher.command = {nanobind::cast<std::string>(executable), "-m", "kidi"};
+                launcher.binary =
+                    nanobind::cast<std::string>(nanobind::module_::import_("kidi._native").attr("__file__"));
+            }
+            return kidi::cli::main(static_cast<int>(arguments.size() + 1), argv.data(), launcher);
         },
         nanobind::arg("args"));
 }

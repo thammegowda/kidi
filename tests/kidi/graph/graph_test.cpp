@@ -228,9 +228,8 @@ TEST(GraphTest, LruRecapture) {
 }
 
 TEST(GraphTest, ReplayCacheEvicts) {
-    setenv("KIDI_REPLAY_CAPACITY", "1", 1);
     Context context;
-    unsetenv("KIDI_REPLAY_CAPACITY");
+    context.set_replay_capacity(1);
     auto input = tensor({2}, {1, 2});
     int first_calls = 0, second_calls = 0;
     const auto replay = [&](std::string_view key, int& calls) {
@@ -487,9 +486,8 @@ TEST(GraphTest, AcceleratorReplay) {
 TEST(GraphTest, DisabledReplayRunsEagerly) {
     auto compiler = std::make_shared<SingleCaptureCompiler>();
     const kidi::ops::StepCompilerScope scope(compiler);
-    setenv("KIDI_REPLAY", "0", 1);
+    const kidi::ops::EagerScope eager;
     Context context;
-    unsetenv("KIDI_REPLAY");
     int calls = 0;
     auto input = tensor({2}, {1, 2});
     for (int call = 0; call < 3; ++call)
@@ -497,7 +495,7 @@ TEST(GraphTest, DisabledReplayRunsEagerly) {
             ++calls;
             return std::vector{context.add(inputs[0], inputs[0])};
         });
-    constexpr auto MESSAGE = "KIDI_REPLAY=0 runs the step eagerly even with an attached accelerator";
+    constexpr auto MESSAGE = "an eager scope runs the step eagerly even with an attached accelerator";
     EXPECT_FALSE(context.replay_enabled()) << MESSAGE;
     EXPECT_EQ(calls, 3) << MESSAGE;
     EXPECT_EQ(compiler->compiles, 0) << MESSAGE;

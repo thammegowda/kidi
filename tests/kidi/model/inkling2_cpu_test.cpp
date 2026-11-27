@@ -10,22 +10,43 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <sstream>
 #include <limits>
 
 #include <gtest/gtest.h>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 namespace {
 using namespace kidi;
 using ops::require;
 
-TEST(Inkling2CpuTest, Int8PrefillDecodeAndRewind) {
-    const auto directory = checkpoint::Hub{}.resolve("@thinkingmachines/Inkling-2-Mini");
-    if (!directory && directory.error().code == ErrorCode::IO) GTEST_SKIP() << directory.error().message;
-    ASSERT_TRUE(directory.has_value()) << directory.error().message;
-    runtime::ynn::set_thread_count(16);
-    const auto config = require(checkpoint::load_config(*directory));
+// Real-checkpoint regression for the CPU INT8 path; registered only with KIDI_BUILD_INTEGRATION_TESTS.
+class Inkling2CpuTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        auto resolved = checkpoint::Hub{}.resolve("@thinkingmachines/Inkling-2-Mini");
+        if (!resolved && resolved.error().code == ErrorCode::IO) GTEST_SKIP() << resolved.error().message;
+        ASSERT_TRUE(resolved.has_value()) << resolved.error().message;
+#if !defined(_WIN32)
+        // Int8PrefillDecodeAndRewind keeps a packed ~26 GB INT8 model alive while it loads the prepared INT8 cache.
+        const auto pages = static_cast<std::uint64_t>(sysconf(_SC_PHYS_PAGES));
+        const auto gib = pages * static_cast<std::uint64_t>(sysconf(_SC_PAGE_SIZE)) >> 30;
+        if (gib < 64) GTEST_SKIP() << "needs 64 GiB of RAM for the CPU INT8 checkpoint; host has " << gib << " GiB";
+#endif
+        directory = std::move(*resolved);
+        runtime::ynn::set_thread_count(16);
+    }
+
+    std::filesystem::path directory;
+};
+
+TEST_F(Inkling2CpuTest, Int8PrefillDecodeAndRewind) {
+    const auto config = require(checkpoint::load_config(directory));
     auto model = require(model::create_model_as<model::CausalLanguageModel>(
         config["model"], {.device = tensor::Device::cpu(), .parameter_dtype = tensor::DType::BF16}));
     // The default CPU policy must pack experts even without an explicit --precision q8.
@@ -58,7 +79,7 @@ TEST(Inkling2CpuTest, Int8PrefillDecodeAndRewind) {
     ASSERT_EQ(full.size(), tokens.size() * vocabulary);
     ASSERT_TRUE(std::ranges::all_of(full, [](float value) { return std::isfinite(value); }));
     {
-        const auto prepared = require(checkpoint::prepare(*directory, model::Inkling2Impl::int8_preparation));
+        const auto prepared = require(checkpoint::prepare(directory, model::Inkling2Impl::int8_preparation));
         auto cached = require(model::create_model_as<model::CausalLanguageModel>(
             config["model"], {.device = tensor::Device::cpu(), .parameter_dtype = tensor::DType::BF16}));
         require(cached->set_checkpoint(require(checkpoint::Weights::load(prepared / "model.safetensors"))));
@@ -135,13 +156,9 @@ TEST(Inkling2CpuTest, Int8PrefillDecodeAndRewind) {
 // Prefill chunks of 16+ tokens use the INT8 flash attention; decode keeps the legacy float-query kernel. INT8
 // activation quantization amplifies any bit-level change (scaling attention outputs by 1+1e-6 already gives top-1
 // ~95.6% and mean KL ~9e-3 on ARCHITECTURE.md), so the bounds are that noise floor, not exact agreement.
-TEST(Inkling2CpuTest, Int8FlashPrefillTracksDecodeQuality) {
-    const auto directory = checkpoint::Hub{}.resolve("@thinkingmachines/Inkling-2-Mini");
-    if (!directory && directory.error().code == ErrorCode::IO) GTEST_SKIP() << directory.error().message;
-    ASSERT_TRUE(directory.has_value()) << directory.error().message;
-    runtime::ynn::set_thread_count(16);
-    const auto config = require(checkpoint::load_config(*directory));
-    const auto prepared = require(checkpoint::prepare(*directory, model::Inkling2Impl::int8_preparation));
+TEST_F(Inkling2CpuTest, Int8FlashPrefillTracksDecodeQuality) {
+    const auto config = require(checkpoint::load_config(directory));
+    const auto prepared = require(checkpoint::prepare(directory, model::Inkling2Impl::int8_preparation));
     auto model = require(model::create_model_as<model::CausalLanguageModel>(
         config["model"], {.device = tensor::Device::cpu(), .parameter_dtype = tensor::DType::BF16}));
     require(model->set_checkpoint(require(checkpoint::Weights::load(prepared / "model.safetensors"))));
@@ -196,11 +213,7 @@ TEST(Inkling2CpuTest, Int8FlashPrefillTracksDecodeQuality) {
     EXPECT_LT(std::abs(prefill_nll - decode_nll) / (TOKENS - 1), 0.02) << "nats per token";
 }
 
-TEST(Inkling2CpuTest, AdaptivePromptLookup) {
-    const auto directory = checkpoint::Hub{}.resolve("@thinkingmachines/Inkling-2-Mini");
-    if (!directory && directory.error().code == ErrorCode::IO) GTEST_SKIP() << directory.error().message;
-    ASSERT_TRUE(directory.has_value()) << directory.error().message;
-    runtime::ynn::set_thread_count(16);
+TEST_F(Inkling2CpuTest, AdaptivePromptLookup) {
     std::string prompt;
     for (int i = 0; i < 8; ++i) prompt += "int value = 0;\n";
     prompt += "int value =";
@@ -211,11 +224,11 @@ TEST(Inkling2CpuTest, AdaptivePromptLookup) {
                                                .ignore_eos = true};
     std::vector<std::int32_t> expected;
     {
-        auto plain = require(inference::Generator::load(*directory, {.dense_lm_head = true}));
+        auto plain = require(inference::Generator::load(directory, {.dense_lm_head = true}));
         expected = require(plain.generate(prompt, options)).generation.token_ids;
     }
     auto speculative = require(inference::Generator::load(
-        *directory, {.dense_lm_head = true, .prompt_lookup = true, .draft_tokens = 8}));
+        directory, {.dense_lm_head = true, .prompt_lookup = true, .draft_tokens = 8}));
     const auto actual = require(speculative.generate(prompt, options));
     EXPECT_EQ(actual.generation.token_ids, expected);
     EXPECT_TRUE(actual.stats.speculative);

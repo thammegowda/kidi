@@ -147,9 +147,6 @@ auto check_linear(std::size_t rows) -> void {
 
 auto check_packed_projection(std::size_t rows, std::size_t width, std::size_t columns, int bits) -> void {
     kidi::ops::Context cpu(Device::cpu()), vk(Device::vulkan());
-    const auto previous = std::getenv("KIDI_VULKAN_PACKED");
-    const std::string saved = previous ? previous : "";
-    setenv("KIDI_VULKAN_PACKED", "1", 1);
     const auto input_values = make_sequence(rows * width, 0.125F);
     std::vector<std::int8_t> unpacked(columns * width);
     const auto low = -(1 << (bits - 1));
@@ -168,10 +165,6 @@ auto check_packed_projection(std::size_t rows, std::size_t width, std::size_t co
         "wide packed linear", cpu.packed_linear(input, packed_weight, scale, bits, width, 0.125F, 0.0625F),
         vk.packed_linear(to_vulkan(input), to_vulkan(packed_weight), to_vulkan(scale), bits, width, 0.125F, 0.0625F),
         1e-5F);
-    if (previous)
-        setenv("KIDI_VULKAN_PACKED", saved.c_str(), 1);
-    else
-        unsetenv("KIDI_VULKAN_PACKED");
 }
 
 auto check_gated_feed_forward(std::size_t rows, bool silu = false) -> void {
@@ -291,40 +284,6 @@ auto check_attention(std::size_t rows) -> void {
                  vk.grouped_query_attention(to_vulkan(query), to_vulkan(qk), to_vulkan(qv), 2, 1,
                                             to_vulkan(mask_tensor), 0.5F, 0, quantization, quantization),
                  1e-4F);
-}
-
-auto check_native_attention(std::size_t rows, std::size_t batch) -> void {
-    const auto* previous = std::getenv("KIDI_VULKAN_ATTENTION");
-    const std::string saved = previous ? previous : "";
-    setenv("KIDI_VULKAN_ATTENTION", "1", 1);
-    kidi::ops::Context cpu(Device::cpu()), vk(Device::vulkan());
-    constexpr std::size_t HEADS = 2;
-    constexpr std::size_t KEY_HEADS = 1;
-    constexpr std::size_t WIDTH = 64;
-    const auto query_values = make_sequence(batch * rows * HEADS * WIDTH, 0.015625F);
-    const auto key_values = make_sequence(batch * rows * KEY_HEADS * WIDTH, 0.0125F);
-    const auto value_values = make_sequence(batch * rows * KEY_HEADS * WIDTH, 0.02F);
-    const auto query =
-        tensor({static_cast<std::int64_t>(batch), static_cast<std::int64_t>(rows), HEADS * WIDTH}, query_values);
-    const auto key =
-        tensor({static_cast<std::int64_t>(batch), static_cast<std::int64_t>(rows), KEY_HEADS * WIDTH}, key_values);
-    const auto value =
-        tensor({static_cast<std::int64_t>(batch), static_cast<std::int64_t>(rows), KEY_HEADS * WIDTH}, value_values);
-    std::vector<float> mask(batch * rows * rows, 0.F);
-    if (rows > 1)
-        for (std::size_t item = 0; item < batch; ++item)
-            for (std::size_t row = 0; row + 1 < rows; ++row) mask[(item * rows + row) * rows + rows - 1] = -1.0e9F;
-    const auto mask_tensor = tensor(
-        {static_cast<std::int64_t>(batch), 1, static_cast<std::int64_t>(rows), static_cast<std::int64_t>(rows)}, mask);
-    assert_close("native attention",
-                 cpu.grouped_query_attention(query, key, value, HEADS, KEY_HEADS, mask_tensor, 0.125F),
-                 vk.grouped_query_attention(to_vulkan(query), to_vulkan(key), to_vulkan(value), HEADS, KEY_HEADS,
-                                            to_vulkan(mask_tensor), 0.125F),
-                 2e-3F);
-    if (previous)
-        setenv("KIDI_VULKAN_ATTENTION", saved.c_str(), 1);
-    else
-        unsetenv("KIDI_VULKAN_ATTENTION");
 }
 
 auto check_indexing() -> void {
@@ -546,17 +505,6 @@ TEST_F(VulkanOpsTest, Attention) {
     for (const auto rows : {std::size_t{1}, std::size_t{32}}) {
         SCOPED_TRACE("rows=" + std::to_string(rows));
         check_attention(rows);
-    }
-}
-
-TEST_F(VulkanOpsTest, NativeAttention) {
-    {
-        SCOPED_TRACE("rows=7 batch=1");
-        check_native_attention(7, 1);
-    }
-    {
-        SCOPED_TRACE("rows=5 batch=2");
-        check_native_attention(5, 2);
     }
 }
 
