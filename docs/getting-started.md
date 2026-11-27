@@ -150,7 +150,22 @@ CUDA_VISIBLE_DEVICES=0 build-release-cuda/kidi serve -m @thinkingmachines/Inklin
 
 CUDA defaults to native NVFP4/MXFP8 expert storage, interleaved gate/up kernels and BF16 KV caches, fitting below
 24 GiB in the tested 8K-context configuration. On `serve` and `generate`, `--precision q8` explicitly selects INT8
-experts on CUDA or CPU; `--precision bf16` is a CUDA-only comparison mode.
+experts on CUDA or CPU; `--precision bf16` is a CUDA-only comparison mode. `--kv-cache-precision int8` stores
+group-32 INT8 KV caches (one F32 scale per 32 values, 56% of BF16 storage); `fp32` is rejected on CUDA.
+
+As on Metal, the 20 sliding-window layers keep ring caches of their 1,024-token window plus 4,096 rows, and only
+the four full-attention layers (8 visits with the loop) grow with the context: about 32 KiB of KV per token instead
+of 192 KiB, or 18 KiB with INT8. On a 48 GB RTX A6000, `kidi agent` sizes a 694,272-token context (previously
+119,808) from the same 29 GiB of free memory, and the model's full 1,048,576 tokens with INT8. A turn reuses the
+previous prompt's cache only if the reply since then fits in the 4,096 spare rows; longer replies make the next
+turn prefill the conversation again.
+
+On an 85K-token prompt, BF16 caches prefilled at 899 tokens/s and decoded at 30.1 tokens/s; INT8 caches at 751 and
+29.1. INT8 currently trades some prefill speed for memory: decode attention at this length is limited by
+parallelism rather than cache bandwidth.
+
+Inputs of any length run as steps of at most 512 tokens (power-of-two lengths on CUDA), so a large file in the
+conversation keeps activation memory bounded, and varied prompt lengths reuse the buffers of a few step lengths.
 
 ## Inkling-2 on Apple Silicon
 

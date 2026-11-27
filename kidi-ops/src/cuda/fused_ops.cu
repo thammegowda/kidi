@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <limits>
 #include <mma.h>
 
 namespace kidi::cuda {
@@ -1470,29 +1471,60 @@ __global__ void l2_clip_bf16_fast(Launch plan) {
     if (lane < 16) dst[lane] = __float2bfloat16(v * factor);
 }
 
+/// Quantizes rows [tokens, width] to INT8 with one F32 scale per 32 columns (max |x| / 127, rounded to nearest even)
+/// and writes them to cache row `positions[token]`. One warp per 32-column group.
+__global__ void quantize_cache(Launch plan) {
+    const auto& cache = plan.inputs[2];
+    const auto width = cache.shape[cache.rank - 1];
+    const auto group = static_cast<std::int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+    if (group * 32 >= width) return;
+    const int lane = threadIdx.x & 31;
+    const auto token = static_cast<std::int64_t>(blockIdx.y);
+    const auto row = static_cast<std::int64_t>(static_cast<const int*>(address(plan.inputs[1]))[token]);
+    const float value = read(plan.inputs[0], token * width + group * 32 + lane);
+    float maximum = fabsf(value);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+    // IEEE division and rounding match the CPU cache quantizer.
+    const float scale = maximum > 0 ? __fdiv_rn(maximum, 127.F) : 1.F;
+    const float code = fminf(fmaxf(rintf(__fmul_rn(value, __fdiv_rn(1.F, scale))), -127.F), 127.F);
+    static_cast<signed char*>(address(cache))[row * width + group * 32 + lane] = static_cast<signed char>(code);
+    if (lane == 0) static_cast<float*>(address(plan.inputs[3]))[row * (width / 32) + group] = scale;
+}
+
+/// Position of query `token`: `start + token`, or the I32 positions operand. Linear caches clamp it to their last row;
+/// ring caches (eighth attribute) keep absolute positions and store key `k` in row `k % rows`.
+__device__ std::int64_t relative_query_position(const Launch& plan, std::int64_t token, bool ring) {
+    if (plan.count < 7) return plan.attributes[2] + token;
+    const auto position = static_cast<std::int64_t>(static_cast<const int*>(address(plan.inputs[6]))[token]);
+    return ring ? position : min(position, plan.inputs[1].shape[0] - 1);
+}
+
 /// One block per (query, head), one warp per key stride. The sink is a zero-valued key with logit `sink`;
 /// keys closer than `extent` add the per-query relative logit, and a sigmoid gate scales the output.
-/// Positions come from `start + token` or the optional I32 positions operand; a positive log floor scales the
-/// query's key logits (not the sink) by 1 + alpha * log(max(1, (position + 1) / floor)).
+/// A positive log floor scales the query's key logits (not the sink) by
+/// 1 + alpha * log(max(1, (position + 1) / floor)). INT8 caches (nine operands) carry F32 scales [rows, width / 32].
 __global__ void relative_attention(Launch plan) {
     __shared__ float peaks[ATTENTION_WARPS], totals[ATTENTION_WARPS], partial[ATTENTION_WARPS][MAX_LANE_VALUES * 32];
-    const auto heads = plan.attributes[0], key_heads = plan.attributes[1], start = plan.attributes[2],
-               window = plan.attributes[3], extent = plan.attributes[4];
+    const auto heads = plan.attributes[0], key_heads = plan.attributes[1], window = plan.attributes[3],
+               extent = plan.attributes[4];
     const float log_alpha = attribute_float(plan, 5), log_floor = attribute_float(plan, 6);
     const auto token = static_cast<std::int64_t>(blockIdx.x), head = static_cast<std::int64_t>(blockIdx.y);
     const auto width = plan.inputs[0].shape[1] / heads, key_head = head / (heads / key_heads);
-    const auto key_stride = plan.inputs[1].shape[1];
+    const auto key_stride = plan.inputs[1].shape[1], rows = plan.inputs[1].shape[0];
+    const bool ring = plan.attribute_count > 7 && plan.attributes[7];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32, warps = blockDim.x / 32;
     const int values = static_cast<int>(width / 32);
-    const auto position =
-        plan.count == 7
-            ? min(static_cast<std::int64_t>(static_cast<const int*>(address(plan.inputs[6]))[token]),
-                  plan.inputs[1].shape[0] - 1)
-            : start + token;
+    const auto position = relative_query_position(plan, token, ring);
     const auto first = window ? max(static_cast<std::int64_t>(0), position - window + 1) : 0;
     const float tau =
         log_floor > 0 ? 1.F + log_alpha * logf(fmaxf(1.F, static_cast<float>(position + 1) / log_floor)) : 1.F;
     const float scale = rsqrtf(static_cast<float>(width));
+    // Each 32-lane value chunk of a head is one INT8 scale group.
+    const bool scaled = plan.count == 9;
+    const auto groups = key_stride / 32, head_group = key_head * width / 32;
+    const auto* key_scales = scaled ? static_cast<const float*>(address(plan.inputs[7])) : nullptr;
+    const auto* value_scales = scaled ? static_cast<const float*>(address(plan.inputs[8])) : nullptr;
     float query[MAX_LANE_VALUES], accumulator[MAX_LANE_VALUES];
     for (int value = 0; value < values; ++value) {
         query[value] = read(plan.inputs[0], (token * heads + head) * width + value * 32 + lane) * scale;
@@ -1500,17 +1532,23 @@ __global__ void relative_attention(Launch plan) {
     }
     float peak = -1e30F, total = 0;
     for (auto key = first + warp; key <= position; key += warps) {
-        const auto base = key * key_stride + key_head * width;
+        const auto row = ring ? key % rows : key;
+        const auto base = row * key_stride + key_head * width;
         float dot = 0;
-        for (int value = 0; value < values; ++value) dot += query[value] * read(plan.inputs[1], base + value * 32 + lane);
+        for (int value = 0; value < values; ++value)
+            dot += query[value] * read(plan.inputs[1], base + value * 32 + lane) *
+                   (scaled ? key_scales[row * groups + head_group + value] : 1.F);
         float logit = warp_sum(dot);
         const auto distance = position - key;
         if (distance < extent) logit += read(plan.inputs[3], (token * heads + head) * extent + distance);
         logit *= tau;
         const float next = fmaxf(peak, logit), decay = expf(peak - next), weight = expf(logit - next);
         total = total * decay + weight;
-        for (int value = 0; value < values; ++value)
-            accumulator[value] = accumulator[value] * decay + weight * read(plan.inputs[2], base + value * 32 + lane);
+        for (int value = 0; value < values; ++value) {
+            const float stored = read(plan.inputs[2], base + value * 32 + lane) *
+                                 (scaled ? value_scales[row * groups + head_group + value] : 1.F);
+            accumulator[value] = accumulator[value] * decay + weight * stored;
+        }
         peak = next;
     }
     if (lane == 0) peaks[warp] = peak, totals[warp] = total;
@@ -1529,31 +1567,46 @@ __global__ void relative_attention(Launch plan) {
     }
 }
 
-/// Vectorized BF16 decode attention for width == 128 with configurable warps per head.
-template <int WARPS>
-__global__ void __launch_bounds__(WARPS * 32) relative_attention_bf16_d128(Launch plan) {
+/// Vectorized decode attention for width == 128 BF16 queries with configurable warps per head. Caches are BF16, or
+/// INT8 with one F32 scale per 32 columns (nine operands).
+template <int WARPS, bool INT8>
+__global__ void __launch_bounds__(WARPS * 32) relative_attention_d128(Launch plan) {
     __shared__ float peaks[WARPS], totals[WARPS], warp_scales[WARPS], partial[WARPS][128];
-    const auto heads = plan.attributes[0], key_heads = plan.attributes[1], start = plan.attributes[2],
-               window = plan.attributes[3], extent = plan.attributes[4];
+    const auto heads = plan.attributes[0], key_heads = plan.attributes[1], window = plan.attributes[3],
+               extent = plan.attributes[4];
     const float log_alpha = attribute_float(plan, 5), log_floor = attribute_float(plan, 6);
     const auto token = static_cast<std::int64_t>(blockIdx.x), head = static_cast<std::int64_t>(blockIdx.y);
     constexpr int WIDTH = 128;
     const auto key_head = head / (heads / key_heads);
-    const auto key_stride = plan.inputs[1].shape[1];
+    const auto key_stride = plan.inputs[1].shape[1], rows = plan.inputs[1].shape[0];
+    const bool ring = plan.attribute_count > 7 && plan.attributes[7];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const auto position =
-        plan.count == 7
-            ? min(static_cast<std::int64_t>(static_cast<const int*>(address(plan.inputs[6]))[token]),
-                  plan.inputs[1].shape[0] - 1)
-            : start + token;
+    const auto position = relative_query_position(plan, token, ring);
     const auto first = window ? max(static_cast<std::int64_t>(0), position - window + 1) : 0;
     const float tau =
         log_floor > 0 ? 1.F + log_alpha * logf(fmaxf(1.F, static_cast<float>(position + 1) / log_floor)) : 1.F;
     const float scale = rsqrtf(static_cast<float>(WIDTH));
     const auto* q_ptr =
         static_cast<const __nv_bfloat16*>(address(plan.inputs[0])) + (token * heads + head) * WIDTH + lane * 4;
-    const auto* k_cache = static_cast<const __nv_bfloat16*>(address(plan.inputs[1]));
-    const auto* v_cache = static_cast<const __nv_bfloat16*>(address(plan.inputs[2]));
+    const auto* k_cache = address(plan.inputs[1]);
+    const auto* v_cache = address(plan.inputs[2]);
+    const auto* key_scales = INT8 ? static_cast<const float*>(address(plan.inputs[7])) : nullptr;
+    const auto* value_scales = INT8 ? static_cast<const float*>(address(plan.inputs[8])) : nullptr;
+    // Each lane loads four columns of one 32-column scale group.
+    const auto column = key_head * WIDTH + lane * 4, groups = key_stride / 32;
+    const auto load = [&](const void* cache, const float* scales, std::int64_t row, float (&values)[4]) {
+        if constexpr (INT8) {
+            const auto codes = *reinterpret_cast<const char4*>(static_cast<const signed char*>(cache) +
+                                                               row * key_stride + column);
+            const float factor = scales[row * groups + column / 32];
+            values[0] = codes.x * factor;
+            values[1] = codes.y * factor;
+            values[2] = codes.z * factor;
+            values[3] = codes.w * factor;
+        } else {
+            load_bf16x4(static_cast<const __nv_bfloat16*>(cache) + row * key_stride + column, values);
+        }
+    };
     float q[4], acc[4]{};
     load_bf16x4(q_ptr, q);
 #pragma unroll
@@ -1562,9 +1615,9 @@ __global__ void __launch_bounds__(WARPS * 32) relative_attention_bf16_d128(Launc
     const bool rel_bf16 = plan.inputs[3].type == static_cast<int>(Type::BF16);
     float peak = -1e30F, total = 0;
     for (auto key = first + warp; key <= position; key += WARPS) {
-        const auto base = key * key_stride + key_head * WIDTH + lane * 4;
+        const auto row = ring ? key % rows : key;
         float kv[4];
-        load_bf16x4(k_cache + base, kv);
+        load(k_cache, key_scales, row, kv);
         const float dot = q[0] * kv[0] + q[1] * kv[1] + q[2] * kv[2] + q[3] * kv[3];
         float logit = warp_sum(dot);
         const auto distance = position - key;
@@ -1573,7 +1626,7 @@ __global__ void __launch_bounds__(WARPS * 32) relative_attention_bf16_d128(Launc
         logit *= tau;
         const float next = fmaxf(peak, logit), decay = expf(peak - next), weight = expf(logit - next);
         total = total * decay + weight;
-        load_bf16x4(v_cache + base, kv);
+        load(v_cache, value_scales, row, kv);
 #pragma unroll
         for (int i = 0; i < 4; ++i) acc[i] = acc[i] * decay + weight * kv[i];
         peak = next;
@@ -2062,11 +2115,12 @@ auto fused_operation(const Launch& plan, Op operation, cudaStream_t stream) -> v
             const auto width = plan.inputs[0].shape[1] / heads;
             const bool bf16_kv = plan.inputs[1].type == static_cast<int>(Type::BF16) &&
                                  plan.inputs[2].type == static_cast<int>(Type::BF16);
+            const bool int8_kv = plan.count == 9;
             const bool q_bf16_or_f32 =
                 plan.inputs[0].type == static_cast<int>(Type::BF16) || plan.inputs[0].type == static_cast<int>(Type::F32);
             const bool flash_aligned = aligned(plan.inputs[0]) && aligned(plan.inputs[1]) && aligned(plan.inputs[2]) &&
                                        aligned(plan.inputs[5]) && aligned(plan.output);
-            const bool flash_ok = tokens > 1 && bf16_kv && q_bf16_or_f32 &&
+            const bool flash_ok = tokens > 1 && (bf16_kv || int8_kv) && q_bf16_or_f32 &&
                                   plan.inputs[0].type == plan.inputs[5].type &&
                                   plan.inputs[0].type == plan.output.type && flash_aligned &&
                                   (width == 64 || width == 128 || width == 256 || width == 512);
@@ -2096,14 +2150,21 @@ auto fused_operation(const Launch& plan, Op operation, cudaStream_t stream) -> v
                 args.key_heads = key_heads;
                 args.key_offset = start;
                 args.mask_window = window;
-                args.keys = plan.inputs[1].shape[0];
+                // Ring caches address keys by absolute position, so only the positions bound them.
+                const bool ring = plan.attribute_count > 7 && plan.attributes[7];
+                args.keys = ring ? std::numeric_limits<int>::max() : plan.inputs[1].shape[0];
+                args.ring_rows = ring ? plan.inputs[1].shape[0] : 0;
                 args.extent = extent;
                 args.head_dim = static_cast<int>(width);
                 args.scale = 1.F / std::sqrt(static_cast<float>(width));
                 int raw_alpha = static_cast<int>(plan.attributes[5]), raw_floor = static_cast<int>(plan.attributes[6]);
                 std::memcpy(&args.log_alpha, &raw_alpha, sizeof(float));
                 std::memcpy(&args.log_floor, &raw_floor, sizeof(float));
-                if (plan.count == 7) {
+                if (int8_kv) {
+                    args.key_scales = to_flash(plan.inputs[7]);
+                    args.value_scales = to_flash(plan.inputs[8]);
+                }
+                if (plan.count >= 7) {
                     args.has_mask = true;
                     args.mask = to_flash(plan.inputs[6]);
                     args.mask.type = 3;
@@ -2115,20 +2176,31 @@ auto fused_operation(const Launch& plan, Op operation, cudaStream_t stream) -> v
                 }
                 if (flash_attention_bf16(args, stream)) break;
             }
-            const bool bf16_d128 = width == 128 && plan.inputs[0].type == static_cast<int>(Type::BF16) && bf16_kv &&
-                                   plan.inputs[5].type == static_cast<int>(Type::BF16) &&
-                                   plan.output.type == static_cast<int>(Type::BF16);
-            if (bf16_d128) {
+            const bool d128 = width == 128 && plan.inputs[0].type == static_cast<int>(Type::BF16) &&
+                              (bf16_kv || int8_kv) && plan.inputs[5].type == static_cast<int>(Type::BF16) &&
+                              plan.output.type == static_cast<int>(Type::BF16);
+            if (d128) {
                 const dim3 grid(static_cast<unsigned>(tokens), static_cast<unsigned>(heads));
-                const auto max_keys = window > 0 ? window : plan.inputs[1].shape[0];
-                if (max_keys <= 256)
-                    kernel::relative_attention_bf16_d128<8><<<grid, 8 * 32, 0, stream>>>(plan);
+                const bool few_keys = (window > 0 ? window : plan.inputs[1].shape[0]) <= 256;
+                if (int8_kv && few_keys)
+                    kernel::relative_attention_d128<8, true><<<grid, 8 * 32, 0, stream>>>(plan);
+                else if (int8_kv)
+                    kernel::relative_attention_d128<32, true><<<grid, 32 * 32, 0, stream>>>(plan);
+                else if (few_keys)
+                    kernel::relative_attention_d128<8, false><<<grid, 8 * 32, 0, stream>>>(plan);
                 else
-                    kernel::relative_attention_bf16_d128<32><<<grid, 32 * 32, 0, stream>>>(plan);
+                    kernel::relative_attention_d128<32, false><<<grid, 32 * 32, 0, stream>>>(plan);
             } else {
                 const dim3 grid(static_cast<unsigned>(tokens), static_cast<unsigned>(heads));
                 kernel::relative_attention<<<grid, kernel::ATTENTION_WARPS * 32, 0, stream>>>(plan);
             }
+            break;
+        }
+        case Op::QUANTIZE_CACHE: {
+            const auto& cache = plan.inputs[2];
+            const auto groups = cache.shape[cache.rank - 1] / 32;
+            const dim3 grid(static_cast<unsigned>((groups + 7) / 8), static_cast<unsigned>(plan.inputs[0].shape[0]));
+            kernel::quantize_cache<<<grid, 256, 0, stream>>>(plan);
             break;
         }
         case Op::SILU_GATE:

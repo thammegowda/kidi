@@ -137,6 +137,7 @@ int minimum_inputs(const Descriptor& descriptor) {
         case Op::RMS_ROTARY:
         case Op::QUANTIZED_LINEAR:
         case Op::BLEND_EPILOGUE:
+        case Op::QUANTIZE_CACHE:
             return 4;
         case Op::EMBEDDING:
         case Op::EMBEDDING_SUM:
@@ -389,11 +390,18 @@ void infer_fused(Descriptor& descriptor, Type requested_type) {
             const auto* attributes = descriptor.attributes.data();
             const auto heads = attributes[0], key_heads = attributes[1], extent = attributes[4];
             const auto tokens = input.shape[0];
-            fail((count != 6 && count != 7) || descriptor.attribute_count != 7 || heads <= 0 || key_heads <= 0 ||
-                     heads % key_heads || input.rank != 2 || input.shape[1] % heads,
+            fail((count != 6 && count != 7 && count != 9) ||
+                     (descriptor.attribute_count != 7 && descriptor.attribute_count != 8) || heads <= 0 ||
+                     key_heads <= 0 || heads % key_heads || input.rank != 2 || input.shape[1] % heads,
                  "relative attention heads");
-            // Device positions replace `start`; the kernel clamps them to the cache.
-            fail(count == 7 && (descriptor.inputs[6].type != Type::I32 ||
+            // Ring caches keep key `position` in row `position % rows`, so a chunk and its window must fit the rows.
+            if (descriptor.attribute_count == 8)
+                fail(attributes[7] < 0 || attributes[7] > 1 ||
+                         (attributes[7] && (count < 7 || attributes[3] <= 0 ||
+                                            tokens + attributes[3] - 1 > descriptor.inputs[1].shape[0])),
+                     "relative attention ring");
+            // Device positions replace `start`; kernels clamp them to linear caches.
+            fail(count >= 7 && (descriptor.inputs[6].type != Type::I32 ||
                                 descriptor.inputs[6].elements() != static_cast<std::size_t>(tokens)),
                  "relative attention positions");
             const auto width = input.shape[1] / heads;
@@ -406,6 +414,34 @@ void infer_fused(Descriptor& descriptor, Type requested_type) {
                      descriptor.inputs[4].elements() != static_cast<std::size_t>(tokens * heads) ||
                      descriptor.inputs[5].elements() != input.elements(),
                  "relative attention geometry");
+            // INT8 caches carry F32 scales [rows, groups]; groups of 32 columns never straddle a head.
+            const auto& key_scales = descriptor.inputs[7];
+            fail(count == 9 && (key.type != Type::I8 || value.type != Type::I8 || key_scales.type != Type::F32 ||
+                                key_scales.rank != 2 || key_scales.shape[0] != key.shape[0] ||
+                                key_scales.shape[1] * 32 != key.shape[1] ||
+                                !std::equal(key_scales.shape.begin(), key_scales.shape.begin() + 2,
+                                            descriptor.inputs[8].shape.begin()) ||
+                                descriptor.inputs[8].type != Type::F32),
+                 "relative attention INT8 cache");
+            fail(count != 9 && (key.type == Type::I8 || value.type == Type::I8), "relative attention cache scales");
+            break;
+        }
+        case Op::QUANTIZE_CACHE: {
+            // rows [tokens, width] -> cache I8 [capacity, width] and scales F32 [capacity, width / 32] at positions.
+            const auto& positions = descriptor.inputs[1];
+            const auto& cache = descriptor.inputs[2];
+            const auto& scales = descriptor.inputs[3];
+            const auto rows = cache.rank == 3 ? cache.shape[1] : cache.shape[0];
+            const auto width = cache.shape[cache.rank - 1];
+            fail(count != 4 || input.rank != 2 || (input.type != Type::F32 && input.type != Type::BF16) ||
+                     positions.type != Type::I32 || positions.elements() != static_cast<std::size_t>(input.shape[0]) ||
+                     cache.type != Type::I8 || (cache.rank != 2 && !(cache.rank == 3 && cache.shape[0] == 1)) ||
+                     width != input.shape[1] || width % 32 || scales.type != Type::F32 || scales.rank != 2 ||
+                     scales.shape[0] != rows || scales.shape[1] * 32 != width,
+                 "INT8 cache update");
+            output.rank = 1;
+            output.shape[0] = 1;
+            output.type = Type::F32;
             break;
         }
         case Op::SILU_GATE:
@@ -439,7 +475,8 @@ void validate_attention(const Descriptor& descriptor) {
 }
 
 void infer(Descriptor& descriptor) {
-    if (descriptor.input_count < 1 || descriptor.input_count > 8) throw std::runtime_error("CUDA: invalid input count");
+    if (descriptor.input_count < 1 || descriptor.input_count > MAX_INPUTS)
+        throw std::runtime_error("CUDA: invalid input count");
     if (descriptor.attribute_count < 0 || descriptor.attribute_count > 32)
         throw std::runtime_error("CUDA: invalid attribute count");
     const auto required = minimum_inputs(descriptor);
@@ -638,6 +675,7 @@ void infer(Descriptor& descriptor) {
         case Op::SHORT_CONVOLUTION:
         case Op::L2_CLIP:
         case Op::RELATIVE_ATTENTION:
+        case Op::QUANTIZE_CACHE:
         case Op::DEQUANTIZE_EXPERTS:
         case Op::BLOCK_SCALED_LINEAR:
         case Op::ROUTE_EXPERTS:
@@ -1311,6 +1349,7 @@ void Program::run(const Tensor* inputs, int count, void* output) {
     if (relocated && operation != Op::SCATTER && operation != Op::SCATTER_KV &&
         !(operation == Op::ATTENTION && descriptor.inputs[0].shape[1] == 1) &&
         !(operation == Op::RELATIVE_ATTENTION && descriptor.inputs[0].shape[0] == 1) &&
+        operation != Op::QUANTIZE_CACHE &&
         !(operation == Op::SHORT_CONVOLUTION && descriptor.attribute_count >= 2))
         throw std::runtime_error("CUDA: relocated operands are only supported by scatter and single-query attention");
     if (operation == Op::CONV1D || operation == Op::SNAKE_CONV1D || operation == Op::SNAKE_QUANTIZED_LINEAR) {
@@ -1446,7 +1485,8 @@ void Program::run(const Tensor* inputs, int count, void* output) {
     } else if (operation == Op::DIFFUSION_UPDATE) {
         diffusion_update(launch, static_cast<float*>(impl_->scratch.get()), execution_stream);
     } else if (operation == Op::RESIDUAL_MIX || operation == Op::SHORT_CONVOLUTION || operation == Op::L2_CLIP ||
-               operation == Op::RELATIVE_ATTENTION || operation == Op::DEQUANTIZE_EXPERTS ||
+               operation == Op::RELATIVE_ATTENTION || operation == Op::QUANTIZE_CACHE ||
+               operation == Op::DEQUANTIZE_EXPERTS ||
                operation == Op::BLOCK_SCALED_LINEAR || operation == Op::ROUTE_EXPERTS ||
                operation == Op::BLEND_PROLOGUE || operation == Op::BLEND_EPILOGUE) {
         fused_operation(launch, operation, execution_stream);

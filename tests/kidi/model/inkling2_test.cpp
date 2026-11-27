@@ -379,4 +379,117 @@ TEST(Inkling2Test, CudaReplayMatchesEager) {
         EXPECT_EQ(argmax(captured[row]), argmax(eager[row])) << "logit row " << row;
     }
 }
+
+// CUDA keeps sliding-window layers in ring caches, so only full-attention layer visits grow with the context. A prompt
+// longer than the ring, passed in one call, runs in bounded steps of a few lengths and decodes as it prefills, with
+// BF16 or INT8 caches.
+TEST(Inkling2Test, CudaLongPrompt) {
+    const auto directory = checkpoint::Hub{}.resolve("@thinkingmachines/Inkling-2-Mini");
+    if (!directory && directory.error().code == ErrorCode::IO) GTEST_SKIP() << directory.error().message;
+    ASSERT_TRUE(directory.has_value()) << directory.error().message;
+    const auto config = require(checkpoint::load_config(*directory));
+    auto model = require(model::create_model_as<model::CausalLanguageModel>(
+        config["model"], {.device = tensor::Device::cuda(), .parameter_dtype = tensor::DType::BF16}));
+    require(model->set_checkpoint(require(checkpoint::Weights::load(config["weights_file"].as<std::string>()))));
+
+    const auto spec = config["model"];
+    const auto local = spec["local_layer_ids"].as<std::vector<std::int32_t>>();
+    const auto loop = spec["loop_config"];
+    std::size_t global_visits = 0;
+    for (std::int32_t layer = 0; layer < spec["num_hidden_layers"].as<std::int32_t>(); ++layer) {
+        if (std::ranges::find(local, layer) != local.end()) continue;
+        const bool core = layer >= loop["core_start"].as<std::int32_t>() && layer < loop["core_end"].as<std::int32_t>();
+        global_visits += core ? loop["num_passes"].as<std::size_t>() : 1;
+    }
+    const auto kv = spec["num_key_value_heads"].as<std::size_t>() * spec["head_dim"].as<std::size_t>();
+    const auto cache_bytes = [&](std::size_t capacity) {
+        return require(model->create_state(capacity))->cache_bytes();
+    };
+    const auto relative_error = [](const std::vector<float>& actual, const std::vector<float>& reference) {
+        double squared_error = 0, squared_reference = 0;
+        for (std::size_t column = 0; column < reference.size(); ++column) {
+            const double difference = actual[column] - reference[column];
+            squared_error += difference * difference;
+            squared_reference += static_cast<double>(reference[column]) * reference[column];
+        }
+        return std::sqrt(squared_error / squared_reference);
+    };
+
+    // Rings hold the window plus 4096 rows; the last prefill chunk and every decode step below wrap around them.
+    const auto ring_rows = spec["sliding_window_size"].as<std::size_t>() + 4096;
+    const auto tokenizer = require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
+    std::string text;
+    for (int line = 0; line < 400; ++line)
+        text += "Line " + std::to_string(line) + ": the quick brown fox jumps over the lazy dog.\n";
+    const auto prompt = require(tokenizer.encode(text + "Line 400: the quick brown fox jumps over the lazy"));
+    ASSERT_GT(prompt.size(), ring_rows + 64);
+    ASSERT_LT(prompt.size(), 8192U);
+
+    const auto backend = require(tensor::BackendRegistry::instance().backend(tensor::Device::cuda()));
+    std::vector<float> bfloat;
+    for (const auto precision : {core::KVCachePrecision::BF16, core::KVCachePrecision::INT8}) {
+        const bool int8 = precision == core::KVCachePrecision::INT8;
+        SCOPED_TRACE(int8 ? "INT8 KV" : "BF16 KV");
+        model->set_kv_cache_precision(precision);
+        // Full-attention visits store BF16 keys and values, or INT8 codes plus one F32 scale per 32 columns.
+        const auto row_bytes = int8 ? 2 * (kv + kv / 32 * sizeof(float)) : 2 * kv * sizeof(std::uint16_t);
+        EXPECT_EQ(cache_bytes(16384) - cache_bytes(8192), 8192 * global_visits * row_bytes)
+            << "sliding-window caches grew with the context";
+
+        auto prefilled = require(model->create_state(8192));
+        const auto free_before = backend->free_memory(tensor::Device::cuda());
+        const auto full = host_logits(require(model->forward(prompt, *prefilled)));
+        const auto free_after = backend->free_memory(tensor::Device::cuda());
+        // Buffers for one bounded step stay cached for reuse; a single 6,000-token step would keep about 15 GiB.
+        EXPECT_LT(free_before > free_after ? free_before - free_after : 0, std::size_t{6} << 30);
+
+        // Decode the last 64 tokens one at a time through a compiled CUDA graph.
+        auto decoded = require(model->create_state(8192));
+        const auto split = prompt.size() - 64;
+        (void)require(model->forward(std::span(prompt).first(split), *decoded));
+        const auto previous = ops::profile_options();
+        auto logged = previous;
+        logged.log_graph_captures = true;
+        ops::set_profile_options(logged);
+        testing::internal::CaptureStderr();
+        std::vector<float> last;
+        for (auto index = split; index < prompt.size(); ++index)
+            last = host_logits(require(model->forward(std::span(prompt).subspan(index, 1), *decoded)));
+        const auto captures = testing::internal::GetCapturedStderr();
+        ops::set_profile_options(previous);
+        EXPECT_NE(captures.find(std::string("kidi_cuda_graph|key=inkling2_decode:8192:ring") + (int8 ? ":int8" : "") +
+                                ":logits"),
+                  std::string::npos)
+            << "decode did not run through a compiled CUDA graph";
+        ASSERT_EQ(last.size(), full.size());
+        // BF16 prefill and decode differ by up to ~0.13 relative RMS on long prompts; misplaced ring rows exceed 1.
+        EXPECT_LT(relative_error(last, full), 0.25) << "decode diverged from prefill past the ring";
+        EXPECT_EQ(argmax(last), argmax(full));
+        const std::array next{argmax(full)};
+        EXPECT_NE(require(tokenizer.decode(next)).find("dog"), std::string::npos);
+
+        // Another request's state replays the same captured step with its own caches and scales.
+        const auto from_prefilled = host_logits(require(model->forward(next, *prefilled)));
+        const auto from_decoded = host_logits(require(model->forward(next, *decoded)));
+        EXPECT_LT(relative_error(from_prefilled, from_decoded), 0.25) << "replayed step used another state's caches";
+        EXPECT_EQ(argmax(from_prefilled), argmax(from_decoded));
+        if (!int8) {
+            bfloat = full;
+            continue;
+        }
+        // INT8 rounding moves the logits about as much as BF16 batching does (0.04 relative RMS here).
+        EXPECT_LT(relative_error(full, bfloat), 0.15) << "INT8 caches changed the logits";
+        EXPECT_EQ(argmax(full), argmax(bfloat));
+    }
+
+    // Prompt tails of ten different lengths reuse power-of-two steps; one step per length would keep about 3.6 GiB.
+    auto tails = require(model->create_state(1024));
+    const auto tails_before = backend->free_memory(tensor::Device::cuda());
+    for (std::size_t length = 100; length < 110; ++length) {
+        require(model->rewind(*tails, 0));
+        (void)host_logits(require(model->forward(std::span(prompt).first(length), *tails)));
+    }
+    const auto tails_after = backend->free_memory(tensor::Device::cuda());
+    EXPECT_LT(tails_before > tails_after ? tails_before - tails_after : 0, std::size_t{1} << 30);
+}
 } // namespace

@@ -255,6 +255,7 @@ public:
     /// Specialized operations with CPU and CUDA implementations.
     /// Positions are `start + row` unless a device I32 [tokens] `positions` tensor supplies them. A positive
     /// `log_floor` multiplies each query's logits by 1 + log_alpha * log(max(1, (position + 1) / log_floor)).
+    /// On CUDA and Metal, `ring_mode` windowed attention with positions reads key `p` from cache row `p % rows`.
     struct RelativeAttention {
         std::int64_t heads, key_heads, start, window, extent;
         float log_alpha = 0, log_floor = 0;
@@ -275,14 +276,15 @@ public:
     /// Multiplies [..., heads, width] rows by the optional [heads, width] scale and caps each row's L2 norm.
     auto l2_clip(const Tensor& input, const Tensor& scale, float threshold) -> Tensor;
     /// Causal attention of [tokens, heads * width] queries over [capacity, key_heads * width] caches, with relative
-    /// logits [tokens, heads, extent], sink logits [tokens, heads] and sigmoid `gate`. CPU I8 caches require
-    /// F32 scales [capacity, key_heads * groups_per_head]; scale groups must divide each head's width.
+    /// logits [tokens, heads, extent], sink logits [tokens, heads] and sigmoid `gate`. I8 caches require F32 scales
+    /// [capacity, key_heads * groups_per_head]; scale groups must divide each head's width (32 columns on CUDA and
+    /// Metal, which also require `positions`).
     auto relative_attention(const Tensor& query, const Tensor& key, const Tensor& value, const Tensor& relative,
                             const Tensor& sink, const Tensor& gate, RelativeAttention shape,
                             const Tensor& positions = {}, const Tensor& key_scales = {},
                             const Tensor& value_scales = {}) -> Tensor;
-    /// CPU: quantizes [tokens, heads, width] into I8 cache [1, capacity, heads * width] at absolute `positions`,
-    /// with F32 scales [capacity, heads * groups_per_head]. Existing rows outside `positions` are unchanged.
+    /// Quantizes [tokens, heads, width] into I8 cache [1, capacity, heads * width] at cache rows `positions`, with F32
+    /// scales [capacity, heads * groups_per_head] (32 columns per group on CUDA and Metal). Other rows are unchanged.
     auto quantize_cache_(Tensor& cache, Tensor& scales, const Tensor& input, const Tensor& positions) -> void;
     /// Unit-RMS-normalizes `destination` and `message` [tokens, width] and writes concatenated BF16 [tokens, 2 * width].
     auto blend_prologue(const Tensor& destination, const Tensor& message, float epsilon) -> Tensor;

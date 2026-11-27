@@ -78,9 +78,13 @@ struct Tensor {
 class ProjectionCache;
 std::shared_ptr<ProjectionCache> make_projection_cache();
 
+/// Most operands one operation takes: INT8 relative attention reads a query, key and value caches, relative logits,
+/// sinks, gates, positions and the two cache scales.
+inline constexpr int MAX_INPUTS = 10;
+
 struct Descriptor {
     Op operation = Op::ADD;
-    std::array<Tensor, 8> inputs{};
+    std::array<Tensor, MAX_INPUTS> inputs{};
     int input_count = 0;
     Tensor output;
     std::array<std::int64_t, 32> attributes{};

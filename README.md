@@ -93,7 +93,7 @@ commands, configuration and the standalone client.
 
 | Model | Use | Notes |
 |---|---|---|
-| **Inkling 2 Mini** (`@thinkingmachines/Inkling-2-Mini`) | Agent with reasoning and tool calls | Looped 24-layer MoE with 128 experts (top-8). CUDA keeps native NVFP4/MXFP8 experts and fits under 24 GiB at an 8K context; Apple Metal uses compact VQ weights; CPU converts to INT8 once and caches the result. |
+| **Inkling 2 Mini** (`@thinkingmachines/Inkling-2-Mini`) | Agent with reasoning and tool calls | Looped 24-layer MoE with 128 experts (top-8). CUDA keeps native NVFP4/MXFP8 experts and fits under 24 GiB at an 8K context; sliding-window layers use small ring caches, so a 48 GB GPU holds a ~690K-token context (its full 1M tokens with `--kv-cache-precision int8`). Apple Metal uses compact VQ weights; CPU converts to INT8 once and caches the result. |
 | **Gemma 4** (`E2B-it`, `E4B-it`) | Agent default (E2B mobile QAT), chat, photo Q&A | Native mixed 2/4/8-bit QAT checkpoints load without conversion; BF16 checkpoints can also run as INT8 or INT4 |
 | **Qwen 3** | Chat and text generation | Also the language backbone of OmniVoice |
 | **Whisper**, **OmniVoice**, **Kokoro-82M**, **RTG** | Speech recognition, speech synthesis, translation | See [Also in Kidi](#also-in-kidi) |

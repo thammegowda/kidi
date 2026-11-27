@@ -1568,11 +1568,13 @@ auto Context::relative_attention(const Tensor& query, const Tensor& key, const T
             output.data()));
         return cpu_tensor(*this, std::vector(query.shape().begin(), query.shape().end()), output, query.dtype());
     }
-    if ((key_scales.defined() || value_scales.defined()) && device().kind != tensor::DeviceKind::A_GPU)
-        throw Failure({ErrorCode::UNSUPPORTED, "scaled relative attention caches require CPU or Metal"});
+    if ((key_scales.defined() || value_scales.defined()) && device().kind != tensor::DeviceKind::A_GPU &&
+        device().kind != tensor::DeviceKind::CUDA)
+        throw Failure({ErrorCode::UNSUPPORTED, "scaled relative attention caches require CPU, CUDA or Metal"});
     if (device().kind != tensor::DeviceKind::CUDA && device().kind != tensor::DeviceKind::A_GPU)
         throw Failure({ErrorCode::UNSUPPORTED, "relative attention requires CPU, CUDA or Metal"});
-    const bool ring_mode = shape.ring_mode && shape.window > 0 && device().kind == tensor::DeviceKind::A_GPU;
+    const bool ring_mode = shape.ring_mode && shape.window > 0 &&
+                           (device().kind == tensor::DeviceKind::A_GPU || device().kind == tensor::DeviceKind::CUDA);
     const std::array<std::int64_t, 8> attributes{shape.heads,
                                                  shape.key_heads,
                                                  shape.start,
@@ -1586,7 +1588,7 @@ auto Context::relative_attention(const Tensor& query, const Tensor& key, const T
     if (key_scales.defined() || value_scales.defined()) {
         if (!positions.defined() || !key_scales.defined() || !value_scales.defined())
             throw Failure({ErrorCode::INVALID_ARGUMENT,
-                           "Metal INT8 relative attention requires positions, key_scales, and value_scales"});
+                           "INT8 relative attention requires positions, key_scales, and value_scales"});
         return impl_->run({Operation::RELATIVE_ATTENTION, attr_span, query.dtype()},
                           {&query, &key, &value, &relative, &sink, &gate, &positions, &key_scales, &value_scales});
     }
@@ -1597,14 +1599,14 @@ auto Context::relative_attention(const Tensor& query, const Tensor& key, const T
                       {&query, &key, &value, &relative, &sink, &gate});
 }
 auto Context::quantize_cache_(Tensor& cache, Tensor& scales, const Tensor& input, const Tensor& positions) -> void {
-    if (device().kind == tensor::DeviceKind::A_GPU) {
+    if (device().kind == tensor::DeviceKind::A_GPU || device().kind == tensor::DeviceKind::CUDA) {
         if (input.dimensions() != 3 || cache.dimensions() != 3 || cache.size(0) != 1 || input.size(1) == 0 ||
             input.size(2) == 0 || cache.size(2) != input.size(1) * input.size(2) ||
             cache.dtype() != tensor::DType::I8 || scales.dimensions() != 2 || scales.size(0) != cache.size(1) ||
             scales.size(1) == 0 || cache.size(2) != scales.size(1) * 32 || scales.dtype() != tensor::DType::F32 ||
             positions.dtype() != tensor::DType::I32 || positions.dimensions() != 1 ||
             positions.size(0) != input.size(0))
-            throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid Metal INT8 cache update"});
+            throw Failure({ErrorCode::INVALID_ARGUMENT, "invalid GPU INT8 cache update"});
         auto flat = require(
             input.reshape({static_cast<std::int64_t>(input.size(0)), static_cast<std::int64_t>(cache.size(2))}));
         impl_->run({Operation::QUANTIZE_CACHE, {}, tensor::DType::F32}, {&flat, &positions, &cache, &scales});

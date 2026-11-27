@@ -24,6 +24,9 @@ struct FlashAttentionArgs {
     FlashView relative;
     FlashView sink;
     FlashView gate;
+    /// INT8 key and value caches: F32 scales [rows, width / 32], one per 32 columns.
+    FlashView key_scales;
+    FlashView value_scales;
     bool has_mask = false;
     bool has_relative = false;
     std::int64_t batches = 1;
@@ -33,6 +36,8 @@ struct FlashAttentionArgs {
     std::int64_t key_offset = 0;
     std::int64_t mask_window = 0;
     std::int64_t keys = 0;
+    /// Nonzero for ring caches: key `k` lives in row `k % ring_rows`, and `keys` bounds absolute key positions.
+    std::int64_t ring_rows = 0;
     std::int64_t extent = 0;
     int head_dim = 0;
     float scale = 0.F;

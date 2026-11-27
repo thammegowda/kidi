@@ -121,6 +121,13 @@ __global__ void __launch_bounds__(kThreads)
                          static_cast<std::int64_t>(key_head) * HeadDim;
     const auto* v_base = v_ptr + (v_batch * args.value.shape[1] + (HasRelative ? 0 : args.key_offset)) * kv_stride +
                          static_cast<std::int64_t>(key_head) * HeadDim;
+    // INT8 caches (one batch) convert to BF16 as tiles load.
+    const bool int8 = HasRelative && args.key.type == static_cast<int>(Type::I8);
+    const auto* k_codes = static_cast<const signed char*>(resolve_view(args.key));
+    const auto* v_codes = static_cast<const signed char*>(resolve_view(args.value));
+    const auto* k_scales = static_cast<const float*>(resolve_view(args.key_scales));
+    const auto* v_scales = static_cast<const float*>(resolve_view(args.value_scales));
+    const std::int64_t head_column = static_cast<std::int64_t>(key_head) * HeadDim;
 
     int key_begin = 0;
     int key_end = static_cast<int>(args.keys);
@@ -294,9 +301,13 @@ __global__ void __launch_bounds__(kThreads)
             const int chunk = v % KChunks;
             const int k_pos = t0 + row;
             const bool valid = k_pos < keys;
-            ptx::cp_async_zfill_16<false>(kv_smem + row * HeadDim + kv_swizzle_chunk(row, chunk) * 8,
-                                          k_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + chunk * 8,
-                                          valid);
+            auto* destination = kv_smem + row * HeadDim + kv_swizzle_chunk(row, chunk) * 8;
+            if (int8)
+                load_int8_chunk(destination, k_codes, k_scales, valid ? key_row(args, k_pos) : 0,
+                                head_column + chunk * 8, kv_stride, valid);
+            else
+                ptx::cp_async_zfill_16<false>(
+                    destination, k_base + (valid ? key_row(args, k_pos) : 0) * kv_stride + chunk * 8, valid);
         }
         ptx::cp_async_fence();
         ptx::cp_async_wait<0>();
@@ -338,9 +349,13 @@ __global__ void __launch_bounds__(kThreads)
             const int chunk = v % KChunks;
             const int k_pos = t0 + row;
             const bool valid = k_pos < keys;
-            ptx::cp_async_zfill_16<false>(kv_smem + row * HeadDim + kv_swizzle_chunk(row, chunk) * 8,
-                                          v_base + static_cast<std::int64_t>(valid ? k_pos : 0) * kv_stride + chunk * 8,
-                                          valid);
+            auto* destination = kv_smem + row * HeadDim + kv_swizzle_chunk(row, chunk) * 8;
+            if (int8)
+                load_int8_chunk(destination, v_codes, v_scales, valid ? key_row(args, k_pos) : 0,
+                                head_column + chunk * 8, kv_stride, valid);
+            else
+                ptx::cp_async_zfill_16<false>(
+                    destination, v_base + (valid ? key_row(args, k_pos) : 0) * kv_stride + chunk * 8, valid);
         }
         ptx::cp_async_fence();
 
@@ -567,6 +582,13 @@ __global__ void __launch_bounds__(FaConfig<HeadDim>::Threads)
         ((args.value.shape[0] == 1 ? 0 : batch) * args.value.shape[1] + (HasRelative ? 0 : args.key_offset)) *
             kv_stride +
         static_cast<std::int64_t>(key_head) * HeadDim;
+    // INT8 caches (one batch) convert to BF16 as tiles load.
+    const bool int8 = HasRelative && args.key.type == static_cast<int>(Type::I8);
+    const auto* k_codes = static_cast<const signed char*>(resolve_view(args.key));
+    const auto* v_codes = static_cast<const signed char*>(resolve_view(args.value));
+    const auto* k_scales = static_cast<const float*>(resolve_view(args.key_scales));
+    const auto* v_scales = static_cast<const float*>(resolve_view(args.value_scales));
+    const std::int64_t head_column = static_cast<std::int64_t>(key_head) * HeadDim;
     const int keys = static_cast<int>(args.keys);
 
     int key_begin = 0, key_end = keys, full_begin = 0, full_end = positions ? 0 : keys;
@@ -617,10 +639,16 @@ __global__ void __launch_bounds__(FaConfig<HeadDim>::Threads)
             const int chunk = v % KChunks;
             const int key = first_key + row;
             const bool valid = key < keys;
-            const std::int64_t offset = static_cast<std::int64_t>(valid ? key : 0) * kv_stride + chunk * 8;
+            const auto cache_row = valid ? key_row(args, key) : 0;
             const int slot = (buffer * Bc + row) * HeadDim + kv_swizzle_chunk(row, chunk) * 8;
-            ptx::cp_async_zfill_16<true>(k_smem + slot, k_base + offset, valid);
-            ptx::cp_async_zfill_16<true>(v_smem + slot, v_base + offset, valid);
+            if (int8) {
+                load_int8_chunk(k_smem + slot, k_codes, k_scales, cache_row, head_column + chunk * 8, kv_stride, valid);
+                load_int8_chunk(v_smem + slot, v_codes, v_scales, cache_row, head_column + chunk * 8, kv_stride, valid);
+            } else {
+                const std::int64_t offset = cache_row * kv_stride + chunk * 8;
+                ptx::cp_async_zfill_16<true>(k_smem + slot, k_base + offset, valid);
+                ptx::cp_async_zfill_16<true>(v_smem + slot, v_base + offset, valid);
+            }
         }
     };
 
@@ -891,6 +919,11 @@ auto run_bf16(const FlashAttentionArgs& args, const std::int64_t (&mask_strides)
 auto flash_attention_bf16(const FlashAttentionArgs& args, cudaStream_t stream) -> bool {
     if (args.batches <= 0 || args.queries <= 0 || args.heads <= 0 || args.key_heads <= 0 || args.keys <= 0 ||
         args.heads % args.key_heads != 0)
+        return false;
+    if (args.key.type == static_cast<int>(Type::I8) &&
+        (args.batches != 1 || !args.has_relative || args.value.type != static_cast<int>(Type::I8) ||
+         (!args.key_scales.data && !args.key_scales.binding) ||
+         (!args.value_scales.data && !args.value_scales.binding)))
         return false;
 
     std::int64_t m_strides[4]{};

@@ -1026,15 +1026,17 @@ auto Generator::context_capacity(GenerationOptions options) const -> Result<std:
 auto Generator::fit_context_size(std::size_t memory_bytes) -> Result<std::size_t> {
     try {
         const auto maximum = config_["model"]["max_position_embeddings"].as<std::size_t>();
-        // Two sizes give the marginal per-token cost, excluding fixed and sliding-window state.
-        constexpr std::size_t SMALL = 4096, LARGE = 8192;
-        if (maximum <= LARGE) return maximum;
+        // Two sizes give the marginal per-token cost. Both exceed sliding-window ring caches (Inkling-2 keeps
+        // window + 4096 rows), which stop growing once full.
+        constexpr std::size_t MINIMUM = 4096, SMALL = 8192, LARGE = 16384;
+        if (maximum <= SMALL) return maximum;
+        const auto large_size = std::min(maximum, LARGE);
         const auto small = require(model_->create_state(SMALL))->cache_bytes();
-        const auto large = require(model_->create_state(LARGE))->cache_bytes();
+        const auto large = require(model_->create_state(large_size))->cache_bytes();
         if (large <= small) return maximum;
-        const auto per_token = (large - small + LARGE - SMALL - 1) / (LARGE - SMALL);
+        const auto per_token = (large - small + large_size - SMALL - 1) / (large_size - SMALL);
         const auto fixed = small > per_token * SMALL ? small - per_token * SMALL : 0;
-        if (memory_bytes <= fixed + per_token * SMALL)
+        if (memory_bytes <= fixed + per_token * MINIMUM)
             throw ops::Failure({ErrorCode::RUNTIME, "not enough free memory for a 4096-token context"});
         return std::min(maximum, (memory_bytes - fixed) / per_token) / 1024 * 1024;
     } catch (const ops::Failure& error) {
