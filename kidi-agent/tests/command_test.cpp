@@ -1,4 +1,5 @@
 #include "kidi/agent/command.h"
+#include "kidi/agent/markdown.h"
 #include "kidi/agent/terminal.h"
 #include "kidi/agent/transcript.h"
 
@@ -233,7 +234,8 @@ protected:
         return wait_for("> ", output_text_.find(text, from) + text.size());
     }
 
-    auto wait_empty_prompt(std::size_t from = 0) -> bool { return wait_for(">                     ", from); }
+    // The input shows a placeholder only while it is empty and ready for a task.
+    auto wait_empty_prompt(std::size_t from = 0) -> bool { return wait_for("Ask Kidi; /help lists commands", from); }
 
     auto wait_approval(std::size_t from = 0) -> bool {
         if (!wait_for("Approval required:", from)) return false;
@@ -281,7 +283,6 @@ TEST_F(AgentTerminal, EditHistoryPaste) {
     send("helo\033[Dl\r");
     ASSERT_TRUE(wait_task("echo: hello"));
     auto from = output_text_.size();
-    // The full-screen log redraws earlier replies, so every step must expect a distinct reply.
     send("\033[A\033[F!\r");
     ASSERT_TRUE(wait_task("echo: hello!", from));
     from = output_text_.size();
@@ -479,7 +480,6 @@ TEST_F(AgentTerminal, PresentationAndWorkspaceTranscript) {
     EXPECT_EQ(output_text_.find("{\"command\":"), std::string::npos);
     EXPECT_NE(output_text_.find("\\x1b]0;untrusted\\x07"), std::string::npos);
     EXPECT_EQ(output_text_.find("\033]0;untrusted"), std::string::npos);
-    EXPECT_NE(output_text_.find("Assistant"), std::string::npos);
     auto from = output_text_.size();
     send("/reset\r");
     ASSERT_TRUE(wait_task("Conversation cleared", from));
@@ -523,7 +523,7 @@ TEST_F(AgentTerminal, NoSave) {
     send("/exit\r");
     finish();
     EXPECT_FALSE(std::filesystem::exists(root_ / "cache"));
-    EXPECT_NE(output_text_.find("\033[?1049l"), std::string::npos);
+    EXPECT_NE(output_text_.find("\033[?2004l"), std::string::npos);
 }
 
 TEST_F(AgentTerminal, TranscriptAppendAndWorkspaceIsolation) {
@@ -571,6 +571,74 @@ TEST_F(AgentTerminal, TranscriptFailureIsExplicit) {
     ASSERT_TRUE(wait_for("--no-save"));
     finish(1);
     EXPECT_EQ(output_text_.find("echo: hello"), std::string::npos);
+}
+
+TEST_F(AgentTerminal, MultilineInputStaysInScrollback) {
+    start();
+    // Ctrl-J adds a line; Enter submits both lines as one task.
+    send("line one\nline two\r");
+    ASSERT_TRUE(wait_task("line two"));
+    send("/exit\r");
+    finish();
+    // The transcript is printed inline, never on the alternate screen, so native scrollback and copying work.
+    EXPECT_EQ(output_text_.find("\033[?1049h"), std::string::npos);
+    bool found = false;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root_ / "cache")) {
+        if (entry.path().extension() != ".jsonl") continue;
+        std::ifstream input(entry.path());
+        for (std::string line; std::getline(input, line);) {
+            const auto record = Json::parse(line, nullptr, false);
+            found = found || (record.is_object() && record.value("content", "") == "line one\nline two");
+        }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(TerminalMarkdown, StylesAndPassthrough) {
+    const auto lines = render_markdown("# Title\nUse **bold** and `code`.\n- [x] done\n```\n**raw**\n```\n", true, 80);
+    ASSERT_EQ(lines.size(), 6);
+    EXPECT_EQ(lines[0], "\033[1;4mTitle\033[0m");
+    EXPECT_EQ(lines[1], "Use \033[1mbold\033[0m and \033[38;5;180mcode\033[0m.\033[0m");
+    EXPECT_EQ(lines[2], "☑ done");
+    EXPECT_NE(lines[4].find("**raw**"), std::string::npos) << "code blocks keep their text";
+    EXPECT_EQ(render_markdown("snake_case_name and 2*3", true, 80)[0], "snake_case_name and 2*3");
+    // Without color the source is unchanged, so copied text is exactly what the model wrote.
+    EXPECT_EQ(render_markdown("# Title\n| a | b |\n", false, 80), (std::vector<std::string>{"# Title", "| a | b |"}));
+}
+
+TEST(TerminalMarkdown, StreamsLinesAndAlignsTables) {
+    MarkdownStream stream(true);
+    EXPECT_TRUE(stream.feed("| Name | Count |\n|:--|--:|\n| a | 12", 80).empty());
+    EXPECT_EQ(stream.preview(80).size(), 5) << "a held table previews as a box";
+    const auto table = stream.feed("3 |\nafter\n", 80);
+    ASSERT_EQ(table.size(), 6);
+    EXPECT_EQ(display_width(table[0]), display_width(table[3]));
+    EXPECT_NE(table[3].find(" a    "), std::string::npos) << "left aligned";
+    EXPECT_NE(table[3].find("   123 "), std::string::npos) << "right aligned";
+    EXPECT_EQ(table[5], "after");
+    // A table wider than the terminal wraps its cells at spaces; only a hopelessly narrow one falls back to source.
+    const auto wide = render_markdown("| Key | Details |\n|---|---|\n| Name | a long description that must wrap |\n"
+                                      "| API | short |\n",
+                                      true, 30);
+    for (const auto& line : wide) EXPECT_LE(display_width(line), 29u) << line;
+    EXPECT_GT(wide.size(), 7u);
+    EXPECT_NE(wide[3].find("Name"), std::string::npos);
+    EXPECT_NE(wide[3].find("a long"), std::string::npos) << "breaks between words";
+    EXPECT_EQ(render_markdown("| a | b |\n|---|---|\n", true, 8).size(), 2);
+    // A pipe inside a code span stays in its cell, and stray pipes never add columns beyond the header's.
+    const auto piped = render_markdown("| Key | Value |\n|---|---|\n| API | `\"deg\" | \"rad\"` |\n| X | a | b |\n",
+                                       true, 80);
+    ASSERT_EQ(piped.size(), 6);
+    EXPECT_EQ(display_width(piped[3]), display_width(piped[0]));
+    EXPECT_NE(piped[3].find("\"deg\" | \"rad\""), std::string::npos) << piped[3];
+    EXPECT_EQ(display_width(piped[4]), display_width(piped[0]));
+    EXPECT_NE(piped[4].find("a | b"), std::string::npos) << piped[4];
+}
+
+TEST(TerminalMarkdown, Widths) {
+    EXPECT_EQ(display_width("\033[1mab\033[0m\xe4\xb8\xad"), 4);
+    EXPECT_EQ(fit_width("abcdef", 4), "abc…");
+    EXPECT_EQ(wrap_width("\033[1mabcd\033[0m", 2), (std::vector<std::string>{"\033[1mab\033[0m", "\033[1mcd\033[0m"}));
 }
 
 TEST(CodeTerminalText, Utf8AndControls) {

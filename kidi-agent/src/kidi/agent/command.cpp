@@ -430,7 +430,8 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
                     "/permissions reset  Revoke session approvals (keep the CLI permission mode)\n"
                     "/context            Show exact prompt and context token counts\n"
                     "/compact            Summarize older history (keep session approvals)\n"
-                    "Arrows edit and recall tasks; Page Up/Down scrolls the transcript; Tab completes commands.\n",
+                    "Arrows edit and recall tasks; Alt-Enter or Ctrl-J adds a line; Tab completes commands.\n"
+                    "Scroll, select and copy the transcript with your terminal.\n",
                     TerminalTone::DIM);
                 continue;
             }

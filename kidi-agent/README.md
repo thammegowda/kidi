@@ -57,9 +57,13 @@ also logs the server at debug level.
 
 ## Shell
 
-The terminal UI (FTXUI) provides line editing, task history, multiline paste, transcript scrolling and a status bar
-with context usage, token speed and prefill time. Piped input, redirected output and `TERM=dumb` use plain line
-input; `-p` runs one task. `--color auto|always|never` controls styling (`auto` respects `NO_COLOR`).
+The shell prints the conversation inline, so your terminal's own scrollback, search, selection and copying work as
+usual. Replies are rendered as Markdown (headings, emphasis, code, lists, quotes and aligned tables) while they stream;
+code blocks keep their exact text for copying. Below the transcript, a small live area shows the streaming reply or
+running tool, the input line and a status bar with context usage, token speed and prefill time. The input supports
+line editing, task history, multiline paste, and Alt-Enter or Ctrl-J for a new line. Piped input, redirected output
+and `TERM=dumb` use plain line input; `-p` runs one task. `--color auto|always|never` controls styling (`auto` respects
+`NO_COLOR`; without color, replies are printed as raw Markdown).
 
 | Command | Action |
 | --- | --- |
