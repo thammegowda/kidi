@@ -9,6 +9,7 @@
 #include "kidi/model/registry.h"
 #include "kidi/ops/context.h"
 #include "kidi/tensor/backend.h"
+#include "kidi/text/response.h"
 #include "kidi/text/tokenizer.h"
 
 #include <algorithm>
@@ -35,9 +36,13 @@ auto host_logits(const tensor::Tensor& logits) -> std::vector<float> {
     return {values.begin(), values.end()};
 }
 
-auto chat_messages(inference::Generator& generator, const nlohmann::ordered_json& messages) -> inference::TextGeneration {
+auto chat_messages(inference::Generator& generator, const nlohmann::ordered_json& messages,
+                   const nlohmann::ordered_json& template_args = nlohmann::ordered_json::object(),
+                   std::size_t maximum_new_tokens = 48) -> inference::TextGeneration {
     const auto id = require(generator.enqueue_chat(
-        messages, {.maximum_new_tokens = 48, .context_size = 512, .prefix_cache_bytes = std::size_t{1} << 30}));
+        messages,
+        {.maximum_new_tokens = maximum_new_tokens, .context_size = 512, .prefix_cache_bytes = std::size_t{1} << 30},
+        template_args));
     while (true)
         for (auto& event : require(generator.step()).events)
             if (event.request_id == id && event.completed) return std::move(*event.completed);
@@ -294,17 +299,84 @@ TEST(Inkling2Test, PrefixReuseFallback) {
         << "prefix reuse changed the answer or reused a non-rewindable prefix";
     std::cout << "prefix fallback: " << reused.text << '\n';
 
-    // A follow-up turn resumes from the previous prompt boundary and matches a full prefill.
+    // A follow-up turn resumes from the previous prompt boundary. Prefill batch sizes differ between the resumed and
+    // full requests, so BF16 rounding may reword the brief thinking trace; the one-word answer must still match.
+    const nlohmann::ordered_json direct{{"reasoning_effort", 0.0}};
+    const auto answer = [&](const nlohmann::ordered_json& messages) {
+        auto result = chat_messages(generator, messages, direct, 160);
+        auto response = text::parse_assistant_response(result.text);
+        return std::pair{std::move(result), std::move(response)};
+    };
     nlohmann::ordered_json turns{{{"role", "system"}, {"content", "Answer in one word."}},
                                  {{"role", "user"}, {"content", "What color is the sky?"}}};
-    const auto first = chat_messages(generator, turns);
-    turns.push_back({{"role", "assistant"}, {"content", first.text}});
+    const auto [first, first_response] = answer(turns);
+    EXPECT_EQ(first_response.content, "Blue") << first.text;
+    turns.push_back({{"role", "assistant"},
+                     {"content", first_response.content},
+                     {"reasoning_content", first_response.reasoning}});
     turns.push_back({{"role", "user"}, {"content", "And the grass?"}});
-    const auto resumed = chat_messages(generator, turns);
+    const auto [resumed, resumed_response] = answer(turns);
     EXPECT_EQ(resumed.stats.reused_prompt_tokens, first.stats.prompt_tokens);
     (void)chat(generator, "Name a fruit.");
-    const auto full = chat_messages(generator, turns);
+    const auto [full, full_response] = answer(turns);
     EXPECT_EQ(full.stats.reused_prompt_tokens, 0U);
-    EXPECT_EQ(resumed.text, full.text);
+    EXPECT_EQ(resumed_response.content, "Green") << resumed.text;
+    EXPECT_EQ(full_response.content, "Green") << full.text;
+}
+
+TEST(Inkling2Test, CudaReplayMatchesEager) {
+    const auto directory = checkpoint::Hub{}.resolve("@thinkingmachines/Inkling-2-Mini");
+    if (!directory && directory.error().code == ErrorCode::IO) GTEST_SKIP() << directory.error().message;
+    ASSERT_TRUE(directory.has_value()) << directory.error().message;
+    const auto config = require(checkpoint::load_config(*directory));
+    const auto weights = require(checkpoint::Weights::load(config["weights_file"].as<std::string>()));
+    const auto tokenizer = require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));
+    const auto prompt = require(tokenizer.encode("The capital of France is Paris. The capital of Japan is"));
+    const auto continuation = require(tokenizer.encode(" Tokyo is the capital of Japan."));
+
+    const auto run = [&](bool replay) {
+        const auto run_model = [&] {
+            auto model = require(model::create_model_as<model::CausalLanguageModel>(
+                config["model"], {.device = tensor::Device::cuda(), .parameter_dtype = tensor::DType::BF16}));
+            require(model->set_checkpoint(weights));
+            auto state = require(model->create_state(256));
+            std::vector<std::vector<float>> logits;
+            logits.push_back(host_logits(require(model->forward(prompt, *state, true))));
+            for (const auto token : continuation)
+                logits.push_back(host_logits(require(model->forward(std::span(&token, 1), *state))));
+            return logits;
+        };
+        if (replay) return run_model();
+        const ops::EagerScope eager;
+        return run_model();
+    };
+
+    const auto previous = ops::profile_options();
+    auto logged = previous;
+    logged.log_graph_captures = true;
+    ops::set_profile_options(logged);
+    testing::internal::CaptureStderr();
+    const auto captured = run(true);
+    const auto captures = testing::internal::GetCapturedStderr();
+    ops::set_profile_options(previous);
+    ASSERT_NE(captures.find("kidi_cuda_graph|key=inkling2_decode:"), std::string::npos)
+        << "decode steps did not run through a compiled CUDA graph";
+    const auto eager = run(false);
+
+    // Compiled replay fuses projections that share an input; the wider BF16 GEMV may round differently, so logits
+    // need not be bitwise equal, but stale or misbound recurrent state would move them far more.
+    ASSERT_EQ(captured.size(), eager.size());
+    for (std::size_t row = 0; row < captured.size(); ++row) {
+        ASSERT_EQ(captured[row].size(), eager[row].size());
+        double squared_error = 0, squared_reference = 0;
+        for (std::size_t column = 0; column < captured[row].size(); ++column) {
+            const double difference = captured[row][column] - eager[row][column];
+            squared_error += difference * difference;
+            squared_reference += static_cast<double>(eager[row][column]) * eager[row][column];
+        }
+        const auto relative_error = std::sqrt(squared_error / squared_reference);
+        EXPECT_LT(relative_error, 0.05) << "logit row " << row;
+        EXPECT_EQ(argmax(captured[row]), argmax(eager[row])) << "logit row " << row;
+    }
 }
 } // namespace

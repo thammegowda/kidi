@@ -115,6 +115,8 @@ jobs:
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: |
+          # The runner image's preinstalled Microsoft apt source can reject requests and fail the update.
+          grep -rlZ packages.microsoft.com /etc/apt/sources.list.d | xargs -0r sudo rm -f
           sudo apt-get update
           sudo apt-get install -y ninja-build ccache gcc-14 g++-14
 
