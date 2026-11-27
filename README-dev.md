@@ -432,6 +432,11 @@ Adding an architecture requires its model implementation, weight mappings and
 applicable checkpoint hooks. Gemma, Whisper, OmniVoice and RTG are examples, not automatic
 support for arbitrary Hugging Face architectures.
 
+The shared CPU/CUDA block-scaled projection API accepts configurable groups (including 32/64/128),
+optional global scales, and separate E2M1 FP4, E4M3 FP8, and symmetric signed INT4 encodings.
+Native byte-scale formats retain their checkpoint semantics; floating scales are also supported.
+CUDA BF16 symmetric INT4 projections with device-resident parameters reuse these kernels.
+
 - [ARCHITECTURE.md](ARCHITECTURE.md): ownership, execution, state and backend contracts.
 - [CODING_GUIDELINES.md](CODING_GUIDELINES.md): APIs, naming, formatting and testing rules.
 - [Manual model setup](docs/getting-started.md#optional-manual-setup): configuration and converter entry points.
