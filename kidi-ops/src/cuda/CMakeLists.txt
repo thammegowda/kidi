@@ -4,6 +4,17 @@ endif()
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
     set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "Target CUDA architectures")
 endif()
+# NVIDIA's Linux packages install the toolkit under /usr/local/cuda (a symlink to the active version) without adding
+# its bin directory to PATH. CMAKE_CUDA_COMPILER, CUDACXX and nvcc on PATH take precedence.
+set(KIDI_CUDA_ROOT "/usr/local/cuda" CACHE PATH "CUDA toolkit searched when nvcc is not on PATH")
+if(NOT CMAKE_CUDA_COMPILER AND "$ENV{CUDACXX}" STREQUAL "")
+    find_program(KIDI_CUDA_NVCC nvcc PATHS "${KIDI_CUDA_ROOT}/bin" NO_CACHE)
+    if(NOT KIDI_CUDA_NVCC)
+        message(FATAL_ERROR "nvcc is not on PATH or in ${KIDI_CUDA_ROOT}/bin; install the CUDA 13+ toolkit or set "
+                            "KIDI_CUDA_ROOT")
+    endif()
+    set(CMAKE_CUDA_COMPILER "${KIDI_CUDA_NVCC}" CACHE FILEPATH "CUDA compiler" FORCE)
+endif()
 enable_language(CUDA)
 find_package(CUDAToolkit 13 REQUIRED)
 

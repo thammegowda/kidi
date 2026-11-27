@@ -86,8 +86,12 @@ runtime memory must be measured separately from artifact size.
 ### CUDA
 
 The optional NVIDIA backend requires Linux, the CUDA 13+ toolkit, and a
-compatible GPU. From an initialized checkout, build the standalone portable
-static CUDA CLI (`build-release-cuda/kidi`):
+compatible GPU. CMake uses `CUDACXX` or `nvcc` from `PATH`, else
+`$KIDI_CUDA_ROOT/bin/nvcc`; `KIDI_CUDA_ROOT` defaults to `/usr/local/cuda`, where NVIDIA's
+packages install the toolkit, and Make goals also append its `bin` (nvcc and tools) to
+`PATH`. The CUDA presets target Ampere and newer (`80-real;90`); on hosts that also have
+older GPUs, hide them with `CUDA_VISIBLE_DEVICES`. From an initialized checkout, build
+the standalone portable static CUDA CLI (`build-release-cuda/kidi`):
 
 ```bash
 make release-cuda

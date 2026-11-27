@@ -380,7 +380,8 @@ void check_nonbroadcast_causal_attention(int device, bool per_key) {
 }
 
 // Prefill-sized causal and sliding-window attention with position masks, including a later chunk whose queries start
-// partway into the cache, against the scalar reference.
+// partway into the cache, against the scalar reference. The 4-query chunk is too small for FA2 on any GPU, so it
+// covers the fallback kernel with a key offset.
 void check_structured_prefill_attention(int device) {
     using namespace kidi::cuda;
     using Buffer = std::unique_ptr<void, decltype(&release)>;
@@ -389,10 +390,14 @@ void check_structured_prefill_attention(int device) {
         std::int64_t first, window, offset = 0, batches = 1, heads = 8, key_heads = 2;
         bool bfloat_io = false, masked = true;
     };
-    const Case cases[]{{0, 0}, {0, 128}, {190, 0}, {190, 128},
+    const Case cases[]{{0, 0},
+                       {0, 128},
+                       {190, 0},
+                       {190, 128},
                        {0, 0, 64, 2, 6, 2, true, false},
                        {190, 128, 64, 2, 6, 2, true},
-                       {-65, 128, 64, 2}};
+                       {-65, 128, 64, 2},
+                       {296, 128, 64}};
     const auto bfloat = [](float number) {
         std::uint32_t bits = 0;
         std::memcpy(&bits, &number, sizeof(bits));
@@ -1290,6 +1295,21 @@ TEST_F(CudaRuntimeTest, RejectsInvalidDevices) {
     using namespace kidi::cuda;
     EXPECT_FALSE(available(-1)) << "CUDA invalid device accepted";
     EXPECT_FALSE(available(device_count())) << "CUDA invalid device accepted";
+}
+
+void host_entry() {}
+
+// Callers fall back to smaller kernels when an opt-in is refused, so it must not leave an error for the next launch
+// check (FlashAttention tiles exceed the ~99 KiB limit of sm_86 GPUs).
+TEST_F(CudaRuntimeTest, RefusedSharedMemoryLeavesNoPendingError) {
+    on_each_device([](int device) {
+        const kidi::cuda::DeviceScope scope(device);
+        int limit = 0;
+        ASSERT_EQ(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device), cudaSuccess);
+        (void)cudaGetLastError();
+        EXPECT_NE(kidi::cuda::allow_shared_memory<&host_entry>(limit + 1, nullptr), cudaSuccess);
+        EXPECT_EQ(cudaGetLastError(), cudaSuccess);
+    });
 }
 
 TEST_F(CudaRuntimeTest, BfloatBias) { on_each_device(check_bfloat_bias); }

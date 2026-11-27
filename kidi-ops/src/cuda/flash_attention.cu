@@ -217,8 +217,11 @@ __global__ void __launch_bounds__(kThreads)
                             static_cast<std::size_t>(batch) * m_s0 + static_cast<std::size_t>(h_idx) * m_s1 +
                             static_cast<std::size_t>(q_idx) * m_s2 + static_cast<std::size_t>(k_idx) * m_s3;
                         if (args.mask.type == 3) {
-                            query_position = min(static_cast<std::int64_t>(static_cast<const std::int32_t*>(mask_ptr)[m_off]),
-                                                 static_cast<std::int64_t>(keys - 1));
+                            // Positions are absolute, so only relative attention clamps them to its last key (as
+                            // FA2 does): with a key offset, `keys - 1` would drop the newest keys.
+                            query_position = static_cast<const std::int32_t*>(mask_ptr)[m_off];
+                            if constexpr (HasRelative)
+                                query_position = min(query_position, static_cast<std::int64_t>(keys - 1));
                             mv = key_position <= query_position &&
                                          (!args.mask_window || query_position - key_position < args.mask_window)
                                      ? 0.F

@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 
 // Numerical compatibility helpers for Kidi's qat-fp32 verification mode; there is no PyTorch or Python runtime

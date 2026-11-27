@@ -8,6 +8,7 @@
 #include "kidi/model/inkling2.h"
 #include "kidi/model/registry.h"
 #include "kidi/ops/context.h"
+#include "kidi/tensor/backend.h"
 #include "kidi/text/tokenizer.h"
 
 #include <algorithm>
@@ -219,6 +220,10 @@ TEST(Inkling2Test, CompactWeightsMatchBfloatReference) {
     const auto directory = checkpoint::Hub{}.resolve("@thinkingmachines/Inkling-2-Mini");
     if (!directory && directory.error().code == ErrorCode::IO) GTEST_SKIP() << directory.error().message;
     ASSERT_TRUE(directory.has_value()) << directory.error().message;
+    // The BF16 reference expands all ~26B parameters (~49 GiB), more than 48 GB GPUs hold.
+    const auto backend = require(tensor::BackendRegistry::instance().backend(tensor::Device::cuda()));
+    if (const auto free = backend->free_memory(tensor::Device::cuda()); free < (std::size_t{56} << 30))
+        GTEST_SKIP() << "the BF16 reference needs 56 GiB of free GPU memory; " << (free >> 30) << " GiB are free";
     const auto config = require(checkpoint::load_config(*directory));
     const auto weights = require(checkpoint::Weights::load(config["weights_file"].as<std::string>()));
     const auto tokenizer = require(text::Tokenizer::load(config["tokenizer_file"].as<std::string>()));

@@ -9,6 +9,8 @@ WEB_DIR ?= build-web
 APP_CONFIG ?= examples/kidi-app.yaml
 APP_PORT ?= 10010
 KIDI_CUTLASS_ROOT ?=
+# CUDA toolkit whose bin directory (nvcc and tools) is appended to PATH, after any nvcc already there.
+KIDI_CUDA_ROOT ?= /usr/local/cuda
 # Parallel CTest jobs: min(cores, 12). GPU tests are further capped at one per GPU (max 8), see cmake/gpu-launch.sh.
 TEST_JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 # Hard ceiling: TEST_JOBS may lower parallelism but never exceed 12 concurrent tests.
@@ -22,7 +24,7 @@ TEST_CUDA := $(if $(filter debug-cuda,$(TEST_PRESET)),ON,OFF)
 TEST_BACKEND := $(if $(filter debug-cuda,$(TEST_PRESET)),cuda,$(KIDI_BACKEND))
 CUDA_CMAKE_ARGS = $(if $(KIDI_CUTLASS_ROOT),-DKIDI_CUTLASS_ROOT="$(abspath $(KIDI_CUTLASS_ROOT))")
 
-export PATH := $(CURDIR)/.cache/tools/bin:$(PATH)
+export PATH := $(CURDIR)/.cache/tools/bin:$(PATH)$(if $(wildcard $(KIDI_CUDA_ROOT)/bin),:$(KIDI_CUDA_ROOT)/bin)
 export KIDI_HUB PYTHON
 
 .PHONY: setup setup-test debug debug-cuda release release-cuda build-test build-python-test prepare-test native-test test-cuda test-all test-all-cuda ynnpack-test python-test web-deps web-test-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
