@@ -238,13 +238,11 @@ mcp_servers:
 
 ## Standalone client
 
-`kidi-agent` connects to a running Kidi server; it does not start one:
+`kidi-agent` connects to a running Kidi server; it does not start one. `make release` builds it beside `kidi`:
 
 ```bash
-cmake -S kidi-agent -B .cache/kidi-agent-build
-cmake --build .cache/kidi-agent-build -j
 kidi serve --model /path/to/checkpoint --port 18097
-.cache/kidi-agent-build/kidi-agent --base-url http://127.0.0.1:18097/v1   # the default URL
+build-release/kidi-agent --base-url http://127.0.0.1:18097/v1   # the default URL
 ```
 
 Use only trusted Kidi endpoints: prompts and tool results are sent unencrypted and without API keys.

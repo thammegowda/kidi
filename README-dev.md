@@ -49,9 +49,7 @@ CLI-only and Python wheel targets do not acquire web packages or require Node.js
 
 The [Kidi agent](kidi-agent/README.md), a local shell for chat and workspace tasks, is enabled by
 default on Linux and macOS. Run `kidi agent` to start or reuse a background Kidi server. The
-native command does not link libcurl. To build the standalone Kidi HTTP
-client independently of inference, use
-`cmake -S kidi-agent -B .cache/kidi-agent-build`.
+native command does not link libcurl. The standalone `kidi-agent` HTTP client is built beside `kidi`.
 Both clients use the shared `/v1/chat/context` route for exact token preflight
 and compact long conversation history automatically. The handoff prompt is
 configured in embedded `kidi-agent/agent.yaml` or an explicit override.
