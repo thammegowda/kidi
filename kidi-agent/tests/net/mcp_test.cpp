@@ -305,6 +305,32 @@ TEST_F(McpSignIn, CachesToolListsForTwelveHours) {
     EXPECT_NE(notices.back().find("using the list from 13 hours ago"), std::string::npos);
 }
 
+// Every agent process opens its own store on the same file; concurrent sign-ins must not overwrite each other.
+TEST(CredentialStore, ConcurrentWritersKeepEveryEntry) {
+    const auto path = std::filesystem::temp_directory_path() / ("kidi-credentials-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(path);
+    const auto file = path / "credentials.json";
+    {
+        std::vector<std::jthread> writers;
+        for (int writer = 0; writer < 4; ++writer)
+            writers.emplace_back([&file, writer] {
+                CredentialStore store(file);
+                for (int index = 0; index < 25; ++index)
+                    ASSERT_TRUE(store.put(std::to_string(writer) + "-" + std::to_string(index), {{"token", index}}));
+            });
+    }
+    const CredentialStore store(file);
+    for (int writer = 0; writer < 4; ++writer)
+        for (int index = 0; index < 25; ++index)
+            EXPECT_TRUE(store.get(std::to_string(writer) + "-" + std::to_string(index))) << writer << "-" << index;
+    std::size_t leftovers = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(path))
+        leftovers += entry.path().filename() != "credentials.json" &&
+                     entry.path().filename() != "credentials.json.lock";
+    EXPECT_EQ(leftovers, 0) << "no temporary files are left behind";
+    std::filesystem::remove_all(path);
+}
+
 // The terminal's sign-in: the browser returns to a temporary listener on 127.0.0.1, which needs no cookie.
 TEST(LoopbackSignIn, ReceivesTheBrowsersReturn) {
     int shown_port = 0;

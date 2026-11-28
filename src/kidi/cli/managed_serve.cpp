@@ -3,6 +3,7 @@
 
 #include "kidi/checkpoint/hub.h"
 #include "kidi/cli/log.h"
+#include "kidi/core/files.h"
 #include "kidi/agent/chat/transport.h"
 #include "kidi/inference/decoder.h"
 #include "kidi/server/routes.h"
@@ -22,7 +23,6 @@
 #include <utility>
 #include <vector>
 #include <fcntl.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -60,9 +60,9 @@ private:
 };
 
 struct ClientLease {
-    File file;
+    core::LockFile file;
     ~ClientLease() {
-        if (futimens(file.get(), nullptr) < 0) log::error("cannot record managed server session end");
+        if (futimens(file.native_handle(), nullptr) < 0) log::error("cannot record managed server session end");
     }
 };
 
@@ -81,17 +81,22 @@ auto open_file(const fs::path& path, int flags) -> File {
     return File(copy);
 }
 
-auto unlock(int fd) -> void {
-    while (flock(fd, LOCK_UN) < 0)
-        if (errno != EINTR) fail_io("cannot unlock managed server state");
+// Lock files coordinate clients and the background server across processes; failing to use one is fatal here.
+auto open_lock(const fs::path& path, bool create) -> core::LockFile {
+    auto file = core::LockFile::open(path, create);
+    if (!file) throw std::runtime_error(file.error().message);
+    return std::move(*file);
 }
 
-auto try_lock(const File& file, int operation) -> bool {
-    while (flock(file.get(), operation | LOCK_NB) < 0) {
-        if (errno == EWOULDBLOCK) return false;
-        if (errno != EINTR) fail_io("cannot lock managed server state");
-    }
-    return true;
+auto try_lock(core::LockFile& file, core::LockFile::Mode mode) -> bool {
+    auto locked = file.try_lock(mode);
+    if (!locked) throw std::runtime_error("managed server state: " + locked.error().message);
+    return *locked;
+}
+
+auto unlock(core::LockFile& file) -> void {
+    if (auto unlocked = file.unlock(); !unlocked)
+        throw std::runtime_error("managed server state: " + unlocked.error().message);
 }
 
 auto private_directory(const fs::path& path, bool create) -> bool {
@@ -143,7 +148,7 @@ auto effective_precision(const Namespace& arguments, const std::string& model) -
     return "checkpoint";
 }
 
-auto start_server(const std::vector<std::string>& launch, const fs::path& dir, const File& startup,
+auto start_server(const std::vector<std::string>& launch, const fs::path& dir, const core::LockFile& startup,
                   const std::string& model, const fs::path& cache, const Namespace& arguments) -> void {
     const auto log = open_file(dir / "serve.log", O_WRONLY | O_CREAT | O_TRUNC);
     const auto input = open_file("/dev/null", O_RDONLY);
@@ -163,7 +168,7 @@ auto start_server(const std::vector<std::string>& launch, const fs::path& dir, c
         "--cache-tokens=" + std::to_string(cache_tokens),
         arguments.get<bool>("prompt_lookup") ? "--max-active=1" : "--max-active=2",
         "--managed-dir=" + dir.string(),
-        "--managed-lock-fd=" + std::to_string(startup.get()),
+        "--managed-lock-fd=" + std::to_string(startup.native_handle()),
     };
     flags.insert(flags.begin(), launch.begin(), launch.end());
     if (arguments.get<bool>("prompt_lookup")) {
@@ -187,7 +192,7 @@ auto start_server(const std::vector<std::string>& launch, const fs::path& dir, c
         sigemptyset(&none);
         sigprocmask(SIG_SETMASK, &none, nullptr);
         if (dup2(input.get(), STDIN_FILENO) < 0 || dup2(log.get(), STDOUT_FILENO) < 0 ||
-            dup2(log.get(), STDERR_FILENO) < 0 || fcntl(startup.get(), F_SETFD, 0) < 0)
+            dup2(log.get(), STDERR_FILENO) < 0 || fcntl(startup.native_handle(), F_SETFD, 0) < 0)
             _exit(1);
         execv(argv[0], argv.data());
         constexpr char message[] = "cannot exec kidi serve\n";
@@ -267,9 +272,10 @@ auto stop_idle_servers(const fs::path& keep) -> void {
         if (dir == keep || !private_directory(dir, false) || !fs::exists(dir / STATE_NAME, error) ||
             !fs::exists(dir / "clients.lock", error))
             continue;
-        const auto clients = open_file(dir / "clients.lock", O_RDWR);
-        const auto startup = open_file(dir / "server.lock", O_RDWR | O_CREAT);
-        if (!try_lock(clients, LOCK_EX) || !try_lock(startup, LOCK_EX)) continue;
+        auto clients = open_lock(dir / "clients.lock", false);
+        auto startup = open_lock(dir / "server.lock", true);
+        if (!try_lock(clients, core::LockFile::Mode::EXCLUSIVE) || !try_lock(startup, core::LockFile::Mode::EXCLUSIVE))
+            continue;
         if (auto stopped = stop_server(dir); !stopped) {
             log::error("{}", stopped.error().message);
             continue;
@@ -285,8 +291,8 @@ auto ensure_server(const std::vector<std::string>& launch, const fs::path& dir, 
     const auto deadline = Clock::now() + 30min;
     while (Clock::now() < deadline) {
         {
-            const auto startup = open_file(dir / "server.lock", O_RDWR | O_CREAT);
-            if (try_lock(startup, LOCK_EX)) {
+            auto startup = open_lock(dir / "server.lock", true);
+            if (try_lock(startup, core::LockFile::Mode::EXCLUSIVE)) {
                 if (std::exchange(restart, false))
                     if (auto stopped = stop_server(dir); !stopped) return std::unexpected(stopped.error());
                 if (const auto endpoint = read_endpoint(state); endpoint && accessible(*endpoint)) return *endpoint;
@@ -333,14 +339,14 @@ auto managed_provider(agent::chat::ChatClientOptions options, const Namespace& a
             .dump();
     const auto dir = runtime_directory() / std::to_string(std::hash<std::string>{}(identity));
     if (!private_directory(dir, true)) throw std::runtime_error("not a private directory: " + dir.string());
-    auto lease = std::make_shared<ClientLease>(open_file(dir / "clients.lock", O_RDWR | O_CREAT));
+    auto lease = std::make_shared<ClientLease>(open_lock(dir / "clients.lock", true));
     const auto deadline = Clock::now() + IDLE_TIMEOUT;
-    while (!try_lock(lease->file, LOCK_SH)) {
+    while (!try_lock(lease->file, core::LockFile::Mode::SHARED)) {
         if (Clock::now() >= deadline)
             return std::unexpected(Error{ErrorCode::IO, "background inference did not finish shutting down"});
         std::this_thread::sleep_for(POLL_INTERVAL);
     }
-    if (futimens(lease->file.get(), nullptr) < 0) fail_io("cannot record managed server session start");
+    if (futimens(lease->file.native_handle(), nullptr) < 0) fail_io("cannot record managed server session start");
     auto endpoint = ensure_server(launch, dir, options.model, cache, arguments, arguments.get<bool>("restart"));
     if (!endpoint) return std::unexpected(endpoint.error());
     options.base_url = "http://127.0.0.1:" + std::to_string(endpoint->port) + "/v1";
@@ -453,9 +459,9 @@ auto serve_managed(inference::Generator& generator, tensor::Device device, Serve
     const auto& dir = arguments.get<fs::path>("managed_dir");
     const auto state = dir / STATE_NAME;
     const auto pid = getpid();
-    const File startup(arguments.get<int>("managed_lock_fd"));
+    auto startup = core::LockFile::adopt(arguments.get<int>("managed_lock_fd"));
     const auto clients = dir / "clients.lock";
-    const auto lease = open_file(clients, O_RDWR);
+    auto lease = open_lock(clients, false);
     // Agent histories carry tool output and images; this bounds one request body, not the model context.
     auto http = liteapp::HttpServer::create({.max_body_bytes = 64U * 1024U * 1024U});
     if (!http) {
@@ -478,13 +484,10 @@ auto serve_managed(inference::Generator& generator, tensor::Device device, Serve
         log::error("cannot start managed server: {}", running.error().message);
         return 1;
     }
-    const auto staging = dir / ("server." + std::to_string(pid) + ".tmp");
-    std::ofstream out(staging, std::ios::trunc);
-    out << agent::Json{{"port", *port}, {"pid", pid}}.dump() << '\n';
-    out.close();
-    if (!out) throw std::runtime_error("cannot write managed server state: " + staging.string());
-    fs::rename(staging, state);
-    unlock(startup.get());
+    if (auto written = core::write_atomic(state, agent::Json{{"port", *port}, {"pid", pid}}.dump() + '\n');
+        !written)
+        throw std::runtime_error("cannot write managed server state: " + written.error().message);
+    unlock(startup);
     log::info("serving {} on http://127.0.0.1:{}/v1 (PID {}); state: {}", options.model_name, *port, pid,
               state.string());
 
@@ -501,7 +504,7 @@ auto serve_managed(inference::Generator& generator, tensor::Device device, Serve
                 std::this_thread::sleep_for(IDLE_POLL_INTERVAL);
                 if (stop.stop_requested()) return;
                 if (!owns_state()) break;
-                if (try_lock(lease, LOCK_EX)) {
+                if (try_lock(lease, core::LockFile::Mode::EXCLUSIVE)) {
                     // The file timestamp also captures sessions shorter than the polling interval.
                     const auto released = fs::last_write_time(clients);
                     if (had_clients || released != last_release) {
@@ -510,12 +513,12 @@ auto serve_managed(inference::Generator& generator, tensor::Device device, Serve
                     }
                     had_clients = false;
                     if (Clock::now() - last_client >= IDLE_TIMEOUT) break;
-                    unlock(lease.get());
+                    unlock(lease);
                 } else {
                     had_clients = true;
                 }
             }
-        } catch (const std::system_error& error) {
+        } catch (const std::exception& error) {
             log::error("managed server idle check: {}", error.what());
         }
         http->stop();
@@ -523,7 +526,7 @@ auto serve_managed(inference::Generator& generator, tensor::Device device, Serve
     const auto listened = running->wait();
     idle.request_stop();
     idle.join();
-    if (try_lock(startup, LOCK_EX) && owns_state()) fs::remove(state);
+    if (try_lock(startup, core::LockFile::Mode::EXCLUSIVE) && owns_state()) fs::remove(state);
     if (listened) return 0;
     log::error("managed server listener failed: {}", listened.error().message);
     return 1;

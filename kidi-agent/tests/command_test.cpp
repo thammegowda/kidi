@@ -691,11 +691,13 @@ TEST_F(AgentSessionTest, ListsAndResumesTranscripts) {
     ASSERT_EQ(sessions->size(), 1);
     EXPECT_EQ(sessions->front().title, "first");
     EXPECT_EQ(sessions->front().messages, 4);
-    // A tool call interrupted before its result is dropped on resume.
+    // A tool call interrupted before its result is dropped on resume, and a record cut off by a crash is repaired so
+    // the next one is kept.
     std::ofstream(sessions->front().path, std::ios::app)
         << R"({"type":"message","role":"user","content":"third"})" << '\n'
         << R"({"type":"message","role":"assistant","content":"","tool_calls":[{"id":"x","name":"run_command",)"
-        << R"("arguments":{"command":"true"}}]})" << '\n';
+        << R"("arguments":{"command":"true"}}]})" << '\n'
+        << R"({"type":"message","role":"user","content":"cut of)";
     {
         AgentSession resumed(options, {});
         ASSERT_TRUE(resumed.resume(sessions->front().path));
@@ -718,8 +720,8 @@ TEST_F(AgentSessionTest, SendsResumesAndRefusesImages) {
     bool vision = true;
     std::vector<Json> completions;
     const auto provider = [&](chat::ChatClientOptions options) -> Result<Provider> {
-        return completion_provider(std::move(options), [&](const chat::ChatClientOptions&, std::string payload,
-                                                           std::stop_token, std::string_view route) -> Result<std::string> {
+        const auto complete = [&](const chat::ChatClientOptions&, std::string payload, std::stop_token,
+                                  std::string_view route) -> Result<std::string> {
             auto request = Json::parse(payload);
             if (!vision && request.dump().find("image_url") != std::string::npos)
                 return std::unexpected(Error{ErrorCode::RUNTIME, "no vision tower"});
@@ -727,7 +729,8 @@ TEST_F(AgentSessionTest, SendsResumesAndRefusesImages) {
             completions.push_back(std::move(request));
             return std::string(
                 R"({"choices":[{"message":{"role":"assistant","content":"a flame"},"finish_reason":"stop"}]})");
-        });
+        };
+        return completion_provider(std::move(options), complete);
     };
     const SessionOptions options{
         .chat = {.model = "test"}, .system_prompt = "system", .workspace = root, .create_provider = provider};

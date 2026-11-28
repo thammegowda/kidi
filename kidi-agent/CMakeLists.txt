@@ -34,6 +34,14 @@ if(NOT TARGET liteapp::workspace)
     add_subdirectory("${KIDI_AGENT_ROOT}/third_party/liteapp" "${CMAKE_CURRENT_BINARY_DIR}/liteapp" EXCLUDE_FROM_ALL)
 endif()
 
+# Built by Kidi's own CMakeLists when the agent is part of the Kidi build.
+if(NOT TARGET kidi::files)
+    add_library(kidi_files STATIC "${KIDI_AGENT_ROOT}/src/kidi/core/files.cpp")
+    add_library(kidi::files ALIAS kidi_files)
+    target_include_directories(kidi_files PUBLIC "${KIDI_AGENT_ROOT}/src")
+    target_compile_features(kidi_files PUBLIC cxx_std_23)
+endif()
+
 add_library(kidi_agent
     src/kidi/agent/agent.cpp
     src/kidi/agent/config.cpp
@@ -51,7 +59,7 @@ add_library(kidi::agent ALIAS kidi_agent)
 target_compile_features(kidi_agent PUBLIC cxx_std_23)
 target_include_directories(kidi_agent PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src" "${KIDI_AGENT_ROOT}/src")
 target_include_directories(kidi_agent PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(kidi_agent PUBLIC nlohmann_json::nlohmann_json PRIVATE yaml-cpp::yaml-cpp liteapp::workspace)
+target_link_libraries(kidi_agent PUBLIC nlohmann_json::nlohmann_json PRIVATE yaml-cpp::yaml-cpp liteapp::workspace kidi::files)
 
 add_library(kidi_agent_http src/kidi/agent/chat/http.cpp)
 add_library(kidi::agent_http ALIAS kidi_agent_http)

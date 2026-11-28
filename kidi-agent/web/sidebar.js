@@ -68,9 +68,10 @@ export async function refreshSessions() {
       return;
     }
     sessionsList.replaceChildren(...sessions.map(session => {
-      const row = element('div', 'session-row' + (session.current ? ' current' : ''));
-      row.append(element('div', 'session-title', session.title || '(untitled)'),
-        element('div', 'session-meta', `${age(session.time_ns)} · ${session.messages} messages`));
+      const row = element('button', 'session-row' + (session.current ? ' current' : ''));
+      row.type = 'button';
+      row.append(element('span', 'session-title', session.title || '(untitled)'),
+        element('span', 'session-meta', `${age(session.time_ns)} · ${session.messages} messages`));
       row.addEventListener('click', async () => {
         try {
           const {messages} = await call('sessions.open', {id: session.id});

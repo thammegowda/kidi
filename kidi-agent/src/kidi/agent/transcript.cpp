@@ -5,6 +5,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <array>
+#include <cstdio>
+#include <optional>
+#include <string_view>
 #include <sstream>
 #include <utility>
 
@@ -18,6 +22,22 @@ auto io_error(std::string message) -> std::unexpected<Error> {
 auto timestamp() -> std::int64_t {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+// The length of `file` up to and including its last newline, found by reading backwards from `size`.
+auto complete_length(std::FILE* file, std::uintmax_t size) -> std::optional<std::uintmax_t> {
+    std::array<char, 65536> block;
+    for (auto end = size; end > 0;) {
+        const auto start = end > block.size() ? end - block.size() : 0;
+        const auto count = static_cast<std::size_t>(end - start);
+        if (::fseeko(file, static_cast<off_t>(start), SEEK_SET) != 0 ||
+            std::fread(block.data(), 1, count, file) != count)
+            return std::nullopt;
+        if (const auto newline = std::string_view(block.data(), count).rfind('\n'); newline != std::string_view::npos)
+            return start + newline + 1;
+        end = start;
+    }
+    return 0;
 }
 
 } // namespace
@@ -106,6 +126,17 @@ auto Transcript::open(const std::filesystem::path& workspace, std::string_view m
 }
 
 auto Transcript::reopen(const std::filesystem::path& path) -> Result<Transcript> {
+    // A crash can leave a cut-off last record; drop it so the next record starts on a line of its own.
+    {
+        std::unique_ptr<std::FILE, CloseFile> file(std::fopen(path.string().c_str(), "r"));
+        std::error_code error;
+        const auto size = std::filesystem::file_size(path, error);
+        if (!file || error) return io_error("read " + path.string());
+        const auto complete = complete_length(file.get(), size);
+        if (!complete) return io_error("read " + path.string() + ": " + std::strerror(errno));
+        if (*complete != size) std::filesystem::resize_file(path, *complete, error);
+        if (error) return io_error("repair " + path.string() + ": " + error.message());
+    }
     Transcript result;
     result.path_ = path;
     result.file_.reset(std::fopen(path.string().c_str(), "a"));

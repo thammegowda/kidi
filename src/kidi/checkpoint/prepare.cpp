@@ -8,44 +8,11 @@
 #include <random>
 #include <nlohmann/json.hpp>
 
-#if defined(__unix__) || defined(__APPLE__)
-#include <cerrno>
-#include <cstring>
-#include <fcntl.h>
-#include <sys/file.h>
-#include <unistd.h>
-#endif
-
+#include "kidi/core/files.h"
 #include "kidi/ops/context.h"
 
 namespace kidi::checkpoint {
 using ops::require;
-
-namespace {
-#if defined(__unix__) || defined(__APPLE__)
-class PreparationLock {
-public:
-    explicit PreparationLock(const std::filesystem::path& path) {
-        descriptor_ = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-        if (descriptor_ >= 0) {
-            int result;
-            do { result = ::flock(descriptor_, LOCK_EX); } while (result < 0 && errno == EINTR);
-            if (result == 0) return;
-            const auto error = errno;
-            ::close(descriptor_);
-            errno = error;
-        }
-        throw ops::Failure({ErrorCode::IO, "cannot lock checkpoint cache: " + std::string(std::strerror(errno))});
-    }
-    ~PreparationLock() { ::close(descriptor_); }
-    PreparationLock(const PreparationLock&) = delete;
-    auto operator=(const PreparationLock&) -> PreparationLock& = delete;
-
-private:
-    int descriptor_ = -1;
-};
-#endif
-} // namespace
 
 auto prepare(const std::filesystem::path& path, PreparationHook customize) -> Result<std::filesystem::path> {
     static std::mutex conversion_mutex;
@@ -90,9 +57,9 @@ auto prepare(const std::filesystem::path& path, PreparationHook customize) -> Re
             }
         };
         if (valid()) return destination;
-#if defined(__unix__) || defined(__APPLE__)
-        const PreparationLock process_lock(root / ("." + cache_name.string() + ".lock"));
-#endif
+        // Another process may be converting the same checkpoint; wait for it rather than converting twice.
+        auto process_lock = require(core::LockFile::open(root / ("." + cache_name.string() + ".lock")));
+        require(process_lock.lock());
         if (valid()) return destination;
         if (std::filesystem::exists(destination)) {
             std::cerr << "kidi_checkpoint_cache|path=" << destination << "|action=rebuild|reason=stale_or_incomplete\n";

@@ -7,6 +7,10 @@ const strip = document.getElementById('attachments');
 const input = document.getElementById('attach-input');
 let images = [];
 let onError = () => {};
+// Additions run one at a time so the limit holds; sending a message starts a new batch generation, which stops
+// conversions still running for the sent message from attaching to the next one.
+let queue = Promise.resolve();
+let generation = 0;
 
 function render() {
   strip.replaceChildren(...images.map((url, index) => {
@@ -29,12 +33,21 @@ function render() {
   strip.hidden = !images.length;
 }
 
-export async function addImages(files) {
+export function addImages(files) {
+  const batch = generation;
+  queue = queue.then(() => addBatch([...files], batch));
+  return queue;
+}
+
+async function addBatch(files, batch) {
   for (const file of files) {
+    if (batch !== generation) return;
     if (!file.type.startsWith('image/')) continue;
     if (images.length >= MAX_IMAGES) return onError(`Attach at most ${MAX_IMAGES} images.`);
     try {
-      images.push(await blobToDataUrl(await prepareImage(file)));
+      const url = await blobToDataUrl(await prepareImage(file));
+      if (batch !== generation) return;
+      images.push(url);
     } catch {
       onError(`Cannot read ${file.name || 'the image'}.`);
     }
@@ -46,6 +59,7 @@ export async function addImages(files) {
 export function takeImages() {
   const taken = images;
   images = [];
+  generation += 1;
   render();
   return taken;
 }

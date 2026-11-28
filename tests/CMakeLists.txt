@@ -81,6 +81,7 @@ function(kidi_add_test target source)
 endfunction()
 
 kidi_add_test(kidi_argparse_test tests/kidi/cli/argparse_test.cpp STANDALONE LINK kidi::argparse)
+kidi_add_test(kidi_files_test tests/kidi/core/files_test.cpp STANDALONE LINK kidi::files)
 if(TARGET kidi::agent)
     kidi_add_test(kidi_agent_test kidi-agent/tests/agent_test.cpp STANDALONE LINK kidi::agent)
     target_sources(kidi_agent_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-agent/tests/tools/workspace_test.cpp")

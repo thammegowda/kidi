@@ -3,7 +3,7 @@
 #include "kidi/agent/agent.h"
 
 #include <filesystem>
-#include <mutex>
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -21,11 +21,12 @@ public:
     auto erase(const std::string& key) -> Result<void>;
 
 private:
+    static auto parse(std::string_view text) -> Json;
     auto load() const -> Json;
-    auto save(const Json& entries) -> Result<void>;
+    // Applies `change` to the stored entries under a lock shared by all processes; saves when it returns true.
+    auto update(const std::function<bool(Json&)>& change) -> Result<void>;
 
     std::filesystem::path path_;
-    mutable std::mutex mutex_;
 };
 
 } // namespace kidi::agent::net

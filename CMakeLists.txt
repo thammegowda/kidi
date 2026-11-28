@@ -147,6 +147,13 @@ add_library(kidi
 )
 add_library(kidi::kidi ALIAS kidi)
 
+# Cross-process file locks and atomic file replacement, shared by the engine and kidi-agent.
+add_library(kidi_files STATIC src/kidi/core/files.cpp)
+add_library(kidi::files ALIAS kidi_files)
+target_include_directories(kidi_files PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_features(kidi_files PUBLIC cxx_std_23)
+target_link_libraries(kidi PRIVATE kidi::files)
+
 if(EMSCRIPTEN)
     if(KIDI_WASM_WEBGPU)
         target_sources(kidi PRIVATE src/kidi/tensor/web_gpu_backend.cpp src/kidi/runtime/webgpu/operators.cpp)
