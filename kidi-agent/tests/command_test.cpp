@@ -1,5 +1,7 @@
+#include "kidi/agent/chat_transport.h"
 #include "kidi/agent/command.h"
 #include "kidi/agent/markdown.h"
+#include "kidi/agent/session.h"
 #include "kidi/agent/terminal.h"
 #include "kidi/agent/transcript.h"
 
@@ -12,6 +14,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <optional>
 #include <fstream>
 #include <signal.h>
 #include <sys/ioctl.h>
@@ -639,6 +642,114 @@ TEST(TerminalMarkdown, Widths) {
     EXPECT_EQ(display_width("\033[1mab\033[0m\xe4\xb8\xad"), 4);
     EXPECT_EQ(fit_width("abcdef", 4), "abc…");
     EXPECT_EQ(wrap_width("\033[1mabcd\033[0m", 2), (std::vector<std::string>{"\033[1mab\033[0m", "\033[1mcd\033[0m"}));
+}
+
+// A temporary workspace with XDG_CACHE_HOME inside it; TearDown restores the variable even after a failed ASSERT.
+class AgentSessionTest : public testing::Test {
+protected:
+    std::filesystem::path root;
+    std::optional<std::string> saved_cache_home;
+
+    auto SetUp() -> void override {
+        char path[] = "/tmp/kidi-session-test-XXXXXX";
+        ASSERT_NE(::mkdtemp(path), nullptr);
+        root = path;
+        if (const auto* previous = std::getenv("XDG_CACHE_HOME")) saved_cache_home = previous;
+        ::setenv("XDG_CACHE_HOME", (root / "cache").c_str(), 1);
+    }
+
+    auto TearDown() -> void override {
+        if (saved_cache_home)
+            ::setenv("XDG_CACHE_HOME", saved_cache_home->c_str(), 1);
+        else
+            ::unsetenv("XDG_CACHE_HOME");
+        if (!root.empty()) std::filesystem::remove_all(root);
+    }
+};
+
+TEST_F(AgentSessionTest, ListsAndResumesTranscripts) {
+    const SessionOptions options{.chat = {.model = "test"},
+                                 .system_prompt = "system",
+                                 .workspace = root,
+                                 .mode = "ask",
+                                 .create_provider = test_provider};
+    {
+        AgentSession session(options, {});
+        ASSERT_TRUE(session.run("first"));
+        ASSERT_TRUE(session.reset());
+        ASSERT_TRUE(session.run("second"));
+    }
+    auto sessions = list_sessions(root);
+    ASSERT_TRUE(sessions);
+    ASSERT_EQ(sessions->size(), 1);
+    EXPECT_EQ(sessions->front().title, "first");
+    EXPECT_EQ(sessions->front().messages, 4);
+    // A tool call interrupted before its result is dropped on resume.
+    std::ofstream(sessions->front().path, std::ios::app)
+        << R"({"type":"message","role":"user","content":"third"})" << '\n'
+        << R"({"type":"message","role":"assistant","content":"","tool_calls":[{"id":"x","name":"run_command",)"
+        << R"("arguments":{"command":"true"}}]})" << '\n';
+    {
+        AgentSession resumed(options, {});
+        ASSERT_TRUE(resumed.resume(sessions->front().path));
+        const auto& history = resumed.history();
+        ASSERT_EQ(history.size(), 4) << "the reset dropped the first exchange";
+        EXPECT_EQ(history[1].content, "second");
+        EXPECT_EQ(history[2].content, "echo: second");
+        EXPECT_EQ(history[3].content, "third");
+        ASSERT_TRUE(resumed.run("fourth"));
+        EXPECT_EQ(resumed.transcript_path(), sessions->front().path);
+        EXPECT_FALSE(resumed.resume(root / "elsewhere.jsonl"));
+    }
+    sessions = list_sessions(root);
+    ASSERT_TRUE(sessions);
+    ASSERT_EQ(sessions->size(), 1) << "a resumed conversation appends to its own transcript";
+    EXPECT_EQ(sessions->front().messages, 8);
+}
+
+TEST_F(AgentSessionTest, SendsResumesAndRefusesImages) {
+    bool vision = true;
+    std::vector<Json> completions;
+    const auto provider = [&](ChatClientOptions chat) -> Result<Provider> {
+        return completion_provider(std::move(chat), [&](const ChatClientOptions&, std::string payload, std::stop_token,
+                                                         std::string_view route) -> Result<std::string> {
+            auto request = Json::parse(payload);
+            if (!vision && request.dump().find("image_url") != std::string::npos)
+                return std::unexpected(Error{ErrorCode::RUNTIME, "no vision tower"});
+            if (route == "/chat/context") return std::string(R"({"prompt_tokens":1,"context_tokens":4096})");
+            completions.push_back(std::move(request));
+            return std::string(
+                R"({"choices":[{"message":{"role":"assistant","content":"a flame"},"finish_reason":"stop"}]})");
+        });
+    };
+    const SessionOptions options{
+        .chat = {.model = "test"}, .system_prompt = "system", .workspace = root, .create_provider = provider};
+    const std::string image = "data:image/png;base64,iVBORw0KGgo=";
+    {
+        AgentSession session(options, {});
+        ASSERT_TRUE(session.run("what is this?", {image}));
+        ASSERT_EQ(completions.size(), 1);
+        const auto& content = completions[0]["messages"][1]["content"];
+        ASSERT_TRUE(content.is_array());
+        EXPECT_EQ(content[0], (Json{{"type", "text"}, {"text", "what is this?"}}));
+        EXPECT_EQ(content[1]["image_url"]["url"], image);
+    }
+    auto sessions = list_sessions(root);
+    ASSERT_TRUE(sessions);
+    ASSERT_EQ(sessions->size(), 1);
+    {
+        AgentSession resumed(options, {});
+        ASSERT_TRUE(resumed.resume(sessions->front().path));
+        ASSERT_EQ(resumed.history().size(), 3);
+        EXPECT_EQ(resumed.history()[1].images, std::vector<std::string>{image});
+    }
+    vision = false;
+    {
+        AgentSession session(options, {});
+        EXPECT_FALSE(session.run("and this?", {image}));
+        EXPECT_EQ(session.history().size(), 1) << "a refused image must not stay in the history";
+        EXPECT_TRUE(session.run("plain text still works"));
+    }
 }
 
 TEST(CodeTerminalText, Utf8AndControls) {

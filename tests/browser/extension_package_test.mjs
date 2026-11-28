@@ -26,7 +26,7 @@ test('packages Chromium and Firefox extensions without hosted-page isolation scr
         assert.doesNotMatch(manifest.content_security_policy.extension_pages, /(?:^|\s)'unsafe-eval'/);
         for (const file of ['background.mjs', 'editor.html', 'editor.mjs', 'editor.css',
             'progress.mjs', 'selection-bridge.js', 'gmail-bridge.js', 'article-bridge.js', 'pdf.mjs',
-            'read-aloud.js', 'audio-playback.js', 'speech-controller.js', 'playback-worklet.js',
+            'read-aloud.js', 'speech-controller.js', 'liteapp/media/audio.mjs', 'liteapp/media/playback-worklet.mjs',
             'libs/readability/Readability.js', 'libs/readability/LICENSE',
             'libs/pdfjs/pdf.min.mjs', 'libs/pdfjs/pdf.worker.min.mjs', 'libs/pdfjs/LICENSE',
             'libs/pdfjs/cmaps/Adobe-Japan1-UCS2.bcmap', 'libs/pdfjs/standard_fonts/FoxitSerif.pfb',

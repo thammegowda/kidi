@@ -7,6 +7,7 @@
   <title>Kidi</title>
   <link rel="icon" type="image/png" sizes="512x512" href="./icons/kidi-logo.png">
   <link rel="apple-touch-icon" href="./icons/kidi-logo.png">
+  <link rel="stylesheet" href="./liteapp/markdown/markdown.css">
   <link rel="stylesheet" href="./style.css">
   <script type="module" src="./app.js"></script>
 </head>
@@ -184,7 +185,7 @@
           </span>
         </p>
         <form class="composer" id="composer">
-          <input id="image-files" type="file" accept="image/jpeg,image/png" multiple hidden>
+          <input id="image-files" type="file" accept="image/*" multiple hidden>
           <button class="attach" id="attach" type="button" aria-label="Attach images" title="Attach images">＋</button>
           <textarea id="prompt" rows="1" maxlength="100000"
             placeholder="Message Kidi…" aria-label="Message Kidi"></textarea>

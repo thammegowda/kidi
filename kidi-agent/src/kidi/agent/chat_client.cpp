@@ -111,6 +111,11 @@ auto encode_request(const ChatClientOptions& options, std::span<const Message> m
         }
         for (const auto& message : messages) {
             Json item{{"role", role_name(message.role)}, {"content", message.content}};
+            if (!message.images.empty()) {
+                item["content"] = Json::array({{{"type", "text"}, {"text", message.content}}});
+                for (const auto& image : message.images)
+                    item["content"].push_back({{"type", "image_url"}, {"image_url", {{"url", image}}}});
+            }
             if (!message.reasoning_content.empty()) item["reasoning_content"] = message.reasoning_content;
             if (message.role == Role::TOOL) item["tool_call_id"] = message.tool_call_id;
             if (!message.tool_calls.empty()) {

@@ -23,11 +23,6 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
 endif()
 option(KIDI_BUILD_AGENT "Build the embeddable agent library and the kidi agent command" ${KIDI_AGENT_PLATFORM})
 option(KIDI_ENABLE_CUDA "Build NVIDIA CUDA inference and optional cuVS GPU HNSW indexing" OFF)
-set(KIDI_DESKTOP_APP_DEFAULT ON)
-if(ANDROID OR EMSCRIPTEN)
-    set(KIDI_DESKTOP_APP_DEFAULT OFF)
-endif()
-option(KIDI_BUILD_DESKTOP_APP "Build the native LiteApp web UI" ${KIDI_DESKTOP_APP_DEFAULT})
 if(EMSCRIPTEN)
     option(KIDI_WASM_THREADS "Enable WebAssembly pthreads" ON)
     option(KIDI_WASM_WEBGPU "Build the WebGPU execution backend" OFF)
@@ -419,7 +414,7 @@ if(NOT EMSCRIPTEN)
     set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "Build LiteApp's GoogleTest suite" FORCE)
     add_subdirectory(third_party/liteapp EXCLUDE_FROM_ALL)
 
-    # kidi's single HTTP API (OpenAI-compatible chat), hosted by both `kidi serve` and the desktop app.
+    # kidi's single HTTP API (OpenAI-compatible chat), hosted by `kidi serve` and the background server of `kidi agent`.
     add_library(kidi_server STATIC
         src/kidi/server/engine.cpp
         src/kidi/server/chat_api.cpp
@@ -441,7 +436,7 @@ if(NOT EMSCRIPTEN)
     if(KIDI_BUILD_AGENT)
         add_subdirectory(kidi-agent)
         if(KIDI_AGENT_PLATFORM)
-            target_sources(kidi_cli_main PRIVATE src/kidi/cli/managed_serve.cpp)
+            target_sources(kidi_cli_main PRIVATE src/kidi/cli/agent_speech.cpp src/kidi/cli/managed_serve.cpp)
             target_link_libraries(kidi_cli_main PRIVATE kidi_agent_command kidi::agent_http liteapp::httplib)
             target_compile_definitions(kidi_cli_main PRIVATE KIDI_HAS_AGENT=1)
         endif()
@@ -467,99 +462,6 @@ if(NOT EMSCRIPTEN)
         foreach(_kidi_target IN ITEMS kidi_argparse kidi kidi_server kidi_cli_main)
             target_compile_options(${_kidi_target} PRIVATE -ffunction-sections -fdata-sections)
         endforeach()
-    endif()
-endif()
-
-if(KIDI_BUILD_DESKTOP_APP)
-    set(KIDI_DESKTOP_WEB_STAGE "${CMAKE_CURRENT_BINARY_DIR}/generated/desktop-web")
-    set(KIDI_DESKTOP_WEB_DEPENDENCY_FILES)
-    file(MAKE_DIRECTORY "${KIDI_DESKTOP_WEB_STAGE}")
-    function(kidi_stage_desktop_asset source relative)
-        if(IS_ABSOLUTE "${relative}" OR relative MATCHES "(^|/)\\.\\.?(/|$)")
-            message(FATAL_ERROR "Invalid desktop asset destination: ${relative}")
-        endif()
-        if(source MATCHES "^web/libs/mermaid/")
-            list(APPEND KIDI_DESKTOP_WEB_DEPENDENCY_FILES "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
-            set(KIDI_DESKTOP_WEB_DEPENDENCY_FILES "${KIDI_DESKTOP_WEB_DEPENDENCY_FILES}" PARENT_SCOPE)
-        elseif(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" OR
-               IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
-            message(FATAL_ERROR "Invalid desktop asset mapping: ${relative} -> ${source}")
-        endif()
-        set(output "${KIDI_DESKTOP_WEB_STAGE}/${relative}")
-        get_filename_component(output_directory "${output}" DIRECTORY)
-        add_custom_command(
-            OUTPUT "${output}"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${output_directory}"
-            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                "${CMAKE_CURRENT_SOURCE_DIR}/${source}" "${output}"
-            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
-            VERBATIM
-        )
-    endfunction()
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/web/ui/assets.txt"
-        "${CMAKE_CURRENT_SOURCE_DIR}/desktop/assets.txt")
-    file(STRINGS "web/ui/assets.txt" KIDI_SHARED_WEB_FILES)
-    set(KIDI_DESKTOP_ARCHIVE_FILES ${KIDI_SHARED_WEB_FILES})
-    foreach(file IN LISTS KIDI_SHARED_WEB_FILES)
-        kidi_stage_desktop_asset("web/ui/${file}" "${file}")
-    endforeach()
-    file(STRINGS "desktop/assets.txt" KIDI_DESKTOP_ASSET_MAPPINGS)
-    foreach(mapping IN LISTS KIDI_DESKTOP_ASSET_MAPPINGS)
-        string(REPLACE "\t" ";" mapping_parts "${mapping}")
-        list(LENGTH mapping_parts mapping_size)
-        if(NOT mapping_size EQUAL 2)
-            message(FATAL_ERROR "Invalid desktop/assets.txt entry: ${mapping}")
-        endif()
-        list(GET mapping_parts 0 relative)
-        list(GET mapping_parts 1 source)
-        string(REGEX REPLACE "^/" "" relative "${relative}")
-        if(relative IN_LIST KIDI_DESKTOP_ARCHIVE_FILES)
-            message(FATAL_ERROR "Duplicate desktop asset destination: ${relative}")
-        endif()
-        kidi_stage_desktop_asset("${source}" "${relative}")
-        list(APPEND KIDI_DESKTOP_ARCHIVE_FILES "${relative}")
-    endforeach()
-    list(REMOVE_DUPLICATES KIDI_DESKTOP_WEB_DEPENDENCY_FILES)
-    add_custom_target(kidi_web_dependencies
-        COMMAND node "${CMAKE_CURRENT_SOURCE_DIR}/web/tools/prepare-libs.mjs"
-        BYPRODUCTS ${KIDI_DESKTOP_WEB_DEPENDENCY_FILES}
-        DEPENDS
-            "${CMAKE_CURRENT_SOURCE_DIR}/web/package.json"
-            "${CMAKE_CURRENT_SOURCE_DIR}/web/package-lock.json"
-            "${CMAKE_CURRENT_SOURCE_DIR}/web/tools/prepare-libs.mjs"
-        COMMENT "Preparing locked web dependencies"
-        VERBATIM
-    )
-    liteapp_embed_archive(
-        TARGET kidi_desktop_assets
-        NAMESPACE kidi::desktop_assets
-        HEADER kidi/desktop_assets.h
-        ROOT "${KIDI_DESKTOP_WEB_STAGE}"
-        FILES ${KIDI_DESKTOP_ARCHIVE_FILES}
-    )
-    add_dependencies(kidi_desktop_assets kidi_web_dependencies)
-    add_library(kidi_desktop_ebook STATIC desktop/ebook.cpp)
-    target_include_directories(kidi_desktop_ebook PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/desktop")
-    target_link_libraries(kidi_desktop_ebook PUBLIC liteapp::vfs)
-    liteapp_harden(kidi_desktop_ebook)
-    add_executable(kidi_app desktop/app.cpp)
-    set_target_properties(kidi_app PROPERTIES OUTPUT_NAME kidi-app)
-    target_link_libraries(kidi_app PRIVATE
-        kidi::kidi
-        kidi_server
-        kidi_desktop_ebook
-        kidi_desktop_assets
-        liteapp::app
-        liteapp::service
-        nlohmann_json::nlohmann_json
-    )
-    liteapp_link_embedded_resources(kidi_app)
-    liteapp_harden(kidi_app)
-    if(APPLE)
-        target_link_options(kidi_app PRIVATE -Wl,-dead_strip -Wl,-no_exported_symbols)
-    elseif(UNIX AND NOT EMSCRIPTEN)
-        target_link_options(kidi_app PRIVATE -Wl,--gc-sections)
     endif()
 endif()
 

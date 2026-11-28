@@ -87,6 +87,44 @@ auto validate_registration(const ToolRegistration& tool) -> Result<void> {
     return {};
 }
 
+auto parse_speech(const Json& speech) -> Result<SpeechConfig> {
+    if (auto valid = fields(speech, {}, {"transcribe", "speak"}); !valid) return std::unexpected(valid.error());
+    SpeechConfig config;
+    if (speech.contains("transcribe")) {
+        const auto& transcribe = speech["transcribe"];
+        if (auto valid = fields(transcribe, {"model"}); !valid) return std::unexpected(valid.error());
+        if (!nonempty_string(transcribe["model"])) return invalid("speech.transcribe.model must be a nonempty string");
+        config.transcribe_model = transcribe["model"].get<std::string>();
+    }
+    if (speech.contains("speak")) {
+        const auto& speak = speech["speak"];
+        if (auto valid = fields(speak, {"model", "reference_text"}, {"steps", "pace", "voice"}); !valid)
+            return std::unexpected(valid.error());
+        if (!nonempty_string(speak["model"]) || !nonempty_string(speak["reference_text"]))
+            return invalid("speech.speak.model and reference_text must be nonempty strings");
+        config.speak_model = speak["model"].get<std::string>();
+        config.reference_text = speak["reference_text"].get<std::string>();
+        if (speak.contains("steps")) {
+            if (!speak["steps"].is_number_unsigned() || speak["steps"] == 0 || speak["steps"] > 64)
+                return invalid("speech.speak.steps must be an integer in [1, 64]");
+            config.steps = speak["steps"].get<std::size_t>();
+        }
+        if (speak.contains("pace")) {
+            if (!speak["pace"].is_number() || speak["pace"].get<double>() < 0.25 || speak["pace"].get<double>() > 4)
+                return invalid("speech.speak.pace must be a number in [0.25, 4]");
+            config.pace = speak["pace"].get<float>();
+        }
+        if (speak.contains("voice")) {
+            if (!speak["voice"].is_object()) return invalid("speech.speak.voice must be a mapping");
+            for (const auto& [key, value] : speak["voice"].items()) {
+                if (!value.is_string()) return invalid("speech.speak.voice values must be strings");
+                config.voice.emplace(key, value.get<std::string>());
+            }
+        }
+    }
+    return config;
+}
+
 } // namespace
 
 auto parse_agent_config(std::string_view yaml) -> Result<AgentConfig> {
@@ -97,7 +135,8 @@ auto parse_agent_config(std::string_view yaml) -> Result<AgentConfig> {
         std::size_t remaining = 16384;
         auto document = json_value(documents.front(), 0, remaining);
         if (!document) return std::unexpected(document.error());
-        if (auto valid = fields(*document, {"version", "prompts", "tools"}, {"sampling", "reasoning_effort"}); !valid)
+        if (auto valid = fields(*document, {"version", "prompts", "tools"}, {"sampling", "reasoning_effort", "speech"});
+            !valid)
             return std::unexpected(valid.error());
         if (!(*document)["version"].is_number_integer() || (*document)["version"] != 1)
             return invalid("version must be integer 1");
@@ -142,6 +181,11 @@ auto parse_agent_config(std::string_view yaml) -> Result<AgentConfig> {
             if (!nonempty_string((*document)["reasoning_effort"]))
                 return invalid("reasoning_effort must be a nonempty string");
             config.reasoning_effort = (*document)["reasoning_effort"].get<std::string>();
+        }
+        if (document->contains("speech")) {
+            auto speech = parse_speech((*document)["speech"]);
+            if (!speech) return std::unexpected(speech.error());
+            config.speech = std::move(*speech);
         }
         const auto& tools = (*document)["tools"];
         if (!tools.is_array()) return invalid("tools must be a sequence (use [] for no tools)");

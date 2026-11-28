@@ -13,7 +13,9 @@ auto json_response(const ChatJson& body, int status = 200) -> liteapp::Response 
     return liteapp::Response::json(body.dump(), status);
 }
 
-auto error_status(const Error& error) -> int { return error.code == ErrorCode::INVALID_ARGUMENT ? 400 : 500; }
+auto error_status(const Error& error) -> int {
+    return error.code == ErrorCode::INVALID_ARGUMENT || error.code == ErrorCode::UNSUPPORTED ? 400 : 500;
+}
 
 auto elapsed_ms(Clock::time_point started) -> double {
     return std::chrono::duration<double, std::milli>(Clock::now() - started).count();
@@ -27,11 +29,7 @@ auto enqueue(const ChatRequest& request) {
 
 auto prepare_request(const RouteOptions& options, const liteapp::Request& http) -> Result<ChatRequest> {
     const auto body = ChatJson::parse(http.body, nullptr, false);
-    auto prepared = prepare_chat_request(body, options.defaults);
-    if (prepared && options.customize)
-        if (auto customized = options.customize(body, *prepared); !customized)
-            return std::unexpected(customized.error());
-    return prepared;
+    return prepare_chat_request(body, options.defaults);
 }
 
 /// Emits OpenAI SSE chunks for deltas produced by AssistantResponseStream.
@@ -71,8 +69,9 @@ auto mount_chat_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteOpt
     server.get("/v1/models", [shared](const liteapp::Request&) {
         return json_response({{"object", "list"},
                               {"data", ChatJson::array({{{"id", shared->model_name},
-                                                           {"object", "model"},
-                                                           {"owned_by", "kidi"}}})}});
+                                                         {"object", "model"},
+                                                         {"owned_by", "kidi"},
+                                                         {"capabilities", {{"vision", shared->vision}}}}})}});
     });
     server.post("/v1/chat/context", [shared, &engine](const liteapp::Request& http) {
         auto prepared = prepare_request(*shared, http);

@@ -163,6 +163,10 @@ TEST_F(ChatTest, PromptsAndStopTokens) {
     auto image = Json::parse(R"([{"role":"user","content":[{"type":"image_url","image_url":"x"}]}])");
     EXPECT_FALSE(generator.chat_prompt_tokens(image)) << "structured generation accepted an image without embeddings";
     EXPECT_FALSE(generator.enqueue_chat(image)) << "structured generation accepted an image without embeddings";
+    image[0]["content"][0]["image_url"] = {{"url", "data:image/png;base64,iVBORw0KGgo="}};
+    const auto blind = generator.enqueue_chat(image);
+    ASSERT_FALSE(blind);
+    EXPECT_EQ(blind.error().code, kidi::ErrorCode::UNSUPPORTED) << "a text-only checkpoint must refuse images";
     EXPECT_FALSE(generator.enqueue_chat(messages, options, {{"messages", "reserved"}}))
         << "reserved template arguments were accepted";
 

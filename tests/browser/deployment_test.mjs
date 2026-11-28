@@ -9,13 +9,11 @@ test('shared entry assets and audio worklets resolve within repository subpaths'
     const worker = await readFile(new URL('../../web/hosts/wasm/tts-worker.mjs', import.meta.url), 'utf8');
     const build = await readFile(new URL('../../web/tools/build.mjs', import.meta.url), 'utf8');
     const packager = await readFile(new URL('../../web/tools/package-site.mjs', import.meta.url), 'utf8');
-    const desktop = await readFile(new URL('../../desktop/app.cpp', import.meta.url), 'utf8');
-    const cmake = await readFile(new URL('../../CMakeLists.txt', import.meta.url), 'utf8');
     const manifest = await readFile(new URL('../../web/ui/assets.txt', import.meta.url), 'utf8');
-    const desktopManifest = await readFile(new URL('../../desktop/assets.txt', import.meta.url), 'utf8');
     const assets = [...html.matchAll(/(?:src|href)="([^"]+)"/g)].map(match => match[1]);
     assets.push(...[...css.matchAll(/url\("([^"]+)"\)/g)].map(match => match[1]));
-    const worklets = [...app.matchAll(/audioWorklet\.addModule\(new URL\('([^']+)', import\.meta\.url\)\)/g)];
+    const audio = await readFile(new URL('../../third_party/liteapp/web/media/audio.mjs', import.meta.url), 'utf8');
+    const worklets = [...audio.matchAll(/audioWorklet\.addModule\(new URL\('([^']+)', import\.meta\.url\)\)/g)];
     assert.equal(worklets.length, 2);
     assets.push(...worklets.map(match => match[1]));
     for (const asset of assets) {
@@ -29,17 +27,12 @@ test('shared entry assets and audio worklets resolve within repository subpaths'
     assert.doesNotMatch(build, /\['single'/);
     const shared = new Set(manifest.split(/\r?\n/).filter(Boolean));
     for (const match of app.matchAll(/from '\.\/([^']+)'/g))
-        if (match[1] !== 'backend.js') assert.ok(shared.has(match[1]), `shared UI manifest omits ${match[1]}`);
+        if (match[1] !== 'backend.js' && !match[1].startsWith('liteapp/'))
+            assert.ok(shared.has(match[1]), `shared UI manifest omits ${match[1]}`);
     for (const asset of ['speech-highlights.js', 'pause.svg', 'play.svg']) {
         assert.match(manifest, new RegExp(asset.replace('.', '\\.')));
     }
-    for (const consumer of [desktop, cmake, packager]) assert.match(consumer, /web\/ui\/assets\.txt/);
+    assert.match(packager, /web\/ui\/assets\.txt/);
     assert.match(packager, /browser-epub\.js/);
-    assert.match(cmake, /file\(STRINGS "desktop\/assets\.txt" KIDI_DESKTOP_ASSET_MAPPINGS\)/);
-    assert.doesNotMatch(cmake, /web\/libs\/mermaid\/mermaid\.min\.js/);
-    for (const line of desktopManifest.trim().split(/\r?\n/)) {
-        const [destination, source] = line.split('\t');
-        assert.ok(destination.startsWith('/') && source, `invalid desktop asset mapping: ${line}`);
-        await access(new URL(`../../${source}`, import.meta.url));
-    }
+    for (const file of manifest.split(/\r?\n/).filter(Boolean)) await access(new URL(`../../web/ui/${file}`, import.meta.url));
 });

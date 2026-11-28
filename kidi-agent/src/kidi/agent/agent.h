@@ -42,6 +42,8 @@ struct Message {
     std::string reasoning_content;
     std::vector<ToolCall> tool_calls;
     std::string tool_call_id;
+    // User messages only: images as data:image/...;base64 URLs, sent to vision models as image_url parts.
+    std::vector<std::string> images;
     bool is_summary = false;
     std::optional<TokenUsage> usage;
 };
@@ -138,6 +140,10 @@ auto compact_history(const Provider& provider, std::span<const ToolSpec> tools, 
 // Synchronous, serial execution. Completed messages remain in history even on failure.
 // Callbacks and providers must return errors (not throw) and honor cooperative cancellation.
 auto run_turn(const Provider& provider, std::span<const Tool> tools, std::vector<Message>& history, std::string input,
+              const RunOptions& options = {}, const Callbacks& callbacks = {}, std::stop_token stop = {})
+    -> Result<TurnResult>;
+// As above, with a complete user message (e.g. one carrying images).
+auto run_turn(const Provider& provider, std::span<const Tool> tools, std::vector<Message>& history, Message input,
               const RunOptions& options = {}, const Callbacks& callbacks = {}, std::stop_token stop = {})
     -> Result<TurnResult>;
 

@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {ReadAloud} from '../../web/ui/read-aloud.js';
-import {resample} from '../../web/ui/audio-playback.js';
+import {importSiteModule} from './packaged-site.mjs';
+
+const {ReadAloud} = await importSiteModule('read-aloud.js');
+const {resample} = await importSiteModule('liteapp/media/audio.mjs');
 
 const tick = async () => {
   for (let count = 0; count < 12; count++) await new Promise(resolve => setImmediate(resolve));
@@ -14,7 +16,7 @@ function harness(t, failResume = false) {
     state = 'running';
     sampleRate = 8000;
     destination = {};
-    audioWorklet = {addModule: async url => assert.match(url.pathname, /playback-worklet\.js$/)};
+    audioWorklet = {addModule: async url => assert.match(url.pathname, /liteapp\/media\/playback-worklet\.mjs$/)};
     constructor() { audio = this; }
     async resume() { if (failResume) throw new Error('Audio permission denied'); }
     async close() { this.state = 'closed'; }

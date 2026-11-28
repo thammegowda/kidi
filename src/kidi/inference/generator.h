@@ -123,7 +123,7 @@ public:
     auto enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options = {})
         -> Result<std::uint64_t>;
     auto chat_prompt_tokens(std::span<const text::ChatMessage> messages) const -> Result<std::size_t>;
-    /// Structured text-only chat; multimodal inputs require enqueue_chat's image path.
+    /// Structured chat in OpenAI form; user messages may hold image_url parts with base64 data URLs.
     auto enqueue_chat(const nlohmann::ordered_json& messages, GenerationOptions options = {},
                       const nlohmann::ordered_json& template_args = nlohmann::ordered_json::object())
         -> Result<std::uint64_t>;
@@ -144,7 +144,8 @@ public:
     auto native_qat() const -> bool { return checkpoint::native_qat(config_["model"]); }
     auto speculative() const noexcept -> bool { return static_cast<bool>(drafter_); }
     auto vision_supported() const -> bool {
-        return config_["model"]["type"].as<std::string>() == "gemma4_text" && static_cast<bool>(config_["vision"]);
+        return config_["model"]["type"].as<std::string>() == "gemma4_text" && static_cast<bool>(config_["vision"]) &&
+               !config_["vision"]["use_clipped_linears"].as<bool>(false);
     }
     auto memory() const -> GeneratorMemory;
     /// Prepares reusable request shapes and weights before the first request. Serving recycles compatible
@@ -182,6 +183,14 @@ private:
         std::size_t max_pixels;
     };
     std::vector<CachedImage> images_;
+    struct ImageBatch {
+        std::vector<CachedImage> images;
+        std::string key;
+    };
+    auto check_image_request(const GenerationOptions& options) const -> void;
+    // Encodes one image (or reuses its cached embeddings) and returns the prompt placeholders that stand for it.
+    auto image_placeholders(std::string encoded, const GenerationOptions& options, ImageBatch& batch) -> std::string;
+    auto enqueue_with_images(const std::string& prompt, GenerationOptions options, ImageBatch batch) -> std::uint64_t;
     GeneratorOptions options_;
     bool prefill_warmed_ = false;
     struct PrefixEntry {

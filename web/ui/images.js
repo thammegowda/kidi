@@ -1,3 +1,5 @@
+import {blobToDataUrl} from './liteapp/media/base64.mjs';
+
 const CACHE = 'kidi-chat-images-v1';
 const LEGACY_CACHES = ['kidi-chat-images-v2'];
 export const MAX_IMAGES = 8;
@@ -38,35 +40,40 @@ export async function removeUnusedImages(retained) {
     }
 }
 
-export async function stageImages(module, messages, {directory = '/images'} = {}) {
-    if (!/^\/images(?:\/[a-z0-9-]+)?$/.test(directory)) throw new Error('Invalid image staging directory');
-    const files = [];
-    let created = false;
-    const dispose = () => {
-        for (const path of files.splice(0)) module.FS.unlink(path);
-        if (created && directory !== '/images') module.FS.rmdir(directory);
-        created = false;
-    };
-    let total = 0;
-    try {
-        const staged = [];
-        for (const message of messages) {
-            const images = [];
-            for (const image of message.images || []) {
-                if (message.role !== 'user' || files.length >= MAX_IMAGES)
-                    throw new Error('Images require user messages, at most eight per conversation');
-                const blob = await readImage(image);
-                total += blob.size;
-                if (total > MAX_IMAGE_BYTES) throw new Error('Images exceed the 32 MiB conversation limit');
-                module.FS.mkdirTree(directory);
-                created = true;
-                const path = `${directory}/${files.length}.${blob.type === 'image/png' ? 'png' : 'jpg'}`;
-                module.FS.writeFile(path, new Uint8Array(await blob.arrayBuffer()));
-                files.push(path);
-                images.push(path);
-            }
-            staged.push({role: message.role, content: message.content, images});
+// OpenAI chat messages for kidi_enqueue: each user image becomes an image_url data URL part ahead of the text.
+export async function chatMessages(messages) {
+    let count = 0, total = 0;
+    const result = [];
+    for (const {role, content, images = []} of messages) {
+        if (!images.length) {
+            result.push({role, content});
+            continue;
         }
-        return {messages: staged, dispose};
-    } catch (error) { dispose(); throw error; }
+        count += images.length;
+        if (role !== 'user' || count > MAX_IMAGES)
+            throw new Error('Images require user messages, at most eight per conversation');
+        const parts = [];
+        for (const image of images) {
+            const blob = await readImage(image);
+            total += blob.size;
+            if (total > MAX_IMAGE_BYTES) throw new Error('Images exceed the 32 MiB conversation limit');
+            parts.push({type: 'image_url', image_url: {url: await blobToDataUrl(blob)}});
+        }
+        parts.push({type: 'text', text: content});
+        result.push({role, content: parts});
+    }
+    return result;
+}
+
+export const hasImages = messages => messages.some(message => Array.isArray(message.content));
+
+// Copies `text` into the module heap as NUL-terminated UTF-8. ccall copies string arguments onto the 2 MiB Wasm
+// stack, which image requests overflow. The caller frees the pointer.
+export function heapString(module, text) {
+    const bytes = new TextEncoder().encode(text);
+    const pointer = Number(module._malloc(bytes.length + 1));
+    if (!pointer || pointer + bytes.length + 1 > module.HEAPU8.byteLength) throw new Error('Cannot allocate request');
+    module.HEAPU8.set(bytes, pointer);
+    module.HEAPU8[pointer + bytes.length] = 0;
+    return pointer;
 }

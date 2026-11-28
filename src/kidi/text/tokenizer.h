@@ -20,7 +20,6 @@ using TemplateFiles = std::map<std::string, std::filesystem::path, std::less<>>;
 
 struct ChatMessage {
     std::string role, content;
-    std::vector<std::filesystem::path> images;
 };
 
 struct SpecialTokens {

@@ -13,6 +13,8 @@ auto invalid(std::string message) -> std::unexpected<Error> {
 
 auto message_bytes(const Message& message) -> std::size_t {
     auto bytes = message.content.size() + message.reasoning_content.size() + message.tool_call_id.size() + 32;
+    // Each image costs a few hundred prompt tokens however large its file is.
+    bytes += message.images.size() * 1024;
     for (const auto& call : message.tool_calls)
         bytes += call.id.size() + call.name.size() +
                  call.arguments.dump(-1, ' ', false, Json::error_handler_t::replace).size();
@@ -235,8 +237,14 @@ auto compact_history(const Provider& provider, std::span<const ToolSpec> tools, 
 
 auto run_turn(const Provider& provider, std::span<const Tool> tools, std::vector<Message>& history, std::string input,
               const RunOptions& options, const Callbacks& callbacks, std::stop_token stop) -> Result<TurnResult> {
-    if (!provider || input.empty() || !options.max_model_calls || !options.max_tool_calls ||
-        !options.max_history_bytes || !options.max_tool_output_bytes)
+    return run_turn(provider, tools, history, Message{.role = Role::USER, .content = std::move(input)}, options,
+                    callbacks, stop);
+}
+
+auto run_turn(const Provider& provider, std::span<const Tool> tools, std::vector<Message>& history, Message user,
+              const RunOptions& options, const Callbacks& callbacks, std::stop_token stop) -> Result<TurnResult> {
+    if (!provider || user.role != Role::USER || user.content.empty() || !options.max_model_calls ||
+        !options.max_tool_calls || !options.max_history_bytes || !options.max_tool_output_bytes)
         return invalid("provider, input and positive execution limits are required");
     if (!options.compact_prompt.empty() &&
         (!provider.context || !provider.summarize || !options.max_compactions || !options.max_summary_calls))
@@ -261,7 +269,6 @@ auto run_turn(const Provider& provider, std::span<const Tool> tools, std::vector
         return result;
     };
     auto bytes = history_bytes(history);
-    Message user{.role = Role::USER, .content = std::move(input)};
     if (message_bytes(user) > options.max_history_bytes) return invalid("input exceeds max_history_bytes");
     if (bytes + message_bytes(user) > options.max_history_bytes) {
         if (!can_compact) return invalid("history exceeds max_history_bytes");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kidi/agent/agent.h"
+#include "kidi/agent/speech.h"
 
 #include <filesystem>
 #include <string_view>
@@ -24,6 +25,7 @@ struct AgentConfig {
     } sampling;
     // Sent as the request's reasoning_effort when nonempty; summaries always use "none".
     std::string reasoning_effort;
+    SpeechConfig speech;
     std::vector<ToolRegistration> tools;
 };
 

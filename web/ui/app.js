@@ -1,6 +1,7 @@
 import {renderMarkdown, renderStreamingMarkdown} from './markdown.js';
 import {backend} from './backend.js';
-import {resample} from './audio-playback.js';
+import {CAPTURE_RATE, openMicrophone, openPlayer, resample} from './liteapp/media/audio.mjs';
+import {prepareImage} from './liteapp/media/images.mjs';
 import {
   readEbook, readEbookTranslation, removeEbook, removeEbookTranslation, storeEbook, storeEbookTranslation,
 } from './ebooks.js';
@@ -188,7 +189,7 @@ function renderLibrary() {
   const available = typeof backend.importEbook === 'function' && typeof backend.loadEbookChapter === 'function';
   $('add-book').disabled = readerBusy || !available;
   $('library-search').disabled = !available;
-  if (!available) setLibraryStatus('EPUB import is currently available in the desktop app.', false);
+  if (!available) setLibraryStatus('EPUB import is not available in this app.', false);
   const query = libraryQuery.trim().toLocaleLowerCase();
   const books = state.books.filter(book => !query ||
     `${book.title} ${book.author}`.toLocaleLowerCase().includes(query));
@@ -260,7 +261,7 @@ function validatedEbookMetadata(metadata) {
       !Array.isArray(metadata.chapters) || !metadata.chapters.length ||
       metadata.chapters.some(chapter =>
         !chapter || typeof chapter.id !== 'string' || typeof chapter.title !== 'string'))
-    throw new Error('The desktop app returned invalid EPUB metadata');
+    throw new Error('The host returned invalid EPUB metadata');
   return metadata;
 }
 
@@ -1003,7 +1004,7 @@ async function loadBookChapter(chapterIndex, requestedScroll) {
     const chapter = await backend.loadEbookChapter(session, index);
     if (token !== readerRenderToken || readerBookId !== book.id) return;
     if (!chapter || typeof chapter.html !== 'string')
-      throw new Error('The desktop app returned an invalid EPUB chapter');
+      throw new Error('The host returned an invalid EPUB chapter');
     const content = $('book-chapter-content').querySelector('.book-chapter-content');
     content.replaceChildren(sanitizeBookChapter(chapter.html));
     if (!content.textContent.trim()) throw new Error('This EPUB chapter has no readable text');
@@ -1539,7 +1540,8 @@ async function attachImages(files) {
     for (const file of selected) {
       bytes += file.size;
       if (bytes > MAX_IMAGE_BYTES) throw new Error('Images exceed the 32 MiB conversation limit');
-      draftImages.push(await storeImage(file, file.name));
+      draftImages.push(await storeImage(await prepareImage(file, {maxSide: Infinity, maxBytes: MAX_IMAGE_BYTES}),
+        file.name));
     }
     renderImageList($('attachments'), draftImages, true);
     showNotice(); renderRuntime();
@@ -1993,7 +1995,7 @@ function renderConfig() {
   $('wasm-preferences').hidden = !configurableRuntime;
   $('runtime-execution-setting').hidden = !configurableRuntime;
   $('runtime-settings-disclaimer').textContent = wasm
-    ? 'The browser runtime is experimental and slower than native Kidi. Use the native desktop app for the best performance and reliability.'
+    ? 'The browser runtime is experimental and slower than native Kidi. Use native Kidi (`kidi agent --web`) for the best performance and reliability.'
     : 'Models execute in Kidi’s native Android runtime; the bundled WebView provides the shared interface.';
   selectSettingsPage(!wasm && settingsPage === 'cache' ? 'llm' : settingsPage);
   if (configurableRuntime) {
@@ -2679,65 +2681,55 @@ async function ensurePlayback(sampleRate) {
     return playback;
   }
   if (!playbackPromise) playbackPromise = (async () => {
-    const context = sampleRate ? new AudioContext({sampleRate}) : new AudioContext();
-    try {
-      await Promise.all([context.resume(),
-        context.audioWorklet.addModule(new URL('./playback-worklet.js', import.meta.url))]);
-      const node = new AudioWorkletNode(context, 'kidi-playback', {outputChannelCount: [1]});
-      node.connect(context.destination);
-      node.port.onmessage = event => {
-        const data = event.data;
-        if (playback?.node !== node || data.streamId !== playbackStreamId) return;
-        const stream = ttsStreams.get(data.streamId);
-        if (!stream) return;
-        if (data.type === 'buffered') {
-          const wasPlaying = stream.bufferedFrames > 0;
-          stream.playedFrames = data.playedFrames;
-          stream.bufferedFrames = (stream.sentFrames || 0) - data.playedFrames;
-          if (stream.bufferedFrames <= playerBufferLimit(context.sampleRate))
-            for (const resolve of stream.capacityWaiters?.splice(0) || []) resolve();
-          if (wasPlaying !== (stream.bufferedFrames > 0)) renderRuntime();
-        } else if (data.type === 'segment-started' || data.type === 'segment-ended') {
-          if (data.type === 'segment-started' && stream.voiceTurn) voiceLatency.complete();
-          const segment = stream.segments?.get(data.segmentId);
-          if (segment) segment.status = data.type === 'segment-started' ? 'playing' : 'played';
-          renderSpeechHighlights(ttsStreams.values());
-          if (segment && stream.reader && !readerScrubbing) {
-            const offset = stream.readerSourceOffset +
-              (data.type === 'segment-started' ? segment.start : segment.end);
-            updateReaderSpeechPosition(offset, stream.readerTextLength);
-            if (data.type === 'segment-started') {
-              const row = scrollReaderSegmentIntoView(stream, segment);
-              if (stream.readerSide === 'target' && row) {
-                readerTranslationTtsIndex = Number(row.dataset.translationSourceIndex);
-                wakeReaderTranslation();
-              }
+    const {context, node} = await openPlayer({sampleRate});
+    node.port.onmessage = event => {
+      const data = event.data;
+      if (playback?.node !== node || data.streamId !== playbackStreamId) return;
+      const stream = ttsStreams.get(data.streamId);
+      if (!stream) return;
+      if (data.type === 'buffered') {
+        const wasPlaying = stream.bufferedFrames > 0;
+        stream.playedFrames = data.playedFrames;
+        stream.bufferedFrames = (stream.sentFrames || 0) - data.playedFrames;
+        if (stream.bufferedFrames <= playerBufferLimit(context.sampleRate))
+          for (const resolve of stream.capacityWaiters?.splice(0) || []) resolve();
+        if (wasPlaying !== (stream.bufferedFrames > 0)) renderRuntime();
+      } else if (data.type === 'segment-started' || data.type === 'segment-ended') {
+        if (data.type === 'segment-started' && stream.voiceTurn) voiceLatency.complete();
+        const segment = stream.segments?.get(data.segmentId);
+        if (segment) segment.status = data.type === 'segment-started' ? 'playing' : 'played';
+        renderSpeechHighlights(ttsStreams.values());
+        if (segment && stream.reader && !readerScrubbing) {
+          const offset = stream.readerSourceOffset +
+            (data.type === 'segment-started' ? segment.start : segment.end);
+          updateReaderSpeechPosition(offset, stream.readerTextLength);
+          if (data.type === 'segment-started') {
+            const row = scrollReaderSegmentIntoView(stream, segment);
+            if (stream.readerSide === 'target' && row) {
+              readerTranslationTtsIndex = Number(row.dataset.translationSourceIndex);
+              wakeReaderTranslation();
             }
           }
-          renderRuntime();
-        } else if (data.type === 'drained' && stream.completed) finishTts(stream.button, data.streamId, true);
-      };
-      playback = {context, node};
-      const failed = error => {
-        if (playback?.node !== node) return;
-        const id = playbackStreamId;
-        playback = null;
-        playbackPromise = null;
-        if (id !== null) audioFailure(id, error);
-        if (context.state !== 'closed')
-          context.close().catch(closeError => console.error('Unable to close failed playback context:', closeError));
-      };
-      node.onprocessorerror = () => failed(new Error('Speech audio processor failed'));
-      context.onstatechange = () => {
-        if (context.state === 'closed' || context.state === 'interrupted')
-          failed(new Error('Speech audio playback was interrupted'));
-      };
-      return playback;
-    } catch (error) {
-      try { await context.close(); }
-      catch (closeError) { console.error('Unable to close failed playback context:', closeError); }
-      throw error;
-    }
+        }
+        renderRuntime();
+      } else if (data.type === 'drained' && stream.completed) finishTts(stream.button, data.streamId, true);
+    };
+    playback = {context, node};
+    const failed = error => {
+      if (playback?.node !== node) return;
+      const id = playbackStreamId;
+      playback = null;
+      playbackPromise = null;
+      if (id !== null) audioFailure(id, error);
+      if (context.state !== 'closed')
+        context.close().catch(closeError => console.error('Unable to close failed playback context:', closeError));
+    };
+    node.onprocessorerror = () => failed(new Error('Speech audio processor failed'));
+    context.onstatechange = () => {
+      if (context.state === 'closed' || context.state === 'interrupted')
+        failed(new Error('Speech audio playback was interrupted'));
+    };
+    return playback;
   })().catch(error => {
     playbackPromise = null;
     throw error;
@@ -2829,18 +2821,14 @@ async function beginCapture(id) {
   const media = activeRequest?.id === id && activeRequest.pendingMedia ?
     activeRequest.pendingMedia : await navigator.mediaDevices.getUserMedia({audio: microphoneConstraints()});
   if (activeRequest?.id === id) activeRequest.pendingMedia = null;
-  const context = new AudioContext();
-  await context.audioWorklet.addModule(new URL('./capture-worklet.js', import.meta.url));
-  const source = context.createMediaStreamSource(media);
-  const node = new AudioWorkletNode(context, 'kidi-capture');
-  const silence = context.createGain(); silence.gain.value = 0;
-  source.connect(node); node.connect(silence); silence.connect(context.destination);
+  // Frames are dispatched as tasks, so `recording` below is set before the first one arrives.
+  const microphone = await openMicrophone({media, onFrame: values => captureFrame(values)});
   const vad = state.components.asr?.settings?.vad || {};
   const profile = realtimeProfile();
   const configuredSilenceMs = Number(vad.silence_ms || profile.endpointMs);
   const minimumSpeechMs = Number(vad.minimum_speech_ms || 250);
   recording = {
-    id, sequence: 0, context, media, source, node,
+    id, sequence: 0, microphone,
     heardSpeech: false, speechMs: 0, silenceMs: 0,
     preRoll: [], preRollSamples: 0,
     threshold: Number(vad.threshold || .012),
@@ -2854,15 +2842,14 @@ async function beginCapture(id) {
       return false;
     }
     const pcm = new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
-    const header = audioHeader(1, id, current.sequence++, 16000, pcm.byteLength);
+    const header = audioHeader(1, id, current.sequence++, CAPTURE_RATE, pcm.byteLength);
     const frame = new Uint8Array(header.byteLength + pcm.byteLength);
     frame.set(header); frame.set(pcm, header.byteLength); backend.sendBinary(frame);
     return true;
   };
-  node.port.onmessage = event => {
+  const captureFrame = values => {
     const current = recording;
     if (!current) return;
-    const values = new Int16Array(event.data);
     let energy = 0;
     for (const value of values) energy += (value / 32768) ** 2;
     const rms = Math.sqrt(energy / Math.max(1, values.length));
@@ -2896,7 +2883,7 @@ async function beginCapture(id) {
     }
     if (voiceMode && current.heardSpeech && current.silenceMs >= current.silenceLimitMs) stopCapture();
   };
-  await context.resume();
+  await microphone.context.resume();
   $('mic').classList.add('recording'); $('mic').setAttribute('aria-label', 'Stop dictation');
   renderRuntime();
 }
@@ -2914,9 +2901,7 @@ function stopCapture(notify = true) {
     renderRuntime();
     return;
   }
-  current.source.disconnect(); current.node.disconnect();
-  for (const track of current.media.getTracks()) track.stop();
-  current.context.close();
+  current.microphone.close();
   $('mic').classList.remove('recording'); $('mic').setAttribute('aria-label', 'Start dictation');
   if (notify && activeRequest?.kind === 'asr') {
     if (current.heardSpeech) {

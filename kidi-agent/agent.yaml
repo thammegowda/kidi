@@ -35,6 +35,18 @@ sampling:
 # template decide. Inkling-2 defaults to high, where it can deliberate past --max-tokens before acting.
 reasoning_effort: medium
 
+# Dictation and read-aloud in the web UI (--web): Hub models downloaded and loaded on first use, on the device that
+# --backend selects. Remove an entry to disable that feature.
+speech:
+  transcribe:
+    model: openai/whisper-small
+  speak:
+    model: thammegowda/OmniVoice-q8
+    steps: 16
+    pace: 0.74 # duration scale; below 1 speaks faster
+    reference_text: Nice to meet you. # synthesized once so that every reply uses the same voice
+    voice: {gender: female, age: young adult, pitch: moderate}
+
 # This list is the exposed registry. Remove entries to disable tools.
 # handler selects a compiled implementation; it cannot change that handler's capability.
 tools:

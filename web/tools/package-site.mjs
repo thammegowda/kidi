@@ -1,6 +1,6 @@
 import {mkdir, cp, copyFile, readdir, readFile, rm, writeFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
-import {join, dirname} from 'node:path';
+import {dirname, join, relative, sep} from 'node:path';
 import {prepareWebLibraries} from './prepare-libs.mjs';
 import {unsignedHeapIndices} from './wasm-glue.mjs';
 
@@ -41,15 +41,23 @@ export async function packageSite(destination, runtimes = {
         await writeFile(join(destination, file),
             source.replaceAll('../../../third_party/liteapp/web/', './liteapp/'));
     }
-    await cp(join(root, 'third_party/liteapp/web'), join(destination, 'liteapp'), {recursive: true});
+    // The browser app uses LiteApp's transports and Markdown renderer with its libraries; the IDE components, editor
+    // libraries and the vendoring tool are not part of the site.
+    const liteappWeb = join(root, 'third_party/liteapp/web');
+    const unused = new Set(['ide', 'tools', 'libs/codemirror', 'libs/xterm']);
+    await cp(liteappWeb, join(destination, 'liteapp'), {
+        recursive: true,
+        filter: source => {
+            const parts = relative(liteappWeb, source).split(sep);
+            return !unused.has(parts[0]) && !unused.has(parts.slice(0, 2).join('/'));
+        },
+    });
     const sharedAssets = (await readFile(join(root, 'web/ui/assets.txt'), 'utf8')).split(/\r?\n/).filter(Boolean);
     for (const file of sharedAssets) {
         const target = join(destination, file);
         await mkdir(dirname(target), {recursive: true});
         await copyFile(join(root, 'web/ui', file), target);
     }
-    for (const file of ['capture-worklet.js', 'playback-worklet.js'])
-        await copyFile(join(root, 'web/hosts/desktop', file), join(destination, file));
     const sharedIndex = await readFile(join(root, 'web/ui/index.html'), 'utf8');
     await copyFile(join(root, 'benchmarks/browser/runtime_bench.mjs'), join(destination, 'runtime-bench.mjs'));
     const numericalChecks = await readFile(join(root, 'tests/browser/webgpu_numerical.mjs'), 'utf8');
@@ -62,7 +70,7 @@ export async function packageSite(destination, runtimes = {
         ? sharedIndex.replace('<script type="module" src="./app.js"></script>',
             '<script src="./coi-serviceworker.js"></script>\n  <script type="module" src="./app.js"></script>')
         : sharedIndex);
-    for (const name of ['marked', 'dompurify', 'highlightjs', 'mermaid', 'js-yaml']) {
+    for (const name of ['mermaid', 'js-yaml']) {
         await mkdir(join(destination, 'libs', name), {recursive: true});
         for (const file of await readdir(join(libraries, name)))
             await copyFile(join(libraries, name, file), join(destination, 'libs', name, file));

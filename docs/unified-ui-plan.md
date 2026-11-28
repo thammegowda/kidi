@@ -1,5 +1,9 @@
 # Unified Kidi UI and Multimodal Feature Plan
 
+> **Superseded.** The native desktop host (`desktop/`, `kidi-app`) was removed. The native UI is now
+> `kidi agent --web` ([guide](../kidi-agent/README.md#web-ui)), built on LiteApp's workspace services and IDE kit;
+> this plan remains as history for the WebAssembly app in `web/ui/` and `web/hosts/wasm/`.
+
 ## Objective
 
 Build one shared, multi-view Kidi application that is packaged with two

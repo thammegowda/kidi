@@ -25,7 +25,7 @@ auto serve(inference::Generator& generator, const ServeOptions& options) -> int 
     server::ChatEngine engine(generator);
     server::mount_chat_routes(server, engine, {.model_name = options.model_name,
                                                  .defaults = options.generation,
-                                                 .customize = {}});
+                                                 .vision = generator.vision_supported() && !generator.speculative()});
 
     active_server = &server;
     std::signal(SIGINT, [](int) {

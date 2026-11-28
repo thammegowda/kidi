@@ -1,4 +1,5 @@
 #include "kidi/cli/managed_serve.h"
+#include "kidi/cli/agent_speech.h"
 
 #include "kidi/checkpoint/hub.h"
 #include "kidi/cli/log.h"
@@ -180,6 +181,11 @@ auto start_server(const std::vector<std::string>& launch, const fs::path& dir, c
         const auto daemon = fork();
         if (daemon < 0) _exit(1);
         if (daemon > 0) _exit(0);
+        // The client may block signals (kidi agent --web waits for Ctrl-C with sigwait); exec keeps a blocked mask,
+        // and the server must still stop on SIGTERM.
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, nullptr);
         if (dup2(input.get(), STDIN_FILENO) < 0 || dup2(log.get(), STDOUT_FILENO) < 0 ||
             dup2(log.get(), STDERR_FILENO) < 0 || fcntl(startup.get(), F_SETFD, 0) < 0)
             _exit(1);
@@ -252,6 +258,26 @@ auto stop_server(const fs::path& dir) -> Result<void> {
         Error{ErrorCode::RUNTIME, "background inference PID " + std::to_string(endpoint->pid) + " did not exit"});
 }
 
+// A rebuilt or reconfigured kidi starts its own background server. Idle servers of other configurations would hold
+// their device memory until their own idle timeout, so they are stopped first; servers with a session are kept.
+auto stop_idle_servers(const fs::path& keep) -> void {
+    std::error_code error;
+    for (const auto& entry : fs::directory_iterator(keep.parent_path(), error)) {
+        const auto dir = entry.path();
+        if (dir == keep || !private_directory(dir, false) || !fs::exists(dir / STATE_NAME, error) ||
+            !fs::exists(dir / "clients.lock", error))
+            continue;
+        const auto clients = open_file(dir / "clients.lock", O_RDWR);
+        const auto startup = open_file(dir / "server.lock", O_RDWR | O_CREAT);
+        if (!try_lock(clients, LOCK_EX) || !try_lock(startup, LOCK_EX)) continue;
+        if (auto stopped = stop_server(dir); !stopped) {
+            log::error("{}", stopped.error().message);
+            continue;
+        }
+        fs::remove(dir / STATE_NAME, error);
+    }
+}
+
 auto ensure_server(const std::vector<std::string>& launch, const fs::path& dir, const std::string& model,
                    const fs::path& cache, const Namespace& arguments, bool restart) -> Result<Endpoint> {
     bool waiting_for_server = false;
@@ -269,6 +295,7 @@ auto ensure_server(const std::vector<std::string>& launch, const fs::path& dir, 
                         Error{ErrorCode::RUNTIME,
                               "background inference exited during startup; see " + (dir / "serve.log").string()});
                 fs::remove(state);
+                stop_idle_servers(dir);
                 log::info("starting background inference for {}; log: {}", model, (dir / "serve.log").string());
                 start_server(launch, dir, startup, model, cache, arguments);
             }
@@ -385,9 +412,10 @@ auto configure_managed_serve_parser(ArgumentParser& parser) -> void {
 }
 
 auto managed_agent_command(const Namespace& arguments, const Launcher& launcher) -> int {
-    return agent::agent_command(arguments, [&](agent::ChatClientOptions options) {
-        return managed_provider(std::move(options), arguments, launcher);
-    });
+    return agent::agent_command(
+        arguments,
+        [&](agent::ChatClientOptions options) { return managed_provider(std::move(options), arguments, launcher); },
+        [&](const agent::SpeechConfig& speech) { return agent_speech(arguments.get<std::string>("backend"), speech); });
 }
 
 auto protect_managed_lock(const Namespace& arguments) -> void {
@@ -426,13 +454,17 @@ auto serve_managed(inference::Generator& generator, tensor::Device device, Serve
     const File startup(arguments.get<int>("managed_lock_fd"));
     const auto clients = dir / "clients.lock";
     const auto lease = open_file(clients, O_RDWR);
-    auto http = liteapp::HttpServer::create();
+    // Agent histories carry tool output and images; this bounds one request body, not the model context.
+    auto http = liteapp::HttpServer::create({.max_body_bytes = 64U * 1024U * 1024U});
     if (!http) {
         log::error("cannot create managed server: {}", http.error().message);
         return 1;
     }
     server::ChatEngine engine(generator);
-    server::mount_chat_routes(*http, engine, {.model_name = options.model_name, .defaults = options.generation});
+    server::mount_chat_routes(*http, engine,
+                              {.model_name = options.model_name,
+                               .defaults = options.generation,
+                               .vision = generator.vision_supported() && !generator.speculative()});
     http->get("/kidi-agent/ready", [pid](const auto&) { return liteapp::Response::text(std::to_string(pid)); });
     const auto port = http->bind();
     if (!port) {

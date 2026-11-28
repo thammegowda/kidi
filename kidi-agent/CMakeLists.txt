@@ -28,6 +28,12 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/agent.yaml" KIDI_AGENT_YAML)
 configure_file(src/kidi/agent/default_config.h.in generated/default_config.h @ONLY)
 
+# The workspace tools are built on LiteApp's root-confined workspace (also used by the web UI's file services).
+if(NOT TARGET liteapp::workspace)
+    set(LITEAPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${KIDI_AGENT_ROOT}/third_party/liteapp" "${CMAKE_CURRENT_BINARY_DIR}/liteapp" EXCLUDE_FROM_ALL)
+endif()
+
 add_library(kidi_agent
     src/kidi/agent/agent.cpp
     src/kidi/agent/config.cpp
@@ -38,16 +44,8 @@ add_library(kidi::agent ALIAS kidi_agent)
 target_compile_features(kidi_agent PUBLIC cxx_std_23)
 target_include_directories(kidi_agent PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src" "${KIDI_AGENT_ROOT}/src")
 target_include_directories(kidi_agent PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(kidi_agent PUBLIC nlohmann_json::nlohmann_json PRIVATE yaml-cpp::yaml-cpp)
+target_link_libraries(kidi_agent PUBLIC nlohmann_json::nlohmann_json PRIVATE yaml-cpp::yaml-cpp liteapp::workspace)
 
-if(NOT TARGET liteapp::httplib)
-    find_package(Threads REQUIRED)
-    add_library(kidi_agent_httplib INTERFACE)
-    add_library(liteapp::httplib ALIAS kidi_agent_httplib)
-    target_include_directories(kidi_agent_httplib SYSTEM INTERFACE
-        "${KIDI_AGENT_ROOT}/third_party/liteapp/libs/httplib")
-    target_link_libraries(kidi_agent_httplib INTERFACE Threads::Threads)
-endif()
 add_library(kidi_agent_http src/kidi/agent/chat_http.cpp)
 add_library(kidi::agent_http ALIAS kidi_agent_http)
 target_link_libraries(kidi_agent_http PUBLIC kidi::agent PRIVATE liteapp::httplib)
@@ -59,12 +57,27 @@ if(TARGET kidi_cli_main OR KIDI_AGENT_BUILD_CLI)
         target_compile_features(kidi_agent_argparse PUBLIC cxx_std_23)
         target_include_directories(kidi_agent_argparse PUBLIC "${KIDI_AGENT_ROOT}/src")
     endif()
-    add_library(kidi_agent_command src/kidi/agent/command.cpp src/kidi/agent/markdown.cpp src/kidi/agent/terminal.cpp
-        src/kidi/agent/transcript.cpp)
+    add_library(kidi_agent_command src/kidi/agent/command.cpp src/kidi/agent/markdown.cpp src/kidi/agent/session.cpp
+        src/kidi/agent/terminal.cpp src/kidi/agent/transcript.cpp)
     target_link_libraries(kidi_agent_command PUBLIC kidi::agent kidi::argparse)
     if(UNIX)
         find_package(Threads REQUIRED)
         target_link_libraries(kidi_agent_command PRIVATE Threads::Threads)
+    endif()
+    # `kidi agent --web` embeds the files web/assets.txt lists; --web-assets serves the same manifest from a checkout.
+    if(UNIX AND TARGET liteapp::app AND TARGET liteapp::service AND
+       COMMAND liteapp_embed_manifest)
+        liteapp_embed_manifest(
+            TARGET kidi_agent_web_assets
+            NAMESPACE kidi::agent_web_assets
+            HEADER kidi/agent_web_assets.h
+            MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/web/assets.txt"
+            BASE "${KIDI_AGENT_ROOT}"
+        )
+        target_sources(kidi_agent_command PRIVATE src/kidi/agent/web.cpp)
+        target_link_libraries(kidi_agent_command PRIVATE kidi_agent_web_assets liteapp::app liteapp::service
+            liteapp::vfs liteapp::workspace)
+        target_compile_definitions(kidi_agent_command PRIVATE KIDI_AGENT_WEB=1)
     endif()
     if(KIDI_AGENT_BUILD_CLI)
         add_executable(kidi_agent_cli src/main.cpp)

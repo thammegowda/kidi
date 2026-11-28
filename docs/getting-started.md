@@ -259,8 +259,9 @@ options through to the model's chat template:
 
 Template options and tool-call argument formats are model-specific; Inkling expects `arguments` as an object, not a
 JSON-encoded string. The structured path uses the template's own thinking default unless explicitly overridden.
-Requests without `template_args` retain the existing simple-chat behavior. Structured generation currently accepts
-text only; images use the existing multimodal API. `generate` responses contain raw assistant text; use `serve` for
+Requests without `template_args` retain the existing simple-chat behavior. User messages may also carry OpenAI
+`image_url` parts with base64 `data:image/...` URLs when the checkpoint has a supported vision tower (Gemma 4 E2B
+QAT); `kidi serve` reports this as `capabilities.vision` in `/v1/models`. `generate` responses contain raw assistant text; use `serve` for
 parsed reasoning and tool calls.
 
 Add `--assistant-model` (with `@owner/model` or a local directory) to enable Gemma CPU speculative decoding in
@@ -273,14 +274,12 @@ kidi generate -m @google/gemma-4-E2B-it \
   --precision q8 --draft-tokens 4
 ```
 
-`kidi serve` and the desktop app run the same server module (`src/kidi/server`): one engine thread owns the model and
+`kidi serve` and `kidi agent`'s background server run the same server module (`src/kidi/server`): one engine thread owns the model and
 serves every request, and the same routes expose an OpenAI-compatible `/v1/chat/completions` endpoint (streaming or
 not) for agent harnesses. It supports OpenAI `tools`, string tool-call `arguments`, `chat_template_kwargs`,
 `reasoning_effort` and `max_tokens`. Decoding is greedy unless a request sets `temperature`; `top_p` and `top_k` are
 also accepted. Responses return parsed `reasoning_content` and `tool_calls` when the model emits reasoning or
-tool-call markup (Inkling and Gemma 4 do), and plain `content` otherwise. `kidi serve` is that server with no UI; the
-desktop app adds its UI (text chats call `/v1`) and a WebSocket channel for image chats and speech/ebook operations,
-whose text generation goes through the same engine. The server listens on `127.0.0.1:8000` by default and has no API
+tool-call markup (Inkling and Gemma 4 do), and plain `content` otherwise. The server listens on `127.0.0.1:8000` by default and has no API
 keys or TLS, so use it only with trusted local clients.
 
 ## Whisper Transcription

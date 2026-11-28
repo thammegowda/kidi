@@ -546,17 +546,10 @@ button:disabled { opacity: .45; cursor: default; transform: none; }
 .markdown-scroll { max-width: 100%; overflow: auto; margin-bottom: 1em; }
 .markdown-scroll > pre, .markdown-scroll > table { margin-bottom: 0; }
 .mermaid-diagram { display: block; width: 100%; min-height: 120px; max-height: 600px; height: auto; margin: 10px 0; border: 0; border-radius: 8px; background: #fff; }
-.diagram-source { margin: 8px 0; color: var(--muted); font-size: 10px; }
-.diagram-source summary { cursor: pointer; padding: 4px 0; }
 .message-content table { min-width: 100%; border-collapse: collapse; white-space: nowrap; }
 .message-content th, .message-content td { padding: 8px 11px; border: 1px solid var(--line); text-align: left; }
 .message-content th { background: var(--panel-2); color: var(--text); }
 .message-content hr { margin: 1.4em 0; border: 0; border-top: 1px solid var(--line); }
-.hljs-keyword, .hljs-selector-tag, .hljs-literal { color: #e6a1bb; }
-.hljs-string, .hljs-attribute { color: #a8d9a0; }
-.hljs-number, .hljs-symbol { color: #dbbe78; }
-.hljs-comment { color: #758078; font-style: italic; }
-.hljs-title, .hljs-function { color: #8dc6ee; }
 .message-footer { display: flex; min-height: 15px; align-items: center; padding: 3px 4px 0; }
 .message-stats { color: #737b85; font-size: 9px; line-height: 1; }
 .message-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 1px; }

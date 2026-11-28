@@ -133,7 +133,8 @@ for visible in '' '-1'; do
     test "$(XDG_RUNTIME_DIR="$auto_root" CUDA_VISIBLE_DEVICES="$visible" "$kidi" agent --model "$model" \
         --workspace "$root" --timeout-ms 5000 --max-tokens 8 --temperature 0 -p auto)" = lambda
 done
-test "$(find "$auto_root" -name server.json -type f | wc -l)" -eq 2
+# Each setting started its own daemon (two logs); the second stopped the idle first.
+test "$(find "$auto_root" -name server.json -type f | wc -l)" -eq 1
 auto_device='cpu:0'
 if [[ $(uname -s) == Darwin ]]; then auto_device='(cpu:0|a_gpu:0)'; fi
 test "$(grep -lE "inference device: $auto_device \(backend=auto\)" "$auto_root"/kidi-agent-*/*/serve.log | wc -l)" -eq 2
@@ -193,12 +194,13 @@ grep -q '"is_summary":true' "$compact_session"
 grep -q '^{"type":"message","role":"user","content":"Task 8 ' "$compact_session"
 
 # Context settings belong to server identity, even if the effective default
-# happens to equal the explicitly requested setting.
+# happens to equal the explicitly requested setting. The new server stops the
+# idle one, so two configurations never hold device memory at once.
 XDG_RUNTIME_DIR="$compact_runtime" CUDA_VISIBLE_DEVICES="${KIDI_TEST_AUTO_CUDA:-}" \
     "$kidi" agent --model "$compact_model" --backend "$compact_backend" \
     --workspace "$root" --config "$root/compact.yaml" --max-tokens 8 --temperature 0 --timeout-ms 5000 -p short \
     > "$root/compact-default.out"
-test "$(find "$compact_runtime" -name server.json -type f | wc -l)" -eq 2
+test "$(find "$compact_runtime" -name server.json -type f | wc -l)" -eq 1
 for state in "$compact_runtime"/kidi-agent-*/*/server.json; do
     read -r pid port < <(sed -nE 's/^\{"port":([0-9]+),"pid":([0-9]+)\}$/\2 \1/p' "$state")
     test "$("$curl" -fsS --noproxy '*' --max-time 2 "http://127.0.0.1:$port/v1/chat/context" \

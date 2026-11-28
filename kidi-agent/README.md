@@ -83,6 +83,29 @@ Before the conversation fills the context, the agent compacts older messages int
 the system prompt, the latest request and the most recent complete tool exchange, using exact token counts from the
 server (`POST /v1/chat/context`). Summaries are lossy, so put permanent rules in `prompts.system`.
 
+## Web UI
+
+`kidi agent --web` serves the same agent as a lightweight local studio and prints a one-time link (`--port` picks
+the port; over SSH, forward it and open the link yourself):
+
+- **Chat view** centers the conversation; **Code view** adds a file tree, a CodeMirror editor with tabs, diffs of
+  the agent's edits (Changes) and a terminal. Saved conversations are under **History**.
+- Approvals appear inline with a diff for file writes (Allow / Always this session / Deny).
+- **Settings** edits the system prompt for this server's conversations; `agent.yaml` is unchanged.
+- Images can be attached, pasted or dropped into the composer for vision models (Gemma 4 E2B QAT); other models
+  refuse them before they enter the conversation.
+- The microphone button dictates into the composer (Whisper small), and the speaker button on a reply reads it
+  aloud (OmniVoice). Both models download and load on first use, on the device `--backend` selects.
+- Dark, light or system theme.
+
+The server listens on 127.0.0.1 only and admits the browser that opened the link (an HTTP-only cookie). For UI work,
+`--web-assets kidi-agent/web` serves the UI from a checkout instead of the embedded copy, so edits need only a reload.
+
+The file tree, editor, diffs, terminal, themes and the workspace sandbox behind them (shared with the agent's file
+and command tools) come from LiteApp's IDE components (`third_party/liteapp`: `liteapp::workspace` and `web/ide`).
+Kidi adds the conversation, approvals, images, speech and settings in [`web/`](web/) and
+[`web.cpp`](src/kidi/agent/web.cpp); generic UI building blocks belong in LiteApp.
+
 ## Tools and permissions
 
 | Tool | Operation |

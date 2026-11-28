@@ -6,8 +6,6 @@ THREADS ?= 8
 MIN_CHRF ?= 99.0
 PORT ?= 8080
 WEB_DIR ?= build-web
-APP_CONFIG ?= examples/kidi-app.yaml
-APP_PORT ?= 10010
 KIDI_CUTLASS_ROOT ?=
 # CUDA toolkit whose bin directory (nvcc and tools) is appended to PATH, after any nvcc already there.
 KIDI_CUDA_ROOT ?= /usr/local/cuda
@@ -27,7 +25,7 @@ CUDA_CMAKE_ARGS = $(if $(KIDI_CUTLASS_ROOT),-DKIDI_CUTLASS_ROOT="$(abspath $(KID
 export PATH := $(CURDIR)/.cache/tools/bin:$(PATH)$(if $(wildcard $(KIDI_CUDA_ROOT)/bin),:$(KIDI_CUDA_ROOT)/bin)
 export KIDI_HUB PYTHON
 
-.PHONY: setup setup-test debug debug-cuda release release-cuda build-test build-python-test prepare-test native-test test-cuda test-all test-all-cuda ynnpack-test python-test web-deps web-test-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test app app-dev wasm extension serve apk apk-release
+.PHONY: setup setup-test debug debug-cuda release release-cuda build-test build-python-test prepare-test native-test test-cuda test-all test-all-cuda ynnpack-test python-test web-deps web-test-deps web-test web-smoke-test extension-smoke-test extension-gmail-test extension-article-test extension-pdf-test extension-edge-test extension-edge-e2e-test extension-edge-open extension-edge-open-local extension-edge-load-local extension-edge-summary-local regression-test test wasm extension serve apk apk-release
 
 refresh:
 	git submodule update --init --recursive --depth 10 --jobs 12
@@ -100,13 +98,6 @@ test test-cuda:
 test-all test-all-cuda:
 	$(MAKE) prepare-test TEST_PRESET=$(patsubst test-all%,debug%,$@)
 	ctest --preset $(patsubst test-all%,debug%,$@) -j $(CTEST_JOBS)
-
-app:
-	cmake --preset release -DKIDI_BUILD_DESKTOP_APP=ON
-	cmake --build --preset release --target kidi_app
-
-app-dev: app
-	build-release/kidi-app "$(APP_CONFIG)" --port "$(APP_PORT)" --dev
 
 wasm:
 	node web/tools/build.mjs "$(WEB_DIR)"

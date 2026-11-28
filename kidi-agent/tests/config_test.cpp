@@ -53,6 +53,25 @@ TEST(AgentConfig, ParsesYamlRegistry) {
     ASSERT_TRUE(effort) << effort.error().message;
     EXPECT_EQ(effort->reasoning_effort, "low");
     EXPECT_FALSE(parse_agent_config("version: 1\nprompts: {system: Hi}\nreasoning_effort: 1\ntools: []"));
+    EXPECT_TRUE(config->speech.transcribe_model.empty() && config->speech.speak_model.empty());
+    const auto speech = parse_agent_config(
+        "version: 1\nprompts: {system: Hi}\ntools: []\nspeech:\n  transcribe: {model: a/asr}\n"
+        "  speak: {model: b/tts, reference_text: Hello there., steps: 12, pace: 0.8, voice: {age: young adult}}");
+    ASSERT_TRUE(speech) << speech.error().message;
+    EXPECT_EQ(speech->speech.transcribe_model, "a/asr");
+    EXPECT_EQ(speech->speech.speak_model, "b/tts");
+    EXPECT_EQ(speech->speech.reference_text, "Hello there.");
+    EXPECT_EQ(speech->speech.steps, 12);
+    EXPECT_FLOAT_EQ(speech->speech.pace, 0.8F);
+    EXPECT_EQ(speech->speech.voice.at("age"), "young adult");
+    for (const auto* bad : {"{speak: {model: b/tts}}", "{speak: {model: b/tts, reference_text: Hi, steps: 0}}",
+                            "{transcribe: {model: a/asr, language: en}}", "{listen: {model: a/asr}}"})
+        EXPECT_FALSE(parse_agent_config(std::string("version: 1\nprompts: {system: Hi}\ntools: []\nspeech: ") + bad))
+            << bad;
+    const auto shipped = default_agent_config();
+    ASSERT_TRUE(shipped) << shipped.error().message;
+    EXPECT_FALSE(shipped->speech.transcribe_model.empty());
+    EXPECT_FALSE(shipped->speech.speak_model.empty());
     ASSERT_EQ(config->tools.size(), 1);
     const auto& tool = config->tools.front();
     EXPECT_EQ(tool.handler, "native_read");

@@ -1,6 +1,6 @@
 #pragma once
 
-/// Serving engine shared by every kidi server front end (`kidi serve`, the desktop app's HTTP and WebSocket routes).
+/// Serving engine shared by every kidi server front end (`kidi serve` and `kidi agent`'s background server).
 /// One worker thread batches all queued generations; token inspection is serialized with that worker.
 /// Callers block in `run` on their own thread and receive streamed text there.
 

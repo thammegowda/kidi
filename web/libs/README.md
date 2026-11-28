@@ -6,6 +6,9 @@ Keep both kinds unmodified and package them locally with their licenses.
 
 ## Vendored releases
 
+The Markdown stack (marked, DOMPurify, highlight.js and Temml for math) is vendored by LiteApp under
+`third_party/liteapp/web/libs/` together with its renderer, `third_party/liteapp/web/markdown/`.
+
 These files are checked in. Versions, source archives, and SHA-512 archive
 integrity values are pinned below; npm acquisition never updates these copies.
 
@@ -14,22 +17,16 @@ integrity values are pinned below; npm acquisition never updates these copies.
 | `acorn/` | 8.15.0 | [acorn-8.15.0.tgz](https://registry.npmjs.org/acorn/-/acorn-8.15.0.tgz) | `dist/acorn.mjs` as `acorn.mjs` | MIT |
 | `acorn-walk/` | 8.3.4 | [acorn-walk-8.3.4.tgz](https://registry.npmjs.org/acorn-walk/-/acorn-walk-8.3.4.tgz) | `dist/walk.mjs` as `walk.mjs` | MIT |
 | `coi-serviceworker/` | 0.1.7 | [coi-serviceworker-0.1.7.tgz](https://registry.npmjs.org/coi-serviceworker/-/coi-serviceworker-0.1.7.tgz) | `coi-serviceworker.js` | MIT |
-| `dompurify/` | 3.4.15 | [dompurify-3.4.15.tgz](https://registry.npmjs.org/dompurify/-/dompurify-3.4.15.tgz) | `dist/purify.es.mjs` as `purify.es.mjs` | Apache-2.0 OR MPL-2.0 |
-| `highlightjs/` | 11.12.0 | [cdn-assets-11.12.0.tgz](https://registry.npmjs.org/@highlightjs/cdn-assets/-/cdn-assets-11.12.0.tgz) | `es/highlight.min.js` as `highlight.min.js` | BSD-3-Clause |
 | `js-yaml/` | 4.1.0 | [js-yaml-4.1.0.tgz](https://registry.npmjs.org/js-yaml/-/js-yaml-4.1.0.tgz) | `dist/js-yaml.mjs` as `js-yaml.mjs` | MIT |
 | `lucide-static/` | 0.468.0 | [lucide-static-0.468.0.tgz](https://registry.npmjs.org/lucide-static/-/lucide-static-0.468.0.tgz) | Ten selected SVG icons | ISC |
-| `marked/` | 18.0.13 | [marked-18.0.13.tgz](https://registry.npmjs.org/marked/-/marked-18.0.13.tgz) | `lib/marked.esm.js` as `marked.esm.js` | MIT |
 | `readability/` | 0.6.0 | [readability-0.6.0.tgz](https://registry.npmjs.org/@mozilla/readability/-/readability-0.6.0.tgz) | `Readability.js` | Apache-2.0 |
 
 ```text
 acorn-8.15.0.tgz       sha512-NZyJarBfL7nWwIq+FDL6Zp/yHEhePMNnnJ0y3qfieCrmNvYct8uvtiV41UvlSe6apAfk0fY1FbWx+NwfmpvtTg==
 acorn-walk-8.3.4.tgz   sha512-ueEepnujpqee2o5aIYnvHU6C0A42MNdsIDeqy5BydrkuC5R1ZuUFnm27EeFJGoEHJQgn3uleRvmTXaJgfXbt4g==
 coi-serviceworker-0.1.7.tgz sha512-bjSUqEngCPOkErY2vbyWsaIGCNRODYzlNycaREVw5s12/C8SM+RnRUUeX6pZbTtov6C52ZLY/+tvHK+BDxuUuA==
-dompurify-3.4.15.tgz   sha512-EUBjM+B+lkDE41iE82DDSCfkoPGfXx8IxFxPMjNzm/Uk4xDet77rTN9wqlxlVg71kK7XGuUMv6wUxJUwwv+Xyw==
-cdn-assets-11.12.0.tgz sha512-KvOKXODaiFmId9xaq3xc5xCL66wVLUuOngDbO9B/kewbFTqdGbn2nJxNhN3H5R1cgDTVj6R8vH0zgiNDEGjpDw==
 js-yaml-4.1.0.tgz      sha512-wpxZs9NoxZaJESJGIZTyDEaYpl0FKSA+FB9aJiyemKhMwkxQg63h4T1KJgUGHpTqPDNRcmmYLugrRjJlBtWvRA==
 lucide-static-0.468.0.tgz sha512-JvpWui2umxRyEVMoETfMzb+qKqibV/sdoqJbKmW1JLdkuhXluJKoO6NqCbvCK/vAbUuH5bTEFD4T6uECsrNcnA==
-marked-18.0.13.tgz     sha512-xTxVzZsBFwunP6HDmtBkabUQEYArnP7/rMDGmPj9SlrKlQ4i8MdYVow+nJL0eOqwpUqhzBoTBRADGN6uYwPyOw==
 readability-0.6.0.tgz  sha512-juG5VWh4qAivzTAeMzvY9xs9HY5rAcr2E4I7tiSSCokRFi7XIZCAu92ZkSTsIj1OPceCifL3cpfteP3pDT9/QQ==
 ```
 

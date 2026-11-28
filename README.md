@@ -61,6 +61,9 @@ on your machine.
   and history, with no second model (Inkling-2 on CPU, greedy decoding).
 - **Full terminal UI.** Streaming replies, line editing, history, multiline paste, colored tool activity, and a status
   bar with context usage, token speed and prefill time. Ctrl-C cancels a turn, including a running command.
+- **Web studio.** `kidi agent --web` opens the same agent in a light local web UI: chat or code layout, file tree,
+  editor, diffs of the agent's edits, a terminal, saved conversations, image input for vision models, dictation and
+  read-aloud. See the [web UI guide](kidi-agent/README.md#web-ui).
 - **Scriptable and configurable.** `-p "task"` runs one task and exits. Prompts, sampling and the tool registry come
   from [`agent.yaml`](kidi-agent/agent.yaml) (replace it with `--config`); each tool binds to a compiled handler, so
   renaming a tool cannot widen what it can do. Sessions are saved as private local JSONL transcripts (`--no-save`
@@ -155,7 +158,7 @@ The server listens on `127.0.0.1` and has no API keys or TLS; use it only with t
   ([guide](docs/getting-started.md#text-to-speech)).
 - **Translation:** 500 languages to English with the [RTG 500 model](https://huggingface.co/thammegowda/rtg-500eng-v1)
   and `kidi translate` ([guide](docs/getting-started.md#rtg-translation-from-hugging-face)).
-- **Apps:** a [desktop app](desktop/README.md), a [WebAssembly/WebGPU browser app](web/README.md) and an
+- **Apps:** `kidi agent --web` (local web studio), a [WebAssembly/WebGPU browser app](web/README.md) and an
   [Android app](android/README.md). Features vary by app and include streaming chat, voice dictation and read-aloud,
   camera/photo Q&A, and a bilingual EPUB reader.
 

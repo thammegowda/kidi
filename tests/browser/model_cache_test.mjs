@@ -38,55 +38,6 @@ test('built wasm32 runtime addresses memory above 2 GiB within its 4 GiB limit',
     } finally { module._free(base); }
 });
 
-test('image attachments persist outside chat text and stage bounded temporary request files', async () => {
-    const {storeImage, readImage, stageImages, removeUnusedImages} =
-        await import('../../web/ui/images.js');
-    const previous = globalThis.caches;
-    const saved = new Map(), files = new Map(), removedDirectories = [];
-    globalThis.caches = {open: async () => ({
-        put: async (key, response) => saved.set(key, response),
-        match: async key => saved.get(key)?.clone(),
-        keys: async () => [...saved.keys()].map(url => ({url})),
-        delete: async key => saved.delete(typeof key === 'string' ? key : key.url)
-    })};
-    const module = {FS: {mkdirTree: () => {}, writeFile: (path, bytes) => files.set(path, bytes),
-        unlink: path => files.delete(path), rmdir: path => removedDirectories.push(path)}};
-    try {
-        const image = await storeImage(new Blob(['image bytes'], {type: 'image/jpeg'}), 'photo.jpg');
-        assert.equal(await (await readImage(image)).text(), 'image bytes');
-        const staged = await stageImages(module, [{role: 'user', content: 'Describe', images: [image]}]);
-        assert.deepEqual(staged.messages[0].images, ['/images/0.jpg']);
-        assert.deepEqual(files.get('/images/0.jpg'), new TextEncoder().encode('image bytes'));
-        assert.equal(files.size, 1);
-        staged.dispose();
-        assert.equal(files.size, 0);
-        const original = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 255, 128, 42]);
-        const png = await storeImage(new Blob([original], {type: 'image/png'}), 'original.png');
-        const pngRequest = await stageImages(module, [{role: 'user', content: '', images: [png]}]);
-        assert.deepEqual(files.get('/images/0.png'), original);
-        pngRequest.dispose();
-        assert.equal(files.size, 0);
-        const one = await stageImages(module, [{role: 'user', content: '', images: [png]}],
-            {directory: '/images/request-1'});
-        const two = await stageImages(module, [{role: 'user', content: '', images: [image]}],
-            {directory: '/images/request-2'});
-        one.dispose();
-        one.dispose();
-        assert.equal(files.has('/images/request-2/0.jpg'), true);
-        two.dispose();
-        assert.deepEqual(removedDirectories, ['/images/request-1', '/images/request-2']);
-        assert.equal(files.size, 0);
-        await assert.rejects(stageImages(module, [], {directory: '/model'}), /staging directory/);
-        await assert.rejects(stageImages(module, [{role: 'assistant', content: '', images: [image]}]), /user messages/);
-        await assert.rejects(stageImages(module, [{role: 'user', content: '', images: Array(9).fill(image)}]), /at most eight/);
-        assert.equal(files.size, 0);
-        await removeUnusedImages([image]);
-        assert.equal(saved.size, 1);
-        await removeUnusedImages([]);
-        await assert.rejects(stageImages(module, [{role: 'user', content: '', images: [image]}]), /Image unavailable/);
-        await assert.rejects(readImage({id: '../../model/model.yaml'}), /Invalid image/);
-    } finally { globalThis.caches = previous; }
-});
 test('lowered wasm32 glue fixes direct and pthread heap indices without changing arithmetic shifts', () => {
     const source = 'HEAP32[ptr >> 2] = 1; (growMemViews(), HEAPU64)[addr >> 3] = 2n; const signed = value >> 3;';
     const fixed = unsignedHeapIndices(source);
