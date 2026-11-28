@@ -69,6 +69,9 @@ auto Transcript::directory(const std::filesystem::path& workspace) -> Result<std
 #endif
     if (cache.empty() || !cache.is_absolute())
         return io_error("set an absolute XDG_CACHE_HOME or HOME, or use --no-save");
+    // Resolved like the workspace, so listed, opened and resumed transcripts share one path (macOS /tmp is a link).
+    cache = std::filesystem::weakly_canonical(cache, error);
+    if (error) return io_error("resolve cache directory: " + error.message());
     // Stable across processes and builds; canonical paths isolate workspaces, including symlink aliases.
     std::uint64_t hash = 14695981039346656037ULL;
     for (const unsigned char byte : canonical.generic_string()) hash = (hash ^ byte) * 1099511628211ULL;
