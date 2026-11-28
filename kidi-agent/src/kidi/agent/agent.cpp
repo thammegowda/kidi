@@ -59,10 +59,33 @@ auto validate_history(std::span<const Message> history) -> Result<void> {
     return {};
 }
 
-auto execute(const Tool& tool, const ToolCall& call, const RunOptions& options, const Callbacks& callbacks,
-             std::stop_token stop) -> Result<std::string> {
+auto execute(const Tool& tool, const ToolCall& call, std::span<const Message> history, const RunOptions& options,
+             const Callbacks& callbacks, std::stop_token stop) -> Result<std::string> {
     if (stop.stop_requested()) return std::unexpected(Error{ErrorCode::RUNTIME, "cancelled"});
-    switch (options.permissions.access(tool.capability)) {
+    if (tool.check)
+        if (auto allowed = tool.check(call, history); !allowed) return std::unexpected(allowed.error());
+    const auto access = options.permissions.access(tool.capability);
+    if (access != Access::DENY && tool.setup)
+        if (auto reason = tool.setup->needed()) {
+            const auto& service = tool.setup->service;
+            if (!callbacks.setup)
+                return std::unexpected(Error{ErrorCode::UNSUPPORTED,
+                                             call.name + " needs " + service + " to be connected (" + *reason +
+                                                 "), which this session cannot ask for. Tell the user to start an "
+                                                 "interactive kidi agent once and approve connecting " + service +
+                                                 "."});
+            auto sign_in = callbacks.setup(tool.spec, *tool.setup, *reason);
+            if (!sign_in) return std::unexpected(sign_in.error());
+            if (!*sign_in)
+                return std::unexpected(Error{ErrorCode::RUNTIME, "The user chose not to connect " + service +
+                                                                      " now, so " + call.name +
+                                                                      " is unavailable. Continue without it."});
+            if (auto done = tool.setup->run(**sign_in, stop); !done)
+                return std::unexpected(Error{done.error().code, "Connecting " + service + " failed: " +
+                                                                    done.error().message +
+                                                                    ". Tell the user; they can try again."});
+        }
+    switch (access) {
         case Access::DENY:
             return std::unexpected(Error{ErrorCode::RUNTIME, "permission denied: " + call.name});
         case Access::ASK: {
@@ -366,7 +389,7 @@ auto run_turn(const Provider& provider, std::span<const Tool> tools, std::vector
                 std::ranges::find_if(tools, [&](const Tool& item) { return item.spec.name == call.name; });
             auto output = tool == tools.end() ? Result<std::string>(std::unexpected(
                                                     Error{ErrorCode::INVALID_ARGUMENT, "unknown tool: " + call.name}))
-                                              : execute(*tool, call, options, callbacks, stop);
+                                              : execute(*tool, call, history, options, callbacks, stop);
             auto content =
                 output ? std::move(*output)
                        : Json{{"error", output.error().message}}.dump(-1, ' ', false, Json::error_handler_t::replace);

@@ -1,8 +1,8 @@
-#include "kidi/agent/chat_transport.h"
+#include "kidi/agent/chat/transport.h"
 #include "kidi/agent/command.h"
-#include "kidi/agent/markdown.h"
+#include "kidi/agent/ui/markdown.h"
 #include "kidi/agent/session.h"
-#include "kidi/agent/terminal.h"
+#include "kidi/agent/ui/terminal.h"
 #include "kidi/agent/transcript.h"
 
 #include <gtest/gtest.h>
@@ -25,9 +25,16 @@
 #include <unistd.h>
 
 namespace kidi::agent {
+
+using ui::display_width;
+using ui::fit_width;
+using ui::MarkdownStream;
+using ui::render_markdown;
+using ui::terminal_text;
+using ui::wrap_width;
 namespace {
 
-auto test_provider(ChatClientOptions options) -> Result<Provider> {
+auto test_provider(chat::ChatClientOptions options) -> Result<Provider> {
     Provider provider([options](std::span<const Message> messages, std::span<const ToolSpec>,
                          std::stop_token stop) -> Result<Message> {
         if (messages.back().role == Role::TOOL)
@@ -710,9 +717,9 @@ TEST_F(AgentSessionTest, ListsAndResumesTranscripts) {
 TEST_F(AgentSessionTest, SendsResumesAndRefusesImages) {
     bool vision = true;
     std::vector<Json> completions;
-    const auto provider = [&](ChatClientOptions chat) -> Result<Provider> {
-        return completion_provider(std::move(chat), [&](const ChatClientOptions&, std::string payload, std::stop_token,
-                                                         std::string_view route) -> Result<std::string> {
+    const auto provider = [&](chat::ChatClientOptions options) -> Result<Provider> {
+        return completion_provider(std::move(options), [&](const chat::ChatClientOptions&, std::string payload,
+                                                           std::stop_token, std::string_view route) -> Result<std::string> {
             auto request = Json::parse(payload);
             if (!vision && request.dump().find("image_url") != std::string::npos)
                 return std::unexpected(Error{ErrorCode::RUNTIME, "no vision tower"});

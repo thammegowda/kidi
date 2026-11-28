@@ -1,11 +1,11 @@
-#include "kidi/agent/markdown.h"
+#include "kidi/agent/ui/markdown.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <utility>
 
-namespace kidi::agent {
+namespace kidi::agent::ui {
 namespace {
 
 constexpr std::string_view RESET = "\033[0m";
@@ -483,4 +483,4 @@ auto render_markdown(std::string_view text, bool color, std::size_t width) -> st
     return lines;
 }
 
-} // namespace kidi::agent
+} // namespace kidi::agent::ui

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "kidi/cli/argparse.h"
-#include "kidi/agent/chat_client.h"
+#include "kidi/agent/chat/client.h"
 #include "kidi/agent/session.h"
 #include "kidi/agent/speech.h"
 

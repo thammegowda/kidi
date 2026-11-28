@@ -4,7 +4,7 @@
 
 #include <chrono>
 
-namespace kidi::agent {
+namespace kidi::agent::chat {
 
 struct ChatClientOptions {
     std::string base_url = "http://127.0.0.1:18097/v1";
@@ -24,4 +24,4 @@ struct ChatClientOptions {
 // Kidi server's Chat Completions protocol over plain HTTP. No redirects or retries.
 auto http_provider(ChatClientOptions options = {}) -> Result<Provider>;
 
-} // namespace kidi::agent
+} // namespace kidi::agent::chat

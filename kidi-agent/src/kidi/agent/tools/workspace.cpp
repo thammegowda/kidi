@@ -1,4 +1,7 @@
-#include "kidi/agent/workspace.h"
+#include "kidi/agent/tools/workspace.h"
+
+#include "kidi/agent/tools/arguments.h"
+#include "kidi/agent/tools/web.h"
 
 #include <liteapp/workspace/workspace.h>
 
@@ -8,7 +11,7 @@
 #include <string>
 #include <vector>
 
-namespace kidi::agent {
+namespace kidi::agent::tools {
 namespace {
 
 using liteapp::workspace::Workspace;
@@ -29,32 +32,17 @@ auto from_liteapp(const liteapp::Error& error) -> std::unexpected<Error> {
     return std::unexpected(Error{code, error.message});
 }
 
-auto string_arg(const Json& args, std::string_view key) -> Result<std::string> {
-    const auto item = args.find(key);
-    if (item == args.end() || !item->is_string()) return invalid(std::string(key) + " must be a string");
-    return item->get<std::string>();
-}
-
-auto size_arg(const Json& args, std::string_view key, std::size_t fallback) -> Result<std::size_t> {
-    const auto item = args.find(key);
-    if (item == args.end()) return fallback;
-    if (!item->is_number_unsigned() && (!item->is_number_integer() || item->get<std::int64_t>() < 0))
-        return invalid(std::string(key) + " must be a nonnegative integer");
-    const auto value = item->get<std::uint64_t>();
-    if (value > std::numeric_limits<std::size_t>::max()) return invalid(std::string(key) + " is too large");
-    return static_cast<std::size_t>(value);
-}
 
 // The JSON tool handlers; files and commands go through the shared liteapp workspace.
 struct Tools {
     Workspace workspace;
 
     auto read(const Json& args, std::stop_token stop) const -> Result<std::string> {
-        auto path = string_arg(args, "path");
+        auto path = string_argument(args, "path");
         if (!path) return std::unexpected(path.error());
         const auto limit = workspace.options().limits.max_file_bytes;
-        const auto offset = size_arg(args, "offset", 0);
-        const auto max_bytes = size_arg(args, "max_bytes", std::min<std::size_t>(4096, limit));
+        const auto offset = size_argument(args, "offset", 0);
+        const auto max_bytes = size_argument(args, "max_bytes", std::min<std::size_t>(4096, limit));
         if (!offset) return std::unexpected(offset.error());
         if (!max_bytes) return std::unexpected(max_bytes.error());
         auto page = workspace.read_page(*path, *offset, *max_bytes, stop);
@@ -68,7 +56,7 @@ struct Tools {
 
     auto list(const Json& args, std::stop_token stop) const -> Result<std::string> {
         if (stop.stop_requested()) return std::unexpected(Error{ErrorCode::RUNTIME, "cancelled"});
-        auto path = string_arg(args, "path");
+        auto path = string_argument(args, "path");
         if (!path) return std::unexpected(path.error());
         if (path->empty()) return invalid("expected a nonempty relative workspace path");
         auto entries = workspace.list(*path);
@@ -80,8 +68,8 @@ struct Tools {
     }
 
     auto write(const Json& args, std::stop_token stop) const -> Result<std::string> {
-        auto path = string_arg(args, "path");
-        auto content = string_arg(args, "content");
+        auto path = string_argument(args, "path");
+        auto content = string_argument(args, "content");
         if (!path) return std::unexpected(path.error());
         if (!content) return std::unexpected(content.error());
         auto written = workspace.write(*path, *content, std::nullopt, stop);
@@ -91,14 +79,14 @@ struct Tools {
 
     auto make_directory(const Json& args, std::stop_token stop) const -> Result<std::string> {
         if (stop.stop_requested()) return std::unexpected(Error{ErrorCode::RUNTIME, "cancelled"});
-        auto path = string_arg(args, "path");
+        auto path = string_argument(args, "path");
         if (!path) return std::unexpected(path.error());
         if (auto made = workspace.make_directory(*path); !made) return from_liteapp(made.error());
         return std::string("directory created");
     }
 
     auto run(const Json& args, std::stop_token stop) const -> Result<std::string> {
-        auto command = string_arg(args, "command");
+        auto command = string_argument(args, "command");
         if (!command) return std::unexpected(command.error());
         if (command->empty() || command->find('\0') != std::string::npos)
             return invalid("command must be nonempty text");
@@ -119,8 +107,8 @@ auto workspace_tools(const std::filesystem::path& root, WorkspaceOptions options
     return workspace_tools(root, *config, options);
 }
 
-auto workspace_tools(const std::filesystem::path& root, const AgentConfig& config, WorkspaceOptions options)
-    -> Result<std::vector<Tool>> {
+auto workspace_tools(const std::filesystem::path& root, const AgentConfig& config, WorkspaceOptions options,
+                     net::McpServers servers) -> Result<std::vector<Tool>> {
     auto workspace = Workspace::open(root, {.limits = {.max_file_bytes = options.max_file_bytes,
                                                        .max_directory_entries = options.max_directory_entries,
                                                        .max_command_output = options.max_command_output,
@@ -128,7 +116,7 @@ auto workspace_tools(const std::filesystem::path& root, const AgentConfig& confi
                                             .temporary_prefix = TEMPORARY_PREFIX});
     if (!workspace) return from_liteapp(workspace.error());
     auto tools = std::make_shared<const Tools>(Tools{std::move(*workspace)});
-    const std::vector<Tool> handlers{
+    const std::vector<Tool> fixed{
         {{.name = "read_file"},
          Capability::READ,
          [tools](const Json& args, std::stop_token stop) { return tools->read(args, stop); }},
@@ -145,7 +133,10 @@ auto workspace_tools(const std::filesystem::path& root, const AgentConfig& confi
          Capability::EXECUTE,
          [tools](const Json& args, std::stop_token stop) { return tools->run(args, stop); }},
     };
+    if (servers.empty()) servers = net::mcp_servers(config.mcp_servers);
+    auto handlers = web_tool_handlers({.servers = std::move(servers)});
+    for (const auto& tool : fixed) handlers.push_back(fixed_handler(tool));
     return configure_tools(config, handlers);
 }
 
-} // namespace kidi::agent
+} // namespace kidi::agent::tools

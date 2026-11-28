@@ -6,6 +6,7 @@
 
 #include <concepts>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -18,6 +19,12 @@ namespace kidi::agent {
 
 // JSON is the tool-schema and provider boundary, not an inference dependency.
 using Json = nlohmann::ordered_json;
+
+inline auto failure(ErrorCode code, std::string message) -> std::unexpected<Error> {
+    return std::unexpected(Error{code, std::move(message)});
+}
+
+inline auto cancelled() -> std::unexpected<Error> { return failure(ErrorCode::RUNTIME, "cancelled"); }
 
 enum class Role { SYSTEM, USER, ASSISTANT, TOOL };
 enum class Capability { READ, WRITE, EXECUTE, NETWORK, CUSTOM };
@@ -54,10 +61,29 @@ struct ToolSpec {
     Json parameters = Json::object();
 };
 
+// How a host lets the user approve a sign-in in a browser.
+struct BrowserSignIn {
+    std::string redirect_uri; // where the browser returns after sign-in; the host receives it there
+    // Shows `url` to the user (opening a browser where it can) and returns the URL the browser came back to.
+    std::function<Result<std::string>(const std::string& url, std::stop_token)> visit;
+};
+
+// One-time setup a tool needs before it works, such as signing in to the service behind it. Hosts ask the user
+// first; the model sees only the outcome, never credentials.
+struct ToolSetup {
+    std::string service;                                // what the user connects, such as "TinyFish"
+    std::function<std::optional<std::string>()> needed; // why setup is needed now, or nullopt when ready
+    std::function<Result<void>(const BrowserSignIn&, std::stop_token)> run;
+};
+
 struct Tool {
     ToolSpec spec;
     Capability capability = Capability::CUSTOM;
     std::function<Result<std::string>(const Json&, std::stop_token)> invoke;
+    // Optional precondition on the call and the conversation so far, checked before approval; its error is the
+    // tool result. web_fetch uses it to open only addresses that the user or a tool result supplied.
+    std::function<Result<void>(const ToolCall&, std::span<const Message>)> check;
+    std::shared_ptr<const ToolSetup> setup; // optional
 };
 
 struct Permissions {
@@ -97,6 +123,10 @@ struct Event {
 struct Callbacks {
     std::function<Result<bool>(const ToolSpec&, const ToolCall&)> approve;
     std::function<void(const Event&)> observe;
+    // Asks the user to set up a tool (see ToolSetup); returns how the browser sign-in reaches this host, or
+    // nullopt when the user declines. Without it, tools that need setup fail with an explanation.
+    std::function<Result<std::optional<BrowserSignIn>>(const ToolSpec&, const ToolSetup&, const std::string& reason)>
+        setup;
 };
 
 struct ContextUsage {

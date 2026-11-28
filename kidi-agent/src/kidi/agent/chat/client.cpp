@@ -1,10 +1,10 @@
-#include "kidi/agent/chat_transport.h"
+#include "kidi/agent/chat/transport.h"
 
 #include <algorithm>
 #include <limits>
 #include <utility>
 
-namespace kidi::agent {
+namespace kidi::agent::chat {
 namespace {
 
 auto invalid(std::string message) -> std::unexpected<Error> {
@@ -204,4 +204,4 @@ auto completion_provider(ChatClientOptions options, CompletionTransport transpor
     return provider;
 }
 
-} // namespace kidi::agent
+} // namespace kidi::agent::chat

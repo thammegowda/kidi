@@ -1,11 +1,12 @@
 #include "kidi/agent/command.h"
-#include "kidi/agent/chat_client.h"
+#include "kidi/agent/chat/client.h"
 #include "kidi/agent/session.h"
-#include "kidi/agent/terminal.h"
+#include "kidi/agent/net/sign_in.h"
+#include "kidi/agent/ui/terminal.h"
 #include "kidi/agent/transcript.h"
-#include "kidi/agent/workspace.h"
+#include "kidi/agent/tools/workspace.h"
 #if defined(KIDI_AGENT_WEB)
-#include "kidi/agent/web.h"
+#include "kidi/agent/ui/web.h"
 #endif
 
 #include <algorithm>
@@ -18,6 +19,11 @@
 #include <thread>
 
 namespace kidi::agent {
+
+using ui::InputState;
+using ui::Terminal;
+using ui::terminal_text;
+using ui::TerminalTone;
 
 auto configure_parser(cli::ArgumentParser& parser, bool managed) -> void {
     if (managed) {
@@ -47,8 +53,9 @@ auto configure_parser(cli::ArgumentParser& parser, bool managed) -> void {
         .default_value(std::string("ask"))
         .choices({"none", "read-only", "ask", "workspace-write", "full-access"})
         .help(
-            "none: plain chat without tools; read-only: read files only; ask: ask before writes and commands "
-            "(default); workspace-write: allow writes but ask before commands; full-access: allow both");
+            "none: plain chat without tools; read-only: read files only; ask: ask before writes, commands and web "
+            "requests (default); workspace-write: allow writes but ask before commands and web requests; "
+            "full-access: allow all");
     parser.add_argument("--max-steps").dest("max_steps").default_value<std::size_t>(64);
     parser.add_argument("--max-tool-calls").dest("max_tool_calls").default_value<std::size_t>(256);
     parser.add_argument("--max-tokens")
@@ -88,7 +95,7 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
         return 1;
     }
     if (const auto& system = arguments.get<std::string>("system"); !system.empty()) config->system_prompt = system;
-    ChatClientOptions options_http{
+    chat::ChatClientOptions options_http{
         .model = arguments.contains("model") ? arguments.get<std::string>("model") : "kidi-local",
         .max_tokens = arguments.get<std::size_t>("max_tokens"),
         .timeout = std::chrono::milliseconds(arguments.get<std::int64_t>("timeout_ms")),
@@ -106,7 +113,8 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
     if (arguments.contains("base_url")) {
         options_http.base_url = arguments.get<std::string>("base_url");
     }
-    auto tools = workspace_tools(arguments.get<std::filesystem::path>("workspace"), *config);
+    auto servers = net::mcp_servers(config->mcp_servers);
+    auto tools = tools::workspace_tools(arguments.get<std::filesystem::path>("workspace"), *config, {}, servers);
     if (!tools) {
         std::cerr << "kidi-agent: " << terminal_text(tools.error().message) << '\n';
         return 1;
@@ -124,6 +132,8 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
     options.permissions.read = mode == "none" ? Access::DENY : Access::ALLOW;
     options.permissions.write = read_only ? Access::DENY : mode == "ask" ? Access::ASK : Access::ALLOW;
     options.permissions.execute = read_only ? Access::DENY : mode == "full-access" ? Access::ALLOW : Access::ASK;
+    // Web requests send queries and addresses off this computer, so they are approved unless access is full.
+    options.permissions.network = mode == "none" ? Access::DENY : mode == "full-access" ? Access::ALLOW : Access::ASK;
     const auto offered = [&](const Tool& tool) { return options.permissions.access(tool.capability) != Access::DENY; };
     if (!config->tools_prompt.empty() && std::ranges::any_of(*tools, offered)) {
         if (!config->system_prompt.ends_with('\n')) config->system_prompt += '\n';
@@ -139,7 +149,8 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
                                    .mode = mode,
                                    .save = !arguments.get<bool>("no_save"),
                                    .announce_transcript = interactive,
-                                   .create_provider = std::move(create_provider)};
+                                   .create_provider = std::move(create_provider),
+                                   .discover_tools = net::mcp_tool_discovery(config->mcp_servers, servers)};
 #if defined(KIDI_AGENT_WEB)
     if (arguments.get<bool>("web")) {
         if (!interactive) {
@@ -147,7 +158,7 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
             return 1;
         }
         auto speech = create_speech ? create_speech(config->speech) : Speech{};
-        return web_agent(std::move(session_options), std::move(speech), arguments.get<std::int32_t>("port"),
+        return ui::web_agent(std::move(session_options), std::move(speech), arguments.get<std::int32_t>("port"),
                          arguments.get<std::filesystem::path>("web_assets"));
     }
 #else
@@ -247,6 +258,39 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
                 if (response->text.empty() || response->text == "n" || response->text == "no") return Approval::DENY;
                 terminal.write("Choose y, a or n; empty input denies.\n", TerminalTone::WARNING);
             }
+        };
+    if (interactive)
+        view.setup = [&](const ToolSpec& spec, const ToolSetup& setup,
+                         const std::string& reason) -> Result<std::optional<BrowserSignIn>> {
+            terminal.write(terminal_text(spec.name) + " needs " + terminal_text(setup.service) + ": " +
+                               terminal_text(reason) + ".\n",
+                           TerminalTone::WARNING);
+            for (;;) {
+                auto response = terminal.read("Connect " + terminal_text(setup.service) + " now? It opens a browser "
+                                              "sign-in. [Y/n] ",
+                                              false);
+                if (!response) return std::unexpected(response.error());
+                if (response->state == InputState::INTERRUPTED)
+                    return std::unexpected(Error{ErrorCode::RUNTIME, "setup cancelled"});
+                if (response->state == InputState::END) {
+                    input_closed = true;
+                    return std::unexpected(Error{ErrorCode::IO, "cannot read the answer: end of input"});
+                }
+                if (response->text == "n" || response->text == "no") return std::optional<BrowserSignIn>{};
+                if (response->text.empty() || response->text == "y" || response->text == "yes") break;
+                terminal.write("Choose y or n.\n", TerminalTone::WARNING);
+            }
+            auto sign_in = net::loopback_sign_in([&, service = setup.service](const std::string& url, int port) {
+                terminal.write("Sign in to " + terminal_text(service) + " in your browser:\n  " + url + "\n");
+                if (!net::open_in_browser(url))
+                    terminal.write("If that browser runs on another computer, forward port " + std::to_string(port) +
+                                       " first (ssh -L " + std::to_string(port) + ":127.0.0.1:" +
+                                       std::to_string(port) + " <this host>), or use kidi agent --web.\n",
+                                   TerminalTone::DIM);
+                terminal.write("Waiting for the sign-in (Ctrl-C cancels)...\n", TerminalTone::DIM);
+            });
+            if (!sign_in) return std::unexpected(sign_in.error());
+            return std::optional<BrowserSignIn>(std::move(*sign_in));
         };
     session = std::make_unique<AgentSession>(std::move(session_options), std::move(view));
     const auto run = [&](std::string task) -> int {

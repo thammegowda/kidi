@@ -1,4 +1,6 @@
-#include "kidi/agent/web.h"
+#include "kidi/agent/ui/web.h"
+#include "kidi/agent/net/http.h"
+#include "kidi/agent/net/sign_in.h"
 
 #include "kidi/agent_web_assets.h"
 
@@ -23,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-namespace kidi::agent {
+namespace kidi::agent::ui {
 namespace {
 
 using JsonValue = nlohmann::json;
@@ -180,6 +182,22 @@ public:
             approval_ready_.notify_all();
             return JsonValue::object();
         });
+        router.register_method("setup.respond", [this](ServiceContext& context) -> liteapp::Result<JsonValue> {
+            const auto& payload = context.payload();
+            const auto decision = payload.value("decision", std::string{});
+            const auto origin = payload.value("origin", std::string{});
+            if (decision != "connect" && decision != "decline")
+                return failure("invalid", "decision must be connect or decline");
+            if (decision == "connect" && !(origin.starts_with("http://") || origin.starts_with("https://")))
+                return failure("invalid", "connect needs the page's origin");
+            const std::lock_guard lock(approval_mutex_);
+            if (!setup_ || setup_->id != payload.value("id", std::string{}))
+                return failure("stale", "that setup is no longer pending");
+            if (decision == "connect") setup_->origin = origin;
+            else setup_->declined = true;
+            approval_ready_.notify_all();
+            return JsonValue::object();
+        });
         router.register_method("chat.context", [this](ServiceContext&) -> liteapp::Result<JsonValue> {
             auto idle = idle_session();
             if (!idle) return std::unexpected(idle.error());
@@ -282,6 +300,11 @@ private:
         std::optional<Approval> decision;
         bool cancelled = false;
     };
+    struct PendingSetup {
+        std::string id;
+        std::optional<std::string> origin; // the page's origin once the user chose Connect
+        bool declined = false;
+    };
 
     auto make_session() -> std::unique_ptr<AgentSession> {
         SessionView view;
@@ -315,6 +338,9 @@ private:
         view.event = [this](const Event& event) { observe(event); };
         view.approve = [this](const ToolSpec& spec, const ToolCall& call, bool unsandboxed) {
             return approve(spec, call, unsandboxed);
+        };
+        view.setup = [this](const ToolSpec& spec, const ToolSetup& setup, const std::string& reason) {
+            return set_up(spec, setup, reason);
         };
         return std::make_unique<AgentSession>(options_, std::move(view));
     }
@@ -383,6 +409,78 @@ private:
         if (!decision) return std::unexpected(Error{ErrorCode::RUNTIME, "approval cancelled"});
         return *decision;
     }
+
+    // Asks the page to connect the service a tool needs; on Connect, the sign-in returns to this server's
+    // /oauth/callback at the page's own origin, which works wherever the page itself is reachable.
+    auto set_up(const ToolSpec& spec, const ToolSetup& setup, const std::string& reason)
+        -> Result<std::optional<BrowserSignIn>> {
+        const auto id = std::to_string(++approvals_);
+        JsonValue payload{{"id", id}, {"tool", spec.name}, {"service", setup.service}, {"reason", reason}};
+        std::unique_lock lock(approval_mutex_);
+        if (turn_cancelled_) return std::unexpected(Error{ErrorCode::RUNTIME, "setup cancelled"});
+        setup_ = PendingSetup{.id = id};
+        lock.unlock();
+        broadcast("setup", payload);
+        lock.lock();
+        approval_ready_.wait(lock, [&] { return setup_->origin || setup_->declined || turn_cancelled_; });
+        const auto pending = std::move(*setup_);
+        setup_.reset();
+        lock.unlock();
+        if (!pending.origin) {
+            broadcast("setup_done", {{"id", id}, {"decision", pending.declined ? "declined" : "cancelled"}});
+            if (pending.declined) return std::optional<BrowserSignIn>{};
+            return std::unexpected(Error{ErrorCode::RUNTIME, "setup cancelled"});
+        }
+        BrowserSignIn browser;
+        browser.redirect_uri = *pending.origin + "/oauth/callback";
+        browser.visit = [this, id, origin = *pending.origin](const std::string& url,
+                                                             std::stop_token stop) -> Result<std::string> {
+            {
+                const std::lock_guard guard(approval_mutex_);
+                sign_in_waiting_ = true;
+                sign_in_return_.reset();
+            }
+            broadcast("setup_open", {{"id", id}, {"url", url}});
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+            std::unique_lock guard(approval_mutex_);
+            while (!sign_in_return_ && !turn_cancelled_ && !stop.stop_requested() &&
+                   std::chrono::steady_clock::now() < deadline)
+                approval_ready_.wait_for(guard, std::chrono::milliseconds(500));
+            sign_in_waiting_ = false;
+            auto target = std::move(sign_in_return_);
+            sign_in_return_.reset();
+            guard.unlock();
+            broadcast("setup_done", {{"id", id}, {"decision", target ? "returned" : "cancelled"}});
+            if (!target)
+                return std::unexpected(Error{ErrorCode::RUNTIME, std::chrono::steady_clock::now() < deadline
+                                                                     ? "cancelled"
+                                                                     : "no sign-in arrived within 5 minutes"});
+            return origin + *target;
+        };
+        return std::optional<BrowserSignIn>(std::move(browser));
+    }
+
+public:
+    // The browser's return from a sign-in, at /oauth/callback.
+    auto sign_in_returned(const liteapp::Request& request) -> liteapp::Response {
+        std::string target = "/oauth/callback?";
+        for (const auto* name : {"code", "state", "error", "error_description", "iss"})
+            if (const auto value = request.query_parameter(name); !value.empty())
+                target += std::string(target.back() == '?' ? "" : "&") + name + "=" + net::url_encode(value);
+        {
+            const std::lock_guard lock(approval_mutex_);
+            if (!sign_in_waiting_) {
+                return liteapp::Response::text("No sign-in is waiting; start it again from Kidi.", 409);
+            }
+            sign_in_return_ = std::move(target);
+            approval_ready_.notify_all();
+        }
+        auto response = liteapp::Response::text(net::sign_in_done_page());
+        response.content_type = "text/html; charset=utf-8";
+        return response;
+    }
+
+private:
 
     // Stops the running turn. Only a running turn is cancelled, so a late Stop cannot cancel the next one.
     auto cancel() -> void {
@@ -622,6 +720,9 @@ private:
     std::mutex approval_mutex_;
     std::condition_variable approval_ready_;
     std::optional<PendingApproval> pending_;
+    std::optional<PendingSetup> setup_;           // guarded by approval_mutex_
+    bool sign_in_waiting_ = false;                // guarded by approval_mutex_
+    std::optional<std::string> sign_in_return_;   // the /oauth/callback target, guarded by approval_mutex_
     bool turn_cancelled_ = false;
     std::atomic<std::uint64_t> approvals_{0};
 
@@ -663,7 +764,9 @@ auto web_agent(SessionOptions options, Speech speech, std::int32_t port, const s
         .host = "127.0.0.1",
         .port = port,
         .max_body_bytes = 64 * 1024,
-        .local_access = liteapp::LocalAccess{.token = *token, .cookie_name = "kidi_agent_access"},
+        .local_access = liteapp::LocalAccess{.token = *token,
+                                             .cookie_name = "kidi_agent_access",
+                                             .open_paths = {"/oauth/callback"}},
         // CodeMirror and xterm.js insert their own style sheets; scripts stay limited to the embedded files.
         .content_security_policy =
             "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; "
@@ -674,12 +777,6 @@ auto web_agent(SessionOptions options, Speech speech, std::int32_t port, const s
         return 1;
     }
     auto server = std::move(*created);
-    auto served = assets_directory.empty() ? server.serve_archive(kidi::agent_web_assets::archive())
-                                           : serve_asset_sources(server, assets_directory);
-    if (!served) {
-        std::cerr << "kidi-agent: cannot serve the web UI: " << served.error().message << '\n';
-        return 1;
-    }
     std::error_code canonical_error;
     auto workspace_path = std::filesystem::canonical(options.workspace, canonical_error);
     if (canonical_error) workspace_path = options.workspace;
@@ -687,6 +784,15 @@ auto web_agent(SessionOptions options, Speech speech, std::int32_t port, const s
     WebAgent agent(std::move(options), std::move(speech), std::move(*workspace));
     liteapp::ServiceRouter router({.max_active_requests = 64});
     agent.register_methods(router);
+    // Sign-ins return here, ahead of the UI's catch-all file route.
+    server.get("/oauth/callback",
+               [&agent](const liteapp::Request& request) { return agent.sign_in_returned(request); });
+    auto served = assets_directory.empty() ? server.serve_archive(kidi::agent_web_assets::archive())
+                                           : serve_asset_sources(server, assets_directory);
+    if (!served) {
+        std::cerr << "kidi-agent: cannot serve the web UI: " << served.error().message << '\n';
+        return 1;
+    }
     server.websocket("/ws", [&router](const liteapp::Request&, liteapp::WebSocket& socket) { router.run(socket); },
                      {.max_text_bytes = MAX_IMAGE_BYTES + 3 * MAX_FILE_BYTES, .max_binary_bytes = 64 * 1024});
 
@@ -709,4 +815,4 @@ auto web_agent(SessionOptions options, Speech speech, std::int32_t port, const s
     return 0;
 }
 
-} // namespace kidi::agent
+} // namespace kidi::agent::ui

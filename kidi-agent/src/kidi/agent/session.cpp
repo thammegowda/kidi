@@ -1,6 +1,6 @@
 #include "kidi/agent/session.h"
 
-#include "kidi/agent/terminal.h"
+#include "kidi/agent/ui/terminal.h"
 
 #include <algorithm>
 #include <chrono>
@@ -40,6 +40,7 @@ struct AgentSession::Impl {
     std::optional<Transcript> transcript;
     std::optional<Error> transcript_error;
     std::set<std::string> session_grants;
+    bool discovered = false; // options.discover_tools ran for this conversation
     std::optional<ContextUsage> context;
     std::optional<Speed> speed;
     std::string model;
@@ -61,7 +62,7 @@ struct AgentSession::Impl {
         if (view.status) view.status({model, context, speed}, phase);
     }
     auto error(const Error& value) const -> void {
-        notice("kidi-agent: " + terminal_text(value.message), Notice::ERROR);
+        notice("kidi-agent: " + ui::terminal_text(value.message), Notice::ERROR);
     }
 
     auto current_stop() -> std::stop_source {
@@ -174,14 +175,14 @@ struct AgentSession::Impl {
             auto opened = Transcript::open(options.workspace, model);
             if (!opened) {
                 transcript_error = opened.error();
-                notice("kidi-agent: " + terminal_text(opened.error().message) + " (use --no-save to opt out)",
+                notice("kidi-agent: " + ui::terminal_text(opened.error().message) + " (use --no-save to opt out)",
                        Notice::ERROR);
                 return std::unexpected(opened.error());
             }
             transcript.emplace(std::move(*opened));
             save(transcript_message(history.front()));
             if (options.announce_transcript)
-                notice("[session] " + terminal_text(transcript->path().string()), Notice::SESSION);
+                notice("[session] " + ui::terminal_text(transcript->path().string()), Notice::SESSION);
         }
         if (transcript_error) {
             error(*transcript_error);
@@ -202,7 +203,7 @@ struct AgentSession::Impl {
         }
         if (*decision == Approval::SESSION) {
             session_grants.insert(spec.name);
-            notice("Session approval granted for " + terminal_text(spec.name) + ". /permissions reset revokes it.",
+            notice("Session approval granted for " + ui::terminal_text(spec.name) + ". /permissions reset revokes it.",
                    Notice::SESSION);
         }
         return *decision != Approval::DENY;
@@ -247,6 +248,7 @@ AgentSession::AgentSession(SessionOptions options, SessionView view) : impl_(std
         state.callbacks.approve = [&state](const ToolSpec& spec, const ToolCall& call) {
             return state.approve(spec, call);
         };
+    if (state.view.setup) state.callbacks.setup = state.view.setup;
     state.callbacks.observe = [&state](const Event& event) { state.observe(event); };
 }
 
@@ -256,6 +258,16 @@ auto AgentSession::run(std::string task, std::vector<std::string> images) -> Res
     auto& state = *impl_;
     const Impl::Rearm rearm{state};
     if (auto ready = state.prepare(); !ready) return std::unexpected(ready.error());
+    if (!state.discovered && state.options.discover_tools) {
+        state.discovered = true;
+        net::DiscoveryPrompts prompts{
+            .setup = state.view.setup,
+            .notice = [&state](const std::string& text) { state.notice(ui::terminal_text(text), Notice::INFO); }};
+        std::vector<std::string> names;
+        for (const auto& tool : state.options.tools) names.push_back(tool.spec.name);
+        for (auto& tool : state.options.discover_tools(prompts, names, state.current_stop().get_token()))
+            state.options.tools.push_back(std::move(tool));
+    }
     Message user{.role = Role::USER, .content = std::move(task), .images = std::move(images)};
     // A model without vision rejects images on every later request, so refuse them before they enter the history.
     if (!user.images.empty() && state.provider->context) {

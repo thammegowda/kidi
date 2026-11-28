@@ -3,7 +3,7 @@
 
 #include "kidi/checkpoint/hub.h"
 #include "kidi/cli/log.h"
-#include "kidi/agent/chat_transport.h"
+#include "kidi/agent/chat/transport.h"
 #include "kidi/inference/decoder.h"
 #include "kidi/server/routes.h"
 #include "kidi/tensor/backend.h"
@@ -307,7 +307,7 @@ auto ensure_server(const std::vector<std::string>& launch, const fs::path& dir, 
         Error{ErrorCode::IO, "background inference did not become ready; see " + (dir / "serve.log").string()});
 }
 
-auto managed_provider(agent::ChatClientOptions options, const Namespace& arguments, const Launcher& launcher)
+auto managed_provider(agent::chat::ChatClientOptions options, const Namespace& arguments, const Launcher& launcher)
     -> Result<agent::Provider> {
     const auto lookup = arguments.get<bool>("prompt_lookup");
     const auto drafts = arguments.get<std::size_t>("draft_tokens");
@@ -345,12 +345,12 @@ auto managed_provider(agent::ChatClientOptions options, const Namespace& argumen
     if (!endpoint) return std::unexpected(endpoint.error());
     options.base_url = "http://127.0.0.1:" + std::to_string(endpoint->port) + "/v1";
 
-    return agent::completion_provider(
+    return agent::chat::completion_provider(
         std::move(options),
-        [lease = std::move(lease), dir, endpoint = *endpoint](const agent::ChatClientOptions& http_options,
+        [lease = std::move(lease), dir, endpoint = *endpoint](const agent::chat::ChatClientOptions& http_options,
                                                               std::string payload, std::stop_token stop,
                                                               std::string_view route) -> Result<std::string> {
-            auto result = agent::http_completion(http_options, std::move(payload), stop, endpoint.pid, route);
+            auto result = agent::chat::http_completion(http_options, std::move(payload), stop, endpoint.pid, route);
             if (!result) result.error().message += "; see " + (dir / "serve.log").string();
             return result;
         });
@@ -414,7 +414,9 @@ auto configure_managed_serve_parser(ArgumentParser& parser) -> void {
 auto managed_agent_command(const Namespace& arguments, const Launcher& launcher) -> int {
     return agent::agent_command(
         arguments,
-        [&](agent::ChatClientOptions options) { return managed_provider(std::move(options), arguments, launcher); },
+        [&](agent::chat::ChatClientOptions options) {
+            return managed_provider(std::move(options), arguments, launcher);
+        },
         [&](const agent::SpeechConfig& speech) { return agent_speech(arguments.get<std::string>("backend"), speech); });
 }
 

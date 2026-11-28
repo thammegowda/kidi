@@ -72,6 +72,34 @@ TEST(AgentConfig, ParsesYamlRegistry) {
     ASSERT_TRUE(shipped) << shipped.error().message;
     EXPECT_FALSE(shipped->speech.transcribe_model.empty());
     EXPECT_FALSE(shipped->speech.speak_model.empty());
+    const auto search = std::ranges::find(shipped->tools, "web_search", &ToolRegistration::handler);
+    ASSERT_NE(search, shipped->tools.end());
+    EXPECT_EQ(search->config, (Json{{"server", "tinyfish"}})) << "signing in needs no key";
+    ASSERT_TRUE(shipped->mcp_servers.contains("tinyfish"));
+    EXPECT_EQ(shipped->mcp_servers.at("tinyfish").url, "https://agent.tinyfish.ai/mcp");
+    EXPECT_EQ(shipped->mcp_servers.at("tinyfish").name, "TinyFish");
+    const auto servers = parse_agent_config("version: 1\nprompts: {system: Hi}\ntools: []\nmcp_servers:\n"
+                                            "  docs: {url: 'https://docs.test/mcp'}");
+    ASSERT_TRUE(servers) << servers.error().message;
+    EXPECT_EQ(servers->mcp_servers.at("docs").name, "docs") << "the key names an unnamed server";
+    EXPECT_TRUE(servers->mcp_servers.at("docs").include.empty() && !servers->mcp_servers.at("docs").include_all);
+    const auto included = parse_agent_config("version: 1\nprompts: {system: Hi}\ntools: []\nmcp_servers:\n"
+                                             "  a: {url: 'https://a.test/mcp', include: [search, get_file]}\n"
+                                             "  b: {url: 'https://b.test/mcp', include: all}");
+    ASSERT_TRUE(included) << included.error().message;
+    EXPECT_EQ(included->mcp_servers.at("a").include, (std::vector<std::string>{"search", "get_file"}));
+    EXPECT_TRUE(included->mcp_servers.at("b").include_all);
+    for (const auto* bad : {"{docs: {url: 'http://docs.test/mcp'}}", "{docs: {name: Docs}}",
+                            "{docs: {url: 'https://docs.test/mcp', api_key_env: KEY}}",
+                            "{'bad name': {url: 'https://x.test'}}",
+                            "[https://docs.test/mcp]", "{docs: {url: 'https://docs.test/mcp', include: some}}",
+                            "{docs: {url: 'https://docs.test/mcp', include: ['bad name']}}"})
+        EXPECT_FALSE(parse_agent_config(std::string("version: 1\nprompts: {system: Hi}\ntools: []\nmcp_servers: ") +
+                                        bad))
+            << bad;
+    EXPECT_EQ(search->spec.parameters["additionalProperties"], false) << "arguments are strict by default";
+    EXPECT_FALSE(parse_agent_config("version: 1\nprompts: {system: Hi}\ntools:\n  - {name: t, handler: h, "
+                                    "description: d, parameters: {type: object}, config: [1]}"));
     ASSERT_EQ(config->tools.size(), 1);
     const auto& tool = config->tools.front();
     EXPECT_EQ(tool.handler, "native_read");
@@ -109,6 +137,20 @@ TEST(AgentConfig, BindsOnlyListedHandlers) {
     ASSERT_TRUE(output);
     EXPECT_EQ(*output, "contents");
     EXPECT_EQ(calls, 1);
+    config->tools.front().config = {{"mode", "fast"}};
+    auto configured = configure_tools(*config, handlers);
+    ASSERT_FALSE(configured) << "a handler without config rejects one";
+    EXPECT_NE(configured.error().message.find("takes no config"), std::string::npos);
+    const std::vector<ToolHandler> factories{{"native_read", [](const Json& settings) -> Result<Tool> {
+        return Tool{{.name = "native_read"}, Capability::READ,
+                    [mode = settings.value("mode", "")](const Json&, std::stop_token) -> Result<std::string> {
+                        return mode;
+                    }};
+    }}};
+    configured = configure_tools(*config, factories);
+    ASSERT_TRUE(configured) << configured.error().message;
+    EXPECT_EQ(configured->front().spec.name, "inspect");
+    EXPECT_EQ(*configured->front().invoke({}, {}), "fast");
     config->tools.clear();
     tools = configure_tools(*config, handlers);
     ASSERT_TRUE(tools);
@@ -154,7 +196,7 @@ TEST(AgentConfig, RejectsInvalidRegistry) {
 TEST(AgentConfig, RejectsUnboundHandlers) {
     auto config = parse_agent_config(CUSTOM_CONFIG);
     ASSERT_TRUE(config);
-    EXPECT_FALSE(configure_tools(*config, {}));
+    EXPECT_FALSE(configure_tools(*config, std::span<const Tool>{}));
     Tool handler{{.name = "native_read"}, Capability::WRITE, [](const Json&, std::stop_token) -> Result<std::string> {
                      return std::string("write");
                  }};

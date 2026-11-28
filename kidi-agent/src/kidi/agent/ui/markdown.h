@@ -5,7 +5,7 @@
 #include <string_view>
 #include <vector>
 
-namespace kidi::agent {
+namespace kidi::agent::ui {
 
 // Terminal cells taken by UTF-8 text; ANSI CSI sequences take none.
 auto display_width(std::string_view text) -> std::size_t;
@@ -41,4 +41,4 @@ private:
 
 auto render_markdown(std::string_view text, bool color, std::size_t width) -> std::vector<std::string>;
 
-} // namespace kidi::agent
+} // namespace kidi::agent::ui

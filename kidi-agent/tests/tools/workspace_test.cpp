@@ -1,4 +1,4 @@
-#include "kidi/agent/workspace.h"
+#include "kidi/agent/tools/workspace.h"
 
 #include <gtest/gtest.h>
 
@@ -9,7 +9,7 @@
 #include <unistd.h>
 #endif
 
-namespace kidi::agent {
+namespace kidi::agent::tools {
 namespace {
 
 class AgentWorkspace : public testing::Test {
@@ -242,4 +242,4 @@ TEST_F(AgentWorkspace, LimitsDirectory) {
 }
 
 } // namespace
-} // namespace kidi::agent
+} // namespace kidi::agent::tools

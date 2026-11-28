@@ -292,6 +292,62 @@ export function notice(text, kind = 'info') {
   else append(node);
 }
 
+// A tool needs a service connected: Connect signs in through the browser and the tool call resumes on its own.
+const setups = new Map();
+
+function onSetup(payload) {
+  const card = element('div', 'approval');
+  card.append(element('div', 'approval-title', `Connect ${payload.service}?`),
+    element('div', 'approval-detail', `${payload.tool} needs it: ${payload.reason}.`));
+  const status = element('div', 'approval-detail');
+  const buttons = element('div', 'approval-buttons');
+  const connect = element('button', 'primary', `Connect ${payload.service}`);
+  const later = element('button', '', 'Not now');
+  for (const button of [connect, later]) button.type = 'button';
+  const entry = {card, payload, status, tab: null};
+  connect.addEventListener('click', () => {
+    // A tab opened inside the click is allowed by popup blockers; it is pointed at the sign-in page once known.
+    entry.tab = window.open('', '_blank');
+    if (entry.tab) entry.tab.opener = null;
+    buttons.remove();
+    status.textContent = 'Opening the sign-in page…';
+    call('setup.respond', {id: payload.id, decision: 'connect', origin: location.origin}).catch(error => {
+      status.textContent = error.message;
+      entry.tab?.close();
+    });
+  });
+  later.addEventListener('click', () => call('setup.respond', {id: payload.id, decision: 'decline'}).catch(() => {}));
+  buttons.append(connect, later);
+  card.append(buttons, status);
+  setups.set(payload.id, entry);
+  ensureTurn().append(card);
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function onSetupOpen({id, url}) {
+  const entry = setups.get(id);
+  if (!entry) return;
+  if (entry.tab && !entry.tab.closed) entry.tab.location = url;
+  const link = element('a', '', 'sign-in page');
+  link.href = url;
+  link.target = '_blank';
+  link.rel = 'noopener';
+  entry.status.replaceChildren(`Finish signing in to ${entry.payload.service} in the `, link,
+    ' that opened; this continues on its own.');
+}
+
+function onSetupDone({id, decision}) {
+  const entry = setups.get(id);
+  if (!entry) return;
+  setups.delete(id);
+  const signedIn = decision === 'returned';
+  entry.card.className = `approval resolved ${signedIn ? 'allowed' : 'refused'}`;
+  entry.card.replaceChildren(
+    element('span', 'approval-mark', signedIn ? '✓' : '✗'),
+    element('span', 'approval-result', signedIn ? 'Signed in to' : decision === 'declined' ? 'Not connected:' : 'Cancelled:'),
+    element('span', 'tool-name', entry.payload.service));
+}
+
 function onDone(result) {
   for (const entry of toolCards.values()) if (entry.interval) finishTool(entry, '', true);
   // The session already reported the failure as a notice; only cancellations need saying.
@@ -420,6 +476,9 @@ on('tool', onTool);
 on('tool_result', onToolResult);
 on('approval', onApproval);
 on('approval_done', onApprovalDone);
+on('setup', onSetup);
+on('setup_open', onSetupOpen);
+on('setup_done', onSetupDone);
 on('notice', ({text, kind}) => notice(text, kind));
 on('compact', ({started, detail}) => notice(started ? 'Compacting the conversation…' : detail, 'context'));
 on('done', onDone);

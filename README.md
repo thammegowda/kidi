@@ -51,6 +51,10 @@ on your machine.
 - **Works in your project, with your approval.** The agent reads and lists files, writes files, creates directories,
   and runs shell commands such as builds, tests and searches. By default it asks before every write or command:
   approve once (**y**), for the rest of the session (**a**), or deny (**n**).
+- **Searches and reads the web.** `web_search` finds current information and `web_fetch` reads pages as compact
+  Markdown, so a small local model can use the web without filling its context. The first search asks you to
+  connect a free [TinyFish](https://tinyfish.ai) account with one browser sign-in; see the
+  [web tools guide](kidi-agent/README.md#web-search-and-fetch).
 - **Long sessions stay fast.** The server keeps the previous request's KV cache, so each turn prefills only the new
   messages. Before the context fills, the agent compacts older turns into a handoff summary using exact token counts
   from the server; `/context` shows usage and `/compact` compacts on demand.
@@ -71,13 +75,13 @@ on your machine.
 - **Embeddable.** The agent loop, YAML configuration and workspace tools are C++ libraries (`kidi::agent`) that apps
   can link and extend with their own tools.
 
-| `--permissions` | Tools offered | File writes | Commands |
-| --- | --- | --- | --- |
-| `none` | None (plain chat) | - | - |
-| `read-only` | Read and list files | Denied | Denied |
-| `ask` (default) | All | Ask | Ask |
-| `workspace-write` | All | Allowed | Ask |
-| `full-access` | All | Allowed | Allowed |
+| `--permissions` | Tools offered | File writes | Commands | Web requests |
+| --- | --- | --- | --- | --- |
+| `none` | None (plain chat) | - | - | - |
+| `read-only` | Read and list files, web | Denied | Denied | Ask |
+| `ask` (default) | All | Ask | Ask | Ask |
+| `workspace-write` | All | Allowed | Ask | Ask |
+| `full-access` | All | Allowed | Allowed | Allowed |
 
 ```bash
 kidi agent --permissions none --system "Answer in French."               # plain chat

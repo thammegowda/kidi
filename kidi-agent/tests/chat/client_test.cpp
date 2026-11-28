@@ -1,6 +1,6 @@
-#include "kidi/agent/chat_client.h"
-#include "kidi/agent/chat_transport.h"
-#include "kidi/agent/workspace.h"
+#include "kidi/agent/chat/client.h"
+#include "kidi/agent/chat/transport.h"
+#include "kidi/agent/tools/workspace.h"
 
 #include <gtest/gtest.h>
 #include <httplib.h>
@@ -8,7 +8,7 @@
 #include <atomic>
 #include <thread>
 
-namespace kidi::agent {
+namespace kidi::agent::chat {
 namespace {
 
 TEST(AgentProvider, HeadlessCompletionsStillStream) {
@@ -480,4 +480,4 @@ TEST(AgentProvider, RejectsInvalidUtf8Input) {
 }
 
 } // namespace
-} // namespace kidi::agent
+} // namespace kidi::agent::chat

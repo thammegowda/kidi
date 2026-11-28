@@ -37,8 +37,15 @@ endif()
 add_library(kidi_agent
     src/kidi/agent/agent.cpp
     src/kidi/agent/config.cpp
-    src/kidi/agent/chat_client.cpp
-    src/kidi/agent/workspace.cpp
+    src/kidi/agent/chat/client.cpp
+    src/kidi/agent/net/credentials.cpp
+    src/kidi/agent/net/http.cpp
+    src/kidi/agent/net/mcp.cpp
+    src/kidi/agent/net/oauth.cpp
+    src/kidi/agent/net/sign_in.cpp
+    src/kidi/agent/tools/html.cpp
+    src/kidi/agent/tools/web.cpp
+    src/kidi/agent/tools/workspace.cpp
 )
 add_library(kidi::agent ALIAS kidi_agent)
 target_compile_features(kidi_agent PUBLIC cxx_std_23)
@@ -46,7 +53,7 @@ target_include_directories(kidi_agent PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src" "
 target_include_directories(kidi_agent PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(kidi_agent PUBLIC nlohmann_json::nlohmann_json PRIVATE yaml-cpp::yaml-cpp liteapp::workspace)
 
-add_library(kidi_agent_http src/kidi/agent/chat_http.cpp)
+add_library(kidi_agent_http src/kidi/agent/chat/http.cpp)
 add_library(kidi::agent_http ALIAS kidi_agent_http)
 target_link_libraries(kidi_agent_http PUBLIC kidi::agent PRIVATE liteapp::httplib)
 
@@ -57,8 +64,8 @@ if(TARGET kidi_cli_main OR KIDI_AGENT_BUILD_CLI)
         target_compile_features(kidi_agent_argparse PUBLIC cxx_std_23)
         target_include_directories(kidi_agent_argparse PUBLIC "${KIDI_AGENT_ROOT}/src")
     endif()
-    add_library(kidi_agent_command src/kidi/agent/command.cpp src/kidi/agent/markdown.cpp src/kidi/agent/session.cpp
-        src/kidi/agent/terminal.cpp src/kidi/agent/transcript.cpp)
+    add_library(kidi_agent_command src/kidi/agent/command.cpp src/kidi/agent/ui/markdown.cpp src/kidi/agent/session.cpp
+        src/kidi/agent/ui/terminal.cpp src/kidi/agent/transcript.cpp)
     target_link_libraries(kidi_agent_command PUBLIC kidi::agent kidi::argparse)
     if(UNIX)
         find_package(Threads REQUIRED)
@@ -74,7 +81,7 @@ if(TARGET kidi_cli_main OR KIDI_AGENT_BUILD_CLI)
             MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/web/assets.txt"
             BASE "${KIDI_AGENT_ROOT}"
         )
-        target_sources(kidi_agent_command PRIVATE src/kidi/agent/web.cpp)
+        target_sources(kidi_agent_command PRIVATE src/kidi/agent/ui/web.cpp)
         target_link_libraries(kidi_agent_command PRIVATE kidi_agent_web_assets liteapp::app liteapp::service
             liteapp::vfs liteapp::workspace)
         target_compile_definitions(kidi_agent_command PRIVATE KIDI_AGENT_WEB=1)
@@ -92,10 +99,11 @@ if(KIDI_AGENT_STANDALONE AND BUILD_TESTING)
     add_subdirectory("${KIDI_AGENT_ROOT}/third_party/ynnpack-dev/third_party/googletest"
         "${CMAKE_CURRENT_BINARY_DIR}/googletest" EXCLUDE_FROM_ALL)
     include(GoogleTest)
-    add_executable(kidi_agent_test tests/agent_test.cpp tests/config_test.cpp tests/workspace_test.cpp)
-    target_link_libraries(kidi_agent_test PRIVATE kidi::agent GTest::gtest_main)
+    add_executable(kidi_agent_test tests/agent_test.cpp tests/config_test.cpp tests/net/mcp_test.cpp
+        tests/tools/web_test.cpp tests/tools/workspace_test.cpp)
+    target_link_libraries(kidi_agent_test PRIVATE kidi::agent liteapp::core GTest::gtest_main)
     gtest_discover_tests(kidi_agent_test)
-    add_executable(kidi_agent_chat_client_test tests/chat_client_test.cpp)
+    add_executable(kidi_agent_chat_client_test tests/chat/client_test.cpp)
     target_link_libraries(kidi_agent_chat_client_test PRIVATE kidi::agent_http liteapp::httplib GTest::gtest_main)
     gtest_discover_tests(kidi_agent_chat_client_test)
     if(TARGET kidi_agent_command AND UNIX)

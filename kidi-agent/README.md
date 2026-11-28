@@ -1,8 +1,8 @@
 # Kidi Agent
 
 A small C++23 local agent: a terminal shell for chat and workspace tasks, plus an embeddable library. Inference uses
-Kidi's Chat Completions API over plain HTTP. There is no Node, curl or TLS dependency; external model providers and
-HTTPS are not supported.
+Kidi's Chat Completions API over plain HTTP; external model providers are not supported. The web tools and MCP
+servers use the `curl` program for HTTPS; there is no Node or TLS library dependency.
 
 ## Quick start
 
@@ -104,7 +104,7 @@ The server listens on 127.0.0.1 only and admits the browser that opened the link
 The file tree, editor, diffs, terminal, themes and the workspace sandbox behind them (shared with the agent's file
 and command tools) come from LiteApp's IDE components (`third_party/liteapp`: `liteapp::workspace` and `web/ide`).
 Kidi adds the conversation, approvals, images, speech and settings in [`web/`](web/) and
-[`web.cpp`](src/kidi/agent/web.cpp); generic UI building blocks belong in LiteApp.
+[`ui/web.cpp`](src/kidi/agent/ui/web.cpp); generic UI building blocks belong in LiteApp.
 
 ## Tools and permissions
 
@@ -115,14 +115,16 @@ Kidi adds the conversation, approvals, images, speech and settings in [`web/`](w
 | `write_file` | Atomically replace or create a UTF-8 file |
 | `make_directory` | Create one directory |
 | `run_command` | Run `/bin/sh -c` in the workspace root (60-second timeout, 32 KiB of output) |
+| `web_search` | Search the web; returns up to 10 results as title, URL and snippet |
+| `web_fetch` | Read a web page as compact Markdown, about 1,500 tokens per part, with an offset for the next part |
 
-| `--permissions` | Tools offered | File writes | Commands |
-| --- | --- | --- | --- |
-| `none` | None (plain chat) | - | - |
-| `read-only` | `read_file`, `list_files` | Denied | Denied |
-| `ask` (default) | All | Ask | Ask |
-| `workspace-write` | All | Allowed | Ask |
-| `full-access` | All | Allowed | Allowed |
+| `--permissions` | Tools offered | File writes | Commands | Web requests |
+| --- | --- | --- | --- | --- |
+| `none` | None (plain chat) | - | - | - |
+| `read-only` | `read_file`, `list_files`, web tools | Denied | Denied | Ask |
+| `ask` (default) | All | Ask | Ask | Ask |
+| `workspace-write` | All | Allowed | Ask | Ask |
+| `full-access` | All | Allowed | Allowed | Allowed |
 
 Approval prompts show every argument and offer **y** (once), **a** (this tool for the rest of the session) or **n**.
 One-shot tasks never read approvals from stdin, so operations that need approval are denied; use `full-access` for
@@ -131,6 +133,32 @@ unattended commands only in a trusted, disposable environment.
 **Permissions are not an OS sandbox.** File handlers reject absolute paths, `..`, `.git`, symlinks and special files,
 but `run_command` runs with your privileges. Remove it from the registry to disable it, or run the standalone client
 under the [Landlock sandbox](../tools/sandbox/README.md).
+
+### Web search and fetch
+
+Search uses [TinyFish](https://docs.tinyfish.ai), which is free within a daily allowance. Nothing needs setting up
+in advance: the first time the agent searches, it asks to connect TinyFish. Choose **Connect** (or answer **y** in the
+terminal), sign in in the browser tab that opens, and the search continues on its own. Kidi talks to TinyFish through
+its [MCP](https://modelcontextprotocol.io) server and signs in with OAuth (PKCE), so no key is copied anywhere; the
+sign-in is kept in `~/.config/kidi/credentials.json` (readable only by you) and renewed automatically. **Not now**
+leaves web search off for that request. Over SSH, the web UI works through its forwarded port; the terminal prints
+the sign-in link and the port to forward.
+
+Queries and page addresses leave your computer, so web requests ask for approval unless `--permissions
+full-access`.
+
+- `web_fetch` downloads pages itself with `curl` and converts them to compact Markdown: the main content only, with
+  scripts, navigation, footers, forms, images and common clutter (cookie banners, share bars, sidebars) removed, and
+  links within a site written as `/paths`. Pages never leave your computer for conversion; pages built by
+  JavaScript come back with a note that content may be missing, and PDFs and other documents are refused.
+- It opens only addresses that you gave or that earlier web results listed, so text planted in a page cannot make
+  the model send data to an address it made up. It reads only the public internet: loopback, private, link-local and
+  cloud metadata addresses are refused, and every redirect is checked again.
+- Requests time out (15 s for search, 20 s for a page), network failures are retried once, and downloads are capped
+  at 5 MiB. A failure tells the model what went wrong and what you can do.
+- Any tool can declare a one-time setup like this sign-in (`ToolSetup`); the agent asks you before running it, and
+  the model only learns whether the tool is available.
+- Remove the tools from `agent.yaml` to disable web access.
 
 ## Prompts and registry
 
@@ -158,10 +186,24 @@ tools:
       properties:
         path: {type: string}
       required: [path]
-      additionalProperties: false
+  - name: web_search
+    handler: web_search
+    description: Search the web.
+    config: {server: tinyfish}
+    parameters:
+      type: object
+      properties:
+        query: {type: string}
+      required: [query]
+mcp_servers:
+  tinyfish: {name: TinyFish, url: https://agent.tinyfish.ai/mcp}
 ```
 
-`handler` selects a compiled implementation, so renaming a tool cannot change its capability. Remove entries to
+`handler` selects a compiled implementation, so renaming a tool cannot change its capability. A tool's optional
+`config` mapping is read by its handler: `web_search` takes `{server}`, naming an `mcp_servers` entry (with an
+optional `tool`); other built-in handlers take none.
+
+Arguments outside `parameters` are rejected unless the schema sets `additionalProperties: true`. Remove entries to
 disable tools (`tools: []` for none). `prompts.tools` is appended to the system prompt only when tools are offered
 (never with `--permissions none`), `prompts.continue` is sent once if the model replies silently after tool results,
 and `prompts.compact` enables compaction. Without `sampling:` decoding is greedy; `--temperature` overrides
@@ -169,6 +211,30 @@ the configured temperature, and compaction summaries are always greedy. `reasoni
 request (`--reasoning-effort` overrides it; summaries use `none`). Inkling-2 thinks at `high` when it is unset and can
 deliberate past the reply limit before acting, so the embedded config uses `medium`. `--max-tokens` (default 16384)
 limits one reply, including reasoning and tool arguments such as a whole file passed to `write_file`.
+
+### MCP servers
+
+`mcp_servers` names remote [MCP](https://modelcontextprotocol.io) servers. The agent finds their tools by itself;
+`include` decides which ones it may use:
+
+```yaml
+mcp_servers:
+  tinyfish: {name: TinyFish, url: https://agent.tinyfish.ai/mcp}          # backs web_search and web_fetch only
+  github:
+    url: https://api.githubcopilot.com/mcp/
+    include: [search_code, get_file_contents]                              # exactly these tools; or: all
+```
+
+- Included tools appear as `<server>_<tool>` (here `github_search_code`) with the server's own descriptions and
+  parameters, so no schemas are written by hand. Without `include`, a server only backs built-in tools.
+- `include: [names]` exposes exactly those tools, even if the server adds more later. `include: all` exposes
+  whatever the server offers, now and in future; the agent notes it, since one changed server then changes your
+  agent.
+- Tool lists are cached for 12 hours in `~/.cache/kidi/mcp-tools.json`, so conversations start without asking the
+  server; when the cache is stale and the server cannot be reached, the old list is used and you are told.
+- MCP tools are network requests: they ask for approval under `--permissions ask`, results are untrusted data, and
+  long results are cut at 32 KB. The first use asks you to connect the server (a browser sign-in, renewed
+  automatically).
 
 ## Standalone client
 

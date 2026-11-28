@@ -1,11 +1,11 @@
-#include "kidi/agent/chat_transport.h"
+#include "kidi/agent/chat/transport.h"
 
 #include <httplib.h>
 #include <algorithm>
 #include <map>
 #include <utility>
 
-namespace kidi::agent {
+namespace kidi::agent::chat {
 namespace {
 
 // SSE framing is independent of HTTP chunks, which may split a JSON value or a UTF-8 character.
@@ -205,4 +205,4 @@ auto http_provider(ChatClientOptions options) -> Result<Provider> {
     });
 }
 
-} // namespace kidi::agent
+} // namespace kidi::agent::chat

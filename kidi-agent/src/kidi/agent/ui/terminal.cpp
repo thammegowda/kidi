@@ -1,6 +1,6 @@
-#include "kidi/agent/terminal.h"
+#include "kidi/agent/ui/terminal.h"
 
-#include "kidi/agent/markdown.h"
+#include "kidi/agent/ui/markdown.h"
 
 #include <algorithm>
 #include <atomic>
@@ -31,7 +31,7 @@
 #include <unistd.h>
 #endif
 
-namespace kidi::agent {
+namespace kidi::agent::ui {
 namespace {
 
 constexpr std::string_view RESET = "\033[0m";
@@ -1021,4 +1021,4 @@ auto Terminal::end_stream() -> void {
     });
 }
 
-} // namespace kidi::agent
+} // namespace kidi::agent::ui

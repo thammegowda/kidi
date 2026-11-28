@@ -1,6 +1,7 @@
 #pragma once
 
-#include "kidi/agent/chat_client.h"
+#include "kidi/agent/chat/client.h"
+#include "kidi/agent/net/mcp.h"
 #include "kidi/agent/transcript.h"
 
 #include <filesystem>
@@ -14,7 +15,7 @@
 
 namespace kidi::agent {
 
-using ProviderFactory = std::function<Result<Provider>(ChatClientOptions)>;
+using ProviderFactory = std::function<Result<Provider>(chat::ChatClientOptions)>;
 
 enum class Notice { INFO, CONTEXT, SESSION, WARNING, ERROR };
 enum class Approval { DENY, ONCE, SESSION };
@@ -42,10 +43,15 @@ struct SessionView {
     std::function<void(const SessionStatus& status, std::string_view phase)> status;
     // Asks the user about a tool call that needs approval; without it such calls are denied.
     std::function<Result<Approval>(const ToolSpec& spec, const ToolCall& call, bool unsandboxed)> approve;
+    // Asks the user to connect a service that a tool needs (see ToolSetup); returns how the browser sign-in reaches
+    // this front end, or nullopt when the user declines. Without it such tools report that they need setup.
+    std::function<Result<std::optional<BrowserSignIn>>(const ToolSpec& spec, const ToolSetup& setup,
+                                                       const std::string& reason)>
+        setup;
 };
 
 struct SessionOptions {
-    ChatClientOptions chat;
+    chat::ChatClientOptions chat;
     RunOptions run;
     std::vector<Tool> tools;
     std::string system_prompt;
@@ -54,6 +60,8 @@ struct SessionOptions {
     bool save = true;
     bool announce_transcript = false;
     ProviderFactory create_provider;
+    // Tools found at the start of each conversation, such as an MCP server's included tools.
+    net::ToolDiscovery discover_tools;
 };
 
 struct SessionSummary {

@@ -8,7 +8,7 @@
 #include <string>
 #include <string_view>
 
-namespace kidi::agent {
+namespace kidi::agent::ui {
 
 auto terminal_text(std::string_view text) -> std::string;
 
@@ -46,4 +46,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace kidi::agent
+} // namespace kidi::agent::ui
