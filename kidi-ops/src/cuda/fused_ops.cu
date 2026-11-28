@@ -1906,18 +1906,21 @@ auto tile_format(const Launch& plan) -> int {
 }
 
 // Instantiates a tiled kernel for the runtime gated/format combination.
+template <template <bool, int> class Kernel, bool GATED, typename... Arguments>
+auto launch_tiled_format(const Launch& plan, int format, dim3 grid, cudaStream_t stream, Arguments... arguments)
+    -> void {
+    if (format == 0)
+        Kernel<GATED, 0>::launch(grid, stream, plan, arguments...);
+    else
+        Kernel<GATED, 1>::launch(grid, stream, plan, arguments...);
+}
+
 template <template <bool, int> class Kernel, typename... Arguments>
 auto launch_tiled(const Launch& plan, int format, dim3 grid, cudaStream_t stream, Arguments... arguments) -> void {
-    const auto launch = [&]<bool GATED>() {
-        if (format == 0)
-            Kernel<GATED, 0>::launch(grid, stream, plan, arguments...);
-        else
-            Kernel<GATED, 1>::launch(grid, stream, plan, arguments...);
-    };
     if (plan.attributes[0])
-        launch.template operator()<true>();
+        launch_tiled_format<Kernel, true>(plan, format, grid, stream, arguments...);
     else
-        launch.template operator()<false>();
+        launch_tiled_format<Kernel, false>(plan, format, grid, stream, arguments...);
 }
 
 template <bool GATED, int FORMAT>
