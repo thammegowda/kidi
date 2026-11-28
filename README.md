@@ -1,8 +1,9 @@
 # Kidi <a href="docs/kidi-logo.png"><img src="docs/kidi-logo-small.png" alt="Kidi logo" width="48" height="48"></a>
 
-**A local AI agent and inference engine in one C++ binary.** `kidi agent` chats, reads your code, edits files and
-runs commands with open models on your own NVIDIA GPU, Apple Silicon or CPU: no cloud API, no API keys, and no PyTorch
-or Python ML stack.
+**A local AI agent and inference engine in one C++ binary.** `kidi agent` reads your code, edits files, runs
+commands, searches the web and plugs into MCP tools, all driven by an open model on your own NVIDIA GPU, Apple
+Silicon or CPU. No cloud model, no API keys to paste, and no PyTorch or Python ML stack. Web search and MCP tools are
+optional; they are the only parts that go online, and by default only when you approve.
 
 Kidi (*"spark"* in Kannada) also serves an OpenAI-compatible API to other tools, and runs speech, translation and
 vision models in desktop, browser and Android apps.
@@ -45,16 +46,21 @@ later sessions with the same model reuse it, and it exits 10 minutes after the l
 
 ## Kidi Agent
 
-`kidi agent` is a terminal agent backed by Kidi's own inference server, so the model, the tools and the UI all run
-on your machine.
+`kidi agent` is a terminal agent backed by Kidi's own inference server, so the model, your files and the UI stay on
+your machine.
 
 - **Works in your project, with your approval.** The agent reads and lists files, writes files, creates directories,
   and runs shell commands such as builds, tests and searches. By default it asks before every write or command:
   approve once (**y**), for the rest of the session (**a**), or deny (**n**).
-- **Searches and reads the web.** `web_search` finds current information and `web_fetch` reads pages as compact
-  Markdown, so a small local model can use the web without filling its context. The first search asks you to
-  connect a free [TinyFish](https://tinyfish.ai) account with one browser sign-in; see the
-  [web tools guide](kidi-agent/README.md#web-search-and-fetch).
+- **Knows what happened after its training.** A local model's knowledge stops at its training date; `web_search`
+  finds current information and `web_fetch` reads pages as compact Markdown, so even a small model can use the web
+  without filling its context. Search goes through a configurable MCP search provider (currently
+  [TinyFish](https://tinyfish.ai), free and without tight rate limits); the first search asks you to connect it with
+  one browser sign-in. See the [web tools guide](kidi-agent/README.md#web-search-and-fetch).
+- **Plugs into MCP tools.** Add a remote [MCP](https://modelcontextprotocol.io) server to `agent.yaml` and name the
+  tools you want (`include: [search_code, ...]`); the agent discovers their descriptions and parameters itself. The
+  first use opens a one-click browser sign-in, in the terminal or the web UI, with no keys to copy; see
+  [MCP servers](kidi-agent/README.md#mcp-servers).
 - **Long sessions stay fast.** The server keeps the previous request's KV cache, so each turn prefills only the new
   messages. Before the context fills, the agent compacts older turns into a handoff summary using exact token counts
   from the server; `/context` shows usage and `/compact` compacts on demand.
@@ -72,8 +78,15 @@ on your machine.
   from [`agent.yaml`](kidi-agent/agent.yaml) (replace it with `--config`); each tool binds to a compiled handler, so
   renaming a tool cannot widen what it can do. Sessions are saved as private local JSONL transcripts (`--no-save`
   turns this off).
-- **Embeddable.** The agent loop, YAML configuration and workspace tools are C++ libraries (`kidi::agent`) that apps
-  can link and extend with their own tools.
+- **Embeddable.** The agent loop, YAML configuration, workspace and web tools, and MCP client are C++ libraries
+  (`kidi::agent`) that apps can link and extend with their own tools.
+
+> [!WARNING]
+> **What leaves your computer.** The model, your files and your conversations stay local, except through the optional
+> web and MCP tools. Search queries go to the search provider, `web_fetch` contacts the sites it reads, and MCP tools
+> send their arguments to their servers. The model writes these requests from your conversation, so they can carry
+> text from your code. Every such request waits for your approval unless you run `--permissions full-access`. For a
+> fully offline agent, use `--permissions none` or remove those tools from `agent.yaml`.
 
 | `--permissions` | Tools offered | File writes | Commands | Web requests |
 | --- | --- | --- | --- | --- |

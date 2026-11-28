@@ -141,6 +141,10 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
     }
     const auto& prompt = arguments.get<std::string>("prompt");
     const bool interactive = prompt.empty();
+    // Listing a server's tools is itself a request, so --permissions none never contacts MCP servers.
+    auto discover_tools = options.permissions.network == Access::DENY
+                              ? net::ToolDiscovery{}
+                              : net::mcp_tool_discovery(config->mcp_servers, servers);
     SessionOptions session_options{.chat = std::move(options_http),
                                    .run = std::move(options),
                                    .tools = std::move(*tools),
@@ -150,7 +154,7 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
                                    .save = !arguments.get<bool>("no_save"),
                                    .announce_transcript = interactive,
                                    .create_provider = std::move(create_provider),
-                                   .discover_tools = net::mcp_tool_discovery(config->mcp_servers, servers)};
+                                   .discover_tools = std::move(discover_tools)};
 #if defined(KIDI_AGENT_WEB)
     if (arguments.get<bool>("web")) {
         if (!interactive) {
