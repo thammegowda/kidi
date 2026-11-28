@@ -10,7 +10,7 @@ want kernel-level process confinement. `kidi agent` itself is not OS-sandboxed.
 ```bash
 kidi serve -m @thinkingmachines/Inkling-2-Mini --backend cuda --port 18097   # outside the sandbox
 git worktree add ../kidi-task-42                                            # one disposable worktree per task
-bin=$(realpath .cache/kidi-agent-build/kidi-agent)                            # standalone client
+bin=$(realpath build-release/kidi-agent)                                      # built by make release
 tools/sandbox/sandbox.sh --ro "$(dirname "$bin")" ../kidi-task-42 -- "$bin"                     # interactive
 tools/sandbox/sandbox.sh --ro "$(dirname "$bin")" ../kidi-task-42 -- "$bin" -p "fix the test"   # one-shot
 tools/sandbox/sandbox.sh --allow-https ../kidi-task-42 -- bash               # same sandbox, a shell

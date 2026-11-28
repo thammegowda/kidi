@@ -1,8 +1,10 @@
 #include "kidi/cli/managed_serve.h"
+#include "kidi/cli/agent_speech.h"
 
 #include "kidi/checkpoint/hub.h"
 #include "kidi/cli/log.h"
-#include "kidi/agent/chat_transport.h"
+#include "kidi/core/files.h"
+#include "kidi/agent/chat/transport.h"
 #include "kidi/inference/decoder.h"
 #include "kidi/server/routes.h"
 #include "kidi/tensor/backend.h"
@@ -21,7 +23,6 @@
 #include <utility>
 #include <vector>
 #include <fcntl.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -59,9 +60,9 @@ private:
 };
 
 struct ClientLease {
-    File file;
+    core::LockFile file;
     ~ClientLease() {
-        if (futimens(file.get(), nullptr) < 0) log::error("cannot record managed server session end");
+        if (futimens(file.native_handle(), nullptr) < 0) log::error("cannot record managed server session end");
     }
 };
 
@@ -80,17 +81,22 @@ auto open_file(const fs::path& path, int flags) -> File {
     return File(copy);
 }
 
-auto unlock(int fd) -> void {
-    while (flock(fd, LOCK_UN) < 0)
-        if (errno != EINTR) fail_io("cannot unlock managed server state");
+// Lock files coordinate clients and the background server across processes; failing to use one is fatal here.
+auto open_lock(const fs::path& path, bool create) -> core::LockFile {
+    auto file = core::LockFile::open(path, create);
+    if (!file) throw std::runtime_error(file.error().message);
+    return std::move(*file);
 }
 
-auto try_lock(const File& file, int operation) -> bool {
-    while (flock(file.get(), operation | LOCK_NB) < 0) {
-        if (errno == EWOULDBLOCK) return false;
-        if (errno != EINTR) fail_io("cannot lock managed server state");
-    }
-    return true;
+auto try_lock(core::LockFile& file, core::LockFile::Mode mode) -> bool {
+    auto locked = file.try_lock(mode);
+    if (!locked) throw std::runtime_error("managed server state: " + locked.error().message);
+    return *locked;
+}
+
+auto unlock(core::LockFile& file) -> void {
+    if (auto unlocked = file.unlock(); !unlocked)
+        throw std::runtime_error("managed server state: " + unlocked.error().message);
 }
 
 auto private_directory(const fs::path& path, bool create) -> bool {
@@ -142,7 +148,7 @@ auto effective_precision(const Namespace& arguments, const std::string& model) -
     return "checkpoint";
 }
 
-auto start_server(const std::vector<std::string>& launch, const fs::path& dir, const File& startup,
+auto start_server(const std::vector<std::string>& launch, const fs::path& dir, const core::LockFile& startup,
                   const std::string& model, const fs::path& cache, const Namespace& arguments) -> void {
     const auto log = open_file(dir / "serve.log", O_WRONLY | O_CREAT | O_TRUNC);
     const auto input = open_file("/dev/null", O_RDONLY);
@@ -162,7 +168,7 @@ auto start_server(const std::vector<std::string>& launch, const fs::path& dir, c
         "--cache-tokens=" + std::to_string(cache_tokens),
         arguments.get<bool>("prompt_lookup") ? "--max-active=1" : "--max-active=2",
         "--managed-dir=" + dir.string(),
-        "--managed-lock-fd=" + std::to_string(startup.get()),
+        "--managed-lock-fd=" + std::to_string(startup.native_handle()),
     };
     flags.insert(flags.begin(), launch.begin(), launch.end());
     if (arguments.get<bool>("prompt_lookup")) {
@@ -180,8 +186,13 @@ auto start_server(const std::vector<std::string>& launch, const fs::path& dir, c
         const auto daemon = fork();
         if (daemon < 0) _exit(1);
         if (daemon > 0) _exit(0);
+        // The client may block signals (kidi agent --web waits for Ctrl-C with sigwait); exec keeps a blocked mask,
+        // and the server must still stop on SIGTERM.
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, nullptr);
         if (dup2(input.get(), STDIN_FILENO) < 0 || dup2(log.get(), STDOUT_FILENO) < 0 ||
-            dup2(log.get(), STDERR_FILENO) < 0 || fcntl(startup.get(), F_SETFD, 0) < 0)
+            dup2(log.get(), STDERR_FILENO) < 0 || fcntl(startup.native_handle(), F_SETFD, 0) < 0)
             _exit(1);
         execv(argv[0], argv.data());
         constexpr char message[] = "cannot exec kidi serve\n";
@@ -252,6 +263,27 @@ auto stop_server(const fs::path& dir) -> Result<void> {
         Error{ErrorCode::RUNTIME, "background inference PID " + std::to_string(endpoint->pid) + " did not exit"});
 }
 
+// A rebuilt or reconfigured kidi starts its own background server. Idle servers of other configurations would hold
+// their device memory until their own idle timeout, so they are stopped first; servers with a session are kept.
+auto stop_idle_servers(const fs::path& keep) -> void {
+    std::error_code error;
+    for (const auto& entry : fs::directory_iterator(keep.parent_path(), error)) {
+        const auto dir = entry.path();
+        if (dir == keep || !private_directory(dir, false) || !fs::exists(dir / STATE_NAME, error) ||
+            !fs::exists(dir / "clients.lock", error))
+            continue;
+        auto clients = open_lock(dir / "clients.lock", false);
+        auto startup = open_lock(dir / "server.lock", true);
+        if (!try_lock(clients, core::LockFile::Mode::EXCLUSIVE) || !try_lock(startup, core::LockFile::Mode::EXCLUSIVE))
+            continue;
+        if (auto stopped = stop_server(dir); !stopped) {
+            log::error("{}", stopped.error().message);
+            continue;
+        }
+        fs::remove(dir / STATE_NAME, error);
+    }
+}
+
 auto ensure_server(const std::vector<std::string>& launch, const fs::path& dir, const std::string& model,
                    const fs::path& cache, const Namespace& arguments, bool restart) -> Result<Endpoint> {
     bool waiting_for_server = false;
@@ -259,8 +291,8 @@ auto ensure_server(const std::vector<std::string>& launch, const fs::path& dir, 
     const auto deadline = Clock::now() + 30min;
     while (Clock::now() < deadline) {
         {
-            const auto startup = open_file(dir / "server.lock", O_RDWR | O_CREAT);
-            if (try_lock(startup, LOCK_EX)) {
+            auto startup = open_lock(dir / "server.lock", true);
+            if (try_lock(startup, core::LockFile::Mode::EXCLUSIVE)) {
                 if (std::exchange(restart, false))
                     if (auto stopped = stop_server(dir); !stopped) return std::unexpected(stopped.error());
                 if (const auto endpoint = read_endpoint(state); endpoint && accessible(*endpoint)) return *endpoint;
@@ -269,6 +301,7 @@ auto ensure_server(const std::vector<std::string>& launch, const fs::path& dir, 
                         Error{ErrorCode::RUNTIME,
                               "background inference exited during startup; see " + (dir / "serve.log").string()});
                 fs::remove(state);
+                stop_idle_servers(dir);
                 log::info("starting background inference for {}; log: {}", model, (dir / "serve.log").string());
                 start_server(launch, dir, startup, model, cache, arguments);
             }
@@ -280,7 +313,7 @@ auto ensure_server(const std::vector<std::string>& launch, const fs::path& dir, 
         Error{ErrorCode::IO, "background inference did not become ready; see " + (dir / "serve.log").string()});
 }
 
-auto managed_provider(agent::ChatClientOptions options, const Namespace& arguments, const Launcher& launcher)
+auto managed_provider(agent::chat::ChatClientOptions options, const Namespace& arguments, const Launcher& launcher)
     -> Result<agent::Provider> {
     const auto lookup = arguments.get<bool>("prompt_lookup");
     const auto drafts = arguments.get<std::size_t>("draft_tokens");
@@ -306,24 +339,24 @@ auto managed_provider(agent::ChatClientOptions options, const Namespace& argumen
             .dump();
     const auto dir = runtime_directory() / std::to_string(std::hash<std::string>{}(identity));
     if (!private_directory(dir, true)) throw std::runtime_error("not a private directory: " + dir.string());
-    auto lease = std::make_shared<ClientLease>(open_file(dir / "clients.lock", O_RDWR | O_CREAT));
+    auto lease = std::make_shared<ClientLease>(open_lock(dir / "clients.lock", true));
     const auto deadline = Clock::now() + IDLE_TIMEOUT;
-    while (!try_lock(lease->file, LOCK_SH)) {
+    while (!try_lock(lease->file, core::LockFile::Mode::SHARED)) {
         if (Clock::now() >= deadline)
             return std::unexpected(Error{ErrorCode::IO, "background inference did not finish shutting down"});
         std::this_thread::sleep_for(POLL_INTERVAL);
     }
-    if (futimens(lease->file.get(), nullptr) < 0) fail_io("cannot record managed server session start");
+    if (futimens(lease->file.native_handle(), nullptr) < 0) fail_io("cannot record managed server session start");
     auto endpoint = ensure_server(launch, dir, options.model, cache, arguments, arguments.get<bool>("restart"));
     if (!endpoint) return std::unexpected(endpoint.error());
     options.base_url = "http://127.0.0.1:" + std::to_string(endpoint->port) + "/v1";
 
-    return agent::completion_provider(
+    return agent::chat::completion_provider(
         std::move(options),
-        [lease = std::move(lease), dir, endpoint = *endpoint](const agent::ChatClientOptions& http_options,
+        [lease = std::move(lease), dir, endpoint = *endpoint](const agent::chat::ChatClientOptions& http_options,
                                                               std::string payload, std::stop_token stop,
                                                               std::string_view route) -> Result<std::string> {
-            auto result = agent::http_completion(http_options, std::move(payload), stop, endpoint.pid, route);
+            auto result = agent::chat::http_completion(http_options, std::move(payload), stop, endpoint.pid, route);
             if (!result) result.error().message += "; see " + (dir / "serve.log").string();
             return result;
         });
@@ -385,9 +418,12 @@ auto configure_managed_serve_parser(ArgumentParser& parser) -> void {
 }
 
 auto managed_agent_command(const Namespace& arguments, const Launcher& launcher) -> int {
-    return agent::agent_command(arguments, [&](agent::ChatClientOptions options) {
-        return managed_provider(std::move(options), arguments, launcher);
-    });
+    return agent::agent_command(
+        arguments,
+        [&](agent::chat::ChatClientOptions options) {
+            return managed_provider(std::move(options), arguments, launcher);
+        },
+        [&](const agent::SpeechConfig& speech) { return agent_speech(arguments.get<std::string>("backend"), speech); });
 }
 
 auto protect_managed_lock(const Namespace& arguments) -> void {
@@ -423,16 +459,20 @@ auto serve_managed(inference::Generator& generator, tensor::Device device, Serve
     const auto& dir = arguments.get<fs::path>("managed_dir");
     const auto state = dir / STATE_NAME;
     const auto pid = getpid();
-    const File startup(arguments.get<int>("managed_lock_fd"));
+    auto startup = core::LockFile::adopt(arguments.get<int>("managed_lock_fd"));
     const auto clients = dir / "clients.lock";
-    const auto lease = open_file(clients, O_RDWR);
-    auto http = liteapp::HttpServer::create();
+    auto lease = open_lock(clients, false);
+    // Agent histories carry tool output and images; this bounds one request body, not the model context.
+    auto http = liteapp::HttpServer::create({.max_body_bytes = 64U * 1024U * 1024U});
     if (!http) {
         log::error("cannot create managed server: {}", http.error().message);
         return 1;
     }
     server::ChatEngine engine(generator);
-    server::mount_chat_routes(*http, engine, {.model_name = options.model_name, .defaults = options.generation});
+    server::mount_chat_routes(*http, engine,
+                              {.model_name = options.model_name,
+                               .defaults = options.generation,
+                               .vision = generator.vision_supported() && !generator.speculative()});
     http->get("/kidi-agent/ready", [pid](const auto&) { return liteapp::Response::text(std::to_string(pid)); });
     const auto port = http->bind();
     if (!port) {
@@ -444,13 +484,10 @@ auto serve_managed(inference::Generator& generator, tensor::Device device, Serve
         log::error("cannot start managed server: {}", running.error().message);
         return 1;
     }
-    const auto staging = dir / ("server." + std::to_string(pid) + ".tmp");
-    std::ofstream out(staging, std::ios::trunc);
-    out << agent::Json{{"port", *port}, {"pid", pid}}.dump() << '\n';
-    out.close();
-    if (!out) throw std::runtime_error("cannot write managed server state: " + staging.string());
-    fs::rename(staging, state);
-    unlock(startup.get());
+    if (auto written = core::write_atomic(state, agent::Json{{"port", *port}, {"pid", pid}}.dump() + '\n');
+        !written)
+        throw std::runtime_error("cannot write managed server state: " + written.error().message);
+    unlock(startup);
     log::info("serving {} on http://127.0.0.1:{}/v1 (PID {}); state: {}", options.model_name, *port, pid,
               state.string());
 
@@ -467,7 +504,7 @@ auto serve_managed(inference::Generator& generator, tensor::Device device, Serve
                 std::this_thread::sleep_for(IDLE_POLL_INTERVAL);
                 if (stop.stop_requested()) return;
                 if (!owns_state()) break;
-                if (try_lock(lease, LOCK_EX)) {
+                if (try_lock(lease, core::LockFile::Mode::EXCLUSIVE)) {
                     // The file timestamp also captures sessions shorter than the polling interval.
                     const auto released = fs::last_write_time(clients);
                     if (had_clients || released != last_release) {
@@ -476,12 +513,12 @@ auto serve_managed(inference::Generator& generator, tensor::Device device, Serve
                     }
                     had_clients = false;
                     if (Clock::now() - last_client >= IDLE_TIMEOUT) break;
-                    unlock(lease.get());
+                    unlock(lease);
                 } else {
                     had_clients = true;
                 }
             }
-        } catch (const std::system_error& error) {
+        } catch (const std::exception& error) {
             log::error("managed server idle check: {}", error.what());
         }
         http->stop();
@@ -489,7 +526,7 @@ auto serve_managed(inference::Generator& generator, tensor::Device device, Serve
     const auto listened = running->wait();
     idle.request_stop();
     idle.join();
-    if (try_lock(startup, LOCK_EX) && owns_state()) fs::remove(state);
+    if (try_lock(startup, core::LockFile::Mode::EXCLUSIVE) && owns_state()) fs::remove(state);
     if (listened) return 0;
     log::error("managed server listener failed: {}", listened.error().message);
     return 1;

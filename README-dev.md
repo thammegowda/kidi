@@ -49,9 +49,7 @@ CLI-only and Python wheel targets do not acquire web packages or require Node.js
 
 The [Kidi agent](kidi-agent/README.md), a local shell for chat and workspace tasks, is enabled by
 default on Linux and macOS. Run `kidi agent` to start or reuse a background Kidi server. The
-native command does not link libcurl. To build the standalone Kidi HTTP
-client independently of inference, use
-`cmake -S kidi-agent -B .cache/kidi-agent-build`.
+native command does not link libcurl. The standalone `kidi-agent` HTTP client is built beside `kidi`.
 Both clients use the shared `/v1/chat/context` route for exact token preflight
 and compact long conversation history automatically. The handoff prompt is
 configured in embedded `kidi-agent/agent.yaml` or an explicit override.
@@ -431,6 +429,11 @@ sidecars, compatibility checks, conversion/export rules and cache identity.
 Adding an architecture requires its model implementation, weight mappings and
 applicable checkpoint hooks. Gemma, Whisper, OmniVoice and RTG are examples, not automatic
 support for arbitrary Hugging Face architectures.
+
+The shared CPU/CUDA block-scaled projection API accepts configurable groups (including 32/64/128),
+optional global scales, and separate E2M1 FP4, E4M3 FP8, and symmetric signed INT4 encodings.
+Native byte-scale formats retain their checkpoint semantics; floating scales are also supported.
+CUDA BF16 symmetric INT4 projections with device-resident parameters reuse these kernels.
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): ownership, execution, state and backend contracts.
 - [CODING_GUIDELINES.md](CODING_GUIDELINES.md): APIs, naming, formatting and testing rules.

@@ -136,16 +136,6 @@ auto loaded_synthesizer() -> kidi::inference::Synthesizer& {
     if (!session().synthesizer) throw std::runtime_error("Load a TTS model first");
     return *session().synthesizer;
 }
-auto messages(const char* messages_json) -> std::vector<kidi::text::ChatMessage> {
-    std::vector<kidi::text::ChatMessage> result;
-    for (const auto& message : nlohmann::json::parse(messages_json)) {
-        kidi::text::ChatMessage item{message.at("role").get<std::string>(), message.at("content").get<std::string>()};
-        if (message.contains("images"))
-            for (const auto& image : message.at("images")) item.images.emplace_back(image.get<std::string>());
-        result.push_back(std::move(item));
-    }
-    return result;
-}
 auto optional_string(const nlohmann::json& value, std::string_view key, std::string_view label)
     -> std::optional<std::string> {
     if (!value.contains(key)) return std::nullopt;
@@ -378,13 +368,15 @@ EMSCRIPTEN_KEEPALIVE auto kidi_load(const char* directory) -> const char* {
     });
 }
 
+/// `messages_json` holds OpenAI chat messages whose user images are base64 data URLs in image_url parts. Callers
+/// pass it in a heap buffer: a stack-copied ccall string cannot hold large images.
 EMSCRIPTEN_KEEPALIVE auto kidi_enqueue(const char* messages_json, int maximum_tokens, int image_max_pixels) -> const
     char* {
     return answer([&]() -> nlohmann::json {
-        const auto request = messages(messages_json);
         auto settings = options(maximum_tokens);
         settings.image_max_pixels = static_cast<std::size_t>(image_max_pixels);
-        auto id = kidi::ops::require(loaded().enqueue_chat(request, settings));
+        auto id = kidi::ops::require(loaded().enqueue_chat(nlohmann::ordered_json::parse(messages_json), settings,
+                                                           {{"enable_thinking", false}}));
         return {{"request_id", id}};
     });
 }

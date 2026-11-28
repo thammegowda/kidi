@@ -81,16 +81,20 @@ function(kidi_add_test target source)
 endfunction()
 
 kidi_add_test(kidi_argparse_test tests/kidi/cli/argparse_test.cpp STANDALONE LINK kidi::argparse)
+kidi_add_test(kidi_files_test tests/kidi/core/files_test.cpp STANDALONE LINK kidi::files)
 if(TARGET kidi::agent)
     kidi_add_test(kidi_agent_test kidi-agent/tests/agent_test.cpp STANDALONE LINK kidi::agent)
-    target_sources(kidi_agent_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-agent/tests/workspace_test.cpp")
+    target_sources(kidi_agent_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-agent/tests/tools/workspace_test.cpp")
     target_sources(kidi_agent_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-agent/tests/config_test.cpp")
+    target_sources(kidi_agent_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-agent/tests/tools/web_test.cpp")
+    target_sources(kidi_agent_test PRIVATE "${PROJECT_SOURCE_DIR}/kidi-agent/tests/net/mcp_test.cpp")
+    target_link_libraries(kidi_agent_test PRIVATE liteapp::core)
     if(TARGET kidi_agent_command AND UNIX)
         kidi_add_test(kidi_agent_command_test kidi-agent/tests/command_test.cpp
             STANDALONE LINK kidi_agent_command TIMEOUT 60)
     endif()
     if(TARGET kidi::agent_http)
-        kidi_add_test(kidi_agent_chat_client_test kidi-agent/tests/chat_client_test.cpp
+        kidi_add_test(kidi_agent_chat_client_test kidi-agent/tests/chat/client_test.cpp
             STANDALONE LINK kidi::agent_http liteapp::httplib)
     endif()
 endif()
@@ -198,20 +202,6 @@ kidi_add_test(kidi_rtg_attention_test tests/kidi/layers/attention_test.cpp)
 kidi_add_test(kidi_rtg_precision_test tests/kidi/layers/precision_test.cpp)
 kidi_add_test(kidi_rtg_int8_precision_test tests/kidi/layers/int8_precision_test.cpp)
 kidi_add_test(kidi_qwen3_test tests/kidi/model/qwen3_test.cpp)
-if(TARGET liteapp_http)
-    kidi_add_test(kidi_desktop_websocket_test tests/kidi/desktop/websocket_test.cpp
-        LINK liteapp::http liteapp::service liteapp::httplib)
-    kidi_add_test(kidi_desktop_http_test tests/kidi/desktop/http_test.cpp
-        LINK liteapp::http liteapp::httplib)
-endif()
-if(TARGET kidi_desktop_ebook)
-    kidi_add_test(kidi_desktop_ebook_test tests/kidi/desktop/ebook_test.cpp STANDALONE LINK kidi_desktop_ebook)
-endif()
-if(TARGET kidi_desktop_assets)
-    kidi_add_test(kidi_desktop_assets_test tests/kidi/desktop/assets_test.cpp
-        STANDALONE LINK kidi_desktop_assets liteapp::vfs)
-endif()
-
 if(KIDI_BUILD_INTEGRATION_TESTS)
     if(NOT KIDI_TEST_PYTHON OR NOT EXISTS "${KIDI_TEST_PYTHON}")
         message(FATAL_ERROR "KIDI_TEST_PYTHON must name the prepared test-environment interpreter")

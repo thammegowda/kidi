@@ -3,6 +3,7 @@ package ai.gowda.kidi
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.util.Base64
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
@@ -574,19 +575,26 @@ internal class LiteAppServiceHost(
         val result = JSONArray()
         for (index in 0 until source.length()) {
             val input = source.getJSONObject(index)
-            val output = JSONObject()
-                .put("role", input.getString("role"))
-                .put("content", input.optString("content"))
-            input.optJSONArray("images")?.let { sourceImages ->
-                val paths = JSONArray()
+            val output = JSONObject().put("role", input.getString("role"))
+            val sourceImages = input.optJSONArray("images")
+            if (sourceImages == null || sourceImages.length() == 0) {
+                output.put("content", input.optString("content"))
+            } else {
+                // OpenAI image_url parts with base64 data URLs, ahead of the text.
+                val parts = JSONArray()
                 synchronized(imageLock) {
                     for (image in 0 until sourceImages.length()) {
-                        val path = images[sourceImages.getInt(image)]
+                        val file = images[sourceImages.getInt(image)]
                             ?: throw ServiceFailure("invalid_messages", "Message image is unavailable")
-                        paths.put(path.absolutePath)
+                        val bytes = file.readBytes()
+                        val type = if (bytes.size > 3 && bytes[0] == 0x89.toByte() && bytes[1] == 'P'.code.toByte())
+                            "png" else "jpeg"
+                        val url = "data:image/$type;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+                        parts.put(JSONObject().put("type", "image_url").put("image_url", JSONObject().put("url", url)))
                     }
                 }
-                output.put("images", paths)
+                parts.put(JSONObject().put("type", "text").put("text", input.optString("content")))
+                output.put("content", parts)
             }
             result.put(output)
         }

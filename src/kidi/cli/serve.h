@@ -13,7 +13,7 @@ struct ServeOptions {
 };
 
 /// Hosts kidi's shared HTTP API (`kidi/server/routes.h`) headlessly until the process is stopped.
-/// The desktop app mounts the same routes next to its UI.
+/// `kidi agent` mounts the same routes in its background server.
 auto serve(inference::Generator& generator, const ServeOptions& options) -> int;
 
 } // namespace kidi::cli

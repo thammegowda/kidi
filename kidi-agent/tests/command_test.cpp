@@ -1,5 +1,8 @@
+#include "kidi/agent/chat/transport.h"
 #include "kidi/agent/command.h"
-#include "kidi/agent/terminal.h"
+#include "kidi/agent/ui/markdown.h"
+#include "kidi/agent/session.h"
+#include "kidi/agent/ui/terminal.h"
 #include "kidi/agent/transcript.h"
 
 #include <gtest/gtest.h>
@@ -11,6 +14,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <optional>
 #include <fstream>
 #include <signal.h>
 #include <sys/ioctl.h>
@@ -21,9 +25,16 @@
 #include <unistd.h>
 
 namespace kidi::agent {
+
+using ui::display_width;
+using ui::fit_width;
+using ui::MarkdownStream;
+using ui::render_markdown;
+using ui::terminal_text;
+using ui::wrap_width;
 namespace {
 
-auto test_provider(ChatClientOptions options) -> Result<Provider> {
+auto test_provider(chat::ChatClientOptions options) -> Result<Provider> {
     Provider provider([options](std::span<const Message> messages, std::span<const ToolSpec>,
                          std::stop_token stop) -> Result<Message> {
         if (messages.back().role == Role::TOOL)
@@ -233,7 +244,8 @@ protected:
         return wait_for("> ", output_text_.find(text, from) + text.size());
     }
 
-    auto wait_empty_prompt(std::size_t from = 0) -> bool { return wait_for(">                     ", from); }
+    // The input shows a placeholder only while it is empty and ready for a task.
+    auto wait_empty_prompt(std::size_t from = 0) -> bool { return wait_for("Ask Kidi; /help lists commands", from); }
 
     auto wait_approval(std::size_t from = 0) -> bool {
         if (!wait_for("Approval required:", from)) return false;
@@ -281,7 +293,6 @@ TEST_F(AgentTerminal, EditHistoryPaste) {
     send("helo\033[Dl\r");
     ASSERT_TRUE(wait_task("echo: hello"));
     auto from = output_text_.size();
-    // The full-screen log redraws earlier replies, so every step must expect a distinct reply.
     send("\033[A\033[F!\r");
     ASSERT_TRUE(wait_task("echo: hello!", from));
     from = output_text_.size();
@@ -479,7 +490,6 @@ TEST_F(AgentTerminal, PresentationAndWorkspaceTranscript) {
     EXPECT_EQ(output_text_.find("{\"command\":"), std::string::npos);
     EXPECT_NE(output_text_.find("\\x1b]0;untrusted\\x07"), std::string::npos);
     EXPECT_EQ(output_text_.find("\033]0;untrusted"), std::string::npos);
-    EXPECT_NE(output_text_.find("Assistant"), std::string::npos);
     auto from = output_text_.size();
     send("/reset\r");
     ASSERT_TRUE(wait_task("Conversation cleared", from));
@@ -523,7 +533,7 @@ TEST_F(AgentTerminal, NoSave) {
     send("/exit\r");
     finish();
     EXPECT_FALSE(std::filesystem::exists(root_ / "cache"));
-    EXPECT_NE(output_text_.find("\033[?1049l"), std::string::npos);
+    EXPECT_NE(output_text_.find("\033[?2004l"), std::string::npos);
 }
 
 TEST_F(AgentTerminal, TranscriptAppendAndWorkspaceIsolation) {
@@ -571,6 +581,185 @@ TEST_F(AgentTerminal, TranscriptFailureIsExplicit) {
     ASSERT_TRUE(wait_for("--no-save"));
     finish(1);
     EXPECT_EQ(output_text_.find("echo: hello"), std::string::npos);
+}
+
+TEST_F(AgentTerminal, MultilineInputStaysInScrollback) {
+    start();
+    // Ctrl-J adds a line; Enter submits both lines as one task.
+    send("line one\nline two\r");
+    ASSERT_TRUE(wait_task("line two"));
+    send("/exit\r");
+    finish();
+    // The transcript is printed inline, never on the alternate screen, so native scrollback and copying work.
+    EXPECT_EQ(output_text_.find("\033[?1049h"), std::string::npos);
+    bool found = false;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root_ / "cache")) {
+        if (entry.path().extension() != ".jsonl") continue;
+        std::ifstream input(entry.path());
+        for (std::string line; std::getline(input, line);) {
+            const auto record = Json::parse(line, nullptr, false);
+            found = found || (record.is_object() && record.value("content", "") == "line one\nline two");
+        }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(TerminalMarkdown, StylesAndPassthrough) {
+    const auto lines = render_markdown("# Title\nUse **bold** and `code`.\n- [x] done\n```\n**raw**\n```\n", true, 80);
+    ASSERT_EQ(lines.size(), 6);
+    EXPECT_EQ(lines[0], "\033[1;4mTitle\033[0m");
+    EXPECT_EQ(lines[1], "Use \033[1mbold\033[0m and \033[38;5;180mcode\033[0m.\033[0m");
+    EXPECT_EQ(lines[2], "☑ done");
+    EXPECT_NE(lines[4].find("**raw**"), std::string::npos) << "code blocks keep their text";
+    EXPECT_EQ(render_markdown("snake_case_name and 2*3", true, 80)[0], "snake_case_name and 2*3");
+    // Without color the source is unchanged, so copied text is exactly what the model wrote.
+    EXPECT_EQ(render_markdown("# Title\n| a | b |\n", false, 80), (std::vector<std::string>{"# Title", "| a | b |"}));
+}
+
+TEST(TerminalMarkdown, StreamsLinesAndAlignsTables) {
+    MarkdownStream stream(true);
+    EXPECT_TRUE(stream.feed("| Name | Count |\n|:--|--:|\n| a | 12", 80).empty());
+    EXPECT_EQ(stream.preview(80).size(), 5) << "a held table previews as a box";
+    const auto table = stream.feed("3 |\nafter\n", 80);
+    ASSERT_EQ(table.size(), 6);
+    EXPECT_EQ(display_width(table[0]), display_width(table[3]));
+    EXPECT_NE(table[3].find(" a    "), std::string::npos) << "left aligned";
+    EXPECT_NE(table[3].find("   123 "), std::string::npos) << "right aligned";
+    EXPECT_EQ(table[5], "after");
+    // A table wider than the terminal wraps its cells at spaces; only a hopelessly narrow one falls back to source.
+    const auto wide = render_markdown("| Key | Details |\n|---|---|\n| Name | a long description that must wrap |\n"
+                                      "| API | short |\n",
+                                      true, 30);
+    for (const auto& line : wide) EXPECT_LE(display_width(line), 29u) << line;
+    EXPECT_GT(wide.size(), 7u);
+    EXPECT_NE(wide[3].find("Name"), std::string::npos);
+    EXPECT_NE(wide[3].find("a long"), std::string::npos) << "breaks between words";
+    EXPECT_EQ(render_markdown("| a | b |\n|---|---|\n", true, 8).size(), 2);
+    // A pipe inside a code span stays in its cell, and stray pipes never add columns beyond the header's.
+    const auto piped = render_markdown("| Key | Value |\n|---|---|\n| API | `\"deg\" | \"rad\"` |\n| X | a | b |\n",
+                                       true, 80);
+    ASSERT_EQ(piped.size(), 6);
+    EXPECT_EQ(display_width(piped[3]), display_width(piped[0]));
+    EXPECT_NE(piped[3].find("\"deg\" | \"rad\""), std::string::npos) << piped[3];
+    EXPECT_EQ(display_width(piped[4]), display_width(piped[0]));
+    EXPECT_NE(piped[4].find("a | b"), std::string::npos) << piped[4];
+}
+
+TEST(TerminalMarkdown, Widths) {
+    EXPECT_EQ(display_width("\033[1mab\033[0m\xe4\xb8\xad"), 4);
+    EXPECT_EQ(fit_width("abcdef", 4), "abc…");
+    EXPECT_EQ(wrap_width("\033[1mabcd\033[0m", 2), (std::vector<std::string>{"\033[1mab\033[0m", "\033[1mcd\033[0m"}));
+}
+
+// A temporary workspace with XDG_CACHE_HOME inside it; TearDown restores the variable even after a failed ASSERT.
+class AgentSessionTest : public testing::Test {
+protected:
+    std::filesystem::path root;
+    std::optional<std::string> saved_cache_home;
+
+    auto SetUp() -> void override {
+        char path[] = "/tmp/kidi-session-test-XXXXXX";
+        ASSERT_NE(::mkdtemp(path), nullptr);
+        root = path;
+        if (const auto* previous = std::getenv("XDG_CACHE_HOME")) saved_cache_home = previous;
+        ::setenv("XDG_CACHE_HOME", (root / "cache").c_str(), 1);
+    }
+
+    auto TearDown() -> void override {
+        if (saved_cache_home)
+            ::setenv("XDG_CACHE_HOME", saved_cache_home->c_str(), 1);
+        else
+            ::unsetenv("XDG_CACHE_HOME");
+        if (!root.empty()) std::filesystem::remove_all(root);
+    }
+};
+
+TEST_F(AgentSessionTest, ListsAndResumesTranscripts) {
+    const SessionOptions options{.chat = {.model = "test"},
+                                 .system_prompt = "system",
+                                 .workspace = root,
+                                 .mode = "ask",
+                                 .create_provider = test_provider};
+    {
+        AgentSession session(options, {});
+        ASSERT_TRUE(session.run("first"));
+        ASSERT_TRUE(session.reset());
+        ASSERT_TRUE(session.run("second"));
+    }
+    auto sessions = list_sessions(root);
+    ASSERT_TRUE(sessions);
+    ASSERT_EQ(sessions->size(), 1);
+    EXPECT_EQ(sessions->front().title, "first");
+    EXPECT_EQ(sessions->front().messages, 4);
+    // A tool call interrupted before its result is dropped on resume, and a record cut off by a crash is repaired so
+    // the next one is kept.
+    std::ofstream(sessions->front().path, std::ios::app)
+        << R"({"type":"message","role":"user","content":"third"})" << '\n'
+        << R"({"type":"message","role":"assistant","content":"","tool_calls":[{"id":"x","name":"run_command",)"
+        << R"("arguments":{"command":"true"}}]})" << '\n'
+        << R"({"type":"message","role":"user","content":"cut of)";
+    {
+        AgentSession resumed(options, {});
+        ASSERT_TRUE(resumed.resume(sessions->front().path));
+        const auto& history = resumed.history();
+        ASSERT_EQ(history.size(), 4) << "the reset dropped the first exchange";
+        EXPECT_EQ(history[1].content, "second");
+        EXPECT_EQ(history[2].content, "echo: second");
+        EXPECT_EQ(history[3].content, "third");
+        ASSERT_TRUE(resumed.run("fourth"));
+        EXPECT_EQ(resumed.transcript_path(), sessions->front().path);
+        EXPECT_FALSE(resumed.resume(root / "elsewhere.jsonl"));
+    }
+    sessions = list_sessions(root);
+    ASSERT_TRUE(sessions);
+    ASSERT_EQ(sessions->size(), 1) << "a resumed conversation appends to its own transcript";
+    EXPECT_EQ(sessions->front().messages, 8);
+}
+
+TEST_F(AgentSessionTest, SendsResumesAndRefusesImages) {
+    bool vision = true;
+    std::vector<Json> completions;
+    const auto provider = [&](chat::ChatClientOptions options) -> Result<Provider> {
+        const auto complete = [&](const chat::ChatClientOptions&, std::string payload, std::stop_token,
+                                  std::string_view route) -> Result<std::string> {
+            auto request = Json::parse(payload);
+            if (!vision && request.dump().find("image_url") != std::string::npos)
+                return std::unexpected(Error{ErrorCode::RUNTIME, "no vision tower"});
+            if (route == "/chat/context") return std::string(R"({"prompt_tokens":1,"context_tokens":4096})");
+            completions.push_back(std::move(request));
+            return std::string(
+                R"({"choices":[{"message":{"role":"assistant","content":"a flame"},"finish_reason":"stop"}]})");
+        };
+        return completion_provider(std::move(options), complete);
+    };
+    const SessionOptions options{
+        .chat = {.model = "test"}, .system_prompt = "system", .workspace = root, .create_provider = provider};
+    const std::string image = "data:image/png;base64,iVBORw0KGgo=";
+    {
+        AgentSession session(options, {});
+        ASSERT_TRUE(session.run("what is this?", {image}));
+        ASSERT_EQ(completions.size(), 1);
+        const auto& content = completions[0]["messages"][1]["content"];
+        ASSERT_TRUE(content.is_array());
+        EXPECT_EQ(content[0], (Json{{"type", "text"}, {"text", "what is this?"}}));
+        EXPECT_EQ(content[1]["image_url"]["url"], image);
+    }
+    auto sessions = list_sessions(root);
+    ASSERT_TRUE(sessions);
+    ASSERT_EQ(sessions->size(), 1);
+    {
+        AgentSession resumed(options, {});
+        ASSERT_TRUE(resumed.resume(sessions->front().path));
+        ASSERT_EQ(resumed.history().size(), 3);
+        EXPECT_EQ(resumed.history()[1].images, std::vector<std::string>{image});
+    }
+    vision = false;
+    {
+        AgentSession session(options, {});
+        EXPECT_FALSE(session.run("and this?", {image}));
+        EXPECT_EQ(session.history().size(), 1) << "a refused image must not stay in the history";
+        EXPECT_TRUE(session.run("plain text still works"));
+    }
 }
 
 TEST(CodeTerminalText, Utf8AndControls) {

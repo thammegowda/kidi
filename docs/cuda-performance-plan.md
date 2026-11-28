@@ -30,7 +30,9 @@ limitations. Earlier milestone plans and experiment logs remain in Git history.
 - **Attention:** FlashAttention-2 for eligible BF16-cache prefill, a tiled Tensor Core kernel for short queries and
   arbitrary masks, and a tiled FP32 kernel for FP32 caches, all for `head_dim` 64/128/256/512 with GQA query-head
   packing and no score buffer. Decode attention splits keys into partitions (`decode_partitions`, `decode_merge`) for
-  head widths 256 and 512.
+  head widths 256 and 512. Relative attention (Inkling 2) also reads sliding-window ring caches, which keep key `p` in
+  row `p % rows`, and group-32 INT8 caches (`QUANTIZE_CACHE` writes them inside captured decode steps), in both its
+  per-key decode kernels and FlashAttention prefill, which converts INT8 tiles to BF16 as they load.
 - **Fusion:** W8A8 prefill folds the preceding RMS norm or GELU gate into activation quantization (bit-identical to the
   unfused sequence); per-head RMS norm + rotary is one kernel, and one scatter writes K and V while converting to BF16.
 - **Sampling and audio:** greedy token selection, OmniVoice diffusion steps and unfold/fold convolution run on-device.

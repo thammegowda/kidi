@@ -132,7 +132,7 @@ public:
             if (output.dtype() != dtype_ || !std::ranges::equal(output.shape(), shape_))
                 throw ops::Failure(
                     {ErrorCode::INVALID_ARGUMENT, "CUDA output shape or dtype changed after preparation"});
-        std::array<kidi::cuda::Tensor, 8> bindings{};
+        std::array<kidi::cuda::Tensor, kidi::cuda::MAX_INPUTS> bindings{};
         for (std::size_t index = 0; index < inputs.size(); ++index)
             bindings[index] = view(constants_[index].defined() ? constants_[index] : inputs[index]);
         try {
@@ -715,7 +715,8 @@ public:
         std::vector<std::shared_ptr<CudaGraphInput>> bindings;
         for (std::size_t index = 0; index < source.inputs().size(); ++index) {
             const auto& input = source.inputs()[index];
-            bool direct = false, supported = true;
+            // `updated`: an operation writes this input as a side effect, so the write must reach the caller's tensor.
+            bool direct = false, supported = true, updated = false;
             for (const auto& node : source.nodes()) {
                 if (node.mode == graph::Mode::IN_PLACE && node.sources[node.input_count].index == index) direct = true;
                 if (node.operation == Operation::SHORT_CONVOLUTION && node.attributes.size() >= 3 &&
@@ -725,9 +726,11 @@ public:
                 for (std::size_t operand = 0; operand < node.input_count; ++operand) {
                     const auto& origin = node.sources[operand];
                     if (origin.kind != graph::Source::Kind::INPUT || origin.index != index) continue;
+                    if (node.operation == Operation::QUANTIZE_CACHE && operand >= 2) direct = updated = true;
                     if ((node.operation != Operation::SCATTER && node.operation != Operation::ATTENTION &&
                          node.operation != Operation::RELATIVE_ATTENTION &&
-                         node.operation != Operation::SHORT_CONVOLUTION) ||
+                         node.operation != Operation::SHORT_CONVOLUTION &&
+                         node.operation != Operation::QUANTIZE_CACHE) ||
                         (node.operation == Operation::ATTENTION && node.inputs()[0].size(1) != 1) ||
                         (node.operation == Operation::RELATIVE_ATTENTION && node.inputs()[0].size(0) != 1) ||
                         (node.operation == Operation::SHORT_CONVOLUTION &&
@@ -738,6 +741,7 @@ public:
             const bool exported = std::ranges::any_of(source.outputs(), [&](const auto& output) {
                 return output.storage_identity() == input.storage_identity();
             });
+            if (updated && (!supported || exported)) return nullptr;
             if (direct && supported && !exported) {
                 auto binding = std::make_shared<CudaGraphInput>();
                 binding->value = input;
@@ -859,7 +863,7 @@ public:
         return parameters == tensor::DType::BF16 ? tensor::DType::BF16 : tensor::DType::F32;
     }
     auto prepare(const OperatorSpec& spec, TensorInputs inputs) -> std::unique_ptr<Operator> override {
-        if (inputs.size() > 8 || spec.attributes.size() > 32)
+        if (inputs.size() > kidi::cuda::MAX_INPUTS || spec.attributes.size() > 32)
             throw ops::Failure({ErrorCode::UNSUPPORTED, "CUDA operand or attribute count exceeded"});
         kidi::cuda::Descriptor descriptor;
         descriptor.operation = static_cast<kidi::cuda::Op>(spec.operation);

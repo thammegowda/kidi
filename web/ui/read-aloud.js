@@ -1,4 +1,4 @@
-import {resample} from './audio-playback.js';
+import {openPlayer, resample} from './liteapp/media/audio.mjs';
 import {SpeechController} from './speech-controller.js';
 
 export class ReadAloud {
@@ -38,12 +38,7 @@ export class ReadAloud {
     }
     if (this.#player) return this.#player.context.resume().then(() => this.#player);
     if (this.#preparing) return this.#preparing;
-    const context = new AudioContext();
-    this.#preparing = Promise.all([
-      context.resume(), context.audioWorklet.addModule(new URL('./playback-worklet.js', import.meta.url)),
-    ]).then(() => {
-      const node = new AudioWorkletNode(context, 'kidi-playback', {outputChannelCount: [1]});
-      node.connect(context.destination);
+    this.#preparing = openPlayer().then(({context, node}) => {
       node.port.onmessage = ({data}) => {
         const current = this.#current;
         if (!current || data.streamId !== current.streamId) return;
@@ -65,8 +60,6 @@ export class ReadAloud {
       return this.#player;
     }).catch(error => {
       this.#preparing = null;
-      if (context.state !== 'closed')
-        context.close().catch(closeError => console.error('Unable to close failed audio:', closeError));
       throw error;
     });
     return this.#preparing;

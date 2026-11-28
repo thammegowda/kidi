@@ -11,7 +11,7 @@ auto main(int argc, char** argv) -> int {
             std::cout << arguments.output();
             return 0;
         }
-        return kidi::agent::agent_command(arguments, kidi::agent::http_provider);
+        return kidi::agent::agent_command(arguments, kidi::agent::chat::http_provider);
     } catch (const kidi::cli::ParseError& error) {
         std::cerr << error.usage() << "kidi-agent: " << error.what() << '\n';
         return 2;

@@ -1,7 +1,7 @@
 #pragma once
 
-/// kidi's HTTP API, mounted by both `kidi serve` and the desktop app so every client (kidi-agent, other
-/// OpenAI-compatible agents, the desktop UI) talks to the same `/health`, `/v1/models`, and `/v1/chat/completions`
+/// kidi's HTTP API, mounted by `kidi serve` and `kidi agent`'s background server so every client (kidi-agent, other
+/// OpenAI-compatible agents) talks to the same `/health`, `/v1/models`, and `/v1/chat/completions`
 /// implementation.
 
 #include "kidi/server/engine.h"
@@ -17,9 +17,8 @@ namespace kidi::server {
 struct RouteOptions {
     std::string model_name;
     GenerationOptions defaults;
-    /// Optional host-specific request extension, applied after standard OpenAI validation (e.g. the desktop app's
-    /// system prompt). An error becomes a 400 response.
-    std::function<Result<void>(const ChatJson& body, ChatRequest& request)> customize;
+    /// Advertised in /v1/models as capabilities.vision: chat accepts image_url parts.
+    bool vision = false;
 };
 
 auto mount_chat_routes(liteapp::HttpServer& server, ChatEngine& engine, RouteOptions options) -> void;

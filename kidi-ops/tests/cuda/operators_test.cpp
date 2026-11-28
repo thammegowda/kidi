@@ -7,6 +7,8 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <numeric>
+#include <random>
 
 #include <gtest/gtest.h>
 
@@ -839,6 +841,169 @@ TEST_F(CudaOpsTest, CudaGraph) {
     context.clear_replays("cuda-test");
     const auto result = require(context.cast(retained, DType::F32).to(tensor::Device::cpu()));
     EXPECT_EQ(require(result.data<float>())[5], 6.F);
+}
+
+// Ring caches keep key `p` in row `p % rows`. Each relative attention kernel (per-key FP32 and BF16 decode,
+// FlashAttention for short chunks and FA2 for long ones) must match a linear cache holding the same keys.
+TEST_F(CudaOpsTest, RelativeAttentionRingCache) {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    ops::Context context(device, false, false, DType::BF16);
+    constexpr std::int64_t H = 6, KVH = 2, WINDOW = 32, ROWS = WINDOW + 64, KEYS = 3 * ROWS + 5, E = 4;
+    std::mt19937 engine(7);
+    std::uniform_real_distribution<float> distribution(-1.F, 1.F);
+    const auto random = [&](std::int64_t count) {
+        std::vector<float> values(static_cast<std::size_t>(count));
+        for (auto& value : values) value = distribution(engine);
+        return values;
+    };
+    const auto upload = [&](std::vector<std::int64_t> shape, const std::vector<float>& values, DType dtype) {
+        const auto tensor = require(Tensor::from_host(std::move(shape), std::span<const float>(values), device));
+        return dtype == DType::F32 ? tensor : context.cast(tensor, dtype);
+    };
+    constexpr std::array cases{std::pair{DType::F32, std::int64_t{32}}, std::pair{DType::BF16, std::int64_t{128}}};
+    for (const auto& [dtype, width] : cases)
+        for (const std::int64_t tokens : {std::int64_t{1}, std::int64_t{8}, std::int64_t{64}}) {
+            SCOPED_TRACE(std::string(dtype == DType::F32 ? "F32" : "BF16") + " tokens=" + std::to_string(tokens));
+            const auto kv = KVH * width;
+            const auto keys = random(KEYS * kv), values = random(KEYS * kv);
+            std::vector<float> ring_keys(static_cast<std::size_t>(ROWS * kv)), ring_values(ring_keys.size());
+            for (auto key = KEYS - ROWS; key < KEYS; ++key) {
+                std::copy_n(keys.begin() + key * kv, kv, ring_keys.begin() + key % ROWS * kv);
+                std::copy_n(values.begin() + key * kv, kv, ring_values.begin() + key % ROWS * kv);
+            }
+            std::vector<std::int32_t> position_values(static_cast<std::size_t>(tokens));
+            std::iota(position_values.begin(), position_values.end(), static_cast<std::int32_t>(KEYS - tokens));
+            const auto positions =
+                require(Tensor::from_host({tokens}, std::span<const std::int32_t>(position_values), device));
+            const auto query = upload({tokens, H * width}, random(tokens * H * width), dtype);
+            const auto gate = upload({tokens, H * width}, random(tokens * H * width), dtype);
+            const auto relative = upload({tokens, H, E}, random(tokens * H * E), DType::F32);
+            const auto sink = upload({tokens, H}, random(tokens * H), DType::F32);
+            ops::Context::RelativeAttention shape{
+                .heads = H, .key_heads = KVH, .start = 0, .window = WINDOW, .extent = E};
+            const auto expected = context.relative_attention(query, upload({KEYS, kv}, keys, dtype),
+                                                             upload({KEYS, kv}, values, dtype), relative, sink, gate,
+                                                             shape, positions);
+            shape.ring_mode = true;
+            const auto actual = context.relative_attention(query, upload({ROWS, kv}, ring_keys, dtype),
+                                                           upload({ROWS, kv}, ring_values, dtype), relative, sink,
+                                                           gate, shape, positions);
+            EXPECT_TRUE(std::ranges::equal(require(actual.copy_to_host()), require(expected.copy_to_host())));
+        }
+}
+
+// INT8 caches hold group-32 codes with F32 scales. The cache update must match the CPU quantizer, and relative
+// attention must read the dequantized values: FlashAttention rounds them to BF16 as tiles load, and per-key decode
+// kernels use them in F32.
+TEST_F(CudaOpsTest, RelativeAttentionInt8Cache) {
+    using namespace kidi;
+    using ops::require;
+    using tensor::DType;
+    using tensor::Tensor;
+    const auto device = tensor::Device::cuda();
+    ops::Context context(device, false, false, DType::BF16);
+    constexpr std::int64_t H = 6, KVH = 2, D = 128, KV = KVH * D, E = 4;
+    std::mt19937 engine(11);
+    std::uniform_real_distribution<float> distribution(-1.F, 1.F);
+    const auto random = [&](std::int64_t count) {
+        std::vector<float> values(static_cast<std::size_t>(count));
+        for (auto& value : values) value = distribution(engine);
+        return values;
+    };
+    const auto upload = [&](std::vector<std::int64_t> shape, const std::vector<float>& values, DType dtype) {
+        const auto tensor = require(Tensor::from_host(std::move(shape), std::span<const float>(values), device));
+        return dtype == DType::F32 ? tensor : context.cast(tensor, dtype);
+    };
+    const auto host_floats = [&](const Tensor& tensor) {
+        const auto host = require(context.cast(tensor, DType::F32).to(tensor::Device::cpu()));
+        const auto values = require(host.data<float>());
+        return std::vector<float>(values.begin(), values.end());
+    };
+
+    {   // Rows land in their cache slots; the slots in between stay zero.
+        constexpr std::int64_t ROWS = 16, T = 5;
+        const auto rows = random(T * KV);
+        const std::vector<std::int32_t> slots{14, 15, 0, 1, 2};
+        auto cache = require(Tensor::zeros({1, ROWS, KV}, DType::I8, device));
+        auto scales = require(Tensor::zeros({ROWS, KV / 32}, DType::F32, device));
+        context.quantize_cache_(cache, scales, upload({T, KVH, D}, rows, DType::F32),
+                                require(Tensor::from_host({T}, std::span<const std::int32_t>(slots), device)));
+        std::vector<std::int8_t> codes(ROWS * KV);
+        std::vector<float> factors(ROWS * KV / 32);
+        for (std::int64_t t = 0; t < T; ++t)
+            for (std::int64_t group = 0; group < KV / 32; ++group) {
+                const auto* source = rows.data() + t * KV + group * 32;
+                float maximum = 0;
+                for (int i = 0; i < 32; ++i) maximum = std::max(maximum, std::abs(source[i]));
+                const float scale = maximum > 0 ? maximum / 127.F : 1.F, inverse = 1.F / scale;
+                const auto row = slots[static_cast<std::size_t>(t)];
+                for (int i = 0; i < 32; ++i)
+                    codes[row * KV + group * 32 + i] =
+                        static_cast<std::int8_t>(std::clamp(std::nearbyint(source[i] * inverse), -127.F, 127.F));
+                factors[row * (KV / 32) + group] = scale;
+            }
+        EXPECT_TRUE(std::ranges::equal(require(cache.copy_to_host()), std::as_bytes(std::span(codes))));
+        EXPECT_EQ(host_floats(scales), factors);
+    }
+
+    std::uniform_int_distribution<int> code(-127, 127);
+    std::uniform_real_distribution<float> factor(0.001F, 0.02F);
+    for (const std::int64_t window : {std::int64_t{0}, std::int64_t{32}}) {
+        // Window 0 reads a linear cache; window 32 reads a ring that the positions wrap three times.
+        const bool ring = window > 0;
+        const std::int64_t ROWS = ring ? window + 64 : 300, KEYS = ring ? 3 * ROWS + 5 : ROWS;
+        std::array<std::vector<std::int8_t>, 2> codes;
+        std::array<std::vector<float>, 2> factors, dequantized;
+        for (std::size_t cache = 0; cache < 2; ++cache) {
+            codes[cache].resize(ROWS * KV);
+            factors[cache].resize(ROWS * KV / 32);
+            dequantized[cache].resize(ROWS * KV);
+            for (auto& value : codes[cache]) value = static_cast<std::int8_t>(code(engine));
+            for (auto& value : factors[cache]) value = factor(engine);
+            for (std::size_t index = 0; index < dequantized[cache].size(); ++index)
+                dequantized[cache][index] = codes[cache][index] * factors[cache][index / 32];
+        }
+        const auto int8 = [&](std::size_t cache) {
+            return require(Tensor::from_bytes({ROWS, KV}, DType::I8, std::as_bytes(std::span(codes[cache])), device));
+        };
+        const auto scales = [&](std::size_t cache) { return upload({ROWS, KV / 32}, factors[cache], DType::F32); };
+        for (const auto dtype : {DType::BF16, DType::F32})
+            for (const std::int64_t tokens : {std::int64_t{1}, std::int64_t{8}, std::int64_t{64}}) {
+                SCOPED_TRACE(std::string(ring ? "ring" : "linear") + (dtype == DType::F32 ? " F32" : " BF16") +
+                             " tokens=" + std::to_string(tokens));
+                std::vector<std::int32_t> position_values(static_cast<std::size_t>(tokens));
+                std::iota(position_values.begin(), position_values.end(), static_cast<std::int32_t>(KEYS - tokens));
+                const auto positions =
+                    require(Tensor::from_host({tokens}, std::span<const std::int32_t>(position_values), device));
+                const auto query = upload({tokens, H * D}, random(tokens * H * D), dtype);
+                const auto gate = upload({tokens, H * D}, random(tokens * H * D), dtype);
+                const auto relative = upload({tokens, H, E}, random(tokens * H * E), DType::F32);
+                const auto sink = upload({tokens, H}, random(tokens * H), DType::F32);
+                const ops::Context::RelativeAttention shape{
+                    .heads = H, .key_heads = KVH, .start = 0, .window = window, .extent = E, .ring_mode = ring};
+                const auto actual = context.relative_attention(query, int8(0), int8(1), relative, sink, gate, shape,
+                                                               positions, scales(0), scales(1));
+                // Decode reads exact F32 products; prefill tiles hold the same values rounded to BF16.
+                const auto reference = tokens == 1 ? DType::F32 : DType::BF16;
+                const auto expected = context.relative_attention(
+                    query, upload({ROWS, KV}, dequantized[0], reference), upload({ROWS, KV}, dequantized[1], reference),
+                    relative, sink, gate, shape, positions);
+                if (tokens > 1) {
+                    EXPECT_TRUE(std::ranges::equal(require(actual.copy_to_host()), require(expected.copy_to_host())));
+                    continue;
+                }
+                const auto actual_values = host_floats(actual), expected_values = host_floats(expected);
+                ASSERT_EQ(actual_values.size(), expected_values.size());
+                for (std::size_t index = 0; index < actual_values.size(); ++index)
+                    ASSERT_NEAR(actual_values[index], expected_values[index],
+                                1e-2F * std::max(1.F, std::abs(expected_values[index])))
+                        << "index=" << index;
+            }
+    }
 }
 
 TEST_F(CudaOpsTest, BfloatContext) {

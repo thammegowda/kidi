@@ -9,8 +9,7 @@ import {fileURLToPath} from 'node:url';
 import {prepareWebLibraries} from '../../web/tools/prepare-libs.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
-const vendored = ['acorn', 'acorn-walk', 'coi-serviceworker', 'dompurify', 'highlightjs', 'js-yaml',
-    'lucide-static', 'marked', 'readability'];
+const vendored = ['acorn', 'acorn-walk', 'coi-serviceworker', 'js-yaml', 'lucide-static', 'readability'];
 
 async function vendorSnapshot() {
     const files = {};
@@ -69,12 +68,13 @@ test('acquisition generates only Mermaid and PDF.js without changing vendored fi
     assert.deepEqual(await vendorSnapshot(), vendors);
 });
 
-test('desktop and Android dependency mappings retain packaged licenses', async () => {
-    for (const manifest of ['desktop/assets.txt', 'android/assets.txt']) {
+test('Android dependency mappings retain packaged licenses', async () => {
+    for (const manifest of ['android/assets.txt']) {
         const source = await readFile(join(root, manifest), 'utf8');
         const mappings = new Map(source.trim().split('\n').map(line => line.split('\t')));
-        for (const path of ['/icons/LICENSE.txt', '/libs/marked/LICENSE', '/libs/dompurify/LICENSE',
-            '/libs/dompurify/LICENSE-MPL', '/libs/highlightjs/LICENSE', '/libs/mermaid/LICENSE'])
+        for (const path of ['/icons/LICENSE.txt', '/liteapp/libs/marked/LICENSE', '/liteapp/libs/dompurify/LICENSE',
+            '/liteapp/libs/dompurify/LICENSE-MPL', '/liteapp/libs/highlightjs/LICENSE', '/liteapp/libs/temml/LICENSE',
+            '/libs/mermaid/LICENSE'])
             assert.ok(mappings.has(path), `${manifest} requires ${path}`);
     }
 });

@@ -1,5 +1,4 @@
 app.js
-audio-playback.js
 ebooks.js
 icons/audio-waveform.svg
 icons/book-open.svg

@@ -19,6 +19,13 @@ constexpr std::string_view PACKED_PREFIX = "kidi.cpu.packed.";
 constexpr std::array STREAMS{"attn", "k", "v", "mlp"};
 constexpr float EPSILON = 1e-6F;
 constexpr std::int32_t CONV_WIDTH = 4;
+// Longer inputs run as consecutive steps of at most this many tokens. Step activations grow with its length (about
+// 2.6 MB per token on CUDA), so a file-sized prompt in one step would exhaust device memory.
+constexpr std::size_t MAX_STEP_TOKENS = 512;
+// Ring caches keep this many rows beyond the attention window, so a request may generate this many tokens after its
+// prompt while the next turn can still rewind to that prompt and reuse it. A step must also fit in these rows.
+constexpr std::size_t RING_SPARE_ROWS = 4096;
+static_assert(RING_SPARE_ROWS >= MAX_STEP_TOKENS);
 
 auto cpu_projection(std::string_view name) -> bool {
     constexpr std::array<std::string_view, 9> SUFFIXES{
@@ -63,6 +70,11 @@ auto step_input(Tensor& tensor, std::vector<std::int64_t> shape, DType dtype) ->
 auto retains_local_history(const Inkling2State& state, std::size_t rewind, std::int32_t window) -> bool {
     return rewind == 0 || state.local_capacity >= state.capacity || state.position <= state.local_capacity ||
            state.position - rewind <= state.local_capacity - static_cast<std::size_t>(window) + 1;
+}
+
+/// Metal and CUDA keep sliding-window layers in ring caches instead of full-context caches.
+auto ring_caches(tensor::Device device) -> bool {
+    return device.kind == tensor::DeviceKind::A_GPU || device.kind == tensor::DeviceKind::CUDA;
 }
 } // namespace
 
@@ -789,8 +801,8 @@ auto Inkling2Impl::supports_device_tokens() const -> bool {
 
 auto Inkling2Impl::cache_capacities(std::size_t capacity) const -> std::pair<std::size_t, std::size_t> {
     const auto global = std::min(max_positions_, ((capacity + 255) / 256) * 256);
-    const auto local_cap = device().kind == tensor::DeviceKind::A_GPU && window_ > 0
-                               ? std::min(global, static_cast<std::size_t>(window_) + 512)
+    const auto local_cap = ring_caches(device()) && window_ > 0
+                               ? std::min(global, static_cast<std::size_t>(window_) + RING_SPARE_ROWS)
                                : global;
     return {global, local_cap};
 }
@@ -1392,12 +1404,18 @@ auto Inkling2Impl::run_forward(const Tensor& ids, const Tensor& positions, const
     auto& context = *context_;
     // T == 1 native decode runs inside a single captured CUDA graph across all sequence positions.
     if (T == 1 && !stacked_experts_.empty() && context.replay_enabled()) {
+        // Ring caches add the local write slot as a step input, after ids, positions and conv_slot. Each visit
+        // passes its caches, plus their scales when INT8, so every request's state binds to the captured step.
+        const bool ring = local_positions.defined();
+        const bool scaled = state.visits.front().key_scales.defined();
+        const std::size_t first_visit = ring ? 4 : 3, per_visit = scaled ? 8 : 6;
         auto& step = state.replay_inputs;
         step.clear();
-        step.reserve(3 + state.visits.size() * 6);
+        step.reserve(first_visit + state.visits.size() * per_visit);
         step.push_back(ids);
         step.push_back(positions);
         step.push_back(conv_slot);
+        if (ring) step.push_back(local_positions);
         for (const auto& visit : state.visits) {
             step.push_back(visit.key);
             step.push_back(visit.value);
@@ -1405,8 +1423,13 @@ auto Inkling2Impl::run_forward(const Tensor& ids, const Tensor& positions, const
             step.push_back(visit.value_conv);
             step.push_back(visit.attention_conv);
             step.push_back(visit.mlp_conv);
+            if (scaled) {
+                step.push_back(visit.key_scales);
+                step.push_back(visit.value_scales);
+            }
         }
-        std::string key = "inkling2_decode:" + std::to_string(state.capacity);
+        std::string key = "inkling2_decode:" + std::to_string(state.capacity) + (ring ? ":ring" : "") +
+                          (scaled ? ":int8" : "");
         if (!select)
             key += ":logits";
         else if (*select == ops::TokenOutput::DEVICE)
@@ -1416,17 +1439,22 @@ auto Inkling2Impl::run_forward(const Tensor& ids, const Tensor& positions, const
         if (hidden) key += ":hidden";
         const auto outputs = context.replay(key, step, [&](std::span<const Tensor> operands) {
             for (std::size_t index = 0; index < state.visits.size(); ++index) {
-                const auto base = 3 + index * 6;
-                state.visits[index].key = operands[base];
-                state.visits[index].value = operands[base + 1];
-                state.visits[index].key_conv = operands[base + 2];
-                state.visits[index].value_conv = operands[base + 3];
-                state.visits[index].attention_conv = operands[base + 4];
-                state.visits[index].mlp_conv = operands[base + 5];
+                const auto base = first_visit + index * per_visit;
+                auto& visit = state.visits[index];
+                visit.key = operands[base];
+                visit.value = operands[base + 1];
+                visit.key_conv = operands[base + 2];
+                visit.value_conv = operands[base + 3];
+                visit.attention_conv = operands[base + 4];
+                visit.mlp_conv = operands[base + 5];
+                if (scaled) {
+                    visit.key_scales = operands[base + 6];
+                    visit.value_scales = operands[base + 7];
+                }
             }
             Tensor captured_hidden;
-            auto result = execute_step(operands[0], operands[1], {}, operands[2], {}, state, 1, false, select,
-                                       hidden ? &captured_hidden : nullptr);
+            auto result = execute_step(operands[0], operands[1], ring ? operands[3] : Tensor{}, operands[2], {}, state,
+                                       1, false, select, hidden ? &captured_hidden : nullptr);
             if (hidden) return std::vector{std::move(result), std::move(captured_hidden)};
             return std::vector{std::move(result)};
         });
@@ -1447,16 +1475,24 @@ auto Inkling2Impl::stage_host_step(std::span<const std::int32_t> tokens, Inkling
     try {
         if (tokens.empty() || state.position + tokens.size() > state.capacity)
             return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "Inkling-2 input exceeds state capacity"});
-        const bool ring_local = device().kind == tensor::DeviceKind::A_GPU && state.local_capacity > 0 &&
-                                state.local_capacity < state.capacity;
-        const auto max_ring_chunk = ring_local && state.local_capacity > static_cast<std::size_t>(window_)
-                                        ? state.local_capacity - static_cast<std::size_t>(window_)
-                                        : state.capacity;
-        if (ring_local && tokens.size() > max_ring_chunk) {
+        const bool ring_local =
+            ring_caches(device()) && state.local_capacity > 0 && state.local_capacity < state.capacity;
+        auto max_step = MAX_STEP_TOKENS;
+        if (ring_local && state.local_capacity > static_cast<std::size_t>(window_))
+            max_step = std::min(max_step, state.local_capacity - static_cast<std::size_t>(window_));
+        // Prepared CUDA operators keep output buffers for every step length they see, so arbitrary prompt tails would
+        // accumulate memory. CUDA steps use power-of-two lengths of at least 16, plus one shorter tail.
+        const auto step_length = [&](std::size_t remaining) {
+            const auto length = std::min(remaining, max_step);
+            return device().kind == tensor::DeviceKind::CUDA && length >= 16 && length < max_step
+                       ? std::bit_floor(length)
+                       : length;
+        };
+        if (step_length(tokens.size()) < tokens.size()) {
             std::vector<Tensor> outputs;
             std::vector<Tensor> hiddens;
-            for (std::size_t offset = 0; offset < tokens.size(); offset += max_ring_chunk) {
-                const auto count = std::min(max_ring_chunk, tokens.size() - offset);
+            for (std::size_t offset = 0, count = 0; offset < tokens.size(); offset += count) {
+                count = step_length(tokens.size() - offset);
                 const bool last = offset + count == tokens.size();
                 Tensor chunk_hidden;
                 auto chunk_out = stage_host_step(tokens.subspan(offset, count), state, all_logits,
@@ -1554,8 +1590,8 @@ auto Inkling2Impl::forward_device_token(const Tensor& token, LanguageModelState&
         require(pos_host.data<std::int32_t>())[0] = static_cast<std::int32_t>(start);
         auto& slot_host = step_input(state.decode_step.conv_slot, {1}, DType::I32);
         require(slot_host.data<std::int32_t>())[0] = static_cast<std::int32_t>(start % CONV_WIDTH);
-        const bool ring_local = device().kind == tensor::DeviceKind::A_GPU && state.local_capacity > 0 &&
-                                state.local_capacity < state.capacity;
+        const bool ring_local =
+            ring_caches(device()) && state.local_capacity > 0 && state.local_capacity < state.capacity;
         std::vector<Tensor> to_stage{pos_host, slot_host};
         if (ring_local) {
             auto& lpos = step_input(state.decode_step.local_positions, {1}, DType::I32);

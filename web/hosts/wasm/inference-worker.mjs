@@ -1,5 +1,5 @@
 import {configureModelHub, loadModel, MAX_WASM_MEMORY, webGpuSupport} from './model-cache.mjs';
-import {stageImages} from './images.js';
+import {chatMessages, hasImages, heapString} from './images.js';
 
 let module;
 let active = false;
@@ -124,13 +124,13 @@ self.onmessage = async ({data}) => {
             generation = {tokenCount: 0, elapsedMs: 0, decodeMs: 0, decodeTokens: 0, firstTokenMs: null};
             let result;
             if (data.type === 'generate') {
-                const staged = await stageImages(module, data.messages);
+                const messages = await chatMessages(data.messages);
+                const pointer = heapString(module, JSON.stringify(messages));
                 try {
-                    if (staged.messages.some(message => message.images.length))
-                        post({type: 'encoding-images'});
-                    result = await call('kidi_enqueue', ['string', 'number', 'number'],
-                        [JSON.stringify(staged.messages), data.maximumTokens, data.imageMaxPixels ?? 3000000]);
-                } finally { staged.dispose(); }
+                    if (hasImages(messages)) post({type: 'encoding-images'});
+                    result = await call('kidi_enqueue', ['pointer', 'number', 'number'],
+                        [pointer, data.maximumTokens, data.imageMaxPixels ?? 3000000]);
+                } finally { module._free(pointer); }
             } else {
                 const method = documentMode ? 'kidi_document_enqueue' : 'kidi_editor_enqueue';
                 result = await call(method, ['string', 'number'],

@@ -101,17 +101,6 @@ auto throw_java(JNIEnv* environment, const std::string& message) -> void {
     if (type) environment->ThrowNew(type, message.c_str());
 }
 
-auto messages(std::string_view source) -> std::vector<kidi::text::ChatMessage> {
-    std::vector<kidi::text::ChatMessage> result;
-    for (const auto& message : nlohmann::json::parse(source)) {
-        kidi::text::ChatMessage value{message.at("role").get<std::string>(), message.at("content").get<std::string>()};
-        if (message.contains("images"))
-            for (const auto& image : message.at("images")) value.images.emplace_back(image.get<std::string>());
-        result.push_back(std::move(value));
-    }
-    return result;
-}
-
 /// Devices to try for a preference. Chat Auto prefers the NPU, TTS Auto prefers
 /// Vulkan, and ASR Auto stays on its quality-checked CPU INT8 path.
 auto candidates(std::string_view accelerator, bool speech, bool auto_npu) -> std::vector<kidi::tensor::Device> {
@@ -367,7 +356,8 @@ extern "C" JNIEXPORT auto JNICALL Java_ai_gowda_kidi_NativeRuntime_enqueue(JNIEn
         JavaString source(environment, messages_json);
         std::scoped_lock lock(runtime_mutex);
         const auto request_id =
-            kidi::ops::require(loaded().enqueue_chat(messages(source.get()), options(maximum_tokens)));
+            kidi::ops::require(loaded().enqueue_chat(nlohmann::ordered_json::parse(source.get()),
+                                                     options(maximum_tokens), {{"enable_thinking", false}}));
         return {{"request_id", request_id}};
     });
 }

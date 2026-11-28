@@ -1,7 +1,7 @@
 import {MessageTransport, ServiceRouter} from '../../../third_party/liteapp/web/liteapp.mjs';
 import {createWebGpu} from './webgpu.mjs';
 import {configureModelHub, loadModel, storeConvertedSpeech} from './model-cache.mjs';
-import {stageImages} from './images.js';
+import {chatMessages, hasImages, heapString} from './images.js';
 import {scopedModel} from './scoped-model.mjs';
 import {RuntimeScheduler, awaitWithSignal} from './runtime-scheduler.mjs';
 import {evictionCandidate, modelIdentity, protectedRepresentationOwners, synthesisGpuReserve,
@@ -429,13 +429,13 @@ router.register('load', async ({payload, emit, signal}) => {
 });
 
 router.register('generate', request => streamGeneration(request, async (model, data, emit, signal) => {
-    const staged = await stageImages(runtime.module, data.messages, {directory: `/images/request-${nextDirectory++}`});
+    const messages = await chatMessages(data.messages);
+    const pointer = heapString(runtime.module, JSON.stringify(messages));
     try {
-        if (staged.messages.some(message => message.images.length))
-            emit('worker', {type: 'encoding-images'});
-        return await call(model, 'kidi_enqueue', ['string', 'number', 'number'],
-            [JSON.stringify(staged.messages), data.maximumTokens, data.imageMaxPixels ?? 3000000], signal);
-    } finally { staged.dispose(); }
+        if (hasImages(messages)) emit('worker', {type: 'encoding-images'});
+        return await call(model, 'kidi_enqueue', ['pointer', 'number', 'number'],
+            [pointer, data.maximumTokens, data.imageMaxPixels ?? 3000000], signal);
+    } finally { runtime.module._free(pointer); }
 }));
 
 router.register('editor', request => streamGeneration(request, (model, data, _emit, signal) =>

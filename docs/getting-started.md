@@ -64,7 +64,7 @@ If you have a compatible prebuilt Kidi wheel, install that wheel instead of
 `python -m pip install '/path/to/kidi-0.1.0-cp312-abi3-macosx_26_0_arm64.whl[hf]'`.
 No compiler or source checkout is needed to use that wheel, including automatic
 model setup. See the
-[installation reference](../README.md#python-installation) for wheel and Git-URL
+[installation reference](../README.md#quick-start) for Git-URL
 installation. A Git install compiles from source; it is not a prebuilt download.
 
 ## 2. Start Chat
@@ -87,9 +87,9 @@ For an [NVIDIA CUDA build](../README-dev.md#cuda), use `--backend cuda:0`:
 python -m kidi agent -m @google/gemma-4-E4B-it-qat-mobile-transformers --backend cuda:0
 ```
 
-`cuda` also selects GPU 0; `cuda:INDEX` selects a different device. CUDA is an
-explicit choice rather than part of `auto` selection and requires a package
-built with `KIDI_ENABLE_CUDA=ON`.
+`cuda` also selects GPU 0; `cuda:INDEX` selects a different device. CUDA
+requires a build with `KIDI_ENABLE_CUDA=ON`, such as `make release-cuda`; in
+such a build, `auto` selects CUDA before Metal and CPU.
 
 You can also use
 `kidi agent` instead of `python -m kidi agent` when `kidi` is on `PATH`. On first
@@ -136,8 +136,37 @@ template.
 | `/exit` | Exit |
 
 Ctrl-C cancels the current reply; Ctrl-D exits at the prompt. Use `--color never` or set `NO_COLOR` to disable
-colors. Sampling follows the agent configuration (temperature 0.6); pass `--temperature 0` for greedy replies. Without
-`--permissions none`, the same shell can also read and edit files in `--workspace` after asking for approval.
+colors. Sampling follows the agent configuration (temperature 0.6, medium reasoning effort); pass `--temperature 0`
+for greedy replies or `--reasoning-effort` to change how long the model thinks. Without `--permissions none`, the
+same shell can also read and edit files in `--workspace` after asking for approval.
+
+## Inkling-2 on NVIDIA CUDA
+
+```bash
+build-release-cuda/kidi agent -m @thinkingmachines/Inkling-2-Mini --backend cuda
+# Or start a server explicitly:
+CUDA_VISIBLE_DEVICES=0 build-release-cuda/kidi serve -m @thinkingmachines/Inkling-2-Mini --backend cuda \
+  --port 18097 --context-size 65536 --cache-tokens 65536 --prefill-chunk-size 512
+```
+
+CUDA defaults to native NVFP4/MXFP8 expert storage, interleaved gate/up kernels and BF16 KV caches, fitting below
+24 GiB in the tested 8K-context configuration. On `serve` and `generate`, `--precision q8` explicitly selects INT8
+experts on CUDA or CPU; `--precision bf16` is a CUDA-only comparison mode. `--kv-cache-precision int8` stores
+group-32 INT8 KV caches (one F32 scale per 32 values, 56% of BF16 storage); `fp32` is rejected on CUDA.
+
+As on Metal, the 20 sliding-window layers keep ring caches of their 1,024-token window plus 4,096 rows, and only
+the four full-attention layers (8 visits with the loop) grow with the context: about 32 KiB of KV per token instead
+of 192 KiB, or 18 KiB with INT8. On a 48 GB RTX A6000, `kidi agent` sizes a 694,272-token context (previously
+119,808) from the same 29 GiB of free memory, and the model's full 1,048,576 tokens with INT8. A turn reuses the
+previous prompt's cache only if the reply since then fits in the 4,096 spare rows; longer replies make the next
+turn prefill the conversation again.
+
+On an 85K-token prompt, BF16 caches prefilled at 899 tokens/s and decoded at 30.1 tokens/s; INT8 caches at 751 and
+29.1. INT8 currently trades some prefill speed for memory: decode attention at this length is limited by
+parallelism rather than cache bandwidth.
+
+Inputs of any length run as steps of at most 512 tokens (power-of-two lengths on CUDA), so a large file in the
+conversation keeps activation memory bounded, and varied prompt lengths reuse the buffers of a few step lengths.
 
 ## Inkling-2 on Apple Silicon
 
@@ -212,6 +241,47 @@ This mode is opt-in, CPU/text/greedy-only and limited to one active request. It 
 `--assistant-model`, which still denotes the existing Gemma-specific hidden-state assistant.
 That assistant now also uses the adaptive budget.
 
+## Scripted Generation and the Server API
+
+For scripted pipelines, `kidi generate` streams JSONL requests to JSONL responses:
+
+```bash
+printf '%s\n' '{"messages":[{"role":"user","content":"Explain binary search in three bullet points."}],"max_tokens":128}' | \
+  kidi generate -m @google/gemma-4-E2B-it-qat-mobile-transformers
+```
+
+For structured, text-only conversations, include `template_args` (even `{}`) to pass message fields and template
+options through to the model's chat template:
+
+```json
+{"messages":[{"role":"user","content":"Weather in Paris?"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","function":{"name":"weather","arguments":{"city":"Paris"}}}]},{"role":"tool","tool_call_id":"c1","content":"Sunny"}],"template_args":{"tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"reasoning_effort":"low"}}
+```
+
+Template options and tool-call argument formats are model-specific; Inkling expects `arguments` as an object, not a
+JSON-encoded string. The structured path uses the template's own thinking default unless explicitly overridden.
+Requests without `template_args` retain the existing simple-chat behavior. User messages may also carry OpenAI
+`image_url` parts with base64 `data:image/...` URLs when the checkpoint has a supported vision tower (Gemma 4 E2B
+QAT); `kidi serve` reports this as `capabilities.vision` in `/v1/models`. `generate` responses contain raw assistant text; use `serve` for
+parsed reasoning and tool calls.
+
+Add `--assistant-model` (with `@owner/model` or a local directory) to enable Gemma CPU speculative decoding in
+`generate` or `serve`:
+
+```bash
+printf '%s\n' '{"messages":[{"role":"user","content":"Explain binary search."}],"max_tokens":128}' | \
+kidi generate -m @google/gemma-4-E2B-it \
+  --assistant-model @google/gemma-4-E2B-it-assistant \
+  --precision q8 --draft-tokens 4
+```
+
+`kidi serve` and `kidi agent`'s background server run the same server module (`src/kidi/server`): one engine thread owns the model and
+serves every request, and the same routes expose an OpenAI-compatible `/v1/chat/completions` endpoint (streaming or
+not) for agent harnesses. It supports OpenAI `tools`, string tool-call `arguments`, `chat_template_kwargs`,
+`reasoning_effort` and `max_tokens`. Decoding is greedy unless a request sets `temperature`; `top_p` and `top_k` are
+also accepted. Responses return parsed `reasoning_content` and `tool_calls` when the model emits reasoning or
+tool-call markup (Inkling and Gemma 4 do), and plain `content` otherwise. The server listens on `127.0.0.1:8000` by default and has no API
+keys or TLS, so use it only with trusted local clients.
+
 ## Whisper Transcription
 
 Kidi supports the multilingual `openai/whisper-tiny`, `openai/whisper-base`, `openai/whisper-small`, and
@@ -256,6 +326,35 @@ Classic and extensible PCM WAV containers are supported.
 
 In the browser, choose the speech model by Hub ID. Draft transcription replaces the composer text while recording; the
 last pass after stop may revise that draft.
+
+## Text-to-Speech
+
+Synthesize natural speech using **OmniVoice** (multilingual with voice design attributes) or **Kokoro-82M** (compact US English):
+
+```bash
+# OmniVoice: use a published INT8 package directly, or export offline with tools/converters/omnivoice.py
+build-release/kidi synthesize \
+  --model @thammegowda/OmniVoice-q8 \
+  --text 'Hello from Kidi.' \
+  --language English \
+  --voice gender=female --voice 'age=young adult' --voice accent=british \
+  --out hello.wav
+```
+
+```bash
+# Kokoro-82M: convert offline with selected voice pack(s) and synthesize
+SOURCE="$(hf download hexgrad/Kokoro-82M config.json kokoro-v1_0.pth voices/af_heart.pt README.md VOICES.md)"
+python tools/converters/kokoro.py "$SOURCE" .cache/kokoro-int8 --voices af_heart
+
+build-release/kidi synthesize \
+  --model .cache/kokoro-int8 \
+  --text 'Hello world.' \
+  --language English \
+  --voice name=af_heart --voice speed=1.0 \
+  --out kokoro.wav
+```
+
+> **Note on model licenses:** Kokoro-82M and Misaki are Apache-2.0. Pretrained OmniVoice weights are **CC-BY-NC** (non-commercial) and bundle the Higgs Audio 2 decoder; review the generated `NOTICE` file before redistributing converted checkpoints.
 
 ## Cache and Revisions
 
@@ -352,4 +451,4 @@ line. The same `--cache` option applies.
 
 Once cached, inference runs locally; use `HF_HUB_OFFLINE=1` to disable Hub lookups.
 For ordered JSONL file processing instead of a terminal conversation,
-see [`kidi generate`](../README.md#gemma-4-generation).
+see [Scripted Generation and the Server API](#scripted-generation-and-the-server-api).

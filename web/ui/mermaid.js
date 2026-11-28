@@ -1,4 +1,4 @@
-import DOMPurify from './libs/dompurify/purify.es.mjs';
+import DOMPurify from './liteapp/libs/dompurify/purify.es.mjs';
 
 let renderer;
 

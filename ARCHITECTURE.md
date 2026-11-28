@@ -14,12 +14,11 @@ inference::{Decoder, Transcriber, Synthesizer} -> model::{Transformer, Gemma4, W
 `web/ui/` is Kidi's shared application interface. Host adapters implement one
 backend contract without duplicating UI behavior:
 
-- `web/hosts/wasm/` runs the native ABI in browser workers;
-- `web/hosts/desktop/` uses LiteApp's authenticated loopback WebSocket; and
+- `web/hosts/wasm/` runs the native ABI in browser workers; and
 - `web/hosts/android/` uses an origin-scoped Android WebMessage port and invokes
   the JNI runtime in the app process.
 
-All three use LiteApp's versioned request/event/cancellation envelopes. Android
+Both use LiteApp's versioned request/event/cancellation envelopes. Android
 packages the UI in the APK and serves it from
 `https://appassets.androidplatform.net`; it does not load a hosted UI or start a
 loopback server. JSON carries control, progress, transcripts, and completion;
@@ -1185,7 +1184,7 @@ keeps up to 128 geometry lookup entries, and live operators retain their program
 when that lookup cache is cleared. No weight values are captured in these programs.
 
 Metal can optionally bound retained expanded matrices with `--metal-prefill-cache-mib`
-(`generate` and `serve`; the desktop app's `metal_prefill_cache_mb`). Matrices beyond that budget are unpacked from the original packed
+(`generate` and `serve`). Matrices beyond that budget are unpacked from the original packed
 weights into shared GPU scratch before the same FP16 matrix operator. This does
 not bound the packed model, transient/native workspace, or total process memory.
 The default retains all expanded matrices; the bounded path trades extra unpack

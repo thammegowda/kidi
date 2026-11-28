@@ -84,7 +84,7 @@ struct View {
 
 struct Launch {
     int operation;
-    View inputs[8];
+    View inputs[MAX_INPUTS];
     View output;
     int count;
     int attribute_count;

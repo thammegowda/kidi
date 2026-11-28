@@ -57,6 +57,14 @@ Every model directory (local or `<hub_cache>/<owner>/<repo>/`) stores `config.js
 
 `checkpoint::load_config(directory)` reads `config.json`, normalizes Hugging Face `model_type` / `architectures` into `config["model"]["type"]`, and resolves companion file paths (`weights_file`, `tokenizer_file`, etc.).
 
+Generation uses each checkpoint's chat template rather than model-specific prompt markup. Stop, padding and BOS
+token IDs come from `generation_config.json`, then the root/text `config.json`, then the tokenizer's configured
+special tokens. EOS may be a single ID or a list; absent padding/BOS IDs use the first EOS ID. Raw prompts do not
+require a chat template. Parameter dtype comes from `dtype`/`torch_dtype`; older exports without either use the
+largest uncompressed floating tensor. Quantization metadata remains available to the model; only
+`quant_method: gemma` selects the native Gemma QAT execution policy. Padded embeddings are supported when the
+model exposes tokenizer-sized output logits.
+
 ---
 
 ## 3. Checkpoint State Mapping (`checkpoint::Weights`)

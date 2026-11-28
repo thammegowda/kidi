@@ -1,8 +1,8 @@
 #include "kidi/runtime/ynn/feed_forward_cache.h"
 
+#include "kidi/core/files.h"
+
 #include <array>
-#include <atomic>
-#include <cerrno>
 #include <cstring>
 #include <system_error>
 #include <type_traits>
@@ -70,19 +70,6 @@ auto filename(const FeedForwardCacheSpec& spec) -> std::string {
            std::to_string(spec.input_size) + "-m" + std::to_string(spec.intermediate_size) + ".bin";
 }
 
-#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
-auto write_all(int descriptor, const void* data, std::size_t size) -> bool {
-    const auto* bytes = static_cast<const std::byte*>(data);
-    while (size) {
-        const auto written = ::write(descriptor, bytes, size);
-        if (written < 0 && errno == EINTR) continue;
-        if (written <= 0) return false;
-        bytes += written;
-        size -= static_cast<std::size_t>(written);
-    }
-    return true;
-}
-#endif
 } // namespace
 
 auto FeedForwardCache::configure(const std::filesystem::path& directory, const std::filesystem::path& source) noexcept
@@ -139,19 +126,9 @@ auto FeedForwardCache::load(const FeedForwardCacheSpec& spec, std::size_t payloa
 auto FeedForwardCache::store(const FeedForwardCacheSpec& spec, std::span<const std::uint8_t> payload) const noexcept
     -> void {
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
-    std::filesystem::path temporary;
     try {
         if (!writable_ || payload.empty()) return;
         std::filesystem::create_directories(directory_);
-        const auto destination = directory_ / filename(spec);
-        static std::atomic<std::uint64_t> sequence = 0;
-        int descriptor = -1;
-        while (descriptor < 0) {
-            temporary = destination.string() + ".tmp." + std::to_string(::getpid()) + "." +
-                        std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
-            descriptor = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
-            if (descriptor < 0 && errno != EEXIST) return;
-        }
         Header header{.magic = MAGIC,
                       .version = FORMAT_VERSION,
                       .header_size = PAYLOAD_OFFSET,
@@ -161,20 +138,10 @@ auto FeedForwardCache::store(const FeedForwardCacheSpec& spec, std::span<const s
                       .payload_size = payload.size()};
         std::array<std::byte, PAYLOAD_OFFSET> prefix{};
         std::memcpy(prefix.data(), &header, sizeof(header));
-        const auto written = write_all(descriptor, prefix.data(), prefix.size()) &&
-                             write_all(descriptor, payload.data(), payload.size());
-        if (::close(descriptor) != 0 || !written) {
-            std::filesystem::remove(temporary);
-            return;
-        }
-        std::error_code error;
-        std::filesystem::rename(temporary, destination, error);
-        if (error) std::filesystem::remove(temporary);
+        // A failed write leaves the old file or none; the cache is rebuilt from the checkpoint next time.
+        const std::array<std::span<const std::byte>, 2> parts{prefix, std::as_bytes(payload)};
+        (void)core::write_atomic(directory_ / filename(spec), parts);
     } catch (...) {
-        if (!temporary.empty()) {
-            std::error_code error;
-            std::filesystem::remove(temporary, error);
-        }
     }
 #else
     (void)spec;

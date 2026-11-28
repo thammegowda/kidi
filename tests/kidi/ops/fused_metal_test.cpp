@@ -287,7 +287,7 @@ n_layers_per_attn_res_block: 1
 sliding_window_size: 64
 local_layer_ids: [0]
 rel_extent: 64
-model_max_length: 2048
+model_max_length: 8192
 sconv_kernel_size: 4
 use_value_norm_no_gamma: true
 attn_res_normalize_values: true
@@ -316,9 +316,10 @@ log_scaling_n_floor: 0
         require(network->mark_rewind_point(cache));
         auto key_conv = cache.visits.front().key_conv;
 
-        require(network->grow_state(cache, 768));
+        // Beyond the ring's window + 4096 spare rows, so the sliding-window layer stops growing.
+        require(network->grow_state(cache, 5120));
         ASSERT_EQ(cache.sequence_position(), 3U);
-        ASSERT_EQ(cache.sequence_capacity(), 768U);
+        ASSERT_EQ(cache.sequence_capacity(), 5120U);
         ASSERT_LT(cache.visits.front().key.size(1), cache.visits.back().key.size(1));
         EXPECT_EQ(cache.visits.front().key_conv.storage_identity(), key_conv.storage_identity());
         for (auto& visit : cache.visits)
@@ -339,10 +340,10 @@ log_scaling_n_floor: 0
         EXPECT_EQ(overwritten.error().code, ErrorCode::UNSUPPORTED);
         require(network->mark_rewind_point(cache));
         const auto rewind = cache.position++;
-        require(network->grow_state(cache, 1536));
+        require(network->grow_state(cache, 6144));
         EXPECT_EQ(cache.visits.front().key.storage_identity(), ring.storage_identity());
         EXPECT_EQ(require(cache.visits.front().key.host_bytes()).back(), MARK);
-        EXPECT_GT(cache.visits.back().key.size(1), 768U);
+        EXPECT_GT(cache.visits.back().key.size(1), 5120U);
         EXPECT_EQ(network->rewind_floor(cache, rewind), rewind);
         require(network->rewind(cache, rewind));
         EXPECT_EQ(cache.sequence_position(), rewind);

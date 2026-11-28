@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kidi Agent</title>
+  <link rel="icon" href="icons/kidi-logo.png">
+  <link rel="stylesheet" href="liteapp/libs/xterm/xterm.css">
+  <link rel="stylesheet" href="liteapp/ide/ide.css">
+  <link rel="stylesheet" href="liteapp/markdown/markdown.css">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body class="ide">
+  <header class="topbar">
+    <div class="brand"><img src="icons/kidi-logo.png" alt=""><span>Kidi</span></div>
+    <div class="workspace" id="workspace-name"></div>
+    <div class="spacer"></div>
+    <span class="badge" id="mode-badge" title="Permission mode"></span>
+    <button class="ghost small" id="layout-toggle"></button>
+    <button class="ghost small" id="theme"></button>
+    <button class="ghost small" id="toggle-terminal" title="Toggle terminal (Ctrl+`)">Terminal</button>
+    <button class="ghost small" id="open-settings" title="Settings">Settings</button>
+  </header>
+
+  <main class="layout" id="layout">
+    <aside class="sidebar" id="sidebar">
+      <nav class="sidebar-tabs" role="tablist">
+        <button role="tab" data-panel="files" class="active">Files</button>
+        <button role="tab" data-panel="changes">Changes <span class="count" id="changes-count"></span></button>
+      </nav>
+      <section class="panel active" data-panel="files">
+        <div class="panel-actions">
+          <button class="ghost small" id="new-file" title="New file">+ File</button>
+          <button class="ghost small" id="refresh-files" title="Refresh">Refresh</button>
+        </div>
+        <div class="tree" id="file-tree" role="tree"></div>
+      </section>
+      <section class="panel" data-panel="changes">
+        <div class="panel-actions">
+          <button class="ghost small" id="refresh-changes" title="Refresh">Refresh</button>
+        </div>
+        <div id="changes-list"></div>
+      </section>
+    </aside>
+    <div class="splitter" data-resize="--sidebar" data-edge="left" data-min="160"></div>
+
+    <section class="center">
+      <div class="editor-tabs" id="editor-tabs"></div>
+      <div class="editor-area" id="editor-area">
+        <div class="welcome" id="welcome">
+          <img src="icons/kidi-logo.png" alt="">
+          <h1>Kidi Agent</h1>
+          <p>Ask the agent on the right. Open files from the tree to read or edit them, and review the agent's edits
+            under <b>Changes</b>.</p>
+          <p class="hint">Ctrl/⌘+S saves · Ctrl+` toggles the terminal · Enter sends, Shift+Enter adds a line</p>
+        </div>
+      </div>
+      <div class="splitter horizontal" data-resize="--terminal" data-edge="bottom" data-container=".center" data-min="80"
+        id="terminal-splitter" hidden></div>
+      <div class="terminal-panel" id="terminal-panel" hidden>
+        <div class="terminal-bar"><span>Terminal</span><div class="spacer"></div>
+          <button class="ghost small" id="restart-terminal">Restart</button>
+          <button class="ghost small" id="close-terminal">Hide</button></div>
+        <div class="terminal-host" id="terminal-host"></div>
+      </div>
+    </section>
+    <div class="splitter" data-resize="--chat" data-edge="right" data-min="300"></div>
+
+    <section class="chat" id="chat">
+      <div class="chat-header">
+        <span class="chat-title" id="chat-title">New conversation</span>
+        <button class="ghost small" id="toggle-history" title="Saved conversations of this workspace">History</button>
+        <button class="ghost small" id="new-chat" title="Start a new conversation">New</button>
+      </div>
+      <div class="history-panel" id="history-panel" hidden><div id="sessions-list"></div></div>
+      <div class="messages" id="messages"></div>
+      <form class="composer" id="composer">
+        <div class="composer-box">
+          <div class="attachments" id="attachments" hidden></div>
+          <textarea id="prompt" rows="2" placeholder="Ask Kidi… (/ for commands)" autocomplete="off"></textarea>
+          <div class="composer-bar">
+            <button type="button" class="icon attach" id="attach"
+              title="Attach images (paste or drop also work; needs a vision model such as Gemma 4)">+</button>
+            <button type="button" class="icon dictate" id="dictate" title="Dictate" hidden></button>
+            <input type="file" id="attach-input" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+            <span class="hint" id="composer-hint" title="Enter sends · Shift+Enter adds a line">⏎ send · ⇧⏎ newline</span>
+            <div class="spacer"></div>
+            <button type="button" class="icon stop" id="stop" title="Stop (cancel the current turn)" hidden>■</button>
+            <button type="submit" class="icon send" id="send" title="Send (Enter)">↑</button>
+          </div>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <footer class="statusbar">
+    <span id="status-model"></span>
+    <span id="status-context"></span>
+    <span id="status-speed"></span>
+    <div class="spacer"></div>
+    <span id="status-phase"></span>
+  </footer>
+  <div class="banner" id="banner" hidden></div>
+  <dialog class="settings" id="settings">
+    <form method="dialog" id="settings-form">
+      <h2>Settings</h2>
+      <label for="system-prompt">System prompt</label>
+      <p class="hint">Applies to this conversation and new ones until the server stops; agent.yaml is unchanged.</p>
+      <textarea id="system-prompt" rows="16" spellcheck="false"></textarea>
+      <div class="settings-actions">
+        <button type="button" class="ghost small" id="settings-default">Restore default</button>
+        <div class="spacer"></div>
+        <button value="cancel" class="ghost small" formnovalidate>Cancel</button>
+        <button value="save" class="primary small" id="settings-save">Save</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

@@ -2,6 +2,8 @@
 
 #include "cuda/flash_attention.h"
 
+#include <cuda_bf16.h>
+
 #include <cstddef>
 #include <cstdint>
 
@@ -13,6 +15,30 @@ __device__ __forceinline__ const void* resolve_view(const FlashView& v) {
 
 __device__ __forceinline__ void* resolve_mut(const FlashView& v) {
     return v.binding ? static_cast<unsigned char*>(*v.binding) + v.binding_offset : const_cast<void*>(v.data);
+}
+
+/// Cache row holding key `key`: the key itself for linear caches, or its ring slot.
+__device__ __forceinline__ std::int64_t key_row(const FlashAttentionArgs& args, int key) {
+    return args.ring_rows ? key % args.ring_rows : key;
+}
+
+/// Writes eight columns of an INT8 cache row to shared memory as BF16. Rows hold `width` INT8 values, and `scales`
+/// holds one F32 scale per 32 columns of each row. Invalid rows are written as zeros.
+__device__ __forceinline__ void load_int8_chunk(__nv_bfloat16* destination, const signed char* cache,
+                                                const float* scales, std::int64_t row, std::int64_t column,
+                                                std::int64_t width, bool valid) {
+    uint4 packed{};
+    if (valid) {
+        const uint2 bytes = *reinterpret_cast<const uint2*>(cache + row * width + column);
+        const float scale = scales[row * (width / 32) + column / 32];
+        const auto* values = reinterpret_cast<const signed char*>(&bytes);
+        const auto pack = [&](int index) {
+            const __nv_bfloat162 pair = __floats2bfloat162_rn(values[index] * scale, values[index + 1] * scale);
+            return reinterpret_cast<const unsigned&>(pair);
+        };
+        packed = make_uint4(pack(0), pack(2), pack(4), pack(6));
+    }
+    *reinterpret_cast<uint4*>(destination) = packed;
 }
 
 __device__ __forceinline__ void structured_key_bounds(const FlashAttentionArgs& args, const void* positions,

@@ -1,8 +1,13 @@
 #include "kidi/agent/command.h"
-#include "kidi/agent/chat_client.h"
-#include "kidi/agent/terminal.h"
+#include "kidi/agent/chat/client.h"
+#include "kidi/agent/session.h"
+#include "kidi/agent/net/sign_in.h"
+#include "kidi/agent/ui/terminal.h"
 #include "kidi/agent/transcript.h"
-#include "kidi/agent/workspace.h"
+#include "kidi/agent/tools/workspace.h"
+#if defined(KIDI_AGENT_WEB)
+#include "kidi/agent/ui/web.h"
+#endif
 
 #include <algorithm>
 #include <iostream>
@@ -14,6 +19,11 @@
 #include <thread>
 
 namespace kidi::agent {
+
+using ui::InputState;
+using ui::Terminal;
+using ui::terminal_text;
+using ui::TerminalTone;
 
 auto configure_parser(cli::ArgumentParser& parser, bool managed) -> void {
     if (managed) {
@@ -43,11 +53,20 @@ auto configure_parser(cli::ArgumentParser& parser, bool managed) -> void {
         .default_value(std::string("ask"))
         .choices({"none", "read-only", "ask", "workspace-write", "full-access"})
         .help(
-            "none: plain chat without tools; read-only: read files only; ask: ask before writes and commands "
-            "(default); workspace-write: allow writes but ask before commands; full-access: allow both");
+            "none: plain chat without tools; read-only: read files only; ask: ask before writes, commands and web "
+            "requests (default); workspace-write: allow writes but ask before commands and web requests; "
+            "full-access: allow all");
     parser.add_argument("--max-steps").dest("max_steps").default_value<std::size_t>(64);
     parser.add_argument("--max-tool-calls").dest("max_tool_calls").default_value<std::size_t>(256);
-    parser.add_argument("--max-tokens").dest("max_tokens").default_value<std::size_t>(4096);
+    parser.add_argument("--max-tokens")
+        .dest("max_tokens")
+        .default_value<std::size_t>(16384)
+        .help("token limit for one model reply, including reasoning and tool arguments");
+    parser.add_argument("--reasoning-effort")
+        .dest("reasoning_effort")
+        .default_value(std::string{})
+        .choices({"none", "minimal", "low", "medium", "high", "xhigh"})
+        .help("thinking effort for model replies (default: the agent config's reasoning_effort)");
     parser.add_argument("--temperature")
         .default_value<double>(-1)
         .help("sampling temperature; 0 is greedy (default: the agent config's sampling.temperature)");
@@ -55,9 +74,20 @@ auto configure_parser(cli::ArgumentParser& parser, bool managed) -> void {
         .dest("timeout_ms")
         .default_value<std::int64_t>(120000)
         .help("abort a model request after this long without any response bytes");
+    parser.add_argument("--web")
+        .action(cli::Action::STORE_TRUE)
+        .help("open the agent in a local web UI with a file tree, editor, diffs and terminal");
+    parser.add_argument("--port")
+        .default_value<std::int32_t>(0)
+        .help("loopback port for --web (default: any free port)");
+    parser.add_argument("--web-assets")
+        .dest("web_assets")
+        .default_value(std::filesystem::path{})
+        .help("serve the --web UI live from a checkout's kidi-agent/web, per its assets.txt (UI edits need a reload)");
 }
 
-auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provider) -> int {
+auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provider, SpeechFactory create_speech)
+    -> int {
     const auto& config_path = arguments.get<std::filesystem::path>("config");
     auto config = config_path.empty() ? default_agent_config() : load_agent_config(config_path);
     if (!config) {
@@ -65,7 +95,7 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
         return 1;
     }
     if (const auto& system = arguments.get<std::string>("system"); !system.empty()) config->system_prompt = system;
-    ChatClientOptions options_http{
+    chat::ChatClientOptions options_http{
         .model = arguments.contains("model") ? arguments.get<std::string>("model") : "kidi-local",
         .max_tokens = arguments.get<std::size_t>("max_tokens"),
         .timeout = std::chrono::milliseconds(arguments.get<std::int64_t>("timeout_ms")),
@@ -78,10 +108,13 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
     options_http.temperature = temperature >= 0 ? static_cast<float>(temperature) : config->sampling.temperature;
     options_http.top_p = config->sampling.top_p;
     options_http.top_k = config->sampling.top_k;
+    const auto& effort = arguments.get<std::string>("reasoning_effort");
+    options_http.reasoning_effort = effort.empty() ? config->reasoning_effort : effort;
     if (arguments.contains("base_url")) {
         options_http.base_url = arguments.get<std::string>("base_url");
     }
-    auto tools = workspace_tools(arguments.get<std::filesystem::path>("workspace"), *config);
+    auto servers = net::mcp_servers(config->mcp_servers);
+    auto tools = tools::workspace_tools(arguments.get<std::filesystem::path>("workspace"), *config, {}, servers);
     if (!tools) {
         std::cerr << "kidi-agent: " << terminal_text(tools.error().message) << '\n';
         return 1;
@@ -99,6 +132,8 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
     options.permissions.read = mode == "none" ? Access::DENY : Access::ALLOW;
     options.permissions.write = read_only ? Access::DENY : mode == "ask" ? Access::ASK : Access::ALLOW;
     options.permissions.execute = read_only ? Access::DENY : mode == "full-access" ? Access::ALLOW : Access::ASK;
+    // Web requests send queries and addresses off this computer, so they are approved unless access is full.
+    options.permissions.network = mode == "none" ? Access::DENY : mode == "full-access" ? Access::ALLOW : Access::ASK;
     const auto offered = [&](const Tool& tool) { return options.permissions.access(tool.capability) != Access::DENY; };
     if (!config->tools_prompt.empty() && std::ranges::any_of(*tools, offered)) {
         if (!config->system_prompt.ends_with('\n')) config->system_prompt += '\n';
@@ -106,112 +141,59 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
     }
     const auto& prompt = arguments.get<std::string>("prompt");
     const bool interactive = prompt.empty();
+    // Listing a server's tools is itself a request, so --permissions none never contacts MCP servers.
+    auto discover_tools = options.permissions.network == Access::DENY
+                              ? net::ToolDiscovery{}
+                              : net::mcp_tool_discovery(config->mcp_servers, servers);
+    SessionOptions session_options{.chat = std::move(options_http),
+                                   .run = std::move(options),
+                                   .tools = std::move(*tools),
+                                   .system_prompt = config->system_prompt,
+                                   .workspace = arguments.get<std::filesystem::path>("workspace"),
+                                   .mode = mode,
+                                   .save = !arguments.get<bool>("no_save"),
+                                   .announce_transcript = interactive,
+                                   .create_provider = std::move(create_provider),
+                                   .discover_tools = std::move(discover_tools)};
+#if defined(KIDI_AGENT_WEB)
+    if (arguments.get<bool>("web")) {
+        if (!interactive) {
+            std::cerr << "kidi-agent: --web and --prompt cannot be combined\n";
+            return 1;
+        }
+        auto speech = create_speech ? create_speech(config->speech) : Speech{};
+        return ui::web_agent(std::move(session_options), std::move(speech), arguments.get<std::int32_t>("port"),
+                         arguments.get<std::filesystem::path>("web_assets"));
+    }
+#else
+    static_cast<void>(create_speech);
+    if (arguments.get<bool>("web")) {
+        std::cerr << "kidi-agent: this build has no web UI; use the kidi CLI (kidi agent --web)\n";
+        return 1;
+    }
+#endif
     Terminal terminal(arguments.get<std::string>("color"));
-    std::set<std::string> session_grants;
-    std::mutex stop_mutex;
-    std::stop_source stop;
-    const auto current_stop = [&] {
-        const std::lock_guard lock(stop_mutex);
-        return stop;
-    };
-    const auto request_stop = [&] { current_stop().request_stop(); };
     bool input_closed = false;
-    std::vector<Message> history{{.role = Role::SYSTEM, .content = config->system_prompt}};
-    std::optional<Transcript> transcript;
-    std::optional<Error> transcript_error;
-    std::optional<ContextUsage> context;
-    struct Speed {
-        double tokens_per_second = 0, prefill_seconds = 0;
-        bool decode_only = false;
+    std::unique_ptr<AgentSession> session;
+    SessionView view;
+    if (interactive && terminal.interactive())
+        view.stream = [&](std::string_view text, bool thinking) { terminal.stream(text, thinking); };
+    view.busy = [&](std::string_view phase, bool tool) { terminal.activity(phase, tool); };
+    view.idle = [&](bool failed) {
+        terminal.end_stream();
+        terminal.finish_activity(failed);
     };
-    std::optional<Speed> speed;
-    bool streamed_content = false, streamed_reasoning = false;
-    std::string model = options_http.model.empty() ? "local model" : options_http.model;
-    const auto save = [&](Json record) {
-        if (!transcript || transcript_error) return;
-        auto result = transcript->append(std::move(record));
-        if (!result) {
-            transcript_error = result.error();
-            request_stop();
-        }
+    view.reply = [&](const Message& reply, bool streamed_reasoning, bool streamed_content) {
+        if (!streamed_reasoning) terminal.thinking(reply.reasoning_content);
+        if (!streamed_content && !reply.tool_calls.empty() && !reply.content.empty())
+            terminal.write(terminal_text(reply.content) + "\n", TerminalTone::ASSISTANT);
     };
-    const auto show_status = [&](std::string_view phase) {
-        if (!interactive) return;
-        // Fixed-width fields first so live updates do not shift the bar; the changing phase goes last.
-        std::ostringstream text;
-        text << std::filesystem::path(model).filename().string() << " | ctx " << std::fixed << std::setprecision(1);
-        if (context && context->context_tokens)
-            text << std::setw(5) << 100.0 * context->prompt_tokens / context->context_tokens << "% "
-                 << std::setw(static_cast<int>(std::to_string(context->context_tokens).size()))
-                 << context->prompt_tokens << '/' << context->context_tokens;
-        else
-            text << "   --";
-        text << " | ";
-        if (!speed)
-            text << "    -- tok/s";
-        else if (speed->decode_only)
-            text << std::setw(6) << speed->tokens_per_second << " tok/s | prefill " << std::setw(5)
-                 << speed->prefill_seconds << 's';
-        else
-            text << std::setw(6) << speed->tokens_per_second << " tok/s req";
-        text << " | " << phase;
-        terminal.status(text.str());
+    view.notice = [&](std::string_view text, Notice kind) {
+        static constexpr TerminalTone TONES[] = {TerminalTone::DEFAULT, TerminalTone::CONTEXT, TerminalTone::SESSION,
+                                                 TerminalTone::WARNING, TerminalTone::ERROR};
+        terminal.write(std::string(text) + "\n", TONES[static_cast<int>(kind)]);
     };
-    Callbacks callbacks;
-    if (interactive && terminal.interactive()) {
-        options_http.on_delta = [&](std::string_view text, bool thinking) {
-            auto& seen = thinking ? streamed_reasoning : streamed_content;
-            if (!seen) {
-                terminal.activity(thinking ? "Thinking" : "Answering");
-                seen = true;
-            }
-            terminal.stream(text, thinking);
-        };
-    }
-    if (interactive) {
-        callbacks.approve = [&](const ToolSpec& spec, const ToolCall& call) -> Result<bool> {
-            if (session_grants.contains(spec.name)) return true;
-            terminal.write("Approval required: " + terminal_text(spec.name) + "\n", TerminalTone::WARNING);
-            // Approval must expose every argument, even when the activity preview was abbreviated.
-            terminal.tool(spec.name, call.arguments, true);
-            terminal.write("Allow once [y], allow ANY arguments to this tool for this session [a], deny [N].\n",
-                           TerminalTone::DIM);
-            const auto tool =
-                std::ranges::find_if(*tools, [&](const Tool& item) { return item.spec.name == spec.name; });
-            if (tool != tools->end() && tool->capability == Capability::EXECUTE)
-                terminal.write("Shell commands are not sandboxed; session approval permits any command as your user.\n",
-                               TerminalTone::WARNING);
-            for (;;) {
-                auto response = terminal.read("Approve? [y/a/N] ", false);
-                if (!response) return std::unexpected(response.error());
-                if (response->state == InputState::INTERRUPTED) {
-                    request_stop();
-                    return std::unexpected(Error{ErrorCode::RUNTIME, "approval cancelled"});
-                }
-                if (response->state == InputState::END) {
-                    input_closed = true;
-                    request_stop();
-                    return std::unexpected(Error{ErrorCode::IO, "cannot read approval: end of input"});
-                }
-                if (response->text == "y" || response->text == "yes") return true;
-                if (response->text == "a" || response->text == "always") {
-                    session_grants.insert(spec.name);
-                    terminal.write("Session approval granted for " + terminal_text(spec.name) +
-                                       ". /permissions reset revokes it.\n",
-                                   TerminalTone::SESSION);
-                    return true;
-                }
-                if (response->text.empty() || response->text == "n" || response->text == "no") return false;
-                terminal.write("Choose y, a or n; empty input denies.\n", TerminalTone::WARNING);
-            }
-        };
-    }
-    callbacks.observe = [&](const Event& event) {
-        if (event.kind == EventKind::MODEL_START) {
-            show_status("Generating");
-            terminal.activity(context ? "Processing " + std::to_string(context->prompt_tokens) + " prompt tokens"
-                                      : "Waiting for model");
-        }
+    view.event = [&](const Event& event) {
         if (event.kind == EventKind::TOOL_START) {
             const auto arguments = Json::parse(event.detail, nullptr, false);
             if (arguments.is_object())
@@ -219,190 +201,114 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
             else
                 terminal.write("[tool] " + terminal_text(event.tool_name) + "\n" + terminal_text(event.detail) + "\n",
                                TerminalTone::TOOL);
-            show_status("Working");
-            terminal.activity(event.tool_name, true);
-            save({{"type", "tool_start"},
-                  {"name", event.tool_name},
-                  {"id", event.call_id},
-                  {"arguments", arguments.is_discarded() ? Json(event.detail) : arguments}});
         }
-        if (event.kind == EventKind::TOOL_FINISH) {
-            terminal.finish_activity(event.is_error);
-            save(transcript_message({.role = Role::TOOL, .content = event.detail, .tool_call_id = event.call_id}));
-            if (event.is_error) {
-                const auto error = Json::parse(event.detail, nullptr, false);
-                const auto text = error.is_object() && error.contains("error") && error["error"].is_string()
-                                      ? error["error"].get<std::string>()
-                                      : event.detail;
-                terminal.write("[tool error] " + terminal_text(text) + "\n", TerminalTone::ERROR);
-            }
+        if (event.kind == EventKind::TOOL_FINISH && event.is_error) {
+            const auto error = Json::parse(event.detail, nullptr, false);
+            const auto text = error.is_object() && error.contains("error") && error["error"].is_string()
+                                  ? error["error"].get<std::string>()
+                                  : event.detail;
+            terminal.write("[tool error] " + terminal_text(text) + "\n", TerminalTone::ERROR);
         }
-        if (event.kind == EventKind::COMPACT_START) {
-            terminal.activity("Compacting");
+        if (event.kind == EventKind::COMPACT_START)
             terminal.write("[context] Compacting conversation...\n", TerminalTone::CONTEXT);
-        }
-        if (event.kind == EventKind::COMPACT_FINISH) {
-            terminal.finish_activity();
+        if (event.kind == EventKind::COMPACT_FINISH)
             terminal.write("[context] " + terminal_text(event.detail) + "\n", TerminalTone::CONTEXT);
-            Json checkpoint{{"type", "compact"}, {"messages", Json::array()}};
-            for (const auto& message : history) checkpoint["messages"].push_back(transcript_message(message));
-            save(std::move(checkpoint));
-        }
     };
-    const auto visible_specs = [&] {
-        std::vector<ToolSpec> specs;
-        for (const auto& tool : *tools)
-            if (options.permissions.access(tool.capability) != Access::DENY) specs.push_back(tool.spec);
-        return specs;
+    // Fixed-width fields first so live updates do not shift the bar; the changing phase goes last.
+    const auto show_status = [&](const SessionStatus& status, std::string_view phase) {
+        std::ostringstream text;
+        text << std::filesystem::path(status.model).filename().string() << " | ctx " << std::fixed
+             << std::setprecision(1);
+        const auto& context = status.context;
+        if (context && context->context_tokens)
+            text << std::setw(5) << 100.0 * context->prompt_tokens / context->context_tokens << "% "
+                 << std::setw(static_cast<int>(std::to_string(context->context_tokens).size()))
+                 << context->prompt_tokens << '/' << context->context_tokens;
+        else
+            text << "   --";
+        text << " | ";
+        if (!status.speed)
+            text << "    -- tok/s";
+        else if (status.speed->decode_only)
+            text << std::setw(6) << status.speed->tokens_per_second << " tok/s | prefill " << std::setw(5)
+                 << status.speed->prefill_seconds << 's';
+        else
+            text << std::setw(6) << status.speed->tokens_per_second << " tok/s req";
+        text << " | " << phase;
+        terminal.status(text.str());
     };
-    Result<Provider> provider;
-    // Tell the user up front when the context cannot hold real work, instead of compacting constantly.
-    const auto check_context = [&] {
-        constexpr std::size_t RECOMMENDED = 32768;
-        if (!provider->context) return;
-        auto usage = provider->context(std::span(history).first(1), visible_specs(), {});
-        if (!usage || usage->context_tokens >= RECOMMENDED) return;
-        terminal.write("[context] warning: " + std::to_string(usage->context_tokens) +
-                           "-token context; the system prompt and tools already use " +
-                           std::to_string(usage->prompt_tokens) +
-                           ". Long tasks will compact often. Omit --context-size to size it from free memory, or "
-                           "use " +
-                           std::to_string(RECOMMENDED) + " or more.\n",
-                       TerminalTone::WARNING);
-    };
-    const auto run = [&](std::string task, bool control = false) -> int {
-        if (!*provider) {
-            terminal.activity("Starting model");
-            provider = create_provider(std::move(options_http));
-            terminal.finish_activity(!provider);
-            if (provider) {
-                if (!provider->model.empty()) model = provider->model;
-                auto complete = std::move(provider->complete);
-                provider->complete = [&, complete = std::move(complete)](auto messages, auto specs,
-                                                                         std::stop_token token) -> Result<Message> {
-                    const auto started = std::chrono::steady_clock::now();
-                    streamed_content = streamed_reasoning = false;
-                    auto reply = complete(messages, specs, token);
-                    terminal.end_stream();
-                    terminal.finish_activity(!reply);
-                    const auto seconds =
-                        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-                    speed.reset();
-                    if (reply) {
-                        if (reply->usage) {
-                            const auto& usage = *reply->usage;
-                            if (usage.decode_ms > 0)
-                                speed = Speed{usage.completion_tokens * 1000.0 / usage.decode_ms,
-                                              usage.prefill_ms / 1000.0, true};
-                            else if (seconds > 0)
-                                speed = Speed{usage.completion_tokens / seconds};
-                            if (context)
-                                context->prompt_tokens = reply->usage->prompt_tokens + reply->usage->completion_tokens;
-                        }
-                        save(transcript_message(*reply));
-                        if (transcript_error) return std::unexpected(*transcript_error);
-                        if (!streamed_reasoning) terminal.thinking(reply->reasoning_content);
-                        if (!streamed_content && !reply->tool_calls.empty() && !reply->content.empty())
-                            terminal.write(terminal_text(reply->content) + "\n", TerminalTone::ASSISTANT);
-                    }
-                    return reply;
-                };
-                if (provider->context) {
-                    auto inspect = std::move(provider->context);
-                    provider->context = [&, inspect = std::move(inspect)](
-                                            auto messages, auto specs, std::stop_token token) -> Result<ContextUsage> {
-                        terminal.activity("Checking context");
-                        auto usage = inspect(messages, specs, token);
-                        terminal.finish_activity(!usage);
-                        if (usage) context = *usage;
-                        return usage;
-                    };
+    if (interactive) view.status = show_status;
+    if (interactive)
+        view.approve = [&](const ToolSpec& spec, const ToolCall& call, bool unsandboxed) -> Result<Approval> {
+            terminal.write("Approval required: " + terminal_text(spec.name) + "\n", TerminalTone::WARNING);
+            // Approval must expose every argument, even when the activity preview was abbreviated.
+            terminal.tool(spec.name, call.arguments, true);
+            terminal.write("Allow once [y], allow ANY arguments to this tool for this session [a], deny [N].\n",
+                           TerminalTone::DIM);
+            if (unsandboxed)
+                terminal.write("Shell commands are not sandboxed; session approval permits any command as your user.\n",
+                               TerminalTone::WARNING);
+            for (;;) {
+                auto response = terminal.read("Approve? [y/a/N] ", false);
+                if (!response) return std::unexpected(response.error());
+                if (response->state == InputState::INTERRUPTED)
+                    return std::unexpected(Error{ErrorCode::RUNTIME, "approval cancelled"});
+                if (response->state == InputState::END) {
+                    input_closed = true;
+                    return std::unexpected(Error{ErrorCode::IO, "cannot read approval: end of input"});
                 }
-                check_context();
+                if (response->text == "y" || response->text == "yes") return Approval::ONCE;
+                if (response->text == "a" || response->text == "always") return Approval::SESSION;
+                if (response->text.empty() || response->text == "n" || response->text == "no") return Approval::DENY;
+                terminal.write("Choose y, a or n; empty input denies.\n", TerminalTone::WARNING);
             }
-        }
-        if (!provider) {
-            terminal.write("kidi-agent: " + terminal_text(provider.error().message) + "\n", TerminalTone::ERROR);
-            return 1;
-        }
-        {
-            const std::lock_guard lock(stop_mutex);
-            stop = std::stop_source{};
-        }
-        if (transcript_error) {
-            terminal.write("kidi-agent: " + terminal_text(transcript_error->message) + "\n", TerminalTone::ERROR);
-            return 1;
-        }
-        if (!transcript && !arguments.get<bool>("no_save")) {
-            auto opened = Transcript::open(arguments.get<std::filesystem::path>("workspace"), model);
-            if (!opened) {
-                transcript_error = opened.error();
-                terminal.write("kidi-agent: " + terminal_text(opened.error().message) + " (use --no-save to opt out)\n",
-                               TerminalTone::ERROR);
-                return 1;
-            }
-            transcript.emplace(std::move(*opened));
-            save(transcript_message(history.front()));
-            if (interactive)
-                terminal.write("[session] " + terminal_text(transcript->path().string()) + "\n", TerminalTone::SESSION);
-        }
-        if (transcript_error) {
-            terminal.write("kidi-agent: " + terminal_text(transcript_error->message) + "\n", TerminalTone::ERROR);
-            return 1;
-        }
-        const auto token = current_stop().get_token();
-        if (control) {
-            const auto specs = visible_specs();
-            if (task == "/compact") {
-                auto result = compact_history(*provider, specs, history, options, callbacks, token);
-                terminal.finish_activity(!result);
-                if (result && !transcript_error) {
-                    show_status("Ready");
-                    return 0;
+        };
+    if (interactive)
+        view.setup = [&](const ToolSpec& spec, const ToolSetup& setup,
+                         const std::string& reason) -> Result<std::optional<BrowserSignIn>> {
+            terminal.write(terminal_text(spec.name) + " needs " + terminal_text(setup.service) + ": " +
+                               terminal_text(reason) + ".\n",
+                           TerminalTone::WARNING);
+            for (;;) {
+                auto response = terminal.read("Connect " + terminal_text(setup.service) + " now? It opens a browser "
+                                              "sign-in. [Y/n] ",
+                                              false);
+                if (!response) return std::unexpected(response.error());
+                if (response->state == InputState::INTERRUPTED)
+                    return std::unexpected(Error{ErrorCode::RUNTIME, "setup cancelled"});
+                if (response->state == InputState::END) {
+                    input_closed = true;
+                    return std::unexpected(Error{ErrorCode::IO, "cannot read the answer: end of input"});
                 }
-                if (transcript_error) result = std::unexpected(*transcript_error);
-                terminal.write("kidi-agent: " + terminal_text(result.error().message) + "\n", TerminalTone::ERROR);
-                return 1;
+                if (response->text == "n" || response->text == "no") return std::optional<BrowserSignIn>{};
+                if (response->text.empty() || response->text == "y" || response->text == "yes") break;
+                terminal.write("Choose y or n.\n", TerminalTone::WARNING);
             }
-            if (!provider->context) {
-                terminal.write("kidi-agent: provider does not support context inspection\n", TerminalTone::ERROR);
-                return 1;
-            }
-            auto usage = provider->context(history, specs, token);
-            if (!usage) {
-                terminal.write("kidi-agent: " + terminal_text(usage.error().message) + "\n", TerminalTone::ERROR);
-                return 1;
-            }
-            terminal.write(std::to_string(usage->prompt_tokens) + " / " + std::to_string(usage->context_tokens) +
-                               " context tokens (including system prompt and tool schemas)\n",
-                           TerminalTone::CONTEXT);
-            show_status("Ready");
-            return 0;
-        }
-        save(transcript_message({.role = Role::USER, .content = task}));
-        if (transcript_error) {
-            terminal.write("kidi-agent: " + terminal_text(transcript_error->message) + "\n", TerminalTone::ERROR);
-            return 1;
-        }
-        auto result = run_turn(*provider, *tools, history, std::move(task), options, callbacks, token);
-        if (transcript_error) result = std::unexpected(*transcript_error);
-        if (!result) {
-            terminal.finish_activity(true);
-            save({{"type", "error"}, {"message", result.error().message}});
-            if (transcript_error) result = std::unexpected(*transcript_error);
-            terminal.write("kidi-agent: " + terminal_text(result.error().message) + "\n", TerminalTone::ERROR);
-            show_status("Stopped");
-            return 1;
-        }
-        if (!streamed_content) terminal.answer(result->text);
-        show_status("Ready");
+            auto sign_in = net::loopback_sign_in([&, service = setup.service](const std::string& url, int port) {
+                terminal.write("Sign in to " + terminal_text(service) + " in your browser:\n  " + url + "\n");
+                if (!net::open_in_browser(url))
+                    terminal.write("If that browser runs on another computer, forward port " + std::to_string(port) +
+                                       " first (ssh -L " + std::to_string(port) + ":127.0.0.1:" +
+                                       std::to_string(port) + " <this host>), or use kidi agent --web.\n",
+                                   TerminalTone::DIM);
+                terminal.write("Waiting for the sign-in (Ctrl-C cancels)...\n", TerminalTone::DIM);
+            });
+            if (!sign_in) return std::unexpected(sign_in.error());
+            return std::optional<BrowserSignIn>(std::move(*sign_in));
+        };
+    session = std::make_unique<AgentSession>(std::move(session_options), std::move(view));
+    const auto run = [&](std::string task) -> int {
+        auto result = session->run(std::move(task));
+        if (!result) return 1;
+        if (!session->streamed_answer()) terminal.answer(result->text);
         return 0;
     };
     if (!interactive) return run(prompt);
     const auto interactive_loop = [&]() -> int {
-        terminal.write("Kidi Agent (native; " + mode + "). /help for commands. Ctrl-C cancels; Ctrl-D exits.\n",
+        terminal.write("Kidi Agent (native; " + session->mode() +
+                           "). /help for commands. Ctrl-C cancels; Ctrl-D exits.\n",
                        TerminalTone::TOOL);
-        show_status("Ready");
+        show_status(session->status(), "Ready");
         for (;;) {
             auto input = terminal.read("> ");
             if (!input) {
@@ -420,43 +326,47 @@ auto agent_command(const cli::Namespace& arguments, ProviderFactory create_provi
                     "/permissions reset  Revoke session approvals (keep the CLI permission mode)\n"
                     "/context            Show exact prompt and context token counts\n"
                     "/compact            Summarize older history (keep session approvals)\n"
-                    "Arrows edit and recall tasks; Page Up/Down scrolls the transcript; Tab completes commands.\n",
+                    "Arrows edit and recall tasks; Alt-Enter or Ctrl-J adds a line; Tab completes commands.\n"
+                    "Scroll, select and copy the transcript with your terminal.\n",
                     TerminalTone::DIM);
                 continue;
             }
-            if (line == "/compact" || line == "/context") {
-                if (run(std::move(line), true) && transcript_error) return 1;
+            if (line == "/compact") {
+                if (!session->compact() && session->failed()) return 1;
+                continue;
+            }
+            if (line == "/context") {
+                auto usage = session->context();
+                if (usage)
+                    terminal.write(std::to_string(usage->prompt_tokens) + " / " +
+                                       std::to_string(usage->context_tokens) +
+                                       " context tokens (including system prompt and tool schemas)\n",
+                                   TerminalTone::CONTEXT);
+                else if (session->failed())
+                    return 1;
                 continue;
             }
             if (line == "/permissions" || line == "/permissions reset") {
-                if (line == "/permissions reset") session_grants.clear();
-                auto result = "Permission mode: " + mode + "\nSession-approved tools:";
-                for (const auto& name : session_grants) result += ' ' + terminal_text(name);
-                if (session_grants.empty()) result += " none";
+                if (line == "/permissions reset") session->revoke_grants();
+                auto result = "Permission mode: " + session->mode() + "\nSession-approved tools:";
+                for (const auto& name : session->grants()) result += ' ' + terminal_text(name);
+                if (session->grants().empty()) result += " none";
                 terminal.write(result + "\n", TerminalTone::CONTEXT);
                 continue;
             }
             if (line == "/reset") {
-                history.resize(1);
-                save({{"type", "reset"}});
-                if (transcript_error) {
-                    terminal.write("kidi-agent: " + terminal_text(transcript_error->message) + "\n",
-                                   TerminalTone::ERROR);
-                    return 1;
-                }
-                context.reset();
-                speed.reset();
+                if (!session->reset()) return 1;
                 terminal.write("Conversation cleared; session approvals unchanged.\n", TerminalTone::CONTEXT);
                 continue;
             }
             if (line.empty()) continue;
-            // A failed turn keeps the session; only an unavailable model ends it.
-            if (run(std::move(line)) && (!provider || transcript_error)) return 1;
+            // A failed turn keeps the session; only an unavailable model or transcript ends it.
+            if (run(std::move(line)) && session->failed()) return 1;
             if (input_closed) break;
         }
         return 0;
     };
-    return terminal.run_interactive(interactive_loop, request_stop);
+    return terminal.run_interactive(interactive_loop, [&] { session->cancel(); });
 }
 
 } // namespace kidi::agent

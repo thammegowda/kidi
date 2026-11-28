@@ -23,7 +23,6 @@
 #include <algorithm>
 #include <array>
 #include <limits>
-#include <fstream>
 #include <utility>
 
 namespace kidi::inference {
@@ -110,6 +109,85 @@ auto validate_text_chat(const nlohmann::ordered_json& messages) -> Result<void> 
         }
     }
     return {};
+}
+
+auto decode_base64(std::string_view text) -> std::string {
+    std::string bytes;
+    bytes.reserve(text.size() / 4 * 3);
+    std::uint32_t buffer = 0;
+    int bits = 0;
+    for (const char character : text) {
+        std::uint32_t value;
+        if (character >= 'A' && character <= 'Z') value = character - 'A';
+        else if (character >= 'a' && character <= 'z') value = character - 'a' + 26;
+        else if (character >= '0' && character <= '9') value = character - '0' + 52;
+        else if (character == '+' || character == '-') value = 62;
+        else if (character == '/' || character == '_') value = 63;
+        else if (character == '=') break;
+        else throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "image data is not valid base64"});
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            bytes.push_back(static_cast<char>((buffer >> bits) & 0xff));
+        }
+    }
+    return bytes;
+}
+
+// The bytes of an OpenAI image part ({"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}}).
+auto image_part_bytes(const nlohmann::ordered_json& part) -> std::optional<std::string> {
+    if (!part.is_object() || part.value("type", "") != "image_url") return std::nullopt;
+    const auto& image = part.contains("image_url") ? part["image_url"] : nlohmann::ordered_json();
+    const auto url = image.is_string() ? image.get<std::string>()
+                     : image.is_object() && image.contains("url") && image["url"].is_string()
+                         ? image["url"].get<std::string>()
+                         : std::string{};
+    const auto comma = url.find(',');
+    if (!url.starts_with("data:image/") || comma == std::string::npos ||
+        std::string_view(url).substr(0, comma).find(";base64") == std::string_view::npos)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "image_url must be a base64 data:image/... URL"});
+    return decode_base64(std::string_view(url).substr(comma + 1));
+}
+
+// The request limits every image path enforces: at most eight PNG, JPEG or PPM images totalling 32 MiB.
+auto check_image_limits(const std::string& encoded, std::size_t count, std::size_t total_bytes) -> void {
+    if (count >= 8)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "images require user messages, at most eight per context"});
+    if (encoded.empty() || total_bytes + encoded.size() > 32 * 1024 * 1024)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "images exceed the 32 MiB request limit"});
+    if (!encoded.starts_with("\x89PNG") && !encoded.starts_with("\xff\xd8\xff") && !encoded.starts_with("P6") &&
+        !encoded.starts_with("P5"))
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "images must be PNG, JPEG or PPM"});
+}
+
+// Flattens each user message with image parts to text, replacing every image by `placeholders(bytes)` in place.
+template <class Placeholders>
+auto expand_image_parts(nlohmann::ordered_json messages, Placeholders&& placeholders) -> nlohmann::ordered_json {
+    if (!messages.is_array()) return messages;
+    for (auto& message : messages) {
+        if (!message.is_object() || !message.contains("content") || !message["content"].is_array()) continue;
+        const auto& content = message["content"];
+        const auto image = [](const auto& part) { return part.is_object() && part.value("type", "") == "image_url"; };
+        if (std::ranges::none_of(content, image)) continue;
+        if (message.value("role", "") != "user")
+            throw ops::Failure(
+                {ErrorCode::INVALID_ARGUMENT, "images require user messages, at most eight per context"});
+        std::string text;
+        for (const auto& part : content) {
+            if (auto bytes = image_part_bytes(part)) {
+                text += placeholders(std::move(*bytes));
+            } else if (part.is_string()) {
+                text += part.get<std::string>();
+            } else if (part.is_object() && part.contains("text") && part["text"].is_string()) {
+                text += part["text"].get<std::string>();
+            } else {
+                throw ops::Failure({ErrorCode::UNSUPPORTED, "message content parts must be text or image_url"});
+            }
+        }
+        message["content"] = std::move(text);
+    }
+    return messages;
 }
 
 auto format_text_chat(const text::Tokenizer& tokenizer, const nlohmann::ordered_json& messages,
@@ -882,106 +960,98 @@ auto Generator::configure_serving(ServingOptions options) -> Result<void> {
         return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
     }
 }
+auto Generator::check_image_request(const GenerationOptions& options) const -> void {
+    if (!vision_supported())
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "this checkpoint has no supported vision tower"});
+    if (drafter_)
+        throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding currently supports text-only requests"});
+    if (options.image_max_pixels < image::MIN_RESIZED_PIXELS || options.image_max_pixels > image::MAX_RESIZED_PIXELS)
+        throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "image resize limit must be 161280 to 3000000 pixels"});
+}
+
+auto Generator::image_placeholders(std::string encoded, const GenerationOptions& options, ImageBatch& batch)
+    -> std::string {
+    std::size_t total_bytes = 0;
+    for (const auto& image : batch.images) total_bytes += image.encoded.size();
+    check_image_limits(encoded, batch.images.size(), total_bytes);
+    auto cached = std::ranges::find_if(images_, [&](const CachedImage& image) {
+        return image.encoded == encoded && image.tokens == options.image_tokens &&
+               image.max_pixels == options.image_max_pixels;
+    });
+    tensor::Tensor embeddings;
+    if (cached != images_.end()) {
+        embeddings = cached->embeddings;
+    } else {
+        if (model_->device().capabilities().compute.host() && model_->accelerator().empty()) {
+            model_->release_workspaces();
+            if (vision_) vision_->release_workspaces();
+        }
+        if (options.on_image_progress) options.on_image_progress("Preparing image pixels");
+        const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
+        const auto pixels = require(image::prepare_gemma4(bytes, options.image_tokens, options.image_max_pixels));
+        if (!vision_) {
+            if (options.on_image_progress) options.on_image_progress("Preparing image model");
+            const core::MemoryScope memory("load:vision");
+            const ModuleScope construction(tensor::DType::F32, false, model_->device());
+            auto vision = model::Gemma4Vision(config_["vision"], model_->hidden_size(), native_qat());
+            auto weights = require(checkpoint::Weights::load(config_["weights_file"].as<std::string>()));
+            require(vision->set_checkpoint(weights));
+            vision->set_precision(runtime_precision(options_.precision, model_->device()));
+            vision_ = vision.ptr();
+        }
+        if (options.on_image_progress) options.on_image_progress("Encoding images");
+        auto features = vision_->encode_image(pixels);
+        if (vision_->device().capabilities().compute.host()) vision_->release_workspaces();
+        embeddings = require(require(std::move(features)).to(model_->device()));
+        if (options.on_image_progress) options.on_image_progress("Image encoded");
+    }
+    std::string placeholders = "<|image>";
+    for (std::size_t index = 0; index < embeddings.size(1); ++index) placeholders += "<|image|>";
+    placeholders += "<image|>";
+    batch.key += std::to_string(options.image_tokens) + ":" + std::to_string(options.image_max_pixels) + ":" +
+                 std::to_string(encoded.size()) + ":" + encoded;
+    batch.images.push_back({std::move(encoded), std::move(embeddings), options.image_tokens, options.image_max_pixels});
+    return placeholders;
+}
+
+auto Generator::enqueue_with_images(const std::string& prompt, GenerationOptions options, ImageBatch batch)
+    -> std::uint64_t {
+    std::vector<model::EmbeddingSpan> positions;
+    if (!batch.images.empty()) {
+        const auto ids = require(tokenizer_.encode(prompt));
+        const auto image_token = config_["image_token_id"].as<std::int32_t>();
+        std::size_t image_index = 0;
+        for (std::size_t position = 0; position < ids.size();) {
+            if (ids[position] != image_token) {
+                ++position;
+                continue;
+            }
+            if (image_index >= batch.images.size())
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "extra image placeholders"});
+            const auto& embeddings = batch.images[image_index++].embeddings;
+            const auto count = embeddings.size(1);
+            if (count > ids.size() - position ||
+                !std::ranges::all_of(std::span(ids).subspan(position, count),
+                                     [&](auto token) { return token == image_token; }))
+                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "image token count mismatch"});
+            positions.push_back({position, embeddings});
+            position += count;
+        }
+        if (image_index != batch.images.size())
+            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "missing image placeholders"});
+    }
+    options.raw_prompt = true;
+    const auto id = require(enqueue(prompt, options));
+    waiting_.back().images = std::move(positions);
+    waiting_.back().image_key = std::move(batch.key);
+    images_ = std::move(batch.images);
+    return id;
+}
+
 auto Generator::enqueue_chat(std::span<const text::ChatMessage> messages, GenerationOptions options)
     -> Result<std::uint64_t> {
     try {
-        if (drafter_ && std::ranges::any_of(messages, [](const auto& message) { return !message.images.empty(); }))
-            throw ops::Failure({ErrorCode::UNSUPPORTED, "speculative decoding currently supports text-only requests"});
-        if (options.image_max_pixels < image::MIN_RESIZED_PIXELS ||
-            options.image_max_pixels > image::MAX_RESIZED_PIXELS)
-            throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "image resize limit must be 161280 to 3000000 pixels"});
-        std::vector<text::ChatMessage> expanded(messages.begin(), messages.end());
-        std::vector<CachedImage> current;
-        std::string image_key;
-        for (auto& message : expanded) {
-            std::string placeholders;
-            for (const auto& path : message.images) {
-                if (!vision_supported())
-                    throw ops::Failure({ErrorCode::UNSUPPORTED, "this checkpoint has no supported vision tower"});
-                if (message.role != "user" || current.size() >= 8)
-                    throw ops::Failure(
-                        {ErrorCode::INVALID_ARGUMENT, "images require user messages, at most eight per context"});
-                const auto size = std::filesystem::file_size(path);
-                if (!size || size > 32 * 1024 * 1024 || image_key.size() + size > 32 * 1024 * 1024)
-                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "images exceed the 32 MiB request limit"});
-                std::ifstream stream(path, std::ios::binary);
-                std::string encoded(size, '\0');
-                if (!stream.read(encoded.data(), encoded.size()) || stream.peek() != std::char_traits<char>::eof())
-                    throw ops::Failure({ErrorCode::IO, "unable to read complete image"});
-                auto cached = std::ranges::find_if(images_, [&](const CachedImage& image) {
-                    return image.encoded == encoded && image.tokens == options.image_tokens &&
-                           image.max_pixels == options.image_max_pixels;
-                });
-                tensor::Tensor embeddings;
-                if (cached != images_.end()) {
-                    embeddings = cached->embeddings;
-                } else {
-                    if (model_->device().capabilities().compute.host() && model_->accelerator().empty()) {
-                        model_->release_workspaces();
-                        if (vision_) vision_->release_workspaces();
-                    }
-                    if (options.on_image_progress) options.on_image_progress("Preparing image pixels");
-                    const auto pixels = require(image::prepare_gemma4(
-                        std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()),
-                        options.image_tokens, options.image_max_pixels));
-                    if (!vision_) {
-                        if (options.on_image_progress) options.on_image_progress("Preparing image model");
-                        const core::MemoryScope memory("load:vision");
-                        const ModuleScope construction(tensor::DType::F32, false, model_->device());
-                        auto vision = model::Gemma4Vision(config_["vision"], model_->hidden_size(), native_qat());
-                        auto weights = require(checkpoint::Weights::load(config_["weights_file"].as<std::string>()));
-                        require(vision->set_checkpoint(weights));
-                        vision->set_precision(runtime_precision(options_.precision, model_->device()));
-                        vision_ = vision.ptr();
-                    }
-                    if (options.on_image_progress) options.on_image_progress("Encoding images");
-                    auto features = vision_->encode_image(pixels);
-                    if (vision_->device().capabilities().compute.host()) vision_->release_workspaces();
-                    embeddings = require(require(std::move(features)).to(model_->device()));
-                    if (options.on_image_progress) options.on_image_progress("Image encoded");
-                }
-                placeholders += "<|image>";
-                for (std::size_t index = 0; index < embeddings.size(1); ++index) placeholders += "<|image|>";
-                placeholders += "<image|>";
-                image_key += std::to_string(options.image_tokens) + ":" + std::to_string(options.image_max_pixels) +
-                             ":" + std::to_string(encoded.size()) + ":" + encoded;
-                current.push_back(
-                    {std::move(encoded), std::move(embeddings), options.image_tokens, options.image_max_pixels});
-            }
-            message.images.clear();
-            message.content = placeholders + message.content;
-        }
-        const auto prompt = require(tokenizer_.format_chat(expanded));
-        std::vector<model::EmbeddingSpan> positions;
-        if (!current.empty()) {
-            const auto ids = require(tokenizer_.encode(prompt));
-            const auto image_token = config_["image_token_id"].as<std::int32_t>();
-            std::size_t image_index = 0;
-            for (std::size_t position = 0; position < ids.size();) {
-                if (ids[position] != image_token) {
-                    ++position;
-                    continue;
-                }
-                if (image_index >= current.size())
-                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "extra image placeholders"});
-                const auto& embeddings = current[image_index++].embeddings;
-                const auto count = embeddings.size(1);
-                if (count > ids.size() - position ||
-                    !std::ranges::all_of(std::span(ids).subspan(position, count),
-                                         [&](auto token) { return token == image_token; }))
-                    throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "image token count mismatch"});
-                positions.push_back({position, embeddings});
-                position += count;
-            }
-            if (image_index != current.size())
-                throw ops::Failure({ErrorCode::INVALID_ARGUMENT, "missing image placeholders"});
-        }
-        options.raw_prompt = true;
-        const auto id = require(enqueue(prompt, options));
-        waiting_.back().images = std::move(positions);
-        waiting_.back().image_key = std::move(image_key);
-        images_ = std::move(current);
-        return id;
+        return enqueue_with_images(require(tokenizer_.format_chat(messages)), std::move(options), {});
     } catch (const ops::Failure& error) {
         return std::unexpected(error.error());
     } catch (const std::exception& error) {
@@ -999,19 +1069,40 @@ auto Generator::chat_prompt_tokens(std::span<const text::ChatMessage> messages) 
 }
 auto Generator::enqueue_chat(const nlohmann::ordered_json& messages, GenerationOptions options,
                               const nlohmann::ordered_json& template_args) -> Result<std::uint64_t> {
-    auto prompt = format_text_chat(tokenizer_, messages, template_args);
-    if (!prompt) return std::unexpected(std::move(prompt.error()));
-    options.raw_prompt = true;
-    return enqueue(*prompt, options);
+    try {
+        ImageBatch batch;
+        const auto expanded = expand_image_parts(messages, [&](std::string encoded) {
+            check_image_request(options);
+            return image_placeholders(std::move(encoded), options, batch);
+        });
+        auto prompt = require(format_text_chat(tokenizer_, expanded, template_args));
+        return enqueue_with_images(prompt, std::move(options), std::move(batch));
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
+    }
 }
 
 auto Generator::chat_prompt_tokens(const nlohmann::ordered_json& messages,
                                    const nlohmann::ordered_json& template_args) const -> Result<std::size_t> {
-    auto prompt = format_text_chat(tokenizer_, messages, template_args);
-    if (!prompt) return std::unexpected(std::move(prompt.error()));
-    auto ids = tokenizer_.encode(*prompt);
-    if (!ids) return std::unexpected(std::move(ids.error()));
-    return ids->size();
+    try {
+        // Counts each image at the default token budget without encoding it, under the same limits as generation.
+        std::size_t count = 0, total_bytes = 0;
+        const auto expanded = expand_image_parts(messages, [&](const std::string& encoded) {
+            check_image_request(GenerationOptions{});
+            check_image_limits(encoded, count++, total_bytes);
+            total_bytes += encoded.size();
+            std::string placeholders = "<|image>";
+            for (std::int32_t index = 0; index < GenerationOptions{}.image_tokens; ++index) placeholders += "<|image|>";
+            return placeholders + "<image|>";
+        });
+        return require(tokenizer_.encode(require(format_text_chat(tokenizer_, expanded, template_args)))).size();
+    } catch (const ops::Failure& error) {
+        return std::unexpected(error.error());
+    } catch (const std::exception& error) {
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, error.what()});
+    }
 }
 
 auto Generator::context_capacity(GenerationOptions options) const -> Result<std::size_t> {
@@ -1026,15 +1117,17 @@ auto Generator::context_capacity(GenerationOptions options) const -> Result<std:
 auto Generator::fit_context_size(std::size_t memory_bytes) -> Result<std::size_t> {
     try {
         const auto maximum = config_["model"]["max_position_embeddings"].as<std::size_t>();
-        // Two sizes give the marginal per-token cost, excluding fixed and sliding-window state.
-        constexpr std::size_t SMALL = 4096, LARGE = 8192;
-        if (maximum <= LARGE) return maximum;
+        // Two sizes give the marginal per-token cost. Both exceed sliding-window ring caches (Inkling-2 keeps
+        // window + 4096 rows), which stop growing once full.
+        constexpr std::size_t MINIMUM = 4096, SMALL = 8192, LARGE = 16384;
+        if (maximum <= SMALL) return maximum;
+        const auto large_size = std::min(maximum, LARGE);
         const auto small = require(model_->create_state(SMALL))->cache_bytes();
-        const auto large = require(model_->create_state(LARGE))->cache_bytes();
+        const auto large = require(model_->create_state(large_size))->cache_bytes();
         if (large <= small) return maximum;
-        const auto per_token = (large - small + LARGE - SMALL - 1) / (LARGE - SMALL);
+        const auto per_token = (large - small + large_size - SMALL - 1) / (large_size - SMALL);
         const auto fixed = small > per_token * SMALL ? small - per_token * SMALL : 0;
-        if (memory_bytes <= fixed + per_token * SMALL)
+        if (memory_bytes <= fixed + per_token * MINIMUM)
             throw ops::Failure({ErrorCode::RUNTIME, "not enough free memory for a 4096-token context"});
         return std::min(maximum, (memory_bytes - fixed) / per_token) / 1024 * 1024;
     } catch (const ops::Failure& error) {

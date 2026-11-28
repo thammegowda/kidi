@@ -79,3 +79,4 @@ __pycache__/
 **/.kidi-cache/
 
 tmp*
+.history*

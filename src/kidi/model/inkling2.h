@@ -14,12 +14,13 @@
 
 namespace kidi::model {
 
-/// Caches of one (layer, loop pass) visit: keys/values by absolute position and a ring buffer of the last W
-/// inputs of each short convolution (key, value, attention output, MoE output).
+/// Caches of one (layer, loop pass) visit: keys/values by absolute position (on Metal and CUDA, sliding-window
+/// layers keep key `p` in ring row `p % local_capacity`) and a ring buffer of the last W inputs of each short
+/// convolution (key, value, attention output, MoE output).
 struct Inkling2Visit {
     tensor::Tensor key, value;
     tensor::Tensor key_conv, value_conv, attention_conv, mlp_conv;
-    tensor::Tensor key_scales, value_scales; // CPU INT8 KV: F32 [capacity, key_heads * groups_per_head]
+    tensor::Tensor key_scales, value_scales; // INT8 KV: F32 [capacity, key_heads * groups_per_head]
     std::array<tensor::Tensor, 4> rewind_inputs;
     bool record_rewind = false;
 };
@@ -47,7 +48,8 @@ struct Inkling2State : LanguageModelState {
 
 /// Thinking Machines Inkling-2 text model (`inkling2_loop_text`): block attention residuals, relative-position
 /// attention with sinks, short convolutions, a sigmoid-routed MoE and a looped core of layers. CPU uses INT8 experts;
-/// CUDA keeps native NVFP4/MXFP8 experts and BF16 caches. CPU uses group-32 INT8 KV caches; activations are BF16.
+/// CUDA keeps native NVFP4/MXFP8 experts. KV caches are group-32 INT8 on CPU and BF16 (or opt-in INT8) on CUDA and
+/// Metal; activations are BF16 (F32 on Metal).
 /// `tools/reference/inkling2.py` is the executable specification.
 KIDI_MODULE(Inkling2);
 class Inkling2Impl : public CausalLanguageModel {
@@ -73,6 +75,9 @@ public:
             if (kv_cache_precision_ == core::KVCachePrecision::FP32) return tensor::DType::F32;
             return tensor::DType::BF16;
         }
+        if (kv_cache_precision_ == core::KVCachePrecision::INT8) return tensor::DType::I8;
+        if (kv_cache_precision_ == core::KVCachePrecision::FP32)
+            return std::unexpected(Error{ErrorCode::UNSUPPORTED, "Inkling-2 CUDA KV caches support BF16 or INT8"});
         return tensor::DType::BF16;
     }
     auto preparation_ns() const noexcept -> std::uint64_t override;

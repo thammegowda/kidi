@@ -130,6 +130,90 @@ TEST(Agent, ApprovalPerCall) {
     }
 }
 
+TEST(Agent, SetupRunsOnceTheUserAgrees) {
+    int calls = 0, asked = 0, runs = 0;
+    bool ready = false;
+    auto tool = test_tool(calls, Capability::NETWORK);
+    tool.setup = std::make_shared<const ToolSetup>(ToolSetup{
+        "Example",
+        [&]() -> std::optional<std::string> {
+            if (ready) return std::nullopt;
+            return "sign in to Example";
+        },
+        [&](const BrowserSignIn& browser, std::stop_token) -> Result<void> {
+            ++runs;
+            EXPECT_EQ(browser.redirect_uri, "http://127.0.0.1:1/oauth/callback");
+            ready = true;
+            return {};
+        }});
+    std::vector<Tool> tools{tool};
+    RunOptions options;
+    options.permissions.network = Access::ALLOW;
+    std::vector<std::string> results;
+    const auto provider = [&](std::span<const Message> messages, auto, std::stop_token) -> Result<Message> {
+        if (messages.back().role == Role::TOOL) {
+            results.push_back(messages.back().content);
+            return Message{.role = Role::ASSISTANT, .content = "done"};
+        }
+        return tool_reply();
+    };
+    const auto turn = [&](Callbacks callbacks) {
+        std::vector<Message> history;
+        EXPECT_TRUE(run_turn(provider, tools, history, "go", options, callbacks));
+    };
+    turn({});
+    EXPECT_NE(results.back().find("needs Example to be connected (sign in to Example)"), std::string::npos)
+        << "without a front end that can ask, the model learns how to get set up";
+    Callbacks declining{.setup = [&](const ToolSpec& spec, const ToolSetup& setup, const std::string& reason)
+                            -> Result<std::optional<BrowserSignIn>> {
+        ++asked;
+        EXPECT_EQ(spec.name, "edit");
+        EXPECT_EQ(setup.service, "Example");
+        EXPECT_EQ(reason, "sign in to Example");
+        return std::optional<BrowserSignIn>{};
+    }};
+    turn(declining);
+    EXPECT_NE(results.back().find("The user chose not to connect Example now"), std::string::npos);
+    EXPECT_EQ(runs, 0);
+    Callbacks accepting{.setup = [&](const ToolSpec&, const ToolSetup&, const std::string&)
+                            -> Result<std::optional<BrowserSignIn>> {
+        ++asked;
+        return std::optional<BrowserSignIn>(BrowserSignIn{"http://127.0.0.1:1/oauth/callback", {}});
+    }};
+    turn(accepting);
+    EXPECT_EQ(results.back(), "edited");
+    EXPECT_EQ(runs, 1);
+    turn(accepting);
+    EXPECT_EQ(asked, 2) << "a ready tool asks nothing";
+    EXPECT_EQ(calls, 2);
+    options.permissions.network = Access::DENY;
+    turn(accepting);
+    EXPECT_EQ(asked, 2) << "a denied tool never asks for setup";
+}
+
+TEST(Agent, FailedCheckSkipsApprovalAndCall) {
+    int calls = 0, approvals = 0, requests = 0;
+    auto tool = test_tool(calls);
+    tool.check = [](const ToolCall&, std::span<const Message> history) -> Result<void> {
+        EXPECT_EQ(history.back().role, Role::ASSISTANT) << "the check sees the conversation up to the call";
+        return std::unexpected(Error{ErrorCode::INVALID_ARGUMENT, "not allowed here"});
+    };
+    std::vector<Tool> tools{tool};
+    std::vector<Message> history;
+    Provider provider = [&](std::span<const Message> messages, auto, std::stop_token) -> Result<Message> {
+        if (++requests == 1) return tool_reply();
+        EXPECT_EQ(messages.back().content, R"({"error":"not allowed here"})");
+        return Message{.role = Role::ASSISTANT, .content = "done"};
+    };
+    Callbacks callbacks{.approve = [&](const ToolSpec&, const ToolCall&) -> Result<bool> {
+        ++approvals;
+        return true;
+    }};
+    EXPECT_TRUE(run_turn(provider, tools, history, "edit", {}, callbacks));
+    EXPECT_EQ(approvals, 0);
+    EXPECT_EQ(calls, 0);
+}
+
 TEST(Agent, MissingApprovalFailsClosed) {
     int calls = 0;
     std::vector<Tool> tools{test_tool(calls)};
